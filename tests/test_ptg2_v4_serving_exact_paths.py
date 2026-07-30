@@ -449,7 +449,7 @@ async def test_project_graph_candidates_enriches_and_validates_dictionary(
 
 
 @pytest.mark.asyncio
-async def test_v4_explicit_npi_scope_handles_unscoped_and_empty_rate_scope(
+async def test_v4_explicit_npi_scope_handles_unscoped_and_scoped_requests(
     monkeypatch,
 ) -> None:
     graph_lookup = AsyncMock(return_value={1234567890: (3, 5)})
@@ -458,9 +458,10 @@ async def test_v4_explicit_npi_scope_handles_unscoped_and_empty_rate_scope(
         object(), _tables(), {"npi": "1234567890"}
     ) == serving._ExplicitNpiGraphScope(1234567890, (3, 5))
     assert graph_lookup.await_args.kwargs["allowed_provider_set_keys"] is None
-    monkeypatch.setattr(
-        serving, "_shared_rate_provider_set_keys", AsyncMock(return_value=())
+    rate_scope = AsyncMock(
+        side_effect=AssertionError("graph scope must not scan code rows")
     )
+    monkeypatch.setattr(serving, "_shared_rate_provider_set_keys", rate_scope)
     monkeypatch.setattr(
         serving,
         "load_v4_graph_root",
@@ -471,11 +472,10 @@ async def test_v4_explicit_npi_scope_handles_unscoped_and_empty_rate_scope(
         object(),
         _tables(),
         {"npi": "1234567890", "plan_id": "plan-1", "code": "70553"},
-    ) == serving._ExplicitNpiGraphScope(1234567890, ())
+    ) == serving._ExplicitNpiGraphScope(1234567890, (3, 5))
     assert graph_lookup.await_args.kwargs["allowed_provider_set_keys"] is None
     assert graph_lookup.await_args.kwargs["max_members"] == 64
-    rate_call = serving._shared_rate_provider_set_keys.await_args
-    assert rate_call.kwargs["provider_set_keys"] == (3, 5)
+    rate_scope.assert_not_awaited()
 
 
 @pytest.mark.asyncio

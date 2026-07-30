@@ -295,54 +295,94 @@ async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
     assert stopped_tasks
 
 
+_LANE_ENV_BY_RESULT_KEY = {
+    "workers": "HLTHPRT_PTG2_RUST_WORKERS",
+    "rapidgzip_threads": "HLTHPRT_PTG2_RUST_RAPIDGZIP_THREADS",
+    "parse": "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS",
+    "top_level_byte_scan": "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN",
+    "work_queue": "HLTHPRT_PTG2_RUST_WORK_QUEUE",
+    "event_queue": "HLTHPRT_PTG2_RUST_EVENT_QUEUE",
+    "split_negotiated_rates": "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
+    "raw_chunk_bytes": "HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES",
+    "provider_refs_in_workers": "HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS",
+    "provider_ref_workers": "HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS",
+    "provider_ref_queue": "HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE",
+    "provider_ref_chunk_items": "HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS",
+    "provider_ref_raw_chunk_bytes": "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES",
+    "manifest_merge_chunk_bytes": "HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES",
+    "manifest_merge_sort_workers": "HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS",
+    "file_process_concurrency": "HLTHPRT_PTG2_FILE_PROCESS_CONCURRENCY",
+}
+
+_LANE_SCANNER_PARAMS = {
+    "_expected_queue": "arq:PTGSmall",
+    "_expected_worker_class": "process.PTGSmall",
+    "_scanner_rust_workers": 4,
+    "_scanner_rapidgzip_threads": 8,
+    "_scanner_parse_in_workers": True,
+    "_scanner_top_level_byte_scan": True,
+    "_scanner_work_queue": 5,
+    "_scanner_event_queue": 9,
+    "_scanner_split_negotiated_rates": 8192,
+    "_scanner_raw_chunk_bytes": 33554432,
+    "_scanner_provider_refs_in_workers": False,
+    "_scanner_provider_ref_workers": 3,
+    "_scanner_provider_ref_queue": 4,
+    "_scanner_provider_ref_chunk_items": 512,
+    "_scanner_provider_ref_raw_chunk_bytes": 524288,
+    "_manifest_merge_chunk_bytes": 268435456,
+    "_manifest_merge_sort_workers": 4,
+    "_file_process_concurrency": 2,
+}
+
+_EXPECTED_LANE_ENV = {
+    "workers": "4",
+    "rapidgzip_threads": "8",
+    "parse": "true",
+    "top_level_byte_scan": "true",
+    "work_queue": "5",
+    "event_queue": "9",
+    "split_negotiated_rates": "8192",
+    "raw_chunk_bytes": "33554432",
+    "provider_refs_in_workers": "false",
+    "provider_ref_workers": "3",
+    "provider_ref_queue": "4",
+    "provider_ref_chunk_items": "512",
+    "provider_ref_raw_chunk_bytes": "524288",
+    "manifest_merge_chunk_bytes": "268435456",
+    "manifest_merge_sort_workers": "4",
+    "file_process_concurrency": "2",
+}
+
+
+def _lane_environment_observer(observed_env_map):
+    async def observe_lane_environment(**_kwargs):
+        observed_env_map.update(
+            {
+                result_key: ptg_control.os.environ.get(env_name)
+                for result_key, env_name in _LANE_ENV_BY_RESULT_KEY.items()
+            }
+        )
+        return {}
+
+    return observe_lane_environment
+
+
 @pytest.mark.asyncio
 async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
     """Verify ptg control start applies lane scanner env."""
     observed_env_map = {}
-
-    async def fake_ptg_main(**_kwargs):
-        observed_env_map["workers"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORKERS")
-        observed_env_map["rapidgzip_threads"] = ptg_control.os.environ.get(
-            "HLTHPRT_PTG2_RUST_RAPIDGZIP_THREADS"
-        )
-        observed_env_map["parse"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS")
-        observed_env_map["top_level_byte_scan"] = ptg_control.os.environ.get(
-            "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN"
-        )
-        observed_env_map["work_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORK_QUEUE")
-        observed_env_map["event_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_EVENT_QUEUE")
-        observed_env_map["split_negotiated_rates"] = ptg_control.os.environ.get(
-            "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES"
-        )
-        observed_env_map["raw_chunk_bytes"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES")
-        observed_env_map["provider_refs_in_workers"] = ptg_control.os.environ.get(
-            "HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS"
-        )
-        observed_env_map["provider_ref_workers"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS")
-        observed_env_map["provider_ref_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE")
-        observed_env_map["provider_ref_chunk_items"] = ptg_control.os.environ.get(
-            "HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS"
-        )
-        observed_env_map["provider_ref_raw_chunk_bytes"] = ptg_control.os.environ.get(
-            "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES"
-        )
-        observed_env_map["manifest_merge_chunk_bytes"] = ptg_control.os.environ.get(
-            "HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES"
-        )
-        observed_env_map["manifest_merge_sort_workers"] = ptg_control.os.environ.get(
-            "HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS"
-        )
-        observed_env_map["file_process_concurrency"] = ptg_control.os.environ.get(
-            "HLTHPRT_PTG2_FILE_PROCESS_CONCURRENCY"
-        )
-        return {}
 
     async def has_fake_marked_control_run(*_args, **_kwargs):
         return True
 
     monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_QUEUE", "arq:PTGSmall")
     monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_CLASS", "process.PTGSmall")
-    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(
+        ptg_control,
+        "ptg_main",
+        _lane_environment_observer(observed_env_map),
+    )
     monkeypatch.setattr(
         ptg_control,
         "mark_control_run",
@@ -354,47 +394,11 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
         {},
         {
             "run_id": "run_ptg",
-            "params": {
-                "_expected_queue": "arq:PTGSmall",
-                "_expected_worker_class": "process.PTGSmall",
-                "_scanner_rust_workers": 4,
-                "_scanner_rapidgzip_threads": 8,
-                "_scanner_parse_in_workers": True,
-                "_scanner_top_level_byte_scan": True,
-                "_scanner_work_queue": 5,
-                "_scanner_event_queue": 9,
-                "_scanner_split_negotiated_rates": 8192,
-                "_scanner_raw_chunk_bytes": 33554432,
-                "_scanner_provider_refs_in_workers": False,
-                "_scanner_provider_ref_workers": 3,
-                "_scanner_provider_ref_queue": 4,
-                "_scanner_provider_ref_chunk_items": 512,
-                "_scanner_provider_ref_raw_chunk_bytes": 524288,
-                "_manifest_merge_chunk_bytes": 268435456,
-                "_manifest_merge_sort_workers": 4,
-                "_file_process_concurrency": 2,
-            },
+            "params": _LANE_SCANNER_PARAMS,
         },
     )
 
-    assert observed_env_map == {
-        "workers": "4",
-        "rapidgzip_threads": "8",
-        "parse": "true",
-        "top_level_byte_scan": "true",
-        "work_queue": "5",
-        "event_queue": "9",
-        "split_negotiated_rates": "8192",
-        "raw_chunk_bytes": "33554432",
-        "provider_refs_in_workers": "false",
-        "provider_ref_workers": "3",
-        "provider_ref_queue": "4",
-        "provider_ref_chunk_items": "512",
-        "provider_ref_raw_chunk_bytes": "524288",
-        "manifest_merge_chunk_bytes": "268435456",
-        "manifest_merge_sort_workers": "4",
-        "file_process_concurrency": "2",
-    }
+    assert observed_env_map == _EXPECTED_LANE_ENV
 
 
 @pytest.mark.asyncio

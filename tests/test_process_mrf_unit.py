@@ -216,40 +216,6 @@ def test_mrf_flush_rows_are_configurable(monkeypatch):
 @pytest.mark.asyncio
 async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
     """Verify process json index dedupes provider url jobs."""
-    class FakeRedis:
-        def __init__(self):
-            self.calls = []
-            self.values = {}
-            self.sets = {}
-            self.hashes = {}
-
-        async def enqueue_job(self, *args, **kwargs):
-            self.calls.append((args, kwargs))
-            return SimpleNamespace()
-
-        async def incrby(self, key, value):
-            self.values[key] = int(self.values.get(key, 0)) + int(value)
-
-        async def expire(self, *_args, **_kwargs):
-            is_expiration_set = True
-            return is_expiration_set
-
-        async def hsetnx(self, key, field, value):
-            values = self.hashes.setdefault(key, {})
-            if field in values:
-                return 0
-            values[field] = value
-            return 1
-
-        async def hdel(self, key, field):
-            return int(self.hashes.get(key, {}).pop(field, None) is not None)
-
-        async def sadd(self, key, value):
-            values = self.sets.setdefault(key, set())
-            before = len(values)
-            values.add(value)
-            return 1 if len(values) > before else 0
-
     async def fake_download(_url, filename, **_kwargs):
         payload = {
             "plan_urls": [],
@@ -266,7 +232,7 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
     monkeypatch.setattr(process_initial, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_initial, "make_class", lambda *_args, **_kwargs: SimpleNamespace())
 
-    redis = FakeRedis()
+    redis = _UniqueWorkRedis()
     context_by_field = {
         "redis": redis,
         "context": {
@@ -1027,9 +993,7 @@ async def test_plan_summary_dependencies_ready(monkeypatch):
     assert missing == ["plan_prices"]
 
 
-@pytest.mark.asyncio
-async def test_refresh_plan_drug_statistics_upserts_concurrent_refreshes(monkeypatch):
-    """Verify refresh plan drug statistics upserts concurrent refreshes."""
+def _plan_drug_statistics_tables():
     from sqlalchemy import Boolean, Column, DateTime, Integer, MetaData, String, Table
 
     metadata = MetaData()
@@ -1063,27 +1027,36 @@ async def test_refresh_plan_drug_statistics_upserts_concurrent_refreshes(monkeyp
         Column("drug_tier", String, primary_key=True),
         Column("drug_count", Integer),
     )
+    return plan_drug, stats, tier_stats
+
+
+class _AggregateInsertSpy:
+    def __init__(self, table, inserts):
+        self.table = table
+        self.inserts = inserts
+        self.excluded = SimpleNamespace(
+            **{column.name: f"excluded_{column.name}" for column in table.c}
+        )
+
+    def from_select(self, columns, select_stmt):
+        self.columns = columns
+        self.select_stmt = select_stmt
+        return self
+
+    def on_conflict_do_update(self, index_elements=None, set_=None):
+        self.index_elements = index_elements
+        self.set_ = set_
+        return self
+
+    async def status(self):
+        self.inserts.append(self)
+
+
+@pytest.mark.asyncio
+async def test_refresh_plan_drug_statistics_upserts_concurrent_refreshes(monkeypatch):
+    """Verify refresh plan drug statistics upserts concurrent refreshes."""
+    plan_drug, stats, tier_stats = _plan_drug_statistics_tables()
     inserts = []
-
-    class FakeInsert:
-        def __init__(self, table):
-            self.table = table
-            self.excluded = SimpleNamespace(
-                **{column.name: f"excluded_{column.name}" for column in table.c}
-            )
-
-        def from_select(self, columns, select_stmt):
-            self.columns = columns
-            self.select_stmt = select_stmt
-            return self
-
-        def on_conflict_do_update(self, index_elements=None, set_=None):
-            self.index_elements = index_elements
-            self.set_ = set_
-            return self
-
-        async def status(self):
-            inserts.append(self)
 
     def fake_make_class(cls, suffix, schema_override=None):
         table_by_cls = {
@@ -1097,7 +1070,11 @@ async def test_refresh_plan_drug_statistics_upserts_concurrent_refreshes(monkeyp
         raise AssertionError("aggregate refresh should upsert instead of delete then insert")
 
     monkeypatch.setattr(process_initial, "make_class", fake_make_class)
-    monkeypatch.setattr(process_initial.db, "insert", lambda table: FakeInsert(table))
+    monkeypatch.setattr(
+        process_initial.db,
+        "insert",
+        lambda table: _AggregateInsertSpy(table, inserts),
+    )
     monkeypatch.setattr(process_initial.db, "delete", fail_delete)
 
     await process_initial._refresh_plan_drug_statistics({"94529WI0240007"}, "20260612", "mrf")

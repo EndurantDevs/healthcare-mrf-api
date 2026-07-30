@@ -644,71 +644,101 @@ async def test_get_all_unified_phone_facet_counts_include_service_locations(monk
     assert "JOIN phone_candidates AS phone_match" in conn.last_sql
 
 
+def _provider_directory_fallback_record(*, premise_key=None):
+    provider_record_map = {
+        "npi": 1033213624,
+        "inferred_npi": None,
+        "entity_name": "MARY S HARPER GERIATRIC PSY CTR",
+        "type": "practice",
+        "first_line": "115 Harper Ct",
+        "second_line": "Suite 100" if premise_key else None,
+        "city_name": "Tuscaloosa",
+        "state_name": "AL",
+        "postal_code": "35401",
+        "country_code": "US",
+        "telephone_number": "+12053663010",
+        "phone_number": "2053663010",
+        "address_key": "00000000-0000-0000-0000-000000000001"
+        if premise_key
+        else "e4cd3105-5ce1-efd3-3f31-d48bfa864a13",
+        "address_sources": ["provider_directory_fhir"],
+        "source_record_ids": [
+            "provider_directory_fhir:practitioner_role:pdfhir_alohr:role-1:loc-1"
+        ],
+        "source_count": 1,
+        "taxonomy_array": [],
+        "plans_network_array": [],
+        "procedures_array": [],
+        "medications_array": [],
+    }
+    if premise_key:
+        provider_record_map["premise_key"] = premise_key
+    return provider_record_map
+
+
+class _ProviderDirectoryFallbackConnection:
+    def __init__(self, row):
+        self.row = row
+        self.sql_calls = []
+
+    async def all(self, sql, **params):
+        sql_text = str(sql)
+        self.sql_calls.append((sql_text, dict(params)))
+        if "page_npis AS" in sql_text:
+            return []
+        return [self.row] if "SELECT c.*" in sql_text else []
+
+    async def first(self, *_args, **_kwargs):
+        return None
+
+
+async def _provider_directory_fallback_columns(table_name, *, session=None):
+    assert session is None
+    if table_name != "entity_address_unified":
+        return set()
+    return npi_module._public_address_serving_column_keys() | {
+        "address_precision",
+        "location_key",
+        "premise_key",
+        "source_count",
+        "updated_at",
+        "zip5",
+        "phone_number",
+        "inferred_npi",
+    }
+
+
+async def _empty_provider_directory_enrichment(*_args, **_kwargs):
+    return {}
+
+
+def _install_provider_directory_fallback(monkeypatch, *, premise_key=None):
+    connection = _ProviderDirectoryFallbackConnection(
+        _provider_directory_fallback_record(premise_key=premise_key)
+    )
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(
+        npi_module,
+        "_table_columns",
+        _provider_directory_fallback_columns,
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_summary_map",
+        _empty_provider_directory_enrichment,
+    )
+    monkeypatch.setattr(
+        npi_module.db,
+        "acquire",
+        lambda: FakeAcquire(connection),
+    )
+    return connection
+
+
 @pytest.mark.asyncio
 async def test_get_all_unified_phone_lookup_returns_provider_directory_only_row(monkeypatch):
     """Verify get all unified phone lookup returns provider directory only row."""
-    class ProviderDirectoryOnlyConnection:
-        def __init__(self):
-            self.sql_calls = []
-
-        async def all(self, sql, **params):
-            sql_text = str(sql)
-            self.sql_calls.append((sql_text, dict(params)))
-            if "page_npis AS" in sql_text:
-                return []
-            if "SELECT c.*" in sql_text:
-                return [
-                    {
-                        "npi": 1033213624,
-                        "inferred_npi": None,
-                        "entity_name": "MARY S HARPER GERIATRIC PSY CTR",
-                        "type": "practice",
-                        "first_line": "115 Harper Ct",
-                        "second_line": None,
-                        "city_name": "Tuscaloosa",
-                        "state_name": "AL",
-                        "postal_code": "35401",
-                        "country_code": "US",
-                        "telephone_number": "+12053663010",
-                        "phone_number": "2053663010",
-                        "address_key": "e4cd3105-5ce1-efd3-3f31-d48bfa864a13",
-                        "address_sources": ["provider_directory_fhir"],
-                        "source_record_ids": [
-                            "provider_directory_fhir:practitioner_role:pdfhir_alohr:role-1:loc-1"
-                        ],
-                        "source_count": 1,
-                        "taxonomy_array": [],
-                        "plans_network_array": [],
-                        "procedures_array": [],
-                        "medications_array": [],
-                    }
-                ]
-            return []
-
-        async def first(self, *_args, **_kwargs):
-            return None
-
-    async def fake_table_columns(table_name, *, session=None):
-        assert session is None
-        if table_name == "entity_address_unified":
-            return npi_module._public_address_serving_column_keys() | {
-                "address_precision",
-                "location_key",
-                "source_count",
-                "updated_at",
-                "zip5",
-                "phone_number",
-            }
-        return set()
-
-    async def fake_provider_enrichment_summary(*_args, **_kwargs):
-        return {}
-
-    conn = ProviderDirectoryOnlyConnection()
-    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
-    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
-    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_provider_enrichment_summary)
-    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    conn = _install_provider_directory_fallback(monkeypatch)
 
     request = types.SimpleNamespace(
         args={
@@ -756,71 +786,10 @@ def test_provider_list_phone_candidate_limit_covers_page_window_and_stays_bounde
 async def test_get_all_unified_site_key_returns_provider_directory_row(monkeypatch):
     """Verify get all unified address site key lookup returns provider directory only row."""
     address_site_key = "00000000-0000-0000-0000-000000000002"
-
-    class ProviderDirectoryOnlyConnection:
-        def __init__(self):
-            self.sql_calls = []
-
-        async def all(self, sql, **params):
-            sql_text = str(sql)
-            self.sql_calls.append((sql_text, dict(params)))
-            if "page_npis AS" in sql_text:
-                return []
-            if "SELECT c.*" in sql_text:
-                return [
-                    {
-                        "npi": 1033213624,
-                        "inferred_npi": None,
-                        "entity_name": "MARY S HARPER GERIATRIC PSY CTR",
-                        "type": "practice",
-                        "first_line": "115 Harper Ct",
-                        "second_line": "Suite 100",
-                        "city_name": "Tuscaloosa",
-                        "state_name": "AL",
-                        "postal_code": "35401",
-                        "country_code": "US",
-                        "telephone_number": "+12053663010",
-                        "phone_number": "2053663010",
-                        "address_key": "00000000-0000-0000-0000-000000000001",
-                        "premise_key": address_site_key,
-                        "address_sources": ["provider_directory_fhir"],
-                        "source_record_ids": [
-                            "provider_directory_fhir:practitioner_role:pdfhir_alohr:role-1:loc-1"
-                        ],
-                        "source_count": 1,
-                        "taxonomy_array": [],
-                        "plans_network_array": [],
-                        "procedures_array": [],
-                        "medications_array": [],
-                    }
-                ]
-            return []
-
-        async def first(self, *_args, **_kwargs):
-            return None
-
-    async def fake_table_columns(table_name, *, session=None):
-        assert session is None
-        if table_name == "entity_address_unified":
-            return npi_module._public_address_serving_column_keys() | {
-                "address_precision",
-                "location_key",
-                "premise_key",
-                "source_count",
-                "updated_at",
-                "zip5",
-                "phone_number",
-            }
-        return set()
-
-    async def fake_provider_enrichment_summary(*_args, **_kwargs):
-        return {}
-
-    conn = ProviderDirectoryOnlyConnection()
-    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
-    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
-    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_provider_enrichment_summary)
-    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    conn = _install_provider_directory_fallback(
+        monkeypatch,
+        premise_key=address_site_key,
+    )
 
     request = types.SimpleNamespace(
         args={
@@ -853,69 +822,7 @@ async def test_get_all_unified_site_key_returns_provider_directory_row(monkeypat
 @pytest.mark.asyncio
 async def test_get_all_unified_exact_npi_lookup_returns_provider_directory_only_row(monkeypatch):
     """Verify get all unified exact npi lookup returns provider directory only row."""
-    class ProviderDirectoryOnlyConnection:
-        def __init__(self):
-            self.sql_calls = []
-
-        async def all(self, sql, **params):
-            sql_text = str(sql)
-            self.sql_calls.append((sql_text, dict(params)))
-            if "page_npis AS" in sql_text:
-                return []
-            if "SELECT c.*" in sql_text:
-                return [
-                    {
-                        "npi": 1033213624,
-                        "inferred_npi": None,
-                        "entity_name": "MARY S HARPER GERIATRIC PSY CTR",
-                        "type": "practice",
-                        "first_line": "115 Harper Ct",
-                        "second_line": None,
-                        "city_name": "Tuscaloosa",
-                        "state_name": "AL",
-                        "postal_code": "35401",
-                        "country_code": "US",
-                        "telephone_number": "+12053663010",
-                        "phone_number": "2053663010",
-                        "address_key": "e4cd3105-5ce1-efd3-3f31-d48bfa864a13",
-                        "address_sources": ["provider_directory_fhir"],
-                        "source_record_ids": [
-                            "provider_directory_fhir:practitioner_role:pdfhir_alohr:role-1:loc-1"
-                        ],
-                        "source_count": 1,
-                        "taxonomy_array": [],
-                        "plans_network_array": [],
-                        "procedures_array": [],
-                        "medications_array": [],
-                    }
-                ]
-            return []
-
-        async def first(self, *_args, **_kwargs):
-            return None
-
-    async def fake_table_columns(table_name, *, session=None):
-        assert session is None
-        if table_name == "entity_address_unified":
-            return npi_module._public_address_serving_column_keys() | {
-                "address_precision",
-                "location_key",
-                "source_count",
-                "updated_at",
-                "zip5",
-                "phone_number",
-                "inferred_npi",
-            }
-        return set()
-
-    async def fake_provider_enrichment_summary(*_args, **_kwargs):
-        return {}
-
-    conn = ProviderDirectoryOnlyConnection()
-    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
-    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
-    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_provider_enrichment_summary)
-    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    conn = _install_provider_directory_fallback(monkeypatch)
 
     request = types.SimpleNamespace(
         args={
@@ -955,58 +862,6 @@ async def test_get_all_rejects_invalid_npi_filter(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_all_unified_exact_lookup_can_include_provider_directory_source_summary(monkeypatch):
     """Verify get all unified exact lookup can include provider directory source summary."""
-    class ProviderDirectoryOnlyConnection:
-        async def all(self, sql, **_params):
-            sql_text = str(sql)
-            if "page_npis AS" in sql_text:
-                return []
-            if "SELECT c.*" in sql_text:
-                return [
-                    {
-                        "npi": 1033213624,
-                        "inferred_npi": None,
-                        "entity_name": "MARY S HARPER GERIATRIC PSY CTR",
-                        "type": "practice",
-                        "first_line": "115 Harper Ct",
-                        "city_name": "Tuscaloosa",
-                        "state_name": "AL",
-                        "postal_code": "35401",
-                        "country_code": "US",
-                        "telephone_number": "+12053663010",
-                        "phone_number": "2053663010",
-                        "address_key": "e4cd3105-5ce1-efd3-3f31-d48bfa864a13",
-                        "address_sources": ["provider_directory_fhir"],
-                        "source_record_ids": [
-                            "provider_directory_fhir:practitioner_role:pdfhir_alohr:role-1:loc-1"
-                        ],
-                        "source_count": 1,
-                        "taxonomy_array": [],
-                        "plans_network_array": [],
-                        "procedures_array": [],
-                        "medications_array": [],
-                    }
-                ]
-            return []
-
-        async def first(self, *_args, **_kwargs):
-            return None
-
-    async def fake_table_columns(table_name, *, session=None):
-        assert session is None
-        if table_name == "entity_address_unified":
-            return npi_module._public_address_serving_column_keys() | {
-                "address_precision",
-                "location_key",
-                "source_count",
-                "updated_at",
-                "zip5",
-                "phone_number",
-            }
-        return set()
-
-    async def fake_provider_enrichment_summary(*_args, **_kwargs):
-        return {}
-
     async def fake_source_detail_map(source_ids, **_kwargs):
         assert source_ids == ["pdfhir_alohr"]
         return {
@@ -1020,11 +875,8 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
             }
         }
 
-    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
-    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
-    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_provider_enrichment_summary)
+    conn = _install_provider_directory_fallback(monkeypatch)
     monkeypatch.setattr(npi_module, "_fetch_provider_directory_source_detail_map", fake_source_detail_map)
-    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(ProviderDirectoryOnlyConnection()))
 
     request = types.SimpleNamespace(
         args={
@@ -1038,6 +890,7 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
     )
     resp = await get_all(request)
     provider_record_map = json.loads(resp.body)["rows"][0]
+    assert conn.sql_calls
 
     assert provider_record_map["provider_directory_sources"] == [
             {

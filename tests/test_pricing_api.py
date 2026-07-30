@@ -457,10 +457,7 @@ async def test_group_plan_providers_classification_internal_medicine_uses_base_t
     assert params["group_provider_specialty_taxonomy_code_0"] == "207R00000X"
 
 
-@pytest.mark.asyncio
-async def test_group_plan_providers_applies_location_filter_and_returns_addresses(monkeypatch):
-    """Location filters should constrain group-plan provider NPIs and return addresses."""
-
+def _patch_group_plan_snapshot_tables(monkeypatch) -> None:
     async def fake_snapshot_id_for_plan(_session, _plan_fields):
         return "ptg2:test"
 
@@ -478,6 +475,44 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
         fake_plan_snapshot_pairs,
     )
     monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
+
+
+def _assert_group_plan_location_response(request, pricing_response) -> None:
+    assert pricing_response["location_filter"] == {
+        "requested": True,
+        "city": "chicago",
+        "state": "IL",
+        "zip5": "60626",
+        "zip_radius_miles": 0.0,
+        "zips_considered": 1,
+        "include_mail_addresses": False,
+        "address_source": "npi",
+        "address_types": ["primary", "secondary"],
+        "count_requested": True,
+        "count_exact": True,
+        "plan_ids_considered": ["TESTPLAN001"],
+        "plan_market_types_considered": ["group"],
+    }
+    assert pricing_response["providers"]["total_distinct"] == 1
+    assert pricing_response["providers"]["items"][0]["address"]["zip5"] == "60626"
+    provider_sql = str(request.ctx.sa_session.executions[0][0][0])
+    count_sql = str(request.ctx.sa_session.executions[1][0][0])
+    address_sql = str(request.ctx.sa_session.executions[2][0][0])
+    params = request.ctx.sa_session.executions[0][0][1]
+    assert "mrf.npi_address addr" in provider_sql
+    assert "addr.type IN ('primary', 'secondary')" in provider_sql
+    assert "LEFT(COALESCE(addr.postal_code, ''), 5) = ANY(:location_zips)" in provider_sql
+    assert "mrf.npi_address addr" in count_sql
+    assert "type IN ('primary', 'secondary')" in address_sql
+    assert params["location_city"] == "chicago"
+    assert params["location_state"] == "IL"
+    assert params["location_zips"] == ["60626"]
+
+
+@pytest.mark.asyncio
+async def test_group_plan_providers_applies_location_filter_and_returns_addresses(monkeypatch):
+    """Location filters should constrain group-plan provider NPIs and return addresses."""
+    _patch_group_plan_snapshot_tables(monkeypatch)
     request = make_request(
         [
             FakeResult(rows=[types.SimpleNamespace(npi=1073913877)]),
@@ -512,23 +547,6 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
 
     response = await group_plan_providers(request)
     pricing_response = json.loads(response.body)
-
-    assert pricing_response["location_filter"] == {
-        "requested": True,
-        "city": "chicago",
-        "state": "IL",
-        "zip5": "60626",
-        "zip_radius_miles": 0.0,
-        "zips_considered": 1,
-        "include_mail_addresses": False,
-        "address_source": "npi",
-        "address_types": ["primary", "secondary"],
-            "count_requested": True,
-            "count_exact": True,
-            "plan_ids_considered": ["TESTPLAN001"],
-            "plan_market_types_considered": ["group"],
-    }
-    assert pricing_response["providers"]["total_distinct"] == 1
     assert pricing_response["providers"]["items"][0]["address"] == {
         "type": "primary",
         "first_line": "1400 W GREENLEAF AVE STE 101",
@@ -539,18 +557,7 @@ async def test_group_plan_providers_applies_location_filter_and_returns_addresse
         "zip5": "60626",
         "phone_number": "3125550100",
     }
-    provider_sql = str(request.ctx.sa_session.executions[0][0][0])
-    count_sql = str(request.ctx.sa_session.executions[1][0][0])
-    address_sql = str(request.ctx.sa_session.executions[2][0][0])
-    params = request.ctx.sa_session.executions[0][0][1]
-    assert "mrf.npi_address addr" in provider_sql
-    assert "addr.type IN ('primary', 'secondary')" in provider_sql
-    assert "LEFT(COALESCE(addr.postal_code, ''), 5) = ANY(:location_zips)" in provider_sql
-    assert "mrf.npi_address addr" in count_sql
-    assert "type IN ('primary', 'secondary')" in address_sql
-    assert params["location_city"] == "chicago"
-    assert params["location_state"] == "IL"
-    assert params["location_zips"] == ["60626"]
+    _assert_group_plan_location_response(request, pricing_response)
 
 
 @pytest.mark.asyncio
@@ -996,27 +1003,10 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
 @pytest.mark.asyncio
 async def test_group_plan_providers_uses_unified_service_locations_when_configured(monkeypatch):
     """Unified address serving should use service-location rows for group-plan filters."""
-
-    async def fake_snapshot_id_for_plan(_session, _plan_fields):
-        return "ptg2:test"
-
-    async def fake_snapshot_serving_tables(_session, _snapshot_id):
-        return strict_snapshot_tables(_snapshot_id)
-
     async def fake_group_plan_provider_address_source(_session):
         return "mrf.entity_address_unified", True, True, True
 
-    monkeypatch.setattr(
-        pricing_module,
-        "current_source_snapshot_id_for_plan",
-        fake_snapshot_id_for_plan,
-    )
-    monkeypatch.setattr(
-        pricing_module,
-        "current_network_snapshots_for_plan",
-        fake_plan_snapshot_pairs,
-    )
-    monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
+    _patch_group_plan_snapshot_tables(monkeypatch)
     monkeypatch.setattr(
         pricing_module,
         "_group_plan_provider_address_source",
@@ -1058,11 +1048,6 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
     response = await group_plan_providers(request)
     pricing_response = json.loads(response.body)
 
-    assert pricing_response["location_filter"]["address_source"] == "unified"
-    assert pricing_response["location_filter"]["address_types"] == ["practice", "site", "primary", "secondary"]
-    assert pricing_response["location_filter"]["count_requested"] is True
-    assert pricing_response["location_filter"]["count_exact"] is False
-    assert pricing_response["providers"]["total_distinct"] is None
     assert pricing_response["providers"]["items"][0]["address"] == {
         "type": "practice",
         "first_line": "2335 S MICHIGAN AVE",
@@ -1075,6 +1060,20 @@ async def test_group_plan_providers_uses_unified_service_locations_when_configur
         "address_precision": "street",
         "plan_coverage_match": False,
     }
+    _assert_unified_group_plan_location_response(request, pricing_response)
+
+
+def _assert_unified_group_plan_location_response(request, pricing_response) -> None:
+    assert pricing_response["location_filter"]["address_source"] == "unified"
+    assert pricing_response["location_filter"]["address_types"] == [
+        "practice",
+        "site",
+        "primary",
+        "secondary",
+    ]
+    assert pricing_response["location_filter"]["count_requested"] is True
+    assert pricing_response["location_filter"]["count_exact"] is False
+    assert pricing_response["providers"]["total_distinct"] is None
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     address_sql = str(request.ctx.sa_session.executions[1][0][0])
     assert len(request.ctx.sa_session.executions) == 2
@@ -1464,71 +1463,62 @@ async def test_get_pricing_provider_score_defaults_to_most_local_mode():
     assert pricing_response["scores_by_benchmark_mode"]["state"] is None
 
 
-def _live_override_cohort_row():
-    return {
-        "row_data": {
-            "year": 2023,
-            "benchmark_mode": "zip",
-            "geography_scope": "zip",
-            "geography_value": "20850",
-            "cohort_level": "L0",
-            "peer_count": 44,
-            "specialty_key": "cardiology",
-            "taxonomy_code": "207RC0000X",
-            "procedure_bucket": "100,200",
-            "target_appropriateness": 2.0408163265306123,
-            "target_rx_appropriateness": 2.0,
-            "target_effectiveness": 80.0,
-            "target_qpp_cost": 70.0,
-            "target_cost": 24489.795918367346,
-        }
+def _live_override_cohort_row(**cohort_overrides):
+    cohort_row_map = {
+        "year": 2023,
+        "benchmark_mode": "zip",
+        "geography_scope": "zip",
+        "geography_value": "20850",
+        "cohort_level": "L0",
+        "peer_count": 44,
+        "specialty_key": "cardiology",
+        "taxonomy_code": "207RC0000X",
+        "procedure_bucket": "100,200",
+        "target_appropriateness": 2.0408163265306123,
+        "target_rx_appropriateness": 2.0,
+        "target_effectiveness": 80.0,
+        "target_qpp_cost": 70.0,
+        "target_cost": 24489.795918367346,
     }
+    cohort_row_map.update(cohort_overrides)
+    return {"row_data": cohort_row_map}
 
 
-def _live_override_request():
+def _live_override_results(*, cohort_rows, total_services=120.0, provider_type=None):
+    provider_profile_map = {
+        "npi": 1003000126,
+        "year": 2023,
+        "state": "MD",
+        "zip5": "20850",
+        "total_services": total_services,
+        "total_beneficiaries": total_services / 2,
+        "total_allowed_amount": 24000.0,
+    }
+    if provider_type is not None:
+        provider_profile_map["provider_type"] = provider_type
+    return [
+        FakeResult(rows=[provider_profile_map]),
+        FakeResult(rows=[{"quality_score": 80.0, "cost_score": 70.0}]),
+        FakeResult(rows=[{"total_rx_claims": 150.0, "total_rx_beneficiaries": 75.0}]),
+        FakeResult(scalar=0.4),
+        FakeResult(rows=cohort_rows),
+    ]
+
+
+def _live_override_request(*, cohort_rows=None, benchmark_mode="zip"):
+    request_args_map = {
+        "year": "2023",
+        "specialty": "cardiology",
+        "taxonomy_code": "207RC0000X",
+        "procedure_codes": "100,999",
+    }
+    if benchmark_mode is not None:
+        request_args_map["benchmark_mode"] = benchmark_mode
     return make_request(
-        [
-            FakeResult(
-                rows=[
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "state": "MD",
-                        "zip5": "20850",
-                        "total_services": 120.0,
-                        "total_beneficiaries": 60.0,
-                        "total_allowed_amount": 24000.0,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "quality_score": 80.0,
-                        "cost_score": 70.0,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "total_rx_claims": 150.0,
-                        "total_rx_beneficiaries": 75.0,
-                    }
-                ]
-            ),
-            FakeResult(scalar=0.4),
-            FakeResult(
-                rows=[_live_override_cohort_row()]
-            ),
-        ],
-        args={
-            "year": "2023",
-            "benchmark_mode": "zip",
-            "specialty": "cardiology",
-            "taxonomy_code": "207RC0000X",
-            "procedure_codes": "100,999",
-        },
+        _live_override_results(
+            cohort_rows=cohort_rows or [_live_override_cohort_row()]
+        ),
+        args=request_args_map,
     )
 
 
@@ -1561,104 +1551,35 @@ async def test_get_pricing_provider_score_live_override_path():
 @pytest.mark.asyncio
 async def test_live_score_override_all_modes():
     """Apply live overrides across modes when no benchmark is forced."""
-    request = make_request(
-        [
-            FakeResult(
-                rows=[
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "state": "MD",
-                        "zip5": "20850",
-                        "provider_type": "Cardiology",
-                        "total_services": 100.0,
-                        "total_beneficiaries": 50.0,
-                        "total_allowed_amount": 24000.0,
-                    }
-                ]
+    request = _live_override_request(
+        benchmark_mode=None,
+        cohort_rows=[
+            _live_override_cohort_row(),
+            _live_override_cohort_row(
+                benchmark_mode="state",
+                geography_scope="state",
+                geography_value="MD",
+                cohort_level="L1",
+                peer_count=120,
+                target_appropriateness=2.1,
+                target_rx_appropriateness=2.2,
+                target_effectiveness=81.0,
+                target_qpp_cost=72.0,
+                target_cost=25000.0,
             ),
-            FakeResult(
-                rows=[
-                    {
-                        "quality_score": 80.0,
-                        "cost_score": 70.0,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "total_rx_claims": 150.0,
-                        "total_rx_beneficiaries": 75.0,
-                    }
-                ]
-            ),
-            FakeResult(scalar=0.4),
-            FakeResult(
-                rows=[
-                    {
-                        "row_data": {
-                            "year": 2023,
-                            "benchmark_mode": "zip",
-                            "geography_scope": "zip",
-                            "geography_value": "20850",
-                            "cohort_level": "L0",
-                            "peer_count": 44,
-                            "specialty_key": "cardiology",
-                            "taxonomy_code": "207RC0000X",
-                            "procedure_bucket": "100,200",
-                            "target_appropriateness": 2.0408163265306123,
-                            "target_rx_appropriateness": 2.0,
-                            "target_effectiveness": 80.0,
-                            "target_qpp_cost": 70.0,
-                            "target_cost": 24489.795918367346,
-                        }
-                    },
-                    {
-                        "row_data": {
-                            "year": 2023,
-                            "benchmark_mode": "state",
-                            "geography_scope": "state",
-                            "geography_value": "MD",
-                            "cohort_level": "L1",
-                            "peer_count": 120,
-                            "specialty_key": "cardiology",
-                            "taxonomy_code": "207RC0000X",
-                            "procedure_bucket": "100,200",
-                            "target_appropriateness": 2.1,
-                            "target_rx_appropriateness": 2.2,
-                            "target_effectiveness": 81.0,
-                            "target_qpp_cost": 72.0,
-                            "target_cost": 25000.0,
-                        }
-                    },
-                    {
-                        "row_data": {
-                            "year": 2023,
-                            "benchmark_mode": "national",
-                            "geography_scope": "national",
-                            "geography_value": "US",
-                            "cohort_level": "L2",
-                            "peer_count": 500,
-                            "specialty_key": "cardiology",
-                            "taxonomy_code": "207RC0000X",
-                            "procedure_bucket": "100,200",
-                            "target_appropriateness": 2.2,
-                            "target_rx_appropriateness": 2.1,
-                            "target_effectiveness": 82.0,
-                            "target_qpp_cost": 71.0,
-                            "target_cost": 25500.0,
-                        }
-                    },
-                ]
+            _live_override_cohort_row(
+                benchmark_mode="national",
+                geography_scope="national",
+                geography_value="US",
+                cohort_level="L2",
+                peer_count=500,
+                target_appropriateness=2.2,
+                target_rx_appropriateness=2.1,
+                target_effectiveness=82.0,
+                target_qpp_cost=71.0,
+                target_cost=25500.0,
             ),
         ],
-        args={
-            "year": "2023",
-            "specialty": "cardiology",
-            "taxonomy_code": "207RC0000X",
-            "procedure_codes": "100,999",
-        },
     )
 
     response = await get_pricing_provider_score(request, "1003000126")
@@ -1872,105 +1793,59 @@ async def test_get_pricing_provider_score_unavailable_when_profile_is_insufficie
     assert pricing_response["available_benchmark_modes"] == []
 
 
+def _provider_score_variant_cohort_rows():
+    return [
+                _live_override_cohort_row(
+                    target_appropriateness=2.0,
+                    target_cost=24500.0,
+                ),
+                _live_override_cohort_row(
+                    geography_scope="state",
+                    geography_value="MD",
+                    cohort_level="L1",
+                    peer_count=90,
+                    target_appropriateness=2.1,
+                    target_rx_appropriateness=2.1,
+                    target_effectiveness=81.0,
+                    target_qpp_cost=71.0,
+                    target_cost=25000.0,
+                ),
+                _live_override_cohort_row(
+                    benchmark_mode="state",
+                    geography_scope="state",
+                    geography_value="MD",
+                    cohort_level="L1",
+                    peer_count=130,
+                    target_appropriateness=2.1,
+                    target_rx_appropriateness=2.2,
+                    target_effectiveness=81.0,
+                    target_qpp_cost=72.0,
+                    target_cost=25000.0,
+                ),
+                _live_override_cohort_row(
+                    benchmark_mode="national",
+                    geography_scope="national",
+                    geography_value="US",
+                    cohort_level="L2",
+                    peer_count=500,
+                    target_appropriateness=2.2,
+                    target_rx_appropriateness=2.1,
+                    target_effectiveness=82.0,
+                    target_qpp_cost=71.0,
+                    target_cost=25500.0,
+                ),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_get_pricing_provider_score_variants_scope_provider_returns_variant_cards():
     """Return score variant cards for provider-scoped requests."""
     request = make_request(
-        [
-            FakeResult(
-                rows=[
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "state": "MD",
-                        "zip5": "20850",
-                        "provider_type": "Cardiology",
-                        "total_services": 100.0,
-                        "total_beneficiaries": 50.0,
-                        "total_allowed_amount": 24000.0,
-                    }
-                ]
-            ),
-            FakeResult(rows=[{"quality_score": 80.0, "cost_score": 70.0}]),
-            FakeResult(rows=[{"total_rx_claims": 150.0, "total_rx_beneficiaries": 75.0}]),
-            FakeResult(scalar=0.4),
-            FakeResult(
-                rows=[
-                    {
-                        "row_data": {
-                            "year": 2023,
-                            "benchmark_mode": "zip",
-                            "geography_scope": "zip",
-                            "geography_value": "20850",
-                            "cohort_level": "L0",
-                            "peer_count": 44,
-                            "specialty_key": "cardiology",
-                            "taxonomy_code": "207RC0000X",
-                            "procedure_bucket": "100,200",
-                            "target_appropriateness": 2.0,
-                            "target_rx_appropriateness": 2.0,
-                            "target_effectiveness": 80.0,
-                            "target_qpp_cost": 70.0,
-                            "target_cost": 24500.0,
-                        }
-                    },
-                    {
-                        "row_data": {
-                            "year": 2023,
-                            "benchmark_mode": "zip",
-                            "geography_scope": "state",
-                            "geography_value": "MD",
-                            "cohort_level": "L1",
-                            "peer_count": 90,
-                            "specialty_key": "cardiology",
-                            "taxonomy_code": "207RC0000X",
-                            "procedure_bucket": "100,200",
-                            "target_appropriateness": 2.1,
-                            "target_rx_appropriateness": 2.1,
-                            "target_effectiveness": 81.0,
-                            "target_qpp_cost": 71.0,
-                            "target_cost": 25000.0,
-                        }
-                    },
-                    {
-                        "row_data": {
-                            "year": 2023,
-                            "benchmark_mode": "state",
-                            "geography_scope": "state",
-                            "geography_value": "MD",
-                            "cohort_level": "L1",
-                            "peer_count": 130,
-                            "specialty_key": "cardiology",
-                            "taxonomy_code": "207RC0000X",
-                            "procedure_bucket": "100,200",
-                            "target_appropriateness": 2.1,
-                            "target_rx_appropriateness": 2.2,
-                            "target_effectiveness": 81.0,
-                            "target_qpp_cost": 72.0,
-                            "target_cost": 25000.0,
-                        }
-                    },
-                    {
-                        "row_data": {
-                            "year": 2023,
-                            "benchmark_mode": "national",
-                            "geography_scope": "national",
-                            "geography_value": "US",
-                            "cohort_level": "L2",
-                            "peer_count": 500,
-                            "specialty_key": "cardiology",
-                            "taxonomy_code": "207RC0000X",
-                            "procedure_bucket": "100,200",
-                            "target_appropriateness": 2.2,
-                            "target_rx_appropriateness": 2.1,
-                            "target_effectiveness": 82.0,
-                            "target_qpp_cost": 71.0,
-                            "target_cost": 25500.0,
-                        }
-                    },
-                ]
-            ),
-        ],
+        _live_override_results(
+            total_services=100.0,
+            provider_type="Cardiology",
+            cohort_rows=_provider_score_variant_cohort_rows(),
+        ),
         args={
             "year": "2023",
             "variants_scope": "provider",
@@ -4918,127 +4793,7 @@ async def test_get_provider_procedure_estimated_cost_level_zip_ring_fallback():
 async def test_get_provider_procedure_estimated_cost_level_near_dynamic():
     """Use nearby dynamic peers for the estimated cost level."""
     request = make_request(
-        [
-            FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
-            FakeResult(scalar="mrf.pricing_procedure_peer_stats"),
-            FakeResult(
-                rows=[
-                    {
-                        "zip5": "20814",
-                        "state": "MD",
-                        "city_lower": "bethesda",
-                        "latitude": 39.0,
-                        "longitude": -77.1,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "procedure_code": 123,
-                        "geography_scope": "national",
-                        "geography_value": "US",
-                        "specialty_key": "diagnostic radiology",
-                        "setting_key": "all",
-                        "claim_count": 42,
-                        "avg_submitted_charge": 415.0,
-                        "total_submitted_charge": 17430.0,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {"zip5": "20814", "state": "MD", "city_lower": "bethesda", "distance_miles": 0.0},
-                    {"zip5": "20816", "state": "MD", "city_lower": "bethesda", "distance_miles": 6.5},
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "npi": 1003000101,
-                        "claim_count": 15.0,
-                        "avg_submitted_charge": 200.0,
-                        "geography_value": "20814",
-                    },
-                    {
-                        "npi": 1003000102,
-                        "claim_count": 16.0,
-                        "avg_submitted_charge": 220.0,
-                        "geography_value": "20814",
-                    },
-                    {
-                        "npi": 1003000103,
-                        "claim_count": 17.0,
-                        "avg_submitted_charge": 240.0,
-                        "geography_value": "20814",
-                    },
-                    {
-                        "npi": 1003000104,
-                        "claim_count": 18.0,
-                        "avg_submitted_charge": 260.0,
-                        "geography_value": "20814",
-                    },
-                    {
-                        "npi": 1003000105,
-                        "claim_count": 19.0,
-                        "avg_submitted_charge": 280.0,
-                        "geography_value": "20816",
-                    },
-                    {
-                        "npi": 1003000106,
-                        "claim_count": 20.0,
-                        "avg_submitted_charge": 300.0,
-                        "geography_value": "20816",
-                    },
-                    {
-                        "npi": 1003000107,
-                        "claim_count": 21.0,
-                        "avg_submitted_charge": 320.0,
-                        "geography_value": "20816",
-                    },
-                    {
-                        "npi": 1003000108,
-                        "claim_count": 22.0,
-                        "avg_submitted_charge": 340.0,
-                        "geography_value": "20816",
-                    },
-                    {
-                        "npi": 1003000109,
-                        "claim_count": 23.0,
-                        "avg_submitted_charge": 360.0,
-                        "geography_value": "20816",
-                    },
-                    {
-                        "npi": 1003000110,
-                        "claim_count": 24.0,
-                        "avg_submitted_charge": 380.0,
-                        "geography_value": "20816",
-                    },
-                    {
-                        "npi": 1003000111,
-                        "claim_count": 25.0,
-                        "avg_submitted_charge": 400.0,
-                        "geography_value": "20816",
-                    },
-                    {
-                        "npi": 1003000112,
-                        "claim_count": 26.0,
-                        "avg_submitted_charge": 420.0,
-                        "geography_value": "20816",
-                    },
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "service_description": "Magnetic resonance imaging, brain",
-                        "reported_code": "70553",
-                    }
-                ]
-            ),
-        ],
+        _near_dynamic_fallback_identity_results() + _near_dynamic_peer_results(),
         args={
             "year": "2023",
             "zip5": "20814",
@@ -5059,79 +4814,114 @@ async def test_get_provider_procedure_estimated_cost_level_near_dynamic():
     assert pricing_response["query"]["cohort_strategy_used"] == "near_dynamic"
 
 
+def _near_dynamic_peer_results() -> list[FakeResult]:
+    peer_rows = [
+        {
+            "npi": 1003000101 + offset,
+            "claim_count": 15.0 + offset,
+            "avg_submitted_charge": 200.0 + 20.0 * offset,
+            "geography_value": "20814" if offset < 4 else "20816",
+        }
+        for offset in range(12)
+    ]
+    return [
+        FakeResult(
+            rows=[
+                {"zip5": "20814", "state": "MD", "city_lower": "bethesda", "distance_miles": 0.0},
+                {"zip5": "20816", "state": "MD", "city_lower": "bethesda", "distance_miles": 6.5},
+            ]
+        ),
+        FakeResult(rows=peer_rows),
+        FakeResult(
+            rows=[
+                {
+                    "service_description": "Magnetic resonance imaging, brain",
+                    "reported_code": "70553",
+                }
+            ]
+        ),
+    ]
+
+
+def _near_dynamic_fallback_identity_results() -> list[FakeResult]:
+    return [
+        FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
+        FakeResult(scalar="mrf.pricing_procedure_peer_stats"),
+        FakeResult(
+            rows=[
+                {
+                    "zip5": "20814",
+                    "state": "MD",
+                    "city_lower": "bethesda",
+                    "latitude": 39.0,
+                    "longitude": -77.1,
+                }
+            ]
+        ),
+        FakeResult(
+            rows=[
+                {
+                    "npi": 1003000126,
+                    "year": 2023,
+                    "procedure_code": 123,
+                    "geography_scope": "national",
+                    "geography_value": "US",
+                    "specialty_key": "diagnostic radiology",
+                    "setting_key": "all",
+                    "claim_count": 42,
+                    "avg_submitted_charge": 415.0,
+                    "total_submitted_charge": 17430.0,
+                }
+            ]
+        ),
+    ]
+
+
+def _near_dynamic_fallback_peer_results() -> list[FakeResult]:
+    peer_profile_map = {
+        "procedure_code": 123,
+        "year": 2023,
+        "geography_scope": "zip5",
+        "geography_value": "20816",
+        "specialty_key": "diagnostic radiology",
+        "setting_key": "all",
+        "provider_count": 250,
+        "min_claim_count": 11.0,
+        "max_claim_count": 900.0,
+        "p10": 150.0,
+        "p20": 250.0,
+        "p40": 350.0,
+        "p50": 425.0,
+        "p60": 500.0,
+        "p80": 700.0,
+        "p90": 900.0,
+    }
+    return [
+        FakeResult(
+            rows=[
+                {"zip5": "20814", "state": "MD", "city_lower": "bethesda", "distance_miles": 0.0},
+                {"zip5": "20816", "state": "MD", "city_lower": "bethesda", "distance_miles": 6.5},
+            ]
+        ),
+        FakeResult(rows=[]),
+        FakeResult(rows=[]),
+        FakeResult(rows=[peer_profile_map]),
+        FakeResult(
+            rows=[
+                {
+                    "service_description": "Magnetic resonance imaging, brain",
+                    "reported_code": "70553",
+                }
+            ]
+        ),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_get_provider_procedure_estimated_cost_level_near_dynamic_fallbacks_to_precomputed():
     """Fall back to precomputed peers when dynamic peers are insufficient."""
     request = make_request(
-        [
-            FakeResult(scalar="mrf.pricing_provider_procedure_cost_profile"),
-            FakeResult(scalar="mrf.pricing_procedure_peer_stats"),
-            FakeResult(
-                rows=[
-                    {
-                        "zip5": "20814",
-                        "state": "MD",
-                        "city_lower": "bethesda",
-                        "latitude": 39.0,
-                        "longitude": -77.1,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "procedure_code": 123,
-                        "geography_scope": "national",
-                        "geography_value": "US",
-                        "specialty_key": "diagnostic radiology",
-                        "setting_key": "all",
-                        "claim_count": 42,
-                        "avg_submitted_charge": 415.0,
-                        "total_submitted_charge": 17430.0,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {"zip5": "20814", "state": "MD", "city_lower": "bethesda", "distance_miles": 0.0},
-                    {"zip5": "20816", "state": "MD", "city_lower": "bethesda", "distance_miles": 6.5},
-                ]
-            ),
-            FakeResult(rows=[]),
-            FakeResult(rows=[]),
-            FakeResult(
-                rows=[
-                    {
-                        "procedure_code": 123,
-                        "year": 2023,
-                        "geography_scope": "zip5",
-                        "geography_value": "20816",
-                        "specialty_key": "diagnostic radiology",
-                        "setting_key": "all",
-                        "provider_count": 250,
-                        "min_claim_count": 11.0,
-                        "max_claim_count": 900.0,
-                        "p10": 150.0,
-                        "p20": 250.0,
-                        "p40": 350.0,
-                        "p50": 425.0,
-                        "p60": 500.0,
-                        "p80": 700.0,
-                        "p90": 900.0,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "service_description": "Magnetic resonance imaging, brain",
-                        "reported_code": "70553",
-                    }
-                ]
-            ),
-        ],
+        _near_dynamic_fallback_identity_results() + _near_dynamic_fallback_peer_results(),
         args={
             "year": "2023",
             "zip5": "20814",

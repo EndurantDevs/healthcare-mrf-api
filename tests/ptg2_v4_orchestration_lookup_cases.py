@@ -218,7 +218,7 @@ async def _assert_shared_rate_provider_scope(monkeypatch) -> None:
 
 
 async def _assert_direct_npi_rate_scope(monkeypatch) -> None:
-    """Assert bounded graph-first intersection for a direct code request."""
+    """Assert direct code requests defer intersection to the serving read."""
     monkeypatch.setattr(
         serving,
         "_ptg2_manifest_plan_code_values",
@@ -229,36 +229,31 @@ async def _assert_direct_npi_rate_scope(monkeypatch) -> None:
         "load_v4_graph_root",
         AsyncMock(return_value=V4GraphRoot(17, "direct_v1", b"d" * 32)),
     )
+    rate_scope = AsyncMock(
+        side_effect=AssertionError("exact NPI scope scanned code twice")
+    )
     monkeypatch.setattr(
         serving,
         "_shared_rate_provider_set_keys",
-        AsyncMock(return_value=()),
+        rate_scope,
     )
     serving._v4_sets_by_npi.return_value = {
         1_111_111_111: (7, 8),
     }
-    empty_scope = await serving._version_three_explicit_npi_graph_scope(
+    scoped = await serving._version_three_explicit_npi_graph_scope(
         object(),
         _tables(),
         {"npi": 1_111_111_111, "market_type": "commercial"},
     )
-    assert empty_scope == serving._ExplicitNpiGraphScope(1_111_111_111, ())
-
-    serving._shared_rate_provider_set_keys.return_value = (8,)
-    serving._v4_sets_by_npi.return_value = {1_111_111_111: (8,)}
-    scoped = await serving._version_three_explicit_npi_graph_scope(
-        object(),
-        _tables(),
-        {"npi": 1_111_111_111, "plan_market_type": "employer"},
+    assert scoped == serving._ExplicitNpiGraphScope(
+        1_111_111_111,
+        (7, 8),
     )
-    assert scoped == serving._ExplicitNpiGraphScope(1_111_111_111, (8,))
     assert serving._v4_sets_by_npi.await_args.kwargs[
         "allowed_provider_set_keys"
     ] is None
     assert serving._v4_sets_by_npi.await_args.kwargs["max_members"] == 64
-    assert serving._shared_rate_provider_set_keys.await_args.kwargs[
-        "provider_set_keys"
-    ] == (8,)
+    rate_scope.assert_not_awaited()
 
 
 async def _assert_explicit_npi_rate_scopes(monkeypatch) -> None:
@@ -289,7 +284,7 @@ async def _assert_explicit_npi_rate_scopes(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_v4_rate_scope_and_explicit_npi_orchestration(monkeypatch) -> None:
-    """Apply rate-set scope to explicit NPI graph membership resolution."""
+    """Defer exact-NPI rate filtering to the single serving scan."""
     await _assert_shared_rate_provider_scope(monkeypatch)
     await _assert_explicit_npi_rate_scopes(monkeypatch)
 

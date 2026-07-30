@@ -1696,9 +1696,7 @@ def test_runner_passes_independent_occurrence_checks_and_bounds_query_scans(tmp_
     )
 
 
-def test_runner_reserves_random_keys_until_true_first_observation(tmp_path):
-    """Ensure random keys remain unused until their measured cold request."""
-
+def _random_reservation_audit(tmp_path):
     source_path = _write_source_fixture(
         tmp_path / "source.json.gz",
         references_before=True,
@@ -1727,7 +1725,10 @@ def test_runner_reserves_random_keys_until_true_first_observation(tmp_path):
             api_occurrence_source,
             config,
         ).execute_audit(started_at=dt.datetime.now(dt.timezone.utc))
+    return config, fetcher, random_plan, random_query_keys, report
 
+
+def _assert_cold_before_warm(fetcher, random_query_keys) -> None:
     seen_query_keys = set()
     for query, phase, _page_size in fetcher.detailed_calls:
         query_key = query.stable_key
@@ -1755,6 +1756,8 @@ def test_runner_reserves_random_keys_until_true_first_observation(tmp_path):
     } == random_query_keys
     assert max(random_cold_positions) < min(random_warm_positions)
 
+
+def _assert_random_key_call_order(fetcher, random_plan, random_query_keys) -> None:
     for query_key in random_query_keys:
         cold_request = next(
             request
@@ -1775,6 +1778,8 @@ def test_runner_reserves_random_keys_until_true_first_observation(tmp_path):
             for _position, phase, page_size in calls_for_key_list
         )
 
+
+def _assert_random_reservation_report(report: dict, random_query_keys: set) -> None:
     assert report["status"] == "pass"
     assert report["checks"]["positive_queries_executed"] == report["checks"][
         "positive_queries"
@@ -1798,6 +1803,16 @@ def test_runner_reserves_random_keys_until_true_first_observation(tmp_path):
     assert "reserved query key" in report["random_api_requests"]["latency"][
         "semantics"
     ]
+
+
+def test_runner_reserves_random_keys_until_true_first_observation(tmp_path):
+    """Ensure random keys remain unused until their measured cold request."""
+    _config, fetcher, random_plan, random_query_keys, report = (
+        _random_reservation_audit(tmp_path)
+    )
+    _assert_cold_before_warm(fetcher, random_query_keys)
+    _assert_random_key_call_order(fetcher, random_plan, random_query_keys)
+    _assert_random_reservation_report(report, random_query_keys)
 
 
 def test_persisted_occurrence_with_wrong_source_fails_direct_source_comparison(tmp_path):
@@ -2171,15 +2186,14 @@ def _provenance_payload(plan_id="plan-value", snapshot_id="snapshot-value"):
 def _api_page_document(
     page_items,
     *,
-    offset,
-    limit,
-    total,
+    pagination,
     plan_id="plan-value",
     snapshot_id="snapshot-value",
     matched=True,
     audit_sample=None,
     source_set=DEFAULT_SOURCE_SET,
 ):
+    offset, limit, total = pagination
     page_document_by_field = {
         "items": page_items,
         "pagination": {
@@ -2255,9 +2269,7 @@ def test_http_fetcher_pages_by_offset_and_requires_provenance():
         offsets.append(offset)
         page_document = _api_page_document(
             [{"page": offset}],
-            offset=offset,
-            limit=1,
-            total=2,
+            pagination=(offset, 1, 2),
         )
         return httpx.Response(200, json=page_document)
 
@@ -2279,9 +2291,7 @@ def test_http_fetcher_pages_by_offset_and_requires_provenance():
     def missing_provenance(_request):
         page_document = _api_page_document(
             [],
-            offset=0,
-            limit=1,
-            total=0,
+            pagination=(0, 1, 0),
             matched=False,
         )
         page_document.pop("provenance")
@@ -2311,9 +2321,7 @@ def test_http_fetcher_uses_random_page_size_for_complete_query_traversal():
             200,
             json=_api_page_document(
                 page_items,
-                offset=offset,
-                limit=limit,
-                total=len(response_items),
+                pagination=(offset, limit, len(response_items)),
             ),
         )
 
@@ -2354,9 +2362,7 @@ def test_http_fetcher_rejects_coerced_pagination_and_provenance_types(
     def handler(_request):
         page_document = _api_page_document(
             [],
-            offset=0,
-            limit=1,
-            total=0,
+            pagination=(0, 1, 0),
             matched=False,
         )
         mutate(page_document)
@@ -2439,9 +2445,7 @@ def test_http_api_occurrence_source_streams_all_pages_with_bounded_calls():
             200,
             json=_api_page_document(
                 page,
-                offset=offset,
-                limit=limit,
-                total=len(occurrence_items),
+                pagination=(offset, limit, len(occurrence_items)),
                 audit_sample=_persisted_audit_sample(
                     len(occurrence_items),
                     items=occurrence_items,
@@ -2496,9 +2500,7 @@ def test_http_api_occurrence_source_rejects_omitted_or_extra_source_files(
             200,
             json=_api_page_document(
                 [occurrence_item],
-                offset=0,
-                limit=1,
-                total=1,
+                pagination=(0, 1, 1),
                 audit_sample=_persisted_audit_sample(
                     1,
                     items=[occurrence_item],
@@ -2540,9 +2542,7 @@ def test_source_set_preflight_precedes_local_occurrence_sampling(tmp_path):
                 200,
                 json=_api_page_document(
                     [],
-                    offset=0,
-                    limit=1,
-                    total=0,
+                    pagination=(0, 1, 0),
                     matched=False,
                     audit_sample=_persisted_audit_sample(0, items=[]),
                     source_set=DEFAULT_SOURCE_SET,
@@ -2589,9 +2589,7 @@ def test_http_api_occurrence_source_rejects_same_count_digest_tampering():
             200,
             json=_api_page_document(
                 occurrence_items,
-                offset=0,
-                limit=2,
-                total=2,
+                pagination=(0, 2, 2),
                 audit_sample=_persisted_audit_sample(
                     2,
                     items=occurrence_items,
@@ -2663,9 +2661,7 @@ def test_http_api_occurrence_source_requires_persisted_sample_contract(
             200,
             json=_api_page_document(
                 occurrence_items,
-                offset=0,
-                limit=2,
-                total=2,
+                pagination=(0, 2, 2),
                 audit_sample=audit_sample,
             ),
         )
@@ -2698,9 +2694,7 @@ def test_http_api_occurrence_source_rejects_non_monotonic_ids():
             200,
             json=_api_page_document(
                 occurrence_items,
-                offset=0,
-                limit=2,
-                total=2,
+                pagination=(0, 2, 2),
                 audit_sample=_persisted_audit_sample(2),
             ),
         )

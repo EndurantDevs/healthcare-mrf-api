@@ -9983,14 +9983,12 @@ async def _v4_bounded_npi_sets(
     return tuple(provider_set_keys_by_npi[requested_npi])
 
 
-async def _bounded_v4_npi_code_scope(
+async def _bounded_v4_npi_scope(
     session,
     serving_tables: PTG2ServingTables,
-    args: Mapping[str, Any],
     requested_npi: int,
-    requested_plan_code: tuple[str, str, str],
 ) -> _ExplicitNpiGraphScope | None:
-    """Intersect a bounded V4 NPI projection with one exact code."""
+    """Resolve bounded V4 NPI membership before one filtered code read."""
 
     provider_set_keys = await _v4_bounded_npi_sets(
         session,
@@ -10001,27 +9999,9 @@ async def _bounded_v4_npi_code_scope(
         return None
     if not provider_set_keys:
         return _ExplicitNpiGraphScope(requested_npi, ())
-    requested_plan, requested_system, requested_code = requested_plan_code
-    rate_provider_set_keys = await _shared_rate_provider_set_keys(
-        session,
-        serving_tables,
-        plan_id=requested_plan,
-        plan_market_type=str(
-            args.get("plan_market_type")
-            or args.get("market_type")
-            or ""
-        ),
-        reported_code=requested_code,
-        code_system=requested_system,
-        provider_set_keys=provider_set_keys,
-    )
-    if not set(rate_provider_set_keys).issubset(provider_set_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 V4 exact-NPI code scope escaped its bounded graph"
-        )
     return _ExplicitNpiGraphScope(
         requested_npi,
-        tuple(rate_provider_set_keys),
+        tuple(provider_set_keys),
     )
 
 
@@ -10036,12 +10016,10 @@ async def _v4_explicit_npi_scope(
     allowed_provider_set_keys: frozenset[int] | None = None
     requested_plan_code = _ptg2_manifest_plan_code_values(dict(args))
     if requested_plan_code is not None:
-        bounded_scope = await _bounded_v4_npi_code_scope(
+        bounded_scope = await _bounded_v4_npi_scope(
             session,
             serving_tables,
-            args,
             requested_npi,
-            requested_plan_code,
         )
         if bounded_scope is not None:
             return bounded_scope
@@ -16720,7 +16698,7 @@ async def _read_multi_ptg2_snapshots(
         serving_tables_by_snapshot_id = (
             validated_serving_tables_by_snapshot_id
         )
-    query_args_by_network: dict[tuple[str, str], dict[str, Any]] = {}
+    network_responses = []
     for source_key, snapshot_id in network_snapshots:
         network_args = args
         if release_selection is not None:
@@ -16728,25 +16706,17 @@ async def _read_multi_ptg2_snapshots(
             if binding is None:
                 return None
             network_args = binding_query_args(args, binding)
-        query_args_by_network[(source_key, snapshot_id)] = network_args
-
-    async def read_network(source_key: str, snapshot_id: str):
-        """Read one frozen forward network through an independent DB session."""
-
-        async with sa_db.session() as network_session:
-            network_response = await _search_one_ptg2_snapshot(
-                network_session,
-                snapshot_id,
-                query_args_by_network[(source_key, snapshot_id)],
-                sub_pagination,
-                serving_tables=serving_tables_by_snapshot_id[snapshot_id],
-            )
-        return source_key, snapshot_id, network_response
-
-    return await _gather_ptg2_network_reads(
-        list(network_snapshots),
-        read_network,
-    )
+        network_response = await _search_one_ptg2_snapshot(
+            session,
+            snapshot_id,
+            network_args,
+            sub_pagination,
+            serving_tables=serving_tables_by_snapshot_id[snapshot_id],
+        )
+        network_responses.append(
+            (source_key, snapshot_id, network_response)
+        )
+    return network_responses
 
 
 async def _search_plan_release_index(

@@ -307,18 +307,8 @@ async def test_object_json_helpers_reject_array_payloads(
         assert await helper("https://adapter.example.invalid/json", {}) == value
 
 
-@pytest.mark.asyncio
-async def test_web_api_resolver_preserves_direct_and_location_lookup_targets(
-    monkeypatch,
-):
-    """Resolve direct and indirection records without losing plan provenance."""
-
-    base_url = "https://adapter.example.invalid/"
-    source_record_by_field = {
-        "source_id": "mrfsource_adapter_contract",
-        "display_name": "Synthetic Source",
-    }
-    payloads_by_url = {
+def _webtpa_contract_payloads(base_url):
+    return {
         f"{base_url}plans": [
             "ignored",
             {"name": "Missing Identifier"},
@@ -351,6 +341,16 @@ async def test_web_api_resolver_preserves_direct_and_location_lookup_targets(
         ],
     }
 
+
+@pytest.mark.asyncio
+async def test_web_api_resolver_preserves_direct_and_location_lookup_targets(
+    monkeypatch,
+):
+    """Resolve direct and indirection records without losing plan provenance."""
+
+    base_url = "https://adapter.example.invalid/"
+    payloads_by_url = _webtpa_contract_payloads(base_url)
+
     async def fetch_value(url, **_kwargs):
         return payloads_by_url[url]
 
@@ -363,7 +363,10 @@ async def test_web_api_resolver_preserves_direct_and_location_lookup_targets(
     monkeypatch.setattr(discovery, "_fetch_json", fetch_location)
 
     crawl_targets = await discovery._resolve_webtpa_mrf_api(
-        source_record_by_field,
+        {
+            "source_id": "mrfsource_adapter_contract",
+            "display_name": "Synthetic Source",
+        },
         f"{base_url}landing",
         {
             "plans_path": "/plans",
@@ -495,48 +498,48 @@ def test_web_api_base_url_requires_absolute_http_context(url, expected):
         assert discovery._webtpa_api_base_url(url) == expected
 
 
-@pytest.mark.asyncio
-async def test_directory_resolver_combines_direct_nested_and_landing_targets(
-    monkeypatch,
-):
-    """Keep direct downloads and nested adapter targets in directory order."""
-
-    source_record_by_field = {
-        "source_id": "mrfsource_directory_contract",
-        "display_name": "Synthetic Source",
-    }
-    directory_url = "https://directory.example.invalid/networks"
-    page_url = "https://directory.example.invalid/network-a"
+def _auxiant_contract_fixture():
     external_url = "https://external.example.invalid/landing"
-    direct_directory_link_by_field = {
-        "target_kind": "file_reference",
-        "target_file_type": "allowed-amounts",
-        "container_format": "json",
-        "url": "https://files.example.invalid/historical.json",
-        "label": "Historical",
-    }
-    direct_page_link_by_field = {
-        "target_kind": "file_reference",
-        "target_file_type": "in-network",
-        "container_format": "gzip",
-        "url": "https://files.example.invalid/current.json.gz",
-        "label": "Current",
-    }
-    external_link_by_field = {
-        "target_kind": "source_landing_page",
-        "url": external_url,
-        "label": "External",
+    return {
+        "source": {
+            "source_id": "mrfsource_directory_contract",
+            "display_name": "Synthetic Source",
+        },
+        "directory_url": "https://directory.example.invalid/networks",
+        "page_url": "https://directory.example.invalid/network-a",
+        "external_url": external_url,
+        "directory_link": {
+            "target_kind": "file_reference",
+            "target_file_type": "allowed-amounts",
+            "container_format": "json",
+            "url": "https://files.example.invalid/historical.json",
+            "label": "Historical",
+        },
+        "page_link": {
+            "target_kind": "file_reference",
+            "target_file_type": "in-network",
+            "container_format": "gzip",
+            "url": "https://files.example.invalid/current.json.gz",
+            "label": "Current",
+        },
+        "external_link": {
+            "target_kind": "source_landing_page",
+            "url": external_url,
+            "label": "External",
+        },
     }
 
+
+def _install_auxiant_contract_mocks(monkeypatch, fixture):
     async def fetch_text(url, **_kwargs):
-        return "directory" if url == directory_url else "network-page"
+        return "directory" if url == fixture["directory_url"] else "network-page"
 
     def parse_links(text, **_kwargs):
         if text == "directory":
-            return [direct_directory_link_by_field]
+            return [fixture["directory_link"]]
         return [
-            direct_page_link_by_field,
-            external_link_by_field,
+            fixture["page_link"],
+            fixture["external_link"],
             {"target_kind": "source_landing_page", "url": ""},
         ]
 
@@ -544,7 +547,7 @@ async def test_directory_resolver_combines_direct_nested_and_landing_targets(
         source={"source_id": "nested"},
         url="https://files.example.invalid/nested.json",
         label="Nested label",
-        resolved_from_url=external_url,
+        resolved_from_url=fixture["external_url"],
         metadata={"resolver": "nested-adapter"},
     )
     monkeypatch.setattr(discovery, "_fetch_text", fetch_text)
@@ -552,21 +555,35 @@ async def test_directory_resolver_combines_direct_nested_and_landing_targets(
         discovery,
         "_parse_auxiant_directory_networks",
         lambda *_args, **_kwargs: [
-            {"url": page_url, "label": "Synthetic Network"},
+            {"url": fixture["page_url"], "label": "Synthetic Network"},
             {"url": "https://directory.example.invalid/ignored", "label": "Ignored"},
         ],
     )
     monkeypatch.setattr(discovery, "_parse_auxiant_page_links", parse_links)
-    monkeypatch.setattr(discovery, "classify_hosting_platform", lambda _url: "nested-platform")
+    monkeypatch.setattr(
+        discovery,
+        "classify_hosting_platform",
+        lambda _url: "nested-platform",
+    )
     monkeypatch.setattr(
         discovery,
         "_crawl_targets_for_source",
         AsyncMock(return_value=[nested_target]),
     )
 
+
+@pytest.mark.asyncio
+async def test_directory_resolver_combines_direct_nested_and_landing_targets(
+    monkeypatch,
+):
+    """Keep direct downloads and nested adapter targets in directory order."""
+
+    fixture = _auxiant_contract_fixture()
+    _install_auxiant_contract_mocks(monkeypatch, fixture)
+
     crawl_targets = await discovery._resolve_auxiant_wordpress_directory(
-        source_record_by_field,
-        directory_url,
+        fixture["source"],
+        fixture["directory_url"],
         {
             "type": "auxiant_wordpress_directory",
             "directory_path": "/networks",

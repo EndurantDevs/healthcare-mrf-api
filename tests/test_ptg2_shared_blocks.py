@@ -3153,6 +3153,95 @@ async def test_build_heartbeat_is_owned_and_extends_the_gc_lease():
     assert params["lease_until"] > params["heartbeat_at"]
 
 
+async def _create_mapping_summary_tables(quoted_schema: str) -> None:
+    await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
+    await db.execute_ddl(
+        f"""
+        CREATE TABLE {quoted_schema}.ptg2_v3_block (
+            block_hash bytea PRIMARY KEY,
+            raw_byte_count bigint NOT NULL CHECK (raw_byte_count >= 0)
+        )
+        """
+    )
+    await db.execute_ddl(
+        f"""
+        CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_block (
+            snapshot_key bigint NOT NULL,
+            object_kind varchar(64) NOT NULL,
+            block_key bigint NOT NULL CHECK (block_key >= 0),
+            fragment_no integer NOT NULL CHECK (fragment_no >= 0),
+            entry_count bigint NOT NULL CHECK (entry_count >= 0),
+            block_hash bytea NOT NULL
+                REFERENCES {quoted_schema}.ptg2_v3_block (block_hash),
+            PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)
+        )
+        """
+    )
+
+
+async def _insert_mapping_summary_rows(
+    session,
+    quoted_schema: str,
+    references: list[SharedBlockReference],
+) -> None:
+    await session.execute(
+        text(
+            f"""
+            INSERT INTO {quoted_schema}.ptg2_v3_block
+                (block_hash, raw_byte_count)
+            VALUES (:block_hash, :raw_byte_count)
+            """
+        ),
+        [
+            {"block_hash": block_hash, "raw_byte_count": raw_byte_count}
+            for block_hash, raw_byte_count in {
+                reference.block_hash: reference.raw_byte_count
+                for reference in references
+            }.items()
+        ],
+    )
+    await session.execute(
+        text(
+            f"""
+            INSERT INTO {quoted_schema}.ptg2_v3_snapshot_block
+                (snapshot_key, object_kind, block_key, fragment_no,
+                 entry_count, block_hash)
+            VALUES
+                (:snapshot_key, :object_kind, :block_key, :fragment_no,
+                 :entry_count, :block_hash)
+            """
+        ),
+        [
+            {
+                "snapshot_key": 41,
+                "object_kind": reference.object_kind,
+                "block_key": reference.block_key,
+                "fragment_no": reference.fragment_no,
+                "entry_count": reference.entry_count,
+                "block_hash": reference.block_hash,
+            }
+            for reference in references
+        ],
+    )
+
+
+def _assert_mapping_summary(summary, references: list[SharedBlockReference]) -> None:
+    assert summary.mapping_digest == shared_mapping_digest(references)
+    assert summary.mapping_count == len(references)
+    assert summary.unique_block_count == len(
+        {reference.block_hash for reference in references}
+    )
+    assert summary.entry_count == sum(
+        reference.entry_count for reference in references
+    )
+    assert summary.logical_byte_count == sum(
+        reference.raw_byte_count for reference in references
+    )
+    assert summary.object_kinds == tuple(
+        sorted({reference.object_kind for reference in references})
+    )
+
+
 @pytest.mark.asyncio
 async def test_mapping_summary_real_postgres_uses_same_uncommitted_transaction():
     """Read uncommitted mappings through the caller's PostgreSQL transaction."""
@@ -3174,93 +3263,16 @@ async def test_mapping_summary_real_postgres_uses_same_uncommitted_transaction()
     await db.disconnect()
     await db.connect()
     try:
-        await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
-        await db.execute_ddl(
-            f"""
-            CREATE TABLE {quoted_schema}.ptg2_v3_block (
-                block_hash bytea PRIMARY KEY,
-                raw_byte_count bigint NOT NULL CHECK (raw_byte_count >= 0)
-            )
-            """
-        )
-        await db.execute_ddl(
-            f"""
-            CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_block (
-                snapshot_key bigint NOT NULL,
-                object_kind varchar(64) NOT NULL,
-                block_key bigint NOT NULL CHECK (block_key >= 0),
-                fragment_no integer NOT NULL CHECK (fragment_no >= 0),
-                entry_count bigint NOT NULL CHECK (entry_count >= 0),
-                block_hash bytea NOT NULL
-                    REFERENCES {quoted_schema}.ptg2_v3_block (block_hash),
-                PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)
-            )
-            """
-        )
+        await _create_mapping_summary_tables(quoted_schema)
         async with db.transaction() as session:
-            await session.execute(
-                text(
-                    f"""
-                    INSERT INTO {quoted_schema}.ptg2_v3_block
-                        (block_hash, raw_byte_count)
-                    VALUES (:block_hash, :raw_byte_count)
-                    """
-                ),
-                [
-                    {
-                        "block_hash": block_hash,
-                        "raw_byte_count": raw_byte_count,
-                    }
-                    for block_hash, raw_byte_count in {
-                        reference.block_hash: reference.raw_byte_count
-                        for reference in references
-                    }.items()
-                ],
-            )
-            await session.execute(
-                text(
-                    f"""
-                    INSERT INTO {quoted_schema}.ptg2_v3_snapshot_block
-                        (snapshot_key, object_kind, block_key, fragment_no,
-                         entry_count, block_hash)
-                    VALUES
-                        (:snapshot_key, :object_kind, :block_key, :fragment_no,
-                         :entry_count, :block_hash)
-                    """
-                ),
-                [
-                    {
-                        "snapshot_key": 41,
-                        "object_kind": reference.object_kind,
-                        "block_key": reference.block_key,
-                        "fragment_no": reference.fragment_no,
-                        "entry_count": reference.entry_count,
-                        "block_hash": reference.block_hash,
-                    }
-                    for reference in references
-                ],
-            )
-
+            await _insert_mapping_summary_rows(session, quoted_schema, references)
             summary = await summarize_shared_snapshot_mappings(
                 session,
                 schema_name=schema_name,
                 snapshot_key=41,
             )
 
-        assert summary.mapping_digest == shared_mapping_digest(references)
-        assert summary.mapping_count == len(references)
-        assert summary.unique_block_count == len(
-            {reference.block_hash for reference in references}
-        )
-        assert summary.entry_count == sum(
-            reference.entry_count for reference in references
-        )
-        assert summary.logical_byte_count == sum(
-            reference.raw_byte_count for reference in references
-        )
-        assert summary.object_kinds == tuple(
-            sorted({reference.object_kind for reference in references})
-        )
+        _assert_mapping_summary(summary, references)
     finally:
         await db.execute_ddl(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
         await db.disconnect()

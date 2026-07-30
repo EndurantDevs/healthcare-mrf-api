@@ -2203,17 +2203,15 @@ async def test_v4_multi_npi_rate_scope_keeps_native_forward_intersection(
 
 
 @pytest.mark.asyncio
-async def test_v4_explicit_npi_bounds_graph_before_requested_code(
+async def test_v4_explicit_npi_defers_requested_code_to_serving_read(
     monkeypatch,
 ) -> None:
-    rate_scope_calls: list[dict[str, object]] = []
     graph_calls: list[dict[str, object]] = []
     events: list[str] = []
 
-    async def fake_rate_scope(*_args, **kwargs):
-        events.append("rate")
-        rate_scope_calls.append(kwargs)
-        return (8,)
+    rate_scope = AsyncMock(
+        side_effect=AssertionError("graph scope must not scan code rows")
+    )
 
     async def fake_graph(*_args, **kwargs):
         events.append("graph")
@@ -2226,7 +2224,7 @@ async def test_v4_explicit_npi_bounds_graph_before_requested_code(
         AsyncMock(return_value=graph.V4GraphRoot(17, "direct_v1", b"d" * 32)),
     )
     monkeypatch.setattr(
-        ptg2_serving, "_shared_rate_provider_set_keys", fake_rate_scope
+        ptg2_serving, "_shared_rate_provider_set_keys", rate_scope
     )
     monkeypatch.setattr(
         ptg2_serving, "_v4_sets_by_npi", fake_graph
@@ -2242,15 +2240,7 @@ async def test_v4_explicit_npi_bounds_graph_before_requested_code(
         },
     )
     assert scope == ptg2_serving._ExplicitNpiGraphScope(1234567890, (8,))
-    assert rate_scope_calls == [
-        {
-            "plan_id": "plan-1",
-            "plan_market_type": "",
-            "reported_code": "70553",
-            "code_system": "CPT",
-            "provider_set_keys": (8,),
-        }
-    ]
     assert graph_calls[0]["allowed_provider_set_keys"] is None
     assert graph_calls[0]["max_members"] == 64
-    assert events == ["graph", "rate"]
+    assert events == ["graph"]
+    rate_scope.assert_not_awaited()
