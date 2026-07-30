@@ -464,12 +464,12 @@ async def test_fact_failure_stops_later_sources_and_preserves_checkpoint(
             checkpointed=True,
         )
 
-    assert visited_dataset_ids == ["dataset-a"] * 83 + ["dataset-b"]
+    assert visited_dataset_ids == ["dataset-a"] * 115 + ["dataset-b"]
     assert [
         call.kwargs["expected_batch"] for call in advance.await_args_list
-    ] == list(range(83))
+    ] == list(range(115))
     assert all(
-        call.kwargs["total_batches"] == 249
+        call.kwargs["total_batches"] == 345
         for call in advance.await_args_list
     )
     mark_state.assert_not_awaited()

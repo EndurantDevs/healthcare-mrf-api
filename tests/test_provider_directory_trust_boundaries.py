@@ -355,8 +355,8 @@ def _profile_checkpoint_by_name(
     build: importer._ProviderDirectoryProfileBuild,
     *,
     state: str = "building_profile",
-    evidence_next_batch: int = 83,
-    evidence_total_batches: int = 83,
+    evidence_next_batch: int = 115,
+    evidence_total_batches: int = 115,
     profile_next_batch: int = 0,
     profile_total_batches: int = 400,
 ) -> dict[str, object]:
@@ -413,10 +413,10 @@ def _assert_profile_checkpoint_value_contracts(build):
 
 
 def _assert_single_source_profile_evidence_batches(evidence_batches):
-    """Require all 83 fact/role partitions for one source."""
+    """Require all 115 fact/resource partitions for one source."""
     assert evidence_batches[0].kind == "copy"
     fact_batches = evidence_batches[1:]
-    assert len(fact_batches) == 83
+    assert len(fact_batches) == 115
     assert {batch.kind for batch in fact_batches} == {"fact"}
     assert {batch.source_id for batch in fact_batches} == {"source_a"}
     assert {batch.dataset_id for batch in fact_batches} == {"dataset_a"}
@@ -440,7 +440,7 @@ def _assert_single_source_profile_evidence_batches(evidence_batches):
 
 
 def _assert_global_profile_batch_plan(build):
-    """Require the exact global 19-source 1577/400 no-copy plan."""
+    """Require the exact global 19-source 2185/400 no-copy plan."""
     source_ids = tuple(f"source_{index:02d}" for index in range(19))
     global_build = importer.replace(
         build,
@@ -461,7 +461,7 @@ def _assert_global_profile_batch_plan(build):
         has_existing_artifacts=True,
         npi_batch_size=profile.PROFILE_NPI_BATCH_SIZE,
     )
-    assert len(evidence_batches) == 1577
+    assert len(evidence_batches) == 2185
     assert len(compact_batches) == 400
     assert {batch.kind for batch in evidence_batches} == {"fact"}
     assert {batch.kind for batch in compact_batches} == {"npi"}
@@ -514,33 +514,7 @@ def test_profile_batch_and_checkpoint_value_contracts():
     _assert_profile_checkpoint_value_contracts(build)
 
 
-def test_profile_batch_plan_reserves_plan_membership_bucket_geometry(
-    monkeypatch,
-):
-    """Keep the pending membership fact inside the composite resume identity."""
-    build = _profile_build()
-    current_plan = importer._provider_directory_profile_batch_plan(
-        build.source_ids,
-        build.retained_source_ids,
-        build.dataset_ids,
-        has_existing_artifacts=False,
-    )
-    fact_types = tuple(
-        dict.fromkeys(
-            (*profile.PROFILE_EVIDENCE_FACT_TYPES, "plan_membership")
-        )
-    )
-    monkeypatch.setattr(
-        profile,
-        "PROFILE_EVIDENCE_FACT_TYPES",
-        fact_types,
-    )
-    batch_plan = importer._provider_directory_profile_batch_plan(
-        build.source_ids,
-        build.retained_source_ids,
-        build.dataset_ids,
-        has_existing_artifacts=False,
-    )
+def _assert_membership_bucket_geometry(batch_plan, legacy_plan) -> None:
     membership_batches = [
         batch
         for batch in batch_plan.evidence_batches
@@ -548,7 +522,7 @@ def test_profile_batch_plan_reserves_plan_membership_bucket_geometry(
     ]
 
     assert len(batch_plan.evidence_batches) == 115
-    assert batch_plan.fingerprint != current_plan.fingerprint
+    assert batch_plan.fingerprint != legacy_plan.fingerprint
     assert len(membership_batches) == (
         profile.PROFILE_AFFILIATION_ROLE_BUCKETS
     )
@@ -560,6 +534,75 @@ def test_profile_batch_plan_reserves_plan_membership_bucket_geometry(
     ) == (
         importer.ProviderDirectoryOrganizationAffiliation.__tablename__,
     )
+    assert (
+        importer._PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE
+        == {
+            "affiliation": (
+                "hashtextextended-role-resource-id-seed0-positive-mod-v1",
+            ),
+            "organization": (
+                "hashtextextended-role-resource-id-seed0-positive-mod-v1",
+                "hashtextextended-affiliation-resource-id-seed0-positive-mod-v1",
+            ),
+            "plan_membership": (
+                "hashtextextended-affiliation-resource-id-seed0-positive-mod-v1",
+            ),
+        }
+    )
+
+
+def _membership_scheme_drift_plan(monkeypatch, build):
+    bucket_schemes_by_fact_type = dict(
+        importer._PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE
+    )
+    bucket_schemes_by_fact_type["plan_membership"] = (
+        "hashtextextended-role-resource-id-seed0-positive-mod-v1",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE",
+        bucket_schemes_by_fact_type,
+    )
+    return importer._provider_directory_profile_batch_plan(
+        build.source_ids,
+        build.retained_source_ids,
+        build.dataset_ids,
+        has_existing_artifacts=False,
+    )
+
+
+def test_profile_batch_plan_reserves_plan_membership_bucket_geometry(
+    monkeypatch,
+):
+    """Bind membership geometry and its affiliation-resource scheme."""
+    build = _profile_build()
+    batch_plan = importer._provider_directory_profile_batch_plan(
+        build.source_ids,
+        build.retained_source_ids,
+        build.dataset_ids,
+        has_existing_artifacts=False,
+    )
+    legacy_fact_types = tuple(
+        fact_type
+        for fact_type in profile.PROFILE_EVIDENCE_FACT_TYPES
+        if fact_type != "plan_membership"
+    )
+    monkeypatch.setattr(
+        profile,
+        "PROFILE_EVIDENCE_FACT_TYPES",
+        legacy_fact_types,
+    )
+    legacy_plan = importer._provider_directory_profile_batch_plan(
+        build.source_ids,
+        build.retained_source_ids,
+        build.dataset_ids,
+        has_existing_artifacts=False,
+    )
+    _assert_membership_bucket_geometry(batch_plan, legacy_plan)
+
+    drifted_plan = _membership_scheme_drift_plan(monkeypatch, build)
+    assert drifted_plan.fingerprint != legacy_plan.fingerprint
+    assert drifted_plan.fingerprint != batch_plan.fingerprint
 
 
 def test_profile_batch_plan_rejects_source_dataset_cardinality_drift():
@@ -725,8 +768,8 @@ def _patch_profile_finalize_retry(monkeypatch, build):
 
 def _assert_high_fanout_profile_calls(evidence_calls, profile_calls):
     """Require 19-source fact fanout and complete 5M NPI geometry."""
-    assert len(evidence_calls) == 1577
-    for fact_type in ("affiliation", "organization"):
+    assert len(evidence_calls) == 2185
+    for fact_type in ("affiliation", "organization", "plan_membership"):
         assert sum(
             call["fact_type"] == fact_type for call in evidence_calls
         ) == 19 * profile.PROFILE_AFFILIATION_ROLE_BUCKETS
@@ -1114,7 +1157,7 @@ async def test_profile_checkpoint_rejects_compact_progress_before_evidence(
 async def test_profile_batch_total_mismatch_invalidates_incompatible_checkpoint(
     monkeypatch,
 ):
-    """The v2 strategy rejects checkpoints from the regressed v1 geometry."""
+    """The v4 strategy rejects checkpoints from the regressed v1 geometry."""
     build = _profile_build()
     checkpoint_by_name = _profile_checkpoint_by_name(build)
     checkpoint_by_name.update(
@@ -1141,7 +1184,7 @@ async def test_profile_batch_total_mismatch_invalidates_incompatible_checkpoint(
         has_existing_artifacts=False,
         evidence_build_fence=fence,
         profile_build_fence=fence,
-        evidence_total_batches=83,
+        evidence_total_batches=115,
         profile_total_batches=400,
     )
     stage_identity.assert_not_awaited()
@@ -1151,7 +1194,7 @@ async def test_profile_batch_total_mismatch_invalidates_incompatible_checkpoint(
 async def test_profile_batch_total_mismatch_reinitializes_logged_stages(
     monkeypatch,
 ):
-    """Replace the regressed v1 checkpoint with the restored v1 batch totals."""
+    """Replace the regressed checkpoint with the current v4 batch totals."""
     build = _profile_build()
     checkpoint_by_name = _profile_checkpoint_by_name(build)
     checkpoint_by_name.update(
@@ -1201,7 +1244,7 @@ async def test_profile_batch_total_mismatch_reinitializes_logged_stages(
     )
 
     drop_stages.assert_awaited_once_with(build, checkpoint_by_name)
-    assert initialized.evidence_total_batches == 83
+    assert initialized.evidence_total_batches == 115
     assert initialized.profile_total_batches == 400
     assert initialized.state == "building_evidence"
 
@@ -1323,7 +1366,7 @@ async def _assert_global_profile_reinitialized(
         )
     )
     drop_stages.assert_awaited_once_with(resolved_build, checkpoint_map)
-    assert initialized.evidence_total_batches == 1577
+    assert initialized.evidence_total_batches == 2185
     assert initialized.profile_total_batches == 400
     insert_call = next(
         call
@@ -1332,7 +1375,7 @@ async def _assert_global_profile_reinitialized(
         and "INSERT INTO" in str(call.args[0])
     )
     assert insert_call.kwargs["profile_as_of"] == "2026-07-29"
-    assert insert_call.kwargs["evidence_total_batches"] == 1577
+    assert insert_call.kwargs["evidence_total_batches"] == 2185
     assert insert_call.kwargs["profile_total_batches"] == 400
 
 
@@ -1340,7 +1383,7 @@ async def _assert_global_profile_reinitialized(
 async def test_profile_resolve_reinitializes_regressed_global_checkpoint_as_of(
     monkeypatch,
 ):
-    """Give a 19-source 20/2 checkpoint fresh as-of and 1577/400 totals."""
+    """Give a 19-source 20/2 checkpoint fresh as-of and 2185/400 totals."""
     controls = _patch_global_profile_resolution(monkeypatch)
     initial_build = await importer._resolve_provider_directory_profile_build(
         "mrf",
@@ -1415,8 +1458,8 @@ async def test_profile_plan_order_change_reinitializes_same_geometry(
     checkpoint_map = _profile_checkpoint_by_name(
         changed_build,
         state="failed",
-        evidence_next_batch=1577,
-        evidence_total_batches=1577,
+        evidence_next_batch=2185,
+        evidence_total_batches=2185,
         profile_total_batches=400,
     )
     checkpoint_map.update(

@@ -24,6 +24,24 @@ PRODUCER_BUILD_ID = "ptg2_scanner-test-producer"
 VERIFIER_BUILD_ID = "ptg2_scanner-test-verifier"
 
 
+def assert_first_binding_reference_layouts(connection, first_binding) -> None:
+    """Require every canonical raw and manifest reference for one binding."""
+    reference_layouts = {
+        (key[2], key[3], key[4])
+        for key in connection.rows_by_table["reference"]
+        if key[:2]
+        == (
+            first_binding.catalog_set_sha256,
+            first_binding.source_file_id,
+        )
+    }
+    assert reference_layouts == {
+        ("raw", 0, 0),
+        ("manifest", 2, 4),
+        ("manifest", 2, 8),
+    }
+
+
 def digest(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 

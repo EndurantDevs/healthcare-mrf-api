@@ -5,14 +5,8 @@
 
 from __future__ import annotations
 
-import argparse
-import asyncio
-import hashlib
 import json
-import os
-import re
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -30,92 +24,24 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from process import provider_directory_profile as profile
+from scripts.research.provider_directory_profile_harness_support import (
+    arguments as harness_arguments,
+    bind as _bind,
+    connect as harness_connect,
+    decoded as _decoded,
+    run as run_harness,
+    schema_name as harness_schema_name,
+    table_ref as _ref,
+)
 
 
 FIXTURE_NPI = 1588616783
+PROFILE_AS_OF = "2026-07-13"
+ALL_SOURCE_IDS = ["source_a", "source_b"]
 INITIAL_EVIDENCE_TABLE = "profile_evidence"
 INITIAL_PROFILE_TABLE = "profile"
 INCREMENTAL_EVIDENCE_TABLE = "profile_evidence_incremental"
 INCREMENTAL_PROFILE_TABLE = "profile_incremental"
-
-
-def _arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dsn", default=os.getenv("HLTHPRT_DB_DSN"))
-    parser.add_argument(
-        "--host",
-        default=os.getenv("HLTHPRT_DB_HOST", "127.0.0.1"),
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.getenv("HLTHPRT_DB_PORT", "5432")),
-    )
-    parser.add_argument("--user", default=os.getenv("HLTHPRT_DB_USER"))
-    parser.add_argument(
-        "--database",
-        default=os.getenv("HLTHPRT_DB_DATABASE"),
-    )
-    parser.add_argument(
-        "--password",
-        default=os.getenv("HLTHPRT_DB_PASSWORD") or os.getenv("PGPASSWORD"),
-    )
-    parser.add_argument("--keep-schema", action="store_true")
-    return parser.parse_args()
-
-
-def _schema_name() -> str:
-    token = f"{os.getpid()}:{time.time_ns()}"
-    digest = hashlib.sha1(token.encode("ascii")).hexdigest()[:12]
-    return f"pd_profile_harness_{digest}"
-
-
-def _bind(sql: str, *parameter_names: str) -> str:
-    bound_sql = sql
-    for index, parameter_name in enumerate(parameter_names, start=1):
-        bound_sql = re.sub(
-            rf":{re.escape(parameter_name)}\b",
-            "$" + str(index),
-            bound_sql,
-        )
-    unresolved_tokens = re.findall(
-        r"(?<!:):[a-zA-Z_][a-zA-Z0-9_]*",
-        bound_sql,
-    )
-    if unresolved_tokens:
-        raise RuntimeError(
-            "provider_directory_profile_harness_unbound_parameters:"
-            + ",".join(sorted(set(unresolved_tokens)))
-        )
-    return bound_sql
-
-
-def _decoded(json_value: Any) -> Any:
-    return json.loads(json_value) if isinstance(json_value, str) else json_value
-
-
-async def _connect(
-    arguments: argparse.Namespace,
-) -> asyncpg.Connection:
-    if arguments.dsn:
-        return await asyncpg.connect(arguments.dsn)
-    missing_settings = [
-        setting_name
-        for setting_name in ("user", "database", "password")
-        if not getattr(arguments, setting_name)
-    ]
-    if missing_settings:
-        raise RuntimeError(
-            "provider_directory_profile_harness_db_config_missing:"
-            + ",".join(missing_settings)
-        )
-    return await asyncpg.connect(
-        host=arguments.host,
-        port=arguments.port,
-        user=arguments.user,
-        password=arguments.password,
-        database=arguments.database,
-    )
 
 
 def _fixture_sql(schema: str) -> str:
@@ -123,10 +49,6 @@ def _fixture_sql(schema: str) -> str:
         "{{SCHEMA}}",
         schema,
     )
-
-
-def _ref(schema: str, table_name: str) -> str:
-    return profile.qualified_table(schema, table_name)
 
 
 async def _initialize_fixture(
@@ -157,11 +79,23 @@ async def _create_evidence_artifact(
         role_ref=_ref(schema, "role"),
         organization_ref=_ref(schema, "organization"),
         service_ref=_ref(schema, "service"),
+        endpoint_ref=_ref(schema, "endpoint"),
+        affiliation_ref=_ref(schema, "affiliation"),
+        affiliation_organization_ref=_ref(
+            schema,
+            "affiliation_organization",
+        ),
     )
     await connection.execute(
-        _bind(evidence_insert_sql, "source_ids", "dataset_ids"),
+        _bind(
+            evidence_insert_sql,
+            "source_ids",
+            "dataset_ids",
+            "profile_as_of",
+        ),
         source_ids,
         dataset_ids,
+        PROFILE_AS_OF,
     )
     for index_statement in profile.profile_index_statements(
         schema,
@@ -169,6 +103,74 @@ async def _create_evidence_artifact(
         evidence=True,
     ):
         await connection.execute(index_statement)
+
+
+async def _copy_retained_profiles(
+    connection: asyncpg.Connection,
+    schema: str,
+    artifact_refs: tuple[str, str],
+    prior_tables: tuple[str, str],
+    refreshed_source_ids: list[str],
+) -> None:
+    """Copy profiles outside the refreshed source set into the new stage."""
+    evidence_ref, profile_ref = artifact_refs
+    old_profile_table, old_evidence_table = prior_tables
+    await connection.execute(
+        _bind(
+            profile.copy_unaffected_profiles_sql(
+                profile_source_ref=_ref(schema, old_profile_table),
+                evidence_source_ref=_ref(schema, old_evidence_table),
+                evidence_stage_ref=evidence_ref,
+                profile_stage_ref=profile_ref,
+            ),
+            "source_ids",
+            "retained_source_ids",
+            "profile_as_of",
+        ),
+        refreshed_source_ids,
+        ALL_SOURCE_IDS,
+        PROFILE_AS_OF,
+    )
+
+
+async def _populate_compact_profiles(
+    connection: asyncpg.Connection,
+    schema: str,
+    artifact_refs: tuple[str, str],
+    generation_id: str,
+    prior_tables: tuple[str, str] | None,
+    refreshed_source_ids: list[str] | None,
+) -> None:
+    """Aggregate exact evidence into the compact profile stage."""
+    evidence_ref, profile_ref = artifact_refs
+    old_evidence_ref = (
+        _ref(schema, prior_tables[1]) if prior_tables is not None else None
+    )
+    aggregate_sql = profile.profile_insert_sql(
+        evidence_ref=evidence_ref,
+        target_ref=profile_ref,
+        old_evidence_ref=old_evidence_ref,
+        rebuild_all=prior_tables is None,
+    )
+    if prior_tables is None:
+        await connection.execute(
+            _bind(aggregate_sql, "generation_id"),
+            generation_id,
+        )
+        return
+    await connection.execute(
+        _bind(
+            aggregate_sql,
+            "source_ids",
+            "retained_source_ids",
+            "profile_as_of",
+            "generation_id",
+        ),
+        refreshed_source_ids,
+        ALL_SOURCE_IDS,
+        PROFILE_AS_OF,
+        generation_id,
+    )
 
 
 async def _create_compact_artifact(
@@ -182,56 +184,38 @@ async def _create_compact_artifact(
     old_evidence_table: str | None = None,
     refreshed_source_ids: list[str] | None = None,
 ) -> None:
+    """Create and index one initial or incremental compact artifact."""
     profile_ref = _ref(schema, table_name)
     evidence_ref = _ref(schema, evidence_table)
-    has_existing_artifacts = bool(
-        old_profile_table
-        and old_evidence_table
-        and refreshed_source_ids
+    prior_tables = (
+        (old_profile_table, old_evidence_table)
+        if old_profile_table and old_evidence_table and refreshed_source_ids
+        else None
     )
+    artifact_refs = (evidence_ref, profile_ref)
     await connection.execute(profile.profile_table_sql(schema, table_name))
-    if has_existing_artifacts:
-        await connection.execute(
-            _bind(
-                profile.copy_unaffected_profiles_sql(
-                    profile_source_ref=_ref(schema, old_profile_table or ""),
-                    evidence_source_ref=_ref(schema, old_evidence_table or ""),
-                    evidence_stage_ref=evidence_ref,
-                    profile_stage_ref=profile_ref,
-                ),
-                "source_ids",
-            ),
+    if prior_tables is not None and refreshed_source_ids is not None:
+        await _copy_retained_profiles(
+            connection,
+            schema,
+            artifact_refs,
+            prior_tables,
             refreshed_source_ids,
         )
-    aggregate_sql = profile.profile_insert_sql(
-        evidence_ref=evidence_ref,
-        target_ref=profile_ref,
-        old_evidence_ref=(
-            _ref(schema, old_evidence_table or "")
-            if has_existing_artifacts
-            else None
-        ),
-        rebuild_all=not has_existing_artifacts,
+    await _populate_compact_profiles(
+        connection,
+        schema,
+        artifact_refs,
+        generation_id,
+        prior_tables,
+        refreshed_source_ids,
     )
-    if has_existing_artifacts:
-        await connection.execute(
-            _bind(aggregate_sql, "source_ids", "generation_id"),
-            refreshed_source_ids,
-            generation_id,
-        )
-    else:
-        await connection.execute(
-            _bind(aggregate_sql, "generation_id"),
-            generation_id,
-        )
     for index_statement in profile.profile_index_statements(
         schema,
         table_name,
         evidence=False,
     ):
         await connection.execute(index_statement)
-
-
 async def _build_initial_artifacts(
     connection: asyncpg.Connection,
     schema: str,
@@ -277,8 +261,12 @@ async def _build_incremental_artifacts(
                 target_ref=_ref(schema, INCREMENTAL_EVIDENCE_TABLE),
             ),
             "source_ids",
+            "retained_source_ids",
+            "profile_as_of",
         ),
         ["source_b"],
+        ALL_SOURCE_IDS,
+        PROFILE_AS_OF,
     )
     await _create_evidence_rows_for_refresh(connection, schema)
     await _create_compact_artifact(
@@ -304,11 +292,23 @@ async def _create_evidence_rows_for_refresh(
         role_ref=_ref(schema, "role"),
         organization_ref=_ref(schema, "organization"),
         service_ref=_ref(schema, "service"),
+        endpoint_ref=_ref(schema, "endpoint"),
+        affiliation_ref=_ref(schema, "affiliation"),
+        affiliation_organization_ref=_ref(
+            schema,
+            "affiliation_organization",
+        ),
     )
     await connection.execute(
-        _bind(evidence_insert_sql, "source_ids", "dataset_ids"),
+        _bind(
+            evidence_insert_sql,
+            "source_ids",
+            "dataset_ids",
+            "profile_as_of",
+        ),
         ["source_b"],
         ["dataset_b"],
+        PROFILE_AS_OF,
     )
     for index_statement in profile.profile_index_statements(
         schema,
@@ -449,10 +449,10 @@ async def _lookup_execution_ms(
 
 
 async def _execute_profile_harness(
-    arguments: argparse.Namespace,
+    connection_options: Any,
 ) -> dict[str, Any]:
-    schema = _schema_name()
-    connection = await _connect(arguments)
+    schema = harness_schema_name()
+    connection = await harness_connect(connection_options)
     try:
         await _initialize_fixture(connection, schema)
         await _build_initial_artifacts(connection, schema)
@@ -478,10 +478,10 @@ async def _execute_profile_harness(
             "lookup_execution_ms": execution_ms,
             "incremental_refresh_verified": True,
             "logged_artifacts_verified": True,
-            "schema_retained": arguments.keep_schema,
+            "schema_retained": connection_options.keep_schema,
         }
     finally:
-        if not arguments.keep_schema:
+        if not connection_options.keep_schema:
             await connection.execute(
                 f"DROP SCHEMA IF EXISTS {profile.quote_identifier(schema)} CASCADE;"
             )
@@ -490,7 +490,9 @@ async def _execute_profile_harness(
 
 def main() -> None:
     """Run the disposable PostgreSQL profile self-harness."""
-    harness_metrics = asyncio.run(_execute_profile_harness(_arguments()))
+    harness_metrics = run_harness(
+        _execute_profile_harness(harness_arguments(__doc__ or ""))
+    )
     print(json.dumps(harness_metrics, sort_keys=True))
 
 

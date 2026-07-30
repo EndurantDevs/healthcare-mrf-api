@@ -92,8 +92,13 @@ UHC_RETAINED_PUBLICATION_CONTRACT_ID = (
 UHC_RETAINED_PUBLICATION_METADATA_KEY = "uhc_retained_publication_v1"
 UHC_RETAINED_SOURCE_ID = UHC_PROVIDER_FILE_SOURCE_ID
 UHC_RETAINED_CANONICAL_CONTRACT_ID = (
-    "healthporta.uhc.provider-directory-canonical.v1"
+    "healthporta.uhc.provider-directory-canonical.v2"
 )
+UHC_TIN_STATUS_UNAVAILABLE = "unavailable_from_uhc_source"
+UHC_PROVIDER_PLAN_RELATIONSHIP_TYPE = (
+    "payer_reported_provider_plan_membership"
+)
+UHC_OWNERSHIP_STATUS_NOT_ASSERTED = "not_asserted"
 
 _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1121,6 +1126,7 @@ class _ProviderResourceContext:
     telecom: list[dict[str, str]]
     location_ids: list[str]
     display_name: str | None
+    source_lineage: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -1137,6 +1143,7 @@ def _provider_resource_context(
     provider_fact: Mapping[str, Any],
     source_file_id: str,
     ordinal: int,
+    source_lineage: Mapping[str, Any],
 ) -> _ProviderResourceContext:
     provider_type = _clean_text(provider_fact.get("type"), upper=True)
     npi = _clean_text(provider_fact.get("npi"))
@@ -1175,6 +1182,7 @@ def _provider_resource_context(
             for address_index in range(len(addresses))
         ],
         display_name=display_name,
+        source_lineage=dict(source_lineage),
     )
 
 
@@ -1222,6 +1230,9 @@ def _organization_payload(
         ),
         "telecom": context.telecom,
         "address_json": context.address_payloads,
+        "tax_id": None,
+        "tin_status": UHC_TIN_STATUS_UNAVAILABLE,
+        "source_lineage": context.source_lineage,
     }
 
 
@@ -1372,13 +1383,25 @@ def _provider_plan_relationship_fields(
             field_name: field_value
             for field_name, field_value in {
                 **common_by_field,
-                "organization_ref": f"Organization/{context.provider_id}",
+                "organization_ref": None,
                 "participating_organization_ref": (
                     f"Organization/{context.provider_id}"
                 ),
+                "code_codes": [
+                    {
+                        "system": (
+                            "https://healthporta.com/fhir/CodeSystem/"
+                            "provider-directory-relationship"
+                        ),
+                        "code": UHC_PROVIDER_PLAN_RELATIONSHIP_TYPE,
+                        "display": "Payer-reported provider plan membership",
+                    }
+                ],
+                "relationship_type": UHC_PROVIDER_PLAN_RELATIONSHIP_TYPE,
+                "ownership_status": UHC_OWNERSHIP_STATUS_NOT_ASSERTED,
+                "source_lineage": context.source_lineage,
             }.items()
-            if field_name
-            not in {"npi", "insurance_plan_refs", "accepting_patients"}
+            if field_name not in {"npi", "accepting_patients"}
         },
     )
 
@@ -1462,10 +1485,16 @@ def _provider_resource_rows(
     source_file_id: str,
     ordinal: int,
     logical_scope: UHCLogicalScope,
+    source_lineage: Mapping[str, Any],
 ) -> tuple[list[tuple[str, str, str, str, str]], list[tuple[str, str, str]]]:
     """Map one provider fact to canonical resources and plan keys."""
 
-    context = _provider_resource_context(provider_fact, source_file_id, ordinal)
+    context = _provider_resource_context(
+        provider_fact,
+        source_file_id,
+        ordinal,
+        source_lineage,
+    )
     resource_rows = [_provider_base_row(provider_fact, context)]
     resource_rows.extend(_provider_location_rows(context))
     plan_rows, key_rows = _provider_plan_rows(
@@ -1702,6 +1731,14 @@ def _append_canonical_fact(
             source_file_id=admitted.source_file_id,
             ordinal=ordinal,
             logical_scope=logical_scope,
+            source_lineage={
+                "catalog_set_sha256": admitted.catalog_set_sha256,
+                "source_file_id": admitted.source_file_id,
+                "file_name": Path(admitted.file_name).name,
+                "artifact_sha256": admitted.artifact_sha256,
+                "record_ordinal": ordinal,
+                "logical_scope_id": logical_scope.logical_scope_id,
+            },
         )
         proof_builder.observe_rows(
             generated_rows,

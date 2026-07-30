@@ -52,11 +52,20 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def _provider_npi(ordinal: int) -> str:
+    return (
+        "1003821380",
+        "1000000491",
+        "1234567893",
+        "1588616783",
+    )[ordinal]
+
+
 def _provider_fact(ordinal: int) -> dict[str, object]:
     is_individual = ordinal % 2 == 0
     return {
         "type": "INDIVIDUAL" if is_individual else "FACILITY",
-        "npi": str(1003821380 + ordinal),
+        "npi": _provider_npi(ordinal),
         "name": (
             {"first": f"Ada{ordinal}", "middle": None, "last": "Lovelace"}
             if is_individual
@@ -213,7 +222,7 @@ async def _insert_semantic_fixture_rows(
                 ) VALUES (2, $1, 0, $1, $2, $3)
                 """,
                 ordinal,
-                str(1003821380 + ordinal),
+                _provider_npi(ordinal),
                 signature,
             )
     return blocks
@@ -690,6 +699,61 @@ async def _prepare_candidate_fixture_tables(database, schema: str) -> None:
     await ensure_dataset_proof_shard_table(database, schema)
 
 
+async def _assert_canonical_facility_evidence(database, stage) -> None:
+    """Require exact file lineage and non-ownership facility semantics."""
+    organization_row = await database.first(
+        f"""
+        SELECT resource_id, payload_json
+          FROM {stage.resource_ref}
+         WHERE resource_type = 'Organization'
+           AND payload_json ->> 'npi' = '1000000491';
+        """
+    )
+    assert organization_row is not None
+    organization = organization_row.payload_json
+    if isinstance(organization, str):
+        organization = json.loads(organization)
+    affiliation_row = await database.first(
+        f"""
+        SELECT payload_json
+          FROM {stage.resource_ref}
+         WHERE resource_type = 'OrganizationAffiliation'
+           AND payload_json ->> 'participating_organization_ref' =
+               :organization_ref;
+        """,
+        organization_ref=f"Organization/{organization_row.resource_id}",
+    )
+    assert affiliation_row is not None
+    affiliation = affiliation_row.payload_json
+    if isinstance(affiliation, str):
+        affiliation = json.loads(affiliation)
+
+    assert organization["name"] == "Clinic 1"
+    assert organization["type_codes"] == ["Clinic"]
+    assert organization["address_json"][0]["city"] == "Chicago"
+    assert organization["tax_id"] is None
+    assert (
+        organization["tin_status"]
+        == "unavailable_from_uhc_source"
+    )
+    lineage = organization["source_lineage"]
+    assert lineage["catalog_set_sha256"] == _digest("complete-catalog")
+    assert lineage["source_file_id"] == _digest("provider_membership")
+    assert lineage["file_name"] == "JSON_Providers_ILIEX.json"
+    assert lineage["artifact_sha256"] == _digest(
+        "provider_membership:artifact"
+    )
+    assert lineage["record_ordinal"] == 1
+    assert affiliation["organization_ref"] is None
+    assert affiliation["insurance_plan_refs"]
+    assert (
+        affiliation["relationship_type"]
+        == "payer_reported_provider_plan_membership"
+    )
+    assert affiliation["ownership_status"] == "not_asserted"
+    assert affiliation["source_lineage"] == lineage
+
+
 async def _assert_candidate_retry_and_validation(database, stage):
     """Assert candidate replacement is replayable and then immutable."""
     source_by_field = {
@@ -953,6 +1017,7 @@ async def test_postgres_canonical_stage_retry_idempotency_and_publish_gate(
             assert stage.summary_input["count_by_field"][
                 "raw_provider_records"
             ] == 4
+            await _assert_canonical_facility_evidence(database, stage)
             await _prepare_candidate_fixture_tables(database, schema)
             candidate, first_proof = (
                 await _assert_candidate_retry_and_validation(database, stage)

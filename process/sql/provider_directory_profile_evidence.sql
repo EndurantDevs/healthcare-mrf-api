@@ -270,6 +270,208 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                AND participating_organization.resource_id = affiliation_edge.participating_organization_resource_id
              WHERE normalized_affiliation.participating_organization_resource_id = affiliation_edge.participating_organization_resource_id
                AND normalized_affiliation.participating_organization_resource_id = normalized_role.organization_resource_id
+        ), plan_membership_rows AS MATERIALIZED (
+            SELECT organization.npi,
+                   affiliation.source_id,
+                   source_context.endpoint_id,
+                   source_context.dataset_id,
+                   source_context.canonical_api_base,
+                   source_context.org_name AS source_org_name,
+                   source_context.plan_name AS source_plan_name,
+                   affiliation.resource_id,
+                   organization.resource_id AS organization_resource_id,
+                   organization.active AS organization_active,
+                   organization.updated_at AS organization_updated_at,
+                   affiliation.active,
+                   affiliation.period_start,
+                   affiliation.period_end,
+                   GREATEST(
+                       affiliation.updated_at,
+                       organization.updated_at
+                   ) AS updated_at,
+                   jsonb_strip_nulls(
+                       jsonb_build_object(
+                           'resource_id', organization.resource_id,
+                           'npi', organization.npi,
+                           'name', organization.name,
+                           'active', organization.active,
+                           'type_codes', organization.type_codes::jsonb,
+                           'telecom', organization.telecom::jsonb,
+                           'candidate_addresses',
+                               organization.address_json::jsonb,
+                           'address_status',
+                               'payer_directory_candidate',
+                           'tin_status', organization.tin_status,
+                           'source_lineage',
+                               organization.source_lineage::jsonb
+                       )
+                   ) || jsonb_build_object('tax_id', NULL)
+                       AS organization_value,
+                   jsonb_strip_nulls(
+                       jsonb_build_object(
+                           'participating_organization',
+                               jsonb_build_object(
+                                   'resource_id', organization.resource_id,
+                                   'npi', organization.npi,
+                                   'name', organization.name,
+                                   'type_codes', organization.type_codes::jsonb
+                               ),
+                           'insurance_plan_refs',
+                               affiliation.insurance_plan_refs::jsonb,
+                           'location_refs', affiliation.location_refs::jsonb,
+                           'specialty_codes',
+                               affiliation.specialty_codes::jsonb,
+                           'membership_codes',
+                               affiliation.code_codes::jsonb,
+                           'plan_scope', affiliation.plan_scope::jsonb,
+                           'network_tier', affiliation.network_tier,
+                           'network_key_id', affiliation.network_key_id,
+                           'relationship_type',
+                               affiliation.relationship_type,
+                           'ownership_status',
+                               affiliation.ownership_status,
+                           'source_lineage',
+                               affiliation.source_lineage::jsonb,
+                           'period_start', affiliation.period_start,
+                           'period_end', affiliation.period_end,
+                           'active', affiliation.active
+                       )
+                   ) AS membership_value
+              FROM {{AFFILIATION_REF}} AS affiliation
+              JOIN source_context
+                ON source_context.source_id = affiliation.source_id
+              CROSS JOIN LATERAL (
+                   SELECT CASE
+                            WHEN BTRIM(
+                                 affiliation.participating_organization_ref
+                            ) ~ '^[A-Za-z0-9.-]{1,64}$'
+                            THEN BTRIM(
+                                 affiliation.participating_organization_ref
+                            )
+                            ELSE substring(
+                                 BTRIM(
+                                     affiliation.participating_organization_ref
+                                 )
+                                 FROM '(?i)(?:^|/)Organization/([A-Za-z0-9.-]{1,64})(?:/_history/[A-Za-z0-9.-]{1,64})?/?(?:[?#].*)?$'
+                            )
+                          END AS organization_resource_id
+              ) AS normalized_membership
+              JOIN {{AFFILIATION_ORGANIZATION_REF}} AS affiliation_edge
+                ON affiliation_edge.dataset_id = source_context.dataset_id
+               AND affiliation_edge.affiliation_resource_id =
+                   affiliation.resource_id
+               AND affiliation_edge.participating_organization_resource_id =
+                   normalized_membership.organization_resource_id
+              JOIN {{ORGANIZATION_REF}} AS organization
+                ON organization.source_id = affiliation.source_id
+               AND organization.resource_id =
+                   affiliation_edge.participating_organization_resource_id
+             WHERE affiliation.relationship_type =
+                   'payer_reported_provider_plan_membership'
+               AND affiliation.ownership_status = 'not_asserted'
+               AND NULLIF(BTRIM(affiliation.organization_ref), '') IS NULL
+               AND organization.tax_id IS NULL
+               AND organization.tin_status =
+                   'unavailable_from_uhc_source'
+               AND jsonb_typeof(
+                       affiliation.plan_scope::jsonb
+                   ) = 'object'
+               AND affiliation.plan_scope::jsonb
+                       ->> 'logical_scope_id' =
+                   organization.source_lineage::jsonb
+                       ->> 'logical_scope_id'
+               AND affiliation.plan_scope::jsonb
+                       ->> 'plan_key_id'
+                   ~ '^[0-9a-f]{64}$'
+               AND NULLIF(
+                       affiliation.plan_scope::jsonb
+                           ->> 'plan_id_type',
+                       ''
+                   ) IS NOT NULL
+               AND NULLIF(
+                       affiliation.plan_scope::jsonb
+                           ->> 'plan_id',
+                       ''
+                   ) IS NOT NULL
+               AND affiliation.plan_scope::jsonb
+                       ->> 'plan_year'
+                   ~ '^[0-9]{4}$'
+               AND jsonb_typeof(
+                       organization.source_lineage::jsonb
+                   ) = 'object'
+               AND organization.source_lineage::jsonb =
+                   affiliation.source_lineage::jsonb
+               AND organization.source_lineage::jsonb
+                       ->> 'catalog_set_sha256'
+                   ~ '^[0-9a-f]{64}$'
+               AND organization.source_lineage::jsonb
+                       ->> 'source_file_id'
+                   ~ '^[0-9a-f]{64}$'
+               AND organization.source_lineage::jsonb
+                       ->> 'artifact_sha256'
+                   ~ '^[0-9a-f]{64}$'
+               AND organization.source_lineage::jsonb
+                       ->> 'logical_scope_id'
+                   ~ '^[0-9a-f]{64}$'
+               AND organization.source_lineage::jsonb
+                       ->> 'record_ordinal'
+                   ~ '^[0-9]+$'
+               AND NULLIF(
+                       organization.source_lineage::jsonb
+                           ->> 'file_name',
+                       ''
+                   ) IS NOT NULL
+               AND length(
+                       organization.source_lineage::jsonb
+                           ->> 'file_name'
+                   ) <= 256
+               AND strpos(
+                       organization.source_lineage::jsonb
+                           ->> 'file_name',
+                       '/'
+                   ) = 0
+               AND strpos(
+                       organization.source_lineage::jsonb
+                           ->> 'file_name',
+                       chr(92)
+                   ) = 0
+               AND jsonb_typeof(
+                       COALESCE(
+                           affiliation.insurance_plan_refs::jsonb,
+                           'null'::jsonb
+                       )
+                   ) = 'array'
+               AND jsonb_array_length(
+                       CASE
+                         WHEN jsonb_typeof(
+                                  COALESCE(
+                                      affiliation.insurance_plan_refs::jsonb,
+                                      'null'::jsonb
+                                  )
+                              ) = 'array'
+                         THEN affiliation.insurance_plan_refs::jsonb
+                         ELSE '[]'::jsonb
+                       END
+                   ) = 1
+               AND CASE
+                     WHEN jsonb_typeof(
+                              COALESCE(
+                                  affiliation.insurance_plan_refs::jsonb,
+                                  'null'::jsonb
+                              )
+                          ) = 'array'
+                     THEN affiliation.insurance_plan_refs::jsonb ->> 0
+                     ELSE NULL
+                   END =
+                   concat(
+                       'InsurancePlan/uhcplan-',
+                       left(
+                           affiliation.plan_scope::jsonb
+                               ->> 'plan_key_id',
+                           48
+                       )
+                   )
+               AND {{AFFILIATION_BUCKET_SQL}}
         ), facts AS (
             SELECT practitioner.npi,
                    'name'::varchar AS fact_type,
@@ -601,6 +803,35 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                AND role.accepting_medicaid IS NOT NULL
 
             UNION ALL
+            SELECT membership.npi, 'organization',
+                   md5(
+                       lower(
+                           concat_ws(
+                               '|',
+                               membership.organization_resource_id,
+                               membership.organization_value ->> 'name',
+                               membership.npi::text
+                           )
+                       )
+                   ),
+                   membership.organization_value,
+                   membership.source_id, membership.endpoint_id,
+                   membership.dataset_id,
+                   membership.canonical_api_base,
+                   membership.source_org_name,
+                   membership.source_plan_name, 'Organization',
+                   membership.organization_resource_id, NULL::varchar,
+                   membership.organization_active,
+                   NULL::varchar, NULL::varchar,
+                   membership.organization_updated_at
+              FROM plan_membership_rows AS membership
+             WHERE {{ORGANIZATION_FACT_SCOPE_SQL}}
+               AND NULLIF(
+                       membership.organization_value ->> 'name',
+                       ''
+                   ) IS NOT NULL
+
+            UNION ALL
             SELECT role.resolved_npi, 'organization',
                    md5(lower(COALESCE(organization.name, role.organization_ref, ''))),
                    jsonb_strip_nulls(
@@ -622,6 +853,8 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                AND organization.resource_id = {{ROLE_ORGANIZATION_RESOURCE_ID_SQL}}
              WHERE {{ORGANIZATION_FACT_SCOPE_SQL}}
                AND NULLIF(COALESCE(organization.name, role.organization_ref, ''), '') IS NOT NULL
+               AND COALESCE(organization.tin_status, '') <>
+                   'unavailable_from_uhc_source'
 
             UNION ALL
             SELECT affiliation.npi, 'affiliation',
@@ -636,6 +869,29 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                    affiliation.updated_at
               FROM affiliation_rows AS affiliation
              WHERE {{AFFILIATION_FACT_SCOPE_SQL}}
+
+            UNION ALL
+            SELECT membership.npi, 'plan_membership',
+                   md5(
+                       concat_ws(
+                           '|',
+                           membership.source_id,
+                           membership.dataset_id,
+                           membership.resource_id,
+                           membership.membership_value::text
+                       )
+                   ),
+                   membership.membership_value,
+                   membership.source_id, membership.endpoint_id,
+                   membership.dataset_id, membership.canonical_api_base,
+                   membership.source_org_name,
+                   membership.source_plan_name,
+                   'OrganizationAffiliation', membership.resource_id,
+                   NULL::varchar, membership.active,
+                   membership.period_start, membership.period_end,
+                   membership.updated_at
+              FROM plan_membership_rows AS membership
+             WHERE {{PLAN_MEMBERSHIP_FACT_SCOPE_SQL}}
 
             UNION ALL
             SELECT service.npi, 'service',

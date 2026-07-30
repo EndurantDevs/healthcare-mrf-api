@@ -14443,10 +14443,24 @@ _PROFILE_EVIDENCE_PROGRESS_PHASE = (
 _PROFILE_COMPACT_PROGRESS_PHASE = (
     "provider-directory profile compact NPI batches"
 )
-_PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES = (
-    "affiliation",
-    "organization",
-    "plan_membership",
+_PROFILE_PARENT_PROGRESS_DONE = 4
+_PROFILE_PARENT_PROGRESS_TOTAL = 7
+_PROFILE_ROLE_RESOURCE_BUCKET_SCHEME = (
+    "hashtextextended-role-resource-id-seed0-positive-mod-v1"
+)
+_PROFILE_AFFILIATION_RESOURCE_BUCKET_SCHEME = (
+    "hashtextextended-affiliation-resource-id-seed0-positive-mod-v1"
+)
+_PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE = {
+    "affiliation": (_PROFILE_ROLE_RESOURCE_BUCKET_SCHEME,),
+    "organization": (
+        _PROFILE_ROLE_RESOURCE_BUCKET_SCHEME,
+        _PROFILE_AFFILIATION_RESOURCE_BUCKET_SCHEME,
+    ),
+    "plan_membership": (_PROFILE_AFFILIATION_RESOURCE_BUCKET_SCHEME,),
+}
+_PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES = tuple(
+    _PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE
 )
 
 
@@ -14458,12 +14472,21 @@ def _profile_batch_detail_by_name(
     ),
 ) -> dict[str, Any]:
     if isinstance(batch, _ProviderDirectoryProfileEvidenceBatch):
+        bucket_schemes = (
+            _PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE.get(
+                str(batch.fact_type or ""),
+                (),
+            )
+        )
         return {
             "batch_kind": batch.kind,
             "source_id": batch.source_id,
             "fact_type": batch.fact_type,
             "role_bucket": batch.role_bucket,
             "role_bucket_count": batch.role_bucket_count,
+            "resource_bucket": batch.role_bucket,
+            "resource_bucket_count": batch.role_bucket_count,
+            "bucket_schemes": list(bucket_schemes),
         }
     if isinstance(batch, _ProviderDirectoryProfileCompactBatch):
         return {
@@ -14478,6 +14501,39 @@ def _provider_directory_profile_build_id(
     build: _ProviderDirectoryProfileBuild,
 ) -> str:
     return build.build_id or build.generation_id
+
+
+def _provider_directory_profile_overall_pct(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    phase: str,
+    completed_batches: int,
+    total_batches: int,
+) -> float:
+    """Map nested profile batches into publishing-artifact step four."""
+
+    if build.batch_plan is not None:
+        evidence_total = len(build.batch_plan.evidence_batches)
+        profile_total = len(build.batch_plan.compact_batches)
+    else:
+        evidence_total = total_batches
+        profile_total = total_batches
+    combined_total = max(evidence_total + profile_total, 1)
+    if phase == "evidence":
+        combined_done = min(completed_batches, evidence_total)
+    elif phase == "profile":
+        combined_done = evidence_total + min(
+            completed_batches,
+            profile_total,
+        )
+    else:
+        raise ValueError(f"unsupported profile progress phase: {phase}")
+    nested_fraction = combined_done / combined_total
+    overall_done = _PROFILE_PARENT_PROGRESS_DONE + nested_fraction
+    return round(
+        (overall_done / _PROFILE_PARENT_PROGRESS_TOTAL) * 100,
+        2,
+    )
 
 
 async def _mark_provider_directory_profile_batch_progress(
@@ -14505,12 +14561,19 @@ async def _mark_provider_directory_profile_batch_progress(
             f"unsupported profile progress phase: {phase}"
         )
     details_by_name: dict[str, Any] = {
+        "_progress_unit": "batches",
         "profile_build_id": _provider_directory_profile_build_id(build),
         "profile_generation_id": build.generation_id,
         "profile_batch_phase": phase,
         "completed_batches": completed_batches,
         "total_batches": total_batches,
         "resumed_from_batch": resumed_from_batch,
+        "stage_pct": round(
+            (completed_batches / max(total_batches, 1)) * 100,
+            2,
+        ),
+        "overall_parent_done": _PROFILE_PARENT_PROGRESS_DONE,
+        "overall_parent_total": _PROFILE_PARENT_PROGRESS_TOTAL,
     }
     details_by_name.update(
         _profile_batch_detail_by_name(batch)
@@ -14520,7 +14583,12 @@ async def _mark_provider_directory_profile_batch_progress(
         phase=phase_label,
         done=completed_batches,
         total=total_batches,
-        unit="batches",
+        overall_pct=_provider_directory_profile_overall_pct(
+            build,
+            phase=phase,
+            completed_batches=completed_batches,
+            total_batches=total_batches,
+        ),
         message=(
             f"{phase_label}; "
             f"{completed_batches} of {total_batches} complete"
@@ -14699,8 +14767,8 @@ def _provider_directory_profile_batch_plan(
         "contract": "provider-directory-profile-executable-plan-v1",
         "has_existing_artifacts": has_existing_artifacts,
         "include_copy_batch": include_copy_batch,
-        "role_bucket_scheme": (
-            "hashtextextended-role-resource-id-seed0-positive-mod-v1"
+        "bucket_schemes_by_fact_type": (
+            _PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE
         ),
         "role_bucket_fact_types": (
             _PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES
@@ -33764,7 +33832,7 @@ async def _mark_provider_directory_progress(
     phase: str,
     done: int,
     total: int,
-    unit: str = "steps",
+    overall_pct: float | None = None,
     message: str,
     details: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
@@ -33773,16 +33841,25 @@ async def _mark_provider_directory_progress(
         return
     total = max(total, 1)
     done = max(0, min(done, total))
+    progress_details_by_name = dict(details or {})
+    progress_unit = (
+        _clean_text(progress_details_by_name.pop("_progress_unit", None))
+        or "steps"
+    )
     progress_by_name = {
-        "unit": unit,
+        "unit": progress_unit,
         "done": done,
         "total": total,
-        "pct": round((done / total) * 100, 2),
+        "pct": (
+            round((done / total) * 100, 2)
+            if overall_pct is None
+            else round(max(0.0, min(overall_pct, 100.0)), 2)
+        ),
         "phase": phase,
         "message": message,
     }
-    if isinstance(details, dict) and details:
-        progress_by_name["detail"] = details
+    if progress_details_by_name:
+        progress_by_name["detail"] = progress_details_by_name
     try:
         await mark_control_run(
             run_id,

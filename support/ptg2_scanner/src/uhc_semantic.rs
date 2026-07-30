@@ -2178,6 +2178,14 @@ mod tests {
             "last_updated_on":null
         }"#
         .to_vec();
+        let record: ProviderRecord = serde_json::from_slice(&facility.record).unwrap();
+        let facility_value: serde_json::Value =
+            serde_json::from_slice(&canonical_value_bytes(&record).unwrap()).unwrap();
+        for prohibited_field in ["tin", "tax_id"] {
+            let mut invalid_value = facility_value.clone();
+            invalid_value[prohibited_field] = serde_json::json!("123456789");
+            assert!(serde_json::from_value::<ProviderRecord>(invalid_value).is_err());
+        }
         let report = encode_admitted_ranges_to_copy(&facility, io::sink(), &test_budget()).unwrap();
         assert_eq!(report.counters.raw_facility_records, 4);
         assert_eq!(report.counters.named_facility_records, 4);
@@ -2303,7 +2311,7 @@ mod tests {
         )
         .unwrap();
         assert!(plan_worker
-            .process_plan(0, &plan_source.record)
+            .process_plan(0, br#"{"plan_id_type":"H","plan_id":"P","years":[2026],"marketing_name":null,"marketing_url":null,"summary_url":null,"formulary_url":null,"plan_contact":null,"network":null,"formulary":null,"last_updated_on":null}"#)
             .unwrap_err()
             .to_string()
             .contains("canonical UHC plan fact"));

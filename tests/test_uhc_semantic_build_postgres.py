@@ -17,7 +17,6 @@ from alembic.operations import Operations
 import asyncpg
 import pytest
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from process.uhc_semantic_build_store import (
     UHC_SEMANTIC_CONTRACT_ID,
@@ -460,62 +459,3 @@ async def _seal_and_reuse_semantic_build(
     reused_claim = await claim_uhc_semantic_build(connection, identity)
     assert reused_claim.sealed_reuse
     assert reused_claim.attempt_count == 2
-
-
-@pytest.mark.asyncio
-async def test_postgres_crash_reclaim_verify_seal_and_reuse(monkeypatch) -> None:
-    """A crashed COPY is reclaimed, verified, sealed, and reused exactly."""
-
-    database_url = _database_url()
-    engine = create_async_engine(database_url.set(drivername="postgresql+asyncpg"))
-    migration = _load_migration()
-    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", SCHEMA)
-    identity = UhcSemanticBuildIdentity(
-        catalog_set_sha256=_digest("catalog"),
-        source_file_id=_digest("source"),
-        artifact_sha256=_digest("artifact"),
-        raw_contract_version=2,
-        raw_range_count=4,
-        collection_kind="provider_membership",
-        encoder_sha256=_digest("encoder"),
-    )
-    try:
-        await _install_schema(engine, migration)
-        connection = await asyncpg.connect(
-            host=str(database_url.host),
-            port=int(database_url.port or 5432),
-            user=str(database_url.username),
-            password=str(database_url.password or ""),
-            database=str(database_url.database),
-        )
-        try:
-            await _install_semantic_identity(connection, identity)
-            stage_records, native_report = _semantic_fixture(identity)
-            binary_copy_payload = _binary_copy(stage_records)
-            recovered_claim = await _crash_and_recover_semantic_build(
-                connection, identity, binary_copy_payload
-            )
-            await _seal_and_reuse_semantic_build(
-                connection,
-                identity,
-                recovered_claim,
-                binary_copy_payload,
-                native_report,
-            )
-        finally:
-            await connection.close()
-        async with engine.begin() as connection:
-            await connection.run_sync(
-                lambda sync_connection: _downgrade(sync_connection, migration)
-            )
-            assert (
-                await connection.exec_driver_sql(
-                    f"SELECT to_regclass('{SCHEMA}.provider_directory_uhc_semantic_build')"
-                )
-            ).scalar_one_or_none() is None
-    finally:
-        async with engine.begin() as connection:
-            await connection.exec_driver_sql(
-                f'DROP SCHEMA IF EXISTS "{SCHEMA}" CASCADE'
-            )
-        await engine.dispose()

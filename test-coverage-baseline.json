@@ -50,6 +50,7 @@
         "api/provider_language.py",
         "api/provider_language_merge.py",
         "api/provider_profile.py",
+        "api/provider_profile_composer_parts.py",
         "api/provider_profile_display.py",
         "api/provider_specialty_cache_entries.py",
         "api/provider_specialty_filters.py",
@@ -217,6 +218,7 @@
         "process/provider_directory_projection_worker_admission.py",
         "process/provider_directory_projection_workset.py",
         "process/provider_directory_proof_store.py",
+        "process/provider_directory_refresh_preset.py",
         "process/provider_directory_retained_artifact_base.py",
         "process/provider_directory_retained_artifact_contract.py",
         "process/provider_directory_retained_artifact_keys.py",
@@ -443,6 +445,7 @@
         "process/tin_npi_connector_temporal.py",
         "process/uhc_canonical_proof.py",
         "process/uhc_official_file_acquisition.py",
+        "process/uhc_provider_file_admission.py",
         "process/uhc_provider_file_catalog.py",
         "process/uhc_provider_file_catalog_artifacts.py",
         "process/uhc_provider_file_catalog_contract.py",
@@ -479,12 +482,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 37811,
-          "total": 42080
+          "covered": 37915,
+          "total": 42122
         },
         "lines": {
-          "covered": 119543,
-          "total": 126177
+          "covered": 119821,
+          "total": 126336
         }
       },
       "one_time_floor_reset": {
@@ -593,16 +596,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 3360,
-          "total": 3790
+          "covered": 3358,
+          "total": 3785
         },
         "lines": {
-          "covered": 51836,
-          "total": 58783
+          "covered": 51838,
+          "total": 58781
         },
         "regions": {
-          "covered": 76486,
-          "total": 86917
+          "covered": 76505,
+          "total": 86928
         }
       },
       "one_time_floor_reset": {

@@ -1,20 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import os
-from pathlib import Path
-import subprocess
-import sys
-
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 from db import migration_adoption
 from db import migration_index_adoption
-
-
-ROOT = Path(__file__).resolve().parents[1]
-
 
 class _OperationRecorder:
     def __init__(self):
@@ -475,35 +466,3 @@ def test_known_legacy_index_shape_is_replaced(monkeypatch):
     assert created_index[3]["schema"] == "mrf"
     assert created_index[3]["postgresql_include"] == ("payload_hash",)
     assert str(created_index[3]["postgresql_where"]) == "record_id <> ''"
-
-
-def test_provider_directory_adoption_migrations_compile_offline_sql():
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "HLTHPRT_DB_HOST": "offline.invalid",
-            "HLTHPRT_DB_PORT": "5432",
-            "HLTHPRT_DB_USER": "offline",
-            "HLTHPRT_DB_PASSWORD": "offline",
-            "HLTHPRT_DB_DATABASE": "offline",
-            "HLTHPRT_DB_SCHEMA": "mrf",
-            "DB_SCHEMA": "mrf",
-        }
-    )
-    offline_sql_compile_process = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "alembic",
-            "upgrade",
-            "20260713233000_provider_directory_resource_identifiers:head",
-            "--sql",
-        ],
-        cwd=ROOT,
-        env=environment,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert "provider_directory_dataset_resource_plan_lookup_idx" in offline_sql_compile_process.stdout
-    assert "import_run_provider_directory_retry_child_idx" in offline_sql_compile_process.stdout

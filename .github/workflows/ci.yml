@@ -668,6 +668,7 @@ jobs:
         env:
           HLTHPRT_RETAINED_ARTIFACT_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
           HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
+          HLTHPRT_UHC_ORGANIZATION_EVIDENCE_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
           HLTHPRT_PROVIDER_DIRECTORY_PROJECTION_NATIVE_BIN: "${{ github.workspace }}/support/ptg2_scanner/target/debug/ptg2_scanner"
         run: >
           timeout --foreground 295s python -m pytest -q
@@ -716,6 +717,7 @@ jobs:
           tests/test_provider_directory_projection_materializer_postgres.py
           tests/test_provider_directory_projection_materializer_census_postgres.py
           tests/test_provider_directory_projection_decoded_census_migration_postgres.py
+          tests/test_uhc_organization_evidence_schema.py
       - name: Upload PostgreSQL coverage data
         uses: actions/upload-artifact@v7
         with:

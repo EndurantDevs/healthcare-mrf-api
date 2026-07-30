@@ -593,18 +593,15 @@ artifact and do not traverse the FHIR graph at request time.
 
 ### Profile publication batching and recovery
 
-The `source-fact-role32-org32-npi5m-v3` build strategy is an
-executable resource bound, not only a label. Evidence publication uses 21
-fact branches per source, with the high-fanout `affiliation` and
-`organization` branches split
-into the same 32 deterministic role-hash buckets. This produces 83 bounded
-evidence statements per source. The composite geometry reserves the same
-32-way bucket implementation for a later reviewed `plan_membership` fact, but
-v3 does not advertise or execute that fact. Integrating `plan_membership` must
-advance the strategy to
-`source-fact-role32-org32-membership32-npi5m-v4`, producing 115 statements per
-source. The executable-plan fingerprint also changes, so an older checkpoint
-cannot resume under the expanded fact registry.
+The `source-fact-role32-org32-membership32-npi5m-v4` build strategy is an
+executable resource bound, not only a label. Evidence publication uses 22
+fact branches per source. The high-fanout `affiliation` branch is split into
+32 deterministic PractitionerRole-resource buckets; `plan_membership` uses 32
+OrganizationAffiliation-resource buckets; and `organization` executes both
+resource-keyed branches under the matching bucket coordinate. This produces
+115 bounded evidence statements per source. The executable-plan fingerprint
+binds the exact per-fact resource-key scheme, so a v3 checkpoint or a
+same-cardinality plan using a different bucket key cannot resume under v4.
 Compact profile publication covers the full 10-digit NPI space in 400
 half-open ranges of 5,000,000 values. A partial refresh with retained sources
 outside the selected source set prepends one copy batch to each phase. A
@@ -631,15 +628,26 @@ checkpoint boundary and after each committed batch, the same worker also
 projects that durable offset through the existing control-run
 `progress`/`heartbeat_at` contract. The dashboard therefore exposes
 `provider-directory profile evidence batches` with the exact
-`83 * selected-source-count` total (plus an optional copy batch), followed by
+`115 * selected-source-count` total (plus an optional copy batch), followed by
 `provider-directory profile compact NPI batches` with 400 ranges (plus an
 optional copy batch). Progress uses `unit=batches`, carries the immutable
 profile build/generation identity and current source/fact/bucket or NPI-range
 descriptor, and restarts from the checkpoint's committed offset without
-regressing within a phase. Status writes occur only at batch boundaries, never
-per evidence row or NPI. The enclosing
-`provider-directory publishing artifacts` phase resumes after Profile
-publication completes.
+regressing within a phase. Resource-keyed batches expose authenticated
+`resource_bucket`, `resource_bucket_count`, and `bucket_schemes` details;
+legacy `role_bucket` fields remain for dashboard compatibility but must not be
+read as a PractitionerRole key for `plan_membership` or the composite
+`organization` branch. The exact stage percentage remains in
+`progress.detail.stage_pct`,
+while the top-level percentage is mapped monotonically into the enclosing
+publishing interval from step 4/7 through step 5/7. Consequently the first
+inner batch replaces the outer 4/7 snapshot immediately instead of being
+discarded as a lower percentage, and the final outer 5/7 update cannot regress
+behind a completed inner phase. This mapping is a deterministic completed-work
+fraction, not an elapsed-time prediction or ETA. Status writes occur only at
+batch boundaries,
+never per evidence row or NPI. The enclosing `provider-directory publishing
+artifacts` phase resumes after Profile publication completes.
 
 ## Provider Profile API Verification Matrix
 
@@ -1274,6 +1282,26 @@ OrganizationAffiliation, Practitioner, and PractitionerRole. It never
 constructs `/metadata` or resource-search URLs for the file source. The
 Louisiana `flex.optum.com` FHIR source remains probe-only and keeps its separate
 identity.
+
+Facility records from the corporate source stay in this same typed and Profile
+pipeline. A UHC facility Organization retains the source-reported NPI, name,
+facility type, phone, and payer-directory candidate addresses. Its public
+Profile value uses `tax_id: null` and
+`tin_status: unavailable_from_uhc_source`, because the official UHC file does
+not publish a TIN. That status means unknown from UHC, not “no TIN,” and no TIN
+is inferred from NPI, name, address, plan, or unrelated PTG/TiC evidence.
+
+UHC facility plan participation is emitted as a `plan_membership` fact backed
+by the exact current dataset-scoped affiliation edge. The value retains the
+participating Organization, explicit InsurancePlan references, reviewed plan
+scope and year, network tier/key when published, immutable file lineage, and
+`relationship_type: payer_reported_provider_plan_membership`. It also carries
+`ownership_status: not_asserted`; it is not proof of legal ownership, control,
+employment, billing-group/TIN ownership, an exact network-bound office, or
+real-time acceptance. Profile source entries retain both `endpoint_id` and
+`dataset_id`, and evidence retains the concrete Organization or
+OrganizationAffiliation resource ID. Stale dataset edges and self-referential
+ownership-looking affiliations cannot produce these membership facts.
 
 Capital Blue Cross publishes seven populated Plan-Net collections and an empty
 `Endpoint` collection at `https://providerdirectory-api.capbluecross.com/r4`.

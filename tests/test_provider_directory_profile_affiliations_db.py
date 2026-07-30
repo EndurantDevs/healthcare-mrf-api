@@ -14,13 +14,21 @@ from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import MetaData
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from api.endpoint import npi as npi_endpoint
 from db.connection import Database
 from process import provider_directory_profile as profile
+from process.uhc_provider_file_identity import (
+    PROVIDER_MEMBERSHIP,
+    UHCSourceFileDescriptor,
+    logical_scope_for_file,
+)
+from process.uhc_retained_dataset import _provider_resource_rows
 
 
 FIXTURE_DIRECTORY = Path(__file__).parent / "fixtures"
@@ -272,6 +280,374 @@ async def _insert_raw_fhir_fixture(
             ('stale-dataset-a', 'clinic', 'aff-stale');
         """
     )
+    await _insert_uhc_facility_fixture(database, schema)
+
+
+def _uhc_logical_scope():
+    return logical_scope_for_file(
+        UHCSourceFileDescriptor(
+            "ifp",
+            PROVIDER_MEMBERSHIP,
+            "JSON_Providers_ILIEX.json",
+        )
+    )
+
+
+def _uhc_lineage_by_field(
+    *,
+    source_file_id: str = "f" * 64,
+    artifact_sha256: str = "a" * 64,
+    catalog_set_sha256: str = "c" * 64,
+    record_ordinal: int = 17,
+) -> dict[str, Any]:
+    return {
+        "catalog_set_sha256": catalog_set_sha256,
+        "source_file_id": source_file_id,
+        "file_name": "JSON_Providers_ILIEX.json",
+        "artifact_sha256": artifact_sha256,
+        "record_ordinal": record_ordinal,
+        "logical_scope_id": _uhc_logical_scope().logical_scope_id,
+    }
+
+
+def _uhc_facility_semantic_fact(
+    *,
+    npi: str = "1000000491",
+    name: str = "Example UHC Facility",
+) -> dict[str, Any]:
+    return {
+        "type": "FACILITY",
+        "npi": npi,
+        "name": None,
+        "facility_name": name,
+        "facility_type": ["Clinic"],
+        "gender": None,
+        "accepting": "accepting",
+        "addresses": [
+            {
+                "address": "1 Main St",
+                "city": "Chicago",
+                "state": "IL",
+                "zip": "60601",
+                "phone": "3125551212",
+            }
+        ],
+        "plans": [
+            {
+                "plan_id_type": "HIOS-PLAN-ID",
+                "plan_id": "12345IL0010001",
+                "years": [2026],
+                "network_tier": "PREFERRED",
+            }
+        ],
+        "specialty": ["Family Medicine"],
+        "last_updated_on": "2026-07-01",
+    }
+
+
+async def _insert_uhc_profile_source(
+    database: Database,
+    schema: str,
+) -> None:
+    source_ref = profile.qualified_table(
+        schema,
+        "provider_directory_source",
+    )
+    await database.status(
+        f"""
+        INSERT INTO {source_ref} (
+            source_id, endpoint_id, canonical_api_base, org_name, plan_name
+        ) VALUES (
+            'profile-source-uhc', 'profile-endpoint-uhc',
+            'https://providermrf.uhc.com', 'UnitedHealthcare',
+            'Official provider files'
+        );
+        """
+    )
+
+
+async def _insert_canonical_uhc_resources(
+    database: Database,
+    schema: str,
+    *,
+    npi: str,
+    facility_name: str,
+    source_file_id: str,
+    record_ordinal: int,
+    lineage_by_field: dict[str, Any],
+) -> tuple[str, str]:
+    """Land production canonical UHC payloads into their typed relations."""
+    assert profile.is_valid_npi(npi)
+    canonical_rows, _membership_keys = _provider_resource_rows(
+        _uhc_facility_semantic_fact(npi=npi, name=facility_name),
+        source_file_id=source_file_id,
+        ordinal=record_ordinal,
+        logical_scope=_uhc_logical_scope(),
+        source_lineage=lineage_by_field,
+    )
+    resource_id_by_type: dict[str, str] = {}
+    for (
+        resource_type,
+        resource_id,
+        _payload_hash,
+        payload_json,
+        _source_rank,
+    ) in canonical_rows:
+        if resource_type not in {"Organization", "OrganizationAffiliation"}:
+            continue
+        resource_id_by_type[resource_type] = resource_id
+        model = importer.RESOURCE_MODELS_BY_TYPE[resource_type]
+        table_ref = profile.qualified_table(schema, model.__tablename__)
+        typed_fields_by_name = {
+            **json.loads(payload_json),
+            "source_id": "profile-source-uhc",
+            "updated_at": datetime(2026, 7, 19),
+        }
+        await database.status(
+            f"INSERT INTO {table_ref} SELECT * FROM jsonb_populate_record("
+            f"NULL::{table_ref}, CAST(:typed_fields AS jsonb));",
+            typed_fields=json.dumps(
+                typed_fields_by_name,
+                default=_json_default,
+                sort_keys=True,
+            ),
+        )
+    assert set(resource_id_by_type) == {
+        "Organization",
+        "OrganizationAffiliation",
+    }
+    return (
+        resource_id_by_type["Organization"],
+        resource_id_by_type["OrganizationAffiliation"],
+    )
+
+
+async def _insert_uhc_membership_edges(
+    database: Database,
+    schema: str,
+    *,
+    organization_resource_id: str,
+    affiliation_resource_id: str,
+    dataset_id: str,
+) -> None:
+    edge_ref = profile.qualified_table(
+        schema,
+        "provider_directory_dataset_affiliation_organization",
+    )
+    await database.status(
+        f"INSERT INTO {edge_ref} VALUES "
+        "(:dataset_id, :organization_resource_id, "
+        ":affiliation_resource_id);",
+        dataset_id=dataset_id,
+        organization_resource_id=organization_resource_id,
+        affiliation_resource_id=affiliation_resource_id,
+    )
+
+
+async def _insert_non_uhc_direct_organization(
+    database: Database,
+    schema: str,
+) -> None:
+    """Install a generic NPI Organization that must not become a direct fact."""
+    assert profile.is_valid_npi("1003821380")
+    organization_ref = profile.qualified_table(
+        schema,
+        "provider_directory_organization",
+    )
+    await database.status(
+        f"""
+        INSERT INTO {organization_ref} (
+            source_id, resource_id, npi, name, active, type_codes,
+            telecom, address_json, updated_at
+        ) VALUES (
+            'profile-source-a', 'generic-direct-organization', 1003821380,
+            'Generic FHIR Facility', TRUE, '["Clinic"]'::jsonb,
+            '[{{"system":"phone","value":"3125550199"}}]'::jsonb,
+            '[{{"city":"Chicago","state":"IL"}}]'::jsonb, now()
+        );
+        """
+    )
+
+
+async def _insert_uhc_facility_with_edge(
+    database: Database,
+    schema: str,
+    *,
+    npi: str,
+    facility_name: str,
+    lineage_by_field: dict[str, Any],
+    dataset_id: str,
+) -> tuple[str, str]:
+    organization_id, affiliation_id = await _insert_canonical_uhc_resources(
+        database,
+        schema,
+        npi=npi,
+        facility_name=facility_name,
+        source_file_id=str(lineage_by_field["source_file_id"]),
+        record_ordinal=int(lineage_by_field["record_ordinal"]),
+        lineage_by_field=lineage_by_field,
+    )
+    await _insert_uhc_membership_edges(
+        database,
+        schema,
+        organization_resource_id=organization_id,
+        affiliation_resource_id=affiliation_id,
+        dataset_id=dataset_id,
+    )
+    return organization_id, affiliation_id
+
+
+async def _insert_current_uhc_facility(
+    database: Database,
+    schema: str,
+) -> None:
+    await _insert_uhc_facility_with_edge(
+        database,
+        schema,
+        npi="1000000491",
+        facility_name="Example UHC Facility",
+        lineage_by_field=_uhc_lineage_by_field(),
+        dataset_id="profile-dataset-uhc",
+    )
+
+
+async def _insert_stale_uhc_facility(
+    database: Database,
+    schema: str,
+) -> None:
+    stale_lineage = _uhc_lineage_by_field(
+        source_file_id="1" * 64,
+        artifact_sha256="2" * 64,
+        catalog_set_sha256="3" * 64,
+        record_ordinal=18,
+    )
+    await _insert_uhc_facility_with_edge(
+        database,
+        schema,
+        npi="1234567893",
+        facility_name="Stale UHC Facility",
+        lineage_by_field=stale_lineage,
+        dataset_id="stale-dataset-uhc",
+    )
+
+
+async def _insert_self_referential_uhc_facility(
+    database: Database,
+    schema: str,
+) -> None:
+    self_ref_lineage = _uhc_lineage_by_field(
+        source_file_id="4" * 64,
+        artifact_sha256="5" * 64,
+        catalog_set_sha256="6" * 64,
+        record_ordinal=19,
+    )
+    self_ref_organization_id, self_ref_affiliation_id = (
+        await _insert_uhc_facility_with_edge(
+            database,
+            schema,
+            npi="1000000004",
+            facility_name="Ownership-looking UHC Facility",
+            lineage_by_field=self_ref_lineage,
+            dataset_id="profile-dataset-uhc",
+        )
+    )
+    affiliation_ref = profile.qualified_table(
+        schema,
+        "provider_directory_organization_affiliation",
+    )
+    await database.status(
+        f"UPDATE {affiliation_ref} "
+        "SET organization_ref=:organization_ref "
+        "WHERE source_id='profile-source-uhc' "
+        "AND resource_id=:affiliation_resource_id;",
+        organization_ref=f"Organization/{self_ref_organization_id}",
+        affiliation_resource_id=self_ref_affiliation_id,
+    )
+
+
+async def _insert_mismatched_scope_uhc_facility(
+    database: Database,
+    schema: str,
+) -> None:
+    mismatched_scope_lineage = _uhc_lineage_by_field(
+        source_file_id="7" * 64,
+        artifact_sha256="8" * 64,
+        catalog_set_sha256="9" * 64,
+        record_ordinal=20,
+    )
+    _organization_id, affiliation_id = (
+        await _insert_uhc_facility_with_edge(
+            database,
+            schema,
+            npi="1000000012",
+            facility_name="Mismatched-scope UHC Facility",
+            lineage_by_field=mismatched_scope_lineage,
+            dataset_id="profile-dataset-uhc",
+        )
+    )
+    affiliation_ref = profile.qualified_table(
+        schema,
+        "provider_directory_organization_affiliation",
+    )
+    await database.status(
+        f"UPDATE {affiliation_ref} "
+        "SET plan_scope=jsonb_set("
+        "plan_scope, '{logical_scope_id}', "
+        "to_jsonb(CAST(:wrong_scope AS text))"
+        ") WHERE source_id='profile-source-uhc' "
+        "AND resource_id=:affiliation_resource_id;",
+        wrong_scope="0" * 64,
+        affiliation_resource_id=affiliation_id,
+    )
+
+
+async def _insert_malformed_plan_refs_uhc_facility(
+    database: Database,
+    schema: str,
+) -> None:
+    malformed_plan_refs_lineage = _uhc_lineage_by_field(
+        source_file_id="a" * 64,
+        artifact_sha256="b" * 64,
+        catalog_set_sha256="d" * 64,
+        record_ordinal=21,
+    )
+    _organization_id, affiliation_id = (
+        await _insert_uhc_facility_with_edge(
+            database,
+            schema,
+            npi="1000000020",
+            facility_name="Malformed-plan-refs UHC Facility",
+            lineage_by_field=malformed_plan_refs_lineage,
+            dataset_id="profile-dataset-uhc",
+        )
+    )
+    affiliation_ref = profile.qualified_table(
+        schema,
+        "provider_directory_organization_affiliation",
+    )
+    await database.status(
+        f"UPDATE {affiliation_ref} "
+        "SET insurance_plan_refs="
+        "CAST(:malformed_plan_refs AS jsonb) "
+        "WHERE source_id='profile-source-uhc' "
+        "AND resource_id=:affiliation_resource_id;",
+        malformed_plan_refs=json.dumps({"unexpected": "shape"}),
+        affiliation_resource_id=affiliation_id,
+    )
+
+
+async def _insert_uhc_facility_fixture(
+    database: Database,
+    schema: str,
+) -> None:
+    """Land positive and fail-closed semantic-to-canonical UHC evidence."""
+    await _insert_uhc_profile_source(database, schema)
+    await _insert_current_uhc_facility(database, schema)
+    await _insert_stale_uhc_facility(database, schema)
+    await _insert_self_referential_uhc_facility(database, schema)
+    await _insert_mismatched_scope_uhc_facility(database, schema)
+    await _insert_malformed_plan_refs_uhc_facility(database, schema)
+    await _insert_non_uhc_direct_organization(database, schema)
 
 
 async def _archive_profile_dataset_a(database: Database, schema: str) -> None:
@@ -359,6 +735,7 @@ async def _create_profile_bucket_probe_scopes(
     schema: str,
     *,
     row_count: int,
+    include_affiliation_edges: bool = False,
 ) -> tuple[str, str]:
     """Create production-shaped scoped relations with high source fanout."""
     role_relation = importer.ProviderDirectoryPractitionerRole.__tablename__
@@ -387,6 +764,7 @@ async def _create_profile_bucket_probe_scopes(
         role_scope,
         affiliation_scope,
         row_count=row_count,
+        include_affiliation_edges=include_affiliation_edges,
     )
     for model, scope_table in (
         (importer.ProviderDirectoryPractitionerRole, role_scope),
@@ -425,20 +803,7 @@ async def _create_profile_bucket_probe_tables(
         )
 
 
-async def _seed_profile_bucket_probe_rows(
-    database: Database,
-    schema: str,
-    role_scope: str,
-    affiliation_scope: str,
-    *,
-    row_count: int,
-) -> None:
-    """Populate production-shaped role and affiliation scope rows."""
-    role_scope_ref = profile.qualified_table(schema, role_scope)
-    affiliation_scope_ref = profile.qualified_table(
-        schema,
-        affiliation_scope,
-    )
+async def _seed_role_bucket_rows(database, role_scope_ref, row_count) -> None:
     await database.status(
         f"""
         INSERT INTO {role_scope_ref} (
@@ -454,6 +819,13 @@ async def _seed_profile_bucket_probe_rows(
         """,
         row_count=row_count,
     )
+
+
+async def _seed_affiliation_bucket_rows(
+    database,
+    affiliation_scope_ref,
+    row_count,
+) -> None:
     await database.status(
         f"""
         INSERT INTO {affiliation_scope_ref} (
@@ -483,11 +855,71 @@ async def _seed_profile_bucket_probe_rows(
     )
 
 
+async def _seed_affiliation_bucket_edges(
+    database,
+    schema,
+    row_count,
+) -> None:
+    affiliation_edge_ref = profile.qualified_table(
+        schema,
+        "provider_directory_dataset_affiliation_organization",
+    )
+    await database.status(
+        f"""
+        INSERT INTO {affiliation_edge_ref} (
+            dataset_id, participating_organization_resource_id,
+            affiliation_resource_id
+        )
+        SELECT 'profile-dataset-a', 'clinic',
+               'bucket-affiliation-' || generated.value
+          FROM generate_series(1, :row_count) AS generated(value);
+        """,
+        row_count=row_count,
+    )
+    await database.status(f"ANALYZE {affiliation_edge_ref};")
+
+
+async def _seed_profile_bucket_probe_rows(
+    database: Database,
+    schema: str,
+    role_scope: str,
+    affiliation_scope: str,
+    *,
+    row_count: int,
+    include_affiliation_edges: bool,
+) -> None:
+    """Populate production-shaped role and affiliation scope rows."""
+    role_scope_ref = profile.qualified_table(schema, role_scope)
+    affiliation_scope_ref = profile.qualified_table(
+        schema,
+        affiliation_scope,
+    )
+    await _seed_role_bucket_rows(database, role_scope_ref, row_count)
+    await _seed_affiliation_bucket_rows(
+        database,
+        affiliation_scope_ref,
+        row_count,
+    )
+    if include_affiliation_edges:
+        await _seed_affiliation_bucket_edges(database, schema, row_count)
+
+
 async def _build_profile_artifacts(
     database: Database,
     schema: str,
+    *,
+    source_ids: tuple[str, ...] = (
+        "profile-source-a",
+        "profile-source-b",
+        "profile-source-uhc",
+    ),
+    dataset_ids: tuple[str, ...] = (
+        "profile-dataset-a",
+        "profile-dataset-b",
+        "profile-dataset-uhc",
+    ),
 ) -> None:
-    """Execute evidence and compact-profile SQL for both current datasets."""
+    """Execute evidence and compact-profile SQL for the selected datasets."""
     table_ref = lambda table_name: profile.qualified_table(schema, table_name)
     await database.status(
         profile.profile_evidence_insert_sql(
@@ -499,8 +931,8 @@ async def _build_profile_artifacts(
             service_ref=table_ref("provider_directory_healthcare_service"),
             endpoint_ref=table_ref("provider_directory_endpoint"),
         ),
-        source_ids=["profile-source-a", "profile-source-b"],
-        dataset_ids=["profile-dataset-a", "profile-dataset-b"],
+        source_ids=list(source_ids),
+        dataset_ids=list(dataset_ids),
         profile_as_of="2026-07-19",
     )
     await database.status(
@@ -987,11 +1419,13 @@ async def _populate_bounded_profile_evidence(
     for source_id, dataset_id in (
         ("profile-source-a", "profile-dataset-a"),
         ("profile-source-b", "profile-dataset-b"),
+        ("profile-source-uhc", "profile-dataset-uhc"),
     ):
         for fact_type in profile.PROFILE_EVIDENCE_FACT_TYPES:
             role_bucket_count = (
                 2
-                if fact_type in {"affiliation", "organization"}
+                if fact_type
+                in {"affiliation", "organization", "plan_membership"}
                 else 1
             )
             for role_bucket in range(role_bucket_count):
@@ -1175,6 +1609,188 @@ async def test_affiliation_profile_requires_participating_org_and_deduplicates_s
 
 
 @pytest.mark.asyncio
+async def test_uhc_facility_profile_preserves_membership_without_ownership(
+    monkeypatch,
+):
+    """Semantic UHC input reaches Profile and the public HTTP contract."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        await _build_profile_artifacts(database, schema)
+        evidence_ref = profile.qualified_table(schema, "profile_evidence")
+        profile_ref = profile.qualified_table(schema, "profile")
+        evidence_rows = await database.all(
+            f"""
+            SELECT fact_type, dataset_id, role_resource_id, value_json
+              FROM {evidence_ref}
+             WHERE npi = 1000000491
+             ORDER BY fact_type;
+            """
+        )
+        profile_row = await database.first(
+            f"SELECT profile_json, evidence_json FROM {profile_ref} "
+            "WHERE npi = 1000000491;"
+        )
+
+    _assert_uhc_facility_profile_rows(evidence_rows, profile_row)
+    await _assert_uhc_facility_profile_endpoint(monkeypatch, profile_row)
+
+
+@pytest.mark.asyncio
+async def test_direct_organization_requires_current_uhc_nonownership_witness(
+    monkeypatch,
+):
+    """Reject generic, stale-only, and ownership-looking direct facilities."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        await _build_profile_artifacts(database, schema)
+        evidence_ref = profile.qualified_table(schema, "profile_evidence")
+        rejected_rows = await database.all(
+            f"""
+            SELECT npi, fact_type, resource_id
+              FROM {evidence_ref}
+             WHERE npi = ANY(
+                       CAST(
+                           ARRAY[
+                               1003821380,
+                               1234567893,
+                               1000000004,
+                               1000000012,
+                               1000000020
+                           ] AS bigint[]
+                       )
+                   )
+               AND fact_type IN ('organization', 'plan_membership')
+             ORDER BY npi, fact_type, resource_id;
+            """
+        )
+
+    assert rejected_rows == []
+
+
+def test_uhc_profile_fixture_npis_are_valid():
+    """Keep acceptance fixtures inside the production NPI checksum gate."""
+    for npi in (
+        1000000491,
+        1003821380,
+        1234567893,
+        1000000004,
+        1000000012,
+        1000000020,
+    ):
+        assert profile.is_valid_npi(npi)
+
+
+def _assert_uhc_facility_profile_rows(
+    evidence_rows: list[Any],
+    profile_row: Any,
+) -> None:
+    """Require exact UHC dataset, organization, plan, and file lineage."""
+    assert profile_row is not None
+    assert [
+        evidence_row.fact_type for evidence_row in evidence_rows
+    ] == [
+        "organization",
+        "plan_membership",
+    ]
+    assert {
+        evidence_row.dataset_id for evidence_row in evidence_rows
+    } == {
+        "profile-dataset-uhc"
+    }
+    assert all(
+        evidence_row.role_resource_id is None
+        for evidence_row in evidence_rows
+    )
+    organization = _decoded(evidence_rows[0].value_json)
+    membership = _decoded(evidence_rows[1].value_json)
+    assert organization["npi"] == 1000000491
+    assert organization["name"] == "Example UHC Facility"
+    assert organization["type_codes"] == ["Clinic"]
+    assert organization["address_status"] == "payer_directory_candidate"
+    assert organization["candidate_addresses"][0]["city"] == "Chicago"
+    assert organization["tax_id"] is None
+    assert (
+        organization["tin_status"]
+        == "unavailable_from_uhc_source"
+    )
+    assert organization["source_lineage"]["record_ordinal"] == 17
+    assert len(membership["insurance_plan_refs"]) == 1
+    assert membership["insurance_plan_refs"][0].startswith(
+        "InsurancePlan/uhcplan-"
+    )
+    assert (
+        membership["relationship_type"]
+        == "payer_reported_provider_plan_membership"
+    )
+    assert membership["ownership_status"] == "not_asserted"
+    assert membership["plan_scope"]["plan_id"] == "12345IL0010001"
+    assert membership["source_lineage"] == organization["source_lineage"]
+    compact_profile = _decoded(profile_row.profile_json)
+    assert compact_profile["sources"] == [
+        {
+            "source_id": "profile-source-uhc",
+            "endpoint_id": "profile-endpoint-uhc",
+            "dataset_id": "profile-dataset-uhc",
+            "api_base": "https://providermrf.uhc.com",
+            "org_name": "UnitedHealthcare",
+            "plan_name": "Official provider files",
+        }
+    ]
+
+
+async def _assert_uhc_facility_profile_endpoint(
+    monkeypatch,
+    profile_row: Any,
+) -> None:
+    """Serve the SQL-built UHC Profile through the real HTTP handler."""
+    compact_profile = _decoded(profile_row.profile_json)
+    evidence_profile = _decoded(profile_row.evidence_json)
+    monkeypatch.setattr(
+        npi_endpoint,
+        "fetch_state_profile_projection",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        npi_endpoint,
+        "_fetch_provider_directory_profile_map",
+        AsyncMock(
+            return_value={
+                1000000491: {
+                    "profile": compact_profile,
+                    "evidence": evidence_profile,
+                }
+            }
+        ),
+    )
+
+    operation_result = await npi_endpoint.get_provider_profile(
+        SimpleNamespace(args={"include_evidence": "true"}),
+        "1000000491",
+    )
+    payload_by_field = json.loads(operation_result.body)
+
+    assert operation_result.status == 200
+    public_profile = payload_by_field["provider_profile"]
+    organization_value = public_profile["categories"]["organizations"][
+        "items"
+    ][0]["value"]
+    membership_value = public_profile["categories"][
+        "network_participation"
+    ]["items"][0]["value"]
+    assert organization_value["tax_id"] is None
+    assert (
+        organization_value["tin_status"]
+        == "unavailable_from_uhc_source"
+    )
+    assert organization_value["address_status"] == "payer_directory_candidate"
+    assert (
+        membership_value["relationship_type"]
+        == "payer_reported_provider_plan_membership"
+    )
+    assert membership_value["ownership_status"] == "not_asserted"
+    assert public_profile["sources"][0]["dataset_id"] == "profile-dataset-uhc"
+    assert "provider_profile_evidence" in payload_by_field
+
+
+@pytest.mark.asyncio
 async def test_bounded_profile_build_matches_monolithic_sql_exactly(monkeypatch):
     """Prove source/fact and NPI batches preserve the existing contract."""
     async with _profile_database(monkeypatch) as (database, schema):
@@ -1244,7 +1860,7 @@ async def test_existing_global_refresh_replaces_without_copy_batches(
         baseline = await _global_refresh_baseline(database, schema)
         await _mutate_global_profile_fixture(database, schema)
         build, batch_plan = _existing_global_profile_build(schema)
-        assert len(batch_plan.evidence_batches) == 166
+        assert len(batch_plan.evidence_batches) == 230
         assert len(batch_plan.compact_batches) == 400
         assert {batch.kind for batch in batch_plan.evidence_batches} == {
             "fact"
@@ -1393,7 +2009,12 @@ async def test_bounded_build_populates_an_initial_empty_serving_pair(
         assert checkpoint_record.has_existing_artifacts is False
         assert checkpoint_record.state == "ready"
         assert metrics["incremental"] is False
-        await _build_profile_artifacts(database, schema)
+        await _build_profile_artifacts(
+            database,
+            schema,
+            source_ids=build.source_ids,
+            dataset_ids=build.dataset_ids,
+        )
         evidence_difference, profile_difference = (
             await _profile_artifact_difference_counts(
                 database,
@@ -1460,8 +2081,10 @@ def _profile_bucket_probe_evidence_sql(
     schema: str,
     role_scope: str,
     affiliation_scope: str,
+    *,
+    fact_type: str = "affiliation",
 ) -> str:
-    """Return the exact bounded affiliation SQL used by the plan proof."""
+    """Return one exact bounded resource-bucket SQL statement."""
     table_ref = lambda table_name: profile.qualified_table(schema, table_name)
     return profile.profile_evidence_insert_sql(
         target_ref=table_ref("profile_evidence"),
@@ -1475,7 +2098,7 @@ def _profile_bucket_probe_evidence_sql(
         ),
         service_ref=table_ref("provider_directory_healthcare_service"),
         endpoint_ref=table_ref("provider_directory_endpoint"),
-        fact_type="affiliation",
+        fact_type=fact_type,
         role_bucket_count=profile.PROFILE_AFFILIATION_ROLE_BUCKETS,
         role_bucket=7,
     )
@@ -1486,6 +2109,8 @@ async def _capture_profile_bucket_probe(
     schema: str,
     role_scope: str,
     affiliation_scope: str,
+    *,
+    fact_type: str = "affiliation",
 ) -> SimpleNamespace:
     """Capture before/after plans plus exact scoped-index metrics."""
     table_ref = lambda table_name: profile.qualified_table(schema, table_name)
@@ -1495,6 +2120,7 @@ async def _capture_profile_bucket_probe(
             schema,
             role_scope,
             affiliation_scope,
+            fact_type=fact_type,
         )
     )
     explain_params_by_name = {
@@ -1528,6 +2154,8 @@ async def _capture_profile_bucket_probe(
     )
     return SimpleNamespace(
         role_scope=role_scope,
+        affiliation_scope=affiliation_scope,
+        fact_type=fact_type,
         before_plan=before_plan,
         after_plan=after_plan,
         affiliation_plan=affiliation_plan,
@@ -1616,6 +2244,73 @@ async def test_role_bucket_plan_uses_scoped_expression_indexes_without_spill(
                 affiliation_scope,
             )
         _assert_profile_bucket_probe(probe)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fact_type", "requires_role_index"),
+    (
+        ("plan_membership", False),
+        ("organization", True),
+    ),
+)
+async def test_affiliation_resource_bucket_plan_uses_index_without_spill(
+    monkeypatch,
+    fact_type,
+    requires_role_index,
+):
+    """Prove UHC membership-backed branches avoid full affiliation scans."""
+    async with _profile_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(importer, "db", database)
+        role_scope, affiliation_scope = (
+            await _create_profile_bucket_probe_scopes(
+                database,
+                schema,
+                row_count=200_000,
+                include_affiliation_edges=True,
+            )
+        )
+        relation_scope_by_name = {
+            importer.ProviderDirectoryPractitionerRole.__tablename__: (
+                role_scope
+            ),
+            importer.ProviderDirectoryOrganizationAffiliation.__tablename__: (
+                affiliation_scope
+            ),
+        }
+        with importer._provider_directory_artifact_relation_scope(
+            relation_scope_by_name
+        ):
+            probe = await _capture_profile_bucket_probe(
+                database,
+                schema,
+                role_scope,
+                affiliation_scope,
+                fact_type=fact_type,
+            )
+
+        affiliation_index_name = str(
+            probe.affiliation_metrics["index_name"]
+        )
+        affiliation_index_nodes = _plan_index_nodes(
+            probe.after_plan,
+            affiliation_index_name,
+        )
+        assert affiliation_index_nodes, _decoded(probe.after_plan)
+        assert all(
+            node["Node Type"] in {"Index Scan", "Bitmap Index Scan"}
+            for node in affiliation_index_nodes
+        )
+        role_index_nodes = _plan_index_nodes(
+            probe.after_plan,
+            str(probe.role_metrics["index_name"]),
+        )
+        role_index_executed = any(
+            int(node.get("Actual Loops", 0)) > 0
+            for node in role_index_nodes
+        )
+        assert role_index_executed is requires_role_index
+        assert _plan_temp_blocks(probe.after_plan) == 0
 
 
 async def _seed_profile_evidence_plan(
@@ -1734,15 +2429,36 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
         build = importer._ProviderDirectoryProfileBuild(
             schema=schema,
             generation_id="profile-affiliation-test",
-            source_ids=("profile-source-a", "profile-source-b"),
-            retained_source_ids=("profile-source-a", "profile-source-b"),
-            dataset_ids=("profile-dataset-a", "profile-dataset-b"),
+            source_ids=(
+                "profile-source-a",
+                "profile-source-b",
+                "profile-source-uhc",
+            ),
+            retained_source_ids=(
+                "profile-source-a",
+                "profile-source-b",
+                "profile-source-uhc",
+            ),
+            dataset_ids=(
+                "profile-dataset-a",
+                "profile-dataset-b",
+                "profile-dataset-uhc",
+            ),
             profile_as_of="2026-07-19",
             evidence_stage="profile_evidence_resume_stage",
             profile_stage="profile_resume_stage",
             build_id="profile-resume-build",
             owner_run_id="profile-run-first",
         )
+        expected_evidence_total = len(
+            importer._provider_directory_profile_batch_plan(
+                build.source_ids,
+                build.retained_source_ids,
+                build.dataset_ids,
+                has_existing_artifacts=True,
+            ).evidence_batches
+        )
+        assert expected_evidence_total == 345
         fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
         original_status = database.status
         fact_statement_starts: list[None] = []
@@ -1786,12 +2502,16 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
         assert [
             (progress["done"], progress["total"])
             for progress in first_run_progress
-        ] == [(0, 166), (1, 166)]
+        ] == [
+            (0, expected_evidence_total),
+            (1, expected_evidence_total),
+        ]
         assert {
             progress["phase"] for progress in first_run_progress
         } == {importer._PROFILE_EVIDENCE_PROGRESS_PHASE}
         assert {
-            progress["unit"] for progress in first_run_progress
+            progress["details"]["_progress_unit"]
+            for progress in first_run_progress
         } == {"batches"}
         interrupted_evidence_count = int(
             await database.scalar(
@@ -1855,7 +2575,7 @@ async def test_profile_build_resumes_after_committed_batch_interruption(
         ]
         assert [
             progress["done"] for progress in retry_evidence_progress
-        ] == list(range(1, 167))
+        ] == list(range(1, expected_evidence_total + 1))
         retry_profile_progress = [
             progress
             for progress_run_id, progress in progress_events
