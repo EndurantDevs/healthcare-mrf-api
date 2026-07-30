@@ -4498,11 +4498,7 @@ def _evidence_stage_table_name(stage_table: str) -> str:
     return _archived_identifier(stage_table, "_evidence")
 
 
-def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = True) -> str:
-    """Build SQL for the normalized raw entity-address staging table."""
-    storage_mode = "UNLOGGED " if unlogged else ""
-    return f"""
-    CREATE {storage_mode}TABLE {db_schema}.{raw_table} (
+_RAW_STAGE_COLUMNS_SQL = f"""
         entity_type varchar(64) NOT NULL,
         entity_id varchar(128) NOT NULL,
         npi bigint,
@@ -4560,8 +4556,16 @@ def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = T
         group_plan_array varchar[] NOT NULL DEFAULT '{{}}',
         base_address_version varchar(64),
         checksum bigint NOT NULL
-    );
-    """
+"""
+
+
+def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = True) -> str:
+    """Build SQL for the normalized raw entity-address staging table."""
+    storage_mode = "UNLOGGED " if unlogged else ""
+    return (
+        f"CREATE {storage_mode}TABLE {db_schema}.{raw_table} ("
+        f"{_RAW_STAGE_COLUMNS_SQL});"
+    )
 
 
 def _address_key_expr(

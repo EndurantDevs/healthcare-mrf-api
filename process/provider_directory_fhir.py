@@ -15119,6 +15119,23 @@ def _is_profile_build_checkpoint_lineage_matching(
     )
 
 
+async def _profile_build_checkpoint_map(
+    schema: str,
+    build_id: str,
+) -> dict[str, Any]:
+    """Load one retry checkpoint as a normalized mapping."""
+    checkpoint_row = await db.first(
+        f"SELECT * FROM {_provider_directory_profile_checkpoint_ref(schema)} "
+        "WHERE build_id = :build_id;",
+        build_id=build_id,
+    )
+    return (
+        _pagination_checkpoint_row_mapping(checkpoint_row)
+        if checkpoint_row is not None
+        else {}
+    )
+
+
 async def _resolve_provider_directory_profile_build(
     schema: str,
     run_id: str | None,
@@ -15146,16 +15163,7 @@ async def _resolve_provider_directory_profile_build(
     )
     profile_stage = profile_artifact.profile_stage_table_name(build_id)
     profile_as_of = _now().date().isoformat()
-    checkpoint_row = await db.first(
-        f"SELECT * FROM {_provider_directory_profile_checkpoint_ref(schema)} "
-        "WHERE build_id = :build_id;",
-        build_id=build_id,
-    )
-    checkpoint_map = (
-        _pagination_checkpoint_row_mapping(checkpoint_row)
-        if checkpoint_row is not None
-        else {}
-    )
+    checkpoint_map = await _profile_build_checkpoint_map(schema, build_id)
     candidate_build = _ProviderDirectoryProfileBuild(
         schema=schema,
         generation_id="",

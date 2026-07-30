@@ -452,6 +452,7 @@ async def test_rollback_runs_lock_validation_and_pointer_updates_in_one_transact
 
     assert rollback_report["status"] == "rolled_back"
     assert rollback_report["idempotent"] is False
+    assert rollback_report["rollback_owner_id"] == ROLLBACK_OWNER
     assert events == ["locked", "loaded", "timestamped", "applied"]
     assert transaction.entered == transaction.exited == 1
 
@@ -495,4 +496,5 @@ async def test_rollback_exact_retry_performs_no_pointer_writes(monkeypatch):
 
     assert rollback_report["status"] == "already_rolled_back"
     assert rollback_report["idempotent"] is True
+    assert rollback_report["rollback_owner_id"] == ROLLBACK_OWNER
     apply_pointer_changes.assert_not_awaited()

@@ -1713,6 +1713,44 @@ def _prepare_v4_audit(
     )
 
 
+async def _load_v4_audit_evidence(
+    session: Any,
+    schema_name: str,
+    atom_key_bits: int,
+    price_membership_block_span: int,
+    preparation: _V4AuditPreparation,
+) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[int, ...]]]:
+    """Load bounded price memberships and verified provider NPIs."""
+    price_reader = _BuildingBlockReader(
+        session,
+        schema_name=schema_name,
+        snapshot_key=preparation.snapshot_key,
+        budget=preparation.budget,
+    )
+    price_memberships = await _price_memberships(
+        price_reader,
+        price_keys=(candidate.price_key for candidate in preparation.candidates),
+        atom_key_bits=int(atom_key_bits),
+        block_span=int(price_membership_block_span),
+    )
+    graph_reader = _V4PersistedGraphReader(
+        session,
+        schema_name=schema_name,
+        snapshot_key=preparation.snapshot_key,
+        representation=preparation.representation,
+        budget=preparation.budget,
+    )
+    provider_npis = await _verified_provider_npis_by_candidate(
+        session,
+        schema_name=schema_name,
+        snapshot_key=preparation.snapshot_key,
+        candidates=preparation.candidates,
+        witnesses=preparation.witnesses,
+        reader=graph_reader,
+    )
+    return price_memberships, provider_npis
+
+
 async def _execute_v4_audit(
     *,
     schema_name: str,
@@ -1723,7 +1761,6 @@ async def _execute_v4_audit(
     preparation: _V4AuditPreparation,
 ) -> _V4AuditExecution:
     """Validate and persist one exact V4 audit sample transaction."""
-
     async with db.transaction() as session:
         await _validate_v4_audit_transaction(
             session,
@@ -1732,34 +1769,12 @@ async def _execute_v4_audit(
             logical_snapshot_id=str(logical_snapshot_id),
             preparation=preparation,
         )
-        price_reader = _BuildingBlockReader(
+        price_memberships, provider_npis = await _load_v4_audit_evidence(
             session,
             schema_name=schema_name,
-            snapshot_key=preparation.snapshot_key,
-            budget=preparation.budget,
-        )
-        price_memberships = await _price_memberships(
-            price_reader,
-            price_keys=(
-                candidate.price_key for candidate in preparation.candidates
-            ),
             atom_key_bits=int(atom_key_bits),
-            block_span=int(price_membership_block_span),
-        )
-        graph_reader = _V4PersistedGraphReader(
-            session,
-            schema_name=schema_name,
-            snapshot_key=preparation.snapshot_key,
-            representation=preparation.representation,
-            budget=preparation.budget,
-        )
-        provider_npis = await _verified_provider_npis_by_candidate(
-            session,
-            schema_name=schema_name,
-            snapshot_key=preparation.snapshot_key,
-            candidates=preparation.candidates,
-            witnesses=preparation.witnesses,
-            reader=graph_reader,
+            price_membership_block_span=int(price_membership_block_span),
+            preparation=preparation,
         )
         audit_occurrences = build_audit_occurrences(
             candidates=preparation.candidates,

@@ -321,18 +321,24 @@ completed partition.
 The attestation persists `activation_intent` and a digest binding that intent
 to the audited report. Generic promotion and attestation consumption accept
 only `audit_and_activate`; an `audit_only` attestation is a durable hold and
-requires a separately reviewed release action. That action calls the existing
-source-snapshot promote control with the full
-`expected_audit_only_attestation_digest` returned by the candidate audit.
-Omitting the digest keeps the generic promotion fail-closed; malformed,
-mismatched, expired, or already-consumed approvals fail before pointer writes.
-An exact approval locks the candidate and held attestation, compares the full
-intent-bound digest in constant time, and consumes that exact hold atomically
-with publication and pointer activation. It does not mutate the intent or
-repeat the audit. Redelivery reuses an unexpired held attestation without
-public audit I/O or promotion. Its terminal progress is `candidate audit-only
-complete`, with exact request counts retained through the control wrapper
-instead of being replaced by a generic success phase.
+requires the authenticated reviewed-activation operation. That operation
+freezes the source import, candidate snapshot, predecessor snapshot, audit run,
+full attestation digest, and actor under one stable operation ID. It pins the
+published predecessor for rollback, consumes the exact hold while switching
+engine pointers, changes only the matching control-plane source routes, and
+requires every affected current serving release to carry the exact candidate
+source/import/snapshot binding before recording completion. Every lifecycle
+transition is append-only, and exact request replay resumes or verifies that
+operation without widening its coordinates. The paired reviewed
+rollback accepts only the stable operation ID and restores the pinned
+predecessor; it cannot select an arbitrary snapshot.
+
+Malformed, mismatched, expired, already-consumed, route-drifted, or
+release-incomplete operations fail closed. Redelivery reuses an unexpired held
+attestation without public audit I/O or generic promotion. Its terminal
+progress is `candidate audit-only complete`, with exact request counts retained
+through the control wrapper instead of being replaced by a generic success
+phase.
 
 Dev-only operational latency, price-comparison, and physical-storage gates run
 against the inactive attested candidate. A separate reviewed activation step

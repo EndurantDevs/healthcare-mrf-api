@@ -288,24 +288,16 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
     return str(snapshot_id_value) if snapshot_id_value else None
 
 
-async def current_network_snapshots_for_plan(
-    session, args: dict[str, object]
-) -> list[tuple[str, str]]:
-    """Resolve the newest sealed shared V3 snapshot for each logical plan network.
-
-    Dated files receive different source keys, so source key alone cannot identify
-    a network across months. Manifest network names define that stable grouping;
-    the source URL month selects its newest retained snapshot. Sources without
-    either metadata retain the source-key and orchestration-month fallback.
-    """
+def _network_snapshot_filters(
+    args: dict[str, object],
+) -> tuple[list[str], dict[str, object], str, str]:
+    """Normalize logical plan-network filters for the live pointer query."""
     requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
     if not requested_plan:
-        return []
+        return [], {}, "", ""
     plan_variants = ein_plan_id_variants(requested_plan)
     market_type = str(args.get("plan_market_type") or "").strip().lower()
     source_key = str(args.get("source_key") or "").strip().lower()
-    # This list changes whenever a source/network publish completes. API pods
-    # cannot see cache invalidation from importer workers, so resolve it live.
     query_parameters_by_name: dict[str, object] = {"plan_ids": plan_variants}
     market_sql = ""
     if market_type:
@@ -315,6 +307,26 @@ async def current_network_snapshots_for_plan(
     if source_key:
         query_parameters_by_name["source_key"] = source_key
         source_sql = "AND cps.source_key = :source_key"
+    return plan_variants, query_parameters_by_name, market_sql, source_sql
+
+
+async def current_network_snapshots_for_plan(
+    session, args: dict[str, object]
+) -> list[tuple[str, str]]:
+    """Resolve the newest sealed shared V3 snapshot for each logical plan network.
+
+    Manifest network names group dated source files; the source URL month selects
+    the newest retained snapshot. Sources without metadata retain pointer fallback.
+    """
+    (
+        plan_variants,
+        query_parameters_by_name,
+        market_sql,
+        source_sql,
+    ) = _network_snapshot_filters(args)
+    if not plan_variants:
+        return []
+    # Resolve live because importer workers cannot invalidate API pod caches.
     logical_network_sql = _logical_network_key_sql("cps", "s")
     effective_month_sql = _source_effective_month_sql("cps", "s")
     source_snapshot_query = await session.execute(

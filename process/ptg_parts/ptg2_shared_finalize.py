@@ -1305,57 +1305,68 @@ def _prepare_code_dictionary_entries(
     return normalized, prepared_contracts
 
 
+def _bind_provider_metadata_entry(
+    entry: dict[str, Any],
+    *,
+    source_count: int,
+    contract_by_identity: Mapping[tuple[Any, ...], Mapping[str, Any]],
+) -> int:
+    """Validate and bind one provider metadata shard to its physical source."""
+    _validate_file_metadata(
+        entry,
+        label="provider-set metadata",
+        expected_format=PTG2_V3_PROVIDER_SET_METADATA_FORMAT,
+        expected_version=PTG2_V3_PROVIDER_SET_METADATA_VERSION,
+    )
+    if not all(field_name in entry for field_name in _PHYSICAL_IDENTITY_FIELDS):
+        raise RuntimeError(
+            "strict V3 provider-set metadata has an incomplete physical identity"
+        )
+    identity = normalized_physical_artifact_identity(entry)
+    try:
+        source_contract = contract_by_identity[identity]
+    except KeyError as exc:
+        raise RuntimeError(
+            "strict V3 provider-set metadata is outside the complete physical input set"
+        ) from exc
+    source_key, _identity, source_run_digest = _source_run_contract_binding(
+        source_contract
+    )
+    if _required_sha256(
+        entry.get("source_run_contract_sha256"),
+        field_name="provider-set metadata source_run_contract_sha256",
+    ) != source_run_digest:
+        raise RuntimeError(
+            "strict V3 provider-set metadata is bound to another source contract"
+        )
+    for field_name in _PHYSICAL_IDENTITY_FIELDS:
+        entry.pop(field_name, None)
+    entry["source_key"] = source_key
+    entry["source_count"] = source_count
+    entry["sha256"] = _required_sha256(
+        entry.get("sha256"), field_name="provider-set metadata sha256"
+    )
+    entry["source_run_contract_sha256"] = source_run_digest
+    return source_key
+
+
 def _prepare_provider_set_metadata_entries(
     entries: Iterable[Mapping[str, Any]],
     *,
     source_run_contracts: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     """Bind authenticated provider/count metadata shards to every physical source."""
-
     normalized = _validated_entries(entries, label="provider-set metadata")
     source_count = len(source_run_contracts)
     contract_by_identity = _source_contracts_by_identity(source_run_contracts)
-    observed_source_keys: set[int] = set()
-    for entry in normalized:
-        _validate_file_metadata(
+    observed_source_keys = {
+        _bind_provider_metadata_entry(
             entry,
-            label="provider-set metadata",
-            expected_format=PTG2_V3_PROVIDER_SET_METADATA_FORMAT,
-            expected_version=PTG2_V3_PROVIDER_SET_METADATA_VERSION,
+            source_count=source_count,
+            contract_by_identity=contract_by_identity,
         )
-        if not all(field_name in entry for field_name in _PHYSICAL_IDENTITY_FIELDS):
-            raise RuntimeError(
-                "strict V3 provider-set metadata has an incomplete physical identity"
-            )
-        identity = normalized_physical_artifact_identity(entry)
-        try:
-            source_contract = contract_by_identity[identity]
-        except KeyError as exc:
-            raise RuntimeError(
-                "strict V3 provider-set metadata is outside the complete physical input set"
-            ) from exc
-        source_key, _identity, source_run_digest = _source_run_contract_binding(
-            source_contract
-        )
-        if (
-            _required_sha256(
-                entry.get("source_run_contract_sha256"),
-                field_name="provider-set metadata source_run_contract_sha256",
-            )
-            != source_run_digest
-        ):
-            raise RuntimeError(
-                "strict V3 provider-set metadata is bound to another source contract"
-            )
-        for field_name in _PHYSICAL_IDENTITY_FIELDS:
-            entry.pop(field_name, None)
-        entry["source_key"] = source_key
-        entry["source_count"] = source_count
-        entry["sha256"] = _required_sha256(
-            entry.get("sha256"), field_name="provider-set metadata sha256"
-        )
-        entry["source_run_contract_sha256"] = source_run_digest
-        observed_source_keys.add(source_key)
+        for entry in normalized
+    }
     if observed_source_keys != set(range(source_count)):
         raise RuntimeError(
             "strict V3 finalizer requires complete dense provider-set metadata source keys"

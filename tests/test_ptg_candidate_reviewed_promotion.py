@@ -33,6 +33,7 @@ def test_promote_ptg2_source_snapshot_threads_reviewed_hold_digest(monkeypatch):
             snapshot_id="snap_new",
             expected_current_snapshot_id="snap_old",
             expected_audit_only_attestation_digest=approval_digest,
+            rollback_owner_id="activation-operation",
         )
     )
 
@@ -40,6 +41,9 @@ def test_promote_ptg2_source_snapshot_threads_reviewed_hold_digest(monkeypatch):
     assert publish.await_args.kwargs[
         "expected_audit_only_attestation_digest"
     ] == bytes.fromhex(approval_digest)
+    assert publish.await_args.kwargs["rollback_owner_id"] == (
+        "activation-operation"
+    )
 
 
 def test_promote_ptg2_source_snapshot_rejects_malformed_hold_digest(monkeypatch):

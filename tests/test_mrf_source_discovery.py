@@ -131,7 +131,7 @@ def test_discovery_command_exposes_public_options():
     ]
 
 
-def test_source_urls_are_loaded_from_registry_file():
+def test_source_config_loads_registry_and_primary_resolvers():
     """Verify this source-discovery regression contract."""
     config = discovery._source_config()
 
@@ -187,6 +187,11 @@ def test_source_urls_are_loaded_from_registry_file():
     )
     assert config["platform_resolvers"]["html_mrf_links"]["type"] == "html_mrf_links"
     assert config["platform_resolvers"]["html_mrf_links"]["max_frames"] == 5
+
+
+def test_source_config_loads_html_and_directory_resolvers():
+    config = discovery._source_config()
+
     assert (
         config["platform_resolvers"]["wordpress_elfinder_mrf_links"]["type"]
         == "wordpress_elfinder_mrf_links"
@@ -235,6 +240,11 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["json_mrf_directory_links"]["type"]
         == "json_mrf_directory_links"
     )
+
+
+def test_source_config_loads_search_and_api_resolvers():
+    config = discovery._source_config()
+
     assert (
         config["platform_resolvers"]["healthspace_machine_readable_files"]["type"]
         == "healthspace_machine_readable_files"
@@ -285,6 +295,11 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["mymedicalshopper_talon_bounded"][
         "max_targets"
     ] == 20
+
+
+def test_source_config_loads_seed_and_monthly_resolvers():
+    config = discovery._source_config()
+
     assert (
         config["platform_resolvers"]["viva_health_mrf"]["type"]
         == "viva_health_mrf"
@@ -334,6 +349,11 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["uha_monthly_toc"]["type"]
         == "monthly_toc_templates"
     )
+
+
+def test_source_config_loads_cloud_listing_resolvers():
+    config = discovery._source_config()
+
     assert (
         config["platform_resolvers"]["hmsa_monthly_toc"]["type"]
         == "monthly_toc_templates"
@@ -381,6 +401,11 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["healthsparq_direct_metadata"]["type"]
         == "healthsparq_direct_metadata"
     )
+
+
+def test_source_config_loads_specialized_resolvers():
+    config = discovery._source_config()
+
     assert (
         config["platform_resolvers"]["cigna_static_mrf_lookup"]["type"]
         == "cigna_static_mrf_lookup"
@@ -1070,15 +1095,12 @@ def test_wordpress_elfinder_hash_path_decodes_file_path():
     )
 
 
-@pytest.mark.asyncio
-async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
-    """WordPress elFinder pages can expose MRF files only after opening a child folder."""
-    discovery_source_dict = {
-        "source_id": "source_example_elfinder",
-        "display_name": "Example elFinder",
-        "hosting_platform": "wordpress_elfinder_mrf_links",
-    }
-    page_html = """
+_ELFINDER_SOURCE = {
+    "source_id": "source_example_elfinder",
+    "display_name": "Example elFinder",
+    "hosting_platform": "wordpress_elfinder_mrf_links",
+}
+_ELFINDER_PAGE_HTML = """
     <div id="wp_file_manager_front123"></div>
     <script>
       jQuery("#wp_file_manager_front123").elfinder({
@@ -1090,20 +1112,25 @@ async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
       });
     </script>
     """
-    directory_hash = "l1_Y2xpZW50X2E"
-    file_hash = (
-        "l1_Y2xpZW50X2EvMjAyNi0wNy0wMV9leGFtcGxlX2FsbG93ZWQtYW1vdW50cy5jc3Y"
-    )
-    form_calls = []
+_ELFINDER_DIRECTORY_HASH = "l1_Y2xpZW50X2E"
+_ELFINDER_FILE_HASH = (
+    "l1_Y2xpZW50X2EvMjAyNi0wNy0wMV9leGFtcGxlX2FsbG93ZWQtYW1vdW50cy5jc3Y"
+)
 
-    async def fake_fetch_text(url, *, max_bytes, session):
-        assert url == "https://example.test/machine-readable-files/"
-        assert max_bytes == 1024
-        assert session.headers["User-Agent"].startswith("Mozilla/5.0")
-        return page_html
 
-    async def fake_post_form_json_value(url, form_fields, *, max_bytes, session):
-        form_calls.append(dict(form_fields))
+async def _fake_elfinder_fetch(url, *, max_bytes, session):
+    assert url == "https://example.test/machine-readable-files/"
+    assert max_bytes == 1024
+    assert session.headers["User-Agent"].startswith("Mozilla/5.0")
+    return _ELFINDER_PAGE_HTML
+
+
+class _ElfinderPost:
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, url, form_fields, *, max_bytes, session):
+        self.calls.append(dict(form_fields))
         assert (
             url
             == "https://example.test/wp-admin/admin-ajax.php?action=mk_file_folder_manager_shortcode"
@@ -1128,32 +1155,37 @@ async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
                     },
                     {
                         "mime": "directory",
-                        "hash": directory_hash,
+                        "hash": _ELFINDER_DIRECTORY_HASH,
                         "name": "client_a",
                         "phash": "l1_Lw",
                     },
                 ],
             }
-        assert form_fields["target"] == directory_hash
+        assert form_fields["target"] == _ELFINDER_DIRECTORY_HASH
         return {
             "files": [
                 {
                     "mime": "text/csv",
                     "size": "526",
-                    "hash": file_hash,
+                    "hash": _ELFINDER_FILE_HASH,
                     "name": "2026-07-01_example_allowed-amounts.csv",
-                    "phash": directory_hash,
+                    "phash": _ELFINDER_DIRECTORY_HASH,
                 }
             ]
         }
 
-    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+@pytest.mark.asyncio
+async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
+    """WordPress elFinder pages can expose MRF files after opening a child folder."""
+    fake_post = _ElfinderPost()
+    monkeypatch.setattr(discovery, "_fetch_text", _fake_elfinder_fetch)
     monkeypatch.setattr(
-        discovery, "_post_form_json_value", fake_post_form_json_value
+        discovery, "_post_form_json_value", fake_post
     )
 
     crawl_targets = await discovery._resolve_wordpress_elfinder_mrf_links(
-        discovery_source_dict,
+        _ELFINDER_SOURCE,
         "https://example.test/machine-readable-files/",
         {
             "type": "wordpress_elfinder_mrf_links",
@@ -1164,7 +1196,7 @@ async def test_wordpress_elfinder_resolver_opens_directory_targets(monkeypatch):
         session=object(),
     )
 
-    assert [call["cmd"] for call in form_calls] == ["open", "open"]
+    assert [call["cmd"] for call in fake_post.calls] == ["open", "open"]
     assert crawl_targets[0].url == (
         "https://files.example.test/root/client_a/"
         "2026-07-01_example_allowed-amounts.csv"
@@ -1355,115 +1387,108 @@ def test_candidate_text_filter_matches_public_aliases():
     )
 
 
-def test_candidate_query_expansion_keeps_searchable_platform_sources():
-    """Verify this source-discovery regression contract."""
-    sapphire = discovery.SourceCandidate(
-        payer_name="BCBS Louisiana",
+_QUERY_EXPANSION_CANDIDATES = (
+    ("BCBS Louisiana", "https://bcbsla.sapphiremrfhub.com/", "sapphire", True),
+    (
+        "Aetna",
+        "https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I"
+        "&brandCode=ALICSI/machine-readable-transparency-in-coverage",
+        "aetna_health1",
+        True,
+    ),
+    (
+        "Example TPA",
+        "https://mrf.healthcarebluebook.com/ExampleTPA",
+        "healthcarebluebook_mrf",
+        True,
+    ),
+    (
+        "Example Network",
+        "https://example.mrf.payercompass.com/",
+        "payercompass_mrf",
+        True,
+    ),
+    (
+        "Example Talon TPA",
+        "https://www.mymedicalshopper.com/mrf-search/example-tpa",
+        "mymedicalshopper_talon",
+        True,
+    ),
+    (
+        "Example Bounded Talon TPA",
+        "https://www.mymedicalshopper.com/mrf-search/example-bounded-tpa",
+        "mymedicalshopper_talon_bounded",
+        True,
+    ),
+    (
+        "Example Delegated TPA",
+        "https://example.test/transparency-in-coverage",
+        "html_mrf_with_healthcarebluebook",
+        True,
+    ),
+    ("Example Blue", "https://example.test/asomrf", "hcsc_asomrf_landing", True),
+    ("Example Regional", "https://example.test/mrf", "html_mrf_links", True),
+    (
+        "Example Alabama Blue",
+        "https://example.test/web/tcr",
+        "bcbsal_html_mrf_links",
+        True,
+    ),
+    (
+        "Example Blue Advantage",
+        "https://example.test/machine-readable-files",
+        "blueadvantage_html_mrf_links",
+        True,
+    ),
+    (
+        "Example Anthem",
+        "https://example.test/machine-readable-file/search/",
+        "anthem_s3_mrf",
+        True,
+    ),
+    (
+        "Example Auxiant",
+        "https://transparency.example.test/directory-of-data-sources/",
+        "auxiant_wordpress",
+        True,
+    ),
+    (
+        "Example Employer",
+        "https://example.test/current_index.json",
+        "direct_toc",
+        False,
+    ),
+)
+
+
+def _query_expansion_candidate(name, url, platform):
+    return discovery.SourceCandidate(
+        payer_name=name,
         provider="master-list",
-        index_url="https://bcbsla.sapphiremrfhub.com/",
-        hosting_platform="sapphire",
-    )
-    aetna = discovery.SourceCandidate(
-        payer_name="Aetna",
-        provider="master-list",
-        index_url=(
-            "https://health1.aetna.com/app/public/#/one/"
-            "insurerCode=AETNACVS_I&brandCode=ALICSI/"
-            "machine-readable-transparency-in-coverage"
-        ),
-        hosting_platform="aetna_health1",
-    )
-    healthcarebluebook = discovery.SourceCandidate(
-        payer_name="Example TPA",
-        provider="master-list",
-        index_url="https://mrf.healthcarebluebook.com/ExampleTPA",
-        hosting_platform="healthcarebluebook_mrf",
-    )
-    payercompass = discovery.SourceCandidate(
-        payer_name="Example Network",
-        provider="master-list",
-        index_url="https://example.mrf.payercompass.com/",
-        hosting_platform="payercompass_mrf",
-    )
-    mymedicalshopper = discovery.SourceCandidate(
-        payer_name="Example Talon TPA",
-        provider="master-list",
-        index_url="https://www.mymedicalshopper.com/mrf-search/example-tpa",
-        hosting_platform="mymedicalshopper_talon",
-    )
-    bounded_mymedicalshopper = discovery.SourceCandidate(
-        payer_name="Example Bounded Talon TPA",
-        provider="master-list",
-        index_url="https://www.mymedicalshopper.com/mrf-search/example-bounded-tpa",
-        hosting_platform="mymedicalshopper_talon_bounded",
-    )
-    delegated_healthcarebluebook = discovery.SourceCandidate(
-        payer_name="Example Delegated TPA",
-        provider="master-list",
-        index_url="https://example.test/transparency-in-coverage",
-        hosting_platform="html_mrf_with_healthcarebluebook",
-    )
-    hcsc = discovery.SourceCandidate(
-        payer_name="Example Blue",
-        provider="master-list",
-        index_url="https://example.test/asomrf",
-        hosting_platform="hcsc_asomrf_landing",
-    )
-    html_mrf = discovery.SourceCandidate(
-        payer_name="Example Regional",
-        provider="master-list",
-        index_url="https://example.test/mrf",
-        hosting_platform="html_mrf_links",
-    )
-    bcbsal = discovery.SourceCandidate(
-        payer_name="Example Alabama Blue",
-        provider="master-list",
-        index_url="https://example.test/web/tcr",
-        hosting_platform="bcbsal_html_mrf_links",
-    )
-    blueadvantage = discovery.SourceCandidate(
-        payer_name="Example Blue Advantage",
-        provider="master-list",
-        index_url="https://example.test/machine-readable-files",
-        hosting_platform="blueadvantage_html_mrf_links",
-    )
-    anthem = discovery.SourceCandidate(
-        payer_name="Example Anthem",
-        provider="master-list",
-        index_url="https://example.test/machine-readable-file/search/",
-        hosting_platform="anthem_s3_mrf",
-    )
-    auxiant_directory = discovery.SourceCandidate(
-        payer_name="Example Auxiant",
-        provider="master-list",
-        index_url="https://transparency.example.test/directory-of-data-sources/",
-        hosting_platform="auxiant_wordpress",
-    )
-    direct_group = discovery.SourceCandidate(
-        payer_name="Example Employer",
-        provider="master-list",
-        index_url="https://example.test/current_index.json",
-        hosting_platform="direct_toc",
+        index_url=url,
+        hosting_platform=platform,
     )
 
-    assert discovery._is_candidate_query_expansion_supported(sapphire)
-    assert discovery._is_candidate_query_expansion_supported(aetna)
-    assert discovery._is_candidate_query_expansion_supported(healthcarebluebook)
-    assert discovery._is_candidate_query_expansion_supported(payercompass)
-    assert discovery._is_candidate_query_expansion_supported(mymedicalshopper)
-    assert discovery._is_candidate_query_expansion_supported(
-        bounded_mymedicalshopper
+
+@pytest.mark.parametrize(
+    ("name", "url", "platform", "expected"),
+    _QUERY_EXPANSION_CANDIDATES,
+)
+def test_candidate_query_expansion_keeps_searchable_platform_sources(
+    name, url, platform, expected
+):
+    candidate = _query_expansion_candidate(name, url, platform)
+
+    assert discovery._is_candidate_query_expansion_supported(candidate) is expected
+
+
+def test_candidate_query_expansion_preserves_target_context():
+    sapphire = _query_expansion_candidate(
+        "BCBS Louisiana",
+        "https://bcbsla.sapphiremrfhub.com/",
+        "sapphire",
     )
-    assert discovery._is_candidate_query_expansion_supported(
-        delegated_healthcarebluebook
-    )
-    assert discovery._is_candidate_query_expansion_supported(hcsc)
-    assert discovery._is_candidate_query_expansion_supported(html_mrf)
-    assert discovery._is_candidate_query_expansion_supported(bcbsal)
-    assert discovery._is_candidate_query_expansion_supported(blueadvantage)
-    assert discovery._is_candidate_query_expansion_supported(anthem)
-    assert discovery._is_candidate_query_expansion_supported(auxiant_directory)
-    assert not discovery._is_candidate_query_expansion_supported(direct_group)
+
     expanded = discovery._candidate_with_target_payer_query(
         sapphire, "Example Packaging"
     )
@@ -2452,76 +2477,78 @@ def test_healthsparq_toc_target_plan_hashes_enrich_parsed_file_rows():
     ]
 
 
+_QUERY_EXPANSION_SOURCE = {
+    "source_id": "src_aetna",
+    "display_name": "Example Carrier",
+    "metadata_json": {
+        "raw": {
+            "target_payer_query": "Example Packaging",
+            "query_expansion_source": True,
+        }
+    },
+}
+_QUERY_EXPANSION_TOC = {
+    "reporting_entity_name": "Example Reporting Entity",
+    "reporting_entity_type": "Third Party Administrator",
+    "version": "1.0.0",
+    "reporting_structure": [
+        {
+            "reporting_plans": [
+                {
+                    "plan_name": "Example Water Co. DBA Example PackagingHSA Choice Plan",
+                    "plan_id_type": "ein",
+                    "plan_id": "222222222",
+                    "plan_market_type": "group",
+                },
+                {
+                    "plan_name": "Example Water Co. DBA Example PackagingChoice Plan",
+                    "plan_id_type": "ein",
+                    "plan_id": "222222222",
+                    "plan_market_type": "group",
+                },
+            ],
+            "in_network_files": [
+                {
+                    "description": "in network file",
+                    "location": "https://example.test/in-network.json.gz",
+                }
+            ],
+        }
+    ],
+}
+_QUERY_EXPANSION_PLAN_INFO = [
+    {
+        "plan_id": "222222222",
+        "plan_id_type": "ein",
+        "plan_market_type": "group",
+        "plan_name": "HSA Choice Plan",
+        "engine_plan_hash": "hash-hsa",
+        "company_name": "Example Packaging",
+    },
+    {
+        "plan_id": "222222222",
+        "plan_id_type": "ein",
+        "plan_market_type": "group",
+        "plan_name": "Choice Plan",
+        "engine_plan_hash": "hash-choice",
+        "company_name": "Example Packaging",
+    },
+]
+
+
 def test_query_expanded_generic_toc_rows_normalize_plan_labels_before_merge():
-    """Verify this source-discovery regression contract."""
-    catalog_source_dict = {
-        "source_id": "src_aetna",
-        "display_name": "Example Carrier",
-        "metadata_json": {
-            "raw": {
-                "target_payer_query": "Example Packaging",
-                "query_expansion_source": True,
-            }
-        },
-    }
-    toc_document_dict = {
-        "reporting_entity_name": "Example Reporting Entity",
-        "reporting_entity_type": "Third Party Administrator",
-        "version": "1.0.0",
-        "reporting_structure": [
-            {
-                "reporting_plans": [
-                    {
-                        "plan_name": "Example Water Co. DBA Example PackagingHSA Choice Plan",
-                        "plan_id_type": "ein",
-                        "plan_id": "222222222",
-                        "plan_market_type": "group",
-                    },
-                    {
-                        "plan_name": "Example Water Co. DBA Example PackagingChoice Plan",
-                        "plan_id_type": "ein",
-                        "plan_id": "222222222",
-                        "plan_market_type": "group",
-                    },
-                ],
-                "in_network_files": [
-                    {
-                        "description": "in network file",
-                        "location": "https://example.test/in-network.json.gz",
-                    }
-                ],
-            }
-        ],
-    }
     crawl_target = discovery.CrawlTarget(
-        source=catalog_source_dict,
+        source=_QUERY_EXPANSION_SOURCE,
         url="https://example.test/index.json",
         label="Example Packaging TOC",
         resolved_from_url="https://example.test/latest_metadata.json",
-        metadata={
-            "plan_info": [
-                {
-                    "plan_id": "222222222",
-                    "plan_id_type": "ein",
-                    "plan_market_type": "group",
-                    "plan_name": "HSA Choice Plan",
-                    "engine_plan_hash": "hash-hsa",
-                    "company_name": "Example Packaging",
-                },
-                {
-                    "plan_id": "222222222",
-                    "plan_id_type": "ein",
-                    "plan_market_type": "group",
-                    "plan_name": "Choice Plan",
-                    "engine_plan_hash": "hash-choice",
-                    "company_name": "Example Packaging",
-                },
-            ]
-        },
+        metadata={"plan_info": _QUERY_EXPANSION_PLAN_INFO},
     )
 
     plan_rows, file_rows = discovery._toc_rows_from_content(
-        catalog_source_dict, "https://example.test/index.json", toc_document_dict
+        _QUERY_EXPANSION_SOURCE,
+        "https://example.test/index.json",
+        _QUERY_EXPANSION_TOC,
     )
 
     assert [plan_row["plan_name"] for plan_row in plan_rows] == [
@@ -2865,9 +2892,7 @@ def test_master_list_coverage_evidence_metadata_is_stored_on_source_rows():
     assert source_row["metadata_json"]["plan_names"] == ["Example Guided Health Plan"]
 
 
-def test_master_list_public_gap_sources_classify_supported_platforms():
-    """Verify this source-discovery regression contract."""
-    markdown = """
+_PUBLIC_GAP_MASTER_LIST = """
 | Payer | Type | Public MRF TOC / landing URL | Notes |
 |---|---|---|---|
 | 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | aliases: 90 Degree, 90DB |
@@ -2965,9 +2990,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Centivo - Rockwell Automation | group | https://eldoradocomputing.hosted-by-files.com/centivopublicRCKWL/ | aliases: Centivo, Centivo Health, Rockwell Automation |
 """
 
-    candidates = discovery.parse_master_list(markdown)
-    by_name = {candidate.payer_name: candidate for candidate in candidates}
 
+def _assert_public_gap_primary_sources(by_name):
     assert (
         by_name["90 Degree Benefits"].hosting_platform
         == "healthspace_machine_readable_files"
@@ -3023,6 +3047,9 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["Varipro"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Varipro"].aliases == ("Varipro TPA", "Valipro TPA")
+
+
+def _assert_public_gap_administrator_sources(by_name):
     assert by_name["Reliance Matrix"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["Reliance Matrix"].aliases == (
         "Reliance Standard",
@@ -3080,6 +3107,9 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["HealthChoice - HPI"].hosting_platform == "payercompass_mrf"
     assert by_name["Marpai"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Insurance Systems"].hosting_platform == "payercompass_mrf"
+
+
+def _assert_public_gap_network_sources(by_name):
     assert by_name["Kapnick Insurance Group"].hosting_platform == "sapphire"
     assert (
         by_name["Insight Benefit Administrators"].hosting_platform
@@ -3131,6 +3161,9 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["The Ohio State University"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["U.S. Renal Care"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["Washington Community Schools"].hosting_platform == "mymedicalshopper_talon"
+
+
+def _assert_public_gap_regional_sources(by_name):
     assert (
         by_name["BlueAdvantage Administrators of Arkansas"].hosting_platform
         == "blueadvantage_html_mrf_links"
@@ -3188,6 +3221,9 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         == "healthcarebluebook_mrf"
     )
     assert by_name["Insurance Management Services"].aliases == ("IMS", "IMS TPA")
+
+
+def _assert_public_gap_remaining_sources(by_name):
     assert by_name["Boon-Chapman"].hosting_platform == "html_mrf_links_mixed_directories"
     assert by_name["HealthEZ"].hosting_platform == "healthez_benefits_mrf"
     assert by_name["HealthEZ"].aliases == ("Health EZ", "HealthEZ Benefits")
@@ -3235,6 +3271,17 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["UCare"].hosting_platform == "html_mrf_links"
     assert by_name["UCare"].benefit_lines == ("medical", "dental")
     assert by_name["UCare"].aliases == ("UCare Minnesota", "UCare IFP")
+
+
+def test_master_list_public_gap_sources_classify_supported_platforms():
+    candidates = discovery.parse_master_list(_PUBLIC_GAP_MASTER_LIST)
+    by_name = {candidate.payer_name: candidate for candidate in candidates}
+    _assert_public_gap_primary_sources(by_name)
+    _assert_public_gap_administrator_sources(by_name)
+    _assert_public_gap_network_sources(by_name)
+    _assert_public_gap_regional_sources(by_name)
+    _assert_public_gap_remaining_sources(by_name)
+
     mercycare_list = [
         candidate for candidate in candidates if candidate.payer_name == "Mercy/MercyCare"
     ]
@@ -4445,36 +4492,20 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Centivo" in by_name["Centivo - Rockwell Automation"].aliases
 
 
-@pytest.mark.asyncio
-async def test_master_list_public_alias_queries_match_expected_candidates():
-    """Verify this source-discovery regression contract."""
-    candidates = await discovery._load_candidates(
-        "master-list", test_mode=True, limit=2000
-    )
+def _master_candidate_names(candidates, query, *, importable):
+    return {
+        candidate.payer_name
+        for candidate in candidates
+        if (not importable or discovery._is_candidate_importable_source(candidate))
+        and discovery._is_candidate_text_filter_match(
+            candidate,
+            entity_types=(),
+            payer_query=query,
+        )
+    }
 
-    def matching_names(query: str) -> set[str]:
-        return {
-            candidate.payer_name
-            for candidate in candidates
-            if discovery._is_candidate_text_filter_match(
-                candidate,
-                entity_types=(),
-                payer_query=query,
-            )
-        }
 
-    def matching_importable_names(query: str) -> set[str]:
-        return {
-            candidate.payer_name
-            for candidate in candidates
-            if discovery._is_candidate_importable_source(candidate)
-            and discovery._is_candidate_text_filter_match(
-                candidate,
-                entity_types=(),
-                payer_query=query,
-            )
-        }
-
+def _assert_master_alias_carrier_queries(matching_names, matching_importable_names):
     assert "United Healthcare" in matching_names("UMR (Using Spectera Network)")
     assert "United Healthcare" in matching_names("UHC Vision (Using Spectera Network)")
     assert "United Healthcare" in matching_names("DBP")
@@ -4529,6 +4560,9 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Delta Dental Plan of Michigan" in matching_importable_names(
         "Delta Dental Plan of Ohio, Inc."
     )
+
+
+def _assert_master_alias_plan_queries(matching_names, matching_importable_names):
     assert "Delta Dental" in matching_names("DeltaDental")
     assert "Delta Dental" not in matching_importable_names("DeltaDental")
     assert "Delta Dental" in matching_names("Delta Dental of Missouri")
@@ -4579,6 +4613,9 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Luminare Health Benefits" in matching_importable_names(
         "First Health Cofinity"
     )
+
+
+def _assert_master_alias_dental_queries(matching_names, matching_importable_names):
     assert "Empire BlueCross BlueShield" in matching_names(
         "Empire Blue Cross Blue Sheild"
     )
@@ -4629,6 +4666,9 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Peak Health" in matching_importable_names("Peak Health Plan")
     assert "Centivo - Rockwell Automation" in matching_importable_names("Centivo")
     assert "Reliance Matrix" in matching_importable_names("reliancematrix")
+
+
+def _assert_master_alias_eyemed_queries(matching_names, matching_importable_names):
     assert "Reliance Matrix" in matching_importable_names("Davis Vision")
     assert "Reliance Matrix" in matching_importable_names("Davis Vision Network")
     assert "Reliance Matrix" in matching_importable_names("Guardian - Davis Vision")
@@ -4677,6 +4717,9 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "EyeMed" in matching_names(
         "Blue 20/20 of Massachusetts (powered by EyeMed)"
     )
+
+
+def _assert_master_alias_vision_queries(matching_names, matching_importable_names):
     assert "EyeMed" in matching_names("BlueCare Vision of Illinois (powered by EyeMed)")
     assert "EyeMed" in matching_names("Dearborn National with EyeMed")
     assert "EyeMed" in matching_names("DeltaVision administered by EyeMed")
@@ -4728,6 +4771,9 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Vision Benefits of America" not in matching_importable_names(
         "Vision Benefits of Ameriva"
     )
+
+
+def _assert_master_alias_remaining_queries(matching_names, matching_importable_names):
     assert "Vision Benefits of America" in matching_names("VBA Vision Network")
     assert "Vision Benefits of America" not in matching_importable_names(
         "VBA Vision Network"
@@ -4764,6 +4810,29 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "United Concordia Dental" in matching_names("United Concordia")
     assert "Unum Dental / Starmount Life" in matching_names("Starmount Life")
     assert "EMI Health" in matching_names("Companion Life dental")
+
+
+@pytest.mark.asyncio
+async def test_master_list_public_alias_queries_match_expected_candidates():
+    candidates = await discovery._load_candidates(
+        "master-list", test_mode=True, limit=2000
+    )
+    matching_names = lambda query: _master_candidate_names(
+        candidates, query, importable=False
+    )
+    matching_importable_names = lambda query: _master_candidate_names(
+        candidates, query, importable=True
+    )
+    validators = (
+        _assert_master_alias_carrier_queries,
+        _assert_master_alias_plan_queries,
+        _assert_master_alias_dental_queries,
+        _assert_master_alias_eyemed_queries,
+        _assert_master_alias_vision_queries,
+        _assert_master_alias_remaining_queries,
+    )
+    for validator in validators:
+        validator(matching_names, matching_importable_names)
 
 
 @pytest.mark.asyncio
@@ -5199,279 +5268,140 @@ def test_dedupe_candidates_prefers_more_specific_url_for_same_canonical_key():
     )
 
 
-def test_classify_hosting_platforms():
-    """Verify this source-discovery regression contract."""
-    assert (
-        discovery.classify_hosting_platform("https://transparency-in-coverage.uhc.com/")
-        == "uhc_public_blobs"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://providermrf.uhc.com/api/files/ui/ifp/"
-        )
-        == "uhc_provider_mrf_files"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://bci.sapphiremrfhub.com/")
-        == "sapphire"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://bcbsm.sapphiremrfhub.com/tocs/current/vsp_vision"
-        )
-        == "sapphire"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://mrfdata.hmhs.com/")
-        == "highmark_hmhs"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.bcbswy.com/machine-readable-files/"
-        )
-        == "bcbswy_hmhs_monthly_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.bcbsil.com/asomrf?EIN=260241222"
-        )
-        == "bcbs_asomrf"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://bcbsglobalsolutions.com/transparency-in-coverage/"
-        )
-        == "bcbs_global_solutions_mrf"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://groupadmin.bcbsglobalsolutions.com/transparency-in-coverage-toc-json.cfm?planType=4EverLife"
-        )
-        == "bcbs_global_solutions_mrf"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.bluecrossnc.com/policies-best-practices/machine-readable-files"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://mrfmftprod.bcbsnc.com/prod/etl/outbound/table-of-contents/non-aso/"
-            "2026-05-27_blue-cross-and-blue-shield-of-north-carolina_index.json"
-        )
-        == "direct_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://transparency-in-coverage.bluecrossma.com/"
-        )
-        == "bcbsma_monthly_tocs"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.cigna.com/legal/compliance/machine-readable-files"
-        )
-        == "cigna_static_mrf_lookup"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://transparency.auxiant.com/directory-of-data-sources/"
-        )
-        == "auxiant_wordpress"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://transparency.auxiant.com/healthsmart/"
-        )
-        == "auxiant_wordpress"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.asrhealthbenefits.com/MRF")
-        == "asr_health_benefits"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://mrfsearch.meritain.com/")
-        == "meritain_mrf_search"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://mrf.healthcarebluebook.com/Lucent")
-        == "healthcarebluebook_mrf"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://mrf.healthgram.com/")
-        == "healthgram"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/"
-        )
-        == "html_mrf_with_healthcarebluebook"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://lucenthealth.com/transparency-in-coverage/"
-        )
-        == "html_mrf_with_healthcarebluebook"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://hpitpa.com/transparency-in-coverage-machine-readable-files/"
-        )
-        == "html_mrf_with_healthcarebluebook"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.priorityhealth.com/landing/transparency"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.anglehealth.com/machine-readable-files"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://mrf.pacificsource.com/File/Visit/Index"
-        )
-        == "pacificsource_azure_mrf_listing"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.cchealth.org/health-insurance/my-contra-costa-health-plan/transparency-in-coverage"
-        )
-        == "hostedjson_azure_mrf_listing"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://hostedjson.blob.core.windows.net/transparencyfiles?restype=container&comp=list"
-        )
-        == "hostedjson_azure_mrf_listing"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://ghcscw.com/transparency-in-coverage"
-        )
-        == "ghcscw_azure_mrf_listing"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://salud.grupotriples.com/en/transparency-in-coverage-machine-readable-files/"
-        )
-        == "triples_mtt_api"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://salud.grupotriples.com/en/wp-json/app/v1/mtt?network=Puerto+Rico"
-        )
-        == "triples_mtt_api"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://sawus2prdticmrfhma.z5.web.core.windows.net/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.lacare.org/transparency-coverage-machine-readable-files"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.gravie.com/compliance/transparency-in-coverage/"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.mymedicalshopper.com/mrf-search/varipro"
-        )
-        == "mymedicalshopper_talon"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.mymedicalshopper.com/mrf-search/diversified-group"
-        )
-        == "mymedicalshopper_talon_bounded"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.mymedicalshopper.com/mrf/sample-employer-network-varipro-77100"
-        )
-        == "mymedicalshopper_talon"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://clm.magnacare.com/transparency/")
-        == "magnacare_transparency_mrf"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.blueadvantagearkansas.com/interoperability/machine-readable-files"
-        )
-        == "blueadvantage_html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.geha.com/transparency-in-coverage"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.sharphealthplan.com/api-access-for-developers"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://group-health.com/price-transparency"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.wpshealth.com/resources/customer-resources/price-transparency.shtml"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://files.myplancentral.com/TIC/TOC/")
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://data.sccgov.org/data.json")
-        == "socrata_data_json_mrf_catalog"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://transparency.emblemhealth.com/")
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://transparency.connecticare.com/OON")
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.securityhealth.org/insurance-resources/json"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://transparency.lacare.org")
-        == "lacare_s3_listing"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://mrfhub.providencehealthplan.com/")
-        == "providence_mrf_api"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://github.com/ExampleCarrier/MRF")
-        == "github_repo_mrf"
-    )
+_HOSTING_PLATFORM_CASES = (
+    ("https://transparency-in-coverage.uhc.com/", "uhc_public_blobs"),
+    ("https://providermrf.uhc.com/api/files/ui/ifp/", "uhc_provider_mrf_files"),
+    ("https://bci.sapphiremrfhub.com/", "sapphire"),
+    ("https://bcbsm.sapphiremrfhub.com/tocs/current/vsp_vision", "sapphire"),
+    ("https://mrfdata.hmhs.com/", "highmark_hmhs"),
+    ("https://www.bcbswy.com/machine-readable-files/", "bcbswy_hmhs_monthly_toc"),
+    ("https://www.bcbsil.com/asomrf?EIN=260241222", "bcbs_asomrf"),
+    (
+        "https://bcbsglobalsolutions.com/transparency-in-coverage/",
+        "bcbs_global_solutions_mrf",
+    ),
+    (
+        "https://groupadmin.bcbsglobalsolutions.com/"
+        "transparency-in-coverage-toc-json.cfm?planType=4EverLife",
+        "bcbs_global_solutions_mrf",
+    ),
+    (
+        "https://www.bluecrossnc.com/policies-best-practices/machine-readable-files",
+        "html_mrf_links",
+    ),
+    (
+        "https://mrfmftprod.bcbsnc.com/prod/etl/outbound/table-of-contents/non-aso/"
+        "2026-05-27_blue-cross-and-blue-shield-of-north-carolina_index.json",
+        "direct_toc",
+    ),
+    ("https://transparency-in-coverage.bluecrossma.com/", "bcbsma_monthly_tocs"),
+    (
+        "https://www.cigna.com/legal/compliance/machine-readable-files",
+        "cigna_static_mrf_lookup",
+    ),
+    (
+        "https://transparency.auxiant.com/directory-of-data-sources/",
+        "auxiant_wordpress",
+    ),
+    ("https://transparency.auxiant.com/healthsmart/", "auxiant_wordpress"),
+    ("https://www.asrhealthbenefits.com/MRF", "asr_health_benefits"),
+    ("https://mrfsearch.meritain.com/", "meritain_mrf_search"),
+    ("https://mrf.healthcarebluebook.com/Lucent", "healthcarebluebook_mrf"),
+    ("https://mrf.healthgram.com/", "healthgram"),
+    (
+        "https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/",
+        "html_mrf_with_healthcarebluebook",
+    ),
+    (
+        "https://lucenthealth.com/transparency-in-coverage/",
+        "html_mrf_with_healthcarebluebook",
+    ),
+    (
+        "https://hpitpa.com/transparency-in-coverage-machine-readable-files/",
+        "html_mrf_with_healthcarebluebook",
+    ),
+    (
+        "https://www.priorityhealth.com/landing/transparency",
+        "html_delegated_mrf_links",
+    ),
+    (
+        "https://www.anglehealth.com/machine-readable-files",
+        "html_delegated_mrf_links",
+    ),
+    (
+        "https://mrf.pacificsource.com/File/Visit/Index",
+        "pacificsource_azure_mrf_listing",
+    ),
+    (
+        "https://www.cchealth.org/health-insurance/"
+        "my-contra-costa-health-plan/transparency-in-coverage",
+        "hostedjson_azure_mrf_listing",
+    ),
+    (
+        "https://hostedjson.blob.core.windows.net/"
+        "transparencyfiles?restype=container&comp=list",
+        "hostedjson_azure_mrf_listing",
+    ),
+    ("https://ghcscw.com/transparency-in-coverage", "ghcscw_azure_mrf_listing"),
+    (
+        "https://salud.grupotriples.com/en/"
+        "transparency-in-coverage-machine-readable-files/",
+        "triples_mtt_api",
+    ),
+    (
+        "https://salud.grupotriples.com/en/wp-json/app/v1/mtt?network=Puerto+Rico",
+        "triples_mtt_api",
+    ),
+    ("https://sawus2prdticmrfhma.z5.web.core.windows.net/", "html_mrf_links"),
+    (
+        "https://www.lacare.org/transparency-coverage-machine-readable-files",
+        "html_delegated_mrf_links",
+    ),
+    (
+        "https://www.gravie.com/compliance/transparency-in-coverage/",
+        "html_delegated_mrf_links",
+    ),
+    (
+        "https://www.mymedicalshopper.com/mrf-search/varipro",
+        "mymedicalshopper_talon",
+    ),
+    (
+        "https://www.mymedicalshopper.com/mrf-search/diversified-group",
+        "mymedicalshopper_talon_bounded",
+    ),
+    (
+        "https://www.mymedicalshopper.com/mrf/"
+        "sample-employer-network-varipro-77100",
+        "mymedicalshopper_talon",
+    ),
+    ("https://clm.magnacare.com/transparency/", "magnacare_transparency_mrf"),
+    (
+        "https://www.blueadvantagearkansas.com/"
+        "interoperability/machine-readable-files",
+        "blueadvantage_html_mrf_links",
+    ),
+    ("https://www.geha.com/transparency-in-coverage", "html_delegated_mrf_links"),
+    ("https://www.sharphealthplan.com/api-access-for-developers", "html_mrf_links"),
+    ("https://group-health.com/price-transparency", "html_mrf_links"),
+    (
+        "https://www.wpshealth.com/resources/"
+        "customer-resources/price-transparency.shtml",
+        "html_mrf_links",
+    ),
+    ("https://files.myplancentral.com/TIC/TOC/", "html_mrf_links"),
+    ("https://data.sccgov.org/data.json", "socrata_data_json_mrf_catalog"),
+    ("https://transparency.emblemhealth.com/", "html_mrf_links"),
+    ("https://transparency.connecticare.com/OON", "html_mrf_links"),
+    ("https://www.securityhealth.org/insurance-resources/json", "html_mrf_links"),
+    ("https://transparency.lacare.org", "lacare_s3_listing"),
+    ("https://mrfhub.providencehealthplan.com/", "providence_mrf_api"),
+    ("https://github.com/ExampleCarrier/MRF", "github_repo_mrf"),
+)
+
+
+@pytest.mark.parametrize(("url", "platform"), _HOSTING_PLATFORM_CASES)
+def test_classify_hosting_platforms(url, platform):
+    assert discovery.classify_hosting_platform(url) == platform
 
 
 def test_meritain_mrf_search_parser_extracts_group_healthsparq_links():
@@ -6548,124 +6478,152 @@ async def test_html_bluebook_direct_nested_error(
     assert resolved_targets[0].metadata["target_file_type"] == "table-of-contents"
 
 
+_SOCRATA_SOURCE = {
+    "source_id": "source_vhp",
+    "payer_id": "payer_vhp",
+    "display_name": "Valley Health Plan",
+    "metadata_json": {"benefit_lines": ["medical", "dental", "vision"]},
+}
+_SOCRATA_DATASETS = {
+    "dataset": [
+        {
+            "accessLevel": "public",
+            "title": (
+                "In Network Rates - Individual and Family Plans - Gold 80 - "
+                "Santa Clara County - June 2026"
+            ),
+            "description": "Machine-readable file that contains In-network rates.",
+            "issued": "2026-05-20",
+            "modified": "2026-05-20",
+            "contactPoint": {"fn": "Ethan Giang"},
+            "keyword": ["price transparency"],
+            "identifier": "https://data.sccgov.org/api/views/qq69-6225",
+            "landingPage": "https://data.sccgov.org/d/qq69-6225",
+            "distribution": [
+                {
+                    "downloadURL": (
+                        "https://data.sccgov.org/download/"
+                        "qq69-6225/application/vnd.geo+json"
+                    ),
+                    "mediaType": "application/vnd.geo+json",
+                }
+            ],
+        },
+        {
+            "accessLevel": "public",
+            "title": (
+                "In Network Rates - Pediatric Dental - Covered California and IFP - "
+                "Santa Clara County - June 2026"
+            ),
+            "description": "Machine-readable file that contains In-network rates.",
+            "issued": "2026-05-20",
+            "modified": "2026-05-20",
+            "contactPoint": {"fn": "ryan.aralar@vhp.sccgov.org"},
+            "keyword": ["price transparency"],
+            "identifier": "https://data.sccgov.org/api/views/rj4i-khih",
+            "landingPage": "https://data.sccgov.org/d/rj4i-khih",
+            "distribution": [
+                {
+                    "downloadURL": (
+                        "https://data.sccgov.org/download/"
+                        "rj4i-khih/application/vnd.geo+json"
+                    ),
+                    "mediaType": "application/vnd.geo+json",
+                }
+            ],
+        },
+        {
+            "accessLevel": "public",
+            "title": "In Network Rates - VSP Vision Care Advantage - June 2026",
+            "description": "Machine-readable file that contains In-network rates.",
+            "issued": "2026-06-05",
+            "modified": "2026-06-05",
+            "contactPoint": {"fn": "Ethan Giang"},
+            "keyword": ["price transparency"],
+            "identifier": "https://data.sccgov.org/api/views/bxvw-whxu",
+            "landingPage": "https://data.sccgov.org/d/bxvw-whxu",
+            "distribution": [
+                {
+                    "downloadURL": (
+                        "https://data.sccgov.org/download/"
+                        "bxvw-whxu/application/vnd.geo+json"
+                    ),
+                    "mediaType": "application/vnd.geo+json",
+                }
+            ],
+        },
+        {
+            "accessLevel": "public",
+            "title": (
+                "Out-of-Network Allowed Amounts - Covered California - "
+                "Gold 80 - June 2026"
+            ),
+            "description": (
+                "Allowed amounts paid to providers outside of the VHP network."
+            ),
+            "issued": "2026-05-20",
+            "modified": "2026-05-20",
+            "contactPoint": {"fn": "ryan.aralar@vhp.sccgov.org"},
+            "keyword": ["price transparency"],
+            "identifier": "https://data.sccgov.org/api/views/d6r6-tdzg",
+            "landingPage": "https://data.sccgov.org/d/d6r6-tdzg",
+            "distribution": [
+                {
+                    "downloadURL": (
+                        "https://data.sccgov.org/download/"
+                        "d6r6-tdzg/application/vnd.geo+json"
+                    ),
+                    "mediaType": "application/vnd.geo+json",
+                }
+            ],
+        },
+        {
+            "accessLevel": "public",
+            "title": "In Network Rates - VSP Vision Care Advantage - May 2026",
+            "description": "Machine-readable file that contains In-network rates.",
+            "issued": "2026-04-28",
+            "contactPoint": {"fn": "Ethan Giang"},
+            "keyword": ["price transparency"],
+            "identifier": "https://data.sccgov.org/api/views/mhey-u94c",
+            "distribution": [
+                {
+                    "downloadURL": (
+                        "https://data.sccgov.org/download/"
+                        "mhey-u94c/application/vnd.geo+json"
+                    ),
+                    "mediaType": "application/vnd.geo+json",
+                }
+            ],
+        },
+        {
+            "accessLevel": "public",
+            "title": "County budget rows",
+            "description": "Not a machine-readable rate file.",
+            "contactPoint": {"fn": "County"},
+            "keyword": ["finance"],
+            "distribution": [
+                {
+                    "downloadURL": (
+                        "https://data.sccgov.org/download/abcd-1234/application/json"
+                    ),
+                    "mediaType": "application/json",
+                }
+            ],
+        },
+    ]
+}
+
+
 @pytest.mark.asyncio
 async def test_socrata_data_json_resolver_discovers_latest_vhp_mrf_files(monkeypatch):
-    """Verify this source-discovery regression contract."""
-    catalog_source_dict = {
-        "source_id": "source_vhp",
-        "payer_id": "payer_vhp",
-        "display_name": "Valley Health Plan",
-        "metadata_json": {"benefit_lines": ["medical", "dental", "vision"]},
-    }
-    catalog_response_dict = {
-        "dataset": [
-            {
-                "accessLevel": "public",
-                "title": "In Network Rates - Individual and Family Plans - Gold 80 - Santa Clara County - June 2026",
-                "description": "Machine-readable file that contains In-network rates.",
-                "issued": "2026-05-20",
-                "modified": "2026-05-20",
-                "contactPoint": {"fn": "Ethan Giang"},
-                "keyword": ["price transparency"],
-                "identifier": "https://data.sccgov.org/api/views/qq69-6225",
-                "landingPage": "https://data.sccgov.org/d/qq69-6225",
-                "distribution": [
-                    {
-                        "downloadURL": "https://data.sccgov.org/download/qq69-6225/application/vnd.geo+json",
-                        "mediaType": "application/vnd.geo+json",
-                    }
-                ],
-            },
-            {
-                "accessLevel": "public",
-                "title": "In Network Rates - Pediatric Dental - Covered California and IFP - Santa Clara County - June 2026",
-                "description": "Machine-readable file that contains In-network rates.",
-                "issued": "2026-05-20",
-                "modified": "2026-05-20",
-                "contactPoint": {"fn": "ryan.aralar@vhp.sccgov.org"},
-                "keyword": ["price transparency"],
-                "identifier": "https://data.sccgov.org/api/views/rj4i-khih",
-                "landingPage": "https://data.sccgov.org/d/rj4i-khih",
-                "distribution": [
-                    {
-                        "downloadURL": "https://data.sccgov.org/download/rj4i-khih/application/vnd.geo+json",
-                        "mediaType": "application/vnd.geo+json",
-                    }
-                ],
-            },
-            {
-                "accessLevel": "public",
-                "title": "In Network Rates - VSP Vision Care Advantage - June 2026",
-                "description": "Machine-readable file that contains In-network rates.",
-                "issued": "2026-06-05",
-                "modified": "2026-06-05",
-                "contactPoint": {"fn": "Ethan Giang"},
-                "keyword": ["price transparency"],
-                "identifier": "https://data.sccgov.org/api/views/bxvw-whxu",
-                "landingPage": "https://data.sccgov.org/d/bxvw-whxu",
-                "distribution": [
-                    {
-                        "downloadURL": "https://data.sccgov.org/download/bxvw-whxu/application/vnd.geo+json",
-                        "mediaType": "application/vnd.geo+json",
-                    }
-                ],
-            },
-            {
-                "accessLevel": "public",
-                "title": "Out-of-Network Allowed Amounts - Covered California - Gold 80 - June 2026",
-                "description": "Allowed amounts paid to providers outside of the VHP network.",
-                "issued": "2026-05-20",
-                "modified": "2026-05-20",
-                "contactPoint": {"fn": "ryan.aralar@vhp.sccgov.org"},
-                "keyword": ["price transparency"],
-                "identifier": "https://data.sccgov.org/api/views/d6r6-tdzg",
-                "landingPage": "https://data.sccgov.org/d/d6r6-tdzg",
-                "distribution": [
-                    {
-                        "downloadURL": "https://data.sccgov.org/download/d6r6-tdzg/application/vnd.geo+json",
-                        "mediaType": "application/vnd.geo+json",
-                    }
-                ],
-            },
-            {
-                "accessLevel": "public",
-                "title": "In Network Rates - VSP Vision Care Advantage - May 2026",
-                "description": "Machine-readable file that contains In-network rates.",
-                "issued": "2026-04-28",
-                "contactPoint": {"fn": "Ethan Giang"},
-                "keyword": ["price transparency"],
-                "identifier": "https://data.sccgov.org/api/views/mhey-u94c",
-                "distribution": [
-                    {
-                        "downloadURL": "https://data.sccgov.org/download/mhey-u94c/application/vnd.geo+json",
-                        "mediaType": "application/vnd.geo+json",
-                    }
-                ],
-            },
-            {
-                "accessLevel": "public",
-                "title": "County budget rows",
-                "description": "Not a machine-readable rate file.",
-                "contactPoint": {"fn": "County"},
-                "keyword": ["finance"],
-                "distribution": [
-                    {
-                        "downloadURL": "https://data.sccgov.org/download/abcd-1234/application/json",
-                        "mediaType": "application/json",
-                    }
-                ],
-            },
-        ]
-    }
-
     async def fake_fetch_json(url, **_kwargs):
         assert url == "https://data.sccgov.org/data.json"
-        return catalog_response_dict
+        return _SOCRATA_DATASETS
 
     monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
 
     dataset_targets = await discovery._resolve_socrata_data_json_mrf_catalog(
-        catalog_source_dict,
+        _SOCRATA_SOURCE,
         "https://data.sccgov.org/data.json",
         {
             "type": "socrata_data_json_mrf_catalog",
@@ -7408,15 +7366,22 @@ async def test_mymedicalshopper_subscription_uses_overall_deadline_for_heartbeat
     assert any(message.get("msg") == "pong" for message in _mms_sent_messages(ws))
 
 
-@pytest.mark.asyncio
-async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypatch):
-    """Verify this source-discovery regression contract."""
-    calls = []
+_MMS_QUERY_SOURCE = {
+    "metadata_json": {
+        "raw": {
+            "target_payer_query": "Example Packaging Inc",
+            "query_expansion_source": True,
+        }
+    }
+}
 
-    async def fake_subscribe_collect(
-        _ws, *, name, params, sub_id, timeout_seconds
-    ):
-        calls.append(
+
+class _MMSQuerySubscription:
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, _ws, *, name, params, sub_id, timeout_seconds):
+        self.calls.append(
             {
                 "name": name,
                 "params": params,
@@ -7462,21 +7427,20 @@ async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypat
             ]
         raise AssertionError(f"unexpected subscription: {name}")
 
+
+@pytest.mark.asyncio
+async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypatch):
+    """Verify the bounded target-query subscription contract."""
+    fake_subscription = _MMSQuerySubscription()
     monkeypatch.setattr(
-        discovery, "_mymedicalshopper_ddp_subscribe_collect", fake_subscribe_collect
+        discovery,
+        "_mymedicalshopper_ddp_subscribe_collect",
+        fake_subscription,
     )
-    source_dict = {
-        "metadata_json": {
-            "raw": {
-                "target_payer_query": "Example Packaging Inc",
-                "query_expansion_source": True,
-            }
-        }
-    }
 
     employers = await discovery._mymedicalshopper_entity_employers(
         object(),
-        source_record=source_dict,
+        source_record=_MMS_QUERY_SOURCE,
         entity_slug="example-tpa",
         resolver={"page_size": 20},
         timeout_seconds=5,
@@ -7493,7 +7457,7 @@ async def test_mymedicalshopper_entity_employers_searches_target_query(monkeypat
         }
     ]
     info_call_by_name = next(
-        call for call in calls if call["name"] == "tabular_getInfo"
+        call for call in fake_subscription.calls if call["name"] == "tabular_getInfo"
     )
     assert info_call_by_name["params"][1] == {
         "$and": [
@@ -12735,127 +12699,133 @@ async def test_pc_resolver_file_list_wrapper(
     assert crawl_target.metadata["target_file_type"] == "in-network"
 
 
-@pytest.mark.asyncio
-async def test_resolve_payercompass_mrf_enriches_plans_from_index_zip(monkeypatch):
-    """Verify this source-discovery regression contract."""
-    catalog_source_dict = {
-        "source_id": "source_1",
-        "payer_id": "payer_1",
-        "display_name": "PayerCompass Plan",
+_PAYERCOMPASS_SOURCE = {
+    "source_id": "source_1",
+    "payer_id": "payer_1",
+    "display_name": "PayerCompass Plan",
+}
+_PAYERCOMPASS_RESOLVER = {
+    "type": "payercompass_mrf",
+    "download_path": "/api/File/Download",
+    "max_timeframes": 2,
+}
+_PAYERCOMPASS_STRUCTURE = {
+    "mrfConfig": {
+        "timeFrames": [
+            {
+                "id": "2026-06-01_2",
+                "name": "June 01, 2026",
+                "fileCount": 1,
+                "fileType": 2,
+            },
+            {
+                "id": "2026-06-01_1",
+                "name": "June 01, 2026",
+                "fileCount": 1,
+                "fileType": 1,
+            },
+        ]
     }
-    resolver_config_dict = {
-        "type": "payercompass_mrf",
-        "download_path": "/api/File/Download",
-        "max_timeframes": 2,
-    }
-    structure_response_dict = {
-        "mrfConfig": {
-            "timeFrames": [
-                {
-                    "id": "2026-06-01_2",
-                    "name": "June 01, 2026",
-                    "fileCount": 1,
-                    "fileType": 2,
-                },
-                {
-                    "id": "2026-06-01_1",
-                    "name": "June 01, 2026",
-                    "fileCount": 1,
-                    "fileType": 1,
-                },
-            ]
+}
+_PAYERCOMPASS_FILES = {
+    "2026-06-01_2": [
+        {
+            "id": "index-file",
+            "name": "2026-06-01_example_index.json.zip",
+            "size": "8.97 KB",
         }
-    }
-    files_by_timeframe = {
-        "2026-06-01_2": [
-            {
-                "id": "index-file",
-                "name": "2026-06-01_example_index.json.zip",
-                "size": "8.97 KB",
-            }
-        ],
-        "2026-06-01_1": [
-            {
-                "id": "inn-file",
-                "name": (
-                    "2026-06-01_example_11111111-2222-3333-4444-555555555555_"
-                    "in-network-rates.json.zip"
-                ),
-                "size": "25.85 MB",
-            }
-        ],
-    }
-    index_toc_dict = {
-        "reporting_entity_name": "Example TPA",
-        "reporting_entity_type": "third_party_administrator",
-        "reporting_structure": [
-            {
-                "reporting_plans": [
-                    {
-                        "plan_name": "Acme Health Plan",
-                        "plan_id_type": "EIN",
-                        "plan_id": "123456789",
-                        "plan_market_type": "group",
-                    }
-                ],
-                "in_network_files": [
-                    {
-                        "location": (
-                            "https://example.mrf.payercompass.com/file/get?name="
-                            "2026-06-01_example_11111111-2222-3333-4444-"
-                            "555555555555_in-network-rates.json.zip"
-                        )
-                    }
-                ],
-            },
-            {
-                "reporting_plans": [
-                    {
-                        "plan_name": "Beta Health Plan",
-                        "plan_id_type": "EIN",
-                        "plan_id": "987654321",
-                        "plan_market_type": "group",
-                    }
-                ],
-                "in_network_files": [
-                    {
-                        "location": (
-                            "https://example.mrf.payercompass.com/file/get?name="
-                            "2026-06-01_example_11111111-2222-3333-4444-"
-                            "555555555555_in-network-rates.json.zip"
-                        )
-                    }
-                ],
-            },
-        ],
-    }
-    fetch_calls = []
+    ],
+    "2026-06-01_1": [
+        {
+            "id": "inn-file",
+            "name": (
+                "2026-06-01_example_11111111-2222-3333-4444-555555555555_"
+                "in-network-rates.json.zip"
+            ),
+            "size": "25.85 MB",
+        }
+    ],
+}
+_PAYERCOMPASS_INDEX = {
+    "reporting_entity_name": "Example TPA",
+    "reporting_entity_type": "third_party_administrator",
+    "reporting_structure": [
+        {
+            "reporting_plans": [
+                {
+                    "plan_name": "Acme Health Plan",
+                    "plan_id_type": "EIN",
+                    "plan_id": "123456789",
+                    "plan_market_type": "group",
+                }
+            ],
+            "in_network_files": [
+                {
+                    "location": (
+                        "https://example.mrf.payercompass.com/file/get?name="
+                        "2026-06-01_example_11111111-2222-3333-4444-"
+                        "555555555555_in-network-rates.json.zip"
+                    )
+                }
+            ],
+        },
+        {
+            "reporting_plans": [
+                {
+                    "plan_name": "Beta Health Plan",
+                    "plan_id_type": "EIN",
+                    "plan_id": "987654321",
+                    "plan_market_type": "group",
+                }
+            ],
+            "in_network_files": [
+                {
+                    "location": (
+                        "https://example.mrf.payercompass.com/file/get?name="
+                        "2026-06-01_example_11111111-2222-3333-4444-"
+                        "555555555555_in-network-rates.json.zip"
+                    )
+                }
+            ],
+        },
+    ],
+}
 
-    async def fake_post_json(url, payload, **_kwargs):
+
+class _PayerCompassFixture:
+    def __init__(self):
+        self.fetch_calls = []
+
+    async def post_json(self, url, payload, **_kwargs):
         assert url == "https://example.mrf.payercompass.com/api/Home/GetStructureInfo"
         assert payload == {}
-        return structure_response_dict
+        return _PAYERCOMPASS_STRUCTURE
 
-    async def fake_post_json_value(url, payload, **_kwargs):
+    async def post_json_value(self, url, payload, **_kwargs):
         assert url == "https://example.mrf.payercompass.com/api/File/List"
-        return files_by_timeframe[payload["timeFrameId"]]
+        return _PAYERCOMPASS_FILES[payload["timeFrameId"]]
 
-    async def fake_fetch_zip_json_values(url, **_kwargs):
-        fetch_calls.append(url)
-        return [("2026-06-01_example_index.json", index_toc_dict)]
+    async def fetch_zip_json_values(self, url, **_kwargs):
+        self.fetch_calls.append(url)
+        return [("2026-06-01_example_index.json", _PAYERCOMPASS_INDEX)]
 
-    monkeypatch.setattr(discovery, "_post_json", fake_post_json)
-    monkeypatch.setattr(discovery, "_post_json_value", fake_post_json_value)
-    monkeypatch.setattr(discovery, "_fetch_zip_json_values", fake_fetch_zip_json_values)
 
+@pytest.mark.asyncio
+async def test_resolve_payercompass_mrf_enriches_plans_from_index_zip(monkeypatch):
+    fixture = _PayerCompassFixture()
+    monkeypatch.setattr(discovery, "_post_json", fixture.post_json)
+    monkeypatch.setattr(discovery, "_post_json_value", fixture.post_json_value)
+    monkeypatch.setattr(
+        discovery, "_fetch_zip_json_values", fixture.fetch_zip_json_values
+    )
     resolved_targets = await discovery._resolve_payercompass_mrf(
-        catalog_source_dict,
+        _PAYERCOMPASS_SOURCE,
         "https://example.mrf.payercompass.com/",
-        resolver_config_dict,
+        _PAYERCOMPASS_RESOLVER,
         None,
     )
 
-    assert fetch_calls == [
+    assert fixture.fetch_calls == [
         "https://example.mrf.payercompass.com/api/File/Download?Id=index-file"
     ]
     index_target, in_network_target = resolved_targets
@@ -14078,15 +14048,14 @@ async def test_source_payer_query_filters_before_candidate_limit(monkeypatch):
     assert outcome_by_field["sources"] in {1}
 
 
-@pytest.mark.asyncio
-async def test_direct_discovery_run_emits_visible_state(monkeypatch):
-    """Verify the source-discovery progress and persistence contract."""
-    persisted_batches = []
-    events = []
-    progress = []
-    flush_timeouts = []
+class _DirectDiscoveryHarness:
+    def __init__(self):
+        self.persisted_batches = []
+        self.events = []
+        self.progress = []
+        self.flush_timeouts = []
 
-    async def fake_load_candidates(_provider, *, test_mode, limit):
+    async def load_candidates(self, _provider, *, test_mode, limit):
         assert test_mode is True
         assert limit in {1}
         return [
@@ -14098,23 +14067,23 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
             )
         ]
 
-    async def fake_push_objects(row_dicts, model, *, rewrite, use_copy):
-        persisted_batches.append((model, row_dicts, rewrite, use_copy))
+    async def push_objects(self, row_dicts, model, *, rewrite, use_copy):
+        self.persisted_batches.append((model, row_dicts, rewrite, use_copy))
 
-    async def fake_store_candidates(_candidates, *, discovery_run_id):
+    async def store_candidates(self, _candidates, *, discovery_run_id):
         assert discovery_run_id.startswith("mrfcrawl_")
         return (
             [{"payer_id": "payer_1"}],
             [{"source_id": "source_1", "index_url": "https://example.com/index.json"}],
         )
 
-    async def fake_noop(*_args, **_kwargs):
+    async def noop(self, *_args, **_kwargs):
         return None
 
-    async def fake_flush(timeout_seconds):
-        flush_timeouts.append(timeout_seconds)
+    async def flush(self, timeout_seconds):
+        self.flush_timeouts.append(timeout_seconds)
 
-    async def fake_execute_checkpointed_source_batch(**kwargs):
+    async def execute_source_batch(self, **kwargs):
         assert kwargs["root_run_id"].startswith("mrfcrawl_")
         assert kwargs["owner_run_id"] == kwargs["root_run_id"]
         assert kwargs["source_records"] == [
@@ -14136,54 +14105,63 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
             bytes_streamed=0,
         )
 
-    monkeypatch.setattr(discovery, "_load_candidates", fake_load_candidates)
-    monkeypatch.setattr(discovery, "init_db", fake_noop)
-    monkeypatch.setattr(discovery, "ensure_database", fake_noop)
-    monkeypatch.setattr(discovery, "_ensure_catalog_tables", fake_noop)
-    monkeypatch.setattr(discovery, "push_objects", fake_push_objects)
-    monkeypatch.setattr(discovery, "_store_candidates", fake_store_candidates)
+
+
+@pytest.mark.asyncio
+async def test_direct_discovery_run_emits_visible_state(monkeypatch):
+    """Verify the source-discovery progress and persistence contract."""
+    harness = _DirectDiscoveryHarness()
+    monkeypatch.setattr(discovery, "_load_candidates", harness.load_candidates)
+    monkeypatch.setattr(discovery, "init_db", harness.noop)
+    monkeypatch.setattr(discovery, "ensure_database", harness.noop)
+    monkeypatch.setattr(discovery, "_ensure_catalog_tables", harness.noop)
+    monkeypatch.setattr(discovery, "push_objects", harness.push_objects)
+    monkeypatch.setattr(discovery, "_store_candidates", harness.store_candidates)
     monkeypatch.setattr(
         discovery,
         "execute_checkpointed_source_batch",
-        fake_execute_checkpointed_source_batch,
+        harness.execute_source_batch,
     )
     monkeypatch.setattr(
-        discovery, "enqueue_status_event", lambda payload: events.append(payload)
+        discovery, "enqueue_status_event", lambda payload: harness.events.append(payload)
     )
     monkeypatch.setattr(
-        discovery, "enqueue_live_progress", lambda **payload: progress.append(payload)
+        discovery,
+        "enqueue_live_progress",
+        lambda **payload: harness.progress.append(payload),
     )
-    monkeypatch.setattr(discovery, "flush_status_events", fake_flush)
+    monkeypatch.setattr(discovery, "flush_status_events", harness.flush)
 
     discovery_summary = await discovery.main(test_mode=True, provider="master-list", limit=1)
 
     control_run_id = discovery_summary["crawl_run_id"]
     crawl_rows = [
         row_batch[0]
-        for model, row_batch, _rewrite, _use_copy in persisted_batches
+        for model, row_batch, _rewrite, _use_copy in harness.persisted_batches
         if model is discovery.MRFCrawlRun
     ]
     assert control_run_id.startswith("mrfcrawl_")
-    assert [event["status"] for event in events] == ["running", "succeeded"]
-    assert all(event["run_id"] == control_run_id for event in events)
-    assert events[0]["importer"] == "mrf-source-discovery"
-    assert events[0]["triggered_by"] == "direct_cli"
-    assert events[0]["params"]["provider"] == "master-list"
-    assert events[1]["metrics"]["crawl_run_id"] == control_run_id
-    assert events[1]["metrics"]["crawl_status"] == "succeeded"
-    assert events[1]["metrics"]["catalog_export_version"] == 1
-    assert events[1]["metrics"]["process_workers"] == 1
-    assert events[1]["metrics"]["discovery_proof_version"] == 2
-    assert events[1]["metrics"]["source_set_count"] == 1
-    assert events[1]["metrics"]["completed_source_count"] == 1
-    assert events[1]["metrics"]["sources"] in {1}
+    assert [event["status"] for event in harness.events] == ["running", "succeeded"]
+    assert all(event["run_id"] == control_run_id for event in harness.events)
+    assert harness.events[0]["importer"] == "mrf-source-discovery"
+    assert harness.events[0]["triggered_by"] == "direct_cli"
+    assert harness.events[0]["params"]["provider"] == "master-list"
+    metrics = harness.events[1]["metrics"]
+    assert metrics["crawl_run_id"] == control_run_id
+    assert metrics["crawl_status"] == "succeeded"
+    assert metrics["catalog_export_version"] == 1
+    assert metrics["process_workers"] == 1
+    assert metrics["discovery_proof_version"] == 2
+    assert metrics["source_set_count"] == 1
+    assert metrics["completed_source_count"] == 1
+    assert metrics["sources"] in {1}
     assert [crawl_row["run_id"] for crawl_row in crawl_rows] == [control_run_id, control_run_id]
-    assert [progress_update["run_id"] for progress_update in progress] == [
+    assert [progress_update["run_id"] for progress_update in harness.progress] == [
         control_run_id,
         control_run_id,
         control_run_id,
     ]
-    assert flush_timeouts == [1.0]
+    assert harness.flush_timeouts == [1.0]
 
 
 @pytest.mark.asyncio

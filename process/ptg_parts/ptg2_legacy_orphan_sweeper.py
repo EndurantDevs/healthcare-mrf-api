@@ -240,6 +240,43 @@ async def _apply_locked_plan(
     )
 
 
+async def _locked_legacy_sweep_audit(
+    connection: Any,
+    *,
+    schema_name: str,
+    control_schema_name: str,
+    lock_timeout: str,
+    expected_plan_digest: str,
+) -> Any:
+    """Lock the exact authority catalog and return any completed audit."""
+    await lock_legacy_sweep_lifecycle(connection, lock_timeout=lock_timeout)
+    authority_before_lock = await require_legacy_sweep_schema(
+        connection,
+        schema_name=schema_name,
+        control_schema_name=control_schema_name,
+    )
+    await lock_legacy_sweep_authority(
+        connection,
+        schema_name=schema_name,
+        control_schema_name=control_schema_name,
+        lock_timeout=lock_timeout,
+        present_optional_table_names=authority_before_lock.present_optional_table_names,
+        lifecycle_locked=True,
+    )
+    authority_after_lock = await require_legacy_sweep_schema(
+        connection,
+        schema_name=schema_name,
+        control_schema_name=control_schema_name,
+    )
+    if authority_after_lock != authority_before_lock:
+        raise RuntimeError("legacy_sweep_authority_catalog_changed")
+    return await load_legacy_sweep_audit(
+        connection,
+        schema_name=schema_name,
+        plan_digest=expected_plan_digest,
+    )
+
+
 async def execute_legacy_orphan_sweep(
     *,
     expected_plan_digest: str,
@@ -251,40 +288,17 @@ async def execute_legacy_orphan_sweep(
     database: Any = db,
 ) -> LegacySweepExecution:
     """Apply exactly one reviewed plan or prove an exact prior replay."""
-
     _validate_apply_inputs(expected_plan_digest, actor)
     resolved_schema = resolve_ptg2_schema(schema_name)
     resolved_control_schema = _resolve_control_schema(control_schema_name)
     audit_id = legacy_sweep_audit_id(expected_plan_digest)
     async with database.acquire() as connection:
-        await lock_legacy_sweep_lifecycle(
-            connection,
-            lock_timeout=lock_timeout,
-        )
-        authority_before_lock = await require_legacy_sweep_schema(
-            connection,
-            schema_name=resolved_schema,
-            control_schema_name=resolved_control_schema,
-        )
-        await lock_legacy_sweep_authority(
+        existing_audit = await _locked_legacy_sweep_audit(
             connection,
             schema_name=resolved_schema,
             control_schema_name=resolved_control_schema,
             lock_timeout=lock_timeout,
-            present_optional_table_names=authority_before_lock.present_optional_table_names,
-            lifecycle_locked=True,
-        )
-        authority_after_lock = await require_legacy_sweep_schema(
-            connection,
-            schema_name=resolved_schema,
-            control_schema_name=resolved_control_schema,
-        )
-        if authority_after_lock != authority_before_lock:
-            raise RuntimeError("legacy_sweep_authority_catalog_changed")
-        existing_audit = await load_legacy_sweep_audit(
-            connection,
-            schema_name=resolved_schema,
-            plan_digest=expected_plan_digest,
+            expected_plan_digest=expected_plan_digest,
         )
         if existing_audit is not None:
             replay_counts = await verify_applied_audit_state(

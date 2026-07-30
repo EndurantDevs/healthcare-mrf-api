@@ -11,6 +11,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 from pathlib import PurePath
+from typing import Any, Mapping, Sequence
 
 import pytz
 from aiocsv import AsyncDictReader
@@ -841,9 +842,31 @@ async def process_state_attributes(ctx, task):
                 await push_objects(attr_obj_list, myplanattributes)
 
 
+async def _enqueue_attribute_file_group(
+    redis: Any,
+    *,
+    heading: str,
+    job_name: str,
+    files: Sequence[Mapping[str, Any]],
+    test_mode: bool,
+) -> None:
+    """Enqueue one homogeneous attribute source group."""
+    print(heading)
+    for source_file in files:
+        print("Adding: ", source_file)
+        await redis.enqueue_job(
+            job_name,
+            {
+                "url": source_file["url"],
+                "year": source_file["year"],
+                "context": {"test_mode": test_mode},
+            },
+            _queue_name=ATTRIBUTES_QUEUE_NAME,
+        )
+
+
 async def enqueue_attribute_sources(test_mode: bool = False):
     """Queue all configured plan attribute, benefit, and pricing sources."""
-
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
@@ -851,61 +874,19 @@ async def enqueue_attribute_sources(test_mode: bool = False):
         default_queue_name=ATTRIBUTES_QUEUE_NAME,
     )
     source_groups = _attribute_source_groups()
-    attribute_files = _bounded_test_files(source_groups["attributes"], test_mode)
-    state_attribute_files = _bounded_test_files(source_groups["state_attributes"], test_mode)
-    price_files = _bounded_test_files(source_groups["prices"], test_mode)
-    benefits_files = _bounded_test_files(source_groups["benefits"], test_mode)
-
-    print("Starting to process STATE Plan Attribute files..")
-    for file in state_attribute_files:
-        print("Adding: ", file)
-        await redis.enqueue_job(
-            "process_state_attributes",
-            {
-                "url": file["url"],
-                "year": file["year"],
-                "context": {"test_mode": test_mode},
-            },
-            _queue_name=ATTRIBUTES_QUEUE_NAME,
-        )
-
-    print("Starting to process Plan Attribute files..")
-    for file in attribute_files:
-        print("Adding: ", file)
-        await redis.enqueue_job(
-            "process_attributes",
-            {
-                "url": file["url"],
-                "year": file["year"],
-                "context": {"test_mode": test_mode},
-            },
-            _queue_name=ATTRIBUTES_QUEUE_NAME,
-        )
-
-    print("Starting to process Plan Prices files..")
-    for file in price_files:
-        print("Adding: ", file)
-        await redis.enqueue_job(
-            "process_prices",
-            {
-                "url": file["url"],
-                "year": file["year"],
-                "context": {"test_mode": test_mode},
-            },
-            _queue_name=ATTRIBUTES_QUEUE_NAME,
-        )
-
-    print("Starting to process Plan Benefits files..")
-    for file in benefits_files:
-        print("Adding: ", file)
-        await redis.enqueue_job(
-            "process_benefits",
-            {
-                "url": file["url"],
-                "year": file["year"],
-                "context": {"test_mode": test_mode},
-            },
-            _queue_name=ATTRIBUTES_QUEUE_NAME,
+    queue_groups = (
+        ("Starting to process STATE Plan Attribute files..", "process_state_attributes", "state_attributes"),
+        ("Starting to process Plan Attribute files..", "process_attributes", "attributes"),
+        ("Starting to process Plan Prices files..", "process_prices", "prices"),
+        ("Starting to process Plan Benefits files..", "process_benefits", "benefits"),
+    )
+    for heading, job_name, source_group_name in queue_groups:
+        await _enqueue_attribute_file_group(
+            redis,
+            heading=heading,
+            job_name=job_name,
+            files=_bounded_test_files(source_groups[source_group_name], test_mode),
+            test_mode=test_mode,
         )
 
 

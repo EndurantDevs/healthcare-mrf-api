@@ -16,7 +16,7 @@ import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Mapping
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from db.connection import db
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
@@ -1249,6 +1249,50 @@ def _v4_dictionary_ranges(expected_count: int) -> Iterable[tuple[int, int]]:
         )
 
 
+def _validated_dense_dictionary_range_sum(
+    range_summary: Sequence[Any],
+    *,
+    range_start: int,
+    range_end: int,
+) -> int:
+    """Validate one dense dictionary range and return its observed sum."""
+    expected_rows = range_end - range_start
+    if (
+        int(range_summary[0]) != expected_rows
+        or range_summary[1] != range_start
+        or range_summary[2] != range_end - 1
+        or not bool(range_summary[3])
+    ):
+        raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
+    return int(range_summary[4])
+
+
+async def _has_out_of_range_dictionary_key(
+    session: Any,
+    *,
+    schema: str,
+    stage_table: str,
+    key_name: str,
+    expected_count: int,
+) -> bool:
+    """Return whether a dense dictionary stage contains an invalid key."""
+    result = await session.scalar(
+        db.text(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {schema}.{stage_table}
+                 WHERE {key_name} < 0
+                    OR {key_name} >= :expected_count
+                 LIMIT 1
+            )
+            """
+        ),
+        {"expected_count": int(expected_count)},
+    )
+    return bool(result)
+
+
 async def _validate_v4_dictionary_stage(
     session: Any,
     *,
@@ -1285,30 +1329,20 @@ async def _validate_v4_dictionary_stage(
         )
         range_summary = range_summary_result.one()
         expected_rows = range_end - range_start
-        if (
-            int(range_summary[0]) != expected_rows
-            or range_summary[1] != range_start
-            or range_summary[2] != range_end - 1
-            or not bool(range_summary[3])
-        ):
-            raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
-        observed_sum += int(range_summary[4])
+        observed_sum += _validated_dense_dictionary_range_sum(
+            range_summary,
+            range_start=range_start,
+            range_end=range_end,
+        )
         if progress_callback is not None:
             progress_callback("validated_dictionary_rows", expected_rows)
             progress_callback("publish_batches", 1)
-    has_out_of_range_key = await session.scalar(
-        db.text(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                  FROM {schema}.{stage_table}
-                 WHERE {key_name} < 0
-                    OR {key_name} >= :expected_count
-                 LIMIT 1
-            )
-            """
-        ),
-        {"expected_count": int(stage.expected_count)},
+    has_out_of_range_key = await _has_out_of_range_dictionary_key(
+        session,
+        schema=schema,
+        stage_table=stage_table,
+        key_name=key_name,
+        expected_count=stage.expected_count,
     )
     if bool(has_out_of_range_key) or (
         stage.expected_sum is not None

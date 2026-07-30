@@ -1842,6 +1842,11 @@ def _install_reviewed_activation_readers(
         "verify_held_candidate_attestation_in_transaction",
         verify,
     )
+    monkeypatch.setattr(
+        source_pointers,
+        "completed_reviewed_activation",
+        AsyncMock(return_value=None),
+    )
 
 
 def _install_reviewed_activation_writers(
@@ -1875,6 +1880,11 @@ def _install_reviewed_activation_writers(
         "consume_candidate_audit_attestation_in_transaction",
         consume,
     )
+    monkeypatch.setattr(
+        source_pointers,
+        "pin_reviewed_activation_predecessor",
+        lambda _session, **_kwargs: record_event("pin"),
+    )
 
 
 def _assert_reviewed_activation(
@@ -1892,6 +1902,7 @@ def _assert_reviewed_activation(
         "lock",
         "candidate",
         "clock",
+        "pin",
         "verify",
         "source_cas",
         "publish",
@@ -1903,6 +1914,8 @@ def _assert_reviewed_activation(
     assert verification_calls[0]["expected_attestation_digest"] == approval_digest
     assert consumption_calls[0]["activation_intent"] == "audit_only"
     assert consumption_calls[0]["expected_attestation_digest"] == approval_digest
+    assert activation_result["rollback_owner_id"] == "activation-operation"
+    assert activation_result["idempotent"] is False
 
 
 def test_strict_candidate_activation_verifies_and_consumes_attestation_atomically(monkeypatch):
@@ -1943,6 +1956,7 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
             snapshot_id="snap_new",
             expected_current_snapshot_id="snap_old",
             expected_audit_only_attestation_digest=approval_digest,
+            rollback_owner_id="activation-operation",
         )
     )
 
