@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from unittest.mock import AsyncMock
 
 import pytest
@@ -72,12 +71,165 @@ async def test_direct_candidate_projection_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_direct_selector_returns_empty_without_rate_or_graph_reads(
+async def test_direct_candidate_projection_accepts_sealed_candidate_scope(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_members",
+        AsyncMock(return_value={1: (7, 8), 2: (8,)}),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        AsyncMock(return_value={7: (3, 1), 8: (3, 2)}),
+    )
+
+    assert await serving._v4_direct_set_candidates(
+        object(),
+        snapshot_key=17,
+        provider_set_keys=(1, 2),
+        candidate_npi_keys=(1, 2, 3),
+    ) == {1: (1, 2, 3), 2: (2, 3)}
+
+
+def test_direct_prefix_metadata_rejects_dictionary_key_drift() -> None:
+    provider_set_id = _provider_set_id(1)
+    metadata_by_id = {
+        provider_set_id: serving._ProviderSetGraphMetadata(
+            provider_set_key=2,
+            provider_count=1,
+        )
+    }
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="provider-set keys are inconsistent",
+    ):
+        serving._v4_direct_prefix_metadata(
+            {1: provider_set_id},
+            metadata_by_id,
+        )
+
+
+def test_direct_prefix_metadata_rejects_rate_cardinality_drift() -> None:
+    metadata_by_key = {
+        1: serving._ProviderSetGraphMetadata(
+            provider_set_key=1,
+            provider_count=1,
+        )
+    }
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="rate provider count is inconsistent",
+    ):
+        serving._validate_direct_provider_counts(
+            [{**_rate_row(1), "provider_count": 2}],
+            metadata_by_key,
+        )
+
+
+def test_direct_prefix_metadata_rejects_declared_prefix_drift() -> None:
+    metadata_by_key = {
+        1: serving._ProviderSetGraphMetadata(
+            provider_set_key=1,
+            provider_count=1,
+            prefix_member_count=1,
+            prefix_member_digest=None,
+        )
+    }
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="prefix count is inconsistent",
+    ):
+        serving._v4_direct_expected_prefix_counts(metadata_by_key, 201)
+
+
+@pytest.mark.asyncio
+async def test_direct_prefix_metadata_skips_relation_without_overrides(
+    monkeypatch,
+) -> None:
+    provider_set_id = _provider_set_id(1)
+    metadata_by_id = {
+        provider_set_id: serving._ProviderSetGraphMetadata(
+            provider_set_key=1,
+            provider_count=1,
+        )
+    }
+    prefix_reader = AsyncMock()
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(return_value=metadata_by_id),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_ordered_npi_prefix_overrides",
+        prefix_reader,
+    )
+
+    assert (
+        await serving._v4_direct_ordered_set_prefixes(
+            object(),
+            _tables(None),
+            [_rate_row(1)],
+            {1: provider_set_id},
+            (1,),
+        )
+        == {}
+    )
+    prefix_reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_prefix_metadata_requires_every_override_owner(
+    monkeypatch,
+) -> None:
+    provider_set_id = _provider_set_id(1)
+    metadata_by_id = {
+        provider_set_id: serving._ProviderSetGraphMetadata(
+            provider_set_key=1,
+            provider_count=1,
+            prefix_member_count=1,
+            prefix_member_digest=serving._v4_npi_prefix_digest((1,)),
+        )
+    }
+    monkeypatch.setattr(
+        serving,
+        "_provider_set_metadata_for_ids",
+        AsyncMock(return_value=metadata_by_id),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_ordered_npi_prefix_overrides",
+        AsyncMock(return_value={}),
+    )
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="prefix relation is incomplete",
+    ):
+        await serving._v4_direct_ordered_set_prefixes(
+            object(),
+            _tables(None),
+            [_rate_row(1)],
+            {1: provider_set_id},
+            (1,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_direct_companion_binding_returns_empty_without_hot_reads(
+    monkeypatch,
+) -> None:
+    """A zero-match CMC binding must not spend the 0L binding's graph budget."""
+
     projection_manifest, candidates = _projection_fixture_for((), {})
     rate_reader = AsyncMock()
     graph_reader = AsyncMock()
+    prefix_reader = AsyncMock()
     monkeypatch.setattr(
         serving,
         "load_v4_inferred_taxonomy_candidates",
@@ -92,6 +244,11 @@ async def test_direct_selector_returns_empty_without_rate_or_graph_reads(
         serving,
         "_v4_direct_set_candidates",
         graph_reader,
+    )
+    monkeypatch.setattr(
+        serving,
+        "_v4_direct_ordered_set_prefixes",
+        prefix_reader,
     )
 
     selection = await serving._select_v4_taxonomy_expansion(
@@ -112,6 +269,7 @@ async def test_direct_selector_returns_empty_without_rate_or_graph_reads(
     assert selection.exhausted is True
     rate_reader.assert_not_awaited()
     graph_reader.assert_not_awaited()
+    prefix_reader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -161,171 +319,6 @@ async def test_direct_selector_rejects_target_above_sealed_prefix_before_io(
     candidate_reader.assert_not_awaited()
     rate_reader.assert_not_awaited()
     graph_reader.assert_not_awaited()
-
-
-@dataclass(frozen=True)
-class _DensePrefixEvidence:
-    merge_calls: list[tuple[int, int, tuple[int, ...] | None]]
-    relation_members: AsyncMock
-    relation_intersections: AsyncMock
-    dictionary_lookup: AsyncMock
-
-
-def _patch_dense_prefix_rates(monkeypatch) -> list[
-    tuple[int, int, tuple[int, ...] | None]
-]:
-    prefix_rows = [_rate_row(provider_set_key) for provider_set_key in range(1, 65)]
-    merge_calls: list[tuple[int, int, tuple[int, ...] | None]] = []
-
-    async def merge_rows(
-        *_args,
-        provider_set_keys,
-        limit,
-        offset,
-        **_kwargs,
-    ):
-        normalized_keys = (
-            None
-            if provider_set_keys is None
-            else tuple(sorted(provider_set_keys))
-        )
-        merge_calls.append((limit, offset, normalized_keys))
-        if normalized_keys is None:
-            return prefix_rows[offset : offset + limit]
-        assert normalized_keys == (1,)
-        return [_rate_row(1)]
-
-    monkeypatch.setattr(
-        serving,
-        "_merge_manifest_code_variant_rows",
-        merge_rows,
-    )
-    return merge_calls
-
-
-def _patch_dense_prefix_providers(monkeypatch, npi_by_key) -> None:
-    monkeypatch.setattr(
-        serving,
-        "_selected_provider_rows_by_set",
-        AsyncMock(
-            return_value={
-                _provider_set_id(1): [
-                    {"npi": npi, "provider_name": f"Provider {npi}"}
-                    for npi in npi_by_key.values()
-                ]
-            }
-        ),
-    )
-
-
-def _patch_dense_prefix_graph(
-    monkeypatch,
-    selected_npi_keys: tuple[int, ...],
-) -> _DensePrefixEvidence:
-    relation_members = AsyncMock(
-        side_effect=lambda *_args, relation, owner_keys, **_kwargs: {
-            owner_key: ((7,) if owner_key == 1 else ())
-            for owner_key in owner_keys
-        }
-        if relation == "set_groups_direct"
-        else (_ for _ in ()).throw(AssertionError(relation))
-    )
-    relation_intersections = AsyncMock(
-        side_effect=lambda *_args, relation, owner_keys, **_kwargs: {
-            owner_key: selected_npi_keys for owner_key in owner_keys
-        }
-        if relation == "group_npis_exact"
-        else (_ for _ in ()).throw(AssertionError(relation))
-    )
-    npi_by_key = {
-        npi_key: 1_000_000_000 + npi_key for npi_key in selected_npi_keys
-    }
-    membership_keys_by_npi = {
-        npi: (1,) for npi in npi_by_key.values()
-    }
-    monkeypatch.setattr(
-        serving,
-        "lookup_v4_relation_members",
-        relation_members,
-    )
-    monkeypatch.setattr(
-        serving,
-        "lookup_v4_relation_intersections",
-        relation_intersections,
-    )
-    selected_dictionary_lookup = AsyncMock(return_value=npi_by_key)
-    monkeypatch.setattr(
-        serving,
-        "v4_npi_values_for_keys",
-        selected_dictionary_lookup,
-    )
-    monkeypatch.setattr(
-        serving,
-        "_v4_sets_by_npi",
-        AsyncMock(return_value=membership_keys_by_npi),
-    )
-    _patch_dense_prefix_providers(monkeypatch, npi_by_key)
-    return _DensePrefixEvidence(
-        merge_calls=_patch_dense_prefix_rates(monkeypatch),
-        relation_members=relation_members,
-        relation_intersections=relation_intersections,
-        dictionary_lookup=selected_dictionary_lookup,
-    )
-
-
-@pytest.mark.asyncio
-async def test_direct_selector_proves_dense_code_page_from_first_prefix(
-    monkeypatch,
-) -> None:
-    """A broad code reads one page, then completes only selected providers."""
-
-    selected_npi_keys = tuple(range(1, 26))
-    projection_manifest, candidates = _projection_fixture_for(
-        selected_npi_keys,
-        {},
-    )
-    monkeypatch.setattr(
-        serving,
-        "load_v4_inferred_taxonomy_candidates",
-        AsyncMock(return_value=candidates),
-    )
-    evidence = _patch_dense_prefix_graph(monkeypatch, selected_npi_keys)
-
-    selection = await serving._select_v4_taxonomy_expansion(
-        object(),
-        _tables(projection_manifest),
-        code_rows=[{"code_key": 4, "rate_count": 31_916}],
-        args={"code_system": "CPT", "code": "70553"},
-        snapshot_id="snapshot",
-        source_trace_set_hash=None,
-        network_names=[],
-        target_count=25,
-        descending=False,
-        projection_manifest=projection_manifest,
-        projection_rule=_projection_rule(projection_manifest),
-    )
-
-    assert selection.total_lower_bound == 25
-    assert selection.exhausted is False
-    assert [
-        serving_row["_ptg_provider_set_key"]
-        for serving_row in selection.row_data
-    ] == [1]
-    assert evidence.merge_calls == [(64, 0, None), (6_637, 0, (1,))]
-    assert evidence.dictionary_lookup.await_args.kwargs["npi_keys"] == (
-        selected_npi_keys
-    )
-    assert evidence.relation_members.await_args.kwargs["owner_keys"] == tuple(
-        range(1, 65)
-    )
-    assert evidence.relation_intersections.await_args.kwargs == {
-        "snapshot_key": 17,
-        "relation": "group_npis_exact",
-        "owner_keys": (7,),
-        "allowed_member_keys": selected_npi_keys,
-        "schema_name": "mrf",
-        "max_members": None,
-    }
 
 
 @pytest.mark.asyncio
