@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -18,6 +19,64 @@ from process.ptg_parts import snapshot_cleanup
 
 def _hash(value: int) -> bytes:
     return bytes([value]) * 32
+
+
+def _patch_v4_abandonment_pipeline(
+    monkeypatch,
+    *,
+    inventory,
+    final_stats,
+    dense_delete_effect=None,
+):
+    """Replace the bounded pipeline and return its observable async mocks."""
+
+    pipeline_mock_by_name = {
+        "shared_tables": AsyncMock(return_value=True),
+        "map_tables": AsyncMock(return_value=True),
+        "inventory": AsyncMock(return_value=inventory),
+        "queue_batch": AsyncMock(
+            side_effect=lambda _connection, **kwargs: len(
+                kwargs["block_hashes"]
+            )
+        ),
+        "delete_dense": (
+            AsyncMock(side_effect=dense_delete_effect)
+            if dense_delete_effect is not None
+            else AsyncMock(return_value=0)
+        ),
+        "finalize": AsyncMock(return_value=final_stats),
+    }
+    monkeypatch.setattr(
+        shared_gc,
+        "_has_shared_tables",
+        pipeline_mock_by_name["shared_tables"],
+    )
+    monkeypatch.setattr(
+        shared_gc,
+        "_has_v4_map_tables",
+        pipeline_mock_by_name["map_tables"],
+    )
+    monkeypatch.setattr(
+        shared_gc,
+        "_owned_v4_inventory",
+        pipeline_mock_by_name["inventory"],
+    )
+    monkeypatch.setattr(
+        shared_gc,
+        "_queue_owned_v4_candidate_batch",
+        pipeline_mock_by_name["queue_batch"],
+    )
+    monkeypatch.setattr(
+        shared_gc,
+        "_delete_owned_v4_dense_batch",
+        pipeline_mock_by_name["delete_dense"],
+    )
+    monkeypatch.setattr(
+        shared_gc,
+        "_finalize_owned_v4_abandonment",
+        pipeline_mock_by_name["finalize"],
+    )
+    return pipeline_mock_by_name
 
 
 def test_shared_schema_requires_all_migration_owned_lifecycle_tables():
@@ -60,25 +119,27 @@ def test_cleanup_recognizes_current_and_legacy_shared_generations_only():
 async def test_owned_v4_abandonment_acquires_connection_without_executor(
     monkeypatch,
 ):
-    """The convenience entry point must run the guarded path on one lease."""
+    """The convenience entry point commits each bounded cleanup step."""
 
     connection = object()
     expected = shared_gc.PTG2SharedLayoutGCStats(logical_layout_count=1)
+    acquired_connections: list[object] = []
 
     @asynccontextmanager
     async def acquire():
+        acquired_connections.append(connection)
         yield connection
 
-    shared_tables = AsyncMock(return_value=True)
-    map_tables = AsyncMock(return_value=True)
-    abandon = AsyncMock(return_value=expected)
+    inventory = shared_gc._OwnedV4AbandonmentInventory(
+        block_hashes=(),
+        stored_bytes=0,
+        abandonment_token="abandon-token",
+    )
     monkeypatch.setattr(shared_gc.db, "acquire", acquire)
-    monkeypatch.setattr(shared_gc, "_has_shared_tables", shared_tables)
-    monkeypatch.setattr(shared_gc, "_has_v4_map_tables", map_tables)
-    monkeypatch.setattr(
-        shared_gc,
-        "_abandon_owned_v4_layout_ready",
-        abandon,
+    pipeline_mock_by_name = _patch_v4_abandonment_pipeline(
+        monkeypatch,
+        inventory=inventory,
+        final_stats=expected,
     )
 
     observed = await shared_gc.abandon_owned_v4_layout(
@@ -89,19 +150,155 @@ async def test_owned_v4_abandonment_acquires_connection_without_executor(
     )
 
     assert observed is expected
-    shared_tables.assert_awaited_once_with(
+    assert len(acquired_connections) == len(shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES) + 2
+    pipeline_mock_by_name["shared_tables"].assert_awaited_once_with(
         connection,
         "mrf",
         require_shared=True,
     )
-    map_tables.assert_awaited_once_with(connection, "mrf")
-    abandon.assert_awaited_once_with(
+    pipeline_mock_by_name["map_tables"].assert_awaited_once_with(connection, "mrf")
+    pipeline_mock_by_name["inventory"].assert_awaited_once()
+    context = pipeline_mock_by_name["inventory"].await_args.kwargs["context"]
+    assert context.schema_name == "mrf"
+    assert context.snapshot_key == 17
+    assert context.build_token == "build-token"
+    assert context.batch_rows == shared_gc.PTG2_V4_ABANDONMENT_BATCH_ROWS_DEFAULT
+    assert pipeline_mock_by_name["delete_dense"].await_count == len(
+        shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES
+    )
+    pipeline_mock_by_name["finalize"].assert_awaited_once_with(
         connection,
+        context=context,
+        inventory=inventory,
+    )
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_abandonment_reports_bounded_work(monkeypatch):
+    """Progress reports only committed candidate, dense, and layout work."""
+
+    inventory = shared_gc._OwnedV4AbandonmentInventory(
+        block_hashes=(_hash(1), _hash(2), _hash(3)),
+        stored_bytes=60,
+        abandonment_token="abandon-token",
+    )
+    progress: list[tuple[str, int]] = []
+    dense_deletes = iter((2, 1, *(0 for _ in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES)))
+    expected = shared_gc.PTG2SharedLayoutGCStats(
+        logical_layout_count=1,
+        candidate_hash_count=3,
+        stored_bytes=60,
+    )
+    pipeline_mock_by_name = _patch_v4_abandonment_pipeline(
+        monkeypatch,
+        inventory=inventory,
+        final_stats=expected,
+        dense_delete_effect=lambda _connection, **_kwargs: next(
+            dense_deletes
+        ),
+    )
+
+    observed = await shared_gc.abandon_owned_v4_layout(
         schema_name="mrf",
         snapshot_key=17,
         build_token="build-token",
-        grace_seconds=23,
+        executor=object(),
+        progress_callback=lambda metric, amount: progress.append(
+            (metric, amount)
+        ),
+        options=shared_gc.PTG2V4AbandonmentOptions(
+            batch_rows=2,
+            timeout_seconds=5,
+            monotonic=lambda: 100.0,
+        ),
     )
+
+    assert observed == expected
+    assert pipeline_mock_by_name["queue_batch"].await_count == 2
+    assert progress == [
+        ("candidate_hashes", 2),
+        ("candidate_hashes", 1),
+        ("dense_rows", 2),
+        ("dense_rows", 1),
+        *(
+            ("dense_tables", 1)
+            for _ in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES
+        ),
+        ("layouts", 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_abandonment_cancellation_stops_after_committed_batch(
+    monkeypatch,
+):
+    """Cancellation after progress leaves only the completed batch committed."""
+
+    connection = object()
+    committed_connections: list[object] = []
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+        committed_connections.append(connection)
+
+    inventory = shared_gc._OwnedV4AbandonmentInventory(
+        block_hashes=(_hash(1), _hash(2), _hash(3)),
+        stored_bytes=60,
+        abandonment_token="abandon-token",
+    )
+    monkeypatch.setattr(shared_gc.db, "acquire", acquire)
+    pipeline_mock_by_name = _patch_v4_abandonment_pipeline(
+        monkeypatch,
+        inventory=inventory,
+        final_stats=shared_gc.PTG2SharedLayoutGCStats(),
+    )
+
+    def cancel_after_first_batch(metric: str, _amount: int) -> None:
+        assert metric == "candidate_hashes"
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await shared_gc.abandon_owned_v4_layout(
+            schema_name="mrf",
+            snapshot_key=17,
+            build_token="build-token",
+            progress_callback=cancel_after_first_batch,
+            options=shared_gc.PTG2V4AbandonmentOptions(batch_rows=2),
+        )
+
+    assert len(committed_connections) == 2
+    assert pipeline_mock_by_name["queue_batch"].await_count == 1
+    pipeline_mock_by_name["delete_dense"].assert_not_awaited()
+    pipeline_mock_by_name["finalize"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_owned_v4_abandonment_fails_closed_at_time_budget(monkeypatch):
+    load_inventory = AsyncMock()
+    monkeypatch.setattr(
+        shared_gc,
+        "_owned_v4_inventory",
+        load_inventory,
+    )
+    observed_times = iter((10.0, 12.0))
+
+    with pytest.raises(
+        shared_gc.PTG2SharedLayoutAbandonmentDeferred,
+        match="time budget",
+    ):
+        await shared_gc.abandon_owned_v4_layout(
+            schema_name="mrf",
+            snapshot_key=17,
+            build_token="build-token",
+            executor=object(),
+            options=shared_gc.PTG2V4AbandonmentOptions(
+                timeout_seconds=1,
+                monotonic=lambda: next(observed_times),
+            ),
+        )
+
+    load_inventory.assert_not_awaited()
 
 
 class _SharedGCExecutor:
@@ -1094,6 +1291,322 @@ async def _assert_gc_fixture_storage(database: Database, schema: str) -> None:
         assert await connection.scalar(
             f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
         ) == 0
+
+
+_V4_ABANDONMENT_TABLE_TEMPLATES = (
+    """
+    CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
+        snapshot_key bigint PRIMARY KEY,
+        generation varchar(32) NOT NULL,
+        state varchar(16) NOT NULL,
+        build_token varchar(96) NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v3_layout_fingerprint (
+        semantic_fingerprint bytea PRIMARY KEY,
+        snapshot_key bigint NOT NULL
+            REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
+        snapshot_id varchar(96) PRIMARY KEY,
+        snapshot_key bigint NOT NULL
+            REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key)
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v3_block (
+        block_hash bytea PRIMARY KEY,
+        format_version smallint NOT NULL,
+        object_kind varchar(64) NOT NULL,
+        codec varchar(16) NOT NULL,
+        entry_count bigint NOT NULL,
+        raw_byte_count bigint NOT NULL,
+        stored_byte_count bigint NOT NULL,
+        payload bytea NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v3_snapshot_block (
+        snapshot_key bigint NOT NULL
+            REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key)
+            ON DELETE CASCADE,
+        object_kind varchar(64) NOT NULL,
+        block_key bigint NOT NULL,
+        fragment_no integer NOT NULL,
+        entry_count bigint NOT NULL,
+        block_hash bytea NOT NULL
+            REFERENCES {schema}.ptg2_v3_block(block_hash),
+        PRIMARY KEY (snapshot_key, object_kind, block_key, fragment_no)
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v3_gc_candidate (
+        block_hash bytea PRIMARY KEY
+            REFERENCES {schema}.ptg2_v3_block(block_hash)
+            ON DELETE CASCADE,
+        eligible_at timestamptz NOT NULL,
+        queued_at timestamptz NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v4_snapshot_map_root (
+        snapshot_key bigint PRIMARY KEY
+            REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key)
+            ON DELETE CASCADE,
+        state varchar(16) NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_v4_snapshot_map_pack (
+        snapshot_key bigint NOT NULL
+            REFERENCES {schema}.ptg2_v4_snapshot_map_root(snapshot_key)
+            ON DELETE CASCADE,
+        object_kind varchar(64) NOT NULL,
+        pack_no integer NOT NULL,
+        first_block_key bigint NOT NULL,
+        first_fragment_no integer NOT NULL,
+        last_block_key bigint NOT NULL,
+        last_fragment_no integer NOT NULL,
+        coordinate_count bigint NOT NULL,
+        entry_count bigint NOT NULL,
+        map_block_hash bytea NOT NULL
+            REFERENCES {schema}.ptg2_v3_block(block_hash),
+        PRIMARY KEY (snapshot_key, object_kind, pack_no)
+    )
+    """,
+)
+_V4_ABANDONMENT_RESERVED_TABLES = frozenset(
+    {
+        "ptg2_v3_snapshot_layout",
+        "ptg2_v3_layout_fingerprint",
+        "ptg2_v3_snapshot_binding",
+        "ptg2_v3_block",
+        "ptg2_v3_snapshot_block",
+        "ptg2_v3_gc_candidate",
+    }
+)
+
+
+async def _create_v4_abandonment_schema(
+    connection,
+    schema: str,
+) -> None:
+    """Create the isolated lifecycle subset used by the abandonment proof."""
+
+    for table_template in _V4_ABANDONMENT_TABLE_TEMPLATES[:6]:
+        await connection.status(table_template.format(schema=schema))
+    for table_name in (
+        set(shared_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES)
+        - _V4_ABANDONMENT_RESERVED_TABLES
+    ):
+        await connection.status(
+            f'CREATE TABLE {schema}."{table_name}" (snapshot_key bigint)'
+        )
+    for table_template in _V4_ABANDONMENT_TABLE_TEMPLATES[6:]:
+        await connection.status(table_template.format(schema=schema))
+
+
+async def _insert_v4_abandonment_fixture(
+    connection,
+    schema: str,
+    *,
+    build_token: str,
+) -> tuple[bytes, ...]:
+    """Populate one owned V4 layout with three mapped and dense records."""
+
+    block_hashes = tuple(
+        _hash(hash_seed)
+        for hash_seed in (31, 32, 33)
+    )
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_snapshot_layout
+            (snapshot_key, generation, state, build_token)
+        VALUES (77, :generation, 'building', :build_token)
+        """,
+        generation=shared_gc.PTG2_V4_SHARED_GENERATION,
+        build_token=build_token,
+    )
+    await connection.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_layout_fingerprint
+            (semantic_fingerprint, snapshot_key)
+        VALUES (:semantic_fingerprint, 77)
+        """,
+        semantic_fingerprint=_hash(30),
+    )
+    for block_key, block_hash in enumerate(block_hashes):
+        block_payload = bytes([block_key + 1])
+        await connection.status(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_block
+                (block_hash, format_version, object_kind, codec, entry_count,
+                 raw_byte_count, stored_byte_count, payload)
+            VALUES (:block_hash, 2, 'serving', 'none', 1, 1, 1, :payload)
+            """,
+            block_hash=block_hash,
+            payload=block_payload,
+        )
+        await connection.status(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_snapshot_block
+                (snapshot_key, object_kind, block_key, fragment_no,
+                 entry_count, block_hash)
+            VALUES (77, 'serving', :block_key, 0, 1, :block_hash)
+            """,
+            block_key=block_key,
+            block_hash=block_hash,
+        )
+    for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
+        await connection.status(
+            f"""
+            INSERT INTO {schema}."{table_name}" (snapshot_key)
+            VALUES (77), (77), (77)
+            """
+        )
+    return block_hashes
+
+
+async def _assert_partial_v4_abandonment(
+    database: Database,
+    schema: str,
+    *,
+    build_token: str,
+) -> None:
+    """Require a canceled first batch to preserve layout reachability."""
+
+    async with database.acquire() as connection:
+        assert await connection.scalar(
+            f"""
+            SELECT build_token
+              FROM {schema}.ptg2_v3_snapshot_layout
+             WHERE snapshot_key = 77
+            """
+        ) == shared_gc._owned_v4_abandonment_token(build_token)
+        assert await connection.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
+        ) == 2
+        assert await connection.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block"
+        ) == 3
+
+
+async def _assert_completed_v4_abandonment(
+    database: Database,
+    schema: str,
+    block_hashes: tuple[bytes, ...],
+) -> None:
+    """Require resumed cleanup to remove layout edges but retain CAS bytes."""
+
+    async with database.acquire() as connection:
+        for table_name in (
+            "ptg2_v3_snapshot_layout",
+            "ptg2_v3_snapshot_block",
+        ):
+            assert await connection.scalar(
+                f'SELECT COUNT(*) FROM {schema}."{table_name}"'
+            ) == 0
+        assert await connection.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
+        ) == 3
+        assert await connection.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block"
+        ) == 3
+        for table_name in shared_gc.PTG2_V3_DENSE_LAYOUT_TABLES:
+            assert await connection.scalar(
+                f'SELECT COUNT(*) FROM {schema}."{table_name}"'
+            ) == 0
+        retained_records = await connection.all(
+            f"SELECT block_hash FROM {schema}.ptg2_v3_block"
+        )
+        assert {
+            bytes(block_record[0])
+            for block_record in retained_records
+        } == set(block_hashes)
+
+
+def _cancel_after_candidate_batch(metric: str, _amount: int) -> None:
+    """Cancel immediately after one candidate batch reports committed."""
+
+    assert metric == "candidate_hashes"
+    raise asyncio.CancelledError
+
+
+async def _drop_test_schema_and_disconnect(
+    database: Database,
+    schema: str,
+) -> None:
+    """Drop one disposable schema before closing its database pool."""
+
+    try:
+        async with database.acquire() as connection:
+            await connection.status(
+                f"DROP SCHEMA IF EXISTS {schema} CASCADE"
+            )
+    finally:
+        await database.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_v4_abandonment_resumes_after_cancellation(
+    monkeypatch,
+):
+    """A canceled bounded cleanup keeps reachability and resumes exactly."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST=1")
+
+    database = Database()
+    schema_name = f"ptg2_v4_abandon_{uuid.uuid4().hex}"
+    schema = f'"{schema_name}"'
+    build_token = "failed-build-token"
+    await database.connect()
+    monkeypatch.setattr(shared_gc, "db", database)
+    try:
+        async with database.acquire() as connection:
+            await connection.status(f"CREATE SCHEMA {schema}")
+            await _create_v4_abandonment_schema(connection, schema)
+            block_hashes = await _insert_v4_abandonment_fixture(
+                connection,
+                schema,
+                build_token=build_token,
+            )
+
+        with pytest.raises(asyncio.CancelledError):
+            await shared_gc.abandon_owned_v4_layout(
+                schema_name=schema_name,
+                snapshot_key=77,
+                build_token=build_token,
+                grace_seconds=60,
+                progress_callback=_cancel_after_candidate_batch,
+                options=shared_gc.PTG2V4AbandonmentOptions(batch_rows=2),
+            )
+        await _assert_partial_v4_abandonment(
+            database,
+            schema,
+            build_token=build_token,
+        )
+
+        resumed = await shared_gc.abandon_owned_v4_layout(
+            schema_name=schema_name,
+            snapshot_key=77,
+            build_token=build_token,
+            grace_seconds=60,
+            options=shared_gc.PTG2V4AbandonmentOptions(batch_rows=2),
+        )
+
+        assert resumed == shared_gc.PTG2SharedLayoutGCStats(1, 3, 3)
+        await _assert_completed_v4_abandonment(
+            database,
+            schema,
+            block_hashes,
+        )
+    finally:
+        await _drop_test_schema_and_disconnect(database, schema)
 
 
 @pytest.mark.asyncio

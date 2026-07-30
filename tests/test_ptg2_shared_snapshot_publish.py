@@ -939,21 +939,7 @@ async def test_independent_publication_lanes_start_together():
     )
 
 
-@pytest.mark.asyncio
-async def test_finalizer_starts_before_independent_atom_preparation_finishes(
-    monkeypatch,
-    tmp_path,
-):
-    """Start finalization and price publication at their exact dependencies."""
-
-    prepared_price = object()
-    atom_release = asyncio.Event()
-    finalizer_started = asyncio.Event()
-    finalizer_release = asyncio.Event()
-    finalizer_calls = []
-    price_publish_started = asyncio.Event()
-    price_publish_release = asyncio.Event()
-
+def _early_finalizer_callbacks(state, prepared_price):
     async def prepare_price(*, price_key_ready, **_kwargs):
         price_key_ready(
             PreparedSharedPriceKeyMap(
@@ -962,21 +948,29 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
                 price_set_count=3,
             )
         )
-        await atom_release.wait()
+        await state.atom_release.wait()
         return prepared_price
 
     async def run_finalizer(**kwargs):
-        finalizer_calls.append(kwargs)
-        finalizer_started.set()
-        await finalizer_release.wait()
+        state.finalizer_calls.append(kwargs)
+        state.finalizer_started.set()
+        await state.finalizer_release.wait()
         return {"blocks": {}}
 
     async def publish_price(prepared):
         assert prepared is prepared_price
-        price_publish_started.set()
-        await price_publish_release.wait()
+        state.price_publish_started.set()
+        await state.price_publish_release.wait()
         return "published-price"
 
+    return prepare_price, run_finalizer, publish_price
+
+
+def _install_early_finalizer_mocks(monkeypatch, tmp_path, state, prepared_price):
+    prepare_price, run_finalizer, publish_price = _early_finalizer_callbacks(
+        state,
+        prepared_price,
+    )
     monkeypatch.setattr(
         shared_snapshot_publish,
         "prepare_shared_price_artifacts",
@@ -992,6 +986,48 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
         "run_v3_direct_finalizer",
         run_finalizer,
     )
+    return publish_price
+
+
+def _assert_early_finalizer_pipeline(pipeline_output, state, prepared_price):
+    prepared, prepare_seconds, prepared_finalizer, price_publication = (
+        pipeline_output
+    )
+    assert prepared is prepared_price
+    assert prepare_seconds >= 0
+    assert prepared_finalizer.summary == {"blocks": {}}
+    assert prepared_finalizer.price_key_map_export_seconds >= 0
+    assert prepared_finalizer.finalizer_seconds >= 0
+    assert state.finalizer_calls[0]["price_key_map_row_count"] == 3
+    assert state.finalizer_calls[0]["scratch_durability"] == (
+        shared_snapshot_publish.PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY
+    )
+    assert price_publication.publication == "published-price"
+    assert price_publication.publish_seconds >= 0
+
+
+@pytest.mark.asyncio
+async def test_finalizer_starts_before_independent_atom_preparation_finishes(
+    monkeypatch,
+    tmp_path,
+):
+    """Start finalization and price publication at their exact dependencies."""
+
+    prepared_price = object()
+    state = SimpleNamespace(
+        atom_release=asyncio.Event(),
+        finalizer_started=asyncio.Event(),
+        finalizer_release=asyncio.Event(),
+        finalizer_calls=[],
+        price_publish_started=asyncio.Event(),
+        price_publish_release=asyncio.Event(),
+    )
+    publish_price = _install_early_finalizer_mocks(
+        monkeypatch,
+        tmp_path,
+        state,
+        prepared_price,
+    )
 
     pipeline_task = asyncio.create_task(
         shared_snapshot_publish._prepare_price_with_early_finalizer(
@@ -1006,32 +1042,20 @@ async def test_finalizer_starts_before_independent_atom_preparation_finishes(
             publish_prepared_price=publish_price,
         )
     )
-    await asyncio.wait_for(finalizer_started.wait(), timeout=0.5)
-    assert not atom_release.is_set()
+    await asyncio.wait_for(state.finalizer_started.wait(), timeout=0.5)
+    assert not state.atom_release.is_set()
     assert not pipeline_task.done()
 
-    atom_release.set()
-    await asyncio.wait_for(price_publish_started.wait(), timeout=0.5)
-    assert not finalizer_release.is_set()
-    price_publish_release.set()
-    finalizer_release.set()
-    (
-        prepared,
-        prepare_seconds,
-        prepared_finalizer,
-        prepared_price_publication,
-    ) = await pipeline_task
-    assert prepared is prepared_price
-    assert prepare_seconds >= 0
-    assert prepared_finalizer.summary == {"blocks": {}}
-    assert prepared_finalizer.price_key_map_export_seconds >= 0
-    assert prepared_finalizer.finalizer_seconds >= 0
-    assert finalizer_calls[0]["price_key_map_row_count"] == 3
-    assert finalizer_calls[0]["scratch_durability"] == (
-        shared_snapshot_publish.PTG2_V3_EPHEMERAL_SCRATCH_DURABILITY
+    state.atom_release.set()
+    await asyncio.wait_for(state.price_publish_started.wait(), timeout=0.5)
+    assert not state.finalizer_release.is_set()
+    state.price_publish_release.set()
+    state.finalizer_release.set()
+    _assert_early_finalizer_pipeline(
+        await pipeline_task,
+        state,
+        prepared_price,
     )
-    assert prepared_price_publication.publication == "published-price"
-    assert prepared_price_publication.publish_seconds >= 0
 
 
 @pytest.mark.asyncio
@@ -1234,46 +1258,13 @@ def test_authoritative_mapping_summary_rejects_overlapping_lane_kinds():
         _validate_authoritative_mapping_summary(summary, lane, lane)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cancel_during_publication", [False, True])
-async def test_prepared_price_cleanup_survives_repeated_cancellation_on_every_exit(
+def _install_cleanup_cancellation_mocks(
     monkeypatch,
-    cancel_during_publication,
+    transaction,
+    prepare_price,
+    publish_prepared,
+    cleanup_prepared,
 ):
-    """Finish prepared-price cleanup across every cancellation exit path."""
-
-    prepared_price = SimpleNamespace(price_set_count=3)
-    publication_started = asyncio.Event()
-    cleanup_started = asyncio.Event()
-    cleanup_release = asyncio.Event()
-    cleanup_finished = asyncio.Event()
-
-    @asynccontextmanager
-    async def transaction():
-        yield object()
-
-    async def publish_prepared(**_kwargs):
-        publication_started.set()
-        if cancel_during_publication:
-            await asyncio.Future()
-        return object()
-
-    async def cleanup_prepared(observed_prepared):
-        assert observed_prepared is prepared_price
-        cleanup_started.set()
-        await cleanup_release.wait()
-        cleanup_finished.set()
-
-    async def prepare_price(**kwargs):
-        kwargs["price_key_ready"](
-            PreparedSharedPriceKeyMap(
-                schema_name="mrf",
-                price_key_map="price_key_map",
-                price_set_count=3,
-            )
-        )
-        return prepared_price
-
     prepare = AsyncMock(side_effect=prepare_price)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
     monkeypatch.setattr(shared_snapshot_publish.db, "transaction", transaction)
@@ -1312,37 +1303,106 @@ async def test_prepared_price_cleanup_survives_repeated_cancellation_on_every_ex
         "cleanup_prepared_shared_price_artifacts",
         cleanup_prepared,
     )
+    return prepare
 
-    publish_task = asyncio.create_task(
-        shared_snapshot_publish.publish_strict_shared_v3_layout(
-            schema_name="mrf",
-            manifest_stage_table="manifest_stage",
-            reserved_snapshot_key=7,
-            build_token="build-token",
-            expected_coverage_scope_id=b"c" * 32,
-            logical_snapshot_id="snapshot-id",
-            expected_source_identities=(),
-            serving_run_entries=(),
-            code_dictionary_entries=(),
-            provider_set_metadata_entries=(),
-            source_audit_witness_entries=(),
-            expected_raw_source_sha256=(),
-            graph_artifact_entries=(),
-            provider_identifier_quarantine={},
-        )
-    )
-    await asyncio.wait_for(publication_started.wait(), timeout=0.5)
+
+def _strict_shared_layout_arguments():
+    return {
+        "schema_name": "mrf",
+        "manifest_stage_table": "manifest_stage",
+        "reserved_snapshot_key": 7,
+        "build_token": "build-token",
+        "expected_coverage_scope_id": b"c" * 32,
+        "logical_snapshot_id": "snapshot-id",
+        "expected_source_identities": (),
+        "serving_run_entries": (),
+        "code_dictionary_entries": (),
+        "provider_set_metadata_entries": (),
+        "source_audit_witness_entries": (),
+        "expected_raw_source_sha256": (),
+        "graph_artifact_entries": (),
+        "provider_identifier_quarantine": {},
+    }
+
+
+async def _cancel_publisher_after_cleanup_starts(
+    publish_task,
+    state,
+    cancel_during_publication,
+):
+    await asyncio.wait_for(state.publication_started.wait(), timeout=0.5)
     if cancel_during_publication:
         publish_task.cancel()
-    await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+    await asyncio.wait_for(state.cleanup_started.wait(), timeout=0.5)
     publish_task.cancel()
     await asyncio.sleep(0)
     publish_task.cancel()
     await asyncio.sleep(0)
     assert not publish_task.done()
-
-    cleanup_release.set()
+    state.cleanup_release.set()
     with pytest.raises(asyncio.CancelledError):
         await publish_task
-    assert cleanup_finished.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during_publication", [False, True])
+async def test_prepared_price_cleanup_survives_repeated_cancellation_on_every_exit(
+    monkeypatch,
+    cancel_during_publication,
+):
+    """Finish prepared-price cleanup across every cancellation exit path."""
+
+    prepared_price = SimpleNamespace(price_set_count=3)
+    state = SimpleNamespace(
+        publication_started=asyncio.Event(),
+        cleanup_started=asyncio.Event(),
+        cleanup_release=asyncio.Event(),
+        cleanup_finished=asyncio.Event(),
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        yield object()
+
+    async def publish_prepared(**_kwargs):
+        state.publication_started.set()
+        if cancel_during_publication:
+            await asyncio.Future()
+        return object()
+
+    async def cleanup_prepared(observed_prepared):
+        assert observed_prepared is prepared_price
+        state.cleanup_started.set()
+        await state.cleanup_release.wait()
+        state.cleanup_finished.set()
+
+    async def prepare_price(**kwargs):
+        kwargs["price_key_ready"](
+            PreparedSharedPriceKeyMap(
+                schema_name="mrf",
+                price_key_map="price_key_map",
+                price_set_count=3,
+            )
+        )
+        return prepared_price
+
+    prepare = _install_cleanup_cancellation_mocks(
+        monkeypatch,
+        transaction,
+        prepare_price,
+        publish_prepared,
+        cleanup_prepared,
+    )
+
+    publish_task = asyncio.create_task(
+        shared_snapshot_publish.publish_strict_shared_v3_layout(
+            **_strict_shared_layout_arguments()
+        )
+    )
+    await _cancel_publisher_after_cleanup_starts(
+        publish_task,
+        state,
+        cancel_during_publication,
+    )
+    assert state.cleanup_finished.is_set()
     assert prepare.await_args.kwargs["price_set_summary_source_count"] is None

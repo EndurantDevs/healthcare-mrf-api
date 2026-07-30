@@ -215,6 +215,7 @@ from process.ptg_parts.ptg2_shared_finalize import (
     attach_v3_source_run_contract,
 )
 from process.ptg_parts.ptg2_shared_gc import (
+    PTG2SharedLayoutAbandonmentDeferred,
     abandon_owned_v4_layout,
 )
 from process.ptg_parts.ptg2_shared_reuse import (
@@ -3754,6 +3755,7 @@ async def _is_failed_shared_layout_abandoned(
     *,
     build_token: str,
     expected_generation: str = PTG2_V3_SHARED_GENERATION,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> bool | None:
     """Abandon an owned unpublished layout, or defer interrupted cleanup to GC."""
     if shared_layout_reservation is None or shared_layout_reservation.reused:
@@ -3764,6 +3766,7 @@ async def _is_failed_shared_layout_abandoned(
                 abandonment = await abandon_owned_v4_layout(
                     snapshot_key=shared_layout_reservation.snapshot_key,
                     build_token=build_token,
+                    progress_callback=progress_callback,
                 )
                 return abandonment.logical_layout_count == 1
             async with db.transaction() as session:
@@ -3773,6 +3776,12 @@ async def _is_failed_shared_layout_abandoned(
                     snapshot_key=shared_layout_reservation.snapshot_key,
                     build_token=build_token,
                 )
+        except PTG2SharedLayoutAbandonmentDeferred:
+            logger.warning(
+                "Bounded PTG V4 failed-layout cleanup deferred to recurring GC",
+                exc_info=True,
+            )
+            return None
         except Exception:
             if attempt == 2:
                 logger.warning(
@@ -6945,10 +6954,32 @@ async def _main_with_artifact_lease(
                 snapshot_id=snapshot_id,
                 internal_run_id=import_run_id,
             )
+            abandonment_progress_by_metric: dict[str, int] = {}
+
+            def report_abandonment_progress(metric: str, amount: int) -> None:
+                """Project committed bounded cleanup work into live progress."""
+
+                abandonment_progress_by_metric[metric] = (
+                    abandonment_progress_by_metric.get(metric, 0)
+                    + int(amount)
+                )
+                failure_report_by_field[
+                    "shared_layout_abandonment_progress"
+                ] = dict(sorted(abandonment_progress_by_metric.items()))
+                write_live_progress(
+                    phase="failure_cleanup",
+                    pct=99,
+                    message=(
+                        "bounded PTG shared-layout cleanup "
+                        f"{metric}={abandonment_progress_by_metric[metric]}"
+                    ),
+                )
+
             abandoned_layout = await _is_failed_shared_layout_abandoned(
                 shared_layout_reservation,
                 build_token=shared_layout_build_token,
                 expected_generation=shared_storage_generation,
+                progress_callback=report_abandonment_progress,
             )
             if abandoned_layout is not None:
                 failure_report_by_field["shared_layout_abandoned"] = abandoned_layout

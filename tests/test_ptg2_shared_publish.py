@@ -645,6 +645,21 @@ class _SlowSharedBlockSQLDriver:
                     False,
                     False,
                     False,
+                    False,
+                )
+            )
+        if "SUM(staged.entry_count)" in statement_text:
+            batch_size = self.batch_sizes[self.fetch_index - 1]
+            return _OneRowResult(
+                (
+                    batch_size,
+                    batch_size * 2,
+                    batch_size * 10,
+                    batch_size * 7,
+                    ["serving"],
+                    False,
+                    False,
+                    False,
                 )
             )
         return _OneRowResult((0,))
@@ -744,12 +759,13 @@ def test_shared_block_publish_batch_is_bounded_for_dense_stages():
     ("flag_index", "message"),
     (
         (4, "incompatible format version"),
-        (5, "stored content metadata"),
-        (6, "mapping conflicts"),
+        (5, "no payload or durable CAS row"),
+        (6, "stored content metadata"),
+        (7, "mapping conflicts"),
     ),
 )
 def test_batched_stage_summary_rejects_invalid_batch_proof(flag_index, message):
-    aggregate_values = [1, 10, 7, ["serving"], False, False, False]
+    aggregate_values = [1, 10, 7, ["serving"], False, False, False, False]
     aggregate_values[flag_index] = True
     summary = ptg2_shared_publish._BatchedBlockStageSummary()
 
@@ -776,6 +792,57 @@ def test_batched_v4_summary_rejects_invalid_batch_proof(flag_index, message):
 
     with pytest.raises(RuntimeError, match=message):
         summary.add(aggregate_values, [1, 10, 7])
+
+
+@pytest.mark.parametrize(
+    ("flag_index", "message"),
+    (
+        (5, "incompatible format version"),
+        (6, "no payload or durable CAS row"),
+        (7, "stored content metadata"),
+    ),
+)
+def test_shared_block_batch_rejects_invalid_cas_proof(flag_index, message):
+    validation_fields = [1, 1, 1, 1, 1, False, False, False]
+    validation_fields[flag_index] = True
+
+    with pytest.raises(RuntimeError, match=message):
+        ptg2_shared_publish._validate_shared_block_batch(validation_fields)
+
+
+@pytest.mark.parametrize(
+    ("summary", "message"),
+    (
+        (
+            ptg2_shared_publish._BatchedBlockStageSummary(
+                mapping_count=-1,
+                coordinate_count=-1,
+            ),
+            "invalid aggregates",
+        ),
+        (
+            ptg2_shared_publish._BatchedBlockStageSummary(
+                mapping_count=1,
+                unique_block_count=1,
+                coordinate_count=0,
+            ),
+            "mapping conflicts",
+        ),
+    ),
+)
+def test_batched_shared_publication_rejects_invalid_totals(summary, message):
+    with pytest.raises(RuntimeError, match=message):
+        ptg2_shared_publish._validated_batched_stage_publication(summary)
+
+
+def test_batched_v4_publication_rejects_invalid_totals():
+    summary = ptg2_shared_publish._BatchedV4CASStageSummary(
+        staged_row_count=1,
+        unique_block_count=2,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid aggregates"):
+        ptg2_shared_publish._validated_v4_cas_publication(summary)
 
 
 def _assert_slow_shared_block_publication(publication, progress_events, session):
@@ -1038,17 +1105,19 @@ def test_provider_set_metadata_files_reject_invalid_contracts(
 
 
 def _assert_shared_stage_sql(session):
-    block_insert_sql = str(session.execute.await_args_list[0].args[0])
+    lock_sql = str(session.execute.await_args_list[0].args[0])
+    assert "FOR KEY SHARE OF stored" in lock_sql
+    block_insert_sql = str(session.execute.await_args_list[1].args[0])
     assert "NOT EXISTS" in block_insert_sql
     assert "staged.format_version = :format_version" in block_insert_sql
     assert "staged.payload IS NOT NULL" in block_insert_sql
     assert "stored.block_hash = staged.block_hash" in block_insert_sql
     assert "ON CONFLICT (block_hash) DO NOTHING" in block_insert_sql
-    aggregate_sql = str(session.execute.await_args_list[-1].args[0])
+    aggregate_sql = str(session.execute.await_args_list[2].args[0])
     assert "LEFT JOIN" in aggregate_sql
     assert "stored.block_hash IS NULL" in aggregate_sql
     assert "stored.payload" not in aggregate_sql
-    assert "staged.payload" not in aggregate_sql
+    assert "staged.payload IS NULL" in aggregate_sql
     assert "BOOL_OR" in aggregate_sql
     assert "staged.format_version <> :format_version" in aggregate_sql
     assert "stored.format_version <> staged.format_version" in aggregate_sql
@@ -1066,23 +1135,44 @@ def _assert_shared_stage_sql(session):
     format_by_field = {
         "format_version": ptg2_shared_publish.PTG2_V3_SHARED_FORMAT_VERSION
     }
-    assert session.execute.await_args_list[0].args[1] == format_by_field
     assert session.execute.await_args_list[1].args[1] == format_by_field
+    assert session.execute.await_args_list[2].args[1] == format_by_field
+    delete_sql = str(session.execute.await_args_list[3].args[0])
+    assert 'DELETE FROM "mrf".ptg2_v3_gc_candidate' in delete_sql
 
 
-@pytest.mark.asyncio
-async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatch):
-    session = SimpleNamespace(
+def _bounded_stage_session() -> SimpleNamespace:
+    """Return a session with one valid bounded aggregate result."""
+
+    return SimpleNamespace(
         execute=AsyncMock(
             side_effect=[
                 None,
+                None,
                 _OneRowResult(
-                    (3, 2, 30, 20, ["a_kind", "z_kind"], False, False)
+                    (
+                        3,
+                        2,
+                        30,
+                        20,
+                        ["a_kind", "z_kind"],
+                        False,
+                        False,
+                        False,
+                    )
                 ),
+                None,
             ]
         ),
         scalar=AsyncMock(),
     )
+
+
+@pytest.mark.asyncio
+async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatch):
+    """The publication result is built only from bounded SQL aggregates."""
+
+    session = _bounded_stage_session()
 
     @asynccontextmanager
     async def transaction():
@@ -1262,6 +1352,71 @@ async def test_v4_cas_stage_publishes_exact_totals_without_snapshot_mappings(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("aggregate_row", "message"),
+    (
+        (
+            (1, 1, 1, 3, 3, 3, 3, ["serving"], True, False, False),
+            "incompatible format version",
+        ),
+        (
+            (1, 1, 1, 3, 3, 3, 3, ["serving"], False, True, False),
+            "no payload or durable CAS row",
+        ),
+        (
+            (1, 1, 1, 3, 3, 3, 3, ["serving"], False, False, True),
+            "conflicts with stored content metadata",
+        ),
+        (
+            (1, 1, 2, 3, 3, 3, 3, ["serving"], False, False, False),
+            "invalid aggregates",
+        ),
+        (
+            (2, 2, 2, 3, 3, 3, 3, ["z_kind", "a_kind"], False, False, False),
+            "invalid object kinds",
+        ),
+    ),
+    ids=(
+        "format-version",
+        "missing-cas",
+        "metadata-conflict",
+        "invalid-totals",
+        "invalid-kinds",
+    ),
+)
+async def test_v4_cas_stage_rejects_invalid_aggregate_proof(
+    monkeypatch,
+    aggregate_row,
+    message,
+):
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[None, None, _OneRowResult(aggregate_row), None]
+        )
+    )
+
+    monkeypatch.setattr(
+        ptg2_shared_publish.db,
+        "transaction",
+        lambda: _session_transaction(session),
+    )
+    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_v4_shared_layout_for_map_write",
+        AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        await publish_v4_cas_block_stage(
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_v4proof",
+            snapshot_key=42,
+            build_token="build-v4",
+        )
+
+
+@pytest.mark.asyncio
 async def test_slow_v4_cas_sql_reports_exact_batches_before_completion(
     monkeypatch,
 ):
@@ -1318,7 +1473,10 @@ async def test_shared_block_stage_rejects_incompatible_version_in_combined_scan(
         execute=AsyncMock(
             side_effect=[
                 None,
-                _OneRowResult((1, 1, 3, 3, ["serving"], True, True)),
+                None,
+                _OneRowResult(
+                    (1, 1, 3, 3, ["serving"], True, False, True)
+                ),
             ]
         ),
         scalar=AsyncMock(),
@@ -1707,9 +1865,18 @@ async def test_shared_block_mapping_upsert_rejects_negative_expected_count():
 @pytest.mark.parametrize(
     ("aggregate_row", "message"),
     (
-        ((1, 1, 3, 3, ["serving"], False, True), "conflicts with stored"),
-        ((1, 2, 3, 3, ["serving"], False, False), "invalid aggregates"),
-        ((2, 2, 3, 3, ["z_kind", "a_kind"], False, False), "invalid object kinds"),
+        (
+            (1, 1, 3, 3, ["serving"], False, False, True),
+            "conflicts with stored",
+        ),
+        (
+            (1, 2, 3, 3, ["serving"], False, False, False),
+            "invalid aggregates",
+        ),
+        (
+            (2, 2, 3, 3, ["z_kind", "a_kind"], False, False, False),
+            "invalid object kinds",
+        ),
     ),
     ids=("stored-mismatch", "invalid-counts", "invalid-kinds"),
 )
@@ -1719,7 +1886,9 @@ async def test_shared_block_stage_rejects_invalid_aggregate_proof(
     message,
 ):
     session = SimpleNamespace(
-        execute=AsyncMock(side_effect=[None, _OneRowResult(aggregate_row)]),
+        execute=AsyncMock(
+            side_effect=[None, None, _OneRowResult(aggregate_row), None]
+        ),
         scalar=AsyncMock(),
     )
 

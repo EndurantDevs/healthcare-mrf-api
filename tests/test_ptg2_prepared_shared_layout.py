@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -13,104 +14,25 @@ from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
 )
 from process.ptg_parts.ptg2_shared_blocks import SharedMappingDigestSummary
-from process.ptg_parts.ptg2_shared_publish import SharedBlockCopyMetrics
-
-
-_FINALIZER_KINDS = (
-    "by_code_price_dictionary",
-    "by_code_price_page_v4",
-    "by_code_provider_shard_v1",
+from tests.ptg2_prepared_shared_layout_fixtures import (
+    FINALIZER_KINDS,
+    GRAPH_KINDS,
+    PRICE_KINDS,
+    copy_metrics,
+    finalizer_summary_by_field,
 )
-_GRAPH_KINDS = (
-    "graph_group_npis_v1",
-    "graph_group_provider_sets_v1",
-    "graph_npi_groups_v1",
-    "graph_provider_set_groups_v1",
-)
-_PRICE_KINDS = (
-    "price_atoms_v3",
-    "price_set_atom_memberships_v3",
-    "provider_set_codes_v3",
-    "provider_set_count_dictionary",
-    "provider_set_page_v3_s2",
-)
-
-
-def _copy_metrics(*, reused: bool) -> SharedBlockCopyMetrics:
-    reused_payload_bytes = 2 if reused else 0
-    reused_row_count = 1 if reused else 0
-    source_copy_bytes = 10 if reused else 7
-    source_payload_bytes = 5 if reused else 4
-    row_count = 2 if reused else 1
-    unique_block_count = row_count
-    existing_block_count = reused_row_count
-    new_block_count = unique_block_count - existing_block_count
-    return SharedBlockCopyMetrics(
-        source_copy_bytes=source_copy_bytes,
-        staged_copy_bytes=source_copy_bytes - reused_payload_bytes,
-        source_payload_bytes=source_payload_bytes,
-        staged_payload_bytes=source_payload_bytes - reused_payload_bytes,
-        reused_payload_bytes=reused_payload_bytes,
-        durable_reused_payload_bytes=reused_payload_bytes,
-        same_copy_reused_payload_bytes=0,
-        row_count=row_count,
-        staged_payload_row_count=new_block_count,
-        reused_payload_row_count=reused_row_count,
-        durable_reused_row_count=reused_row_count,
-        same_copy_reused_row_count=0,
-        unique_block_count=unique_block_count,
-        existing_block_count=existing_block_count,
-        new_block_count=new_block_count,
-        duplicate_block_row_count=0,
-        metadata_scan_seconds=0.01,
-        existence_lookup_seconds=0.02,
-        copy_seconds=0.03,
-    )
-
-
-def _finalizer_summary_by_field(tmp_path):
-    serving_path = tmp_path / "serving-blocks.copy"
-    price_path = tmp_path / "price-blocks.copy"
-    serving_path.write_bytes(b"serving")
-    price_path.write_bytes(b"price")
-    return {
-        "output_directory": str(tmp_path),
-        "source_count": 2,
-        "blocks": {
-            "serving": {
-                "path": serving_path.name,
-                "copy_bytes": serving_path.stat().st_size,
-                "copy_sha256": "1" * 64,
-            },
-            "price_dictionary": {
-                "path": price_path.name,
-                "copy_bytes": price_path.stat().st_size,
-                "copy_sha256": "2" * 64,
-            },
-            "price_dictionary_encoder": {"encoding": "dense_price_v1"},
-            "assigned_encoder": {"encoding": "assigned_v1"},
-        },
-        "dense_keys": {
-            "price": {
-                "count": 2,
-                "ordering": snapshot_publish.PTG2_V3_PRICE_KEY_ORDER,
-            }
-        },
-        "preservation": {"encoded_records": 19},
-        "timings": {"scanner_seconds": 0.25},
-    }
 
 
 def _lane_publications(*, price_kinds, membership_span):
     finalizer = SimpleNamespace(
-        object_kinds=_FINALIZER_KINDS,
+        object_kinds=FINALIZER_KINDS,
         mapping_count=3,
         unique_block_count=3,
         logical_byte_count=30,
         stored_byte_count=3,
     )
     graph = SimpleNamespace(
-        object_kinds=_GRAPH_KINDS,
+        object_kinds=GRAPH_KINDS,
         mapping_count=4,
         unique_block_count=4,
         logical_byte_count=40,
@@ -169,7 +91,7 @@ def _mapping_summary(lanes):
 
 
 def _publication_mocks(tmp_path, *, price_kinds, membership_span, seal_reused):
-    summary_by_field = _finalizer_summary_by_field(tmp_path)
+    summary_by_field = finalizer_summary_by_field(tmp_path)
     lanes = _lane_publications(
         price_kinds=price_kinds,
         membership_span=membership_span,
@@ -185,15 +107,20 @@ def _publication_mocks(tmp_path, *, price_kinds, membership_span, seal_reused):
         export_price=AsyncMock(return_value=tmp_path / "price-key-map.copy"),
         run_finalizer=AsyncMock(return_value=summary_by_field),
         dictionaries=AsyncMock(
-            return_value=SimpleNamespace(code_count=11, support_digest=b"d" * 32)
+            return_value=SimpleNamespace(
+                code_count=11,
+                provider_set_count=3,
+                serving_rate_count=19,
+                support_digest=b"d" * 32,
+            )
         ),
         export_provider_keys=AsyncMock(return_value=tmp_path / "provider-keys.tsv"),
         convert_graph=AsyncMock(),
         create_stage=AsyncMock(),
         copy_block=AsyncMock(
             side_effect=[
-                _copy_metrics(reused=True),
-                _copy_metrics(reused=False),
+                copy_metrics(reused=True),
+                copy_metrics(reused=False),
             ]
         ),
         publish_blocks=AsyncMock(return_value=lanes.finalizer),
@@ -250,7 +177,7 @@ def _prepared_layout_mocks(
     monkeypatch,
     tmp_path,
     *,
-    price_kinds=_PRICE_KINDS,
+    price_kinds=PRICE_KINDS,
     membership_span=16,
     seal_reused=False,
 ):
@@ -361,7 +288,7 @@ async def test_prepared_layout_publishes_and_seals(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_prepared_layout_requires_selective_copy_proof(monkeypatch, tmp_path):
     mocks = _prepared_layout_mocks(monkeypatch, tmp_path)
-    mocks.copy_block.side_effect = [None, _copy_metrics(reused=False)]
+    mocks.copy_block.side_effect = [None, copy_metrics(reused=False)]
 
     with pytest.raises(ExceptionGroup) as exc_info:
         await _publish_prepared_layout(mocks, tmp_path)
@@ -373,6 +300,79 @@ async def test_prepared_layout_requires_selective_copy_proof(monkeypatch, tmp_pa
     )
     mocks.publish_blocks.assert_not_awaited()
     mocks.graph_conversion.cleanup.assert_called_once_with()
+
+
+def _failing_cas_and_waiting_graph(adaptive_started, adaptive_cancelled):
+    async def fail_finalizer_cas(**_kwargs):
+        await adaptive_started.wait()
+        raise RuntimeError(
+            "strict V3 shared block stage has no payload or durable CAS row"
+        )
+
+    async def publish_adaptive_graph(*_args, **_kwargs):
+        adaptive_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            adaptive_cancelled.set()
+
+    return fail_finalizer_cas, publish_adaptive_graph
+
+
+@pytest.mark.asyncio
+async def test_finalizer_cas_failure_cancels_adaptive_v4_lane_before_seal(
+    monkeypatch,
+    tmp_path,
+):
+    """Cancel adaptive dictionary work without fabricating sealed progress."""
+
+    mocks = _prepared_layout_mocks(monkeypatch, tmp_path)
+    adaptive_started = asyncio.Event()
+    adaptive_cancelled = asyncio.Event()
+    seal_v4 = AsyncMock()
+    progress_events = []
+    mocks.graph_conversion.block_count = 4
+    (tmp_path / "price-key-map.copy").write_bytes(b"price keys")
+    (tmp_path / "provider-keys.tsv").write_bytes(b"provider keys")
+    fail_finalizer_cas, publish_adaptive_graph = _failing_cas_and_waiting_graph(
+        adaptive_started,
+        adaptive_cancelled,
+    )
+    mocks.publish_blocks.side_effect = fail_finalizer_cas
+    monkeypatch.setattr(
+        snapshot_publish,
+        "compile_provider_graph_v4_rust",
+        AsyncMock(return_value=mocks.graph_conversion),
+    )
+    monkeypatch.setattr(
+        snapshot_publish,
+        "touch_v4_shared_layout_build",
+        mocks.touch,
+    )
+    monkeypatch.setattr(
+        snapshot_publish,
+        "_publish_v4_graph",
+        publish_adaptive_graph,
+    )
+    monkeypatch.setattr(snapshot_publish, "seal_v4_shared_layout", seal_v4)
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await _publish_prepared_layout(
+            mocks,
+            tmp_path,
+            provider_graph_v4=True,
+            compressed_acquisition_bytes=1,
+            empty_npi_tin_only_normalization_count=0,
+            progress_callback=lambda stage, counters: progress_events.append(
+                (stage, counters)
+            ),
+        )
+
+    assert len(exc_info.value.exceptions) == 1
+    assert "no payload or durable CAS row" in str(exc_info.value.exceptions[0])
+    assert adaptive_cancelled.is_set()
+    seal_v4.assert_not_awaited()
+    assert all(stage != "snapshot seal" for stage, _counters in progress_events)
 
 
 @pytest.mark.asyncio
@@ -454,7 +454,7 @@ async def test_prepared_layout_requires_all_kinds(monkeypatch, tmp_path):
     mocks = _prepared_layout_mocks(
         monkeypatch,
         tmp_path,
-        price_kinds=_PRICE_KINDS[:-1],
+        price_kinds=PRICE_KINDS[:-1],
     )
 
     with pytest.raises(RuntimeError, match="missing required blocks"):
