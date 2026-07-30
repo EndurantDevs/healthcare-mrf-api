@@ -226,6 +226,11 @@ async def control_ptg_source_snapshot_promote(request):
                 is not None
                 else None
             ),
+            rollback_owner_id=(
+                str(request_payload.get("rollback_owner_id"))
+                if request_payload.get("rollback_owner_id") is not None
+                else None
+            ),
         )
     except SourceSnapshotConflict as exc:
         raise SanicException(str(exc), status_code=409) from exc

@@ -40,6 +40,11 @@ from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     lock_writable_snapshot,
 )
 from process.ptg_parts.snapshot_tables import _normalize_source_key
+from process.ptg_parts.source_pointer_reviewed_activation import (
+    PTG2SourcePointerConflict,
+    completed_reviewed_activation,
+    pin_reviewed_activation_predecessor,
+)
 
 
 _GLOBAL_SNAPSHOT_POINTER_RECONCILIATION_SQL = """
@@ -85,10 +90,6 @@ SELECT current_pointer.snapshot_id
    AND NOT EXISTS (SELECT 1 FROM updated_global_pointer)
 LIMIT 1
 """
-
-
-class PTG2SourcePointerConflict(RuntimeError):
-    """Raised when a source pointer changed after an import observed it."""
 
 
 def _allowed_source_pointer_key(source_key: str) -> str:
@@ -1115,6 +1116,7 @@ async def activate_ptg2_source_candidate(
     snapshot_id: str,
     expected_current_snapshot_id: str | None = None,
     expected_audit_only_attestation_digest: bytes | None = None,
+    rollback_owner_id: str | None = None,
 ) -> dict[str, Any]:
     """Audit and activate one authoritative candidate in a single transaction."""
 
@@ -1125,6 +1127,20 @@ async def activate_ptg2_source_candidate(
     schema_name = resolve_ptg2_schema()
     async with db.transaction() as session:
         await _acquire_source_pointer_gc_lock(session)
+        if rollback_owner_id is not None:
+            completed_activation = await completed_reviewed_activation(
+                session,
+                schema_name=schema_name,
+                source_key=normalized_source_key,
+                snapshot_id=normalized_snapshot_id,
+                expected_current_snapshot_id=expected_current_snapshot_id,
+                expected_audit_only_attestation_digest=(
+                    expected_audit_only_attestation_digest
+                ),
+                rollback_owner_id=rollback_owner_id,
+            )
+            if completed_activation is not None:
+                return completed_activation
         await lock_writable_snapshot(
             session,
             db,
@@ -1140,6 +1156,7 @@ async def activate_ptg2_source_candidate(
             expected_audit_only_attestation_digest=(
                 expected_audit_only_attestation_digest
             ),
+            rollback_owner_id=rollback_owner_id,
         )
 
 
@@ -1421,6 +1438,7 @@ def _candidate_activation_result(
     snapshot_id: str,
     activation_context: _CandidateActivationContext,
     allowed_pointer_by_field: dict[str, Any] | None,
+    rollback_owner_id: str | None = None,
 ) -> dict[str, Any]:
     result_by_field = {
         "status": "promoted",
@@ -1437,6 +1455,10 @@ def _candidate_activation_result(
     }
     if allowed_pointer_by_field is not None:
         result_by_field["allowed_amount_pointer"] = allowed_pointer_by_field
+    normalized_owner_id = str(rollback_owner_id or "").strip()
+    if normalized_owner_id:
+        result_by_field["rollback_owner_id"] = normalized_owner_id
+        result_by_field["idempotent"] = False
     return result_by_field
 
 
@@ -1448,6 +1470,7 @@ async def _activate_source_candidate_tx(
     snapshot_id: str,
     expected_current_snapshot_id: str | None,
     expected_audit_only_attestation_digest: bytes | None = None,
+    rollback_owner_id: str | None = None,
 ) -> dict[str, Any]:
     """Activate a source candidate within its pointer transaction."""
     activation_context = await _candidate_activation_context(
@@ -1457,6 +1480,41 @@ async def _activate_source_candidate_tx(
         snapshot_id=snapshot_id,
         expected_current_snapshot_id=expected_current_snapshot_id,
     )
+    await pin_reviewed_activation_predecessor(
+        session,
+        schema_name=schema_name,
+        activation_by_field=activation_context.activation_by_field,
+        activated_at=activation_context.activated_at,
+        rollback_owner_id=rollback_owner_id,
+        is_reviewed_audit_only=(
+            expected_audit_only_attestation_digest is not None
+        ),
+    )
+    return await _complete_candidate_activation(
+        session,
+        schema_name=schema_name,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        activation_context=activation_context,
+        expected_audit_only_attestation_digest=(
+            expected_audit_only_attestation_digest
+        ),
+        rollback_owner_id=rollback_owner_id,
+    )
+
+
+async def _complete_candidate_activation(
+    session: Any,
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    activation_context: _CandidateActivationContext,
+    expected_audit_only_attestation_digest: bytes | None,
+    rollback_owner_id: str | None,
+) -> dict[str, Any]:
+    """Persist the already-validated candidate pointer transition."""
+
     audit_report_digest = await _activate_candidate_source_pointer(
         session,
         schema_name=schema_name,
@@ -1489,6 +1547,7 @@ async def _activate_source_candidate_tx(
         snapshot_id=snapshot_id,
         activation_context=activation_context,
         allowed_pointer_by_field=allowed_pointer_by_field,
+        rollback_owner_id=rollback_owner_id,
     )
 
 

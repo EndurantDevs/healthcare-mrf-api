@@ -69,6 +69,7 @@ def test_rollback_coordinates_and_report_are_explicit():
         source_key=SOURCE_KEY,
         snapshot_id=TARGET_SNAPSHOT,
         expected_current_snapshot_id=CURRENT_SNAPSHOT,
+        rollback_owner_id=ROLLBACK_OWNER,
         decision=RollbackDecision(
             is_already_rolled_back=False,
             plan_pointer_entries=(),
@@ -76,6 +77,7 @@ def test_rollback_coordinates_and_report_are_explicit():
             allowed_action="delete",
         ),
     )
+    assert report["rollback_owner_id"] == ROLLBACK_OWNER
     assert report["allowed_amount_pointer"]["status"] == "removed"
 
 

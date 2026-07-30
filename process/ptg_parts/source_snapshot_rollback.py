@@ -61,6 +61,7 @@ def _rollback_report(
     source_key: str,
     snapshot_id: str,
     expected_current_snapshot_id: str,
+    rollback_owner_id: str,
     decision: RollbackDecision,
 ) -> dict[str, Any]:
     report_by_field: dict[str, Any] = {
@@ -72,6 +73,7 @@ def _rollback_report(
         "source_key": source_key,
         "snapshot_id": snapshot_id,
         "previous_snapshot_id": expected_current_snapshot_id,
+        "rollback_owner_id": rollback_owner_id,
         "plan_source_count": len(decision.plan_pointer_entries),
         "global_pointer": (
             "reversed"
@@ -102,7 +104,6 @@ async def rollback_pinned_ptg2_source_snapshot(
     rollback_owner_id: str,
 ) -> dict[str, Any]:
     """Atomically reverse a published source pointer to its exact pinned predecessor."""
-
     (
         normalized_source_key,
         normalized_snapshot_id,
@@ -152,5 +153,6 @@ async def rollback_pinned_ptg2_source_snapshot(
         source_key=normalized_source_key,
         snapshot_id=normalized_snapshot_id,
         expected_current_snapshot_id=normalized_expected_snapshot_id,
+        rollback_owner_id=normalized_owner_id,
         decision=decision,
     )

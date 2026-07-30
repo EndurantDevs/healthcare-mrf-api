@@ -42,7 +42,6 @@ from process.ptg_parts.source_snapshot_shared_layout import (
     validate_retirement_shared_layout,
 )
 
-
 class SourceSnapshotConflict(ValueError):
     """Raised when a source snapshot pointer changed between plan and execute."""
 
@@ -69,7 +68,6 @@ class _TransactionExecutor:
         )
         return getattr(result, "rowcount", None)
 
-
 def _schema_name() -> str:
     return os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
 
@@ -88,6 +86,7 @@ async def promote_ptg2_source_snapshot(
     snapshot_id: str,
     expected_current_snapshot_id: str | None = None,
     expected_audit_only_attestation_digest: str | None = None,
+    rollback_owner_id: str | None = None,
 ) -> dict[str, Any]:
     """Activate one audited strict-V3 candidate and all of its live pointers."""
     source_key = str(source_key or "").strip().lower()
@@ -107,6 +106,7 @@ async def promote_ptg2_source_snapshot(
             snapshot_id=snapshot_id,
             expected_current_snapshot_id=expected_current_snapshot_id,
             expected_audit_only_attestation_digest=approval_digest,
+            rollback_owner_id=rollback_owner_id,
         )
     except (
         CandidateAttestationApprovalConflict,

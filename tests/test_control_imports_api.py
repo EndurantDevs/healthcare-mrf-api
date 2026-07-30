@@ -3665,6 +3665,7 @@ async def test_control_ptg_source_snapshot_promote_endpoint(monkeypatch):
             "snapshot_id": "snap_new",
             "expected_current_snapshot_id": "snap_old",
             "expected_audit_only_attestation_digest": None,
+            "rollback_owner_id": None,
         }
     ]
 
@@ -3684,6 +3685,7 @@ async def test_control_ptg_source_snapshot_promote_threads_reviewed_hold_digest(
                 "source_key": "source_a",
                 "snapshot_id": "snap_new",
                 "expected_audit_only_attestation_digest": approval_digest,
+                "rollback_owner_id": "reviewed-op-1",
             }
         )
     )
@@ -3694,6 +3696,7 @@ async def test_control_ptg_source_snapshot_promote_threads_reviewed_hold_digest(
         "snapshot_id": "snap_new",
         "expected_current_snapshot_id": None,
         "expected_audit_only_attestation_digest": approval_digest,
+        "rollback_owner_id": "reviewed-op-1",
     }
 
 
@@ -3731,6 +3734,7 @@ def _assert_address_refresh_calls(
             "snapshot_id": "snap_new",
             "expected_current_snapshot_id": "snap_old",
             "expected_audit_only_attestation_digest": None,
+            "rollback_owner_id": None,
         }
     ]
     assert import_calls == [
