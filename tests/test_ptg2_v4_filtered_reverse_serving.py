@@ -282,6 +282,14 @@ def _exact_reverse_candidate_scope(candidate_npis, memberships_by_npi):
     )
 
 
+def _patch_empty_direct_prefixes(monkeypatch) -> None:
+    monkeypatch.setattr(
+        serving,
+        "_v4_direct_ordered_set_prefixes",
+        AsyncMock(return_value={}),
+    )
+
+
 def _patch_exact_reverse_dependencies(
     monkeypatch,
     candidates,
@@ -328,11 +336,8 @@ def _patch_exact_reverse_dependencies(
     )
     monkeypatch.setattr(serving, "_shared_forward_entries_for_code_rows", AsyncMock(side_effect=AssertionError("direct code scope must use the bounded rate merge")))
     monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
-    monkeypatch.setattr(
-        serving,
-        "_v4_direct_set_candidates",
-        candidate_scope,
-    )
+    monkeypatch.setattr(serving, "_v4_direct_set_candidates", candidate_scope)
+    _patch_empty_direct_prefixes(monkeypatch)
     monkeypatch.setattr(serving, "v4_graph_taxonomy_projection_scope", taxonomy_scope)
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", merge_rows)
     monkeypatch.setattr(
@@ -411,11 +416,8 @@ def _patch_direct_budget_dependencies(
         bounded_merge,
     )
     monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
-    monkeypatch.setattr(
-        serving,
-        "_v4_direct_set_candidates",
-        candidate_scope,
-    )
+    monkeypatch.setattr(serving, "_v4_direct_set_candidates", candidate_scope)
+    _patch_empty_direct_prefixes(monkeypatch)
     return graph_lookup, bounded_merge
 
 
@@ -1679,10 +1681,9 @@ async def test_direct_selector_rejects_broken_sealed_boundaries(
         AsyncMock(return_value=serving_rows),
     )
     monkeypatch.setattr(
-        serving,
-        "_v4_direct_set_candidates",
-        AsyncMock(return_value={1: (1,)}),
+        serving, "_v4_direct_set_candidates", AsyncMock(return_value={1: (1,)})
     )
+    _patch_empty_direct_prefixes(monkeypatch)
     monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
     monkeypatch.setattr(
         serving,
@@ -1724,10 +1725,9 @@ async def test_direct_selector_returns_exact_empty_selection(
     )
     monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
     monkeypatch.setattr(
-        serving,
-        "_v4_direct_set_candidates",
-        AsyncMock(return_value={1: ()}),
+        serving, "_v4_direct_set_candidates", AsyncMock(return_value={1: ()})
     )
+    _patch_empty_direct_prefixes(monkeypatch)
 
     selection = await _select_direct_fixture(
         projection_manifest,

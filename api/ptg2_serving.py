@@ -12639,6 +12639,228 @@ async def _v4_direct_set_candidates(
     )
 
 
+def _v4_direct_prefix_metadata(
+    provider_set_id_by_key: Mapping[int, str],
+    metadata_by_id: Mapping[str, _ProviderSetGraphMetadata],
+) -> dict[int, _ProviderSetGraphMetadata]:
+    """Bind dictionary metadata back to the exact rate-scoped dense keys."""
+
+    expected_provider_set_ids = set(provider_set_id_by_key.values())
+    if set(metadata_by_id) != expected_provider_set_ids:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy provider-set dictionary is incomplete"
+        )
+    metadata_by_key = {
+        metadata.provider_set_key: metadata
+        for metadata in metadata_by_id.values()
+    }
+    if (
+        len(metadata_by_key) != len(metadata_by_id)
+        or set(metadata_by_key) != set(provider_set_id_by_key)
+        or any(
+            metadata_by_id[provider_set_id].provider_set_key
+            != provider_set_key
+            for provider_set_key, provider_set_id in (
+                provider_set_id_by_key.items()
+            )
+        )
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 inferred-taxonomy provider-set keys are inconsistent"
+        )
+    return metadata_by_key
+
+
+def _validate_direct_provider_counts(
+    serving_rows: Sequence[Mapping[str, Any]],
+    metadata_by_key: Mapping[int, _ProviderSetGraphMetadata],
+) -> None:
+    """Cross-check optional rate cardinalities against the set dictionary."""
+
+    for serving_row in serving_rows:
+        provider_set_key = int(serving_row["_ptg_provider_set_key"])
+        if provider_set_key not in metadata_by_key:
+            continue
+        provider_count = _rate_row_provider_count(serving_row)
+        if (
+            provider_count is not None
+            and provider_count
+            != metadata_by_key[provider_set_key].provider_count
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 inferred-taxonomy rate provider count is inconsistent"
+            )
+
+
+def _v4_direct_expected_prefix_counts(
+    metadata_by_key: Mapping[int, _ProviderSetGraphMetadata],
+    prefix_target: int,
+) -> dict[int, int]:
+    """Select override owners and authenticate their declared cardinalities."""
+
+    expected_count_by_key = {
+        provider_set_key: min(metadata.provider_count, prefix_target)
+        for provider_set_key, metadata in metadata_by_key.items()
+        if metadata.prefix_member_count is not None
+    }
+    if any(
+        metadata_by_key[provider_set_key].prefix_member_count != expected_count
+        or metadata_by_key[provider_set_key].prefix_member_digest is None
+        for provider_set_key, expected_count in expected_count_by_key.items()
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sparse NPI prefix count is inconsistent"
+        )
+    return expected_count_by_key
+
+
+def _v4_direct_shape_prefixes(
+    metadata_by_key: Mapping[int, _ProviderSetGraphMetadata],
+    prefixes_by_key: Mapping[int, tuple[int, ...]],
+    expected_count_by_key: Mapping[int, int],
+    candidate_npi_keys: tuple[int, ...],
+) -> dict[int, _V4DirectSetPrefix]:
+    """Verify prefix payloads and retain candidate members in stored order."""
+
+    candidate_scope = frozenset(candidate_npi_keys)
+    authenticated_prefix_by_set: dict[int, _V4DirectSetPrefix] = {}
+    for provider_set_key, expected_count in expected_count_by_key.items():
+        provider_metadata = metadata_by_key[provider_set_key]
+        prefix_members = prefixes_by_key[provider_set_key]
+        if (
+            len(prefix_members) != expected_count
+            or _v4_npi_prefix_digest(prefix_members)
+            != provider_metadata.prefix_member_digest
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 sparse NPI prefix failed authentication"
+            )
+        authenticated_prefix_by_set[provider_set_key] = _V4DirectSetPrefix(
+            candidate_npi_keys=tuple(
+                npi_key
+                for npi_key in prefix_members
+                if npi_key in candidate_scope
+            ),
+            is_complete=provider_metadata.provider_count <= len(prefix_members),
+        )
+    return authenticated_prefix_by_set
+
+
+async def _v4_direct_ordered_set_prefixes(
+    session,
+    serving_tables: PTG2ServingTables,
+    serving_rows: Sequence[Mapping[str, Any]],
+    provider_set_id_by_key: Mapping[int, str],
+    candidate_npi_keys: tuple[int, ...],
+) -> dict[int, _V4DirectSetPrefix]:
+    """Authenticate sparse ordered prefixes and intersect the candidate scope."""
+
+    metadata_by_id = await _provider_set_metadata_for_ids(
+        session,
+        serving_tables,
+        provider_set_id_by_key.values(),
+    )
+    metadata_by_key = _v4_direct_prefix_metadata(
+        provider_set_id_by_key,
+        metadata_by_id,
+    )
+    _validate_direct_provider_counts(serving_rows, metadata_by_key)
+    expected_count_by_key = _v4_direct_expected_prefix_counts(
+        metadata_by_key,
+        _v4_hot_prefix_limits(serving_tables).target,
+    )
+    if not expected_count_by_key:
+        return {}
+    prefixes_by_key = await lookup_v4_ordered_npi_prefix_overrides(
+        session,
+        snapshot_key=_required_shared_snapshot_key(serving_tables),
+        provider_set_keys=tuple(expected_count_by_key),
+        schema_name=PTG2_SCHEMA,
+        max_members=sum(expected_count_by_key.values()),
+    )
+    if set(prefixes_by_key) != set(expected_count_by_key):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 sparse NPI prefix relation is incomplete"
+        )
+    authenticated_prefix_by_set = _v4_direct_shape_prefixes(
+        metadata_by_key,
+        prefixes_by_key,
+        expected_count_by_key,
+        candidate_npi_keys,
+    )
+    record_v4_npi_prefix_override_sets(len(authenticated_prefix_by_set))
+    return authenticated_prefix_by_set
+
+
+def _v4_direct_prefix_fallback_keys(
+    serving_rows: Sequence[Mapping[str, Any]],
+    known_exact_set_keys: frozenset[int],
+    candidate_npi_keys_by_set: Mapping[int, tuple[int, ...]],
+    prefix_by_set: Mapping[int, _V4DirectSetPrefix],
+    *,
+    target_count: int,
+) -> tuple[int, ...]:
+    """Find prefixes whose unknown tail can still outrank the target page."""
+
+    normalized_target = max(int(target_count), 1)
+    selected_count = 0
+    fallback_set_keys: list[int] = []
+    fallback_set_key_set: set[int] = set()
+    seen_npi_keys_by_signature: dict[
+        tuple[str, str, str, str], set[int]
+    ] = defaultdict(set)
+    for serving_row in serving_rows:
+        provider_set_key = int(serving_row["_ptg_provider_set_key"])
+        signature = _v4_dense_provider_expansion_key(serving_row, 0)[1:]
+        seen_npi_keys = seen_npi_keys_by_signature[signature]
+        for npi_key in candidate_npi_keys_by_set.get(provider_set_key, ()):
+            if npi_key in seen_npi_keys:
+                continue
+            seen_npi_keys.add(npi_key)
+            selected_count += 1
+            if selected_count >= normalized_target:
+                return tuple(fallback_set_keys)
+        prefix_evidence = prefix_by_set.get(provider_set_key)
+        if (
+            provider_set_key not in known_exact_set_keys
+            and (prefix_evidence is None or not prefix_evidence.is_complete)
+            and provider_set_key not in fallback_set_key_set
+        ):
+            fallback_set_key_set.add(provider_set_key)
+            fallback_set_keys.append(provider_set_key)
+    return tuple(fallback_set_keys)
+
+
+def _v4_direct_merge_fallback(
+    prefix_by_set: Mapping[int, _V4DirectSetPrefix],
+    exact_candidates_by_set: Mapping[int, tuple[int, ...]],
+) -> dict[int, tuple[int, ...]]:
+    """Keep authenticated prefix order ahead of each exact fallback tail."""
+
+    merged_candidates_by_set: dict[int, tuple[int, ...]] = {}
+    for provider_set_key, exact_candidates in exact_candidates_by_set.items():
+        prefix_evidence = prefix_by_set.get(provider_set_key)
+        if prefix_evidence is None:
+            merged_candidates_by_set[provider_set_key] = exact_candidates
+            continue
+        prefix_candidates = prefix_evidence.candidate_npi_keys
+        prefix_candidate_set = frozenset(prefix_candidates)
+        if not prefix_candidate_set.issubset(exact_candidates):
+            raise PTG2ManifestArtifactError(
+                "PTG2 V4 inferred-taxonomy exact fallback disagrees with "
+                "its authenticated NPI prefix"
+            )
+        merged_candidates_by_set[provider_set_key] = (
+            prefix_candidates
+            + tuple(
+                npi_key
+                for npi_key in exact_candidates
+                if npi_key not in prefix_candidate_set
+            )
+        )
+    return merged_candidates_by_set
+
+
 async def _v4_direct_npi_memberships(
     session,
     serving_tables: PTG2ServingTables,
@@ -12942,6 +13164,14 @@ class _V4DirectContext:
     declared_occurrences: int
     scan_budget: ForwardReadBudget
     candidate_npi_keys: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _V4DirectSetPrefix:
+    """Authenticated candidate intersection for one ordered set prefix."""
+
+    candidate_npi_keys: tuple[int, ...]
+    is_complete: bool
 
 
 @dataclass(frozen=True)
@@ -13410,6 +13640,7 @@ async def _v4_direct_read_window(
         )
     await _v4_direct_update_candidates(
         session,
+        serving_tables,
         context,
         serving_rows,
         candidate_npi_keys_by_set,
@@ -13435,29 +13666,60 @@ async def _v4_direct_read_window(
 
 async def _v4_direct_update_candidates(
     session,
+    serving_tables: PTG2ServingTables,
     context: _V4DirectContext,
     serving_rows: list[dict[str, Any]],
     candidate_npi_keys_by_set: dict[int, tuple[int, ...]],
 ) -> None:
     """Project only newly visited rate sets into the sealed candidate scope."""
 
-    provider_set_keys = tuple(
-        sorted(_v4_rate_scope_set_ids(serving_rows, None))
-    )
+    provider_set_id_by_key = _v4_rate_scope_set_ids(serving_rows, None)
+    provider_set_keys = tuple(sorted(provider_set_id_by_key))
     if len(provider_set_keys) > context.maximum_code_sets:
         raise PTG2OnlineWorkBudgetExceeded("code_sets")
+    known_exact_set_keys = frozenset(candidate_npi_keys_by_set)
     new_provider_set_keys = tuple(
         provider_set_key
         for provider_set_key in provider_set_keys
-        if provider_set_key not in candidate_npi_keys_by_set
+        if provider_set_key not in known_exact_set_keys
     )
-    if new_provider_set_keys:
+    if not new_provider_set_keys:
+        return
+    new_provider_set_id_by_key = {
+        provider_set_key: provider_set_id_by_key[provider_set_key]
+        for provider_set_key in new_provider_set_keys
+    }
+    prefix_by_set = await _v4_direct_ordered_set_prefixes(
+        session,
+        serving_tables,
+        serving_rows,
+        new_provider_set_id_by_key,
+        context.candidate_npi_keys,
+    )
+    candidate_npi_keys_by_set.update(
+        {
+            provider_set_key: prefix_evidence.candidate_npi_keys
+            for provider_set_key, prefix_evidence in prefix_by_set.items()
+        }
+    )
+    fallback_set_keys = _v4_direct_prefix_fallback_keys(
+        serving_rows,
+        known_exact_set_keys,
+        candidate_npi_keys_by_set,
+        prefix_by_set,
+        target_count=context.request.target_count,
+    )
+    if fallback_set_keys:
+        exact_candidates_by_set = await _v4_direct_set_candidates(
+            session,
+            snapshot_key=context.snapshot_key,
+            provider_set_keys=fallback_set_keys,
+            candidate_npi_keys=context.candidate_npi_keys,
+        )
         candidate_npi_keys_by_set.update(
-            await _v4_direct_set_candidates(
-                session,
-                snapshot_key=context.snapshot_key,
-                provider_set_keys=new_provider_set_keys,
-                candidate_npi_keys=context.candidate_npi_keys,
+            _v4_direct_merge_fallback(
+                prefix_by_set,
+                exact_candidates_by_set,
             )
         )
 
