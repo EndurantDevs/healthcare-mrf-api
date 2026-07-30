@@ -5141,24 +5141,62 @@ async def _v4_sets_from_projection(
     )
 
 
-async def _v4_sets_by_npi(
+def _v4_second_hop_read_bounds(
+    projection: _V4NpiProjection,
+    read_bounds: _V4GraphReadBounds,
+    max_projection_members: int | None,
+) -> _V4GraphReadBounds:
+    """Charge first-hop members against an explicit projection budget."""
+
+    if max_projection_members is None:
+        return read_bounds
+    first_member_count = sum(
+        len(first_members)
+        for first_members in projection.first_members_by_npi_key.values()
+    )
+    remaining_members = int(max_projection_members) - first_member_count
+    if remaining_members < 0:
+        raise PTG2SharedBlockError(
+            "PTG V4 graph selection exceeds max_members"
+        )
+    return _V4GraphReadBounds(read_bounds.schema_name, remaining_members)
+
+
+def _v4_initial_projection_read_bounds(
+    schema_name: str,
+    max_members: int | None,
+    max_projection_members: int | None,
+) -> _V4GraphReadBounds:
+    """Select the first-hop cap without changing legacy reader semantics."""
+
+    projection_member_limit = (
+        max_members
+        if max_projection_members is None
+        else int(max_projection_members)
+    )
+    return _V4GraphReadBounds(schema_name, projection_member_limit)
+
+
+async def _v4_sets_by_normalized_npis(
     session,
     serving_tables: PTG2ServingTables,
-    npis: Iterable[int],
-    *,
-    allowed_provider_set_keys: Iterable[int] | None = None,
-    schema_name: str = PTG2_SCHEMA,
-    max_members: int | None = None,
+    normalized_npis: tuple[int, ...],
+    allowed_provider_set_keys: Iterable[int] | None,
+    schema_name: str,
+    max_members: int | None,
+    max_projection_members: int | None,
 ) -> dict[int, tuple[int, ...]]:
-    """Resolve hot NPI-to-set membership through the selected V4 representation."""
-    normalized_npis = tuple(sorted({int(npi) for npi in npis}))
-    if not normalized_npis:
-        return {}
+    """Resolve one already-normalized NPI membership request."""
+
     allowed_provider_sets = _normalized_optional_integer_keys(
         allowed_provider_set_keys
     )
     snapshot_key = _required_shared_snapshot_key(serving_tables)
-    read_bounds = _V4GraphReadBounds(schema_name, max_members)
+    read_bounds = _v4_initial_projection_read_bounds(
+        schema_name,
+        max_members,
+        max_projection_members,
+    )
     with v4_graph_request_scope():
         projection = await _load_v4_npi_projection(
             session,
@@ -5168,6 +5206,11 @@ async def _v4_sets_by_npi(
         )
         if not projection.first_member_keys:
             return {npi: () for npi in normalized_npis}
+        read_bounds = _v4_second_hop_read_bounds(
+            projection,
+            read_bounds,
+            max_projection_members,
+        )
         reverse_sets = await _v4_scoped_reverse_sets(
             session,
             serving_tables,
@@ -5193,6 +5236,32 @@ async def _v4_sets_by_npi(
         provider_sets_by_first_member,
         allowed_provider_sets,
         max_members=max_members,
+    )
+
+
+async def _v4_sets_by_npi(
+    session,
+    serving_tables: PTG2ServingTables,
+    npis: Iterable[int],
+    *,
+    allowed_provider_set_keys: Iterable[int] | None = None,
+    schema_name: str = PTG2_SCHEMA,
+    max_members: int | None = None,
+    max_projection_members: int | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Resolve hot NPI-to-set membership through the selected V4 representation."""
+
+    normalized_npis = tuple(sorted({int(npi) for npi in npis}))
+    if not normalized_npis:
+        return {}
+    return await _v4_sets_by_normalized_npis(
+        session,
+        serving_tables,
+        normalized_npis,
+        allowed_provider_set_keys,
+        schema_name,
+        max_members,
+        max_projection_members,
     )
 
 
@@ -9858,6 +9927,8 @@ _V4_GRAPH_MEMBER_LIMIT_ERRORS = frozenset(
         "PTG2 V4 graph selection exceeds max_members",
     }
 )
+_V4_PATTERN_EXACT_NPI_PROVIDER_SET_LIMIT = 512
+_V4_PATTERN_EXACT_NPI_PROJECTION_MEMBER_LIMIT = 2_048
 
 
 def _is_v4_member_limit(exc: Exception) -> bool:
@@ -9866,25 +9937,32 @@ def _is_v4_member_limit(exc: Exception) -> bool:
     return str(exc) in _V4_GRAPH_MEMBER_LIMIT_ERRORS
 
 
-async def _v4_direct_npi_sets(
+async def _v4_bounded_npi_sets(
     session,
     serving_tables: PTG2ServingTables,
     requested_npi: int,
 ) -> tuple[int, ...] | None:
-    """Load one direct NPI membership within the sealed set limit."""
+    """Load one hot V4 NPI membership within its exact online limits."""
     snapshot_key = _required_shared_snapshot_key(serving_tables)
     root = await load_v4_graph_root(
         session,
         snapshot_key,
         schema_name=PTG2_SCHEMA,
     )
-    if root.representation != "direct_v1":
+    if root.representation == "direct_v1":
+        maximum_provider_sets = (
+            _v4_hot_prefix_limits(
+                serving_tables
+            ).maximum_provider_expansion_provider_sets
+        )
+        maximum_projection_members = None
+    elif root.representation == "pattern_v1":
+        maximum_provider_sets = _V4_PATTERN_EXACT_NPI_PROVIDER_SET_LIMIT
+        maximum_projection_members = (
+            _V4_PATTERN_EXACT_NPI_PROJECTION_MEMBER_LIMIT
+        )
+    else:
         return None
-    maximum_provider_sets = (
-        _v4_hot_prefix_limits(
-            serving_tables
-        ).maximum_provider_expansion_provider_sets
-    )
     try:
         provider_set_keys_by_npi = await _v4_sets_by_npi(
             session,
@@ -9892,6 +9970,7 @@ async def _v4_direct_npi_sets(
             (requested_npi,),
             allowed_provider_set_keys=None,
             max_members=maximum_provider_sets,
+            max_projection_members=maximum_projection_members,
         )
     except (PTG2SharedBlockError, PTG2ManifestArtifactError) as exc:
         if not _is_v4_member_limit(exc):
@@ -9904,16 +9983,16 @@ async def _v4_direct_npi_sets(
     return tuple(provider_set_keys_by_npi[requested_npi])
 
 
-async def _bounded_direct_npi_code_scope(
+async def _bounded_v4_npi_code_scope(
     session,
     serving_tables: PTG2ServingTables,
     args: Mapping[str, Any],
     requested_npi: int,
     requested_plan_code: tuple[str, str, str],
 ) -> _ExplicitNpiGraphScope | None:
-    """Intersect a bounded direct NPI projection with one exact code."""
+    """Intersect a bounded V4 NPI projection with one exact code."""
 
-    provider_set_keys = await _v4_direct_npi_sets(
+    provider_set_keys = await _v4_bounded_npi_sets(
         session,
         serving_tables,
         requested_npi,
@@ -9957,7 +10036,7 @@ async def _v4_explicit_npi_scope(
     allowed_provider_set_keys: frozenset[int] | None = None
     requested_plan_code = _ptg2_manifest_plan_code_values(dict(args))
     if requested_plan_code is not None:
-        bounded_scope = await _bounded_direct_npi_code_scope(
+        bounded_scope = await _bounded_v4_npi_code_scope(
             session,
             serving_tables,
             args,

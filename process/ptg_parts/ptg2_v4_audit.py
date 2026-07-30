@@ -142,6 +142,30 @@ class _V4PhysicalBlock:
     payload: bytes
 
 
+@dataclass(frozen=True)
+class _V4PhysicalPayloadFields:
+    hash: str = "block_hash"
+    version: str = "format_version"
+    kind: str = "object_kind"
+    codec: str = "codec"
+    entry_count: str = "block_entry_count"
+    raw_byte_count: str = "raw_byte_count"
+    stored_byte_count: str = "stored_byte_count"
+    payload: str = "payload"
+
+
+_MAP_PAYLOAD_FIELDS = _V4PhysicalPayloadFields(
+    hash="map_block_hash",
+    version="map_format_version",
+    kind="map_object_kind",
+    codec="map_codec",
+    entry_count="map_block_entry_count",
+    raw_byte_count="map_raw_byte_count",
+    stored_byte_count="map_stored_byte_count",
+    payload="map_payload",
+)
+
+
 def _unframe_heavy_bitmap_fragment(
     fragment_payload: bytes,
     *,
@@ -257,6 +281,74 @@ def _read_exact(source: Any, byte_count: int, *, label: str) -> bytes:
     return payload
 
 
+def _read_v4_witness_fields(copy_file: Any) -> tuple[bytes, bytes, bytes] | None:
+    field_count = struct.unpack(
+        ">h", _read_exact(copy_file, 2, label="COPY row header")
+    )[0]
+    if field_count == _PG_COPY_TRAILER:
+        if copy_file.read(1):
+            raise RuntimeError("PTG V4 audit witness has trailing COPY bytes")
+        return None
+    if field_count != 3:
+        raise RuntimeError("PTG V4 audit witness has an invalid COPY row width")
+    fields: list[bytes] = []
+    for field_index, expected_width in enumerate((4, 4, 8)):
+        width = struct.unpack(
+            ">i", _read_exact(copy_file, 4, label="COPY field width")
+        )[0]
+        if width != expected_width:
+            raise RuntimeError(
+                "PTG V4 audit witness has an invalid COPY field width "
+                f"at column {field_index}"
+            )
+        fields.append(_read_exact(copy_file, width, label="COPY field"))
+    return fields[0], fields[1], fields[2]
+
+
+def _validated_v4_witness(
+    fields: tuple[bytes, bytes, bytes],
+    previous_provider_set_key: int | None,
+) -> V4ProviderSetAuditWitness:
+    witness = V4ProviderSetAuditWitness(
+        provider_set_key=struct.unpack(">i", fields[0])[0],
+        provider_group_key=struct.unpack(">i", fields[1])[0],
+        npi=struct.unpack(">q", fields[2])[0],
+    )
+    if (
+        witness.provider_set_key < 0
+        or witness.provider_group_key < 0
+        or not 1_000_000_000 <= witness.npi <= 9_999_999_999
+        or (
+            previous_provider_set_key is not None
+            and witness.provider_set_key <= previous_provider_set_key
+        )
+    ):
+        raise RuntimeError("PTG V4 audit witness rows are invalid or unordered")
+    return witness
+
+
+def _stream_v4_audit_witnesses(
+    path: Path,
+    requested_keys: set[int],
+) -> tuple[dict[int, V4ProviderSetAuditWitness], int]:
+    witnesses_by_set: dict[int, V4ProviderSetAuditWitness] = {}
+    previous_provider_set_key: int | None = None
+    observed_row_count = 0
+    with path.open("rb") as copy_file:
+        if (
+            _read_exact(copy_file, len(_PG_COPY_HEADER), label="COPY header")
+            != _PG_COPY_HEADER
+        ):
+            raise RuntimeError("PTG V4 audit witness has an invalid COPY header")
+        while (fields := _read_v4_witness_fields(copy_file)) is not None:
+            witness = _validated_v4_witness(fields, previous_provider_set_key)
+            previous_provider_set_key = witness.provider_set_key
+            observed_row_count += 1
+            if witness.provider_set_key in requested_keys:
+                witnesses_by_set[witness.provider_set_key] = witness
+    return witnesses_by_set, observed_row_count
+
+
 def load_v4_audit_witnesses(
     graph_compilation: V4GraphCompilationResult,
     *,
@@ -275,57 +367,10 @@ def load_v4_audit_witnesses(
         for provider_set_key in requested_keys
     ):
         raise RuntimeError("PTG V4 audit provider-set key is outside int4 range")
-    witnesses_by_set: dict[int, V4ProviderSetAuditWitness] = {}
-    previous_provider_set_key: int | None = None
-    observed_row_count = 0
-    with path.open("rb") as copy_file:
-        if (
-            _read_exact(copy_file, len(_PG_COPY_HEADER), label="COPY header")
-            != _PG_COPY_HEADER
-        ):
-            raise RuntimeError("PTG V4 audit witness has an invalid COPY header")
-        while True:
-            field_count = struct.unpack(
-                ">h", _read_exact(copy_file, 2, label="COPY row header")
-            )[0]
-            if field_count == _PG_COPY_TRAILER:
-                if copy_file.read(1):
-                    raise RuntimeError("PTG V4 audit witness has trailing COPY bytes")
-                break
-            if field_count != 3:
-                raise RuntimeError("PTG V4 audit witness has an invalid COPY row width")
-            fields: list[bytes] = []
-            for field_index, expected_width in enumerate((4, 4, 8)):
-                width = struct.unpack(
-                    ">i", _read_exact(copy_file, 4, label="COPY field width")
-                )[0]
-                if width != expected_width:
-                    raise RuntimeError(
-                        "PTG V4 audit witness has an invalid COPY field width "
-                        f"at column {field_index}"
-                    )
-                fields.append(_read_exact(copy_file, width, label="COPY field"))
-            provider_set_key = struct.unpack(">i", fields[0])[0]
-            provider_group_key = struct.unpack(">i", fields[1])[0]
-            npi = struct.unpack(">q", fields[2])[0]
-            if (
-                provider_set_key < 0
-                or provider_group_key < 0
-                or not 1_000_000_000 <= npi <= 9_999_999_999
-                or (
-                    previous_provider_set_key is not None
-                    and provider_set_key <= previous_provider_set_key
-                )
-            ):
-                raise RuntimeError("PTG V4 audit witness rows are invalid or unordered")
-            previous_provider_set_key = provider_set_key
-            observed_row_count += 1
-            if provider_set_key in requested_keys:
-                witnesses_by_set[provider_set_key] = V4ProviderSetAuditWitness(
-                    provider_set_key=provider_set_key,
-                    provider_group_key=provider_group_key,
-                    npi=npi,
-                )
+    witnesses_by_set, observed_row_count = _stream_v4_audit_witnesses(
+        path,
+        requested_keys,
+    )
     if observed_row_count != expected_row_count:
         raise RuntimeError("PTG V4 audit witness row count changed after compilation")
     if _sha256_file(path) != expected_sha256:
@@ -360,31 +405,24 @@ def _validated_physical_payload(
     *,
     expected_kind: str,
     maximum_raw_bytes: int,
-    hash_field: str = "block_hash",
-    version_field: str = "format_version",
-    kind_field: str = "object_kind",
-    codec_field: str = "codec",
-    entry_count_field: str = "block_entry_count",
-    raw_byte_count_field: str = "raw_byte_count",
-    stored_byte_count_field: str = "stored_byte_count",
-    payload_field: str = "payload",
+    fields: _V4PhysicalPayloadFields = _V4PhysicalPayloadFields(),
 ) -> _V4PhysicalBlock:
-    block_hash = bytes(block_row.get(hash_field) or b"")
-    block_payload = bytes(block_row.get(payload_field) or b"")
+    block_hash = bytes(block_row.get(fields.hash) or b"")
+    block_payload = bytes(block_row.get(fields.payload) or b"")
     format_version = _nonnegative_int(
-        block_row.get(version_field), label="CAS format version"
+        block_row.get(fields.version), label="CAS format version"
     )
     entry_count = _nonnegative_int(
-        block_row.get(entry_count_field), label="CAS entry count"
+        block_row.get(fields.entry_count), label="CAS entry count"
     )
     raw_byte_count = _nonnegative_int(
-        block_row.get(raw_byte_count_field), label="CAS raw bytes"
+        block_row.get(fields.raw_byte_count), label="CAS raw bytes"
     )
     stored_byte_count = _nonnegative_int(
-        block_row.get(stored_byte_count_field), label="CAS stored bytes"
+        block_row.get(fields.stored_byte_count), label="CAS stored bytes"
     )
-    codec = str(block_row.get(codec_field) or "")
-    object_kind = str(block_row.get(kind_field) or "")
+    codec = str(block_row.get(fields.codec) or "")
+    object_kind = str(block_row.get(fields.kind) or "")
     if (
         len(block_hash) != 32
         or format_version != PTG2_V3_SHARED_FORMAT_VERSION
@@ -408,6 +446,230 @@ def _validated_physical_payload(
         entry_count=entry_count,
         payload=block_payload,
     )
+
+
+def _relation_manifest_from_row(
+    manifest_row: Mapping[str, Any],
+) -> _V4RelationManifest:
+    return _V4RelationManifest(
+        relation=str(manifest_row.get("relation") or ""),
+        member_object_kind=str(manifest_row.get("member_object_kind") or ""),
+        locator_object_kind=str(manifest_row.get("locator_object_kind") or ""),
+        owner_base=_nonnegative_int(
+            manifest_row.get("owner_base"),
+            label="relation owner_base",
+            maximum=0xFFFFFFFF,
+        ),
+        owner_count=_nonnegative_int(
+            manifest_row.get("owner_count"),
+            label="relation owner_count",
+            maximum=0x100000000,
+        ),
+        logical_member_count=_nonnegative_int(
+            manifest_row.get("logical_member_count"),
+            label="relation logical_member_count",
+        ),
+        vector_member_count=_nonnegative_int(
+            manifest_row.get("vector_member_count"),
+            label="relation vector_member_count",
+        ),
+        member_width=_nonnegative_int(
+            manifest_row.get("member_width"),
+            label="relation member_width",
+            maximum=64,
+        ),
+        member_page_bytes=_nonnegative_int(
+            manifest_row.get("member_page_bytes"),
+            label="relation member_page_bytes",
+            maximum=PTG2_V4_AUDIT_MAX_GRAPH_PAGE_BYTES,
+        ),
+        locator_page_bytes=_nonnegative_int(
+            manifest_row.get("locator_page_bytes"),
+            label="relation locator_page_bytes",
+            maximum=PTG2_V4_AUDIT_MAX_GRAPH_PAGE_BYTES,
+        ),
+        locator_owner_span=_nonnegative_int(
+            manifest_row.get("locator_owner_span"),
+            label="relation locator_owner_span",
+            maximum=0xFFFFFFFF,
+        ),
+    )
+
+
+def _validate_relation_manifest(
+    manifest: _V4RelationManifest,
+    *,
+    relation: str,
+    locator_kind: str,
+    member_kind: str,
+) -> None:
+    if (
+        manifest.relation != relation
+        or manifest.member_object_kind != member_kind
+        or manifest.locator_object_kind != locator_kind
+        or manifest.member_width != 4
+        or manifest.member_page_bytes < 4
+        or manifest.member_page_bytes % manifest.member_width
+        or manifest.locator_page_bytes < _LOCATOR.size
+        or manifest.locator_page_bytes % _LOCATOR.size
+        or manifest.locator_owner_span <= 0
+        or manifest.locator_page_bytes
+        != manifest.locator_owner_span * _LOCATOR.size
+        or manifest.owner_base + manifest.owner_count > 0x100000000
+        or manifest.vector_member_count > manifest.logical_member_count
+    ):
+        raise RuntimeError("PTG V4 audit relation manifest is inconsistent")
+
+
+def _heavy_owner_from_row(heavy_row: Mapping[str, Any]) -> _V4HeavyOwner:
+    return _V4HeavyOwner(
+        relation=str(heavy_row.get("relation") or ""),
+        owner_key=_nonnegative_int(
+            heavy_row.get("owner_key"),
+            label="heavy owner key",
+            maximum=0xFFFFFFFF,
+        ),
+        object_kind=str(heavy_row.get("object_kind") or ""),
+        member_count=_nonnegative_int(
+            heavy_row.get("member_count"),
+            label="heavy member count",
+            maximum=0xFFFFFFFF,
+        ),
+        member_base=_nonnegative_int(
+            heavy_row.get("member_base"),
+            label="heavy member base",
+            maximum=0xFFFFFFFF,
+        ),
+        member_span=_nonnegative_int(
+            heavy_row.get("member_span"),
+            label="heavy member span",
+            maximum=0xFFFFFFFF,
+        ),
+        fragment_count=_nonnegative_int(
+            heavy_row.get("fragment_count"),
+            label="heavy fragment count",
+            maximum=0x7FFFFFFF,
+        ),
+    )
+
+
+def _validate_heavy_owner(
+    owner: _V4HeavyOwner,
+    manifest: _V4RelationManifest,
+    expected_kind: str,
+    observed_owners: Mapping[int, _V4HeavyOwner],
+) -> None:
+    owner_limit = manifest.owner_base + manifest.owner_count
+    if (
+        owner.relation != manifest.relation
+        or owner.object_kind != expected_kind
+        or not manifest.owner_base <= owner.owner_key < owner_limit
+        or owner.member_span <= 0
+        or owner.fragment_count <= 0
+        or owner.member_count > owner.member_span
+        or owner.member_base + owner.member_span > 0x100000000
+        or owner.owner_key in observed_owners
+    ):
+        raise RuntimeError("PTG V4 audit heavy-owner manifest is inconsistent")
+
+
+def _join_heavy_owner_fragments(
+    owner: _V4HeavyOwner,
+    coordinates: Mapping[tuple[int, int], V4SnapshotMapCoordinate],
+    blocks: Mapping[bytes, _V4PhysicalBlock],
+) -> bytes:
+    fragments: list[bytes] = []
+    logical_offset = 0
+    observed_entry_count = 0
+    for fragment_no in range(owner.fragment_count):
+        coordinate = coordinates[(owner.owner_key, fragment_no)]
+        fragment_payload = blocks[bytes(coordinate.block_hash)].payload
+        logical_fragment = _unframe_heavy_bitmap_fragment(
+            fragment_payload,
+            owner=owner,
+            fragment_no=fragment_no,
+            entry_count=int(coordinate.entry_count),
+            logical_offset=logical_offset,
+        )
+        fragments.append(logical_fragment)
+        logical_offset += len(logical_fragment)
+        observed_entry_count += int(coordinate.entry_count)
+    if observed_entry_count != owner.member_count:
+        raise RuntimeError("PTG V4 audit heavy member count changed")
+    return b"".join(fragments)
+
+
+def _validate_heavy_bitmap_payload(
+    owner: _V4HeavyOwner,
+    heavy_payload: bytes,
+) -> None:
+    expected_size = (
+        PTG2_V4_HEAVY_BITMAP_HEADER_BYTES + (owner.member_span + 7) // 8
+    )
+    if len(heavy_payload) != expected_size:
+        raise RuntimeError("PTG V4 audit heavy bitmap size changed")
+    magic, stored_owner, member_base, member_span, member_count = (
+        _HEAVY_HEADER.unpack_from(heavy_payload)
+    )
+    bitmap = heavy_payload[PTG2_V4_HEAVY_BITMAP_HEADER_BYTES :]
+    if (
+        magic != PTG2_V4_HEAVY_BITMAP_MAGIC
+        or stored_owner != owner.owner_key
+        or member_base != owner.member_base
+        or member_span != owner.member_span
+        or member_count != owner.member_count
+        or (
+            owner.member_span % 8
+            and bitmap[-1] & (0xFF << (owner.member_span % 8))
+        )
+        or sum(byte.bit_count() for byte in bitmap) != owner.member_count
+    ):
+        raise RuntimeError("PTG V4 audit heavy bitmap is inconsistent")
+
+
+def _validate_map_pack_metadata(
+    map_pack_row: Mapping[str, Any],
+    block: _V4PhysicalBlock,
+    coordinates: Sequence[V4SnapshotMapCoordinate],
+) -> None:
+    first = (coordinates[0].block_key, coordinates[0].fragment_no)
+    last = (coordinates[-1].block_key, coordinates[-1].fragment_no)
+    expected_first = (
+        _nonnegative_int(
+            map_pack_row.get("first_block_key"),
+            label="map first key",
+        ),
+        _nonnegative_int(
+            map_pack_row.get("first_fragment_no"),
+            label="map first fragment",
+        ),
+    )
+    expected_last = (
+        _nonnegative_int(
+            map_pack_row.get("last_block_key"),
+            label="map last key",
+        ),
+        _nonnegative_int(
+            map_pack_row.get("last_fragment_no"),
+            label="map last fragment",
+        ),
+    )
+    if (
+        first != expected_first
+        or last != expected_last
+        or len(coordinates)
+        != _nonnegative_int(
+            map_pack_row.get("coordinate_count"),
+            label="map coordinate count",
+        )
+        or block.entry_count != len(coordinates)
+        or sum(coordinate.entry_count for coordinate in coordinates)
+        != _nonnegative_int(
+            map_pack_row.get("pack_entry_count"),
+            label="map entry count",
+        )
+    ):
+        raise RuntimeError("PTG V4 audit map pack metadata is inconsistent")
 
 
 class _V4PersistedGraphReader:
@@ -475,81 +737,20 @@ class _V4PersistedGraphReader:
         ]
         if len(manifest_rows) != 1:
             raise RuntimeError("PTG V4 audit relation manifest is missing or duplicated")
-        manifest_row = manifest_rows[0]
-        manifest = _V4RelationManifest(
-            relation=str(manifest_row.get("relation") or ""),
-            member_object_kind=str(
-                manifest_row.get("member_object_kind") or ""
-            ),
-            locator_object_kind=str(
-                manifest_row.get("locator_object_kind") or ""
-            ),
-            owner_base=_nonnegative_int(
-                manifest_row.get("owner_base"),
-                label="relation owner_base",
-                maximum=0xFFFFFFFF,
-            ),
-            owner_count=_nonnegative_int(
-                manifest_row.get("owner_count"),
-                label="relation owner_count",
-                maximum=0x100000000,
-            ),
-            logical_member_count=_nonnegative_int(
-                manifest_row.get("logical_member_count"),
-                label="relation logical_member_count",
-            ),
-            vector_member_count=_nonnegative_int(
-                manifest_row.get("vector_member_count"),
-                label="relation vector_member_count",
-            ),
-            member_width=_nonnegative_int(
-                manifest_row.get("member_width"),
-                label="relation member_width",
-                maximum=64,
-            ),
-            member_page_bytes=_nonnegative_int(
-                manifest_row.get("member_page_bytes"),
-                label="relation member_page_bytes",
-                maximum=PTG2_V4_AUDIT_MAX_GRAPH_PAGE_BYTES,
-            ),
-            locator_page_bytes=_nonnegative_int(
-                manifest_row.get("locator_page_bytes"),
-                label="relation locator_page_bytes",
-                maximum=PTG2_V4_AUDIT_MAX_GRAPH_PAGE_BYTES,
-            ),
-            locator_owner_span=_nonnegative_int(
-                manifest_row.get("locator_owner_span"),
-                label="relation locator_owner_span",
-                maximum=0xFFFFFFFF,
-            ),
+        manifest = _relation_manifest_from_row(manifest_rows[0])
+        _validate_relation_manifest(
+            manifest,
+            relation=normalized,
+            locator_kind=expected_locator_kind,
+            member_kind=expected_member_kind,
         )
-        if (
-            manifest.relation != normalized
-            or manifest.member_object_kind != expected_member_kind
-            or manifest.locator_object_kind != expected_locator_kind
-            or manifest.member_width != 4
-            or manifest.member_page_bytes < 4
-            or manifest.member_page_bytes % manifest.member_width
-            or manifest.locator_page_bytes < _LOCATOR.size
-            or manifest.locator_page_bytes % _LOCATOR.size
-            or manifest.locator_owner_span <= 0
-            or manifest.locator_page_bytes
-            != manifest.locator_owner_span * _LOCATOR.size
-            or manifest.owner_base + manifest.owner_count > 0x100000000
-            or manifest.vector_member_count > manifest.logical_member_count
-        ):
-            raise RuntimeError("PTG V4 audit relation manifest is inconsistent")
         self._manifest_cache[normalized] = manifest
         return manifest
 
-    async def _map_coordinates(
-        self,
-        *,
-        object_kind: str,
+    @staticmethod
+    def _requested_map_pairs(
         coordinate_pairs: Iterable[tuple[int, int]],
-    ) -> dict[tuple[int, int], V4SnapshotMapCoordinate]:
-        """Load authenticated packed-map coordinates under the audit budget."""
-
+    ) -> tuple[tuple[int, int], ...]:
         requested_pairs = tuple(
             sorted(
                 {
@@ -563,59 +764,142 @@ class _V4PersistedGraphReader:
             for block_key, fragment_no in requested_pairs
         ):
             raise RuntimeError("PTG V4 audit map coordinate is negative")
+        return requested_pairs
+
+    def _cached_map_coordinates(
+        self,
+        object_kind: str,
+        requested_pairs: tuple[tuple[int, int], ...],
+    ) -> tuple[
+        dict[tuple[int, int], V4SnapshotMapCoordinate],
+        tuple[tuple[int, int], ...],
+    ]:
         result_by_pair: dict[tuple[int, int], V4SnapshotMapCoordinate] = {}
         missing_pairs: list[tuple[int, int]] = []
         for pair in requested_pairs:
-            cached = self._coordinate_cache.get((object_kind, pair[0], pair[1]))
+            cached = self._coordinate_cache.get(
+                (object_kind, pair[0], pair[1])
+            )
             if cached is None:
                 missing_pairs.append(pair)
             else:
                 result_by_pair[pair] = cached
-        if missing_pairs:
-            schema = _quote_ident(self.schema_name)
-            query_result = await self.session.execute(
-                db.text(
-                    f"""
-                    SELECT pack.pack_no, pack.first_block_key, pack.first_fragment_no,
-                           pack.last_block_key, pack.last_fragment_no,
-                           pack.coordinate_count, pack.entry_count AS pack_entry_count,
-                           pack.map_block_hash,
-                           block.format_version AS map_format_version,
-                           block.object_kind AS map_object_kind,
-                           block.codec AS map_codec,
-                           block.entry_count AS map_block_entry_count,
-                           block.raw_byte_count AS map_raw_byte_count,
-                           block.stored_byte_count AS map_stored_byte_count,
-                           block.payload AS map_payload
-                      FROM {schema}.ptg2_v4_snapshot_map_pack AS pack
-                      JOIN {schema}.ptg2_v3_block AS block
-                        ON block.block_hash = pack.map_block_hash
-                     WHERE pack.snapshot_key = :snapshot_key
-                       AND pack.object_kind = :object_kind
-                       AND EXISTS (
-                           SELECT 1
-                             FROM unnest(
-                                      CAST(:block_keys AS bigint[]),
-                                      CAST(:fragment_nos AS integer[])
-                                  ) AS wanted(block_key, fragment_no)
-                            WHERE ROW(wanted.block_key, wanted.fragment_no)
-                                  BETWEEN ROW(pack.first_block_key, pack.first_fragment_no)
-                                      AND ROW(pack.last_block_key, pack.last_fragment_no)
-                       )
-                     ORDER BY pack.pack_no
-                    """
-                ),
-                {
-                    "snapshot_key": self.snapshot_key,
-                    "object_kind": object_kind,
-                    "block_keys": tuple(pair[0] for pair in missing_pairs),
-                    "fragment_nos": tuple(pair[1] for pair in missing_pairs),
-                },
+        return result_by_pair, tuple(missing_pairs)
+
+    async def _map_pack_rows(
+        self,
+        object_kind: str,
+        missing_pairs: tuple[tuple[int, int], ...],
+    ) -> list[dict[str, Any]]:
+        schema = _quote_ident(self.schema_name)
+        query_result = await self.session.execute(
+            db.text(
+                f"""
+                SELECT pack.pack_no, pack.first_block_key, pack.first_fragment_no,
+                       pack.last_block_key, pack.last_fragment_no,
+                       pack.coordinate_count, pack.entry_count AS pack_entry_count,
+                       pack.map_block_hash,
+                       block.format_version AS map_format_version,
+                       block.object_kind AS map_object_kind,
+                       block.codec AS map_codec,
+                       block.entry_count AS map_block_entry_count,
+                       block.raw_byte_count AS map_raw_byte_count,
+                       block.stored_byte_count AS map_stored_byte_count,
+                       block.payload AS map_payload
+                  FROM {schema}.ptg2_v4_snapshot_map_pack AS pack
+                  JOIN {schema}.ptg2_v3_block AS block
+                    ON block.block_hash = pack.map_block_hash
+                 WHERE pack.snapshot_key = :snapshot_key
+                   AND pack.object_kind = :object_kind
+                   AND EXISTS (
+                       SELECT 1
+                         FROM unnest(
+                                  CAST(:block_keys AS bigint[]),
+                                  CAST(:fragment_nos AS integer[])
+                              ) AS wanted(block_key, fragment_no)
+                        WHERE ROW(wanted.block_key, wanted.fragment_no)
+                              BETWEEN ROW(pack.first_block_key, pack.first_fragment_no)
+                                  AND ROW(pack.last_block_key, pack.last_fragment_no)
+                   )
+                 ORDER BY pack.pack_no
+                """
+            ),
+            {
+                "snapshot_key": self.snapshot_key,
+                "object_kind": object_kind,
+                "block_keys": tuple(pair[0] for pair in missing_pairs),
+                "fragment_nos": tuple(pair[1] for pair in missing_pairs),
+            },
+        )
+        return [_row_mapping(raw_row) for raw_row in query_result]
+
+    def _map_pack_coordinates(
+        self,
+        map_pack_row: Mapping[str, Any],
+        object_kind: str,
+    ) -> Sequence[V4SnapshotMapCoordinate]:
+        block = _validated_physical_payload(
+            map_pack_row,
+            expected_kind=PTG2_V4_MAP_BLOCK_KIND,
+            maximum_raw_bytes=PTG2_V4_AUDIT_MAX_MAP_PACK_BYTES,
+            fields=_MAP_PAYLOAD_FIELDS,
+        )
+        self._charge_block(block)
+        try:
+            coordinates = decode_v4_snapshot_map_pack(
+                block.payload,
+                expected_object_kind=object_kind,
             )
+        except ValueError as exc:
+            raise RuntimeError("PTG V4 audit map pack is invalid") from exc
+        _validate_map_pack_metadata(map_pack_row, block, coordinates)
+        return coordinates
+
+    def _retain_map_pack_coordinates(
+        self,
+        coordinates: Sequence[V4SnapshotMapCoordinate],
+        missing_pairs: set[tuple[int, int]],
+        result_by_pair: dict[tuple[int, int], V4SnapshotMapCoordinate],
+    ) -> None:
+        for coordinate in coordinates:
+            cache_key = (
+                coordinate.object_kind,
+                int(coordinate.block_key),
+                int(coordinate.fragment_no),
+            )
+            previous = self._coordinate_cache.setdefault(
+                cache_key,
+                coordinate,
+            )
+            if previous != coordinate:
+                raise RuntimeError("PTG V4 audit map coordinate conflicts")
+            pair = (int(coordinate.block_key), int(coordinate.fragment_no))
+            if pair not in missing_pairs:
+                continue
+            if pair in result_by_pair:
+                raise RuntimeError("PTG V4 audit map coordinate is ambiguous")
+            result_by_pair[pair] = coordinate
+
+    async def _map_coordinates(
+        self,
+        *,
+        object_kind: str,
+        coordinate_pairs: Iterable[tuple[int, int]],
+    ) -> dict[tuple[int, int], V4SnapshotMapCoordinate]:
+        """Load authenticated packed-map coordinates under the audit budget."""
+
+        requested_pairs = self._requested_map_pairs(coordinate_pairs)
+        result_by_pair, missing_pairs = self._cached_map_coordinates(
+            object_kind,
+            requested_pairs,
+        )
+        if missing_pairs:
             missing_pair_set = set(missing_pairs)
             observed_pack_nos: set[int] = set()
-            for raw_row in query_result:
-                map_pack_row = _row_mapping(raw_row)
+            for map_pack_row in await self._map_pack_rows(
+                object_kind,
+                missing_pairs,
+            ):
                 pack_no = _nonnegative_int(
                     map_pack_row.get("pack_no"),
                     label="map pack number",
@@ -624,79 +908,15 @@ class _V4PersistedGraphReader:
                 if pack_no in observed_pack_nos:
                     raise RuntimeError("PTG V4 audit map query duplicated a pack")
                 observed_pack_nos.add(pack_no)
-                block = _validated_physical_payload(
+                coordinates = self._map_pack_coordinates(
                     map_pack_row,
-                    expected_kind=PTG2_V4_MAP_BLOCK_KIND,
-                    maximum_raw_bytes=PTG2_V4_AUDIT_MAX_MAP_PACK_BYTES,
-                    hash_field="map_block_hash",
-                    version_field="map_format_version",
-                    kind_field="map_object_kind",
-                    codec_field="map_codec",
-                    entry_count_field="map_block_entry_count",
-                    raw_byte_count_field="map_raw_byte_count",
-                    stored_byte_count_field="map_stored_byte_count",
-                    payload_field="map_payload",
+                    object_kind,
                 )
-                self._charge_block(block)
-                try:
-                    coordinates = decode_v4_snapshot_map_pack(
-                        block.payload,
-                        expected_object_kind=object_kind,
-                    )
-                except ValueError as exc:
-                    raise RuntimeError("PTG V4 audit map pack is invalid") from exc
-                first = (coordinates[0].block_key, coordinates[0].fragment_no)
-                last = (coordinates[-1].block_key, coordinates[-1].fragment_no)
-                expected_first = (
-                    _nonnegative_int(
-                        map_pack_row.get("first_block_key"),
-                        label="map first key",
-                    ),
-                    _nonnegative_int(
-                        map_pack_row.get("first_fragment_no"),
-                        label="map first fragment",
-                    ),
+                self._retain_map_pack_coordinates(
+                    coordinates,
+                    missing_pair_set,
+                    result_by_pair,
                 )
-                expected_last = (
-                    _nonnegative_int(
-                        map_pack_row.get("last_block_key"),
-                        label="map last key",
-                    ),
-                    _nonnegative_int(
-                        map_pack_row.get("last_fragment_no"),
-                        label="map last fragment",
-                    ),
-                )
-                if (
-                    first != expected_first
-                    or last != expected_last
-                    or len(coordinates)
-                    != _nonnegative_int(
-                        map_pack_row.get("coordinate_count"),
-                        label="map coordinate count",
-                    )
-                    or block.entry_count != len(coordinates)
-                    or sum(coordinate.entry_count for coordinate in coordinates)
-                    != _nonnegative_int(
-                        map_pack_row.get("pack_entry_count"),
-                        label="map entry count",
-                    )
-                ):
-                    raise RuntimeError("PTG V4 audit map pack metadata is inconsistent")
-                for coordinate in coordinates:
-                    cache_key = (
-                        coordinate.object_kind,
-                        int(coordinate.block_key),
-                        int(coordinate.fragment_no),
-                    )
-                    previous = self._coordinate_cache.setdefault(cache_key, coordinate)
-                    if previous != coordinate:
-                        raise RuntimeError("PTG V4 audit map coordinate conflicts")
-                    pair = (int(coordinate.block_key), int(coordinate.fragment_no))
-                    if pair in missing_pair_set:
-                        if pair in result_by_pair:
-                            raise RuntimeError("PTG V4 audit map coordinate is ambiguous")
-                        result_by_pair[pair] = coordinate
         if set(result_by_pair) != set(requested_pairs):
             raise RuntimeError("PTG V4 audit map is missing a required coordinate")
         return result_by_pair
@@ -789,49 +1009,14 @@ class _V4PersistedGraphReader:
         )
         expected_kind = f"v4_{manifest.relation}_heavy_bitmap_v1"
         owners_by_key: dict[int, _V4HeavyOwner] = {}
-        owner_limit = manifest.owner_base + manifest.owner_count
         for raw_row in query_result:
-            heavy_row = _row_mapping(raw_row)
-            owner = _V4HeavyOwner(
-                relation=str(heavy_row.get("relation") or ""),
-                owner_key=_nonnegative_int(
-                    heavy_row.get("owner_key"),
-                    label="heavy owner key",
-                    maximum=0xFFFFFFFF,
-                ),
-                object_kind=str(heavy_row.get("object_kind") or ""),
-                member_count=_nonnegative_int(
-                    heavy_row.get("member_count"),
-                    label="heavy member count",
-                    maximum=0xFFFFFFFF,
-                ),
-                member_base=_nonnegative_int(
-                    heavy_row.get("member_base"),
-                    label="heavy member base",
-                    maximum=0xFFFFFFFF,
-                ),
-                member_span=_nonnegative_int(
-                    heavy_row.get("member_span"),
-                    label="heavy member span",
-                    maximum=0xFFFFFFFF,
-                ),
-                fragment_count=_nonnegative_int(
-                    heavy_row.get("fragment_count"),
-                    label="heavy fragment count",
-                    maximum=0x7FFFFFFF,
-                ),
+            owner = _heavy_owner_from_row(_row_mapping(raw_row))
+            _validate_heavy_owner(
+                owner,
+                manifest,
+                expected_kind,
+                owners_by_key,
             )
-            if (
-                owner.relation != manifest.relation
-                or owner.object_kind != expected_kind
-                or not manifest.owner_base <= owner.owner_key < owner_limit
-                or owner.member_span <= 0
-                or owner.fragment_count <= 0
-                or owner.member_count > owner.member_span
-                or owner.member_base + owner.member_span > 0x100000000
-                or owner.owner_key in owners_by_key
-            ):
-                raise RuntimeError("PTG V4 audit heavy-owner manifest is inconsistent")
             owners_by_key[owner.owner_key] = owner
         return owners_by_key
 
@@ -968,49 +1153,63 @@ class _V4PersistedGraphReader:
         )
         payloads_by_owner: dict[int, bytes] = {}
         for owner_key, owner in owners_by_key.items():
-            fragments: list[bytes] = []
-            logical_offset = 0
-            observed_entry_count = 0
-            for fragment_no in range(owner.fragment_count):
-                coordinate = coordinates[(owner_key, fragment_no)]
-                fragment_payload = blocks[bytes(coordinate.block_hash)].payload
-                logical_fragment = _unframe_heavy_bitmap_fragment(
-                    fragment_payload,
-                    owner=owner,
-                    fragment_no=fragment_no,
-                    entry_count=int(coordinate.entry_count),
-                    logical_offset=logical_offset,
-                )
-                fragments.append(logical_fragment)
-                logical_offset += len(logical_fragment)
-                observed_entry_count += int(coordinate.entry_count)
-            if observed_entry_count != owner.member_count:
-                raise RuntimeError("PTG V4 audit heavy member count changed")
-            heavy_payload = b"".join(fragments)
-            expected_size = PTG2_V4_HEAVY_BITMAP_HEADER_BYTES + (
-                owner.member_span + 7
-            ) // 8
-            if len(heavy_payload) != expected_size:
-                raise RuntimeError("PTG V4 audit heavy bitmap size changed")
-            magic, stored_owner, member_base, member_span, member_count = _HEAVY_HEADER.unpack_from(
-                heavy_payload
+            heavy_payload = _join_heavy_owner_fragments(
+                owner,
+                coordinates,
+                blocks,
             )
-            bitmap = heavy_payload[PTG2_V4_HEAVY_BITMAP_HEADER_BYTES :]
-            if (
-                magic != PTG2_V4_HEAVY_BITMAP_MAGIC
-                or stored_owner != owner.owner_key
-                or member_base != owner.member_base
-                or member_span != owner.member_span
-                or member_count != owner.member_count
-                or (
-                    owner.member_span % 8
-                    and bitmap[-1] & (0xFF << (owner.member_span % 8))
-                )
-                or sum(byte.bit_count() for byte in bitmap) != owner.member_count
-            ):
-                raise RuntimeError("PTG V4 audit heavy bitmap is inconsistent")
+            _validate_heavy_bitmap_payload(owner, heavy_payload)
             payloads_by_owner[owner_key] = heavy_payload
         return payloads_by_owner
+
+    async def _regular_scalar_members(
+        self,
+        manifest: _V4RelationManifest,
+        locators: Mapping[int, tuple[int, int]],
+    ) -> dict[int, int]:
+        page_keys = {
+            (member_offset // manifest.members_per_page)
+            * manifest.members_per_page
+            for member_offset, _member_count in locators.values()
+        }
+        pages = await self._member_pages(manifest, page_keys)
+        members_by_owner: dict[int, int] = {}
+        for owner_key, (member_offset, _member_count) in locators.items():
+            page_key = (
+                member_offset // manifest.members_per_page
+            ) * manifest.members_per_page
+            local_offset = member_offset - page_key
+            page = pages.get(page_key, ())
+            if local_offset >= len(page):
+                raise RuntimeError("PTG V4 audit scalar locator is truncated")
+            self.budget.add_members(1)
+            members_by_owner[owner_key] = page[local_offset]
+        return members_by_owner
+
+    async def _heavy_scalar_members(
+        self,
+        manifest: _V4RelationManifest,
+        heavy: Mapping[int, _V4HeavyOwner],
+    ) -> dict[int, int]:
+        payloads = await self._heavy_payloads(manifest, heavy)
+        members_by_owner: dict[int, int] = {}
+        for owner_key, owner in heavy.items():
+            bitmap = payloads[owner_key][
+                PTG2_V4_HEAVY_BITMAP_HEADER_BYTES:
+            ]
+            set_offsets = [
+                byte_index * 8 + bit
+                for byte_index, byte in enumerate(bitmap)
+                for bit in range(8)
+                if byte & (1 << bit)
+            ]
+            if len(set_offsets) != 1:
+                raise RuntimeError(
+                    "PTG V4 audit scalar bitmap changed cardinality"
+                )
+            self.budget.add_members(1)
+            members_by_owner[owner_key] = owner.member_base + set_offsets[0]
+        return members_by_owner
 
     async def single_members(
         self,
@@ -1032,36 +1231,111 @@ class _V4PersistedGraphReader:
             owner.member_count != 1 for owner in heavy.values()
         ):
             raise RuntimeError("PTG V4 audit scalar relation changed cardinality")
-        page_keys = {
-            (member_offset // manifest.members_per_page) * manifest.members_per_page
-            for member_offset, _member_count in locators.values()
-        }
-        pages = await self._member_pages(manifest, page_keys)
-        members_by_owner: dict[int, int] = {}
-        for owner_key, (member_offset, _member_count) in locators.items():
-            page_key = (
-                member_offset // manifest.members_per_page
-            ) * manifest.members_per_page
-            local_offset = member_offset - page_key
-            page = pages.get(page_key, ())
-            if local_offset >= len(page):
-                raise RuntimeError("PTG V4 audit scalar locator is truncated")
-            self.budget.add_members(1)
-            members_by_owner[owner_key] = page[local_offset]
-        heavy_payloads = await self._heavy_payloads(manifest, heavy)
-        for owner_key, owner in heavy.items():
-            bitmap = heavy_payloads[owner_key][PTG2_V4_HEAVY_BITMAP_HEADER_BYTES :]
-            set_offsets = [
-                byte_index * 8 + bit
-                for byte_index, byte in enumerate(bitmap)
-                for bit in range(8)
-                if byte & (1 << bit)
-            ]
-            if len(set_offsets) != 1:
-                raise RuntimeError("PTG V4 audit scalar bitmap changed cardinality")
-            self.budget.add_members(1)
-            members_by_owner[owner_key] = owner.member_base + set_offsets[0]
+        members_by_owner = await self._regular_scalar_members(
+            manifest,
+            locators,
+        )
+        members_by_owner.update(
+            await self._heavy_scalar_members(manifest, heavy)
+        )
         return members_by_owner
+
+    def _heavy_edge_membership(
+        self,
+        requested_edges: tuple[tuple[int, int], ...],
+        heavy: Mapping[int, _V4HeavyOwner],
+        payloads: Mapping[int, bytes],
+    ) -> dict[tuple[int, int], bool]:
+        membership_by_edge: dict[tuple[int, int], bool] = {}
+        for owner_key, member_key in requested_edges:
+            owner = heavy.get(owner_key)
+            if owner is None:
+                continue
+            self.budget.add_members(1)
+            offset = member_key - owner.member_base
+            if offset < 0 or offset >= owner.member_span:
+                membership_by_edge[(owner_key, member_key)] = False
+                continue
+            bitmap = payloads[owner_key][
+                PTG2_V4_HEAVY_BITMAP_HEADER_BYTES:
+            ]
+            membership_by_edge[(owner_key, member_key)] = bool(
+                bitmap[offset // 8] & (1 << (offset % 8))
+            )
+        return membership_by_edge
+
+    @staticmethod
+    def _regular_edge_search_bounds(
+        edges: tuple[tuple[int, int], ...],
+        locators: Mapping[int, tuple[int, int]],
+        membership_by_edge: dict[tuple[int, int], bool],
+    ) -> dict[tuple[int, int], list[int]]:
+        search_bounds_by_edge: dict[tuple[int, int], list[int]] = {}
+        for edge in edges:
+            member_offset, member_count = locators[edge[0]]
+            if member_count == 0:
+                membership_by_edge[edge] = False
+                continue
+            search_bounds_by_edge[edge] = [
+                member_offset,
+                member_offset + member_count - 1,
+            ]
+        return search_bounds_by_edge
+
+    async def _search_regular_edges(
+        self,
+        manifest: _V4RelationManifest,
+        search_bounds_by_edge: dict[tuple[int, int], list[int]],
+    ) -> dict[tuple[int, int], bool]:
+        membership_by_edge: dict[tuple[int, int], bool] = {}
+        rounds = 0
+        while search_bounds_by_edge:
+            rounds += 1
+            if rounds > PTG2_V4_AUDIT_MAX_BINARY_SEARCH_ROUNDS:
+                raise RuntimeError(
+                    "PTG V4 audit member search exceeded its round cap"
+                )
+            middle_by_edge = {
+                edge: (bounds[0] + bounds[1]) // 2
+                for edge, bounds in search_bounds_by_edge.items()
+            }
+            page_keys = {
+                (middle // manifest.members_per_page)
+                * manifest.members_per_page
+                for middle in middle_by_edge.values()
+            }
+            pages = await self._member_pages(manifest, page_keys)
+            completed_edges: list[tuple[int, int]] = []
+            for edge, middle in middle_by_edge.items():
+                page_key = (
+                    middle // manifest.members_per_page
+                ) * manifest.members_per_page
+                page = pages.get(page_key, ())
+                local_offset = middle - page_key
+                if local_offset >= len(page):
+                    raise RuntimeError(
+                        "PTG V4 audit member locator is truncated"
+                    )
+                self.budget.add_members(1)
+                observed_member = page[local_offset]
+                target_member = edge[1]
+                if observed_member == target_member:
+                    membership_by_edge[edge] = True
+                    completed_edges.append(edge)
+                elif observed_member < target_member:
+                    search_bounds_by_edge[edge][0] = middle + 1
+                else:
+                    search_bounds_by_edge[edge][1] = middle - 1
+                if (
+                    search_bounds_by_edge[edge][0]
+                    > search_bounds_by_edge[edge][1]
+                    and edge not in completed_edges
+                ):
+                    membership_by_edge[edge] = False
+                    completed_edges.append(edge)
+            for edge in completed_edges:
+                search_bounds_by_edge.pop(edge, None)
+        return membership_by_edge
 
     async def contains_edges(
         self,
@@ -1085,91 +1359,37 @@ class _V4PersistedGraphReader:
         owner_keys = {owner_key for owner_key, _member_key in requested_edges}
         heavy = await self._heavy_owners(manifest, owner_keys)
         heavy_payloads = await self._heavy_payloads(manifest, heavy)
-        membership_by_edge: dict[tuple[int, int], bool] = {}
-        for owner_key, member_key in requested_edges:
-            owner = heavy.get(owner_key)
-            if owner is None:
-                continue
-            self.budget.add_members(1)
-            offset = member_key - owner.member_base
-            if offset < 0 or offset >= owner.member_span:
-                membership_by_edge[(owner_key, member_key)] = False
-                continue
-            bitmap = heavy_payloads[owner_key][PTG2_V4_HEAVY_BITMAP_HEADER_BYTES :]
-            membership_by_edge[(owner_key, member_key)] = bool(
-                bitmap[offset // 8] & (1 << (offset % 8))
-            )
-
+        membership_by_edge = self._heavy_edge_membership(
+            requested_edges,
+            heavy,
+            heavy_payloads,
+        )
         regular_edges = tuple(
             edge for edge in requested_edges if edge[0] not in heavy
         )
         locators = await self._locators(
             manifest, (owner_key for owner_key, _member_key in regular_edges)
         )
-        search_bounds_by_edge: dict[tuple[int, int], list[int]] = {}
-        for edge in regular_edges:
-            member_offset, member_count = locators[edge[0]]
-            if member_count == 0:
-                membership_by_edge[edge] = False
-            else:
-                search_bounds_by_edge[edge] = [
-                    member_offset,
-                    member_offset + member_count - 1,
-                ]
-        rounds = 0
-        while search_bounds_by_edge:
-            rounds += 1
-            if rounds > PTG2_V4_AUDIT_MAX_BINARY_SEARCH_ROUNDS:
-                raise RuntimeError("PTG V4 audit member search exceeded its round cap")
-            middle_by_edge = {
-                edge: (bounds[0] + bounds[1]) // 2
-                for edge, bounds in search_bounds_by_edge.items()
-            }
-            page_keys = {
-                (middle // manifest.members_per_page) * manifest.members_per_page
-                for middle in middle_by_edge.values()
-            }
-            pages = await self._member_pages(manifest, page_keys)
-            completed_edges: list[tuple[int, int]] = []
-            for edge, middle in middle_by_edge.items():
-                page_key = (
-                    middle // manifest.members_per_page
-                ) * manifest.members_per_page
-                page = pages.get(page_key, ())
-                local_offset = middle - page_key
-                if local_offset >= len(page):
-                    raise RuntimeError("PTG V4 audit member locator is truncated")
-                self.budget.add_members(1)
-                observed_member = page[local_offset]
-                target_member = edge[1]
-                if observed_member == target_member:
-                    membership_by_edge[edge] = True
-                    completed_edges.append(edge)
-                elif observed_member < target_member:
-                    search_bounds_by_edge[edge][0] = middle + 1
-                else:
-                    search_bounds_by_edge[edge][1] = middle - 1
-                if (
-                    search_bounds_by_edge[edge][0]
-                    > search_bounds_by_edge[edge][1]
-                    and edge not in completed_edges
-                ):
-                    membership_by_edge[edge] = False
-                    completed_edges.append(edge)
-            for edge in completed_edges:
-                search_bounds_by_edge.pop(edge, None)
+        search_bounds_by_edge = self._regular_edge_search_bounds(
+            regular_edges,
+            locators,
+            membership_by_edge,
+        )
+        membership_by_edge.update(
+            await self._search_regular_edges(
+                manifest,
+                search_bounds_by_edge,
+            )
+        )
         return membership_by_edge
 
 
-async def _validate_building_v4_context(
+async def _building_v4_root_row(
     session: Any,
     *,
     schema_name: str,
-    build_ownership: SharedLayoutBuildOwnership,
-    representation: str,
-) -> None:
-    """Lock and verify the exact unsealed V4 root owned by this build."""
-
+    snapshot_key: int,
+) -> dict[str, Any]:
     schema = _quote_ident(schema_name)
     query_result = await session.execute(
         db.text(
@@ -1191,12 +1411,19 @@ async def _validate_building_v4_context(
              FOR UPDATE OF layout, root
             """
         ),
-        {"snapshot_key": int(build_ownership.snapshot_key)},
+        {"snapshot_key": int(snapshot_key)},
     )
     root_rows = [_row_mapping(root_row) for root_row in query_result]
     if len(root_rows) != 1:
         raise RuntimeError("PTG V4 audit building root is missing or duplicated")
-    root_row = root_rows[0]
+    return root_rows[0]
+
+
+def _validate_building_v4_root_row(
+    root_row: Mapping[str, Any],
+    build_ownership: SharedLayoutBuildOwnership,
+    representation: str,
+) -> None:
     completion_count_fields = (
         "object_kind_count",
         "map_pack_count",
@@ -1233,6 +1460,27 @@ async def _validate_building_v4_context(
         )
     ):
         raise RuntimeError("PTG V4 audit lost its exact building-root ownership")
+
+
+async def _validate_building_v4_context(
+    session: Any,
+    *,
+    schema_name: str,
+    build_ownership: SharedLayoutBuildOwnership,
+    representation: str,
+) -> None:
+    """Lock and verify the exact unsealed V4 root owned by this build."""
+
+    root_row = await _building_v4_root_row(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(build_ownership.snapshot_key),
+    )
+    _validate_building_v4_root_row(
+        root_row,
+        build_ownership,
+        representation,
+    )
 
 
 async def _npi_keys_for_values(
@@ -1279,17 +1527,10 @@ async def _npi_keys_for_values(
     return by_npi
 
 
-async def _verified_provider_npis_by_candidate(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
+def _selected_witnesses_by_set(
     candidates: Sequence[AuditCandidate],
     witnesses: Mapping[int, V4ProviderSetAuditWitness],
-    reader: _V4PersistedGraphReader,
-) -> dict[int, tuple[int, ...]]:
-    """Prove compiler witnesses through the persisted graph and NPI dictionary."""
-
+) -> dict[int, V4ProviderSetAuditWitness]:
     expected_positive_sets = {
         candidate.provider_set_key
         for candidate in candidates
@@ -1302,25 +1543,31 @@ async def _verified_provider_npis_by_candidate(
     }
     if expected_positive_sets - set(witnesses) or expected_empty_sets & set(witnesses):
         raise RuntimeError("PTG V4 audit witness disagrees with candidate provider counts")
-    selected_witnesses_by_set = {
+    return {
         provider_set_key: witnesses[provider_set_key]
         for provider_set_key in expected_positive_sets
     }
+
+
+async def _verify_witness_set_groups(
+    reader: _V4PersistedGraphReader,
+    witnesses_by_set: Mapping[int, V4ProviderSetAuditWitness],
+) -> None:
     if reader.representation == "pattern_v1":
         pattern_by_group = await reader.single_members(
             "group_patterns",
             (
                 witness.provider_group_key
-                for witness in selected_witnesses_by_set.values()
+                for witness in witnesses_by_set.values()
             ),
         )
         set_pattern_edges = {
             (provider_set_key, pattern_by_group[witness.provider_group_key])
-            for provider_set_key, witness in selected_witnesses_by_set.items()
+            for provider_set_key, witness in witnesses_by_set.items()
         }
         pattern_group_edges = {
             (pattern_by_group[witness.provider_group_key], witness.provider_group_key)
-            for witness in selected_witnesses_by_set.values()
+            for witness in witnesses_by_set.values()
         }
         set_pattern_membership = await reader.contains_edges(
             "set_patterns", set_pattern_edges
@@ -1335,7 +1582,7 @@ async def _verified_provider_npis_by_candidate(
     elif reader.representation == "direct_v1":
         direct_edges = {
             (provider_set_key, witness.provider_group_key)
-            for provider_set_key, witness in selected_witnesses_by_set.items()
+            for provider_set_key, witness in witnesses_by_set.items()
         }
         direct_membership = await reader.contains_edges(
             "set_groups_direct", direct_edges
@@ -1345,21 +1592,52 @@ async def _verified_provider_npis_by_candidate(
     else:
         raise RuntimeError("PTG V4 audit representation is unsupported")
 
+
+async def _verify_witness_group_npis(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    witnesses_by_set: Mapping[int, V4ProviderSetAuditWitness],
+    reader: _V4PersistedGraphReader,
+) -> None:
     npi_key_by_value = await _npi_keys_for_values(
         session,
         schema_name=schema_name,
         snapshot_key=int(snapshot_key),
-        npis=(witness.npi for witness in selected_witnesses_by_set.values()),
+        npis=(witness.npi for witness in witnesses_by_set.values()),
     )
     group_npi_edges = {
         (witness.provider_group_key, npi_key_by_value[witness.npi])
-        for witness in selected_witnesses_by_set.values()
+        for witness in witnesses_by_set.values()
     }
     group_npi_membership = await reader.contains_edges(
         "group_npis_exact", group_npi_edges
     )
     if not all(group_npi_membership.values()):
         raise RuntimeError("PTG V4 audit witness NPI is absent from its exact group")
+
+
+async def _verified_provider_npis_by_candidate(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    candidates: Sequence[AuditCandidate],
+    witnesses: Mapping[int, V4ProviderSetAuditWitness],
+    reader: _V4PersistedGraphReader,
+) -> dict[int, tuple[int, ...]]:
+    """Prove compiler witnesses through the persisted graph and NPI dictionary."""
+
+    selected_witnesses = _selected_witnesses_by_set(candidates, witnesses)
+    await _verify_witness_set_groups(reader, selected_witnesses)
+    await _verify_witness_group_npis(
+        session,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        witnesses_by_set=selected_witnesses,
+        reader=reader,
+    )
     return {
         candidate.candidate_ordinal: (
             (witnesses[candidate.provider_set_key].npi,)
@@ -1368,6 +1646,208 @@ async def _verified_provider_npis_by_candidate(
         )
         for candidate in candidates
     }
+
+
+@dataclass(frozen=True)
+class _V4AuditPreparation:
+    representation: str
+    candidates: Sequence[AuditCandidate]
+    candidate_summary: Mapping[str, Any]
+    witnesses: Mapping[int, V4ProviderSetAuditWitness]
+    source_count: int
+    core_layout_id: bytes
+    snapshot_key: int
+    budget: _ReadBudget
+
+
+@dataclass(frozen=True)
+class _V4AuditExecution:
+    audit_occurrences: Sequence[Any]
+    provider_npis: Mapping[int, tuple[int, ...]]
+
+
+def _prepare_v4_audit(
+    *,
+    finalizer_summary: Mapping[str, Any],
+    mapping_digest: bytes,
+    core_support_digest: bytes,
+    graph_compilation: V4GraphCompilationResult,
+    build_ownership: SharedLayoutBuildOwnership,
+) -> _V4AuditPreparation:
+    normalized_mapping_digest = bytes(mapping_digest)
+    normalized_core_support = bytes(core_support_digest)
+    if len(normalized_mapping_digest) != 32:
+        raise ValueError("PTG V4 audit mapping digest must contain 32 bytes")
+    if len(normalized_core_support) != 32:
+        raise ValueError("PTG V4 audit core support digest must contain 32 bytes")
+    try:
+        representation = _REPRESENTATION_BY_COMPILER_LAYOUT[
+            str(graph_compilation.selected_layout)
+        ]
+    except KeyError as exc:
+        raise RuntimeError("PTG V4 audit compiler layout is unsupported") from exc
+    candidates, candidate_summary = load_audit_candidates(finalizer_summary)
+    witnesses = load_v4_audit_witnesses(
+        graph_compilation,
+        provider_set_keys=(
+            candidate.provider_set_key for candidate in candidates
+        ),
+    )
+    core_layout_id = hashlib.sha256(
+        _CORE_LAYOUT_DOMAIN
+        + normalized_mapping_digest
+        + normalized_core_support
+    ).digest()
+    return _V4AuditPreparation(
+        representation=representation,
+        candidates=candidates,
+        candidate_summary=candidate_summary,
+        witnesses=witnesses,
+        source_count=_integer(
+            finalizer_summary.get("source_count"),
+            "source_count",
+        ),
+        core_layout_id=core_layout_id,
+        snapshot_key=int(build_ownership.snapshot_key),
+        budget=_ReadBudget(),
+    )
+
+
+async def _execute_v4_audit(
+    *,
+    schema_name: str,
+    build_ownership: SharedLayoutBuildOwnership,
+    logical_snapshot_id: str,
+    atom_key_bits: int,
+    price_membership_block_span: int,
+    preparation: _V4AuditPreparation,
+) -> _V4AuditExecution:
+    """Validate and persist one exact V4 audit sample transaction."""
+
+    async with db.transaction() as session:
+        await _validate_v4_audit_transaction(
+            session,
+            schema_name=schema_name,
+            build_ownership=build_ownership,
+            logical_snapshot_id=str(logical_snapshot_id),
+            preparation=preparation,
+        )
+        price_reader = _BuildingBlockReader(
+            session,
+            schema_name=schema_name,
+            snapshot_key=preparation.snapshot_key,
+            budget=preparation.budget,
+        )
+        price_memberships = await _price_memberships(
+            price_reader,
+            price_keys=(
+                candidate.price_key for candidate in preparation.candidates
+            ),
+            atom_key_bits=int(atom_key_bits),
+            block_span=int(price_membership_block_span),
+        )
+        graph_reader = _V4PersistedGraphReader(
+            session,
+            schema_name=schema_name,
+            snapshot_key=preparation.snapshot_key,
+            representation=preparation.representation,
+            budget=preparation.budget,
+        )
+        provider_npis = await _verified_provider_npis_by_candidate(
+            session,
+            schema_name=schema_name,
+            snapshot_key=preparation.snapshot_key,
+            candidates=preparation.candidates,
+            witnesses=preparation.witnesses,
+            reader=graph_reader,
+        )
+        audit_occurrences = build_audit_occurrences(
+            candidates=preparation.candidates,
+            provider_npis=provider_npis,
+            price_memberships=price_memberships,
+            core_layout_id=preparation.core_layout_id,
+            budget=preparation.budget,
+        )
+        await _insert_occurrences(
+            session,
+            schema_name=schema_name,
+            snapshot_key=preparation.snapshot_key,
+            audit_occurrences=audit_occurrences,
+        )
+    return _V4AuditExecution(audit_occurrences, provider_npis)
+
+
+async def _validate_v4_audit_transaction(
+    session: Any,
+    *,
+    schema_name: str,
+    build_ownership: SharedLayoutBuildOwnership,
+    logical_snapshot_id: str,
+    preparation: _V4AuditPreparation,
+) -> None:
+    await _validate_building_v4_context(
+        session,
+        schema_name=schema_name,
+        build_ownership=build_ownership,
+        representation=preparation.representation,
+    )
+    await _validate_candidate_provider_counts(
+        session,
+        schema_name=schema_name,
+        snapshot_key=preparation.snapshot_key,
+        candidates=preparation.candidates,
+    )
+    await _validate_snapshot_source_dictionary(
+        session,
+        schema_name=schema_name,
+        logical_snapshot_id=logical_snapshot_id,
+        source_count=preparation.source_count,
+        required_source_keys=(
+            candidate.source_key for candidate in preparation.candidates
+        ),
+    )
+
+
+def _v4_audit_metadata(
+    preparation: _V4AuditPreparation,
+    execution: _V4AuditExecution,
+    *,
+    price_membership_block_span: int,
+    inferred_taxonomy_candidates: Mapping[str, Any],
+) -> dict[str, Any]:
+    hydration_work = _HydrationWork(
+        price_candidate_count=len(preparation.candidates),
+        provider_candidate_count=len(preparation.candidates),
+        represented_source_count=len(
+            {candidate.source_key for candidate in preparation.candidates}
+        ),
+        provider_selection_budget=len(preparation.candidates),
+        provider_selection_count=sum(
+            len(provider_npis)
+            for provider_npis in execution.provider_npis.values()
+        ),
+    )
+    metadata = _publication_metadata(
+        audit_occurrences=execution.audit_occurrences,
+        candidates=preparation.candidates,
+        hydration_work=hydration_work,
+        candidate_summary=preparation.candidate_summary,
+        source_count=preparation.source_count,
+        core_layout_id=preparation.core_layout_id,
+        price_membership_block_span=int(price_membership_block_span),
+        budget=preparation.budget,
+    )
+    metadata["provider_selection"] = PTG2_V4_AUDIT_PROVIDER_SELECTION
+    metadata["provider_graph_representation"] = preparation.representation
+    metadata["provider_graph_verification"] = (
+        "set_patterns_pattern_groups_group_npis_exact_v1"
+        if preparation.representation == "pattern_v1"
+        else "set_groups_direct_group_npis_exact_v1"
+    )
+    metadata["inferred_taxonomy_candidates"] = dict(
+        inferred_taxonomy_candidates
+    )
+    return metadata
 
 
 async def publish_v4_audit_sample(
@@ -1385,126 +1865,32 @@ async def publish_v4_audit_sample(
 ) -> SharedAuditPublication:
     """Persist a V3-compatible occurrence sample proved through packed V4 CAS."""
 
-    normalized_mapping_digest = bytes(mapping_digest)
-    normalized_core_support = bytes(core_support_digest)
-    if len(normalized_mapping_digest) != 32:
-        raise ValueError("PTG V4 audit mapping digest must contain 32 bytes")
-    if len(normalized_core_support) != 32:
-        raise ValueError("PTG V4 audit core support digest must contain 32 bytes")
-    try:
-        representation = _REPRESENTATION_BY_COMPILER_LAYOUT[
-            str(graph_compilation.selected_layout)
-        ]
-    except KeyError as exc:
-        raise RuntimeError("PTG V4 audit compiler layout is unsupported") from exc
-    candidates, candidate_summary = load_audit_candidates(finalizer_summary)
-    witnesses = load_v4_audit_witnesses(
-        graph_compilation,
-        provider_set_keys=(candidate.provider_set_key for candidate in candidates),
+    preparation = _prepare_v4_audit(
+        finalizer_summary=finalizer_summary,
+        mapping_digest=mapping_digest,
+        core_support_digest=core_support_digest,
+        graph_compilation=graph_compilation,
+        build_ownership=build_ownership,
     )
-    source_count = _integer(finalizer_summary.get("source_count"), "source_count")
-    core_layout_id = hashlib.sha256(
-        _CORE_LAYOUT_DOMAIN + normalized_mapping_digest + normalized_core_support
-    ).digest()
-    budget = _ReadBudget()
-    snapshot_key = int(build_ownership.snapshot_key)
-    async with db.transaction() as session:
-        await _validate_building_v4_context(
-            session,
-            schema_name=schema_name,
-            build_ownership=build_ownership,
-            representation=representation,
-        )
-        await _validate_candidate_provider_counts(
-            session,
-            schema_name=schema_name,
-            snapshot_key=snapshot_key,
-            candidates=candidates,
-        )
-        await _validate_snapshot_source_dictionary(
-            session,
-            schema_name=schema_name,
-            logical_snapshot_id=str(logical_snapshot_id),
-            source_count=source_count,
-            required_source_keys=(candidate.source_key for candidate in candidates),
-        )
-        price_reader = _BuildingBlockReader(
-            session,
-            schema_name=schema_name,
-            snapshot_key=snapshot_key,
-            budget=budget,
-        )
-        price_memberships = await _price_memberships(
-            price_reader,
-            price_keys=(candidate.price_key for candidate in candidates),
-            atom_key_bits=int(atom_key_bits),
-            block_span=int(price_membership_block_span),
-        )
-        graph_reader = _V4PersistedGraphReader(
-            session,
-            schema_name=schema_name,
-            snapshot_key=snapshot_key,
-            representation=representation,
-            budget=budget,
-        )
-        provider_npis = await _verified_provider_npis_by_candidate(
-            session,
-            schema_name=schema_name,
-            snapshot_key=snapshot_key,
-            candidates=candidates,
-            witnesses=witnesses,
-            reader=graph_reader,
-        )
-        audit_occurrences = build_audit_occurrences(
-            candidates=candidates,
-            provider_npis=provider_npis,
-            price_memberships=price_memberships,
-            core_layout_id=core_layout_id,
-            budget=budget,
-        )
-        await _insert_occurrences(
-            session,
-            schema_name=schema_name,
-            snapshot_key=snapshot_key,
-            audit_occurrences=audit_occurrences,
-        )
-    hydration_work = _HydrationWork(
-        price_candidate_count=len(candidates),
-        provider_candidate_count=len(candidates),
-        represented_source_count=len(
-            {candidate.source_key for candidate in candidates}
-        ),
-        provider_selection_budget=len(candidates),
-        provider_selection_count=sum(
-            len(provider_npis_for_candidate)
-            for provider_npis_for_candidate in provider_npis.values()
-        ),
+    execution = await _execute_v4_audit(
+        schema_name=schema_name,
+        build_ownership=build_ownership,
+        logical_snapshot_id=logical_snapshot_id,
+        atom_key_bits=atom_key_bits,
+        price_membership_block_span=price_membership_block_span,
+        preparation=preparation,
     )
-    metadata = _publication_metadata(
-        audit_occurrences=audit_occurrences,
-        candidates=candidates,
-        hydration_work=hydration_work,
-        candidate_summary=candidate_summary,
-        source_count=source_count,
-        core_layout_id=core_layout_id,
-        price_membership_block_span=int(price_membership_block_span),
-        budget=budget,
-    )
-    metadata["provider_selection"] = PTG2_V4_AUDIT_PROVIDER_SELECTION
-    metadata["provider_graph_representation"] = representation
-    metadata["provider_graph_verification"] = (
-        "set_patterns_pattern_groups_group_npis_exact_v1"
-        if representation == "pattern_v1"
-        else "set_groups_direct_group_npis_exact_v1"
-    )
-    metadata["inferred_taxonomy_candidates"] = dict(
-        inferred_taxonomy_candidates
+    metadata = _v4_audit_metadata(
+        preparation,
+        execution,
+        price_membership_block_span=price_membership_block_span,
+        inferred_taxonomy_candidates=inferred_taxonomy_candidates,
     )
     return SharedAuditPublication(
         metadata=metadata,
         support_digest=shared_support_digest({"audit_sample": metadata}),
-        row_count=len(audit_occurrences),
-        core_layout_id=core_layout_id,
+        row_count=len(execution.audit_occurrences),
+        core_layout_id=preparation.core_layout_id,
     )
 
 
