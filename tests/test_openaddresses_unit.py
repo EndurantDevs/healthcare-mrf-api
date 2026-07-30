@@ -951,3 +951,163 @@ def test_openaddresses_operator_registration():
     assert adapter["target_module"] == "process.openaddresses"
     assert adapter["target_function"] == "process_data"
     assert "openaddresses" in control_imports._CANCELABLE_IMPORTERS
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected_value"),
+    [
+        (None, 1.5),
+        ("invalid", 1.5),
+        ("0", 1.5),
+        ("2.75", 2.75),
+    ],
+)
+def test_openaddresses_float_environment_guard(
+    monkeypatch,
+    raw_value,
+    expected_value,
+):
+    environment_name = "HLTHPRT_OPENADDRESSES_TEST_FLOAT"
+    if raw_value is None:
+        monkeypatch.delenv(environment_name, raising=False)
+    else:
+        monkeypatch.setenv(environment_name, raw_value)
+
+    assert openaddresses._env_float(environment_name, 1.5) == expected_value
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "default", "expected_value"),
+    [
+        (None, True, True),
+        ("yes", False, True),
+        ("off", True, False),
+    ],
+)
+def test_openaddresses_boolean_environment_guard(
+    monkeypatch,
+    raw_value,
+    default,
+    expected_value,
+):
+    environment_name = "HLTHPRT_OPENADDRESSES_TEST_FLAG"
+    if raw_value is None:
+        monkeypatch.delenv(environment_name, raising=False)
+    else:
+        monkeypatch.setenv(environment_name, raw_value)
+
+    assert (
+        openaddresses._is_env_flag_enabled(environment_name, default)
+        is expected_value
+    )
+
+
+def test_openaddresses_identifier_helpers_are_stable_and_bounded():
+    short_identifier = "short_name"
+    long_identifier = "table_" + ("x" * 100)
+
+    assert openaddresses._bounded_identifier(short_identifier) == short_identifier
+    assert len(openaddresses._bounded_identifier(long_identifier)) == 63
+    assert len(openaddresses._archived_identifier(long_identifier)) == 63
+    assert openaddresses._archived_identifier(long_identifier).endswith("_old")
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "expected_count"),
+    [
+        (None, 0),
+        (7, 7),
+        ("12", 12),
+        ("UPDATE 5", 5),
+        ("unknown", 0),
+    ],
+)
+def test_openaddresses_status_count_accepts_database_status_shapes(
+    raw_status,
+    expected_count,
+):
+    assert openaddresses._status_count(raw_status) == expected_count
+
+
+def test_openaddresses_address_component_helpers_fail_closed():
+    assert openaddresses._normalize_house_number(None) is None
+    assert openaddresses._normalize_house_number("Building A-12") == "buildinga12"
+    assert openaddresses._normalize_house_number("---") is None
+    assert openaddresses._street_after_house(None) is None
+    assert openaddresses._street_after_house("Main Street") == "Main Street"
+    assert openaddresses._valid_us_coordinate("invalid", -90) is None
+    assert openaddresses._valid_us_coordinate(90, -90) is None
+    assert openaddresses._source_state("ca/example") is None
+    assert openaddresses._source_updated("invalid") is None
+
+
+def test_openaddresses_lookup_params_reject_incomplete_and_non_us_addresses():
+    assert openaddresses.lookup_params_from_address({}) is None
+    assert (
+        openaddresses.lookup_params_from_address(
+            {
+                "first_line": "1 Main Street",
+                "country_code": "CA",
+                "state_name": "Ontario",
+                "postal_code": "K1A 0B1",
+            }
+        )
+        is None
+    )
+    assert (
+            openaddresses.lookup_params_from_address(
+                {
+                    "first_line": "1 Main Street",
+                    "country_code": "US",
+                    "postal_code": "78701",
+                }
+            )
+        is None
+    )
+
+
+def test_openaddresses_source_filter_and_task_bounds(monkeypatch):
+    source_items = [
+        {"source": "ca/on", "layer": "addresses"},
+        {"source": "us/tx", "layer": "buildings"},
+        {"source": "us/ca", "layer": "addresses", "output": {"output": False}},
+        {"source": "us/ny", "layer": "addresses", "output": {"output": True}},
+    ]
+    monkeypatch.setenv(
+        "HLTHPRT_OPENADDRESSES_LOCAL_FILES",
+        "/tmp/first.geojson, /tmp/second.geojson",
+    )
+
+    assert openaddresses._us_data_items(source_items) == [source_items[3]]
+    assert openaddresses._local_files_from_env() == [
+        openaddresses.Path("/tmp/first.geojson"),
+        openaddresses.Path("/tmp/second.geojson"),
+    ]
+    assert openaddresses._local_files_from_task_or_env(
+        {"local_files": "/tmp/one.geojson, /tmp/two.geojson"}
+    ) == [
+        openaddresses.Path("/tmp/one.geojson"),
+        openaddresses.Path("/tmp/two.geojson"),
+    ]
+    assert (
+        openaddresses._task_or_env_int_range(
+            {"workers": 99},
+            "workers",
+            "HLTHPRT_OPENADDRESSES_WORKERS",
+            2,
+            minimum=1,
+            maximum=8,
+        )
+        == 8
+    )
+    assert openaddresses._is_task_or_env_flag_enabled(
+        {"enabled": "yes"},
+        "enabled",
+        "HLTHPRT_OPENADDRESSES_ENABLED",
+    )
+    assert not openaddresses._is_task_or_env_flag_enabled(
+        {"enabled": "off"},
+        "enabled",
+        "HLTHPRT_OPENADDRESSES_ENABLED",
+        default=True,
+    )

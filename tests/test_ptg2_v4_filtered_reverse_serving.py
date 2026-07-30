@@ -764,9 +764,33 @@ async def test_inferred_taxonomy_v4_tampered_candidate_fails_closed(
         )
 
 
-def test_inferred_taxonomy_v4_projection_is_optional_for_legacy_snapshot() -> None:
-    assert serving._v4_inferred_taxonomy_projection_rule(
+@pytest.mark.asyncio
+async def test_inferred_taxonomy_v4_projection_fails_before_graph_read(
+    monkeypatch,
+) -> None:
+    graph_lookup = AsyncMock()
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_members",
+        graph_lookup,
+    )
+
+    with pytest.raises(serving.PTG2OnlineWorkBudgetExceeded) as exc_info:
+        await _select_provider_expansion(None, rate_count=260)
+
+    assert exc_info.value.dimension == "inferred_taxonomy_projection"
+    graph_lookup.assert_not_awaited()
+
+
+def test_inferred_taxonomy_v3_keeps_legacy_provider_path() -> None:
+    v3_tables = replace(
         _tables(None),
+        storage_generation="shared_blocks_v3",
+        shared_block_layout="dense_shared_blocks_v3",
+    )
+
+    assert serving._v4_inferred_taxonomy_projection_rule(
+        v3_tables,
         {"code_system": "CPT", "code": "70553"},
     ) is None
 

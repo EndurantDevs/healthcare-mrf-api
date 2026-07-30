@@ -636,22 +636,14 @@ def relaxed_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> st
     """
 
 
-def _record_from_feature(
-    feature: dict[str, Any],
+def _record_from_feature_parts(
+    feature_parts_by_name: dict[str, Any],
     *,
     source_name: str | None,
     data_id: int | None,
     job_id: int | None,
-    updated: Any,
 ) -> dict[str, Any] | None:
-    """Convert one GeoJSON feature into an import record."""
-    feature_parts_by_name, reason = _feature_parts(
-        feature,
-        source_name=source_name,
-        updated=updated,
-    )
-    if reason or not feature_parts_by_name:
-        return None
+    """Shape one validated OpenAddresses feature record."""
     house_number = feature_parts_by_name["house_number"]
     street_name = feature_parts_by_name["street_name"]
     street_match = feature_parts_by_name["street_match"]
@@ -701,6 +693,30 @@ def _record_from_feature(
         "source_updated": feature_parts_by_name["source_updated"],
         "imported_at": datetime.datetime.now(datetime.timezone.utc),
     }
+
+
+def _record_from_feature(
+    feature: dict[str, Any],
+    *,
+    source_name: str | None,
+    data_id: int | None,
+    job_id: int | None,
+    updated: Any,
+) -> dict[str, Any] | None:
+    """Convert one GeoJSON feature into an import record."""
+    feature_parts_by_name, reason = _feature_parts(
+        feature,
+        source_name=source_name,
+        updated=updated,
+    )
+    if reason or not feature_parts_by_name:
+        return None
+    return _record_from_feature_parts(
+        feature_parts_by_name,
+        source_name=source_name,
+        data_id=data_id,
+        job_id=job_id,
+    )
 
 
 def _zip_recovery_record_from_feature(
@@ -2164,6 +2180,13 @@ async def _plan_openaddresses_backfill_shards(
         backfill_state_code=state_code,
         backfill_zip_prefix_length=zip_prefix_length,
     )
+    return _backfill_shards_from_candidate_rows(shard_candidate_rows)
+
+
+def _backfill_shards_from_candidate_rows(
+    shard_candidate_rows: list[Any] | None,
+) -> list[OpenAddressesBackfillShard]:
+    """Normalize candidate counts into safe OpenAddresses backfill shards."""
     shards: list[OpenAddressesBackfillShard] = []
     skipped_candidates = 0
     for candidate_row in shard_candidate_rows or []:

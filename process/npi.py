@@ -906,39 +906,25 @@ async def startup(ctx):  # pragma: no cover
                 await db.status(create_index_sql)
     print("Preparing done")
 
-async def refresh_do_business_as(
-    target_table: str | None = None,
-    source_table: str | None = None,
-    test_mode: bool | None = None,
-) -> tuple[int, int] | None:
-    """
-    Populate the NPI.do_business_as array from other identifier entries (type code 3).
-    """
-    await ensure_database(bool(test_mode))
-    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
-    table = target_table or NPIData.__tablename__
-    source_table_name = source_table or NPIDataOtherIdentifier.__tablename__
-
-    source_exists = await db.scalar(
-        f"SELECT to_regclass('{db_schema}.{source_table_name}');"
-    )
-    if not source_exists:
-        print(f"Skipping do_business_as refresh: source table {db_schema}.{source_table_name} does not exist.")
-        return
-
-    update_sql = f"""
+def _do_business_as_update_sql(
+    db_schema: str,
+    target_table: str,
+    source_table: str,
+) -> str:
+    """Return the set-based business-name enrichment statement."""
+    return f"""
         WITH sub AS (
             SELECT
                 npi,
                 ARRAY_AGG(DISTINCT other_provider_identifier ORDER BY other_provider_identifier) AS names,
                 STRING_AGG(DISTINCT other_provider_identifier, ' ' ORDER BY other_provider_identifier) AS search_text
-            FROM {db_schema}.{source_table_name}
+            FROM {db_schema}.{source_table}
             WHERE other_provider_identifier_type_code = '3'
               AND NULLIF(other_provider_identifier, '') IS NOT NULL
             GROUP BY npi
         ),
         updated AS (
-            UPDATE {db_schema}.{table} AS n
+            UPDATE {db_schema}.{target_table} AS n
             SET
                 do_business_as = sub.names,
                 do_business_as_text = COALESCE(sub.search_text, '')
@@ -952,11 +938,17 @@ async def refresh_do_business_as(
         )
         SELECT count(*) FROM updated;
     """
-    updated = int(await db.scalar(update_sql) or 0)
 
-    clear_sql = f"""
+
+def _do_business_as_clear_sql(
+    db_schema: str,
+    target_table: str,
+    source_table: str,
+) -> str:
+    """Return the statement that clears business names absent from the source."""
+    return f"""
         WITH cleared AS (
-            UPDATE {db_schema}.{table} AS n
+            UPDATE {db_schema}.{target_table} AS n
             SET
                 do_business_as = ARRAY[]::varchar[],
                 do_business_as_text = ''
@@ -966,7 +958,7 @@ async def refresh_do_business_as(
             )
               AND NOT EXISTS (
                     SELECT 1
-                    FROM {db_schema}.{source_table_name} AS s
+                    FROM {db_schema}.{source_table} AS s
                     WHERE s.npi = n.npi
                       AND s.other_provider_identifier_type_code = '3'
                       AND NULLIF(s.other_provider_identifier, '') IS NOT NULL
@@ -975,7 +967,47 @@ async def refresh_do_business_as(
         )
         SELECT count(*) FROM cleared;
     """
-    cleared = int(await db.scalar(clear_sql) or 0)
+
+
+async def refresh_do_business_as(
+    target_table: str | None = None,
+    source_table: str | None = None,
+    test_mode: bool | None = None,
+) -> tuple[int, int] | None:
+    """Populate NPI business names from other identifier entries."""
+    await ensure_database(bool(test_mode))
+    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf'
+    target_table_name = target_table or NPIData.__tablename__
+    source_table_name = source_table or NPIDataOtherIdentifier.__tablename__
+    if not await db.scalar(
+        f"SELECT to_regclass('{db_schema}.{source_table_name}');"
+    ):
+        print(
+            "Skipping do_business_as refresh: source table "
+            f"{db_schema}.{source_table_name} does not exist."
+        )
+        return
+
+    updated = int(
+        await db.scalar(
+            _do_business_as_update_sql(
+                db_schema,
+                target_table_name,
+                source_table_name,
+            )
+        )
+        or 0
+    )
+    cleared = int(
+        await db.scalar(
+            _do_business_as_clear_sql(
+                db_schema,
+                target_table_name,
+                source_table_name,
+            )
+        )
+        or 0
+    )
     print(f"do_business_as refresh complete: updated={updated}, cleared={cleared}")
     return updated, cleared
 
@@ -1013,6 +1045,23 @@ async def refresh_taxonomy_arrays(
     return updated
 
 
+async def _resolve_npi_archive_once(
+    staging_table: str,
+    field_map: dict[str, str],
+    schema: str,
+    cancel_check,
+):
+    """Resolve the staged NPI addresses through the canonical archive."""
+    return await resolve_into_archive(
+        staging_table,
+        field_map,
+        source_bit=1,
+        priority=0,
+        schema=schema,
+        cancel_check=cancel_check,
+    )
+
+
 async def resolve_npi_address_archive(
     *,
     staging_table: str,
@@ -1045,15 +1094,12 @@ async def resolve_npi_address_archive(
         )
     else:
         print("NPI canonical address keys were populated during load; skipping SQL restamp")
-
     try:
-        stats = await resolve_into_archive(
+        stats = await _resolve_npi_archive_once(
             staging_table,
             field_map,
-            source_bit=1,
-            priority=0,
-            schema=schema,
-            cancel_check=cancel_check,
+            schema,
+            cancel_check,
         )
     except RuntimeError as exc:
         if not _is_address_key_mismatch_error(exc):
@@ -1068,37 +1114,34 @@ async def resolve_npi_address_archive(
             update_existing=True,
         )
         print(f"NPI canonical address SQL repair complete: updated={repaired}")
-        stats = await resolve_into_archive(
+        stats = await _resolve_npi_archive_once(
             staging_table,
             field_map,
-            source_bit=1,
-            priority=0,
-            schema=schema,
-            cancel_check=cancel_check,
+            schema,
+            cancel_check,
         )
     print(f"NPI canonical address resolve complete: {stats}")
     return stats
 
 
-async def rebuild_phone_staffing_table(
-    *,
+async def _is_phone_staffing_ready(
     target_table: str,
     address_table: str,
     schema: str,
-) -> None:
-    """Rebuild the phone-level provider staffing materialization."""
+) -> bool:
+    """Validate the tables required by phone staffing materialization."""
     if not await db.scalar(f"SELECT to_regclass('{schema}.{target_table}');"):
         print(
             f"Skipping phone staffing materialization for {schema}.{target_table}: "
             "target staging table is missing."
         )
-        return
+        return False
     if not await db.scalar(f"SELECT to_regclass('{schema}.{address_table}');"):
         print(
             f"Skipping phone staffing materialization for {schema}.{target_table}: "
             f"address staging table {schema}.{address_table} is missing."
         )
-        return
+        return False
     if not await db.scalar(f"SELECT to_regclass('{schema}.nucc_taxonomy');"):
         raise NPIPrerequisiteError(
             f"Cannot materialize {schema}.{target_table}: {schema}.nucc_taxonomy is missing. "
@@ -1120,6 +1163,18 @@ async def rebuild_phone_staffing_table(
             f"Cannot materialize {schema}.{target_table}: {schema}.nucc_taxonomy has no "
             "Pharmacist rows with int_code. Run the NUCC importer before NPI."
         )
+    return True
+
+
+async def rebuild_phone_staffing_table(
+    *,
+    target_table: str,
+    address_table: str,
+    schema: str,
+) -> None:
+    """Rebuild the phone-level provider staffing materialization."""
+    if not await _is_phone_staffing_ready(target_table, address_table, schema):
+        return
 
     print(f"Materializing phone staffing table {schema}.{target_table} from {schema}.{address_table}...")
     await db.status(f"TRUNCATE TABLE {schema}.{target_table};")
@@ -1156,6 +1211,49 @@ async def rebuild_phone_staffing_table(
 
 
 
+def _npi_shutdown_timing(
+    phase: str,
+    status: str,
+    started: float,
+    started_at: str,
+) -> tuple[dict[str, object], float]:
+    """Shape one terminal NPI shutdown timing record."""
+    elapsed = round(time.monotonic() - started, 3)
+    return (
+        {
+            "phase": phase,
+            "status": status,
+            "elapsed_seconds": elapsed,
+            "started_at": started_at,
+            "finished_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        },
+        elapsed,
+    )
+
+
+def _emit_npi_shutdown_progress(
+    run_id: str,
+    phase: str,
+    status: str,
+    done: int,
+) -> None:
+    """Emit one shutdown phase transition when control is attached."""
+    if not run_id:
+        return
+    action = "completed" if done else ("failed" if status == "failed" else "started")
+    enqueue_live_progress(
+        run_id=run_id,
+        importer="npi",
+        status=status,
+        phase=f"npi shutdown {phase}",
+        unit="phase",
+        total=1,
+        done=done,
+        pct=100 if done else 0,
+        message=f"npi shutdown {phase} {action}",
+    )
+
+
 async def shutdown(ctx):  # pragma: no cover
     """Finalize, index, validate, and atomically publish an NPI import."""
     import_date = ctx['import_date']
@@ -1168,68 +1266,29 @@ async def shutdown(ctx):  # pragma: no cover
         started = time.monotonic()
         started_at = datetime.datetime.now(datetime.UTC).isoformat()
         print(f"NPI_SHUTDOWN_PHASE_START phase={phase} started_at={started_at}")
-        if run_id:
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="npi",
-                status="running",
-                phase=f"npi shutdown {phase}",
-                unit="phase",
-                total=1,
-                done=0,
-                pct=0,
-                message=f"npi shutdown {phase} started",
-            )
+        _emit_npi_shutdown_progress(run_id, phase, "running", 0)
         try:
             phase_result = await awaitable
         except Exception:
-            elapsed = round(time.monotonic() - started, 3)
-            shutdown_phase_timings.append(
-                {
-                    "phase": phase,
-                    "status": "failed",
-                    "elapsed_seconds": elapsed,
-                    "started_at": started_at,
-                    "finished_at": datetime.datetime.now(datetime.UTC).isoformat(),
-                }
+            timing, elapsed = _npi_shutdown_timing(
+                phase,
+                "failed",
+                started,
+                started_at,
             )
+            shutdown_phase_timings.append(timing)
             print(f"NPI_SHUTDOWN_PHASE_FAILED phase={phase} elapsed_seconds={elapsed}")
-            if run_id:
-                enqueue_live_progress(
-                    run_id=run_id,
-                    importer="npi",
-                    status="failed",
-                    phase=f"npi shutdown {phase}",
-                    unit="phase",
-                    total=1,
-                    done=0,
-                    pct=0,
-                    message=f"npi shutdown {phase} failed",
-                )
+            _emit_npi_shutdown_progress(run_id, phase, "failed", 0)
             raise
-        elapsed = round(time.monotonic() - started, 3)
-        shutdown_phase_timings.append(
-            {
-                "phase": phase,
-                "status": "succeeded",
-                "elapsed_seconds": elapsed,
-                "started_at": started_at,
-                "finished_at": datetime.datetime.now(datetime.UTC).isoformat(),
-            }
+        timing, elapsed = _npi_shutdown_timing(
+            phase,
+            "succeeded",
+            started,
+            started_at,
         )
+        shutdown_phase_timings.append(timing)
         print(f"NPI_SHUTDOWN_PHASE_DONE phase={phase} elapsed_seconds={elapsed}")
-        if run_id:
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="npi",
-                status="running",
-                phase=f"npi shutdown {phase}",
-                unit="phase",
-                total=1,
-                done=1,
-                pct=100,
-                message=f"npi shutdown {phase} completed",
-            )
+        _emit_npi_shutdown_progress(run_id, phase, "running", 1)
         return phase_result
 
     if not context.get('run'):

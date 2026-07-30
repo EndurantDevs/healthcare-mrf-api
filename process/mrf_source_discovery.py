@@ -1993,6 +1993,62 @@ def _file_benefit_metadata(source: dict[str, Any], *values: Any) -> dict[str, An
     return metadata
 
 
+def _master_list_candidates_from_cells(
+    current_section: str,
+    cells: list[str],
+) -> list[SourceCandidate]:
+    """Convert one master-list table row into source candidates."""
+    raw_payer_name = _clean_text(cells[0])
+    payer_name = re.sub(r"^↳\s*", "", raw_payer_name).strip()
+    payer_name = re.sub(r"\s+\([^)]*\)\s*$", "", payer_name).strip() or payer_name
+    if not payer_name:
+        return []
+    entity_type = _infer_entity_type(current_section, raw_payer_name)
+    entity_type, url_cell, notes_text = _master_list_url_cell(cells, entity_type)
+    urls = tuple(
+        url for url in _http_urls(url_cell) if not _is_placeholder_source_url(url)
+    ) or (None,)
+    raw_payload_by_field = {
+        "section": current_section,
+        "raw_payer_name": raw_payer_name,
+        "url_cell": url_cell,
+        "notes": notes_text,
+    }
+    if target_payer_query := _master_list_target_payer_query(notes_text):
+        raw_payload_by_field["target_payer_query"] = target_payer_query
+    return [
+        SourceCandidate(
+            payer_name=payer_name,
+            provider="master-list",
+            source_url=str(_repo_root() / "specs" / "mrf_payer_master_list.md"),
+            index_url=url,
+            human_url=url,
+            status=_master_list_status(url, notes_text),
+            source_type="curated_registry",
+            access_model="free" if url else "unknown",
+            hosting_platform=classify_hosting_platform(url),
+            parent_group=_infer_parent_group(current_section, payer_name),
+            entity_type=entity_type,
+            aliases=_master_list_aliases(notes_text),
+            benefit_lines=_master_list_benefit_lines(notes_text),
+            source_tier=_master_list_source_tier(notes_text, url),
+            source_coverage=_master_list_note_values(
+                notes_text, r"source[-_\s]*coverage"
+            ),
+            vendor_names=_master_list_note_values(notes_text, r"vendor[-_\s]*names?"),
+            network_names=_master_list_note_values(
+                notes_text, r"network[-_\s]*names?"
+            ),
+            plan_names=_master_list_note_values(notes_text, r"plan[-_\s]*names?"),
+            confidence=85 if url else 45,
+            license_status="curated_public_research",
+            review_status="pending",
+            raw_payload=dict(raw_payload_by_field),
+        )
+        for url in urls
+    ]
+
+
 def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
     """Parse the markdown source list into source candidates."""
     candidates: list[SourceCandidate] = []
@@ -2007,61 +2063,7 @@ def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
         cells = [cell.strip() for cell in line.strip("|").split("|")]
         if len(cells) < 3 or cells[0].lower().startswith(("payer", "blue plan")):
             continue
-        raw_payer_name = _clean_text(cells[0])
-        payer_name = re.sub(r"^↳\s*", "", raw_payer_name).strip()
-        payer_name = re.sub(r"\s+\([^)]*\)\s*$", "", payer_name).strip() or payer_name
-        if not payer_name:
-            continue
-        type_value = _infer_entity_type(current_section, raw_payer_name)
-        type_value, url_cell, notes_text = _master_list_url_cell(cells, type_value)
-        urls = tuple(
-            url for url in _http_urls(url_cell) if not _is_placeholder_source_url(url)
-        ) or (None,)
-        parent_group = _infer_parent_group(current_section, payer_name)
-        for url in urls:
-            target_payer_query = _master_list_target_payer_query(notes_text)
-            raw_payload_map = {
-                "section": current_section,
-                "raw_payer_name": raw_payer_name,
-                "url_cell": url_cell,
-                "notes": notes_text,
-            }
-            if target_payer_query:
-                raw_payload_map["target_payer_query"] = target_payer_query
-            candidates.append(
-                SourceCandidate(
-                    payer_name=payer_name,
-                    provider="master-list",
-                    source_url=str(_repo_root() / "specs" / "mrf_payer_master_list.md"),
-                    index_url=url,
-                    human_url=url,
-                    status=_master_list_status(url, notes_text),
-                    source_type="curated_registry",
-                    access_model="free" if url else "unknown",
-                    hosting_platform=classify_hosting_platform(url),
-                    parent_group=parent_group,
-                    entity_type=type_value,
-                    aliases=_master_list_aliases(notes_text),
-                    benefit_lines=_master_list_benefit_lines(notes_text),
-                    source_tier=_master_list_source_tier(notes_text, url),
-                    source_coverage=_master_list_note_values(
-                        notes_text, r"source[-_\s]*coverage"
-                    ),
-                    vendor_names=_master_list_note_values(
-                        notes_text, r"vendor[-_\s]*names?"
-                    ),
-                    network_names=_master_list_note_values(
-                        notes_text, r"network[-_\s]*names?"
-                    ),
-                    plan_names=_master_list_note_values(
-                        notes_text, r"plan[-_\s]*names?"
-                    ),
-                    confidence=85 if url else 45,
-                    license_status="curated_public_research",
-                    review_status="pending",
-                    raw_payload=raw_payload_map,
-                )
-            )
+        candidates.extend(_master_list_candidates_from_cells(current_section, cells))
     return _dedupe_candidates(candidates)
 
 
@@ -3502,6 +3504,94 @@ def _metadata_text_fields(line: str) -> dict[str, str]:
     return text_by_field
 
 
+def _metadata_text_plan_row(
+    source_row_dict: dict[str, Any],
+    url: str,
+    line: str,
+    fields_by_name: dict[str, str],
+    now: dt.datetime,
+) -> tuple[str, dict[str, Any]] | None:
+    """Build one optional plan row from parsed text metadata."""
+    plan_name = fields_by_name.get("plan name")
+    sponsor_ein = fields_by_name.get("sponsor ein") or fields_by_name.get("ein")
+    if not sponsor_ein and not plan_name:
+        return None
+    plan_row_id = _id(
+        "mrfplan",
+        {
+            "source": source_row_dict["source_id"],
+            "plan_id": sponsor_ein,
+            "plan_name": plan_name,
+            "metadata_url": url,
+        },
+    )
+    return plan_row_id, {
+        "mrf_plan_id": plan_row_id,
+        "payer_id": source_row_dict.get("payer_id"),
+        "source_id": source_row_dict["source_id"],
+        "plan_id": sponsor_ein or None,
+        "plan_id_type": "ein" if sponsor_ein else None,
+        "plan_name": plan_name,
+        "market_type": None,
+        "reporting_entity_name": source_row_dict.get("display_name"),
+        "reporting_entity_type": "third_party_administrator",
+        "metadata_json": {"raw_line": line, "metadata_url": url},
+        "first_seen_at": now,
+        "last_seen_at": now,
+    }
+
+
+def _metadata_text_file_row(
+    source_row_dict: dict[str, Any],
+    url: str,
+    line: str,
+    file_url: str,
+    fields_by_name: dict[str, str],
+    now: dt.datetime,
+) -> tuple[str, dict[str, Any]]:
+    """Build one file row from parsed text metadata."""
+    file_type = _metadata_text_file_type(
+        fields_by_name.get("file scope") or fields_by_name.get("scope")
+    )
+    plan_name = fields_by_name.get("plan name")
+    sponsor_ein = fields_by_name.get("sponsor ein") or fields_by_name.get("ein")
+    canonical_url = _canonical_or_none(file_url) or file_url
+    file_row_id = _id(
+        "mrffile",
+        {
+            "source": source_row_dict["source_id"],
+            "type": file_type,
+            "url": canonical_url,
+        },
+    )
+    return file_row_id, {
+        "mrf_file_id": file_row_id,
+        "payer_id": source_row_dict.get("payer_id"),
+        "source_id": source_row_dict["source_id"],
+        "file_type": file_type,
+        "url": file_url,
+        "canonical_url": canonical_url,
+        "from_index_url": url,
+        "description": plan_name,
+        "network_name": plan_name,
+        "plan_ids": [sponsor_ein] if sponsor_ein else [],
+        "plan_names": [plan_name] if plan_name else [],
+        "market_types": [],
+        "is_signed_url": _is_signed(file_url),
+        "size_bytes": None,
+        "schema_version": None,
+        "metadata_json": {
+            "resolver": "html_metadata_text",
+            "container_format": _container_format(file_url),
+            **_file_benefit_metadata(source_row_dict, file_url, plan_name, line),
+            "metadata_fields": fields_by_name,
+            "metadata_url": url,
+        },
+        "first_seen_at": now,
+        "last_seen_at": now,
+    }
+
+
 def _metadata_text_rows_from_content(
     source_row_dict: dict[str, Any], url: str, text: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -3513,76 +3603,26 @@ def _metadata_text_rows_from_content(
         file_url = _first_http_url(line)
         if not file_url or not _is_direct_mrf_body_url(file_url):
             continue
-        fields = _metadata_text_fields(line)
-        file_type = _metadata_text_file_type(
-            fields.get("file scope") or fields.get("scope")
+        fields_by_name = _metadata_text_fields(line)
+        plan_row = _metadata_text_plan_row(
+            source_row_dict,
+            url,
+            line,
+            fields_by_name,
+            now,
         )
-        plan_name = fields.get("plan name")
-        sponsor_ein = fields.get("sponsor ein") or fields.get("ein")
-        plan_row_id = _id(
-            "mrfplan",
-            {
-                "source": source_row_dict["source_id"],
-                "plan_id": sponsor_ein,
-                "plan_name": plan_name,
-                "metadata_url": url,
-            },
+        if plan_row is not None:
+            plan_row_id, plan_row_by_field = plan_row
+            plan_rows_by_id[plan_row_id] = plan_row_by_field
+        file_row_id, file_row_by_field = _metadata_text_file_row(
+            source_row_dict,
+            url,
+            line,
+            file_url,
+            fields_by_name,
+            now,
         )
-        if sponsor_ein or plan_name:
-            plan_rows_by_id[plan_row_id] = {
-                "mrf_plan_id": plan_row_id,
-                "payer_id": source_row_dict.get("payer_id"),
-                "source_id": source_row_dict["source_id"],
-                "plan_id": sponsor_ein or None,
-                "plan_id_type": "ein" if sponsor_ein else None,
-                "plan_name": plan_name,
-                "market_type": None,
-                "reporting_entity_name": source_row_dict.get("display_name"),
-                "reporting_entity_type": "third_party_administrator",
-                "metadata_json": {"raw_line": line, "metadata_url": url},
-                "first_seen_at": now,
-                "last_seen_at": now,
-            }
-        canonical_url = _canonical_or_none(file_url) or file_url
-        file_row_id = _id(
-            "mrffile",
-            {
-                "source": source_row_dict["source_id"],
-                "type": file_type,
-                "url": canonical_url,
-            },
-        )
-        file_rows_by_id[file_row_id] = {
-            "mrf_file_id": file_row_id,
-            "payer_id": source_row_dict.get("payer_id"),
-            "source_id": source_row_dict["source_id"],
-            "file_type": file_type,
-            "url": file_url,
-            "canonical_url": canonical_url,
-            "from_index_url": url,
-            "description": plan_name,
-            "network_name": plan_name,
-            "plan_ids": [sponsor_ein] if sponsor_ein else [],
-            "plan_names": [plan_name] if plan_name else [],
-            "market_types": [],
-            "is_signed_url": _is_signed(file_url),
-            "size_bytes": None,
-            "schema_version": None,
-                "metadata_json": {
-                    "resolver": "html_metadata_text",
-                    "container_format": _container_format(file_url),
-                    **_file_benefit_metadata(
-                        source_row_dict,
-                        file_url,
-                        plan_name,
-                        line,
-                    ),
-                "metadata_fields": fields,
-                "metadata_url": url,
-            },
-            "first_seen_at": now,
-            "last_seen_at": now,
-        }
+        file_rows_by_id[file_row_id] = file_row_by_field
     return list(plan_rows_by_id.values()), list(file_rows_by_id.values())
 
 
@@ -5980,6 +6020,94 @@ def _sapphire_static_query_hashes(page_data_text: str | None) -> list[str]:
     return list(dict.fromkeys(hashes))
 
 
+def _collect_sapphire_mapping_toc_links(
+    node_by_field: dict[str, Any],
+    target_by_url: dict[str, dict[str, Any]],
+    base_url: str | None,
+    context_by_field: dict[str, Any] | None,
+) -> None:
+    """Collect labeled TOC links from one Sapphire query mapping."""
+    next_context_by_field = dict(context_by_field or {})
+    for key in ("payer_name", "name", "label", "title", "file_name"):
+        if node_by_field.get(key):
+            next_context_by_field.setdefault(key, node_by_field.get(key))
+    for key in ("url", "href", "publicURL", "downloadUrl", "path"):
+        if not node_by_field.get(key):
+            continue
+        toc_target = _sapphire_toc_target(
+            node_by_field.get(key),
+            base_url=base_url,
+            label=next_context_by_field.get("label")
+            or next_context_by_field.get("title")
+            or next_context_by_field.get("name"),
+            file_name=next_context_by_field.get("file_name"),
+            payer_name=next_context_by_field.get("payer_name"),
+        )
+        if toc_target:
+            target_by_url.setdefault(
+                _canonical_or_none(str(toc_target["url"]))
+                or str(toc_target["url"]),
+                toc_target,
+            )
+    for child in node_by_field.values():
+        _collect_sapphire_query_toc_links(
+            child,
+            target_by_url,
+            base_url,
+            next_context_by_field,
+        )
+
+
+def _collect_sapphire_query_toc_links(
+    node: Any,
+    target_by_url: dict[str, dict[str, Any]],
+    base_url: str | None,
+    context_by_field: dict[str, Any] | None = None,
+) -> None:
+    """Recursively collect labeled TOC links from Sapphire query values."""
+    if isinstance(node, dict):
+        _collect_sapphire_mapping_toc_links(
+            node,
+            target_by_url,
+            base_url,
+            context_by_field,
+        )
+        return
+    if isinstance(node, list):
+        for child in node:
+            _collect_sapphire_query_toc_links(
+                child,
+                target_by_url,
+                base_url,
+                context_by_field,
+            )
+        return
+    if isinstance(node, str) and "/tocs/" in node:
+        toc_target = _sapphire_toc_target(
+            node,
+            base_url=base_url,
+            label=(
+                context_by_field.get("label")
+                or context_by_field.get("title")
+                or context_by_field.get("name")
+                if context_by_field
+                else None
+            ),
+            file_name=(
+                context_by_field.get("file_name") if context_by_field else None
+            ),
+            payer_name=(
+                context_by_field.get("payer_name") if context_by_field else None
+            ),
+        )
+        if toc_target:
+            target_by_url.setdefault(
+                _canonical_or_none(str(toc_target["url"]))
+                or str(toc_target["url"]),
+                toc_target,
+            )
+
+
 def _parse_sapphire_static_query_toc_links(
     query_text: str | None,
     *,
@@ -5991,62 +6119,11 @@ def _parse_sapphire_static_query_toc_links(
     except json.JSONDecodeError:
         return []
     target_by_url: dict[str, dict[str, Any]] = {}
-
-    def visit(node: Any, context: dict[str, Any] | None = None) -> None:
-        """Recursively inspect Sapphire query values and collect labeled links."""
-        if isinstance(node, dict):
-            next_context_by_field = dict(context or {})
-            for key in ("payer_name", "name", "label", "title", "file_name"):
-                if node.get(key):
-                    next_context_by_field.setdefault(key, node.get(key))
-            for key in ("url", "href", "publicURL", "downloadUrl", "path"):
-                if not node.get(key):
-                    continue
-                toc_target_by_field = _sapphire_toc_target(
-                    node.get(key),
-                    base_url=base_url,
-                    label=next_context_by_field.get("label")
-                    or next_context_by_field.get("title")
-                    or next_context_by_field.get("name"),
-                    file_name=next_context_by_field.get("file_name"),
-                    payer_name=next_context_by_field.get("payer_name"),
-                )
-                if not toc_target_by_field:
-                    continue
-                target_by_url.setdefault(
-                    _canonical_or_none(str(toc_target_by_field["url"]))
-                    or str(toc_target_by_field["url"]),
-                    toc_target_by_field,
-                )
-            for child in node.values():
-                visit(child, next_context_by_field)
-            return
-        if isinstance(node, list):
-            for child in node:
-                visit(child, context)
-            return
-        if isinstance(node, str) and "/tocs/" in node:
-            toc_target_by_field = _sapphire_toc_target(
-                node,
-                base_url=base_url,
-                label=(
-                    context.get("label")
-                    or context.get("title")
-                    or context.get("name")
-                    if context
-                    else None
-                ),
-                file_name=context.get("file_name") if context else None,
-                payer_name=context.get("payer_name") if context else None,
-            )
-            if toc_target_by_field:
-                target_by_url.setdefault(
-                    _canonical_or_none(str(toc_target_by_field["url"]))
-                    or str(toc_target_by_field["url"]),
-                    toc_target_by_field,
-                )
-
-    visit(query_payload_dict)
+    _collect_sapphire_query_toc_links(
+        query_payload_dict,
+        target_by_url,
+        base_url,
+    )
     return list(target_by_url.values())
 
 
@@ -6118,6 +6195,66 @@ def _parse_healthgram_network_pages(
     return list(page_by_url.values())
 
 
+async def _healthgram_network_page_targets(
+    source_record: dict[str, Any],
+    network_page: dict[str, Any],
+    landing_url: str,
+    landing_html: str,
+    resolver: dict[str, Any],
+    resolver_type: str,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve one Healthgram network page into TOC targets."""
+    page_url = str(network_page.get("url") or "").strip()
+    page_label = (
+        _clean_text(network_page.get("label"))
+        or source_record.get("display_name")
+        or "Healthgram"
+    )
+    page_html = (
+        landing_html
+        if page_url == landing_url
+        else await _fetch_text(
+            page_url,
+            max_bytes=int(
+                resolver.get("network_page_max_bytes")
+                or resolver.get("max_bytes")
+                or 5 * 1024 * 1024
+            ),
+            session=session,
+        )
+    )
+    crawl_targets: list[CrawlTarget] = []
+    for parsed_target in _parse_html_mrf_links(page_html, base_url=page_url):
+        if parsed_target.get("target_file_type") != "table-of-contents":
+            continue
+        target_url = str(parsed_target.get("url") or "").strip()
+        if not target_url:
+            continue
+        crawl_targets.append(
+            CrawlTarget(
+                source=source_record,
+                url=target_url,
+                label=page_label,
+                resolved_from_url=page_url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": parsed_target.get("target_kind"),
+                    "target_file_type": "table-of-contents",
+                    "container_format": parsed_target.get("container_format"),
+                    "html_attr": parsed_target.get("html_attr"),
+                    "healthgram_index_label": _clean_text(
+                        parsed_target.get("label")
+                    ),
+                    "healthgram_landing_url": landing_url,
+                    "healthgram_network_page_url": page_url,
+                    "healthgram_network_name": page_label,
+                },
+            )
+        )
+    return crawl_targets
+
+
 async def _resolve_healthgram_network_index(
     source_record: dict[str, Any],
     url: str,
@@ -6142,50 +6279,18 @@ async def _resolve_healthgram_network_index(
     max_pages = _as_int(resolver.get("max_network_pages")) or 50
     targets_by_url: dict[str, CrawlTarget] = {}
     for network_page in network_pages[:max_pages]:
-        page_url = str(network_page.get("url") or "").strip()
-        page_label = (
-            _clean_text(network_page.get("label"))
-            or source_record.get("display_name")
-            or "Healthgram"
+        page_targets = await _healthgram_network_page_targets(
+            source_record,
+            network_page,
+            url,
+            html_text,
+            resolver,
+            resolver_type,
+            session,
         )
-        page_html = (
-            html_text
-            if page_url == url
-            else await _fetch_text(
-                page_url,
-                max_bytes=int(
-                    resolver.get("network_page_max_bytes")
-                    or resolver.get("max_bytes")
-                    or 5 * 1024 * 1024
-                ),
-                session=session,
-            )
-        )
-        for parsed_target in _parse_html_mrf_links(page_html, base_url=page_url):
-            if parsed_target.get("target_file_type") != "table-of-contents":
-                continue
-            target_url = str(parsed_target.get("url") or "").strip()
-            if not target_url:
-                continue
-            index_label = _clean_text(parsed_target.get("label"))
-            key = _canonical_or_none(target_url) or target_url
-            targets_by_url[key] = CrawlTarget(
-                source=source_record,
-                url=target_url,
-                label=page_label,
-                resolved_from_url=page_url,
-                metadata={
-                    "resolver": resolver_type,
-                    "target_kind": parsed_target.get("target_kind"),
-                    "target_file_type": "table-of-contents",
-                    "container_format": parsed_target.get("container_format"),
-                    "html_attr": parsed_target.get("html_attr"),
-                    "healthgram_index_label": index_label,
-                    "healthgram_landing_url": url,
-                    "healthgram_network_page_url": page_url,
-                    "healthgram_network_name": page_label,
-                },
-            )
+        for crawl_target in page_targets:
+            url_key = _canonical_or_none(crawl_target.url) or crawl_target.url
+            targets_by_url[url_key] = crawl_target
     crawl_targets = list(targets_by_url.values())
     if not crawl_targets:
         raise ValueError(f"no Healthgram network index links found for {url}")
@@ -6344,6 +6449,41 @@ async def _resolve_hcsc_asomrf_landing(
     return crawl_targets
 
 
+def _point32_contextual_targets(
+    source_row: dict[str, Any],
+    html_text: str,
+    *,
+    base_url: str,
+    landing_url: str,
+    directory_url: str | None = None,
+) -> list[CrawlTarget]:
+    """Bind Point32 crawl targets to landing and optional directory context."""
+    crawl_targets: list[CrawlTarget] = []
+    for crawl_target in _crawl_targets_from_html_mrf_links(
+        source_row,
+        html_text,
+        base_url=base_url,
+        resolver="point32_azure_mrf_directory",
+    ):
+        metadata_by_field = {
+            **dict(crawl_target.metadata or {}),
+            "resolver": "point32_azure_mrf_directory",
+            "point32_landing_url": landing_url,
+        }
+        if directory_url:
+            metadata_by_field["point32_directory_url"] = directory_url
+        crawl_targets.append(
+            CrawlTarget(
+                source=source_row,
+                url=crawl_target.url,
+                label=crawl_target.label,
+                resolved_from_url=base_url,
+                metadata=metadata_by_field,
+            )
+        )
+    return crawl_targets
+
+
 async def _resolve_point32_azure_mrf_directory(
     source_row: dict[str, Any],
     url: str,
@@ -6360,27 +6500,18 @@ async def _resolve_point32_azure_mrf_directory(
             max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
             session=session,
         )
-        for crawl_target in _crawl_targets_from_html_mrf_links(
-            source_row,
+        crawl_targets.extend(
+            _point32_contextual_targets(
+                source_row,
+                html_text,
+                base_url=url,
+                landing_url=url,
+            )
+        )
+        directory_urls = _point32_directory_urls_from_html(
             html_text,
             base_url=url,
-            resolver="point32_azure_mrf_directory",
-        ):
-            metadata = {
-                **dict(crawl_target.metadata or {}),
-                "resolver": "point32_azure_mrf_directory",
-                "point32_landing_url": url,
-            }
-            crawl_targets.append(
-                CrawlTarget(
-                    source=source_row,
-                    url=crawl_target.url,
-                    label=crawl_target.label,
-                    resolved_from_url=crawl_target.resolved_from_url,
-                    metadata=metadata,
-                )
-            )
-        directory_urls = _point32_directory_urls_from_html(html_text, base_url=url)
+        )
         if not directory_urls:
             directory_urls = _html_mrf_directory_urls(html_text, base_url=url)
     max_directories = _as_int(resolver.get("max_directories")) or 5
@@ -6390,27 +6521,15 @@ async def _resolve_point32_azure_mrf_directory(
             max_bytes=int(resolver.get("directory_max_bytes") or 50 * 1024 * 1024),
             session=session,
         )
-        for crawl_target in _crawl_targets_from_html_mrf_links(
-            source_row,
-            directory_html,
-            base_url=directory_url,
-            resolver="point32_azure_mrf_directory",
-        ):
-            metadata = {
-                **dict(crawl_target.metadata or {}),
-                "resolver": "point32_azure_mrf_directory",
-                "point32_landing_url": url,
-                "point32_directory_url": directory_url,
-            }
-            crawl_targets.append(
-                CrawlTarget(
-                    source=source_row,
-                    url=crawl_target.url,
-                    label=crawl_target.label,
-                    resolved_from_url=directory_url,
-                    metadata=metadata,
-                )
+        crawl_targets.extend(
+            _point32_contextual_targets(
+                source_row,
+                directory_html,
+                base_url=directory_url,
+                landing_url=url,
+                directory_url=directory_url,
             )
+        )
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
@@ -6418,6 +6537,29 @@ async def _resolve_point32_azure_mrf_directory(
     if not crawl_targets:
         raise ValueError(f"no Point32 Azure MRF directory targets found for {url}")
     return crawl_targets
+
+
+def _delegated_crawl_target_with_context(
+    source_record: dict[str, Any],
+    delegated_target: CrawlTarget,
+    delegated_url: str,
+    platform: str,
+    landing_url: str,
+) -> CrawlTarget:
+    """Bind one delegated target back to its original landing page."""
+    metadata = {
+        **dict(delegated_target.metadata or {}),
+        "delegated_source_url": delegated_url,
+        "delegated_source_platform": platform,
+        "delegated_landing_url": landing_url,
+    }
+    return CrawlTarget(
+        source=source_record,
+        url=delegated_target.url,
+        label=delegated_target.label,
+        resolved_from_url=delegated_target.resolved_from_url or delegated_url,
+        metadata=metadata,
+    )
 
 
 async def _resolve_html_delegated_mrf_links(
@@ -6460,20 +6602,13 @@ async def _resolve_html_delegated_mrf_links(
         except Exception:
             continue
         for delegated_target in delegated_targets:
-            metadata = {
-                **dict(delegated_target.metadata or {}),
-                "delegated_source_url": delegated_url,
-                "delegated_source_platform": platform,
-                "delegated_landing_url": url,
-            }
             crawl_targets.append(
-                CrawlTarget(
-                    source=source_record,
-                    url=delegated_target.url,
-                    label=delegated_target.label,
-                    resolved_from_url=delegated_target.resolved_from_url
-                    or delegated_url,
-                    metadata=metadata,
+                _delegated_crawl_target_with_context(
+                    source_record,
+                    delegated_target,
+                    delegated_url,
+                    platform,
+                    url,
                 )
             )
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
@@ -7307,6 +7442,99 @@ def _embedded_mrf_urls(value: str, *, base_url: str | None = None) -> list[str]:
     return urls
 
 
+def _json_mrf_directory_crawl_target(
+    source_row_dict: dict[str, Any],
+    file_url: str,
+    *,
+    directory_url: str,
+    resolver_type: str,
+) -> CrawlTarget | None:
+    """Build one typed crawl target from a JSON-directory file URL."""
+    label = Path(urlsplit(file_url).path).name
+    if _is_html_mrf_toc_url(file_url, label):
+        target_kind = "toc_json"
+        target_file_type = "table-of-contents"
+    elif _is_html_mrf_body_reference(file_url, label):
+        target_kind = "file_reference"
+        target_file_type = _mrf_file_type_from_text(file_url, label)
+    else:
+        return None
+    if not target_file_type:
+        return None
+    plan_info = (
+        _plan_info_from_label(label) if target_kind == "file_reference" else []
+    )
+    metadata_by_field = {
+        "resolver": resolver_type,
+        "target_kind": target_kind,
+        "target_file_type": target_file_type,
+        "container_format": _container_format(file_url),
+        "directory_url": directory_url,
+        "plan_info": plan_info,
+    }
+    return CrawlTarget(
+        source=source_row_dict,
+        url=file_url,
+        label=_mrf_file_plan_label(label) or label,
+        resolved_from_url=directory_url,
+        metadata={
+            key: metadata_value
+            for key, metadata_value in metadata_by_field.items()
+            if metadata_value not in (None, "", [])
+        },
+    )
+
+
+def _collect_json_mrf_directory_targets(
+    source_row_dict: dict[str, Any],
+    directory_value: Any,
+    *,
+    directory_url: str,
+    resolver_type: str,
+    crawl_targets: list[CrawlTarget],
+    seen_url_keys: set[str],
+) -> None:
+    """Walk nested JSON values and collect unique MRF crawl targets."""
+    if isinstance(directory_value, dict):
+        for nested in directory_value.values():
+            _collect_json_mrf_directory_targets(
+                source_row_dict,
+                nested,
+                directory_url=directory_url,
+                resolver_type=resolver_type,
+                crawl_targets=crawl_targets,
+                seen_url_keys=seen_url_keys,
+            )
+        return
+    if isinstance(directory_value, list):
+        for nested in directory_value:
+            _collect_json_mrf_directory_targets(
+                source_row_dict,
+                nested,
+                directory_url=directory_url,
+                resolver_type=resolver_type,
+                crawl_targets=crawl_targets,
+                seen_url_keys=seen_url_keys,
+            )
+        return
+    if not isinstance(directory_value, str):
+        return
+    for file_url in _embedded_mrf_urls(directory_value, base_url=directory_url):
+        url_key = _canonical_or_none(file_url) or file_url
+        if url_key in seen_url_keys:
+            continue
+        crawl_target = _json_mrf_directory_crawl_target(
+            source_row_dict,
+            file_url,
+            directory_url=directory_url,
+            resolver_type=resolver_type,
+        )
+        if crawl_target is None:
+            continue
+        seen_url_keys.add(url_key)
+        crawl_targets.append(crawl_target)
+
+
 def _json_mrf_directory_targets_from_payload(
     source_row_dict: dict[str, Any],
     directory_payload: Any,
@@ -7316,65 +7544,14 @@ def _json_mrf_directory_targets_from_payload(
 ) -> list[CrawlTarget]:
     """Walk a JSON directory payload and build unique crawl targets."""
     crawl_targets: list[CrawlTarget] = []
-    seen_url_keys: set[str] = set()
-
-    def visit(directory_value: Any) -> None:
-        """Visit nested JSON values and collect directory MRF references."""
-        if isinstance(directory_value, dict):
-            for nested in directory_value.values():
-                visit(nested)
-            return
-        if isinstance(directory_value, list):
-            for nested in directory_value:
-                visit(nested)
-            return
-        if not isinstance(directory_value, str):
-            return
-        for file_url in _embedded_mrf_urls(
-            directory_value,
-            base_url=directory_url,
-        ):
-            label = Path(urlsplit(file_url).path).name
-            target_kind: str | None = None
-            target_file_type: str | None = None
-            if _is_html_mrf_toc_url(file_url, label):
-                target_kind = "toc_json"
-                target_file_type = "table-of-contents"
-            elif _is_html_mrf_body_reference(file_url, label):
-                target_kind = "file_reference"
-                target_file_type = _mrf_file_type_from_text(file_url, label)
-            if not target_kind or not target_file_type:
-                continue
-            key = _canonical_or_none(file_url) or file_url
-            if key in seen_url_keys:
-                continue
-            seen_url_keys.add(key)
-            plan_info = (
-                _plan_info_from_label(label) if target_kind == "file_reference" else []
-            )
-            metadata = {
-                "resolver": resolver_type,
-                "target_kind": target_kind,
-                "target_file_type": target_file_type,
-                "container_format": _container_format(file_url),
-                "directory_url": directory_url,
-                "plan_info": plan_info,
-            }
-            crawl_targets.append(
-                CrawlTarget(
-                    source=source_row_dict,
-                    url=file_url,
-                    label=_mrf_file_plan_label(label) or label,
-                    resolved_from_url=directory_url,
-                    metadata={
-                        key: metadata_value
-                        for key, metadata_value in metadata.items()
-                        if metadata_value not in (None, "", [])
-                    },
-                )
-            )
-
-    visit(directory_payload)
+    _collect_json_mrf_directory_targets(
+        source_row_dict,
+        directory_payload,
+        directory_url=directory_url,
+        resolver_type=resolver_type,
+        crawl_targets=crawl_targets,
+        seen_url_keys=set(),
+    )
     return crawl_targets
 
 
@@ -7532,6 +7709,60 @@ def _humana_pct_targets_from_payload(
     return crawl_targets
 
 
+async def _humana_pct_file_type_targets(
+    source_row_dict: dict[str, Any],
+    api_url: str,
+    file_type: str,
+    resolver: dict[str, Any],
+    resolver_type: str,
+    max_targets: int,
+    existing_target_count: int,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Fetch bounded Humana PCT pages for one configured file type."""
+    page_size = _as_int(resolver.get("page_size")) or 100
+    max_pages = _as_int(resolver.get("max_pages")) or 25
+    crawl_targets: list[CrawlTarget] = []
+    for page in range(max_pages):
+        start = page * page_size
+        page_url = api_url + "?" + urlencode(
+            {
+                "fileType": file_type,
+                "iDisplayStart": start,
+                "iDisplayLength": page_size,
+                "sEcho": page + 1,
+            }
+        )
+        page_payload = await _fetch_json(
+            page_url,
+            max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
+            session=session,
+        )
+        page_rows = _humana_pct_payload_rows(page_payload)
+        if not page_rows:
+            break
+        remaining = max_targets - existing_target_count - len(crawl_targets)
+        if remaining <= 0:
+            break
+        crawl_targets.extend(
+            _humana_pct_targets_from_payload(
+                source_row_dict,
+                page_payload,
+                api_url=page_url,
+                resolver=resolver,
+                resolver_type=resolver_type,
+                include_body_files=bool(resolver.get("include_body_files")),
+                max_targets=remaining,
+            )
+        )
+        total = _humana_pct_total_records(page_payload)
+        if total is not None and start + len(page_rows) >= total:
+            break
+        if len(page_rows) < page_size:
+            break
+    return crawl_targets
+
+
 async def _resolve_humana_pct_file_list(
     source_row_dict: dict[str, Any],
     url: str,
@@ -7549,49 +7780,21 @@ async def _resolve_humana_pct_file_list(
         for file_type_value in (resolver.get("file_types") or ["innetwork"])
         if str(file_type_value).strip()
     ]
-    page_size = _as_int(resolver.get("page_size")) or 100
-    max_pages = _as_int(resolver.get("max_pages")) or 25
     max_targets = _as_int(resolver.get("max_targets")) or 1000
-    include_body_files = bool(resolver.get("include_body_files"))
     crawl_targets: list[CrawlTarget] = []
     for file_type in file_types:
-        for page in range(max_pages):
-            start = page * page_size
-            page_url = api_url + "?" + urlencode(
-                {
-                    "fileType": file_type,
-                    "iDisplayStart": start,
-                    "iDisplayLength": page_size,
-                    "sEcho": page + 1,
-                }
+        crawl_targets.extend(
+            await _humana_pct_file_type_targets(
+                source_row_dict,
+                api_url,
+                file_type,
+                resolver,
+                resolver_type,
+                max_targets,
+                len(crawl_targets),
+                session,
             )
-            page_payload = await _fetch_json(
-                page_url,
-                max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
-                session=session,
-            )
-            page_rows = _humana_pct_payload_rows(page_payload)
-            if not page_rows:
-                break
-            remaining = max_targets - len(crawl_targets)
-            if remaining <= 0:
-                break
-            crawl_targets.extend(
-                _humana_pct_targets_from_payload(
-                    source_row_dict,
-                    page_payload,
-                    api_url=page_url,
-                    resolver=resolver,
-                    resolver_type=resolver_type,
-                    include_body_files=include_body_files,
-                    max_targets=remaining,
-                )
-            )
-            total = _humana_pct_total_records(page_payload)
-            if total is not None and start + len(page_rows) >= total:
-                break
-            if len(page_rows) < page_size:
-                break
+        )
         if len(crawl_targets) >= max_targets:
             break
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
@@ -8012,19 +8215,16 @@ def _payercompass_target_match_keys(target: CrawlTarget) -> set[str]:
     )
 
 
-async def _enrich_payercompass_target_plan_info(
+async def _payercompass_plan_index(
     crawl_targets: list[CrawlTarget],
     *,
-    resolver: dict[str, Any],
-    max_bytes: int,
+    index_fetch_max_bytes: int,
     session: aiohttp.ClientSession,
-) -> list[CrawlTarget]:
-    """Add index plan metadata to PayerCompass crawl targets."""
-    index_fetch_max_bytes = (
-        _as_int(resolver.get("index_max_bytes"))
-        or _as_int(resolver.get("max_index_bytes"))
-        or max_bytes
-    )
+) -> tuple[
+    dict[str, list[dict[str, Any]]],
+    dict[str, str | None],
+]:
+    """Collect PayerCompass plan and TOC metadata indexes."""
     plan_info_by_key: dict[str, list[dict[str, Any]]] = {}
     toc_metadata_by_field: dict[str, str | None] = {}
     for crawl_target in crawl_targets:
@@ -8053,6 +8253,27 @@ async def _enrich_payercompass_target_plan_info(
             for metadata_key, metadata_value in member_metadata.items():
                 if metadata_value and not toc_metadata_by_field.get(metadata_key):
                     toc_metadata_by_field[metadata_key] = metadata_value
+    return plan_info_by_key, toc_metadata_by_field
+
+
+async def _enrich_payercompass_target_plan_info(
+    crawl_targets: list[CrawlTarget],
+    *,
+    resolver: dict[str, Any],
+    max_bytes: int,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Add index plan metadata to PayerCompass crawl targets."""
+    index_fetch_max_bytes = (
+        _as_int(resolver.get("index_max_bytes"))
+        or _as_int(resolver.get("max_index_bytes"))
+        or max_bytes
+    )
+    plan_info_by_key, toc_metadata_by_field = await _payercompass_plan_index(
+        crawl_targets,
+        index_fetch_max_bytes=index_fetch_max_bytes,
+        session=session,
+    )
     if not plan_info_by_key:
         return crawl_targets
     for crawl_target in crawl_targets:
@@ -9139,6 +9360,55 @@ def _decode_embedded_url_text(value: str | None) -> str:
     return text
 
 
+def _is_html_json_mrf_toc(path: str, text: str) -> bool:
+    """Classify a JSON-shaped HTML reference as an MRF TOC."""
+    file_name = Path(path).name.replace("_", "-")
+    if re.search(r"(^|-)index(?:-[a-z0-9]+)?\.json(?:\.gz)?$", file_name) and any(
+        token in text
+        for token in (
+            "mrf",
+            "machine-readable",
+            "price-transparency",
+            "transparency",
+            "table-of-content",
+            "table of content",
+            "table-of-contents",
+            "table of contents",
+        )
+    ):
+        return True
+    return any(
+        token in text
+        for token in (
+            "index.json",
+            "index.json.gz",
+            "toc",
+            "table-of-content",
+            "table of content",
+            "table-of-contents",
+            "table of contents",
+        )
+    )
+
+
+def _is_extensionless_html_mrf_toc(path: str, text: str) -> bool:
+    """Classify an extensionless HTML reference as an MRF TOC."""
+    file_name = Path(path).name.replace("_", "-")
+    if "." in file_name or not file_name.endswith(("-index", "-toc")):
+        return False
+    return any(
+        token in text
+        for token in (
+            "/mrf/",
+            "mrf",
+            "machine-readable",
+            "transparency",
+            "table-of-contents",
+            "table of contents",
+        )
+    )
+
+
 def _is_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
     """Classify whether a URL or label refers to an MRF table of contents."""
     parsed = urlsplit(str(url or ""))
@@ -9148,7 +9418,7 @@ def _is_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
     text = f"{path} {query} {label or ''}".lower().replace("_", "-")
     if _is_non_tic_mrf_reference(url, label):
         return False
-    if any(
+    has_provider_only_text = any(
         token in text for token in ("formulary", "provider-data", "provider ")
     ) and not any(
         token in text
@@ -9162,38 +9432,13 @@ def _is_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
             "table-of-contents",
             "table of contents",
         )
-    ):
+    )
+    if has_provider_only_text:
         return False
     if host == "d3oz7y1cwsecds.cloudfront.net" and path == "/member-prod/bcbsal":
         return True
     if path.endswith((".json", ".json.gz")):
-        file_name = Path(path).name.replace("_", "-")
-        if re.search(r"(^|-)index(?:-[a-z0-9]+)?\.json(?:\.gz)?$", file_name) and any(
-            token in text
-            for token in (
-                "mrf",
-                "machine-readable",
-                "price-transparency",
-                "transparency",
-                "table-of-content",
-                "table of content",
-                "table-of-contents",
-                "table of contents",
-            )
-        ):
-            return True
-        return any(
-            token in text
-            for token in (
-                "index.json",
-                "index.json.gz",
-                "toc",
-                "table-of-content",
-                "table of content",
-                "table-of-contents",
-                "table of contents",
-            )
-        )
+        return _is_html_json_mrf_toc(path, text)
     if "sapphiremrfhub.com" in host and "/tocs/" in path:
         return True
     if "name=table-of-contents" in query and "ext=json" in query:
@@ -9206,22 +9451,47 @@ def _is_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
         and any(token in text for token in ("index", "table-of-contents"))
     ):
         return True
-    file_name = Path(path).name.replace("_", "-")
-    if "." in file_name:
-        return False
-    if not file_name.endswith(("-index", "-toc")):
-        return False
-    return any(
-        token in text
-        for token in (
-            "/mrf/",
-            "mrf",
-            "machine-readable",
-            "transparency",
-            "table-of-contents",
-            "table of contents",
+    return _is_extensionless_html_mrf_toc(path, text)
+
+
+def _is_extensionless_html_mrf_body_text(
+    text: str,
+    inferred_file_type: str | None,
+) -> bool:
+    """Return whether extensionless text carries a recognizable MRF body."""
+    has_body_context = inferred_file_type in {
+        "in-network",
+        "allowed-amounts",
+    } and (
+        re.search(r"(?:^|[-/])20\d{2}[-/]\d{2}[-/]\d{2}(?:[-/]|$)", text)
+        or any(
+            token in text
+            for token in ("large-group", "small-group", "individual-and-family")
         )
     )
+    has_mrf_context = has_body_context or any(
+        token in text
+        for token in (
+            "getmachinereadablefile",
+            "machine-readable",
+            "mrf",
+            "transparency",
+        )
+    )
+    has_rate_context = any(
+        token in text
+        for token in (
+            "allowed",
+            "in-network",
+            "in network",
+            "negotiated",
+            "out-of-network",
+            "out of network",
+            "rate",
+            "rates",
+        )
+    )
+    return bool(has_mrf_context and has_rate_context)
 
 
 def _is_html_mrf_body_reference(url: str | None, label: str | None = None) -> bool:
@@ -9239,48 +9509,11 @@ def _is_html_mrf_body_reference(url: str | None, label: str | None = None) -> bo
         return False
     text = f"{path} {label or ''} {query_file_name or ''}".lower().replace("_", "-")
     inferred_file_type = _mrf_file_type_from_text(url, label)
-    if not direct_body:
-        file_name = Path(path).name
-        if "." in file_name:
-            return False
-        extensionless_mrf_body = inferred_file_type in {
-            "in-network",
-            "allowed-amounts",
-        } and (
-            re.search(r"(?:^|[-/])20\d{2}[-/]\d{2}[-/]\d{2}(?:[-/]|$)", text)
-            or any(
-                token in text
-                for token in (
-                    "large-group",
-                    "small-group",
-                    "individual-and-family",
-                )
-            )
-        )
-        if not extensionless_mrf_body and not any(
-            token in text
-            for token in (
-                "getmachinereadablefile",
-                "machine-readable",
-                "mrf",
-                "transparency",
-            )
-        ):
-            return False
-        if not any(
-            token in text
-            for token in (
-                "allowed",
-                "in-network",
-                "in network",
-                "negotiated",
-                "out-of-network",
-                "out of network",
-                "rate",
-                "rates",
-            )
-        ):
-            return False
+    if not direct_body and (
+        "." in Path(path).name
+        or not _is_extensionless_html_mrf_body_text(text, inferred_file_type)
+    ):
+        return False
     if any(token in text for token in ("formulary", "provider-data", "provider ")):
         return False
     if direct_body and _mrf_file_type_from_text(url, label) == "table-of-contents":
@@ -11908,6 +12141,47 @@ def _bcbsma_monthly_toc_targets(
     return crawl_targets
 
 
+def _build_monthly_toc_crawl_target(
+    source_row_dict: dict[str, Any],
+    resolved_from_url: str,
+    resolver: dict[str, Any],
+    base_url: str,
+    template: str,
+    month_date: dt.datetime,
+    target_max_bytes: int | None,
+) -> CrawlTarget:
+    """Build one configured monthly TOC target."""
+    month_values_by_field = {
+        "year": month_date.strftime("%Y"),
+        "month": month_date.strftime("%m"),
+        "month_start": month_date.strftime("%Y-%m-01"),
+        "month_start_compact": month_date.strftime("%Y%m01"),
+        "month_prefix": month_date.strftime("%Y-%m"),
+        "yyyymm": month_date.strftime("%Y%m"),
+    }
+    file_path = template.format(**month_values_by_field)
+    file_name = Path(urlsplit(file_path).path).name or file_path
+    target_url = (
+        file_path
+        if file_path.startswith(("http://", "https://"))
+        else urljoin(base_url.rstrip("/") + "/", file_path.lstrip("/"))
+    )
+    return CrawlTarget(
+        source=source_row_dict,
+        url=target_url,
+        label=file_name,
+        resolved_from_url=resolved_from_url,
+        metadata={
+            "resolver": str(resolver.get("type") or "monthly_toc"),
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "month_start": month_values_by_field["month_start"],
+            "file_name": file_name,
+            "target_max_bytes": target_max_bytes,
+        },
+    )
+
+
 def _monthly_toc_targets(
     source_row_dict: dict[str, Any],
     url: str,
@@ -11929,51 +12203,29 @@ def _monthly_toc_targets(
     month_offsets = resolver.get("month_offsets")
     if not isinstance(month_offsets, list) or not month_offsets:
         month_offsets = [0]
-    target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
     current = now or _utc_now()
+    target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
     crawl_targets: list[CrawlTarget] = []
     seen_urls: set[str] = set()
     for raw_offset in month_offsets:
         offset = _as_int(raw_offset)
         if offset is None:
             continue
-        month_date = _add_months(current, offset)
-        month_values_by_field = {
-            "year": month_date.strftime("%Y"),
-            "month": month_date.strftime("%m"),
-            "month_start": month_date.strftime("%Y-%m-01"),
-            "month_start_compact": month_date.strftime("%Y%m01"),
-            "month_prefix": month_date.strftime("%Y-%m"),
-            "yyyymm": month_date.strftime("%Y%m"),
-        }
         for template in templates:
-            file_path = template.format(**month_values_by_field)
-            file_name = Path(urlsplit(file_path).path).name or file_path
-            target_url = (
-                file_path
-                if file_path.startswith(("http://", "https://"))
-                else urljoin(base_url.rstrip("/") + "/", file_path.lstrip("/"))
+            crawl_target = _build_monthly_toc_crawl_target(
+                source_row_dict,
+                url,
+                resolver,
+                base_url,
+                template,
+                _add_months(current, offset),
+                target_max_bytes,
             )
-            key = _canonical_or_none(target_url) or target_url
-            if key in seen_urls:
+            url_key = _canonical_or_none(crawl_target.url) or crawl_target.url
+            if url_key in seen_urls:
                 continue
-            seen_urls.add(key)
-            crawl_targets.append(
-                CrawlTarget(
-                    source=source_row_dict,
-                    url=target_url,
-                    label=file_name,
-                    resolved_from_url=url,
-                    metadata={
-                        "resolver": str(resolver.get("type") or "monthly_toc"),
-                        "target_kind": "toc_json",
-                        "target_file_type": "table-of-contents",
-                        "month_start": month_values_by_field["month_start"],
-                        "file_name": file_name,
-                        "target_max_bytes": target_max_bytes,
-                    },
-                )
-            )
+            seen_urls.add(url_key)
+            crawl_targets.append(crawl_target)
     return crawl_targets
 
 
@@ -12283,6 +12535,87 @@ def _triples_mtt_latest_year_month(payload: Any) -> tuple[str | None, str | None
     return str(max(years)), f"{max(months):02d}"
 
 
+def _latest_triples_file_entries(
+    file_entries: list[dict[str, Any]],
+    *,
+    latest_month_only: bool,
+) -> list[dict[str, Any]]:
+    """Return the latest configured Triples file month when requested."""
+    if not latest_month_only:
+        return file_entries
+    latest = max(
+        (
+            (str(file_entry.get("year") or ""), str(file_entry.get("month") or ""))
+            for file_entry in file_entries
+            if file_entry.get("url")
+        ),
+        default=None,
+    )
+    if latest is None:
+        return file_entries
+    return [
+        file_entry
+        for file_entry in file_entries
+        if (str(file_entry.get("year") or ""), str(file_entry.get("month") or ""))
+        == latest
+    ]
+
+
+def _triples_mtt_crawl_target(
+    source_record: dict[str, Any],
+    file_entry: dict[str, Any],
+    *,
+    resolved_from_url: str,
+    resolver_type: str,
+) -> CrawlTarget | None:
+    """Build one typed Triples MTT crawl target."""
+    file_url = _clean_text(file_entry.get("url"))
+    label = _clean_text(file_entry.get("marketing")) or Path(
+        urlsplit(file_url).path
+    ).name
+    file_type = _mrf_file_type_from_text(file_url, label)
+    if not file_url or not file_type:
+        return None
+    plan_name = " - ".join(
+        part
+        for part in (
+            _clean_text(file_entry.get("plan")),
+            _clean_text(file_entry.get("marketing")),
+        )
+        if part
+    )
+    return CrawlTarget(
+        source=source_record,
+        url=file_url,
+        label=label,
+        resolved_from_url=resolved_from_url,
+        metadata={
+            "resolver": resolver_type,
+            "target_kind": (
+                "toc_json"
+                if file_type == "table-of-contents"
+                else "file_reference"
+            ),
+            "target_file_type": file_type,
+            "container_format": _container_format(file_url),
+            "triples_id": file_entry.get("id"),
+            "network": file_entry.get("network"),
+            "plan": file_entry.get("plan"),
+            "year": file_entry.get("year"),
+            "month": file_entry.get("month"),
+            "marketing": file_entry.get("marketing"),
+            "plan_info": [
+                {
+                    "plan_id": None,
+                    "plan_id_type": None,
+                    "plan_market_type": "group",
+                    "plan_name": plan_name or None,
+                }
+            ],
+        },
+    )
+
+
 def _triples_mtt_targets_from_payload(
     source_record: dict[str, Any],
     payload_by_field: Any,
@@ -12299,74 +12632,26 @@ def _triples_mtt_targets_from_payload(
         for file_entry in payload_by_field.get("list") or ()
         if isinstance(file_entry, dict)
     ]
-    if resolver.get("latest_month_only", True):
-        latest = max(
-            (
-                (str(file_entry.get("year") or ""), str(file_entry.get("month") or ""))
-                for file_entry in file_entries
-                if file_entry.get("url")
-            ),
-            default=None,
-        )
-        if latest:
-            file_entries = [
-                file_entry
-                for file_entry in file_entries
-                if (str(file_entry.get("year") or ""), str(file_entry.get("month") or ""))
-                == latest
-            ]
+    file_entries = _latest_triples_file_entries(
+        file_entries,
+        latest_month_only=resolver.get("latest_month_only", True),
+    )
     crawl_targets: list[CrawlTarget] = []
     seen_urls: set[str] = set()
     for file_entry in file_entries:
-        file_url = _clean_text(file_entry.get("url"))
-        label = _clean_text(file_entry.get("marketing")) or Path(urlsplit(file_url).path).name
-        file_type = _mrf_file_type_from_text(file_url, label)
-        if not file_url or not file_type:
-            continue
-        key = _canonical_or_none(file_url) or file_url
-        if key in seen_urls:
-            continue
-        seen_urls.add(key)
-        plan_name = " - ".join(
-            part
-            for part in (
-                _clean_text(file_entry.get("plan")),
-                _clean_text(file_entry.get("marketing")),
-            )
-            if part
+        crawl_target = _triples_mtt_crawl_target(
+            source_record,
+            file_entry,
+            resolved_from_url=resolved_from_url,
+            resolver_type=resolver_type,
         )
-        crawl_targets.append(
-            CrawlTarget(
-                source=source_record,
-                url=file_url,
-                label=label,
-                resolved_from_url=resolved_from_url,
-                metadata={
-                    "resolver": resolver_type,
-                    "target_kind": (
-                        "toc_json"
-                        if file_type == "table-of-contents"
-                        else "file_reference"
-                    ),
-                    "target_file_type": file_type,
-                    "container_format": _container_format(file_url),
-                    "triples_id": file_entry.get("id"),
-                    "network": file_entry.get("network"),
-                    "plan": file_entry.get("plan"),
-                    "year": file_entry.get("year"),
-                    "month": file_entry.get("month"),
-                    "marketing": file_entry.get("marketing"),
-                    "plan_info": [
-                        {
-                            "plan_id": None,
-                            "plan_id_type": None,
-                            "plan_market_type": "group",
-                            "plan_name": plan_name or None,
-                        }
-                    ],
-                },
-            )
-        )
+        if crawl_target is None:
+            continue
+        url_key = _canonical_or_none(crawl_target.url) or crawl_target.url
+        if url_key in seen_urls:
+            continue
+        seen_urls.add(url_key)
+        crawl_targets.append(crawl_target)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
         crawl_targets = crawl_targets[:max_targets]
@@ -12460,6 +12745,64 @@ def _healthspace_execute_soap_envelope(
     )
 
 
+def _healthspace_mrf_target_from_element(
+    source_row_dict: dict[str, Any],
+    file_element: Any,
+    *,
+    resolved_from_url: str,
+    resolver_type: str,
+) -> CrawlTarget | None:
+    """Build one crawl target from a HealthSpace SOAP file element."""
+    url = _clean_text(file_element.attrib.get("FilePathURL"))
+    file_name = (
+        _clean_text(file_element.attrib.get("FileName"))
+        or Path(urlsplit(url).path).name
+    )
+    if not url:
+        return None
+    file_type = _mrf_file_type_from_text(url, file_name)
+    if not file_type and _is_non_tic_mrf_reference(url, file_name):
+        return None
+    if not file_type:
+        return None
+    target_kind = (
+        "toc_json"
+        if file_type == "table-of-contents"
+        and urlsplit(url).path.lower().endswith((".json", ".json.gz"))
+        else "file_reference"
+    )
+    company_id = _clean_text(file_element.attrib.get("CompanyId"))
+    company_name = _clean_text(file_element.attrib.get("CompanyName"))
+    plan_entries = (
+        [
+            {
+                "plan_id": company_name,
+                "plan_id_type": "healthspace_company_name",
+                "plan_market_type": "group",
+                "plan_name": company_name,
+            }
+        ]
+        if company_name
+        else []
+    )
+    return CrawlTarget(
+        source=source_row_dict,
+        url=url,
+        label=company_name or _mrf_file_plan_label(file_name) or file_name,
+        resolved_from_url=resolved_from_url,
+        metadata={
+            "resolver": resolver_type,
+            "target_kind": target_kind,
+            "target_file_type": file_type,
+            "container_format": _container_format(url),
+            "company_id": company_id,
+            "company_name": company_name,
+            "file_name": file_name,
+            "plan_info": plan_entries,
+        },
+    )
+
+
 def _healthspace_mrf_targets_from_soap(
     source_row_dict: dict[str, Any],
     soap_text: str,
@@ -12475,57 +12818,19 @@ def _healthspace_mrf_targets_from_soap(
     for file_element in root.iter():
         if file_element.tag.rsplit("}", 1)[-1] != "MachineReadableFile":
             continue
-        url = _clean_text(file_element.attrib.get("FilePathURL"))
-        file_name = (
-            _clean_text(file_element.attrib.get("FileName")) or Path(urlsplit(url).path).name
+        crawl_target = _healthspace_mrf_target_from_element(
+            source_row_dict,
+            file_element,
+            resolved_from_url=resolved_from_url,
+            resolver_type=resolver_type,
         )
-        if not url:
+        if crawl_target is None:
             continue
-        file_type = _mrf_file_type_from_text(url, file_name)
-        if not file_type and _is_non_tic_mrf_reference(url, file_name):
+        url_key = _canonical_or_none(crawl_target.url) or crawl_target.url
+        if url_key in seen_urls:
             continue
-        if not file_type:
-            continue
-        target_kind = (
-            "toc_json"
-            if file_type == "table-of-contents"
-            and urlsplit(url).path.lower().endswith((".json", ".json.gz"))
-            else "file_reference"
-        )
-        company_id = _clean_text(file_element.attrib.get("CompanyId"))
-        company_name = _clean_text(file_element.attrib.get("CompanyName"))
-        plan_entries = []
-        if company_name:
-            plan_entries.append(
-                {
-                    "plan_id": company_name,
-                    "plan_id_type": "healthspace_company_name",
-                    "plan_market_type": "group",
-                    "plan_name": company_name,
-                }
-            )
-        key = _canonical_or_none(url) or url
-        if key in seen_urls:
-            continue
-        seen_urls.add(key)
-        crawl_targets.append(
-            CrawlTarget(
-                source=source_row_dict,
-                url=url,
-                label=company_name or _mrf_file_plan_label(file_name) or file_name,
-                resolved_from_url=resolved_from_url,
-                metadata={
-                    "resolver": resolver_type,
-                    "target_kind": target_kind,
-                    "target_file_type": file_type,
-                    "container_format": _container_format(url),
-                    "company_id": company_id,
-                    "company_name": company_name,
-                    "file_name": file_name,
-                    "plan_info": plan_entries,
-                },
-            )
-        )
+        seen_urls.add(url_key)
+        crawl_targets.append(crawl_target)
     return crawl_targets
 
 
@@ -13416,6 +13721,64 @@ def _providence_toc_targets_from_payload(
     return crawl_targets
 
 
+async def _providence_groups_by_id(
+    api_endpoint: str,
+    group_queries: list[str],
+    headers_by_name: dict[str, str],
+    max_bytes: int,
+    session: aiohttp.ClientSession,
+) -> dict[str, dict[str, Any]]:
+    """Fetch unique Providence groups in query-response order."""
+    groups_by_id: dict[str, dict[str, Any]] = {}
+    for query in group_queries:
+        group_url = urljoin(api_endpoint.rstrip("/") + "/", "group/")
+        group_url = f"{group_url}?{urlencode({'groupname': query})}"
+        group_payload = await _fetch_json_with_headers(
+            group_url,
+            headers=headers_by_name,
+            max_bytes=max_bytes,
+            session=session,
+        )
+        for group in group_payload.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            group_id = _clean_text(group.get("group-id"))
+            if group_id:
+                groups_by_id.setdefault(group_id, group)
+    return groups_by_id
+
+
+async def _providence_group_toc_targets(
+    source_row_dict: dict[str, Any],
+    api_endpoint: str,
+    group_ids: list[str],
+    headers_by_name: dict[str, str],
+    max_bytes: int,
+    resolver_type: str,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Fetch Providence TOC targets for an ordered group-id selection."""
+    crawl_targets: list[CrawlTarget] = []
+    for group_id in group_ids:
+        toc_url = urljoin(api_endpoint.rstrip("/") + "/", "toc/")
+        toc_url = f"{toc_url}?{urlencode({'groupid': group_id})}"
+        toc_payload = await _fetch_json_with_headers(
+            toc_url,
+            headers=headers_by_name,
+            max_bytes=max_bytes,
+            session=session,
+        )
+        crawl_targets.extend(
+            _providence_toc_targets_from_payload(
+                source_row_dict,
+                toc_payload,
+                api_url=toc_url,
+                resolver_type=resolver_type,
+            )
+        )
+    return crawl_targets
+
+
 async def _resolve_providence_mrf_api(
     source_row_dict: dict[str, Any],
     url: str,
@@ -13442,35 +13805,23 @@ async def _resolve_providence_mrf_api(
         for query_value in (resolver.get("group_queries") or ["Individual and Family Plans"])
         if str(query_value).strip()
     ]
-    groups_by_id: dict[str, dict[str, Any]] = {}
-    for query in group_queries:
-        group_url = urljoin(api_endpoint.rstrip("/") + "/", "group/")
-        group_url = f"{group_url}?{urlencode({'groupname': query})}"
-        group_payload = await _fetch_json_with_headers(
-            group_url, headers=headers_by_name, max_bytes=max_bytes, session=session
-        )
-        for group in group_payload.get("groups") or []:
-            if not isinstance(group, dict):
-                continue
-            group_id = _clean_text(group.get("group-id"))
-            if group_id:
-                groups_by_id.setdefault(group_id, group)
+    groups_by_id = await _providence_groups_by_id(
+        api_endpoint,
+        group_queries,
+        headers_by_name,
+        max_bytes,
+        session,
+    )
     max_groups = _as_int(resolver.get("max_groups")) or 25
-    crawl_targets: list[CrawlTarget] = []
-    for group_id in list(groups_by_id)[:max_groups]:
-        toc_url = urljoin(api_endpoint.rstrip("/") + "/", "toc/")
-        toc_url = f"{toc_url}?{urlencode({'groupid': group_id})}"
-        toc_payload = await _fetch_json_with_headers(
-            toc_url, headers=headers_by_name, max_bytes=max_bytes, session=session
-        )
-        crawl_targets.extend(
-            _providence_toc_targets_from_payload(
-                source_row_dict,
-                toc_payload,
-                api_url=toc_url,
-                resolver_type=resolver_type,
-            )
-        )
+    crawl_targets = await _providence_group_toc_targets(
+        source_row_dict,
+        api_endpoint,
+        list(groups_by_id)[:max_groups],
+        headers_by_name,
+        max_bytes,
+        resolver_type,
+        session,
+    )
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
@@ -14383,6 +14734,28 @@ def _target_fetch_max_bytes(target: CrawlTarget, default: int) -> int:
     return int(default or MAX_TOC_BYTES_DEFAULT)
 
 
+def _toc_target_plan_fields(
+    target_metadata_by_field: dict[str, Any],
+) -> dict[str, list[str]]:
+    """Build normalized plan fields for a persisted TOC target row."""
+    plan_info = _metadata_plan_info(target_metadata_by_field)
+    return {
+        "plan_ids": [
+            plan.get("plan_id") for plan in plan_info if plan.get("plan_id")
+        ],
+        "plan_names": [
+            plan.get("plan_name") for plan in plan_info if plan.get("plan_name")
+        ],
+        "market_types": sorted(
+            {
+                plan.get("plan_market_type")
+                for plan in plan_info
+                if plan.get("plan_market_type")
+            }
+        ),
+    }
+
+
 def _toc_target_file_row(crawl_target: CrawlTarget) -> dict[str, Any]:
     """Convert a crawl target into a persisted TOC file row."""
     now = _utc_now()
@@ -14397,7 +14770,6 @@ def _toc_target_file_row(crawl_target: CrawlTarget) -> dict[str, Any]:
         target_metadata_by_field.get("target_file_type")
         or "table-of-contents"
     )
-    plan_info = _metadata_plan_info(target_metadata_by_field)
     size_bytes = (
         _parse_size_bytes(target_metadata_by_field.get("blob_size"))
         or _parse_size_bytes(target_metadata_by_field.get("size_bytes"))
@@ -14420,17 +14792,7 @@ def _toc_target_file_row(crawl_target: CrawlTarget) -> dict[str, Any]:
         "from_index_url": crawl_target.resolved_from_url,
         "description": crawl_target.label,
         "network_name": crawl_target.label,
-        "plan_ids": [plan.get("plan_id") for plan in plan_info if plan.get("plan_id")],
-        "plan_names": [
-            plan.get("plan_name") for plan in plan_info if plan.get("plan_name")
-        ],
-        "market_types": sorted(
-            {
-                plan.get("plan_market_type")
-                for plan in plan_info
-                if plan.get("plan_market_type")
-            }
-        ),
+        **_toc_target_plan_fields(target_metadata_by_field),
         "is_signed_url": _is_signed(crawl_target.url),
         "size_bytes": size_bytes,
         "etag": target_metadata_by_field.get("etag"),

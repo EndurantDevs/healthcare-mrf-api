@@ -12238,7 +12238,7 @@ def _v4_inferred_taxonomy_projection_rule(
     serving_tables: PTG2ServingTables,
     args: Mapping[str, Any],
 ) -> tuple[Mapping[str, Any], V4InferredTaxonomyProjectionRule] | None:
-    """Resolve an optional sealed rule without changing legacy V4 behavior."""
+    """Resolve the sealed rule required by inferred-only V4 selection."""
 
     if not bool(getattr(serving_tables, "uses_v4_graph", False)):
         return None
@@ -12250,7 +12250,9 @@ def _v4_inferred_taxonomy_projection_rule(
         None,
     )
     if projection_manifest is None:
-        return None
+        raise PTG2OnlineWorkBudgetExceeded(
+            "inferred_taxonomy_projection"
+        )
     rule = _inferred_provider_taxonomy_rule(dict(args))
     if rule is None:
         raise PTG2ManifestArtifactError(
