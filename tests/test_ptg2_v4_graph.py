@@ -85,8 +85,9 @@ async def test_building_v4_relation_read_is_bound_to_its_build_token(
     root_loader = AsyncMock(return_value=root)
     observed_by_argument: dict[str, object] = {}
 
-    async def fake_lookup(*_args, **kwargs):
+    async def fake_lookup(*lookup_args, **kwargs):
         observed_by_argument.update(kwargs)
+        observed_by_argument["request"] = lookup_args[1]
         return {3: (5, 7)}
 
     monkeypatch.setattr(graph, "_load_building_v4_graph_root", root_loader)
@@ -109,8 +110,10 @@ async def test_building_v4_relation_read_is_bound_to_its_build_token(
         "schema_name": "mrf",
         "build_token": "build-17",
     }
-    assert observed_by_argument["authenticated_root"] == root
-    assert observed_by_argument["max_members"] == 11
+    request = observed_by_argument["request"]
+    assert isinstance(request, graph._V4RelationLookupRequest)
+    assert request.authenticated_root == root
+    assert request.max_members == 11
 
 
 @pytest.mark.asyncio
@@ -411,6 +414,121 @@ def _heavy_bitmap_relation_manifest() -> graph.V4RelationManifest:
         locator_page_bytes=32,
         locator_owner_span=2,
     )
+
+
+def _regular_lookup_fixture(
+    *,
+    allowed_member_keys: tuple[int, ...] | None = None,
+) -> graph._V4RelationLookup:
+    manifest = _heavy_bitmap_relation_manifest()
+    return graph._V4RelationLookup(
+        snapshot_key=manifest.snapshot_key,
+        relation=manifest.relation,
+        owner_keys=(1,),
+        schema_name="mrf",
+        max_members=8,
+        per_owner_limit=None,
+        allowed_member_keys=allowed_member_keys,
+        manifest=manifest,
+        heavy_owners={},
+        regular_owner_keys=(1,),
+    )
+
+
+def test_v4_lookup_validation_rejects_invalid_limits_and_owners() -> None:
+    for request in (
+        graph._V4RelationLookupRequest(17, "npi_groups_exact", (1,), "mrf", -1),
+        graph._V4RelationLookupRequest(
+            17,
+            "npi_groups_exact",
+            (1,),
+            "mrf",
+            8,
+            prefix_members_per_owner=-1,
+        ),
+    ):
+        with pytest.raises(PTG2SharedBlockError):
+            graph._validate_v4_lookup_limits(request)
+    manifest = _heavy_bitmap_relation_manifest()
+    with pytest.raises(PTG2SharedBlockError, match="outside its manifest"):
+        graph._validate_v4_lookup_owner_scope(manifest, (8,))
+    heavy_owner = graph.V4HeavyOwner(
+        relation=manifest.relation,
+        owner_key=7,
+        object_kind="v4_npi_groups_exact_heavy_bitmap_v1",
+        member_count=1,
+        member_base=0,
+        member_span=1,
+        fragment_count=1,
+    )
+    with pytest.raises(PTG2SharedBlockError, match="unrequested owner"):
+        graph._validate_v4_heavy_owner_scope((1,), manifest, {7: heavy_owner})
+
+
+@pytest.mark.asyncio
+async def test_v4_scoped_lookup_returns_before_unneeded_graph_io(
+    monkeypatch,
+) -> None:
+    empty_request = graph._V4RelationLookupRequest(
+        17,
+        "npi_groups_exact",
+        (),
+        "mrf",
+        8,
+    )
+    assert await graph._lookup_v4_relation_members_scoped(
+        object(),
+        empty_request,
+    ) == {}
+    prepared_lookup = _regular_lookup_fixture(allowed_member_keys=())
+    monkeypatch.setattr(
+        graph,
+        "_prepare_v4_relation_lookup",
+        AsyncMock(return_value=prepared_lookup),
+    )
+    request = graph._V4RelationLookupRequest(
+        17,
+        "npi_groups_exact",
+        (1,),
+        "mrf",
+        8,
+        allowed_member_keys=(),
+    )
+    assert await graph._lookup_v4_relation_members_scoped(
+        object(),
+        request,
+    ) == {1: ()}
+    assert graph._v4_member_page_keys(prepared_lookup, {1: (0, 0)}) == set()
+
+
+@pytest.mark.asyncio
+async def test_v4_map_pair_loader_rejects_duplicate_and_missing_packs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        graph,
+        "_retain_map_pack_coordinates",
+        lambda *_args, **_kwargs: None,
+    )
+    pack_loader = AsyncMock(return_value=[{"pack_no": 1}, {"pack_no": 1}])
+    monkeypatch.setattr(graph, "_query_v4_map_packs", pack_loader)
+    with pytest.raises(PTG2SharedBlockError, match="duplicate pack"):
+        await graph._load_map_coordinate_pairs(
+            object(),
+            schema_name="mrf",
+            snapshot_key=980001,
+            object_kind="coverage_duplicate_pack",
+            coordinate_pairs=((1, 0),),
+        )
+    pack_loader.return_value = []
+    with pytest.raises(PTG2SharedBlockError, match="missing a graph coordinate"):
+        await graph._load_map_coordinate_pairs(
+            object(),
+            schema_name="mrf",
+            snapshot_key=980002,
+            object_kind="coverage_missing_pack",
+            coordinate_pairs=((1, 0),),
+        )
 
 
 async def _assert_heavy_bitmap_page_limit(
@@ -1739,6 +1857,85 @@ async def test_v4_pattern_npi_hot_path_never_enumerates_exact_groups(
     )
     assert observed == {1234567890: (3, 8, 10)}
     assert relations == ["npi_patterns", "pattern_sets"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_set_count", (37, 299, 512, 513))
+async def test_v4_pattern_npi_separates_projection_and_retained_set_budgets(
+    monkeypatch,
+    provider_set_count: int,
+) -> None:
+    """Charge both projection hops while retaining at most 512 exact sets."""
+
+    async def fake_root(*_args, **_kwargs):
+        return graph.V4GraphRoot(17, "pattern_v1", b"p" * 32)
+
+    async def fake_npi_keys(*_args, **_kwargs):
+        return {1234567890: 4}
+
+    async def fake_lookup(*_args, **kwargs):
+        if kwargs["relation"] == "npi_patterns":
+            assert kwargs["max_members"] == 2_048
+            return {4: (2,)}
+        if kwargs["relation"] == "pattern_sets":
+            assert kwargs["max_members"] == 2_047
+            return {2: tuple(range(1, provider_set_count + 1))}
+        raise AssertionError(kwargs["relation"])
+
+    monkeypatch.setattr(ptg2_serving, "load_v4_graph_root", fake_root)
+    monkeypatch.setattr(ptg2_serving, "v4_npi_keys_for_values", fake_npi_keys)
+    monkeypatch.setattr(ptg2_serving, "lookup_v4_relation_members", fake_lookup)
+    request = ptg2_serving._v4_sets_by_npi(
+        object(),
+        _v4_serving_tables(),
+        (1234567890,),
+        max_members=512,
+        max_projection_members=2_048,
+    )
+    if provider_set_count == 513:
+        with pytest.raises(
+            graph.PTG2SharedBlockError,
+            match="graph selection exceeds max_members",
+        ):
+            await request
+        return
+    assert await request == {
+        1234567890: tuple(range(1, provider_set_count + 1))
+    }
+
+
+@pytest.mark.asyncio
+async def test_v4_pattern_npi_stops_when_first_hop_spends_projection_budget(
+    monkeypatch,
+) -> None:
+    """Never start the second hop after the cumulative projection cap is spent."""
+
+    async def fake_lookup(*_args, **kwargs):
+        assert kwargs["relation"] == "npi_patterns"
+        return {4: (1, 2, 3)}
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=graph.V4GraphRoot(17, "pattern_v1", b"p" * 32)),
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "v4_npi_keys_for_values",
+        AsyncMock(return_value={1234567890: 4}),
+    )
+    monkeypatch.setattr(ptg2_serving, "lookup_v4_relation_members", fake_lookup)
+    with pytest.raises(
+        graph.PTG2SharedBlockError,
+        match="graph selection exceeds max_members",
+    ):
+        await ptg2_serving._v4_sets_by_npi(
+            object(),
+            _v4_serving_tables(),
+            (1234567890,),
+            max_members=2,
+            max_projection_members=2,
+        )
 
 
 @pytest.mark.asyncio

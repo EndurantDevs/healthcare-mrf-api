@@ -205,24 +205,29 @@ async def test_direct_exact_npi_integrity_failure_does_not_fallback(
     rate_scope.assert_not_awaited()
 
 
+@pytest.mark.parametrize("membership_count", (37, 299, 512))
 @pytest.mark.asyncio
-async def test_pattern_exact_npi_keeps_code_scoped_graph_order(
+async def test_pattern_exact_npi_bounds_graph_before_dense_code_scope(
     monkeypatch,
+    membership_count,
 ) -> None:
-    """Leave the already-bounded pattern representation on its current path."""
+    """Use NPI-to-pattern-to-set before touching a dense code projection."""
 
-    events: list[str] = []
+    events: list[tuple[str, object]] = []
+    provider_set_keys = tuple(range(1, membership_count + 1))
+    matching_provider_set_keys = provider_set_keys[-2:]
 
     async def rate_scope(*_args, **kwargs):
-        events.append("rate")
-        assert "provider_set_keys" not in kwargs
-        return (7, 8)
+        events.append(("rate", dict(kwargs)))
+        assert tuple(kwargs["provider_set_keys"]) == provider_set_keys
+        return matching_provider_set_keys
 
     async def graph_lookup(*_args, **kwargs):
-        events.append("graph")
-        assert kwargs["allowed_provider_set_keys"] == frozenset({7, 8})
-        assert "max_members" not in kwargs
-        return {_NPI: (8,)}
+        events.append(("graph", dict(kwargs)))
+        assert kwargs["allowed_provider_set_keys"] is None
+        assert kwargs["max_members"] == 512
+        assert kwargs["max_projection_members"] == 2_048
+        return {_NPI: provider_set_keys}
 
     monkeypatch.setattr(
         serving,
@@ -242,5 +247,103 @@ async def test_pattern_exact_npi_keeps_code_scoped_graph_order(
         _explicit_args(),
     )
 
+    assert observed == serving._ExplicitNpiGraphScope(
+        _NPI,
+        matching_provider_set_keys,
+    )
+    assert [event_name for event_name, _payload in events] == [
+        "graph",
+        "rate",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pattern_exact_npi_rejects_rate_scope_outside_bounded_membership(
+    monkeypatch,
+) -> None:
+    """Fail closed if the targeted forward read escapes the NPI membership."""
+
+    monkeypatch.setattr(
+        serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(17, "pattern_v1", b"p" * 32)),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_v4_sets_by_npi",
+        AsyncMock(return_value={_NPI: tuple(range(1, 38))}),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_shared_rate_provider_set_keys",
+        AsyncMock(return_value=(38,)),
+    )
+
+    with pytest.raises(
+        serving.PTG2ManifestArtifactError,
+        match="code scope escaped its bounded graph",
+    ):
+        await serving._version_three_explicit_npi_graph_scope(
+            object(),
+            _tables(),
+            _explicit_args(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    (
+        (
+            serving.PTG2SharedBlockError,
+            "PTG V4 graph selection exceeds max_members",
+        ),
+        (
+            serving.PTG2ManifestArtifactError,
+            "PTG2 V4 graph selection exceeds max_members",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_pattern_exact_npi_falls_back_after_bounded_graph_refusal(
+    monkeypatch,
+    error_type,
+    message,
+) -> None:
+    """Keep the existing code-first path for a pattern-heavy NPI."""
+
+    events: list[tuple[str, object]] = []
+
+    async def graph_lookup(*_args, **kwargs):
+        events.append(("graph", dict(kwargs)))
+        if kwargs.get("max_members") is not None:
+            assert kwargs["max_members"] == 512
+            assert kwargs["max_projection_members"] == 2_048
+            raise error_type(message)
+        assert kwargs["allowed_provider_set_keys"] == frozenset({7, 8})
+        return {_NPI: (8,)}
+
+    async def rate_scope(*_args, **kwargs):
+        events.append(("rate", dict(kwargs)))
+        assert "provider_set_keys" not in kwargs
+        return (7, 8)
+
+    monkeypatch.setattr(
+        serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(17, "pattern_v1", b"p" * 32)),
+    )
+    monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
+    monkeypatch.setattr(serving, "_shared_rate_provider_set_keys", rate_scope)
+
+    observed = await serving._version_three_explicit_npi_graph_scope(
+        object(),
+        _tables(),
+        _explicit_args(),
+    )
+
     assert observed == serving._ExplicitNpiGraphScope(_NPI, (8,))
-    assert events == ["rate", "graph"]
+    assert [event_name for event_name, _payload in events] == [
+        "graph",
+        "rate",
+        "graph",
+    ]

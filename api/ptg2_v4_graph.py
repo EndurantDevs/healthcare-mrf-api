@@ -210,6 +210,38 @@ class V4HeavyOwner:
 
 
 @dataclass(frozen=True)
+class _V4RelationLookupRequest:
+    snapshot_key: int
+    relation: str
+    owner_keys: tuple[int, ...]
+    schema_name: str
+    max_members: int | None
+    prefix_members_per_owner: int | None = None
+    allowed_member_keys: tuple[int, ...] | None = None
+    authenticated_root: V4GraphRoot | None = None
+
+
+@dataclass(frozen=True)
+class _V4RelationLookup:
+    snapshot_key: int
+    relation: str
+    owner_keys: tuple[int, ...]
+    schema_name: str
+    max_members: int | None
+    per_owner_limit: int | None
+    allowed_member_keys: tuple[int, ...] | None
+    manifest: V4RelationManifest
+    heavy_owners: Mapping[int, V4HeavyOwner]
+    regular_owner_keys: tuple[int, ...]
+
+    @property
+    def is_intersection(self) -> bool:
+        """Return whether the lookup retains only allowed member keys."""
+
+        return self.allowed_member_keys is not None
+
+
+@dataclass(frozen=True)
 class _CachedPhysicalBlock:
     block_hash: bytes
     object_kind: str
@@ -1044,6 +1076,78 @@ def _normalized_owner_keys(owner_keys: Iterable[int]) -> tuple[int, ...]:
     return _normalized_u32_keys(owner_keys, kind="owner")
 
 
+def _relation_manifest_from_fields(
+    fields: Mapping[str, Any],
+    *,
+    snapshot_key: int,
+    relation: str,
+    locator_kind: str,
+    member_kind: str,
+) -> V4RelationManifest:
+    manifest = V4RelationManifest(
+        snapshot_key=int(snapshot_key),
+        relation=relation,
+        member_object_kind=member_kind,
+        locator_object_kind=locator_kind,
+        owner_base=_strict_manifest_int(
+            fields, "owner_base", maximum=0xFFFFFFFF
+        ),
+        owner_count=_strict_manifest_int(
+            fields, "owner_count", maximum=0x1_0000_0000
+        ),
+        logical_member_count=_strict_manifest_int(
+            fields, "logical_member_count"
+        ),
+        vector_member_count=_strict_manifest_int(
+            fields, "vector_member_count"
+        ),
+        member_width=_strict_manifest_int(
+            fields, "member_width", minimum=1, maximum=64
+        ),
+        member_page_bytes=_strict_manifest_int(
+            fields,
+            "member_page_bytes",
+            minimum=PTG2_V4_MEMBER_WIDTH_BYTES,
+            maximum=PTG2_V4_MAX_GRAPH_PAGE_BYTES,
+        ),
+        locator_page_bytes=_strict_manifest_int(
+            fields,
+            "locator_page_bytes",
+            minimum=PTG2_V4_LOCATOR_WIDTH_BYTES,
+            maximum=PTG2_V4_MAX_GRAPH_PAGE_BYTES,
+        ),
+        locator_owner_span=_strict_manifest_int(
+            fields, "locator_owner_span", minimum=1, maximum=0xFFFFFFFF
+        ),
+    )
+    _validate_relation_manifest_fields(fields, manifest)
+    return manifest
+
+
+def _validate_relation_manifest_fields(
+    fields: Mapping[str, Any],
+    manifest: V4RelationManifest,
+) -> None:
+    has_identity_change = (
+        _strict_manifest_int(fields, "snapshot_key", minimum=1)
+        != manifest.snapshot_key
+        or fields.get("relation") != manifest.relation
+        or fields.get("member_object_kind") != manifest.member_object_kind
+        or fields.get("locator_object_kind") != manifest.locator_object_kind
+    )
+    has_geometry_change = (
+        manifest.member_width != PTG2_V4_MEMBER_WIDTH_BYTES
+        or manifest.member_page_bytes % manifest.member_width
+        or manifest.locator_page_bytes % PTG2_V4_LOCATOR_WIDTH_BYTES
+        or manifest.locator_page_bytes
+        != manifest.locator_owner_span * PTG2_V4_LOCATOR_WIDTH_BYTES
+        or manifest.owner_base + manifest.owner_count > 0x1_0000_0000
+        or manifest.vector_member_count > manifest.logical_member_count
+    )
+    if has_identity_change or has_geometry_change:
+        raise PTG2SharedBlockError("PTG V4 relation manifest is inconsistent")
+
+
 async def load_v4_relation_manifest(
     session: Any,
     *,
@@ -1081,60 +1185,12 @@ async def load_v4_relation_manifest(
     )
     manifest_row = query_result.first()
     fields = _row_mapping(manifest_row) if manifest_row is not None else {}
-    owner_base = _strict_manifest_int(
-        fields, "owner_base", maximum=0xFFFFFFFF
-    )
-    owner_count = _strict_manifest_int(
-        fields, "owner_count", maximum=0x1_0000_0000
-    )
-    logical_member_count = _strict_manifest_int(fields, "logical_member_count")
-    vector_member_count = _strict_manifest_int(fields, "vector_member_count")
-    member_width = _strict_manifest_int(
-        fields, "member_width", minimum=1, maximum=64
-    )
-    member_page_bytes = _strict_manifest_int(
+    manifest = _relation_manifest_from_fields(
         fields,
-        "member_page_bytes",
-        minimum=PTG2_V4_MEMBER_WIDTH_BYTES,
-        maximum=PTG2_V4_MAX_GRAPH_PAGE_BYTES,
-    )
-    locator_page_bytes = _strict_manifest_int(
-        fields,
-        "locator_page_bytes",
-        minimum=PTG2_V4_LOCATOR_WIDTH_BYTES,
-        maximum=PTG2_V4_MAX_GRAPH_PAGE_BYTES,
-    )
-    locator_owner_span = _strict_manifest_int(
-        fields, "locator_owner_span", minimum=1, maximum=0xFFFFFFFF
-    )
-    if (
-        _strict_manifest_int(fields, "snapshot_key", minimum=1)
-        != int(snapshot_key)
-        or fields.get("relation") != normalized_relation
-        or fields.get("member_object_kind") != member_kind
-        or fields.get("locator_object_kind") != locator_kind
-        or member_width != PTG2_V4_MEMBER_WIDTH_BYTES
-        or member_page_bytes % member_width
-        or locator_page_bytes % PTG2_V4_LOCATOR_WIDTH_BYTES
-        or locator_page_bytes
-        != locator_owner_span * PTG2_V4_LOCATOR_WIDTH_BYTES
-        or owner_base + owner_count > 0x1_0000_0000
-        or vector_member_count > logical_member_count
-    ):
-        raise PTG2SharedBlockError("PTG V4 relation manifest is inconsistent")
-    manifest = V4RelationManifest(
         snapshot_key=int(snapshot_key),
         relation=normalized_relation,
-        member_object_kind=member_kind,
-        locator_object_kind=locator_kind,
-        owner_base=owner_base,
-        owner_count=owner_count,
-        logical_member_count=logical_member_count,
-        vector_member_count=vector_member_count,
-        member_width=member_width,
-        member_page_bytes=member_page_bytes,
-        locator_page_bytes=locator_page_bytes,
-        locator_owner_span=locator_owner_span,
+        locator_kind=locator_kind,
+        member_kind=member_kind,
     )
     return _cache_bounded(_RELATION_CACHE, cache_key, manifest)
 
@@ -1155,9 +1211,93 @@ async def load_v4_heavy_owners(
     if not requested:
         return {}
     cache_prefix = (str(schema_name), int(snapshot_key), normalized_relation)
+    heavy_by_owner, missing_owner_keys = _cached_v4_heavy_owners(
+        cache_prefix,
+        requested,
+    )
+    if not missing_owner_keys:
+        return _selected_v4_heavy_owners(requested, heavy_by_owner)
+    query_result = await _query_v4_heavy_owner_rows(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        relation=normalized_relation,
+        owner_keys=missing_owner_keys,
+    )
+    loaded_by_owner, loaded_owner_keys = _validated_v4_heavy_owners(
+        query_result,
+        snapshot_key=int(snapshot_key),
+        relation=normalized_relation,
+        requested_owner_keys=set(missing_owner_keys),
+    )
+    _cache_v4_heavy_owner_results(
+        cache_prefix,
+        heavy_by_owner,
+        loaded_by_owner,
+        set(missing_owner_keys) - loaded_owner_keys,
+    )
+    return _selected_v4_heavy_owners(requested, heavy_by_owner)
+
+
+async def _query_v4_heavy_owner_rows(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    relation: str,
+    owner_keys: list[int],
+) -> Any:
+    return await session.execute(
+        text(
+            f"""
+            SELECT snapshot_key, relation, owner_key, object_kind, member_count,
+                   member_base, member_span, fragment_count
+              FROM {_quote_ident(schema_name)}.ptg2_v4_heavy_owner
+             WHERE snapshot_key = :snapshot_key
+               AND relation = :relation
+               AND owner_key = ANY(CAST(:owner_keys AS bigint[]))
+             ORDER BY owner_key
+            """
+        ),
+        {
+            "snapshot_key": snapshot_key,
+            "relation": relation,
+            "owner_keys": owner_keys,
+        },
+    )
+
+
+def _validated_v4_heavy_owners(
+    query_result: Any,
+    *,
+    snapshot_key: int,
+    relation: str,
+    requested_owner_keys: set[int],
+) -> tuple[dict[int, V4HeavyOwner], set[int]]:
+    expected_kind = f"v4_{relation}_heavy_bitmap_v1"
+    loaded_owner_keys: set[int] = set()
+    loaded_by_owner: dict[int, V4HeavyOwner] = {}
+    for raw_row in query_result:
+        owner = _v4_heavy_owner_from_fields(
+            _row_mapping(raw_row),
+            snapshot_key=snapshot_key,
+            relation=relation,
+            expected_kind=expected_kind,
+            requested_owner_keys=requested_owner_keys,
+            loaded_owner_keys=loaded_owner_keys,
+        )
+        loaded_owner_keys.add(owner.owner_key)
+        loaded_by_owner[owner.owner_key] = owner
+    return loaded_by_owner, loaded_owner_keys
+
+
+def _cached_v4_heavy_owners(
+    cache_prefix: tuple[str, int, str],
+    requested_owner_keys: tuple[int, ...],
+) -> tuple[dict[int, V4HeavyOwner], list[int]]:
     heavy_by_owner: dict[int, V4HeavyOwner] = {}
     missing_owner_keys: list[int] = []
-    for owner_key in requested:
+    for owner_key in requested_owner_keys:
         cache_key = (*cache_prefix, owner_key)
         cached = _HEAVY_OWNER_CACHE.get(cache_key)
         if cached is not None:
@@ -1167,74 +1307,72 @@ async def load_v4_heavy_owners(
             _HEAVY_OWNER_NEGATIVE_CACHE.move_to_end(cache_key)
         else:
             missing_owner_keys.append(owner_key)
-    if not missing_owner_keys:
-        return {
-            owner_key: heavy_by_owner[owner_key]
-            for owner_key in requested
-            if owner_key in heavy_by_owner
-        }
-    schema = _quote_ident(schema_name)
-    query_result = await session.execute(
-        text(
-            f"""
-            SELECT snapshot_key, relation, owner_key, object_kind, member_count,
-                   member_base, member_span, fragment_count
-              FROM {schema}.ptg2_v4_heavy_owner
-             WHERE snapshot_key = :snapshot_key
-               AND relation = :relation
-               AND owner_key = ANY(CAST(:owner_keys AS bigint[]))
-             ORDER BY owner_key
-            """
-        ),
-        {
-            "snapshot_key": int(snapshot_key),
-            "relation": normalized_relation,
-            "owner_keys": list(missing_owner_keys),
-        },
-    )
-    expected_kind = f"v4_{normalized_relation}_heavy_bitmap_v1"
-    missing_owner_key_set = set(missing_owner_keys)
-    loaded_owner_keys: set[int] = set()
-    loaded_by_owner: dict[int, V4HeavyOwner] = {}
-    for raw_row in query_result:
-        fields = _row_mapping(raw_row)
-        owner_key = _strict_manifest_int(
+    return heavy_by_owner, missing_owner_keys
+
+
+def _selected_v4_heavy_owners(
+    requested_owner_keys: tuple[int, ...],
+    heavy_by_owner: Mapping[int, V4HeavyOwner],
+) -> dict[int, V4HeavyOwner]:
+    return {
+        owner_key: heavy_by_owner[owner_key]
+        for owner_key in requested_owner_keys
+        if owner_key in heavy_by_owner
+    }
+
+
+def _v4_heavy_owner_from_fields(
+    fields: Mapping[str, Any],
+    *,
+    snapshot_key: int,
+    relation: str,
+    expected_kind: str,
+    requested_owner_keys: set[int],
+    loaded_owner_keys: set[int],
+) -> V4HeavyOwner:
+    owner = V4HeavyOwner(
+        relation=relation,
+        owner_key=_strict_manifest_int(
             fields, "owner_key", maximum=0xFFFFFFFF
-        )
-        member_count = _strict_manifest_int(
+        ),
+        object_kind=expected_kind,
+        member_count=_strict_manifest_int(
             fields, "member_count", maximum=0xFFFFFFFF
-        )
-        member_base = _strict_manifest_int(
+        ),
+        member_base=_strict_manifest_int(
             fields, "member_base", maximum=0xFFFFFFFF
-        )
-        member_span = _strict_manifest_int(
+        ),
+        member_span=_strict_manifest_int(
             fields, "member_span", minimum=1, maximum=0xFFFFFFFF
-        )
-        fragment_count = _strict_manifest_int(
+        ),
+        fragment_count=_strict_manifest_int(
             fields, "fragment_count", minimum=1, maximum=0x7FFFFFFF
+        ),
+    )
+    has_invalid_owner = (
+        _strict_manifest_int(fields, "snapshot_key", minimum=1) != snapshot_key
+        or fields.get("relation") != relation
+        or fields.get("object_kind") != expected_kind
+        or owner.owner_key not in requested_owner_keys
+        or owner.owner_key in loaded_owner_keys
+    )
+    has_invalid_span = (
+        owner.member_count > owner.member_span
+        or owner.member_base + owner.member_span > 0x1_0000_0000
+    )
+    if has_invalid_owner or has_invalid_span:
+        raise PTG2SharedBlockError(
+            "PTG V4 heavy-owner manifest is inconsistent"
         )
-        if (
-            _strict_manifest_int(fields, "snapshot_key", minimum=1)
-            != int(snapshot_key)
-            or fields.get("relation") != normalized_relation
-            or fields.get("object_kind") != expected_kind
-            or owner_key not in missing_owner_key_set
-            or member_count > member_span
-            or member_base + member_span > 0x1_0000_0000
-            or owner_key in loaded_owner_keys
-        ):
-            raise PTG2SharedBlockError("PTG V4 heavy-owner manifest is inconsistent")
-        loaded_owner_keys.add(owner_key)
-        owner = V4HeavyOwner(
-            relation=normalized_relation,
-            owner_key=owner_key,
-            object_kind=expected_kind,
-            member_count=member_count,
-            member_base=member_base,
-            member_span=member_span,
-            fragment_count=fragment_count,
-        )
-        loaded_by_owner[owner_key] = owner
+    return owner
+
+
+def _cache_v4_heavy_owner_results(
+    cache_prefix: tuple[str, int, str],
+    heavy_by_owner: dict[int, V4HeavyOwner],
+    loaded_by_owner: Mapping[int, V4HeavyOwner],
+    absent_owner_keys: set[int],
+) -> None:
     for owner_key, owner in loaded_by_owner.items():
         heavy_by_owner[owner_key] = owner
         cache_key = (*cache_prefix, owner_key)
@@ -1245,7 +1383,7 @@ async def load_v4_heavy_owners(
             owner,
             maximum_entries=_HEAVY_OWNER_CACHE_MAX_ENTRIES,
         )
-    for owner_key in missing_owner_key_set - loaded_owner_keys:
+    for owner_key in absent_owner_keys:
         cache_key = (*cache_prefix, owner_key)
         _HEAVY_OWNER_CACHE.pop(cache_key, None)
         _cache_entry_bounded(
@@ -1254,11 +1392,6 @@ async def load_v4_heavy_owners(
             None,
             maximum_entries=_HEAVY_OWNER_NEGATIVE_CACHE_MAX_ENTRIES,
         )
-    return {
-        owner_key: heavy_by_owner[owner_key]
-        for owner_key in requested
-        if owner_key in heavy_by_owner
-    }
 
 
 async def _load_map_coordinate_pairs(
@@ -1271,6 +1404,50 @@ async def _load_map_coordinate_pairs(
 ) -> dict[tuple[int, int], Any]:
     """Load exact packed-map coordinates with bounded immutable caching."""
 
+    requested_pairs = _normalized_map_coordinate_pairs(coordinate_pairs)
+    coordinates_by_pair, missing_pairs = _cached_map_coordinate_pairs(
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        object_kind=object_kind,
+        requested_pairs=requested_pairs,
+    )
+    if not missing_pairs:
+        return coordinates_by_pair
+    missing_pair_set = set(missing_pairs)
+    query_result = await _query_v4_map_packs(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        object_kind=object_kind,
+        missing_pairs=missing_pairs,
+    )
+    observed_pack_nos: set[int] = set()
+    for raw_row in query_result:
+        map_pack_row = _row_mapping(raw_row)
+        pack_no = int(map_pack_row.get("pack_no") or 0)
+        if pack_no in observed_pack_nos:
+            raise PTG2SharedBlockError(
+                "PTG V4 map query returned a duplicate pack"
+            )
+        observed_pack_nos.add(pack_no)
+        _retain_map_pack_coordinates(
+            map_pack_row,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            object_kind=object_kind,
+            missing_pairs=missing_pair_set,
+            coordinates_by_pair=coordinates_by_pair,
+        )
+    if set(coordinates_by_pair) != set(requested_pairs):
+        raise PTG2SharedBlockError(
+            "PTG V4 snapshot map is missing a graph coordinate"
+        )
+    return coordinates_by_pair
+
+
+def _normalized_map_coordinate_pairs(
+    coordinate_pairs: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
     requested_pairs = tuple(
         sorted(
             {
@@ -1284,12 +1461,22 @@ async def _load_map_coordinate_pairs(
         for block_key, fragment_no in requested_pairs
     ):
         raise PTG2SharedBlockError("PTG V4 graph coordinate is negative")
+    return requested_pairs
+
+
+def _cached_map_coordinate_pairs(
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    object_kind: str,
+    requested_pairs: tuple[tuple[int, int], ...],
+) -> tuple[dict[tuple[int, int], Any], list[tuple[int, int]]]:
     coordinates_by_pair: dict[tuple[int, int], Any] = {}
     missing_pairs: list[tuple[int, int]] = []
     for block_key, fragment_no in requested_pairs:
         cache_key = (
             str(schema_name),
-            int(snapshot_key),
+            snapshot_key,
             object_kind,
             block_key,
             fragment_no,
@@ -1299,14 +1486,18 @@ async def _load_map_coordinate_pairs(
             missing_pairs.append((block_key, fragment_no))
         else:
             coordinates_by_pair[(block_key, fragment_no)] = cached
-    if not missing_pairs:
-        return coordinates_by_pair
+    return coordinates_by_pair, missing_pairs
 
-    schema = _quote_ident(schema_name)
-    missing_pair_set = set(missing_pairs)
-    missing_block_keys = [pair[0] for pair in missing_pairs]
-    missing_fragment_nos = [pair[1] for pair in missing_pairs]
-    query_result = await session.execute(
+
+async def _query_v4_map_packs(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    object_kind: str,
+    missing_pairs: list[tuple[int, int]],
+) -> Any:
+    return await session.execute(
         text(
             f"""
             SELECT pack.pack_no, pack.first_block_key, pack.first_fragment_no,
@@ -1315,8 +1506,8 @@ async def _load_map_coordinate_pairs(
                    block.format_version, block.object_kind, block.codec,
                    block.entry_count AS block_entry_count,
                    block.raw_byte_count, block.stored_byte_count, block.payload
-              FROM {schema}.ptg2_v4_snapshot_map_pack AS pack
-              JOIN {schema}.ptg2_v3_block AS block
+              FROM {_quote_ident(schema_name)}.ptg2_v4_snapshot_map_pack AS pack
+              JOIN {_quote_ident(schema_name)}.ptg2_v3_block AS block
                 ON block.block_hash = pack.map_block_hash
              WHERE pack.snapshot_key = :snapshot_key
                AND pack.object_kind = :object_kind
@@ -1339,52 +1530,55 @@ async def _load_map_coordinate_pairs(
             """
         ),
         {
-            "snapshot_key": int(snapshot_key),
+            "snapshot_key": snapshot_key,
             "object_kind": object_kind,
-            "block_keys": missing_block_keys,
-            "fragment_nos": missing_fragment_nos,
+            "block_keys": [pair[0] for pair in missing_pairs],
+            "fragment_nos": [pair[1] for pair in missing_pairs],
         },
     )
-    observed_pack_nos: set[int] = set()
-    for raw_row in query_result:
-        map_pack_row = _row_mapping(raw_row)
-        pack_no = int(map_pack_row.get("pack_no") or 0)
-        if pack_no in observed_pack_nos:
-            raise PTG2SharedBlockError("PTG V4 map query returned a duplicate pack")
-        observed_pack_nos.add(pack_no)
-        physical = _validated_physical_block(
-            map_pack_row,
-            expected_kind=PTG2_V4_MAP_BLOCK_KIND,
-            maximum_raw_bytes=PTG2_V4_MAX_MAP_PACK_RAW_BYTES,
+
+
+def _retain_map_pack_coordinates(
+    map_pack_row: Mapping[str, Any],
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    object_kind: str,
+    missing_pairs: set[tuple[int, int]],
+    coordinates_by_pair: dict[tuple[int, int], Any],
+) -> None:
+    physical = _validated_physical_block(
+        map_pack_row,
+        expected_kind=PTG2_V4_MAP_BLOCK_KIND,
+        maximum_raw_bytes=PTG2_V4_MAX_MAP_PACK_RAW_BYTES,
+    )
+    _request_io().database_bytes += int(
+        map_pack_row.get("stored_byte_count") or 0
+    )
+    _request_io().database_blocks += 1
+    try:
+        coordinates = decode_v4_snapshot_map_pack(
+            physical.payload,
+            expected_object_kind=object_kind,
         )
-        _request_io().database_bytes += int(
-            map_pack_row.get("stored_byte_count") or 0
+    except ValueError as exc:
+        raise PTG2SharedBlockError(str(exc)) from exc
+    if len(coordinates) != int(map_pack_row.get("coordinate_count") or 0):
+        raise PTG2SharedBlockError(
+            "PTG V4 map pack count does not match its root"
         )
-        _request_io().database_blocks += 1
-        try:
-            coordinates = decode_v4_snapshot_map_pack(
-                physical.payload,
-                expected_object_kind=object_kind,
-            )
-        except ValueError as exc:
-            raise PTG2SharedBlockError(str(exc)) from exc
-        if len(coordinates) != int(map_pack_row.get("coordinate_count") or 0):
-            raise PTG2SharedBlockError("PTG V4 map pack count does not match its root")
-        for coordinate in coordinates:
-            pair = (int(coordinate.block_key), int(coordinate.fragment_no))
-            cache_key = (
-                str(schema_name),
-                int(snapshot_key),
-                object_kind,
-                pair[0],
-                pair[1],
-            )
-            _MAP_COORDINATE_CACHE.put(cache_key, coordinate, 96)
-            if pair in missing_pair_set:
-                coordinates_by_pair[pair] = coordinate
-    if set(coordinates_by_pair) != set(requested_pairs):
-        raise PTG2SharedBlockError("PTG V4 snapshot map is missing a graph coordinate")
-    return coordinates_by_pair
+    for coordinate in coordinates:
+        pair = (int(coordinate.block_key), int(coordinate.fragment_no))
+        cache_key = (
+            str(schema_name),
+            snapshot_key,
+            object_kind,
+            pair[0],
+            pair[1],
+        )
+        _MAP_COORDINATE_CACHE.put(cache_key, coordinate, 96)
+        if pair in missing_pairs:
+            coordinates_by_pair[pair] = coordinate
 
 
 async def _load_map_coordinates(
@@ -2095,337 +2289,498 @@ def _common_heavy_object_kind(
 
 async def _lookup_v4_relation_members_scoped(
     session: Any,
-    *,
-    snapshot_key: int,
-    relation: str,
-    owner_keys: Iterable[int],
-    schema_name: str,
-    max_members: int | None,
-    prefix_members_per_owner: int | None = None,
-    allowed_member_keys: Iterable[int] | None = None,
-    authenticated_root: V4GraphRoot | None = None,
+    request: _V4RelationLookupRequest,
 ) -> dict[int, tuple[int, ...]]:
     """Resolve one bounded relation inside an active request I/O scope."""
 
-    normalized_owner_keys = _normalized_owner_keys(owner_keys)
-    normalized_allowed_member_keys = (
-        None
-        if allowed_member_keys is None
-        else _normalized_u32_keys(allowed_member_keys, kind="member")
-    )
-    if not normalized_owner_keys:
+    normalized_request = _normalized_v4_lookup_request(request)
+    if not normalized_request.owner_keys:
         return {}
-    if max_members is not None and int(max_members) < 0:
+    lookup = await _prepare_v4_relation_lookup(session, normalized_request)
+    if lookup.allowed_member_keys == ():
+        return {owner_key: () for owner_key in lookup.owner_keys}
+    total_members = _initial_v4_member_count(lookup)
+    _enforce_v4_member_limit(lookup, total_members)
+    if not lookup.regular_owner_keys:
+        return await _lookup_v4_heavy_only(session, lookup)
+    locator_by_owner, locator_page_keys, total_members = (
+        await _load_v4_regular_locators(session, lookup, total_members)
+    )
+    heavy_members, total_members = await _load_v4_lookup_heavy_members(
+        session,
+        lookup,
+        total_members,
+    )
+    member_page_keys = _v4_member_page_keys(lookup, locator_by_owner)
+    _charge_v4_regular_lookup(
+        lookup,
+        locator_by_owner,
+        locator_page_keys,
+        member_page_keys,
+    )
+    if not member_page_keys:
+        return _ordered_v4_lookup_members(lookup, heavy_members, {})
+    members_by_page = await _load_v4_member_pages(
+        session,
+        lookup,
+        member_page_keys,
+    )
+    regular_members = _decode_v4_regular_members(
+        lookup,
+        locator_by_owner,
+        members_by_page,
+        total_members,
+    )
+    return _ordered_v4_lookup_members(lookup, heavy_members, regular_members)
+
+
+def _normalized_v4_lookup_request(
+    request: _V4RelationLookupRequest,
+) -> _V4RelationLookupRequest:
+    allowed_member_keys = (
+        None
+        if request.allowed_member_keys is None
+        else _normalized_u32_keys(request.allowed_member_keys, kind="member")
+    )
+    return _V4RelationLookupRequest(
+        snapshot_key=int(request.snapshot_key),
+        relation=str(request.relation or "").strip().lower(),
+        owner_keys=_normalized_owner_keys(request.owner_keys),
+        schema_name=str(request.schema_name),
+        max_members=(
+            None if request.max_members is None else int(request.max_members)
+        ),
+        prefix_members_per_owner=(
+            None
+            if request.prefix_members_per_owner is None
+            else int(request.prefix_members_per_owner)
+        ),
+        allowed_member_keys=allowed_member_keys,
+        authenticated_root=request.authenticated_root,
+    )
+
+
+def _validate_v4_lookup_limits(request: _V4RelationLookupRequest) -> None:
+    if request.max_members is not None and request.max_members < 0:
         raise PTG2SharedBlockError("PTG V4 max_members cannot be negative")
     if (
-        prefix_members_per_owner is not None
-        and int(prefix_members_per_owner) < 0
+        request.prefix_members_per_owner is not None
+        and request.prefix_members_per_owner < 0
     ):
         raise PTG2SharedBlockError(
             "PTG V4 prefix_members_per_owner cannot be negative"
         )
-    per_owner_limit = (
-        None
-        if prefix_members_per_owner is None
-        else int(prefix_members_per_owner)
-    )
-    normalized_relation = str(relation or "").strip().lower()
-    _relation_kinds(normalized_relation)
-    root = authenticated_root or await load_v4_graph_root(
-        session,
-        int(snapshot_key),
-        schema_name=schema_name,
-    )
-    if root.snapshot_key != int(snapshot_key):
-        raise PTG2SharedBlockError(
-            "PTG V4 authenticated root changed snapshot identity"
-        )
-    _validate_relation_for_root(root, normalized_relation)
-    relation_manifest = await load_v4_relation_manifest(
-        session,
-        snapshot_key=int(snapshot_key),
-        relation=normalized_relation,
-        schema_name=schema_name,
-    )
-    owner_limit = relation_manifest.owner_base + relation_manifest.owner_count
-    if any(
-        owner_key < relation_manifest.owner_base or owner_key >= owner_limit
-        for owner_key in normalized_owner_keys
-    ):
-        raise PTG2SharedBlockError("PTG V4 relation owner is outside its manifest")
-    _charge_v4_hot_npi_work(
-        normalized_relation,
-        batch_count=1,
-    )
-    _charge_v4_taxonomy_projection_work(batch_count=1)
-    _request_io().logical_lookups += 1
-    if normalized_allowed_member_keys == ():
-        return {owner_key: () for owner_key in normalized_owner_keys}
 
-    selected_heavy_owners = await load_v4_heavy_owners(
-        session,
-        snapshot_key=int(snapshot_key),
-        relation=normalized_relation,
-        owner_keys=normalized_owner_keys,
-        schema_name=schema_name,
-    )
+
+def _validate_v4_lookup_owner_scope(
+    manifest: V4RelationManifest,
+    owner_keys: Iterable[int],
+) -> None:
+    owner_limit = manifest.owner_base + manifest.owner_count
+    if any(
+        owner_key < manifest.owner_base or owner_key >= owner_limit
+        for owner_key in owner_keys
+    ):
+        raise PTG2SharedBlockError(
+            "PTG V4 relation owner is outside its manifest"
+        )
+
+
+def _validate_v4_heavy_owner_scope(
+    lookup_owner_keys: tuple[int, ...],
+    manifest: V4RelationManifest,
+    heavy_owners: Mapping[int, V4HeavyOwner],
+) -> None:
     if (
-        normalized_relation in PTG2_V4_ORDER_PRESERVING_RELATIONS
-        and selected_heavy_owners
+        manifest.relation in PTG2_V4_ORDER_PRESERVING_RELATIONS
+        and heavy_owners
     ):
         raise PTG2SharedBlockError(
             "PTG V4 ordered prefix relation cannot use bitmap owners"
         )
-    if any(
-        owner_key < relation_manifest.owner_base or owner_key >= owner_limit
-        for owner_key in selected_heavy_owners
-    ):
-        raise PTG2SharedBlockError("PTG V4 heavy owner is outside its relation")
-    if any(owner_key not in normalized_owner_keys for owner_key in selected_heavy_owners):
-        raise PTG2SharedBlockError("PTG V4 heavy-owner lookup returned an unrequested owner")
-    regular_owner_keys = tuple(
-        owner_key
-        for owner_key in normalized_owner_keys
-        if owner_key not in selected_heavy_owners
-    )
-    is_intersection = normalized_allowed_member_keys is not None
-    total_members = (
-        0
-        if is_intersection
-        else sum(
-            owner.member_count
-            if per_owner_limit is None
-            else min(owner.member_count, per_owner_limit)
-            for owner in selected_heavy_owners.values()
+    _validate_v4_lookup_owner_scope(manifest, heavy_owners)
+    if any(owner_key not in lookup_owner_keys for owner_key in heavy_owners):
+        raise PTG2SharedBlockError(
+            "PTG V4 heavy-owner lookup returned an unrequested owner"
         )
+
+
+async def _prepare_v4_relation_lookup(
+    session: Any,
+    request: _V4RelationLookupRequest,
+) -> _V4RelationLookup:
+    _validate_v4_lookup_limits(request)
+    _relation_kinds(request.relation)
+    root = request.authenticated_root or await load_v4_graph_root(
+        session,
+        request.snapshot_key,
+        schema_name=request.schema_name,
     )
-    if max_members is not None and total_members > int(max_members):
-        raise PTG2SharedBlockError("PTG V4 graph selection exceeds max_members")
-    if not regular_owner_keys:
-        heavy_members = await _lookup_v4_selected_heavy_members(
+    if root.snapshot_key != request.snapshot_key:
+        raise PTG2SharedBlockError(
+            "PTG V4 authenticated root changed snapshot identity"
+        )
+    _validate_relation_for_root(root, request.relation)
+    manifest = await load_v4_relation_manifest(
+        session,
+        snapshot_key=request.snapshot_key,
+        relation=request.relation,
+        schema_name=request.schema_name,
+    )
+    _validate_v4_lookup_owner_scope(manifest, request.owner_keys)
+    _charge_v4_hot_npi_work(request.relation, batch_count=1)
+    _charge_v4_taxonomy_projection_work(batch_count=1)
+    _request_io().logical_lookups += 1
+    heavy_owners = (
+        {}
+        if request.allowed_member_keys == ()
+        else await load_v4_heavy_owners(
             session,
-            snapshot_key=int(snapshot_key),
-            schema_name=schema_name,
-            relation_manifest=relation_manifest,
-            heavy_owners=selected_heavy_owners,
-            per_owner_limit=per_owner_limit,
-            allowed_member_keys=normalized_allowed_member_keys,
+            snapshot_key=request.snapshot_key,
+            relation=request.relation,
+            owner_keys=request.owner_keys,
+            schema_name=request.schema_name,
         )
-        if is_intersection:
-            total_members = sum(len(members) for members in heavy_members.values())
-            if max_members is not None and total_members > int(max_members):
-                raise PTG2SharedBlockError(
-                    "PTG V4 graph selection exceeds max_members"
-                )
-        return {
-            owner_key: heavy_members[owner_key]
-            for owner_key in normalized_owner_keys
-        }
-
-    owner_base = relation_manifest.owner_base
-    locator_owner_span = relation_manifest.locator_owner_span
-    locator_page_keys = {
-        owner_base
-        + ((owner_key - owner_base) // locator_owner_span) * locator_owner_span
-        for owner_key in regular_owner_keys
-    }
-    locator_coordinates = await _load_map_coordinates(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        object_kind=relation_manifest.locator_object_kind,
-        block_keys=locator_page_keys,
     )
-    locator_blocks = await _load_physical_blocks(
-        session,
-        schema_name=schema_name,
-        object_kind=relation_manifest.locator_object_kind,
-        coordinates=locator_coordinates.values(),
-        maximum_raw_bytes=relation_manifest.locator_page_bytes,
+    _validate_v4_heavy_owner_scope(request.owner_keys, manifest, heavy_owners)
+    return _V4RelationLookup(
+        snapshot_key=request.snapshot_key,
+        relation=request.relation,
+        owner_keys=request.owner_keys,
+        schema_name=request.schema_name,
+        max_members=request.max_members,
+        per_owner_limit=request.prefix_members_per_owner,
+        allowed_member_keys=request.allowed_member_keys,
+        manifest=manifest,
+        heavy_owners=heavy_owners,
+        regular_owner_keys=tuple(
+            owner_key
+            for owner_key in request.owner_keys
+            if owner_key not in heavy_owners
+        ),
     )
-    locator_by_owner: dict[int, tuple[int, int]] = {}
-    for owner_key in regular_owner_keys:
-        page_key = owner_base + (
-            (owner_key - owner_base) // locator_owner_span
-        ) * locator_owner_span
-        coordinate = locator_coordinates[page_key]
-        block = locator_blocks[bytes(coordinate.block_hash)]
-        member_offset, member_count = _decode_locator(
-            block.payload,
-            entry_count=block.entry_count,
-            local_owner_index=owner_key - page_key,
-            maximum_entries=locator_owner_span,
-        )
-        if (
-            member_offset > 0xFFFFFFFFFFFFFFFF - member_count
-            or member_offset + member_count > relation_manifest.vector_member_count
-        ):
-            raise PTG2SharedBlockError("PTG V4 locator range exceeds its manifest")
-        selected_member_count = (
-            member_count
-            if per_owner_limit is None
-            else min(member_count, per_owner_limit)
-        )
-        locator_by_owner[owner_key] = (member_offset, selected_member_count)
-        if not is_intersection:
-            total_members += selected_member_count
-            if max_members is not None and total_members > int(max_members):
-                raise PTG2SharedBlockError(
-                    "PTG V4 graph selection exceeds max_members"
-                )
 
+
+def _initial_v4_member_count(lookup: _V4RelationLookup) -> int:
+    if lookup.is_intersection:
+        return 0
+    return sum(
+        owner.member_count
+        if lookup.per_owner_limit is None
+        else min(owner.member_count, lookup.per_owner_limit)
+        for owner in lookup.heavy_owners.values()
+    )
+
+
+def _enforce_v4_member_limit(
+    lookup: _V4RelationLookup,
+    total_members: int,
+) -> None:
+    if (
+        lookup.max_members is not None
+        and total_members > lookup.max_members
+    ):
+        raise PTG2SharedBlockError(
+            "PTG V4 graph selection exceeds max_members"
+        )
+
+
+async def _load_v4_lookup_heavy_members(
+    session: Any,
+    lookup: _V4RelationLookup,
+    total_members: int,
+) -> tuple[dict[int, tuple[int, ...]], int]:
     heavy_members = await _lookup_v4_selected_heavy_members(
         session,
-        snapshot_key=int(snapshot_key),
-        schema_name=schema_name,
-        relation_manifest=relation_manifest,
-        heavy_owners=selected_heavy_owners,
-        per_owner_limit=per_owner_limit,
-        allowed_member_keys=normalized_allowed_member_keys,
+        snapshot_key=lookup.snapshot_key,
+        schema_name=lookup.schema_name,
+        relation_manifest=lookup.manifest,
+        heavy_owners=lookup.heavy_owners,
+        per_owner_limit=lookup.per_owner_limit,
+        allowed_member_keys=lookup.allowed_member_keys,
     )
-    if is_intersection:
+    if lookup.is_intersection:
         total_members = sum(len(members) for members in heavy_members.values())
-        if max_members is not None and total_members > int(max_members):
-            raise PTG2SharedBlockError(
-                "PTG V4 graph selection exceeds max_members"
-            )
+        _enforce_v4_member_limit(lookup, total_members)
+    return heavy_members, total_members
 
-    members_per_page = relation_manifest.members_per_page
+
+async def _lookup_v4_heavy_only(
+    session: Any,
+    lookup: _V4RelationLookup,
+) -> dict[int, tuple[int, ...]]:
+    heavy_members, _total_members = await _load_v4_lookup_heavy_members(
+        session,
+        lookup,
+        _initial_v4_member_count(lookup),
+    )
+    return {
+        owner_key: heavy_members[owner_key]
+        for owner_key in lookup.owner_keys
+    }
+
+
+def _v4_locator_page_keys(lookup: _V4RelationLookup) -> set[int]:
+    owner_base = lookup.manifest.owner_base
+    owner_span = lookup.manifest.locator_owner_span
+    return {
+        owner_base + ((owner_key - owner_base) // owner_span) * owner_span
+        for owner_key in lookup.regular_owner_keys
+    }
+
+
+def _decode_v4_owner_locator(
+    lookup: _V4RelationLookup,
+    owner_key: int,
+    page_key: int,
+    coordinate: Any,
+    locator_blocks: Mapping[bytes, _CachedPhysicalBlock],
+) -> tuple[int, int]:
+    block = locator_blocks[bytes(coordinate.block_hash)]
+    member_offset, member_count = _decode_locator(
+        block.payload,
+        entry_count=block.entry_count,
+        local_owner_index=owner_key - page_key,
+        maximum_entries=lookup.manifest.locator_owner_span,
+    )
+    if (
+        member_offset > 0xFFFFFFFFFFFFFFFF - member_count
+        or member_offset + member_count > lookup.manifest.vector_member_count
+    ):
+        raise PTG2SharedBlockError(
+            "PTG V4 locator range exceeds its manifest"
+        )
+    selected_count = (
+        member_count
+        if lookup.per_owner_limit is None
+        else min(member_count, lookup.per_owner_limit)
+    )
+    return member_offset, selected_count
+
+
+async def _load_v4_regular_locators(
+    session: Any,
+    lookup: _V4RelationLookup,
+    total_members: int,
+) -> tuple[dict[int, tuple[int, int]], set[int], int]:
+    locator_page_keys = _v4_locator_page_keys(lookup)
+    coordinates = await _load_map_coordinates(
+        session,
+        schema_name=lookup.schema_name,
+        snapshot_key=lookup.snapshot_key,
+        object_kind=lookup.manifest.locator_object_kind,
+        block_keys=locator_page_keys,
+    )
+    blocks = await _load_physical_blocks(
+        session,
+        schema_name=lookup.schema_name,
+        object_kind=lookup.manifest.locator_object_kind,
+        coordinates=coordinates.values(),
+        maximum_raw_bytes=lookup.manifest.locator_page_bytes,
+    )
+    locator_by_owner: dict[int, tuple[int, int]] = {}
+    for owner_key in lookup.regular_owner_keys:
+        owner_base = lookup.manifest.owner_base
+        owner_span = lookup.manifest.locator_owner_span
+        page_key = owner_base + (
+            (owner_key - owner_base) // owner_span
+        ) * owner_span
+        locator = _decode_v4_owner_locator(
+            lookup,
+            owner_key,
+            page_key,
+            coordinates[page_key],
+            blocks,
+        )
+        locator_by_owner[owner_key] = locator
+        if not lookup.is_intersection:
+            total_members += locator[1]
+            _enforce_v4_member_limit(lookup, total_members)
+    return locator_by_owner, locator_page_keys, total_members
+
+
+def _v4_member_page_keys(
+    lookup: _V4RelationLookup,
+    locator_by_owner: Mapping[int, tuple[int, int]],
+) -> set[int]:
+    members_per_page = lookup.manifest.members_per_page
     member_page_keys: set[int] = set()
     for member_offset, member_count in locator_by_owner.values():
         if member_count == 0:
             continue
-        first_page = (
-            member_offset // members_per_page
-        ) * members_per_page
+        first_page = (member_offset // members_per_page) * members_per_page
         last_page = (
             (member_offset + member_count - 1) // members_per_page
         ) * members_per_page
         member_page_keys.update(
             range(first_page, last_page + 1, members_per_page)
         )
+    return member_page_keys
+
+
+def _charge_v4_regular_lookup(
+    lookup: _V4RelationLookup,
+    locator_by_owner: Mapping[int, tuple[int, int]],
+    locator_page_keys: set[int],
+    member_page_keys: set[int],
+) -> None:
+    member_count = sum(count for _offset, count in locator_by_owner.values())
+    page_count = len(locator_page_keys) + len(member_page_keys)
+    byte_count = (
+        len(locator_page_keys) * lookup.manifest.locator_page_bytes
+        + len(member_page_keys) * lookup.manifest.member_page_bytes
+    )
     _charge_v4_hot_source_work(
-        normalized_relation,
-        owner_count=len(regular_owner_keys),
-        member_count=sum(
-            member_count for _member_offset, member_count in locator_by_owner.values()
-        ),
-        page_count=len(locator_page_keys) + len(member_page_keys),
-        byte_count=(
-            len(locator_page_keys) * relation_manifest.locator_page_bytes
-            + len(member_page_keys) * relation_manifest.member_page_bytes
-        ),
+        lookup.relation,
+        owner_count=len(lookup.regular_owner_keys),
+        member_count=member_count,
+        page_count=page_count,
+        byte_count=byte_count,
     )
     _charge_v4_taxonomy_projection_work(
-        member_count=sum(
-            member_count
-            for _member_offset, member_count in locator_by_owner.values()
-        ),
-        page_count=len(locator_page_keys) + len(member_page_keys),
-        byte_count=(
-            len(locator_page_keys) * relation_manifest.locator_page_bytes
-            + len(member_page_keys) * relation_manifest.member_page_bytes
-        ),
+        member_count=member_count,
+        page_count=page_count,
+        byte_count=byte_count,
     )
     _charge_v4_hot_npi_work(
-        normalized_relation,
-        member_count=sum(
-            member_count for _member_offset, member_count in locator_by_owner.values()
-        ),
+        lookup.relation,
+        member_count=member_count,
         locator_page_count=len(locator_page_keys),
         member_page_count=len(member_page_keys),
-        byte_count=(
-            len(locator_page_keys) * relation_manifest.locator_page_bytes
-            + len(member_page_keys) * relation_manifest.member_page_bytes
-        ),
+        byte_count=byte_count,
     )
-    if not member_page_keys:
-        members_by_regular_owner = {
-            owner_key: () for owner_key in regular_owner_keys
-        }
-        return {
-            owner_key: heavy_members.get(
-                owner_key,
-                members_by_regular_owner.get(owner_key, ()),
-            )
-            for owner_key in normalized_owner_keys
-        }
-    member_coordinates = await _load_map_coordinates(
+
+
+async def _load_v4_member_pages(
+    session: Any,
+    lookup: _V4RelationLookup,
+    member_page_keys: set[int],
+) -> dict[int, tuple[int, ...]]:
+    coordinates = await _load_map_coordinates(
         session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        object_kind=relation_manifest.member_object_kind,
+        schema_name=lookup.schema_name,
+        snapshot_key=lookup.snapshot_key,
+        object_kind=lookup.manifest.member_object_kind,
         block_keys=member_page_keys,
     )
-    member_blocks = await _load_physical_blocks(
+    blocks = await _load_physical_blocks(
         session,
-        schema_name=schema_name,
-        object_kind=relation_manifest.member_object_kind,
-        coordinates=member_coordinates.values(),
-        maximum_raw_bytes=relation_manifest.member_page_bytes,
+        schema_name=lookup.schema_name,
+        object_kind=lookup.manifest.member_object_kind,
+        coordinates=coordinates.values(),
+        maximum_raw_bytes=lookup.manifest.member_page_bytes,
     )
-    members_by_page = {
-        page_key: _decode_member_page(
-            member_blocks[bytes(coordinate.block_hash)].payload,
-            entry_count=member_blocks[bytes(coordinate.block_hash)].entry_count,
-            maximum_entries=members_per_page,
-        )
-        for page_key, coordinate in member_coordinates.items()
-    }
-    members_by_owner: dict[int, tuple[int, ...]] = {}
-    allowed_member_key_set = (
-        None
-        if normalized_allowed_member_keys is None
-        else frozenset(normalized_allowed_member_keys)
-    )
-    for owner_key, (member_offset, member_count) in locator_by_owner.items():
-        members: list[int] = []
-        previous_member: int | None = None
-        seen_members: set[int] | None = (
-            set()
-            if normalized_relation in PTG2_V4_ORDER_PRESERVING_RELATIONS
-            else None
-        )
-        remaining = int(member_count)
-        cursor = int(member_offset)
-        while remaining:
-            page_key = (
-                cursor // members_per_page
-            ) * members_per_page
-            local_offset = cursor - page_key
-            page = members_by_page.get(page_key)
-            if page is None or local_offset >= len(page):
-                raise PTG2SharedBlockError("PTG V4 locator points outside its member page")
-            take = min(remaining, len(page) - local_offset)
-            if take <= 0:
-                raise PTG2SharedBlockError("PTG V4 member page cannot advance")
-            for member in page[local_offset:local_offset + take]:
-                if seen_members is not None:
-                    if member in seen_members:
-                        raise PTG2SharedBlockError(
-                            "PTG V4 ordered relation members are not unique"
-                        )
-                    seen_members.add(member)
-                elif previous_member is not None and previous_member >= member:
-                    raise PTG2SharedBlockError(
-                        "PTG V4 relation members are not unique and ordered"
-                    )
-                previous_member = member
-                if allowed_member_key_set is None or member in allowed_member_key_set:
-                    members.append(member)
-            cursor += take
-            remaining -= take
-        members_by_owner[owner_key] = tuple(members)
-        if is_intersection:
-            total_members += len(members)
-            if max_members is not None and total_members > int(max_members):
-                raise PTG2SharedBlockError(
-                    "PTG V4 graph selection exceeds max_members"
-                )
-    members_by_owner.update(heavy_members)
     return {
-        owner_key: members_by_owner[owner_key]
-        for owner_key in normalized_owner_keys
+        page_key: _decode_member_page(
+            blocks[bytes(coordinate.block_hash)].payload,
+            entry_count=blocks[bytes(coordinate.block_hash)].entry_count,
+            maximum_entries=lookup.manifest.members_per_page,
+        )
+        for page_key, coordinate in coordinates.items()
+    }
+
+
+def _selected_v4_page_members(
+    members: tuple[int, ...],
+    *,
+    previous_member: int | None,
+    seen_members: set[int] | None,
+    allowed_members: frozenset[int] | None,
+) -> tuple[list[int], int | None]:
+    selected_members: list[int] = []
+    for member in members:
+        if seen_members is not None:
+            if member in seen_members:
+                raise PTG2SharedBlockError(
+                    "PTG V4 ordered relation members are not unique"
+                )
+            seen_members.add(member)
+        elif previous_member is not None and previous_member >= member:
+            raise PTG2SharedBlockError(
+                "PTG V4 relation members are not unique and ordered"
+            )
+        previous_member = member
+        if allowed_members is None or member in allowed_members:
+            selected_members.append(member)
+    return selected_members, previous_member
+
+
+def _decode_v4_owner_members(
+    lookup: _V4RelationLookup,
+    member_offset: int,
+    member_count: int,
+    members_by_page: Mapping[int, tuple[int, ...]],
+) -> tuple[int, ...]:
+    selected_members: list[int] = []
+    previous_member: int | None = None
+    seen_members: set[int] | None = (
+        set()
+        if lookup.relation in PTG2_V4_ORDER_PRESERVING_RELATIONS
+        else None
+    )
+    allowed_members = (
+        None
+        if lookup.allowed_member_keys is None
+        else frozenset(lookup.allowed_member_keys)
+    )
+    remaining = int(member_count)
+    cursor = int(member_offset)
+    while remaining:
+        members_per_page = lookup.manifest.members_per_page
+        page_key = (cursor // members_per_page) * members_per_page
+        local_offset = cursor - page_key
+        page = members_by_page.get(page_key)
+        if page is None or local_offset >= len(page):
+            raise PTG2SharedBlockError(
+                "PTG V4 locator points outside its member page"
+            )
+        take = min(remaining, len(page) - local_offset)
+        if take <= 0:
+            raise PTG2SharedBlockError("PTG V4 member page cannot advance")
+        selected, previous_member = _selected_v4_page_members(
+            page[local_offset:local_offset + take],
+            previous_member=previous_member,
+            seen_members=seen_members,
+            allowed_members=allowed_members,
+        )
+        selected_members.extend(selected)
+        cursor += take
+        remaining -= take
+    return tuple(selected_members)
+
+
+def _decode_v4_regular_members(
+    lookup: _V4RelationLookup,
+    locator_by_owner: Mapping[int, tuple[int, int]],
+    members_by_page: Mapping[int, tuple[int, ...]],
+    total_members: int,
+) -> dict[int, tuple[int, ...]]:
+    members_by_owner: dict[int, tuple[int, ...]] = {}
+    for owner_key, (member_offset, member_count) in locator_by_owner.items():
+        members = _decode_v4_owner_members(
+            lookup,
+            member_offset,
+            member_count,
+            members_by_page,
+        )
+        members_by_owner[owner_key] = members
+        if lookup.is_intersection:
+            total_members += len(members)
+            _enforce_v4_member_limit(lookup, total_members)
+    return members_by_owner
+
+
+def _ordered_v4_lookup_members(
+    lookup: _V4RelationLookup,
+    heavy_members: Mapping[int, tuple[int, ...]],
+    regular_members: Mapping[int, tuple[int, ...]],
+) -> dict[int, tuple[int, ...]]:
+    return {
+        owner_key: heavy_members.get(
+            owner_key,
+            regular_members.get(owner_key, ()),
+        )
+        for owner_key in lookup.owner_keys
     }
 
 
@@ -2447,18 +2802,16 @@ async def lookup_building_v4_relation_members(
         schema_name=schema_name,
         build_token=build_token,
     )
+    request = _V4RelationLookupRequest(
+        snapshot_key=int(snapshot_key),
+        relation=relation,
+        owner_keys=tuple(owner_keys),
+        schema_name=schema_name,
+        max_members=max_members,
+        authenticated_root=root,
+    )
     with v4_graph_request_scope():
-        return await _lookup_v4_relation_members_scoped(
-            session,
-            snapshot_key=int(snapshot_key),
-            relation=relation,
-            owner_keys=owner_keys,
-            schema_name=schema_name,
-            max_members=max_members,
-            prefix_members_per_owner=None,
-            allowed_member_keys=None,
-            authenticated_root=root,
-        )
+        return await _lookup_v4_relation_members_scoped(session, request)
 
 
 async def lookup_v4_relation_members(
@@ -2472,28 +2825,17 @@ async def lookup_v4_relation_members(
 ) -> dict[int, tuple[int, ...]]:
     """Resolve a dense V4 relation while fetching each distinct CAS page once."""
 
+    request = _V4RelationLookupRequest(
+        snapshot_key=snapshot_key,
+        relation=relation,
+        owner_keys=tuple(owner_keys),
+        schema_name=schema_name,
+        max_members=max_members,
+    )
     if _ACTIVE_V4_GRAPH_REQUEST_IO.get() is not None:
-        return await _lookup_v4_relation_members_scoped(
-            session,
-            snapshot_key=snapshot_key,
-            relation=relation,
-            owner_keys=owner_keys,
-            schema_name=schema_name,
-            max_members=max_members,
-            prefix_members_per_owner=None,
-            allowed_member_keys=None,
-        )
+        return await _lookup_v4_relation_members_scoped(session, request)
     with v4_graph_request_scope():
-        return await _lookup_v4_relation_members_scoped(
-            session,
-            snapshot_key=snapshot_key,
-            relation=relation,
-            owner_keys=owner_keys,
-            schema_name=schema_name,
-            max_members=max_members,
-            prefix_members_per_owner=None,
-            allowed_member_keys=None,
-        )
+        return await _lookup_v4_relation_members_scoped(session, request)
 
 
 async def lookup_v4_relation_intersections(
@@ -2508,28 +2850,18 @@ async def lookup_v4_relation_intersections(
 ) -> dict[int, tuple[int, ...]]:
     """Resolve only allowed members while authenticating complete owner vectors."""
 
+    request = _V4RelationLookupRequest(
+        snapshot_key=snapshot_key,
+        relation=relation,
+        owner_keys=tuple(owner_keys),
+        schema_name=schema_name,
+        max_members=max_members,
+        allowed_member_keys=tuple(allowed_member_keys),
+    )
     if _ACTIVE_V4_GRAPH_REQUEST_IO.get() is not None:
-        return await _lookup_v4_relation_members_scoped(
-            session,
-            snapshot_key=snapshot_key,
-            relation=relation,
-            owner_keys=owner_keys,
-            schema_name=schema_name,
-            max_members=max_members,
-            prefix_members_per_owner=None,
-            allowed_member_keys=allowed_member_keys,
-        )
+        return await _lookup_v4_relation_members_scoped(session, request)
     with v4_graph_request_scope():
-        return await _lookup_v4_relation_members_scoped(
-            session,
-            snapshot_key=snapshot_key,
-            relation=relation,
-            owner_keys=owner_keys,
-            schema_name=schema_name,
-            max_members=max_members,
-            prefix_members_per_owner=None,
-            allowed_member_keys=allowed_member_keys,
-        )
+        return await _lookup_v4_relation_members_scoped(session, request)
 
 
 async def lookup_v4_relation_member_prefixes(
@@ -2544,28 +2876,18 @@ async def lookup_v4_relation_member_prefixes(
 ) -> dict[int, tuple[int, ...]]:
     """Resolve authenticated owner prefixes without reading complete vectors."""
 
+    request = _V4RelationLookupRequest(
+        snapshot_key=snapshot_key,
+        relation=relation,
+        owner_keys=tuple(owner_keys),
+        schema_name=schema_name,
+        max_members=max_members,
+        prefix_members_per_owner=limit_per_owner,
+    )
     if _ACTIVE_V4_GRAPH_REQUEST_IO.get() is not None:
-        return await _lookup_v4_relation_members_scoped(
-            session,
-            snapshot_key=snapshot_key,
-            relation=relation,
-            owner_keys=owner_keys,
-            schema_name=schema_name,
-            max_members=max_members,
-            prefix_members_per_owner=limit_per_owner,
-            allowed_member_keys=None,
-        )
+        return await _lookup_v4_relation_members_scoped(session, request)
     with v4_graph_request_scope():
-        return await _lookup_v4_relation_members_scoped(
-            session,
-            snapshot_key=snapshot_key,
-            relation=relation,
-            owner_keys=owner_keys,
-            schema_name=schema_name,
-            max_members=max_members,
-            prefix_members_per_owner=limit_per_owner,
-            allowed_member_keys=None,
-        )
+        return await _lookup_v4_relation_members_scoped(session, request)
 
 
 async def lookup_v4_ordered_prefixes(
@@ -2583,28 +2905,17 @@ async def lookup_v4_ordered_prefixes(
         raise PTG2SharedBlockError(
             "PTG V4 ordered prefix maximum cannot be negative"
         )
+    request = _V4RelationLookupRequest(
+        snapshot_key=snapshot_key,
+        relation="set_npi_prefix_override",
+        owner_keys=tuple(provider_set_keys),
+        schema_name=schema_name,
+        max_members=normalized_max_members,
+    )
     if _ACTIVE_V4_GRAPH_REQUEST_IO.get() is not None:
-        return await _lookup_v4_relation_members_scoped(
-            session,
-            snapshot_key=snapshot_key,
-            relation="set_npi_prefix_override",
-            owner_keys=provider_set_keys,
-            schema_name=schema_name,
-            max_members=normalized_max_members,
-            prefix_members_per_owner=None,
-            allowed_member_keys=None,
-        )
+        return await _lookup_v4_relation_members_scoped(session, request)
     with v4_graph_request_scope():
-        return await _lookup_v4_relation_members_scoped(
-            session,
-            snapshot_key=snapshot_key,
-            relation="set_npi_prefix_override",
-            owner_keys=provider_set_keys,
-            schema_name=schema_name,
-            max_members=normalized_max_members,
-            prefix_members_per_owner=None,
-            allowed_member_keys=None,
-        )
+        return await _lookup_v4_relation_members_scoped(session, request)
 
 
 lookup_v4_ordered_npi_prefix_overrides = lookup_v4_ordered_prefixes

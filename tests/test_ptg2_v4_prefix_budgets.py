@@ -95,8 +95,10 @@ async def test_prefix_preserves_combined_limits_in_active_scope(
         )
 
     assert observed == {0: (1,)}
-    assert scoped_lookup.await_args.kwargs["prefix_members_per_owner"] == 2
-    assert scoped_lookup.await_args.kwargs["max_members"] == 3
+    request = scoped_lookup.await_args.args[1]
+    assert isinstance(request, graph._V4RelationLookupRequest)
+    assert request.prefix_members_per_owner == 2
+    assert request.max_members == 3
 
 
 @pytest.mark.asyncio
