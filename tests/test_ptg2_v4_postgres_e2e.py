@@ -706,16 +706,7 @@ def _isolate_graph_caches(monkeypatch) -> None:
     monkeypatch.setattr(graph, "_HEAVY_OWNER_NEGATIVE_CACHE", OrderedDict())
 
 
-async def _create_v4_test_schema(
-    database: Database,
-    *,
-    schema_name: str,
-    monkeypatch,
-) -> None:
-    """Create the minimal migrated V4 catalog required by the E2E tests."""
-
-    schema = _quoted(schema_name)
-    await database.execute_ddl(f"CREATE SCHEMA {schema}")
+async def _create_v4_layout_tables(database: Database, schema: str) -> None:
     for statement in (
         f"""
         CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
@@ -751,6 +742,12 @@ async def _create_v4_test_schema(
             created_at timestamptz NOT NULL DEFAULT now()
         )
         """,
+    ):
+        await database.execute_ddl(statement)
+
+
+async def _create_v4_provider_tables(database: Database, schema: str) -> None:
+    for statement in (
         f"""
         CREATE TABLE {schema}.ptg2_v3_provider_group (
             snapshot_key bigint NOT NULL,
@@ -781,6 +778,12 @@ async def _create_v4_test_schema(
             PRIMARY KEY (npi, checksum)
         )
         """,
+    ):
+        await database.execute_ddl(statement)
+
+
+async def _create_v4_block_tables(database: Database, schema: str) -> None:
+    for statement in (
         f"""
         CREATE TABLE {schema}.ptg2_v3_block (
             block_hash bytea PRIMARY KEY,
@@ -817,6 +820,15 @@ async def _create_v4_test_schema(
         """,
     ):
         await database.execute_ddl(statement)
+
+
+async def _apply_v4_test_migrations(
+    database: Database,
+    *,
+    schema_name: str,
+    monkeypatch,
+) -> None:
+    schema = _quoted(schema_name)
     await database.execute_ddl(attempt_guard_prerequisite_ddl(schema))
 
     migration = _load_v4_migration()
@@ -840,6 +852,26 @@ async def _create_v4_test_schema(
         connection = await session.connection()
         for statement in tax_recorder.executed:
             await connection.exec_driver_sql(statement)
+
+
+async def _create_v4_test_schema(
+    database: Database,
+    *,
+    schema_name: str,
+    monkeypatch,
+) -> None:
+    """Create the minimal migrated V4 catalog required by the E2E tests."""
+
+    schema = _quoted(schema_name)
+    await database.execute_ddl(f"CREATE SCHEMA {schema}")
+    await _create_v4_layout_tables(database, schema)
+    await _create_v4_provider_tables(database, schema)
+    await _create_v4_block_tables(database, schema)
+    await _apply_v4_test_migrations(
+        database,
+        schema_name=schema_name,
+        monkeypatch=monkeypatch,
+    )
 
 
 async def _install_frozen_candidate_test_schema(

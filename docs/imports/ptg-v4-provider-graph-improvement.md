@@ -220,6 +220,26 @@ criterion. The first source-controlled dev policy is 300 fixed seconds, plus
 Operators cannot override the sealed byte/fact counts or these coefficients at
 canary time.
 
+Relational dictionary publication uses the authenticated
+`ptg2_v4_dictionary_publication_adaptive_v1` runtime contract. It starts with
+100,000 ordered rows per database operation, reserves fixed row-work overhead,
+and keeps the encoded/estimated row-work envelope at or below 16 MiB. This is
+an admission estimate for inserted and replay-validated rows, not the literal
+SQL text or network payload size. An operation taking four seconds or longer
+halves the next range toward the 10,000-row fallback; operations at or below
+two seconds recover geometrically. The widest tax sidecar estimate includes
+its source bitmap and fixed bind/materialization work. A four-second heartbeat
+repeats only the last completed counters: rows and batches advance only after
+the range has been inserted and replay verified. The dashboard therefore shows
+a healthy heartbeat with unchanged completed-work counters while a bounded
+operation is still executing; it must not render that heartbeat as additional
+rows completed. Final completeness is also bounded: target keys are enumerated
+through adaptive indexed pages, every group-tax row performs an indexed group
+dictionary lookup, and a compact exact bitset proves that every tax token is
+referenced. No full-snapshot `COUNT(DISTINCT ...)` or anti-join belongs in this
+lane. Batch adaptation changes neither canonical ordering, transaction scope,
+content digests, nor graph layout.
+
 V4 also memoizes byte-identical inline provider-group arrays before JSON
 deserialization and normalization. A cache entry retains the exact raw bytes,
 their digest, parsed groups, normalized transform, and audit counts; digest

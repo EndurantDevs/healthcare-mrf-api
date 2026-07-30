@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
 )
@@ -14,7 +16,12 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
 )
 
 
-def _serving_index_by_field(*, full_rebuild_scope_digest=None):
+def _serving_index_by_field(
+    *,
+    full_rebuild_scope_digest=None,
+    dictionary_publication=None,
+    source_count=1,
+):
     """Build a minimal validated serving index for rebuild identity assertions."""
 
     finalizer_summary_by_field = {
@@ -24,7 +31,7 @@ def _serving_index_by_field(*, full_rebuild_scope_digest=None):
         },
         "dense_keys": {"price": {"count": 3}},
         "preservation": {"encoded_records": 5},
-        "source_count": 1,
+        "source_count": source_count,
         "timings": {"finalizer_seconds": 0.5},
     }
     stream_summary_by_name = {
@@ -47,6 +54,7 @@ def _serving_index_by_field(*, full_rebuild_scope_digest=None):
             provider_group_count=2,
             npi_count=3,
             block_count=4,
+            dictionary_publication=dictionary_publication,
         ),
         code_count=6,
         audit_sample={"sample_digest": "a" * 64},
@@ -56,6 +64,33 @@ def _serving_index_by_field(*, full_rebuild_scope_digest=None):
         stored_byte_count=7,
         full_rebuild_scope_digest=full_rebuild_scope_digest,
     )
+
+
+def test_serving_index_authenticates_v4_dictionary_publication_contract():
+    """Seal adaptive publication thresholds without changing graph content."""
+
+    dictionary_publication_by_field = {
+        "contract": "ptg2_v4_dictionary_publication_adaptive_v1",
+        "default_range_rows": 100_000,
+    }
+
+    serving_index = _serving_index_by_field(
+        dictionary_publication=dictionary_publication_by_field,
+    )
+
+    assert serving_index["provider_graph"]["dictionary_publication"] == (
+        dictionary_publication_by_field
+    )
+    assert "dictionary_publication" not in _serving_index_by_field()[
+        "provider_graph"
+    ]
+
+
+def test_serving_index_requires_a_positive_source_count():
+    """Reject a physical layout that cannot prove any source input."""
+
+    with pytest.raises(RuntimeError, match="source_count must be positive"):
+        _serving_index_by_field(source_count=0)
 
 
 def _support_components_by_field():

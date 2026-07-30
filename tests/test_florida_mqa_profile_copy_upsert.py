@@ -565,15 +565,7 @@ async def test_retention_maintenance_is_best_effort_outside_success(monkeypatch)
     cleanup.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_copy_upsert_postgres_temp_table_conflict_contract():
-    """Verify copy upsert postgres temp table conflict contract."""
-    if os.getenv("HLTHPRT_TEST_FL_MQA_COPY_POSTGRES") != "1":
-        pytest.skip("set HLTHPRT_TEST_FL_MQA_COPY_POSTGRES=1 for PostgreSQL proof")
-
-    root = Path(__file__).resolve().parents[1]
-    load_dotenv(root / ".env", override=False)
-    table_name = f"fl_pp_copy_e2e_{uuid.uuid4().hex[:12]}"
+def _copy_contract_model(table_name: str):
     metadata = MetaData()
     publication_target = Table(
         table_name,
@@ -584,7 +576,71 @@ async def test_copy_upsert_postgres_temp_table_conflict_contract():
         Column("occurred_on", Date),
         schema="pg_temp",
     )
-    model = type("SyntheticCopyTarget", (), {"__table__": publication_target})
+    return type("SyntheticCopyTarget", (), {"__table__": publication_target})
+
+
+async def _copy_contract_rows(connection, model, table_name: str):
+    await connection.status(
+        f"""
+        CREATE TEMP TABLE "{table_name}" (
+            row_id varchar(64) PRIMARY KEY,
+            payload jsonb NOT NULL,
+            tags varchar[],
+            occurred_on date
+        ) ON COMMIT DROP;
+        """
+    )
+    await florida._copy_upsert_chunk_on_connection(
+        connection,
+        model,
+        [
+            {
+                "row_id": "same",
+                "payload": {"version": 1},
+                "tags": ["first"],
+                "occurred_on": "2026-07-26",
+            }
+        ],
+        "row_id",
+    )
+    await florida._copy_upsert_chunk_on_connection(
+        connection,
+        model,
+        [
+            {
+                "row_id": "same",
+                "payload": {"version": 2},
+                "tags": ["updated"],
+                "occurred_on": "2026-07-27",
+            },
+            {
+                "row_id": "new",
+                "payload": {"version": 1},
+                "tags": ["new"],
+                "occurred_on": "2026-07-27",
+            },
+        ],
+        "row_id",
+    )
+    return await connection.all(
+        f"""
+        SELECT row_id, payload, tags, occurred_on
+          FROM "{table_name}"
+         ORDER BY row_id;
+        """
+    )
+
+
+@pytest.mark.asyncio
+async def test_copy_upsert_postgres_temp_table_conflict_contract():
+    """Verify copy upsert postgres temp table conflict contract."""
+    if os.getenv("HLTHPRT_TEST_FL_MQA_COPY_POSTGRES") != "1":
+        pytest.skip("set HLTHPRT_TEST_FL_MQA_COPY_POSTGRES=1 for PostgreSQL proof")
+
+    root = Path(__file__).resolve().parents[1]
+    load_dotenv(root / ".env", override=False)
+    table_name = f"fl_pp_copy_e2e_{uuid.uuid4().hex[:12]}"
+    model = _copy_contract_model(table_name)
 
     await florida.db.connect()
     try:
@@ -596,55 +652,7 @@ async def test_copy_upsert_postgres_temp_table_conflict_contract():
             )
             if not callable(getattr(driver, "copy_records_to_table", None)):
                 pytest.skip("active database driver does not expose binary COPY")
-            await connection.status(
-                f"""
-                CREATE TEMP TABLE "{table_name}" (
-                    row_id varchar(64) PRIMARY KEY,
-                    payload jsonb NOT NULL,
-                    tags varchar[],
-                    occurred_on date
-                ) ON COMMIT DROP;
-                """
-            )
-            await florida._copy_upsert_chunk_on_connection(
-                connection,
-                model,
-                [
-                    {
-                        "row_id": "same",
-                        "payload": {"version": 1},
-                        "tags": ["first"],
-                        "occurred_on": "2026-07-26",
-                    }
-                ],
-                "row_id",
-            )
-            await florida._copy_upsert_chunk_on_connection(
-                connection,
-                model,
-                [
-                    {
-                        "row_id": "same",
-                        "payload": {"version": 2},
-                        "tags": ["updated"],
-                        "occurred_on": "2026-07-27",
-                    },
-                    {
-                        "row_id": "new",
-                        "payload": {"version": 1},
-                        "tags": ["new"],
-                        "occurred_on": "2026-07-27",
-                    },
-                ],
-                "row_id",
-            )
-            source_rows = await connection.all(
-                f"""
-                SELECT row_id, payload, tags, occurred_on
-                  FROM "{table_name}"
-                 ORDER BY row_id;
-                """
-            )
+            source_rows = await _copy_contract_rows(connection, model, table_name)
     finally:
         await florida.db.disconnect()
 

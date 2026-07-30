@@ -98,12 +98,8 @@ async def _delete_catalog_source() -> None:
         )
 
 
-@pytest.mark.asyncio
-async def test_postgres_retry_replays_only_unfinished_sources_and_fences_owner():
-    """Persist retry progress while rejecting stale checkpoint owners."""
-
-    database_url = _database_url()
-    source_records = [
+def _retry_source_records() -> list[dict[str, str]]:
+    return [
         {
             "source_id": "source_alpha",
             "payer_id": "payer_alpha",
@@ -115,69 +111,85 @@ async def test_postgres_retry_replays_only_unfinished_sources_and_fences_owner()
             "index_url": "https://example.test/beta.json",
         },
     ]
+
+
+async def _record_failed_source_batch(checkpoint_store, source_records) -> None:
+    frozen_records = await checkpoint_store.initialize_batch(
+        TEST_ROOT_RUN_ID,
+        "run_parent",
+        source_records,
+    )
+    assert frozen_records == source_records
+    assert await checkpoint_store.is_source_claimed(
+        TEST_ROOT_RUN_ID, "source_alpha", "run_parent"
+    )
+    assert await checkpoint_store.is_source_completed(
+        TEST_ROOT_RUN_ID,
+        "source_alpha",
+        "run_parent",
+        SourceProcessResult(urls_checked=1, plans_discovered=2),
+    )
+    assert await checkpoint_store.is_source_claimed(
+        TEST_ROOT_RUN_ID, "source_beta", "run_parent"
+    )
+    assert await checkpoint_store.is_source_failed(
+        TEST_ROOT_RUN_ID,
+        "source_beta",
+        "run_parent",
+        RuntimeError("temporary source failure"),
+    )
+    failed_summary = await checkpoint_store.summarize_batch(
+        TEST_ROOT_RUN_ID, "run_parent"
+    )
+    assert failed_summary.completed_source_count == 1
+    assert failed_summary.failed_source_count == 1
+    assert failed_summary.is_complete is False
+
+
+async def _complete_source_batch_retry(checkpoint_store, source_records):
+    resumed_records = await checkpoint_store.resume_batch(
+        TEST_ROOT_RUN_ID,
+        "run_retry",
+        "run_parent",
+    )
+    assert resumed_records == source_records
+    assert await checkpoint_store.pending_sources(TEST_ROOT_RUN_ID) == [
+        source_records[1]
+    ]
+    assert not await checkpoint_store.is_source_completed(
+        TEST_ROOT_RUN_ID,
+        "source_beta",
+        "run_parent",
+        SourceProcessResult(),
+    )
+    assert await checkpoint_store.is_source_claimed(
+        TEST_ROOT_RUN_ID, "source_beta", "run_retry"
+    )
+    assert await checkpoint_store.is_source_completed(
+        TEST_ROOT_RUN_ID,
+        "source_beta",
+        "run_retry",
+        SourceProcessResult(urls_checked=1, files_discovered=3),
+    )
+    return await checkpoint_store.summarize_batch(
+        TEST_ROOT_RUN_ID, "run_retry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_retry_replays_only_unfinished_sources_and_fences_owner():
+    """Persist retry progress while rejecting stale checkpoint owners."""
+
+    database_url = _database_url()
+    source_records = _retry_source_records()
     checkpoint_store = DatabaseDiscoveryCheckpointStore()
     await db.disconnect()
     await _clear_test_batch(database_url)
     try:
-        frozen_records = await checkpoint_store.initialize_batch(
-            TEST_ROOT_RUN_ID,
-            "run_parent",
+        await _record_failed_source_batch(checkpoint_store, source_records)
+        completed_summary = await _complete_source_batch_retry(
+            checkpoint_store,
             source_records,
-        )
-        assert frozen_records == source_records
-        assert await checkpoint_store.is_source_claimed(
-            TEST_ROOT_RUN_ID, "source_alpha", "run_parent"
-        )
-        assert await checkpoint_store.is_source_completed(
-            TEST_ROOT_RUN_ID,
-            "source_alpha",
-            "run_parent",
-            SourceProcessResult(urls_checked=1, plans_discovered=2),
-        )
-        assert await checkpoint_store.is_source_claimed(
-            TEST_ROOT_RUN_ID, "source_beta", "run_parent"
-        )
-        assert await checkpoint_store.is_source_failed(
-            TEST_ROOT_RUN_ID,
-            "source_beta",
-            "run_parent",
-            RuntimeError("temporary source failure"),
-        )
-
-        failed_summary = await checkpoint_store.summarize_batch(
-            TEST_ROOT_RUN_ID, "run_parent"
-        )
-        assert failed_summary.completed_source_count == 1
-        assert failed_summary.failed_source_count == 1
-        assert failed_summary.is_complete is False
-
-        resumed_records = await checkpoint_store.resume_batch(
-            TEST_ROOT_RUN_ID,
-            "run_retry",
-            "run_parent",
-        )
-        assert resumed_records == source_records
-        assert await checkpoint_store.pending_sources(TEST_ROOT_RUN_ID) == [
-            source_records[1]
-        ]
-        assert not await checkpoint_store.is_source_completed(
-            TEST_ROOT_RUN_ID,
-            "source_beta",
-            "run_parent",
-            SourceProcessResult(),
-        )
-        assert await checkpoint_store.is_source_claimed(
-            TEST_ROOT_RUN_ID, "source_beta", "run_retry"
-        )
-        assert await checkpoint_store.is_source_completed(
-            TEST_ROOT_RUN_ID,
-            "source_beta",
-            "run_retry",
-            SourceProcessResult(urls_checked=1, files_discovered=3),
-        )
-
-        completed_summary = await checkpoint_store.summarize_batch(
-            TEST_ROOT_RUN_ID, "run_retry"
         )
         expected_digest = source_set_sha256(["source_alpha", "source_beta"])
         assert completed_summary.is_complete is True

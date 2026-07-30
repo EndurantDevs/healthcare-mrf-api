@@ -50,90 +50,94 @@ class FakeSessionContext:
         return False
 
 
+def _facility_provider_rows():
+    return [
+        {
+            "npi": 1111111111,
+            "reporting_year": 2025,
+            "facility_ccn": "123456",
+            "organization_name": "General Hospital",
+            "doing_business_as_name": "GH",
+            "facility_city": "MIAMI",
+            "facility_state": "FL",
+            "facility_zip_code": "33101",
+            "enrollment_provider_type_code": "12",
+            "enrollment_provider_type_text": "Physician",
+            "practice_location_type": "Hospital",
+            "entity_type_code": "1",
+            "provider_first_name": "Anna",
+            "provider_last_name": "Smith",
+            "provider_organization_name": None,
+            "provider_city": "MIAMI",
+            "provider_state": "FL",
+            "taxonomy_code": "207R00000X",
+            "specialty_display_name": "Internal Medicine",
+            "specialty_classification": "Allopathic & Osteopathic Physicians",
+            "specialty_section": "Physicians",
+        },
+        {
+            "npi": 2222222222,
+            "reporting_year": 2025,
+            "facility_ccn": "123456",
+            "organization_name": "General Hospital",
+            "doing_business_as_name": "GH",
+            "facility_city": "MIAMI",
+            "facility_state": "FL",
+            "facility_zip_code": "33101",
+            "enrollment_provider_type_code": "22",
+            "enrollment_provider_type_text": "Group",
+            "practice_location_type": "Hospital",
+            "entity_type_code": "2",
+            "provider_first_name": None,
+            "provider_last_name": None,
+            "provider_organization_name": "Ocean Group Practice",
+            "provider_city": "MIAMI",
+            "provider_state": "FL",
+            "taxonomy_code": None,
+            "specialty_display_name": None,
+            "specialty_classification": None,
+            "specialty_section": None,
+        },
+    ]
+
+
+def _facility_query_results():
+    return [
+        FakeResult(first_row={"total_providers": 2}),
+        FakeResult(
+            rows=[
+                {
+                    "facility_ccn": "123456",
+                    "organization_name": "General Hospital",
+                    "doing_business_as_name": "GH",
+                    "city": "MIAMI",
+                    "state": "FL",
+                    "provider_count": 2,
+                }
+            ]
+        ),
+        FakeResult(rows=_facility_provider_rows()),
+        FakeResult(
+            rows=[
+                {
+                    "specialty": "Internal Medicine",
+                    "classification": "Allopathic & Osteopathic Physicians",
+                    "provider_count": 1,
+                },
+                {
+                    "specialty": "Unknown",
+                    "classification": "Unknown",
+                    "provider_count": 1,
+                },
+            ]
+        ),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_get_facility_connected_providers_returns_providers_and_specialty_stats(monkeypatch):
     """Verify get facility connected providers returns providers and specialty stats."""
-    fake_session = FakeSession(
-        [
-            FakeResult(first_row={"total_providers": 2}),
-            FakeResult(
-                rows=[
-                    {
-                        "facility_ccn": "123456",
-                        "organization_name": "General Hospital",
-                        "doing_business_as_name": "GH",
-                        "city": "MIAMI",
-                        "state": "FL",
-                        "provider_count": 2,
-                    }
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "npi": 1111111111,
-                        "reporting_year": 2025,
-                        "facility_ccn": "123456",
-                        "organization_name": "General Hospital",
-                        "doing_business_as_name": "GH",
-                        "facility_city": "MIAMI",
-                        "facility_state": "FL",
-                        "facility_zip_code": "33101",
-                        "enrollment_provider_type_code": "12",
-                        "enrollment_provider_type_text": "Physician",
-                        "practice_location_type": "Hospital",
-                        "entity_type_code": "1",
-                        "provider_first_name": "Anna",
-                        "provider_last_name": "Smith",
-                        "provider_organization_name": None,
-                        "provider_city": "MIAMI",
-                        "provider_state": "FL",
-                        "taxonomy_code": "207R00000X",
-                        "specialty_display_name": "Internal Medicine",
-                        "specialty_classification": "Allopathic & Osteopathic Physicians",
-                        "specialty_section": "Physicians",
-                    },
-                    {
-                        "npi": 2222222222,
-                        "reporting_year": 2025,
-                        "facility_ccn": "123456",
-                        "organization_name": "General Hospital",
-                        "doing_business_as_name": "GH",
-                        "facility_city": "MIAMI",
-                        "facility_state": "FL",
-                        "facility_zip_code": "33101",
-                        "enrollment_provider_type_code": "22",
-                        "enrollment_provider_type_text": "Group",
-                        "practice_location_type": "Hospital",
-                        "entity_type_code": "2",
-                        "provider_first_name": None,
-                        "provider_last_name": None,
-                        "provider_organization_name": "Ocean Group Practice",
-                        "provider_city": "MIAMI",
-                        "provider_state": "FL",
-                        "taxonomy_code": None,
-                        "specialty_display_name": None,
-                        "specialty_classification": None,
-                        "specialty_section": None,
-                    },
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "specialty": "Internal Medicine",
-                        "classification": "Allopathic & Osteopathic Physicians",
-                        "provider_count": 1,
-                    },
-                    {
-                        "specialty": "Unknown",
-                        "classification": "Unknown",
-                        "provider_count": 1,
-                    },
-                ]
-            ),
-        ]
-    )
+    fake_session = FakeSession(_facility_query_results())
 
     monkeypatch.setattr(npi_module, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(npi_module.db, "session", lambda: FakeSessionContext(fake_session))

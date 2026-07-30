@@ -1446,6 +1446,108 @@ def _complete_catalog_row(source):
     return row_by_key
 
 
+class _CompleteCatalogClient:
+    def __init__(self, *_args):
+        self.base_url = "https://example.invalid"
+
+    def authenticate(self):
+        return None
+
+    def download(self, _source, target):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("fixture", encoding="utf-8")
+        return "b" * 64, 7
+
+
+async def _capture_catalog_upsert(_model, _rows, _conflict_column):
+    return None
+
+
+def _iter_complete_catalog_rows(_path, source, *, parser_metrics=None):
+    del parser_metrics
+    row = _complete_catalog_row(source)
+    yield 1, dict(row), row, list(source.expected_fields)
+
+
+def _install_complete_catalog_input(monkeypatch) -> None:
+    """Install the complete-catalog acquisition and matching fixture."""
+    monkeypatch.setenv("HLTHPRT_FL_MQA_USERNAME", "test")
+    monkeypatch.setenv("HLTHPRT_FL_MQA_PASSWORD", "x")
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "FloridaMQAClient",
+        _CompleteCatalogClient,
+    )
+    monkeypatch.setattr(florida_mqa_profile_module, "_ensure_tables", AsyncMock())
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_apply_retention_maintenance",
+        AsyncMock(return_value={"status": "completed"}),
+    )
+    monkeypatch.setattr(florida_mqa_profile_module, "_claim_import_run", AsyncMock())
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_load_florida_license_index",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_artifact_header",
+        lambda _path, source: list(source.expected_fields),
+    )
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_iter_rows",
+        _iter_complete_catalog_rows,
+    )
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_match_master",
+        lambda *_args, **_kwargs: (1000000004, "deterministic", {"method": "fixture"}),
+    )
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_upsert_rows",
+        _capture_catalog_upsert,
+    )
+
+
+def _install_complete_catalog_publication(monkeypatch, published) -> None:
+    """Install the retained-count and publication fixture."""
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_retained_import_counts",
+        AsyncMock(
+            return_value={
+                "retained_source_records": len(DEFAULT_SOURCE_KEYS),
+                "retained_facts": len(DEFAULT_SOURCE_KEYS),
+                "retained_matched_records": len(DEFAULT_SOURCE_KEYS),
+                "retained_non_projectable_records": 0,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_publish_projection_swap",
+        published,
+    )
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "_apply_post_success_retention",
+        AsyncMock(side_effect=lambda **kwargs: kwargs["metrics"]),
+    )
+    monkeypatch.setattr(
+        florida_mqa_profile_module,
+        "enqueue_live_progress",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        florida_mqa_profile_module.db,
+        "scalar",
+        AsyncMock(return_value=27),
+    )
+
+
 @pytest.mark.asyncio
 async def test_complete_catalog_import_requires_every_validated_source_before_publication(
     monkeypatch,
@@ -1464,74 +1566,8 @@ async def test_complete_catalog_import_requires_every_validated_source_before_pu
             },
         )
     )
-
-    async def capture_upsert(_model, _rows, _conflict_column):
-        return None
-
-    class CatalogClient:
-        def __init__(self, *_args):
-            self.base_url = "https://example.invalid"
-
-        def authenticate(self):
-            return None
-
-        def download(self, _source, target):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("fixture", encoding="utf-8")
-            return "b" * 64, 7
-
-    def catalog_rows(_path, source, *, parser_metrics=None):
-        del parser_metrics
-        row = _complete_catalog_row(source)
-        yield 1, dict(row), row, list(source.expected_fields)
-
-    monkeypatch.setenv("HLTHPRT_FL_MQA_USERNAME", "test")
-    monkeypatch.setenv("HLTHPRT_FL_MQA_PASSWORD", "x")
-    monkeypatch.setattr(florida_mqa_profile_module, "FloridaMQAClient", CatalogClient)
-    monkeypatch.setattr(florida_mqa_profile_module, "_ensure_tables", AsyncMock())
-    monkeypatch.setattr(
-        florida_mqa_profile_module,
-        "_apply_retention_maintenance",
-        AsyncMock(return_value={"status": "completed"}),
-    )
-    monkeypatch.setattr(florida_mqa_profile_module, "_claim_import_run", AsyncMock())
-    monkeypatch.setattr(
-        florida_mqa_profile_module,
-        "_load_florida_license_index",
-        AsyncMock(return_value={}),
-    )
-    monkeypatch.setattr(florida_mqa_profile_module, "_artifact_header", lambda _path, source: list(source.expected_fields))
-    monkeypatch.setattr(florida_mqa_profile_module, "_iter_rows", catalog_rows)
-    monkeypatch.setattr(
-        florida_mqa_profile_module,
-        "_match_master",
-        lambda *_args, **_kwargs: (1000000004, "deterministic", {"method": "fixture"}),
-    )
-    monkeypatch.setattr(florida_mqa_profile_module, "_upsert_rows", capture_upsert)
-    monkeypatch.setattr(
-        florida_mqa_profile_module,
-        "_retained_import_counts",
-        AsyncMock(
-            return_value={
-                "retained_source_records": len(DEFAULT_SOURCE_KEYS),
-                "retained_facts": len(DEFAULT_SOURCE_KEYS),
-                "retained_matched_records": len(DEFAULT_SOURCE_KEYS),
-                "retained_non_projectable_records": 0,
-            }
-        ),
-    )
-    monkeypatch.setattr(florida_mqa_profile_module, "_publish_projection_swap", published)
-    monkeypatch.setattr(
-        florida_mqa_profile_module,
-        "_apply_post_success_retention",
-        AsyncMock(side_effect=lambda **kwargs: kwargs["metrics"]),
-    )
-    monkeypatch.setattr(florida_mqa_profile_module, "enqueue_live_progress", lambda **_kwargs: None)
-    monkeypatch.setattr(
-        florida_mqa_profile_module.db,
-        "scalar",
-        AsyncMock(return_value=27),
-    )
+    _install_complete_catalog_input(monkeypatch)
+    _install_complete_catalog_publication(monkeypatch, published)
 
     operation_result = await florida_mqa_profile_module.import_florida_mqa_profile(
         source_keys=DEFAULT_SOURCE_KEYS,
@@ -1962,14 +1998,8 @@ def test_source_reported_total_only_describes_unmaterialized_fhir_facts():
     assert category(1, True)["source_reported_total"] == 1
 
 
-def test_composer_deduplicates_equal_cross_source_fact_and_keeps_both_evidence_paths():
-    """Verify composer deduplicates equal cross source fact and keeps both evidence paths."""
-    name_value_by_key = {
-        "text": "Alex Example",
-        "family": "Example",
-        "given": ["Alex"],
-    }
-    state_profile_by_key = {
+def _cross_source_state_profile_fixture(name_value_by_key):
+    profile_by_key = {
         "schema_version": PROFILE_SCHEMA_VERSION,
         "npi": 1000000004,
         "categories": {
@@ -1978,7 +2008,7 @@ def test_composer_deduplicates_equal_cross_source_fact_and_keeps_both_evidence_p
         },
         "sources": [],
     }
-    state_profile_by_key["categories"]["identity"] = {
+    profile_by_key["categories"]["identity"] = {
         "availability": "available",
         "items": [
             {
@@ -1996,7 +2026,11 @@ def test_composer_deduplicates_equal_cross_source_fact_and_keeps_both_evidence_p
             }
         ],
     }
-    fhir_profile_by_key = {
+    return profile_by_key
+
+
+def _cross_source_fhir_profile(name_value_by_key):
+    return {
         "facts": {
             "name": {
                 "items": [
@@ -2016,6 +2050,17 @@ def test_composer_deduplicates_equal_cross_source_fact_and_keeps_both_evidence_p
         },
         "sources": [],
     }
+
+
+def test_composer_deduplicates_equal_cross_source_fact_and_keeps_both_evidence_paths():
+    """Verify composer deduplicates equal cross source fact and keeps both evidence paths."""
+    name_value_by_key = {
+        "text": "Alex Example",
+        "family": "Example",
+        "given": ["Alex"],
+    }
+    state_profile_by_key = _cross_source_state_profile_fixture(name_value_by_key)
+    fhir_profile_by_key = _cross_source_fhir_profile(name_value_by_key)
     profile = compose_provider_profile(
         1000000004,
         state_projection={"profile": state_profile_by_key},

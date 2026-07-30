@@ -443,11 +443,12 @@ def test_publisher_tax_contract_requires_summary_and_both_artifacts() -> None:
 @pytest.mark.parametrize(
     ("row", "message"),
     (
-        ((bytes(15), "matched_ein", 0, b"\x01"), "tax identity changed"),
-        ((bytes(16), "invalid", None, b"\x01"), "tax identity changed"),
-        ((bytes(16), "matched_ein", None, b"\x01"), "tax identity changed"),
-        ((bytes(16), "missing", 0, b"\x01"), "tax identity changed"),
-        ((bytes(16), "missing", None, b"\x80"), "source bitmap changed"),
+        ((bytes(15), "matched_ein", 0, b"\x01", True), "tax identity changed"),
+        ((bytes(16), "invalid", None, b"\x01", True), "tax identity changed"),
+        ((bytes(16), "matched_ein", None, b"\x01", True), "tax identity changed"),
+        ((bytes(16), "missing", 0, b"\x01", True), "tax identity changed"),
+        ((bytes(16), "missing", None, b"\x01", False), "tax identity changed"),
+        ((bytes(16), "missing", None, b"\x80", True), "source bitmap changed"),
     ),
 )
 def test_publisher_group_tax_rows_reject_invalid_identity_and_bitmap(

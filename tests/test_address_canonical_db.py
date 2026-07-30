@@ -420,26 +420,14 @@ async def test_address_archive_v2_state_code_rejects_unmapped_values():
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('CALIFORNIA (CA)');") is None
 
 
-@pytest.mark.asyncio(loop_scope="session")
-async def test_stamp_and_resolve_addresses_into_archive_v2(monkeypatch):
-    """Verify stamp and resolve addresses into archive v2."""
-    _requires_test_database()
-    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-    stage_table = "address_canon_stage_test"
-    progress_events = []
-    monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **payload: progress_events.append(payload))
-
+async def _prepare_stamp_resolve_fixture(schema, stage_table):
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {schema};")
     await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
     await db.status(
         f"""
         CREATE TABLE {schema}.{stage_table} (
-            address_key uuid,
-            first_line text,
-            second_line text,
-            city text,
-            state text,
-            zip_code text
+            address_key uuid, first_line text, second_line text,
+            city text, state text, zip_code text
         );
         """
     )
@@ -449,7 +437,9 @@ async def test_stamp_and_resolve_addresses_into_archive_v2(monkeypatch):
     )
     await db.status(
         f"""
-        INSERT INTO {schema}.{stage_table} (first_line, second_line, city, state, zip_code)
+        INSERT INTO {schema}.{stage_table} (
+            first_line, second_line, city, state, zip_code
+        )
         VALUES
             ('123 Main Street', 'Suite 200', 'Miami', 'Florida', '33156-2814'),
             ('123 MAIN ST STE 200', NULL, 'MIAMI', 'FL', '33156'),
@@ -457,128 +447,113 @@ async def test_stamp_and_resolve_addresses_into_archive_v2(monkeypatch):
         """
     )
 
-    stamped = await stamp_address_keys(
-        stage_table,
-        {
-            "first_line": "first_line",
-            "second_line": "second_line",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "'US'",
-        },
-        schema=schema,
-        shards=2,
-    )
-    stats = await resolve_into_archive(
-        stage_table,
-        {
-            "first_line": "first_line",
-            "second_line": "second_line",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "'US'",
-        },
-        source_bit=2,
-        priority=1,
-        schema=schema,
-    )
 
-    archive_rows = int(await db.scalar(f"SELECT count(*) FROM {schema}.address_archive_v2;") or 0)
-    stage_keys = int(await db.scalar(f"SELECT count(DISTINCT address_key) FROM {schema}.{stage_table};") or 0)
+async def _assert_initial_archive_resolution(schema, stage_table, stamped, stats):
+    archive_rows = int(
+        await db.scalar(f"SELECT count(*) FROM {schema}.address_archive_v2;") or 0
+    )
+    stage_keys = int(
+        await db.scalar(
+            f"SELECT count(DISTINCT address_key) FROM {schema}.{stage_table};"
+        )
+        or 0
+    )
     source_bits = await db.all(
         f"SELECT DISTINCT source_bits FROM {schema}.address_archive_v2 ORDER BY source_bits;"
     )
-
-    assert stamped == 3
-    assert stage_keys == 2
-    assert archive_rows == 2
-    assert stats.staged == 3
-    assert stats.distinct_keys == 2
-    assert stats.inserted == 2
-    assert stats.null_key_rows == 0
+    assert (stamped, stage_keys, archive_rows) == (3, 2, 2)
+    assert (stats.staged, stats.distinct_keys, stats.inserted) == (3, 2, 2)
+    assert stats.null_key_rows == stats.eligible_null_key_rows == 0
     assert stats.eligible_key_rows == 3
-    assert stats.eligible_null_key_rows == 0
     assert stats.gate_violations == ()
     assert stats.reason_buckets["missing_zip"] == 0
     assert stats.reason_buckets["missing_state"] == 0
     assert stats.reason_buckets["unit_conflicts"] == 1
     assert [source_row[0] for source_row in source_bits] == [2]
-
     premise_keys = int(
         await db.scalar(
-            f"SELECT count(*) FROM {schema}.address_archive_v2 WHERE premise_key IS NOT NULL;"
+            f"SELECT count(*) FROM {schema}.address_archive_v2 "
+            "WHERE premise_key IS NOT NULL;"
         )
         or 0
     )
     assert premise_keys == 2
 
-    same_source_rerun_stats = await resolve_into_archive(
-        stage_table,
-        {
-            "first_line": "first_line",
-            "second_line": "second_line",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "'US'",
-        },
-        source_bit=2,
-        priority=1,
-        schema=schema,
-    )
-    assert same_source_rerun_stats.inserted == 0
-    assert same_source_rerun_stats.provenance_updates == 0
-    assert same_source_rerun_stats.gate_sample_rows == []
 
+async def _assert_archive_resolution_reruns(schema, stage_table, progress_events):
+    field_map = {
+        **_canonical_stage_field_map(),
+        "country": "'US'",
+    }
+    same_source_stats = await resolve_into_archive(
+        stage_table, field_map, source_bit=2, priority=1, schema=schema
+    )
+    assert same_source_stats.inserted == same_source_stats.provenance_updates == 0
+    assert same_source_stats.gate_sample_rows == []
     rerun_stats = await resolve_into_archive(
-        stage_table,
-        {
-            "first_line": "first_line",
-            "second_line": "second_line",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "'US'",
-        },
-        source_bit=4,
-        priority=0,
-        schema=schema,
+        stage_table, field_map, source_bit=4, priority=0, schema=schema
     )
     source_bits_after = await db.all(
         f"SELECT DISTINCT source_bits FROM {schema}.address_archive_v2 ORDER BY source_bits;"
     )
-    display_priority_value = await db.scalar(
-        f"SELECT min(display_priority) FROM {schema}.address_archive_v2;"
+    display_priority = int(
+        await db.scalar(
+            f"SELECT min(display_priority) FROM {schema}.address_archive_v2;"
+        )
     )
-    display_priority = int(display_priority_value)
-
     assert rerun_stats.inserted == 0
     assert rerun_stats.provenance_updates == 2
     assert len(rerun_stats.gate_sample_rows) == 2
-    assert {source_row["source_bits"] for source_row in rerun_stats.gate_sample_rows} == {6}
-    assert {source_row["unit_norm"] for source_row in rerun_stats.gate_sample_rows} == {"ste200", "ste310"}
+    assert {
+        gate_sample["source_bits"] for gate_sample in rerun_stats.gate_sample_rows
+    } == {6}
+    assert {
+        gate_sample["unit_norm"] for gate_sample in rerun_stats.gate_sample_rows
+    } == {
+        "ste200",
+        "ste310",
+    }
     assert [source_row[0] for source_row in source_bits_after] == [6]
     assert display_priority == 0
-    assert "address key stamping" in {event.get("phase") for event in progress_events}
-    assert "address archive resolve" in {event.get("phase") for event in progress_events}
+    phases = {event.get("phase") for event in progress_events}
+    assert {"address key stamping", "address archive resolve"} <= phases
     assert any(
         event.get("source") == "address-canonical"
         and event.get("unit") == "shard"
         and event.get("total") == 2
         for event in progress_events
     )
-    assert any(
-        event.get("source") == "address-canonical"
-        and event.get("message") == "canonical address archive resolved"
-        for event in progress_events
+    messages = {event.get("message") for event in progress_events}
+    assert "canonical address archive resolved" in messages
+    assert "canonical address gate passed" in messages
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_stamp_and_resolve_addresses_into_archive_v2(monkeypatch):
+    """Verify stamp and resolve addresses into archive v2."""
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    stage_table = "address_canon_stage_test"
+    progress_events = []
+    monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **payload: progress_events.append(payload))
+
+    await _prepare_stamp_resolve_fixture(schema, stage_table)
+    field_map = {**_canonical_stage_field_map(), "country": "'US'"}
+    stamped = await stamp_address_keys(
+        stage_table,
+        field_map,
+        schema=schema,
+        shards=2,
     )
-    assert any(
-        event.get("source") == "address-canonical"
-        and event.get("message") == "canonical address gate passed"
-        for event in progress_events
+    stats = await resolve_into_archive(
+        stage_table,
+        field_map,
+        source_bit=2,
+        priority=1,
+        schema=schema,
     )
+    await _assert_initial_archive_resolution(schema, stage_table, stamped, stats)
+    await _assert_archive_resolution_reruns(schema, stage_table, progress_events)
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -696,13 +671,8 @@ async def test_resolve_aborts_when_stamped_key_disagrees_with_identity(monkeypat
     )
 
 
-@pytest.mark.asyncio(loop_scope="session")
-async def test_migrate_legacy_archive_to_v2_builds_bridge_and_verifies_geocodes():
-    """Verify migrate legacy archive to v2 builds bridge and verifies geocodes."""
-    _requires_test_database()
-    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-    legacy_table = "address_archive_legacy_migrate_test"
-
+async def _prepare_legacy_archive_fixture(schema: str, legacy_table: str) -> None:
+    """Create the deterministic legacy archive migration fixture."""
     await db.status(f"DROP TABLE IF EXISTS {schema}.{legacy_table};")
     await db.status(
         f"""
@@ -748,14 +718,8 @@ async def test_migrate_legacy_archive_to_v2_builds_bridge_and_verifies_geocodes(
         """
     )
 
-    stats = await migrate_legacy_archive_to_v2(
-        schema=schema,
-        legacy_table=legacy_table,
-        work_mem="64MB",
-        timeout="2min",
-        sample_limit=5,
-    )
 
+def _assert_legacy_archive_stats(stats) -> None:
     assert stats.legacy_rows == 5
     assert stats.keyable_rows == 4
     assert stats.non_keyable_rows == 1
@@ -770,6 +734,8 @@ async def test_migrate_legacy_archive_to_v2_builds_bridge_and_verifies_geocodes(
     assert stats.geocoded_missing_keys == 0
     assert stats.sample_rows
 
+
+async def _assert_legacy_archive_output(schema: str) -> None:
     winner = await db.first(
         f"""
         SELECT formatted_address, lat, long, place_id, source_bits, display_priority
@@ -783,7 +749,6 @@ async def test_migrate_legacy_archive_to_v2_builds_bridge_and_verifies_geocodes(
     assert str(winner.place_id) == "place-new"
     assert int(winner.source_bits) & 1 == 1
     assert int(winner.display_priority) == 0
-
     map_rows = await db.all(
         f"SELECT checksum FROM {schema}.address_checksum_map ORDER BY checksum;"
     )
@@ -791,8 +756,28 @@ async def test_migrate_legacy_archive_to_v2_builds_bridge_and_verifies_geocodes(
         f"SELECT checksum, count(*) AS n FROM {schema}.address_checksum_collision GROUP BY checksum;"
     )
     assert [int(source_row.checksum) for source_row in map_rows] == [10, 11]
-    assert [(int(source_row.checksum), int(source_row.n)) for source_row in collision_rows] == [(20, 2)]
+    assert [
+        (int(source_row.checksum), int(source_row.n))
+        for source_row in collision_rows
+    ] == [(20, 2)]
 
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_migrate_legacy_archive_to_v2_builds_bridge_and_verifies_geocodes():
+    """Verify migrate legacy archive to v2 builds bridge and verifies geocodes."""
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    legacy_table = "address_archive_legacy_migrate_test"
+    await _prepare_legacy_archive_fixture(schema, legacy_table)
+    stats = await migrate_legacy_archive_to_v2(
+        schema=schema,
+        legacy_table=legacy_table,
+        work_mem="64MB",
+        timeout="2min",
+        sample_limit=5,
+    )
+    _assert_legacy_archive_stats(stats)
+    await _assert_legacy_archive_output(schema)
     rerun_stats = await migrate_legacy_archive_to_v2(
         schema=schema,
         legacy_table=legacy_table,
@@ -934,6 +919,60 @@ def _assert_canonical_projection(case, sql_values, python_values, group_key_by_n
         assert group_key_by_name[group] == current, case["id"]
 
 
+async def _prepare_archive_collision_fixture(schema, stage_table):
+    await _reset_canonical_stage(
+        schema,
+        stage_table,
+        """
+        ('99 Conflict Road', 'Suite 1', 'Austin', 'TX', '78701', 'US'),
+        ('1 Missing Zip Road', NULL, 'Austin', 'TX', NULL, 'US'),
+        ('2 Missing State Road', NULL, 'Austin', NULL, '78701', 'US'),
+        (NULL, NULL, 'Austin', 'TX', '78701', 'US'),
+        ('3 Foreign Road', NULL, 'Toronto', 'ON', 'M5V 2T6', 'CA'),
+        ('4 Odd Unit Road', 'Desk near lobby', 'Austin', 'TX', '78701', 'US')
+        """,
+    )
+    await db.status(
+        f"TRUNCATE TABLE {schema}.address_checksum_map, "
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+    )
+    await stamp_address_keys(
+        stage_table,
+        _canonical_stage_field_map(),
+        schema=schema,
+        shards=1,
+    )
+    collision_key = await db.scalar(
+        f"""
+        SELECT {schema}.addr_key_v1(
+            '99 Conflict Road', 'Suite 1', 'Austin', 'TX', '78701', 'US'
+        );
+        """
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.address_archive_v2 (
+            address_key, identity_key, precision, unit_norm, country_code
+        )
+        VALUES (
+            :address_key, 'v2|differentstreet|ste1||TX|78701|US|street',
+            'street', 'ste1', 'US'
+        );
+        """,
+        address_key=collision_key,
+    )
+
+
+async def _resolve_archive_fixture(schema, stage_table):
+    return await resolve_into_archive(
+        stage_table,
+        _canonical_stage_field_map(),
+        source_bit=2,
+        priority=1,
+        schema=schema,
+    )
+
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_python_and_sql_address_canonical_golden_corpus_match():
     """Verify python and sql address canonical golden corpus match."""
@@ -962,84 +1001,10 @@ async def test_resolve_reason_buckets_and_collision_abort(monkeypatch):
     progress_events = []
     monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **payload: progress_events.append(payload))
 
-    await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
-    await db.status(
-        f"""
-        CREATE TABLE {schema}.{stage_table} (
-            address_key uuid,
-            first_line text,
-            second_line text,
-            city text,
-            state text,
-            zip_code text,
-            country text
-        );
-        """
-    )
-    await db.status(
-        f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
-    )
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{stage_table} (first_line, second_line, city, state, zip_code, country)
-        VALUES
-            ('99 Conflict Road', 'Suite 1', 'Austin', 'TX', '78701', 'US'),
-            ('1 Missing Zip Road', NULL, 'Austin', 'TX', NULL, 'US'),
-            ('2 Missing State Road', NULL, 'Austin', NULL, '78701', 'US'),
-            (NULL, NULL, 'Austin', 'TX', '78701', 'US'),
-            ('3 Foreign Road', NULL, 'Toronto', 'ON', 'M5V 2T6', 'CA'),
-            ('4 Odd Unit Road', 'Desk near lobby', 'Austin', 'TX', '78701', 'US');
-        """
-    )
-    await stamp_address_keys(
-        stage_table,
-        {
-            "first_line": "first_line",
-            "second_line": "second_line",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "COALESCE(NULLIF(country, ''), 'US')",
-        },
-        schema=schema,
-        shards=1,
-    )
-    collision_key = await db.scalar(
-        f"""
-        SELECT {schema}.addr_key_v1(
-            '99 Conflict Road', 'Suite 1', 'Austin', 'TX', '78701', 'US'
-        );
-        """
-    )
-    await db.status(
-        f"""
-        INSERT INTO {schema}.address_archive_v2 (
-            address_key, identity_key, precision, unit_norm, country_code
-        )
-        VALUES (
-            :address_key, 'v2|differentstreet|ste1||TX|78701|US|street',
-            'street', 'ste1', 'US'
-        );
-        """,
-        address_key=collision_key,
-    )
+    await _prepare_archive_collision_fixture(schema, stage_table)
 
     with pytest.raises(RuntimeError, match="Canonical address key collision"):
-        await resolve_into_archive(
-            stage_table,
-            {
-                "first_line": "first_line",
-                "second_line": "second_line",
-                "city": "city",
-                "state": "state",
-                "zip": "zip_code",
-                "country": "COALESCE(NULLIF(country, ''), 'US')",
-            },
-            source_bit=2,
-            priority=1,
-            schema=schema,
-        )
+        await _resolve_archive_fixture(schema, stage_table)
     assert any(
         event.get("status") == "failed"
         and event.get("source") == "address-canonical"
@@ -1051,20 +1016,7 @@ async def test_resolve_reason_buckets_and_collision_abort(monkeypatch):
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
         f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
     )
-    stats = await resolve_into_archive(
-        stage_table,
-        {
-            "first_line": "first_line",
-            "second_line": "second_line",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "COALESCE(NULLIF(country, ''), 'US')",
-        },
-        source_bit=2,
-        priority=1,
-        schema=schema,
-    )
+    stats = await _resolve_archive_fixture(schema, stage_table)
 
     assert stats.reason_buckets["missing_zip"] == 1
     assert stats.reason_buckets["missing_state"] == 1
@@ -1259,13 +1211,7 @@ async def test_resolve_aborts_same_batch_identity_collision(monkeypatch):
     )
 
 
-@pytest.mark.asyncio(loop_scope="session")
-async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
-    """Verify facility anchor coordinates refresh archive geocode fields."""
-    _requires_test_database()
-    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-    stage_table = "facility_anchor_geocode_fixture"
-
+async def _prepare_facility_anchor_geocode_fixture(schema, stage_table):
     await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
     await db.status(
         f"""
@@ -1287,33 +1233,23 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
             address_line1, city, state, zip_code, latitude, longitude, facility_type
         )
         VALUES (
-            '777 Facility Audit Way', 'Austin', 'TX', '78702', 30.26720000, -97.74310000, 'Hospital'
+            '777 Facility Audit Way', 'Austin', 'TX', '78702',
+            30.26720000, -97.74310000, 'Hospital'
         );
         """
     )
-
-    await stamp_address_keys(
-        stage_table,
-        {
-            "first_line": "address_line1",
-            "second_line": "NULL",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "'US'",
-        },
-        schema=schema,
-    )
+    field_map = {
+        "first_line": "address_line1",
+        "second_line": "NULL",
+        "city": "city",
+        "state": "state",
+        "zip": "zip_code",
+        "country": "'US'",
+    }
+    await stamp_address_keys(stage_table, field_map, schema=schema)
     await resolve_into_archive(
         stage_table,
-        {
-            "first_line": "address_line1",
-            "second_line": "NULL",
-            "city": "city",
-            "state": "state",
-            "zip": "zip_code",
-            "country": "'US'",
-        },
+        field_map,
         source_bit=8,
         priority=4,
         schema=schema,
@@ -1322,20 +1258,16 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
     await db.status(
         f"""
         UPDATE {schema}.address_archive_v2
-           SET lat = NULL,
-               long = NULL,
-               geo_source = NULL,
-               geocode_source = NULL,
-               geocode_quality = NULL,
-               geocoded_at = NULL
+           SET lat = NULL, long = NULL, geo_source = NULL,
+               geocode_source = NULL, geocode_quality = NULL, geocoded_at = NULL
          WHERE address_key = :address_key;
         """,
         address_key=address_key,
     )
+    return address_key
 
-    updated = await facility_anchors._refresh_archive_geocodes_from_facility_anchors(stage_table, schema)
-    assert updated == 1
 
+async def _assert_facility_anchor_geocode(schema, stage_table, address_key):
     source_row = await db.first(
         f"""
         SELECT lat, long, geo_source, geocode_source, geocode_quality
@@ -1349,15 +1281,15 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
     assert source_row.geo_source == "manual"
     assert source_row.geocode_source == "facility_anchor"
     assert source_row.geocode_quality == "facility_anchor"
-
     await db.status(
-        f"""
-        UPDATE {schema}.{stage_table}
-           SET latitude = 31.0,
-               longitude = -98.0;
-        """
+        f"UPDATE {schema}.{stage_table} SET latitude = 31.0, longitude = -98.0;"
     )
-    assert await facility_anchors._refresh_archive_geocodes_from_facility_anchors(stage_table, schema) == 0
+    assert (
+        await facility_anchors._refresh_archive_geocodes_from_facility_anchors(
+            stage_table, schema
+        )
+        == 0
+    )
     unchanged = await db.first(
         f"""
         SELECT lat, long
@@ -1368,6 +1300,20 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
     )
     assert float(unchanged.lat) == pytest.approx(30.2672)
     assert float(unchanged.long) == pytest.approx(-97.7431)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
+    """Verify facility anchor coordinates refresh archive geocode fields."""
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    stage_table = "facility_anchor_geocode_fixture"
+
+    address_key = await _prepare_facility_anchor_geocode_fixture(schema, stage_table)
+
+    updated = await facility_anchors._refresh_archive_geocodes_from_facility_anchors(stage_table, schema)
+    assert updated == 1
+    await _assert_facility_anchor_geocode(schema, stage_table, address_key)
 
 
 async def _prepare_mrf_address_source(schema, stage_table):
