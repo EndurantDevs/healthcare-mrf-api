@@ -9100,6 +9100,151 @@ LIMIT :limit OFFSET :offset
 """
 
 
+_MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL = """
+WITH located AS MATERIALIZED (
+    SELECT
+        addr.location_key,
+        addr.npi,
+        addr.address_key,
+        addr.address_source_mask,
+        {distance_sql} AS distance_miles,
+        addr.type,
+        addr.checksum
+    FROM {address_table} addr
+    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
+    WHERE {filter_sql}
+), mrf_requested AS MATERIALIZED (
+    SELECT DISTINCT located.npi, located.address_key
+    FROM located
+    WHERE located.address_key IS NOT NULL
+      AND (located.address_source_mask & 1) = 0
+), mrf_assured AS MATERIALIZED (
+    SELECT requested.npi, requested.address_key
+    FROM mrf_requested requested
+    CROSS JOIN LATERAL (
+        SELECT 1
+        FROM {ptg2_schema}.mrf_address mrf
+        WHERE mrf.npi = requested.npi
+          AND mrf.address_key = requested.address_key
+          AND CARDINALITY(
+                  COALESCE(mrf.source_issuer_names, ARRAY[]::varchar[])
+              ) >= 2
+        LIMIT 1
+    ) assured
+), cms_requested AS MATERIALIZED (
+    SELECT DISTINCT located.npi
+    FROM located
+    WHERE (located.address_source_mask & 4) <> 0
+      AND (located.address_source_mask & 1) = 0
+), cms_doctor_rows AS MATERIALIZED (
+    SELECT requested.npi, doctor.premise_key
+    FROM cms_requested requested
+    CROSS JOIN LATERAL (
+        SELECT candidate.premise_key
+        FROM {ptg2_schema}.entity_address_unified candidate
+        WHERE candidate.npi = requested.npi
+          AND (candidate.address_source_mask & 4) <> 0
+        OFFSET 0
+    ) doctor
+), cms_nppes_rows AS MATERIALIZED (
+    SELECT requested.npi, nppes.premise_key
+    FROM cms_requested requested
+    CROSS JOIN LATERAL (
+        SELECT candidate.premise_key
+        FROM {ptg2_schema}.entity_address_unified candidate
+        WHERE candidate.npi = requested.npi
+          AND (candidate.address_source_mask & 1) <> 0
+        OFFSET 0
+    ) nppes
+), cms_anchored_npis AS MATERIALIZED (
+    SELECT DISTINCT doctor.npi
+    FROM cms_doctor_rows doctor
+    JOIN cms_nppes_rows nppes
+      ON nppes.npi = doctor.npi
+     AND nppes.premise_key = doctor.premise_key
+), assured_location_keys AS MATERIALIZED (
+    SELECT located.location_key
+    FROM located
+    WHERE (located.address_source_mask & 1) <> 0
+    UNION
+    SELECT located.location_key
+    FROM located
+    JOIN mrf_assured mrf
+      ON mrf.npi = located.npi
+     AND mrf.address_key = located.address_key
+    UNION
+    SELECT located.location_key
+    FROM located
+    JOIN cms_anchored_npis cms ON cms.npi = located.npi
+    WHERE (located.address_source_mask & 4) <> 0
+), ranked AS MATERIALIZED (
+    SELECT
+        located.location_key,
+        located.npi,
+        located.distance_miles,
+        ROW_NUMBER() OVER (
+            PARTITION BY located.npi
+            ORDER BY located.distance_miles ASC NULLS LAST,
+                     CASE located.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
+                     located.checksum
+        ) AS address_rank
+    FROM located
+    JOIN assured_location_keys assured
+      ON assured.location_key = located.location_key
+), selected AS MATERIALIZED (
+    SELECT *
+    FROM ranked
+    WHERE address_rank = 1
+    ORDER BY distance_miles ASC NULLS LAST, npi
+    LIMIT :limit OFFSET :offset
+)
+SELECT
+    addr.npi,
+    {location_hash_sql} AS location_hash,
+    addr.state_name AS state,
+    addr.city_name AS city,
+    LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
+    selected.distance_miles,
+    addr.type,
+    addr.checksum,
+    {telephone_sql} AS telephone_number,
+    {fax_sql} AS fax_number,
+    addr.phone_number,
+    addr.phone_extension,
+    addr.fax_number_digits,
+    addr.fax_extension,
+    jsonb_build_object(
+        'first_line', addr.first_line,
+        'second_line', addr.second_line,
+        'city', addr.city_name,
+        'state', addr.state_name,
+        'postal_code', addr.postal_code,
+        'country_code', addr.country_code,
+        'telephone_number', {telephone_sql},
+        'fax_number', {fax_sql},
+        'phone_number', addr.phone_number,
+        'phone_extension', addr.phone_extension,
+        'fax_number_digits', addr.fax_number_digits,
+        'fax_extension', addr.fax_extension,
+        'address_key', addr.address_key::text,
+        'location_key', {location_key_sql},
+        'address_sources', {address_sources_sql},
+        'source_record_ids', {source_record_ids_sql},
+        'source_count', {source_count_sql},
+        'multi_source_confirmed', {multi_source_sql},
+        'source_mask', {source_mask_sql},
+        'address_source_mask', {address_source_mask_sql},
+        'location_confidence_id', {location_confidence_sql},
+        'lat', addr.lat,
+        'long', addr.long
+    )::text AS address_payload,
+    selected.address_rank
+FROM selected
+JOIN {address_table} addr ON addr.location_key = selected.location_key
+ORDER BY selected.distance_miles ASC NULLS LAST, addr.npi
+"""
+
+
 _MEMBERSHIP_LOCATION_KNN_SQL = """
 WITH nearest_addresses AS MATERIALIZED (
     SELECT
@@ -9191,13 +9336,18 @@ WITH nearest_addresses AS MATERIALIZED (
     FROM nearest_addresses addr
     WHERE {address_assurance_sql}
 )
-SELECT matched.*,
-       (probe_stats.raw_probe_count < :raw_probe_limit) AS _ptg_source_exhausted
-FROM matched
-CROSS JOIN probe_stats
-WHERE address_rank = 1
-ORDER BY distance_miles ASC NULLS LAST, npi
-LIMIT :limit
+SELECT selected.*,
+       (probe_stats.raw_probe_count < :raw_probe_limit) AS _ptg_source_exhausted,
+       (selected.npi IS NULL) AS _ptg_probe_empty
+FROM probe_stats
+LEFT JOIN LATERAL (
+    SELECT matched.*
+    FROM matched
+    WHERE address_rank = 1
+    ORDER BY distance_miles ASC NULLS LAST, npi
+    LIMIT :limit
+) selected ON TRUE
+ORDER BY selected.distance_miles ASC NULLS LAST, selected.npi
 """
 
 
@@ -9234,7 +9384,6 @@ def _membership_geo_sql(
             "addr.lat IS NOT NULL",
             "addr.long IS NOT NULL",
             "COALESCE(addr.address_precision, '') <> 'city_zip'",
-            _ptg2_geo_assured_address_sql("addr"),
             _ptg2_geo_dwithin_sql("addr.lat", "addr.long"),
         ]
     return distance_sql, [
@@ -9433,7 +9582,7 @@ async def _membership_location_query(
         uses_unified_addresses=uses_unified_addresses,
         address_zip5_sql=_ptg2_address_zip5_sql("addr", unified=uses_unified_addresses),
         parameter_map=parameter_map,
-        literal_service_address_types=knn_order_sql is not None,
+        literal_service_address_types=uses_unified_addresses,
         include_taxonomy_filters=knn_order_sql is None,
     )
     if filter_sql_parts is None:
@@ -9861,10 +10010,18 @@ def _membership_location_sql(
         "distance_sql": query_context.distance_sql,
         "address_table": query_context.address_table,
         "npi_scope_table": query_context.npi_scope_table,
+        "ptg2_schema": PTG2_SCHEMA,
         "filter_sql": query_context.filter_sql,
         "address_assurance_sql": query_context.address_assurance_sql,
     }
     if query_context.knn_order_sql is None or offset != 0:
+        if (
+            _is_unified_address_table(query_context.address_table)
+            and query_context.address_assurance_sql != "TRUE"
+        ):
+            return _MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL.format(
+                **format_values_by_name
+            )
         return _MEMBERSHIP_LOCATION_SQL.format(**format_values_by_name)
     requested_limit = max(int(limit), 1)
     probe_limit = requested_limit + max(requested_limit // 2, 64)
@@ -10050,7 +10207,8 @@ async def _append_rate_matched_locations(
     new_location_rows = [
         location
         for location in candidate_location_rows
-        if int(location["npi"]) not in seen_candidate_npis
+        if location.get("npi") not in (None, "")
+        and int(location["npi"]) not in seen_candidate_npis
     ]
     if not new_location_rows:
         return 0
@@ -14480,18 +14638,49 @@ def _v4_direct_retained_rows(
     ]
 
 
-def _v4_direct_projection_scope(context: _V4DirectContext):
+_PTG2_V4_DIRECT_TAXONOMY_IO_MAX_MULTIPLIER = 5
+
+
+def _v4_direct_io_multiplier(
+    serving_tables: PTG2ServingTables,
+) -> int:
+    """Bound legacy direct_v1 physical amplification by authenticated limits."""
+
+    multiplier = (
+        _v4_hot_prefix_limits(
+            serving_tables
+        ).maximum_group_npi_batches_per_set
+        + 1
+    )
+    if multiplier > _PTG2_V4_DIRECT_TAXONOMY_IO_MAX_MULTIPLIER:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 direct taxonomy compatibility multiplier exceeds its cap"
+        )
+    return multiplier
+
+
+def _v4_direct_projection_scope(
+    serving_tables: PTG2ServingTables,
+    context: _V4DirectContext,
+):
+    """Apply a bounded physical-I/O compatibility cap for direct_v1 graphs."""
+
     rule = context.request.projection_rule
+    physical_work_multiplier = (
+        _v4_direct_io_multiplier(serving_tables)
+    )
     return v4_graph_taxonomy_projection_scope(
         maximum_members=int(
             rule.max_online_candidate_pattern_projection_members
         ),
         maximum_pages=int(
             rule.max_online_inferred_taxonomy_graph_pages
-        ),
+        )
+        * physical_work_multiplier,
         maximum_bytes=int(
             rule.max_online_inferred_taxonomy_graph_bytes
-        ),
+        )
+        * physical_work_multiplier,
         maximum_batches=int(
             rule.max_online_inferred_taxonomy_graph_batches
         ),
@@ -14508,7 +14697,7 @@ async def _v4_direct_selection(
     request = context.request
     with (
         v4_graph_request_scope(),
-        _v4_direct_projection_scope(context),
+        _v4_direct_projection_scope(serving_tables, context),
     ):
         prefix = await _v4_direct_ranked_prefix(
             session,
