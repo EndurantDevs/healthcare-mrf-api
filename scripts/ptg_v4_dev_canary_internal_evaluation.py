@@ -46,9 +46,7 @@ def metric_failures(
         "cold_exact_requests": 0,
         "npi_prefix_override_sets": int(owner_spec.uses_override),
         "component_fallback_sets": (
-            0
-            if owner_spec.uses_override
-            else int(owner_spec.uses_component_fallback)
+            0 if owner_spec.uses_override else int(owner_spec.uses_component_fallback)
         ),
     }
     maximum_by_field = {
@@ -96,19 +94,14 @@ def _is_sample_outside_page_envelope(
 ) -> bool:
     """Return whether one owner request exceeds any packed-page hard cap."""
 
-    locator_pages = int(
-        metric_delta_by_field.get("hot_group_npi_locator_pages", -1)
-    )
-    member_pages = int(
-        metric_delta_by_field.get("hot_group_npi_member_pages", -1)
-    )
+    locator_pages = int(metric_delta_by_field.get("hot_group_npi_locator_pages", -1))
+    member_pages = int(metric_delta_by_field.get("hot_group_npi_member_pages", -1))
     return bool(
         locator_pages < 0
         or locator_pages > INTERNAL_MAXIMUM_LOCATOR_PAGES
         or member_pages < 0
         or member_pages > INTERNAL_MAXIMUM_MEMBER_PAGES
-        or source_pages + locator_pages + member_pages
-        > INTERNAL_MAXIMUM_GRAPH_PAGES
+        or source_pages + locator_pages + member_pages > INTERNAL_MAXIMUM_GRAPH_PAGES
     )
 
 
@@ -123,10 +116,13 @@ def compiler_work_failures(
     work_by_section = compiler_work(diagnostic, owner_spec)
     maximum_by_field = work_by_section["maximum"]
     observed_by_field = work_by_section["observed"]
-    if any(
-        observed_by_field[field_name] > maximum_by_field[field_name]
-        for field_name in maximum_by_field
-    ) or observed_by_field["source_pages"] > INTERNAL_MAXIMUM_SOURCE_PAGES:
+    if (
+        any(
+            observed_by_field[field_name] > maximum_by_field[field_name]
+            for field_name in maximum_by_field
+        )
+        or observed_by_field["source_pages"] > INTERNAL_MAXIMUM_SOURCE_PAGES
+    ):
         return [f"{owner_spec.role} compiler work exceeds sealed online caps"]
     return []
 
@@ -179,6 +175,60 @@ def owner_mode(owner_spec: Any) -> str:
     return "online_factor"
 
 
+def owner_prefix_failures(
+    owner_spec: Any,
+    *,
+    cold: Any,
+    warm: Any,
+    dense_keys: Sequence[int],
+    actual_digest: str,
+    exact_prefix_limit: int,
+) -> list[str]:
+    """Validate stable exact prefix identity against compiler evidence."""
+
+    failures: list[str] = []
+    if (
+        not cold.is_prefix_stable
+        or not warm.is_prefix_stable
+        or warm.prefix_npis != cold.prefix_npis
+    ):
+        failures.append(f"{owner_spec.role} exact prefix changed across samples")
+    if (
+        len(dense_keys) != owner_spec.expected_member_count
+        or actual_digest != owner_spec.expected_member_digest
+    ):
+        failures.append(f"{owner_spec.role} prefix differs from compiler digest")
+    if len(dense_keys) != exact_prefix_limit:
+        failures.append(
+            f"{owner_spec.role} prefix is not the exact "
+            f"{exact_prefix_limit}-member workload"
+        )
+    return failures
+
+
+def owner_latency_failures(
+    args: Any,
+    *,
+    owner_spec: Any,
+    cold_p95: float,
+    warm_p95: float,
+    release_latency_ceiling_ms: float,
+) -> list[str]:
+    """Validate cold and warm observations against configured latency limits."""
+
+    failures: list[str] = []
+    for phase_name, p95_value, limit_value in (
+        ("cold", cold_p95, float(args.cold_p95_limit_ms)),
+        ("warm", warm_p95, float(args.warm_p95_limit_ms)),
+    ):
+        if p95_value > limit_value:
+            failures.append(
+                f"{owner_spec.role} {phase_name} p95 exceeds "
+                f"{release_latency_ceiling_ms:g}ms gate"
+            )
+    return failures
+
+
 def _owner_workload_failures(
     evidence_by_field: Mapping[str, Any],
 ) -> list[str]:
@@ -228,10 +278,7 @@ def validate_internal_evidence(
         failures.append("internal worst-owner evidence contract is missing")
     if evidence_by_field.get("snapshot_id") != snapshot_id:
         failures.append("internal worst-owner snapshot differs from acceptance")
-    if (
-        evidence_by_field.get("reference_snapshot_id")
-        != expected_reference_snapshot_id
-    ):
+    if evidence_by_field.get("reference_snapshot_id") != expected_reference_snapshot_id:
         failures.append(
             "internal worst-owner reference snapshot differs from acceptance"
         )
@@ -244,9 +291,7 @@ def validate_internal_evidence(
     ):
         field_value = evidence_by_field.get(field_name)
         if not isinstance(field_value, str) or not field_value.strip():
-            failures.append(
-                f"internal worst-owner {field_name} is missing"
-            )
+            failures.append(f"internal worst-owner {field_name} is missing")
     if evidence_by_field.get("passed") is not True:
         failures.append("internal worst-owner production probe did not pass")
     failures.extend(_owner_workload_failures(evidence_by_field))
@@ -264,8 +309,7 @@ def metric_delta(
     """Subtract cumulative V4 counters for one isolated request."""
 
     return {
-        field_name: int(after.get(field_name) or 0)
-        - int(before.get(field_name) or 0)
+        field_name: int(after.get(field_name) or 0) - int(before.get(field_name) or 0)
         for field_name in _DELTA_FIELDS
     }
 

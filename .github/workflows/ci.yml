@@ -643,6 +643,7 @@ jobs:
           timeout --foreground 295s python -m pytest -q
           tests/test_ptg2_v4_migration_postgres.py
           tests/test_ptg2_v4_taxonomy_candidates_postgres.py
+          tests/test_ptg2_v4_taxonomy_candidates_lifecycle.py
           tests/test_ptg2_provider_tax_identity_postgres.py
           tests/test_ptg2_tax_identity_publication_postgres.py
           tests/test_ptg2_v4_snapshot_maps.py

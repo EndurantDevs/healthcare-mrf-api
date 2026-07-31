@@ -133,7 +133,9 @@ def _publication_mocks(tmp_path, *, price_kinds, membership_span, seal_reused):
                 metadata={"contract": "audit-sample-v1", "row_count": 3}
             )
         ),
-        seal=AsyncMock(return_value=SimpleNamespace(snapshot_key=17, reused=seal_reused)),
+        seal=AsyncMock(
+            return_value=SimpleNamespace(snapshot_key=17, reused=seal_reused)
+        ),
         sealed_audit=AsyncMock(
             return_value={"contract": "persisted-audit-v1", "row_count": 3}
         ),
@@ -341,7 +343,7 @@ async def test_finalizer_cas_failure_cancels_adaptive_v4_lane_before_seal(
     mocks.publish_blocks.side_effect = fail_finalizer_cas
     monkeypatch.setattr(
         snapshot_publish,
-        "compile_provider_graph_v4_rust",
+        "_compile_v4_provider_graph",
         AsyncMock(return_value=mocks.graph_conversion),
     )
     monkeypatch.setattr(

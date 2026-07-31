@@ -13,6 +13,7 @@ from process.ptg_parts.ptg2_shared_source_set import (
     PTG2_V3_SOURCE_SET_CONTRACT,
 )
 from process.ptg_parts.canonical import canonical_json_dumps
+from process.ptg_parts import ptg2_v4_graph_compiler as graph_compiler
 from scripts import ptg_v4_dev_canary_acceptance as acceptance
 from scripts import ptg_v4_dev_canary_publication as publication
 from scripts import ptg_v4_dev_canary_storage_budget as storage_policy
@@ -36,36 +37,123 @@ from scripts.ptg_v4_dev_canary_storage_sql import _ownership_predicates
 from scripts.ptg_v4_dev_canary_support import CanaryConfigurationError
 
 
+def _layout_candidate(
+    candidate_name: str,
+    encoded_bytes: int,
+) -> dict[str, object]:
+    common_by_field = {
+        "eligible": True,
+        "graph_encoded_bytes": encoded_bytes - 200,
+        "mapping_persistence_encoded_bytes": 200,
+        "map_payload_encoded_bytes": 132,
+        "map_coordinate_count": 1,
+        "map_pack_count": 1,
+        "map_object_kind_count": 1,
+        "inferred_taxonomy_encoded_bytes": 0,
+        "inferred_taxonomy_eligible": True,
+        "inferred_taxonomy_rejection_reason": None,
+        "inferred_taxonomy_rejection_rule_digest": None,
+        "inferred_taxonomy_rejection_observed_count": None,
+        "inferred_taxonomy_rejection_cap": None,
+        "complete_persistent_encoded_bytes": encoded_bytes,
+    }
+    if candidate_name == "direct":
+        return {
+            **common_by_field,
+            "complete_prefix_eligible": True,
+            "complete_prefix_projection_encoded_bytes": 10,
+        }
+    return {
+        **common_by_field,
+        "component_fallback_eligible": True,
+        "unsafe_component_set_count": 0,
+        "sparse_prefix_eligible": True,
+        "sparse_prefix_owner_count": 0,
+        "sparse_prefix_member_count": 0,
+        "sparse_prefix_raw_bytes": 0,
+        "sparse_prefix_projection_encoded_bytes": 10,
+    }
+
+
+def _adaptive_layout_evidence(representation: str) -> dict[str, object]:
+    direct_bytes = 300 if representation == "direct_v1" else 301
+    pattern_bytes = 299 if representation == "pattern_v1" else 301
+    decision_by_field = {
+        "contract": graph_compiler.PTG2_V4_ADAPTIVE_LAYOUT_DECISION_CONTRACT,
+        "cost_contract": graph_compiler.PTG2_V4_ADAPTIVE_LAYOUT_COST_CONTRACT,
+        "selection_policy": (graph_compiler.PTG2_V4_ADAPTIVE_LAYOUT_SELECTION_POLICY),
+        "compiler_options": graph_compiler._effective_compiler_options(None),
+        "selected_representation": representation,
+        "selected_encoded_bytes": (
+            direct_bytes if representation == "direct_v1" else pattern_bytes
+        ),
+        "direct": _layout_candidate("direct", direct_bytes),
+        "pattern": _layout_candidate("pattern", pattern_bytes),
+    }
+    return {
+        **decision_by_field,
+        "decision_digest": graph_compiler._adaptive_layout_evidence_digest(
+            decision_by_field
+        ),
+    }
+
+
+def _source_set_evidence(case: StorageCanaryCase) -> dict[str, object]:
+    return {
+        "contract": PTG2_V3_SOURCE_SET_CONTRACT,
+        "source_count": case.source_count,
+        "raw_container_sha256_digest": case.source_set_digest,
+    }
+
+
+def _snapshot_evidence(
+    case: StorageCanaryCase,
+    *,
+    logical_bytes: int,
+    representation: str,
+) -> dict[str, object]:
+    return {
+        "snapshot_id": f"ptg2:v4:{case.case_name}",
+        "import_run_id": f"run_{case.case_name}",
+        "snapshot_status": "published",
+        "layout_state": "sealed",
+        "layout_generation": "shared_blocks_v4",
+        "layout_logical_byte_count": logical_bytes,
+        "layout_manifest": {
+            "serving_index": {
+                "serving_binary": {
+                    "provider_graph_v4": {
+                        "representation": representation,
+                        "adaptive_layout": _adaptive_layout_evidence(representation),
+                    }
+                }
+            }
+        },
+    }
+
+
 def _database_evidence(
     case: StorageCanaryCase,
     *,
     factor_edge_count: int,
     v4_logical_bytes: int = 123_456_789,
+    representation: str = "direct_v1",
 ) -> dict[str, object]:
     """Build sealed snapshot, source-set, and compiler resource evidence."""
 
-    source_set_by_field = {
-        "contract": PTG2_V3_SOURCE_SET_CONTRACT,
-        "source_count": case.source_count,
-        "raw_container_sha256_digest": case.source_set_digest,
-    }
+    source_set_by_field = _source_set_evidence(case)
     return {
-        "snapshot": {
-            "snapshot_id": f"ptg2:v4:{case.case_name}",
-            "import_run_id": f"run_{case.case_name}",
-            "snapshot_status": "published",
-            "layout_state": "sealed",
-            "layout_generation": "shared_blocks_v4",
-            "layout_logical_byte_count": v4_logical_bytes,
-        },
+        "snapshot": _snapshot_evidence(
+            case,
+            logical_bytes=v4_logical_bytes,
+            representation=representation,
+        ),
         "root": {
             "state": "complete",
-            "representation": case.expected_representation,
+            "representation": representation,
             "logical_byte_count": v4_logical_bytes,
         },
-        "exact_counts": {
-            "map_logical_byte_count": v4_logical_bytes,
-        },
+        "exact_counts": {"map_logical_byte_count": v4_logical_bytes},
         "reference_equivalence": {
             "v4_snapshot_id": f"ptg2:v4:{case.case_name}",
             "reference_snapshot_id": case.reference_snapshot_id,
@@ -78,9 +166,7 @@ def _database_evidence(
                 "snapshot_status": "published",
                 "layout_state": "sealed",
                 "layout_generation": "shared_blocks_v3",
-                "layout_logical_byte_count": (
-                    case.base_layout_logical_bytes
-                ),
+                "layout_logical_byte_count": (case.base_layout_logical_bytes),
             },
         },
         "provider_graph_diagnostic": {
@@ -113,8 +199,33 @@ def test_storage_budget_keeps_each_initial_canary_measurement_only(
     assert report["promotion_state"] == "measurement_only_pending_review"
     assert report["base_layout_logical_bytes"] == case.base_layout_logical_bytes
     assert report["v4_factored_layout_logical_bytes"] == 123_456_789
+    assert report["encoded_persistent_projection_contract"] == (
+        "encoded_persistent_projection_v1"
+    )
+    assert report["encoded_persistent_projection_bytes"] == 300
+    assert report["graph_physical_minus_encoded_projection_bytes"] == -177
+    assert report["graph_physical_to_encoded_projection_basis_points"] == 4_100
+    assert report["graph_projection_drift_within_budget"] is True
     assert report["graph_gate_bytes"] == 123
     assert report["snapshot_gate_bytes"] == 456
+
+
+@pytest.mark.parametrize("representation", ("direct_v1", "pattern_v1"))
+def test_storage_budget_derives_layout_from_sealed_shape_decision(
+    representation: str,
+) -> None:
+    """The same source roster accepts either layout when measured shape selects it."""
+
+    case = STORAGE_CANARY_CASES[0]
+    budget = storage_budget(
+        _database_evidence(
+            case,
+            factor_edge_count=100,
+            representation=representation,
+        )
+    )
+
+    assert budget.case == case
 
 
 def test_storage_budget_accepts_distinct_factored_bytes() -> None:
@@ -138,9 +249,7 @@ def test_storage_budget_accepts_distinct_factored_bytes() -> None:
 def test_sealed_factor_scale_cannot_self_approve_a_storage_ceiling() -> None:
     case = STORAGE_CANARY_CASES[0]
 
-    budget = storage_budget(
-        _database_evidence(case, factor_edge_count=10**12)
-    )
+    budget = storage_budget(_database_evidence(case, factor_edge_count=10**12))
 
     assert budget.maximum_graph_physical_storage_bytes is None
     assert budget.maximum_snapshot_physical_storage_bytes is None
@@ -160,7 +269,11 @@ def test_sealed_factor_scale_cannot_self_approve_a_storage_ceiling() -> None:
             "sealed source set differs",
         ),
         (
-            ("reference_equivalence", "reference_snapshot", "layout_logical_byte_count"),
+            (
+                "reference_equivalence",
+                "reference_snapshot",
+                "layout_logical_byte_count",
+            ),
             1,
             "storage baseline differs",
         ),
@@ -176,8 +289,8 @@ def test_sealed_factor_scale_cannot_self_approve_a_storage_ceiling() -> None:
         ),
         (
             ("root", "representation"),
-            "direct_v1",
-            "factored layout evidence",
+            "pattern_v1",
+            "representation differs from compiler decision",
         ),
         (
             ("exact_counts", "map_logical_byte_count"),
@@ -215,15 +328,11 @@ def test_accept_cli_has_no_operator_storage_or_representation_override() -> None
     )
     accept_parser = subparsers.choices["accept"]
 
-    assert "--maximum-graph-storage-bytes" not in (
-        accept_parser._option_string_actions
-    )
+    assert "--maximum-graph-storage-bytes" not in (accept_parser._option_string_actions)
     assert "--maximum-snapshot-storage-bytes" not in (
         accept_parser._option_string_actions
     )
-    assert "--expected-representation" not in (
-        accept_parser._option_string_actions
-    )
+    assert "--expected-representation" not in (accept_parser._option_string_actions)
 
 
 def test_acceptance_passes_only_derived_storage_budget(
@@ -266,207 +375,3 @@ def test_acceptance_passes_only_derived_storage_budget(
     assert captured_by_field["image_identity"] == "sha256:measured-image"
     assert captured_by_field["root_counts"] == {}
     assert captured_by_field["relation_counts"] == {}
-
-
-def _physical_storage_evidence(
-    *,
-    graph_gate_bytes: int,
-    snapshot_gate_bytes: int,
-) -> dict[str, object]:
-    """Build fully shaped physical evidence around exact measured gate bytes."""
-
-    retained_raw_by_field = _retained_raw_storage_evidence()
-    return {
-        "contract": STORAGE_EVIDENCE_CONTRACT,
-        "relations": [
-            {
-                "relation": relation_name,
-                "exists": True,
-                "total_bytes": 1,
-                "attributed_bytes": 1,
-            }
-            for relation_name in WHOLE_SNAPSHOT_PHYSICAL_RELATIONS
-        ],
-        "baseline_captured": True,
-        "allocation_reconciled": True,
-        "missing_required_object_kinds": [],
-        "graph_gate_bytes": graph_gate_bytes,
-        "snapshot_gate_bytes": snapshot_gate_bytes,
-        "retained_raw_artifact_physical_bytes": 2_000,
-        "retained_raw_artifacts": retained_raw_by_field,
-        "storage_claim_scope": (
-            "whole_snapshot_v4_graph_and_retained_raw"
-        ),
-        "cas": {
-            "reference_source": (
-                "direct_rows_plus_authenticated_v4_map_payloads"
-            ),
-            "reference_population": "published_sealed_layout_keys",
-            "distinct_referenced_block_count": 1,
-            "new_during_import_block_count": 1,
-            "preexisting_reused_block_count": 0,
-            "shared_block_count": 0,
-        },
-    }
-
-
-def _retained_raw_storage_evidence() -> dict[str, object]:
-    """Build exact retained compressed-file evidence for storage gates."""
-
-    retained_artifacts = [
-        {
-            "ordinal": ordinal,
-            "source_file_version_id": f"version-{ordinal}",
-            "raw_sha256": f"{ordinal:064x}",
-            "raw_byte_count": 4_000_000_000,
-            "physical_allocated_bytes": 1_000,
-            "source_version_reference_count": 1,
-            "artifact_manifest_count": 1,
-        }
-        for ordinal in (1, 2)
-    ]
-    retained_raw_by_field = {
-        "contract": RETAINED_RAW_ARTIFACT_STORAGE_CONTRACT,
-        "snapshot_id": "ptg2:v4:provider_fragmented_391",
-        "frozen_rate_file_set_sha256": "a" * 64,
-        "source_file_version_count": 2,
-        "distinct_artifact_count": 2,
-        "referenced_raw_bytes": 8_000_000_000,
-        "referenced_physical_bytes": 2_000,
-        "all_files_verified": True,
-        "attribution": "full_referenced_physical_bytes_conservative",
-        "artifacts": retained_artifacts,
-    }
-    retained_raw_by_field["evidence_sha256"] = hashlib.sha256(
-        canonical_json_dumps(retained_raw_by_field).encode("utf-8")
-    ).hexdigest()
-    return retained_raw_by_field
-
-
-def test_tax_identity_sidecars_are_snapshot_owned_graph_storage() -> None:
-    """Keep every token-only sidecar inside both physical storage gates."""
-
-    tax_relations = {
-        "ptg2_provider_tax_identity_manifest",
-        "ptg2_provider_tax_identity",
-        "ptg2_provider_group_tax_identity",
-    }
-    assert tax_relations <= publication.REQUIRED_PHYSICAL_RELATIONS
-    assert tax_relations <= WHOLE_SNAPSHOT_PHYSICAL_RELATIONS
-    assert (
-        "ptg2_provider_tax_identity_legacy_layout"
-        in WHOLE_SNAPSHOT_PHYSICAL_RELATIONS
-    )
-    for relation_name in tax_relations:
-        assert _ownership_predicates(
-            relation_name,
-            "ptg2:ignored",
-            501,
-        ) == (
-            '"snapshot_key" = $1::bigint',
-            '"snapshot_key" IS NOT NULL',
-            501,
-        )
-
-
-def _physical_storage_approval(
-    *,
-    case: StorageCanaryCase,
-) -> PhysicalStorageApproval:
-    approval = PhysicalStorageApproval(
-        measurement_reference_snapshot_id=case.reference_snapshot_id,
-        measurement_snapshot_id="ptg2:v4:measured",
-        measurement_import_run_id="run_measured",
-        measurement_image_identity="sha256:measured-image",
-        measurement_evidence_sha256="",
-        measured_graph_gate_bytes=1_000,
-        measured_snapshot_gate_bytes=2_000,
-        tolerance_basis_points=200,
-        approved_graph_physical_storage_bytes=1_020,
-        approved_snapshot_physical_storage_bytes=2_040,
-    )
-    return replace(
-        approval,
-        measurement_evidence_sha256=(
-            storage_policy.physical_storage_measurement_evidence_sha256(
-                approval
-            )
-        ),
-    )
-
-
-def test_unapproved_measurement_reports_bytes_but_blocks_promotion() -> None:
-    case = STORAGE_CANARY_CASES[1]
-    budget = storage_budget(_database_evidence(case, factor_edge_count=10))
-    failures: list[str] = []
-
-    publication._validate_physical_storage(
-        _physical_storage_evidence(
-            graph_gate_bytes=1_000,
-            snapshot_gate_bytes=2_000,
-        ),
-        budget,
-        failures,
-    )
-
-    assert failures == [UNAPPROVED_STORAGE_CEILING_FAILURE]
-    report = budget.report(
-        graph_gate_bytes=1_000,
-        snapshot_gate_bytes=2_000,
-        measurement_image_identity="sha256:measured-image",
-    )
-    assert report["graph_gate_bytes"] == 1_000
-    assert report["snapshot_gate_bytes"] == 2_000
-    assert report["promotion_approved"] is False
-    assert report["measurement_evidence"] == {
-        "contract": storage_policy.STORAGE_MEASUREMENT_EVIDENCE_CONTRACT,
-        "measurement_reference_snapshot_id": case.reference_snapshot_id,
-        "measurement_snapshot_id": f"ptg2:v4:{case.case_name}",
-        "measurement_import_run_id": f"run_{case.case_name}",
-        "measurement_image_identity": "sha256:measured-image",
-        "measured_graph_gate_bytes": 1_000,
-        "measured_snapshot_gate_bytes": 2_000,
-    }
-    measured_approval = replace(
-        _physical_storage_approval(case=case),
-        measurement_snapshot_id=f"ptg2:v4:{case.case_name}",
-        measurement_import_run_id=f"run_{case.case_name}",
-    )
-    measured_approval = replace(
-        measured_approval,
-        measurement_evidence_sha256=(
-            storage_policy.physical_storage_measurement_evidence_sha256(
-                measured_approval
-            )
-        ),
-    )
-    assert report["measurement_evidence_sha256"] == (
-        measured_approval.measurement_evidence_sha256
-    )
-
-
-def test_checked_in_absolute_ceiling_requires_exact_reviewed_tolerance() -> None:
-    measured_case = STORAGE_CANARY_CASES[1]
-    approval = _physical_storage_approval(case=measured_case)
-    storage_policy._validate_storage_approval(measured_case, approval)
-    approved_case = replace(
-        measured_case,
-        physical_storage_approval=approval,
-    )
-    unapproved_budget = storage_budget(
-        _database_evidence(measured_case, factor_edge_count=10)
-    )
-    approved_budget = replace(unapproved_budget, case=approved_case)
-    failures: list[str] = []
-
-    publication._validate_physical_storage(
-        _physical_storage_evidence(
-            graph_gate_bytes=1_020,
-            snapshot_gate_bytes=2_040,
-        ),
-        approved_budget,
-        failures,
-    )
-
-    assert failures == []
-    assert approved_budget.is_promotion_approved is True

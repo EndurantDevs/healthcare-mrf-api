@@ -5,6 +5,7 @@ import pytest
 from process.ptg_parts import ptg2_v4_graph_compiler as compiler
 from process.ptg_parts.ptg2_v4_graph_compiler import compile_provider_graph_v4_rust
 from tests.ptg2_v4_graph_compiler_test_support import (
+    compiler_inputs,
     compiler_fixture,
     scanner_binary,
 )
@@ -64,54 +65,59 @@ def test_tax_preload_admission_scales_with_shards_and_disjoint_groups() -> None:
 async def test_wrapper_authenticates_tax_work_and_reuses_checkpoint(
     tmp_path: Path,
 ) -> None:
+    """Authenticate tax-resource evidence and reuse the sealed checkpoint."""
+
     artifacts, provider_map = compiler_fixture(tmp_path)
+    npi_scope, inferred_taxonomy = await compiler_inputs(tmp_path, artifacts)
     output = tmp_path / "compiled"
 
     first = await compile_provider_graph_v4_rust(
         graph_artifact_entries=artifacts,
         provider_set_key_map_path=provider_map,
+        npi_scope=npi_scope,
+        inferred_taxonomy=inferred_taxonomy,
         output_directory=output,
         binary_path=scanner_binary(),
     )
-    assert first.checkpoint_reused is False
-    assert first.resource_admission["factor_edge_count"] == 9
-    assert first.resource_admission["factor_owner_count"] == 7
-    assert (
-        first.resource_admission[
-            "tax_identity_merge_bitmap_upper_bound_bytes"
-        ]
-        == 2
-    )
-    assert (
-        first.resource_admission[
-            "tax_identity_source_ordinal_upper_bound_bytes"
-        ]
-        == 270
-    )
-    assert (
-        first.resource_admission[
-            "tax_identity_projection_upper_bound_bytes"
-        ]
-        == 642
-    )
-    assert first.resource_admission["tax_identity_projection_bytes"] > 0
-    assert first.provider_tax_identity_copy_path.is_file()
-    assert first.provider_group_tax_identity_copy_path.is_file()
-    assert first.summary["tax_identity"]["provider_group_count"] == 2
-    assert first.summary["tax_identity"]["matched_ein_count"] == 1
-    assert first.summary["tax_identity"]["missing_count"] == 1
-    assert first.summary["tax_identity"]["source_bitmap_bytes"] == 1
-    assert first.summary["tax_identity"]["source_ordinal_map"] == [
-        {"shard_id": "shard-a", "ordinal": 0}
-    ]
-    assert (output / "v4-complete.json").is_file()
+    _assert_tax_compilation_evidence(first, output)
 
     second = await compile_provider_graph_v4_rust(
         graph_artifact_entries=artifacts,
         provider_set_key_map_path=provider_map,
+        npi_scope=npi_scope,
+        inferred_taxonomy=inferred_taxonomy,
         output_directory=output,
         binary_path=scanner_binary(),
     )
     assert second.checkpoint_reused is True
     assert second.selected_layout == first.selected_layout
     assert second.selected_encoded_bytes == first.selected_encoded_bytes
+
+
+def _assert_tax_compilation_evidence(compilation, output_directory: Path) -> None:
+    assert compilation.checkpoint_reused is False
+    assert compilation.resource_admission["factor_edge_count"] == 9
+    assert compilation.resource_admission["factor_owner_count"] == 7
+    assert (
+        compilation.resource_admission["tax_identity_merge_bitmap_upper_bound_bytes"]
+        == 2
+    )
+    assert (
+        compilation.resource_admission["tax_identity_source_ordinal_upper_bound_bytes"]
+        == 270
+    )
+    assert (
+        compilation.resource_admission["tax_identity_projection_upper_bound_bytes"]
+        == 642
+    )
+    assert compilation.resource_admission["tax_identity_projection_bytes"] > 0
+    assert compilation.provider_tax_identity_copy_path.is_file()
+    assert compilation.provider_group_tax_identity_copy_path.is_file()
+    assert compilation.summary["tax_identity"]["provider_group_count"] == 2
+    assert compilation.summary["tax_identity"]["matched_ein_count"] == 1
+    assert compilation.summary["tax_identity"]["missing_count"] == 1
+    assert compilation.summary["tax_identity"]["source_bitmap_bytes"] == 1
+    assert compilation.summary["tax_identity"]["source_ordinal_map"] == [
+        {"shard_id": "shard-a", "ordinal": 0}
+    ]
+    assert (output_directory / "v4-complete.json").is_file()

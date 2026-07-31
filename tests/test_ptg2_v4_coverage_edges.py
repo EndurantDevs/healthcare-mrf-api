@@ -4,9 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from process.ptg_parts import ptg2_v4_graph_compiler as compiler
+
 pytest.register_assert_rewrite(
     "tests.ptg2_v4_coverage_graph_audit_cases",
     "tests.ptg2_v4_coverage_graph_compiler_cases",
+    "tests.ptg2_v4_coverage_layout_mutations",
     "tests.ptg2_v4_coverage_prefix_diagnostics",
     "tests.ptg2_v4_coverage_summary_mutations",
     "tests.ptg2_v4_coverage_publication_cases",
@@ -52,9 +55,57 @@ from tests.ptg2_v4_coverage_prefix_diagnostics import (
     test_compiler_rejects_unavailable_factor_artifact,
 )
 from tests.ptg2_v4_coverage_summary_mutations import (
-    test_compiler_progress_rejects_post_terminal_and_backward_events,
     test_compiler_summary_authentication_branch_matrix,
 )
+from tests.ptg2_v4_coverage_layout_mutations import (
+    test_adaptive_layout_digest_binds_every_compiler_option,
+    test_adaptive_layout_evidence_ignores_source_identity,
+    test_adaptive_layout_evidence_uses_complete_candidate_costs,
+    test_adaptive_layout_rejects_cost_digest_and_eligibility_tampering,
+    test_adaptive_layout_rejects_direct_prefix_cap_drift,
+)
+
+
+def test_compiler_progress_rejects_post_terminal_and_backward_events() -> None:
+    """Reject post-terminal, backward, and regressing progress updates."""
+
+    progress_event_by_field = {
+        "version": compiler.PTG2_V4_PROGRESS_VERSION,
+        "seq": 1,
+        "phase": "complete",
+        "done": 1,
+        "total": 1,
+        "unit": "stage",
+        "elapsed_ms": 1,
+        "terminal": True,
+    }
+    terminal_state = compiler._CompilerProgressState()
+    assert terminal_state.is_accepted(progress_event_by_field)
+    assert not terminal_state.is_accepted({**progress_event_by_field, "seq": 2})
+
+    backward_state = compiler._CompilerProgressState(
+        seq=1,
+        phase_index=3,
+        phase="derive_patterns",
+    )
+    assert not backward_state.is_accepted(
+        {
+            **progress_event_by_field,
+            "seq": 2,
+            "phase": "resource_admission",
+            "done": 0,
+            "terminal": False,
+        }
+    )
+    pct_state = compiler._CompilerProgressState(phase_pct=99.0)
+    assert not pct_state.is_accepted(
+        {
+            **progress_event_by_field,
+            "phase": "resource_admission",
+            "done": 0,
+            "terminal": False,
+        }
+    )
 
 
 @pytest.mark.asyncio

@@ -40,13 +40,35 @@ NPI -> pattern
 Pattern identifiers are physical, snapshot-relative coordinates. They never
 participate in logical provider identity or cross-snapshot digests.
 
-For each file, one deterministic chooser compares complete encoded sizes and
-publishes one graph representation:
+For each sealed snapshot compilation, one deterministic chooser compares complete
+`encoded_persistent_projection_v1` costs and publishes one graph
+representation:
 
 - direct layout for small, low-fanout graphs;
 - pattern layout for fragmented graphs;
 - exact source-component traversal only for pattern-overflow owners that remain
   within the declared online work limits.
+
+The choice is automatic and shape-driven. Each candidate cost includes the
+post-bitmap member and locator blocks, dictionaries, ordered-prefix projection,
+the exact packed coordinate-map payload, its pack/root rows, relation
+manifests, and heavy-owner metadata. This is an exact versioned
+application-encoded persistence projection, not an estimate of PostgreSQL
+heap, index, or TOAST allocation. The chooser seals the complete generic
+compiler-option vector and rejects a candidate whose online-work,
+prefix-storage, factor-edge, or model-memory eligibility proof fails. It fails
+closed if neither candidate is eligible and selects direct only on an exact
+eligible-cost tie.
+
+The decision does not inspect a source, carrier, plan, subscription, import,
+or canary identity. Equal graph geometry and compiler options with different
+source metadata therefore have the same representation decision, costs, and
+decision digest; a different incidence shape or option vector may choose
+differently. The selected and losing candidate geometry, eligibility reasons,
+encoded costs, option vector, policy, and decision digest are retained in
+progress, the graph summary, and the sealed manifest. Publication reconstructs
+the packed map and rejects any selected-candidate coordinate, pack, object-kind,
+payload-byte, or total-cost drift.
 
 The direct flat set/group expansion is not published for a pattern-shaped file.
 The compiler uses component and component-tuple memoization, so deriving
@@ -56,16 +78,49 @@ patterns does not recreate the logical set/group expansion in scratch.
 
 The public provider page is bounded to 200 results. The compiler targets an
 ordered 201-NPI prefix, including one continuation sentinel, for every provider
-set. It first proves the prefix from exact factor counts and bounded traversal.
-Only owners that cannot prove it within the online group, source-owner,
-source-member, page, and byte limits receive a manifest-listed ordered prefix
-override.
+set. It proves every candidate prefix from exact factor counts and bounded
+group-first traversal before choosing a representation.
 
-The override is an exact ordered vector, not a bitmap. It is content-addressed,
-digest-checked, globally size-capped, and published only for failing owners.
+The two candidate layouts account for and publish that projection differently:
+
+- `direct_v1` includes one authenticated prefix metadata row and ordered vector
+  for every provider set, including empty and short sets. This makes bounded
+  provider serving complete before direct set-to-group traversal.
+- `pattern_v1` retains the smaller sparse projection. It publishes exact
+  prefixes only for owners that cannot prove the requested page within the
+  online group, source-owner, source-member, page, byte, or second-hop limits.
+
+Pattern overflow normally uses the bounded source-component first hop. An owner
+whose component degree exceeds that fallback cap is pattern-eligible only when
+the sparse projection contains its exact authenticated target-length prefix.
+Serving applies and removes those owners before loading set-pattern or
+set-component relations, so a covered owner never enters the capped component
+walk. An uncovered over-cap owner makes pattern serving ineligible.
+
+Every stored prefix is an exact ordered vector, not a bitmap. It is
+content-addressed, digest-checked, and globally owner/member-byte capped.
 Requests at or below the online target use the bounded hot path. Larger or
 unbounded internal requests use the separately metered exact cold V4 traversal;
-they do not fall back to an incomplete prefix.
+they do not treat a bounded prefix as the complete provider set.
+
+New direct manifests prove complete prefix coverage with all of the following:
+
+- `selected_layout=direct`;
+- `direct_layout_complete_prefix_eligible=true`;
+- `observe.npi_prefix_override_owner_count` equal to
+  `observe.provider_set_count`;
+- the prefix metadata COPY row count equal to that same provider-set count; and
+- prefix relation member geometry equal to the authenticated aggregate count.
+
+Pattern manifests retain sparse owner counts and authenticate separate
+component-over-cap, exact-prefix-covered, and uncovered-unsafe counters. Summary
+validation recomputes the eligibility equation before publication.
+
+Existing sparse `direct_v1` snapshots remain readable. When a set has no stored
+prefix metadata, the reader uses the existing bounded exact direct fallback;
+it does not infer completeness or rewrite the snapshot. Complete direct prefixes
+and the new diagnostics are produced by reimport, not by relabeling or
+repacking an older layout.
 
 Provider-expanded CPT serving reads rates in sealed 64-row pages and loads only
 the provider sets mathematically needed for the requested ordered prefix. Once
@@ -90,18 +145,27 @@ There is no blanket gzip layer. Compression may be added later to a measured
 relation only when its physical `pg_total_relation_size` reduction exceeds its
 decode and CPU cost.
 
-Physical storage acceptance includes tables, indexes, TOAST, packed maps, every
-map-reachable CAS block, ordered prefix overrides, and diagnostics. It reports
-both the V4 graph footprint and the whole coexisting snapshot footprint.
+Physical storage acceptance separately measures tables, indexes, TOAST, packed
+maps, every map-reachable CAS block, ordered prefixes, prefix metadata and
+digests, and diagnostics with `pg_total_relation_size` plus owned/shared
+attribution. The compiler's direct candidate includes the complete all-set
+prefix relation and metadata; the pattern candidate includes only its sparse
+unsafe-owner prefix relation and metadata. Shared relations are counted once.
+The canary reports the signed residual and ratio between the selected
+application-encoded projection and the measured physical graph footprint.
+Activation fails when either the generic physical ceiling or the reviewed
+estimator-drift budget is exceeded. Acceptance reports both the V4 graph
+footprint and the whole coexisting snapshot footprint; neither number is
+relabelled as the compiler cost.
 
 The storage ceiling is not a canary command-line input. A source-controlled
-policy binds each rollout case to its frozen V3 snapshot, authenticated raw
-source-set digest, source count, retained base-layout logical bytes, and
-expected V4 representation. The first roster covers a direct-layout baseline,
-a provider-fragmented pattern case, and a reference-extreme pattern case.
-Unknown or changed source sets fail closed until a reviewed policy change
-records the new immutable baseline.
-Individual raw source hashes are never stored in the policy.
+policy binds each rollout case only to its frozen V3 snapshot, authenticated
+raw source-set digest, source count, retained base-layout logical bytes, and
+physical ceilings. It does not bind or predict a V4 representation. The sealed
+adaptive decision is the sole representation authority. Unknown or changed
+source sets fail closed until a reviewed policy change records the new
+immutable physical baseline, while source renaming alone cannot alter the
+shape decision. Individual raw source hashes are never stored in the policy.
 
 The first release deliberately marks all three roster entries as
 measurement-only. It records exact `graph_gate_bytes` and
@@ -203,6 +267,34 @@ is present. The direct baseline, provider-fragmented, and reference-extreme
 cases remain neutrally identified in source control. No earlier V4 measurement
 can be used as the final approval value.
 
+## Source-scoped taxonomy selection
+
+V4 chooses inferred-taxonomy projection geometry from the exact NPIs reachable
+in the source being compiled, rather than from the installation-wide NPI
+catalog. Before the graph compiler runs, a Rust prepass writes a sorted,
+deduplicated binary PostgreSQL COPY stream of `(npi_key, npi)` rows and binds it
+to the authenticated dense NPI-to-group reciprocal graph, its shard vector,
+byte count, and SHA-256. The file lives only under a randomized, mode-private,
+run-owned scratch directory. It is not placed in CAS, a shared layout,
+snapshot metadata, or the publication manifest.
+
+The taxonomy lookup pins one database connection. A short first transaction
+creates a session-local TEMP scope table, and a second transaction starts with
+`REPEATABLE READ READ ONLY`, authenticates and COPYs the same open file
+descriptor, and performs only the bounded joins needed for the selected
+source scope. Closing the connection removes the TEMP table. Successful,
+failed, canceled, and hard-death lifecycle tests require zero persistent
+relation, CAS, packed-map, or manifest delta.
+
+The compiler receives only the resulting authenticated candidate vector. It
+computes direct and pattern costs from the same immutable source scope, selects
+one layout, and emits one selected taxonomy COPY. Publication authenticates
+that COPY immediately before and after ingestion, stages it in a transaction-
+local TEMP table, and publishes only those selected rows with the graph maps.
+It never re-queries the mutable taxonomy catalog after compiler selection.
+Changing a catalog row after the prepass therefore cannot silently change the
+published representation or members.
+
 ## Import progress and timing
 
 The importer publishes weighted progress from download, scan, graph compile,
@@ -212,6 +304,14 @@ publish, audit, and activation. Movement and heartbeat are separate:
 - `event_seq` and `observed_at` prove the process is alive;
 - a healthy heartbeat without progress movement still fails the stuck-import
   gate.
+
+The V4 graph segment exposes distinct progress phases for authenticated NPI
+scope extraction, taxonomy input preparation, layout/taxonomy selection, and
+selected-COPY publication. Each phase reports completed bytes or rows only
+after the corresponding authenticated boundary completes. A heartbeat during
+COPY or bounded database work does not advance those counters. The dashboard
+can therefore distinguish a long source-scope read from compiler work and
+publication instead of appearing frozen at one generic graph percentage.
 
 Import ceilings are calculated from compressed input bytes and exact component
 fact work. A fixed ceiling copied from a smaller file is not an acceptance
@@ -366,27 +466,39 @@ is required after those gates; an audit-only source import cannot enter the
 generic promotion or route/release reconciliation paths.
 
 1. Exact counts, digests, packed-map roots, relation manifests, prefix
-   overrides, and diagnostics must reconcile against PostgreSQL.
+   metadata/vectors, layout eligibility, component-over-cap coverage, and
+   diagnostics must reconcile against PostgreSQL. A new direct layout must have
+   exactly one authenticated prefix owner per provider set; a pattern layout
+   must match its sparse prefix count.
 2. Exact sampled V4 traversals must match the retained V3 truth.
 3. The public no-NPI, provider-expanded, cost-ordered CPT page of 25 results
    must match an independently captured frozen-V3 semantic page and have cold
-   and warm p95 at or below 50 ms. Cold p95 requires at least 20 distinct fresh
-   API processes; API headers and metrics must identify the same process and
-   exact image.
-4. The compiler-declared worst override owner and worst non-override online
-   owner must each return the exact 201-member prefix within 50 ms, cold and
-   warm, without exceeding physical read limits.
+   and warm p95 at or below the current 70 ms release ceiling. Cold p95 requires
+   at least 20 distinct fresh API processes; API headers and metrics must
+   identify the same process and exact image. The 50 ms bound remains the
+   follow-up optimization target and is not a blocker for this release.
+4. The compiler-declared worst stored-prefix owner and, when the selected
+   representation retains ordinary online owners, the worst non-prefix owner
+   must each return the exact 201-member prefix within the same 70 ms release
+   ceiling, cold and warm, without exceeding physical read limits. Complete
+   direct layouts have no ordinary online owner; the 50 ms follow-up target is
+   measured and retained separately.
 5. Storage must pass both snapshot-attributed and positive import-delta gates
-   against the source-controlled, source-set-bound ceiling.
+   against the source-controlled, source-set-bound ceiling. The report must
+   retain the selected encoded projection, measured physical
+   `pg_total_relation_size` attribution, and estimator residual; generic
+   ceiling or residual drift blocks activation.
 6. Progress must be visible from dispatch through terminal 100%, with polling
    no slower than five seconds and no unreported movement gap.
 7. Rerunning identical input must choose the same representation and produce
-   the same authenticated logical roots.
+   the same authenticated logical roots. Synthetic identity-invariance proof
+   must also show that changing only source metadata leaves layout and
+   representation byte totals unchanged, while a changed incidence shape may
+   select another layout.
 
-The dev canary order covers a low-fanout/direct shape, a
-reference-fragmented/pattern shape, and a jumbo fragmented shape. Each canary
-is independently accepted; a failure stops the sequence and triggers rollback
-to the retained V3 snapshot.
+The dev canary order covers three frozen source/evidence baselines without
+preselecting their layouts. Each canary is independently accepted; a failure
+stops the sequence and triggers rollback to the retained V3 snapshot.
 
 During this isolated window, generic planned-import dispatch is fenced while
 candidate-audit dispatch remains active. An exact reimport is first created

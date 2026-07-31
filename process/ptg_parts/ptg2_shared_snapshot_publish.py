@@ -9,11 +9,13 @@ import hmac
 import json
 import os
 import re
+import shutil
+import stat
 import struct
 import tempfile
 import time
 import uuid
-from contextlib import nullcontext, suppress
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -92,7 +94,10 @@ from process.ptg_parts.ptg2_shared_reuse import (
 from process.ptg_parts.ptg2_source_witness_store import publish_shared_source_witness
 from process.ptg_parts.ptg2_v4_graph_compiler import (
     V4GraphCompilationResult,
+    V4GraphNpiScopePreparation,
     compile_provider_graph_v4_rust,
+    prepare_provider_graph_v4_npi_scope_rust,
+    v4_adaptive_layout_decision_from_summary,
 )
 from process.ptg_parts.ptg2_v4_audit import publish_v4_audit_sample
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
@@ -110,7 +115,8 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
 )
 from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
     V4InferredTaxonomyPublication,
-    publish_v4_inferred_taxonomy_candidates,
+    publish_prepared_v4_inferred_taxonomy_candidates,
+    stage_v4_inferred_taxonomy_compiler_copy,
 )
 
 
@@ -136,9 +142,7 @@ _REQUIRED_PRICE_OBJECT_KINDS = _REQUIRED_OBJECT_KINDS - {
     "graph_group_provider_sets_v1",
     "graph_provider_set_groups_v1",
 }
-_V4_DICTIONARY_PUBLICATION_BATCH_CONTRACT = (
-    "ptg2_v4_dictionary_publication_adaptive_v1"
-)
+_V4_DICTIONARY_PUBLICATION_BATCH_CONTRACT = "ptg2_v4_dictionary_publication_adaptive_v1"
 _V4_DICTIONARY_DEFAULT_RANGE_ROWS = 100_000
 _V4_DICTIONARY_FALLBACK_RANGE_ROWS = 10_000
 _V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES = 16 * 1024 * 1024
@@ -148,20 +152,12 @@ _V4_DICTIONARY_SLOW_STATEMENT_SECONDS = 4.0
 _V4_DICTIONARY_RECOVERY_STATEMENT_SECONDS = 2.0
 _V4_DICTIONARY_HEARTBEAT_SECONDS = 4.0
 _V4_TAX_IDENTITY_MANIFEST_CONTRACT = "ptg2_provider_group_tax_identity_v1"
-_V4_TAX_IDENTITY_PROJECTION_CONTRACT = (
-    "ptg2_provider_tax_identity_projection_v1"
-)
+_V4_TAX_IDENTITY_PROJECTION_CONTRACT = "ptg2_provider_tax_identity_projection_v1"
 _V4_TAX_NORMALIZATION_CONTRACT = "ein_ascii_digits_or_2_7_hyphen_v1"
 _V4_TAX_HMAC_CONTRACT = "hmac_sha256_ptg_tin_v1"
-_V4_TAX_CANDIDATE_PREFIX_CONTRACT = (
-    "tin_id_128=first_16_bytes(tin_hmac_sha256)"
-)
-_V4_TAX_AUTHORITY_CONTRACT = (
-    "tin_hmac_sha256_full_32_bytes_authoritative"
-)
-_V4_TAX_SOURCE_ORDINAL_CONTRACT = (
-    "snapshot_shard_id_sorted_lsb0_bitmap_v1"
-)
+_V4_TAX_CANDIDATE_PREFIX_CONTRACT = "tin_id_128=first_16_bytes(tin_hmac_sha256)"
+_V4_TAX_AUTHORITY_CONTRACT = "tin_hmac_sha256_full_32_bytes_authoritative"
+_V4_TAX_SOURCE_ORDINAL_CONTRACT = "snapshot_shard_id_sorted_lsb0_bitmap_v1"
 _V4_TAX_POLICY_DESCRIPTOR_DOMAIN = b"PTG2V4TINPOLICY\x01"
 _V4_TAX_SOURCE_ORDINAL_DOMAIN = b"PTG2V4TAXORD\x01"
 _V4_TAX_CONTENT_DOMAIN = b"PTG2V4TAXCONTENT\x01"
@@ -276,14 +272,10 @@ class _V4DictionaryPublicationBatchContract:
     contract: str = _V4_DICTIONARY_PUBLICATION_BATCH_CONTRACT
     default_range_rows: int = _V4_DICTIONARY_DEFAULT_RANGE_ROWS
     fallback_range_rows: int = _V4_DICTIONARY_FALLBACK_RANGE_ROWS
-    max_estimated_row_work_bytes: int = (
-        _V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES
-    )
+    max_estimated_row_work_bytes: int = _V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES
     fixed_work_overhead_bytes: int = _V4_DICTIONARY_FIXED_WORK_OVERHEAD_BYTES
     estimated_row_bytes: int = _V4_DICTIONARY_ESTIMATED_ROW_BYTES
-    slow_statement_millis: int = int(
-        _V4_DICTIONARY_SLOW_STATEMENT_SECONDS * 1_000
-    )
+    slow_statement_millis: int = int(_V4_DICTIONARY_SLOW_STATEMENT_SECONDS * 1_000)
     recovery_statement_millis: int = int(
         _V4_DICTIONARY_RECOVERY_STATEMENT_SECONDS * 1_000
     )
@@ -408,9 +400,7 @@ class _MeasuredPublicationProgress:
         metric_name = str(metric or "").strip()
         if not metric_name:
             raise ValueError("publication progress metric must be non-empty")
-        self._totals[metric_name] = (
-            self._totals.get(metric_name, 0) + normalized_amount
-        )
+        self._totals[metric_name] = self._totals.get(metric_name, 0) + normalized_amount
         now = self._clock()
         if now >= self._next_emit_at:
             self.flush(now=now)
@@ -466,6 +456,7 @@ class _V4GraphPublication:
     stored_byte_count: int
     map_summary: V4SnapshotMapSummary
     representation: str
+    adaptive_layout: Mapping[str, Any]
     compiler_summary: Mapping[str, Any]
     dictionary_publication: Mapping[str, Any]
     inferred_taxonomy_candidates: Mapping[str, Any]
@@ -499,7 +490,9 @@ def _validate_authoritative_mapping_summary(
     for publication in lane_publications:
         publication_kinds = tuple(publication.object_kinds)
         if publication_kinds != tuple(sorted(set(publication_kinds))):
-            raise RuntimeError("strict V3 publication lane returned invalid object kinds")
+            raise RuntimeError(
+                "strict V3 publication lane returned invalid object kinds"
+            )
         duplicate_kinds = set(lane_kinds).intersection(publication_kinds)
         if duplicate_kinds:
             raise RuntimeError(
@@ -603,10 +596,9 @@ async def _prepare_price_with_early_finalizer(
     expected_source_identities: Iterable[
         Mapping[str, Any] | SharedPhysicalArtifactIdentity
     ],
-    publish_prepared_price: Callable[
-        [PreparedSharedPriceArtifacts], Awaitable[Any]
-    ]
-    | None = None,
+    publish_prepared_price: (
+        Callable[[PreparedSharedPriceArtifacts], Awaitable[Any]] | None
+    ) = None,
     finalizer_progress_callback: Callable[[str, int], None] | None = None,
 ) -> tuple[
     PreparedSharedPriceArtifacts,
@@ -647,16 +639,12 @@ async def _prepare_price_with_early_finalizer(
         )
     except BaseException:
         prepare_task.cancel()
-        await _await_cleanup_task(
-            asyncio.gather(prepare_task, return_exceptions=True)
-        )
+        await _await_cleanup_task(asyncio.gather(prepare_task, return_exceptions=True))
         prepared_after_cancellation = _completed_prepared_price(prepare_task)
         if prepared_after_cancellation is not None:
             await _await_cleanup_task(
                 asyncio.create_task(
-                    cleanup_prepared_shared_price_artifacts(
-                        prepared_after_cancellation
-                    )
+                    cleanup_prepared_shared_price_artifacts(prepared_after_cancellation)
                 )
             )
         if not price_key_ready.done():
@@ -712,9 +700,7 @@ async def _prepare_price_with_early_finalizer(
         )
         for task in active_tasks:
             task.cancel()
-        await _await_cleanup_task(
-            asyncio.gather(*active_tasks, return_exceptions=True)
-        )
+        await _await_cleanup_task(asyncio.gather(*active_tasks, return_exceptions=True))
         prepared_after_failure = _completed_prepared_price(prepare_task)
         if prepared_after_failure is not None:
             await _await_cleanup_task(
@@ -776,13 +762,13 @@ def _snapshot_source_rows(
         for source_record in source_records
     )
     if any(
-        source_key != source_record["source_key"] or identity.as_dict() != {
+        source_key != source_record["source_key"]
+        or identity.as_dict()
+        != {
             field_name: source_record[field_name]
             for field_name in ("source_type", "identity_kind", "identity_sha256")
         }
-        for source_record, (source_key, identity) in zip(
-            source_records, expected_dense
-        )
+        for source_record, (source_key, identity) in zip(source_records, expected_dense)
     ):
         raise ValueError(
             "strict V3 snapshot source keys do not match physical artifact ordinals"
@@ -847,9 +833,7 @@ async def _persist_logical_snapshot_source_set(
             "snapshot_id": str(snapshot_id),
             "source_set_contract": source_set_by_field["contract"],
             "source_set_count": source_set_by_field["source_count"],
-            "source_set_digest": source_set_by_field[
-                "raw_container_sha256_digest"
-            ],
+            "source_set_digest": source_set_by_field["raw_container_sha256_digest"],
         },
     )
     updated_row = update_result.first()
@@ -888,9 +872,7 @@ async def publish_shared_v3_snapshot_sources(
                 SharedLogicalPlanScope(
                     plan_id=str(scope.plan_id or "").strip(),
                     plan_id_type=str(scope.plan_id_type or "").strip().lower(),
-                    plan_market_type=str(
-                        scope.plan_market_type or ""
-                    ).strip().lower(),
+                    plan_market_type=str(scope.plan_market_type or "").strip().lower(),
                 )
                 for scope in plan_scopes
                 if str(scope.plan_id or "").strip()
@@ -940,8 +922,7 @@ async def publish_shared_v3_snapshot_sources(
         scope = _row_mapping(scope_row)
         if (
             str(scope.get("plan_id") or "") != primary_plan.plan_id
-            or str(scope.get("plan_market_type") or "")
-            != primary_plan.plan_market_type
+            or str(scope.get("plan_market_type") or "") != primary_plan.plan_market_type
             or bytes(scope.get("coverage_scope_id") or b"") != scope_id
         ):
             raise RuntimeError(
@@ -1286,9 +1267,14 @@ def _iter_v4_block_references(path: Path) -> Iterable[SharedBlockReference]:
                 or min(block_key, fragment_no, entry_count, raw_byte_count) < 0
                 or stored_byte_count != raw_byte_count
                 or len(block_hash) != 32
-                or (previous_coordinate is not None and coordinate <= previous_coordinate)
+                or (
+                    previous_coordinate is not None
+                    and coordinate <= previous_coordinate
+                )
             ):
-                raise RuntimeError("PTG V4 graph reference ordering or metadata changed")
+                raise RuntimeError(
+                    "PTG V4 graph reference ordering or metadata changed"
+                )
             previous_coordinate = coordinate
             yield SharedBlockReference(
                 object_kind=object_kind,
@@ -1502,8 +1488,7 @@ async def _validate_v4_dictionary_stage(
         heartbeat_callback=heartbeat_callback,
     )
     if bool(has_out_of_range_key) or (
-        stage.expected_sum is not None
-        and observed_sum != int(stage.expected_sum)
+        stage.expected_sum is not None and observed_sum != int(stage.expected_sum)
     ):
         raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
 
@@ -1531,11 +1516,10 @@ async def _validated_v4_dense_dictionary_sum(
             expected_count=stage.expected_count,
             sizer=sizer,
         )
-        range_summary_result, elapsed_seconds = (
-            await _await_v4_dictionary_statement(
-                session.execute(
-                    db.text(
-                        f"""
+        range_summary_result, elapsed_seconds = await _await_v4_dictionary_statement(
+            session.execute(
+                db.text(
+                    f"""
                         SELECT COUNT(*)::bigint, MIN({key_name}), MAX({key_name}),
                                COALESCE(BOOL_AND({stage.value_predicate}), TRUE),
                                COALESCE(SUM({stage.sum_expression}), 0)::bigint
@@ -1543,11 +1527,10 @@ async def _validated_v4_dense_dictionary_sum(
                          WHERE {key_name} >= :range_start
                            AND {key_name} < :range_end
                         """
-                    ),
-                    {"range_start": range_start, "range_end": range_end},
                 ),
-                heartbeat_callback=heartbeat_callback,
-            )
+                {"range_start": range_start, "range_end": range_end},
+            ),
+            heartbeat_callback=heartbeat_callback,
         )
         range_summary = range_summary_result.one()
         expected_rows = range_end - range_start
@@ -1638,10 +1621,7 @@ async def _validate_v4_sparse_dictionary_stage(
             break
         first_key = int(batch_summary[1])
         last_key = int(batch_summary[2])
-        if (
-            first_key <= previous_key
-            or not bool(batch_summary[3])
-        ):
+        if first_key <= previous_key or not bool(batch_summary[3]):
             raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
         observed_count += batch_count
         observed_sum += int(batch_summary[4])
@@ -1651,8 +1631,7 @@ async def _validate_v4_sparse_dictionary_stage(
             progress_callback("publish_batches", 1)
         sizer.observe(elapsed_seconds)
     if observed_count != int(stage.expected_count) or (
-        stage.expected_sum is not None
-        and observed_sum != int(stage.expected_sum)
+        stage.expected_sum is not None and observed_sum != int(stage.expected_sum)
     ):
         raise RuntimeError("PTG V4 dictionary COPY changed or duplicated keys")
 
@@ -1718,11 +1697,10 @@ async def _publish_v4_dictionary_stage_ranges(
             ),
             heartbeat_callback=heartbeat_callback,
         )
-        matching_count, verification_seconds = (
-            await _await_v4_dictionary_statement(
-                session.scalar(
-                    db.text(
-                        f"""
+        matching_count, verification_seconds = await _await_v4_dictionary_statement(
+            session.scalar(
+                db.text(
+                    f"""
                         SELECT COUNT(*)::bigint
                           FROM {schema}.{stage_table} AS staged
                           JOIN {schema}.{target_table} AS stored
@@ -1731,11 +1709,10 @@ async def _publish_v4_dictionary_stage_ranges(
                          WHERE staged.{key_name} >= :range_start
                            AND staged.{key_name} < :range_end
                         """
-                    ),
-                    range_parameters_by_name,
                 ),
-                heartbeat_callback=heartbeat_callback,
-            )
+                range_parameters_by_name,
+            ),
+            heartbeat_callback=heartbeat_callback,
         )
         expected_rows = range_end - range_start
         if int(matching_count or 0) != expected_rows:
@@ -1883,11 +1860,10 @@ async def _matching_v4_sparse_batch_count(
 ) -> tuple[int, float]:
     """Count exact target rows for one sparse batch."""
 
-    matching_count, verification_seconds = (
-        await _await_v4_dictionary_statement(
-            session.scalar(
-                db.text(
-                    f"""
+    matching_count, verification_seconds = await _await_v4_dictionary_statement(
+        session.scalar(
+            db.text(
+                f"""
                     SELECT COUNT(*)::bigint
                       FROM {schema}.{stage_table} AS staged
                       JOIN {schema}.{target_table} AS stored
@@ -1896,11 +1872,10 @@ async def _matching_v4_sparse_batch_count(
                      WHERE staged.{key_name} > :previous_key
                        AND staged.{key_name} <= :last_key
                     """
-                ),
-                parameters_by_name,
             ),
-            heartbeat_callback=heartbeat_callback,
-        )
+            parameters_by_name,
+        ),
+        heartbeat_callback=heartbeat_callback,
     )
     return int(matching_count or 0), verification_seconds
 
@@ -1936,20 +1911,17 @@ async def _publish_v4_sparse_batch(
         parameters_by_name=parameters_by_name,
         heartbeat_callback=heartbeat_callback,
     )
-    matching_count, verification_seconds = (
-        await _matching_v4_sparse_batch_count(
-            session,
-            schema=schema,
-            stage_table=stage_table,
-            target_table=target_table,
-            key_name=key_name,
-            matching_columns=" AND ".join(
-                f"stored.{column} = staged.{column}"
-                for column in quoted_columns
-            ),
-            parameters_by_name=parameters_by_name,
-            heartbeat_callback=heartbeat_callback,
-        )
+    matching_count, verification_seconds = await _matching_v4_sparse_batch_count(
+        session,
+        schema=schema,
+        stage_table=stage_table,
+        target_table=target_table,
+        key_name=key_name,
+        matching_columns=" AND ".join(
+            f"stored.{column} = staged.{column}" for column in quoted_columns
+        ),
+        parameters_by_name=parameters_by_name,
+        heartbeat_callback=heartbeat_callback,
     )
     return matching_count, max(insert_seconds, verification_seconds)
 
@@ -2033,16 +2005,14 @@ async def _publish_v4_sparse_ranges(
         estimated_row_bytes=stage.estimated_row_bytes,
     )
     while True:
-        batch_count, last_key, boundary_seconds = (
-            await _v4_sparse_batch_boundary(
-                session,
-                schema=schema,
-                stage_table=stage_table,
-                key_name=key_name,
-                previous_key=previous_key,
-                batch_rows=sizer.current_rows,
-                heartbeat_callback=heartbeat_callback,
-            )
+        batch_count, last_key, boundary_seconds = await _v4_sparse_batch_boundary(
+            session,
+            schema=schema,
+            stage_table=stage_table,
+            key_name=key_name,
+            previous_key=previous_key,
+            batch_rows=sizer.current_rows,
+            heartbeat_callback=heartbeat_callback,
         )
         if batch_count == 0 or last_key is None:
             break
@@ -2063,6 +2033,31 @@ async def _publish_v4_sparse_ranges(
             progress_callback("published_dictionary_rows", batch_count)
             progress_callback("publish_batches", 1)
         sizer.observe(max(boundary_seconds, publication_seconds))
+    await _validate_v4_sparse_target(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        target_table=target_table,
+        key_name=key_name,
+        stage=stage,
+        published_count=published_count,
+        heartbeat_callback=heartbeat_callback,
+    )
+
+
+async def _validate_v4_sparse_target(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    target_table: str,
+    key_name: str,
+    stage: _V4DenseDictionaryStage,
+    published_count: int,
+    heartbeat_callback: Callable[[], None] | None,
+) -> None:
+    """Verify that sparse publication retained exactly the authenticated keys."""
+
     target_count = await _count_v4_target_keys(
         session,
         schema=schema,
@@ -2073,9 +2068,8 @@ async def _publish_v4_sparse_ranges(
         estimated_row_bytes=stage.estimated_row_bytes,
         heartbeat_callback=heartbeat_callback,
     )
-    if (
-        published_count != int(stage.expected_count)
-        or int(target_count or 0) != int(stage.expected_count)
+    if published_count != int(stage.expected_count) or int(target_count or 0) != int(
+        stage.expected_count
     ):
         raise RuntimeError("PTG V4 persisted dictionary rows changed")
 
@@ -2129,9 +2123,7 @@ def _v4_tax_source_ordinal_digest(
             or not isinstance(entry.get("shard_id"), str)
             or not entry["shard_id"]
         ):
-            raise RuntimeError(
-                "PTG V4 tax identity source ordinal map changed"
-            )
+            raise RuntimeError("PTG V4 tax identity source ordinal map changed")
         encoded_shard_id = entry["shard_id"].encode("utf-8")
         digest.update(struct.pack(">I", len(encoded_shard_id)))
         digest.update(encoded_shard_id)
@@ -2142,18 +2134,12 @@ def _v4_tax_source_ordinal_digest(
 def _v4_tax_summary_digest(value: Any, label: str) -> bytes:
     """Decode one exact lowercase SHA-256 field."""
 
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or value.lower() != value
-    ):
+    if not isinstance(value, str) or len(value) != 64 or value.lower() != value:
         raise RuntimeError(f"PTG V4 tax identity {label} changed")
     try:
         decoded = bytes.fromhex(value)
     except ValueError as exc:
-        raise RuntimeError(
-            f"PTG V4 tax identity {label} changed"
-        ) from exc
+        raise RuntimeError(f"PTG V4 tax identity {label} changed") from exc
     if len(decoded) != 32:
         raise RuntimeError(f"PTG V4 tax identity {label} changed")
     return decoded
@@ -2176,18 +2162,15 @@ def _has_expected_v4_tax_contract(
 
     return (
         set(tax_summary) == _V4_TAX_SUMMARY_FIELDS
-        and tax_summary.get("contract")
-        == _V4_TAX_IDENTITY_PROJECTION_CONTRACT
+        and tax_summary.get("contract") == _V4_TAX_IDENTITY_PROJECTION_CONTRACT
         and isinstance(token_policy_id, str)
         and _V4_TAX_POLICY_ID.fullmatch(token_policy_id) is not None
         and len(token_policy_id.encode("ascii")) <= 55
-        and tax_summary.get("normalization_contract")
-        == _V4_TAX_NORMALIZATION_CONTRACT
+        and tax_summary.get("normalization_contract") == _V4_TAX_NORMALIZATION_CONTRACT
         and tax_summary.get("hmac_contract") == _V4_TAX_HMAC_CONTRACT
         and tax_summary.get("candidate_prefix_contract")
         == _V4_TAX_CANDIDATE_PREFIX_CONTRACT
-        and tax_summary.get("authority_contract")
-        == _V4_TAX_AUTHORITY_CONTRACT
+        and tax_summary.get("authority_contract") == _V4_TAX_AUTHORITY_CONTRACT
         and tax_summary.get("source_ordinal_contract")
         == _V4_TAX_SOURCE_ORDINAL_CONTRACT
     )
@@ -2202,41 +2185,31 @@ def _v4_tax_contract_header(
     if not _has_expected_v4_tax_contract(tax_summary, token_policy_id):
         raise RuntimeError("PTG V4 tax identity contract changed")
     raw_source_ordinals = tax_summary.get("source_ordinal_map")
-    if (
-        not isinstance(raw_source_ordinals, list)
-        or not raw_source_ordinals
-    ):
+    if not isinstance(raw_source_ordinals, list) or not raw_source_ordinals:
         raise RuntimeError("PTG V4 tax identity source map changed")
     source_ordinals = tuple(
         dict(entry) if isinstance(entry, Mapping) else entry
         for entry in raw_source_ordinals
     )
     source_shard_ids = tuple(
-        entry.get("shard_id")
-        for entry in source_ordinals
-        if isinstance(entry, Mapping)
+        entry.get("shard_id") for entry in source_ordinals if isinstance(entry, Mapping)
     )
     if source_shard_ids != tuple(sorted(set(source_shard_ids))):
         raise RuntimeError("PTG V4 tax identity source map changed")
-    source_ordinal_map_digest = _v4_tax_source_ordinal_digest(
-        source_ordinals
-    )
+    source_ordinal_map_digest = _v4_tax_source_ordinal_digest(source_ordinals)
     token_policy_descriptor = _v4_tax_policy_descriptor(token_policy_id)
-    if (
-        not hmac.compare_digest(
-            token_policy_descriptor,
-            _v4_tax_summary_digest(
-                tax_summary.get("token_policy_descriptor_sha256"),
-                "policy descriptor",
-            ),
-        )
-        or not hmac.compare_digest(
-            source_ordinal_map_digest,
-            _v4_tax_summary_digest(
-                tax_summary.get("source_ordinal_map_digest"),
-                "source ordinal digest",
-            ),
-        )
+    if not hmac.compare_digest(
+        token_policy_descriptor,
+        _v4_tax_summary_digest(
+            tax_summary.get("token_policy_descriptor_sha256"),
+            "policy descriptor",
+        ),
+    ) or not hmac.compare_digest(
+        source_ordinal_map_digest,
+        _v4_tax_summary_digest(
+            tax_summary.get("source_ordinal_map_digest"),
+            "source ordinal digest",
+        ),
     ):
         raise RuntimeError("PTG V4 tax identity descriptor changed")
     return (
@@ -2254,16 +2227,9 @@ def _v4_tax_contract_counts(
 ) -> Mapping[str, int]:
     """Validate source width and exact per-state publication counts."""
 
-    source_shard_count = _v4_tax_summary_count(
-        tax_summary, "source_shard_count"
-    )
-    source_bitmap_bytes = _v4_tax_summary_count(
-        tax_summary, "source_bitmap_bytes"
-    )
-    if (
-        source_bitmap_bytes != (source_shard_count + 7) // 8
-        or source_shard_count <= 0
-    ):
+    source_shard_count = _v4_tax_summary_count(tax_summary, "source_shard_count")
+    source_bitmap_bytes = _v4_tax_summary_count(tax_summary, "source_bitmap_bytes")
+    if source_bitmap_bytes != (source_shard_count + 7) // 8 or source_shard_count <= 0:
         raise RuntimeError("PTG V4 tax identity source shape changed")
     count_by_name = {
         name: _v4_tax_summary_count(tax_summary, name)
@@ -2287,8 +2253,7 @@ def _v4_tax_contract_counts(
             )
         )
         != count_by_name["provider_group_count"]
-        or count_by_name["tax_identity_count"]
-        > count_by_name["matched_ein_count"]
+        or count_by_name["tax_identity_count"] > count_by_name["matched_ein_count"]
         or count_by_name["provider_group_count"] != expected_group_count
     ):
         raise RuntimeError("PTG V4 tax identity counts changed")
@@ -2315,9 +2280,7 @@ def _validated_v4_tax_identity_contract(
     ) = _v4_tax_contract_header(tax_summary)
     count_by_name = _v4_tax_contract_counts(
         tax_summary,
-        expected_group_count=int(
-            compilation.observe.get("group_count") or 0
-        ),
+        expected_group_count=int(compilation.observe.get("group_count") or 0),
     )
     if count_by_name["source_shard_count"] != len(source_ordinals):
         raise RuntimeError("PTG V4 tax identity source shape changed")
@@ -2355,9 +2318,7 @@ def _v4_tax_artifact_byte_count(
     )
     if any(name not in artifact_by_name for name in expected_names):
         raise RuntimeError("PTG V4 tax identity artifacts are missing")
-    return sum(
-        int(artifact_by_name[name].byte_count) for name in expected_names
-    )
+    return sum(int(artifact_by_name[name].byte_count) for name in expected_names)
 
 
 def _v4_tax_result_rows(result: Any) -> tuple[Any, ...]:
@@ -2496,20 +2457,14 @@ def _validated_v4_tax_group_row(
         or (
             tax_state == "matched_ein"
             and (
-                tin_key is None
-                or tin_key < 0
-                or tin_key >= contract.tax_identity_count
+                tin_key is None or tin_key < 0 or tin_key >= contract.tax_identity_count
             )
         )
         or (tax_state != "matched_ein" and tin_key is not None)
     ):
         raise RuntimeError("PTG V4 provider-group tax identity changed")
-    unused_bits = (
-        contract.source_bitmap_bytes * 8 - contract.source_shard_count
-    )
-    if unused_bits and (
-        source_bitmap[-1] & (0xFF << (8 - unused_bits))
-    ):
+    unused_bits = contract.source_bitmap_bytes * 8 - contract.source_shard_count
+    if unused_bits and (source_bitmap[-1] & (0xFF << (8 - unused_bits))):
         raise RuntimeError("PTG V4 provider-group source bitmap changed")
     return group_id, tax_state, tin_key, source_bitmap
 
@@ -2589,12 +2544,10 @@ def _consume_v4_tax_group_rows(
     latest_group_id = previous_group_id
     newly_referenced_tokens = 0
     for group_row in group_rows:
-        group_id, tax_state, tin_key, source_bitmap = (
-            _validated_v4_tax_group_row(
-                group_row,
-                previous_group_id=latest_group_id,
-                contract=contract,
-            )
+        group_id, tax_state, tin_key, source_bitmap = _validated_v4_tax_group_row(
+            group_row,
+            previous_group_id=latest_group_id,
+            contract=contract,
         )
         _append_v4_tax_group_digest(
             content_digest,
@@ -2619,10 +2572,7 @@ def _tax_group_row_estimate(
 ) -> int:
     """Estimate one group-tax validation row including its source bitmap."""
 
-    return (
-        _V4_DICTIONARY_ESTIMATED_ROW_BYTES
-        + int(contract.source_bitmap_bytes)
-    )
+    return _V4_DICTIONARY_ESTIMATED_ROW_BYTES + int(contract.source_bitmap_bytes)
 
 
 async def _validate_v4_tax_group_rows(
@@ -2765,15 +2715,11 @@ def _v4_tax_manifest_values(
         "snapshot_key": int(snapshot_key),
         "contract": _V4_TAX_IDENTITY_MANIFEST_CONTRACT,
         "token_policy_id": contract.token_policy_id,
-        "token_policy_descriptor_sha256": (
-            contract.token_policy_descriptor_sha256
-        ),
+        "token_policy_descriptor_sha256": (contract.token_policy_descriptor_sha256),
         "normalization_contract": _V4_TAX_NORMALIZATION_CONTRACT,
         "hmac_contract": _V4_TAX_HMAC_CONTRACT,
         "source_ordinal_contract": _V4_TAX_SOURCE_ORDINAL_CONTRACT,
-        "source_ordinal_map": [
-            dict(entry) for entry in contract.source_ordinal_map
-        ],
+        "source_ordinal_map": [dict(entry) for entry in contract.source_ordinal_map],
         "source_ordinal_map_digest": contract.source_ordinal_map_digest,
         "source_shard_count": contract.source_shard_count,
         "provider_group_count": contract.provider_group_count,
@@ -2804,9 +2750,11 @@ async def _insert_v4_tax_manifest(
     }
     columns = tuple(expected_by_name)
     value_expressions = tuple(
-        "CAST(:source_ordinal_map AS jsonb)"
-        if column == "source_ordinal_map"
-        else f":{column}"
+        (
+            "CAST(:source_ordinal_map AS jsonb)"
+            if column == "source_ordinal_map"
+            else f":{column}"
+        )
         for column in columns
     )
     await session.execute(
@@ -2962,11 +2910,10 @@ async def _publish_v4_tax_group_batch(
         ),
         heartbeat_callback=heartbeat_callback,
     )
-    matching_count, verification_seconds = (
-        await _await_v4_dictionary_statement(
-            session.scalar(
-                db.text(
-                    f"""
+    matching_count, verification_seconds = await _await_v4_dictionary_statement(
+        session.scalar(
+            db.text(
+                f"""
                     SELECT COUNT(*)::bigint
                       FROM {schema}.{stage} AS staged
                       JOIN {schema}.ptg2_provider_group_tax_identity AS stored
@@ -2979,11 +2926,10 @@ async def _publish_v4_tax_group_batch(
                      WHERE staged.provider_group_global_id_128 > :previous_group_id
                        AND staged.provider_group_global_id_128 <= :last_group_id
                     """
-                ),
-                parameters_by_name,
             ),
-            heartbeat_callback=heartbeat_callback,
-        )
+            parameters_by_name,
+        ),
+        heartbeat_callback=heartbeat_callback,
     )
     return (
         int(matching_count or 0),
@@ -3013,13 +2959,10 @@ async def _reject_tax_group_count(
         estimated_row_bytes=estimated_row_bytes,
         heartbeat_callback=heartbeat_callback,
     )
-    if (
-        int(published_count) != int(expected_count)
-        or int(target_count or 0) != int(expected_count)
+    if int(published_count) != int(expected_count) or int(target_count or 0) != int(
+        expected_count
     ):
-        raise RuntimeError(
-            "PTG V4 persisted provider-group tax identity changed"
-        )
+        raise RuntimeError("PTG V4 persisted provider-group tax identity changed")
 
 
 async def _publish_tax_group_ranges(
@@ -3062,9 +3005,7 @@ async def _publish_tax_group_ranges(
             heartbeat_callback=heartbeat_callback,
         )
         if matching_count != batch_count:
-            raise RuntimeError(
-                "PTG V4 persisted provider-group tax identity changed"
-            )
+            raise RuntimeError("PTG V4 persisted provider-group tax identity changed")
         published_count += batch_count
         previous_group_id = last_group_id
         if progress_callback is not None:
@@ -3089,8 +3030,7 @@ async def _publish_v4_tax_group_ranges(
     stage = _quote_ident(stage_table)
     sizer = _V4DictionaryBatchSizer(
         estimated_row_bytes=(
-            _V4_DICTIONARY_ESTIMATED_ROW_BYTES
-            + max(int(source_bitmap_bytes), 0)
+            _V4_DICTIONARY_ESTIMATED_ROW_BYTES + max(int(source_bitmap_bytes), 0)
         ),
     )
     published_count = await _publish_tax_group_ranges(
@@ -3109,35 +3049,435 @@ async def _publish_v4_tax_group_ranges(
         expected_count=expected_count,
         published_count=published_count,
         estimated_row_bytes=(
-            _V4_DICTIONARY_ESTIMATED_ROW_BYTES
-            + max(int(source_bitmap_bytes), 0)
+            _V4_DICTIONARY_ESTIMATED_ROW_BYTES + max(int(source_bitmap_bytes), 0)
         ),
         heartbeat_callback=heartbeat_callback,
     )
 
 
-async def _publish_v4_taxonomy_sidecar(
+@dataclass(frozen=True)
+class _V4CompilerCopySpec:
+    schema_name: str
+    stage_table: str
+    columns: tuple[str, ...]
+    expected_byte_count: int
+    expected_sha256: str
+    label: str
+
+
+class _V4MeasuredCopyReader:
+    """Report exact bytes handed to PostgreSQL from one authenticated file."""
+
+    def __init__(
+        self,
+        source: Any,
+        progress_callback: Callable[[str, int], None] | None,
+    ) -> None:
+        self._source = source
+        self._progress_callback = progress_callback
+
+    def read(self, size: int = -1) -> bytes:
+        """Read and report bytes from the already-authenticated descriptor."""
+
+        chunk = self._source.read(size)
+        if chunk and self._progress_callback is not None:
+            self._progress_callback("copy_bytes", len(chunk))
+        return chunk
+
+
+@contextmanager
+def _authenticated_v4_copy_file(
+    path: Path,
+    spec: _V4CompilerCopySpec,
+):
+    """Open one regular compiler file without following a replaced symlink."""
+
+    try:
+        path_metadata = path.lstat()
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise RuntimeError(f"PTG V4 {spec.label} is unavailable") from exc
+    copy_file = os.fdopen(descriptor, "rb")
+    try:
+        opened_metadata = os.fstat(copy_file.fileno())
+        _validate_v4_copy_file(
+            copy_file,
+            opened_metadata,
+            spec,
+            path_metadata=path_metadata,
+            phase="at COPY open",
+        )
+        yield copy_file, opened_metadata
+    finally:
+        copy_file.close()
+
+
+def _validate_v4_copy_file(
+    copy_file: Any,
+    observed_metadata: os.stat_result,
+    spec: _V4CompilerCopySpec,
+    *,
+    path_metadata: os.stat_result,
+    phase: str,
+) -> None:
+    """Authenticate one open descriptor against its expected file identity."""
+
+    copy_file.seek(0)
+    observed_sha256 = _sha256_path_from_open_file(copy_file)
+    if (
+        stat.S_ISLNK(path_metadata.st_mode)
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or observed_metadata.st_dev != path_metadata.st_dev
+        or observed_metadata.st_ino != path_metadata.st_ino
+        or observed_metadata.st_size != spec.expected_byte_count
+        or observed_metadata.st_mtime_ns != path_metadata.st_mtime_ns
+        or observed_sha256 != spec.expected_sha256
+    ):
+        raise RuntimeError(f"PTG V4 {spec.label} changed {phase}")
+
+
+async def _copy_authenticated_v4_compiler_input(
     session: Any,
+    path: Path,
+    *,
+    spec: _V4CompilerCopySpec,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
+    """Authenticate the same open descriptor before and after binary COPY."""
+
+    with _authenticated_v4_copy_file(path, spec) as (
+        copy_file,
+        opened_metadata,
+    ):
+        copy_file.seek(0)
+        connection = await session.connection()
+        raw_connection = await connection.get_raw_connection()
+        driver_connection = getattr(
+            raw_connection,
+            "driver_connection",
+            raw_connection,
+        )
+        copy_to_table = getattr(
+            driver_connection,
+            "copy_to_table",
+            None,
+        )
+        if copy_to_table is None:
+            raise NotImplementedError(
+                "active database driver does not expose binary COPY"
+            )
+        await copy_to_table(
+            spec.stage_table,
+            source=_V4MeasuredCopyReader(copy_file, progress_callback),
+            schema_name=spec.schema_name,
+            columns=list(spec.columns),
+            format="binary",
+        )
+        _validate_v4_copy_file(
+            copy_file,
+            os.fstat(copy_file.fileno()),
+            spec,
+            path_metadata=opened_metadata,
+            phase="during COPY",
+        )
+
+
+@asynccontextmanager
+async def _v4_taxonomy_scope_session(stage_table: str):
+    """Pin one backend across TEMP creation and the read-only source lookup."""
+
+    if db.engine is None or db.session_factory is None:
+        await db.connect()
+    if db.engine is None or db.session_factory is None:
+        raise RuntimeError("PTG V4 taxonomy database is unavailable")
+    quoted_stage = _quote_ident(stage_table)
+    async with db.engine.connect() as connection:
+        session = db.session_factory(bind=connection)
+        try:
+            async with session.begin():
+                await session.execute(
+                    db.text(
+                        f"CREATE TEMP TABLE {quoted_stage} "
+                        "(npi_key integer PRIMARY KEY CHECK (npi_key >= 0), "
+                        " npi bigint NOT NULL UNIQUE "
+                        " CHECK (npi BETWEEN 1000000000 AND 9999999999)) "
+                        "ON COMMIT PRESERVE ROWS"
+                    )
+                )
+            async with session.begin():
+                await session.execute(
+                    db.text(
+                        "SET TRANSACTION ISOLATION LEVEL " "REPEATABLE READ READ ONLY"
+                    )
+                )
+                yield session
+        finally:
+            cleanup_task = asyncio.create_task(
+                _close_v4_taxonomy_scope(
+                    session,
+                    connection,
+                    quoted_stage,
+                )
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+                raise
+
+
+async def _close_v4_taxonomy_scope(
+    session: Any,
+    connection: Any,
+    quoted_stage: str,
+) -> None:
+    """Drop one run-owned TEMP scope or invalidate its pinned connection."""
+
+    try:
+        if session.in_transaction():
+            await session.rollback()
+        async with session.begin():
+            await session.execute(db.text(f"DROP TABLE IF EXISTS {quoted_stage}"))
+    except BaseException:
+        await session.close()
+        await connection.invalidate()
+        raise
+    await session.close()
+
+
+def _sha256_path_from_open_file(source: Any) -> str:
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _v4_taxonomy_copy_progress(
+    progress_callback: Callable[[str, Mapping[str, int]], None] | None,
+) -> Callable[[str, int], None] | None:
+    """Adapt exact COPY byte movement to the importer progress contract."""
+
+    if progress_callback is None:
+        return None
+
+    def report_copy_progress(name: str, count: int) -> None:
+        """Forward one measured taxonomy COPY counter."""
+
+        progress_callback(
+            "taxonomy input preparation",
+            {str(name): int(count)},
+        )
+
+    return report_copy_progress
+
+
+def _taxonomy_input_complete(
+    prepared_input: Mapping[str, Any],
+    progress_callback: Callable[[str, Mapping[str, int]], None] | None,
+) -> None:
+    """Report the authenticated taxonomy-input boundary exactly once."""
+
+    if progress_callback is None:
+        return
+    member_contract = _mapping(
+        prepared_input.get("members"),
+        "taxonomy member artifact",
+    )
+    rule_contracts = prepared_input.get("rules")
+    if not isinstance(rule_contracts, list):
+        raise RuntimeError("PTG V4 taxonomy preparation rules changed")
+    progress_callback(
+        "taxonomy input preparation",
+        {
+            "completed_rows": sum(
+                int(_mapping(rule, "taxonomy rule")["member_count"])
+                for rule in rule_contracts
+            ),
+            "completed_bytes": int(member_contract["byte_count"]),
+            "completed_batches": 1,
+        },
+    )
+
+
+def _taxonomy_copy_complete(
+    compilation: V4GraphCompilationResult,
+    progress_callback: Callable[[str, Mapping[str, int]], None] | None,
+) -> None:
+    """Report the selected taxonomy COPY only after publication succeeds."""
+
+    if progress_callback is None:
+        return
+    taxonomy_artifact = _v4_compiler_artifact(
+        compilation,
+        "inferred_taxonomy_candidates",
+    )
+    progress_callback(
+        "selected taxonomy copy publication",
+        {
+            "published_rows": int(taxonomy_artifact.row_count),
+            "published_bytes": int(taxonomy_artifact.byte_count),
+            "completed_batches": 1,
+        },
+    )
+
+
+async def _wait_for_v4_graph_compilation(
+    compile_task: asyncio.Task[V4GraphCompilationResult],
+    touch_build: Callable[[], Awaitable[Any]],
+) -> V4GraphCompilationResult:
+    """Wait for native compilation while retaining the shared-build lease."""
+
+    while True:
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(compile_task),
+                timeout=30.0,
+            )
+        except TimeoutError:
+            await touch_build()
+
+
+def _cleanup_v4_graph_inputs(
+    input_directory: Path,
+    npi_scope: V4GraphNpiScopePreparation | None,
+    taxonomy_input: Mapping[str, Any] | None,
+) -> None:
+    """Remove every run-owned compiler input after success or failure."""
+
+    if taxonomy_input is not None:
+        Path(str(taxonomy_input["members"]["path"])).unlink(missing_ok=True)
+    if npi_scope is not None:
+        npi_scope.cleanup()
+    shutil.rmtree(input_directory, ignore_errors=True)
+
+
+async def _compile_v4_provider_graph(
+    *,
+    graph_artifact_entries: Iterable[Mapping[str, Any]],
+    provider_set_key_map_path: Path,
+    work_directory: Path,
+    schema_name: str,
+    touch_build: Callable[[], Awaitable[Any]],
+    progress_callback: Callable[[str, Mapping[str, int]], None] | None,
+) -> V4GraphCompilationResult:
+    """Prepare, compile, and always remove one adaptive V4 input bundle."""
+
+    input_directory = work_directory / f"provider-graph-v4-input-{uuid.uuid4().hex}"
+    input_directory.mkdir(mode=0o700)
+    npi_scope: V4GraphNpiScopePreparation | None = None
+    taxonomy_input: Mapping[str, Any] | None = None
+    compile_task: asyncio.Task[V4GraphCompilationResult] | None = None
+    try:
+        npi_scope = await prepare_provider_graph_v4_npi_scope_rust(
+            graph_artifact_entries=graph_artifact_entries,
+            output_path=input_directory / "npi-scope.copy",
+        )
+        await touch_build()
+        taxonomy_input = await _prepare_v4_taxonomy_compiler_input(
+            npi_scope,
+            schema_name=schema_name,
+            work_directory=input_directory,
+            progress_callback=progress_callback,
+        )
+        await touch_build()
+        compile_task = asyncio.create_task(
+            compile_provider_graph_v4_rust(
+                graph_artifact_entries=npi_scope.graph_artifact_entries,
+                provider_set_key_map_path=provider_set_key_map_path,
+                npi_scope=npi_scope,
+                inferred_taxonomy=taxonomy_input,
+                output_directory=work_directory / "provider-graph-v4-native",
+            )
+        )
+        return await _wait_for_v4_graph_compilation(compile_task, touch_build)
+    finally:
+        if compile_task is not None and not compile_task.done():
+            compile_task.cancel()
+            await asyncio.gather(compile_task, return_exceptions=True)
+        _cleanup_v4_graph_inputs(input_directory, npi_scope, taxonomy_input)
+
+
+async def _copy_v4_taxonomy_scope(
+    session: Any,
+    npi_scope: V4GraphNpiScopePreparation,
+    *,
+    stage_table: str,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
+    """COPY and validate one authenticated dense source-local NPI scope."""
+
+    scope_manifest = npi_scope.manifest
+    await _copy_authenticated_v4_compiler_input(
+        session,
+        npi_scope.copy_path,
+        spec=_V4CompilerCopySpec(
+            schema_name="pg_temp",
+            stage_table=stage_table,
+            columns=("npi_key", "npi"),
+            expected_byte_count=int(scope_manifest["output_byte_count"]),
+            expected_sha256=str(scope_manifest["output_sha256"]),
+            label="NPI scope prepass",
+        ),
+        progress_callback=progress_callback,
+    )
+    temporary_schema = _quote_ident("pg_temp")
+    quoted_stage = _quote_ident(stage_table)
+    scope_result = await session.execute(
+        db.text(
+            f"SELECT COUNT(*)::bigint, "
+            f"COUNT(DISTINCT npi_key)::bigint, "
+            f"COUNT(DISTINCT npi)::bigint "
+            f"FROM {temporary_schema}.{quoted_stage}"
+        )
+    )
+    expected_count = int(scope_manifest["row_count"])
+    if tuple(map(int, scope_result.one())) != (
+        expected_count,
+        expected_count,
+        expected_count,
+    ):
+        raise RuntimeError("PTG V4 NPI scope stage changed before taxonomy lookup")
+
+
+async def _prepare_v4_taxonomy_compiler_input(
+    npi_scope: V4GraphNpiScopePreparation,
     *,
     schema_name: str,
-    snapshot_key: int,
-    build_token: str,
-    npi_count: int,
-    representation: str,
-    pattern_count: int,
-) -> V4InferredTaxonomyPublication:
-    """Publish taxonomy evidence against the exact building-root identity."""
+    work_directory: Path,
+    progress_callback: Callable[[str, Mapping[str, int]], None] | None,
+) -> Mapping[str, Any]:
+    """Resolve bounded taxonomy evidence from one immutable scope transaction."""
 
-    return await publish_v4_inferred_taxonomy_candidates(
-        session,
-        schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
-        build_token=build_token,
-        rules=INFERRED_PROVIDER_TAXONOMY_RULES,
-        npi_count=int(npi_count),
-        representation=representation,
-        pattern_count=int(pattern_count),
+    from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
+        prepare_v4_inferred_taxonomy_compiler_input,
     )
+
+    stage_table = f"ptg2_v4_npi_scope_input_{uuid.uuid4().hex[:20]}"
+    members_path = work_directory / "v4-inferred-taxonomy-members.u32le"
+    members_path.unlink(missing_ok=True)
+    try:
+        scope_manifest = npi_scope.manifest
+        async with _v4_taxonomy_scope_session(stage_table) as session:
+            await _copy_v4_taxonomy_scope(
+                session,
+                npi_scope,
+                stage_table=stage_table,
+                progress_callback=_v4_taxonomy_copy_progress(progress_callback),
+            )
+            prepared_input = await prepare_v4_inferred_taxonomy_compiler_input(
+                session,
+                schema_name=schema_name,
+                npi_scope_stage_table=stage_table,
+                npi_scope_stage_schema_name="pg_temp",
+                npi_scope_sha256=str(scope_manifest["output_sha256"]),
+                rules=INFERRED_PROVIDER_TAXONOMY_RULES,
+                members_path=members_path,
+            )
+            _taxonomy_input_complete(prepared_input, progress_callback)
+            return prepared_input
+    except BaseException:
+        members_path.unlink(missing_ok=True)
+        raise
 
 
 async def _drop_v4_dictionary_stages(
@@ -3151,9 +3491,7 @@ async def _drop_v4_dictionary_stages(
         return
     await db.status(
         "DROP TABLE IF EXISTS "
-        + ", ".join(
-            f"{schema}.{_quote_ident(stage)}" for stage in stage_names
-        )
+        + ", ".join(f"{schema}.{_quote_ident(stage)}" for stage in stage_names)
         + ";"
     )
 
@@ -3176,9 +3514,7 @@ async def _publish_v4_dictionaries_and_maps(
     """Bulk-copy dense dictionaries, then publish exact metadata and packed maps."""
 
     if int(compressed_acquisition_bytes) <= 0:
-        raise RuntimeError(
-            "PTG V4 compressed acquisition bytes must be positive"
-        )
+        raise RuntimeError("PTG V4 compressed acquisition bytes must be positive")
     if int(empty_npi_tin_only_normalization_count) < 0:
         raise RuntimeError(
             "PTG V4 empty-NPI TIN-only normalization count cannot be negative"
@@ -3186,14 +3522,10 @@ async def _publish_v4_dictionaries_and_maps(
     schema = _quote_ident(schema_name)
     token = uuid.uuid4().hex[:20]
     expected_group_count = int(compilation.observe.get("group_count") or 0)
-    expected_component_count = int(
-        compilation.observe.get("component_count") or 0
-    )
+    expected_component_count = int(compilation.observe.get("component_count") or 0)
     expected_npi_count = int(compilation.observe.get("npi_count") or 0)
     root_representation = (
-        "pattern_v1"
-        if compilation.selected_layout == "pattern"
-        else "direct_v1"
+        "pattern_v1" if compilation.selected_layout == "pattern" else "direct_v1"
     )
     root_pattern_count = (
         int(compilation.observe.get("pattern_count") or 0)
@@ -3208,6 +3540,10 @@ async def _publish_v4_dictionaries_and_maps(
     )
     tax_identity_contract = _validated_v4_tax_identity_contract(compilation)
     tax_identity_artifact_bytes = _v4_tax_artifact_byte_count(compilation)
+    taxonomy_artifact = _v4_compiler_artifact(
+        compilation,
+        "inferred_taxonomy_candidates",
+    )
     prefix_target = int(compilation.summary["npi_prefix_target"])
     group_stage = f"ptg2_v4_group_stage_{token}"
     component_stage = f"ptg2_v4_component_stage_{token}"
@@ -3332,7 +3668,6 @@ async def _publish_v4_dictionaries_and_maps(
                 columns=("pattern_key", "pattern_digest", "set_count"),
                 **_progress_callback_kwargs(progress_callback),
             )
-
         dictionary_stages = [
             _V4DenseDictionaryStage(
                 stage_table=group_stage,
@@ -3343,9 +3678,7 @@ async def _publish_v4_dictionaries_and_maps(
                     "provider_group_key",
                     "provider_group_global_id_128",
                 ),
-                value_predicate=(
-                    "octet_length(provider_group_global_id_128) = 16"
-                ),
+                value_predicate=("octet_length(provider_group_global_id_128) = 16"),
             ),
             _V4DenseDictionaryStage(
                 stage_table=component_stage,
@@ -3410,6 +3743,12 @@ async def _publish_v4_dictionaries_and_maps(
                 schema_name=schema_name,
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
+            )
+            taxonomy_stage = await stage_v4_inferred_taxonomy_compiler_copy(
+                session,
+                copy_path=compilation.inferred_taxonomy_copy_path,
+                expected_byte_count=taxonomy_artifact.byte_count,
+                expected_sha256=taxonomy_artifact.sha256,
             )
             for dictionary_stage in dictionary_stages:
                 await _validate_v4_dictionary_stage(
@@ -3492,9 +3831,7 @@ async def _publish_v4_dictionaries_and_maps(
 
             diagnostic_parameters_by_name = {
                 "snapshot_key": int(snapshot_key),
-                "compressed_acquisition_bytes": int(
-                    compressed_acquisition_bytes
-                ),
+                "compressed_acquisition_bytes": int(compressed_acquisition_bytes),
                 "input_factor_bytes": int(
                     compilation.resource_admission["input_factor_bytes"]
                 ),
@@ -3509,9 +3846,7 @@ async def _publish_v4_dictionaries_and_maps(
                     compilation.summary["max_set_patterns_per_set"]
                 ),
                 "max_set_components_per_fallback_set": int(
-                    compilation.summary[
-                        "max_set_components_per_fallback_set"
-                    ]
+                    compilation.summary["max_set_components_per_fallback_set"]
                 ),
                 "max_online_group_keys_per_set": int(
                     compilation.summary["max_online_group_keys_per_set"]
@@ -3532,72 +3867,46 @@ async def _publish_v4_dictionaries_and_maps(
                     compilation.summary["online_group_npi_batch_size"]
                 ),
                 "max_online_group_npi_members_per_set": int(
-                    compilation.summary[
-                        "max_online_group_npi_members_per_set"
-                    ]
+                    compilation.summary["max_online_group_npi_members_per_set"]
                 ),
                 "max_online_group_npi_locator_pages_per_set": int(
-                    compilation.summary[
-                        "max_online_group_npi_locator_pages_per_set"
-                    ]
+                    compilation.summary["max_online_group_npi_locator_pages_per_set"]
                 ),
                 "max_online_group_npi_member_pages_per_set": int(
-                    compilation.summary[
-                        "max_online_group_npi_member_pages_per_set"
-                    ]
+                    compilation.summary["max_online_group_npi_member_pages_per_set"]
                 ),
                 "max_online_group_npi_bytes_per_set": int(
-                    compilation.summary[
-                        "max_online_group_npi_bytes_per_set"
-                    ]
+                    compilation.summary["max_online_group_npi_bytes_per_set"]
                 ),
                 "max_online_group_npi_batches_per_set": int(
-                    compilation.summary[
-                        "max_online_group_npi_batches_per_set"
-                    ]
+                    compilation.summary["max_online_group_npi_batches_per_set"]
                 ),
                 "provider_expansion_rate_page_rows": int(
                     compilation.summary["provider_expansion_rate_page_rows"]
                 ),
                 "max_online_provider_expansion_rate_rows": int(
-                    compilation.summary[
-                        "max_online_provider_expansion_rate_rows"
-                    ]
+                    compilation.summary["max_online_provider_expansion_rate_rows"]
                 ),
                 "max_online_provider_expansion_provider_sets": int(
-                    compilation.summary[
-                        "max_online_provider_expansion_provider_sets"
-                    ]
+                    compilation.summary["max_online_provider_expansion_provider_sets"]
                 ),
                 "max_online_provider_expansion_graph_batches": int(
-                    compilation.summary[
-                        "max_online_provider_expansion_graph_batches"
-                    ]
+                    compilation.summary["max_online_provider_expansion_graph_batches"]
                 ),
                 "maximum_group_npi_member_work": int(
-                    compilation.observe[
-                        "maximum_online_group_npi_member_work"
-                    ]
+                    compilation.observe["maximum_online_group_npi_member_work"]
                 ),
                 "maximum_group_npi_locator_page_work": int(
-                    compilation.observe[
-                        "maximum_online_group_npi_locator_page_work"
-                    ]
+                    compilation.observe["maximum_online_group_npi_locator_page_work"]
                 ),
                 "maximum_group_npi_member_page_work": int(
-                    compilation.observe[
-                        "maximum_online_group_npi_member_page_work"
-                    ]
+                    compilation.observe["maximum_online_group_npi_member_page_work"]
                 ),
                 "maximum_group_npi_byte_work": int(
-                    compilation.observe[
-                        "maximum_online_group_npi_byte_work"
-                    ]
+                    compilation.observe["maximum_online_group_npi_byte_work"]
                 ),
                 "maximum_group_npi_batch_work": int(
-                    compilation.observe[
-                        "maximum_online_group_npi_batch_work"
-                    ]
+                    compilation.observe["maximum_online_group_npi_batch_work"]
                 ),
                 "group_unsafe_set_count": int(
                     compilation.observe["npi_prefix_group_unsafe_set_count"]
@@ -3620,25 +3929,17 @@ async def _publish_v4_dictionaries_and_maps(
                     compilation.observe["npi_prefix_worst_groups_to_target"]
                 ),
                 "worst_uses_override": bool(
-                    compilation.observe[
-                        "npi_prefix_worst_provider_set_uses_override"
-                    ]
+                    compilation.observe["npi_prefix_worst_provider_set_uses_override"]
                 ),
                 "worst_uses_component_fallback": bool(
-                    compilation.observe[
-                        "npi_prefix_worst_uses_component_fallback"
-                    ]
+                    compilation.observe["npi_prefix_worst_uses_component_fallback"]
                 ),
                 "worst_member_count": int(
                     compilation.observe["npi_prefix_worst_member_count"]
                 ),
                 "worst_member_digest": (
                     bytes.fromhex(
-                        str(
-                            compilation.observe[
-                                "npi_prefix_worst_member_digest"
-                            ]
-                        )
+                        str(compilation.observe["npi_prefix_worst_member_digest"])
                     )
                     if compilation.observe.get("npi_prefix_worst_member_digest")
                     is not None
@@ -3657,37 +3958,25 @@ async def _publish_v4_dictionaries_and_maps(
                     compilation.observe["npi_prefix_worst_source_byte_work"]
                 ),
                 "worst_group_npi_member_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_group_npi_member_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_group_npi_member_work"]
                 ),
                 "worst_group_npi_locator_page_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_group_npi_locator_page_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_group_npi_locator_page_work"]
                 ),
                 "worst_group_npi_member_page_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_group_npi_member_page_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_group_npi_member_page_work"]
                 ),
                 "worst_group_npi_byte_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_group_npi_byte_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_group_npi_byte_work"]
                 ),
                 "worst_group_npi_batch_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_group_npi_batch_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_group_npi_batch_work"]
                 ),
                 "worst_online_provider_set_key": compilation.observe[
                     "npi_prefix_worst_online_provider_set_key"
                 ],
                 "worst_online_groups_to_target": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_groups_to_target"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_groups_to_target"]
                 ),
                 "worst_online_groups_to_target_exact": bool(
                     compilation.observe[
@@ -3700,53 +3989,35 @@ async def _publish_v4_dictionaries_and_maps(
                     ]
                 ),
                 "worst_online_group_work_bound": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_group_work_bound"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_group_work_bound"]
                 ),
                 "worst_online_member_count": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_member_count"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_member_count"]
                 ),
                 "worst_online_member_digest": (
                     bytes.fromhex(
                         str(
-                            compilation.observe[
-                                "npi_prefix_worst_online_member_digest"
-                            ]
+                            compilation.observe["npi_prefix_worst_online_member_digest"]
                         )
                     )
-                    if compilation.observe.get(
-                        "npi_prefix_worst_online_member_digest"
-                    )
+                    if compilation.observe.get("npi_prefix_worst_online_member_digest")
                     is not None
                     else None
                 ),
                 "worst_online_source_owner_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_source_owner_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_source_owner_work"]
                 ),
                 "worst_online_source_member_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_source_member_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_source_member_work"]
                 ),
                 "worst_online_source_page_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_source_page_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_source_page_work"]
                 ),
                 "worst_online_source_byte_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_source_byte_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_source_byte_work"]
                 ),
                 "worst_online_group_npi_member_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_group_npi_member_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_group_npi_member_work"]
                 ),
                 "worst_online_group_npi_locator_page_work": int(
                     compilation.observe[
@@ -3759,14 +4030,10 @@ async def _publish_v4_dictionaries_and_maps(
                     ]
                 ),
                 "worst_online_group_npi_byte_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_group_npi_byte_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_group_npi_byte_work"]
                 ),
                 "worst_online_group_npi_batch_work": int(
-                    compilation.observe[
-                        "npi_prefix_worst_online_group_npi_batch_work"
-                    ]
+                    compilation.observe["npi_prefix_worst_online_group_npi_batch_work"]
                 ),
             }
             diagnostic_columns = (
@@ -3800,8 +4067,7 @@ async def _publish_v4_dictionaries_and_maps(
                 snapshot_parameter_map,
             )
             if tuple(diagnostic_result.one()) != tuple(
-                diagnostic_parameters_by_name[column]
-                for column in diagnostic_columns
+                diagnostic_parameters_by_name[column] for column in diagnostic_columns
             ):
                 raise RuntimeError("PTG V4 persisted graph diagnostics changed")
 
@@ -3828,7 +4094,9 @@ async def _publish_v4_dictionaries_and_maps(
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
                 entries=tuple(
-                    sorted(compilation.relation_summaries, key=lambda row: row["relation"])
+                    sorted(
+                        compilation.relation_summaries, key=lambda row: row["relation"]
+                    )
                 ),
             )
             await publish_v4_heavy_owners(
@@ -3855,13 +4123,14 @@ async def _publish_v4_dictionaries_and_maps(
             # immutable sidecar only after the dense dictionary and complete
             # authenticated building graph are available in this transaction.
             taxonomy_publication = (
-                await _publish_v4_taxonomy_sidecar(
+                await publish_prepared_v4_inferred_taxonomy_candidates(
                     session,
                     schema_name=schema_name,
                     snapshot_key=int(snapshot_key),
                     build_token=build_token,
+                    stage_table=taxonomy_stage.table_name,
+                    rules=INFERRED_PROVIDER_TAXONOMY_RULES,
                     npi_count=expected_npi_count,
-                    representation=root_representation,
                     pattern_count=root_pattern_count,
                 )
             )
@@ -3878,13 +4147,9 @@ async def _publish_v4_dictionaries_and_maps(
                 _V4TaxIdentityPublication(
                     manifest={
                         **dict(tax_identity_manifest),
-                        "artifact_byte_count": (
-                            tax_identity_artifact_bytes
-                        ),
+                        "artifact_byte_count": (tax_identity_artifact_bytes),
                     },
-                    provider_group_count=(
-                        tax_identity_contract.provider_group_count
-                    ),
+                    provider_group_count=(tax_identity_contract.provider_group_count),
                     tax_identity_count=tax_identity_contract.tax_identity_count,
                     artifact_byte_count=tax_identity_artifact_bytes,
                 ),
@@ -3930,21 +4195,17 @@ async def _publish_v4_graph(
             map_summary,
             taxonomy_publication,
             tax_identity_publication,
-        ) = (
-            await _publish_v4_dictionaries_and_maps(
-                compilation,
-                schema_name=schema_name,
-                snapshot_key=int(snapshot_key),
-                build_token=build_token,
-                compressed_acquisition_bytes=int(
-                    compressed_acquisition_bytes
-                ),
-                empty_npi_tin_only_normalization_count=int(
-                    empty_npi_tin_only_normalization_count
-                ),
-                **_progress_callback_kwargs(progress_callback),
-                heartbeat_callback=heartbeat_callback,
-            )
+        ) = await _publish_v4_dictionaries_and_maps(
+            compilation,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=build_token,
+            compressed_acquisition_bytes=int(compressed_acquisition_bytes),
+            empty_npi_tin_only_normalization_count=int(
+                empty_npi_tin_only_normalization_count
+            ),
+            **_progress_callback_kwargs(progress_callback),
+            heartbeat_callback=heartbeat_callback,
         )
     except BaseException:
         await _queue_failed_v4_graph_blocks(
@@ -3967,26 +4228,43 @@ async def _publish_v4_graph(
         }
         for artifact in compilation.output_artifacts
     )
+    adaptive_layout = v4_adaptive_layout_decision_from_summary(compilation.summary)
+    expected_representation = (
+        "pattern_v1" if compilation.selected_layout == "pattern" else "direct_v1"
+    )
+    if adaptive_layout["selected_representation"] != expected_representation:
+        raise RuntimeError("PTG V4 adaptive layout publication selection changed")
+    selected_layout_evidence = adaptive_layout[
+        "pattern" if compilation.selected_layout == "pattern" else "direct"
+    ]
+    if (
+        int(map_summary.stored_map_byte_count)
+        != int(selected_layout_evidence["map_payload_encoded_bytes"])
+        or int(map_summary.coordinate_count)
+        != int(selected_layout_evidence["map_coordinate_count"])
+        or int(map_summary.map_pack_count)
+        != int(selected_layout_evidence["map_pack_count"])
+        or int(map_summary.object_kind_count)
+        != int(selected_layout_evidence["map_object_kind_count"])
+    ):
+        raise RuntimeError(
+            "PTG V4 adaptive layout packed-map plan differs from publication"
+        )
     support_digest = shared_support_digest(
         {
-            "contract_version": 1,
+            "contract_version": 2,
             "compiler_format": compilation.summary.get("format"),
             "selected_layout": compilation.selected_layout,
+            "adaptive_layout": adaptive_layout,
             "map_digest": map_summary.map_digest.hex(),
             "artifacts": artifact_contracts,
             "relation_summaries": tuple(compilation.relation_summaries),
             "heavy_bitmaps": tuple(compilation.heavy_bitmaps),
-            "inferred_taxonomy_candidates": dict(
-                taxonomy_publication.manifest
-            ),
-            "provider_tax_identity": dict(
-                tax_identity_publication.manifest
-            ),
+            "inferred_taxonomy_candidates": dict(taxonomy_publication.manifest),
+            "provider_tax_identity": dict(tax_identity_publication.manifest),
             "observe": dict(compilation.observe),
             "resource_admission": {
-                "compressed_acquisition_bytes": int(
-                    compressed_acquisition_bytes
-                ),
+                "compressed_acquisition_bytes": int(compressed_acquisition_bytes),
                 "empty_npi_tin_only_normalization_count": int(
                     empty_npi_tin_only_normalization_count
                 ),
@@ -4023,6 +4301,7 @@ async def _publish_v4_graph(
         representation=(
             "pattern_v1" if compilation.selected_layout == "pattern" else "direct_v1"
         ),
+        adaptive_layout=adaptive_layout,
         compiler_summary=dict(compilation.summary),
         dictionary_publication=_V4_DICTIONARY_BATCH_CONTRACT.as_dict(),
         inferred_taxonomy_candidates=dict(taxonomy_publication.manifest),
@@ -4120,9 +4399,7 @@ def _physical_serving_index(
     source_count = _integer(finalizer_summary.get("source_count"), "source_count")
     if source_count <= 0:
         raise RuntimeError("strict V3 source_count must be positive")
-    quarantine = validate_provider_identifier_quarantine(
-        provider_identifier_quarantine
-    )
+    quarantine = validate_provider_identifier_quarantine(provider_identifier_quarantine)
     price_dictionary = {
         **price_encoder,
         "price_set_count": _integer(price_dense.get("count"), "price key count"),
@@ -4167,6 +4444,8 @@ def _physical_serving_index(
             "provider_group_count": int(graph_publication.provider_group_count),
             "npi_count": int(graph_publication.npi_count),
             "block_count": int(graph_publication.block_count),
+            "representation": str(getattr(graph_publication, "representation", "")),
+            "adaptive_layout": dict(getattr(graph_publication, "adaptive_layout", {})),
             "inferred_taxonomy_candidates": dict(
                 getattr(
                     graph_publication,
@@ -4282,9 +4561,7 @@ async def _publish_prepared_shared_layout(
         progress_callback(stage_name, normalized_by_name)
 
     shared_generation = (
-        PTG2_V4_SHARED_GENERATION
-        if provider_graph_v4
-        else PTG2_V3_SHARED_GENERATION
+        PTG2_V4_SHARED_GENERATION if provider_graph_v4 else PTG2_V3_SHARED_GENERATION
     )
     if provider_graph_v4 and (
         compressed_acquisition_bytes is None
@@ -4301,9 +4578,7 @@ async def _publish_prepared_shared_layout(
             "strict shared publication must use the configured PostgreSQL schema"
         )
     coverage_scope_id = _validated_coverage_scope_id(expected_coverage_scope_id)
-    quarantine = validate_provider_identifier_quarantine(
-        provider_identifier_quarantine
-    )
+    quarantine = validate_provider_identifier_quarantine(provider_identifier_quarantine)
 
     async def touch_build() -> None:
         """Refresh the reserved layout's build heartbeat transactionally."""
@@ -4439,29 +4714,17 @@ async def _publish_prepared_shared_layout(
             )
         stage_started_at = time.monotonic()
         if provider_graph_v4:
-            compile_task = asyncio.create_task(
-                compile_provider_graph_v4_rust(
-                    graph_artifact_entries=graph_artifact_entries,
-                    provider_set_key_map_path=provider_set_keys,
-                    output_directory=(
-                        Path(raw_work_directory) / "provider-graph-v4-native"
-                    ),
-                )
+            graph_artifact_entries = tuple(
+                dict(entry) for entry in graph_artifact_entries
             )
-            try:
-                while True:
-                    try:
-                        graph_conversion = await asyncio.wait_for(
-                            asyncio.shield(compile_task),
-                            timeout=30.0,
-                        )
-                        break
-                    except TimeoutError:
-                        await touch_build()
-            except BaseException:
-                compile_task.cancel()
-                await asyncio.gather(compile_task, return_exceptions=True)
-                raise
+            graph_conversion = await _compile_v4_provider_graph(
+                graph_artifact_entries=graph_artifact_entries,
+                provider_set_key_map_path=provider_set_keys,
+                work_directory=Path(raw_work_directory),
+                schema_name=schema_name,
+                touch_build=touch_build,
+                progress_callback=progress_callback,
+            )
         else:
             graph_conversion = await _convert_shared_graph_natively(
                 graph_artifact_entries=graph_artifact_entries,
@@ -4547,7 +4810,7 @@ async def _publish_prepared_shared_layout(
             stage_started_at = time.monotonic()
             try:
                 if provider_graph_v4:
-                    return await _publish_v4_graph(
+                    graph_publication = await _publish_v4_graph(
                         graph_conversion,
                         schema_name=schema_name,
                         snapshot_key=int(reserved_snapshot_key),
@@ -4559,9 +4822,7 @@ async def _publish_prepared_shared_layout(
                             empty_npi_tin_only_normalization_count or 0
                         ),
                         **_progress_callback_kwargs(
-                            lane_progress.add
-                            if progress_callback is not None
-                            else None
+                            lane_progress.add if progress_callback is not None else None
                         ),
                         heartbeat_callback=(
                             lane_progress.heartbeat
@@ -4569,6 +4830,11 @@ async def _publish_prepared_shared_layout(
                             else None
                         ),
                     )
+                    _taxonomy_copy_complete(
+                        graph_conversion,
+                        progress_callback,
+                    )
+                    return graph_publication
                 return await publish_shared_graph(
                     graph_conversion,
                     schema_name=schema_name,
@@ -4587,9 +4853,7 @@ async def _publish_prepared_shared_layout(
             "dense keys",
         )
         price_dense = _mapping(dense_keys.get("price"), "dense price keys")
-        expected_price_set_count = _integer(
-            price_dense.get("count"), "price key count"
-        )
+        expected_price_set_count = _integer(price_dense.get("count"), "price key count")
         expected_price_key_order = str(price_dense.get("ordering") or "")
         if (
             prepared_price.price_set_count != expected_price_set_count
@@ -4615,9 +4879,7 @@ async def _publish_prepared_shared_layout(
             stage_started_at = time.monotonic()
             try:
                 with observe_shared_price_progress(
-                    lane_progress.add
-                    if progress_callback is not None
-                    else None
+                    lane_progress.add if progress_callback is not None else None
                 ):
                     return await publish_shared_price_artifacts(
                         schema_name=schema_name,
@@ -4709,7 +4971,9 @@ async def _publish_prepared_shared_layout(
         )
         observed_kinds = set(mapping_summary.object_kinds)
         missing_kinds = (
-            _REQUIRED_PRICE_OBJECT_KINDS if provider_graph_v4 else _REQUIRED_OBJECT_KINDS
+            _REQUIRED_PRICE_OBJECT_KINDS
+            if provider_graph_v4
+            else _REQUIRED_OBJECT_KINDS
         ) - observed_kinds
         if missing_kinds:
             raise RuntimeError(
@@ -4955,8 +5219,7 @@ async def publish_strict_shared_v3_layout(
     provider_set_metadata_entries = tuple(provider_set_metadata_entries)
     expected_source_identities = tuple(expected_source_identities)
     expected_raw_source_digests = tuple(
-        str(raw_hash or "").strip().lower()
-        for raw_hash in expected_raw_source_sha256
+        str(raw_hash or "").strip().lower() for raw_hash in expected_raw_source_sha256
     )
     compressed_acquisition_bytes: int | None = None
     if provider_graph_v4:
@@ -4985,9 +5248,7 @@ async def publish_strict_shared_v3_layout(
                     and byte_count_by_hash[raw_hash] != byte_count
                 )
             ):
-                raise RuntimeError(
-                    "PTG V4 compressed acquisition entry is invalid"
-                )
+                raise RuntimeError("PTG V4 compressed acquisition entry is invalid")
             byte_count_by_hash[raw_hash] = byte_count
         if set(byte_count_by_hash) != set(expected_raw_source_digests):
             raise RuntimeError(
@@ -4995,9 +5256,7 @@ async def publish_strict_shared_v3_layout(
             )
         compressed_acquisition_bytes = sum(byte_count_by_hash.values())
         if compressed_acquisition_bytes <= 0:
-            raise RuntimeError(
-                "PTG V4 compressed acquisition bytes must be positive"
-            )
+            raise RuntimeError("PTG V4 compressed acquisition bytes must be positive")
     publication_started_at = time.monotonic()
     configured_schema = resolve_ptg2_schema()
     if str(schema_name).strip() != configured_schema:
@@ -5005,9 +5264,7 @@ async def publish_strict_shared_v3_layout(
             "strict V3 publication must use the configured PostgreSQL schema"
         )
     shared_generation = (
-        PTG2_V4_SHARED_GENERATION
-        if provider_graph_v4
-        else PTG2_V3_SHARED_GENERATION
+        PTG2_V4_SHARED_GENERATION if provider_graph_v4 else PTG2_V3_SHARED_GENERATION
     )
     async with db.transaction() as session:
         touch = (
@@ -5075,9 +5332,7 @@ async def publish_strict_shared_v3_layout(
                 expected_source_identities=expected_source_identities,
                 publish_prepared_price=publish_prepared_price_early,
                 finalizer_progress_callback=(
-                    finalizer_progress.add
-                    if progress_callback is not None
-                    else None
+                    finalizer_progress.add if progress_callback is not None else None
                 ),
             )
         price_work_progress.flush()

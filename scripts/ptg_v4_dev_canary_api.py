@@ -22,6 +22,7 @@ from scripts.ptg_v4_dev_canary_reference import (
 )
 from scripts.ptg_v4_dev_canary_support import (
     PROTECTED_API_PARAMETERS,
+    PTG_V4_RELEASE_LATENCY_CEILING_MS,
     BoundedApiSpec,
     CanaryConfigurationError,
     GraphReadLimits,
@@ -67,9 +68,7 @@ def service_inputs(
         args.metrics_url,
         allow_insecure_http=args.allow_insecure_http,
     )
-    api_headers, _api_environment_names = headers_from_environment(
-        args.api_header_env
-    )
+    api_headers, _api_environment_names = headers_from_environment(args.api_header_env)
     metrics_headers, _metrics_environment_names = headers_from_environment(
         args.metrics_header_env
     )
@@ -139,19 +138,17 @@ def api_spec(args: Any) -> BoundedApiSpec:
     if args.page_limit < 1 or args.expected_item_count < 1:
         raise CanaryConfigurationError("bounded page sizes must be positive")
     if args.expected_item_count > args.page_limit:
-        raise CanaryConfigurationError(
-            "expected items cannot exceed the page limit"
-        )
+        raise CanaryConfigurationError("expected items cannot exceed the page limit")
     if args.minimum_cold_process_samples < 20:
         raise CanaryConfigurationError(
             "cold p95 requires at least 20 unique fresh-process samples"
         )
     if (
-        not 0 < args.cold_p95_limit_ms <= 50
-        or not 0 < args.warm_p95_limit_ms <= 50
+        not 0 < args.cold_p95_limit_ms <= PTG_V4_RELEASE_LATENCY_CEILING_MS
+        or not 0 < args.warm_p95_limit_ms <= PTG_V4_RELEASE_LATENCY_CEILING_MS
     ):
         raise CanaryConfigurationError(
-            "public cold and warm latency gates must be within 50ms"
+            "public cold and warm latency gates exceed the release ceiling"
         )
     return BoundedApiSpec(
         snapshot_id=args.snapshot_id,
@@ -182,9 +179,7 @@ def reference_spec(args: Any) -> BoundedApiSpec:
         str(args.code_system).strip().upper() != "CPT"
         or str(args.code).strip() != "70553"
     ):
-        raise CanaryConfigurationError(
-            "frozen V3 reference is fixed to CPT 70553"
-        )
+        raise CanaryConfigurationError("frozen V3 reference is fixed to CPT 70553")
     return BoundedApiSpec(
         snapshot_id=str(args.snapshot_id).strip(),
         npi=None,
@@ -193,8 +188,8 @@ def reference_spec(args: Any) -> BoundedApiSpec:
         limit=25,
         expected_item_count=args.expected_item_count,
         expected_result_state="matched",
-        cold_p95_limit_ms=50,
-        warm_p95_limit_ms=50,
+        cold_p95_limit_ms=PTG_V4_RELEASE_LATENCY_CEILING_MS,
+        warm_p95_limit_ms=PTG_V4_RELEASE_LATENCY_CEILING_MS,
         minimum_cold_process_samples=20,
     )
 
@@ -229,9 +224,7 @@ def api_parameters(
     )
     parameters_by_name = spec.parameters(extras_by_name)
     if "npi" in parameters_by_name:
-        raise CanaryConfigurationError(
-            "public traversal probe must not send npi"
-        )
+        raise CanaryConfigurationError("public traversal probe must not send npi")
     return parameters_by_name
 
 
@@ -247,14 +240,12 @@ async def _metric_wrapped_request(
         headers=context.metrics_headers,
         maximum_bytes=context.maximum_bytes,
     )
-    document_by_field, _elapsed_ms, api_identity_by_field = (
-        await get_identity_json(
-            client,
-            f"{context.api_url}/api/v1/pricing/providers/by-procedure",
-            headers=context.api_headers,
-            parameters=context.parameters,
-            maximum_bytes=context.maximum_bytes,
-        )
+    document_by_field, _elapsed_ms, api_identity_by_field = await get_identity_json(
+        client,
+        f"{context.api_url}/api/v1/pricing/providers/by-procedure",
+        headers=context.api_headers,
+        parameters=context.parameters,
+        maximum_bytes=context.maximum_bytes,
     )
     metrics_after = await get_metrics(
         client,
@@ -267,12 +258,10 @@ async def _metric_wrapped_request(
         metrics_after,
         limits=graph_limits_by_field,
     )
-    graph_evidence_by_field["runtime_identity"] = (
-        require_same_runtime_identity(
-            metrics_before.get("runtime_identity", {}),
-            api_identity_by_field,
-            metrics_after.get("runtime_identity", {}),
-        )
+    graph_evidence_by_field["runtime_identity"] = require_same_runtime_identity(
+        metrics_before.get("runtime_identity", {}),
+        api_identity_by_field,
+        metrics_after.get("runtime_identity", {}),
     )
     return document_by_field, graph_evidence_by_field
 
@@ -308,14 +297,12 @@ async def _collect_warm_samples(
     response_documents: list[dict[str, Any]] = []
     warm_samples_ms: list[float] = []
     for _sample_index in range(sample_count):
-        document_by_field, elapsed_ms, identity_by_field = (
-            await get_identity_json(
-                client,
-                f"{context.api_url}/api/v1/pricing/providers/by-procedure",
-                headers=context.api_headers,
-                parameters=context.parameters,
-                maximum_bytes=context.maximum_bytes,
-            )
+        document_by_field, elapsed_ms, identity_by_field = await get_identity_json(
+            client,
+            f"{context.api_url}/api/v1/pricing/providers/by-procedure",
+            headers=context.api_headers,
+            parameters=context.parameters,
+            maximum_bytes=context.maximum_bytes,
         )
         require_same_runtime_identity(
             expected_identity_by_field,
@@ -334,16 +321,12 @@ async def _collect_warm_probe_evidence(
 ) -> _WarmProbeEvidence:
     timeout = httpx.Timeout(args.request_timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        first_document, graph_evidence_by_field = (
-            await _metric_wrapped_request(
-                client,
-                context=context,
-                graph_limits_by_field=graph_limits_by_field,
-            )
+        first_document, graph_evidence_by_field = await _metric_wrapped_request(
+            client,
+            context=context,
+            graph_limits_by_field=graph_limits_by_field,
         )
-        expected_identity_by_field = dict(
-            graph_evidence_by_field["runtime_identity"]
-        )
+        expected_identity_by_field = dict(graph_evidence_by_field["runtime_identity"])
         await _assert_warmup_process(
             client,
             context=context,

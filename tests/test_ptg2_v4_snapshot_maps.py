@@ -63,20 +63,17 @@ from tests.ptg2_v4_migration_catalog_support import (
     attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
 )
+from tests.ptg2_v4_coverage_support import (
+    synthetic_adaptive_layout_decision,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = (
-    ROOT
-    / "alembic"
-    / "versions"
-    / "20260723100000_ptg2_v4_snapshot_map_pack.py"
+    ROOT / "alembic" / "versions" / "20260723100000_ptg2_v4_snapshot_map_pack.py"
 )
 TAXONOMY_MIGRATION_PATH = (
-    ROOT
-    / "alembic"
-    / "versions"
-    / "20260724120000_ptg2_v4_taxonomy_candidates.py"
+    ROOT / "alembic" / "versions" / "20260724120000_ptg2_v4_taxonomy_candidates.py"
 )
 
 
@@ -128,22 +125,14 @@ def _sealed_graph_blocks():
     member_payload = struct.pack("<IIIII", 10, 11, 12, 13, 14)
     locator_payload = struct.pack("<QI", 0, 0) + struct.pack("<QI", 0, 5)
     heavy_payload = (
-        b"PTG2V4BM"
-        + struct.pack("<IIII", 1, 0, 10, 5)
-        + bytes((0x1F, 0x00))
+        b"PTG2V4BM" + struct.pack("<IIII", 1, 0, 10, 5) + bytes((0x1F, 0x00))
     )
     return tuple(
         sorted(
             (
-                SharedBlock(
-                    "alpha_members_v1", 0, 0, 5, "none", 20, member_payload
-                ),
-                SharedBlock(
-                    "alpha_locators_v1", 1, 0, 2, "none", 24, locator_payload
-                ),
-                SharedBlock(
-                    "alpha_heavy_v1", 1, 0, 5, "none", 26, heavy_payload
-                ),
+                SharedBlock("alpha_members_v1", 0, 0, 5, "none", 20, member_payload),
+                SharedBlock("alpha_locators_v1", 1, 0, 2, "none", 24, locator_payload),
+                SharedBlock("alpha_heavy_v1", 1, 0, 5, "none", 26, heavy_payload),
             ),
             key=lambda block: (
                 block.object_kind,
@@ -151,7 +140,7 @@ def _sealed_graph_blocks():
                 block.fragment_no,
             ),
         )
-)
+    )
 
 
 def _v4_positive_diagnostic_limits() -> dict[str, int]:
@@ -281,10 +270,19 @@ def test_v4_migration_is_additive_after_the_current_head(monkeypatch):
     recorder.executed.clear()
     migration.downgrade()
     downgrade_sql = " ".join(_normalized(statement) for statement in recorder.executed)
-    assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_snapshot_map_pack"' in downgrade_sql
-    assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_snapshot_map_root"' in downgrade_sql
+    assert (
+        'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_snapshot_map_pack"'
+        in downgrade_sql
+    )
+    assert (
+        'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_snapshot_map_root"'
+        in downgrade_sql
+    )
     assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_heavy_owner"' in downgrade_sql
-    assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_relation_manifest"' in downgrade_sql
+    assert (
+        'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_relation_manifest"'
+        in downgrade_sql
+    )
     assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_npi_scope"' in downgrade_sql
     assert "ptg2_v3_npi_scope" not in downgrade_sql
 
@@ -305,7 +303,9 @@ def test_v4_models_match_root_pack_and_dense_npi_contracts():
     pack = PTG2V4SnapshotMapPack.__table__
     npi = PTG2V4NPIScope.__table__
 
-    assert tuple(column.name for column in root.primary_key.columns) == ("snapshot_key",)
+    assert tuple(column.name for column in root.primary_key.columns) == (
+        "snapshot_key",
+    )
     assert tuple(column.name for column in pack.primary_key.columns) == (
         "snapshot_key",
         "object_kind",
@@ -377,7 +377,9 @@ def test_v4_projection_models_match_metadata_contracts():
 def test_v4_map_pack_round_trip_and_gc_reachability_are_exact():
     packs = tuple(iter_v4_snapshot_map_packs(_references(), max_coordinates_per_pack=2))
 
-    assert [(pack.object_kind, pack.pack_no, pack.coordinate_count) for pack in packs] == [
+    assert [
+        (pack.object_kind, pack.pack_no, pack.coordinate_count) for pack in packs
+    ] == [
         ("alpha_v1", 0, 2),
         ("alpha_v1", 1, 1),
         ("beta_v1", 0, 2),
@@ -722,9 +724,7 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                     },
                     {
                         "relation": "set_npi_prefix_override",
-                        "member_object_kind": (
-                            "v4_set_npi_prefix_override_members_v1"
-                        ),
+                        "member_object_kind": ("v4_set_npi_prefix_override_members_v1"),
                         "locator_object_kind": (
                             "v4_set_npi_prefix_override_locators_v1"
                         ),
@@ -762,17 +762,15 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                 snapshot_key=snapshot_key,
                 graph_blocks=graph_blocks,
             )
-            taxonomy_publication = (
-                await publish_v4_inferred_taxonomy_candidates(
-                    session,
-                    schema_name=schema_name,
-                    snapshot_key=snapshot_key,
-                    build_token="build-v4",
-                    rules=INFERRED_PROVIDER_TAXONOMY_RULES,
-                    npi_count=npi_publication.row_count,
-                    representation="pattern_v1",
-                    pattern_count=pattern_publication.row_count,
-                )
+            taxonomy_publication = await publish_v4_inferred_taxonomy_candidates(
+                session,
+                schema_name=schema_name,
+                snapshot_key=snapshot_key,
+                build_token="build-v4",
+                rules=INFERRED_PROVIDER_TAXONOMY_RULES,
+                npi_count=npi_publication.row_count,
+                representation="pattern_v1",
+                pattern_count=pattern_publication.row_count,
             )
             persisted_summary = await summarize_persisted_v4_snapshot_maps(
                 session,
@@ -910,6 +908,9 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                             "format": "postgres_binary_v3",
                             "price_dictionary": {"preserved": True},
                         },
+                        "provider_graph": {
+                            "adaptive_layout": (synthetic_adaptive_layout_decision())
+                        },
                     }
                 },
                 summary_batch_rows=1,
@@ -947,7 +948,7 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                     async with session.begin_nested():
                         await session.execute(
                             sa.text(
-                                f"DELETE FROM {schema}.\"{table_name}\" "
+                                f'DELETE FROM {schema}."{table_name}" '
                                 "WHERE snapshot_key = :snapshot_key"
                             ),
                             {"snapshot_key": snapshot_key},
@@ -1041,32 +1042,44 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                 ),
                 {"snapshot_key": overlap_snapshot_key},
             )
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=overlap_snapshot_key,
-        ) == 0
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=overlap_snapshot_key,
+            )
+            == 0
+        )
         assert npi_publication.row_count == 2
         assert component_publication.row_count == 1
         assert pattern_publication.row_count == 1
         assert relation_publication.row_count == 2
         assert heavy_owner_publication.row_count == 1
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_npi_scope "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=snapshot_key,
-        ) == 2
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_npi_scope "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=snapshot_key,
+            )
+            == 2
+        )
         assert summary.coordinate_count == 3
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=snapshot_key,
-        ) == 3
-        assert await database.scalar(
-            f"SELECT state FROM {schema}.ptg2_v4_snapshot_map_root "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=snapshot_key,
-        ) == "complete"
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=snapshot_key,
+            )
+            == 3
+        )
+        assert (
+            await database.scalar(
+                f"SELECT state FROM {schema}.ptg2_v4_snapshot_map_root "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=snapshot_key,
+            )
+            == "complete"
+        )
         manifest = await database.scalar(
             f"SELECT layout_manifest FROM {schema}.ptg2_v3_snapshot_layout "
             "WHERE snapshot_key = :snapshot_key",
@@ -1081,9 +1094,7 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
         assert serving_index["serving_binary"]["price_dictionary"] == {
             "preserved": True
         }
-        provider_graph_by_field = serving_index["serving_binary"][
-            "provider_graph_v4"
-        ]
+        provider_graph_by_field = serving_index["serving_binary"]["provider_graph_v4"]
         assert provider_graph_by_field["map_digest"] == summary.map_digest.hex()
         assert provider_graph_by_field["resource_admission"] == {
             "compressed_acquisition_bytes": 70,
@@ -1091,32 +1102,29 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
             "factor_edge_count": 10,
             "empty_npi_tin_only_normalization_count": 0,
         }
-        assert taxonomy_publication.rule_count == len(
-            INFERRED_PROVIDER_TAXONOMY_RULES
-        )
+        assert taxonomy_publication.rule_count == len(INFERRED_PROVIDER_TAXONOMY_RULES)
         assert taxonomy_publication.member_count == 0
         assert taxonomy_publication.observe_only_rule_count == 0
         assert provider_graph_by_field["inferred_taxonomy_candidates"] == dict(
             taxonomy_publication.manifest
         )
-        assert provider_graph_by_field["hot_prefix"][
-            "override_owner_count"
-        ] == 0
+        assert provider_graph_by_field["hot_prefix"]["override_owner_count"] == 0
         snapshot_map = serving_index["snapshot_map"]
         assert snapshot_map["component_count"] == 1
         assert snapshot_map["npi_count"] == 2
         assert snapshot_map["pattern_count"] == 1
         assert snapshot_map["relation_count"] == 2
         assert snapshot_map["heavy_owner_count"] == 1
-        assert snapshot_map["relation_manifest_table"] == (
-            "ptg2_v4_relation_manifest"
-        )
+        assert snapshot_map["relation_manifest_table"] == ("ptg2_v4_relation_manifest")
         assert snapshot_map["heavy_owner_table"] == "ptg2_v4_heavy_owner"
         assert snapshot_map["npi_table"] == "ptg2_v4_npi_scope"
-        assert await database.scalar(
-            f"SELECT snapshot_key FROM {schema}.ptg2_v3_snapshot_binding "
-            "WHERE snapshot_id = 'snapshot-v4'"
-        ) == snapshot_key
+        assert (
+            await database.scalar(
+                f"SELECT snapshot_key FROM {schema}.ptg2_v3_snapshot_binding "
+                "WHERE snapshot_id = 'snapshot-v4'"
+            )
+            == snapshot_key
+        )
         map_block_hash = await database.scalar(
             f"SELECT map_block_hash FROM {schema}.ptg2_v4_snapshot_map_pack "
             "WHERE snapshot_key = :snapshot_key ORDER BY object_kind, pack_no LIMIT 1",
@@ -1145,14 +1153,18 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                 max_rows=10,
             )
         assert protected.selected_hashes == ()
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate"
-        ) == 0
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block "
-            "WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))",
-            block_hashes=[references[0].block_hash, map_block_hash],
-        ) == 2
+        assert (
+            await database.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate")
+            == 0
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block "
+                "WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))",
+                block_hashes=[references[0].block_hash, map_block_hash],
+            )
+            == 2
+        )
 
         # A publisher that already holds target KEY SHARE must make the
         # candidate/block FOR UPDATE SKIP LOCKED sweep skip that target.  The
@@ -1253,11 +1265,14 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
             verify_target_blocks,
         )
         assert race_summary.coordinate_count == 1
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate "
-            "WHERE block_hash = :block_hash",
-            block_hash=race_block.block_hash,
-        ) == 0
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_gc_candidate "
+                "WHERE block_hash = :block_hash",
+                block_hash=race_block.block_hash,
+            )
+            == 0
+        )
         race_map_hash = await database.scalar(
             f"SELECT map_block_hash FROM {schema}.ptg2_v4_snapshot_map_pack "
             "WHERE snapshot_key = :snapshot_key",
@@ -1286,16 +1301,22 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
             )
         assert released_race.logical_layout_count == 1
         assert released_race.candidate_hash_count == 2
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=race_reservation.snapshot_key,
-        ) == 0
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=race_reservation.snapshot_key,
-        ) == 0
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=race_reservation.snapshot_key,
+            )
+            == 0
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=race_reservation.snapshot_key,
+            )
+            == 0
+        )
         async with database.acquire() as connection:
             reclaimed_race = await ptg2_shared_gc._sweep_ready(
                 connection,
@@ -1307,11 +1328,14 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
             race_block.block_hash,
             race_map_hash,
         }
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block "
-            "WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))",
-            block_hashes=[race_block.block_hash, race_map_hash],
-        ) == 0
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block "
+                "WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))",
+                block_hashes=[race_block.block_hash, race_map_hash],
+            )
+            == 0
+        )
 
         async with database.transaction() as session:
             cas_snapshot_key = (
@@ -1370,11 +1394,14 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
         assert cas_publication.unique_block_count == 1
         assert cas_publication.logical_byte_count == 3
         assert cas_publication.unique_stored_byte_count == 3
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=cas_snapshot_key,
-        ) == 0
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=cas_snapshot_key,
+            )
+            == 0
+        )
 
         # Selective publication represents an already durable CAS payload as
         # NULL in the stage.  A second V4 layout must reconcile that metadata
@@ -1430,11 +1457,14 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
         )
         assert reused_cas_publication.staged_row_count == 1
         assert reused_cas_publication.unique_block_count == 1
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block "
-            "WHERE block_hash = :block_hash",
-            block_hash=cas_block.block_hash,
-        ) == 1
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_block "
+                "WHERE block_hash = :block_hash",
+                block_hash=cas_block.block_hash,
+            )
+            == 1
+        )
         async with database.transaction() as session:
             await session.execute(
                 sa.text(
@@ -1450,16 +1480,22 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                 ),
                 {"snapshot_key": snapshot_key},
             )
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=snapshot_key,
-        ) == 0
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=snapshot_key,
-        ) == 0
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=snapshot_key,
+            )
+            == 0
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=snapshot_key,
+            )
+            == 0
+        )
     finally:
         try:
             await database.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")

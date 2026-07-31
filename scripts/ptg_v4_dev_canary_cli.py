@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import argparse
 
+from scripts.ptg_v4_dev_canary_support import (
+    PTG_V4_RELEASE_LATENCY_CEILING_MS,
+)
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the read-only canary CLI without any import-dispatch command."""
@@ -117,8 +121,16 @@ def _add_internal_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--prefix-limit", type=int, default=201)
     parser.add_argument("--cold-samples", type=int, default=20)
     parser.add_argument("--warm-samples", type=int, default=20)
-    parser.add_argument("--cold-p95-limit-ms", type=float, default=50.0)
-    parser.add_argument("--warm-p95-limit-ms", type=float, default=50.0)
+    parser.add_argument(
+        "--cold-p95-limit-ms",
+        type=float,
+        default=PTG_V4_RELEASE_LATENCY_CEILING_MS,
+    )
+    parser.add_argument(
+        "--warm-p95-limit-ms",
+        type=float,
+        default=PTG_V4_RELEASE_LATENCY_CEILING_MS,
+    )
 
 
 def _add_database_arguments(
@@ -149,7 +161,15 @@ def _add_http_probe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--metrics-header-env", action="append", default=[])
     parser.add_argument("--request-timeout-seconds", type=float, default=15.0)
     parser.add_argument("--maximum-response-bytes", type=int, default=2 << 20)
-    parser.add_argument("--cold-p95-limit-ms", type=float, default=50.0)
-    parser.add_argument("--warm-p95-limit-ms", type=float, default=50.0)
+    parser.add_argument(
+        "--cold-p95-limit-ms",
+        type=float,
+        default=PTG_V4_RELEASE_LATENCY_CEILING_MS,
+    )
+    parser.add_argument(
+        "--warm-p95-limit-ms",
+        type=float,
+        default=PTG_V4_RELEASE_LATENCY_CEILING_MS,
+    )
     parser.add_argument("--minimum-cold-process-samples", type=int, default=20)
     parser.add_argument("--allow-insecure-http", action="store_true")

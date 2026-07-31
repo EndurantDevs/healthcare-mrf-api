@@ -20,12 +20,27 @@ from tests.ptg2_v4_summary_fixture_support import (
 from tests.ptg2_v4_resource_admission_mutations import (
     resource_admission_mutations,
 )
+from tests.ptg2_v4_coverage_layout_mutations import layout_header_mutations
+from tests.ptg2_v4_coverage_support import (
+    taxonomy_summary_fields,
+    write_empty_taxonomy_artifact,
+)
+from tests.ptg2_v4_summary_validation_support import (
+    packed_summary_validation as _packed_summary_validation,
+    summary_validation_fixture as _summary_validation_fixture,
+)
+
 _OUTPUT_ARTIFACT_NAMES = (
-    "graph_blocks", "graph_references",
-    "provider_groups", "provider_components",
-    "npi_scope", "provider_set_audit_npi",
-    "provider_set_npi_prefix_overrides", "provider_tax_identities",
+    "graph_blocks",
+    "graph_references",
+    "provider_groups",
+    "provider_components",
+    "npi_scope",
+    "provider_set_audit_npi",
+    "provider_set_npi_prefix_overrides",
+    "provider_tax_identities",
     "provider_group_tax_identities",
+    "inferred_taxonomy_candidates",
 )
 
 
@@ -47,14 +62,21 @@ def _summary_path_fields(
         "group_copy_path": artifact_by_name["provider_groups"]["path"],
         "component_copy_path": artifact_by_name["provider_components"]["path"],
         "npi_copy_path": artifact_by_name["npi_scope"]["path"],
-        "provider_set_audit_npi_copy_path": artifact_by_name[
-            "provider_set_audit_npi"
-        ]["path"],
+        "provider_set_audit_npi_copy_path": artifact_by_name["provider_set_audit_npi"][
+            "path"
+        ],
         "provider_set_npi_prefix_override_copy_path": artifact_by_name[
             "provider_set_npi_prefix_overrides"
         ]["path"],
-        "provider_tax_identity_copy_path": artifact_by_name["provider_tax_identities"]["path"],
-        "provider_group_tax_identity_copy_path": artifact_by_name["provider_group_tax_identities"]["path"],
+        "provider_tax_identity_copy_path": artifact_by_name["provider_tax_identities"][
+            "path"
+        ],
+        "provider_group_tax_identity_copy_path": artifact_by_name[
+            "provider_group_tax_identities"
+        ]["path"],
+        "inferred_taxonomy_copy_path": artifact_by_name["inferred_taxonomy_candidates"][
+            "path"
+        ],
         "pattern_copy_path": None,
         "summary_path": str(output_directory / "v4-summary.json"),
     }
@@ -82,26 +104,45 @@ def _resource_fixture(
     }
 
 
-def _valid_summary_fixture(
-    output_directory: Path,
+def _summary_fixture_payload(
+    artifact_by_name: dict[str, dict[str, Any]],
     option_by_name: dict[str, int],
+    selected_graph_encoded_bytes: int,
+    mapping_persistence_encoded_bytes: int,
 ) -> dict[str, Any]:
-    """Build valid compiler evidence without requiring the Rust executable."""
-
-    output_directory.mkdir()
-    artifact_by_name = write_empty_artifacts(output_directory)
-    selected_encoded_bytes = _selected_encoded_bytes(artifact_by_name)
-    input_bytes = 0
-    factor_edges = 0
-    summary_by_name: dict[str, Any] = {
+    direct_complete_encoded_bytes = (
+        selected_graph_encoded_bytes + mapping_persistence_encoded_bytes
+    )
+    return {
         "format": compiler.PTG2_V4_GRAPH_SUMMARY_FORMAT,
         "selected_layout": "direct",
         "pattern_layout_serving_degree_eligible": True,
-        "direct_complete_encoded_bytes": selected_encoded_bytes,
-        "pattern_complete_encoded_bytes": selected_encoded_bytes + 1,
-        "common_encoded_bytes": selected_encoded_bytes,
-        "selected_encoded_bytes": selected_encoded_bytes,
-        "input_byte_count": input_bytes,
+        "pattern_layout_sparse_prefix_eligible": True,
+        "direct_layout_complete_prefix_eligible": True,
+        "pattern_sparse_prefix_owner_count": 0,
+        "pattern_sparse_prefix_member_count": 0,
+        "pattern_sparse_prefix_raw_bytes": 0,
+        "pattern_sparse_prefix_projection_encoded_bytes": 21,
+        "direct_complete_prefix_projection_encoded_bytes": 21,
+        "direct_graph_encoded_bytes": selected_graph_encoded_bytes,
+        "pattern_graph_encoded_bytes": selected_graph_encoded_bytes + 1,
+        "direct_mapping_persistence_encoded_bytes": mapping_persistence_encoded_bytes,
+        "pattern_mapping_persistence_encoded_bytes": mapping_persistence_encoded_bytes,
+        **taxonomy_summary_fields(),
+        "direct_map_payload_encoded_bytes": 0,
+        "pattern_map_payload_encoded_bytes": 0,
+        "direct_map_coordinate_count": 0,
+        "pattern_map_coordinate_count": 0,
+        "direct_map_pack_count": 0,
+        "pattern_map_pack_count": 0,
+        "direct_map_object_kind_count": 0,
+        "pattern_map_object_kind_count": 0,
+        "direct_complete_encoded_bytes": direct_complete_encoded_bytes,
+        "pattern_complete_encoded_bytes": direct_complete_encoded_bytes + 1,
+        "common_encoded_bytes": selected_graph_encoded_bytes,
+        "selected_graph_encoded_bytes": selected_graph_encoded_bytes,
+        "selected_encoded_bytes": direct_complete_encoded_bytes,
+        "input_byte_count": 0,
         "input_sha256": EMPTY_SHA256,
         "block_count": 0,
         "block_copy_bytes": artifact_by_name["graph_blocks"]["byte_count"],
@@ -109,15 +150,35 @@ def _valid_summary_fixture(
         "relation_summaries": empty_relation_fixture(),
         "heavy_bitmaps": [],
         "tax_identity": empty_tax_identity_summary(),
-        "output_artifacts": [
-            artifact_by_name[name] for name in _OUTPUT_ARTIFACT_NAMES
-        ],
+        "output_artifacts": [artifact_by_name[name] for name in _OUTPUT_ARTIFACT_NAMES],
         "resource_admission": _resource_fixture(
             option_by_name,
-            input_bytes=input_bytes,
-            factor_edges=factor_edges,
+            input_bytes=0,
+            factor_edges=0,
         ),
     }
+
+
+def _valid_summary_fixture(
+    output_directory: Path,
+    option_by_name: dict[str, int],
+) -> dict[str, Any]:
+    """Build valid compiler evidence without requiring the Rust executable."""
+
+    output_directory.mkdir()
+    (output_directory / compiler.PTG2_V4_GRAPH_SCRATCH_OWNER_NAME).write_bytes(
+        compiler.PTG2_V4_GRAPH_SCRATCH_OWNER_BYTES
+    )
+    artifact_by_name = write_empty_artifacts(output_directory)
+    write_empty_taxonomy_artifact(output_directory, artifact_by_name)
+    selected_graph_encoded_bytes = _selected_encoded_bytes(artifact_by_name)
+    mapping_persistence_encoded_bytes = 100
+    summary_by_name = _summary_fixture_payload(
+        artifact_by_name,
+        option_by_name,
+        selected_graph_encoded_bytes,
+        mapping_persistence_encoded_bytes,
+    )
     summary_by_name.update(_summary_path_fields(output_directory, artifact_by_name))
     summary_by_name.update(
         {
@@ -142,13 +203,17 @@ def _mutated(summary: dict[str, Any], path: tuple[Any, ...], value: Any):
 
 def _reject(summary: Any, arguments: dict[str, Any], message: str) -> None:
     with pytest.raises(RuntimeError, match=message):
-        compiler._validate_compiler_summary(summary, **arguments)
+        compiler._validate_compiler_summary(
+            summary,
+            **_packed_summary_validation(arguments),
+        )
 
 
-def _header_mutations(
+def _identity_header_mutations(
     summary: dict[str, Any],
-    option_by_name: dict[str, int],
 ) -> tuple[tuple[Any, str], ...]:
+    """Return summary identity and input-binding mutations."""
+
     return (
         (None, "summary is not an object"),
         (_mutated(summary, ("format",), "wrong"), "incompatible format"),
@@ -161,6 +226,16 @@ def _header_mutations(
             ),
             "input byte count changed",
         ),
+    )
+
+
+def _policy_header_mutations(
+    summary: dict[str, Any],
+    option_by_name: dict[str, int],
+) -> tuple[tuple[Any, str], ...]:
+    """Return sealed option and selected-cost mutations."""
+
+    return (
         (
             _mutated(
                 summary,
@@ -339,10 +414,10 @@ def _output_consistency_mutations(
         (
             _mutated(
                 summary,
-                ("selected_encoded_bytes",),
-                summary["selected_encoded_bytes"] - 1,
+                ("selected_graph_encoded_bytes",),
+                summary["selected_graph_encoded_bytes"] - 1,
             ),
-            "selected byte count disagrees",
+            "adaptive-layout choice",
         ),
     )
 
@@ -370,7 +445,9 @@ def _summary_mutations(
     option_by_name: dict[str, int],
 ) -> tuple[tuple[Any, str], ...]:
     return (
-        *_header_mutations(summary, option_by_name),
+        *_identity_header_mutations(summary),
+        *_policy_header_mutations(summary, option_by_name),
+        *layout_header_mutations(summary, _mutated),
         *resource_admission_mutations(summary, option_by_name),
         *_relation_mutations(summary),
         *_output_mutations(summary),
@@ -381,29 +458,11 @@ def test_compiler_summary_authentication_branch_matrix(tmp_path: Path) -> None:
     output = tmp_path / "compiled"
     option_by_name = compiler._effective_compiler_options(None)
     summary = _valid_summary_fixture(output, option_by_name)
-    tax_identity = summary["tax_identity"]
-    validation_arguments_by_name = {
-        "output_directory": output,
-        "expected_input_bytes": int(summary["input_byte_count"]),
-        "expected_factor_edges": int(
-            summary["resource_admission"]["factor_edge_count"]
-        ),
-        "expected_factor_owners": int(
-            summary["resource_admission"]["factor_owner_count"]
-        ),
-        "expected_options": option_by_name,
-        "expected_tax_identity": {
-            "token_policy_id": tax_identity["token_policy_id"],
-            "source_shard_ids": tuple(
-                source_entry["shard_id"]
-                for source_entry in tax_identity["source_ordinal_map"]
-            ),
-            "merge_bitmap_upper_bound_bytes": 0,
-            "source_ordinal_upper_bound_bytes": 268,
-            "projection_upper_bound_bytes": 0,
-        },
-        "allow_checkpoint": False,
-    }
+    validation_arguments_by_name = _summary_validation_fixture(
+        summary,
+        output,
+        option_by_name,
+    )
 
     for changed, message in _summary_mutations(summary, option_by_name):
         _reject(changed, validation_arguments_by_name, message)
@@ -423,50 +482,7 @@ def test_compiler_summary_authentication_branch_matrix(tmp_path: Path) -> None:
     extra_file.unlink()
     validated = compiler._validate_compiler_summary(
         pattern_summary_fixture(summary, output),
-        **validation_arguments_by_name,
+        **_packed_summary_validation(validation_arguments_by_name),
     )
     validated.cleanup()
     assert not output.exists()
-
-
-def test_compiler_progress_rejects_post_terminal_and_backward_events() -> None:
-    progress_event_by_field = {
-        "version": compiler.PTG2_V4_PROGRESS_VERSION,
-        "seq": 1,
-        "phase": "complete",
-        "done": 1,
-        "total": 1,
-        "unit": "stage",
-        "elapsed_ms": 1,
-        "terminal": True,
-    }
-    terminal_state = compiler._CompilerProgressState()
-    assert terminal_state.is_accepted(progress_event_by_field)
-    assert not terminal_state.is_accepted(
-        {**progress_event_by_field, "seq": 2}
-    )
-
-    backward_state = compiler._CompilerProgressState(
-        seq=1,
-        phase_index=3,
-        phase="derive_patterns",
-    )
-    assert not backward_state.is_accepted(
-        {
-            **progress_event_by_field,
-            "seq": 2,
-            "phase": "resource_admission",
-            "done": 0,
-            "terminal": False,
-        }
-    )
-
-    pct_state = compiler._CompilerProgressState(phase_pct=99.0)
-    assert not pct_state.is_accepted(
-        {
-            **progress_event_by_field,
-            "phase": "resource_admission",
-            "done": 0,
-            "terminal": False,
-        }
-    )

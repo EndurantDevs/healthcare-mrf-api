@@ -8,7 +8,9 @@ from tests.ptg2_v4_coverage_support import (
     _reference,
     pytest,
     snapshot_maps,
+    synthetic_adaptive_layout_decision,
 )
+
 
 async def _publish_snapshot_map(monkeypatch):
     reference = _reference("v4_relation_members_v1", 0, 0, entry_count=2)
@@ -49,16 +51,21 @@ async def _assert_persisted_map_summary(
     expected_summary,
     pack,
 ) -> None:
-    persisted_rows = [[{
-        **snapshot_maps._map_pack_row(pack, 17),
-        "map_format_version": PTG2_V3_SHARED_FORMAT_VERSION,
-        "map_object_kind": snapshot_maps.PTG2_V4_MAP_BLOCK_KIND,
-        "map_codec": "none",
-        "map_entry_count": 1,
-        "map_raw_byte_count": len(pack.map_block.payload),
-        "map_stored_byte_count": len(pack.map_block.payload),
-        "map_payload": pack.map_block.payload,
-    }], []]
+    persisted_rows = [
+        [
+            {
+                **snapshot_maps._map_pack_row(pack, 17),
+                "map_format_version": PTG2_V3_SHARED_FORMAT_VERSION,
+                "map_object_kind": snapshot_maps.PTG2_V4_MAP_BLOCK_KIND,
+                "map_codec": "none",
+                "map_entry_count": 1,
+                "map_raw_byte_count": len(pack.map_block.payload),
+                "map_stored_byte_count": len(pack.map_block.payload),
+                "map_payload": pack.map_block.payload,
+            }
+        ],
+        [],
+    ]
 
     async def fake_load_rows(*_args, **_kwargs):
         return persisted_rows.pop(0)
@@ -230,7 +237,14 @@ async def _assert_new_layout_seal(monkeypatch, expected_summary):
         build_token="token",
         expected_summary=expected_summary,
         support_digest=b"u" * 32,
-        layout_manifest={},
+        layout_manifest={
+            "serving_index": {
+                "provider_graph": {
+                    "representation": "pattern_v1",
+                    "adaptive_layout": synthetic_adaptive_layout_decision(),
+                }
+            }
+        },
     )
     assert (sealed.snapshot_key, sealed.reused) == (17, False)
     return owner_by_field
@@ -238,7 +252,14 @@ async def _assert_new_layout_seal(monkeypatch, expected_summary):
 
 def _reusable_layout_row(expected_summary):
     sealed_manifest = snapshot_maps._manifest_with_v4_root(
-        {},
+        {
+            "serving_index": {
+                "provider_graph": {
+                    "representation": "pattern_v1",
+                    "adaptive_layout": synthetic_adaptive_layout_decision(),
+                }
+            }
+        },
         representation="pattern_v1",
         summary=expected_summary,
         metadata=_metadata(),
@@ -295,7 +316,14 @@ async def _assert_reused_layout_seal(
         build_token="token",
         expected_summary=expected_summary,
         support_digest=b"u" * 32,
-        layout_manifest={},
+        layout_manifest={
+            "serving_index": {
+                "provider_graph": {
+                    "representation": "pattern_v1",
+                    "adaptive_layout": synthetic_adaptive_layout_decision(),
+                }
+            }
+        },
     )
     assert (reused.snapshot_key, reused.reused) == (18, True)
     assert deleted_snapshot_keys == [17]

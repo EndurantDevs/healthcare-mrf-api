@@ -587,3 +587,29 @@ pub fn open_full_scan_json_reader(
         rapidgzip,
     )?))
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{configure_process_group, stop_spawned_child, terminate_process_group};
+    use std::io;
+    use std::process::Command;
+
+    #[test]
+    fn spawned_child_cleanup_reaps_its_process_group() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 60"]);
+        configure_process_group(&mut command);
+        let child = command.spawn().expect("spawn isolated cleanup fixture");
+
+        stop_spawned_child(child);
+    }
+
+    #[test]
+    fn process_group_cleanup_rejects_unrepresentable_ids() {
+        let error = terminate_process_group(u32::MAX)
+            .expect_err("process group identifiers must fit signed C integers");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("exceeds i32"));
+    }
+}

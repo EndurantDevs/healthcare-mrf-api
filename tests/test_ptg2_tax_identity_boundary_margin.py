@@ -13,6 +13,7 @@ from process.ptg_parts import ptg2_shared_snapshot_publish as publisher
 from process.ptg_parts import ptg2_v4_graph_compiler as compiler
 from tests.ptg2_v4_graph_compiler_test_support import (
     _write_tax_identity,
+    compiler_manifest_inputs,
     compiler_fixture,
 )
 from tests.ptg2_v4_summary_fixture_support import empty_tax_identity_summary
@@ -181,10 +182,13 @@ def test_compiler_manifest_rejects_unusable_factor_collections(
 ) -> None:
     provider_map = tmp_path / "map.tsv"
     provider_map.write_text("map")
+    npi_scope, inferred_taxonomy = compiler_manifest_inputs(tmp_path)
     with pytest.raises(RuntimeError, match=message):
         compiler.build_v4_graph_compiler_manifest(
             graph_artifact_entries=entries,
             provider_set_key_map_path=provider_map,
+            npi_scope=npi_scope,
+            inferred_taxonomy=inferred_taxonomy,
             output_directory=tmp_path,
         )
 
@@ -193,10 +197,13 @@ def test_compiler_manifest_rejects_duplicates_and_provider_map_drift(
     tmp_path: Path,
 ) -> None:
     artifacts, provider_map = compiler_fixture(tmp_path)
+    npi_scope, inferred_taxonomy = compiler_manifest_inputs(tmp_path)
     with pytest.raises(RuntimeError, match="repeats factor"):
         compiler.build_v4_graph_compiler_manifest(
             graph_artifact_entries=[*artifacts, artifacts[0]],
             provider_set_key_map_path=provider_map,
+            npi_scope=npi_scope,
+            inferred_taxonomy=inferred_taxonomy,
             output_directory=tmp_path,
         )
 
@@ -205,6 +212,8 @@ def test_compiler_manifest_rejects_duplicates_and_provider_map_drift(
         compiler.build_v4_graph_compiler_manifest(
             graph_artifact_entries=artifacts,
             provider_set_key_map_path=provider_map,
+            npi_scope=npi_scope,
+            inferred_taxonomy=inferred_taxonomy,
             output_directory=tmp_path,
         )
 
@@ -309,15 +318,11 @@ def _copy_payload(rows: list[tuple[bytes | None, ...]]) -> bytes:
             "wrong COPY width",
         ),
         (
-            compiler._PG_COPY_HEADER
-            + struct.pack(">h", 1)
-            + b"\x00",
+            compiler._PG_COPY_HEADER + struct.pack(">h", 1) + b"\x00",
             "truncates COPY field",
         ),
         (
-            compiler._PG_COPY_HEADER
-            + struct.pack(">h", 1)
-            + struct.pack(">i", -2),
+            compiler._PG_COPY_HEADER + struct.pack(">h", 1) + struct.pack(">i", -2),
             "invalid NULL COPY field",
         ),
         (
@@ -455,9 +460,7 @@ def test_publisher_group_tax_rows_reject_invalid_identity_and_bitmap(
     row: tuple[object, ...],
     message: str,
 ) -> None:
-    contract = publisher._validated_v4_tax_identity_contract(
-        _publisher_compilation()
-    )
+    contract = publisher._validated_v4_tax_identity_contract(_publisher_compilation())
     with pytest.raises(RuntimeError, match=message):
         publisher._validated_v4_tax_group_row(
             row,

@@ -4,16 +4,18 @@ from tests.ptg2_v4_coverage_support import (
     PTG2_V3_SHARED_FORMAT_VERSION,
     SharedBlockReference,
     SimpleNamespace,
-    _metadata,
     _owner_row,
     _reference,
     _relation_row,
     _summary,
+    assert_snapshot_manifest_builder_rejections,
     json,
     pytest,
+    snapshot_manifest_fixture,
     snapshot_maps,
     struct,
 )
+
 
 def _assert_snapshot_environment(monkeypatch) -> None:
     monkeypatch.delenv("PTG_TEST_SECONDS", raising=False)
@@ -113,62 +115,6 @@ def _snapshot_map_pack_summary():
     return summary
 
 
-def _snapshot_manifest_fixture(summary):
-    metadata = _metadata()
-    manifest = snapshot_maps._manifest_with_v4_root(
-        {},
-        representation="pattern_v1",
-        summary=summary,
-        metadata=metadata,
-    )
-    snapshot_maps._validate_v4_manifest_root(
-        manifest,
-        representation="pattern_v1",
-        summary=summary,
-        metadata=metadata,
-    )
-    assert manifest["serving_index"]["snapshot_map"]["map_digest"] == (
-        summary.map_digest.hex()
-    )
-    with pytest.raises(ValueError, match="serving_index"):
-        snapshot_maps._manifest_copy_with_index({"serving_index": "bad"})
-    with pytest.raises(ValueError, match="storage generation"):
-        snapshot_maps._manifest_copy_with_index(
-            {"serving_index": {"storage_generation": "foreign"}}
-        )
-    with pytest.raises(ValueError, match="incompatible type"):
-        snapshot_maps._apply_v4_index_markers({"type": "foreign"})
-    with pytest.raises(ValueError, match="serving_binary"):
-        snapshot_maps._serving_binary_v4_map(
-            {"serving_binary": "bad"},
-            representation="pattern_v1",
-            summary=summary,
-            metadata=metadata,
-        )
-    with pytest.raises(ValueError, match="must remain"):
-        snapshot_maps._serving_binary_v4_map(
-            {"serving_binary": {"format": "gzip"}},
-            representation="pattern_v1",
-            summary=summary,
-            metadata=metadata,
-        )
-    with pytest.raises(ValueError, match="conflicting provider_graph"):
-        snapshot_maps._serving_binary_v4_map(
-            {"serving_binary": {"provider_graph_v4": {"bad": True}}},
-            representation="pattern_v1",
-            summary=summary,
-            metadata=metadata,
-        )
-    with pytest.raises(ValueError, match="conflicting snapshot-map"):
-        snapshot_maps._manifest_with_v4_root(
-            {"serving_index": {"snapshot_map": {"bad": True}}},
-            representation="pattern_v1",
-            summary=summary,
-            metadata=metadata,
-        )
-    return manifest, metadata
-
-
 def _assert_snapshot_manifest_rejections(manifest, summary, metadata) -> None:
     broken = json.loads(json.dumps(manifest))
     broken["serving_index"]["type"] = "broken"
@@ -205,7 +151,8 @@ def test_snapshot_map_manifest_and_codec_fail_closed(monkeypatch) -> None:
     valid, encoded = _snapshot_map_round_trip()
     _assert_snapshot_map_codec_rejections(valid, encoded)
     summary = _snapshot_map_pack_summary()
-    manifest, metadata = _snapshot_manifest_fixture(summary)
+    manifest, metadata = snapshot_manifest_fixture(summary)
+    assert_snapshot_manifest_builder_rejections(summary, metadata)
     _assert_snapshot_manifest_rejections(manifest, summary, metadata)
 
 
@@ -371,9 +318,9 @@ def _heavy_locator_fixture():
         2,
         b"l" * 32,
     )
-    assert snapshot_maps._locator_identity_by_hash(
-        {("locator", 8): coordinate}
-    ) == {b"l" * 32: ("locator", 2)}
+    assert snapshot_maps._locator_identity_by_hash({("locator", 8): coordinate}) == {
+        b"l" * 32: ("locator", 2)
+    }
     return (
         relation_metadata_by_name,
         heavy_owner_by_coordinate,
@@ -453,13 +400,14 @@ def _assert_relation_entry_validation(
 
 
 def _assert_normalized_relation_rows() -> None:
-    normalized_relation = snapshot_maps._relation_manifest_row(
-        _relation_row("a")
-    )
+    normalized_relation = snapshot_maps._relation_manifest_row(_relation_row("a"))
     assert normalized_relation["relation"] == "a"
-    assert snapshot_maps._normalized_relation_rows(
-        (_relation_row("a"), _relation_row("b"))
-    )[1]["relation"] == "b"
+    assert (
+        snapshot_maps._normalized_relation_rows(
+            (_relation_row("a"), _relation_row("b"))
+        )[1]["relation"]
+        == "b"
+    )
     with pytest.raises(ValueError, match="strictly ordered"):
         snapshot_maps._normalized_relation_rows(
             (_relation_row("b"), _relation_row("a"))
@@ -473,17 +421,18 @@ def _assert_normalized_relation_rows() -> None:
             }
         )
 
-    assert snapshot_maps._normalized_heavy_owner_rows(
-        (_owner_row("a", 1), _owner_row("a", 2))
-    )[0]["owner_key"] == 1
+    assert (
+        snapshot_maps._normalized_heavy_owner_rows(
+            (_owner_row("a", 1), _owner_row("a", 2))
+        )[0]["owner_key"]
+        == 1
+    )
     with pytest.raises(ValueError, match="strictly ordered"):
         snapshot_maps._normalized_heavy_owner_rows(
             (_owner_row("a", 2), _owner_row("a", 1))
         )
     with pytest.raises(ValueError, match="invalid bitmap"):
-        snapshot_maps._heavy_owner_row(
-            {**_owner_row(), "fragment_count": 0}
-        )
+        snapshot_maps._heavy_owner_row({**_owner_row(), "fragment_count": 0})
 
 
 def test_snapshot_persisted_pack_and_metadata_validators() -> None:
@@ -491,9 +440,7 @@ def test_snapshot_persisted_pack_and_metadata_validators() -> None:
     pack_fixture = _persisted_pack_fixture()
     _assert_persisted_pack_rejections(*pack_fixture)
     _assert_root_summary_validation()
-    relation_rows, heavy_owners, locator_pages, coordinate = (
-        _heavy_locator_fixture()
-    )
+    relation_rows, heavy_owners, locator_pages, coordinate = _heavy_locator_fixture()
     _assert_zero_locator_validation(locator_pages, coordinate)
     _assert_metadata_count_validation()
     _assert_relation_entry_validation(relation_rows, heavy_owners)

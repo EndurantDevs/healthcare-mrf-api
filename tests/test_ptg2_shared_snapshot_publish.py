@@ -18,6 +18,7 @@ from process import live_progress
 from process.ptg_parts import ptg2_shared_snapshot_publish as shared_snapshot_publish
 from process.ptg_parts import ptg2_shared_publish as shared_publish
 from process.ptg_parts import live_progress as ptg_live_progress
+from process.ptg_parts import ptg2_v4_graph_compiler as graph_compiler
 from process.ptg_parts.ptg2_shared_blocks import SharedMappingDigestSummary
 from process.ptg_parts.ptg2_shared_price import PreparedSharedPriceKeyMap
 from process.ptg_parts.ptg2_shared_snapshot_publish import (
@@ -70,9 +71,7 @@ def _tax_identity_compilation_summary():
         "hmac_contract": hmac_contract,
         "candidate_prefix_contract": prefix_contract,
         "authority_contract": authority_contract,
-        "source_ordinal_contract": (
-            "snapshot_shard_id_sorted_lsb0_bitmap_v1"
-        ),
+        "source_ordinal_contract": ("snapshot_shard_id_sorted_lsb0_bitmap_v1"),
         "source_ordinal_map": source_ordinals,
         "source_ordinal_map_digest": source_digest.hexdigest(),
         "source_shard_count": 1,
@@ -107,71 +106,23 @@ def test_v4_tax_policy_descriptor_matches_frozen_cross_language_vector():
     )
 
     assert descriptor.hex() == (
-        "a0c06f5494f80663686be6861038a880"
-        "4d9509d0fdc2d2c8cc56c259e53d761c"
+        "a0c06f5494f80663686be6861038a880" "4d9509d0fdc2d2c8cc56c259e53d761c"
     )
 
 
 def test_v4_tax_contract_is_recomputed_before_publication():
     compilation = _tax_identity_compilation_summary()
 
-    contract = (
-        shared_snapshot_publish._validated_v4_tax_identity_contract(
-            compilation
-        )
-    )
+    contract = shared_snapshot_publish._validated_v4_tax_identity_contract(compilation)
 
     assert contract.provider_group_count == 4
     assert contract.tax_identity_count == 1
     assert contract.source_bitmap_bytes == 1
-    assert (
-        shared_snapshot_publish._v4_tax_artifact_byte_count(compilation)
-        == 394
-    )
+    assert shared_snapshot_publish._v4_tax_artifact_byte_count(compilation) == 394
 
-    compilation.summary["tax_identity"][
-        "token_policy_descriptor_sha256"
-    ] = "00" * 32
+    compilation.summary["tax_identity"]["token_policy_descriptor_sha256"] = "00" * 32
     with pytest.raises(RuntimeError, match="descriptor"):
-        shared_snapshot_publish._validated_v4_tax_identity_contract(
-            compilation
-        )
-
-
-@pytest.mark.asyncio
-async def test_v4_taxonomy_sidecar_threads_building_root_identity(
-    monkeypatch,
-) -> None:
-    publication = object()
-    publish_mock = AsyncMock(return_value=publication)
-    monkeypatch.setattr(
-        shared_snapshot_publish,
-        "publish_v4_inferred_taxonomy_candidates",
-        publish_mock,
-    )
-    session = object()
-
-    observed = await shared_snapshot_publish._publish_v4_taxonomy_sidecar(
-        session,
-        schema_name="mrf",
-        snapshot_key=41,
-        build_token="exact-build-token",
-        npi_count=154_184,
-        representation="pattern_v1",
-        pattern_count=45,
-    )
-
-    assert observed is publication
-    assert publish_mock.await_args.kwargs == {
-        "schema_name": "mrf",
-        "snapshot_key": 41,
-        "build_token": "exact-build-token",
-        "rules": shared_snapshot_publish.INFERRED_PROVIDER_TAXONOMY_RULES,
-        "npi_count": 154_184,
-        "representation": "pattern_v1",
-        "pattern_count": 45,
-    }
-    assert publish_mock.await_args.args == (session,)
+        shared_snapshot_publish._validated_v4_tax_identity_contract(compilation)
 
 
 class _SlowProgressDriver:
@@ -251,8 +202,7 @@ def _assert_shared_publish_cadence(progress_writes):
     ] == [4, 8, 12]
     assert max(progress_gaps) <= 4.0
     assert [
-        progress_snapshot["progress_seq"]
-        for progress_snapshot in progress_snapshots
+        progress_snapshot["progress_seq"] for progress_snapshot in progress_snapshots
     ] == [1, 2, 3]
 
 
@@ -302,9 +252,7 @@ def _dense_dictionary_progress_stage():
 
 def _assert_dense_dictionary_range_statements(statements):
     range_statements = [
-        statement
-        for statement, _parameters in statements
-        if "range_start" in statement
+        statement for statement, _parameters in statements if "range_start" in statement
     ]
     assert len(range_statements) == 6
     assert all(">= :range_start" in statement for statement in range_statements)
@@ -388,14 +336,11 @@ async def test_dense_v4_dictionary_ranges_move_exact_progress_every_four_seconds
     )
     progress.flush()
 
-    emitted_times = [
-        observed_at
-        for observed_at, _stage, _counters in progress_events
-    ]
-    assert max(
-        later - earlier
-        for earlier, later in zip(emitted_times, emitted_times[1:])
-    ) <= 4.0
+    emitted_times = [observed_at for observed_at, _stage, _counters in progress_events]
+    assert (
+        max(later - earlier for earlier, later in zip(emitted_times, emitted_times[1:]))
+        <= 4.0
+    )
     assert progress_events[-1][2]["validated_dictionary_rows"] == 200_001
     assert progress_events[-1][2]["published_dictionary_rows"] == 200_001
     _assert_dense_dictionary_range_statements(range_driver.statements)
@@ -405,9 +350,7 @@ def test_v4_dictionary_default_ranges_are_exact_and_ten_times_coarser():
     """One million dense rows need about one tenth of the former batches."""
 
     expected_count = 1_000_001
-    ranges = tuple(
-        shared_snapshot_publish._v4_dictionary_ranges(expected_count)
-    )
+    ranges = tuple(shared_snapshot_publish._v4_dictionary_ranges(expected_count))
 
     assert len(ranges) == 11
     assert len(range(0, expected_count, 10_000)) == 101
@@ -444,14 +387,10 @@ def test_v4_dictionary_batch_sizer_enforces_bytes_and_adapts_time():
         <= shared_snapshot_publish._V4_DICTIONARY_MAX_ESTIMATED_ROW_WORK_BYTES
     )
     initial_rows = sizer.current_rows
-    sizer.observe(
-        shared_snapshot_publish._V4_DICTIONARY_SLOW_STATEMENT_SECONDS
-    )
+    sizer.observe(shared_snapshot_publish._V4_DICTIONARY_SLOW_STATEMENT_SECONDS)
     assert sizer.current_rows == max(sizer.fallback_rows, initial_rows // 2)
     reduced_rows = sizer.current_rows
-    sizer.observe(
-        shared_snapshot_publish._V4_DICTIONARY_RECOVERY_STATEMENT_SECONDS
-    )
+    sizer.observe(shared_snapshot_publish._V4_DICTIONARY_RECOVERY_STATEMENT_SECONDS)
     assert sizer.current_rows == min(sizer.maximum_rows, reduced_rows * 2)
 
 
@@ -591,11 +530,9 @@ def test_v4_dictionary_heartbeat_repeats_only_completed_counters():
 def test_v4_dictionary_heartbeat_skips_unreportable_work():
     """Heartbeat is inert without a callback or before its next cadence."""
 
-    progress_without_callback = (
-        shared_snapshot_publish._MeasuredPublicationProgress(
-            "dictionary",
-            None,
-        )
+    progress_without_callback = shared_snapshot_publish._MeasuredPublicationProgress(
+        "dictionary",
+        None,
     )
     progress_without_callback.heartbeat()
 
@@ -862,7 +799,71 @@ async def test_failed_v4_graph_hashes_are_queued_in_bounded_batches(
     assert second_hashes == [(8_192).to_bytes(32, "big")]
 
 
+def _v4_graph_summary():
+    """Return one complete pattern-selected publication summary."""
+
+    encoding_options_by_name = {
+        name: option_value
+        for name, option_value in graph_compiler._effective_compiler_options(
+            None
+        ).items()
+        if name in graph_compiler.PTG2_V4_GRAPH_ENCODING_OPTION_NAMES
+    }
+    return {
+        **encoding_options_by_name,
+        "format": "ptg2_provider_graph_v4",
+        "selected_layout": "pattern",
+        "selected_encoded_bytes": 231,
+        "direct_layout_complete_prefix_eligible": True,
+        "pattern_layout_sparse_prefix_eligible": True,
+        "pattern_layout_serving_degree_eligible": True,
+        "direct_complete_prefix_projection_encoded_bytes": 10,
+        "pattern_sparse_prefix_owner_count": 0,
+        "pattern_sparse_prefix_member_count": 0,
+        "pattern_sparse_prefix_raw_bytes": 0,
+        "pattern_sparse_prefix_projection_encoded_bytes": 10,
+        "direct_graph_encoded_bytes": 100,
+        "direct_mapping_persistence_encoded_bytes": 132,
+        "direct_inferred_taxonomy_encoded_bytes": 0,
+        "direct_inferred_taxonomy_eligible": True,
+        "direct_inferred_taxonomy_rejection_reason": None,
+        "direct_inferred_taxonomy_rejection_rule_digest": None,
+        "direct_inferred_taxonomy_rejection_observed_count": None,
+        "direct_inferred_taxonomy_rejection_cap": None,
+        "direct_map_payload_encoded_bytes": 132,
+        "direct_map_coordinate_count": 1,
+        "direct_map_pack_count": 1,
+        "direct_map_object_kind_count": 1,
+        "direct_complete_encoded_bytes": 232,
+        "pattern_graph_encoded_bytes": 99,
+        "pattern_mapping_persistence_encoded_bytes": 132,
+        "pattern_inferred_taxonomy_encoded_bytes": 0,
+        "pattern_inferred_taxonomy_eligible": True,
+        "pattern_inferred_taxonomy_rejection_reason": None,
+        "pattern_inferred_taxonomy_rejection_rule_digest": None,
+        "pattern_inferred_taxonomy_rejection_observed_count": None,
+        "pattern_inferred_taxonomy_rejection_cap": None,
+        "pattern_map_payload_encoded_bytes": 132,
+        "pattern_map_coordinate_count": 1,
+        "pattern_map_pack_count": 1,
+        "pattern_map_object_kind_count": 1,
+        "pattern_complete_encoded_bytes": 231,
+        "npi_prefix_target": 200,
+        "max_npi_prefix_override_owners": 250_000,
+        "max_npi_prefix_override_bytes": 64 * 1024 * 1024,
+        "max_set_patterns_per_set": 4096,
+        "max_set_components_per_fallback_set": 4096,
+        "resource_admission": {
+            "max_estimated_model_bytes": 8 * 1024 * 1024 * 1024,
+            "max_factor_edges": 1_000_000,
+        },
+        "observe": {"unsafe_pattern_component_set_count": 0},
+    }
+
+
 def _v4_graph_publication_fixture(tmp_path):
+    """Return authenticated graph, CAS, and map publication evidence."""
+
     artifact = SimpleNamespace(
         name="graph_blocks",
         byte_count=12,
@@ -874,7 +875,7 @@ def _v4_graph_publication_fixture(tmp_path):
         block_copy_path=tmp_path / "graph.copy",
         reference_manifest_path=tmp_path / "references.jsonl",
         selected_layout="pattern",
-        summary={"format": "ptg2_provider_graph_v4"},
+        summary=_v4_graph_summary(),
         relation_summaries=(),
         heavy_bitmaps=(),
         observe={"group_count": 3, "npi_count": 2},
@@ -893,8 +894,10 @@ def _v4_graph_publication_fixture(tmp_path):
     map_summary = SimpleNamespace(
         map_digest=b"m" * 32,
         object_kinds=("v4_set_patterns_members_v1",),
+        object_kind_count=1,
+        map_pack_count=1,
         coordinate_count=1,
-        stored_map_byte_count=64,
+        stored_map_byte_count=132,
     )
     return compilation, cas_publication, map_summary
 
@@ -949,9 +952,7 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
 ):
     """Seal acquisition bytes with graph diagnostics, not the CAS stage."""
 
-    compilation, cas_publication, map_summary = (
-        _v4_graph_publication_fixture(tmp_path)
-    )
+    compilation, cas_publication, map_summary = _v4_graph_publication_fixture(tmp_path)
     publish_cas_mock, publish_maps_mock = _patch_v4_graph_publication(
         monkeypatch,
         cas_publication,
@@ -968,7 +969,7 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
     )
 
     assert publication.logical_byte_count == 88
-    assert publication.stored_byte_count == 152
+    assert publication.stored_byte_count == 220
     assert publication.provider_tax_identity["tax_identity_count"] == 1
     assert publish_cas_mock.await_args.kwargs == {
         "schema_name": "mrf",
@@ -976,12 +977,45 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
         "snapshot_key": 17,
         "build_token": "token",
     }
-    assert publish_maps_mock.await_args.kwargs[
-        "compressed_acquisition_bytes"
-    ] == 4_096
-    assert publish_maps_mock.await_args.kwargs[
-        "empty_npi_tin_only_normalization_count"
-    ] == 2
+    assert publish_maps_mock.await_args.kwargs["compressed_acquisition_bytes"] == 4_096
+    assert (
+        publish_maps_mock.await_args.kwargs["empty_npi_tin_only_normalization_count"]
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_graph_publish_rejects_packed_map_plan_drift(
+    monkeypatch,
+    tmp_path,
+):
+    """Require the selected estimator to match real coordinate-map packs."""
+
+    compilation, cas_publication, map_summary = _v4_graph_publication_fixture(tmp_path)
+    drifted_map_summary = SimpleNamespace(
+        **{
+            **vars(map_summary),
+            "stored_map_byte_count": map_summary.stored_map_byte_count + 1,
+        }
+    )
+    _patch_v4_graph_publication(
+        monkeypatch,
+        cas_publication,
+        drifted_map_summary,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="packed-map plan differs from publication",
+    ):
+        await shared_snapshot_publish._publish_v4_graph(
+            compilation,
+            schema_name="mrf",
+            snapshot_key=17,
+            build_token="token",
+            compressed_acquisition_bytes=4_096,
+            empty_npi_tin_only_normalization_count=2,
+        )
 
 
 @pytest.mark.asyncio
@@ -1031,6 +1065,7 @@ async def test_v4_graph_publish_queues_blocks_after_stage_failure(
 def _failed_tax_stage_compilation(tmp_path):
     """Return the minimum compilation needed to reach the build fence."""
 
+    taxonomy_path = tmp_path / "inferred-taxonomy.copy"
     return SimpleNamespace(
         observe={
             "group_count": 4,
@@ -1048,7 +1083,17 @@ def _failed_tax_stage_compilation(tmp_path):
         provider_set_npi_prefix_override_copy_path=tmp_path / "prefix.copy",
         provider_tax_identity_copy_path=tmp_path / "tax.copy",
         provider_group_tax_identity_copy_path=tmp_path / "group-tax.copy",
-        output_artifacts=(),
+        inferred_taxonomy_copy_path=taxonomy_path,
+        output_artifacts=(
+            SimpleNamespace(
+                name="inferred_taxonomy_candidates",
+                path=taxonomy_path,
+                byte_count=0,
+                sha256="e3b0c44298fc1c149afbf4c8996fb924"
+                "27ae41e4649b934ca495991b7852b855",
+                row_count=0,
+            ),
+        ),
     )
 
 
@@ -1278,9 +1323,7 @@ async def test_v4_first_stage_creation_failure_preserves_original_error(
 ) -> None:
     """No invalid empty DROP may mask failure of the first stage CREATE."""
 
-    status_mock = AsyncMock(
-        side_effect=RuntimeError("first stage create failed")
-    )
+    status_mock = AsyncMock(side_effect=RuntimeError("first stage create failed"))
     monkeypatch.setattr(shared_snapshot_publish.db, "status", status_mock)
     monkeypatch.setattr(
         shared_snapshot_publish,
@@ -1315,9 +1358,7 @@ def _patch_disabled_v4_publication(monkeypatch):
 
     state = SimpleNamespace(
         prepared_price=prepared_price,
-        prepare_mock=AsyncMock(
-            return_value=(prepared_price, 0.0, None, None)
-        ),
+        prepare_mock=AsyncMock(return_value=(prepared_price, 0.0, None, None)),
         publish_v3_mock=AsyncMock(return_value="v3-publication"),
         compile_v4_mock=AsyncMock(),
         publish_v4_mock=AsyncMock(),
@@ -1367,10 +1408,7 @@ async def test_v4_disabled_publication_keeps_v3_path(
     assert publication == "v3-publication"
     assert state.publish_v3_mock.await_args.kwargs["provider_graph_v4"] is False
     assert (
-        state.publish_v3_mock.await_args.kwargs[
-            "compressed_acquisition_bytes"
-        ]
-        is None
+        state.publish_v3_mock.await_args.kwargs["compressed_acquisition_bytes"] is None
     )
     assert (
         state.publish_v3_mock.await_args.kwargs[
@@ -1467,9 +1505,7 @@ def _install_early_finalizer_mocks(monkeypatch, tmp_path, state, prepared_price)
 
 
 def _assert_early_finalizer_pipeline(pipeline_output, state, prepared_price):
-    prepared, prepare_seconds, prepared_finalizer, price_publication = (
-        pipeline_output
-    )
+    prepared, prepare_seconds, prepared_finalizer, price_publication = pipeline_output
     assert prepared is prepared_price
     assert prepare_seconds >= 0
     assert prepared_finalizer.summary == {"blocks": {}}

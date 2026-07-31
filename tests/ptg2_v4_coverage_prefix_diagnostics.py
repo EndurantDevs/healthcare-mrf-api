@@ -276,6 +276,61 @@ def test_compiler_accepts_risk_ranked_owner_below_group_maximum() -> None:
     ) == (7, False)
 
 
+def test_complete_direct_prefix_requires_every_provider_set_owner() -> None:
+    """Direct completeness is stricter than sparse unsafe-owner coverage."""
+
+    option_by_name = compiler._effective_compiler_options(None)
+    count_by_name = {
+        "provider_sets": 2,
+        "group_unsafe_sets": 1,
+        "physical_unsafe_sets": 0,
+        "simulated_sets": 2,
+        "override_members": 2,
+        "override_raw_bytes": 8,
+        "group_merge_visits": 1,
+    }
+    incomplete = compiler._PrefixCounts(
+        override_owners=1,
+        **count_by_name,
+    )
+    complete = compiler._PrefixCounts(
+        override_owners=2,
+        **count_by_name,
+    )
+    percentiles = (1, 1, 1, 1)
+
+    assert not compiler._has_inconsistent_prefix_totals(
+        incomplete,
+        option_by_name,
+        percentiles,
+        has_physical_overflow=False,
+        complete_direct_coverage=False,
+    )
+    assert compiler._has_inconsistent_prefix_totals(
+        incomplete,
+        option_by_name,
+        percentiles,
+        has_physical_overflow=False,
+        complete_direct_coverage=True,
+    )
+    assert not compiler._has_inconsistent_prefix_totals(
+        complete,
+        option_by_name,
+        percentiles,
+        has_physical_overflow=False,
+        complete_direct_coverage=True,
+    )
+    sparse_cap_option_by_name = dict(option_by_name)
+    sparse_cap_option_by_name["max_npi_prefix_override_owners"] = 1
+    assert not compiler._has_inconsistent_prefix_totals(
+        complete,
+        sparse_cap_option_by_name,
+        percentiles,
+        has_physical_overflow=False,
+        complete_direct_coverage=True,
+    )
+
+
 def test_compiler_rejects_unavailable_factor_artifact(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="factor artifact is unavailable"):
         compiler._artifact_manifest({"path": str(tmp_path / "missing.bin")})

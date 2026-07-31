@@ -17,8 +17,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -49,10 +49,16 @@ const STANDARD_HEADER_BYTES: usize = 20;
 const DENSE_HEADER_BYTES: usize = 28;
 const OWNER_RECORD_BYTES: usize = 28;
 const GLOBAL_ID_BYTES: usize = 16;
+const MIN_NPI: u64 = 1_000_000_000;
+const MAX_NPI: u64 = 9_999_999_999;
 const LOCATOR_BYTES: usize = 12;
 const HEAVY_BITMAP_HEADER_BYTES: usize = 24;
 const HEAVY_BITMAP_FRAGMENT_HEADER_BYTES: usize = 32;
 const HEAVY_BITMAP_FRAGMENT_MAGIC: &[u8; 8] = b"PTG2V4BF";
+const V4_MAP_HEADER_BYTES: u64 = 80;
+const V4_MAP_RECORD_BYTES: u64 = 52;
+const V4_MAP_COORDINATES_PER_PACK: u64 = 256;
+const V4_MAP_BLOCK_KIND: &str = "snapshot_coordinate_map_v1";
 const DEFAULT_PAGE_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_SET_PATTERNS_PER_SET: usize = 1_024;
 const DEFAULT_MAX_SET_COMPONENTS_PER_FALLBACK_SET: usize = 4_096;
@@ -86,6 +92,9 @@ const REFERENCE_SPOOL_FIXED_BYTES: u64 = REFERENCE_ENCODE_BUFFER_BYTES
 const ESTIMATED_U32_CAPACITY_BYTES: u64 = 8;
 const ESTIMATED_VEC_OWNER_BYTES: u64 = 64;
 const ESTIMATED_PATTERN_INDEX_BYTES: u64 = 256;
+const ESTIMATED_INFERRED_TAXONOMY_ROW_BYTES: u64 = 512;
+const ESTIMATED_PATTERN_POSTING_SCRATCH_BYTES: u64 = 128;
+const ESTIMATED_PATTERN_PAYLOAD_BYTES_PER_MEMBER: u64 = 24;
 // V4 is a logical graph generation. Immutable CAS blocks intentionally retain
 // the existing physical V3 wire contract so they can share `ptg2_v3_block`.
 const SHARED_FORMAT_VERSION: i16 = 2;
@@ -98,8 +107,34 @@ const PG_COPY_HEADER: &[u8] = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0";
 const PROGRESS_PREFIX: &str = "PTG2_V4_PROGRESS\t";
 const PROGRESS_VERSION: u8 = 1;
 const PROGRESS_MAX_PERIODIC_EVENTS: u64 = 256;
+const NPI_SCOPE_FORMAT: &str = "ptg2_provider_graph_v4_npi_scope_v1";
+const NPI_SCOPE_INPUT_HASH_DOMAIN: &[u8] = b"PTG2V4NPISCOPE\x01";
+const NPI_SCOPE_ARTIFACT_FORMAT: &str = "ptg2_provider_npi_scope_pg_binary_int8_v1";
+const NPI_SCOPE_BINDING_CONTRACT: &str = "provider_npi_scope_to_provider_npi_group_v1";
+const NPI_SCOPE_BINDING_HASH_DOMAIN: &[u8] = b"ptg2:v4:provider-npi-scope-binding:v1\x00";
+const NPI_SCOPE_SHARD_BINDING_CONTRACT: &str = "provider_npi_scope_shard_binding_v1";
+const NPI_SCOPE_SHARD_BINDING_HASH_DOMAIN: &[u8] =
+    b"ptg2:v4:provider-npi-scope-shard-binding:v1\x00";
+const NPI_SCOPE_RETENTION_CONTRACT: &str = "shared_v4_publication_scratch_v1";
+const INFERRED_TAXONOMY_INPUT_CONTRACT: &str = "ptg2_v4_inferred_taxonomy_compiler_input_v1";
+const INFERRED_TAXONOMY_CATALOG_CONTRACT: &str = "snapshot_npi_live_catalog_individual_v1";
+const INFERRED_TAXONOMY_VECTOR_FORMAT: &str = "sorted_u32le_v1";
+const INFERRED_TAXONOMY_DIRECT_REPRESENTATION: &str = "direct_v1";
+const INFERRED_TAXONOMY_PATTERN_REPRESENTATION: &str = "pattern_v1";
+const INFERRED_TAXONOMY_OBSERVE_REPRESENTATION: &str = "observe_v1";
+const INFERRED_TAXONOMY_CANDIDATE_CAP_REASON: &str = "candidate_cap_exceeded";
+const INFERRED_TAXONOMY_PATTERN_CAP_REASON: &str = "pattern_projection_cap_exceeded";
+const INFERRED_TAXONOMY_MEMBER_DIGEST_DOMAIN: &[u8] = b"ptg2:v4:inferred-taxonomy-members:v1\x00";
+const INFERRED_TAXONOMY_RULE_SET_DIGEST_DOMAIN: &[u8] =
+    b"ptg2:v4:inferred-taxonomy-rule-set:v1\x00";
+const INFERRED_TAXONOMY_PATTERN_MEMBER_DIGEST_DOMAIN: &[u8] =
+    b"ptg2:v4:inferred-taxonomy-pattern-members:v2\x00";
+const INFERRED_TAXONOMY_PATTERN_PAYLOAD_MAGIC: &[u8; 8] = b"PTG4TXP2";
+const INFERRED_TAXONOMY_PATTERN_PAYLOAD_VERSION: u32 = 1;
+const DEFAULT_MAX_ONLINE_INFERRED_TAXONOMY_CANDIDATES: usize = 37_000;
+const DEFAULT_MAX_ONLINE_CANDIDATE_PATTERN_PROJECTION_MEMBERS: usize = 131_072;
 
-const OUTPUT_NAMES: [&str; 11] = [
+const OUTPUT_NAMES: [&str; 12] = [
     "v4-graph-blocks.copy",
     "v4-graph-references.jsonl",
     "v4-provider-groups.copy",
@@ -110,6 +145,7 @@ const OUTPUT_NAMES: [&str; 11] = [
     "v4-provider-tax-identities.copy",
     "v4-provider-group-tax-identities.copy",
     "v4-patterns.copy",
+    "v4-inferred-taxonomy-candidates.copy",
     "v4-summary.json",
 ];
 
@@ -275,6 +311,38 @@ pub struct V4MembershipArtifactDescriptor {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct V4NpiScopeMetadata {
+    pub record_format: String,
+    pub sha256: String,
+    pub byte_count: u64,
+    pub row_count: u64,
+    pub provider_npi_group_sha256: String,
+    pub provider_npi_group_record_format: String,
+    pub provider_npi_group_byte_count: u64,
+    pub provider_npi_group_owner_count: u64,
+    pub provider_npi_group_member_count: u64,
+    pub provider_npi_group_member_global_count: u64,
+    pub binding_contract: String,
+    pub binding_sha256: String,
+    pub shard_binding_contract: String,
+    pub shard_binding_sha256: String,
+    pub retention_contract: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub source_shard_id: Option<String>,
+    #[serde(default)]
+    pub shard_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct V4NpiScopeArtifactDescriptor {
+    pub path: PathBuf,
+    pub metadata: V4NpiScopeMetadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct V4TaxIdentityMetadata {
     pub record_format: String,
     pub sha256: String,
@@ -313,6 +381,7 @@ pub struct V4ProviderGraphShardDescriptor {
     pub provider_component_group: V4MembershipArtifactDescriptor,
     pub provider_group_npi: V4MembershipArtifactDescriptor,
     pub provider_npi_group: V4MembershipArtifactDescriptor,
+    pub provider_npi_scope: V4NpiScopeArtifactDescriptor,
     pub provider_group_tax_identity: V4TaxIdentityArtifactDescriptor,
 }
 
@@ -343,6 +412,8 @@ pub struct ProviderGraphV4Options {
     pub npi_prefix_target: usize,
     pub max_npi_prefix_override_owners: usize,
     pub max_npi_prefix_override_bytes: u64,
+    pub max_online_inferred_taxonomy_candidates: usize,
+    pub max_online_candidate_pattern_projection_members: usize,
     pub max_estimated_model_bytes: Option<u64>,
     pub max_factor_edges: Option<u64>,
 }
@@ -379,6 +450,10 @@ impl Default for ProviderGraphV4Options {
             npi_prefix_target: DEFAULT_NPI_PREFIX_TARGET,
             max_npi_prefix_override_owners: DEFAULT_MAX_NPI_PREFIX_OVERRIDE_OWNERS,
             max_npi_prefix_override_bytes: DEFAULT_MAX_NPI_PREFIX_OVERRIDE_BYTES,
+            max_online_inferred_taxonomy_candidates:
+                DEFAULT_MAX_ONLINE_INFERRED_TAXONOMY_CANDIDATES,
+            max_online_candidate_pattern_projection_members:
+                DEFAULT_MAX_ONLINE_CANDIDATE_PATTERN_PROJECTION_MEMBERS,
             max_estimated_model_bytes: None,
             max_factor_edges: None,
         }
@@ -496,6 +571,16 @@ impl ProviderGraphV4Options {
                 "V4 maximum NPI prefix override bytes must be positive",
             ));
         }
+        if self.max_online_inferred_taxonomy_candidates == 0 {
+            return Err(invalid(
+                "V4 maximum inferred-taxonomy candidates must be positive",
+            ));
+        }
+        if self.max_online_candidate_pattern_projection_members == 0 {
+            return Err(invalid(
+                "V4 maximum inferred-taxonomy pattern members must be positive",
+            ));
+        }
         if self.max_estimated_model_bytes == Some(0) {
             return Err(invalid("V4 estimated-model byte limit must be positive"));
         }
@@ -510,9 +595,61 @@ impl ProviderGraphV4Options {
 pub struct ProviderGraphV4Manifest {
     pub shards: Vec<V4ProviderGraphShardDescriptor>,
     pub provider_set_key_map_path: PathBuf,
+    pub npi_scope: ProviderGraphV4NpiScopeInput,
+    pub inferred_taxonomy: ProviderGraphV4InferredTaxonomyInput,
     pub output_directory: PathBuf,
     #[serde(default)]
     pub options: ProviderGraphV4Options,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGraphV4NpiScopeManifest {
+    pub shards: Vec<V4ProviderGraphShardDescriptor>,
+    pub output_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGraphV4NpiScopeInput {
+    pub format: String,
+    pub row_count: u64,
+    pub source_owner_count: u64,
+    pub input_byte_count: u64,
+    pub input_sha256: String,
+    pub output_byte_count: u64,
+    pub output_sha256: String,
+    pub output_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGraphV4InputArtifact {
+    pub path: PathBuf,
+    pub byte_count: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGraphV4InferredTaxonomyRuleInput {
+    pub rule_digest: String,
+    pub catalog_digest: String,
+    pub member_count: u64,
+    pub member_offset_bytes: u64,
+    pub member_byte_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGraphV4InferredTaxonomyInput {
+    pub contract: String,
+    pub catalog_contract: String,
+    pub vector_format: String,
+    pub npi_scope_sha256: String,
+    pub rule_set_digest: String,
+    pub members: ProviderGraphV4InputArtifact,
+    pub rules: Vec<ProviderGraphV4InferredTaxonomyRuleInput>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -563,6 +700,18 @@ pub struct V4OutputArtifactSummary {
     pub byte_count: u64,
     pub sha256: String,
     pub row_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct ProviderGraphV4NpiScopeSummary {
+    pub format: String,
+    pub row_count: u64,
+    pub source_owner_count: u64,
+    pub input_byte_count: u64,
+    pub input_sha256: String,
+    pub output_byte_count: u64,
+    pub output_sha256: String,
+    pub output_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -623,6 +772,8 @@ pub struct V4ObserveCounters {
     pub maximum_components_per_set: u64,
     pub pattern_overflow_set_count: u64,
     pub maximum_components_per_pattern_overflow_set: u64,
+    pub pattern_component_over_cap_set_count: u64,
+    pub pattern_component_over_cap_prefix_covered_set_count: u64,
     pub unsafe_pattern_component_set_count: u64,
     pub npi_prefix_group_unsafe_set_count: u64,
     pub npi_prefix_physical_unsafe_set_count: u64,
@@ -833,7 +984,17 @@ impl ResourceAdmissionTracker {
 pub struct ProviderGraphV4ConversionSummary {
     pub format: String,
     pub selected_layout: ProviderGraphV4Layout,
+    pub member_page_bytes: u64,
+    pub locator_page_bytes: u64,
+    pub heavy_owner_member_threshold: u64,
+    pub heavy_bitmap_minimum_savings_bytes: u64,
     pub pattern_layout_serving_degree_eligible: bool,
+    pub pattern_layout_sparse_prefix_eligible: bool,
+    pub direct_layout_complete_prefix_eligible: bool,
+    pub pattern_sparse_prefix_owner_count: u64,
+    pub pattern_sparse_prefix_member_count: u64,
+    pub pattern_sparse_prefix_raw_bytes: u64,
+    pub pattern_sparse_prefix_projection_encoded_bytes: u64,
     pub max_set_patterns_per_set: u64,
     pub max_set_components_per_fallback_set: u64,
     pub max_online_group_keys_per_set: u64,
@@ -854,9 +1015,37 @@ pub struct ProviderGraphV4ConversionSummary {
     pub npi_prefix_target: u64,
     pub max_npi_prefix_override_owners: u64,
     pub max_npi_prefix_override_bytes: u64,
+    pub max_online_inferred_taxonomy_candidates: u64,
+    pub max_online_candidate_pattern_projection_members: u64,
+    pub direct_complete_prefix_projection_encoded_bytes: u64,
+    pub direct_graph_encoded_bytes: u64,
+    pub pattern_graph_encoded_bytes: u64,
+    pub direct_mapping_persistence_encoded_bytes: u64,
+    pub pattern_mapping_persistence_encoded_bytes: u64,
+    pub direct_map_payload_encoded_bytes: u64,
+    pub pattern_map_payload_encoded_bytes: u64,
+    pub direct_map_coordinate_count: u64,
+    pub pattern_map_coordinate_count: u64,
+    pub direct_map_pack_count: u64,
+    pub pattern_map_pack_count: u64,
+    pub direct_map_object_kind_count: u64,
+    pub pattern_map_object_kind_count: u64,
     pub direct_complete_encoded_bytes: u64,
     pub pattern_complete_encoded_bytes: u64,
+    pub direct_inferred_taxonomy_encoded_bytes: u64,
+    pub pattern_inferred_taxonomy_encoded_bytes: u64,
+    pub direct_inferred_taxonomy_eligible: bool,
+    pub pattern_inferred_taxonomy_eligible: bool,
+    pub direct_inferred_taxonomy_rejection_reason: Option<String>,
+    pub direct_inferred_taxonomy_rejection_rule_digest: Option<String>,
+    pub direct_inferred_taxonomy_rejection_observed_count: Option<u64>,
+    pub direct_inferred_taxonomy_rejection_cap: Option<u64>,
+    pub pattern_inferred_taxonomy_rejection_reason: Option<String>,
+    pub pattern_inferred_taxonomy_rejection_rule_digest: Option<String>,
+    pub pattern_inferred_taxonomy_rejection_observed_count: Option<u64>,
+    pub pattern_inferred_taxonomy_rejection_cap: Option<u64>,
     pub common_encoded_bytes: u64,
+    pub selected_graph_encoded_bytes: u64,
     pub selected_encoded_bytes: u64,
     pub block_copy_path: PathBuf,
     pub reference_manifest_path: PathBuf,
@@ -868,6 +1057,7 @@ pub struct ProviderGraphV4ConversionSummary {
     pub provider_tax_identity_copy_path: PathBuf,
     pub provider_group_tax_identity_copy_path: PathBuf,
     pub pattern_copy_path: Option<PathBuf>,
+    pub inferred_taxonomy_copy_path: PathBuf,
     pub summary_path: PathBuf,
     pub block_count: u64,
     pub block_copy_bytes: u64,
@@ -2119,13 +2309,21 @@ struct GraphModel {
     provider_set_audit_npis: Vec<(u32, u32, u64)>,
     set_npi_prefix_overrides: Vec<Vec<u32>>,
     provider_set_npi_prefix_override_metadata: Vec<(u32, u32, [u8; 32])>,
+    npi_prefix_complete_member_count: u64,
+    npi_prefix_complete_encoded_bytes: u64,
+    npi_prefix_complete_projection_encoded_bytes: u64,
+    npi_prefix_complete_eligible: bool,
+    npi_prefix_sparse_eligible: bool,
+    npi_prefix_sparse_owner_count: u64,
+    npi_prefix_sparse_member_count: u64,
+    npi_prefix_sparse_raw_bytes: u64,
+    npi_prefix_sparse_projection_encoded_bytes: u64,
     group_patterns: Vec<u32>,
     pattern_groups: Vec<Vec<u32>>,
     pattern_sets: Vec<Vec<u32>>,
     pattern_digests: Vec<[u8; 32]>,
     set_patterns: Vec<Vec<u32>>,
     npi_patterns: Vec<Vec<u32>>,
-    direct_edge_count: u64,
     observe: V4ObserveCounters,
 }
 
@@ -2752,6 +2950,12 @@ struct NpiPrefixOverridePlan {
     metadata: Vec<(u32, u32, [u8; 32])>,
     groups_to_target: Vec<u64>,
     encoded_bytes: u64,
+    complete_member_count: u64,
+    complete_encoded_bytes: u64,
+    complete_projection_encoded_bytes: u64,
+    complete_eligible: bool,
+    sparse_eligible: bool,
+    sparse_projection_encoded_bytes: u64,
     group_unsafe_set_count: u64,
     physical_unsafe_set_count: u64,
     group_merge_member_visits: u64,
@@ -3048,6 +3252,8 @@ fn derive_npi_prefix_overrides(
     let mut metadata = Vec::new();
     let mut groups_to_target = Vec::new();
     let mut total_members = 0usize;
+    let mut complete_total_members = 0usize;
+    let mut sparse_eligible = true;
     let mut group_unsafe_set_count = 0u64;
     let mut physical_unsafe_set_count = 0u64;
     let mut group_merge_member_visits = 0u64;
@@ -3234,6 +3440,10 @@ fn derive_npi_prefix_overrides(
                     prefix_members: Some(bounded.members.clone()),
                 },
             );
+            complete_total_members = complete_total_members
+                .checked_add(bounded.members.len())
+                .ok_or(invalid("V4 complete NPI prefix member count overflows"))?;
+            lists[set_index] = bounded.members;
             continue;
         }
         let exact = if bounded_complete {
@@ -3288,24 +3498,19 @@ fn derive_npi_prefix_overrides(
         total_members = total_members
             .checked_add(exact.members.len())
             .ok_or(invalid("V4 NPI prefix override member count overflows"))?;
-        if metadata.len() >= options.max_npi_prefix_override_owners {
-            return Err(invalid(
-                "V4 NPI prefix override owner count exceeds configured maximum",
-            ));
-        }
         let raw_bytes = (total_members as u64)
             .checked_mul(4)
             .ok_or(invalid("V4 NPI prefix override byte count overflows"))?;
-        if raw_bytes > options.max_npi_prefix_override_bytes {
-            return Err(invalid(
-                "V4 NPI prefix override bytes exceed configured maximum",
-            ));
-        }
         let member_count = invalid_conversion(
             u32::try_from(exact.members.len()),
             "V4 NPI prefix override member count exceeds uint32",
         )?;
         metadata.push((owner_key, member_count, npi_prefix_digest(&exact.members)));
+        sparse_eligible = metadata.len() <= options.max_npi_prefix_override_owners
+            && raw_bytes <= options.max_npi_prefix_override_bytes;
+        complete_total_members = complete_total_members
+            .checked_add(exact.members.len())
+            .ok_or(invalid("V4 complete NPI prefix member count overflows"))?;
         lists[set_index] = exact.members;
     }
     let worst_online_probe_merge_member_visits = 0u64;
@@ -3320,12 +3525,12 @@ fn derive_npi_prefix_overrides(
     let worst_online_prefix_member_count =
         worst_online_prefix_members.map_or(0, |members| members.len() as u64);
     admission.reserve_projection(
-        "sparse NPI prefix overrides",
+        "complete direct-layout NPI prefix candidate",
         checked_estimated_sum(
             [
                 estimated_vec_owner_bytes(lists.len())?,
-                estimated_u32_capacity_bytes(total_members)?,
-                estimated_vec_owner_bytes(metadata.len())?,
+                estimated_u32_capacity_bytes(complete_total_members)?,
+                estimated_vec_owner_bytes(lists.len())?,
                 (groups_to_target.len() as u64).saturating_mul(16),
                 estimated_u32_capacity_bytes(worst_prefix_members.len())?,
                 estimated_u32_capacity_bytes(worst_online_prefix_members.map_or(0, Vec::len))?,
@@ -3341,6 +3546,26 @@ fn derive_npi_prefix_overrides(
         },
         options,
     )?;
+    let complete_encoded_bytes = relation_encoded_bytes(
+        &RelationShape {
+            relation: "set_npi_prefix_override",
+            owner_count: lists.len(),
+            member_count: complete_total_members as u64,
+        },
+        options,
+    )?;
+    let complete_projection_encoded_bytes = complete_encoded_bytes
+        .checked_add(dictionary_copy_bytes(&[4, 4, 32], lists.len())?)
+        .ok_or(invalid(
+            "V4 complete NPI prefix projection byte count overflows",
+        ))?;
+    let complete_eligible =
+        complete_prefix_projection_eligible(complete_projection_encoded_bytes, options);
+    let sparse_projection_encoded_bytes = encoded_bytes
+        .checked_add(dictionary_copy_bytes(&[4, 4, 32], metadata.len())?)
+        .ok_or(invalid(
+            "V4 sparse NPI prefix projection byte count overflows",
+        ))?;
     let (
         worst_online_provider_set_key,
         worst_online_groups_to_target,
@@ -3374,6 +3599,12 @@ fn derive_npi_prefix_overrides(
         metadata,
         groups_to_target,
         encoded_bytes,
+        complete_member_count: complete_total_members as u64,
+        complete_encoded_bytes,
+        complete_projection_encoded_bytes,
+        complete_eligible,
+        sparse_eligible,
+        sparse_projection_encoded_bytes,
         group_unsafe_set_count,
         physical_unsafe_set_count,
         group_merge_member_visits,
@@ -3917,6 +4148,8 @@ fn build_graph_model(
         maximum_components_per_set,
         pattern_overflow_set_count: 0,
         maximum_components_per_pattern_overflow_set: 0,
+        pattern_component_over_cap_set_count: 0,
+        pattern_component_over_cap_prefix_covered_set_count: 0,
         unsafe_pattern_component_set_count: 0,
         npi_prefix_group_unsafe_set_count: npi_prefix_override_plan.group_unsafe_set_count,
         npi_prefix_physical_unsafe_set_count: npi_prefix_override_plan.physical_unsafe_set_count,
@@ -4041,6 +4274,15 @@ fn build_graph_model(
         component_tuple_pattern_cache_owner_count: component_tuple_pattern.len() as u64,
         component_tuple_pattern_cache_member_count,
     };
+    let npi_prefix_sparse_owner_count = npi_prefix_override_plan.metadata.len() as u64;
+    let npi_prefix_sparse_member_count: u64 = npi_prefix_override_plan
+        .metadata
+        .iter()
+        .map(|(_, member_count, _)| u64::from(*member_count))
+        .sum();
+    let npi_prefix_sparse_raw_bytes = npi_prefix_sparse_member_count
+        .checked_mul(4)
+        .ok_or(invalid("V4 sparse NPI prefix raw bytes overflow"))?;
     Ok(GraphModel {
         set_base: provider_sets.key_base,
         set_components,
@@ -4055,13 +4297,23 @@ fn build_graph_model(
         provider_set_audit_npis,
         set_npi_prefix_overrides: npi_prefix_override_plan.lists,
         provider_set_npi_prefix_override_metadata: npi_prefix_override_plan.metadata,
+        npi_prefix_complete_member_count: npi_prefix_override_plan.complete_member_count,
+        npi_prefix_complete_encoded_bytes: npi_prefix_override_plan.complete_encoded_bytes,
+        npi_prefix_complete_projection_encoded_bytes: npi_prefix_override_plan
+            .complete_projection_encoded_bytes,
+        npi_prefix_complete_eligible: npi_prefix_override_plan.complete_eligible,
+        npi_prefix_sparse_eligible: npi_prefix_override_plan.sparse_eligible,
+        npi_prefix_sparse_owner_count,
+        npi_prefix_sparse_member_count,
+        npi_prefix_sparse_raw_bytes,
+        npi_prefix_sparse_projection_encoded_bytes: npi_prefix_override_plan
+            .sparse_projection_encoded_bytes,
         group_patterns,
         pattern_groups,
         pattern_sets,
         pattern_digests,
         set_patterns,
         npi_patterns,
-        direct_edge_count,
         observe,
     })
 }
@@ -4208,15 +4460,18 @@ struct HeavyBitmapPlan {
     logical_byte_count: u64,
     raw_byte_count: u64,
     vector_byte_count: u64,
+    encoded_byte_count: u64,
+    block_count: u64,
 }
 
-fn maybe_heavy_bitmap(
+fn maybe_heavy_bitmap_geometry(
     relation: &'static str,
     owner_key: u32,
-    members: &[u32],
+    member_count: usize,
+    member_bounds: Option<(u32, u32)>,
     options: &ProviderGraphV4Options,
 ) -> ProviderGraphV4Result<Option<HeavyBitmapPlan>> {
-    if members.len() < options.heavy_owner_member_threshold || members.is_empty() {
+    if member_count < options.heavy_owner_member_threshold || member_count == 0 {
         return Ok(None);
     }
     let Some(fragment_content_bytes) = options
@@ -4226,8 +4481,9 @@ fn maybe_heavy_bitmap(
     else {
         return Ok(None);
     };
-    let minimum = members[0];
-    let maximum = *members.last().expect("non-empty members");
+    let (minimum, maximum) = member_bounds.ok_or(invalid(
+        "V4 heavy bitmap geometry lacks non-empty member bounds",
+    ))?;
     let span = u64::from(maximum)
         .checked_sub(u64::from(minimum))
         .and_then(|value| value.checked_add(1))
@@ -4250,7 +4506,7 @@ fn maybe_heavy_bitmap(
                 .ok_or(invalid("V4 heavy bitmap framing size overflows"))?,
         )
         .ok_or(invalid("V4 heavy bitmap payload size overflows"))?;
-    let vector_bytes = (members.len() as u64)
+    let vector_bytes = (member_count as u64)
         .checked_mul(4)
         .ok_or(invalid("V4 heavy vector size overflows"))?;
     let bitmap_encoded_bytes = paged_encoded_bytes(
@@ -4266,63 +4522,551 @@ fn maybe_heavy_bitmap(
     }
     invalid_conversion(u32::try_from(span), "V4 heavy bitmap span exceeds uint32")?;
     invalid_conversion(
-        u32::try_from(members.len()),
+        u32::try_from(member_count),
         "V4 heavy bitmap member count exceeds uint32",
     )?;
     Ok(Some(HeavyBitmapPlan {
         relation,
         owner_key,
-        member_count: members.len() as u64,
+        member_count: member_count as u64,
         member_base: minimum,
         member_span: span,
         logical_byte_count,
         raw_byte_count: payload_bytes,
         vector_byte_count: vector_bytes,
+        encoded_byte_count: bitmap_encoded_bytes,
+        block_count: fragment_count,
     }))
+}
+
+fn maybe_heavy_bitmap(
+    relation: &'static str,
+    owner_key: u32,
+    members: &[u32],
+    options: &ProviderGraphV4Options,
+) -> ProviderGraphV4Result<Option<HeavyBitmapPlan>> {
+    maybe_heavy_bitmap_geometry(
+        relation,
+        owner_key,
+        members.len(),
+        members.first().copied().zip(members.last().copied()),
+        options,
+    )
 }
 
 #[derive(Debug)]
 struct LayoutSizes {
     common: u64,
+    direct_graph: u64,
+    pattern_graph: u64,
+    direct_inferred_taxonomy: u64,
+    pattern_inferred_taxonomy: u64,
+    direct_mapping: u64,
+    pattern_mapping: u64,
+    direct_map_payload: u64,
+    pattern_map_payload: u64,
+    direct_map_coordinate_count: u64,
+    pattern_map_coordinate_count: u64,
+    direct_map_pack_count: u64,
+    pattern_map_pack_count: u64,
+    direct_map_object_kind_count: u64,
+    pattern_map_object_kind_count: u64,
     direct: u64,
     pattern: u64,
+}
+
+fn complete_prefix_projection_eligible(
+    projection_encoded_bytes: u64,
+    options: &ProviderGraphV4Options,
+) -> bool {
+    projection_encoded_bytes <= options.max_npi_prefix_override_bytes
+        && options
+            .max_estimated_model_bytes
+            .is_none_or(|limit| projection_encoded_bytes <= limit)
+}
+
+#[derive(Debug)]
+struct PlannedRelationPersistence {
+    relation: &'static str,
+    graph_encoded_bytes: u64,
+    coordinate_count_by_kind: BTreeMap<String, u64>,
+    logical_member_count: u64,
+    vector_member_count: u64,
+    heavy_owner_plans: Vec<HeavyBitmapPlan>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MappingPersistenceSizes {
+    total_encoded_bytes: u64,
+    map_payload_encoded_bytes: u64,
+    coordinate_count: u64,
+    pack_count: u64,
+    object_kind_count: u64,
+}
+
+fn copy_row_encoded_bytes(field_widths: &[usize]) -> ProviderGraphV4Result<u64> {
+    field_widths.iter().try_fold(2u64, |total, width| {
+        total
+            .checked_add(4)
+            .and_then(|value| value.checked_add(*width as u64))
+            .ok_or(invalid("V4 metadata row encoded size overflows"))
+    })
+}
+
+fn paged_block_count(total_bytes: u64, page_bytes: usize) -> ProviderGraphV4Result<u64> {
+    if total_bytes == 0 {
+        return Ok(0);
+    }
+    total_bytes
+        .checked_add(page_bytes as u64 - 1)
+        .and_then(|value| value.checked_div(page_bytes as u64))
+        .ok_or(invalid("V4 planned block count overflows"))
+}
+
+fn planned_relation_persistence(
+    relation: &'static str,
+    owner_base: u32,
+    owner_count: usize,
+    owner_geometries: impl IntoIterator<Item = ProviderGraphV4Result<(usize, Option<(u32, u32)>)>>,
+    options: &ProviderGraphV4Options,
+) -> ProviderGraphV4Result<PlannedRelationPersistence> {
+    let mut vector_member_count = 0u64;
+    let mut bitmap_encoded_bytes = 0u64;
+    let mut logical_member_count = 0u64;
+    let mut heavy_owner_plans = Vec::new();
+    let mut observed_owner_count = 0usize;
+    for (owner_index, geometry) in owner_geometries.into_iter().enumerate() {
+        let (member_count, member_bounds) = geometry?;
+        let owner_key = owner_base
+            .checked_add(owner_index as u32)
+            .ok_or(invalid("V4 planned relation owner key overflows"))?;
+        logical_member_count = logical_member_count
+            .checked_add(member_count as u64)
+            .ok_or(invalid("V4 planned logical member count overflows"))?;
+        if let Some(plan) =
+            maybe_heavy_bitmap_geometry(relation, owner_key, member_count, member_bounds, options)?
+        {
+            bitmap_encoded_bytes = bitmap_encoded_bytes
+                .checked_add(plan.encoded_byte_count)
+                .ok_or(invalid("V4 planned bitmap byte count overflows"))?;
+            heavy_owner_plans.push(plan);
+        } else {
+            vector_member_count = vector_member_count
+                .checked_add(member_count as u64)
+                .ok_or(invalid("V4 planned vector member count overflows"))?;
+        }
+        observed_owner_count = observed_owner_count
+            .checked_add(1)
+            .ok_or(invalid("V4 planned relation owner count overflows"))?;
+    }
+    if observed_owner_count != owner_count {
+        return Err(invalid("V4 planned relation owner count changed"));
+    }
+    let graph_encoded_bytes = relation_encoded_bytes(
+        &RelationShape {
+            relation,
+            owner_count,
+            member_count: vector_member_count,
+        },
+        options,
+    )?
+    .checked_add(bitmap_encoded_bytes)
+    .ok_or(invalid("V4 planned relation byte count overflows"))?;
+    let mut coordinate_count_by_kind = BTreeMap::new();
+    let member_bytes = vector_member_count
+        .checked_mul(4)
+        .ok_or(invalid("V4 planned member byte count overflows"))?;
+    let member_blocks = paged_block_count(
+        member_bytes,
+        aligned_page_bytes(options.member_page_bytes, 4),
+    )?;
+    let locator_blocks = paged_block_count(
+        (owner_count as u64)
+            .checked_mul(LOCATOR_BYTES as u64)
+            .ok_or(invalid("V4 planned locator byte count overflows"))?,
+        aligned_page_bytes(options.locator_page_bytes, LOCATOR_BYTES),
+    )?;
+    if member_blocks > 0 {
+        coordinate_count_by_kind.insert(member_kind(relation), member_blocks);
+    }
+    if locator_blocks > 0 {
+        coordinate_count_by_kind.insert(locator_kind(relation), locator_blocks);
+    }
+    let heavy_blocks = heavy_owner_plans.iter().try_fold(0u64, |total, plan| {
+        total
+            .checked_add(plan.block_count)
+            .ok_or(invalid("V4 planned heavy bitmap block count overflows"))
+    })?;
+    if heavy_blocks > 0 {
+        coordinate_count_by_kind.insert(heavy_bitmap_kind(relation), heavy_blocks);
+    }
+    Ok(PlannedRelationPersistence {
+        relation,
+        graph_encoded_bytes,
+        coordinate_count_by_kind,
+        logical_member_count,
+        vector_member_count,
+        heavy_owner_plans,
+    })
+}
+
+fn planned_list_relation_persistence(
+    relation: &'static str,
+    owner_base: u32,
+    lists: &[Vec<u32>],
+    options: &ProviderGraphV4Options,
+) -> ProviderGraphV4Result<PlannedRelationPersistence> {
+    planned_relation_persistence(
+        relation,
+        owner_base,
+        lists.len(),
+        lists.iter().map(|members| {
+            Ok((
+                members.len(),
+                members.first().copied().zip(members.last().copied()),
+            ))
+        }),
+        options,
+    )
+}
+
+fn planned_ordered_relation_persistence(
+    relation: &'static str,
+    owner_base: u32,
+    owner_count: usize,
+    member_count: u64,
+    options: &ProviderGraphV4Options,
+) -> ProviderGraphV4Result<PlannedRelationPersistence> {
+    let graph_encoded_bytes = relation_encoded_bytes(
+        &RelationShape {
+            relation,
+            owner_count,
+            member_count,
+        },
+        options,
+    )?;
+    let mut coordinate_count_by_kind = BTreeMap::new();
+    let member_blocks = paged_block_count(
+        member_count
+            .checked_mul(4)
+            .ok_or(invalid("V4 ordered relation member bytes overflow"))?,
+        aligned_page_bytes(options.member_page_bytes, 4),
+    )?;
+    let locator_blocks = paged_block_count(
+        (owner_count as u64)
+            .checked_mul(LOCATOR_BYTES as u64)
+            .ok_or(invalid("V4 ordered relation locator bytes overflow"))?,
+        aligned_page_bytes(options.locator_page_bytes, LOCATOR_BYTES),
+    )?;
+    if member_blocks > 0 {
+        coordinate_count_by_kind.insert(member_kind(relation), member_blocks);
+    }
+    if locator_blocks > 0 {
+        coordinate_count_by_kind.insert(locator_kind(relation), locator_blocks);
+    }
+    let _ = owner_base;
+    Ok(PlannedRelationPersistence {
+        relation,
+        graph_encoded_bytes,
+        coordinate_count_by_kind,
+        logical_member_count: member_count,
+        vector_member_count: member_count,
+        heavy_owner_plans: Vec::new(),
+    })
+}
+
+fn planned_direct_set_group_persistence(
+    model: &GraphModel,
+    options: &ProviderGraphV4Options,
+) -> ProviderGraphV4Result<PlannedRelationPersistence> {
+    planned_relation_persistence(
+        "set_groups_direct",
+        model.set_base,
+        model.set_patterns.len(),
+        model.set_patterns.iter().map(|patterns| {
+            let mut member_count = 0usize;
+            let mut minimum = None;
+            let mut maximum = None;
+            for pattern in patterns {
+                let groups = &model.pattern_groups[*pattern as usize];
+                member_count = member_count
+                    .checked_add(groups.len())
+                    .ok_or(invalid("V4 planned set/group count overflows"))?;
+                minimum = minimum.into_iter().chain(groups.first().copied()).min();
+                maximum = maximum.into_iter().chain(groups.last().copied()).max();
+            }
+            Ok((member_count, minimum.zip(maximum)))
+        }),
+        options,
+    )
+}
+
+fn relation_manifest_row_encoded_bytes(
+    plan: &PlannedRelationPersistence,
+) -> ProviderGraphV4Result<u64> {
+    copy_row_encoded_bytes(&[
+        8,
+        plan.relation.len(),
+        member_kind(plan.relation).len(),
+        locator_kind(plan.relation).len(),
+        8,
+        8,
+        8,
+        8,
+        2,
+        4,
+        4,
+        4,
+        8,
+    ])
+}
+
+fn heavy_owner_rows_encoded_bytes(plan: &PlannedRelationPersistence) -> ProviderGraphV4Result<u64> {
+    plan.heavy_owner_plans
+        .iter()
+        .try_fold(0u64, |total, owner| {
+            total
+                .checked_add(copy_row_encoded_bytes(&[
+                    8,
+                    owner.relation.len(),
+                    8,
+                    heavy_bitmap_kind(owner.relation).len(),
+                    8,
+                    8,
+                    8,
+                    4,
+                    8,
+                ])?)
+                .ok_or(invalid("V4 heavy-owner metadata byte count overflows"))
+        })
+}
+
+fn map_root_row_encoded_bytes(representation: &str) -> ProviderGraphV4Result<u64> {
+    copy_row_encoded_bytes(&[
+        8,
+        "complete".len(),
+        2,
+        "packed_coordinate_hash_v1".len(),
+        representation.len(),
+        "snapshot_local_v1".len(),
+        32,
+        4,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        4,
+        8,
+        8,
+        8,
+    ])
+}
+
+fn layout_mapping_persistence_bytes(
+    relations: &[PlannedRelationPersistence],
+    representation: &str,
+) -> ProviderGraphV4Result<MappingPersistenceSizes> {
+    let mut coordinate_count_by_kind = BTreeMap::<String, u64>::new();
+    for relation in relations {
+        for (object_kind, coordinate_count) in &relation.coordinate_count_by_kind {
+            let total = coordinate_count_by_kind
+                .entry(object_kind.clone())
+                .or_default();
+            *total = total
+                .checked_add(*coordinate_count)
+                .ok_or(invalid("V4 map coordinate count overflows"))?;
+        }
+    }
+    let relation_metadata_bytes = relations.iter().try_fold(0u64, |total, plan| {
+        total
+            .checked_add(relation_manifest_row_encoded_bytes(plan)?)
+            .ok_or(invalid("V4 relation metadata bytes overflow"))
+    })?;
+    let heavy_metadata_bytes = relations.iter().try_fold(0u64, |total, plan| {
+        total
+            .checked_add(heavy_owner_rows_encoded_bytes(plan)?)
+            .ok_or(invalid("V4 heavy metadata bytes overflow"))
+    })?;
+    mapping_persistence_bytes(
+        coordinate_count_by_kind,
+        relation_metadata_bytes,
+        heavy_metadata_bytes,
+        representation,
+    )
+}
+
+fn mapping_persistence_bytes(
+    coordinate_count_by_kind: BTreeMap<String, u64>,
+    relation_metadata_bytes: u64,
+    heavy_metadata_bytes: u64,
+    representation: &str,
+) -> ProviderGraphV4Result<MappingPersistenceSizes> {
+    let mut map_block_bytes = 0u64;
+    let mut map_payload_bytes = 0u64;
+    let mut map_pack_metadata_bytes = 0u64;
+    let mut map_pack_count = 0u64;
+    let coordinate_count = coordinate_count_by_kind
+        .values()
+        .try_fold(0u64, |total, count| {
+            total
+                .checked_add(*count)
+                .ok_or(invalid("V4 map coordinate count overflows"))
+        })?;
+    let object_kind_count = coordinate_count_by_kind.len() as u64;
+    for (object_kind, coordinate_count) in coordinate_count_by_kind {
+        let full_packs = coordinate_count / V4_MAP_COORDINATES_PER_PACK;
+        let remainder = coordinate_count % V4_MAP_COORDINATES_PER_PACK;
+        let full_pack_count = invalid_conversion(
+            usize::try_from(full_packs),
+            "V4 map pack count exceeds usize",
+        )?;
+        for pack_coordinates in std::iter::repeat_n(V4_MAP_COORDINATES_PER_PACK, full_pack_count)
+            .chain((remainder > 0).then_some(remainder))
+        {
+            let payload_bytes = V4_MAP_HEADER_BYTES
+                .checked_add(
+                    pack_coordinates
+                        .checked_mul(V4_MAP_RECORD_BYTES)
+                        .ok_or(invalid("V4 map pack payload bytes overflow"))?,
+                )
+                .ok_or(invalid("V4 map pack payload bytes overflow"))?;
+            map_block_bytes = map_block_bytes
+                .checked_add(pg_copy_row_bytes(
+                    V4_MAP_BLOCK_KIND,
+                    invalid_conversion(
+                        usize::try_from(payload_bytes),
+                        "V4 map pack payload exceeds usize",
+                    )?,
+                )?)
+                .ok_or(invalid("V4 map block persistence bytes overflow"))?;
+            map_payload_bytes = map_payload_bytes
+                .checked_add(payload_bytes)
+                .ok_or(invalid("V4 map payload bytes overflow"))?;
+            map_pack_count = map_pack_count
+                .checked_add(1)
+                .ok_or(invalid("V4 map pack count overflows"))?;
+            map_pack_metadata_bytes = map_pack_metadata_bytes
+                .checked_add(copy_row_encoded_bytes(&[
+                    8,
+                    object_kind.len(),
+                    4,
+                    8,
+                    4,
+                    8,
+                    4,
+                    4,
+                    8,
+                    8,
+                    32,
+                    8,
+                ])?)
+                .ok_or(invalid("V4 map pack metadata bytes overflow"))?;
+        }
+    }
+    let total_encoded_bytes = map_root_row_encoded_bytes(representation)?
+        .checked_add(map_block_bytes)
+        .and_then(|value| value.checked_add(map_pack_metadata_bytes))
+        .and_then(|value| value.checked_add(relation_metadata_bytes))
+        .and_then(|value| value.checked_add(heavy_metadata_bytes))
+        .ok_or(invalid("V4 mapping persistence bytes overflow"))?;
+    Ok(MappingPersistenceSizes {
+        total_encoded_bytes,
+        map_payload_encoded_bytes: map_payload_bytes,
+        coordinate_count,
+        pack_count: map_pack_count,
+        object_kind_count,
+    })
+}
+
+fn emitted_mapping_persistence_bytes(
+    relations: &[V4RelationSummary],
+    heavy_owners: &[V4HeavyBitmapSummary],
+    representation: &str,
+) -> ProviderGraphV4Result<MappingPersistenceSizes> {
+    let mut coordinate_count_by_kind = BTreeMap::<String, u64>::new();
+    let mut relation_metadata_bytes = 0u64;
+    for relation in relations {
+        for (object_kind, block_count) in [
+            (&relation.member_object_kind, relation.member_block_count),
+            (&relation.locator_object_kind, relation.locator_block_count),
+        ] {
+            if block_count > 0 {
+                coordinate_count_by_kind.insert(object_kind.clone(), block_count);
+            }
+        }
+        relation_metadata_bytes = relation_metadata_bytes
+            .checked_add(copy_row_encoded_bytes(&[
+                8,
+                relation.relation.len(),
+                relation.member_object_kind.len(),
+                relation.locator_object_kind.len(),
+                8,
+                8,
+                8,
+                8,
+                2,
+                4,
+                4,
+                4,
+                8,
+            ])?)
+            .ok_or(invalid("V4 emitted relation metadata bytes overflow"))?;
+    }
+    let mut heavy_metadata_bytes = 0u64;
+    for owner in heavy_owners {
+        let total = coordinate_count_by_kind
+            .entry(owner.object_kind.clone())
+            .or_default();
+        *total = total
+            .checked_add(owner.block_count)
+            .ok_or(invalid("V4 emitted bitmap coordinate count overflows"))?;
+        heavy_metadata_bytes = heavy_metadata_bytes
+            .checked_add(copy_row_encoded_bytes(&[
+                8,
+                owner.relation.len(),
+                8,
+                owner.object_kind.len(),
+                8,
+                8,
+                8,
+                4,
+                8,
+            ])?)
+            .ok_or(invalid("V4 emitted heavy metadata bytes overflow"))?;
+    }
+    mapping_persistence_bytes(
+        coordinate_count_by_kind,
+        relation_metadata_bytes,
+        heavy_metadata_bytes,
+        representation,
+    )
 }
 
 fn compute_layout_sizes(
     model: &GraphModel,
     tax_identity: &V4TaxIdentityModel,
+    direct_inferred_taxonomy: &V4InferredTaxonomyProjection,
+    pattern_inferred_taxonomy: &V4InferredTaxonomyProjection,
     options: &ProviderGraphV4Options,
 ) -> ProviderGraphV4Result<LayoutSizes> {
-    let common_shapes = [
-        RelationShape {
-            relation: "set_components",
-            owner_count: model.set_components.len(),
-            member_count: model.observe.set_component_edge_count,
-        },
-        RelationShape {
-            relation: "component_groups",
-            owner_count: model.component_groups.len(),
-            member_count: model.observe.component_group_edge_count,
-        },
-        RelationShape {
-            relation: "npi_groups_exact",
-            owner_count: model.npi_groups.len(),
-            member_count: model.observe.group_npi_edge_count,
-        },
-        RelationShape {
-            relation: "group_npis_exact",
-            owner_count: model.group_npis.len(),
-            member_count: model.observe.group_npi_edge_count,
-        },
-        RelationShape {
-            relation: "set_npi_prefix_override",
-            owner_count: model.set_npi_prefix_overrides.len(),
-            member_count: model.observe.npi_prefix_override_member_count,
-        },
+    let common_relation_plans = [
+        planned_list_relation_persistence(
+            "set_components",
+            model.set_base,
+            &model.set_components,
+            options,
+        )?,
+        planned_list_relation_persistence("component_groups", 0, &model.component_groups, options)?,
+        planned_list_relation_persistence("npi_groups_exact", 0, &model.npi_groups, options)?,
+        planned_list_relation_persistence("group_npis_exact", 0, &model.group_npis, options)?,
     ];
-    let common_relations = common_shapes.iter().try_fold(0u64, |total, shape| {
+    let common_relation_bytes = common_relation_plans.iter().try_fold(0u64, |total, plan| {
         total
-            .checked_add(relation_encoded_bytes(shape, options)?)
+            .checked_add(plan.graph_encoded_bytes)
             .ok_or(invalid("V4 common encoded byte count overflows"))
     })?;
     let tax_dictionary_bytes = tax_identity_copy_bytes(tax_identity)?;
@@ -4343,81 +5087,152 @@ fn compute_layout_sizes(
                     .expect("provider-set audit dictionary size was validated"),
             )
         })
-        .and_then(|value| {
-            value.checked_add(
-                dictionary_copy_bytes(
-                    &[4, 4, 32],
-                    model.provider_set_npi_prefix_override_metadata.len(),
-                )
-                .expect("NPI prefix override metadata size was validated"),
-            )
-        })
         .and_then(|value| value.checked_add(tax_dictionary_bytes))
         .ok_or(invalid("V4 common dictionary byte count overflows"))?;
+    let sparse_prefix_relation = planned_ordered_relation_persistence(
+        "set_npi_prefix_override",
+        model.set_base,
+        model.set_npi_prefix_overrides.len(),
+        model.npi_prefix_sparse_member_count,
+        options,
+    )?;
+    let sparse_prefix_dictionary =
+        dictionary_copy_bytes(&[4, 4, 32], model.npi_prefix_sparse_owner_count as usize)?;
+    let complete_prefix_relation = planned_ordered_relation_persistence(
+        "set_npi_prefix_override",
+        model.set_base,
+        model.set_npi_prefix_overrides.len(),
+        model.npi_prefix_complete_member_count,
+        options,
+    )?;
+    let complete_prefix_dictionary =
+        dictionary_copy_bytes(&[4, 4, 32], model.set_npi_prefix_overrides.len())?;
 
-    let direct_shapes = [
-        RelationShape {
-            relation: "group_sets_direct",
-            owner_count: model.group_globals.len(),
-            member_count: model.direct_edge_count,
-        },
-        RelationShape {
-            relation: "set_groups_direct",
-            owner_count: model.set_components.len(),
-            member_count: model.direct_edge_count,
-        },
+    let group_set_geometries = model.group_patterns.iter().map(|pattern| {
+        let members = &model.pattern_sets[*pattern as usize];
+        Ok((
+            members.len(),
+            members.first().copied().zip(members.last().copied()),
+        ))
+    });
+    let direct_relation_plans = [
+        planned_relation_persistence(
+            "group_sets_direct",
+            0,
+            model.group_patterns.len(),
+            group_set_geometries,
+            options,
+        )?,
+        planned_direct_set_group_persistence(model, options)?,
     ];
-    let pattern_shapes = [
-        RelationShape {
-            relation: "group_patterns",
-            owner_count: model.group_globals.len(),
-            member_count: model.group_patterns.len() as u64,
-        },
-        RelationShape {
-            relation: "pattern_groups",
-            owner_count: model.pattern_groups.len(),
-            member_count: model.group_patterns.len() as u64,
-        },
-        RelationShape {
-            relation: "pattern_sets",
-            owner_count: model.pattern_sets.len(),
-            member_count: model.observe.pattern_set_edge_count,
-        },
-        RelationShape {
-            relation: "set_patterns",
-            owner_count: model.set_patterns.len(),
-            member_count: model.observe.set_pattern_edge_count,
-        },
-        RelationShape {
-            relation: "npi_patterns",
-            owner_count: model.npi_patterns.len(),
-            member_count: model.observe.npi_pattern_edge_count,
-        },
-    ];
-    let direct_projection = direct_shapes.iter().try_fold(0u64, |total, shape| {
+    let direct_projection = direct_relation_plans.iter().try_fold(0u64, |total, plan| {
         total
-            .checked_add(relation_encoded_bytes(shape, options)?)
+            .checked_add(plan.graph_encoded_bytes)
             .ok_or(invalid("V4 direct encoded byte count overflows"))
     })?;
-    let pattern_projection = pattern_shapes.iter().try_fold(0u64, |total, shape| {
-        total
-            .checked_add(relation_encoded_bytes(shape, options)?)
-            .ok_or(invalid("V4 pattern encoded byte count overflows"))
-    })?;
-    let common = common_relations
+    let group_pattern_geometries = model
+        .group_patterns
+        .iter()
+        .map(|pattern| Ok((1usize, Some((*pattern, *pattern)))));
+    let pattern_relation_plans = [
+        planned_relation_persistence(
+            "group_patterns",
+            0,
+            model.group_patterns.len(),
+            group_pattern_geometries,
+            options,
+        )?,
+        planned_list_relation_persistence("pattern_groups", 0, &model.pattern_groups, options)?,
+        planned_list_relation_persistence("pattern_sets", 0, &model.pattern_sets, options)?,
+        planned_list_relation_persistence(
+            "set_patterns",
+            model.set_base,
+            &model.set_patterns,
+            options,
+        )?,
+        planned_list_relation_persistence("npi_patterns", 0, &model.npi_patterns, options)?,
+    ];
+    let pattern_projection = pattern_relation_plans
+        .iter()
+        .try_fold(0u64, |total, plan| {
+            total
+                .checked_add(plan.graph_encoded_bytes)
+                .ok_or(invalid("V4 pattern encoded byte count overflows"))
+        })?;
+    let common = common_relation_bytes
         .checked_add(common_dictionaries)
         .and_then(|value| value.checked_add(PG_COPY_HEADER.len() as u64 + 2))
         .ok_or(invalid("V4 common encoded byte count overflows"))?;
-    let direct = common
-        .checked_add(direct_projection)
+    let direct_graph = common
+        .checked_add(complete_prefix_relation.graph_encoded_bytes)
+        .and_then(|value| value.checked_add(complete_prefix_dictionary))
+        .and_then(|value| value.checked_add(direct_projection))
         .ok_or(invalid("V4 direct complete byte count overflows"))?;
     let pattern_dictionary = dictionary_copy_bytes(&[4, 32, 8], model.pattern_sets.len())?;
-    let pattern = common
-        .checked_add(pattern_projection)
+    let pattern_graph = common
+        .checked_add(sparse_prefix_relation.graph_encoded_bytes)
+        .and_then(|value| value.checked_add(sparse_prefix_dictionary))
+        .and_then(|value| value.checked_add(pattern_projection))
         .and_then(|value| value.checked_add(pattern_dictionary))
         .ok_or(invalid("V4 pattern complete byte count overflows"))?;
+    let mut direct_all_relations = common_relation_plans
+        .iter()
+        .chain(std::iter::once(&complete_prefix_relation))
+        .chain(direct_relation_plans.iter())
+        .collect::<Vec<_>>();
+    let mut pattern_all_relations = common_relation_plans
+        .iter()
+        .chain(std::iter::once(&sparse_prefix_relation))
+        .chain(pattern_relation_plans.iter())
+        .collect::<Vec<_>>();
+    let direct_owned = direct_all_relations
+        .drain(..)
+        .map(|plan| PlannedRelationPersistence {
+            relation: plan.relation,
+            graph_encoded_bytes: plan.graph_encoded_bytes,
+            coordinate_count_by_kind: plan.coordinate_count_by_kind.clone(),
+            logical_member_count: plan.logical_member_count,
+            vector_member_count: plan.vector_member_count,
+            heavy_owner_plans: plan.heavy_owner_plans.clone(),
+        })
+        .collect::<Vec<_>>();
+    let pattern_owned = pattern_all_relations
+        .drain(..)
+        .map(|plan| PlannedRelationPersistence {
+            relation: plan.relation,
+            graph_encoded_bytes: plan.graph_encoded_bytes,
+            coordinate_count_by_kind: plan.coordinate_count_by_kind.clone(),
+            logical_member_count: plan.logical_member_count,
+            vector_member_count: plan.vector_member_count,
+            heavy_owner_plans: plan.heavy_owner_plans.clone(),
+        })
+        .collect::<Vec<_>>();
+    let direct_mapping = layout_mapping_persistence_bytes(&direct_owned, "direct_v1")?;
+    let pattern_mapping = layout_mapping_persistence_bytes(&pattern_owned, "pattern_v1")?;
+    let direct = direct_graph
+        .checked_add(direct_mapping.total_encoded_bytes)
+        .and_then(|value| value.checked_add(direct_inferred_taxonomy.encoded_bytes))
+        .ok_or(invalid("V4 direct persistent byte count overflows"))?;
+    let pattern = pattern_graph
+        .checked_add(pattern_mapping.total_encoded_bytes)
+        .and_then(|value| value.checked_add(pattern_inferred_taxonomy.encoded_bytes))
+        .ok_or(invalid("V4 pattern persistent byte count overflows"))?;
     Ok(LayoutSizes {
         common,
+        direct_graph,
+        pattern_graph,
+        direct_inferred_taxonomy: direct_inferred_taxonomy.encoded_bytes,
+        pattern_inferred_taxonomy: pattern_inferred_taxonomy.encoded_bytes,
+        direct_mapping: direct_mapping.total_encoded_bytes,
+        pattern_mapping: pattern_mapping.total_encoded_bytes,
+        direct_map_payload: direct_mapping.map_payload_encoded_bytes,
+        pattern_map_payload: pattern_mapping.map_payload_encoded_bytes,
+        direct_map_coordinate_count: direct_mapping.coordinate_count,
+        pattern_map_coordinate_count: pattern_mapping.coordinate_count,
+        direct_map_pack_count: direct_mapping.pack_count,
+        pattern_map_pack_count: pattern_mapping.pack_count,
+        direct_map_object_kind_count: direct_mapping.object_kind_count,
+        pattern_map_object_kind_count: pattern_mapping.object_kind_count,
         direct,
         pattern,
     })
@@ -4429,10 +5244,22 @@ fn record_pattern_fallback_diagnostics(
     observe: &mut V4ObserveCounters,
 ) -> bool {
     debug_assert_eq!(model.set_patterns.len(), model.set_components.len());
+    let exact_prefix_owners = model
+        .provider_set_npi_prefix_override_metadata
+        .iter()
+        .map(|(owner_key, _, _)| *owner_key)
+        .collect::<HashSet<_>>();
     let mut overflow_set_count = 0u64;
     let mut maximum_components_per_overflow_set = 0u64;
+    let mut component_over_cap_set_count = 0u64;
+    let mut component_over_cap_prefix_covered_set_count = 0u64;
     let mut unsafe_set_count = 0u64;
-    for (patterns, components) in model.set_patterns.iter().zip(&model.set_components) {
+    for (set_index, (patterns, components)) in model
+        .set_patterns
+        .iter()
+        .zip(&model.set_components)
+        .enumerate()
+    {
         if patterns.len() <= options.max_set_patterns_per_set {
             continue;
         }
@@ -4440,11 +5267,24 @@ fn record_pattern_fallback_diagnostics(
         maximum_components_per_overflow_set =
             maximum_components_per_overflow_set.max(components.len() as u64);
         if components.len() > options.max_set_components_per_fallback_set {
-            unsafe_set_count = unsafe_set_count.saturating_add(1);
+            component_over_cap_set_count = component_over_cap_set_count.saturating_add(1);
+            let owner_key = model
+                .set_base
+                .checked_add(set_index as u32)
+                .expect("provider-set key was validated while building the model");
+            if exact_prefix_owners.contains(&owner_key) {
+                component_over_cap_prefix_covered_set_count =
+                    component_over_cap_prefix_covered_set_count.saturating_add(1);
+            } else {
+                unsafe_set_count = unsafe_set_count.saturating_add(1);
+            }
         }
     }
     observe.pattern_overflow_set_count = overflow_set_count;
     observe.maximum_components_per_pattern_overflow_set = maximum_components_per_overflow_set;
+    observe.pattern_component_over_cap_set_count = component_over_cap_set_count;
+    observe.pattern_component_over_cap_prefix_covered_set_count =
+        component_over_cap_prefix_covered_set_count;
     observe.unsafe_pattern_component_set_count = unsafe_set_count;
     unsafe_set_count == 0
 }
@@ -4459,6 +5299,97 @@ fn choose_layout(
     } else {
         ProviderGraphV4Layout::Direct
     }
+}
+
+fn choose_complete_layout(
+    direct_bytes: u64,
+    direct_eligible: bool,
+    pattern_bytes: u64,
+    pattern_eligible: bool,
+) -> ProviderGraphV4Result<ProviderGraphV4Layout> {
+    match (direct_eligible, pattern_eligible) {
+        (true, true) => Ok(choose_layout(direct_bytes, pattern_bytes, true)),
+        (true, false) => Ok(ProviderGraphV4Layout::Direct),
+        (false, true) => Ok(ProviderGraphV4Layout::Pattern),
+        (false, false) => Err(invalid(
+            "V4 graph has no bounded complete online representation",
+        )),
+    }
+}
+
+fn select_npi_prefix_projection(
+    model: &mut GraphModel,
+    observe: &mut V4ObserveCounters,
+    selected_layout: ProviderGraphV4Layout,
+) -> ProviderGraphV4Result<()> {
+    match selected_layout {
+        ProviderGraphV4Layout::Direct => {
+            if !model.npi_prefix_complete_eligible {
+                return Err(invalid(
+                    "V4 direct layout complete NPI prefix exceeds its configured bound",
+                ));
+            }
+            model.provider_set_npi_prefix_override_metadata = model
+                .set_npi_prefix_overrides
+                .iter()
+                .enumerate()
+                .map(|(set_index, members)| {
+                    let owner_key = model
+                        .set_base
+                        .checked_add(set_index as u32)
+                        .ok_or(invalid("V4 complete NPI prefix owner key overflows"))?;
+                    let member_count = invalid_conversion(
+                        u32::try_from(members.len()),
+                        "V4 complete NPI prefix member count exceeds uint32",
+                    )?;
+                    Ok((owner_key, member_count, npi_prefix_digest(members)))
+                })
+                .collect::<ProviderGraphV4Result<Vec<_>>>()?;
+            observe.npi_prefix_override_owner_count =
+                model.provider_set_npi_prefix_override_metadata.len() as u64;
+            observe.npi_prefix_override_member_count = model.npi_prefix_complete_member_count;
+            observe.npi_prefix_override_raw_bytes = model
+                .npi_prefix_complete_member_count
+                .checked_mul(4)
+                .ok_or(invalid("V4 complete NPI prefix raw bytes overflow"))?;
+            observe.npi_prefix_override_encoded_bytes = model.npi_prefix_complete_encoded_bytes;
+            observe.npi_prefix_worst_provider_set_uses_override =
+                observe.npi_prefix_worst_provider_set_key.is_some();
+            observe.npi_prefix_worst_online_provider_set_key = None;
+            observe.npi_prefix_worst_online_groups_to_target = 0;
+            observe.npi_prefix_worst_online_groups_to_target_exact = false;
+            observe.npi_prefix_worst_online_uses_component_fallback = false;
+            observe.npi_prefix_worst_online_group_work_bound = 0;
+            observe.npi_prefix_worst_online_member_count = 0;
+            observe.npi_prefix_worst_online_member_digest = None;
+            observe.npi_prefix_worst_online_source_owner_work = 0;
+            observe.npi_prefix_worst_online_source_member_work = 0;
+            observe.npi_prefix_worst_online_source_page_work = 0;
+            observe.npi_prefix_worst_online_source_byte_work = 0;
+            observe.npi_prefix_worst_online_group_npi_member_work = 0;
+            observe.npi_prefix_worst_online_group_npi_locator_page_work = 0;
+            observe.npi_prefix_worst_online_group_npi_member_page_work = 0;
+            observe.npi_prefix_worst_online_group_npi_byte_work = 0;
+            observe.npi_prefix_worst_online_group_npi_batch_work = 0;
+        }
+        ProviderGraphV4Layout::Pattern => {
+            let exact_prefix_owners = model
+                .provider_set_npi_prefix_override_metadata
+                .iter()
+                .map(|(owner_key, _, _)| *owner_key)
+                .collect::<HashSet<_>>();
+            for (set_index, members) in model.set_npi_prefix_overrides.iter_mut().enumerate() {
+                let owner_key = model
+                    .set_base
+                    .checked_add(set_index as u32)
+                    .ok_or(invalid("V4 sparse NPI prefix owner key overflows"))?;
+                if !exact_prefix_owners.contains(&owner_key) {
+                    members.clear();
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4500,6 +5431,143 @@ struct ReferenceSpool {
     last_coordinate: Option<(i64, i32)>,
 }
 
+#[derive(Clone, Copy)]
+struct OutputFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl OutputFileIdentity {
+    fn from_file(file: &File) -> io::Result<Self> {
+        Self::from_metadata(&file.metadata()?)
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output identity requires a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Ok(Self {})
+        }
+    }
+
+    fn matches_metadata(self, metadata: &fs::Metadata) -> bool {
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            metadata.dev() == self.device && metadata.ino() == self.inode
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    fn matches_path(self, path: &Path) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        !metadata.file_type().is_symlink() && self.matches_metadata(&metadata)
+    }
+}
+
+fn remove_owned_output(path: &Path, identity: OutputFileIdentity) {
+    if identity.matches_path(path) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+struct OwnedOutput {
+    path: PathBuf,
+    identity: OutputFileIdentity,
+    #[cfg(unix)]
+    _guard: File,
+}
+
+struct OutputOwnership {
+    root: PathBuf,
+    outputs: Vec<OwnedOutput>,
+    committed: bool,
+}
+
+impl OutputOwnership {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            outputs: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn create(&mut self, path: &Path) -> ProviderGraphV4Result<File> {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(invalid("V4 provider graph output name is invalid"))?;
+        if path.parent() != Some(self.root.as_path()) || !OUTPUT_NAMES.contains(&name) {
+            return Err(invalid(
+                "V4 provider graph output escaped its canonical output root",
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let identity = OutputFileIdentity::from_file(&file)?;
+        #[cfg(unix)]
+        let guard = match file.try_clone() {
+            Ok(guard) => guard,
+            Err(error) => {
+                remove_owned_output(path, identity);
+                return Err(error.into());
+            }
+        };
+        self.outputs.push(OwnedOutput {
+            path: path.to_path_buf(),
+            identity,
+            #[cfg(unix)]
+            _guard: guard,
+        });
+        Ok(file)
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for OutputOwnership {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for output in self.outputs.iter().rev() {
+            remove_owned_output(&output.path, output.identity);
+        }
+    }
+}
+
 struct CasBlockWriter {
     copy: BufWriter<File>,
     references: BufWriter<File>,
@@ -4508,12 +5576,80 @@ struct CasBlockWriter {
     reference_encode_buffer: Vec<u8>,
     block_count: u64,
     copy_path: PathBuf,
+    reference_path: PathBuf,
+    copy_identity: OutputFileIdentity,
+    reference_identity: OutputFileIdentity,
     finished: bool,
 }
 
 impl CasBlockWriter {
+    #[cfg(test)]
     fn create(copy_path: &Path, reference_path: &Path) -> ProviderGraphV4Result<Self> {
-        let mut copy = BufWriter::new(File::create(copy_path)?);
+        let copy_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(copy_path)?;
+        let copy_identity = OutputFileIdentity::from_file(&copy_file)?;
+        let reference_file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(reference_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                drop(copy_file);
+                remove_owned_output(copy_path, copy_identity);
+                return Err(error.into());
+            }
+        };
+        let reference_identity = OutputFileIdentity::from_file(&reference_file)?;
+        match Self::from_files(
+            copy_path,
+            reference_path,
+            copy_file,
+            reference_file,
+            copy_identity,
+            reference_identity,
+        ) {
+            Ok(writer) => Ok(writer),
+            Err(error) => {
+                remove_owned_output(copy_path, copy_identity);
+                remove_owned_output(reference_path, reference_identity);
+                Err(error)
+            }
+        }
+    }
+
+    fn create_tracked(
+        copy_path: &Path,
+        reference_path: &Path,
+        ownership: &mut OutputOwnership,
+    ) -> ProviderGraphV4Result<Self> {
+        let copy_file = ownership.create(copy_path)?;
+        let reference_file = ownership.create(reference_path)?;
+        let copy_identity = OutputFileIdentity::from_file(&copy_file)?;
+        let reference_identity = OutputFileIdentity::from_file(&reference_file)?;
+        Self::from_files(
+            copy_path,
+            reference_path,
+            copy_file,
+            reference_file,
+            copy_identity,
+            reference_identity,
+        )
+    }
+
+    fn from_files(
+        copy_path: &Path,
+        reference_path: &Path,
+        copy_file: File,
+        reference_file: File,
+        copy_identity: OutputFileIdentity,
+        reference_identity: OutputFileIdentity,
+    ) -> ProviderGraphV4Result<Self> {
+        let mut copy = BufWriter::new(copy_file);
         copy.write_all(PG_COPY_HEADER)?;
         let reference_spool_directory = reference_path
             .parent()
@@ -4521,12 +5657,15 @@ impl CasBlockWriter {
             .to_path_buf();
         Ok(Self {
             copy,
-            references: BufWriter::new(File::create(reference_path)?),
+            references: BufWriter::new(reference_file),
             reference_spools: BTreeMap::new(),
             reference_spool_directory,
             reference_encode_buffer: Vec::with_capacity(REFERENCE_ENCODE_BUFFER_BYTES as usize),
             block_count: 0,
             copy_path: copy_path.to_path_buf(),
+            reference_path: reference_path.to_path_buf(),
+            copy_identity,
+            reference_identity,
             finished: false,
         })
     }
@@ -4675,8 +5814,8 @@ impl CasBlockWriter {
             io::copy(spool.writer.get_mut(), &mut self.references)?;
         }
         self.references.flush()?;
-        self.finished = true;
         let byte_count = fs::metadata(&self.copy_path)?.len();
+        self.finished = true;
         Ok((self.block_count, byte_count))
     }
 }
@@ -4686,6 +5825,8 @@ impl Drop for CasBlockWriter {
         if !self.finished {
             let _ = self.copy.flush();
             let _ = self.references.flush();
+            remove_owned_output(&self.copy_path, self.copy_identity);
+            remove_owned_output(&self.reference_path, self.reference_identity);
         }
     }
 }
@@ -5391,15 +6532,43 @@ fn emit_pattern_relations(
 
 struct PgCopyFileWriter {
     writer: BufWriter<File>,
+    path: PathBuf,
+    identity: OutputFileIdentity,
     finished: bool,
 }
 
 impl PgCopyFileWriter {
     fn create(path: &Path) -> ProviderGraphV4Result<Self> {
-        let mut writer = BufWriter::new(File::create(path)?);
-        writer.write_all(PG_COPY_HEADER)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let identity = OutputFileIdentity::from_file(&file)?;
+        Self::from_file(path, file, identity)
+    }
+
+    fn create_tracked(path: &Path, ownership: &mut OutputOwnership) -> ProviderGraphV4Result<Self> {
+        let file = ownership.create(path)?;
+        let identity = OutputFileIdentity::from_file(&file)?;
+        Self::from_file(path, file, identity)
+    }
+
+    fn from_file(
+        path: &Path,
+        file: File,
+        identity: OutputFileIdentity,
+    ) -> ProviderGraphV4Result<Self> {
+        let mut writer = BufWriter::new(file);
+        if let Err(error) = writer.write_all(PG_COPY_HEADER) {
+            drop(writer);
+            remove_owned_output(path, identity);
+            return Err(error.into());
+        }
         Ok(Self {
             writer,
+            path: path.to_path_buf(),
+            identity,
             finished: false,
         })
     }
@@ -5440,14 +6609,1229 @@ impl PgCopyFileWriter {
         self.finished = true;
         Ok(())
     }
+
+    fn finish_and_digest_with_hook(
+        mut self,
+        after_flush: impl FnOnce(&Path),
+    ) -> ProviderGraphV4Result<(u64, [u8; 32])> {
+        self.writer.write_all(&(-1i16).to_be_bytes())?;
+        self.writer.flush()?;
+        after_flush(&self.path);
+        let file = self.writer.get_mut();
+        let before = file.metadata()?;
+        if !self.identity.matches_metadata(&before) {
+            return Err(invalid("V4 output descriptor identity changed"));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        let after = file.metadata()?;
+        if before.len() != after.len()
+            || !self.identity.matches_metadata(&after)
+            || !self.identity.matches_path(&self.path)
+        {
+            return Err(invalid("V4 output path changed while sealing"));
+        }
+        self.finished = true;
+        Ok((after.len(), digest.finalize().into()))
+    }
 }
 
 impl Drop for PgCopyFileWriter {
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.writer.flush();
+            remove_owned_output(&self.path, self.identity);
         }
     }
+}
+
+fn validate_scope_shard<'a>(
+    descriptor: &'a V4ProviderGraphShardDescriptor,
+    seen_shards: &mut HashSet<String>,
+) -> ProviderGraphV4Result<(
+    &'a V4NpiScopeArtifactDescriptor,
+    &'a V4MembershipArtifactDescriptor,
+)> {
+    let shard_id = descriptor.shard_id.trim();
+    if shard_id.is_empty()
+        || descriptor.shard_id != shard_id
+        || !seen_shards.insert(shard_id.to_owned())
+    {
+        return Err(invalid(
+            "V4 provider graph shard IDs must be non-empty and unique",
+        ));
+    }
+    for (label, source, alias) in [
+        (
+            "membership",
+            descriptor
+                .provider_npi_group
+                .metadata
+                .source_shard_id
+                .as_deref()
+                .map(str::trim),
+            descriptor
+                .provider_npi_group
+                .metadata
+                .shard_id
+                .as_deref()
+                .map(str::trim),
+        ),
+        (
+            "NPI scope",
+            descriptor
+                .provider_npi_scope
+                .metadata
+                .source_shard_id
+                .as_deref()
+                .map(str::trim),
+            descriptor
+                .provider_npi_scope
+                .metadata
+                .shard_id
+                .as_deref()
+                .map(str::trim),
+        ),
+    ] {
+        if source.is_some() && alias.is_some() && source != alias {
+            return Err(invalid(format!("V4 {label} has contradictory shard IDs")));
+        }
+        if source.or(alias).is_some_and(|value| value != shard_id) {
+            return Err(invalid(format!(
+                "V4 {label} shard ID does not match bundle {shard_id}"
+            )));
+        }
+    }
+    Ok((
+        &descriptor.provider_npi_scope,
+        &descriptor.provider_npi_group,
+    ))
+}
+
+fn npi_scope_binding_digest(metadata: &V4NpiScopeMetadata) -> ProviderGraphV4Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    digest.update(NPI_SCOPE_BINDING_HASH_DOMAIN);
+    update_length_prefixed(&mut digest, metadata.record_format.as_bytes())?;
+    digest.update(parse_sha256(&metadata.sha256)?);
+    digest.update(metadata.byte_count.to_be_bytes());
+    digest.update(metadata.row_count.to_be_bytes());
+    digest.update(parse_sha256(&metadata.provider_npi_group_sha256)?);
+    update_length_prefixed(
+        &mut digest,
+        metadata.provider_npi_group_record_format.as_bytes(),
+    )?;
+    digest.update(metadata.provider_npi_group_byte_count.to_be_bytes());
+    digest.update(metadata.provider_npi_group_owner_count.to_be_bytes());
+    digest.update(metadata.provider_npi_group_member_count.to_be_bytes());
+    digest.update(
+        metadata
+            .provider_npi_group_member_global_count
+            .to_be_bytes(),
+    );
+    Ok(digest.finalize().into())
+}
+
+fn npi_scope_shard_binding_digest(
+    metadata: &V4NpiScopeMetadata,
+    shard_id: &str,
+) -> ProviderGraphV4Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    digest.update(NPI_SCOPE_SHARD_BINDING_HASH_DOMAIN);
+    digest.update(parse_sha256(&metadata.binding_sha256)?);
+    update_length_prefixed(&mut digest, shard_id.as_bytes())?;
+    Ok(digest.finalize().into())
+}
+
+fn reciprocal_npi_scope_member_global_count(
+    reciprocal: &V4MembershipArtifactDescriptor,
+) -> ProviderGraphV4Result<u64> {
+    if reciprocal.metadata.record_format != DENSE_FORMAT {
+        return Err(invalid(
+            "V4 provider NPI scope reciprocal graph must use the dense format",
+        ));
+    }
+    reciprocal.metadata.member_global_count.ok_or_else(|| {
+        invalid("V4 provider NPI scope reciprocal graph must declare its global member count")
+    })
+}
+
+struct ValidatedNpiScopeArtifact {
+    reader: BufReader<File>,
+    remaining_rows: u64,
+    previous_npi: u64,
+    finished: bool,
+}
+
+impl ValidatedNpiScopeArtifact {
+    fn open(
+        descriptor: &V4NpiScopeArtifactDescriptor,
+        reciprocal: &V4MembershipArtifactDescriptor,
+        shard_id: &str,
+    ) -> ProviderGraphV4Result<Self> {
+        let metadata = &descriptor.metadata;
+        let reciprocal_member_global_count = reciprocal_npi_scope_member_global_count(reciprocal)?;
+        if metadata.record_format != NPI_SCOPE_ARTIFACT_FORMAT
+            || metadata.binding_contract != NPI_SCOPE_BINDING_CONTRACT
+            || metadata.shard_binding_contract != NPI_SCOPE_SHARD_BINDING_CONTRACT
+            || metadata.retention_contract != NPI_SCOPE_RETENTION_CONTRACT
+            || metadata.provider_npi_group_sha256 != reciprocal.metadata.sha256
+            || metadata.provider_npi_group_record_format != reciprocal.metadata.record_format
+            || metadata.provider_npi_group_byte_count != reciprocal.metadata.byte_count
+            || metadata.provider_npi_group_owner_count != reciprocal.metadata.owner_count
+            || metadata.provider_npi_group_member_count != reciprocal.metadata.member_count
+            || metadata.provider_npi_group_member_global_count != reciprocal_member_global_count
+            || metadata.row_count != reciprocal.metadata.owner_count
+            || parse_sha256(&metadata.binding_sha256)? != npi_scope_binding_digest(metadata)?
+            || parse_sha256(&metadata.shard_binding_sha256)?
+                != npi_scope_shard_binding_digest(metadata, shard_id)?
+        {
+            return Err(invalid(
+                "V4 provider NPI scope binding does not match its reciprocal graph",
+            ));
+        }
+        let expected_bytes = (PG_COPY_HEADER.len() as u64)
+            .checked_add(
+                metadata
+                    .row_count
+                    .checked_mul(14)
+                    .ok_or(invalid("V4 provider NPI scope byte count overflows"))?,
+            )
+            .and_then(|value| value.checked_add(2))
+            .ok_or(invalid("V4 provider NPI scope byte count overflows"))?;
+        let path_metadata = fs::symlink_metadata(&descriptor.path)?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.is_file()
+            || path_metadata.len() != metadata.byte_count
+            || metadata.byte_count != expected_bytes
+        {
+            return Err(invalid("V4 provider NPI scope artifact changed"));
+        }
+        let mut file = File::open(&descriptor.path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if parse_sha256(&metadata.sha256)? != hasher.finalize().as_slice() {
+            return Err(invalid("V4 provider NPI scope checksum changed"));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(file);
+        let mut header = vec![0u8; PG_COPY_HEADER.len()];
+        reader
+            .read_exact(&mut header)
+            .map_err(|_| invalid("V4 provider NPI scope header is truncated"))?;
+        if header != PG_COPY_HEADER {
+            return Err(invalid("V4 provider NPI scope header is invalid"));
+        }
+        Ok(Self {
+            reader,
+            remaining_rows: metadata.row_count,
+            previous_npi: 0,
+            finished: false,
+        })
+    }
+
+    fn next_npi(&mut self) -> ProviderGraphV4Result<Option<u64>> {
+        if self.remaining_rows == 0 {
+            if !self.finished {
+                let mut trailer = [0u8; 2];
+                self.reader
+                    .read_exact(&mut trailer)
+                    .map_err(|_| invalid("V4 provider NPI scope trailer is truncated"))?;
+                let mut extra = [0u8; 1];
+                if trailer != (-1i16).to_be_bytes() || self.reader.read(&mut extra)? != 0 {
+                    return Err(invalid("V4 provider NPI scope trailer is invalid"));
+                }
+                self.finished = true;
+            }
+            return Ok(None);
+        }
+        let mut field_count = [0u8; 2];
+        self.reader
+            .read_exact(&mut field_count)
+            .map_err(|_| invalid("V4 provider NPI scope row is truncated"))?;
+        if i16::from_be_bytes(field_count) != 1 {
+            return Err(invalid(
+                "V4 provider NPI scope row has an invalid field count",
+            ));
+        }
+        let npi = u64::from_be_bytes(read_copy_field::<8>(&mut self.reader, "source NPI")?);
+        if !(MIN_NPI..=MAX_NPI).contains(&npi) || npi <= self.previous_npi {
+            return Err(invalid(
+                "V4 provider NPI scope rows must contain strict sorted ten-digit NPIs",
+            ));
+        }
+        self.previous_npi = npi;
+        self.remaining_rows -= 1;
+        Ok(Some(npi))
+    }
+}
+
+fn extract_provider_graph_v4_npi_scope_inner(
+    shards: &[V4ProviderGraphShardDescriptor],
+    output_path: &Path,
+) -> ProviderGraphV4Result<ProviderGraphV4NpiScopeSummary> {
+    extract_provider_graph_v4_npi_scope_inner_with_hook(shards, output_path, |_| {})
+}
+
+fn extract_provider_graph_v4_npi_scope_inner_with_hook(
+    shards: &[V4ProviderGraphShardDescriptor],
+    output_path: &Path,
+    after_output_flush: impl FnOnce(&Path),
+) -> ProviderGraphV4Result<ProviderGraphV4NpiScopeSummary> {
+    if shards.is_empty() {
+        return Err(invalid("V4 provider graph requires at least one shard"));
+    }
+    let mut ordered = shards.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    let mut seen_shards = HashSet::new();
+    let mut artifacts = Vec::with_capacity(ordered.len());
+    let mut input_digest = Sha256::new();
+    input_digest.update(NPI_SCOPE_INPUT_HASH_DOMAIN);
+    let mut input_byte_count = 0u64;
+    let mut source_owner_count = 0u64;
+    for descriptor in ordered {
+        let (scope_descriptor, reciprocal_descriptor) =
+            validate_scope_shard(descriptor, &mut seen_shards)?;
+        let artifact = ValidatedNpiScopeArtifact::open(
+            scope_descriptor,
+            reciprocal_descriptor,
+            &descriptor.shard_id,
+        )?;
+        input_byte_count = input_byte_count
+            .checked_add(scope_descriptor.metadata.byte_count)
+            .ok_or(invalid("V4 NPI scope input byte count overflows"))?;
+        source_owner_count = source_owner_count
+            .checked_add(scope_descriptor.metadata.row_count)
+            .ok_or(invalid("V4 NPI scope source owner count overflows"))?;
+        update_length_prefixed(&mut input_digest, descriptor.shard_id.as_bytes())?;
+        input_digest.update(parse_sha256(&scope_descriptor.metadata.sha256)?);
+        input_digest.update(scope_descriptor.metadata.byte_count.to_be_bytes());
+        input_digest.update(scope_descriptor.metadata.row_count.to_be_bytes());
+        input_digest.update(parse_sha256(&scope_descriptor.metadata.binding_sha256)?);
+        artifacts.push(artifact);
+    }
+
+    let mut heap = BinaryHeap::new();
+    for (artifact_index, artifact) in artifacts.iter_mut().enumerate() {
+        if let Some(npi) = artifact.next_npi()? {
+            heap.push(Reverse((npi, artifact_index)));
+        }
+    }
+    let mut output = PgCopyFileWriter::create(output_path)?;
+    let mut previous_npi = None;
+    let mut row_count = 0u64;
+    while let Some(Reverse((npi, artifact_index))) = heap.pop() {
+        if previous_npi != Some(npi) {
+            let key = invalid_conversion(
+                i32::try_from(row_count),
+                "V4 NPI scope row count exceeds int32",
+            )?;
+            let npi = invalid_conversion(i64::try_from(npi), "V4 NPI exceeds int64")?;
+            output.row(&[&key.to_be_bytes(), &npi.to_be_bytes()])?;
+            row_count = row_count
+                .checked_add(1)
+                .ok_or(invalid("V4 NPI scope row count overflows"))?;
+            previous_npi = Some(npi as u64);
+        }
+        if let Some(next_npi) = artifacts[artifact_index].next_npi()? {
+            heap.push(Reverse((next_npi, artifact_index)));
+        }
+    }
+    for artifact in &mut artifacts {
+        if artifact.next_npi()?.is_some() {
+            return Err(invalid("V4 provider NPI scope merge is incomplete"));
+        }
+    }
+    let (output_byte_count, output_sha256) =
+        output.finish_and_digest_with_hook(after_output_flush)?;
+    Ok(ProviderGraphV4NpiScopeSummary {
+        format: NPI_SCOPE_FORMAT.to_owned(),
+        row_count,
+        source_owner_count,
+        input_byte_count,
+        input_sha256: hex(&input_digest.finalize()),
+        output_byte_count,
+        output_sha256: hex(&output_sha256),
+        output_path: output_path.to_path_buf(),
+    })
+}
+
+/// Extract the exact sorted snapshot NPI universe from authenticated reciprocal
+/// NPI-to-group factor owners without loading their member edges.
+pub fn extract_provider_graph_v4_npi_scope(
+    shards: &[V4ProviderGraphShardDescriptor],
+    output_path: impl AsRef<Path>,
+) -> ProviderGraphV4Result<ProviderGraphV4NpiScopeSummary> {
+    let output_path = output_path.as_ref();
+    if fs::symlink_metadata(output_path).is_ok() {
+        return Err(invalid(format!(
+            "V4 NPI scope output already exists: {}",
+            output_path.display()
+        )));
+    }
+    extract_provider_graph_v4_npi_scope_inner(shards, output_path)
+}
+
+fn expected_npi_scope_input_identity(
+    shards: &[V4ProviderGraphShardDescriptor],
+) -> ProviderGraphV4Result<(u64, u64, [u8; 32])> {
+    if shards.is_empty() {
+        return Err(invalid("V4 provider graph requires at least one shard"));
+    }
+    let mut ordered = shards.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    let mut seen_shards = HashSet::new();
+    let mut input_byte_count = 0u64;
+    let mut source_owner_count = 0u64;
+    let mut input_digest = Sha256::new();
+    input_digest.update(NPI_SCOPE_INPUT_HASH_DOMAIN);
+    for descriptor in ordered {
+        let (artifact, reciprocal) = validate_scope_shard(descriptor, &mut seen_shards)?;
+        let reciprocal_member_global_count = reciprocal_npi_scope_member_global_count(reciprocal)?;
+        if artifact.metadata.record_format != NPI_SCOPE_ARTIFACT_FORMAT
+            || artifact.metadata.binding_contract != NPI_SCOPE_BINDING_CONTRACT
+            || artifact.metadata.shard_binding_contract != NPI_SCOPE_SHARD_BINDING_CONTRACT
+            || artifact.metadata.retention_contract != NPI_SCOPE_RETENTION_CONTRACT
+            || artifact.metadata.provider_npi_group_sha256 != reciprocal.metadata.sha256
+            || artifact.metadata.provider_npi_group_record_format
+                != reciprocal.metadata.record_format
+            || artifact.metadata.provider_npi_group_byte_count != reciprocal.metadata.byte_count
+            || artifact.metadata.provider_npi_group_owner_count != reciprocal.metadata.owner_count
+            || artifact.metadata.provider_npi_group_member_count != reciprocal.metadata.member_count
+            || artifact.metadata.provider_npi_group_member_global_count
+                != reciprocal_member_global_count
+            || artifact.metadata.row_count != reciprocal.metadata.owner_count
+            || parse_sha256(&artifact.metadata.binding_sha256)?
+                != npi_scope_binding_digest(&artifact.metadata)?
+            || parse_sha256(&artifact.metadata.shard_binding_sha256)?
+                != npi_scope_shard_binding_digest(&artifact.metadata, &descriptor.shard_id)?
+        {
+            return Err(invalid(
+                "V4 provider NPI scope binding does not match its reciprocal graph",
+            ));
+        }
+        input_byte_count = input_byte_count
+            .checked_add(artifact.metadata.byte_count)
+            .ok_or(invalid("V4 NPI scope input byte count overflows"))?;
+        source_owner_count = source_owner_count
+            .checked_add(artifact.metadata.row_count)
+            .ok_or(invalid("V4 NPI scope source owner count overflows"))?;
+        update_length_prefixed(&mut input_digest, descriptor.shard_id.as_bytes())?;
+        input_digest.update(parse_sha256(&artifact.metadata.sha256)?);
+        input_digest.update(artifact.metadata.byte_count.to_be_bytes());
+        input_digest.update(artifact.metadata.row_count.to_be_bytes());
+        input_digest.update(parse_sha256(&artifact.metadata.binding_sha256)?);
+    }
+    Ok((
+        input_byte_count,
+        source_owner_count,
+        input_digest.finalize().into(),
+    ))
+}
+
+fn validate_npi_scope_input(
+    shards: &[V4ProviderGraphShardDescriptor],
+    input: &ProviderGraphV4NpiScopeInput,
+    model_npis: &[u64],
+) -> ProviderGraphV4Result<()> {
+    validate_npi_scope_input_with_hook(shards, input, model_npis, |_| {})
+}
+
+fn validate_npi_scope_input_with_hook(
+    shards: &[V4ProviderGraphShardDescriptor],
+    input: &ProviderGraphV4NpiScopeInput,
+    model_npis: &[u64],
+    after_open: impl FnOnce(&Path),
+) -> ProviderGraphV4Result<()> {
+    let (input_byte_count, source_owner_count, input_digest) =
+        expected_npi_scope_input_identity(shards)?;
+    if input.format != NPI_SCOPE_FORMAT
+        || input.input_byte_count != input_byte_count
+        || input.source_owner_count != source_owner_count
+        || parse_sha256(&input.input_sha256)? != input_digest
+        || input.row_count != model_npis.len() as u64
+    {
+        return Err(invalid("V4 NPI scope prepass identity changed"));
+    }
+    let path_metadata = fs::symlink_metadata(&input.output_path)?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || path_metadata.len() != input.output_byte_count
+    {
+        return Err(invalid("V4 NPI scope prepass artifact changed"));
+    }
+    let path_identity = OutputFileIdentity::from_metadata(&path_metadata)?;
+    let file = File::open(&input.output_path)?;
+    let descriptor_metadata = file.metadata()?;
+    if descriptor_metadata.len() != input.output_byte_count
+        || !path_identity.matches_metadata(&descriptor_metadata)
+    {
+        return Err(invalid("V4 NPI scope prepass artifact changed"));
+    }
+    after_open(&input.output_path);
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    if parse_sha256(&input.output_sha256)? != digest.finalize().as_slice() {
+        return Err(invalid("V4 NPI scope prepass checksum changed"));
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    let rows = read_npi_scope_copy_reader(&mut reader)?;
+    let final_metadata = reader.get_ref().metadata()?;
+    let current_path_metadata = fs::symlink_metadata(&input.output_path)?;
+    if final_metadata.len() != input.output_byte_count
+        || current_path_metadata.len() != input.output_byte_count
+        || current_path_metadata.file_type().is_symlink()
+        || !path_identity.matches_metadata(&final_metadata)
+        || !path_identity.matches_metadata(&current_path_metadata)
+    {
+        return Err(invalid("V4 NPI scope prepass artifact changed"));
+    }
+    if rows.len() != model_npis.len()
+        || rows
+            .iter()
+            .zip(model_npis)
+            .any(|((key, npi), expected_npi)| {
+                *key as usize >= model_npis.len() || *npi != *expected_npi
+            })
+    {
+        return Err(invalid(
+            "V4 NPI scope prepass differs from the complete graph model",
+        ));
+    }
+    Ok(())
+}
+
+fn read_copy_i32(reader: &mut BufReader<File>, label: &'static str) -> ProviderGraphV4Result<i32> {
+    let mut bytes = [0u8; 4];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|_| invalid(format!("V4 NPI scope {label} is truncated")))?;
+    Ok(i32::from_be_bytes(bytes))
+}
+
+fn read_copy_field<const N: usize>(
+    reader: &mut BufReader<File>,
+    label: &'static str,
+) -> ProviderGraphV4Result<[u8; N]> {
+    let length = read_copy_i32(reader, label)?;
+    if length != N as i32 {
+        return Err(invalid(format!(
+            "V4 NPI scope {label} has an invalid width"
+        )));
+    }
+    let mut value = [0u8; N];
+    reader
+        .read_exact(&mut value)
+        .map_err(|_| invalid(format!("V4 NPI scope {label} is truncated")))?;
+    Ok(value)
+}
+
+#[cfg(test)]
+fn read_npi_scope_copy(path: &Path) -> ProviderGraphV4Result<Vec<(u32, u64)>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    read_npi_scope_copy_reader(&mut reader)
+}
+
+fn read_npi_scope_copy_reader(
+    reader: &mut BufReader<File>,
+) -> ProviderGraphV4Result<Vec<(u32, u64)>> {
+    let mut header = vec![0u8; PG_COPY_HEADER.len()];
+    reader
+        .read_exact(&mut header)
+        .map_err(|_| invalid("V4 NPI scope COPY header is truncated"))?;
+    if header != PG_COPY_HEADER {
+        return Err(invalid("V4 NPI scope COPY header is invalid"));
+    }
+    let mut rows = Vec::new();
+    loop {
+        let mut field_count_bytes = [0u8; 2];
+        reader
+            .read_exact(&mut field_count_bytes)
+            .map_err(|_| invalid("V4 NPI scope COPY row header is truncated"))?;
+        let field_count = i16::from_be_bytes(field_count_bytes);
+        if field_count == -1 {
+            let mut trailing = [0u8; 1];
+            if reader.read(&mut trailing)? != 0 {
+                return Err(invalid("V4 NPI scope COPY has trailing bytes"));
+            }
+            break;
+        }
+        if field_count != 2 {
+            return Err(invalid("V4 NPI scope COPY row must have two fields"));
+        }
+        let key = i32::from_be_bytes(read_copy_field::<4>(reader, "key")?);
+        let npi = i64::from_be_bytes(read_copy_field::<8>(reader, "NPI")?);
+        if key < 0 || !(MIN_NPI..=MAX_NPI).contains(&(npi as u64)) {
+            return Err(invalid("V4 NPI scope COPY row is outside its domain"));
+        }
+        let key = key as u32;
+        let npi = npi as u64;
+        if key as usize != rows.len()
+            || rows
+                .last()
+                .is_some_and(|(_, previous_npi)| npi <= *previous_npi)
+        {
+            return Err(invalid(
+                "V4 NPI scope COPY rows must be dense and NPI-sorted",
+            ));
+        }
+        rows.push((key, npi));
+    }
+    Ok(rows)
+}
+
+#[derive(Clone, Debug)]
+struct V4InferredTaxonomyRule {
+    rule_digest: [u8; 32],
+    catalog_digest: [u8; 32],
+    member_keys: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct V4InferredTaxonomyModel {
+    rules: Vec<V4InferredTaxonomyRule>,
+}
+
+#[derive(Clone, Debug)]
+struct V4InferredTaxonomyRow {
+    rule_digest: [u8; 32],
+    catalog_digest: [u8; 32],
+    member_digest: [u8; 32],
+    member_keys: Vec<u8>,
+    representation: &'static str,
+    observe_reason: Option<&'static str>,
+    observe_count_lower_bound: Option<u64>,
+    pattern_count: u32,
+    pattern_member_count: u64,
+    pattern_member_digest: [u8; 32],
+    pattern_member_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct V4InferredTaxonomyRejection {
+    reason: &'static str,
+    rule_digest: [u8; 32],
+    observed_count: u64,
+    cap: u64,
+}
+
+#[derive(Clone, Debug)]
+struct V4InferredTaxonomyProjection {
+    rows: Vec<V4InferredTaxonomyRow>,
+    encoded_bytes: u64,
+    eligible: bool,
+    rejection: Option<V4InferredTaxonomyRejection>,
+}
+
+fn strict_u32le_members(bytes: &[u8], npi_count: usize) -> ProviderGraphV4Result<Vec<u32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(invalid(
+            "V4 inferred-taxonomy candidate member payload is misaligned",
+        ));
+    }
+    let mut members = Vec::with_capacity(bytes.len() / 4);
+    let mut previous = None;
+    for member in bytes.chunks_exact(4) {
+        let key = u32::from_le_bytes(member.try_into().expect("fixed uint32 width"));
+        if previous.is_some_and(|value| key <= value) || key as usize >= npi_count {
+            return Err(invalid(
+                "V4 inferred-taxonomy candidate members are outside the NPI scope",
+            ));
+        }
+        members.push(key);
+        previous = Some(key);
+    }
+    Ok(members)
+}
+
+fn validate_inferred_taxonomy_rule_envelope(
+    input: &ProviderGraphV4InferredTaxonomyInput,
+) -> ProviderGraphV4Result<()> {
+    let mut previous_digest = None;
+    let mut expected_offset = 0u64;
+    let mut rule_set_hasher = Sha256::new();
+    rule_set_hasher.update(INFERRED_TAXONOMY_RULE_SET_DIGEST_DOMAIN);
+    rule_set_hasher.update(
+        invalid_conversion(
+            u32::try_from(input.rules.len()),
+            "V4 inferred-taxonomy rule count exceeds uint32",
+        )?
+        .to_be_bytes(),
+    );
+    for raw_rule in &input.rules {
+        let rule_digest = parse_sha256(&raw_rule.rule_digest)?;
+        parse_sha256(&raw_rule.catalog_digest)?;
+        let expected_member_bytes = raw_rule.member_count.checked_mul(4).ok_or(invalid(
+            "V4 inferred-taxonomy candidate member bytes overflow",
+        ))?;
+        if previous_digest.is_some_and(|value| rule_digest <= value)
+            || raw_rule.member_offset_bytes != expected_offset
+            || raw_rule.member_byte_count != expected_member_bytes
+        {
+            return Err(invalid(
+                "V4 inferred-taxonomy rules must be strict and contiguous",
+            ));
+        }
+        expected_offset = expected_offset
+            .checked_add(raw_rule.member_byte_count)
+            .ok_or(invalid("V4 inferred-taxonomy member range overflows"))?;
+        rule_set_hasher.update(rule_digest);
+        previous_digest = Some(rule_digest);
+    }
+    if expected_offset != input.members.byte_count
+        || parse_sha256(&input.rule_set_digest)? != rule_set_hasher.finalize().as_slice()
+    {
+        return Err(invalid("V4 inferred-taxonomy compiler input is incomplete"));
+    }
+    Ok(())
+}
+
+fn reserve_inferred_taxonomy_memory(
+    input: &ProviderGraphV4InferredTaxonomyInput,
+    admission: &mut ResourceAdmissionTracker,
+) -> ProviderGraphV4Result<()> {
+    let rule_count = invalid_conversion(
+        u64::try_from(input.rules.len()),
+        "resource_admission: inferred-taxonomy rule count exceeds uint64",
+    )?;
+    let member_count = input.members.byte_count / 4;
+    let model_member_bytes = member_count
+        .checked_mul(ESTIMATED_U32_CAPACITY_BYTES)
+        .ok_or(invalid(
+            "resource_admission: inferred-taxonomy model bytes overflow",
+        ))?;
+    let retained_bytes = model_member_bytes
+        .checked_add(rule_count.saturating_mul(ESTIMATED_VEC_OWNER_BYTES))
+        .ok_or(invalid(
+            "resource_admission: inferred-taxonomy model bytes overflow",
+        ))?;
+    admission.reserve_projection("inferred-taxonomy model", retained_bytes)?;
+    admission.reserve_scratch_bytes(
+        "authenticated inferred-taxonomy member input",
+        input.members.byte_count.max(64 * 1024),
+    )
+}
+
+fn reserve_inferred_taxonomy_projection_memory(
+    npi_patterns: &[Vec<u32>],
+    input: &V4InferredTaxonomyModel,
+    options: &ProviderGraphV4Options,
+    admission: &mut ResourceAdmissionTracker,
+) -> ProviderGraphV4Result<()> {
+    let observe_threshold = options
+        .max_online_inferred_taxonomy_candidates
+        .checked_add(1)
+        .ok_or(invalid("V4 inferred-taxonomy candidate cap overflows"))?;
+    let pattern_cap = invalid_conversion(
+        u64::try_from(options.max_online_candidate_pattern_projection_members),
+        "resource_admission: inferred-taxonomy pattern cap exceeds uint64",
+    )?;
+    let rule_count = invalid_conversion(
+        u64::try_from(input.rules.len()),
+        "resource_admission: inferred-taxonomy rule count exceeds uint64",
+    )?;
+    let member_payload_bytes = input.rules.iter().try_fold(0u64, |total, rule| {
+        total
+            .checked_add(
+                invalid_conversion(
+                    u64::try_from(rule.member_keys.len()),
+                    "resource_admission: inferred-taxonomy candidate count exceeds uint64",
+                )?
+                .checked_mul(4)
+                .ok_or(invalid(
+                    "resource_admission: inferred-taxonomy candidate bytes overflow",
+                ))?,
+            )
+            .ok_or(invalid(
+                "resource_admission: inferred-taxonomy candidate bytes overflow",
+            ))
+    })?;
+    let mut retained_pattern_payload_bytes = 0u64;
+    let mut maximum_pattern_scratch_members = 0u64;
+    let mut pattern_rejected = false;
+    for rule in &input.rules {
+        if pattern_rejected
+            || rule.member_keys.is_empty()
+            || rule.member_keys.len() == observe_threshold
+        {
+            continue;
+        }
+        let mut associations = 0u64;
+        for npi_key in &rule.member_keys {
+            let patterns = npi_patterns.get(*npi_key as usize).ok_or(invalid(
+                "resource_admission: inferred-taxonomy candidate exceeds pattern scope",
+            ))?;
+            associations = associations
+                .checked_add(invalid_conversion(
+                    u64::try_from(patterns.len()),
+                    "resource_admission: inferred-taxonomy pattern count exceeds uint64",
+                )?)
+                .ok_or(invalid(
+                    "resource_admission: inferred-taxonomy pattern member count overflows",
+                ))?;
+            if associations > pattern_cap {
+                maximum_pattern_scratch_members =
+                    maximum_pattern_scratch_members.max(pattern_cap.saturating_add(1));
+                pattern_rejected = true;
+                break;
+            }
+        }
+        if !pattern_rejected {
+            maximum_pattern_scratch_members = maximum_pattern_scratch_members.max(associations);
+            retained_pattern_payload_bytes = retained_pattern_payload_bytes
+                .checked_add(
+                    associations
+                        .checked_mul(ESTIMATED_PATTERN_PAYLOAD_BYTES_PER_MEMBER)
+                        .and_then(|value| value.checked_add(48))
+                        .ok_or(invalid(
+                            "resource_admission: inferred-taxonomy pattern payload bytes overflow",
+                        ))?,
+                )
+                .ok_or(invalid(
+                    "resource_admission: inferred-taxonomy pattern payload bytes overflow",
+                ))?;
+        }
+    }
+    let projection_bytes = member_payload_bytes
+        .checked_mul(2)
+        .and_then(|value| {
+            value.checked_add(
+                rule_count
+                    .saturating_mul(2)
+                    .saturating_mul(ESTIMATED_INFERRED_TAXONOMY_ROW_BYTES),
+            )
+        })
+        .and_then(|value| value.checked_add(retained_pattern_payload_bytes))
+        .ok_or(invalid(
+            "resource_admission: inferred-taxonomy simultaneous projection bytes overflow",
+        ))?;
+    admission.reserve_projection(
+        "simultaneous direct/pattern inferred-taxonomy projections",
+        projection_bytes,
+    )?;
+    let pattern_scratch_bytes = maximum_pattern_scratch_members
+        .checked_mul(ESTIMATED_PATTERN_POSTING_SCRATCH_BYTES)
+        .ok_or(invalid(
+            "resource_admission: inferred-taxonomy pattern scratch bytes overflow",
+        ))?;
+    admission.reserve_scratch_bytes("inferred-taxonomy pattern postings", pattern_scratch_bytes)
+}
+
+fn read_inferred_taxonomy_model(
+    input: &ProviderGraphV4InferredTaxonomyInput,
+    scope: &ProviderGraphV4NpiScopeInput,
+    npi_count: usize,
+    admission: &mut ResourceAdmissionTracker,
+) -> ProviderGraphV4Result<V4InferredTaxonomyModel> {
+    if input.contract != INFERRED_TAXONOMY_INPUT_CONTRACT
+        || input.catalog_contract != INFERRED_TAXONOMY_CATALOG_CONTRACT
+        || input.vector_format != INFERRED_TAXONOMY_VECTOR_FORMAT
+        || parse_sha256(&input.npi_scope_sha256)? != parse_sha256(&scope.output_sha256)?
+        || input.rules.is_empty()
+    {
+        return Err(invalid(
+            "V4 inferred-taxonomy compiler input contract is incompatible",
+        ));
+    }
+    validate_inferred_taxonomy_rule_envelope(input)?;
+    let expected_members_digest = parse_sha256(&input.members.sha256)?;
+    let mut member_file = File::open(&input.members.path).map_err(|error| {
+        invalid(format!(
+            "V4 inferred-taxonomy member input is unavailable ({}): {error}",
+            input.members.path.display()
+        ))
+    })?;
+    if member_file.metadata()?.len() != input.members.byte_count {
+        return Err(invalid(
+            "V4 inferred-taxonomy member input byte count changed",
+        ));
+    }
+    let mut authenticated_digest = Sha256::new();
+    let mut authentication_buffer = [0u8; 64 * 1024];
+    loop {
+        let count = member_file.read(&mut authentication_buffer)?;
+        if count == 0 {
+            break;
+        }
+        authenticated_digest.update(&authentication_buffer[..count]);
+    }
+    if authenticated_digest.finalize().as_slice() != expected_members_digest {
+        return Err(invalid(
+            "V4 inferred-taxonomy member input checksum changed",
+        ));
+    }
+    reserve_inferred_taxonomy_memory(input, admission)?;
+    member_file.seek(SeekFrom::Start(0))?;
+    let member_len = invalid_conversion(
+        usize::try_from(input.members.byte_count),
+        "V4 inferred-taxonomy member input exceeds addressable memory",
+    )?;
+    let mut member_bytes = vec![0u8; member_len];
+    member_file.read_exact(&mut member_bytes)?;
+    if Sha256::digest(&member_bytes).as_slice() != expected_members_digest {
+        return Err(invalid(
+            "V4 inferred-taxonomy member input changed after authentication",
+        ));
+    }
+    let mut trailing = [0u8; 1];
+    if member_file.read(&mut trailing)? != 0 {
+        return Err(invalid(
+            "V4 inferred-taxonomy member input grew after authentication",
+        ));
+    }
+    let mut rules = Vec::with_capacity(input.rules.len());
+    let mut previous_digest = None;
+    let mut expected_offset = 0u64;
+    let mut rule_set_hasher = Sha256::new();
+    rule_set_hasher.update(INFERRED_TAXONOMY_RULE_SET_DIGEST_DOMAIN);
+    rule_set_hasher.update(
+        invalid_conversion(
+            u32::try_from(input.rules.len()),
+            "V4 inferred-taxonomy rule count exceeds uint32",
+        )?
+        .to_be_bytes(),
+    );
+    for raw_rule in &input.rules {
+        let rule_digest = parse_sha256(&raw_rule.rule_digest)?;
+        let catalog_digest = parse_sha256(&raw_rule.catalog_digest)?;
+        let expected_member_bytes = raw_rule.member_count.checked_mul(4).ok_or(invalid(
+            "V4 inferred-taxonomy candidate member bytes overflow",
+        ))?;
+        if previous_digest.is_some_and(|value| rule_digest <= value)
+            || raw_rule.member_offset_bytes != expected_offset
+            || raw_rule.member_byte_count != expected_member_bytes
+        {
+            return Err(invalid(
+                "V4 inferred-taxonomy rules must be strict and contiguous",
+            ));
+        }
+        let start = invalid_conversion(
+            usize::try_from(raw_rule.member_offset_bytes),
+            "V4 inferred-taxonomy member offset exceeds addressable memory",
+        )?;
+        let end = invalid_conversion(
+            usize::try_from(
+                raw_rule
+                    .member_offset_bytes
+                    .checked_add(raw_rule.member_byte_count)
+                    .ok_or(invalid("V4 inferred-taxonomy member range overflows"))?,
+            ),
+            "V4 inferred-taxonomy member range exceeds addressable memory",
+        )?;
+        let members = strict_u32le_members(
+            member_bytes.get(start..end).ok_or(invalid(
+                "V4 inferred-taxonomy member range is outside its artifact",
+            ))?,
+            npi_count,
+        )?;
+        if members.len() as u64 != raw_rule.member_count {
+            return Err(invalid(
+                "V4 inferred-taxonomy candidate member count changed",
+            ));
+        }
+        rule_set_hasher.update(rule_digest);
+        rules.push(V4InferredTaxonomyRule {
+            rule_digest,
+            catalog_digest,
+            member_keys: members,
+        });
+        expected_offset = end as u64;
+        previous_digest = Some(rule_digest);
+    }
+    if expected_offset != input.members.byte_count
+        || parse_sha256(&input.rule_set_digest)? != rule_set_hasher.finalize().as_slice()
+    {
+        return Err(invalid("V4 inferred-taxonomy compiler input is incomplete"));
+    }
+    Ok(V4InferredTaxonomyModel { rules })
+}
+
+fn inferred_taxonomy_member_digest(
+    rule_digest: &[u8; 32],
+    member_payload: &[u8],
+) -> ProviderGraphV4Result<[u8; 32]> {
+    if !member_payload.len().is_multiple_of(4) {
+        return Err(invalid(
+            "V4 inferred-taxonomy candidate member payload is misaligned",
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(INFERRED_TAXONOMY_MEMBER_DIGEST_DOMAIN);
+    digest.update(rule_digest);
+    digest.update((member_payload.len() as u64 / 4).to_be_bytes());
+    digest.update(member_payload);
+    Ok(digest.finalize().into())
+}
+
+fn inferred_taxonomy_pattern_digest(
+    rule_digest: &[u8; 32],
+    representation: &str,
+    pattern_count: u32,
+    pattern_member_count: u64,
+    pattern_payload: &[u8],
+) -> ProviderGraphV4Result<[u8; 32]> {
+    let representation_bytes = representation.as_bytes();
+    let mut digest = Sha256::new();
+    digest.update(INFERRED_TAXONOMY_PATTERN_MEMBER_DIGEST_DOMAIN);
+    digest.update(rule_digest);
+    digest.update(
+        invalid_conversion(
+            u16::try_from(representation_bytes.len()),
+            "V4 inferred-taxonomy representation exceeds uint16",
+        )?
+        .to_be_bytes(),
+    );
+    digest.update(representation_bytes);
+    digest.update(u64::from(pattern_count).to_be_bytes());
+    digest.update(pattern_member_count.to_be_bytes());
+    digest.update((pattern_payload.len() as u64).to_be_bytes());
+    digest.update(pattern_payload);
+    Ok(digest.finalize().into())
+}
+
+fn pack_pattern_postings(
+    postings: &BTreeMap<u32, Vec<u32>>,
+    member_count: u64,
+) -> ProviderGraphV4Result<Vec<u8>> {
+    if postings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(INFERRED_TAXONOMY_PATTERN_PAYLOAD_MAGIC);
+    payload.extend_from_slice(&INFERRED_TAXONOMY_PATTERN_PAYLOAD_VERSION.to_le_bytes());
+    payload.extend_from_slice(
+        &invalid_conversion(
+            u32::try_from(postings.len()),
+            "V4 inferred-taxonomy pattern count exceeds uint32",
+        )?
+        .to_le_bytes(),
+    );
+    payload.extend_from_slice(&member_count.to_le_bytes());
+    for (pattern_key, npi_keys) in postings {
+        if npi_keys.is_empty() {
+            return Err(invalid("V4 inferred-taxonomy pattern posting is empty"));
+        }
+        payload.extend_from_slice(&pattern_key.to_le_bytes());
+        payload.extend_from_slice(
+            &invalid_conversion(
+                u32::try_from(npi_keys.len()),
+                "V4 inferred-taxonomy pattern posting exceeds uint32",
+            )?
+            .to_le_bytes(),
+        );
+        for npi_key in npi_keys {
+            payload.extend_from_slice(&npi_key.to_le_bytes());
+        }
+    }
+    Ok(payload)
+}
+
+fn candidate_row_encoded_bytes(row: &V4InferredTaxonomyRow) -> ProviderGraphV4Result<u64> {
+    copy_row_encoded_bytes(&[
+        32,
+        INFERRED_TAXONOMY_CATALOG_CONTRACT.len(),
+        32,
+        INFERRED_TAXONOMY_VECTOR_FORMAT.len(),
+        4,
+        32,
+        row.member_keys.len(),
+        row.representation.len(),
+        row.observe_reason.map_or(0, str::len),
+        row.observe_count_lower_bound.map_or(0, |_| 8),
+        4,
+        8,
+        8,
+        32,
+        row.pattern_member_payload.len(),
+    ])
+}
+
+fn inferred_taxonomy_projection(
+    npi_patterns: &[Vec<u32>],
+    input: &V4InferredTaxonomyModel,
+    layout: ProviderGraphV4Layout,
+    options: &ProviderGraphV4Options,
+) -> ProviderGraphV4Result<V4InferredTaxonomyProjection> {
+    let mut rows = Vec::with_capacity(input.rules.len());
+    let mut encoded_bytes = (PG_COPY_HEADER.len() + 2) as u64;
+    for rule in &input.rules {
+        let observe_threshold = options
+            .max_online_inferred_taxonomy_candidates
+            .checked_add(1)
+            .ok_or(invalid("V4 inferred-taxonomy candidate cap overflows"))?;
+        if rule.member_keys.len() > observe_threshold {
+            return Err(invalid(
+                "V4 inferred-taxonomy candidate witness exceeds its bounded cap",
+            ));
+        }
+        let mut member_payload = Vec::with_capacity(rule.member_keys.len() * 4);
+        for npi_key in &rule.member_keys {
+            member_payload.extend_from_slice(&npi_key.to_le_bytes());
+        }
+        let mut representation = INFERRED_TAXONOMY_DIRECT_REPRESENTATION;
+        let mut observe_reason = None;
+        let mut observe_count_lower_bound = None;
+        let mut pattern_count = 0u32;
+        let mut pattern_member_count = 0u64;
+        let mut pattern_payload = Vec::new();
+        if rule.member_keys.len() == observe_threshold {
+            representation = INFERRED_TAXONOMY_OBSERVE_REPRESENTATION;
+            observe_reason = Some(INFERRED_TAXONOMY_CANDIDATE_CAP_REASON);
+            observe_count_lower_bound = Some(observe_threshold as u64);
+        } else if layout == ProviderGraphV4Layout::Pattern && !rule.member_keys.is_empty() {
+            let mut postings = BTreeMap::<u32, Vec<u32>>::new();
+            for npi_key in &rule.member_keys {
+                let patterns = npi_patterns.get(*npi_key as usize).ok_or(invalid(
+                    "V4 inferred-taxonomy candidate exceeds pattern scope",
+                ))?;
+                if patterns.is_empty() {
+                    return Err(invalid(
+                        "V4 inferred-taxonomy candidate has no pattern evidence",
+                    ));
+                }
+                for pattern_key in patterns {
+                    pattern_member_count = pattern_member_count.checked_add(1).ok_or(invalid(
+                        "V4 inferred-taxonomy pattern member count overflows",
+                    ))?;
+                    if pattern_member_count
+                        > options.max_online_candidate_pattern_projection_members as u64
+                    {
+                        return Ok(V4InferredTaxonomyProjection {
+                            rows: Vec::new(),
+                            encoded_bytes: 0,
+                            eligible: false,
+                            rejection: Some(V4InferredTaxonomyRejection {
+                                reason: INFERRED_TAXONOMY_PATTERN_CAP_REASON,
+                                rule_digest: rule.rule_digest,
+                                observed_count: pattern_member_count,
+                                cap: options.max_online_candidate_pattern_projection_members as u64,
+                            }),
+                        });
+                    }
+                    postings.entry(*pattern_key).or_default().push(*npi_key);
+                }
+            }
+            pattern_count = invalid_conversion(
+                u32::try_from(postings.len()),
+                "V4 inferred-taxonomy pattern count exceeds uint32",
+            )?;
+            pattern_payload = pack_pattern_postings(&postings, pattern_member_count)?;
+            representation = INFERRED_TAXONOMY_PATTERN_REPRESENTATION;
+        }
+        let row = V4InferredTaxonomyRow {
+            rule_digest: rule.rule_digest,
+            catalog_digest: rule.catalog_digest,
+            member_digest: inferred_taxonomy_member_digest(&rule.rule_digest, &member_payload)?,
+            member_keys: member_payload,
+            representation,
+            observe_reason,
+            observe_count_lower_bound,
+            pattern_count,
+            pattern_member_count,
+            pattern_member_digest: inferred_taxonomy_pattern_digest(
+                &rule.rule_digest,
+                representation,
+                pattern_count,
+                pattern_member_count,
+                &pattern_payload,
+            )?,
+            pattern_member_payload: pattern_payload,
+        };
+        encoded_bytes = encoded_bytes
+            .checked_add(candidate_row_encoded_bytes(&row)?)
+            .ok_or(invalid(
+                "V4 inferred-taxonomy candidate encoded bytes overflow",
+            ))?;
+        rows.push(row);
+    }
+    Ok(V4InferredTaxonomyProjection {
+        rows,
+        encoded_bytes,
+        eligible: true,
+        rejection: None,
+    })
+}
+
+fn emit_inferred_taxonomy_candidates(
+    path: &Path,
+    projection: &V4InferredTaxonomyProjection,
+    ownership: &mut OutputOwnership,
+) -> ProviderGraphV4Result<()> {
+    if !projection.eligible {
+        return Err(invalid(projection.rejection.as_ref().map_or(
+            "V4 inferred-taxonomy projection is ineligible",
+            |value| value.reason,
+        )));
+    }
+    let mut output = PgCopyFileWriter::create_tracked(path, ownership)?;
+    for row in &projection.rows {
+        let member_count = invalid_conversion(
+            i32::try_from(row.member_keys.len() / 4),
+            "V4 inferred-taxonomy candidate count exceeds int32",
+        )?;
+        let pattern_count = invalid_conversion(
+            i32::try_from(row.pattern_count),
+            "V4 inferred-taxonomy pattern count exceeds int32",
+        )?;
+        let pattern_member_count = invalid_conversion(
+            i64::try_from(row.pattern_member_count),
+            "V4 inferred-taxonomy pattern member count exceeds int64",
+        )?;
+        let pattern_member_bytes = invalid_conversion(
+            i64::try_from(row.pattern_member_payload.len()),
+            "V4 inferred-taxonomy pattern payload exceeds int64",
+        )?;
+        let observe_count_lower_bound = row
+            .observe_count_lower_bound
+            .map(|value| {
+                invalid_conversion(
+                    i64::try_from(value),
+                    "V4 inferred-taxonomy observe count exceeds int64",
+                )
+                .map(i64::to_be_bytes)
+            })
+            .transpose()?;
+        output.row_nullable(&[
+            Some(&row.rule_digest),
+            Some(INFERRED_TAXONOMY_CATALOG_CONTRACT.as_bytes()),
+            Some(&row.catalog_digest),
+            Some(INFERRED_TAXONOMY_VECTOR_FORMAT.as_bytes()),
+            Some(&member_count.to_be_bytes()),
+            Some(&row.member_digest),
+            Some(&row.member_keys),
+            Some(row.representation.as_bytes()),
+            row.observe_reason.map(str::as_bytes),
+            observe_count_lower_bound.as_ref().map(<[u8; 8]>::as_slice),
+            Some(&pattern_count.to_be_bytes()),
+            Some(&pattern_member_count.to_be_bytes()),
+            Some(&pattern_member_bytes.to_be_bytes()),
+            Some(&row.pattern_member_digest),
+            Some(&row.pattern_member_payload),
+        ])?;
+    }
+    output.finish()
 }
 
 struct EmittedDictionaries {
@@ -5467,27 +7851,29 @@ fn emit_dictionaries(
     tax_identity: &V4TaxIdentityModel,
     layout: ProviderGraphV4Layout,
     progress: &mut ProgressReporter<'_>,
+    ownership: &mut OutputOwnership,
 ) -> ProviderGraphV4Result<EmittedDictionaries> {
     let group_path = output_directory.join("v4-provider-groups.copy");
-    let mut groups = PgCopyFileWriter::create(&group_path)?;
+    let mut groups = PgCopyFileWriter::create_tracked(&group_path, ownership)?;
     for (key, global) in model.group_globals.iter().enumerate() {
         groups.row(&[&(key as i32).to_be_bytes(), global])?;
     }
     groups.finish()?;
     let component_path = output_directory.join("v4-provider-components.copy");
-    let mut components = PgCopyFileWriter::create(&component_path)?;
+    let mut components = PgCopyFileWriter::create_tracked(&component_path, ownership)?;
     for (key, global) in model.component_globals.iter().enumerate() {
         components.row(&[&(key as i32).to_be_bytes(), global])?;
     }
     components.finish()?;
     let npi_path = output_directory.join("v4-npi-scope.copy");
-    let mut npis = PgCopyFileWriter::create(&npi_path)?;
+    let mut npis = PgCopyFileWriter::create_tracked(&npi_path, ownership)?;
     for (key, npi) in model.npis.iter().enumerate() {
         npis.row(&[&(key as i32).to_be_bytes(), &(*npi as i64).to_be_bytes()])?;
     }
     npis.finish()?;
     let provider_set_audit_npi_path = output_directory.join("v4-provider-set-audit-npi.copy");
-    let mut provider_set_audit_npis = PgCopyFileWriter::create(&provider_set_audit_npi_path)?;
+    let mut provider_set_audit_npis =
+        PgCopyFileWriter::create_tracked(&provider_set_audit_npi_path, ownership)?;
     for (provider_set_key, provider_group_key, npi) in &model.provider_set_audit_npis {
         provider_set_audit_npis.row(&[
             &(*provider_set_key as i32).to_be_bytes(),
@@ -5499,7 +7885,7 @@ fn emit_dictionaries(
     let provider_set_npi_prefix_override_path =
         output_directory.join("v4-provider-set-npi-prefix-overrides.copy");
     let mut provider_set_npi_prefix_overrides =
-        PgCopyFileWriter::create(&provider_set_npi_prefix_override_path)?;
+        PgCopyFileWriter::create_tracked(&provider_set_npi_prefix_override_path, ownership)?;
     for (provider_set_key, member_count, member_digest) in
         &model.provider_set_npi_prefix_override_metadata
     {
@@ -5511,7 +7897,8 @@ fn emit_dictionaries(
     }
     provider_set_npi_prefix_overrides.finish()?;
     let provider_tax_identity_path = output_directory.join("v4-provider-tax-identities.copy");
-    let mut provider_tax_identities = PgCopyFileWriter::create(&provider_tax_identity_path)?;
+    let mut provider_tax_identities =
+        PgCopyFileWriter::create_tracked(&provider_tax_identity_path, ownership)?;
     let tax_row_total = tax_identity
         .tin_hmacs
         .len()
@@ -5539,7 +7926,7 @@ fn emit_dictionaries(
     let provider_group_tax_identity_path =
         output_directory.join("v4-provider-group-tax-identities.copy");
     let mut provider_group_tax_identities =
-        PgCopyFileWriter::create(&provider_group_tax_identity_path)?;
+        PgCopyFileWriter::create_tracked(&provider_group_tax_identity_path, ownership)?;
     for (provider_group_global_id, state, tin_key, source_bitmap) in &tax_identity.group_rows {
         let tin_key_bytes = tin_key.map(|value| (value as i32).to_be_bytes());
         provider_group_tax_identities.row_nullable(&[
@@ -5559,7 +7946,7 @@ fn emit_dictionaries(
     provider_group_tax_identities.finish()?;
     let pattern_path = if layout == ProviderGraphV4Layout::Pattern {
         let path = output_directory.join("v4-patterns.copy");
-        let mut patterns = PgCopyFileWriter::create(&path)?;
+        let mut patterns = PgCopyFileWriter::create_tracked(&path, ownership)?;
         for (key, (digest, sets)) in model
             .pattern_digests
             .iter()
@@ -5600,12 +7987,32 @@ pub fn compile_provider_graph_v4(
     output_directory: impl AsRef<Path>,
     options: ProviderGraphV4Options,
 ) -> ProviderGraphV4Result<ProviderGraphV4ConversionSummary> {
+    compile_provider_graph_v4_with_inputs(
+        shards,
+        provider_set_key_map_path,
+        output_directory,
+        options,
+        None,
+        None,
+    )
+}
+
+fn compile_provider_graph_v4_with_inputs(
+    shards: &[V4ProviderGraphShardDescriptor],
+    provider_set_key_map_path: impl AsRef<Path>,
+    output_directory: impl AsRef<Path>,
+    options: ProviderGraphV4Options,
+    npi_scope: Option<&ProviderGraphV4NpiScopeInput>,
+    inferred_taxonomy: Option<&ProviderGraphV4InferredTaxonomyInput>,
+) -> ProviderGraphV4Result<ProviderGraphV4ConversionSummary> {
     let mut sink = stderr_progress_sink;
     compile_provider_graph_v4_with_progress(
         shards,
         provider_set_key_map_path,
         output_directory,
         options,
+        npi_scope,
+        inferred_taxonomy,
         &mut sink,
     )
 }
@@ -5615,35 +8022,48 @@ fn compile_provider_graph_v4_with_progress(
     provider_set_key_map_path: impl AsRef<Path>,
     output_directory: impl AsRef<Path>,
     options: ProviderGraphV4Options,
+    npi_scope: Option<&ProviderGraphV4NpiScopeInput>,
+    inferred_taxonomy: Option<&ProviderGraphV4InferredTaxonomyInput>,
     sink: &mut dyn FnMut(&V4ProgressEvent),
 ) -> ProviderGraphV4Result<ProviderGraphV4ConversionSummary> {
     options.validate()?;
+    let taxonomy_inputs = match (npi_scope, inferred_taxonomy) {
+        (Some(scope), Some(candidate_input)) => Some((scope, candidate_input)),
+        (None, None) => None,
+        _ => {
+            return Err(invalid(
+                "V4 NPI scope and inferred-taxonomy inputs must be supplied together",
+            ));
+        }
+    };
     fs::create_dir_all(output_directory.as_ref())?;
     let output_directory = fs::canonicalize(output_directory.as_ref())?;
-    let paths: Vec<PathBuf> = OUTPUT_NAMES
-        .iter()
-        .map(|name| output_directory.join(name))
-        .collect();
-    for path in &paths {
-        if path.exists() {
-            return Err(invalid(format!(
-                "V4 provider graph output already exists: {}",
-                path.display()
-            )));
+    for name in OUTPUT_NAMES {
+        let path = output_directory.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "V4 provider graph output already exists: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
+    let mut ownership = OutputOwnership::new(&output_directory);
     let mut progress = ProgressReporter::new(sink);
     let result = compile_provider_graph_v4_inner(
         shards,
         provider_set_key_map_path.as_ref(),
         &output_directory,
         &options,
+        taxonomy_inputs,
         &mut progress,
+        &mut ownership,
     );
-    if result.is_err() {
-        for path in paths {
-            let _ = fs::remove_file(path);
-        }
+    if result.is_ok() {
+        ownership.commit();
     }
     result
 }
@@ -5653,7 +8073,12 @@ fn compile_provider_graph_v4_inner(
     provider_set_key_map_path: &Path,
     output_directory: &Path,
     options: &ProviderGraphV4Options,
+    taxonomy_inputs: Option<(
+        &ProviderGraphV4NpiScopeInput,
+        &ProviderGraphV4InferredTaxonomyInput,
+    )>,
     progress: &mut ProgressReporter<'_>,
+    ownership: &mut OutputOwnership,
 ) -> ProviderGraphV4Result<ProviderGraphV4ConversionSummary> {
     progress.emit("resource_admission", 0, 1, "stage", false);
     let mut resource_admission =
@@ -5661,11 +8086,41 @@ fn compile_provider_graph_v4_inner(
     progress.emit("resource_admission", 1, 1, "stage", false);
     let raw = load_raw_factors(shards, progress)?;
     let provider_sets = ProviderSetMap::read(provider_set_key_map_path)?;
-    let model = build_graph_model(
+    let mut model = build_graph_model(
         &raw,
         &provider_sets,
         progress,
         &mut resource_admission,
+        options,
+    )?;
+    let inferred_taxonomy_model = match taxonomy_inputs {
+        Some((scope, candidate_input)) => {
+            validate_npi_scope_input(shards, scope, &model.npis)?;
+            read_inferred_taxonomy_model(
+                candidate_input,
+                scope,
+                model.npis.len(),
+                &mut resource_admission,
+            )?
+        }
+        None => V4InferredTaxonomyModel { rules: Vec::new() },
+    };
+    reserve_inferred_taxonomy_projection_memory(
+        &model.npi_patterns,
+        &inferred_taxonomy_model,
+        options,
+        &mut resource_admission,
+    )?;
+    let direct_inferred_taxonomy = inferred_taxonomy_projection(
+        &model.npi_patterns,
+        &inferred_taxonomy_model,
+        ProviderGraphV4Layout::Direct,
+        options,
+    )?;
+    let pattern_inferred_taxonomy = inferred_taxonomy_projection(
+        &model.npi_patterns,
+        &inferred_taxonomy_model,
+        ProviderGraphV4Layout::Pattern,
         options,
     )?;
     let tax_identity = V4TaxIdentityModel::build(&raw.tax_identities, &model.group_globals)?;
@@ -5685,19 +8140,35 @@ fn compile_provider_graph_v4_inner(
         ))?;
     resource_admission.reconcile_tax_identity_projection(tax_projection_bytes)?;
     let mut observe = model.observe.clone();
-    let sizes = compute_layout_sizes(&model, &tax_identity, options)?;
-    let pattern_layout_serving_degree_eligible =
+    let sizes = compute_layout_sizes(
+        &model,
+        &tax_identity,
+        &direct_inferred_taxonomy,
+        &pattern_inferred_taxonomy,
+        options,
+    )?;
+    let pattern_layout_component_fallback_eligible =
         record_pattern_fallback_diagnostics(&model, options, &mut observe);
-    let selected_layout = choose_layout(
+    let pattern_layout_sparse_prefix_eligible = model.npi_prefix_sparse_eligible;
+    let pattern_layout_serving_degree_eligible =
+        pattern_layout_component_fallback_eligible && pattern_layout_sparse_prefix_eligible;
+    let direct_layout_eligible =
+        model.npi_prefix_complete_eligible && direct_inferred_taxonomy.eligible;
+    let pattern_layout_eligible =
+        pattern_layout_serving_degree_eligible && pattern_inferred_taxonomy.eligible;
+    let selected_layout = choose_complete_layout(
         sizes.direct,
+        direct_layout_eligible,
         sizes.pattern,
-        pattern_layout_serving_degree_eligible,
-    );
+        pattern_layout_eligible,
+    )?;
+    select_npi_prefix_projection(&mut model, &mut observe, selected_layout)?;
     progress.emit("select_layout", 1, 1, "stage", false);
 
     let block_copy_path = output_directory.join("v4-graph-blocks.copy");
     let reference_manifest_path = output_directory.join("v4-graph-references.jsonl");
-    let mut cas = CasBlockWriter::create(&block_copy_path, &reference_manifest_path)?;
+    let mut cas =
+        CasBlockWriter::create_tracked(&block_copy_path, &reference_manifest_path, ownership)?;
     let mut selected_bitmaps = Vec::new();
     let selected_owner_count = [
         model.set_components.len(),
@@ -5816,6 +8287,36 @@ fn compile_provider_graph_v4_inner(
     // terminal phase marker preserves monotonic dashboard phase ordering.
     progress.emit("emit_bitmaps", 1, 1, "stage", false);
     let heavy_bitmaps = selected_bitmaps;
+    let selected_representation = match selected_layout {
+        ProviderGraphV4Layout::Direct => "direct_v1",
+        ProviderGraphV4Layout::Pattern => "pattern_v1",
+    };
+    let emitted_mapping_bytes = emitted_mapping_persistence_bytes(
+        &relation_summaries,
+        &heavy_bitmaps,
+        selected_representation,
+    )?;
+    let selected_mapping = match selected_layout {
+        ProviderGraphV4Layout::Direct => MappingPersistenceSizes {
+            total_encoded_bytes: sizes.direct_mapping,
+            map_payload_encoded_bytes: sizes.direct_map_payload,
+            coordinate_count: sizes.direct_map_coordinate_count,
+            pack_count: sizes.direct_map_pack_count,
+            object_kind_count: sizes.direct_map_object_kind_count,
+        },
+        ProviderGraphV4Layout::Pattern => MappingPersistenceSizes {
+            total_encoded_bytes: sizes.pattern_mapping,
+            map_payload_encoded_bytes: sizes.pattern_map_payload,
+            coordinate_count: sizes.pattern_map_coordinate_count,
+            pack_count: sizes.pattern_map_pack_count,
+            object_kind_count: sizes.pattern_map_object_kind_count,
+        },
+    };
+    if emitted_mapping_bytes != selected_mapping {
+        return Err(invalid(format!(
+            "V4 selected packed-map plan differs from emitted coordinates: planned {selected_mapping:?}, emitted {emitted_mapping_bytes:?}"
+        )));
+    }
     let (block_count, block_copy_bytes) = cas.finish()?;
     let EmittedDictionaries {
         group_copy_path,
@@ -5832,7 +8333,24 @@ fn compile_provider_graph_v4_inner(
         &tax_identity,
         selected_layout,
         progress,
+        ownership,
     )?;
+    let inferred_taxonomy_copy_path = output_directory.join("v4-inferred-taxonomy-candidates.copy");
+    let selected_inferred_taxonomy = match selected_layout {
+        ProviderGraphV4Layout::Direct => &direct_inferred_taxonomy,
+        ProviderGraphV4Layout::Pattern => &pattern_inferred_taxonomy,
+    };
+    emit_inferred_taxonomy_candidates(
+        &inferred_taxonomy_copy_path,
+        selected_inferred_taxonomy,
+        ownership,
+    )?;
+    if fs::metadata(&inferred_taxonomy_copy_path)?.len() != selected_inferred_taxonomy.encoded_bytes
+    {
+        return Err(invalid(
+            "V4 inferred-taxonomy planned bytes differ from emitted COPY",
+        ));
+    }
     let summary_path = output_directory.join("v4-summary.json");
     let input_digest: [u8; 32] = raw.input_digest.finalize().into();
     let mut database_output_bytes = block_copy_bytes;
@@ -5854,16 +8372,19 @@ fn compile_provider_graph_v4_inner(
             .checked_add(fs::metadata(path)?.len())
             .ok_or(invalid("V4 database output byte count overflows"))?;
     }
-    let selected_base_bytes = match selected_layout {
+    let selected_graph_bytes = match selected_layout {
+        ProviderGraphV4Layout::Direct => sizes.direct_graph,
+        ProviderGraphV4Layout::Pattern => sizes.pattern_graph,
+    };
+    if database_output_bytes != selected_graph_bytes {
+        return Err(invalid(format!(
+            "V4 selected bitmap plan differs from emitted graph output: planned {selected_graph_bytes}, emitted {database_output_bytes}"
+        )));
+    }
+    let selected_encoded_bytes = match selected_layout {
         ProviderGraphV4Layout::Direct => sizes.direct,
         ProviderGraphV4Layout::Pattern => sizes.pattern,
     };
-    if database_output_bytes > selected_base_bytes {
-        return Err(invalid(format!(
-            "V4 selected bitmap overrides expanded output: base {selected_base_bytes}, emitted {database_output_bytes}"
-        )));
-    }
-    let selected_encoded_bytes = database_output_bytes;
     let mut output_artifacts = vec![
         output_artifact("graph_blocks", &block_copy_path, block_count)?,
         output_artifact("graph_references", &reference_manifest_path, block_count)?,
@@ -5898,6 +8419,11 @@ fn compile_provider_graph_v4_inner(
             &provider_group_tax_identity_copy_path,
             tax_identity.group_rows.len() as u64,
         )?,
+        output_artifact(
+            "inferred_taxonomy_candidates",
+            &inferred_taxonomy_copy_path,
+            selected_inferred_taxonomy.rows.len() as u64,
+        )?,
     ];
     if let Some(path) = pattern_copy_path.as_ref() {
         output_artifacts.push(output_artifact(
@@ -5909,7 +8435,18 @@ fn compile_provider_graph_v4_inner(
     let summary = ProviderGraphV4ConversionSummary {
         format: "ptg2_provider_graph_v4_factor_adaptive_v1".to_owned(),
         selected_layout,
+        member_page_bytes: options.member_page_bytes as u64,
+        locator_page_bytes: options.locator_page_bytes as u64,
+        heavy_owner_member_threshold: options.heavy_owner_member_threshold as u64,
+        heavy_bitmap_minimum_savings_bytes: options.heavy_bitmap_minimum_savings_bytes as u64,
         pattern_layout_serving_degree_eligible,
+        pattern_layout_sparse_prefix_eligible,
+        direct_layout_complete_prefix_eligible: model.npi_prefix_complete_eligible,
+        pattern_sparse_prefix_owner_count: model.npi_prefix_sparse_owner_count,
+        pattern_sparse_prefix_member_count: model.npi_prefix_sparse_member_count,
+        pattern_sparse_prefix_raw_bytes: model.npi_prefix_sparse_raw_bytes,
+        pattern_sparse_prefix_projection_encoded_bytes: model
+            .npi_prefix_sparse_projection_encoded_bytes,
         max_set_patterns_per_set: options.max_set_patterns_per_set as u64,
         max_set_components_per_fallback_set: options.max_set_components_per_fallback_set as u64,
         max_online_group_keys_per_set: options.max_online_group_keys_per_set as u64,
@@ -5938,9 +8475,65 @@ fn compile_provider_graph_v4_inner(
         npi_prefix_target: options.npi_prefix_target as u64,
         max_npi_prefix_override_owners: options.max_npi_prefix_override_owners as u64,
         max_npi_prefix_override_bytes: options.max_npi_prefix_override_bytes,
+        max_online_inferred_taxonomy_candidates: options.max_online_inferred_taxonomy_candidates
+            as u64,
+        max_online_candidate_pattern_projection_members: options
+            .max_online_candidate_pattern_projection_members
+            as u64,
+        direct_complete_prefix_projection_encoded_bytes: model
+            .npi_prefix_complete_projection_encoded_bytes,
+        direct_graph_encoded_bytes: sizes.direct_graph,
+        pattern_graph_encoded_bytes: sizes.pattern_graph,
+        direct_mapping_persistence_encoded_bytes: sizes.direct_mapping,
+        pattern_mapping_persistence_encoded_bytes: sizes.pattern_mapping,
+        direct_map_payload_encoded_bytes: sizes.direct_map_payload,
+        pattern_map_payload_encoded_bytes: sizes.pattern_map_payload,
+        direct_map_coordinate_count: sizes.direct_map_coordinate_count,
+        pattern_map_coordinate_count: sizes.pattern_map_coordinate_count,
+        direct_map_pack_count: sizes.direct_map_pack_count,
+        pattern_map_pack_count: sizes.pattern_map_pack_count,
+        direct_map_object_kind_count: sizes.direct_map_object_kind_count,
+        pattern_map_object_kind_count: sizes.pattern_map_object_kind_count,
         direct_complete_encoded_bytes: sizes.direct,
         pattern_complete_encoded_bytes: sizes.pattern,
+        direct_inferred_taxonomy_encoded_bytes: sizes.direct_inferred_taxonomy,
+        pattern_inferred_taxonomy_encoded_bytes: sizes.pattern_inferred_taxonomy,
+        direct_inferred_taxonomy_eligible: direct_inferred_taxonomy.eligible,
+        pattern_inferred_taxonomy_eligible: pattern_inferred_taxonomy.eligible,
+        direct_inferred_taxonomy_rejection_reason: direct_inferred_taxonomy
+            .rejection
+            .as_ref()
+            .map(|value| value.reason.to_owned()),
+        direct_inferred_taxonomy_rejection_rule_digest: direct_inferred_taxonomy
+            .rejection
+            .as_ref()
+            .map(|value| hex(&value.rule_digest)),
+        direct_inferred_taxonomy_rejection_observed_count: direct_inferred_taxonomy
+            .rejection
+            .as_ref()
+            .map(|value| value.observed_count),
+        direct_inferred_taxonomy_rejection_cap: direct_inferred_taxonomy
+            .rejection
+            .as_ref()
+            .map(|value| value.cap),
+        pattern_inferred_taxonomy_rejection_reason: pattern_inferred_taxonomy
+            .rejection
+            .as_ref()
+            .map(|value| value.reason.to_owned()),
+        pattern_inferred_taxonomy_rejection_rule_digest: pattern_inferred_taxonomy
+            .rejection
+            .as_ref()
+            .map(|value| hex(&value.rule_digest)),
+        pattern_inferred_taxonomy_rejection_observed_count: pattern_inferred_taxonomy
+            .rejection
+            .as_ref()
+            .map(|value| value.observed_count),
+        pattern_inferred_taxonomy_rejection_cap: pattern_inferred_taxonomy
+            .rejection
+            .as_ref()
+            .map(|value| value.cap),
         common_encoded_bytes: sizes.common,
+        selected_graph_encoded_bytes: selected_graph_bytes,
         selected_encoded_bytes,
         block_copy_path,
         reference_manifest_path,
@@ -5952,6 +8545,7 @@ fn compile_provider_graph_v4_inner(
         provider_tax_identity_copy_path,
         provider_group_tax_identity_copy_path,
         pattern_copy_path,
+        inferred_taxonomy_copy_path,
         summary_path: summary_path.clone(),
         block_count,
         block_copy_bytes,
@@ -5964,7 +8558,7 @@ fn compile_provider_graph_v4_inner(
         input_byte_count: raw.input_byte_count,
         input_sha256: hex(&input_digest),
     };
-    let summary_file = File::create(&summary_path)?;
+    let summary_file = ownership.create(&summary_path)?;
     let mut summary_writer = BufWriter::new(summary_file);
     serde_json::to_writer_pretty(&mut summary_writer, &summary)?;
     summary_writer.flush()?;
@@ -5975,11 +8569,13 @@ fn compile_provider_graph_v4_inner(
 pub fn compile_provider_graph_v4_manifest(
     manifest: ProviderGraphV4Manifest,
 ) -> ProviderGraphV4Result<ProviderGraphV4ConversionSummary> {
-    compile_provider_graph_v4(
+    compile_provider_graph_v4_with_inputs(
         &manifest.shards,
         manifest.provider_set_key_map_path,
         manifest.output_directory,
         manifest.options,
+        Some(&manifest.npi_scope),
+        Some(&manifest.inferred_taxonomy),
     )
 }
 
@@ -6038,7 +8634,7 @@ fn npi_from_global_id(global_id: GlobalId) -> ProviderGraphV4Result<u64> {
         return Err(invalid("V4 NPI membership uses an invalid global ID"));
     }
     let npi = u64::from_be_bytes(global_id[8..].try_into().expect("fixed global ID width"));
-    if npi == 0 || npi > i64::MAX as u64 {
+    if !(MIN_NPI..=MAX_NPI).contains(&npi) {
         return Err(invalid("V4 NPI membership uses an invalid NPI"));
     }
     Ok(npi)
@@ -6313,6 +8909,51 @@ mod tests {
         fs::write(path, output).unwrap();
     }
 
+    fn write_npi_scope(
+        path: &Path,
+        shard_id: &str,
+        reciprocal: &V4MembershipArtifactDescriptor,
+    ) -> V4NpiScopeArtifactDescriptor {
+        let artifact = ValidatedArtifact::open(reciprocal).unwrap();
+        let mut output = PgCopyFileWriter::create(path).unwrap();
+        for owner_index in 0..artifact.owner_count {
+            let npi = npi_from_global_id(artifact.owner(owner_index).unwrap().owner).unwrap();
+            output.row(&[&(npi as i64).to_be_bytes()]).unwrap();
+        }
+        output.finish().unwrap();
+        let bytes = fs::read(path).unwrap();
+        let mut metadata = V4NpiScopeMetadata {
+            record_format: NPI_SCOPE_ARTIFACT_FORMAT.to_owned(),
+            sha256: hex(&Sha256::digest(&bytes)),
+            byte_count: bytes.len() as u64,
+            row_count: artifact.owner_count,
+            provider_npi_group_sha256: reciprocal.metadata.sha256.clone(),
+            provider_npi_group_record_format: reciprocal.metadata.record_format.clone(),
+            provider_npi_group_byte_count: reciprocal.metadata.byte_count,
+            provider_npi_group_owner_count: reciprocal.metadata.owner_count,
+            provider_npi_group_member_count: reciprocal.metadata.member_count,
+            provider_npi_group_member_global_count: reciprocal
+                .metadata
+                .member_global_count
+                .unwrap_or(0),
+            binding_contract: NPI_SCOPE_BINDING_CONTRACT.to_owned(),
+            binding_sha256: String::new(),
+            shard_binding_contract: NPI_SCOPE_SHARD_BINDING_CONTRACT.to_owned(),
+            shard_binding_sha256: String::new(),
+            retention_contract: NPI_SCOPE_RETENTION_CONTRACT.to_owned(),
+            name: Some("provider_npi_scope".to_owned()),
+            source_shard_id: Some(shard_id.to_owned()),
+            shard_id: None,
+        };
+        metadata.binding_sha256 = hex(&npi_scope_binding_digest(&metadata).unwrap());
+        metadata.shard_binding_sha256 =
+            hex(&npi_scope_shard_binding_digest(&metadata, shard_id).unwrap());
+        V4NpiScopeArtifactDescriptor {
+            path: path.to_path_buf(),
+            metadata,
+        }
+    }
+
     struct Fixture {
         _temporary: TempDir,
         shard: V4ProviderGraphShardDescriptor,
@@ -6320,7 +8961,11 @@ mod tests {
         output: PathBuf,
     }
 
-    fn shared_pattern_fixture(group_count: usize, set_count: usize) -> Fixture {
+    fn shared_pattern_fixture_with_shard_id(
+        group_count: usize,
+        set_count: usize,
+        shard_id: &str,
+    ) -> Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let component = global(2, 1);
         let groups: Vec<GlobalId> = (0..group_count)
@@ -6332,52 +8977,915 @@ mod tests {
         let provider_npi = npi(1_234_567_890);
         let set_component = write_membership(
             &temporary.path().join("set-component.sidecar"),
-            "shard-a",
+            shard_id,
             "provider_set_component",
             sets.iter().copied().map(|set| (set, component)),
             true,
         );
         let component_group = write_membership(
             &temporary.path().join("component-group.sidecar"),
-            "shard-a",
+            shard_id,
             "provider_component_group",
             groups.iter().copied().map(|group| (component, group)),
             true,
         );
         let group_npi = write_membership(
             &temporary.path().join("group-npi.sidecar"),
-            "shard-a",
+            shard_id,
             "provider_group_npi",
             groups.iter().copied().map(|group| (group, provider_npi)),
             true,
         );
         let npi_group = write_membership(
             &temporary.path().join("npi-group.sidecar"),
-            "shard-a",
+            shard_id,
             "provider_npi_group",
             groups.iter().copied().map(|group| (provider_npi, group)),
             true,
+        );
+        let provider_npi_scope = write_npi_scope(
+            &temporary.path().join("npi-scope.copy"),
+            shard_id,
+            &npi_group,
         );
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &sets, 1);
         let output = temporary.path().join("output");
         let provider_group_tax_identity = write_missing_tax_identity(
             &temporary.path().join("group-tax-identity.sidecar"),
-            "shard-a",
+            shard_id,
             groups,
         );
         Fixture {
             _temporary: temporary,
             shard: V4ProviderGraphShardDescriptor {
-                shard_id: "shard-a".to_owned(),
+                shard_id: shard_id.to_owned(),
                 provider_set_component: set_component,
                 provider_component_group: component_group,
                 provider_group_npi: group_npi,
                 provider_npi_group: npi_group,
+                provider_npi_scope,
                 provider_group_tax_identity,
             },
             provider_map,
             output,
+        }
+    }
+
+    fn shared_pattern_fixture(group_count: usize, set_count: usize) -> Fixture {
+        shared_pattern_fixture_with_shard_id(group_count, set_count, "source-a")
+    }
+
+    fn scope_input(summary: &ProviderGraphV4NpiScopeSummary) -> ProviderGraphV4NpiScopeInput {
+        ProviderGraphV4NpiScopeInput {
+            format: summary.format.clone(),
+            row_count: summary.row_count,
+            source_owner_count: summary.source_owner_count,
+            input_byte_count: summary.input_byte_count,
+            input_sha256: summary.input_sha256.clone(),
+            output_byte_count: summary.output_byte_count,
+            output_sha256: summary.output_sha256.clone(),
+            output_path: summary.output_path.clone(),
+        }
+    }
+
+    #[test]
+    fn npi_scope_prepass_merges_shards_in_model_key_order() {
+        let shared = shared_pattern_fixture(4, 2);
+        let independent = independent_fixture();
+        let temporary = tempfile::tempdir().unwrap();
+        let output_path = temporary.path().join("v4-npi-scope.copy");
+        let summary = extract_provider_graph_v4_npi_scope(
+            &[shared.shard.clone(), independent.shard.clone()],
+            &output_path,
+        )
+        .unwrap();
+
+        assert_eq!(summary.format, "ptg2_provider_graph_v4_npi_scope_v1");
+        assert_eq!(summary.row_count, 3);
+        assert_eq!(
+            summary.output_sha256,
+            hex(&Sha256::digest(fs::read(&output_path).unwrap()))
+        );
+        assert_eq!(
+            read_npi_scope_copy(&output_path).unwrap(),
+            vec![(0, 1_111_111_111), (1, 1_234_567_890), (2, 2_222_222_222),]
+        );
+    }
+
+    #[test]
+    fn npi_scope_output_refuses_existing_paths_without_mutation() {
+        let fixture = shared_pattern_fixture(4, 2);
+        let temporary = tempfile::tempdir().unwrap();
+        let existing = temporary.path().join("existing.copy");
+        fs::write(&existing, b"caller-owned").unwrap();
+
+        assert!(extract_provider_graph_v4_npi_scope(
+            std::slice::from_ref(&fixture.shard),
+            &existing,
+        )
+        .is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"caller-owned");
+        assert!(PgCopyFileWriter::create(&existing).is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"caller-owned");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let target = temporary.path().join("must-not-be-created.copy");
+            let link = temporary.path().join("dangling.copy");
+            symlink(&target, &link).unwrap();
+            assert!(extract_provider_graph_v4_npi_scope(
+                std::slice::from_ref(&fixture.shard),
+                &link,
+            )
+            .is_err());
+            assert!(fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(!target.exists());
+            assert!(PgCopyFileWriter::create(&link).is_err());
+            assert!(fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(!target.exists());
+        }
+    }
+
+    #[test]
+    fn npi_scope_output_is_removed_after_partial_merge_failure() {
+        let mut fixture = independent_fixture();
+        let scope = &mut fixture.shard.provider_npi_scope;
+        let mut bytes = fs::read(&scope.path).unwrap();
+        let second_npi_offset = PG_COPY_HEADER.len() + 14 + 2 + 4;
+        bytes[second_npi_offset..second_npi_offset + 8]
+            .copy_from_slice(&(MIN_NPI - 1).to_be_bytes());
+        fs::write(&scope.path, &bytes).unwrap();
+        scope.metadata.sha256 = hex(&Sha256::digest(&bytes));
+        scope.metadata.binding_sha256 = hex(&npi_scope_binding_digest(&scope.metadata).unwrap());
+        scope.metadata.shard_binding_sha256 =
+            hex(&npi_scope_shard_binding_digest(&scope.metadata, &fixture.shard.shard_id).unwrap());
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("partial.copy");
+
+        assert!(
+            extract_provider_graph_v4_npi_scope(std::slice::from_ref(&fixture.shard), &output,)
+                .is_err()
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn npi_scope_post_finish_race_preserves_the_foreign_replacement() {
+        let fixture = shared_pattern_fixture(4, 2);
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("raced.copy");
+        let error = extract_provider_graph_v4_npi_scope_inner_with_hook(
+            std::slice::from_ref(&fixture.shard),
+            &output,
+            |path| {
+                fs::remove_file(path).unwrap();
+                fs::write(path, b"foreign-output").unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("output path changed"));
+        assert_eq!(fs::read(&output).unwrap(), b"foreign-output");
+    }
+
+    #[test]
+    fn npi_scope_validation_reads_one_descriptor_and_rejects_path_replacement() {
+        let fixture = shared_pattern_fixture(4, 2);
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("scope.copy");
+        let summary =
+            extract_provider_graph_v4_npi_scope(std::slice::from_ref(&fixture.shard), &output)
+                .unwrap();
+        let input = scope_input(&summary);
+        let error = validate_npi_scope_input_with_hook(
+            std::slice::from_ref(&fixture.shard),
+            &input,
+            &[1_234_567_890],
+            |path| {
+                fs::remove_file(path).unwrap();
+                fs::write(path, b"foreign-output").unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("prepass artifact changed"));
+        assert_eq!(fs::read(&output).unwrap(), b"foreign-output");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npi_scope_validation_rejects_dangling_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = shared_pattern_fixture(4, 2);
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("scope.copy");
+        let summary =
+            extract_provider_graph_v4_npi_scope(std::slice::from_ref(&fixture.shard), &output)
+                .unwrap();
+        fs::remove_file(&output).unwrap();
+        let target = temporary.path().join("must-not-be-created.copy");
+        symlink(&target, &output).unwrap();
+
+        assert!(validate_npi_scope_input(
+            std::slice::from_ref(&fixture.shard),
+            &scope_input(&summary),
+            &[1_234_567_890],
+        )
+        .is_err());
+        assert!(fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn npi_scope_requires_dense_reciprocal_global_count_metadata() {
+        let fixture = shared_pattern_fixture(4, 2);
+        let temporary = tempfile::tempdir().unwrap();
+        for (name, record_format, member_global_count) in [
+            (
+                "standard",
+                STANDARD_FORMAT,
+                fixture
+                    .shard
+                    .provider_npi_group
+                    .metadata
+                    .member_global_count,
+            ),
+            ("missing-count", DENSE_FORMAT, None),
+            (
+                "wrong-count",
+                DENSE_FORMAT,
+                fixture
+                    .shard
+                    .provider_npi_group
+                    .metadata
+                    .member_global_count
+                    .map(|count| count + 1),
+            ),
+        ] {
+            let mut shard = fixture.shard.clone();
+            shard.provider_npi_group.metadata.record_format = record_format.to_owned();
+            shard.provider_npi_group.metadata.member_global_count = member_global_count;
+            let output = temporary.path().join(format!("{name}.copy"));
+            assert!(
+                extract_provider_graph_v4_npi_scope(std::slice::from_ref(&shard), &output).is_err(),
+                "{name}",
+            );
+            assert!(
+                expected_npi_scope_input_identity(std::slice::from_ref(&shard)).is_err(),
+                "{name}",
+            );
+            assert!(!output.exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn npi_scope_copy_reader_rejects_values_outside_exact_ten_digit_range() {
+        let temporary = tempfile::tempdir().unwrap();
+        for npi in [MIN_NPI - 1, MAX_NPI + 1] {
+            let path = temporary.path().join(format!("{npi}.copy"));
+            let mut writer = PgCopyFileWriter::create(&path).unwrap();
+            writer
+                .row(&[&0i32.to_be_bytes(), &(npi as i64).to_be_bytes()])
+                .unwrap();
+            writer.finish().unwrap();
+            assert!(read_npi_scope_copy(&path).is_err(), "{npi}");
+        }
+    }
+
+    #[test]
+    fn npi_scope_copy_reader_rejects_every_framing_boundary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let rejects = |name: &str, bytes: &[u8]| {
+            let path = temporary.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            assert!(read_npi_scope_copy(&path).is_err(), "{name}");
+        };
+
+        rejects("truncated-header.copy", b"");
+        rejects("invalid-header.copy", &[0; PG_COPY_HEADER.len()]);
+
+        let mut bytes = PG_COPY_HEADER.to_vec();
+        rejects("truncated-row-header.copy", &bytes);
+        bytes.extend_from_slice(&1i16.to_be_bytes());
+        rejects("wrong-field-count.copy", &bytes);
+
+        let mut bytes = PG_COPY_HEADER.to_vec();
+        bytes.extend_from_slice(&(-1i16).to_be_bytes());
+        bytes.push(0);
+        rejects("trailing-byte.copy", &bytes);
+
+        let mut bytes = PG_COPY_HEADER.to_vec();
+        bytes.extend_from_slice(&2i16.to_be_bytes());
+        rejects("truncated-key-length.copy", &bytes);
+        bytes.extend_from_slice(&3i32.to_be_bytes());
+        rejects("wrong-key-width.copy", &bytes);
+
+        let mut bytes = PG_COPY_HEADER.to_vec();
+        bytes.extend_from_slice(&2i16.to_be_bytes());
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(&[0; 2]);
+        rejects("truncated-key.copy", &bytes);
+
+        let mut bytes = PG_COPY_HEADER.to_vec();
+        bytes.extend_from_slice(&2i16.to_be_bytes());
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(&0i32.to_be_bytes());
+        rejects("truncated-npi-length.copy", &bytes);
+        bytes.extend_from_slice(&7i32.to_be_bytes());
+        rejects("wrong-npi-width.copy", &bytes);
+
+        let mut bytes = PG_COPY_HEADER.to_vec();
+        bytes.extend_from_slice(&2i16.to_be_bytes());
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(&(-1i32).to_be_bytes());
+        bytes.extend_from_slice(&8i32.to_be_bytes());
+        bytes.extend_from_slice(&(MIN_NPI as i64).to_be_bytes());
+        bytes.extend_from_slice(&(-1i16).to_be_bytes());
+        rejects("negative-key.copy", &bytes);
+
+        let direct = |name: &str, bytes: &[u8], remaining_rows: u64| {
+            let path = temporary.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            let mut artifact = ValidatedNpiScopeArtifact {
+                reader: BufReader::new(File::open(path).unwrap()),
+                remaining_rows,
+                previous_npi: 0,
+                finished: false,
+            };
+            assert!(artifact.next_npi().is_err(), "{name}");
+        };
+        direct("truncated-trailer.copy", b"", 0);
+        direct("truncated-source-row.copy", b"", 1);
+        direct("truncated-source-length.copy", &1i16.to_be_bytes(), 1);
+        let mut truncated_value = 1i16.to_be_bytes().to_vec();
+        truncated_value.extend_from_slice(&8i32.to_be_bytes());
+        truncated_value.extend_from_slice(&[0; 4]);
+        direct("truncated-source-value.copy", &truncated_value, 1);
+    }
+
+    fn inferred_rule(rule_ordinal: u8, member_count: usize) -> V4InferredTaxonomyRule {
+        V4InferredTaxonomyRule {
+            rule_digest: [rule_ordinal; 32],
+            catalog_digest: [rule_ordinal.saturating_add(32); 32],
+            member_keys: (0..member_count as u32).collect(),
+        }
+    }
+
+    fn one_rule_taxonomy_input(
+        members_path: &Path,
+        members: &[u8],
+        scope_sha256: &str,
+    ) -> ProviderGraphV4InferredTaxonomyInput {
+        fs::write(members_path, members).unwrap();
+        let rule_digest = [7u8; 32];
+        let mut rule_set_digest = Sha256::new();
+        rule_set_digest.update(INFERRED_TAXONOMY_RULE_SET_DIGEST_DOMAIN);
+        rule_set_digest.update(1u32.to_be_bytes());
+        rule_set_digest.update(rule_digest);
+        ProviderGraphV4InferredTaxonomyInput {
+            contract: INFERRED_TAXONOMY_INPUT_CONTRACT.to_owned(),
+            catalog_contract: INFERRED_TAXONOMY_CATALOG_CONTRACT.to_owned(),
+            vector_format: INFERRED_TAXONOMY_VECTOR_FORMAT.to_owned(),
+            npi_scope_sha256: scope_sha256.to_owned(),
+            rule_set_digest: hex(&rule_set_digest.finalize()),
+            members: ProviderGraphV4InputArtifact {
+                path: members_path.to_path_buf(),
+                byte_count: members.len() as u64,
+                sha256: hex(&Sha256::digest(members)),
+            },
+            rules: vec![ProviderGraphV4InferredTaxonomyRuleInput {
+                rule_digest: hex(&rule_digest),
+                catalog_digest: hex(&[8; 32]),
+                member_count: members.len() as u64 / 4,
+                member_offset_bytes: 0,
+                member_byte_count: members.len() as u64,
+            }],
+        }
+    }
+
+    #[test]
+    fn inferred_taxonomy_memory_is_authenticated_and_admitted_before_projection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let scope_sha256 = hex(&[9; 32]);
+        let scope = ProviderGraphV4NpiScopeInput {
+            format: NPI_SCOPE_FORMAT.to_owned(),
+            row_count: 1,
+            source_owner_count: 1,
+            input_byte_count: 0,
+            input_sha256: hex(&[0; 32]),
+            output_byte_count: 0,
+            output_sha256: scope_sha256.clone(),
+            output_path: temporary.path().join("unused.copy"),
+        };
+        let input = one_rule_taxonomy_input(
+            &temporary.path().join("taxonomy-members.u32le"),
+            &0u32.to_le_bytes(),
+            &scope_sha256,
+        );
+
+        let mut corrupted = input.clone();
+        corrupted.members.sha256 = hex(&[0; 32]);
+        let mut tiny = blank_admission(Some(1));
+        let error = read_inferred_taxonomy_model(&corrupted, &scope, 1, &mut tiny).unwrap_err();
+        assert!(error.to_string().contains("checksum changed"));
+        assert_eq!(tiny.summary.derived_projection_bytes, 0);
+
+        let mut admitted = blank_admission(None);
+        let model = read_inferred_taxonomy_model(&input, &scope, 1, &mut admitted).unwrap();
+        assert_eq!(model.rules.len(), 1);
+        assert!(admitted.summary.derived_projection_bytes >= ESTIMATED_VEC_OWNER_BYTES);
+        assert!(admitted.summary.retained_scratch_high_water_bytes >= 4);
+        reserve_inferred_taxonomy_projection_memory(
+            &[vec![0, 1]],
+            &model,
+            &ProviderGraphV4Options::default(),
+            &mut admitted,
+        )
+        .unwrap();
+        let exact_peak = admitted.summary.estimated_peak_bytes;
+        assert!(admitted.summary.derived_projection_bytes > input.members.byte_count);
+        assert!(
+            admitted.summary.retained_scratch_high_water_bytes
+                >= 2 * ESTIMATED_PATTERN_POSTING_SCRATCH_BYTES
+        );
+
+        let mut limited = blank_admission(Some(exact_peak - 1));
+        let limited_model = read_inferred_taxonomy_model(&input, &scope, 1, &mut limited).unwrap();
+        let error = reserve_inferred_taxonomy_projection_memory(
+            &[vec![0, 1]],
+            &limited_model,
+            &ProviderGraphV4Options::default(),
+            &mut limited,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("resource_admission"));
+    }
+
+    #[test]
+    fn inferred_taxonomy_rejects_contract_envelope_and_member_boundaries() {
+        assert!(strict_u32le_members(&[0], 1).is_err());
+        assert!(strict_u32le_members(&0u32.to_le_bytes(), 0).is_err());
+        let duplicate_members = [0u32.to_le_bytes(), 0u32.to_le_bytes()].concat();
+        assert!(strict_u32le_members(&duplicate_members, 1).is_err());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let scope_sha256 = hex(&[9; 32]);
+        let scope = ProviderGraphV4NpiScopeInput {
+            format: NPI_SCOPE_FORMAT.to_owned(),
+            row_count: 1,
+            source_owner_count: 1,
+            input_byte_count: 0,
+            input_sha256: hex(&[0; 32]),
+            output_byte_count: 0,
+            output_sha256: scope_sha256.clone(),
+            output_path: temporary.path().join("unused.copy"),
+        };
+        let input = one_rule_taxonomy_input(
+            &temporary.path().join("taxonomy-members.u32le"),
+            &0u32.to_le_bytes(),
+            &scope_sha256,
+        );
+
+        let mut incompatible = input.clone();
+        incompatible.contract = "other".to_owned();
+        assert!(
+            read_inferred_taxonomy_model(&incompatible, &scope, 1, &mut blank_admission(None),)
+                .is_err()
+        );
+
+        let mut missing = input.clone();
+        missing.members.path = temporary.path().join("missing.u32le");
+        assert!(
+            read_inferred_taxonomy_model(&missing, &scope, 1, &mut blank_admission(None))
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
+        );
+
+        let mut wrong_size = input.clone();
+        wrong_size.members.byte_count += 4;
+        wrong_size.rules[0].member_count += 1;
+        wrong_size.rules[0].member_byte_count += 4;
+        assert!(
+            read_inferred_taxonomy_model(&wrong_size, &scope, 2, &mut blank_admission(None),)
+                .unwrap_err()
+                .to_string()
+                .contains("byte count changed")
+        );
+
+        let mut noncontiguous = input.clone();
+        noncontiguous.rules[0].member_offset_bytes = 4;
+        assert!(validate_inferred_taxonomy_rule_envelope(&noncontiguous).is_err());
+
+        let mut incomplete = input.clone();
+        incomplete.rule_set_digest = hex(&[0; 32]);
+        assert!(validate_inferred_taxonomy_rule_envelope(&incomplete).is_err());
+
+        let mut overflowing = input.clone();
+        overflowing.rules[0].member_count = u64::MAX;
+        assert!(validate_inferred_taxonomy_rule_envelope(&overflowing).is_err());
+
+        let model = V4InferredTaxonomyModel {
+            rules: vec![V4InferredTaxonomyRule {
+                rule_digest: [1; 32],
+                catalog_digest: [2; 32],
+                member_keys: vec![1],
+            }],
+        };
+        assert!(reserve_inferred_taxonomy_projection_memory(
+            &[vec![0]],
+            &model,
+            &ProviderGraphV4Options::default(),
+            &mut blank_admission(None),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exceeds pattern scope"));
+
+        let options = ProviderGraphV4Options {
+            max_online_inferred_taxonomy_candidates: usize::MAX,
+            ..ProviderGraphV4Options::default()
+        };
+        assert!(reserve_inferred_taxonomy_projection_memory(
+            &[vec![0]],
+            &V4InferredTaxonomyModel {
+                rules: vec![inferred_rule(1, 1)],
+            },
+            &options,
+            &mut blank_admission(None),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("candidate cap overflows"));
+    }
+
+    #[test]
+    fn manifest_compiler_consumes_authenticated_scope_and_taxonomy() {
+        let fixture = shared_pattern_fixture(64, 16);
+        let scope_summary = extract_provider_graph_v4_npi_scope(
+            std::slice::from_ref(&fixture.shard),
+            fixture._temporary.path().join("compiler-scope.copy"),
+        )
+        .unwrap();
+        let taxonomy = one_rule_taxonomy_input(
+            &fixture
+                ._temporary
+                .path()
+                .join("compiler-taxonomy-members.u32le"),
+            &0u32.to_le_bytes(),
+            &scope_summary.output_sha256,
+        );
+        let summary = compile_provider_graph_v4_manifest(ProviderGraphV4Manifest {
+            shards: vec![fixture.shard],
+            provider_set_key_map_path: fixture.provider_map,
+            npi_scope: scope_input(&scope_summary),
+            inferred_taxonomy: taxonomy,
+            output_directory: fixture.output,
+            options: ProviderGraphV4Options {
+                member_page_bytes: 64,
+                locator_page_bytes: 48,
+                heavy_owner_member_threshold: 8,
+                heavy_bitmap_minimum_savings_bytes: 0,
+                ..ProviderGraphV4Options::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(summary.selected_layout, ProviderGraphV4Layout::Pattern);
+        assert_eq!(summary.observe.pattern_count, 1);
+        assert_eq!(
+            summary
+                .output_artifacts
+                .iter()
+                .find(|artifact| artifact.name == "inferred_taxonomy_candidates")
+                .unwrap()
+                .row_count,
+            1,
+        );
+    }
+
+    #[test]
+    fn manifest_compiler_persists_direct_and_pattern_rejection_layouts() {
+        let direct = independent_fixture();
+        let direct_scope = extract_provider_graph_v4_npi_scope(
+            std::slice::from_ref(&direct.shard),
+            direct._temporary.path().join("direct-scope.copy"),
+        )
+        .unwrap();
+        let direct_members = [0u32, 1u32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let direct_taxonomy = one_rule_taxonomy_input(
+            &direct
+                ._temporary
+                .path()
+                .join("direct-taxonomy-members.u32le"),
+            &direct_members,
+            &direct_scope.output_sha256,
+        );
+        let direct_summary = compile_provider_graph_v4_manifest(ProviderGraphV4Manifest {
+            shards: vec![direct.shard],
+            provider_set_key_map_path: direct.provider_map,
+            npi_scope: scope_input(&direct_scope),
+            inferred_taxonomy: direct_taxonomy,
+            output_directory: direct.output,
+            options: ProviderGraphV4Options {
+                member_page_bytes: 64,
+                locator_page_bytes: 48,
+                heavy_owner_member_threshold: 1,
+                heavy_bitmap_minimum_savings_bytes: 0,
+                ..ProviderGraphV4Options::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            direct_summary.selected_layout,
+            ProviderGraphV4Layout::Direct
+        );
+        assert!(direct_summary.pattern_copy_path.is_none());
+        assert!(direct_summary.direct_inferred_taxonomy_eligible);
+        assert!(direct_summary.pattern_inferred_taxonomy_eligible);
+        assert_eq!(
+            direct_summary
+                .output_artifacts
+                .iter()
+                .find(|artifact| artifact.name == "inferred_taxonomy_candidates")
+                .unwrap()
+                .row_count,
+            1,
+        );
+        assert!(reference_kinds(&direct_summary.reference_manifest_path)
+            .iter()
+            .any(|kind| kind.contains("sets_direct")));
+
+        let rejected = mixed_pattern_component_fixture(64);
+        let rejected_scope = extract_provider_graph_v4_npi_scope(
+            std::slice::from_ref(&rejected.shard),
+            rejected._temporary.path().join("rejected-scope.copy"),
+        )
+        .unwrap();
+        let rejected_taxonomy = one_rule_taxonomy_input(
+            &rejected
+                ._temporary
+                .path()
+                .join("rejected-taxonomy-members.u32le"),
+            &0u32.to_le_bytes(),
+            &rejected_scope.output_sha256,
+        );
+        let rejected_summary = compile_provider_graph_v4_manifest(ProviderGraphV4Manifest {
+            shards: vec![rejected.shard],
+            provider_set_key_map_path: rejected.provider_map,
+            npi_scope: scope_input(&rejected_scope),
+            inferred_taxonomy: rejected_taxonomy,
+            output_directory: rejected.output,
+            options: ProviderGraphV4Options {
+                member_page_bytes: 64,
+                locator_page_bytes: 48,
+                heavy_owner_member_threshold: 8,
+                heavy_bitmap_minimum_savings_bytes: 0,
+                max_online_candidate_pattern_projection_members: 1,
+                ..ProviderGraphV4Options::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            rejected_summary.selected_layout,
+            ProviderGraphV4Layout::Direct
+        );
+        assert!(rejected_summary.direct_inferred_taxonomy_eligible);
+        assert!(!rejected_summary.pattern_inferred_taxonomy_eligible);
+        assert_eq!(
+            rejected_summary
+                .pattern_inferred_taxonomy_rejection_reason
+                .as_deref(),
+            Some(INFERRED_TAXONOMY_PATTERN_CAP_REASON),
+        );
+        assert!(rejected_summary
+            .pattern_inferred_taxonomy_rejection_rule_digest
+            .is_some());
+        assert_eq!(
+            rejected_summary.pattern_inferred_taxonomy_rejection_cap,
+            Some(1),
+        );
+        assert!(rejected_summary
+            .output_artifacts
+            .iter()
+            .all(|artifact| artifact.byte_count > 0));
+
+        let helper_temporary = tempfile::tempdir().unwrap();
+        let range_input = helper_temporary.path().join("plain-range.json");
+        fs::write(&range_input, b"abcdef").unwrap();
+        let range_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut range_reader =
+            crate::input::open_plain_range_json_reader(&range_input, 1, 3, range_bytes).unwrap();
+        let mut range_text = String::new();
+        range_reader.read_to_string(&mut range_text).unwrap();
+        assert_eq!(range_text, "bcd");
+
+        let full_scan_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut full_scan_reader = crate::input::open_full_scan_reader(
+            &range_input,
+            full_scan_bytes,
+            &crate::input::RapidgzipConfig::default(),
+        )
+        .unwrap();
+        let mut full_scan_text = String::new();
+        full_scan_reader
+            .read_to_string(&mut full_scan_text)
+            .unwrap();
+        assert_eq!(full_scan_text, "abcdef");
+
+        let address_input = helper_temporary.path().join("addresses.copy");
+        let address_output = helper_temporary.path().join("addresses.normalized.copy");
+        fs::write(&address_input, b"").unwrap();
+        crate::address_canon::canonicalize_copy_file(&address_input, &address_output).unwrap();
+        assert!(fs::read(address_output).unwrap().is_empty());
+
+        assert_eq!(
+            crate::config::progress_interval("HLTHPRT_PTG2_TEST_COVERAGE_UNSET", 7),
+            7,
+        );
+        assert_ne!(
+            crate::manifest::procedure_global_id(&serde_json::json!({"billing_code": "70553"})).0,
+            [0; 16],
+        );
+        crate::progress::emit_progress(
+            &range_input,
+            6,
+            &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(6)),
+            &HashMap::from([("in_network".to_owned(), 1)]),
+            std::time::Instant::now(),
+            true,
+        );
+    }
+
+    #[test]
+    fn compact_candidate_shape_keeps_five_selected_and_five_observe_rules() {
+        let retained_counts = [17_219, 25_126, 19_419, 32_148, 5_162];
+        let mut rules = retained_counts
+            .into_iter()
+            .enumerate()
+            .map(|(index, count)| inferred_rule(index as u8 + 1, count))
+            .collect::<Vec<_>>();
+        rules.extend((0..5).map(|index| inferred_rule(index as u8 + 6, 37_001)));
+        let input = V4InferredTaxonomyModel { rules };
+        let npi_patterns = vec![vec![0]; 37_001];
+        let options = ProviderGraphV4Options::default();
+
+        let direct = inferred_taxonomy_projection(
+            &npi_patterns,
+            &input,
+            ProviderGraphV4Layout::Direct,
+            &options,
+        )
+        .unwrap();
+        let pattern = inferred_taxonomy_projection(
+            &npi_patterns,
+            &input,
+            ProviderGraphV4Layout::Pattern,
+            &options,
+        )
+        .unwrap();
+
+        for projection in [&direct, &pattern] {
+            assert!(projection.eligible);
+            assert!(projection.rejection.is_none());
+            assert_eq!(projection.rows.len(), 10);
+            assert_eq!(
+                projection
+                    .rows
+                    .iter()
+                    .filter(|row| row.observe_reason.is_none())
+                    .count(),
+                5,
+            );
+            assert_eq!(
+                projection
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row.representation == INFERRED_TAXONOMY_OBSERVE_REPRESENTATION
+                            && row.observe_reason == Some(INFERRED_TAXONOMY_CANDIDATE_CAP_REASON)
+                            && row.observe_count_lower_bound == Some(37_001)
+                    })
+                    .count(),
+                5,
+            );
+            assert_eq!(
+                projection
+                    .rows
+                    .iter()
+                    .map(|row| row.member_keys.len() / 4)
+                    .sum::<usize>(),
+                284_079,
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_candidate_cap_rejects_only_pattern_with_exact_witness() {
+        let input = V4InferredTaxonomyModel {
+            rules: vec![inferred_rule(7, 2)],
+        };
+        let npi_patterns = vec![vec![0, 1], vec![0, 1]];
+        let options = ProviderGraphV4Options {
+            max_online_candidate_pattern_projection_members: 3,
+            ..ProviderGraphV4Options::default()
+        };
+
+        let direct = inferred_taxonomy_projection(
+            &npi_patterns,
+            &input,
+            ProviderGraphV4Layout::Direct,
+            &options,
+        )
+        .unwrap();
+        let pattern = inferred_taxonomy_projection(
+            &npi_patterns,
+            &input,
+            ProviderGraphV4Layout::Pattern,
+            &options,
+        )
+        .unwrap();
+
+        assert!(direct.eligible);
+        assert!(direct.rejection.is_none());
+        assert!(!pattern.eligible);
+        let rejection = pattern.rejection.unwrap();
+        assert_eq!(rejection.reason, INFERRED_TAXONOMY_PATTERN_CAP_REASON);
+        assert_eq!(rejection.rule_digest, [7; 32]);
+        assert_eq!(rejection.observed_count, 4);
+        assert_eq!(rejection.cap, 3);
+    }
+
+    #[test]
+    fn pattern_candidate_cap_stops_at_first_sorted_rule_breach() {
+        let input = V4InferredTaxonomyModel {
+            rules: vec![
+                V4InferredTaxonomyRule {
+                    rule_digest: [1; 32],
+                    catalog_digest: [11; 32],
+                    member_keys: vec![0],
+                },
+                V4InferredTaxonomyRule {
+                    rule_digest: [2; 32],
+                    catalog_digest: [12; 32],
+                    member_keys: vec![1, 2],
+                },
+                V4InferredTaxonomyRule {
+                    rule_digest: [3; 32],
+                    catalog_digest: [13; 32],
+                    member_keys: vec![2, 3],
+                },
+            ],
+        };
+        let npi_patterns = vec![vec![0], vec![0, 1], vec![0, 1], vec![0, 1]];
+        let options = ProviderGraphV4Options {
+            max_online_candidate_pattern_projection_members: 3,
+            ..ProviderGraphV4Options::default()
+        };
+
+        let direct = inferred_taxonomy_projection(
+            &npi_patterns,
+            &input,
+            ProviderGraphV4Layout::Direct,
+            &options,
+        )
+        .unwrap();
+        assert!(direct.eligible);
+        assert_eq!(direct.rows.len(), input.rules.len());
+        assert!(direct.encoded_bytes > 0);
+
+        for _ in 0..3 {
+            let pattern = inferred_taxonomy_projection(
+                &npi_patterns,
+                &input,
+                ProviderGraphV4Layout::Pattern,
+                &options,
+            )
+            .unwrap();
+            assert!(!pattern.eligible);
+            assert!(pattern.rows.is_empty());
+            assert_eq!(pattern.encoded_bytes, 0);
+            let rejection = pattern.rejection.unwrap();
+            assert_eq!(rejection.reason, INFERRED_TAXONOMY_PATTERN_CAP_REASON);
+            assert_eq!(rejection.rule_digest, [2; 32]);
+            assert_eq!(rejection.observed_count, 4);
+            assert_eq!(rejection.cap, 3);
         }
     }
 
@@ -6439,6 +9947,11 @@ mod tests {
             groups.iter().copied().map(|group| (provider_npi, group)),
             true,
         );
+        let provider_npi_scope = write_npi_scope(
+            &temporary.path().join("npi-scope.copy"),
+            "shard-mixed",
+            &npi_group,
+        );
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &sets, 1);
         let output = temporary.path().join("output");
@@ -6455,6 +9968,7 @@ mod tests {
                 provider_component_group: component_group,
                 provider_group_npi: group_npi,
                 provider_npi_group: npi_group,
+                provider_npi_scope,
                 provider_group_tax_identity,
             },
             provider_map,
@@ -6494,7 +10008,12 @@ mod tests {
             "shard-b",
             "provider_npi_group",
             npis.into_iter().zip(groups),
-            false,
+            true,
+        );
+        let provider_npi_scope = write_npi_scope(
+            &temporary.path().join("npi-scope.copy"),
+            "shard-b",
+            &npi_group,
         );
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &sets, 0);
@@ -6512,6 +10031,7 @@ mod tests {
                 provider_component_group: component_group,
                 provider_group_npi: group_npi,
                 provider_npi_group: npi_group,
+                provider_npi_scope,
                 provider_group_tax_identity,
             },
             provider_map,
@@ -6623,6 +10143,18 @@ mod tests {
             .map(|index| global(3, index + 1))
             .collect::<Vec<_>>();
         let provider_npi = npi(1_234_567_890);
+        let provider_npi_group = write_membership(
+            &temporary.path().join("npi-group.sidecar"),
+            "tuple-cache",
+            "provider_npi_group",
+            groups.iter().copied().map(|group| (provider_npi, group)),
+            true,
+        );
+        let provider_npi_scope = write_npi_scope(
+            &temporary.path().join("npi-scope.copy"),
+            "tuple-cache",
+            &provider_npi_group,
+        );
         let shard = V4ProviderGraphShardDescriptor {
             shard_id: "tuple-cache".to_owned(),
             provider_set_component: write_membership(
@@ -6650,13 +10182,8 @@ mod tests {
                 groups.iter().copied().map(|group| (group, provider_npi)),
                 true,
             ),
-            provider_npi_group: write_membership(
-                &temporary.path().join("npi-group.sidecar"),
-                "tuple-cache",
-                "provider_npi_group",
-                groups.iter().copied().map(|group| (provider_npi, group)),
-                true,
-            ),
+            provider_npi_group,
+            provider_npi_scope,
             provider_group_tax_identity: write_missing_tax_identity(
                 &temporary.path().join("group-tax-identity.sidecar"),
                 "tuple-cache",
@@ -7062,6 +10589,16 @@ mod tests {
         assert!(summary.provider_set_audit_npi_copy_path.is_file());
         assert!(summary.provider_set_npi_prefix_override_copy_path.is_file());
         assert!(summary.pattern_copy_path.as_ref().unwrap().is_file());
+        assert_eq!(
+            summary
+                .output_artifacts
+                .iter()
+                .find(|artifact| artifact.name == "provider_set_npi_prefix_overrides")
+                .unwrap()
+                .row_count,
+            0,
+            "pattern representation must retain only sparse unsafe-owner prefixes",
+        );
         let kinds = reference_kinds(&summary.reference_manifest_path);
         assert!(kinds
             .iter()
@@ -7138,8 +10675,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary.selected_layout, ProviderGraphV4Layout::Direct);
+        assert!(summary.direct_layout_complete_prefix_eligible);
         assert!(summary.direct_complete_encoded_bytes < summary.pattern_complete_encoded_bytes);
         assert!(summary.pattern_copy_path.is_none());
+        assert_eq!(summary.observe.provider_set_count, 2);
+        assert_eq!(summary.observe.npi_prefix_override_owner_count, 2);
+        assert_eq!(summary.observe.npi_prefix_override_member_count, 2);
+        assert!(summary.observe.npi_prefix_worst_provider_set_uses_override);
+        assert_eq!(
+            summary.observe.npi_prefix_worst_online_provider_set_key,
+            None
+        );
+        assert_eq!(
+            summary
+                .output_artifacts
+                .iter()
+                .find(|artifact| artifact.name == "provider_set_npi_prefix_overrides")
+                .unwrap()
+                .row_count,
+            2,
+            "direct representation must authenticate a complete prefix for every set",
+        );
         let kinds = reference_kinds(&summary.reference_manifest_path);
         assert!(kinds
             .iter()
@@ -7157,6 +10713,87 @@ mod tests {
     }
 
     #[test]
+    fn direct_planning_and_emission_deduplicate_overlapping_components() {
+        let temporary = tempfile::tempdir().unwrap();
+        let provider_set = global(1, 1);
+        let components = [global(2, 1), global(2, 2)];
+        let groups = [global(3, 1), global(3, 2), global(3, 3)];
+        let provider_npi = npi(1_234_567_890);
+        let provider_npi_group = write_membership(
+            &temporary.path().join("npi-group.sidecar"),
+            "overlap",
+            "provider_npi_group",
+            groups.into_iter().map(|group| (provider_npi, group)),
+            true,
+        );
+        let provider_npi_scope = write_npi_scope(
+            &temporary.path().join("npi-scope.copy"),
+            "overlap",
+            &provider_npi_group,
+        );
+        let shard = V4ProviderGraphShardDescriptor {
+            shard_id: "overlap".to_owned(),
+            provider_set_component: write_membership(
+                &temporary.path().join("set-component.sidecar"),
+                "overlap",
+                "provider_set_component",
+                [(provider_set, components[0]), (provider_set, components[1])],
+                true,
+            ),
+            provider_component_group: write_membership(
+                &temporary.path().join("component-group.sidecar"),
+                "overlap",
+                "provider_component_group",
+                [
+                    (components[0], groups[0]),
+                    (components[0], groups[1]),
+                    (components[1], groups[1]),
+                    (components[1], groups[2]),
+                ],
+                true,
+            ),
+            provider_group_npi: write_membership(
+                &temporary.path().join("group-npi.sidecar"),
+                "overlap",
+                "provider_group_npi",
+                groups.into_iter().map(|group| (group, provider_npi)),
+                true,
+            ),
+            provider_npi_group,
+            provider_npi_scope,
+            provider_group_tax_identity: write_missing_tax_identity(
+                &temporary.path().join("group-tax-identity.sidecar"),
+                "overlap",
+                groups,
+            ),
+        };
+        let provider_map = temporary.path().join("provider-map.copy");
+        write_provider_map(&provider_map, &[provider_set], 0);
+        let summary = compile_provider_graph_v4(
+            std::slice::from_ref(&shard),
+            &provider_map,
+            temporary.path().join("output"),
+            ProviderGraphV4Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.selected_layout, ProviderGraphV4Layout::Direct);
+        for relation in ["group_sets_direct", "set_groups_direct"] {
+            let geometry = summary
+                .relation_summaries
+                .iter()
+                .find(|candidate| candidate.relation == relation)
+                .unwrap();
+            assert_eq!(
+                geometry.logical_member_count, 3,
+                "{relation} retained a duplicate component incidence"
+            );
+        }
+        assert_eq!(summary.observe.direct_group_set_emission_edge_visits, 3);
+        assert_eq!(summary.observe.set_group_expansion_edge_visits, 3);
+    }
+
+    #[test]
     fn pattern_layout_requires_one_bounded_first_hop_per_set() {
         assert_eq!(
             choose_layout(1_000_000_000, 1_000_000, false),
@@ -7170,8 +10807,109 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_planned_bytes_can_reverse_the_raw_vector_choice() {
+        let options = ProviderGraphV4Options {
+            heavy_owner_member_threshold: 1,
+            heavy_bitmap_minimum_savings_bytes: 0,
+            ..ProviderGraphV4Options::default()
+        };
+        let dense_direct = vec![(0..5_000).collect::<Vec<u32>>()];
+        let sparse_pattern = vec![(0..1_200)
+            .map(|value| value * 100_000)
+            .collect::<Vec<u32>>()];
+        let direct_raw = relation_encoded_bytes(
+            &RelationShape {
+                relation: "group_sets_direct",
+                owner_count: 1,
+                member_count: 5_000,
+            },
+            &options,
+        )
+        .unwrap();
+        let pattern_raw = relation_encoded_bytes(
+            &RelationShape {
+                relation: "pattern_sets",
+                owner_count: 1,
+                member_count: 1_200,
+            },
+            &options,
+        )
+        .unwrap();
+        let direct_planned =
+            planned_list_relation_persistence("group_sets_direct", 0, &dense_direct, &options)
+                .unwrap()
+                .graph_encoded_bytes;
+        let pattern_planned =
+            planned_list_relation_persistence("pattern_sets", 0, &sparse_pattern, &options)
+                .unwrap()
+                .graph_encoded_bytes;
+
+        assert!(pattern_raw < direct_raw);
+        assert!(direct_planned < pattern_planned);
+        assert_eq!(
+            choose_layout(direct_planned, pattern_planned, true),
+            ProviderGraphV4Layout::Direct,
+        );
+    }
+
+    #[test]
+    fn packed_map_payload_can_reverse_a_graph_only_choice() {
+        let direct_coordinates = (0..4)
+            .map(|index| (format!("direct-kind-{index}"), 1))
+            .collect::<BTreeMap<_, _>>();
+        let pattern_coordinates = (0..10)
+            .map(|index| (format!("pattern-kind-{index}"), 1))
+            .collect::<BTreeMap<_, _>>();
+        let direct_mapping =
+            mapping_persistence_bytes(direct_coordinates, 0, 0, "direct_v1").unwrap();
+        let pattern_mapping =
+            mapping_persistence_bytes(pattern_coordinates, 0, 0, "pattern_v1").unwrap();
+
+        assert_eq!(direct_mapping.map_payload_encoded_bytes, 4 * (80 + 52));
+        assert_eq!(pattern_mapping.map_payload_encoded_bytes, 10 * (80 + 52));
+        assert_eq!(1_001 + direct_mapping.map_payload_encoded_bytes, 1_529);
+        assert_eq!(1_000 + pattern_mapping.map_payload_encoded_bytes, 2_320);
+        assert_eq!(
+            choose_layout(
+                1_001 + direct_mapping.total_encoded_bytes,
+                1_000 + pattern_mapping.total_encoded_bytes,
+                true,
+            ),
+            ProviderGraphV4Layout::Direct,
+            "the extra persistent coordinate-map kinds must reverse the graph-only choice",
+        );
+    }
+
+    #[test]
+    fn complete_direct_prefix_admission_has_no_sparse_owner_cap() {
+        let options = ProviderGraphV4Options::default();
+        let owner_count = options
+            .max_npi_prefix_override_owners
+            .checked_add(1)
+            .unwrap();
+        let relation_bytes = relation_encoded_bytes(
+            &RelationShape {
+                relation: "set_npi_prefix_override",
+                owner_count,
+                member_count: 0,
+            },
+            &options,
+        )
+        .unwrap();
+        let projection_bytes = relation_bytes
+            .checked_add(dictionary_copy_bytes(&[4, 4, 32], owner_count).unwrap())
+            .unwrap();
+
+        assert_eq!(owner_count, 250_001);
+        assert!(complete_prefix_projection_eligible(
+            projection_bytes,
+            &options
+        ));
+    }
+
+    #[test]
     fn compiler_keeps_pattern_layout_when_only_overflow_sets_use_components() {
-        let safe_fixture = mixed_pattern_component_fixture(128);
+        let safe_fixture = mixed_pattern_component_fixture(1_024);
         let safe = compile_provider_graph_v4(
             std::slice::from_ref(&safe_fixture.shard),
             &safe_fixture.provider_map,
@@ -7198,7 +10936,7 @@ mod tests {
         assert_eq!(safe.observe.maximum_components_per_pattern_overflow_set, 2);
         assert_eq!(safe.observe.unsafe_pattern_component_set_count, 0);
 
-        let unsafe_fixture = mixed_pattern_component_fixture(128);
+        let unsafe_fixture = mixed_pattern_component_fixture(1_024);
         let unsafe_summary = compile_provider_graph_v4(
             std::slice::from_ref(&unsafe_fixture.shard),
             &unsafe_fixture.provider_map,
@@ -7216,6 +10954,145 @@ mod tests {
         );
         assert!(!unsafe_summary.pattern_layout_serving_degree_eligible);
         assert_eq!(unsafe_summary.observe.unsafe_pattern_component_set_count, 1);
+    }
+
+    #[test]
+    fn pattern_over_cap_component_owner_is_safe_only_with_exact_prefix() {
+        let fixture = mixed_pattern_component_fixture(1_024);
+        let summary = compile_provider_graph_v4(
+            std::slice::from_ref(&fixture.shard),
+            &fixture.provider_map,
+            &fixture.output,
+            ProviderGraphV4Options {
+                max_set_patterns_per_set: 1,
+                max_set_components_per_fallback_set: 1,
+                max_online_source_owners_per_set: 1,
+                ..ProviderGraphV4Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.selected_layout, ProviderGraphV4Layout::Pattern);
+        assert!(summary.pattern_layout_serving_degree_eligible);
+        assert_eq!(summary.observe.pattern_component_over_cap_set_count, 1);
+        assert_eq!(
+            summary
+                .observe
+                .pattern_component_over_cap_prefix_covered_set_count,
+            1,
+        );
+        assert_eq!(summary.observe.unsafe_pattern_component_set_count, 0);
+        assert!(
+            summary.observe.npi_prefix_override_owner_count
+                >= summary
+                    .observe
+                    .pattern_component_over_cap_prefix_covered_set_count,
+        );
+    }
+
+    #[test]
+    fn compiler_falls_back_to_pattern_when_complete_direct_prefix_exceeds_cap() {
+        let fixture = independent_fixture();
+        let summary = compile_provider_graph_v4(
+            std::slice::from_ref(&fixture.shard),
+            &fixture.provider_map,
+            &fixture.output,
+            ProviderGraphV4Options {
+                max_npi_prefix_override_bytes: 1,
+                ..ProviderGraphV4Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.selected_layout, ProviderGraphV4Layout::Pattern);
+        assert!(!summary.direct_layout_complete_prefix_eligible);
+        assert!(summary.pattern_layout_serving_degree_eligible);
+        assert_eq!(summary.observe.npi_prefix_override_owner_count, 0);
+    }
+
+    #[test]
+    fn compiler_rejects_graph_when_neither_representation_is_bounded() {
+        let fixture = mixed_pattern_component_fixture(128);
+        let result = compile_provider_graph_v4(
+            std::slice::from_ref(&fixture.shard),
+            &fixture.provider_map,
+            &fixture.output,
+            ProviderGraphV4Options {
+                max_set_patterns_per_set: 1,
+                max_set_components_per_fallback_set: 1,
+                max_npi_prefix_override_bytes: 1,
+                ..ProviderGraphV4Options::default()
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ProviderGraphV4Error::InvalidData(message))
+                if message.contains("no bounded complete online representation")
+        ));
+    }
+
+    #[test]
+    fn automatic_layout_selection_uses_shape_not_source_identity() {
+        let first = shared_pattern_fixture_with_shard_id(64, 16, "source-a");
+        let second = shared_pattern_fixture_with_shard_id(64, 16, "renamed-source-b-long");
+        let first_summary = compile_provider_graph_v4(
+            std::slice::from_ref(&first.shard),
+            &first.provider_map,
+            &first.output,
+            ProviderGraphV4Options::default(),
+        )
+        .unwrap();
+        let second_summary = compile_provider_graph_v4(
+            std::slice::from_ref(&second.shard),
+            &second.provider_map,
+            &second.output,
+            ProviderGraphV4Options::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first_summary.selected_layout,
+            second_summary.selected_layout
+        );
+        assert_eq!(
+            first_summary.direct_complete_encoded_bytes,
+            second_summary.direct_complete_encoded_bytes,
+        );
+        assert_eq!(
+            first_summary.pattern_complete_encoded_bytes,
+            second_summary.pattern_complete_encoded_bytes,
+        );
+        assert_eq!(
+            first_summary.pattern_layout_serving_degree_eligible,
+            second_summary.pattern_layout_serving_degree_eligible,
+        );
+        assert_eq!(
+            first_summary.direct_layout_complete_prefix_eligible,
+            second_summary.direct_layout_complete_prefix_eligible,
+        );
+        assert_eq!(
+            first_summary.relation_summaries,
+            second_summary.relation_summaries,
+        );
+        assert_ne!(
+            first_summary.tax_identity.source_ordinal_map_digest,
+            second_summary.tax_identity.source_ordinal_map_digest,
+            "authenticated source provenance must retain the renamed shard",
+        );
+
+        let changed_shape = independent_fixture();
+        let changed_summary = compile_provider_graph_v4(
+            std::slice::from_ref(&changed_shape.shard),
+            &changed_shape.provider_map,
+            &changed_shape.output,
+            ProviderGraphV4Options::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            first_summary.selected_layout, changed_summary.selected_layout,
+            "different measured graph geometry may select another representation",
+        );
     }
 
     #[test]
@@ -7360,7 +11237,13 @@ mod tests {
             .unwrap();
         assert_eq!(relation.logical_member_count, 512);
         assert_eq!(relation.vector_member_count, 0);
-        assert!(summary.selected_encoded_bytes < summary.pattern_complete_encoded_bytes);
+        assert_eq!(
+            summary.selected_encoded_bytes,
+            match summary.selected_layout {
+                ProviderGraphV4Layout::Direct => summary.direct_complete_encoded_bytes,
+                ProviderGraphV4Layout::Pattern => summary.pattern_complete_encoded_bytes,
+            }
+        );
         assert!(!reference_kinds(&summary.reference_manifest_path)
             .iter()
             .any(|kind| kind == "v4_npi_groups_exact_members_v1"));
@@ -7448,6 +11331,117 @@ mod tests {
     }
 
     #[test]
+    fn compiler_output_race_preserves_foreign_path_and_removes_owned_partial_outputs() {
+        let fixture = shared_pattern_fixture(16, 4);
+        let raced_path = fixture.output.join("v4-provider-groups.copy");
+        let mut injected = false;
+        let mut sink = |event: &V4ProgressEvent| {
+            if !injected && event.phase == "emit_bitmaps" {
+                fs::write(&raced_path, b"caller-owned race").unwrap();
+                injected = true;
+            }
+        };
+
+        let error = compile_provider_graph_v4_with_progress(
+            std::slice::from_ref(&fixture.shard),
+            &fixture.provider_map,
+            &fixture.output,
+            ProviderGraphV4Options::default(),
+            None,
+            None,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(injected);
+        assert!(matches!(
+            error,
+            ProviderGraphV4Error::Io(ref source)
+                if source.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fs::read(&raced_path).unwrap(), b"caller-owned race");
+        for name in OUTPUT_NAMES {
+            if name != "v4-provider-groups.copy" {
+                assert!(
+                    fs::symlink_metadata(fixture.output.join(name)).is_err(),
+                    "run-owned partial output survived: {name}",
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_output_rejects_dangling_symlink_without_following_or_removing_it() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = independent_fixture();
+        fs::create_dir_all(&fixture.output).unwrap();
+        let target = fixture._temporary.path().join("caller-target.copy");
+        let link = fixture.output.join("v4-summary.json");
+        symlink(&target, &link).unwrap();
+
+        let error = compile_provider_graph_v4(
+            std::slice::from_ref(&fixture.shard),
+            &fixture.provider_map,
+            &fixture.output,
+            ProviderGraphV4Options::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!target.exists());
+        for name in OUTPUT_NAMES {
+            if name != "v4-summary.json" {
+                assert!(fs::symlink_metadata(fixture.output.join(name)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn output_ownership_rejects_root_escape_and_preserves_raced_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("output");
+        fs::create_dir(&root).unwrap();
+        let mut ownership = OutputOwnership::new(&root);
+        let raced = root.join("v4-summary.json");
+        fs::write(&raced, b"caller-owned").unwrap();
+        assert!(ownership.create(&raced).is_err());
+        let replaced = root.join("v4-patterns.copy");
+        drop(ownership.create(&replaced).unwrap());
+        fs::remove_file(&replaced).unwrap();
+        fs::write(&replaced, b"replacement after create").unwrap();
+        let escaped = temporary.path().join("v4-summary.json");
+        assert!(ownership.create(&escaped).is_err());
+        drop(ownership);
+        assert_eq!(fs::read(&raced).unwrap(), b"caller-owned");
+        assert_eq!(fs::read(&replaced).unwrap(), b"replacement after create");
+        assert!(!escaped.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_ownership_pins_original_inode_until_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        for attempt in 0..64 {
+            let root = temporary.path().join(format!("output-{attempt}"));
+            fs::create_dir(&root).unwrap();
+            let path = root.join("v4-patterns.copy");
+            let mut ownership = OutputOwnership::new(&root);
+            drop(ownership.create(&path).unwrap());
+            fs::remove_file(&path).unwrap();
+            let replacement = format!("caller replacement {attempt}");
+            fs::write(&path, replacement.as_bytes()).unwrap();
+
+            drop(ownership);
+
+            assert_eq!(fs::read(&path).unwrap(), replacement.as_bytes());
+        }
+    }
+
+    #[test]
     fn compiler_progress_protocol_is_ordered_and_terminal() {
         let fixture = shared_pattern_fixture(64, 16);
         let mut events = Vec::new();
@@ -7458,6 +11452,8 @@ mod tests {
                 &fixture.provider_map,
                 &fixture.output,
                 ProviderGraphV4Options::default(),
+                None,
+                None,
                 &mut sink,
             )
             .unwrap();
@@ -7991,6 +11987,18 @@ mod tests {
         let components = [global(2, 1), global(2, 2), global(2, 3)];
         let groups = [global(3, 1), global(3, 2), global(3, 3)];
         let provider_npi = npi(1_234_567_890);
+        let provider_npi_group = write_membership(
+            &temporary.path().join("npi-group.sidecar"),
+            "multi-shard",
+            "provider_npi_group",
+            groups.into_iter().map(|group| (provider_npi, group)),
+            true,
+        );
+        let provider_npi_scope = write_npi_scope(
+            &temporary.path().join("npi-scope.copy"),
+            "multi-shard",
+            &provider_npi_group,
+        );
         let shard = V4ProviderGraphShardDescriptor {
             shard_id: "multi-shard".to_owned(),
             provider_set_component: write_membership(
@@ -8019,13 +12027,8 @@ mod tests {
                 groups.into_iter().map(|group| (group, provider_npi)),
                 true,
             ),
-            provider_npi_group: write_membership(
-                &temporary.path().join("npi-group.sidecar"),
-                "multi-shard",
-                "provider_npi_group",
-                groups.into_iter().map(|group| (provider_npi, group)),
-                true,
-            ),
+            provider_npi_group,
+            provider_npi_scope,
             provider_group_tax_identity: write_missing_tax_identity(
                 &temporary.path().join("group-tax-identity.sidecar"),
                 "multi-shard",
@@ -8353,7 +12356,7 @@ mod tests {
 
         let unfinished = temporary.path().join("unfinished.copy");
         drop(PgCopyFileWriter::create(&unfinished).unwrap());
-        assert!(unfinished.is_file());
+        assert!(!unfinished.exists());
     }
 
     #[test]
@@ -8640,6 +12643,8 @@ mod tests {
             logical_byte_count: 37,
             raw_byte_count: 357,
             vector_byte_count: 12,
+            encoded_byte_count: 0,
+            block_count: 1,
         };
         let mut out_of_order_cas = CasBlockWriter::create(
             &temporary.path().join("out-of-order.copy"),
@@ -8927,33 +12932,47 @@ mod tests {
         let pattern_groups = vec![vec![0]];
         let group_npis = vec![vec![0]];
 
-        for options in [
-            ProviderGraphV4Options {
+        let mut admission = blank_admission(None);
+        let sparse_capped = derive_npi_prefix_overrides(
+            NpiPrefixInputs {
+                set_base: 0,
+                set_components: &set_components,
+                component_groups: &component_groups,
+                set_patterns: &set_patterns,
+                pattern_groups: &pattern_groups,
+                group_npis: &group_npis,
+            },
+            &ProviderGraphV4Options {
                 max_online_group_keys_per_set: 0,
                 max_npi_prefix_override_owners: 0,
                 ..ProviderGraphV4Options::default()
             },
-            ProviderGraphV4Options {
+            &mut admission,
+        )
+        .unwrap();
+        assert!(!sparse_capped.sparse_eligible);
+        assert!(sparse_capped.complete_eligible);
+
+        let mut admission = blank_admission(None);
+        let complete_capped = derive_npi_prefix_overrides(
+            NpiPrefixInputs {
+                set_base: 0,
+                set_components: &set_components,
+                component_groups: &component_groups,
+                set_patterns: &set_patterns,
+                pattern_groups: &pattern_groups,
+                group_npis: &group_npis,
+            },
+            &ProviderGraphV4Options {
                 max_online_group_keys_per_set: 0,
                 max_npi_prefix_override_bytes: 1,
                 ..ProviderGraphV4Options::default()
             },
-        ] {
-            let mut admission = blank_admission(None);
-            assert!(derive_npi_prefix_overrides(
-                NpiPrefixInputs {
-                    set_base: 0,
-                    set_components: &set_components,
-                    component_groups: &component_groups,
-                    set_patterns: &set_patterns,
-                    pattern_groups: &pattern_groups,
-                    group_npis: &group_npis,
-                },
-                &options,
-                &mut admission,
-            )
-            .is_err());
-        }
+            &mut admission,
+        )
+        .unwrap();
+        assert!(!complete_capped.sparse_eligible);
+        assert!(!complete_capped.complete_eligible);
 
         let temporary = tempfile::tempdir().unwrap();
         let mut cas = CasBlockWriter::create(
@@ -8971,25 +12990,27 @@ mod tests {
         .unwrap();
         assert!(emitter.push_ordered_owner(&[1, 1]).is_err());
 
-        let fixture = shared_pattern_fixture(1, 512);
+        let fixture = mixed_pattern_component_fixture(128);
         let options = ProviderGraphV4Options {
             member_page_bytes: 64,
             heavy_owner_member_threshold: 1,
             heavy_bitmap_minimum_savings_bytes: 0,
+            max_set_patterns_per_set: 1,
+            max_set_components_per_fallback_set: 1,
             ..ProviderGraphV4Options::default()
         };
-        let summary = compile_provider_graph_v4_manifest(ProviderGraphV4Manifest {
-            shards: vec![fixture.shard.clone()],
-            provider_set_key_map_path: fixture.provider_map.clone(),
-            output_directory: fixture.output.clone(),
+        let summary = compile_provider_graph_v4(
+            std::slice::from_ref(&fixture.shard),
+            &fixture.provider_map,
+            &fixture.output,
             options,
-        })
+        )
         .unwrap();
         assert_eq!(summary.selected_layout, ProviderGraphV4Layout::Direct);
         assert!(summary
             .heavy_bitmaps
             .iter()
-            .any(|bitmap| bitmap.relation == "group_sets_direct"));
+            .any(|bitmap| bitmap.relation == "set_groups_direct"));
     }
 
     #[test]
@@ -9066,6 +13087,98 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("sorted and unique"));
+    }
+
+    #[test]
+    fn tax_artifact_parser_rejects_metadata_file_and_state_boundaries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let group = global(3, 1);
+        let valid = || {
+            write_tax_identity(
+                &temporary.path().join(format!(
+                    "tax-{}.sidecar",
+                    fs::read_dir(temporary.path()).unwrap().count()
+                )),
+                "tax-shard",
+                "ptg-tin-hmac-sha256-v1:release-1",
+                [(group, V4TaxIdentityState::Missing, None)],
+            )
+        };
+
+        let artifact = ValidatedTaxIdentityArtifact::open(&valid()).unwrap();
+        assert!(artifact.record(1).is_err());
+
+        let mut inconsistent = valid();
+        inconsistent.metadata.final_file = false;
+        assert!(ValidatedTaxIdentityArtifact::open(&inconsistent)
+            .unwrap_err()
+            .to_string()
+            .contains("metadata is inconsistent"));
+
+        let mut invalid_policy = valid();
+        invalid_policy.metadata.token_policy_id = "invalid".to_owned();
+        assert!(ValidatedTaxIdentityArtifact::open(&invalid_policy)
+            .unwrap_err()
+            .to_string()
+            .contains("policy ID is invalid"));
+
+        let mut missing_file = valid();
+        missing_file.path = temporary.path().join("missing.sidecar");
+        assert!(ValidatedTaxIdentityArtifact::open(&missing_file)
+            .unwrap_err()
+            .to_string()
+            .contains("sidecar is unavailable"));
+
+        let mut wrong_size = valid();
+        wrong_size.metadata.byte_count += 1;
+        assert!(ValidatedTaxIdentityArtifact::open(&wrong_size)
+            .unwrap_err()
+            .to_string()
+            .contains("byte count metadata mismatch"));
+
+        let mut wrong_checksum = valid();
+        wrong_checksum.metadata.sha256 = hex(&[0; 32]);
+        assert!(ValidatedTaxIdentityArtifact::open(&wrong_checksum)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum metadata mismatch"));
+
+        let mut bad_header = valid();
+        let mut bytes = fs::read(&bad_header.path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&bad_header.path, &bytes).unwrap();
+        bad_header.metadata.sha256 = hex(&Sha256::digest(&bytes));
+        assert!(ValidatedTaxIdentityArtifact::open(&bad_header)
+            .unwrap_err()
+            .to_string()
+            .contains("header or size is invalid"));
+
+        let mut token_on_unavailable = valid();
+        let header_bytes =
+            TAX_IDENTITY_FIXED_HEADER_BYTES + token_on_unavailable.metadata.token_policy_id.len();
+        let mut bytes = fs::read(&token_on_unavailable.path).unwrap();
+        bytes[header_bytes + 17] = 1;
+        fs::write(&token_on_unavailable.path, &bytes).unwrap();
+        token_on_unavailable.metadata.sha256 = hex(&Sha256::digest(&bytes));
+        assert!(ValidatedTaxIdentityArtifact::open(&token_on_unavailable)
+            .unwrap_err()
+            .to_string()
+            .contains("carries a token"));
+
+        let mut invalid_state = valid();
+        let mut bytes = fs::read(&invalid_state.path).unwrap();
+        bytes[header_bytes + 16] = 0xff;
+        fs::write(&invalid_state.path, &bytes).unwrap();
+        invalid_state.metadata.sha256 = hex(&Sha256::digest(&bytes));
+        assert!(ValidatedTaxIdentityArtifact::open(&invalid_state).is_err());
+
+        let mut changed_counts = valid();
+        changed_counts.metadata.missing_count = 0;
+        changed_counts.metadata.malformed_count = 1;
+        assert!(ValidatedTaxIdentityArtifact::open(&changed_counts)
+            .unwrap_err()
+            .to_string()
+            .contains("state counts changed"));
     }
 
     #[test]
