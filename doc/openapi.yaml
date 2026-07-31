@@ -4143,6 +4143,12 @@ paths:
         `query.ignored_params` to distinguish matched rows from no snapshot,
         no local match in the requested radius, or no matching rates.
         Strict V3 serves in-network negotiated rates only.
+
+        Radius matches fail closed on address evidence: an address must come
+        from NPPES, be independently reported by at least two marketplace
+        directory issuers, or come from CMS Doctors and Clinicians whose NPI
+        attribution is anchored by an exact NPPES premise. Rate-file evidence
+        proves network participation and price, not practice location.
       parameters:
         - name: year
           in: query
@@ -4309,6 +4315,11 @@ paths:
         - name: include_evidence
           in: query
           schema: { type: boolean }
+          description: |
+            Include truthful location confidence and record-level provenance
+            for the selected address, including dataset identifier, source
+            record/version identifiers, retrieval timestamp, and source URLs
+            when available.
         - name: include_allowed_amounts
           in: query
           schema: { type: boolean, default: true }
@@ -4329,6 +4340,7 @@ paths:
         - name: include_debug
           in: query
           schema: { type: boolean }
+          description: Include source, routing, and address-evidence diagnostics.
         - name: include_legacy_fields
           in: query
           schema: { type: boolean }
@@ -4350,6 +4362,14 @@ paths:
                 matched_service_codes,
                 cost_index,
               ]
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+          description: Maximum provider rows returned on this page.
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: Zero-based provider-row offset for deterministic paging.
       responses:
         '200':
           description: Paginated provider matches by procedure
@@ -4648,6 +4668,14 @@ paths:
                 matched_service_codes,
                 cost_index,
               ]
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+          description: Maximum provider rows returned on this page.
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: Zero-based provider-row offset for deterministic paging.
       responses:
         '200':
           description: Paginated provider matches by procedure

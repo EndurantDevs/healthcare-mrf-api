@@ -29,6 +29,14 @@ PTG2_LEGACY_ADDRESS_COLUMNS = {
 }
 PTG2_UNIFIED_ADDRESS_COLUMNS = PTG2_LEGACY_ADDRESS_COLUMNS | {
     "address_precision",
+    "location_key",
+    "address_sources",
+    "source_record_ids",
+    "source_count",
+    "multi_source_confirmed",
+    "source_mask",
+    "address_source_mask",
+    "location_confidence_id",
 }
 
 PTG_NO_DISPLAY_ADDRESS_FIELDS = {
@@ -93,6 +101,8 @@ PTG_NO_DISPLAY_VERIFICATION_FIELDS = {
     "provider_directory_insurance_plan_matches",
     "provider_directory_match_type",
     "address_verification_evidence",
+    "address_provenance",
+    "geo_evidence_level",
 }
 
 

@@ -2297,6 +2297,16 @@ def _canonical_contact_number_expr(expr: str, country_expr: str = "country_code"
     )
 
 
+def _nullish_text_expr(expr: str) -> str:
+    """Normalize empty and source-system null sentinel strings to SQL NULL."""
+
+    return (
+        f"CASE WHEN LOWER(TRIM(COALESCE(({expr})::text, ''))) "
+        "IN ('', 'null', 'none', 'undefined') THEN NULL "
+        f"ELSE NULLIF(TRIM(({expr})::text), '') END"
+    )
+
+
 def _coordinate_country_key_expr(expr: str) -> str:
     return f"regexp_replace(upper(COALESCE(({expr})::varchar, '')), '[^A-Z0-9]', '', 'g')"
 
@@ -5621,8 +5631,8 @@ def _insert_raw_from_source_sql(
             NULLIF(TRIM(state_name), '')::varchar AS state_name,
             NULLIF(TRIM(postal_code), '')::varchar AS postal_code,
             COALESCE(NULLIF(TRIM(country_code), ''), 'US')::varchar AS country_code,
-            NULLIF(TRIM(telephone_number), '')::varchar AS telephone_number,
-            NULLIF(TRIM(fax_number), '')::varchar AS fax_number,
+            {_nullish_text_expr("telephone_number")}::varchar AS telephone_number,
+            {_nullish_text_expr("fax_number")}::varchar AS fax_number,
             {_canonical_contact_number_expr("telephone_number", "country_code")}::varchar AS phone_number,
             {_contact_extension_expr("telephone_number")}::varchar AS phone_extension,
             {_canonical_contact_number_expr("fax_number", "country_code")}::varchar AS fax_number_digits,
@@ -6137,8 +6147,8 @@ def _materialize_sql(
             NULLIF(TRIM(state_name), '')::varchar AS state_name,
             NULLIF(TRIM(postal_code), '')::varchar AS postal_code,
             COALESCE(NULLIF(TRIM(country_code), ''), 'US')::varchar AS country_code,
-            NULLIF(TRIM(telephone_number), '')::varchar AS telephone_number,
-            NULLIF(TRIM(fax_number), '')::varchar AS fax_number,
+            {_nullish_text_expr("telephone_number")}::varchar AS telephone_number,
+            {_nullish_text_expr("fax_number")}::varchar AS fax_number,
             {_canonical_contact_number_expr("telephone_number", "country_code")}::varchar AS phone_number,
             {_contact_extension_expr("telephone_number")}::varchar AS phone_extension,
             {_canonical_contact_number_expr("fax_number", "country_code")}::varchar AS fax_number_digits,

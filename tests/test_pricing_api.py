@@ -50,6 +50,22 @@ resolve_procedure_taxonomy = pricing_module.resolve_procedure_taxonomy
 pricing_statistics = pricing_module.pricing_statistics
 
 
+def test_ptg_result_status_cannot_contradict_returned_items():
+    payload = {
+        "items": [{"npi": 1000000003}],
+        "query": {"status": "no_match", "snapshot_id": "ptg2:fixture"},
+    }
+
+    pricing_module._annotate_ptg2_result_state(
+        payload,
+        has_plan_scope=True,
+        has_location_filter=True,
+    )
+
+    assert payload["query"]["status"] == "matched"
+    assert payload["result_state"] == "matched"
+
+
 class FakeResult:
     def __init__(self, rows=None, scalar=None):
         self._rows = rows or []

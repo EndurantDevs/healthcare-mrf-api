@@ -183,6 +183,8 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
     if unified:
         assert query.knn_order_sql is not None
         assert "ST_DWithin" in query.filter_sql
+        assert "source_issuer_names" in query.filter_sql
+        assert "geo_doctor_anchor" in query.filter_sql
     else:
         assert query.knn_order_sql is None
         assert query.parameter_map["state_value"] == "IL"
