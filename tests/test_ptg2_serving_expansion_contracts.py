@@ -1,6 +1,7 @@
 """Behavioral contracts for bounded PTG provider expansion."""
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -128,6 +129,64 @@ async def test_empty_hydration_paths_avoid_io():
         (),
         limit=5,
     ) == ()
+
+
+@pytest.mark.asyncio
+async def test_v4_cold_group_traversal_reads_bounded_owner_prefixes(monkeypatch):
+    first_group = "31" * 16
+    second_group = "32" * 16
+    prefix_lookup = AsyncMock(return_value={7: (1, 2), 8: (3,)})
+    monkeypatch.setattr(serving, "_require_strict_shared_v3", lambda _tables: None)
+    monkeypatch.setattr(
+        serving,
+        "_shared_provider_group_keys_for_ids",
+        AsyncMock(return_value={first_group: 7, second_group: 8}),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_members",
+        AsyncMock(side_effect=AssertionError("exact lookup must remain cold")),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_member_prefixes",
+        prefix_lookup,
+    )
+    monkeypatch.setattr(
+        serving,
+        "v4_npi_values_for_keys",
+        AsyncMock(
+            return_value={1: 1234567890, 2: 2234567890, 3: 3234567890}
+        ),
+    )
+
+    member_ids_by_set = await serving._limited_graph_member_ids_by_set(
+        object(),
+        SimpleNamespace(
+            uses_shared_blocks=True,
+            uses_v4_graph=True,
+            shared_snapshot_key=17,
+        ),
+        {"set-a": (first_group, second_group)},
+        limit_per_set=256,
+    )
+
+    assert member_ids_by_set == {
+        "set-a": (
+            serving._ptg2_npi_member_id(1234567890),
+            serving._ptg2_npi_member_id(2234567890),
+            serving._ptg2_npi_member_id(3234567890),
+        ),
+    }
+    prefix_kwargs = prefix_lookup.await_args.kwargs
+    assert tuple(prefix_kwargs.pop("owner_keys")) == (7, 8)
+    assert prefix_kwargs == {
+        "snapshot_key": 17,
+        "relation": "group_npis_exact",
+        "schema_name": serving.PTG2_SCHEMA,
+        "max_members": 512,
+        "limit_per_owner": 256,
+    }
 
 
 def test_filter_fallbacks_and_cache_eviction_are_bounded(monkeypatch):

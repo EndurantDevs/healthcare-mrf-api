@@ -5430,13 +5430,26 @@ async def _v4_group_npis(
     owner_key_by_id = await _shared_provider_group_keys_for_ids(
         session, serving_tables, owner_ids
     )
-    npi_keys_by_group = await lookup_v4_relation_members(
+    lookup = (
+        lookup_v4_relation_members
+        if max_members is None
+        else lookup_v4_relation_member_prefixes
+    )
+    lookup_options = (
+        {}
+        if max_members is None
+        else {
+            "limit_per_owner": max_members,
+            "max_members": max_members * len(owner_key_by_id),
+        }
+    )
+    npi_keys_by_group = await lookup(
         session,
         snapshot_key=snapshot_key,
         relation="group_npis_exact",
         owner_keys=owner_key_by_id.values(),
         schema_name=PTG2_SCHEMA,
-        max_members=max_members,
+        **lookup_options,
     )
     npi_keys = {
         int(npi_key)
