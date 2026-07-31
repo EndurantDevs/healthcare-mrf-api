@@ -199,6 +199,16 @@ def test_address_provenance_exposes_dataset_version_and_retrieval_time():
     }
 
 
+def test_address_provenance_query_falls_back_to_selected_unified_lineage():
+    sql = serving._ADDRESS_PROVENANCE_SQL
+
+    assert "UNION ALL" in sql
+    assert "entity_address_evidence AS stored" in sql
+    assert "entity_address_unified AS unified" in sql
+    assert "WHERE NOT EXISTS" in sql
+    assert "provider_directory_fhir" in sql
+
+
 def test_nullish_contact_values_become_json_null_without_changing_rates():
     address_by_field = {
         "telephone_number": "null",

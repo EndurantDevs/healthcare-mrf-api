@@ -9381,6 +9381,18 @@ def _ptg2_npi_scope_table(
     return f"{schema_name}.{table_name}"
 
 
+def _membership_address_assurance_sql(
+    args: Mapping[str, Any], uses_unified_addresses: bool
+) -> str:
+    """Apply evidence assurance outside every location-predicate branch."""
+
+    if not uses_unified_addresses or not _has_location_filter(
+        dict(args), include_npi=False
+    ):
+        return "TRUE"
+    return _ptg2_geo_assured_address_sql("addr")
+
+
 async def _membership_location_query(
     session,
     serving_tables: PTG2ServingTables,
@@ -9436,7 +9448,7 @@ async def _membership_location_query(
         parameter_map=parameter_map,
         distance_sql=distance_sql,
         knn_order_sql=knn_order_sql,
-        address_assurance_sql="TRUE",
+        address_assurance_sql=_membership_address_assurance_sql(args, uses_unified_addresses),
     )
 
 
@@ -9576,6 +9588,69 @@ def _address_provenance_entry(row_by_field: Mapping[str, Any]) -> dict[str, Any]
 _ADDRESS_PROVENANCE_SQL = f"""
 WITH requested(location_key) AS (
     SELECT UNNEST(CAST(:location_keys AS varchar[]))
+), evidence AS (
+    SELECT stored.location_key,
+           stored.address_key,
+           stored.premise_key,
+           stored.npi,
+           stored.source_id,
+           stored.source_record_key,
+           stored.source_run_id,
+           stored.source_snapshot_id,
+           stored.observed_at,
+           stored.last_seen_at
+      FROM requested
+      JOIN {PTG2_SCHEMA}.entity_address_evidence AS stored
+        ON stored.location_key = requested.location_key
+    UNION ALL
+    SELECT unified.location_key,
+           unified.address_key,
+           unified.premise_key,
+           unified.npi,
+           CASE source_name
+               WHEN 'nppes' THEN 1
+               WHEN 'mrf' THEN 2
+               WHEN 'cms_doctors' THEN 3
+               WHEN 'provider_enrollment_ffs' THEN 4
+               WHEN 'provider_enrollment_ffs_address' THEN 5
+               WHEN 'ptg' THEN 7
+               WHEN 'provider_directory_fhir' THEN 8
+               ELSE 0
+           END::smallint AS source_id,
+           COALESCE(
+               (
+                   SELECT source_record_id
+                     FROM UNNEST(
+                         COALESCE(unified.source_record_ids, ARRAY[]::varchar[])
+                     ) AS source_records(source_record_id)
+                    WHERE source_name <> 'provider_directory_fhir'
+                       OR source_record_id LIKE 'provider_directory_fhir:%'
+                    ORDER BY source_record_id
+                    LIMIT 1
+               ),
+               CONCAT(source_name, ':', unified.location_key)
+           ) AS source_record_key,
+           COALESCE(
+               unified.last_seen_at::text,
+               unified.updated_at::text,
+               unified.location_key
+           ) AS source_run_id,
+           NULL::varchar AS source_snapshot_id,
+           COALESCE(unified.updated_at, unified.last_seen_at)::timestamptz
+               AS observed_at,
+           COALESCE(unified.last_seen_at, unified.updated_at)::timestamptz
+               AS last_seen_at
+      FROM requested
+      JOIN {PTG2_SCHEMA}.entity_address_unified AS unified
+        ON unified.location_key = requested.location_key
+     CROSS JOIN LATERAL UNNEST(
+         COALESCE(unified.address_sources, ARRAY[]::varchar[])
+     ) AS sources(source_name)
+     WHERE NOT EXISTS (
+         SELECT 1
+           FROM {PTG2_SCHEMA}.entity_address_evidence AS stored
+          WHERE stored.location_key = requested.location_key
+     )
 )
 SELECT
     evidence.location_key,
@@ -9604,9 +9679,7 @@ SELECT
                   AND (nppes_anchor.address_source_mask & 1) <> 0
            )
     ) AS cms_source_has_nppes_anchor
-  FROM requested
-  JOIN {PTG2_SCHEMA}.entity_address_evidence AS evidence
-    ON evidence.location_key = requested.location_key
+  FROM evidence
   LEFT JOIN LATERAL (
         SELECT mrf.source_import_ids,
                mrf.source_import_dates,
