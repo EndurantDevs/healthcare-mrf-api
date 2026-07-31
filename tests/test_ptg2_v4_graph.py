@@ -348,6 +348,7 @@ class _HeavyBitmapFragmentCoordinate:
 
 class _HeavyBitmapFragmentFixture:
     def __init__(self) -> None:
+        self.requested_coordinate_pairs = []
         self.owner = graph.V4HeavyOwner(
             relation="npi_groups_exact",
             owner_key=7,
@@ -380,10 +381,15 @@ class _HeavyBitmapFragmentFixture:
             entry_count,
         ) + payload
 
-    async def coordinates(self, *_args, **_kwargs):
-        return self.coordinates_by_key
+    async def coordinates(self, *_args, **kwargs):
+        coordinate_pairs = tuple(kwargs["coordinate_pairs"])
+        self.requested_coordinate_pairs.append(coordinate_pairs)
+        return {
+            pair: self.coordinates_by_key[pair]
+            for pair in coordinate_pairs
+        }
 
-    async def blocks(self, *_args, **_kwargs):
+    async def blocks(self, *_args, **kwargs):
         return {
             coordinate.block_hash: graph._CachedPhysicalBlock(
                 coordinate.block_hash,
@@ -391,7 +397,7 @@ class _HeavyBitmapFragmentFixture:
                 coordinate.entry_count,
                 self.fragment_payloads[coordinate.fragment_no],
             )
-            for coordinate in self.coordinates_by_key.values()
+            for coordinate in kwargs["coordinates"]
         }
 
     def install(self, monkeypatch) -> None:
@@ -410,7 +416,7 @@ def _heavy_bitmap_relation_manifest() -> graph.V4RelationManifest:
         logical_member_count=6,
         vector_member_count=0,
         member_width=4,
-        member_page_bytes=32,
+        member_page_bytes=57,
         locator_page_bytes=32,
         locator_owner_span=2,
     )
@@ -559,6 +565,37 @@ async def _assert_heavy_bitmap_page_limit(
     assert budget_error.value.dimension == "graph_pages"
 
 
+async def _assert_heavy_bitmap_selective_intersection(
+    fixture: _HeavyBitmapFragmentFixture,
+    manifest: graph.V4RelationManifest,
+) -> None:
+    fixture.requested_coordinate_pairs.clear()
+    with (
+        graph.v4_graph_request_scope(),
+        graph.v4_graph_taxonomy_projection_scope(
+            maximum_members=1,
+            maximum_pages=1,
+            maximum_bytes=manifest.member_page_bytes,
+            maximum_batches=0,
+        ) as taxonomy_work,
+    ):
+        assert await graph._lookup_v4_heavy_member_intersections(
+            object(),
+            snapshot_key=17,
+            schema_name="mrf",
+            relation_manifest=manifest,
+            heavy_owners={7: fixture.owner},
+            allowed_member_keys=(116,),
+        ) == {7: (116,)}
+    assert fixture.requested_coordinate_pairs == [((7, 1),)]
+    assert (
+        taxonomy_work.members,
+        taxonomy_work.pages,
+        taxonomy_work.bytes,
+        taxonomy_work.batches,
+    ) == (1, 1, manifest.member_page_bytes, 0)
+
+
 async def _assert_heavy_bitmap_fragment_conflict(
     fixture: _HeavyBitmapFragmentFixture,
     manifest: graph.V4RelationManifest,
@@ -589,7 +626,7 @@ async def test_v4_heavy_bitmap_fragments_use_physical_entry_counts(
         graph.v4_graph_taxonomy_projection_scope(
             maximum_members=6,
             maximum_pages=2,
-            maximum_bytes=64,
+            maximum_bytes=2 * manifest.member_page_bytes,
             maximum_batches=0,
         ) as taxonomy_work,
     ):
@@ -605,8 +642,9 @@ async def test_v4_heavy_bitmap_fragments_use_physical_entry_counts(
         taxonomy_work.pages,
         taxonomy_work.bytes,
         taxonomy_work.batches,
-    ) == (6, 2, 64, 0)
+    ) == (6, 2, 2 * manifest.member_page_bytes, 0)
     await _assert_heavy_bitmap_page_limit(fixture, manifest)
+    await _assert_heavy_bitmap_selective_intersection(fixture, manifest)
     await _assert_heavy_bitmap_fragment_conflict(fixture, manifest)
 
 
@@ -1238,7 +1276,7 @@ async def test_v4_heavy_relation_intersection_avoids_full_fanout(
         taxonomy_work.pages,
         taxonomy_work.bytes,
         taxonomy_work.batches,
-    ) == (fixture.owner.member_count, 1, fixture.manifest.member_page_bytes, 1)
+    ) == (1, 1, fixture.manifest.member_page_bytes, 1)
     await _assert_heavy_intersection_member_limit()
 
 

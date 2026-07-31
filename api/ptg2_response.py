@@ -21,23 +21,28 @@ class _ExactNumericText(str):
     """Canonical numeric text awaiting final JSON response shaping."""
 
 
-PTG2_ITEM_SOURCE_FIELDS = {
+PTG2_ITEM_SOURCE_SUMMARY_FIELDS = {
+    "snapshot_id",
+    "source_artifact_key",
+    "source_key",
+    "source_type",
+    "network_names",
+}
+PTG2_ITEM_SOURCE_DETAIL_FIELDS = {
     "identity_kind",
     "identity_sha256",
     "logical_hash_deferred",
     "logical_json_sha256",
-    "snapshot_id",
-    "source_artifact_key",
-    "source_key",
     "source_trace_set_hash",
-    "source_type",
     "source_trace",
     "raw_container_sha256",
-    "network_names",
     "billing_code_type_version",
     "source_procedure_name",
     "source_procedure_description",
 }
+PTG2_ITEM_SOURCE_FIELDS = (
+    PTG2_ITEM_SOURCE_SUMMARY_FIELDS | PTG2_ITEM_SOURCE_DETAIL_FIELDS
+)
 PTG2_ITEM_DIAGNOSTIC_FIELDS = {
     "billing_code",
     "billing_code_type",
@@ -122,8 +127,9 @@ def _shape_ptg2_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[
 
     include_sources = _include_ptg2_sources(args)
     hidden_item_fields = set(PTG2_ITEM_DIAGNOSTIC_FIELDS)
+    hidden_item_fields.update(PTG2_ITEM_SOURCE_DETAIL_FIELDS)
     if not include_sources:
-        hidden_item_fields.update(PTG2_ITEM_SOURCE_FIELDS)
+        hidden_item_fields.update(PTG2_ITEM_SOURCE_SUMMARY_FIELDS)
     hidden_query_fields = set(PTG2_QUERY_DIAGNOSTIC_FIELDS)
     if not include_sources:
         hidden_query_fields.update(PTG2_QUERY_SOURCE_FIELDS)

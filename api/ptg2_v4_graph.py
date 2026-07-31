@@ -1984,22 +1984,125 @@ async def _lookup_v4_heavy_member_intersections(
     heavy_owners: Mapping[int, V4HeavyOwner],
     allowed_member_keys: tuple[int, ...],
 ) -> dict[int, tuple[int, ...]]:
-    """Return selected bitmap members without expanding heavy-owner fanout."""
+    """Probe only the authenticated bitmap fragments containing allowed keys."""
 
-    payloads_by_owner = await _load_v4_heavy_bitmap_payloads(
-        session,
-        snapshot_key=snapshot_key,
-        schema_name=schema_name,
-        relation_manifest=relation_manifest,
-        heavy_owners=heavy_owners,
+    if not heavy_owners:
+        return {}
+    if not allowed_member_keys:
+        return {owner_key: () for owner_key in heavy_owners}
+
+    fragment_content_bytes = (
+        int(relation_manifest.member_page_bytes)
+        - PTG2_V4_HEAVY_BITMAP_FRAGMENT_HEADER_BYTES
     )
-    return {
-        owner_key: _intersect_heavy_bitmap(
-            payloads_by_owner[owner_key],
-            heavy_owner=owner,
-            allowed_member_keys=allowed_member_keys,
+    if fragment_content_bytes <= PTG2_V4_HEAVY_BITMAP_HEADER_BYTES:
+        raise PTG2SharedBlockError(
+            "PTG V4 heavy bitmap page cannot contain its logical header"
         )
-        for owner_key, owner in heavy_owners.items()
+
+    allowed_keys_by_owner_fragment: dict[
+        tuple[int, int], tuple[int, ...]
+    ] = {}
+    selected_member_count = 0
+    for owner_key, owner in heavy_owners.items():
+        member_limit = owner.member_base + owner.member_span
+        keys_by_fragment: dict[int, list[int]] = {}
+        for member_key in allowed_member_keys:
+            if member_key < owner.member_base:
+                continue
+            if member_key >= member_limit:
+                break
+            logical_byte_offset = (
+                PTG2_V4_HEAVY_BITMAP_HEADER_BYTES
+                + (member_key - owner.member_base) // 8
+            )
+            fragment_no = logical_byte_offset // fragment_content_bytes
+            if fragment_no >= owner.fragment_count:
+                raise PTG2SharedBlockError(
+                    "PTG V4 heavy bitmap member falls outside its fragments"
+                )
+            keys_by_fragment.setdefault(fragment_no, []).append(member_key)
+            selected_member_count += 1
+        for fragment_no, member_keys in keys_by_fragment.items():
+            allowed_keys_by_owner_fragment[(owner_key, fragment_no)] = tuple(
+                member_keys
+            )
+
+    object_kind = _common_heavy_object_kind(heavy_owners)
+    selected_pairs = tuple(sorted(allowed_keys_by_owner_fragment))
+    if not selected_pairs:
+        return {owner_key: () for owner_key in heavy_owners}
+    coordinates = await _load_map_coordinate_pairs(
+        session,
+        schema_name=schema_name,
+        snapshot_key=int(snapshot_key),
+        object_kind=object_kind,
+        coordinate_pairs=selected_pairs,
+    )
+    selected_page_count = len(coordinates)
+    selected_byte_count = (
+        selected_page_count * relation_manifest.member_page_bytes
+    )
+    _charge_v4_hot_source_work(
+        relation_manifest.relation,
+        owner_count=len(heavy_owners),
+        member_count=selected_member_count,
+        page_count=selected_page_count,
+        byte_count=selected_byte_count,
+    )
+    _charge_v4_hot_npi_work(
+        relation_manifest.relation,
+        member_count=selected_member_count,
+        member_page_count=selected_page_count,
+        byte_count=selected_byte_count,
+    )
+    _charge_v4_taxonomy_projection_work(
+        member_count=selected_member_count,
+        page_count=selected_page_count,
+        byte_count=selected_byte_count,
+    )
+    blocks = await _load_physical_blocks(
+        session,
+        schema_name=schema_name,
+        object_kind=object_kind,
+        coordinates=coordinates.values(),
+        maximum_raw_bytes=relation_manifest.member_page_bytes,
+    )
+
+    matches_by_owner: dict[int, list[int]] = {
+        owner_key: [] for owner_key in heavy_owners
+    }
+    for (owner_key, fragment_no), member_keys in (
+        allowed_keys_by_owner_fragment.items()
+    ):
+        owner = heavy_owners[owner_key]
+        coordinate = coordinates[(owner_key, fragment_no)]
+        logical_offset = fragment_no * fragment_content_bytes
+        logical_fragment = _unframe_heavy_bitmap_fragment(
+            blocks[bytes(coordinate.block_hash)].payload,
+            heavy_owner=owner,
+            fragment_no=fragment_no,
+            entry_count=int(coordinate.entry_count),
+            logical_offset=logical_offset,
+        )
+        for member_key in member_keys:
+            bitmap_byte_offset = (
+                PTG2_V4_HEAVY_BITMAP_HEADER_BYTES
+                + (member_key - owner.member_base) // 8
+            )
+            fragment_byte_offset = bitmap_byte_offset - logical_offset
+            if not 0 <= fragment_byte_offset < len(logical_fragment):
+                raise PTG2SharedBlockError(
+                    "PTG V4 heavy bitmap fragment is shorter than its member span"
+                )
+            if logical_fragment[fragment_byte_offset] & (
+                1 << ((member_key - owner.member_base) % 8)
+            ):
+                matches_by_owner[owner_key].append(member_key)
+    _request_io().bitmap_owner_hits += len(heavy_owners)
+    return {
+        owner_key: tuple(matches_by_owner[owner_key])
+        for owner_key in heavy_owners
     }
 
 
