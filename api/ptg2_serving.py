@@ -11,6 +11,7 @@ import os
 import re
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -361,41 +362,127 @@ def _ptg2_nullish_text_sql(value_sql: str) -> str:
     )
 
 
-def _ptg2_geo_assured_address_sql(alias: str) -> str:
-    """Require auditable address evidence before making a radius claim.
-
-    Registry addresses are direct. Marketplace-directory addresses need two
-    independent issuers for the exact address. CMS Doctors and Clinicians
-    addresses are accepted only when that source also contains an exact NPPES
-    address for the same NPI, which anchors the source-to-provider attribution.
-    """
+def _ptg2_independent_issuer_sql(issuer_array_sql: str) -> str:
+    """Require two distinct, nonblank issuer identities."""
 
     return f"""(
-        ({alias}.address_source_mask & 1) <> 0
-        OR EXISTS (
-            SELECT 1
-              FROM {PTG2_SCHEMA}.mrf_address AS geo_mrf
-             WHERE geo_mrf.npi = {alias}.npi
-               AND geo_mrf.address_key = {alias}.address_key
-               AND CARDINALITY(COALESCE(geo_mrf.source_issuer_names, ARRAY[]::varchar[])) >= 2
+        SELECT COUNT(DISTINCT LOWER(BTRIM(issuer_name)))
+          FROM UNNEST(COALESCE({issuer_array_sql}, ARRAY[]::varchar[])) AS issuer_names(issuer_name)
+         WHERE NULLIF(BTRIM(issuer_name), '') IS NOT NULL
+    ) >= 2"""
+
+
+def _ptg2_nonblank_array_value_sql(array_sql: str) -> str:
+    """Require one nonblank value without trusting raw array cardinality."""
+
+    return f"""EXISTS (
+        SELECT 1
+          FROM UNNEST({array_sql}) AS array_values(array_value)
+         WHERE NULLIF(BTRIM(array_value::text), '') IS NOT NULL
+    )"""
+
+
+def _ptg2_mrf_lineage_complete_sql(alias: str) -> str:
+    """Require one MRF row to carry a truthful version and retrieval time."""
+
+    return f"""(
+        (
+            {_ptg2_nonblank_array_value_sql(f'{alias}.source_import_ids')}
+            OR {alias}.date_added IS NOT NULL
         )
-        OR (
-            ({alias}.address_source_mask & 4) <> 0
-            AND EXISTS (
-                SELECT 1
-                  FROM {PTG2_SCHEMA}.entity_address_unified AS geo_doctor_anchor
-                 WHERE geo_doctor_anchor.npi = {alias}.npi
-                   AND (geo_doctor_anchor.address_source_mask & 4) <> 0
-                   AND EXISTS (
-                       SELECT 1
-                         FROM {PTG2_SCHEMA}.entity_address_unified AS geo_nppes_anchor
-                        WHERE geo_nppes_anchor.npi = geo_doctor_anchor.npi
-                          AND geo_nppes_anchor.premise_key = geo_doctor_anchor.premise_key
-                          AND (geo_nppes_anchor.address_source_mask & 1) <> 0
-                   )
-            )
+        AND (
+            {_ptg2_nonblank_array_value_sql(f'{alias}.source_import_dates')}
+            OR {alias}.date_added IS NOT NULL
         )
     )"""
+
+
+def _geo_evidence_level_case_sql(
+    *,
+    nppes_condition_sql: str,
+    mrf_condition_sql: str,
+    cms_condition_sql: str,
+) -> str:
+    """Classify one admitted address with stable evidence precedence."""
+
+    return f"""CASE
+        WHEN {nppes_condition_sql} THEN 'nppes_registry_address'
+        WHEN {mrf_condition_sql} THEN 'multi_issuer_marketplace_address'
+        WHEN {cms_condition_sql} THEN 'cms_doctors_source_with_nppes_identity_anchor'
+        ELSE NULL::varchar
+    END"""
+
+
+def _ptg2_geo_evidence_level_sql(alias: str) -> str:
+    """Return the record-level evidence class for one selected address."""
+
+    nppes_condition_sql = f"""(
+        ({alias}.address_source_mask & 1) <> 0
+        AND {alias}.address_key IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+              FROM {PTG2_SCHEMA}.npi_address AS geo_nppes
+             WHERE geo_nppes.npi = {alias}.npi
+               AND geo_nppes.address_key = {alias}.address_key
+               AND geo_nppes.date_added IS NOT NULL
+        )
+    )"""
+    mrf_condition_sql = f"""EXISTS (
+        SELECT 1
+          FROM {PTG2_SCHEMA}.mrf_address AS geo_mrf
+         WHERE geo_mrf.npi = {alias}.npi
+           AND geo_mrf.address_key = {alias}.address_key
+           AND {_ptg2_independent_issuer_sql('geo_mrf.source_issuer_names')}
+           AND {_ptg2_mrf_lineage_complete_sql('geo_mrf')}
+    )"""
+    cms_condition_sql = f"""(
+        ({alias}.address_source_mask & 4) <> 0
+        AND {alias}.address_key IS NOT NULL
+        AND {alias}.premise_key IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+              FROM {PTG2_SCHEMA}.doctor_clinician_address AS geo_doctor
+             WHERE geo_doctor.npi = {alias}.npi
+               AND geo_doctor.address_key = {alias}.address_key
+               AND geo_doctor.updated_at IS NOT NULL
+        )
+        AND EXISTS (
+            SELECT 1
+              FROM {PTG2_SCHEMA}.entity_address_unified AS geo_nppes_anchor
+              JOIN {PTG2_SCHEMA}.npi_address AS geo_nppes_anchor_source
+                ON geo_nppes_anchor_source.npi = geo_nppes_anchor.npi
+               AND geo_nppes_anchor_source.address_key = geo_nppes_anchor.address_key
+               AND geo_nppes_anchor_source.date_added IS NOT NULL
+             WHERE geo_nppes_anchor.npi = {alias}.npi
+               AND geo_nppes_anchor.premise_key = {alias}.premise_key
+               AND (geo_nppes_anchor.address_source_mask & 1) <> 0
+               AND geo_nppes_anchor.type IN (
+                   'primary', 'secondary', 'practice', 'site'
+               )
+        )
+    )"""
+    return _geo_evidence_level_case_sql(
+        nppes_condition_sql=nppes_condition_sql,
+        mrf_condition_sql=mrf_condition_sql,
+        cms_condition_sql=cms_condition_sql,
+    )
+
+
+def _geo_evidence_source_id_sql(evidence_level_sql: str) -> str:
+    """Map one admitted evidence class to its originating source identity."""
+
+    return f"""CASE ({evidence_level_sql})
+        WHEN 'nppes_registry_address' THEN 1
+        WHEN 'multi_issuer_marketplace_address' THEN 2
+        WHEN 'cms_doctors_source_with_nppes_identity_anchor' THEN 3
+        ELSE 0
+    END::smallint"""
+
+
+def _ptg2_geo_assured_address_sql(alias: str) -> str:
+    """Require the same record-level evidence class returned to callers."""
+
+    return f"({_ptg2_geo_evidence_level_sql(alias)}) IS NOT NULL"
 
 
 def _ptg2_provider_name_sql(alias: str = "n") -> str:
@@ -9098,7 +9185,8 @@ WITH matched AS MATERIALIZED (
             PARTITION BY addr.npi
             ORDER BY {distance_sql} ASC NULLS LAST,
                      CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-                     addr.checksum
+                     addr.checksum,
+                     {location_tiebreak_sql}
         ) AS address_rank
     FROM {address_table} addr
     JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
@@ -9119,6 +9207,7 @@ WITH located AS MATERIALIZED (
         addr.location_key,
         addr.npi,
         addr.address_key,
+        addr.premise_key,
         addr.address_source_mask,
         {distance_sql} AS distance_miles,
         addr.type,
@@ -9126,11 +9215,33 @@ WITH located AS MATERIALIZED (
     FROM {address_table} addr
     JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
     WHERE {filter_sql}
+), nppes_requested AS MATERIALIZED (
+    SELECT DISTINCT located.npi, located.address_key
+    FROM located
+    WHERE (located.address_source_mask & 1) <> 0
+      AND located.address_key IS NOT NULL
+), nppes_assured AS MATERIALIZED (
+    SELECT requested.npi, requested.address_key
+    FROM nppes_requested requested
+    CROSS JOIN LATERAL (
+        SELECT 1
+        FROM {ptg2_schema}.npi_address nppes
+        WHERE nppes.npi = requested.npi
+          AND nppes.address_key = requested.address_key
+          AND nppes.date_added IS NOT NULL
+        LIMIT 1
+    ) complete_nppes
 ), mrf_requested AS MATERIALIZED (
     SELECT DISTINCT located.npi, located.address_key
     FROM located
+    LEFT JOIN nppes_assured nppes
+      ON nppes.npi = located.npi
+     AND nppes.address_key = located.address_key
     WHERE located.address_key IS NOT NULL
-      AND (located.address_source_mask & 1) = 0
+      AND (
+          (located.address_source_mask & 1) = 0
+          OR nppes.npi IS NULL
+      )
 ), mrf_assured AS MATERIALIZED (
     SELECT requested.npi, requested.address_key
     FROM mrf_requested requested
@@ -9139,71 +9250,80 @@ WITH located AS MATERIALIZED (
         FROM {ptg2_schema}.mrf_address mrf
         WHERE mrf.npi = requested.npi
           AND mrf.address_key = requested.address_key
-          AND CARDINALITY(
-                  COALESCE(mrf.source_issuer_names, ARRAY[]::varchar[])
-              ) >= 2
+          AND {mrf_issuer_assurance_sql}
+          AND {mrf_lineage_complete_sql}
         LIMIT 1
     ) assured
 ), cms_requested AS MATERIALIZED (
-    SELECT DISTINCT located.npi
+    SELECT DISTINCT located.npi, located.address_key, located.premise_key
     FROM located
-    WHERE (located.address_source_mask & 4) <> 0
-      AND (located.address_source_mask & 1) = 0
-), cms_doctor_rows AS MATERIALIZED (
-    SELECT requested.npi, doctor.premise_key
-    FROM cms_requested requested
-    CROSS JOIN LATERAL (
-        SELECT candidate.premise_key
-        FROM {ptg2_schema}.entity_address_unified candidate
-        WHERE candidate.npi = requested.npi
-          AND (candidate.address_source_mask & 4) <> 0
-        OFFSET 0
-    ) doctor
-), cms_nppes_rows AS MATERIALIZED (
-    SELECT requested.npi, nppes.premise_key
-    FROM cms_requested requested
-    CROSS JOIN LATERAL (
-        SELECT candidate.premise_key
-        FROM {ptg2_schema}.entity_address_unified candidate
-        WHERE candidate.npi = requested.npi
-          AND (candidate.address_source_mask & 1) <> 0
-        OFFSET 0
-    ) nppes
-), cms_anchored_npis AS MATERIALIZED (
-    SELECT DISTINCT doctor.npi
-    FROM cms_doctor_rows doctor
-    JOIN cms_nppes_rows nppes
-      ON nppes.npi = doctor.npi
-     AND nppes.premise_key = doctor.premise_key
-), assured_location_keys AS MATERIALIZED (
-    SELECT located.location_key
-    FROM located
-    WHERE (located.address_source_mask & 1) <> 0
-    UNION
-    SELECT located.location_key
-    FROM located
-    JOIN mrf_assured mrf
+    LEFT JOIN nppes_assured nppes
+      ON nppes.npi = located.npi
+     AND nppes.address_key = located.address_key
+    LEFT JOIN mrf_assured mrf
       ON mrf.npi = located.npi
      AND mrf.address_key = located.address_key
-    UNION
-    SELECT located.location_key
-    FROM located
-    JOIN cms_anchored_npis cms ON cms.npi = located.npi
     WHERE (located.address_source_mask & 4) <> 0
+      AND located.address_key IS NOT NULL
+      AND located.premise_key IS NOT NULL
+      AND (
+          (located.address_source_mask & 1) = 0
+          OR nppes.npi IS NULL
+      )
+      AND mrf.npi IS NULL
+), cms_assured AS MATERIALIZED (
+    SELECT requested.npi, requested.address_key, requested.premise_key
+    FROM cms_requested requested
+    CROSS JOIN LATERAL (
+        SELECT 1
+        FROM {ptg2_schema}.entity_address_unified candidate
+        JOIN {ptg2_schema}.npi_address anchor_source
+          ON anchor_source.npi = candidate.npi
+         AND anchor_source.address_key = candidate.address_key
+         AND anchor_source.date_added IS NOT NULL
+        WHERE candidate.npi = requested.npi
+          AND candidate.premise_key = requested.premise_key
+          AND (candidate.address_source_mask & 1) <> 0
+          AND candidate.type IN ('primary', 'secondary', 'practice', 'site')
+          AND EXISTS (
+              SELECT 1
+              FROM {ptg2_schema}.doctor_clinician_address doctor
+              WHERE doctor.npi = requested.npi
+                AND doctor.address_key = requested.address_key
+                AND doctor.updated_at IS NOT NULL
+          )
+        LIMIT 1
+    ) nppes
+), classified_locations AS MATERIALIZED (
+    SELECT
+        located.*,
+        {assured_geo_evidence_level_sql} AS geo_evidence_level
+    FROM located
+    LEFT JOIN nppes_assured nppes
+      ON nppes.npi = located.npi
+     AND nppes.address_key = located.address_key
+    LEFT JOIN mrf_assured mrf
+      ON mrf.npi = located.npi
+     AND mrf.address_key = located.address_key
+    LEFT JOIN cms_assured cms
+      ON cms.npi = located.npi
+     AND cms.address_key = located.address_key
+     AND cms.premise_key = located.premise_key
 ), ranked AS MATERIALIZED (
     SELECT
-        located.location_key,
-        located.npi,
-        located.distance_miles,
+        classified.location_key,
+        classified.npi,
+        classified.distance_miles,
+        classified.geo_evidence_level,
         ROW_NUMBER() OVER (
-            PARTITION BY located.npi
-            ORDER BY located.distance_miles ASC NULLS LAST,
-                     CASE located.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-                     located.checksum
+            PARTITION BY classified.npi
+            ORDER BY classified.distance_miles ASC NULLS LAST,
+                     CASE classified.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
+                     classified.checksum,
+                     classified.location_key
         ) AS address_rank
-    FROM located
-    JOIN assured_location_keys assured
-      ON assured.location_key = located.location_key
+    FROM classified_locations AS classified
+    WHERE classified.geo_evidence_level IS NOT NULL
 ), selected AS MATERIALIZED (
     SELECT *
     FROM ranked
@@ -9226,6 +9346,8 @@ SELECT
     addr.phone_extension,
     addr.fax_number_digits,
     addr.fax_extension,
+    selected.geo_evidence_level AS _geo_evidence_level,
+    {selected_geo_evidence_source_id_sql} AS _geo_evidence_source_id,
     jsonb_build_object(
         'first_line', addr.first_line,
         'second_line', addr.second_line,
@@ -9279,6 +9401,7 @@ WITH nearest_addresses AS MATERIALIZED (
         addr.second_line,
         addr.country_code,
         addr.address_key,
+        addr.premise_key,
         {location_key_sql} AS location_key,
         {address_sources_sql} AS address_sources,
         {source_record_ids_sql} AS source_record_ids,
@@ -9287,6 +9410,7 @@ WITH nearest_addresses AS MATERIALIZED (
         {source_mask_sql} AS source_mask,
         {address_source_mask_sql} AS address_source_mask,
         {location_confidence_sql} AS location_confidence_id,
+        {geo_evidence_level_sql} AS geo_evidence_level,
         {distance_sql} AS candidate_distance_miles
     FROM {address_table} addr
     JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
@@ -9294,7 +9418,8 @@ WITH nearest_addresses AS MATERIALIZED (
     ORDER BY {knn_order_sql},
              addr.npi,
              CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-             addr.checksum
+             addr.checksum,
+             addr.location_key
     LIMIT :raw_probe_limit
 ), probe_stats AS MATERIALIZED (
     SELECT COUNT(*)::bigint AS raw_probe_count
@@ -9315,6 +9440,8 @@ WITH nearest_addresses AS MATERIALIZED (
         addr.phone_extension,
         addr.fax_number_digits,
         addr.fax_extension,
+        addr.geo_evidence_level AS _geo_evidence_level,
+        {knn_geo_evidence_source_id_sql} AS _geo_evidence_source_id,
         jsonb_build_object(
             'first_line', addr.first_line,
             'second_line', addr.second_line,
@@ -9344,10 +9471,11 @@ WITH nearest_addresses AS MATERIALIZED (
             PARTITION BY addr.npi
             ORDER BY addr.candidate_distance_miles ASC NULLS LAST,
                      CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-                     addr.checksum
+                     addr.checksum,
+                     addr.location_key
         ) AS address_rank
     FROM nearest_addresses addr
-    WHERE {address_assurance_sql}
+    WHERE addr.geo_evidence_level IS NOT NULL
 )
 SELECT selected.*,
        (probe_stats.raw_probe_count < :raw_probe_limit) AS _ptg_source_exhausted,
@@ -9663,30 +9791,79 @@ _ADDRESS_DATASET_ID_BY_SOURCE_ID = {
 }
 
 
-def _geo_address_evidence_level(
-    address_sources: Iterable[Any],
-    *,
-    mrf_issuer_names: Iterable[Any] = (),
-    cms_source_has_nppes_anchor: bool = False,
-) -> str | None:
-    """Classify the evidence that permits an address to support a radius claim."""
+def _coerce_provenance_id_list(value: Any) -> list[str]:
+    """Preserve scalar run/snapshot IDs without JSON numeric coercion."""
 
-    normalized_sources = {
-        str(source or "").strip().lower().replace("-", "_")
-        for source in address_sources
-    }
-    if "nppes" in normalized_sources:
-        return "nppes_registry_address"
-    independent_issuers = {
-        str(issuer or "").strip().casefold()
-        for issuer in mrf_issuer_names
-        if str(issuer or "").strip()
-    }
-    if "mrf" in normalized_sources and len(independent_issuers) >= 2:
-        return "multi_issuer_marketplace_address"
-    if "cms_doctors" in normalized_sources and cms_source_has_nppes_anchor:
-        return "cms_doctors_source_with_nppes_identity_anchor"
-    return None
+    if value in (None, "", []):
+        return []
+    payload: Any = value
+    if isinstance(value, str):
+        stripped_value = value.strip()
+        if not stripped_value:
+            return []
+        decoded_value = _coerce_json_payload(stripped_value, None)
+        payload = decoded_value if isinstance(decoded_value, list) else [stripped_value]
+    elif not isinstance(value, (list, tuple, set)):
+        payload = [value]
+    values: list[str] = []
+    for item in payload:
+        item_text = str(item or "").strip()
+        if item_text and item_text not in values:
+            values.append(item_text)
+    return values
+
+
+def _provenance_run_retrieved_at(value: Any) -> str | None:
+    """Convert only an unambiguous date-like import run ID to retrieval time."""
+
+    run_id = str(value or "").strip()
+    if not run_id:
+        return None
+    try:
+        if re.fullmatch(r"\d{8}", run_id):
+            return date(int(run_id[0:4]), int(run_id[4:6]), int(run_id[6:8])).isoformat()
+        normalized_run_id = run_id[:-1] + "+00:00" if run_id.endswith("Z") else run_id
+        if "T" in normalized_run_id or " " in normalized_run_id:
+            return datetime.fromisoformat(normalized_run_id).isoformat()
+        return date.fromisoformat(normalized_run_id).isoformat()
+    except ValueError:
+        return None
+
+
+def _valid_compact_run_date_sql(value_sql: str) -> str:
+    """Validate a compact YYYYMMDD run ID without raising in PostgreSQL."""
+
+    run_id_sql = f"NULLIF(BTRIM({value_sql}), '')"
+    year_sql = f"SUBSTRING({run_id_sql} FROM 1 FOR 4)::int"
+    month_sql = f"SUBSTRING({run_id_sql} FROM 5 FOR 2)::int"
+    day_sql = f"SUBSTRING({run_id_sql} FROM 7 FOR 2)::int"
+    days_in_month_sql = (
+        "CASE "
+        f"WHEN {month_sql} = 2 THEN CASE "
+        f"WHEN ({year_sql} % 400 = 0 OR ({year_sql} % 4 = 0 AND {year_sql} % 100 <> 0)) "
+        "THEN 29 ELSE 28 END "
+        f"WHEN {month_sql} IN (4, 6, 9, 11) THEN 30 "
+        "ELSE 31 END"
+    )
+    return (
+        "(CASE "
+        f"WHEN {run_id_sql} ~ '^[0-9]{{8}}$' THEN "
+        f"{year_sql} BETWEEN 1 AND 9999 "
+        f"AND {month_sql} BETWEEN 1 AND 12 "
+        f"AND {day_sql} BETWEEN 1 AND ({days_in_month_sql}) "
+        "ELSE FALSE END)"
+    )
+
+
+def _ptg2_provenance_retrieval_time_sql(alias: str) -> str:
+    """Return one sortable retrieval time for a stored provenance tuple."""
+
+    run_id_sql = f"{alias}.source_run_id"
+    return (
+        f"COALESCE({alias}.last_seen_at, {alias}.observed_at, "
+        f"CASE WHEN {_valid_compact_run_date_sql(run_id_sql)} "
+        f"THEN TO_TIMESTAMP(BTRIM({run_id_sql}), 'YYYYMMDD') END)"
+    )
 
 
 def _isoformat_provenance_value(value: Any) -> str | None:
@@ -9698,15 +9875,17 @@ def _isoformat_provenance_value(value: Any) -> str | None:
 
 def _address_provenance_entry(row_by_field: Mapping[str, Any]) -> dict[str, Any]:
     source_id = int(row_by_field.get("source_id") or 0)
-    version_ids = _coerce_str_list_payload(row_by_field.get("source_import_ids"))
+    version_ids = _coerce_provenance_id_list(row_by_field.get("source_import_ids"))
     if not version_ids:
-        version_ids = _coerce_str_list_payload(
-            _first_payload_value(
-                row_by_field.get("source_snapshot_id"),
-                row_by_field.get("source_run_id"),
-            )
-        )
-    retrieval_values = list(row_by_field.get("source_import_dates") or [])
+        version_ids = _coerce_provenance_id_list(row_by_field.get("source_snapshot_id"))
+    if not version_ids:
+        version_ids = _coerce_provenance_id_list(row_by_field.get("source_run_id"))
+    source_import_dates = row_by_field.get("source_import_dates")
+    retrieval_values = (
+        list(source_import_dates)
+        if isinstance(source_import_dates, (list, tuple, set))
+        else ([source_import_dates] if source_import_dates not in (None, "") else [])
+    )
     if not retrieval_values:
         retrieval_values = [
             _first_payload_value(
@@ -9716,6 +9895,8 @@ def _address_provenance_entry(row_by_field: Mapping[str, Any]) -> dict[str, Any]
                 row_by_field.get("observed_at"),
             )
         ]
+    if not any(retrieval_value not in (None, "") for retrieval_value in retrieval_values):
+        retrieval_values = [_provenance_run_retrieved_at(row_by_field.get("source_run_id"))]
     retrieval_timestamps = sorted(
         {
             timestamp
@@ -9747,11 +9928,40 @@ def _address_provenance_entry(row_by_field: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
+def _is_complete_address_provenance_entry(entry: Mapping[str, Any]) -> bool:
+    """Return whether one public entry proves an originating source tuple."""
+
+    return _coerce_int_payload(entry.get("source_id")) not in (None, 0) and all(
+        entry.get(field_name) not in (None, "", [])
+        for field_name in (
+            "dataset_id",
+            "source_record_id",
+            "record_version_id",
+            "retrieved_at",
+        )
+    )
+
+
 _ADDRESS_PROVENANCE_SQL = f"""
-WITH requested(location_key) AS (
-    SELECT UNNEST(CAST(:location_keys AS varchar[]))
-), evidence AS (
-    SELECT stored.location_key,
+WITH requested(location_key, admitted_source_id) AS (
+    SELECT *
+      FROM UNNEST(
+          CAST(:location_keys AS varchar[]),
+          CAST(:admitted_source_ids AS smallint[])
+      )
+), selected_unified AS MATERIALIZED (
+    SELECT unified.location_key,
+           unified.address_key,
+           unified.premise_key,
+           unified.npi,
+           unified.address_sources,
+           requested.admitted_source_id
+      FROM requested
+      JOIN {PTG2_SCHEMA}.entity_address_unified AS unified
+        ON unified.location_key = requested.location_key
+), stored_evidence AS MATERIALIZED (
+    SELECT stored.evidence_id,
+           stored.location_key,
            stored.address_key,
            stored.premise_key,
            stored.npi,
@@ -9760,149 +9970,265 @@ WITH requested(location_key) AS (
            stored.source_run_id,
            stored.source_snapshot_id,
            stored.observed_at,
-           stored.last_seen_at
+           stored.last_seen_at,
+           stored.retired_at
       FROM requested
       JOIN {PTG2_SCHEMA}.entity_address_evidence AS stored
         ON stored.location_key = requested.location_key
-    UNION ALL
+     WHERE stored.retired_at IS NULL
+), source_members AS MATERIALIZED (
     SELECT unified.location_key,
            unified.address_key,
            unified.premise_key,
            unified.npi,
-           CASE source_name
-               WHEN 'nppes' THEN 1
-               WHEN 'mrf' THEN 2
-               WHEN 'cms_doctors' THEN 3
-               WHEN 'provider_enrollment_ffs' THEN 4
-               WHEN 'provider_enrollment_ffs_address' THEN 5
-               WHEN 'ptg' THEN 7
-               WHEN 'provider_directory_fhir' THEN 8
+           unified.admitted_source_id,
+           sources.source_name,
+           CASE
+               WHEN sources.source_name = 'nppes' THEN 1
+               WHEN sources.source_name = 'mrf' THEN 2
+               WHEN sources.source_name = 'cms_doctors' THEN 3
+               WHEN sources.source_name = 'provider_enrollment_ffs' THEN 4
+               WHEN sources.source_name = 'provider_enrollment_ffs_address' THEN 5
+               WHEN STARTS_WITH(sources.source_name, 'facility_anchor:') THEN 6
+               WHEN sources.source_name = 'ptg' THEN 7
+               WHEN sources.source_name = 'provider_directory_fhir' THEN 8
                ELSE 0
            END::smallint AS source_id,
-           COALESCE(
-               (
-                   SELECT source_record_id
-                     FROM UNNEST(
-                         COALESCE(unified.source_record_ids, ARRAY[]::varchar[])
-                     ) AS source_records(source_record_id)
-                    WHERE source_name <> 'provider_directory_fhir'
-                       OR source_record_id LIKE 'provider_directory_fhir:%'
-                    ORDER BY source_record_id
-                    LIMIT 1
-               ),
-               CONCAT(source_name, ':', unified.location_key)
-           ) AS source_record_key,
-           COALESCE(
-               unified.last_seen_at::text,
-               unified.updated_at::text,
-               unified.location_key
-           ) AS source_run_id,
+           CASE
+               WHEN STARTS_WITH(sources.source_name, 'facility_anchor:')
+                   THEN 'facility_anchor:'
+               ELSE sources.source_name || ':'
+           END::varchar AS source_record_prefix
+      FROM selected_unified AS unified
+     CROSS JOIN LATERAL (
+         SELECT LOWER(BTRIM(listed.source_name)) AS source_name
+           FROM UNNEST(COALESCE(unified.address_sources, ARRAY[]::varchar[]))
+                AS listed(source_name)
+         UNION
+         SELECT CASE unified.admitted_source_id
+                    WHEN 1 THEN 'nppes'
+                    WHEN 2 THEN 'mrf'
+                    WHEN 3 THEN 'cms_doctors'
+                END::varchar
+          WHERE unified.admitted_source_id IN (1, 2, 3)
+     ) AS sources
+     WHERE NULLIF(BTRIM(sources.source_name), '') IS NOT NULL
+), stored_specific AS MATERIALIZED (
+    SELECT DISTINCT ON (stored.location_key, stored.source_id) stored.*
+      FROM source_members AS source
+      JOIN stored_evidence AS stored
+        ON stored.location_key = source.location_key
+       AND stored.source_id = source.source_id
+     WHERE stored.source_id <> 0
+       AND NULLIF(BTRIM(stored.source_record_key), '') IS NOT NULL
+       AND STARTS_WITH(stored.source_record_key, source.source_record_prefix)
+       AND (
+           NULLIF(BTRIM(stored.source_snapshot_id), '') IS NOT NULL
+           OR NULLIF(BTRIM(stored.source_run_id), '') IS NOT NULL
+       )
+       AND (
+           stored.last_seen_at IS NOT NULL
+           OR stored.observed_at IS NOT NULL
+           OR {_valid_compact_run_date_sql('stored.source_run_id')}
+       )
+     ORDER BY stored.location_key,
+           stored.source_id,
+           {_ptg2_provenance_retrieval_time_sql('stored')} DESC,
+           stored.evidence_id DESC
+), live_mrf AS MATERIALIZED (
+    SELECT source.location_key,
+           2::smallint AS source_id,
+           CONCAT(
+               'mrf:', mrf.npi::varchar, ':', COALESCE(mrf.type, ''), ':',
+               COALESCE(mrf.checksum::varchar, '0')
+           )::varchar AS source_record_key,
+           mrf.date_added::text AS source_run_id,
            NULL::varchar AS source_snapshot_id,
-           COALESCE(unified.updated_at, unified.last_seen_at)::timestamptz
-               AS observed_at,
-           COALESCE(unified.last_seen_at, unified.updated_at)::timestamptz
-               AS last_seen_at
-      FROM requested
-      JOIN {PTG2_SCHEMA}.entity_address_unified AS unified
-        ON unified.location_key = requested.location_key
-     CROSS JOIN LATERAL UNNEST(
-         COALESCE(unified.address_sources, ARRAY[]::varchar[])
-     ) AS sources(source_name)
-     WHERE NOT EXISTS (
-         SELECT 1
-           FROM {PTG2_SCHEMA}.entity_address_evidence AS stored
-          WHERE stored.location_key = requested.location_key
-     )
+           mrf.date_added::timestamptz AS observed_at,
+           mrf.date_added::timestamptz AS last_seen_at,
+           mrf.source_import_ids,
+           CASE
+               WHEN {_ptg2_nonblank_array_value_sql('mrf.source_import_dates')}
+               THEN ARRAY(
+                   SELECT source_import_date::text
+                     FROM UNNEST(mrf.source_import_dates)
+                          AS import_dates(source_import_date)
+               )::varchar[]
+               ELSE ARRAY[mrf.date_added::text]::varchar[]
+           END AS source_import_dates,
+           mrf.source_issuer_names,
+           mrf.source_urls,
+           NULL::varchar AS nppes_date_added,
+           NULL::varchar AS doctor_updated_at,
+           0::smallint AS candidate_priority
+      FROM source_members AS source
+     CROSS JOIN LATERAL (
+         SELECT candidate.*
+           FROM {PTG2_SCHEMA}.mrf_address AS candidate
+          WHERE source.source_id = 2
+            AND candidate.npi = source.npi
+            AND candidate.address_key = source.address_key
+            AND (
+                source.admitted_source_id <> 2
+                OR {_ptg2_independent_issuer_sql('candidate.source_issuer_names')}
+            )
+            AND {_ptg2_mrf_lineage_complete_sql('candidate')}
+          ORDER BY
+                ({_ptg2_independent_issuer_sql('candidate.source_issuer_names')}) DESC,
+                candidate.date_added DESC NULLS LAST,
+                candidate.checksum
+          LIMIT 1
+     ) AS mrf
+), live_nppes AS MATERIALIZED (
+    SELECT source.location_key,
+           1::smallint AS source_id,
+           CONCAT(
+               'nppes:', nppes.npi::varchar, ':', COALESCE(nppes.type, ''), ':',
+               COALESCE(nppes.checksum::varchar, '0')
+           )::varchar AS source_record_key,
+           nppes.date_added::text AS source_run_id,
+           NULL::varchar AS source_snapshot_id,
+           nppes.date_added::timestamptz AS observed_at,
+           nppes.date_added::timestamptz AS last_seen_at,
+           NULL::varchar[] AS source_import_ids,
+           NULL::varchar[] AS source_import_dates,
+           NULL::varchar[] AS source_issuer_names,
+           NULL::varchar[] AS source_urls,
+           nppes.date_added::text AS nppes_date_added,
+           NULL::varchar AS doctor_updated_at,
+           0::smallint AS candidate_priority
+      FROM source_members AS source
+     CROSS JOIN LATERAL (
+         SELECT candidate.*
+           FROM {PTG2_SCHEMA}.npi_address AS candidate
+          WHERE source.source_id = 1
+            AND candidate.npi = source.npi
+            AND candidate.address_key = source.address_key
+            AND candidate.date_added IS NOT NULL
+          ORDER BY candidate.date_added DESC, candidate.checksum
+          LIMIT 1
+     ) AS nppes
+), live_cms_doctors AS MATERIALIZED (
+    SELECT source.location_key,
+           3::smallint AS source_id,
+           CONCAT(
+               'cms_doctors:', doctor.npi::varchar, ':',
+               COALESCE(doctor.address_checksum::varchar, '0')
+           )::varchar AS source_record_key,
+           doctor.updated_at::text AS source_run_id,
+           NULL::varchar AS source_snapshot_id,
+           doctor.updated_at::timestamptz AS observed_at,
+           doctor.updated_at::timestamptz AS last_seen_at,
+           NULL::varchar[] AS source_import_ids,
+           NULL::varchar[] AS source_import_dates,
+           NULL::varchar[] AS source_issuer_names,
+           NULL::varchar[] AS source_urls,
+           NULL::varchar AS nppes_date_added,
+           doctor.updated_at::text AS doctor_updated_at,
+           0::smallint AS candidate_priority
+      FROM source_members AS source
+     CROSS JOIN LATERAL (
+         SELECT candidate.*
+           FROM {PTG2_SCHEMA}.doctor_clinician_address AS candidate
+          WHERE source.source_id = 3
+            AND candidate.npi = source.npi
+            AND candidate.address_key = source.address_key
+            AND candidate.updated_at IS NOT NULL
+          ORDER BY candidate.updated_at DESC, candidate.address_checksum
+          LIMIT 1
+     ) AS doctor
+), specific_candidates AS MATERIALIZED (
+    SELECT * FROM live_mrf
+    UNION ALL
+    SELECT * FROM live_nppes
+    UNION ALL
+    SELECT * FROM live_cms_doctors
+    UNION ALL
+    SELECT stored.location_key,
+           stored.source_id,
+           stored.source_record_key,
+           stored.source_run_id,
+           stored.source_snapshot_id,
+           stored.observed_at,
+           stored.last_seen_at,
+           NULL::varchar[] AS source_import_ids,
+           NULL::varchar[] AS source_import_dates,
+           NULL::varchar[] AS source_issuer_names,
+           NULL::varchar[] AS source_urls,
+           NULL::varchar AS nppes_date_added,
+           NULL::varchar AS doctor_updated_at,
+           1::smallint AS candidate_priority
+      FROM stored_specific AS stored
+), specific_evidence AS MATERIALIZED (
+    SELECT DISTINCT ON (candidate.location_key, candidate.source_id)
+           candidate.location_key,
+           candidate.source_id,
+           candidate.source_record_key,
+           candidate.source_run_id,
+           candidate.source_snapshot_id,
+           candidate.observed_at,
+           candidate.last_seen_at,
+           candidate.source_import_ids,
+           candidate.source_import_dates,
+           candidate.source_issuer_names,
+           candidate.source_urls,
+           candidate.nppes_date_added,
+           candidate.doctor_updated_at
+      FROM specific_candidates AS candidate
+     WHERE NULLIF(BTRIM(candidate.source_record_key), '') IS NOT NULL
+       AND (
+           {_ptg2_nonblank_array_value_sql('candidate.source_import_ids')}
+           OR NULLIF(BTRIM(candidate.source_snapshot_id), '') IS NOT NULL
+           OR NULLIF(BTRIM(candidate.source_run_id), '') IS NOT NULL
+       )
+       AND (
+           {_ptg2_nonblank_array_value_sql('candidate.source_import_dates')}
+           OR candidate.nppes_date_added IS NOT NULL
+           OR candidate.doctor_updated_at IS NOT NULL
+           OR candidate.last_seen_at IS NOT NULL
+           OR candidate.observed_at IS NOT NULL
+           OR {_valid_compact_run_date_sql('candidate.source_run_id')}
+       )
+     ORDER BY candidate.location_key,
+           candidate.source_id,
+           candidate.candidate_priority,
+           {_ptg2_provenance_retrieval_time_sql('candidate')} DESC NULLS LAST,
+           candidate.source_record_key
 )
-SELECT
-    evidence.location_key,
-    evidence.source_id,
-    evidence.source_record_key,
-    evidence.source_run_id,
-    evidence.source_snapshot_id,
-    evidence.observed_at,
-    evidence.last_seen_at,
-    mrf_source.source_import_ids,
-    mrf_source.source_import_dates,
-    mrf_source.source_issuer_names,
-    mrf_source.source_urls,
-    nppes_source.date_added AS nppes_date_added,
-    doctor_source.updated_at AS doctor_updated_at,
-    EXISTS (
-        SELECT 1
-          FROM {PTG2_SCHEMA}.entity_address_unified AS doctor_anchor
-         WHERE doctor_anchor.npi = evidence.npi
-           AND (doctor_anchor.address_source_mask & 4) <> 0
-           AND EXISTS (
-               SELECT 1
-                 FROM {PTG2_SCHEMA}.entity_address_unified AS nppes_anchor
-                WHERE nppes_anchor.npi = doctor_anchor.npi
-                  AND nppes_anchor.premise_key = doctor_anchor.premise_key
-                  AND (nppes_anchor.address_source_mask & 1) <> 0
-           )
-    ) AS cms_source_has_nppes_anchor
-  FROM evidence
-  LEFT JOIN LATERAL (
-        SELECT mrf.source_import_ids,
-               mrf.source_import_dates,
-               mrf.source_issuer_names,
-               mrf.source_urls
-          FROM {PTG2_SCHEMA}.mrf_address AS mrf
-         WHERE evidence.source_id = 2
-           AND mrf.npi = evidence.npi
-           AND mrf.address_key = evidence.address_key
-         ORDER BY mrf.date_added DESC NULLS LAST, mrf.checksum
-         LIMIT 1
-  ) AS mrf_source ON TRUE
-  LEFT JOIN LATERAL (
-        SELECT nppes.date_added
-          FROM {PTG2_SCHEMA}.npi_address AS nppes
-         WHERE evidence.source_id = 1
-           AND nppes.npi = evidence.npi
-           AND nppes.address_key = evidence.address_key
-         ORDER BY nppes.date_added DESC NULLS LAST, nppes.checksum
-         LIMIT 1
-  ) AS nppes_source ON TRUE
-  LEFT JOIN LATERAL (
-        SELECT doctor.updated_at
-          FROM {PTG2_SCHEMA}.doctor_clinician_address AS doctor
-         WHERE evidence.source_id = 3
-           AND doctor.npi = evidence.npi
-           AND doctor.address_key = evidence.address_key
-         ORDER BY doctor.updated_at DESC NULLS LAST, doctor.address_checksum
-         LIMIT 1
-  ) AS doctor_source ON TRUE
- ORDER BY evidence.location_key, evidence.source_id, evidence.source_record_key
+SELECT *
+  FROM specific_evidence
+ ORDER BY location_key, source_id, source_record_key
 """
 
 
-def _selected_location_keys(
+def _selected_location_requests(
     location_rows: list[dict[str, Any]],
-) -> list[str]:
-    """Collect the canonical locations selected for the current response."""
+) -> list[tuple[str, int]]:
+    """Collect selected locations and the exact source that admitted each one."""
 
-    return sorted(
-        {
-            str(address_payload.get("location_key"))
-            for location_row in location_rows
-            for address_payload in [
-                _coerce_json_payload(location_row.get("address_payload"), {})
-            ]
-            if isinstance(address_payload, dict)
-            and address_payload.get("location_key") not in (None, "")
-        }
-    )
+    admitted_source_by_location_key: dict[str, int] = {}
+    for location_row in location_rows:
+        address_payload = _coerce_json_payload(location_row.get("address_payload"), {})
+        if not isinstance(address_payload, dict):
+            continue
+        location_key = str(address_payload.get("location_key") or "")
+        if not location_key:
+            continue
+        admitted_source_id = _coerce_int_payload(
+            location_row.get("_geo_evidence_source_id")
+        )
+        admitted_source_by_location_key[location_key] = (
+            admitted_source_id if admitted_source_id in {1, 2, 3} else 0
+        )
+    return sorted(admitted_source_by_location_key.items())
 
 
 def _index_address_provenance(
     provenance_rows: Iterable[Any],
-) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
-    """Index source lineage and assurance context by canonical location."""
+) -> dict[str, list[dict[str, Any]]]:
+    """Index source lineage by canonical location."""
 
     provenance_by_location_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    evidence_context_by_location_key: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"issuer_names": set(), "cms_anchor": False}
-    )
     seen_entries: set[tuple[str, int, str]] = set()
     for provenance_row in provenance_rows:
         provenance_by_field = _row_mapping(provenance_row)
@@ -9913,70 +10239,108 @@ def _index_address_provenance(
             str(provenance_by_field.get("source_record_key") or ""),
         )
         if dedupe_key not in seen_entries:
-            provenance_by_location_key[location_key].append(
-                _address_provenance_entry(provenance_by_field)
-            )
-            seen_entries.add(dedupe_key)
-        evidence_context_by_location_key[location_key]["issuer_names"].update(
-            _coerce_str_list_payload(provenance_by_field.get("source_issuer_names"))
-        )
-        evidence_context_by_location_key[location_key]["cms_anchor"] = bool(
-            evidence_context_by_location_key[location_key]["cms_anchor"]
-            or provenance_by_field.get("cms_source_has_nppes_anchor")
-        )
-    return provenance_by_location_key, evidence_context_by_location_key
+            provenance_entry = _address_provenance_entry(provenance_by_field)
+            if _is_complete_address_provenance_entry(provenance_entry):
+                provenance_by_location_key[location_key].append(provenance_entry)
+                seen_entries.add(dedupe_key)
+    return provenance_by_location_key
+
+
+_PTG_UNPROVEN_ADDRESS_MARKER = "_ptg_unproven_address"
+_PTG_LOCATION_CONTACT_FIELDS = (
+    "telephone_number",
+    "fax_number",
+    "phone_number",
+    "phone_extension",
+    "fax_number_digits",
+    "fax_extension",
+)
+
+
+def _redact_unproven_location_address(location_row: dict[str, Any]) -> None:
+    """Keep the provider/rate candidate while suppressing an unproven address."""
+
+    location_row[_PTG_UNPROVEN_ADDRESS_MARKER] = True
+    for field_name in ("state", "city", "zip5", *_PTG_LOCATION_CONTACT_FIELDS):
+        location_row.pop(field_name, None)
+    location_row["address_payload"] = json.dumps({})
 
 
 def _apply_address_provenance(
     location_rows: list[dict[str, Any]],
     provenance_by_location_key: Mapping[str, list[dict[str, Any]]],
-    evidence_context_by_location_key: Mapping[str, Mapping[str, Any]],
+    *,
+    include_response_evidence: bool = True,
 ) -> None:
-    """Attach indexed provenance and assurance labels to response addresses."""
+    """Validate every address and optionally expose its source lineage."""
 
+    retained_location_rows: list[dict[str, Any]] = []
     for location_row in location_rows:
-        address_payload = _coerce_json_payload(
-            location_row.get("address_payload"), {}
+        evidence_level = location_row.pop("_geo_evidence_level", None)
+        admitted_source_id = _coerce_int_payload(
+            location_row.pop("_geo_evidence_source_id", None)
         )
+        address_payload = _coerce_json_payload(location_row.get("address_payload"), {})
         if not isinstance(address_payload, dict):
+            if evidence_level:
+                continue
+            _redact_unproven_location_address(location_row)
+            retained_location_rows.append(location_row)
             continue
+        address_payload.pop("address_provenance", None)
+        address_payload.pop("geo_evidence_level", None)
         location_key = str(address_payload.get("location_key") or "")
-        provenance = provenance_by_location_key.get(location_key, [])
-        if provenance:
-            address_payload["address_provenance"] = provenance
-        evidence_context = evidence_context_by_location_key.get(location_key, {})
-        evidence_level = _geo_address_evidence_level(
-            address_payload.get("address_sources") or [],
-            mrf_issuer_names=evidence_context.get("issuer_names") or (),
-            cms_source_has_nppes_anchor=bool(evidence_context.get("cms_anchor")),
+        provenance_entries = [
+            entry
+            for entry in provenance_by_location_key.get(location_key, [])
+            if _is_complete_address_provenance_entry(entry)
+        ]
+        has_complete_admitted_lineage = any(
+            admitted_source_id in {1, 2, 3}
+            and _coerce_int_payload(entry.get("source_id")) == admitted_source_id
+            and _is_complete_address_provenance_entry(entry)
+            for entry in provenance_entries
         )
-        if evidence_level:
-            address_payload["geo_evidence_level"] = evidence_level
+        if evidence_level and not has_complete_admitted_lineage:
+            continue
+        if not provenance_entries:
+            _redact_unproven_location_address(location_row)
+            retained_location_rows.append(location_row)
+            continue
+        if include_response_evidence:
+            address_payload["address_provenance"] = provenance_entries
+        if evidence_level and include_response_evidence:
+            address_payload["geo_evidence_level"] = str(evidence_level)
         location_row["address_payload"] = json.dumps(address_payload, default=str)
+        retained_location_rows.append(location_row)
+    location_rows[:] = retained_location_rows
 
 
 async def _hydrate_address_provenance(
     session: Any,
     location_rows: list[dict[str, Any]],
+    *,
+    include_response_evidence: bool = True,
 ) -> None:
-    """Attach record-level source lineage to selected unified address rows."""
+    """Validate selected unified addresses with one set-based lineage query."""
 
-    location_keys = _selected_location_keys(location_rows)
-    if not location_keys or not await _is_relation_available(
+    location_requests = _selected_location_requests(location_rows)
+    provenance_by_location_key: Mapping[str, list[dict[str, Any]]] = {}
+    if location_requests and await _is_relation_available(
         session, f"{PTG2_SCHEMA}.entity_address_evidence"
     ):
-        return
-    provenance_result = await session.execute(
-        text(_ADDRESS_PROVENANCE_SQL),
-        {"location_keys": location_keys},
-    )
-    provenance_by_location_key, evidence_context_by_location_key = (
-        _index_address_provenance(provenance_result)
-    )
+        provenance_result = await session.execute(
+            text(_ADDRESS_PROVENANCE_SQL),
+            {
+                "location_keys": [request[0] for request in location_requests],
+                "admitted_source_ids": [request[1] for request in location_requests],
+            },
+        )
+        provenance_by_location_key = _index_address_provenance(provenance_result)
     _apply_address_provenance(
         location_rows,
         provenance_by_location_key,
-        evidence_context_by_location_key,
+        include_response_evidence=include_response_evidence,
     )
 
 
@@ -10004,16 +10368,19 @@ def _membership_provenance_sql(address_table: str) -> dict[str, str]:
     }
 
 
-def _membership_location_sql(
+def _membership_sql_values(
     query_context: _MembershipLocationQuery,
-    *,
-    limit: int,
-    offset: int,
-) -> str:
-    """Render the bounded location SQL for the chosen address source."""
+) -> tuple[dict[str, str], bool]:
+    """Build location-template values and report unified-address use."""
 
     location_hash_sql = _ptg2_address_location_hash_sql(
         "addr", query_context.address_table
+    )
+    uses_unified_addresses = _is_unified_address_table(query_context.address_table)
+    geo_evidence_level_sql = (
+        _ptg2_geo_evidence_level_sql("addr")
+        if uses_unified_addresses and query_context.address_assurance_sql != "TRUE"
+        else "NULL::varchar"
     )
     format_values_by_name = {
         "location_hash_sql": location_hash_sql,
@@ -10026,10 +10393,52 @@ def _membership_location_sql(
         "ptg2_schema": PTG2_SCHEMA,
         "filter_sql": query_context.filter_sql,
         "address_assurance_sql": query_context.address_assurance_sql,
+        "geo_evidence_level_sql": geo_evidence_level_sql,
+        "location_tiebreak_sql": (
+            "addr.location_key"
+            if uses_unified_addresses
+            else (
+                "COALESCE(addr.address_key::text, ''), "
+                "COALESCE(addr.type, '')"
+            )
+        ),
+        "selected_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
+            "selected.geo_evidence_level"
+        ),
+        "knn_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
+            "addr.geo_evidence_level"
+        ),
+        "mrf_issuer_assurance_sql": _ptg2_independent_issuer_sql(
+            "mrf.source_issuer_names"
+        ),
+        "mrf_lineage_complete_sql": _ptg2_mrf_lineage_complete_sql("mrf"),
+        "assured_geo_evidence_level_sql": _geo_evidence_level_case_sql(
+            nppes_condition_sql=(
+                "(located.address_source_mask & 1) <> 0 AND nppes.npi IS NOT NULL"
+            ),
+            mrf_condition_sql="mrf.npi IS NOT NULL",
+            cms_condition_sql=(
+                "(located.address_source_mask & 4) <> 0 AND cms.npi IS NOT NULL"
+            ),
+        ),
     }
+    return format_values_by_name, uses_unified_addresses
+
+
+def _membership_location_sql(
+    query_context: _MembershipLocationQuery,
+    *,
+    limit: int,
+    offset: int,
+) -> str:
+    """Render the bounded location SQL for the chosen address source."""
+
+    format_values_by_name, uses_unified_addresses = _membership_sql_values(
+        query_context
+    )
     if query_context.knn_order_sql is None or offset != 0:
         if (
-            _is_unified_address_table(query_context.address_table)
+            uses_unified_addresses
             and query_context.address_assurance_sql != "TRUE"
         ):
             return _MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL.format(
@@ -10067,6 +10476,60 @@ async def _execute_membership_location_sql(
             await _restore_knn_planning(session, prior_planner_settings)
 
 
+async def _finalize_location_rows(
+    session,
+    query_context: _MembershipLocationQuery,
+    args: dict[str, Any],
+    location_rows: list[dict[str, Any]],
+    *,
+    candidate_npis: tuple[int, ...] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Validate lineage and preserve probe-exhaustion semantics."""
+
+    raw_location_count = len(location_rows)
+    raw_source_exhausted = next(
+        (
+            bool(location_row["_ptg_source_exhausted"])
+            for location_row in location_rows
+            if "_ptg_source_exhausted" in location_row
+        ),
+        None,
+    )
+    uses_unified_addresses = _is_unified_address_table(query_context.address_table)
+    include_response_evidence = (
+        _is_request_flag_enabled(args.get("include_evidence"))
+        or _is_request_flag_enabled(args.get("include_debug"))
+        or _is_request_flag_enabled(args.get("include_details"))
+    )
+    if uses_unified_addresses:
+        await _hydrate_address_provenance(
+            session,
+            location_rows,
+            include_response_evidence=include_response_evidence,
+        )
+    else:
+        for location_row in location_rows:
+            location_row.pop("_geo_evidence_level", None)
+            location_row.pop("_geo_evidence_source_id", None)
+    if candidate_npis is None and raw_location_count > len(location_rows):
+        source_exhausted = (
+            raw_source_exhausted
+            if raw_source_exhausted is not None
+            else raw_location_count < max(int(limit), 1)
+        )
+        if location_rows:
+            location_rows[0]["_ptg_source_exhausted"] = source_exhausted
+        else:
+            location_rows.append(
+                {
+                    "_ptg_probe_empty": True,
+                    "_ptg_source_exhausted": source_exhausted,
+                }
+            )
+    return location_rows
+
+
 async def _membership_location_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -10101,14 +10564,14 @@ async def _membership_location_rows(
         location_sql,
         offset=offset,
     )
-    uses_unified_addresses = _is_unified_address_table(query_context.address_table)
-    if uses_unified_addresses and (
-        _is_request_flag_enabled(args.get("include_evidence"))
-        or _is_request_flag_enabled(args.get("include_debug"))
-        or _is_request_flag_enabled(args.get("include_details"))
-    ):
-        await _hydrate_address_provenance(session, location_rows)
-    return location_rows
+    return await _finalize_location_rows(
+        session,
+        query_context,
+        args,
+        location_rows,
+        candidate_npis=candidate_npis,
+        limit=limit,
+    )
 
 
 @dataclass
@@ -10500,22 +10963,33 @@ def _graph_provider_data(
     npi = int(location_data["npi"])
     provider_data_map = dict(enriched_data or {"npi": npi, "provider_name": "TiC provider"})
     location_fields = ("distance_miles", "location_hash")
-    if _has_street_address_payload(location_data.get("address_payload")) or not _has_street_address_payload(
-        provider_data_map.get("address_payload")
-    ):
+    is_address_unproven = location_data.get(_PTG_UNPROVEN_ADDRESS_MARKER) is True
+    if is_address_unproven:
+        provider_data_map.update(
+            {
+                "state": None,
+                "city": None,
+                "zip5": None,
+                "address_payload": json.dumps({}),
+            }
+        )
+    elif _has_street_address_payload(
+        location_data.get("address_payload")
+    ) or not _has_street_address_payload(provider_data_map.get("address_payload")):
         location_fields += ("state", "city", "zip5", "address_payload")
     provider_data_map.update({field: location_data.get(field) for field in location_fields})
-    contact_fields = (
-        "telephone_number",
-        "fax_number",
-        "phone_number",
-        "phone_extension",
-        "fax_number_digits",
-        "fax_extension",
-    )
-    provider_data_map.update(
-        {field: location_data.get(field) for field in contact_fields if location_data.get(field) is not None}
-    )
+    if is_address_unproven:
+        provider_data_map.update(
+            {field: None for field in _PTG_LOCATION_CONTACT_FIELDS}
+        )
+    else:
+        provider_data_map.update(
+            {
+                field: location_data.get(field)
+                for field in _PTG_LOCATION_CONTACT_FIELDS
+                if location_data.get(field) is not None
+            }
+        )
     provider_data_map["location_source"] = location_source
     provider_data_map["location_confidence_code"] = location_source
     return provider_data_map

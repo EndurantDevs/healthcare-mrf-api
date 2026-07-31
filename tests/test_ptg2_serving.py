@@ -1766,6 +1766,63 @@ async def test_knn_duplicate_addresses_do_not_signal_location_exhaustion(monkeyp
     assert len(location_calls) == 2
 
 
+@pytest.mark.asyncio
+async def test_lineage_dropped_prefix_grows_to_later_valid_candidates(monkeypatch):
+    location_calls = []
+    lineage_rejected_rows = [
+        {"_ptg_probe_empty": True, "_ptg_source_exhausted": False},
+    ]
+    lineage_valid_rows = [
+        {"npi": 1000000002, "_ptg_source_exhausted": True},
+    ]
+
+    async def fake_location_rows(*_args, limit, **_kwargs):
+        location_calls.append(limit)
+        return (
+            lineage_rejected_rows
+            if len(location_calls) == 1
+            else lineage_valid_rows
+        )
+
+    async def fake_append(
+        _session,
+        _tables,
+        _rate_scope,
+        candidate_rows,
+        matched_rows,
+        provider_set_keys_by_npi,
+        seen_npis,
+    ):
+        before = len(matched_rows)
+        for candidate_row in candidate_rows:
+            if candidate_row.get("npi") in (None, ""):
+                continue
+            npi = int(candidate_row["npi"])
+            if npi in seen_npis:
+                continue
+            seen_npis.add(npi)
+            matched_rows.append(candidate_row)
+            provider_set_keys_by_npi[npi].add(1)
+        return len(matched_rows) - before
+
+    monkeypatch.setattr(ptg2_serving, "_membership_location_rows", fake_location_rows)
+    monkeypatch.setattr(ptg2_serving, "_append_rate_matched_locations", fake_append)
+
+    candidates = await ptg2_serving._paged_graph_candidates(
+        object(),
+        _strict_v3_tables(),
+        {"lat": 41.9, "long": -87.65},
+        frozenset({1}),
+        1,
+    )
+
+    assert candidates is not None
+    assert [candidate_row["npi"] for candidate_row in candidates.location_rows] == [
+        1000000002
+    ]
+    assert len(location_calls) == 2
+
+
 # Provider-directory and address policy
 
 

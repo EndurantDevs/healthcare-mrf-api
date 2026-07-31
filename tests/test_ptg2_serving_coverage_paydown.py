@@ -115,43 +115,18 @@ def test_membership_filter_appends_geo_clauses_without_zip(monkeypatch):
     assert distance_sql == "distance_expression"
 
 
-def test_geo_address_assurance_five_npi_regression_fixture():
-    fixture_by_npi = {
-        # A single marketplace-directory issuer is insufficient.
-        1000000001: ("mrf", ["Issuer A"], False, None),
-        # An unanchored CMS location is insufficient.
-        1000000002: ("cms_doctors", [], False, None),
-        # A secondary NPPES practice location is accepted.
-        1000000003: ("nppes", [], False, "nppes_registry_address"),
-        # A CMS source with a matching NPPES premise is accepted.
-        1000000004: (
-            "cms_doctors",
-            [],
-            True,
-            "cms_doctors_source_with_nppes_identity_anchor",
-        ),
-        # An exact marketplace address reported by three issuers is accepted.
-        1000000005: (
-            "mrf",
-            ["Issuer A", "Issuer B", "Issuer C"],
-            False,
-            "multi_issuer_marketplace_address",
-        ),
-    }
+def test_geo_evidence_case_preserves_stable_precedence():
+    sql = serving._geo_evidence_level_case_sql(
+        nppes_condition_sql="nppes_is_valid",
+        mrf_condition_sql="mrf_is_valid",
+        cms_condition_sql="cms_is_valid",
+    )
 
-    actual_by_npi = {
-        npi: serving._geo_address_evidence_level(
-            [source_name],
-            mrf_issuer_names=issuers,
-            cms_source_has_nppes_anchor=cms_anchor,
-        )
-        for npi, (source_name, issuers, cms_anchor, _expected) in fixture_by_npi.items()
-    }
-
-    assert actual_by_npi == {
-        npi: expected
-        for npi, (_source, _issuers, _cms_anchor, expected) in fixture_by_npi.items()
-    }
+    assert sql.index("nppes_is_valid") < sql.index("mrf_is_valid")
+    assert sql.index("mrf_is_valid") < sql.index("cms_is_valid")
+    assert "nppes_registry_address" in sql
+    assert "multi_issuer_marketplace_address" in sql
+    assert "cms_doctors_source_with_nppes_identity_anchor" in sql
 
 
 def test_unified_geo_sql_requires_record_level_evidence():
@@ -160,13 +135,21 @@ def test_unified_geo_sql_requires_record_level_evidence():
     assert "(addr.address_source_mask & 1) <> 0" in sql
     assert "mrf_address AS geo_mrf" in sql
     assert "source_issuer_names" in sql
-    assert "CARDINALITY" in sql
-    assert "entity_address_unified AS geo_doctor_anchor" in sql
+    assert "COUNT(DISTINCT LOWER(BTRIM(issuer_name)))" in sql
+    assert "UNNEST(geo_mrf.source_import_ids)" in sql
+    assert "npi_address AS geo_nppes" in sql
+    assert "geo_nppes.date_added IS NOT NULL" in sql
+    assert "doctor_clinician_address AS geo_doctor" in sql
+    assert "geo_doctor.updated_at IS NOT NULL" in sql
     assert "entity_address_unified AS geo_nppes_anchor" in sql
-    assert "geo_nppes_anchor.premise_key = geo_doctor_anchor.premise_key" in sql
+    assert "npi_address AS geo_nppes_anchor_source" in sql
+    assert "geo_nppes_anchor.premise_key = addr.premise_key" in sql
+    assert "geo_nppes_anchor.type IN" in sql
+    assert "geo_doctor_anchor" not in sql
 
 
 def test_unified_location_identity_uses_collision_resistant_location_key():
+    assert "premise_key" in serving._PTG2_UNIFIED_ADDRESS_COLUMNS
     assert serving._ptg2_address_location_hash_sql(
         "addr", "mrf.entity_address_unified"
     ) == "CONCAT('entity_address_unified:', addr.location_key)"
@@ -197,16 +180,6 @@ def test_address_provenance_exposes_dataset_version_and_retrieval_time():
         "issuer_names": ["Issuer A", "Issuer B"],
         "source_urls": ["https://example.test/providers.json"],
     }
-
-
-def test_address_provenance_query_falls_back_to_selected_unified_lineage():
-    sql = serving._ADDRESS_PROVENANCE_SQL
-
-    assert "UNION ALL" in sql
-    assert "entity_address_evidence AS stored" in sql
-    assert "entity_address_unified AS unified" in sql
-    assert "WHERE NOT EXISTS" in sql
-    assert "provider_directory_fhir" in sql
 
 
 def test_nullish_contact_values_become_json_null_without_changing_rates():
@@ -291,7 +264,36 @@ async def test_membership_location_rows_executes_standard_query(monkeypatch):
         "_membership_location_query",
         AsyncMock(return_value=_location_query()),
     )
-    session = FakeSession([FakeResult([{"npi": 1234567890}])])
+
+    async def validate_default_response(
+        _session,
+        location_rows,
+        *,
+        include_response_evidence,
+    ):
+        assert include_response_evidence is False
+        for location_row in location_rows:
+            location_row.pop("_geo_evidence_level", None)
+            location_row.pop("_geo_evidence_source_id", None)
+
+    monkeypatch.setattr(
+        serving,
+        "_hydrate_address_provenance",
+        validate_default_response,
+    )
+    session = FakeSession(
+        [
+            FakeResult(
+                [
+                    {
+                        "npi": 1234567890,
+                        "_geo_evidence_level": "nppes_registry_address",
+                        "_geo_evidence_source_id": 1,
+                    }
+                ]
+            )
+        ]
+    )
 
     location_rows = await serving._membership_location_rows(
         session,
@@ -328,7 +330,13 @@ async def test_membership_location_rows_bounds_knn_and_restores_planner(monkeypa
         limit=2,
     )
 
-    assert location_rows == [{"npi": 1234567890}]
+    assert location_rows == [
+        {
+            "npi": 1234567890,
+            serving._PTG_UNPROVEN_ADDRESS_MARKER: True,
+            "address_payload": "{}",
+        }
+    ]
     assert query.parameter_map["raw_probe_limit"] == 67
     enable.assert_awaited_once_with(session)
     restore.assert_awaited_once_with(session, ("auto", "2"))

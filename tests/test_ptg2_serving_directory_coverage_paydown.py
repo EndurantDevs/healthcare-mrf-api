@@ -185,10 +185,21 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
         assert "ST_DWithin" in query.filter_sql
         assert "source_issuer_names" not in query.filter_sql
         assert "source_issuer_names" in query.address_assurance_sql
-        assert "geo_doctor_anchor" in query.address_assurance_sql
+        assert "geo_nppes_anchor.premise_key = addr.premise_key" in query.address_assurance_sql
+        rendered_sql = serving._membership_location_sql(query, limit=1, offset=0)
+        assert "addr.geo_evidence_level AS _geo_evidence_level" in rendered_sql
+        assert "_geo_evidence_source_id" in rendered_sql
+        assert "WHERE addr.geo_evidence_level IS NOT NULL" in rendered_sql
+        assert "addr.checksum,\n             addr.location_key" in rendered_sql
+        assert "addr.checksum,\n                     addr.location_key" in rendered_sql
     else:
         assert query.knn_order_sql is None
         assert query.parameter_map["state_value"] == "IL"
+        rendered_sql = serving._membership_location_sql(query, limit=1, offset=0)
+        assert (
+            "COALESCE(addr.address_key::text, ''), "
+            "COALESCE(addr.type, '')"
+        ) in rendered_sql
 
 
 @pytest.mark.asyncio
@@ -217,13 +228,34 @@ async def test_membership_location_query_does_not_let_exact_zip_bypass_assurance
     assert query is not None
     assert "OR" in query.filter_sql
     assert "source_issuer_names" in query.address_assurance_sql
-    assert "geo_doctor_anchor" in query.address_assurance_sql
+    assert "geo_nppes_anchor.premise_key = addr.premise_key" in query.address_assurance_sql
     rendered_sql = serving._membership_location_sql(query, limit=10, offset=0)
     assert "mrf_requested AS MATERIALIZED" in rendered_sql
-    assert "cms_doctor_rows AS MATERIALIZED" in rendered_sql
-    assert "assured_location_keys AS MATERIALIZED" in rendered_sql
+    assert "cms_assured AS MATERIALIZED" in rendered_sql
+    assert "classified_locations AS MATERIALIZED" in rendered_sql
+    assert "assured_location_keys AS MATERIALIZED" not in rendered_sql
+    assert "SELECT DISTINCT located.npi, located.address_key" in rendered_sql
+    assert "candidate.type IN ('primary', 'secondary', 'practice', 'site')" in rendered_sql
+    assert "JOIN mrf.npi_address anchor_source" in rendered_sql
+    assert "selected.geo_evidence_level AS _geo_evidence_level" in rendered_sql
+    assert "_geo_evidence_source_id" in rendered_sql
     assert "ROW_NUMBER() OVER" in rendered_sql
+    assert "classified.checksum,\n                     classified.location_key" in rendered_sql
     assert "geo_doctor_anchor" not in rendered_sql
+    nppes_requested_sql = rendered_sql.split(
+        "nppes_requested AS MATERIALIZED (", 1
+    )[1].split("), nppes_assured", 1)[0]
+    mrf_requested_sql = rendered_sql.split(
+        "mrf_requested AS MATERIALIZED (", 1
+    )[1].split("), mrf_assured", 1)[0]
+    cms_requested_sql = rendered_sql.split(
+        "cms_requested AS MATERIALIZED (", 1
+    )[1].split("), cms_assured", 1)[0]
+    assert "location_key" not in nppes_requested_sql
+    assert "location_key" not in mrf_requested_sql
+    assert "location_key" not in cms_requested_sql
+    assert "LEFT JOIN nppes_assured nppes" in mrf_requested_sql
+    assert "LEFT JOIN mrf_assured mrf" in cms_requested_sql
 
 
 @pytest.mark.asyncio
