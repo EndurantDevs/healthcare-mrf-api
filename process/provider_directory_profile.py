@@ -374,13 +374,13 @@ def profile_index_statements(
     table_ref = qualified_table(schema, table_name)
     if evidence:
         return (
-            f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'npi_idx'))} ON {table_ref} (npi);",
-            f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'npi_fact_idx'))} ON {table_ref} (npi, fact_type, fact_key);",
-            f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'source_idx'))} ON {table_ref} (source_id, npi);",
-            f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'endpoint_idx'))} ON {table_ref} (endpoint_id, npi);",
+            f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'npi_idx'))} ON {table_ref} (npi);",
+            f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'npi_fact_idx'))} ON {table_ref} (npi, fact_type, fact_key);",
+            f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'source_idx'))} ON {table_ref} (source_id, npi);",
+            f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'endpoint_idx'))} ON {table_ref} (endpoint_id, npi);",
         )
     return (
-        f"CREATE INDEX IF NOT EXISTS {quote_identifier(profile_index_name(table_name, 'generation_idx'))} ON {table_ref} (generation_id);",
+        f"CREATE INDEX {quote_identifier(profile_index_name(table_name, 'generation_idx'))} ON {table_ref} (generation_id);",
     )
 
 
@@ -456,6 +456,76 @@ def copy_unaffected_profiles_sql(
     """
 
 
+def affected_npi_source_insert_sql(
+    *,
+    evidence_ref: str,
+    affected_npi_ref: str,
+) -> str:
+    """Insert NPIs for one refreshed or removed source in index order."""
+    return f"""
+        INSERT INTO {affected_npi_ref} (npi)
+        SELECT DISTINCT npi
+          FROM {evidence_ref}
+         WHERE source_id = :source_id
+         ORDER BY npi
+        ON CONFLICT (npi) DO NOTHING;
+    """
+
+
+def affected_npi_source_count_sql(
+    *,
+    evidence_ref: str,
+    affected_npi_ref: str,
+) -> str:
+    """Count exact new source NPIs before the bounded stage write."""
+
+    return f"""
+        SELECT count(*)::bigint AS projected_rows,
+               (count(*) * 8)::bigint AS projected_logical_bytes
+          FROM (
+                SELECT DISTINCT npi
+                  FROM {evidence_ref}
+                 WHERE source_id = :source_id
+                EXCEPT
+                SELECT npi FROM {affected_npi_ref}
+          ) AS projected_npis;
+    """
+
+
+def affected_npi_delta_insert_sql(
+    *,
+    evidence_stage_ref: str,
+    affected_npi_ref: str,
+) -> str:
+    """Insert NPIs from the bounded delta stage in index order."""
+    return f"""
+        INSERT INTO {affected_npi_ref} (npi)
+        SELECT DISTINCT npi
+          FROM {evidence_stage_ref}
+         ORDER BY npi
+        ON CONFLICT (npi) DO NOTHING;
+    """
+
+
+def affected_npi_delta_count_sql(
+    *,
+    evidence_stage_ref: str,
+    affected_npi_ref: str,
+) -> str:
+    """Count exact new delta NPIs before the bounded stage write."""
+
+    return f"""
+        SELECT count(*)::bigint AS projected_rows,
+               (count(*) * 8)::bigint AS projected_logical_bytes
+          FROM (
+                SELECT DISTINCT npi
+                  FROM {evidence_stage_ref}
+                EXCEPT
+                SELECT npi FROM {affected_npi_ref}
+          ) AS projected_npis;
+    """
+
+
 def profile_evidence_insert_sql(
     *,
     target_ref: str,
@@ -470,6 +540,7 @@ def profile_evidence_insert_sql(
     fact_type: str | None = None,
     role_bucket_count: int = 1,
     role_bucket: int = 0,
+    count_only: bool = False,
 ) -> str:
     """Build immutable source evidence from scoped typed FHIR resources."""
     if fact_type is not None and fact_type not in PROFILE_EVIDENCE_FACT_TYPES:
@@ -478,6 +549,31 @@ def profile_evidence_insert_sql(
         raise ValueError("profile role bucket count must be positive")
     if role_bucket < 0 or role_bucket >= role_bucket_count:
         raise ValueError("profile role bucket is outside the configured range")
+    evidence_columns = ", ".join(
+        quote_identifier(column)
+        for column in profile_evidence_columns()
+    )
+    write_prefix_sql = (
+        ""
+        if count_only
+        else f"INSERT INTO {target_ref} ({evidence_columns})"
+    )
+    result_sql = (
+        """
+        SELECT count(*)::bigint AS projected_rows,
+               COALESCE(
+                   sum(pg_column_size(normalized_facts)),
+                   0
+               )::bigint AS projected_logical_bytes
+          FROM normalized_facts
+        """
+        if count_only
+        else (
+            "SELECT "
+            + evidence_columns
+            + "\n          FROM normalized_facts"
+        )
+    )
     endpoint_ref = endpoint_ref or service_ref.replace(
         "provider_directory_healthcare_service",
         "provider_directory_endpoint",
@@ -517,7 +613,13 @@ def profile_evidence_insert_sql(
     return _render_sql_template(
         "provider_directory_profile_evidence.sql",
         {
-            "TARGET_REF": target_ref,
+            "WRITE_PREFIX_SQL": write_prefix_sql,
+            "RESULT_SQL": result_sql,
+            "CONFLICT_SQL": (
+                ""
+                if count_only
+                else "ON CONFLICT (evidence_key) DO NOTHING;"
+            ),
             "SOURCE_REF": source_ref,
             "PRACTITIONER_REF": practitioner_ref,
             "ROLE_REF": role_ref,
@@ -615,6 +717,12 @@ def profile_evidence_insert_sql(
     )
 
 
+def profile_evidence_count_sql(**kwargs: object) -> str:
+    """Return the exact normalized-row and logical-byte preflight."""
+
+    return profile_evidence_insert_sql(**kwargs, count_only=True)
+
+
 def _profile_evidence_npi_scope_sql(npi_start: int | None) -> str:
     """Constrain every bounded evidence read to the active NPI partition."""
 
@@ -628,16 +736,10 @@ def _profile_evidence_npi_scope_sql(npi_start: int | None) -> str:
     )
 
 
-def profile_insert_sql(
-    *,
-    evidence_ref: str,
-    target_ref: str,
-    old_evidence_ref: str | None,
-    rebuild_all: bool,
-    npi_start: int | None = None,
-    npi_end: int | None = None,
-) -> str:
-    """Build compact and evidence-rich NPI profiles from normalized facts."""
+def _assert_profile_npi_range(
+    npi_start: int | None,
+    npi_end: int | None,
+) -> None:
     if (npi_start is None) != (npi_end is None):
         raise ValueError("profile NPI range requires both bounds")
     if npi_start is not None and (
@@ -646,7 +748,18 @@ def profile_insert_sql(
         or npi_end <= npi_start
         or npi_end > NPI_MAX + 1
     ):
-        raise ValueError("profile NPI range is outside the assignable bounds")
+        raise ValueError(
+            "profile NPI range is outside the assignable bounds"
+        )
+
+
+def _profile_insert_affected_npis_sql(
+    evidence_ref: str,
+    old_evidence_ref: str | None,
+    *,
+    rebuild_all: bool,
+    npi_start: int | None,
+) -> str:
     npi_scope_sql = (
         ""
         if npi_start is None
@@ -656,38 +769,191 @@ def profile_insert_sql(
         )
     )
     if rebuild_all or old_evidence_ref is None:
-        affected_npis_sql = (
+        return (
             f"SELECT DISTINCT npi FROM {evidence_ref} WHERE TRUE"
             f"{npi_scope_sql}"
         )
-    else:
-        affected_npis_sql = f"""
-            SELECT npi
-              FROM {old_evidence_ref}
-             WHERE (
-                       source_id = ANY(CAST(:source_ids AS varchar[]))
-                    OR source_id <> ALL(CAST(:retained_source_ids AS varchar[]))
-                    OR NOT {current_profile_evidence_sql()}
-             )
-               {npi_scope_sql}
-            UNION
-            SELECT npi
-              FROM {evidence_ref}
-             WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
-               {npi_scope_sql}
-        """.strip()
+    return f"""
+        SELECT npi
+          FROM {old_evidence_ref}
+         WHERE (
+                   source_id = ANY(CAST(:source_ids AS varchar[]))
+                OR source_id <> ALL(CAST(:retained_source_ids AS varchar[]))
+                OR NOT {current_profile_evidence_sql()}
+         )
+           {npi_scope_sql}
+        UNION
+        SELECT npi
+          FROM {evidence_ref}
+         WHERE source_id = ANY(CAST(:source_ids AS varchar[]))
+           {npi_scope_sql}
+    """.strip()
+
+
+def _profile_aggregate_sql(
+    *,
+    target_ref: str,
+    evidence_ref: str,
+    affected_npis_sql: str,
+    npi_start: int | None,
+    count_only: bool,
+) -> str:
+    profile_columns_sql = ", ".join(
+        quote_identifier(column) for column in profile_columns()
+    )
+    result_sql = (
+        """
+        SELECT count(*)::bigint AS projected_rows,
+               COALESCE(
+                   sum(pg_column_size(profile_rows)),
+                   0
+               )::bigint AS projected_logical_bytes
+          FROM profile_rows
+        """
+        if count_only
+        else f"SELECT {profile_columns_sql} FROM profile_rows"
+    )
     return _render_sql_template(
         "provider_directory_profile_aggregate.sql",
         {
+            "WRITE_PREFIX_SQL": (
+                ""
+                if count_only
+                else f"INSERT INTO {target_ref} ({profile_columns_sql})"
+            ),
             "AFFECTED_NPIS_SQL": affected_npis_sql,
-            "EVIDENCE_NPI_SCOPE_SQL": _profile_evidence_npi_scope_sql(npi_start),
+            "EVIDENCE_NPI_SCOPE_SQL": (
+                _profile_evidence_npi_scope_sql(npi_start)
+            ),
             "EVIDENCE_REF": evidence_ref,
-            "TARGET_REF": target_ref,
             "PROFILE_FACT_EVIDENCE_LIMIT": PROFILE_FACT_EVIDENCE_LIMIT,
             "PROFILE_FACT_LIMIT": PROFILE_FACT_LIMIT,
             "PROFILE_SCHEMA_VERSION": PROFILE_SCHEMA_VERSION,
+            "RESULT_SQL": result_sql,
+            "CONFLICT_SQL": (
+                ";" if count_only else "ON CONFLICT (npi) DO NOTHING;"
+            ),
         },
     )
+
+
+def profile_insert_sql(
+    *,
+    evidence_ref: str,
+    target_ref: str,
+    old_evidence_ref: str | None,
+    rebuild_all: bool,
+    npi_start: int | None = None,
+    npi_end: int | None = None,
+    count_only: bool = False,
+) -> str:
+    """Build compact and evidence-rich NPI profiles from normalized facts."""
+    _assert_profile_npi_range(npi_start, npi_end)
+    return _profile_aggregate_sql(
+        target_ref=target_ref,
+        evidence_ref=evidence_ref,
+        affected_npis_sql=_profile_insert_affected_npis_sql(
+            evidence_ref,
+            old_evidence_ref,
+            rebuild_all=rebuild_all,
+            npi_start=npi_start,
+        ),
+        npi_start=npi_start,
+        count_only=count_only,
+    )
+
+
+def _profile_delta_evidence_ref(
+    current_evidence_ref: str,
+    delta_evidence_ref: str,
+    affected_npi_ref: str,
+) -> str:
+    current_columns_sql = ", ".join(
+        f"current_evidence.{quote_identifier(column)}"
+        for column in profile_evidence_columns()
+    )
+    delta_columns_sql = ", ".join(
+        f"delta_evidence.{quote_identifier(column)}"
+        for column in profile_evidence_columns()
+    )
+    return f"""(
+        SELECT {current_columns_sql}
+          FROM {current_evidence_ref} AS current_evidence
+          JOIN {affected_npi_ref} AS affected
+            ON affected.npi = current_evidence.npi
+         WHERE current_evidence.source_id
+                   <> ALL(CAST(:refresh_and_removed_source_ids AS varchar[]))
+           AND current_evidence.source_id
+                   = ANY(CAST(:retained_source_ids AS varchar[]))
+           AND {current_profile_evidence_sql("current_evidence")}
+        UNION ALL
+        SELECT {delta_columns_sql}
+          FROM {delta_evidence_ref} AS delta_evidence
+          JOIN {affected_npi_ref} AS affected
+            ON affected.npi = delta_evidence.npi
+         WHERE {current_profile_evidence_sql("delta_evidence")}
+    )"""
+
+
+def _profile_delta_affected_npis_sql(
+    affected_npi_ref: str,
+    npi_start: int | None,
+) -> str:
+    npi_scope_sql = (
+        ""
+        if npi_start is None
+        else (
+            "\n             WHERE affected.npi >= "
+            "CAST(:profile_npi_start AS bigint)"
+            "\n               AND affected.npi < "
+            "CAST(:profile_npi_end AS bigint)"
+        )
+    )
+    return (
+        f"SELECT affected.npi FROM {affected_npi_ref} AS affected"
+        f"{npi_scope_sql}"
+    )
+
+
+def profile_delta_insert_sql(
+    *,
+    current_evidence_ref: str,
+    delta_evidence_ref: str,
+    affected_npi_ref: str,
+    target_ref: str,
+    npi_start: int | None = None,
+    npi_end: int | None = None,
+    count_only: bool = False,
+) -> str:
+    """Rebuild only affected NPIs from the old-plus-delta evidence view."""
+    _assert_profile_npi_range(npi_start, npi_end)
+    return _profile_aggregate_sql(
+        target_ref=target_ref,
+        evidence_ref=_profile_delta_evidence_ref(
+            current_evidence_ref,
+            delta_evidence_ref,
+            affected_npi_ref,
+        ),
+        affected_npis_sql=_profile_delta_affected_npis_sql(
+            affected_npi_ref,
+            npi_start,
+        ),
+        npi_start=npi_start,
+        count_only=count_only,
+    )
+
+
+def profile_count_sql(**kwargs: object) -> str:
+    """Return the exact compact-row and logical-byte preflight."""
+
+    return profile_insert_sql(**kwargs, count_only=True)
+
+
+def profile_delta_count_sql(**kwargs: object) -> str:
+    """Return the exact source-delta compact preflight."""
+
+    return profile_delta_insert_sql(**kwargs, count_only=True)
+
 
 def profile_source_dataset_pairs(
     datasets: Iterable[Any],

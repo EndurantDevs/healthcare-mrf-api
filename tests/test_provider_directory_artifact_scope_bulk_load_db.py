@@ -98,7 +98,10 @@ async def test_real_postgres_duplicate_scope_rows_fail_and_cleanup(monkeypatch):
             (dataset, dataset)
         )
 
-        with pytest.raises(IntegrityError, match="could not create unique index"):
+        with pytest.raises(
+            IntegrityError,
+            match="duplicate key value|could not create unique index",
+        ):
             await importer._materialize_artifact_scope_tables(
                 schema,
                 "duplicate-run",

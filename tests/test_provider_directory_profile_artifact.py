@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import datetime
 import importlib
@@ -63,6 +64,11 @@ def _patch_fresh_profile_stage_identity(monkeypatch) -> None:
         "_assert_provider_directory_profile_checkpoint_ready",
         AsyncMock(),
     )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        AsyncMock(side_effect=("e" * 64, "f" * 64)),
+    )
 
 
 def _profile_build_identity_fixture():
@@ -82,6 +88,20 @@ def _profile_build_identity_fixture():
     )
 
 
+def _single_source_stage_build() -> importer._ProviderDirectoryProfileBuild:
+    """Return the minimal one-source stage build used by lifecycle tests."""
+    return importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation",
+        source_ids=("source_a",),
+        retained_source_ids=("source_a",),
+        dataset_ids=("dataset_a",),
+        profile_as_of="2026-07-19",
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+    )
+
+
 def _resumable_profile_checkpoint(
     build: importer._ProviderDirectoryProfileBuild,
 ) -> dict[str, object]:
@@ -91,6 +111,8 @@ def _resumable_profile_checkpoint(
         "strategy_version": profile.PROFILE_BUILD_STRATEGY_VERSION,
         "schema_version": profile.PROFILE_SCHEMA_VERSION,
         "resume_lineage_hash": build.resume_lineage_hash,
+        "executable_plan_hash": build.batch_plan.fingerprint,
+        "materialization_mode": "full_swap",
         "profile_as_of": "2026-07-19",
         "source_ids": ["source_a"],
         "retained_source_ids": ["source_a"],
@@ -99,8 +121,20 @@ def _resumable_profile_checkpoint(
         "profile_stage": build.profile_stage,
         "evidence_stage_oid": 21,
         "profile_stage_oid": 22,
+        "evidence_stage_storage_fingerprint": "e" * 64,
+        "profile_stage_storage_fingerprint": "f" * 64,
+        "affected_npi_stage_storage_fingerprint": None,
         "evidence_target_oid": 11,
         "profile_target_oid": 12,
+        "current_source_vector_hash": None,
+        "desired_source_vector_hash": None,
+        "refresh_source_ids": [],
+        "removed_source_ids": [],
+        "affected_npi_stage": None,
+        "affected_npi_stage_oid": None,
+        "capacity_geometry_status": "legacy_unavailable",
+        "capacity_geometry_hash": None,
+        "capacity_geometry_json": None,
         "has_existing_artifacts": False,
         "evidence_total_batches": 115,
         "profile_total_batches": 400,
@@ -143,6 +177,11 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
         importer,
         "_provider_directory_profile_stage_relation_identity",
         stage_identity,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        AsyncMock(side_effect=("e" * 64, "f" * 64)),
     )
     monkeypatch.setattr(
         importer,
@@ -358,6 +397,268 @@ def test_profile_artifact_scope_materializes_endpoint_resources():
     assert "Endpoint" in importer.PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES
 
 
+def test_artifact_scope_projection_reuses_exact_materialization_selects():
+    """Keep count and insert on the identical typed source/resource SELECT."""
+
+    source_model = importer.ProviderDirectorySource
+    source_select = importer._provider_directory_artifact_source_select_sql(
+        source_model,
+        "fixture",
+    )
+    source_insert = importer._provider_directory_artifact_source_insert_sql(
+        source_model,
+        "fixture",
+        "source_scope",
+    )
+    source_projection = (
+        importer._provider_directory_artifact_source_projection_sql(
+            source_model,
+            "fixture",
+        )
+    )
+    practitioner_model = next(
+        model
+        for model in importer.RESOURCE_MODELS
+        if importer.RESOURCE_TYPES_BY_MODEL[model] == "Practitioner"
+    )
+    resource_select = (
+        importer._artifact_resource_batch_select_sql(
+            practitioner_model,
+            "fixture",
+        )
+    )
+    resource_insert = (
+        importer._artifact_resource_batch_insert_sql(
+            practitioner_model,
+            "fixture",
+            "practitioner_scope",
+        )
+    )
+    resource_projection = (
+        importer._artifact_resource_batch_projection_sql(
+            practitioner_model,
+            "fixture",
+        )
+    )
+
+    assert source_select in source_insert
+    assert source_select in source_projection
+    assert resource_select in resource_insert
+    assert resource_select in resource_projection
+    assert "FOR UPDATE" not in source_select.upper()
+    assert "FOR SHARE" not in source_select.upper()
+    assert "FOR UPDATE" not in resource_select.upper()
+    assert "FOR SHARE" not in resource_select.upper()
+    assert "SUM(pg_column_size(projected_rows))" in source_projection
+    assert "SUM(pg_column_size(projected_rows))" in resource_projection
+    assert 'MAX("resource_id")::varchar AS last_cursor' in (
+        resource_projection
+    )
+
+
+def test_cutover_dataset_lock_scope_and_wal_count_are_exact():
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (
+            importer.ProviderDirectoryArtifactDataset(
+                source_id="source-a",
+                endpoint_id="endpoint-a",
+                dataset_id="dataset-candidate",
+                evidence_run_id="run-a",
+                previous_dataset_id="dataset-current",
+                expected_incumbent_dataset_id="dataset-current",
+                promote_on_cutover=True,
+            ),
+        )
+    )
+
+    assert importer._provider_directory_artifact_fence_locked_dataset_ids(
+        fence
+    ) == ["dataset-candidate", "dataset-current"]
+    assert importer._provider_directory_profile_cutover_row_lock_count(
+        fence
+    ) == 10
+    lock_sql = importer._artifact_fence_dataset_rows_sql(for_update=True)
+    assert "dataset.dataset_id = ANY" in lock_sql
+    assert "FOR UPDATE OF dataset" in lock_sql
+    assert "WHERE dataset.endpoint_id = ANY" not in lock_sql
+
+
+def _artifact_projection_fence():
+    """Return two deliberately reverse-ordered artifact datasets."""
+    return importer.ProviderDirectoryArtifactDatasetFence(
+        (
+            importer.ProviderDirectoryArtifactDataset(
+                source_id="source_b",
+                endpoint_id="endpoint_b",
+                dataset_id="dataset_b",
+                evidence_run_id="run_b",
+                selected_resources=("Practitioner",),
+            ),
+            importer.ProviderDirectoryArtifactDataset(
+                source_id="source_a",
+                endpoint_id="endpoint_a",
+                dataset_id="dataset_a",
+                evidence_run_id="run_a",
+                selected_resources=("Practitioner",),
+            ),
+        )
+    )
+
+
+def _artifact_projection_query_rows() -> list[dict[str, object]]:
+    """Return source totals followed by ordered resource batch projections."""
+    return [
+        {"projected_rows": 1, "projected_logical_bytes": 100},
+        {"projected_rows": 1, "projected_logical_bytes": 110},
+        {
+            "projected_rows": 2,
+            "projected_logical_bytes": 200,
+            "last_cursor": "practitioner-2",
+        },
+        {
+            "projected_rows": 1,
+            "projected_logical_bytes": 120,
+            "last_cursor": "practitioner-3",
+        },
+        {
+            "projected_rows": 0,
+            "projected_logical_bytes": 0,
+            "last_cursor": None,
+        },
+        {
+            "projected_rows": 1,
+            "projected_logical_bytes": 130,
+            "last_cursor": "practitioner-4",
+        },
+        {
+            "projected_rows": 0,
+            "projected_logical_bytes": 0,
+            "last_cursor": None,
+        },
+    ]
+
+
+def _artifact_batch_coordinates(
+    table: importer.ProviderDirectoryArtifactTableProjection,
+) -> list[tuple[object, ...]]:
+    """Return the exact ordered coordinates covered by a table projection."""
+    return [
+        (
+            batch.source_id,
+            batch.dataset_id,
+            batch.batch_number,
+            batch.after_resource_id,
+            batch.last_resource_id,
+            batch.projected_rows,
+            batch.projected_logical_bytes,
+        )
+        for batch in table.batches
+    ]
+
+
+def _expected_artifact_batch_coordinates() -> list[tuple[object, ...]]:
+    """Return the terminal-aware batch coordinates expected by projection."""
+    return [
+        (
+            "source_a",
+            "dataset_a",
+            1,
+            None,
+            "practitioner-2",
+            2,
+            200,
+        ),
+        (
+            "source_a",
+            "dataset_a",
+            2,
+            "practitioner-2",
+            "practitioner-3",
+            1,
+            120,
+        ),
+        (
+            "source_a",
+            "dataset_a",
+            3,
+            "practitioner-3",
+            None,
+            0,
+            0,
+        ),
+        (
+            "source_b",
+            "dataset_b",
+            1,
+            None,
+            "practitioner-4",
+            1,
+            130,
+        ),
+        (
+            "source_b",
+            "dataset_b",
+            2,
+            "practitioner-4",
+            None,
+            0,
+            0,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_artifact_scope_exact_projection_includes_sources_and_batches(
+    monkeypatch,
+):
+    """Bind ordered source and per-dataset batch coordinates into one hash."""
+    practitioner_model = next(
+        model
+        for model in importer.RESOURCE_MODELS
+        if importer.RESOURCE_TYPES_BY_MODEL[model] == "Practitioner"
+    )
+    projection_query = AsyncMock(side_effect=_artifact_projection_query_rows())
+    monkeypatch.setattr(importer.db, "first", projection_query)
+    projection = (
+        await importer._provider_directory_artifact_scope_exact_projection(
+            "fixture",
+            _artifact_projection_fence(),
+            frozenset({"Practitioner"}),
+            batch_size=2,
+        )
+    )
+
+    assert [table.table_name for table in projection.tables] == [
+        importer.ProviderDirectorySource.__tablename__,
+        *(model.__tablename__ for model in importer.RESOURCE_MODELS),
+    ]
+    source_table = projection.tables[0]
+    practitioner_table = next(
+        table
+        for table in projection.tables
+        if table.table_name == practitioner_model.__tablename__
+    )
+    assert source_table.resource_type == "source"
+    assert source_table.projected_rows == 2
+    assert source_table.projected_logical_bytes == 210
+    assert [batch.source_id for batch in source_table.batches] == [
+        "source_a",
+        "source_b",
+    ]
+    assert practitioner_table.projected_rows == 4
+    assert practitioner_table.projected_logical_bytes == 450
+    assert _artifact_batch_coordinates(
+        practitioner_table
+    ) == _expected_artifact_batch_coordinates()
+    assert projection.projected_rows == 6
+    assert projection.projected_logical_bytes == 660
+    assert projection.projection_hash == importer._identity_hash(
+        projection.canonical_payload()
+    )
+    assert len(projection.projection_hash) == 64
+    assert projection_query.await_count == 7
+
+
 def test_profile_aggregation_is_deterministic_and_evidence_bounded():
     sql = profile.profile_insert_sql(
         evidence_ref='"fixture"."evidence"',
@@ -376,6 +677,35 @@ def test_profile_aggregation_is_deterministic_and_evidence_bounded():
     assert "'^([^:/?#]+://)[^/?#@]*@'" in sql
     assert sql.count('FROM "fixture"."evidence" AS evidence') == 1
     assert "FROM scoped_evidence AS evidence" in sql
+
+
+def test_profile_aggregation_preflight_reuses_exact_output_query():
+    write_sql = profile.profile_delta_insert_sql(
+        current_evidence_ref='"fixture"."current_evidence"',
+        delta_evidence_ref='"fixture"."delta_evidence"',
+        affected_npi_ref='"fixture"."affected_npi"',
+        target_ref='"fixture"."profile"',
+        npi_start=1_000_000_000,
+        npi_end=1_005_000_000,
+    )
+    count_sql = profile.profile_delta_count_sql(
+        current_evidence_ref='"fixture"."current_evidence"',
+        delta_evidence_ref='"fixture"."delta_evidence"',
+        affected_npi_ref='"fixture"."affected_npi"',
+        target_ref='"fixture"."profile"',
+        npi_start=1_000_000_000,
+        npi_end=1_005_000_000,
+    )
+
+    assert 'INSERT INTO "fixture"."profile"' in write_sql
+    assert 'INSERT INTO "fixture"."profile"' not in count_sql
+    assert "sum(pg_column_size(profile_rows))" in count_sql
+    assert "ON CONFLICT (npi) DO NOTHING" not in count_sql
+    write_common = write_sql[write_sql.index("WITH affected_npis") :]
+    count_common = count_sql[count_sql.index("WITH affected_npis") :]
+    assert write_common.split("SELECT npi,")[0] == (
+        count_common.split("SELECT npi,")[0]
+    )
 
 
 def test_profile_aggregation_supports_bounded_npi_ranges():
@@ -718,13 +1048,7 @@ async def test_profile_evidence_population_bounds_each_fact_and_role_bucket(
 ):
     """Emit one checkpointed statement per source/fact/role bucket."""
     status = AsyncMock(return_value=1)
-    create_indexes = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        create_indexes,
-    )
     caplog.set_level(logging.INFO, logger=importer.LOGGER.name)
     build = importer._ProviderDirectoryProfileBuild(
         schema="mrf",
@@ -758,10 +1082,6 @@ async def test_profile_evidence_population_bounds_each_fact_and_role_bucket(
     assert any(
         "Completed Provider Directory Profile evidence batch" in message
         and "rows=1 elapsed_seconds=" in message
-        for message in log_messages
-    )
-    assert any(
-        "Completed Provider Directory Profile evidence indexes" in message
         for message in log_messages
     )
 
@@ -807,6 +1127,51 @@ def _assert_incremental_compact_writes(write_calls):
     )
 
 
+@pytest.mark.parametrize(
+    ("pool_size", "expected_workers"),
+    ((5, 1), (16, 2), (32, 2)),
+)
+def test_profile_worker_windows_preserve_database_pool_reserve(
+    monkeypatch,
+    pool_size,
+    expected_workers,
+):
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", str(pool_size))
+    monkeypatch.delenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_EVIDENCE_WORKERS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_COMPACT_WORKERS",
+        raising=False,
+    )
+
+    assert (
+        importer._provider_directory_profile_evidence_window_size()
+        == expected_workers
+    )
+    assert (
+        importer._provider_directory_profile_compact_window_size()
+        == expected_workers
+    )
+
+
+def test_profile_worker_windows_reject_pool_or_override_over_admission(
+    monkeypatch,
+):
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "4")
+    with pytest.raises(RuntimeError, match="worker_capacity_exceeded"):
+        importer._provider_directory_profile_evidence_window_size()
+
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "16")
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_EVIDENCE_WORKERS",
+        "3",
+    )
+    with pytest.raises(RuntimeError, match="worker_capacity_exceeded"):
+        importer._provider_directory_profile_evidence_window_size()
+
+
 @pytest.mark.asyncio
 async def test_profile_refresh_copies_unaffected_global_rows_before_source(
     monkeypatch,
@@ -814,11 +1179,6 @@ async def test_profile_refresh_copies_unaffected_global_rows_before_source(
     """Incremental rebuilds retain every reviewed source outside the refresh."""
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        AsyncMock(),
-    )
     build = importer._ProviderDirectoryProfileBuild(
         schema="mrf",
         generation_id="generation",
@@ -847,17 +1207,54 @@ async def test_profile_refresh_copies_unaffected_global_rows_before_source(
 
 
 @pytest.mark.asyncio
+async def test_profile_delta_builds_affected_npis_per_source_then_stage(
+    monkeypatch,
+):
+    status = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "status", status)
+    build = importer._ProviderDirectoryProfileBuild(
+        schema="mrf",
+        generation_id="generation",
+        source_ids=("source_b",),
+        retained_source_ids=("source_a", "source_b"),
+        dataset_ids=("dataset_b",),
+        profile_as_of="2026-07-19",
+        evidence_stage="evidence_stage",
+        profile_stage="profile_stage",
+        materialization_mode="source_delta",
+        removed_source_ids=("source_a",),
+        affected_npi_stage="affected_stage",
+    )
+
+    assert (
+        await importer._populate_provider_directory_profile_affected_npi_stage(
+            build
+        )
+        == 3
+    )
+
+    writes = [
+        call
+        for call in status.await_args_list
+        if "INSERT INTO" in call.args[0]
+    ]
+    assert [call.kwargs.get("source_id") for call in writes] == [
+        "source_a",
+        "source_b",
+        None,
+    ]
+    assert all("UNION" not in call.args[0] for call in writes)
+    assert "ORDER BY npi" in writes[0].args[0]
+    assert "ORDER BY npi" in writes[-1].args[0]
+
+
+@pytest.mark.asyncio
 async def test_profile_compact_population_batches_affected_npi_ranges(
     monkeypatch,
     caplog,
 ):
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        AsyncMock(),
-    )
     caplog.set_level(logging.INFO, logger=importer.LOGGER.name)
     build = importer._ProviderDirectoryProfileBuild(
         schema="mrf",
@@ -898,10 +1295,6 @@ async def test_profile_compact_population_batches_affected_npi_ranges(
     assert any(
         "Completed Provider Directory Profile compact batch" in message
         and "rows=1 elapsed_seconds=" in message
-        for message in log_messages
-    )
-    assert any(
-        "Completed Provider Directory Profile compact indexes" in message
         for message in log_messages
     )
 
@@ -961,6 +1354,69 @@ async def test_profile_population_failure_is_retained_in_checkpoint(
 
     mark_failed.assert_awaited_once()
     assert isinstance(mark_failed.await_args.args[1], RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_profile_cancellation_waits_for_failure_marker(monkeypatch):
+    """Drain the durable failure marker before propagating cancellation."""
+    population_started = asyncio.Event()
+    marker_started = asyncio.Event()
+    release_marker = asyncio.Event()
+    marker_completed = asyncio.Event()
+
+    async def populate(*_args, **_kwargs):
+        population_started.set()
+        await asyncio.Future()
+
+    async def mark_failed(*_args, **_kwargs):
+        marker_started.set()
+        await release_marker.wait()
+        marker_completed.set()
+    monkeypatch.setattr(
+        importer,
+        "_claim_provider_directory_profile_build_checkpoint",
+        AsyncMock(
+            return_value=importer._ProviderDirectoryProfileBuildCheckpointState(
+                evidence_next_batch=0,
+                evidence_total_batches=1,
+                profile_next_batch=0,
+                profile_total_batches=1,
+                state="building_evidence",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_populate_claimed_provider_directory_profile_stages",
+        populate,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_mark_profile_build_checkpoint_failed",
+        mark_failed,
+    )
+    build = _single_source_stage_build()
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    task = asyncio.create_task(
+        importer._build_provider_directory_profile_stages(
+            build,
+            fence,
+            fence,
+            has_existing_artifacts=False,
+        )
+    )
+
+    await population_started.wait()
+    task.cancel()
+    await marker_started.wait()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert not marker_completed.is_set()
+
+    release_marker.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert marker_completed.is_set()
 
 
 def _completed_evidence_profile_fixture():

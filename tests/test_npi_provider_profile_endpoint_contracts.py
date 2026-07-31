@@ -68,6 +68,11 @@ def _install_route_dependencies(
         ),
         (
             VALID_NPI,
+            {"generation_id": "not-a-generation", "limit": "10"},
+            "invalid_profile_generation_id",
+        ),
+        (
+            VALID_NPI,
             {"category": "identity", "categories": "services"},
             "conflicting_profile_parameters",
         ),
@@ -193,6 +198,41 @@ async def test_provider_profile_route_rejects_changed_paging_generation(
     compose_evidence.assert_not_called()
 
 
+def _assert_profile_route_evidence_calls(
+    state_fetch,
+    fhir_fetch,
+    compose_profile,
+    compose_evidence,
+    state_projection_by_key,
+    fhir_record_by_key,
+    profile_by_key,
+):
+    state_fetch.assert_awaited_once_with(int(VALID_NPI))
+    fhir_fetch.assert_awaited_once_with(
+        [int(VALID_NPI)],
+        include_evidence=True,
+    )
+    compose_profile.assert_called_once_with(
+        int(VALID_NPI),
+        state_projection=state_projection_by_key,
+        fhir_profile=fhir_record_by_key["profile"],
+        requested_categories=["identity"],
+        include_sensitive=True,
+        page_category="identity",
+        page_limit=7,
+        page_offset=2,
+    )
+    compose_evidence.assert_called_once_with(
+        state_projection=state_projection_by_key,
+        fhir_evidence=fhir_record_by_key["evidence"],
+        provider_profile={
+            **profile_by_key,
+            "profile_as_of": "2026-07-29",
+        },
+        page_category="identity",
+    )
+
+
 @pytest.mark.asyncio
 async def test_provider_profile_route_passes_paging_visibility_and_evidence(
     monkeypatch,
@@ -200,7 +240,10 @@ async def test_provider_profile_route_passes_paging_visibility_and_evidence(
     """Verify provider profile route passes paging visibility and evidence."""
     state_projection_by_key = {"generation_id": "state-generation"}
     fhir_record_by_key = {
-        "profile": {"generation_id": "fhir-generation"},
+        "profile": {
+            "generation_id": "fhir-generation",
+            "profile_as_of": "2026-07-29",
+        },
         "evidence": {"facts": {"name": {"items": []}}},
     }
     profile_by_key = {
@@ -233,26 +276,23 @@ async def test_provider_profile_route_passes_paging_visibility_and_evidence(
     assert operation_result.status == 200
     assert _json_body(operation_result) == {
         "npi": int(VALID_NPI),
-        "provider_profile": profile_by_key,
-        "provider_profile_evidence": evidence_by_key,
+        "provider_profile": {
+            **profile_by_key,
+            "profile_as_of": "2026-07-29",
+        },
+        "provider_profile_evidence": {
+            **evidence_by_key,
+            "profile_as_of": "2026-07-29",
+        },
     }
-    state_fetch.assert_awaited_once_with(int(VALID_NPI))
-    fhir_fetch.assert_awaited_once_with([int(VALID_NPI)], include_evidence=True)
-    compose_profile.assert_called_once_with(
-        int(VALID_NPI),
-        state_projection=state_projection_by_key,
-        fhir_profile=fhir_record_by_key["profile"],
-        requested_categories=["identity"],
-        include_sensitive=True,
-        page_category="identity",
-        page_limit=7,
-        page_offset=2,
-    )
-    compose_evidence.assert_called_once_with(
-        state_projection=state_projection_by_key,
-        fhir_evidence=fhir_record_by_key["evidence"],
-        provider_profile=profile_by_key,
-        page_category="identity",
+    _assert_profile_route_evidence_calls(
+        state_fetch,
+        fhir_fetch,
+        compose_profile,
+        compose_evidence,
+        state_projection_by_key,
+        fhir_record_by_key,
+        profile_by_key,
     )
 
 
@@ -336,3 +376,36 @@ async def test_provider_profile_route_returns_selected_categories_without_eviden
         "services",
     ]
     compose_evidence.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_provider_profile_route_surfaces_null_pre_adoption_as_of(
+    monkeypatch,
+):
+    """Distinguish the one-time fallback from a state-only profile."""
+    profile_by_key = {
+        "generation_id": CURRENT_GENERATION,
+        "categories": {"identity": {"items": []}},
+    }
+    _install_route_dependencies(
+        monkeypatch,
+        fhir_profile_map={
+            int(VALID_NPI): {
+                "profile": {
+                    "generation_id": "fhir-generation",
+                    "profile_as_of": None,
+                }
+            }
+        },
+        composed_profile=profile_by_key,
+    )
+
+    operation_result = await npi_module.get_provider_profile(
+        _request(categories="identity"),
+        VALID_NPI,
+    )
+
+    assert operation_result.status == 200
+    assert _json_body(operation_result)["provider_profile"][
+        "profile_as_of"
+    ] is None

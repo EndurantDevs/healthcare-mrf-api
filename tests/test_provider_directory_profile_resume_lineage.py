@@ -130,11 +130,6 @@ def _patch_one_evidence_batch(monkeypatch) -> AsyncMock:
         "_provider_directory_profile_evidence_batches",
         lambda *_args, **_kwargs: (batch,),
     )
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        AsyncMock(),
-    )
     mark_state = AsyncMock()
     monkeypatch.setattr(
         importer,
@@ -438,7 +433,6 @@ async def test_fact_failure_stops_later_sources_and_preserves_checkpoint(
 
     advance = AsyncMock()
     mark_state = AsyncMock()
-    create_indexes = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(
         importer,
@@ -449,11 +443,6 @@ async def test_fact_failure_stops_later_sources_and_preserves_checkpoint(
         importer,
         "_mark_profile_build_checkpoint_state",
         mark_state,
-    )
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        create_indexes,
     )
 
     with pytest.raises(RuntimeError, match="source-b failed"):
@@ -473,4 +462,3 @@ async def test_fact_failure_stops_later_sources_and_preserves_checkpoint(
         for call in advance.await_args_list
     )
     mark_state.assert_not_awaited()
-    create_indexes.assert_not_awaited()

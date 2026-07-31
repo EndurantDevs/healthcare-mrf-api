@@ -15,6 +15,7 @@ from pathlib import Path
 import statistics
 import struct
 import time
+from types import SimpleNamespace
 from typing import Awaitable, Callable
 import uuid
 
@@ -1737,16 +1738,9 @@ async def test_v4_storage_relation_lookup_accepts_bound_identifiers_on_postgres(
         await connection.close()
 
 
-@pytest.mark.asyncio
-async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """Prove the exact pattern and heavy-bitmap paths through durable CAS."""
-
-    if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
-        pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
-
+async def _compile_pattern_v4_fixture(tmp_path):
+    binary_path = _compiler_binary()
+    assert binary_path.is_file(), f"missing V4 compiler binary: {binary_path}"
     artifacts, provider_map = _factor_fixture(tmp_path)
     compilation_started = time.perf_counter()
     compilation = await _compile_publication_fixture(
@@ -1781,264 +1775,298 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
     ]
     assert len(heavy_references) == int(heavy_npi["block_count"])
     assert (
-        sum(int(reference_entry["entry_count"]) for reference_entry in heavy_references)
+        sum(
+            int(reference_entry["entry_count"])
+            for reference_entry in heavy_references
+        )
         == _GROUP_COUNT
     )
+    return SimpleNamespace(
+        compilation=compilation,
+        compilation_ms=compilation_ms,
+        tmp_path=tmp_path,
+    )
 
-    schema_name = f"ptg2_v4_e2e_{uuid.uuid4().hex}"
-    schema = _quoted(schema_name)
-    database = Database()
-    await database.connect()
-    monkeypatch.setattr(ptg2_shared_publish, "db", database)
-    monkeypatch.setattr(snapshot_publish, "db", database)
+
+async def _connect_pattern_v4_database(state, monkeypatch):
+    state.schema_name = f"ptg2_v4_e2e_{uuid.uuid4().hex}"
+    state.schema = _quoted(state.schema_name)
+    state.database = Database()
+    await state.database.connect()
+    monkeypatch.setattr(ptg2_shared_publish, "db", state.database)
+    monkeypatch.setattr(snapshot_publish, "db", state.database)
     _isolate_graph_caches(monkeypatch)
-    try:
-        await _create_v4_test_schema(
-            database,
-            schema_name=schema_name,
-            monkeypatch=monkeypatch,
+
+
+async def _reserve_pattern_v4_layout(state, monkeypatch):
+    await _create_v4_test_schema(
+        state.database,
+        schema_name=state.schema_name,
+        monkeypatch=monkeypatch,
+    )
+    state.build_token = f"v4-e2e-{uuid.uuid4().hex}"
+    async with state.database.transaction() as session:
+        state.reservation = await reserve_v4_shared_layout(
+            session,
+            schema_name=state.schema_name,
+            semantic_fingerprint=hashlib.sha256(
+                state.build_token.encode()
+            ).digest(),
+            build_token=state.build_token,
         )
-        build_token = f"v4-e2e-{uuid.uuid4().hex}"
-        async with database.transaction() as session:
-            reservation = await reserve_v4_shared_layout(
-                session,
-                schema_name=schema_name,
-                semantic_fingerprint=hashlib.sha256(build_token.encode()).digest(),
-                build_token=build_token,
-            )
-            await _insert_provider_set_rows(
-                session,
-                schema_name=schema_name,
-                snapshot_key=reservation.snapshot_key,
-                provider_sets_by_key={
-                    provider_set_key: _global(1, provider_set_key)
-                    for provider_set_key in range(1, _SET_COUNT + 1)
-                },
-            )
-        publication_started = time.perf_counter()
-        publication_progress: list[tuple[str, int]] = []
-        publication = await snapshot_publish._publish_v4_graph(
-            compilation,
-            schema_name=schema_name,
-            snapshot_key=reservation.snapshot_key,
-            build_token=build_token,
-            compressed_acquisition_bytes=1024,
-            empty_npi_tin_only_normalization_count=0,
-            progress_callback=lambda metric, amount: publication_progress.append(
-                (metric, int(amount))
+        await _insert_provider_set_rows(
+            session,
+            schema_name=state.schema_name,
+            snapshot_key=state.reservation.snapshot_key,
+            provider_sets_by_key={
+                provider_set_key: _global(1, provider_set_key)
+                for provider_set_key in range(1, _SET_COUNT + 1)
+            },
+        )
+
+
+async def _publish_seal_pattern_v4_layout(state):
+    publication_started = time.perf_counter()
+    publication_progress = []
+    state.publication = await snapshot_publish._publish_v4_graph(
+        state.compilation,
+        schema_name=state.schema_name,
+        snapshot_key=state.reservation.snapshot_key,
+        build_token=state.build_token,
+        compressed_acquisition_bytes=1024,
+        empty_npi_tin_only_normalization_count=0,
+        progress_callback=lambda metric, amount: publication_progress.append(
+            (metric, int(amount))
+        ),
+    )
+    taxonomy_manifest = state.publication.inferred_taxonomy_candidates
+    assert taxonomy_manifest["rule_count"] > 0
+    assert taxonomy_manifest["observe_only_rule_count"] == 0
+    assert taxonomy_manifest["member_count"] == 0
+    assert await state.database.scalar(
+        f"SELECT COUNT(*) FROM "
+        f"{state.schema}.ptg2_v4_inferred_taxonomy_candidate "
+        "WHERE snapshot_key = :snapshot_key",
+        snapshot_key=state.reservation.snapshot_key,
+    ) == taxonomy_manifest["rule_count"]
+    async with state.database.transaction() as session:
+        state.sealed = await seal_v4_shared_layout(
+            session,
+            schema_name=state.schema_name,
+            snapshot_key=state.reservation.snapshot_key,
+            build_token=state.build_token,
+            expected_summary=state.publication.map_summary,
+            support_digest=state.publication.support_digest,
+            layout_manifest=_base_layout_manifest(
+                dict(state.publication.adaptive_layout)
             ),
         )
-        taxonomy_manifest = publication.inferred_taxonomy_candidates
-        assert taxonomy_manifest["rule_count"] > 0
-        assert taxonomy_manifest["observe_only_rule_count"] == 0
-        assert taxonomy_manifest["member_count"] == 0
-        assert (
-            await database.scalar(
-                f"SELECT COUNT(*) FROM "
-                f"{schema}.ptg2_v4_inferred_taxonomy_candidate "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=reservation.snapshot_key,
-            )
-            == taxonomy_manifest["rule_count"]
-        )
-        async with database.transaction() as session:
-            sealed = await seal_v4_shared_layout(
-                session,
-                schema_name=schema_name,
-                snapshot_key=reservation.snapshot_key,
-                build_token=build_token,
-                expected_summary=publication.map_summary,
-                support_digest=publication.support_digest,
-                layout_manifest=_base_layout_manifest(
-                    dict(publication.adaptive_layout)
-                ),
-            )
-        publication_ms = (time.perf_counter() - publication_started) * 1_000
-        progress_by_metric: dict[str, int] = {}
-        for metric, amount in publication_progress:
-            progress_by_metric[metric] = progress_by_metric.get(metric, 0) + amount
-        assert progress_by_metric["validated_dictionary_rows"] > 0
-        assert progress_by_metric["published_dictionary_rows"] > 0
-        assert progress_by_metric["publish_batches"] > 0
-        assert sealed.snapshot_key == reservation.snapshot_key
-        assert publication.representation == "pattern_v1"
-        assert publication.mapping_count > 0
-        assert publication.unique_block_count > 0
-        assert (
-            await database.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=sealed.snapshot_key,
-            )
-            == 0
-        )
-        assert (
-            await database.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_npi_scope "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=sealed.snapshot_key,
-            )
-            == 0
-        )
-        assert (
-            await database.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_npi_scope "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=sealed.snapshot_key,
-            )
-            == 1
-        )
-        assert (
-            await database.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_set "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=sealed.snapshot_key,
-            )
-            == _SET_COUNT
-        )
+    state.publication_ms = (time.perf_counter() - publication_started) * 1_000
+    progress_by_metric = {}
+    for metric, amount in publication_progress:
+        progress_by_metric[metric] = progress_by_metric.get(metric, 0) + amount
+    for metric in (
+        "validated_dictionary_rows",
+        "published_dictionary_rows",
+        "publish_batches",
+    ):
+        assert progress_by_metric[metric] > 0
 
-        expected_groups = tuple(range(_GROUP_COUNT))
-        before_metrics = graph.v4_graph_metrics_snapshot()
-        cold_started = time.perf_counter()
-        async with database.transaction() as session:
-            npi_keys = await graph.v4_npi_keys_for_values(
+
+async def _assert_pattern_v4_storage_rows(state):
+    assert state.sealed.snapshot_key == state.reservation.snapshot_key
+    assert state.publication.representation == "pattern_v1"
+    assert state.publication.mapping_count > 0
+    assert state.publication.unique_block_count > 0
+    expected_counts_by_relation = {
+        "ptg2_v3_snapshot_block": 0,
+        "ptg2_v3_npi_scope": 0,
+        "ptg2_v4_npi_scope": 1,
+        "ptg2_v3_provider_set": _SET_COUNT,
+    }
+    for relation, expected_count in expected_counts_by_relation.items():
+        assert await state.database.scalar(
+            f"SELECT COUNT(*) FROM {state.schema}.{relation} "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=state.sealed.snapshot_key,
+        ) == expected_count
+
+
+async def _assert_pattern_v4_cold_reader(state):
+    state.expected_groups = tuple(range(_GROUP_COUNT))
+    before_metrics = graph.v4_graph_metrics_snapshot()
+    cold_started = time.perf_counter()
+    async with state.database.transaction() as session:
+        npi_keys = await graph.v4_npi_keys_for_values(
+            session,
+            snapshot_key=state.sealed.snapshot_key,
+            npis=(_NPI,),
+            schema_name=state.schema_name,
+        )
+        exact_groups = await graph.lookup_v4_relation_members(
+            session,
+            snapshot_key=state.sealed.snapshot_key,
+            relation="npi_groups_exact",
+            owner_keys=(npi_keys[_NPI],),
+            schema_name=state.schema_name,
+        )
+    state.cold_ms = (time.perf_counter() - cold_started) * 1_000
+    after_metrics = graph.v4_graph_metrics_snapshot()
+    assert npi_keys == {_NPI: 0}
+    assert exact_groups == {0: state.expected_groups}
+    assert (
+        after_metrics["bitmap_owner_hits"]
+        == before_metrics["bitmap_owner_hits"] + 1
+    )
+    assert after_metrics["database_blocks"] > before_metrics["database_blocks"]
+
+
+async def _assert_pattern_v4_relation_reads(state):
+    async with state.database.transaction() as session:
+        npi_patterns = await graph.lookup_v4_relation_members(
+            session,
+            snapshot_key=state.sealed.snapshot_key,
+            relation="npi_patterns",
+            owner_keys=(0,),
+            schema_name=state.schema_name,
+        )
+        pattern_groups = await graph.lookup_v4_relation_members(
+            session,
+            snapshot_key=state.sealed.snapshot_key,
+            relation="pattern_groups",
+            owner_keys=npi_patterns[0],
+            schema_name=state.schema_name,
+        )
+        pattern_sets = await graph.lookup_v4_relation_members(
+            session,
+            snapshot_key=state.sealed.snapshot_key,
+            relation="pattern_sets",
+            owner_keys=npi_patterns[0],
+            schema_name=state.schema_name,
+        )
+        set_patterns = await graph.lookup_v4_relation_members(
+            session,
+            snapshot_key=state.sealed.snapshot_key,
+            relation="set_patterns",
+            owner_keys=range(1, _SET_COUNT + 1),
+            schema_name=state.schema_name,
+        )
+    assert npi_patterns == {0: (0,)}
+    assert pattern_groups == {0: state.expected_groups}
+    assert pattern_sets == {0: tuple(range(1, _SET_COUNT + 1))}
+    assert set_patterns == {
+        provider_set_key: (0,)
+        for provider_set_key in range(1, _SET_COUNT + 1)
+    }
+    candidate_sets = await _prove_candidates_in_postgres(
+        state.database,
+        schema_name=state.schema_name,
+        snapshot_key=state.sealed.snapshot_key,
+        candidate_keys_by_npi={_NPI: {1, _SET_COUNT}},
+    )
+    assert candidate_sets == {_NPI: (1, _SET_COUNT)}
+    assert set().union(*(set(groups) for groups in pattern_groups.values())) == set(
+        state.expected_groups
+    )
+
+
+async def _assert_pattern_v4_warm_reader(state):
+    state.warm_durations_ms = []
+    metrics_before = graph.v4_graph_metrics_snapshot()
+    async with state.database.transaction() as session:
+        for _ in range(7):
+            started = time.perf_counter()
+            warm_groups = await graph.lookup_v4_relation_members(
                 session,
-                snapshot_key=sealed.snapshot_key,
-                npis=(_NPI,),
-                schema_name=schema_name,
-            )
-            exact_groups = await graph.lookup_v4_relation_members(
-                session,
-                snapshot_key=sealed.snapshot_key,
+                snapshot_key=state.sealed.snapshot_key,
                 relation="npi_groups_exact",
-                owner_keys=(npi_keys[_NPI],),
-                schema_name=schema_name,
-            )
-        cold_ms = (time.perf_counter() - cold_started) * 1_000
-        after_cold_metrics = graph.v4_graph_metrics_snapshot()
-        assert npi_keys == {_NPI: 0}
-        assert exact_groups == {0: expected_groups}
-        assert (
-            after_cold_metrics["bitmap_owner_hits"]
-            == before_metrics["bitmap_owner_hits"] + 1
-        )
-        assert after_cold_metrics["database_blocks"] > before_metrics["database_blocks"]
-
-        async with database.transaction() as session:
-            npi_patterns = await graph.lookup_v4_relation_members(
-                session,
-                snapshot_key=sealed.snapshot_key,
-                relation="npi_patterns",
                 owner_keys=(0,),
-                schema_name=schema_name,
+                schema_name=state.schema_name,
             )
-            pattern_groups = await graph.lookup_v4_relation_members(
-                session,
-                snapshot_key=sealed.snapshot_key,
-                relation="pattern_groups",
-                owner_keys=npi_patterns[0],
-                schema_name=schema_name,
+            state.warm_durations_ms.append(
+                (time.perf_counter() - started) * 1_000
             )
-            pattern_sets = await graph.lookup_v4_relation_members(
-                session,
-                snapshot_key=sealed.snapshot_key,
-                relation="pattern_sets",
-                owner_keys=npi_patterns[0],
-                schema_name=schema_name,
-            )
-            set_patterns = await graph.lookup_v4_relation_members(
-                session,
-                snapshot_key=sealed.snapshot_key,
-                relation="set_patterns",
-                owner_keys=range(1, _SET_COUNT + 1),
-                schema_name=schema_name,
-            )
-        assert npi_patterns == {0: (0,)}
-        assert pattern_groups == {0: expected_groups}
-        assert pattern_sets == {0: tuple(range(1, _SET_COUNT + 1))}
-        assert set_patterns == {
-            provider_set_key: (0,) for provider_set_key in range(1, _SET_COUNT + 1)
-        }
-        candidate_sets = await _prove_candidates_in_postgres(
-            database,
-            schema_name=schema_name,
-            snapshot_key=sealed.snapshot_key,
-            candidate_keys_by_npi={_NPI: {1, _SET_COUNT}},
-        )
-        assert candidate_sets == {_NPI: (1, _SET_COUNT)}
-        assert set().union(*(set(groups) for groups in pattern_groups.values())) == set(
-            expected_groups
-        )
+            assert warm_groups == {0: state.expected_groups}
+    metrics_after = graph.v4_graph_metrics_snapshot()
+    state.warm_p50_ms = statistics.median(state.warm_durations_ms)
+    assert metrics_after["database_bytes"] == metrics_before["database_bytes"]
+    assert (
+        metrics_after["bitmap_owner_hits"]
+        == metrics_before["bitmap_owner_hits"] + len(state.warm_durations_ms)
+    )
+    assert state.warm_p50_ms < 50
 
-        warm_durations_ms: list[float] = []
-        warm_metrics_before = graph.v4_graph_metrics_snapshot()
-        async with database.transaction() as session:
-            for _ in range(7):
-                started = time.perf_counter()
-                warm = await graph.lookup_v4_relation_members(
-                    session,
-                    snapshot_key=sealed.snapshot_key,
-                    relation="npi_groups_exact",
-                    owner_keys=(0,),
-                    schema_name=schema_name,
-                )
-                warm_durations_ms.append((time.perf_counter() - started) * 1_000)
-                assert warm == {0: expected_groups}
-        warm_metrics_after = graph.v4_graph_metrics_snapshot()
-        warm_p50_ms = statistics.median(warm_durations_ms)
-        assert (
-            warm_metrics_after["database_bytes"]
-            == warm_metrics_before["database_bytes"]
-        )
-        assert warm_metrics_after["bitmap_owner_hits"] == warm_metrics_before[
-            "bitmap_owner_hits"
-        ] + len(warm_durations_ms)
-        assert warm_p50_ms < 50
 
-        physical_bytes = int(
-            await database.scalar(
-                f"""
-                SELECT SUM(pg_total_relation_size(relation_name::regclass))::bigint
-                  FROM unnest(ARRAY[
-                       '{schema_name}.ptg2_v3_block',
-                       '{schema_name}.ptg2_v3_provider_group',
-                       '{schema_name}.ptg2_v4_npi_scope',
-                       '{schema_name}.ptg2_v4_snapshot_map_root',
-                       '{schema_name}.ptg2_v4_snapshot_map_pack',
-                       '{schema_name}.ptg2_v4_provider_component',
-                       '{schema_name}.ptg2_v4_pattern',
-                       '{schema_name}.ptg2_v4_relation_manifest',
-                       '{schema_name}.ptg2_v4_heavy_owner'
-                  ]) AS relation_name
-                """
-            )
-            or 0
+async def _report_pattern_v4_performance(state):
+    physical_bytes = int(
+        await state.database.scalar(
+            f"""
+            SELECT SUM(pg_total_relation_size(relation_name::regclass))::bigint
+              FROM unnest(ARRAY[
+                   '{state.schema_name}.ptg2_v3_block',
+                   '{state.schema_name}.ptg2_v3_provider_group',
+                   '{state.schema_name}.ptg2_v4_npi_scope',
+                   '{state.schema_name}.ptg2_v4_snapshot_map_root',
+                   '{state.schema_name}.ptg2_v4_snapshot_map_pack',
+                   '{state.schema_name}.ptg2_v4_provider_component',
+                   '{state.schema_name}.ptg2_v4_pattern',
+                   '{state.schema_name}.ptg2_v4_relation_manifest',
+                   '{state.schema_name}.ptg2_v4_heavy_owner'
+              ]) AS relation_name
+            """
         )
-        performance_evidence_map = {
-            "block_count": compilation.block_count,
-            "cold_reader_ms": round(cold_ms, 3),
-            "compiler_ms": round(compilation_ms, 3),
-            "coordinate_count": publication.map_summary.coordinate_count,
-            "group_count": _GROUP_COUNT,
-            "heavy_owner_count": len(compilation.heavy_bitmaps),
-            "layout": compilation.selected_layout,
-            "physical_bytes": physical_bytes,
-            "publication_and_seal_ms": round(publication_ms, 3),
-            "set_count": _SET_COUNT,
-            "warm_reader_p50_ms": round(warm_p50_ms, 3),
-            "warm_reader_max_ms": round(max(warm_durations_ms), 3),
-        }
-        print(
-            "PTG2_V4_POSTGRES_E2E "
-            + json.dumps(performance_evidence_map, sort_keys=True)
-        )
-        assert physical_bytes > 0
+        or 0
+    )
+    performance_evidence_map = {
+        "block_count": state.compilation.block_count,
+        "cold_reader_ms": round(state.cold_ms, 3),
+        "compiler_ms": round(state.compilation_ms, 3),
+        "coordinate_count": state.publication.map_summary.coordinate_count,
+        "group_count": _GROUP_COUNT,
+        "heavy_owner_count": len(state.compilation.heavy_bitmaps),
+        "layout": state.compilation.selected_layout,
+        "physical_bytes": physical_bytes,
+        "publication_and_seal_ms": round(state.publication_ms, 3),
+        "set_count": _SET_COUNT,
+        "warm_reader_p50_ms": round(state.warm_p50_ms, 3),
+        "warm_reader_max_ms": round(max(state.warm_durations_ms), 3),
+    }
+    print(
+        "PTG2_V4_POSTGRES_E2E "
+        + json.dumps(performance_evidence_map, sort_keys=True)
+    )
+    assert physical_bytes > 0
+
+
+@pytest.mark.asyncio
+async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Prove the exact pattern and heavy-bitmap paths through durable CAS."""
+
+    if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
+
+    state = await _compile_pattern_v4_fixture(tmp_path)
+    await _connect_pattern_v4_database(state, monkeypatch)
+    try:
+        await _reserve_pattern_v4_layout(state, monkeypatch)
+        await _publish_seal_pattern_v4_layout(state)
+        await _assert_pattern_v4_storage_rows(state)
+
+        await _assert_pattern_v4_cold_reader(state)
+        await _assert_pattern_v4_relation_reads(state)
+        await _assert_pattern_v4_warm_reader(state)
+        await _report_pattern_v4_performance(state)
     finally:
-        compilation.cleanup()
+        state.compilation.cleanup()
         try:
-            await database.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            await state.database.execute_ddl(
+                f"DROP SCHEMA IF EXISTS {state.schema} CASCADE"
+            )
         finally:
-            await database.disconnect()
+            await state.database.disconnect()
 
 
 @pytest.mark.asyncio
@@ -2487,16 +2515,9 @@ async def test_frozen_multipart_scans_publish_and_candidate_audit_exactly(
             await database.disconnect()
 
 
-@pytest.mark.asyncio
-async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgres(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """Prove the smaller direct layout remains exact in both directions."""
-
-    if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
-        pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
-
+async def _compile_direct_v4_fixture(tmp_path):
+    binary_path = _compiler_binary()
+    assert binary_path.is_file(), f"missing V4 compiler binary: {binary_path}"
     artifacts, provider_map = _direct_factor_fixture(tmp_path)
     compilation = await _compile_publication_fixture(
         tmp_path,
@@ -2511,7 +2532,166 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
     }
     assert {"group_sets_direct", "set_groups_direct"} <= relation_names
     assert not relation_names.intersection(graph.PTG2_V4_PATTERN_RELATIONS)
+    return compilation, relation_names
 
+
+async def _publish_direct_v4_fixture(
+    database,
+    *,
+    schema_name,
+    compilation,
+    monkeypatch,
+):
+    await _create_v4_test_schema(
+        database,
+        schema_name=schema_name,
+        monkeypatch=monkeypatch,
+    )
+    build_token = f"v4-direct-e2e-{uuid.uuid4().hex}"
+    async with database.transaction() as session:
+        reservation = await reserve_v4_shared_layout(
+            session,
+            schema_name=schema_name,
+            semantic_fingerprint=hashlib.sha256(build_token.encode()).digest(),
+            build_token=build_token,
+        )
+        await _insert_provider_set_rows(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            provider_sets_by_key={
+                provider_set_key: _global(1, provider_set_key + 1)
+                for provider_set_key in range(2)
+            },
+        )
+    publication = await snapshot_publish._publish_v4_graph(
+        compilation,
+        schema_name=schema_name,
+        snapshot_key=reservation.snapshot_key,
+        build_token=build_token,
+        compressed_acquisition_bytes=1024,
+        empty_npi_tin_only_normalization_count=0,
+    )
+    async with database.transaction() as session:
+        sealed = await seal_v4_shared_layout(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            build_token=build_token,
+            expected_summary=publication.map_summary,
+            support_digest=publication.support_digest,
+            layout_manifest=_base_layout_manifest(
+                dict(publication.adaptive_layout)
+            ),
+        )
+    return publication, sealed
+
+
+def _assert_direct_v4_publication(publication):
+    assert publication.representation == "direct_v1"
+    assert publication.inferred_taxonomy_candidates["rule_count"] > 0
+    assert (
+        publication.inferred_taxonomy_candidates["observe_only_rule_count"]
+        == 0
+    )
+    assert publication.inferred_taxonomy_candidates["member_count"] == 0
+    assert publication.inferred_taxonomy_candidates["pattern_count"] == 0
+
+
+async def _load_direct_v4_relation_results(session, *, schema_name, snapshot_key):
+    relations_by_name = {}
+    for relation in (
+        "set_groups_direct",
+        "group_sets_direct",
+        "npi_groups_exact",
+    ):
+        relations_by_name[relation] = await graph.lookup_v4_relation_members(
+            session,
+            snapshot_key=snapshot_key,
+            relation=relation,
+            owner_keys=(0, 1),
+            schema_name=schema_name,
+        )
+    audit_reader = ptg2_v4_audit._V4PersistedGraphReader(
+        session,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        representation="direct_v1",
+        budget=ptg2_v4_audit._ReadBudget(),
+    )
+    relations_by_name["audit_membership"] = await audit_reader.contains_edges(
+        "set_groups_direct",
+        ((0, 0), (0, 1), (1, 0), (1, 1)),
+    )
+    return relations_by_name
+
+
+def _assert_direct_v4_relation_results(relations_by_name):
+    assert relations_by_name["set_groups_direct"] == {0: (1,), 1: (0,)}
+    assert relations_by_name["group_sets_direct"] == {0: (1,), 1: (0,)}
+    assert relations_by_name["npi_groups_exact"] == {0: (0,), 1: (1,)}
+    assert relations_by_name["audit_membership"] == {
+        (0, 0): False,
+        (0, 1): True,
+        (1, 0): True,
+        (1, 1): False,
+    }
+
+
+async def _assert_direct_v4_persisted_layout(
+    database,
+    *,
+    schema,
+    schema_name,
+    snapshot_key,
+    relation_names,
+):
+    candidate_sets = await _prove_candidates_in_postgres(
+        database,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        candidate_keys_by_npi={
+            1_111_111_111: {0, 1},
+            2_222_222_222: {0, 1},
+        },
+    )
+    assert candidate_sets == {
+        1_111_111_111: (1,),
+        2_222_222_222: (0,),
+    }
+    persisted_relations = {
+        str(relation_row[0])
+        for relation_row in await database.all(
+            f"SELECT relation FROM {schema}.ptg2_v4_relation_manifest "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=snapshot_key,
+        )
+    }
+    assert persisted_relations == relation_names
+    assert not persisted_relations.intersection(graph.PTG2_V4_PATTERN_RELATIONS)
+    assert await database.scalar(
+        f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
+        "WHERE snapshot_key = :snapshot_key",
+        snapshot_key=snapshot_key,
+    ) == 0
+    assert await database.scalar(
+        f"SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_set "
+        "WHERE snapshot_key = :snapshot_key",
+        snapshot_key=snapshot_key,
+    ) == 2
+
+
+@pytest.mark.asyncio
+async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgres(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Prove the smaller direct layout remains exact in both directions."""
+
+    if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
+
+    compilation, relation_names = await _compile_direct_v4_fixture(tmp_path)
     schema_name = f"ptg2_v4_direct_e2e_{uuid.uuid4().hex}"
     schema = _quoted(schema_name)
     database = Database()
@@ -2520,151 +2700,36 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
     monkeypatch.setattr(snapshot_publish, "db", database)
     _isolate_graph_caches(monkeypatch)
     try:
-        await _create_v4_test_schema(
+        publication, sealed = await _publish_direct_v4_fixture(
             database,
             schema_name=schema_name,
+            compilation=compilation,
             monkeypatch=monkeypatch,
         )
-        build_token = f"v4-direct-e2e-{uuid.uuid4().hex}"
+        _assert_direct_v4_publication(publication)
+        assert await database.scalar(
+            f"SELECT representation FROM {schema}.ptg2_v4_snapshot_map_root "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=sealed.snapshot_key,
+        ) == "direct_v1"
+        assert await database.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_pattern "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=sealed.snapshot_key,
+        ) == 0
         async with database.transaction() as session:
-            reservation = await reserve_v4_shared_layout(
-                session,
-                schema_name=schema_name,
-                semantic_fingerprint=hashlib.sha256(build_token.encode()).digest(),
-                build_token=build_token,
-            )
-            await _insert_provider_set_rows(
-                session,
-                schema_name=schema_name,
-                snapshot_key=reservation.snapshot_key,
-                provider_sets_by_key={
-                    provider_set_key: _global(1, provider_set_key + 1)
-                    for provider_set_key in range(2)
-                },
-            )
-        publication = await snapshot_publish._publish_v4_graph(
-            compilation,
-            schema_name=schema_name,
-            snapshot_key=reservation.snapshot_key,
-            build_token=build_token,
-            compressed_acquisition_bytes=1024,
-            empty_npi_tin_only_normalization_count=0,
-        )
-        async with database.transaction() as session:
-            sealed = await seal_v4_shared_layout(
-                session,
-                schema_name=schema_name,
-                snapshot_key=reservation.snapshot_key,
-                build_token=build_token,
-                expected_summary=publication.map_summary,
-                support_digest=publication.support_digest,
-                layout_manifest=_base_layout_manifest(
-                    dict(publication.adaptive_layout)
-                ),
-            )
-
-        assert publication.representation == "direct_v1"
-        assert publication.inferred_taxonomy_candidates["rule_count"] > 0
-        assert publication.inferred_taxonomy_candidates["observe_only_rule_count"] == 0
-        assert publication.inferred_taxonomy_candidates["member_count"] == 0
-        assert publication.inferred_taxonomy_candidates["pattern_count"] == 0
-        assert (
-            await database.scalar(
-                f"SELECT representation FROM {schema}.ptg2_v4_snapshot_map_root "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=sealed.snapshot_key,
-            )
-            == "direct_v1"
-        )
-        assert (
-            await database.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_pattern "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=sealed.snapshot_key,
-            )
-            == 0
-        )
-        async with database.transaction() as session:
-            set_groups = await graph.lookup_v4_relation_members(
-                session,
-                snapshot_key=sealed.snapshot_key,
-                relation="set_groups_direct",
-                owner_keys=(0, 1),
-                schema_name=schema_name,
-            )
-            group_sets = await graph.lookup_v4_relation_members(
-                session,
-                snapshot_key=sealed.snapshot_key,
-                relation="group_sets_direct",
-                owner_keys=(0, 1),
-                schema_name=schema_name,
-            )
-            npi_groups = await graph.lookup_v4_relation_members(
-                session,
-                snapshot_key=sealed.snapshot_key,
-                relation="npi_groups_exact",
-                owner_keys=(0, 1),
-                schema_name=schema_name,
-            )
-            audit_reader = ptg2_v4_audit._V4PersistedGraphReader(
+            relations_by_name = await _load_direct_v4_relation_results(
                 session,
                 schema_name=schema_name,
                 snapshot_key=sealed.snapshot_key,
-                representation="direct_v1",
-                budget=ptg2_v4_audit._ReadBudget(),
             )
-            audit_membership = await audit_reader.contains_edges(
-                "set_groups_direct",
-                ((0, 0), (0, 1), (1, 0), (1, 1)),
-            )
-        assert set_groups == {0: (1,), 1: (0,)}
-        assert group_sets == {0: (1,), 1: (0,)}
-        assert npi_groups == {0: (0,), 1: (1,)}
-        assert audit_membership == {
-            (0, 0): False,
-            (0, 1): True,
-            (1, 0): True,
-            (1, 1): False,
-        }
-        candidate_sets = await _prove_candidates_in_postgres(
+        _assert_direct_v4_relation_results(relations_by_name)
+        await _assert_direct_v4_persisted_layout(
             database,
+            schema=schema,
             schema_name=schema_name,
             snapshot_key=sealed.snapshot_key,
-            candidate_keys_by_npi={
-                1_111_111_111: {0, 1},
-                2_222_222_222: {0, 1},
-            },
-        )
-        assert candidate_sets == {
-            1_111_111_111: (1,),
-            2_222_222_222: (0,),
-        }
-
-        persisted_relations = {
-            str(relation_row[0])
-            for relation_row in await database.all(
-                f"SELECT relation FROM {schema}.ptg2_v4_relation_manifest "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=sealed.snapshot_key,
-            )
-        }
-        assert persisted_relations == relation_names
-        assert not persisted_relations.intersection(graph.PTG2_V4_PATTERN_RELATIONS)
-        assert (
-            await database.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=sealed.snapshot_key,
-            )
-            == 0
-        )
-        assert (
-            await database.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_set "
-                "WHERE snapshot_key = :snapshot_key",
-                snapshot_key=sealed.snapshot_key,
-            )
-            == 2
+            relation_names=relation_names,
         )
     finally:
         compilation.cleanup()

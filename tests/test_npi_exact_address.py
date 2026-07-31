@@ -39,6 +39,32 @@ def test_overlay_query_types_optional_address_key_as_uuid():
     assert ":address_key IS NULL" not in sql
 
 
+@pytest.mark.asyncio
+async def test_address_overlay_serving_identity_uses_current_relation_oid(
+    monkeypatch,
+):
+    """Bind response caching to the uncached address-overlay relation."""
+
+    class Result:
+        def scalar(self):
+            return 424242
+
+    execute = AsyncMock(return_value=Result())
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute)
+
+    assert (
+        await npi_module._provider_directory_address_overlay_serving_identity()
+        == "oid:424242"
+    )
+    assert (
+        "to_regclass(:overlay_table_ref)::oid::bigint"
+        in str(execute.await_args.args[0])
+    )
+    assert execute.await_args.kwargs["params"] == {
+        "overlay_table_ref": "mrf.provider_directory_address_overlay"
+    }
+
+
 def _address_key_detail_payloads(address_key):
     """Return deterministic base and overlay fixtures for exact-address detail."""
     return (
@@ -122,9 +148,18 @@ async def _get_default_and_exact_address_lists(address_key):
     )
 
 
-def _install_exact_address_mocks(monkeypatch, address_key):
+def _install_exact_address_mocks(
+    monkeypatch,
+    address_key,
+    *,
+    candidate_address=False,
+):
     """Install deterministic NPI detail dependencies and return call spies."""
     detail_payload_map, overlay_payload_list = _address_key_detail_payloads(address_key)
+    if candidate_address:
+        overlay_payload_list[0]["address_status"] = (
+            "payer_directory_candidate"
+        )
     build_details = AsyncMock(
         side_effect=[deepcopy(detail_payload_map), deepcopy(detail_payload_map)]
     )
@@ -172,6 +207,10 @@ async def test_get_npi_address_key_returns_exact_address_with_typed_evidence(
         "00000000-0000-0000-0000-000000000003",
     ]
     assert [address["address_key"] for address in exact_addresses] == [address_key]
+    assert all(
+        "address_status" not in address
+        for address in default_addresses
+    )
     assert exact_addresses[0]["provider_directory_sources"][0]["practitioner_roles"] == [
         {"resource_type": "PractitionerRole", "resource_id": "role-1"}
     ]
@@ -183,3 +222,40 @@ async def test_get_npi_address_key_returns_exact_address_with_typed_evidence(
         None,
         address_key,
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_npi_preserves_uhc_candidate_status_after_address_dedup(
+    monkeypatch,
+):
+    """Do not let the earlier NPPES row erase UHC candidate qualification."""
+    address_key = "00000000-0000-0000-0000-000000000002"
+    _install_exact_address_mocks(
+        monkeypatch,
+        address_key,
+        candidate_address=True,
+    )
+    app = types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False})
+
+    operation_result = await npi_module.get_npi(
+        types.SimpleNamespace(
+            args={
+                "include_profile": "false",
+                "sync_geocode": "false",
+                "lookup_stored_geocode": "false",
+            },
+            app=app,
+        ),
+        "1518379601",
+    )
+    address_list = json.loads(operation_result.body)["address_list"]
+    candidate_address = next(
+        address
+        for address in address_list
+        if address["address_key"] == address_key
+    )
+
+    assert candidate_address["address_status"] == (
+        "payer_directory_candidate"
+    )
+    assert "source_record_ids" not in candidate_address

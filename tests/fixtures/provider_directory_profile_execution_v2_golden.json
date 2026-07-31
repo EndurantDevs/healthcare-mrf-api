@@ -1,0 +1,97 @@
+{
+  "import_resources": false,
+  "probe": false,
+  "provider_directory_profile_capacity_attestation": {
+    "lease": {
+      "attestation_id": "7ef089ca3c1e2e28d62d93e92c13b60942cd8305a7bbd30dcd7715c1d362177d",
+      "attestor_id": "capacity-authority-dev",
+      "attestor_release_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "capacity_geometry_hash": "5555555555555555555555555555555555555555555555555555555555555555",
+      "contract_id": "provider-directory-database-capacity-lease-v1",
+      "database_name": "healthporta_test",
+      "database_oid": 16401,
+      "database_system_identifier": "7527713908662902214",
+      "environment_id": "dev-us",
+      "expires_at": "2026-07-30T13:00:00Z",
+      "issued_at": "2026-07-30T12:00:01Z",
+      "key_id": "capacity-key-2026-07",
+      "max_build_deadline": "2026-07-30T12:55:00Z",
+      "nonce": "2222222222222222222222222222222222222222222222222222222222222222",
+      "observed_at": "2026-07-30T12:00:00Z",
+      "reservation_id": "pd-capacity-reservation-7",
+      "signature_algorithm": "Ed25519",
+      "tablespaces": [
+        {
+          "tablespace_name": "pg_default",
+          "tablespace_oid": 1663,
+          "usage": "data",
+          "volume_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        {
+          "tablespace_name": "pg_default",
+          "tablespace_oid": 1663,
+          "usage": "temp",
+          "volume_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      ],
+      "volumes": [
+        {
+          "available_after_all_reservations_bytes": 700000000000,
+          "available_bytes": 1000000000000,
+          "reserved_bytes": 180000000000,
+          "volume_class": "data",
+          "volume_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        {
+          "available_after_all_reservations_bytes": 700000000000,
+          "available_bytes": 1000000000000,
+          "reserved_bytes": 20000000000,
+          "volume_class": "temp",
+          "volume_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        {
+          "available_after_all_reservations_bytes": 300000000000,
+          "available_bytes": 500000000000,
+          "reserved_bytes": 150000000000,
+          "volume_class": "wal",
+          "volume_digest": "4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      ]
+    },
+    "signature": "RxmvWgphpLXZPJaLybyCd8b8uVEDcbIo5aT6PbcYkzMndX8afD3rXtG1RUdDf8Tnh8BzRUHm-J9ekEoCmaerCQ"
+  },
+  "provider_directory_profile_contract_id": "healthporta.provider-directory-profile-execution.v2",
+  "provider_directory_profile_generation": 11,
+  "provider_directory_profile_selection_attestation": {
+    "authority_revision": 7,
+    "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "contract_id": "healthporta.provider-directory-profile-selection-attestation.v1",
+    "node_id": "dev-node",
+    "operation": "publish",
+    "pairs": [
+      {
+        "acquisition_root_run_id": "run-root-1",
+        "dataset_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dataset_id": "dataset-1",
+        "endpoint_id": "endpoint-1",
+        "is_current": true,
+        "lineage_authority": "healthcare-mrf-api.provider-directory-selection-proof.v1",
+        "publication_status": "published",
+        "source_id": "pdfhir_payer"
+      }
+    ],
+    "profile_input_digest": "4eca0836dcd319cb8ce9a31e464a6f883916d9b7a371c7faa90313676612204d",
+    "profile_schema_version": 1,
+    "profile_strategy_version": "source-fact-role32-org32-membership32-npi5m-v4",
+    "proof_id": "734bb19aba591735978758ff5abdf01e1fef38b4d60a5ef90ccfa41308284740",
+    "selection_fingerprint": "bdee59431fa659e4199426063b943bcbbc478c5b788bb543aa26471d13604a4a",
+    "source_context_digest": "9d71bd59d73b176080a32bf43c802b30dbe129d78c4e6f8af5d4c8fc465c5a15"
+  },
+  "publish_artifacts_only": true,
+  "publish_artifacts_targets": [
+    "profile"
+  ],
+  "publish_corroboration": false,
+  "require_complete_global_profile_fence": true,
+  "source_ids": []
+}

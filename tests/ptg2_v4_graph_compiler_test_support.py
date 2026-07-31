@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import struct
+import subprocess
 from typing import Any
 
 from process.ptg_parts import ptg2_v4_graph_compiler as compiler
@@ -349,11 +351,26 @@ def compiler_manifest_inputs(
 
 
 def scanner_binary() -> Path:
-    return (
-        Path(__file__).resolve().parents[1]
-        / "support"
-        / "ptg2_scanner"
-        / "target"
-        / "debug"
-        / "ptg2_provider_graph_v4"
+    root = Path(__file__).resolve().parents[1]
+    scanner_root = root / "support" / "ptg2_scanner"
+    target_root = Path(os.getenv("CARGO_TARGET_DIR", scanner_root / "target"))
+    if not target_root.is_absolute():
+        target_root = root / target_root
+    subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--locked",
+            "--bin",
+            "ptg2_provider_graph_v4",
+            "--manifest-path",
+            str(scanner_root / "Cargo.toml"),
+        ],
+        check=True,
+        cwd=root,
+        timeout=120,
     )
+    candidate = target_root / "debug" / "ptg2_provider_graph_v4"
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise RuntimeError("PTG2 V4 graph compiler test binary was not built")
+    return candidate

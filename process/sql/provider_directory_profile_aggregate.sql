@@ -1,4 +1,4 @@
-INSERT INTO {{TARGET_REF}} ("npi", "profile_json", "evidence_json", "source_ids", "endpoint_ids", "dataset_ids", "source_count", "independent_source_count", "fact_count", "generation_id", "published_at")
+{{WRITE_PREFIX_SQL}}
         WITH affected_npis AS MATERIALIZED (
             {{AFFECTED_NPIS_SQL}}
         ), scoped_evidence AS MATERIALIZED (
@@ -149,31 +149,33 @@ INSERT INTO {{TARGET_REF}} ("npi", "profile_json", "evidence_json", "source_ids"
                                evidence.dataset_id) AS sources
               FROM profile_source_rows AS evidence
              GROUP BY evidence.npi
+        ), profile_rows AS MATERIALIZED (
+            SELECT profile_sources.npi,
+                   jsonb_build_object(
+                       'schema_version', {{PROFILE_SCHEMA_VERSION}},
+                       'sources', profile_sources.sources,
+                       'source_count', profile_sources.source_count,
+                       'independent_source_count', profile_sources.independent_source_count,
+                       'facts', profile_categories.compact_categories
+                   ) AS profile_json,
+                   jsonb_build_object(
+                       'schema_version', {{PROFILE_SCHEMA_VERSION}},
+                       'sources', profile_sources.sources,
+                       'source_count', profile_sources.source_count,
+                       'independent_source_count', profile_sources.independent_source_count,
+                       'facts', profile_categories.evidence_categories
+                   ) AS evidence_json,
+                   profile_sources.source_ids,
+                   profile_sources.endpoint_ids,
+                   profile_sources.dataset_ids,
+                   profile_sources.source_count,
+                   profile_sources.independent_source_count,
+                   profile_categories.fact_count,
+                   CAST(:generation_id AS varchar) AS generation_id,
+                   now() AS published_at
+              FROM profile_sources
+              JOIN profile_categories
+                ON profile_categories.npi = profile_sources.npi
         )
-        SELECT profile_sources.npi,
-               jsonb_build_object(
-                   'schema_version', {{PROFILE_SCHEMA_VERSION}},
-                   'sources', profile_sources.sources,
-                   'source_count', profile_sources.source_count,
-                   'independent_source_count', profile_sources.independent_source_count,
-                   'facts', profile_categories.compact_categories
-               ) AS profile_json,
-               jsonb_build_object(
-                   'schema_version', {{PROFILE_SCHEMA_VERSION}},
-                   'sources', profile_sources.sources,
-                   'source_count', profile_sources.source_count,
-                   'independent_source_count', profile_sources.independent_source_count,
-                   'facts', profile_categories.evidence_categories
-               ) AS evidence_json,
-               profile_sources.source_ids,
-               profile_sources.endpoint_ids,
-               profile_sources.dataset_ids,
-               profile_sources.source_count,
-               profile_sources.independent_source_count,
-               profile_categories.fact_count,
-               CAST(:generation_id AS varchar),
-               now()
-          FROM profile_sources
-          JOIN profile_categories
-            ON profile_categories.npi = profile_sources.npi
-        ON CONFLICT (npi) DO NOTHING;
+        {{RESULT_SQL}}
+        {{CONFLICT_SQL}}

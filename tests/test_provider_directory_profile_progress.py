@@ -87,11 +87,6 @@ def _patch_population_dependencies(monkeypatch) -> AsyncMock:
     )
     monkeypatch.setattr(
         importer,
-        "_create_provider_directory_profile_indexes",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(
-        importer,
         "_mark_profile_build_checkpoint_state",
         AsyncMock(),
     )

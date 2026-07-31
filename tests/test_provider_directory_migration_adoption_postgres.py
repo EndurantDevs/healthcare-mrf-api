@@ -56,6 +56,9 @@ async def main():
             models_by_table = _model_by_table_fullname()
             future_strict_tables = {
                 "provider_directory_profile_build_checkpoint",
+                "provider_directory_profile_capacity_lease_consumption",
+                "provider_directory_profile_delta_receipt",
+                "provider_directory_profile_serving_generation",
             }
             target_tables = [
                 table

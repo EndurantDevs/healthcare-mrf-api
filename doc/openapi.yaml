@@ -8704,11 +8704,31 @@ components:
           type: integer
         generation_id:
           type: string
+          pattern: '^pdprofile_[0-9a-f]{32}$'
           nullable: true
+          description: |
+            Global applied Provider Directory serving generation after the
+            serving singleton is adopted. During the one-time pre-adoption
+            transition, this retains the existing row materialization generation;
+            a present but invalid or mismatched singleton fails closed.
         published_at:
           type: string
           format: date-time
           nullable: true
+          description: |
+            Time the global Provider Directory generation was atomically applied.
+            During the one-time pre-adoption transition, this retains the
+            existing row materialization time.
+        profile_as_of:
+          type: string
+          format: date
+          nullable: true
+          description: |
+            Calendar date used to evaluate temporal Provider Directory facts,
+            including active affiliations and plan memberships. This is
+            intentionally distinct from `published_at`. It is null only during
+            the one-time pre-adoption fallback; clients must not infer it from
+            publication time.
         source_count:
           type: integer
         independent_source_count:
@@ -8768,11 +8788,31 @@ components:
           type: integer
         generation_id:
           type: string
+          pattern: '^pdprofile_[0-9a-f]{32}$'
           nullable: true
+          description: |
+            Global applied Provider Directory serving generation shared with
+            the compact profile after singleton adoption. During the one-time
+            pre-adoption transition, this retains the existing row
+            materialization generation; a present but invalid or mismatched
+            singleton fails closed.
         published_at:
           type: string
           format: date-time
           nullable: true
+          description: |
+            Time the global Provider Directory generation was atomically
+            applied. During the one-time pre-adoption transition, this retains
+            the existing row materialization time.
+        profile_as_of:
+          type: string
+          format: date
+          nullable: true
+          description: |
+            Calendar date used to evaluate the temporal facts represented by
+            this evidence. It is shared with the compact Provider Directory
+            profile and is distinct from `published_at`. It is null only during
+            the one-time pre-adoption fallback.
         source_count:
           type: integer
         independent_source_count:
@@ -8909,6 +8949,14 @@ components:
           type: string
         country_code:
           type: string
+        address_status:
+          type: string
+          enum: [payer_directory_candidate]
+          description: |
+            Present only when an address includes evidence from the official UHC
+            provider-file source. This is a payer-directory candidate location,
+            not proof of an exact network-bound office, ownership, employment,
+            billing-group/TIN ownership, or current appointment acceptance.
         address_key:
           type: string
           format: uuid
@@ -9418,8 +9466,24 @@ components:
           pattern: '^[0-9a-f]{64}$'
         source_generations:
           type: object
+          description: |
+            Applied generation identities for each composed source. The
+            `provider_directory_fhir` value is the singleton global serving
+            generation after adoption. During the one-time pre-adoption
+            transition, it retains the selected profile row's existing
+            materialization generation.
           additionalProperties:
             type: string
+        profile_as_of:
+          type: string
+          format: date
+          nullable: true
+          description: |
+            Calendar date used to evaluate only the Provider Directory FHIR
+            facts in this composed profile. State-regulator facts retain their
+            own source dates. This differs from publication time, is null only
+            during the pre-adoption fallback, and is omitted when no Provider
+            Directory profile contributes.
         categories:
           type: object
           additionalProperties:
@@ -9467,6 +9531,15 @@ components:
         provider_profile_evidence:
           type: object
           description: Evidence is filtered to the facts returned on this page.
+          properties:
+            profile_as_of:
+              type: string
+              format: date
+              nullable: true
+              description: |
+                Provider Directory temporal evaluation date shared with the
+                composed profile. It is null only during the pre-adoption
+                fallback and omitted for state-only evidence.
           additionalProperties: true
       additionalProperties: false
     ProviderProfileGenerationConflict:

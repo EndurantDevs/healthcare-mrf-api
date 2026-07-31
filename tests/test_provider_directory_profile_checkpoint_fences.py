@@ -27,6 +27,13 @@ def _build() -> importer._ProviderDirectoryProfileBuild:
         resume_lineage_hash="a" * 64,
         build_id=build_id,
         owner_run_id="run-a",
+        batch_plan=importer._ProviderDirectoryProfileBatchPlan(
+            has_existing_artifacts=False,
+            include_copy_batch=False,
+            evidence_batches=(object(),),
+            compact_batches=(object(),),
+            fingerprint="f" * 64,
+        ),
     )
 
 
@@ -46,8 +53,15 @@ def _checkpoint_map(
         "profile_stage": build.profile_stage,
         "evidence_stage_oid": 31,
         "profile_stage_oid": 32,
+        "evidence_stage_storage_fingerprint": "e" * 64,
+        "profile_stage_storage_fingerprint": "d" * 64,
         "evidence_target_oid": None,
         "profile_target_oid": None,
+        "executable_plan_hash": "f" * 64,
+        "materialization_mode": "full_swap",
+        "capacity_geometry_status": "legacy_unavailable",
+        "capacity_geometry_hash": None,
+        "capacity_geometry_json": None,
         "has_existing_artifacts": False,
         "evidence_next_batch": 1,
         "evidence_total_batches": 1,
@@ -64,6 +78,11 @@ async def test_profile_stage_pair_requires_checkpointed_oids(monkeypatch):
         importer,
         "_provider_directory_profile_stage_relation_identity",
         stage_identity,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        AsyncMock(side_effect=["e" * 64, "d" * 64]),
     )
 
     assert not await importer._is_profile_stage_pair_matching(
@@ -97,6 +116,11 @@ async def test_ready_profile_checkpoint_requires_complete_logged_stage_pair(
         importer,
         "_provider_directory_profile_stage_relation_identity",
         stage_identity,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        AsyncMock(side_effect=["e" * 64, "d" * 64]),
     )
 
     await importer._assert_provider_directory_profile_checkpoint_ready(
@@ -155,6 +179,11 @@ async def test_ready_profile_checkpoint_rejects_replaced_stage_oid(monkeypatch):
         importer,
         "_provider_directory_profile_stage_relation_identity",
         AsyncMock(return_value=(999, "r", "p")),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        AsyncMock(return_value="e" * 64),
     )
 
     with pytest.raises(RuntimeError, match="ready_checkpoint_stale"):

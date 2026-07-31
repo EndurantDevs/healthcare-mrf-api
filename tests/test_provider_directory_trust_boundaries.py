@@ -307,6 +307,38 @@ def _profile_build() -> importer._ProviderDirectoryProfileBuild:
     )
 
 
+_EVIDENCE_STAGE_STORAGE_FINGERPRINT = "1" * 64
+_PROFILE_STAGE_STORAGE_FINGERPRINT = "2" * 64
+_AFFECTED_NPI_STAGE_STORAGE_FINGERPRINT = "3" * 64
+
+
+def _profile_stage_storage_fingerprint(
+    build: importer._ProviderDirectoryProfileBuild,
+    stage_table: str,
+) -> str:
+    """Return the exact fixture layout hash for one logged build stage."""
+    fingerprints_by_stage = {
+        build.evidence_stage: _EVIDENCE_STAGE_STORAGE_FINGERPRINT,
+        build.profile_stage: _PROFILE_STAGE_STORAGE_FINGERPRINT,
+    }
+    if build.affected_npi_stage is not None:
+        fingerprints_by_stage[build.affected_npi_stage] = (
+            _AFFECTED_NPI_STAGE_STORAGE_FINGERPRINT
+        )
+    return fingerprints_by_stage[stage_table]
+
+
+def _profile_stage_storage_fingerprint_mock(
+    build: importer._ProviderDirectoryProfileBuild,
+) -> AsyncMock:
+    """Return a strict async stage-layout fixture."""
+    return AsyncMock(
+        side_effect=lambda _schema, stage_table, **_params: (
+            _profile_stage_storage_fingerprint(build, stage_table)
+        )
+    )
+
+
 async def _noop_stage_index_rename(_schema: str, _stage: str) -> None:
     return None
 
@@ -351,6 +383,22 @@ def _promotion_dataset(
     return importer.replace(dataset, **overrides)
 
 
+def _checkpoint_batch_plan(
+    build: importer._ProviderDirectoryProfileBuild,
+):
+    """Resolve the executable plan bound into a checkpoint fixture."""
+    return build.batch_plan or importer._provider_directory_profile_batch_plan(
+        build.source_ids,
+        build.retained_source_ids,
+        build.dataset_ids,
+        has_existing_artifacts=False,
+        materialization_mode=build.materialization_mode,
+        current_source_vector_hash=build.current_source_vector_hash,
+        desired_source_vector_hash=build.desired_source_vector_hash,
+        removed_source_ids=build.removed_source_ids,
+    )
+
+
 def _profile_checkpoint_by_name(
     build: importer._ProviderDirectoryProfileBuild,
     *,
@@ -360,11 +408,15 @@ def _profile_checkpoint_by_name(
     profile_next_batch: int = 0,
     profile_total_batches: int = 400,
 ) -> dict[str, object]:
-    return {
+    """Return a complete checkpoint row keyed by persisted column name."""
+    batch_plan = _checkpoint_batch_plan(build)
+    checkpoint_by_name = {
         "build_id": importer._provider_directory_profile_build_id(build),
         "strategy_version": profile.PROFILE_BUILD_STRATEGY_VERSION,
         "schema_version": profile.PROFILE_SCHEMA_VERSION,
         "resume_lineage_hash": build.resume_lineage_hash,
+        "executable_plan_hash": batch_plan.fingerprint,
+        "materialization_mode": build.materialization_mode,
         "profile_as_of": build.profile_as_of,
         "source_ids": list(build.source_ids),
         "retained_source_ids": list(build.retained_source_ids),
@@ -373,8 +425,28 @@ def _profile_checkpoint_by_name(
         "profile_stage": build.profile_stage,
         "evidence_stage_oid": 11,
         "profile_stage_oid": 12,
+        "evidence_stage_storage_fingerprint": _EVIDENCE_STAGE_STORAGE_FINGERPRINT,
+        "profile_stage_storage_fingerprint": _PROFILE_STAGE_STORAGE_FINGERPRINT,
         "evidence_target_oid": None,
         "profile_target_oid": None,
+        "current_source_vector_hash": build.current_source_vector_hash,
+        "desired_source_vector_hash": build.desired_source_vector_hash,
+        "current_source_context_vector_hash": build.current_source_context_vector_hash,
+        "desired_source_context_vector_hash": build.desired_source_context_vector_hash,
+        "refresh_source_ids": list(build.source_ids)
+        if build.materialization_mode == "source_delta"
+        else [],
+        "removed_source_ids": list(build.removed_source_ids),
+        "affected_npi_stage": build.affected_npi_stage,
+        "affected_npi_stage_oid": 13
+        if build.affected_npi_stage is not None
+        else None,
+        "affected_npi_stage_storage_fingerprint": _AFFECTED_NPI_STAGE_STORAGE_FINGERPRINT
+        if build.affected_npi_stage is not None
+        else None,
+        "capacity_geometry_status": build.capacity_geometry_status,
+        "capacity_geometry_hash": build.capacity_geometry_hash,
+        "capacity_geometry_json": build.capacity_geometry_json,
         "has_existing_artifacts": False,
         "evidence_next_batch": evidence_next_batch,
         "evidence_total_batches": evidence_total_batches,
@@ -382,6 +454,7 @@ def _profile_checkpoint_by_name(
         "profile_total_batches": profile_total_batches,
         "state": state,
     }
+    return checkpoint_by_name
 
 
 def _assert_profile_checkpoint_value_contracts(build):
@@ -714,7 +787,6 @@ def _patch_profile_finalize_retry(monkeypatch, build):
     )
     mark_state = AsyncMock()
     advance = AsyncMock()
-    create_indexes = AsyncMock()
     compact = AsyncMock()
     mark_failed = AsyncMock()
     prepared_stages = (SimpleNamespace(), SimpleNamespace())
@@ -728,7 +800,6 @@ def _patch_profile_finalize_retry(monkeypatch, build):
         ),
         "_has_provider_directory_profile_artifacts": AsyncMock(return_value=False),
         "_advance_provider_directory_profile_build_checkpoint": advance,
-        "_create_provider_directory_profile_indexes": create_indexes,
         "_populate_provider_directory_profile_compact_stage": compact,
         "_provider_directory_profile_metrics": AsyncMock(
             return_value={"profile_rows": 1}
@@ -758,7 +829,6 @@ def _patch_profile_finalize_retry(monkeypatch, build):
     return SimpleNamespace(
         advance=advance,
         compact=compact,
-        create_indexes=create_indexes,
         mark_failed=mark_failed,
         mark_state=mark_state,
         attempts=attempts,
@@ -768,10 +838,18 @@ def _patch_profile_finalize_retry(monkeypatch, build):
 
 def _assert_high_fanout_profile_calls(evidence_calls, profile_calls):
     """Require 19-source fact fanout and complete 5M NPI geometry."""
-    assert len(evidence_calls) == 2185
+    materialization_calls = [
+        call for call in evidence_calls if not call.get("count_only", False)
+    ]
+    projection_calls = [
+        call for call in evidence_calls if call.get("count_only", False)
+    ]
+    assert len(materialization_calls) == 2185
+    assert len(projection_calls) == 44
     for fact_type in ("affiliation", "organization", "plan_membership"):
         assert sum(
-            call["fact_type"] == fact_type for call in evidence_calls
+            call["fact_type"] == fact_type
+            for call in materialization_calls
         ) == 19 * profile.PROFILE_AFFILIATION_ROLE_BUCKETS
     assert len(profile_calls) == 400
     assert (
@@ -831,7 +909,8 @@ async def test_profile_bucket_index_is_limited_to_artifact_scope(
         )
     )
     assert len(index_name) <= 63
-    assert "CREATE INDEX IF NOT EXISTS" in index_sql
+    assert index_sql.startswith("CREATE INDEX ")
+    assert "IF NOT EXISTS" not in index_sql
     assert '"source_id"' in index_sql
     assert "hashtextextended(\"resource_id\", 0)" in index_sql
     assert (
@@ -843,7 +922,7 @@ async def test_profile_bucket_index_is_limited_to_artifact_scope(
 async def test_last_evidence_batch_failure_retries_only_finalization(
     monkeypatch,
 ):
-    """Retry indexes, ANALYZE, and state after the last fact was committed."""
+    """Retry ANALYZE and state after the last fact was committed."""
     build = _profile_build()
     controls = _patch_profile_finalize_retry(monkeypatch, build)
     fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
@@ -866,7 +945,6 @@ async def test_last_evidence_batch_failure_retries_only_finalization(
     )
     assert controls.attempts.inserts == 1
     assert controls.attempts.analyzes == 2
-    assert controls.create_indexes.await_count == 2
     controls.advance.assert_awaited_once_with(
         build,
         phase="evidence",
@@ -913,11 +991,6 @@ def _install_high_fanout_profile_spies(
     status = AsyncMock(return_value=1)
     prepare_bucket_index = AsyncMock(return_value=None)
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        AsyncMock(),
-    )
     monkeypatch.setattr(
         importer,
         "_prepare_provider_directory_profile_bucket_index",
@@ -995,6 +1068,7 @@ async def test_profile_high_fanout_plan_never_builds_unbounded_statements(
 
 
 async def _assert_logged_profile_retry_lineage(
+    build,
     checkpoint_by_name,
     dataset_fence,
     fence,
@@ -1008,6 +1082,11 @@ async def _assert_logged_profile_retry_lineage(
         importer,
         "_provider_directory_profile_stage_relation_identity",
         stage_identity,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        _profile_stage_storage_fingerprint_mock(build),
     )
     resumed_build = await importer._resolve_provider_directory_profile_build(
         "mrf",
@@ -1098,6 +1177,7 @@ async def test_profile_build_resolution_preserves_only_logged_retry_lineage(
     }
     first.return_value = checkpoint_by_name
     await _assert_logged_profile_retry_lineage(
+        initial_build,
         checkpoint_by_name,
         dataset_fence,
         fence,
@@ -1214,20 +1294,21 @@ async def test_profile_batch_total_mismatch_reinitializes_logged_stages(
     drop_stages = AsyncMock()
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(
-        importer.db,
-        "first",
-        AsyncMock(return_value=checkpoint_by_name),
+        importer.db, "first", AsyncMock(return_value=checkpoint_by_name)
     )
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(
-        importer,
-        "_drop_profile_stages_for_reinitialize",
-        drop_stages,
+        importer, "_drop_profile_stages_for_reinitialize", drop_stages
     )
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_relation_identity",
         AsyncMock(side_effect=[(21, "r", "p"), (22, "r", "p")]),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        _profile_stage_storage_fingerprint_mock(build),
     )
 
     initialized = (
@@ -1356,6 +1437,11 @@ async def _assert_global_profile_reinitialized(
         importer,
         "_require_provider_directory_profile_stage_oid",
         AsyncMock(side_effect=[21, 22]),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        _profile_stage_storage_fingerprint_mock(resolved_build),
     )
     initialized = (
         await importer._claim_provider_directory_profile_build_checkpoint(
@@ -1553,12 +1639,7 @@ async def test_profile_checkpoint_claim_initializes_and_reclaims_logged_stages(
     first = AsyncMock(return_value=None)
     status = AsyncMock(return_value=1)
     stage_identity = AsyncMock(
-        side_effect=[
-            None,
-            None,
-            (21, "r", "p"),
-            (22, "r", "p"),
-        ]
+        side_effect=[None, None, (21, "r", "p"), (22, "r", "p")]
     )
     monkeypatch.setattr(importer.db, "first", first)
     monkeypatch.setattr(importer.db, "status", status)
@@ -1566,6 +1647,11 @@ async def test_profile_checkpoint_claim_initializes_and_reclaims_logged_stages(
         importer,
         "_provider_directory_profile_stage_relation_identity",
         stage_identity,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        _profile_stage_storage_fingerprint_mock(build),
     )
     fresh_state = (
         await importer._claim_provider_directory_profile_build_checkpoint(
@@ -1645,6 +1731,11 @@ async def test_profile_claim_reopens_only_unfinalized_failed_evidence(
                 (12, "r", "p"),
             ]
         ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_storage_fingerprint",
+        _profile_stage_storage_fingerprint_mock(build),
     )
     fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
 
@@ -1754,11 +1845,6 @@ async def test_existing_profile_stages_receive_retention_and_currentness_params(
     """Pass the trust fence into both evidence copy and compact invalidation."""
     status = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        AsyncMock(),
-    )
     build = _profile_build()
 
     await importer._populate_provider_directory_profile_evidence_stage(
@@ -1810,11 +1896,6 @@ async def test_profile_bounded_population_rejects_invalid_resume_batches(
     """Fail closed on invalid offsets or malformed evidence/profile batches."""
     build = _profile_build()
     monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=1))
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        AsyncMock(),
-    )
     with pytest.raises(
         RuntimeError,
         match="profile_evidence_checkpoint_invalid",
@@ -1912,11 +1993,6 @@ async def test_profile_bounded_population_checkpoints_copy_and_range_batches(
         importer,
         "_mark_profile_build_checkpoint_state",
         mark_state,
-    )
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        AsyncMock(),
     )
     monkeypatch.setattr(
         importer,
@@ -2186,7 +2262,7 @@ async def test_profile_stage_identity_and_stale_reaper_are_oid_fenced(
             "evidence_stage": evidence_stage,
             "profile_stage": profile_stage,
         }
-    ) == (evidence_stage, profile_stage)
+        ) == (evidence_stage, profile_stage, None)
     with pytest.raises(
         RuntimeError,
         match="stale_checkpoint_identity_invalid",
@@ -2222,6 +2298,11 @@ async def _assert_profile_artifact_pair_contract(monkeypatch):
     table_exists.side_effect = [True, True]
     profile_has_rows = AsyncMock(side_effect=[False, False])
     monkeypatch.setattr(importer.db, "scalar", profile_has_rows)
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_serving_state",
+        AsyncMock(return_value=None),
+    )
     assert not await importer._has_provider_directory_profile_artifacts("mrf")
     table_exists.side_effect = [True, True]
     profile_has_rows.side_effect = [True, True]
@@ -3166,6 +3247,35 @@ async def test_artifact_bundle_timeout_recovers_only_verified_commit(
 
 
 @pytest.mark.asyncio
+async def test_artifact_bundle_connection_loss_reconciles_verified_commit(
+    monkeypatch,
+):
+    """Treat a non-timeout lost acknowledgement like any ambiguous commit."""
+
+    stage = _artifact_stage()
+    identities = (
+        importer.ProviderDirectoryArtifactPromotionIdentity(stage, 11),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_capture_provider_directory_artifact_promotion_identities",
+        AsyncMock(return_value=identities),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_promote_provider_directory_artifact_bundle_transaction",
+        AsyncMock(side_effect=RuntimeError("connection acknowledgement lost")),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_is_provider_directory_artifact_promotion_committed",
+        AsyncMock(return_value=True),
+    )
+
+    await importer._promote_provider_directory_artifact_bundle((stage,))
+
+
+@pytest.mark.asyncio
 async def test_artifact_bundle_retry_stops_on_cause_or_exhaustion(monkeypatch):
     """Retry transient lock conflicts and propagate all terminal failures."""
     stage = _artifact_stage()
@@ -3609,11 +3719,6 @@ async def test_profile_unbounded_and_completed_batch_paths(monkeypatch):
     build = _profile_build()
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(
-        importer,
-        "_create_provider_directory_profile_indexes",
-        AsyncMock(),
-    )
     await importer._populate_provider_directory_profile_evidence_stage(
         build,
         has_evidence_target=True,

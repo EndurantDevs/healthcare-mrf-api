@@ -334,6 +334,60 @@ async def test_provider_directory_overlay_fetch_projects_coordinates(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_provider_directory_overlay_qualifies_only_official_uhc_addresses(
+    monkeypatch,
+):
+    """Keep non-UHC payload shape exact while marking official-file candidates."""
+    uhc_address_by_field = {
+        "type": "practice",
+        "first_line": "1 Main St",
+        "source_record_ids": [
+            "provider_directory_fhir:organization_address:"
+            f"{npi_module.UHC_PROVIDER_FILE_SOURCE_ID}:facility-1:1"
+        ],
+    }
+    non_uhc_address_by_field = {
+        "type": "practice",
+        "first_line": "2 Main St",
+        "source_record_ids": [
+            "provider_directory_fhir:organization_address:"
+            "pdfhir_example:facility-2:1"
+        ],
+    }
+
+    class FakeResult:
+        def all(self):
+            return [uhc_address_by_field, non_uhc_address_by_field]
+
+    monkeypatch.setattr(
+        npi_module,
+        "_is_table_available",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_table_columns",
+        AsyncMock(return_value={"lat", "long"}),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_execute_stmt",
+        AsyncMock(return_value=FakeResult()),
+    )
+
+    overlay_address_list = await npi_module._fetch_provider_directory_address_overlay(
+        1000000491
+    )
+
+    assert overlay_address_list[0] == {
+        **uhc_address_by_field,
+        "address_status": "payer_directory_candidate",
+    }
+    assert overlay_address_list[1] == non_uhc_address_by_field
+    assert "address_status" not in non_uhc_address_by_field
+
+
+@pytest.mark.asyncio
 async def test_provider_directory_overlay_fails_closed_without_visibility_tables(
     monkeypatch,
 ):

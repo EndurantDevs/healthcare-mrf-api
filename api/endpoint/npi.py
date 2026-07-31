@@ -15,7 +15,8 @@ import time
 import urllib.parse
 import uuid
 from collections import OrderedDict, defaultdict
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from textwrap import dedent
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Sequence
@@ -66,6 +67,7 @@ from process.ext.utils import download_it
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 from process import provider_directory_profile as profile_artifact
 from process.florida_mqa_profile import STANDARD_CATEGORIES
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
 logger = logging.getLogger(__name__)
@@ -156,6 +158,56 @@ PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
     "group_plan_array",
 }
 PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY = "provider_directory_sources"
+UHC_PROVIDER_FILE_ADDRESS_STATUS = "payer_directory_candidate"
+PROVIDER_DIRECTORY_PROFILE_SERVING_GENERATION_TABLE = (
+    "provider_directory_profile_serving_generation"
+)
+PROVIDER_DIRECTORY_PROFILE_SERVING_QUERY_TEMPLATE = """
+    WITH serving_generation AS MATERIALIZED (
+        SELECT singleton_key, generation_id, published_at, profile_as_of,
+               status, operation, control_generation,
+               profile_target_oid, evidence_target_oid
+          FROM {serving_generation_ref}
+         WHERE singleton_key = 'global'
+    )
+    SELECT profile.npi, profile.profile_json,
+           profile.generation_id AS materialization_generation_id,
+           profile.published_at AS materialized_at,
+           profile.tableoid::bigint AS materialization_profile_target_oid,
+           serving_generation.singleton_key AS serving_generation_key,
+           serving_generation.control_generation AS serving_control_generation,
+           serving_generation.profile_target_oid AS serving_profile_target_oid,
+           serving_generation.evidence_target_oid AS serving_evidence_target_oid,
+           COALESCE(
+               serving_generation.generation_id,
+               profile.generation_id
+           ) AS generation_id,
+           COALESCE(
+               serving_generation.published_at,
+               profile.published_at
+           ) AS published_at,
+           serving_generation.profile_as_of AS profile_as_of
+           {evidence_select}
+      FROM {profile_table_ref} AS profile
+      LEFT JOIN serving_generation
+        ON serving_generation.status = 'published'
+       AND serving_generation.operation = 'publish'
+       AND serving_generation.control_generation > 0
+       AND serving_generation.generation_id IS NOT NULL
+       AND serving_generation.published_at IS NOT NULL
+       AND serving_generation.profile_as_of IS NOT NULL
+       AND serving_generation.profile_target_oid =
+           to_regclass(:profile_table_ref)::oid::bigint
+       AND serving_generation.evidence_target_oid =
+           to_regclass(:evidence_table_ref)::oid::bigint
+       AND profile.tableoid::bigint =
+           serving_generation.profile_target_oid
+     WHERE profile.npi = ANY(CAST(:npis AS bigint[]))
+       AND (
+           NOT EXISTS (SELECT 1 FROM serving_generation)
+           OR serving_generation.singleton_key = 'global'
+       );
+"""
 PROVIDER_DIRECTORY_CATALOG_ALIAS_COLUMNS = (
     # Catalog labels describe ingestion aliases, not provider-verified products.
     "source_id",
@@ -793,6 +845,8 @@ def _npi_detail_cache_key(
     include_evidence: bool = False,
     include_profile: bool = True,
     profile_generation: str | None = None,
+    profile_serving_identity: str | None = None,
+    address_overlay_serving_identity: str | None = None,
     address_limit: int | None = None,
     address_offset: int = 0,
     include_address_total: bool = True,
@@ -805,7 +859,12 @@ def _npi_detail_cache_key(
     debug_mode = f"sources:{int(include_sources)}|evidence:{int(include_evidence)}"
     profile_mode = (
         f"profile:{int(include_profile)}|"
-        f"pgen:{profile_generation or 'none'}"
+        f"pgen:{profile_generation or 'none'}|"
+        f"pserve:{profile_serving_identity or 'unknown'}"
+    )
+    address_overlay_mode = (
+        "pdaddr:"
+        f"{address_overlay_serving_identity or 'unknown'}"
     )
     page_mode = (
         f"alim:{address_limit if address_limit is not None else 'all'}|"
@@ -816,7 +875,7 @@ def _npi_detail_cache_key(
         f"{schema}|{address_source}|{int(npi)}|{view}|"
         f"{'chain' if include_chain else 'default'}|"
         f"extra:{int(extra_info)}|{geocode_mode}|{archive_mode}|{debug_mode}|"
-        f"{profile_mode}|{page_mode}"
+        f"{profile_mode}|{address_overlay_mode}|{page_mode}"
     )
 
 
@@ -932,6 +991,12 @@ def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any])
     ):
         if base.get(key) in (None, "") and duplicate.get(key) not in (None, ""):
             base[key] = duplicate.get(key)
+
+    if (
+        duplicate.get("address_status")
+        == UHC_PROVIDER_FILE_ADDRESS_STATUS
+    ):
+        base["address_status"] = UHC_PROVIDER_FILE_ADDRESS_STATUS
 
     merged_sources = base.get("address_sources") or []
     if isinstance(merged_sources, list):
@@ -4789,6 +4854,24 @@ def _serialize_utc_rfc3339_datetime(
     return parsed_timestamp.isoformat().replace("+00:00", "Z")
 
 
+def _serialize_provider_directory_profile_as_of(
+    profile_as_of: date | str | None,
+) -> str | None:
+    """Return one exact calendar date or fail closed on invalid metadata."""
+    if profile_as_of is None:
+        return None
+    if isinstance(profile_as_of, datetime):
+        raise TypeError("profile_as_of must be a date without a time")
+    if isinstance(profile_as_of, date):
+        return profile_as_of.isoformat()
+    if not isinstance(profile_as_of, str):
+        raise TypeError("profile_as_of must be an ISO date string, date, or None")
+    try:
+        return date.fromisoformat(profile_as_of.strip()).isoformat()
+    except ValueError as exc:
+        raise ValueError("profile_as_of must be an ISO calendar date") from exc
+
+
 _PROVIDER_DIRECTORY_PROFILE_TABLES_SEEN: set[str] = set()
 
 
@@ -4820,16 +4903,69 @@ def _provider_directory_profile_payload(
     if profile is None:
         return None
     published_at = _serialize_utc_rfc3339_datetime(mapping.get("published_at"))
+    profile_as_of = _serialize_provider_directory_profile_as_of(
+        mapping.get("profile_as_of")
+    )
     profile["generation_id"] = mapping.get("generation_id")
     profile["published_at"] = published_at
+    profile["profile_as_of"] = profile_as_of
     profile_payload_by_kind: dict[str, Any] = {"profile": profile}
     if include_evidence:
         evidence = _provider_directory_profile_json(mapping.get("evidence_json"))
         if evidence is not None:
             evidence["generation_id"] = mapping.get("generation_id")
             evidence["published_at"] = published_at
+            evidence["profile_as_of"] = profile_as_of
             profile_payload_by_kind["evidence"] = evidence
     return profile_payload_by_kind
+
+
+def _provider_directory_profile_serving_identity(
+    mapping: Mapping[str, Any],
+) -> str:
+    """Bind response caching to fallback or validated singleton publication."""
+    generation_id = str(mapping.get("generation_id") or "none")
+    published_at = (
+        _serialize_utc_rfc3339_datetime(mapping.get("published_at")) or "none"
+    )
+    profile_as_of = (
+        _serialize_provider_directory_profile_as_of(
+            mapping.get("profile_as_of")
+        )
+        or "none"
+    )
+    if mapping.get("serving_generation_key") == "global":
+        return (
+            f"singleton:{generation_id}:{published_at}:{profile_as_of}:"
+            f"{mapping.get('serving_control_generation')}:"
+            f"{mapping.get('serving_profile_target_oid')}:"
+            f"{mapping.get('serving_evidence_target_oid')}"
+        )
+    return (
+        f"fallback:{generation_id}:{published_at}:{profile_as_of}:"
+        f"{mapping.get('materialization_profile_target_oid')}"
+    )
+
+
+def _provider_directory_profiles_by_npi(
+    profile_query_result: Any,
+    *,
+    include_evidence: bool,
+) -> dict[int, dict[str, Any]]:
+    """Convert one serving-generation query result into public profile payloads."""
+    profiles_by_npi: dict[int, dict[str, Any]] = {}
+    for profile_query_row in profile_query_result.all():
+        mapping = getattr(profile_query_row, "_mapping", profile_query_row)
+        profile_payload_by_kind = _provider_directory_profile_payload(
+            mapping,
+            include_evidence=include_evidence,
+        )
+        if profile_payload_by_kind is not None:
+            profile_payload_by_kind["_serving_identity"] = (
+                _provider_directory_profile_serving_identity(mapping)
+            )
+            profiles_by_npi[int(mapping["npi"])] = profile_payload_by_kind
+    return profiles_by_npi
 
 
 async def _fetch_provider_directory_profile_map(
@@ -4849,39 +4985,41 @@ async def _fetch_provider_directory_profile_map(
     if not normalized_npis:
         return {}
     table_ref = _schema_cache_key(profile_artifact.PROFILE_TABLE)
+    evidence_table_ref = _schema_cache_key(
+        profile_artifact.PROFILE_EVIDENCE_TABLE
+    )
+    serving_generation_ref = _schema_cache_key(
+        PROVIDER_DIRECTORY_PROFILE_SERVING_GENERATION_TABLE
+    )
     if not await _is_provider_directory_profile_table_available(
         table_ref,
         session=session,
     ):
         return {}
-    evidence_select = ", evidence_json" if include_evidence else ""
-    profile_query_result = await _execute_stmt(
-        text(
-            f"""
-            SELECT npi, profile_json, generation_id, published_at
-                   {evidence_select}
-              FROM {table_ref}
-             WHERE npi = ANY(CAST(:npis AS bigint[]));
-            """
-        ),
+    if not await _is_provider_directory_profile_table_available(
+        serving_generation_ref,
         session=session,
-        params={"npis": normalized_npis},
+    ):
+        return {}
+    evidence_select = ", profile.evidence_json" if include_evidence else ""
+    profile_query = PROVIDER_DIRECTORY_PROFILE_SERVING_QUERY_TEMPLATE.format(
+        serving_generation_ref=serving_generation_ref,
+        profile_table_ref=table_ref,
+        evidence_select=evidence_select,
     )
-    profiles_by_npi: dict[int, dict[str, Any]] = {}
-    for profile_query_row in profile_query_result.all():
-        mapping = getattr(
-            profile_query_row,
-            "_mapping",
-            profile_query_row,
-        )
-        profile_payload_by_kind = _provider_directory_profile_payload(
-            mapping,
-            include_evidence=include_evidence,
-        )
-        if profile_payload_by_kind is None:
-            continue
-        profiles_by_npi[int(mapping["npi"])] = profile_payload_by_kind
-    return profiles_by_npi
+    profile_query_result = await _execute_stmt(
+        text(profile_query),
+        session=session,
+        params={
+            "npis": normalized_npis,
+            "profile_table_ref": table_ref,
+            "evidence_table_ref": evidence_table_ref,
+        },
+    )
+    return _provider_directory_profiles_by_npi(
+        profile_query_result,
+        include_evidence=include_evidence,
+    )
 
 
 def _is_unified_address_serving_requested() -> bool:
@@ -9733,154 +9871,321 @@ async def get_full_taxonomy_list(_request, npi):
     return response.json(taxonomy_rows)
 
 
+@dataclass(frozen=True)
+class _ProviderProfileQuery:
+    include_evidence: bool
+    include_sensitive: bool
+    page_category: str | None
+    requested_generation_id: str | None
+    page_limit: int
+    page_offset: int
+    requested_categories: tuple[str, ...]
+
+
+class _ProviderProfileQueryError(ValueError):
+    def __init__(
+        self,
+        error_code: str,
+        message: str,
+        *,
+        status: int = 400,
+        **details_by_key: Any,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.response_by_key = {
+            "error": error_code,
+            "message": message,
+            **details_by_key,
+        }
+
+
+def _provider_profile_error_response(
+    error_code: str,
+    message: str,
+    *,
+    status: int = 400,
+    **details_by_key: Any,
+) -> Any:
+    return response.json(
+        {"error": error_code, "message": message, **details_by_key},
+        status=status,
+    )
+
+
+def _provider_profile_generation_id(
+    request_args: Any,
+) -> str | None:
+    generation_id = _normalize_text_filter(
+        request_args.get("generation_id"),
+        param_name="generation_id",
+        max_length=64,
+    )
+    if generation_id is None:
+        return None
+    generation_id = generation_id.lower()
+    if re.fullmatch(r"[0-9a-f]{64}", generation_id) is None:
+        raise _ProviderProfileQueryError(
+            "invalid_profile_generation_id",
+            "generation_id must be a 64-character hexadecimal value",
+        )
+    return generation_id
+
+
+def _assert_provider_profile_query_scope(
+    request_args: Any,
+    page_category: str | None,
+    requested_generation_id: str | None,
+    raw_categories: Any,
+) -> None:
+    if page_category and raw_categories:
+        raise _ProviderProfileQueryError(
+            "conflicting_profile_parameters",
+            "category and categories cannot be used together",
+        )
+    has_page_window = any(
+        request_args.get(parameter_name) not in (None, "", "null")
+        for parameter_name in ("limit", "offset")
+    )
+    if has_page_window and page_category is None:
+        raise _ProviderProfileQueryError(
+            "profile_category_required",
+            "limit and offset require the category parameter",
+        )
+    if requested_generation_id and page_category is None:
+        raise _ProviderProfileQueryError(
+            "profile_category_required",
+            "generation_id requires the category parameter",
+        )
+
+
+def _provider_profile_requested_categories(
+    raw_categories: Any,
+    page_category: str | None,
+) -> tuple[str, ...]:
+    requested_categories = (
+        (page_category,)
+        if page_category
+        else tuple(
+            field_value.strip()
+            for field_value in str(raw_categories).split(",")
+            if field_value.strip()
+        )
+        if raw_categories
+        else tuple(STANDARD_CATEGORIES)
+    )
+    unknown_categories = sorted(
+        set(requested_categories) - set(STANDARD_CATEGORIES)
+    )
+    if unknown_categories:
+        raise _ProviderProfileQueryError(
+            "invalid_profile_categories",
+            "unknown provider profile categories",
+            unknown_categories=unknown_categories,
+            allowed_categories=list(STANDARD_CATEGORIES),
+        )
+    return requested_categories
+
+
+def _provider_profile_query_from_args(
+    request_args: Any,
+) -> _ProviderProfileQuery:
+    page_category = _normalize_text_filter(
+        request_args.get("category"),
+        param_name="category",
+        max_length=64,
+    )
+    requested_generation_id = _provider_profile_generation_id(
+        request_args,
+    )
+    raw_categories = request_args.get("categories")
+    _assert_provider_profile_query_scope(
+        request_args,
+        page_category,
+        requested_generation_id,
+        raw_categories,
+    )
+    return _ProviderProfileQuery(
+        include_evidence=_is_truthy_arg(
+            request_args.get("include_evidence"),
+            default=False,
+        ),
+        include_sensitive=_is_truthy_arg(
+            request_args.get("include_sensitive"),
+            default=False,
+        ),
+        page_category=page_category,
+        requested_generation_id=requested_generation_id,
+        page_limit=_parse_bounded_int(
+            request_args.get("limit"),
+            param_name="limit",
+            default=25,
+            minimum=1,
+            maximum=50,
+        ),
+        page_offset=_parse_bounded_int(
+            request_args.get("offset"),
+            param_name="offset",
+            default=0,
+            minimum=0,
+            maximum=1_000_000,
+        ),
+        requested_categories=_provider_profile_requested_categories(
+            raw_categories,
+            page_category,
+        ),
+    )
+
+
+def _compose_requested_provider_profile(
+    normalized_npi: int,
+    state_projection: Mapping[str, Any] | None,
+    fhir_record_by_key: Mapping[str, Any] | None,
+    query: _ProviderProfileQuery,
+) -> dict[str, Any] | None:
+    profile_by_key = compose_provider_profile(
+        normalized_npi,
+        state_projection=state_projection,
+        fhir_profile=(
+            fhir_record_by_key.get("profile")
+            if fhir_record_by_key
+            else None
+        ),
+        requested_categories=list(query.requested_categories),
+        include_sensitive=query.include_sensitive,
+        page_category=query.page_category,
+        page_limit=query.page_limit,
+        page_offset=query.page_offset,
+    )
+    if profile_by_key is None:
+        return None
+    fhir_profile_by_key = (
+        fhir_record_by_key.get("profile")
+        if fhir_record_by_key
+        and isinstance(fhir_record_by_key.get("profile"), Mapping)
+        else None
+    )
+    if (
+        isinstance(fhir_profile_by_key, Mapping)
+        and "profile_as_of" in fhir_profile_by_key
+    ):
+        profile_by_key = dict(profile_by_key)
+        profile_by_key["profile_as_of"] = (
+            _serialize_provider_directory_profile_as_of(
+                fhir_profile_by_key.get("profile_as_of")
+            )
+        )
+    return profile_by_key
+
+
+def _provider_profile_generation_error(
+    profile_by_key: Mapping[str, Any],
+    requested_generation_id: str | None,
+) -> Any | None:
+    if (
+        requested_generation_id is None
+        or profile_by_key["generation_id"] == requested_generation_id
+    ):
+        return None
+    return _provider_profile_error_response(
+        "provider_profile_generation_changed",
+        "The provider profile changed; restart category pagination.",
+        status=409,
+        requested_generation_id=requested_generation_id,
+        current_generation_id=profile_by_key["generation_id"],
+    )
+
+
+def _provider_profile_response_by_key(
+    normalized_npi: int,
+    state_projection: Mapping[str, Any] | None,
+    fhir_record_by_key: Mapping[str, Any] | None,
+    profile_by_key: dict[str, Any],
+    query: _ProviderProfileQuery,
+) -> dict[str, Any]:
+    response_by_key: dict[str, Any] = {
+        "npi": normalized_npi,
+        "provider_profile": profile_by_key,
+    }
+    if not query.include_evidence:
+        return response_by_key
+    evidence_by_key = compose_provider_profile_evidence(
+        state_projection=state_projection,
+        fhir_evidence=(
+            fhir_record_by_key.get("evidence")
+            if fhir_record_by_key
+            else None
+        ),
+        provider_profile=profile_by_key,
+        page_category=query.page_category,
+    )
+    if evidence_by_key is None:
+        return response_by_key
+    if "profile_as_of" in profile_by_key:
+        evidence_by_key = dict(evidence_by_key)
+        evidence_by_key["profile_as_of"] = profile_by_key["profile_as_of"]
+    response_by_key["provider_profile_evidence"] = evidence_by_key
+    return response_by_key
+
+
 @blueprint.get("/id/<npi>/profile")
 async def get_provider_profile(request, npi):
     """Return one categorized profile composed across reviewed public sources."""
     if not profile_artifact.is_valid_npi(npi):
-        return response.json(
-            {
-                "error": "invalid_npi",
-                "message": "npi must be a valid 10-digit National Provider Identifier",
-            },
-            status=400,
+        return _provider_profile_error_response(
+            "invalid_npi",
+            "npi must be a valid 10-digit National Provider Identifier",
         )
+    query_args_by_name = {
+        "categories": request.args.get("categories"),
+        "category": request.args.get("category"),
+        "generation_id": request.args.get("generation_id"),
+        "include_evidence": request.args.get("include_evidence"),
+        "include_sensitive": request.args.get("include_sensitive"),
+        "limit": request.args.get("limit"),
+        "offset": request.args.get("offset"),
+    }
+    try:
+        query = _provider_profile_query_from_args(query_args_by_name)
+    except _ProviderProfileQueryError as exc:
+        return response.json(exc.response_by_key, status=exc.status)
     normalized_npi = int(npi)
-    include_evidence = _is_truthy_arg(request.args.get("include_evidence"), default=False)
-    include_sensitive = _is_truthy_arg(request.args.get("include_sensitive"), default=False)
-    page_category = _normalize_text_filter(
-        request.args.get("category"),
-        param_name="category",
-        max_length=64,
-    )
-    requested_generation_id = _normalize_text_filter(
-        request.args.get("generation_id"),
-        param_name="generation_id",
-        max_length=64,
-    )
-    if requested_generation_id:
-        requested_generation_id = requested_generation_id.lower()
-        if not re.fullmatch(r"[0-9a-f]{64}", requested_generation_id):
-            return response.json(
-                {
-                    "error": "invalid_profile_generation_id",
-                    "message": "generation_id must be a 64-character hexadecimal value",
-                },
-                status=400,
-            )
-    raw_categories = request.args.get("categories")
-    if page_category and raw_categories:
-        return response.json(
-            {
-                "error": "conflicting_profile_parameters",
-                "message": "category and categories cannot be used together",
-            },
-            status=400,
-        )
-    has_page_window = request.args.get("limit") not in (None, "", "null") or request.args.get(
-        "offset"
-    ) not in (None, "", "null")
-    if has_page_window and not page_category:
-        return response.json(
-            {
-                "error": "profile_category_required",
-                "message": "limit and offset require the category parameter",
-            },
-            status=400,
-        )
-    if requested_generation_id and not page_category:
-        return response.json(
-            {
-                "error": "profile_category_required",
-                "message": "generation_id requires the category parameter",
-            },
-            status=400,
-        )
-    page_limit = _parse_bounded_int(
-        request.args.get("limit"),
-        param_name="limit",
-        default=25,
-        minimum=1,
-        maximum=50,
-    )
-    page_offset = _parse_bounded_int(
-        request.args.get("offset"),
-        param_name="offset",
-        default=0,
-        minimum=0,
-        maximum=1_000_000,
-    )
-    requested_categories = (
-        [page_category]
-        if page_category
-        else [field_value.strip() for field_value in str(raw_categories).split(",") if field_value.strip()]
-        if raw_categories
-        else list(STANDARD_CATEGORIES)
-    )
-    unknown_categories = sorted(set(requested_categories) - set(STANDARD_CATEGORIES))
-    if unknown_categories:
-        return response.json(
-            {
-                "error": "invalid_profile_categories",
-                "message": "unknown provider profile categories",
-                "unknown_categories": unknown_categories,
-                "allowed_categories": list(STANDARD_CATEGORIES),
-            },
-            status=400,
-        )
     state_projection, fhir_profile_map = await asyncio.gather(
         fetch_state_profile_projection(normalized_npi),
         _fetch_provider_directory_profile_map(
             [normalized_npi],
-            include_evidence=include_evidence,
+            include_evidence=query.include_evidence,
         ),
     )
-    fhir_record = fhir_profile_map.get(normalized_npi)
-    provider_profile = compose_provider_profile(
+    fhir_record_by_key = fhir_profile_map.get(normalized_npi)
+    profile_by_key = _compose_requested_provider_profile(
         normalized_npi,
-        state_projection=state_projection,
-        fhir_profile=fhir_record.get("profile") if fhir_record else None,
-        requested_categories=requested_categories,
-        include_sensitive=include_sensitive,
-        page_category=page_category,
-        page_limit=page_limit,
-        page_offset=page_offset,
+        state_projection,
+        fhir_record_by_key,
+        query,
     )
-    if provider_profile is None:
-        return response.json(
-            {
-                "error": "provider_profile_not_found",
-                "message": "No reviewed provider profile facts are available for this NPI.",
-                "npi": normalized_npi,
-            },
+    if profile_by_key is None:
+        return _provider_profile_error_response(
+            "provider_profile_not_found",
+            "No reviewed provider profile facts are available for this NPI.",
             status=404,
+            npi=normalized_npi,
         )
-    if (
-        requested_generation_id
-        and provider_profile["generation_id"] != requested_generation_id
-    ):
-        return response.json(
-            {
-                "error": "provider_profile_generation_changed",
-                "message": "The provider profile changed; restart category pagination.",
-                "requested_generation_id": requested_generation_id,
-                "current_generation_id": provider_profile["generation_id"],
-            },
-            status=409,
+    generation_error = _provider_profile_generation_error(
+        profile_by_key,
+        query.requested_generation_id,
+    )
+    if generation_error is not None:
+        return generation_error
+    return response.json(
+        _provider_profile_response_by_key(
+            normalized_npi,
+            state_projection,
+            fhir_record_by_key,
+            profile_by_key,
+            query,
         )
-    profile_payload_by_key: dict[str, Any] = {
-        "npi": normalized_npi,
-        "provider_profile": provider_profile,
-    }
-    if include_evidence:
-        evidence = compose_provider_profile_evidence(
-            state_projection=state_projection,
-            fhir_evidence=fhir_record.get("evidence") if fhir_record else None,
-            provider_profile=provider_profile,
-            page_category=page_category,
-        )
-        if evidence is not None:
-            profile_payload_by_key["provider_profile_evidence"] = evidence
-    return response.json(profile_payload_by_key)
+    )
 
 
 @blueprint.get("/plans_by_npi/<npi>")
@@ -9976,6 +10281,27 @@ async def get_npi(request, npi):
                 npi,
                 exc,
             )
+    is_response_cache_enabled = bool(
+        not should_force_address_update
+        and _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS > 0
+        and _NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS > 0
+    )
+    address_overlay_serving_identity: str | None = None
+    if is_response_cache_enabled:
+        try:
+            address_overlay_serving_identity = (
+                await _provider_directory_address_overlay_serving_identity(
+                    session=request_session,
+                )
+            )
+        except Exception as exc:
+            is_response_cache_enabled = False
+            logger.debug(
+                "Provider Directory address-overlay identity fetch failed "
+                "for npi=%s; bypassing response cache: %s",
+                npi,
+                exc,
+            )
     cache_key = _npi_detail_cache_key(
         npi,
         view=provider_enrichment_view,
@@ -9991,12 +10317,20 @@ async def get_npi(request, npi):
             if profile_record and isinstance(profile_record.get("profile"), Mapping)
             else None
         ),
+        profile_serving_identity=(
+            str(profile_record.get("_serving_identity"))
+            if profile_record and profile_record.get("_serving_identity")
+            else None
+        ),
+        address_overlay_serving_identity=(
+            address_overlay_serving_identity
+        ),
         address_limit=address_limit,
         address_offset=address_offset,
         include_address_total=include_address_total,
         address_key=address_key,
     )
-    if not should_force_address_update:
+    if is_response_cache_enabled:
         cached_body = _npi_detail_response_cache_get(cache_key)
         if cached_body is not None:
             return response.raw(cached_body, content_type="application/json")
@@ -10463,7 +10797,7 @@ async def get_npi(request, npi):
             default=str,
             separators=(",", ":"),
         ).encode("utf-8")
-        if _is_npi_detail_response_cacheable(
+        if is_response_cache_enabled and _is_npi_detail_response_cacheable(
             provider_detail_by_field,
             force_address_update=should_force_address_update,
             sync_geocode=should_sync_geocode,
@@ -10624,7 +10958,7 @@ async def get_npi(request, npi):
         default=str,
         separators=(",", ":"),
     ).encode("utf-8")
-    if _is_npi_detail_response_cacheable(
+    if is_response_cache_enabled and _is_npi_detail_response_cacheable(
         provider_detail_by_field,
         force_address_update=should_force_address_update,
         sync_geocode=should_sync_geocode,
@@ -10883,6 +11217,42 @@ async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str,
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
 
 
+async def _provider_directory_address_overlay_serving_identity(
+    *,
+    session: Any = None,
+) -> str:
+    """Return the uncached serving-relation identity used by response caches."""
+    overlay_table_ref = _schema_cache_key(
+        PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+    )
+    identity_result = await _execute_stmt(
+        text(
+            "SELECT to_regclass(:overlay_table_ref)::oid::bigint "
+            "AS overlay_target_oid;"
+        ),
+        session=session,
+        params={"overlay_table_ref": overlay_table_ref},
+    )
+    overlay_target_oid = identity_result.scalar()
+    if overlay_target_oid is None:
+        return "absent"
+    if isinstance(overlay_target_oid, bool):
+        raise RuntimeError(
+            "provider_directory_address_overlay_identity_invalid"
+        )
+    try:
+        normalized_oid = int(overlay_target_oid)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "provider_directory_address_overlay_identity_invalid"
+        ) from exc
+    if normalized_oid < 1:
+        raise RuntimeError(
+            "provider_directory_address_overlay_identity_invalid"
+        )
+    return f"oid:{normalized_oid}"
+
+
 def _provider_directory_overlay_query_sql(
     overlay_columns: set[str],
 ) -> str:
@@ -10969,7 +11339,14 @@ async def _fetch_provider_directory_address_overlay(
     overlay_addresses: list[dict[str, Any]] = []
     for overlay_row in overlay_result.all():
         overlay_mapping = getattr(overlay_row, "_mapping", overlay_row)
-        overlay_addresses.append(dict(overlay_mapping))
+        overlay_address_by_field = dict(overlay_mapping)
+        if UHC_PROVIDER_FILE_SOURCE_ID in _directory_source_ids(
+            overlay_address_by_field.get("source_record_ids")
+        ):
+            overlay_address_by_field["address_status"] = (
+                UHC_PROVIDER_FILE_ADDRESS_STATUS
+            )
+        overlay_addresses.append(overlay_address_by_field)
     return overlay_addresses
 
 

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -24,7 +25,7 @@ PROFILE_SELECTION_RESULT_CONTRACT_ID = (
     "healthporta.provider-directory-profile-selection-result.v1"
 )
 PROFILE_EXECUTION_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-execution.v1"
+    "healthporta.provider-directory-profile-execution.v2"
 )
 PROFILE_SELECTION_LINEAGE_AUTHORITY = (
     "healthcare-mrf-api.provider-directory-selection-proof.v1"
@@ -104,6 +105,7 @@ class ProviderDirectoryProfileExecution:
 
     attestation: ProviderDirectoryProfileSelectionAttestation
     generation: int
+    capacity_attestation: Mapping[str, Any] | None = None
 
 
 def stable_hash(payload: Any, *, domain: str) -> str:
@@ -358,11 +360,22 @@ def validated_profile_execution(
     attestation = validated_profile_selection_attestation(
         task_map.get("provider_directory_profile_selection_attestation")
     )
+    capacity_attestation = task_map.get(
+        "provider_directory_profile_capacity_attestation"
+    )
+    if not isinstance(capacity_attestation, Mapping):
+        raise ProviderDirectoryProfileSelectionError(
+            "Profile execution capacity attestation is invalid"
+        )
     if attestation.node_id != configured_node_id():
         raise ProviderDirectoryProfileSelectionError(
             "Profile selection node does not match this engine"
         )
-    return ProviderDirectoryProfileExecution(attestation, generation)
+    return ProviderDirectoryProfileExecution(
+        attestation,
+        generation,
+        dict(capacity_attestation),
+    )
 
 
 def _profile_result_counts(
@@ -393,6 +406,7 @@ def profile_selection_result(
     execution: ProviderDirectoryProfileExecution,
     *,
     profile_generation_id: str,
+    profile_as_of: str,
     profile_rows: int,
     profile_source_evidence_rows: int,
 ) -> dict[str, Any]:
@@ -403,6 +417,19 @@ def profile_selection_result(
         raise ProviderDirectoryProfileSelectionError(
             "Profile result generation identity is invalid"
         )
+    normalized_profile_as_of = _clean_text(profile_as_of)
+    try:
+        if normalized_profile_as_of is None:
+            raise ValueError
+        parsed_profile_as_of = datetime.date.fromisoformat(
+            normalized_profile_as_of
+        )
+        if parsed_profile_as_of.isoformat() != normalized_profile_as_of:
+            raise ValueError
+    except ValueError as exc:
+        raise ProviderDirectoryProfileSelectionError(
+            "Profile result profile_as_of is invalid"
+        ) from exc
     attestation = execution.attestation
     identity_fields = (
         "proof_id",
@@ -423,6 +450,7 @@ def profile_selection_result(
         "status": "published" if attestation.operation == "publish" else "purged",
         "generation": execution.generation,
         "profile_generation_id": generation_id,
+        "profile_as_of": normalized_profile_as_of,
         "row_counts": _profile_result_counts(
             execution,
             profile_rows,

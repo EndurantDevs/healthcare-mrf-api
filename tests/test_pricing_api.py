@@ -1242,135 +1242,127 @@ async def test_list_procedure_providers_success():
     assert pricing_response["query"]["input_code"]["code_system"] == "HP_PROCEDURE_CODE"
 
 
-@pytest.mark.asyncio
-async def test_get_pricing_provider_score_success():
-    """Return the configured provider score and benchmark details."""
-    request = make_request(
-        [
-            FakeResult(scalar="mrf.pricing_provider_quality_score"),
-            FakeResult(scalar="mrf.pricing_provider_quality_domain"),
-            FakeResult(
-                rows=[
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "model_version": "v2",
-                        "benchmark_mode": "national",
-                        "tier": "high",
-                        "borderline_status": False,
-                        "score_0_100": 72.4,
-                        "estimated_cost_level": "$$",
-                        "risk_ratio_point": 0.91,
-                        "ci75_low": 0.86,
-                        "ci75_high": 0.97,
-                        "ci90_low": 0.82,
-                        "ci90_high": 1.01,
-                        "low_score_threshold_failed": False,
-                        "low_confidence_threshold_failed": False,
-                        "high_score_threshold_passed": True,
-                        "high_confidence_threshold_passed": True,
-                        "selected_geography": "national",
-                        "selected_cohort_level": "L3",
-                        "peer_count": 512,
-                        "specialty_key": "__all__",
-                        "taxonomy_code": None,
-                        "procedure_bucket": "__all__",
-                        "score_method": "direct",
-                        "confidence_0_100": 91.0,
-                        "confidence_band": "high",
-                        "cost_source": "direct",
-                        "data_coverage_0_100": 87.0,
-                        "provider_class": "clinician",
-                        "location_source": "doctor_clinician_address",
-                        "has_claims": True,
-                        "has_qpp": True,
-                        "has_rx": False,
-                        "has_enrollment": True,
-                        "has_medicare_claims": True,
-                    },
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "model_version": "v2",
-                        "benchmark_mode": "state",
-                        "tier": "acceptable",
-                        "borderline_status": False,
-                        "score_0_100": 55.0,
-                        "estimated_cost_level": "$$$",
-                        "risk_ratio_point": 0.99,
-                        "ci75_low": 0.90,
-                        "ci75_high": 1.06,
-                        "ci90_low": 0.84,
-                        "ci90_high": 1.10,
-                        "low_score_threshold_failed": False,
-                        "low_confidence_threshold_failed": False,
-                        "high_score_threshold_passed": False,
-                        "high_confidence_threshold_passed": False,
-                    },
-                    {
-                        "npi": 1003000126,
-                        "year": 2023,
-                        "model_version": "v2",
-                        "benchmark_mode": "zip",
-                        "tier": "low",
-                        "borderline_status": True,
-                        "score_0_100": 30.0,
-                        "estimated_cost_level": "$$$$",
-                        "risk_ratio_point": 1.15,
-                        "ci75_low": 1.05,
-                        "ci75_high": 1.22,
-                        "ci90_low": 1.02,
-                        "ci90_high": 1.25,
-                        "low_score_threshold_failed": True,
-                        "low_confidence_threshold_failed": True,
-                        "high_score_threshold_passed": False,
-                        "high_confidence_threshold_passed": False,
-                    },
-                ]
-            ),
-            FakeResult(
-                rows=[
-                    {
-                        "benchmark_mode": "national",
-                        "domain": "appropriateness",
-                        "risk_ratio": 0.93,
-                        "score_0_100": 69.5,
-                        "evidence_n": 145.0,
-                        "ci75_low": 0.88,
-                        "ci75_high": 0.99,
-                        "ci90_low": 0.84,
-                        "ci90_high": 1.04,
-                    },
-                    {
-                        "benchmark_mode": "national",
-                        "domain": "effectiveness",
-                        "risk_ratio": 0.89,
-                        "score_0_100": 75.0,
-                        "evidence_n": 132.0,
-                        "ci75_low": 0.83,
-                        "ci75_high": 0.95,
-                        "ci90_low": 0.79,
-                        "ci90_high": 1.0,
-                    },
-                    {
-                        "benchmark_mode": "national",
-                        "domain": "cost",
-                        "risk_ratio": 0.95,
-                        "score_0_100": 66.7,
-                        "evidence_n": 201.0,
-                        "ci75_low": 0.9,
-                        "ci75_high": 1.0,
-                        "ci90_low": 0.86,
-                        "ci90_high": 1.05,
-                    },
-                ]
-            ),
-        ],
-        args={"year": "2023", "benchmark_mode": "national"},
-    )
+def _pricing_score_primary_row() -> dict:
+    return {
+        "npi": 1003000126,
+        "year": 2023,
+        "model_version": "v2",
+        "benchmark_mode": "national",
+        "tier": "high",
+        "borderline_status": False,
+        "score_0_100": 72.4,
+        "estimated_cost_level": "$$",
+        "risk_ratio_point": 0.91,
+        "ci75_low": 0.86,
+        "ci75_high": 0.97,
+        "ci90_low": 0.82,
+        "ci90_high": 1.01,
+        "low_score_threshold_failed": False,
+        "low_confidence_threshold_failed": False,
+        "high_score_threshold_passed": True,
+        "high_confidence_threshold_passed": True,
+        "selected_geography": "national",
+        "selected_cohort_level": "L3",
+        "peer_count": 512,
+        "specialty_key": "__all__",
+        "taxonomy_code": None,
+        "procedure_bucket": "__all__",
+        "score_method": "direct",
+        "confidence_0_100": 91.0,
+        "confidence_band": "high",
+        "cost_source": "direct",
+        "data_coverage_0_100": 87.0,
+        "provider_class": "clinician",
+        "location_source": "doctor_clinician_address",
+        "has_claims": True,
+        "has_qpp": True,
+        "has_rx": False,
+        "has_enrollment": True,
+        "has_medicare_claims": True,
+    }
 
-    response = await get_pricing_provider_score(request, "1003000126")
-    pricing_response = json.loads(response.body)
+
+def _pricing_score_alternate_rows() -> list[dict]:
+    shared_fields_map = {
+        "npi": 1003000126,
+        "year": 2023,
+        "model_version": "v2",
+        "low_score_threshold_failed": False,
+        "low_confidence_threshold_failed": False,
+        "high_score_threshold_passed": False,
+        "high_confidence_threshold_passed": False,
+    }
+    return [
+        {
+            **shared_fields_map,
+            "benchmark_mode": "state",
+            "tier": "acceptable",
+            "borderline_status": False,
+            "score_0_100": 55.0,
+            "estimated_cost_level": "$$$",
+            "risk_ratio_point": 0.99,
+            "ci75_low": 0.90,
+            "ci75_high": 1.06,
+            "ci90_low": 0.84,
+            "ci90_high": 1.10,
+        },
+        {
+            **shared_fields_map,
+            "benchmark_mode": "zip",
+            "tier": "low",
+            "borderline_status": True,
+            "score_0_100": 30.0,
+            "estimated_cost_level": "$$$$",
+            "risk_ratio_point": 1.15,
+            "ci75_low": 1.05,
+            "ci75_high": 1.22,
+            "ci90_low": 1.02,
+            "ci90_high": 1.25,
+            "low_score_threshold_failed": True,
+            "low_confidence_threshold_failed": True,
+        },
+    ]
+
+
+def _pricing_score_domain_rows() -> list[dict]:
+    return [
+        {
+            "benchmark_mode": "national",
+            "domain": "appropriateness",
+            "risk_ratio": 0.93,
+            "score_0_100": 69.5,
+            "evidence_n": 145.0,
+            "ci75_low": 0.88,
+            "ci75_high": 0.99,
+            "ci90_low": 0.84,
+            "ci90_high": 1.04,
+        },
+        {
+            "benchmark_mode": "national",
+            "domain": "effectiveness",
+            "risk_ratio": 0.89,
+            "score_0_100": 75.0,
+            "evidence_n": 132.0,
+            "ci75_low": 0.83,
+            "ci75_high": 0.95,
+            "ci90_low": 0.79,
+            "ci90_high": 1.0,
+        },
+        {
+            "benchmark_mode": "national",
+            "domain": "cost",
+            "risk_ratio": 0.95,
+            "score_0_100": 66.7,
+            "evidence_n": 201.0,
+            "ci75_low": 0.9,
+            "ci75_high": 1.0,
+            "ci90_low": 0.86,
+            "ci90_high": 1.05,
+        },
+    ]
+
+
+def _assert_pricing_score_response(pricing_response: dict) -> None:
     assert pricing_response["npi"] == 1003000126
     assert pricing_response["model_version"] == "v2"
     assert pricing_response["benchmark_mode"] == "national"
@@ -1400,6 +1392,25 @@ async def test_get_pricing_provider_score_success():
     assert pricing_response["scores_by_benchmark_mode"]["national"]["tier"] == "high"
     assert pricing_response["scores_by_benchmark_mode"]["national"]["cohort_context"]["computed_live"] is False
     assert pricing_response["available_benchmark_modes"] == ["zip", "state", "national"]
+
+
+@pytest.mark.asyncio
+async def test_get_pricing_provider_score_success():
+    """Return the configured provider score and benchmark details."""
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_quality_score"),
+            FakeResult(scalar="mrf.pricing_provider_quality_domain"),
+            FakeResult(
+                rows=[_pricing_score_primary_row(), *_pricing_score_alternate_rows()]
+            ),
+            FakeResult(rows=_pricing_score_domain_rows()),
+        ],
+        args={"year": "2023", "benchmark_mode": "national"},
+    )
+
+    response = await get_pricing_provider_score(request, "1003000126")
+    _assert_pricing_score_response(json.loads(response.body))
 
 
 @pytest.mark.asyncio

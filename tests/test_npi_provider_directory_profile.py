@@ -137,24 +137,13 @@ async def test_profile_fetch_is_safe_before_first_artifact_publication(
 
 
 @pytest.mark.asyncio
-async def test_profile_fetch_returns_compact_and_optional_evidence(monkeypatch):
-    """Fetch compact facts and opt-in source evidence in one indexed query."""
-    profile_dict = _build_profile_dict()
-    evidence_dict = _build_evidence_dict("s1")
+async def test_profile_fetch_fails_closed_without_serving_generation(
+    monkeypatch,
+):
     execute = AsyncMock(
         side_effect=[
             _Result(scalar_value="mrf.provider_directory_profile"),
-            _Result(
-                rows=[
-                    {
-                        "npi": 1588616783,
-                        "profile_json": json.dumps(profile_dict),
-                        "evidence_json": evidence_dict,
-                        "generation_id": "generation_1",
-                        "published_at": datetime(2026, 7, 13, 20, 0, 0, 123456),
-                    }
-                ]
-            ),
+            _Result(scalar_value=None),
         ]
     )
     monkeypatch.setattr(npi_module, "_execute_stmt", execute)
@@ -164,31 +153,10 @@ async def test_profile_fetch_returns_compact_and_optional_evidence(monkeypatch):
         set(),
     )
 
-    profiles_by_npi = await npi_module._fetch_provider_directory_profile_map(
-        [None, "invalid", "1588616783", 1588616783],
-        include_evidence=True,
-    )
-
-    assert profiles_by_npi[1588616783]["profile"]["generation_id"] == "generation_1"
-    assert profiles_by_npi[1588616783]["profile"]["facts"]["age"]["items"][0][
-        "value"
-    ]["years"] == 56
-    assert profiles_by_npi[1588616783]["evidence"]["facts"]["age"]["items"][0][
-        "evidence"
-    ][0]["source_id"] == "s1"
-    assert profiles_by_npi[1588616783]["profile"]["published_at"] == (
-        "2026-07-13T20:00:00.123456Z"
-    )
-    assert profiles_by_npi[1588616783]["evidence"]["published_at"] == (
-        "2026-07-13T20:00:00.123456Z"
-    )
-    profile_query = execute.await_args_list[1]
-    assert "evidence_json" in str(profile_query.args[0])
-    assert "WHERE npi = ANY(CAST(:npis AS bigint[]))" in str(
-        profile_query.args[0]
-    )
-    assert " JOIN " not in str(profile_query.args[0]).upper()
-    assert profile_query.kwargs["params"] == {"npis": [1588616783]}
+    assert await npi_module._fetch_provider_directory_profile_map(
+        [1588616783]
+    ) == {}
+    assert execute.await_count == 2
 
 
 def test_profile_publication_timestamp_normalizes_aware_datetime_to_utc():
@@ -244,9 +212,39 @@ def test_npi_cache_key_tracks_profile_generation_and_visibility():
         include_profile=False,
         profile_generation=None,
     )
+    first_overlay = npi_module._npi_detail_cache_key(
+        **common_options_by_name,
+        include_profile=False,
+        profile_generation=None,
+        address_overlay_serving_identity="oid:101",
+    )
+    second_overlay = npi_module._npi_detail_cache_key(
+        **common_options_by_name,
+        include_profile=False,
+        profile_generation=None,
+        address_overlay_serving_identity="oid:202",
+    )
+    fallback_generation = npi_module._npi_detail_cache_key(
+        **common_options_by_name,
+        include_profile=True,
+        profile_generation="generation_1",
+        profile_serving_identity=(
+            "fallback:generation_1:2026-07-13T20:00:00Z:101"
+        ),
+    )
+    adopted_generation = npi_module._npi_detail_cache_key(
+        **common_options_by_name,
+        include_profile=True,
+        profile_generation="generation_1",
+        profile_serving_identity=(
+            "singleton:generation_1:2026-07-30T15:00:00Z:6:101:102"
+        ),
+    )
 
     assert first_generation != second_generation
     assert first_generation != profile_disabled
+    assert first_overlay != second_overlay
+    assert fallback_generation != adopted_generation
 
 
 @pytest.mark.asyncio

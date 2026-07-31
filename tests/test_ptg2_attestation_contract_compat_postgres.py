@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import uuid
+from dataclasses import dataclass
 from unittest.mock import AsyncMock
 
 import pytest
@@ -25,6 +26,258 @@ from tests.ptg2_attestation_compat_test_support import (
     writer_identity_by_field as _writer_identity,
     writer_report_by_field as _writer_report,
 )
+
+
+_ATTESTATION_COMPAT_TABLE_DDL = (
+    """CREATE TABLE {schema}.ptg2_snapshot (
+        snapshot_id text PRIMARY KEY,
+        status text NOT NULL
+    )""",
+    """CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
+        snapshot_id text PRIMARY KEY,
+        snapshot_key bigint NOT NULL
+    )""",
+    """CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
+        snapshot_key bigint PRIMARY KEY,
+        state text NOT NULL,
+        generation text NOT NULL
+    )""",
+    """CREATE TABLE {schema}.ptg2_v4_snapshot_map_root (
+        snapshot_key bigint PRIMARY KEY,
+        state text NOT NULL
+    )""",
+    """CREATE TABLE {schema}.ptg2_v3_snapshot_scope (
+        snapshot_id text PRIMARY KEY,
+        coverage_scope_id bytea NOT NULL,
+        plan_id text NOT NULL,
+        plan_market_type text NOT NULL
+    )""",
+    """CREATE TABLE {schema}.ptg2_v3_candidate_audit_attestation (
+        snapshot_id text PRIMARY KEY,
+        snapshot_key bigint NOT NULL,
+        coverage_scope_id bytea NOT NULL,
+        source_set_digest bytea NOT NULL,
+        audit_sample_digest bytea NOT NULL,
+        source_witness_digest bytea NOT NULL,
+        plan_id text NOT NULL,
+        plan_market_type text NOT NULL,
+        source_key text NOT NULL,
+        contract text NOT NULL,
+        report_digest bytea NOT NULL,
+        report jsonb NOT NULL,
+        activation_intent text NOT NULL,
+        attestation_digest bytea NOT NULL,
+        attested_at timestamptz NOT NULL,
+        expires_at timestamptz NOT NULL,
+        activated_at timestamptz
+    )""",
+)
+
+
+@dataclass(frozen=True)
+class _AttestationCompatFixture:
+    schema_name: str
+    quoted_schema: str
+    snapshot_id: str
+    coverage_scope_id: bytes
+    source_set_digest: bytes
+    audit_sample_digest: bytes
+    source_witness_digest: bytes
+    report_by_field: dict[str, object]
+    report_digest: bytes
+
+
+def _attestation_compat_fixture() -> _AttestationCompatFixture:
+    source_witness_digest = b"w" * 32
+    quarantine = provider_identifier_quarantine_payload({})
+    report_by_field = {
+        "source": {
+            "provider_identifier_quarantine": quarantine,
+            "witness": {"payload_sha256": source_witness_digest.hex()},
+        }
+    }
+    report_digest = hashlib.sha256(
+        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
+    ).digest()
+    schema_name = f"ptg2_attestation_compat_{uuid.uuid4().hex[:16]}"
+    return _AttestationCompatFixture(
+        schema_name=schema_name,
+        quoted_schema=_quoted(schema_name),
+        snapshot_id="compat-snapshot",
+        coverage_scope_id=b"\xcc" * 32,
+        source_set_digest=b"s" * 32,
+        audit_sample_digest=b"a" * 32,
+        source_witness_digest=source_witness_digest,
+        report_by_field=report_by_field,
+        report_digest=report_digest,
+    )
+
+
+async def _create_attestation_compat_tables(quoted_schema: str) -> None:
+    for table_ddl in _ATTESTATION_COMPAT_TABLE_DDL:
+        await db.execute_ddl(table_ddl.format(schema=quoted_schema))
+
+
+async def _seed_attestation_compat_snapshot(
+    fixture: _AttestationCompatFixture,
+) -> None:
+    await db.status(
+        f"""INSERT INTO {fixture.quoted_schema}.ptg2_snapshot
+                (snapshot_id, status)
+            VALUES (:snapshot_id, 'published')""",
+        snapshot_id=fixture.snapshot_id,
+    )
+    await db.status(
+        f"""INSERT INTO {fixture.quoted_schema}.ptg2_v3_snapshot_binding
+                (snapshot_id, snapshot_key)
+            VALUES (:snapshot_id, 17)""",
+        snapshot_id=fixture.snapshot_id,
+    )
+    await db.status(
+        f"""INSERT INTO {fixture.quoted_schema}.ptg2_v3_snapshot_layout
+                (snapshot_key, state, generation)
+            VALUES (17, 'sealed', 'shared_blocks_v3')"""
+    )
+    await db.status(
+        f"""INSERT INTO {fixture.quoted_schema}.ptg2_v3_snapshot_scope
+                (snapshot_id, coverage_scope_id, plan_id, plan_market_type)
+            VALUES (:snapshot_id, decode(repeat('cc', 32), 'hex'),
+                    '12-3456789', 'group')""",
+        snapshot_id=fixture.snapshot_id,
+    )
+    await _seed_attestation_compat_record(fixture)
+
+
+async def _seed_attestation_compat_record(
+    fixture: _AttestationCompatFixture,
+) -> None:
+    await db.status(
+        f"""
+        INSERT INTO {fixture.quoted_schema}.ptg2_v3_candidate_audit_attestation
+            (snapshot_id, snapshot_key, coverage_scope_id,
+             source_set_digest, audit_sample_digest,
+             source_witness_digest, plan_id, plan_market_type,
+             source_key, contract, report_digest, report,
+             activation_intent, attestation_digest, attested_at,
+             expires_at, activated_at)
+        VALUES (:snapshot_id, 17, :coverage_scope_id,
+                :source_set_digest, :audit_sample_digest,
+                :source_witness_digest, '12-3456789', 'group',
+                'source-a', :contract, :report_digest,
+                CAST(:report_json AS jsonb),
+                'audit_and_activate', :attestation_digest,
+                clock_timestamp(),
+                clock_timestamp() + interval '1 hour', NULL)
+        """,
+        snapshot_id=fixture.snapshot_id,
+        coverage_scope_id=fixture.coverage_scope_id,
+        source_set_digest=fixture.source_set_digest,
+        audit_sample_digest=fixture.audit_sample_digest,
+        source_witness_digest=fixture.source_witness_digest,
+        contract=ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
+        report_digest=fixture.report_digest,
+        attestation_digest=(
+            ptg2_candidate_attestation.candidate_attestation_digest(
+                fixture.report_digest,
+                "audit_and_activate",
+            )
+        ),
+        report_json=json.dumps(fixture.report_by_field),
+    )
+
+
+async def _assert_supported_attestation(
+    fixture: _AttestationCompatFixture,
+    contract: str,
+) -> None:
+    supported_report = (
+        _writer_report(4)
+        if contract
+        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
+        else fixture.report_by_field
+    )
+    supported_digest = hashlib.sha256(
+        ptg2_candidate_attestation._canonical_report_bytes(supported_report)
+    ).digest()
+    await db.status(
+        f"""
+        UPDATE {fixture.quoted_schema}.ptg2_v3_candidate_audit_attestation
+           SET contract = :contract, report_digest = :report_digest,
+               report = CAST(:report_json AS jsonb),
+               attestation_digest = :attestation_digest, activated_at = NULL
+         WHERE snapshot_id = :snapshot_id
+        """,
+        snapshot_id=fixture.snapshot_id,
+        contract=contract,
+        report_digest=supported_digest,
+        attestation_digest=(
+            ptg2_candidate_attestation.candidate_attestation_digest(
+                supported_digest,
+                "audit_and_activate",
+            )
+        ),
+        report_json=json.dumps(supported_report),
+    )
+    async with db.transaction() as session:
+        observed_digest = await ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
+            session,
+            schema_name=fixture.schema_name,
+            snapshot_id=fixture.snapshot_id,
+            snapshot_key=17,
+            source_key="source-a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+            coverage_scope_id=fixture.coverage_scope_id,
+        )
+    assert observed_digest == supported_digest
+    await db.status(
+        f"""UPDATE {fixture.quoted_schema}.ptg2_v3_candidate_audit_attestation
+               SET activated_at = clock_timestamp()
+             WHERE snapshot_id = :snapshot_id""",
+        snapshot_id=fixture.snapshot_id,
+    )
+    async with db.transaction() as session:
+        assert await ptg2_snapshot.current_snapshot_id(
+            session,
+            requested_snapshot_id=fixture.snapshot_id,
+            requested_source_key="source-a",
+        ) == fixture.snapshot_id
+
+
+async def _assert_unsupported_attestation(
+    fixture: _AttestationCompatFixture,
+) -> None:
+    await db.status(
+        f"""UPDATE {fixture.quoted_schema}.ptg2_v3_candidate_audit_attestation
+               SET contract = 'unsupported-contract', activated_at = NULL
+             WHERE snapshot_id = :snapshot_id""",
+        snapshot_id=fixture.snapshot_id,
+    )
+    async with db.transaction() as session:
+        with pytest.raises(ValueError, match="no current passing"):
+            await ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
+                session,
+                schema_name=fixture.schema_name,
+                snapshot_id=fixture.snapshot_id,
+                snapshot_key=17,
+                source_key="source-a",
+                plan_id="12-3456789",
+                plan_market_type="group",
+                coverage_scope_id=fixture.coverage_scope_id,
+            )
+    await db.status(
+        f"""UPDATE {fixture.quoted_schema}.ptg2_v3_candidate_audit_attestation
+               SET activated_at = clock_timestamp()
+             WHERE snapshot_id = :snapshot_id""",
+        snapshot_id=fixture.snapshot_id,
+    )
+    async with db.transaction() as session:
+        assert await ptg2_snapshot.current_snapshot_id(
+            session,
+            requested_snapshot_id=fixture.snapshot_id,
+            requested_source_key="source-a",
+        ) is None
+
 
 async def _seed_writer_v3_attestation(quoted_schema: str) -> None:
     identity_by_field = _writer_identity()
@@ -197,31 +450,15 @@ async def test_real_postgres_published_snapshot_accepts_v3_and_v4_attestations(
             "isolated PostgreSQL test"
         )
 
-    schema_name = f"ptg2_attestation_compat_{uuid.uuid4().hex[:16]}"
-    quoted_schema = _quoted(schema_name)
-    snapshot_id = "compat-snapshot"
-    coverage_scope_id = b"\xcc" * 32
-    source_set_digest = b"s" * 32
-    audit_sample_digest = b"a" * 32
-    source_witness_digest = b"w" * 32
-    quarantine = provider_identifier_quarantine_payload({})
-    report_by_field = {
-        "source": {
-            "provider_identifier_quarantine": quarantine,
-            "witness": {"payload_sha256": source_witness_digest.hex()},
-        }
-    }
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
-    ).digest()
-    monkeypatch.setattr(ptg2_snapshot, "PTG2_SCHEMA", schema_name)
+    fixture = _attestation_compat_fixture()
+    monkeypatch.setattr(ptg2_snapshot, "PTG2_SCHEMA", fixture.schema_name)
     monkeypatch.setattr(
         ptg2_candidate_attestation,
         "_locked_candidate_identity",
         AsyncMock(
             return_value={
                 **_writer_identity(),
-                "coverage_scope_id": coverage_scope_id,
+                "coverage_scope_id": fixture.coverage_scope_id,
             }
         ),
     )
@@ -229,225 +466,25 @@ async def test_real_postgres_published_snapshot_accepts_v3_and_v4_attestations(
     await db.disconnect()
     await db.connect()
     try:
-        await db.execute_ddl(f"CREATE SCHEMA {quoted_schema}")
-        table_definitions = (
-            f"""CREATE TABLE {quoted_schema}.ptg2_snapshot (
-                snapshot_id text PRIMARY KEY,
-                status text NOT NULL
-            )""",
-            f"""CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_binding (
-                snapshot_id text PRIMARY KEY,
-                snapshot_key bigint NOT NULL
-            )""",
-            f"""CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_layout (
-                snapshot_key bigint PRIMARY KEY,
-                state text NOT NULL,
-                generation text NOT NULL
-            )""",
-            f"""CREATE TABLE {quoted_schema}.ptg2_v4_snapshot_map_root (
-                snapshot_key bigint PRIMARY KEY,
-                state text NOT NULL
-            )""",
-            f"""CREATE TABLE {quoted_schema}.ptg2_v3_snapshot_scope (
-                snapshot_id text PRIMARY KEY,
-                coverage_scope_id bytea NOT NULL,
-                plan_id text NOT NULL,
-                plan_market_type text NOT NULL
-            )""",
-            f"""CREATE TABLE {quoted_schema}.ptg2_v3_candidate_audit_attestation (
-                snapshot_id text PRIMARY KEY,
-                snapshot_key bigint NOT NULL,
-                coverage_scope_id bytea NOT NULL,
-                source_set_digest bytea NOT NULL,
-                audit_sample_digest bytea NOT NULL,
-                source_witness_digest bytea NOT NULL,
-                plan_id text NOT NULL,
-                plan_market_type text NOT NULL,
-                source_key text NOT NULL,
-                contract text NOT NULL,
-                report_digest bytea NOT NULL,
-                report jsonb NOT NULL,
-                activation_intent text NOT NULL,
-                attestation_digest bytea NOT NULL,
-                attested_at timestamptz NOT NULL,
-                expires_at timestamptz NOT NULL,
-                activated_at timestamptz
-            )""",
-        )
-        for table_definition in table_definitions:
-            await db.execute_ddl(table_definition)
+        await db.execute_ddl(f"CREATE SCHEMA {fixture.quoted_schema}")
+        await _create_attestation_compat_tables(fixture.quoted_schema)
 
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_snapshot
-                (snapshot_id, status)
-            VALUES (:snapshot_id, 'published')
-            """,
-            snapshot_id=snapshot_id,
-        )
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_v3_snapshot_binding
-                (snapshot_id, snapshot_key)
-            VALUES (:snapshot_id, 17)
-            """,
-            snapshot_id=snapshot_id,
-        )
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_v3_snapshot_layout
-                (snapshot_key, state, generation)
-            VALUES (17, 'sealed', 'shared_blocks_v3')
-            """
-        )
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_v3_snapshot_scope
-                (snapshot_id, coverage_scope_id, plan_id, plan_market_type)
-            VALUES (:snapshot_id, decode(repeat('cc', 32), 'hex'),
-                    '12-3456789', 'group')
-            """,
-            snapshot_id=snapshot_id,
-        )
-        await db.status(
-            f"""
-            INSERT INTO {quoted_schema}.ptg2_v3_candidate_audit_attestation
-                (snapshot_id, snapshot_key, coverage_scope_id,
-                 source_set_digest, audit_sample_digest,
-                 source_witness_digest, plan_id, plan_market_type,
-                 source_key, contract, report_digest, report,
-                 activation_intent, attestation_digest, attested_at,
-                 expires_at, activated_at)
-            VALUES (:snapshot_id, 17, :coverage_scope_id,
-                    :source_set_digest, :audit_sample_digest,
-                    :source_witness_digest, '12-3456789', 'group',
-                    'source-a', :contract, :report_digest,
-                    CAST(:report_json AS jsonb),
-                    'audit_and_activate', :attestation_digest,
-                    clock_timestamp(),
-                    clock_timestamp() + interval '1 hour', NULL)
-            """,
-            snapshot_id=snapshot_id,
-            coverage_scope_id=coverage_scope_id,
-            source_set_digest=source_set_digest,
-            audit_sample_digest=audit_sample_digest,
-            source_witness_digest=source_witness_digest,
-            contract=(
-                ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
-            ),
-            report_digest=report_digest,
-            attestation_digest=(
-                ptg2_candidate_attestation.candidate_attestation_digest(
-                    report_digest,
-                    "audit_and_activate",
-                )
-            ),
-            report_json=json.dumps(report_by_field),
-        )
+        await _seed_attestation_compat_snapshot(fixture)
 
-        async def assert_supported(contract: str) -> None:
-            supported_report = (
-                _writer_report(4)
-                if contract
-                == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
-                else report_by_field
-            )
-            supported_digest = hashlib.sha256(
-                ptg2_candidate_attestation._canonical_report_bytes(
-                    supported_report
-                )
-            ).digest()
-            await db.status(
-                f"""
-                UPDATE {quoted_schema}.ptg2_v3_candidate_audit_attestation
-                   SET contract = :contract,
-                       report_digest = :report_digest,
-                       report = CAST(:report_json AS jsonb),
-                       attestation_digest = :attestation_digest,
-                       activated_at = NULL
-                 WHERE snapshot_id = :snapshot_id
-                """,
-                snapshot_id=snapshot_id,
-                contract=contract,
-                report_digest=supported_digest,
-                attestation_digest=(
-                    ptg2_candidate_attestation.candidate_attestation_digest(
-                        supported_digest,
-                        "audit_and_activate",
-                    )
-                ),
-                report_json=json.dumps(supported_report),
-            )
-            async with db.transaction() as session:
-                observed_digest = await ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
-                    session,
-                    schema_name=schema_name,
-                    snapshot_id=snapshot_id,
-                    snapshot_key=17,
-                    source_key="source-a",
-                    plan_id="12-3456789",
-                    plan_market_type="group",
-                    coverage_scope_id=coverage_scope_id,
-                )
-            assert observed_digest == supported_digest
-            await db.status(
-                f"""
-                UPDATE {quoted_schema}.ptg2_v3_candidate_audit_attestation
-                   SET activated_at = clock_timestamp()
-                 WHERE snapshot_id = :snapshot_id
-                """,
-                snapshot_id=snapshot_id,
-            )
-            async with db.transaction() as session:
-                assert await ptg2_snapshot.current_snapshot_id(
-                    session,
-                    requested_snapshot_id=snapshot_id,
-                    requested_source_key="source-a",
-                ) == snapshot_id
-
-        await assert_supported(
+        await _assert_supported_attestation(
+            fixture,
             ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
         )
-        await assert_supported(
+        await _assert_supported_attestation(
+            fixture,
             ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
         )
 
-        await db.status(
-            f"""
-            UPDATE {quoted_schema}.ptg2_v3_candidate_audit_attestation
-               SET contract = 'unsupported-contract', activated_at = NULL
-             WHERE snapshot_id = :snapshot_id
-            """,
-            snapshot_id=snapshot_id,
-        )
-        async with db.transaction() as session:
-            with pytest.raises(ValueError, match="no current passing"):
-                await ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
-                    session,
-                    schema_name=schema_name,
-                    snapshot_id=snapshot_id,
-                    snapshot_key=17,
-                    source_key="source-a",
-                    plan_id="12-3456789",
-                    plan_market_type="group",
-                    coverage_scope_id=coverage_scope_id,
-                )
-        await db.status(
-            f"""
-            UPDATE {quoted_schema}.ptg2_v3_candidate_audit_attestation
-               SET activated_at = clock_timestamp()
-             WHERE snapshot_id = :snapshot_id
-            """,
-            snapshot_id=snapshot_id,
-        )
-        async with db.transaction() as session:
-            assert await ptg2_snapshot.current_snapshot_id(
-                session,
-                requested_snapshot_id=snapshot_id,
-                requested_source_key="source-a",
-            ) is None
+        await _assert_unsupported_attestation(fixture)
     finally:
         try:
-            await db.execute_ddl(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
+            await db.execute_ddl(
+                f"DROP SCHEMA IF EXISTS {fixture.quoted_schema} CASCADE"
+            )
         finally:
             await db.disconnect()

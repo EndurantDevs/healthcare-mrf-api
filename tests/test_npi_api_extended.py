@@ -106,6 +106,93 @@ def _provider_directory_source_detail():
     }
 
 
+def _cached_provider_profile_record(published_at, serving_identity):
+    """Build one profile-map record with an internal cache identity."""
+    return {
+        1518379601: {
+            "profile": {
+                "schema_version": 1,
+                "generation_id": (
+                    "pdprofile_11111111111111111111111111111111"
+                ),
+                "published_at": published_at,
+                "facts": {},
+            },
+            "_serving_identity": serving_identity,
+        }
+    }
+
+
+def _profile_cache_transition_records():
+    fallback_identity = (
+        "fallback:pdprofile_11111111111111111111111111111111:"
+        "2026-07-13T20:00:00Z:101"
+    )
+    singleton_identity = (
+        "singleton:pdprofile_11111111111111111111111111111111:"
+        "2026-07-30T15:00:00Z:6:101:102"
+    )
+    return [
+        _cached_provider_profile_record(
+            "2026-07-13T20:00:00Z",
+            fallback_identity,
+        ),
+        _cached_provider_profile_record(
+            "2026-07-30T15:00:00Z",
+            singleton_identity,
+        ),
+        _cached_provider_profile_record(
+            "2026-07-30T15:00:00Z",
+            singleton_identity,
+        ),
+    ]
+
+
+def _install_profile_transition_cache_dependencies(
+    monkeypatch,
+    profile_fetch,
+    build_details,
+):
+    monkeypatch.setattr(
+        npi_module,
+        "_NPI_DETAIL_RESPONSE_CACHE",
+        npi_module.OrderedDict(),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS",
+        300.0,
+    )
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_directory_profile_map",
+        profile_fetch,
+    )
+    monkeypatch.setattr(npi_module, "_build_npi_details", build_details)
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_other_names",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_provider_directory_address_overlay_serving_identity",
+        AsyncMock(return_value="oid:101"),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_detail",
+        AsyncMock(
+            return_value={
+                "summary": None,
+                "enrollments": {},
+                "ffs_visibility": {},
+            }
+        ),
+    )
+
+
 def _geocode_address_entry(checksum, first_line, postal_code):
     """Build one unresolved address for paid/free geocoder path tests."""
     return {
@@ -1466,6 +1553,11 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE", npi_module.OrderedDict())
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 300.0)
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
+    monkeypatch.setattr(
+        npi_module,
+        "_provider_directory_address_overlay_serving_identity",
+        AsyncMock(return_value="oid:101"),
+    )
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     monkeypatch.setattr(
@@ -1547,7 +1639,9 @@ async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_npi_uses_response_cache(monkeypatch):
+async def test_get_npi_cache_tracks_address_overlay_serving_identity(
+    monkeypatch,
+):
     build_calls = []
 
     async def fake_build(_npi, **_kwargs):
@@ -1563,6 +1657,14 @@ async def test_get_npi_uses_response_cache(monkeypatch):
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE", npi_module.OrderedDict())
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 300.0)
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
+    overlay_identity = AsyncMock(
+        side_effect=["oid:101", "oid:101", "oid:202"]
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_provider_directory_address_overlay_serving_identity",
+        overlay_identity,
+    )
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     monkeypatch.setattr(
@@ -1577,10 +1679,90 @@ async def test_get_npi_uses_response_cache(monkeypatch):
     )
     first = await npi_module.get_npi(request, "1518379601")
     second = await npi_module.get_npi(request, "1518379601")
+    third = await npi_module.get_npi(request, "1518379601")
 
     assert json.loads(first.body)["npi"] == 1518379601
     assert first.body == second.body
-    assert len(build_calls) == 1
+    assert third.body == first.body
+    assert len(build_calls) == 2
+    assert overlay_identity.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_get_npi_cache_rolls_from_profile_fallback_to_adopted_singleton(
+    monkeypatch,
+):
+    """Do not reuse pre-adoption publication metadata for the same generation."""
+    profile_fetch = AsyncMock(
+        side_effect=_profile_cache_transition_records()
+    )
+    build_details = AsyncMock(
+        side_effect=_npi_details_builder(
+            [{"checksum": 3, "lat": 40.0, "long": -80.0}]
+        )
+    )
+    _install_profile_transition_cache_dependencies(
+        monkeypatch,
+        profile_fetch,
+        build_details,
+    )
+    request = types.SimpleNamespace(
+        args={},
+        app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False}),
+    )
+
+    response_list = [
+        await npi_module.get_npi(request, "1518379601")
+        for _ in range(3)
+    ]
+
+    published_at_list = [
+        json.loads(response_item.body)["provider_directory_profile"][
+            "published_at"
+        ]
+        for response_item in response_list
+    ]
+    assert published_at_list == [
+        "2026-07-13T20:00:00Z",
+        "2026-07-30T15:00:00Z",
+        "2026-07-30T15:00:00Z",
+    ]
+    assert build_details.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_npi_bypasses_cache_when_overlay_identity_read_fails(
+    monkeypatch,
+):
+    """A transient identity read failure must not use or create stale entries."""
+    profile_fetch = AsyncMock(
+        return_value=_profile_cache_transition_records()[0]
+    )
+    build_details = AsyncMock(
+        side_effect=_npi_details_builder(
+            [{"checksum": 3, "lat": 40.0, "long": -80.0}]
+        )
+    )
+    _install_profile_transition_cache_dependencies(
+        monkeypatch,
+        profile_fetch,
+        build_details,
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_provider_directory_address_overlay_serving_identity",
+        AsyncMock(side_effect=RuntimeError("transient identity failure")),
+    )
+    request = types.SimpleNamespace(
+        args={},
+        app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False}),
+    )
+
+    await npi_module.get_npi(request, "1518379601")
+    await npi_module.get_npi(request, "1518379601")
+
+    assert build_details.await_count == 2
+    assert npi_module._NPI_DETAIL_RESPONSE_CACHE == {}
 
 
 @pytest.mark.asyncio
@@ -1600,6 +1782,11 @@ async def test_get_npi_force_address_update_bypasses_response_cache(monkeypatch)
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE", npi_module.OrderedDict())
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 300.0)
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
+    monkeypatch.setattr(
+        npi_module,
+        "_provider_directory_address_overlay_serving_identity",
+        AsyncMock(return_value="oid:101"),
+    )
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     monkeypatch.setattr(

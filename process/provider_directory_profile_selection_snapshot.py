@@ -104,10 +104,6 @@ async def _lock_profile_selection_tables() -> None:
     """Freeze every table that can alter the global current selection."""
 
     await db.status(f"LOCK TABLE {_table_ref(ProviderDirectoryAPIEndpoint)} IN SHARE MODE;")
-    await db.all(
-        f"SELECT endpoint_id FROM {_table_ref(ProviderDirectoryAPIEndpoint)} "
-        "ORDER BY endpoint_id FOR SHARE;"
-    )
     await db.status(f"LOCK TABLE {_table_ref(ProviderDirectorySource)} IN SHARE MODE;")
     await db.status(
         f"LOCK TABLE {_table_ref(ProviderDirectoryEndpointDataset)} IN SHARE MODE;"

@@ -72,6 +72,61 @@ def _assert_lineage_contract(schemas_by_name) -> None:
     assert {"endpoint_id", "dataset_id"} <= source_properties.keys()
 
 
+def _assert_npi_address_contract(schemas_by_name) -> None:
+    address_status = schemas_by_name["NpiAddress"]["properties"][
+        "address_status"
+    ]
+    assert address_status["enum"] == ["payer_directory_candidate"]
+    assert "exact network-bound office" in address_status["description"]
+    assert "billing-group/TIN ownership" in address_status["description"]
+
+
+def _assert_global_profile_generation_contract(schemas_by_name) -> None:
+    for schema_name in (
+        "ProviderDirectoryProfile",
+        "ProviderDirectoryProfileEvidence",
+    ):
+        properties = schemas_by_name[schema_name]["properties"]
+        generation = properties["generation_id"]
+        assert generation["pattern"] == "^pdprofile_[0-9a-f]{32}$"
+        assert "Global applied Provider Directory" in generation[
+            "description"
+        ]
+        assert "materialization" in generation["description"]
+        assert "pre-adoption" in generation["description"]
+        assert "fails closed" in generation["description"]
+        assert "atomically" in properties["published_at"]["description"]
+        profile_as_of = properties["profile_as_of"]
+        assert profile_as_of["format"] == "date"
+        assert profile_as_of["nullable"] is True
+        assert "distinct from `published_at`" in profile_as_of[
+            "description"
+        ]
+    source_generations = schemas_by_name["ProviderProfileDocument"][
+        "properties"
+    ]["source_generations"]
+    source_generation_description = " ".join(
+        source_generations["description"].split()
+    )
+    assert (
+        "singleton global serving generation"
+        in source_generation_description
+    )
+    assert "pre-adoption transition" in source_generation_description
+    composed_profile_as_of = schemas_by_name["ProviderProfileDocument"][
+        "properties"
+    ]["profile_as_of"]
+    assert composed_profile_as_of["format"] == "date"
+    assert "only the Provider Directory FHIR facts" in (
+        " ".join(composed_profile_as_of["description"].split())
+    )
+    composed_evidence_as_of = schemas_by_name["ProviderProfileResponse"][
+        "properties"
+    ]["provider_profile_evidence"]["properties"]["profile_as_of"]
+    assert composed_evidence_as_of["format"] == "date"
+    assert composed_evidence_as_of["nullable"] is True
+
+
 def test_uhc_organization_profile_documents_tin_and_membership_semantics():
     """Public contract makes TIN absence, lineage, and non-ownership explicit."""
     spec_by_field = yaml.safe_load(OPENAPI_PATH.read_text())
@@ -83,3 +138,5 @@ def test_uhc_organization_profile_documents_tin_and_membership_semantics():
         schemas_by_name["ProviderProfilePlanMembershipValue"]
     )
     _assert_lineage_contract(schemas_by_name)
+    _assert_npi_address_contract(schemas_by_name)
+    _assert_global_profile_generation_contract(schemas_by_name)
