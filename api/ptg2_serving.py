@@ -12956,6 +12956,42 @@ def _next_v4_taxonomy_rate_window(
     )
 
 
+def _next_pattern_rate_window(
+    current_window: int,
+    *,
+    target_count: int,
+    distinct_count: int,
+    declared_occurrences: int,
+    maximum_occurrences: int,
+) -> int:
+    """Grow a pattern prefix without consuming the page seal speculatively."""
+
+    if int(distinct_count) <= 0:
+        return _next_v4_taxonomy_rate_window(
+            current_window,
+            target_count=target_count,
+            distinct_count=distinct_count,
+            declared_occurrences=declared_occurrences,
+            maximum_occurrences=maximum_occurrences,
+        )
+    normalized_current = int(current_window)
+    normalized_distinct = max(int(distinct_count), 1)
+    projected = (
+        normalized_current * max(int(target_count), 1)
+        + normalized_distinct
+        - 1
+    ) // normalized_distinct
+    maximum_growth = max(PTG2_SERVING_BINARY_V3_PAGE_ROWS // 4, 1)
+    return min(
+        int(maximum_occurrences),
+        max(int(declared_occurrences), 0),
+        max(
+            normalized_current + 1,
+            min(projected, normalized_current + maximum_growth),
+        ),
+    )
+
+
 def _v4_selected_pattern_memberships(
     selected_npi_keys: tuple[int, ...],
     npi_keys_by_pattern: Mapping[int, tuple[int, ...]],
@@ -13407,7 +13443,7 @@ async def _select_v4_pattern_taxonomy_expansion(
                 break
             if rate_window >= maximum_occurrences:
                 raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
-            next_window = _next_v4_taxonomy_rate_window(
+            next_window = _next_pattern_rate_window(
                 rate_window,
                 target_count=normalized_target_count,
                 distinct_count=len(selected_occurrences),

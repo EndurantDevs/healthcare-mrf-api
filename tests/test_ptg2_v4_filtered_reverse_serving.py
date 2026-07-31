@@ -961,6 +961,23 @@ def test_pattern_candidate_prefix_deduplicates_shared_postings() -> None:
     assert exhausted is True
 
 
+def test_partial_pattern_prefix_caps_speculative_rate_growth() -> None:
+    assert serving._next_pattern_rate_window(
+        64,
+        target_count=11,
+        distinct_count=4,
+        declared_occurrences=274,
+        maximum_occurrences=6_700,
+    ) == 80
+    assert serving._next_pattern_rate_window(
+        64,
+        target_count=2,
+        distinct_count=0,
+        declared_occurrences=100,
+        maximum_occurrences=100,
+    ) == 100
+
+
 @pytest.mark.parametrize(
     ("max_members", "npi_keys_by_pattern", "error_match"),
     (
