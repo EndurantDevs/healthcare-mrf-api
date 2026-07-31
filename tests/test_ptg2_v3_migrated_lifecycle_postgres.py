@@ -742,21 +742,7 @@ async def _snapshot_state(snapshot_id: str) -> dict[str, Any]:
     return dict(row._mapping)
 
 
-@pytest.mark.asyncio
-async def test_v3_lifecycle_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exercise the migrated strict-V3 lifecycle through fail-closed paths."""
-
-    dsn = os.getenv(OPT_IN_DSN_ENV)
-    if not dsn:
-        pytest.skip(
-            f"set {OPT_IN_DSN_ENV} to a pre-migrated disposable "
-            "ptg2_v3_lifecycle_test_<unique-suffix> database"
-        )
-
-    database_name = _configure_disposable_database(monkeypatch, dsn)
+def _set_lifecycle_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", CONTROL_TOKEN)
     monkeypatch.setenv("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
     monkeypatch.setenv("HLTHPRT_PTG2_HASH_MODE", "sha256")
@@ -775,78 +761,108 @@ async def test_v3_lifecycle_fails_closed(
     monkeypatch.setenv("HLTHPRT_PTG2_V3_SEALED_LEASE_SECONDS", "0")
     monkeypatch.setenv("HLTHPRT_PTG2_V3_BLOCK_GC_GRACE_SECONDS", "0")
 
-    await db.disconnect()
-    await db.connect()
-    await _assert_migrated_empty_target(database_name)
 
-    scanner_support = _load_module(
-        SCANNER_TEST_PATH,
-        f"ptg2_migrated_lifecycle_scanner_{uuid.uuid4().hex}",
-    )
-    scanner_binary = scanner_support._built_scanner_binary()
-    monkeypatch.setenv("HLTHPRT_PTG2_RUST_SCANNER_BIN", str(scanner_binary))
-    scan = scanner_support._run_scanner(
-        scanner_binary,
-        tmp_path,
-        "migrated-lifecycle-source",
-        arch="postgres_binary_v3",
-        provider_references_first=True,
-        grouped=False,
-        multiple_prices=True,
-        duplicate_first_price=False,
-    )
-    serving_records = [
-        SERVING_RECORD.unpack_from(scan["partition_bytes"], offset)
-        for offset in range(
-            0,
-            len(scan["partition_bytes"]),
-            SERVING_RECORD.size,
+class _MigratedLifecycleScenario:
+    def __init__(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self.tmp_path = tmp_path
+        self.monkeypatch = monkeypatch
+        self.stage_table: str | None = None
+
+    async def prepare(self, dsn: str) -> None:
+        database_name = _configure_disposable_database(self.monkeypatch, dsn)
+        _set_lifecycle_environment(self.monkeypatch)
+        await db.disconnect()
+        await db.connect()
+        await _assert_migrated_empty_target(database_name)
+        self._scan_source()
+        self._bind_source_evidence()
+
+    def _scan_source(self) -> None:
+        self.scanner_support = _load_module(
+            SCANNER_TEST_PATH,
+            f"ptg2_migrated_lifecycle_scanner_{uuid.uuid4().hex}",
         )
-    ]
-    assert len(serving_records) == 2
-    provider_set_ids = {
-        serving_record[1] for serving_record in serving_records
-    }
-    assert len(provider_set_ids) == 1
-    provider_set_id = next(iter(provider_set_ids))
-
-    artifact_digest = hashlib.sha256(scan["artifact"].read_bytes()).hexdigest()
-    source_trace_row, source_trace_set_row = _ptg2_source_trace_rows(
-        None,
-        "https://example.test/migrated-lifecycle-source.json",
-    )
-    trace_hash = str(source_trace_row["source_trace_hash"])
-    trace_set_hash = str(source_trace_set_row["source_trace_set_hash"])
-    identity = SharedPhysicalArtifactIdentity(
-        "in_network",
-        "logical_json_sha256_v1",
-        artifact_digest,
-    )
-    assignment = SharedSnapshotSourceAssignment(
-        source_key=0,
-        identity=identity,
-        source_trace_set_hash=trace_set_hash,
-        source_trace_hashes=(trace_hash,),
-        raw_container_sha256=artifact_digest,
-        logical_json_sha256=artifact_digest,
-        logical_hash_deferred=False,
-    )
-    source_set = shared_source_set_metadata([artifact_digest])
-    semantic_fingerprint = shared_semantic_fingerprint(
-        {
-            "contract": "migrated_lifecycle_fixture_v1",
-            "source_identities": [identity.as_dict()],
-            "source_count": 1,
-            "coverage_scope_id": COVERAGE_SCOPE_ID.hex(),
+        scanner_binary = self.scanner_support._built_scanner_binary()
+        self.monkeypatch.setenv(
+            "HLTHPRT_PTG2_RUST_SCANNER_BIN",
+            str(scanner_binary),
+        )
+        self.scan = self.scanner_support._run_scanner(
+            scanner_binary,
+            self.tmp_path,
+            "migrated-lifecycle-source",
+            arch="postgres_binary_v3",
+            provider_references_first=True,
+            grouped=False,
+            multiple_prices=True,
+            duplicate_first_price=False,
+        )
+        self.serving_records = [
+            SERVING_RECORD.unpack_from(self.scan["partition_bytes"], offset)
+            for offset in range(
+                0,
+                len(self.scan["partition_bytes"]),
+                SERVING_RECORD.size,
+            )
+        ]
+        assert len(self.serving_records) == 2
+        provider_set_ids = {
+            serving_record[1] for serving_record in self.serving_records
         }
-    )
+        assert len(provider_set_ids) == 1
+        self.provider_set_id = next(iter(provider_set_ids))
 
-    snapshot_a = f"ptg2-v3-lifecycle-a-{uuid.uuid4().hex}"
-    snapshot_b = f"ptg2-v3-lifecycle-b-{uuid.uuid4().hex}"
-    stage_table: str | None = None
-    app = _build_asgi_app()
-    client = app.asgi_client
-    try:
+    def _bind_source_evidence(self) -> None:
+        self.artifact_digest = hashlib.sha256(
+            self.scan["artifact"].read_bytes()
+        ).hexdigest()
+        self.source_trace_row, source_trace_set_row = _ptg2_source_trace_rows(
+            None,
+            "https://example.test/migrated-lifecycle-source.json",
+        )
+        self.trace_hash = str(self.source_trace_row["source_trace_hash"])
+        self.trace_set_hash = str(source_trace_set_row["source_trace_set_hash"])
+        self.identity = SharedPhysicalArtifactIdentity(
+            "in_network",
+            "logical_json_sha256_v1",
+            self.artifact_digest,
+        )
+        self.assignment = SharedSnapshotSourceAssignment(
+            source_key=0,
+            identity=self.identity,
+            source_trace_set_hash=self.trace_set_hash,
+            source_trace_hashes=(self.trace_hash,),
+            raw_container_sha256=self.artifact_digest,
+            logical_json_sha256=self.artifact_digest,
+            logical_hash_deferred=False,
+        )
+        self.source_set = shared_source_set_metadata([self.artifact_digest])
+        self.semantic_fingerprint = shared_semantic_fingerprint(
+            {
+                "contract": "migrated_lifecycle_fixture_v1",
+                "source_identities": [self.identity.as_dict()],
+                "source_count": 1,
+                "coverage_scope_id": COVERAGE_SCOPE_ID.hex(),
+            }
+        )
+        self.snapshot_a = f"ptg2-v3-lifecycle-a-{uuid.uuid4().hex}"
+        self.snapshot_b = f"ptg2-v3-lifecycle-b-{uuid.uuid4().hex}"
+        self.app = _build_asgi_app()
+        self.client = self.app.asgi_client
+
+    async def publish_first_layout(self) -> None:
+        await self._seed_code_catalog()
+        await self._reserve_first_layout()
+        await self._fill_price_stage()
+        self._build_publication_entries()
+        await self._publish_layout()
+        await self._stage_first_candidate()
+
+    async def _seed_code_catalog(self) -> None:
         await db.status(
             f"""
             INSERT INTO {_quoted(SCHEMA_NAME)}.code_catalog
@@ -859,163 +875,178 @@ async def test_v3_lifecycle_fails_closed(
                 short_description = EXCLUDED.short_description
             """
         )
+
+    async def _reserve_first_layout(self) -> None:
         await _insert_logical_snapshot_prerequisites(
-            snapshot_id=snapshot_a,
+            snapshot_id=self.snapshot_a,
             plan_id=PLAN_A,
-            assignment=assignment,
-            source_trace_row=source_trace_row,
+            assignment=self.assignment,
+            source_trace_row=self.source_trace_row,
         )
         async with db.transaction() as session:
-            first_reservation = await reserve_shared_layout(
+            self.first_reservation = await reserve_shared_layout(
                 session,
                 schema_name=SCHEMA_NAME,
-                semantic_fingerprint=semantic_fingerprint,
+                semantic_fingerprint=self.semantic_fingerprint,
                 build_token="migrated-lifecycle-build-a",
             )
-        assert first_reservation.reused is False
-
-        stage_table = await _create_serving_stage_table(
-            f"lifecycle_{first_reservation.snapshot_key}_{uuid.uuid4().hex[:8]}"
+        assert self.first_reservation.reused is False
+        self.stage_table = await _create_serving_stage_table(
+            f"lifecycle_{self.first_reservation.snapshot_key}_"
+            f"{uuid.uuid4().hex[:8]}"
         )
-        for frame in scan["price_atom_frames"]:
+
+    async def _fill_price_stage(self) -> None:
+        assert self.stage_table is not None
+        for frame in self.scan["price_atom_frames"]:
             await _copy_price_atom_file(
                 Path(frame["path"]),
                 target_table=_ptg2_manifest_support_stage_table(
-                    stage_table,
+                    self.stage_table,
                     "price_atom",
                 ),
             )
-        for frame in scan["price_set_atom_frames"]:
+        for frame in self.scan["price_set_atom_frames"]:
             await _copy_price_atom_member_file(
                 Path(frame["path"]),
                 target_table=_ptg2_manifest_support_stage_table(
-                    stage_table,
+                    self.stage_table,
                     "price_set_atom",
                 ),
             )
-        for frame in scan["price_set_summary_frames"]:
+        for frame in self.scan["price_set_summary_frames"]:
             await _copy_price_set_summary_file(
                 Path(frame["path"]),
                 target_table=_ptg2_manifest_support_stage_table(
-                    stage_table,
+                    self.stage_table,
                     "price_set_summary",
                 ),
             )
 
-        provider_set_metadata_path = tmp_path / "provider-set-metadata.copy"
-        provider_set_metadata_path.write_text(
-            f"{provider_set_id.hex()}\t{serving_records[0][3]}\t{{}}\n",
+    def _build_publication_entries(self) -> None:
+        metadata_path = self.tmp_path / "provider-set-metadata.copy"
+        metadata_path.write_text(
+            f"{self.provider_set_id.hex()}\t{self.serving_records[0][3]}\t{{}}\n",
             encoding="ascii",
         )
-        graph_entries = _graph_artifacts(
-            tmp_path / "migrated-lifecycle-graph",
-            provider_set_id=provider_set_id,
+        self.graph_entries = _graph_artifacts(
+            self.tmp_path / "migrated-lifecycle-graph",
+            provider_set_id=self.provider_set_id,
             provider_group_id=bytes.fromhex("00112233445566778899aabbccddeeff"),
         )
-        scanner_summary = scanner_support._single_frame(
-            scan["frames"],
+        self.scanner_summary = self.scanner_support._single_frame(
+            self.scan["frames"],
             "scanner_summary",
         )
-        serving_run_entries = attach_v3_source_run_contract(
-            scan["partition_frames"],
-            source_identity=identity,
-            scanner_summary=scanner_summary,
-            scanner_config=scanner_support._single_frame(
-                scan["frames"],
+        self.serving_run_entries = attach_v3_source_run_contract(
+            self.scan["partition_frames"],
+            source_identity=self.identity,
+            scanner_summary=self.scanner_summary,
+            scanner_config=self.scanner_support._single_frame(
+                self.scan["frames"],
                 "scanner_config",
             ),
         )
-        code_dictionary_entries = attach_v3_dictionary_contract(
-            scan["code_dictionary_frames"],
-            source_identity=identity,
-            source_run_contract_sha256=serving_run_entries[0][
+        self.code_dictionary_entries = attach_v3_dictionary_contract(
+            self.scan["code_dictionary_frames"],
+            source_identity=self.identity,
+            source_run_contract_sha256=self.serving_run_entries[0][
                 "source_run_contract_sha256"
             ],
-            scanner_summary=scanner_summary,
+            scanner_summary=self.scanner_summary,
         )
-        provider_set_metadata_payload = provider_set_metadata_path.read_bytes()
-        provider_set_metadata_entries = (
+        metadata_payload = metadata_path.read_bytes()
+        self.metadata_entries = (
             {
-                "path": str(provider_set_metadata_path),
+                "path": str(metadata_path),
                 "row_count": 1,
-                "bytes": len(provider_set_metadata_payload),
-                "sha256": hashlib.sha256(
-                    provider_set_metadata_payload
-                ).hexdigest(),
+                "bytes": len(metadata_payload),
+                "sha256": hashlib.sha256(metadata_payload).hexdigest(),
                 "format": "ptg2_v3_provider_set_metadata_copy",
                 "version": 1,
-                "source_type": identity.source_type,
-                "identity_kind": identity.identity_kind,
-                "identity_sha256": identity.identity_sha256,
-                "source_run_contract_sha256": serving_run_entries[0][
+                "source_type": self.identity.source_type,
+                "identity_kind": self.identity.identity_kind,
+                "identity_sha256": self.identity.identity_sha256,
+                "source_run_contract_sha256": self.serving_run_entries[0][
                     "source_run_contract_sha256"
                 ],
             },
         )
-        publication = await publish_strict_shared_v3_layout(
+
+    async def _publish_layout(self) -> None:
+        assert self.stage_table is not None
+        self.publication = await publish_strict_shared_v3_layout(
             schema_name=SCHEMA_NAME,
-            manifest_stage_table=stage_table,
-            reserved_snapshot_key=first_reservation.snapshot_key,
+            manifest_stage_table=self.stage_table,
+            reserved_snapshot_key=self.first_reservation.snapshot_key,
             build_token="migrated-lifecycle-build-a",
             expected_coverage_scope_id=COVERAGE_SCOPE_ID,
-            logical_snapshot_id=snapshot_a,
-            expected_source_identities=[identity],
-            serving_run_entries=serving_run_entries,
-            code_dictionary_entries=code_dictionary_entries,
-            provider_set_metadata_entries=provider_set_metadata_entries,
+            logical_snapshot_id=self.snapshot_a,
+            expected_source_identities=[self.identity],
+            serving_run_entries=self.serving_run_entries,
+            code_dictionary_entries=self.code_dictionary_entries,
+            provider_set_metadata_entries=self.metadata_entries,
             price_set_summary_source_count=1,
-            graph_artifact_entries=graph_entries,
+            graph_artifact_entries=self.graph_entries,
             source_audit_witness_entries=(
-                scanner_support._single_frame(
-                    scan["frames"],
+                self.scanner_support._single_frame(
+                    self.scan["frames"],
                     "source_audit_witness_file",
                 ),
             ),
-            expected_raw_source_sha256=(artifact_digest,),
-            provider_identifier_quarantine=scanner_summary[
+            expected_raw_source_sha256=(self.artifact_digest,),
+            provider_identifier_quarantine=self.scanner_summary[
                 "provider_identifier_quarantine"
             ],
-            scratch_parent=tmp_path,
+            scratch_parent=self.tmp_path,
         )
-        assert publication.snapshot_key == first_reservation.snapshot_key
-        assert publication.layout_reused_at_seal is False
-        assert publication.serving_index["arch_version"] == "postgres_binary_v3"
-        assert publication.serving_index["storage_generation"] == "shared_blocks_v3"
-        assert publication.serving_index["cold_lookup_contract"] == "ptg_v3_cold_v2"
-        assert publication.serving_index["provider_graph"]["npi_count"] == len(NPIS)
+        assert self.publication.snapshot_key == self.first_reservation.snapshot_key
+        assert self.publication.layout_reused_at_seal is False
+        serving_index = self.publication.serving_index
+        assert serving_index["arch_version"] == "postgres_binary_v3"
+        assert serving_index["storage_generation"] == "shared_blocks_v3"
+        assert serving_index["cold_lookup_contract"] == "ptg_v3_cold_v2"
+        assert serving_index["provider_graph"]["npi_count"] == len(NPIS)
         await _drop_ptg2_snapshot_table_names(
-            _ptg2_manifest_stage_table_names(stage_table)
+            _ptg2_manifest_stage_table_names(self.stage_table)
         )
-        stage_table = None
+        self.stage_table = None
 
+    async def _stage_first_candidate(self) -> None:
         first_serving_index = {
-            **dict(publication.serving_index),
+            **dict(self.publication.serving_index),
             "source_key": SOURCE_A,
             "coverage_scope_id": COVERAGE_SCOPE_ID.hex(),
-            "source_set": source_set,
-            "source_trace_set_hash": trace_set_hash,
+            "source_set": self.source_set,
+            "source_trace_set_hash": self.trace_set_hash,
             "network_names": ["Migrated Lifecycle Network"],
         }
         await _stage_candidate(
-            snapshot_id=snapshot_a,
+            snapshot_id=self.snapshot_a,
             source_key=SOURCE_A,
             plan_id=PLAN_A,
-            snapshot_key=publication.snapshot_key,
+            snapshot_key=self.publication.snapshot_key,
             serving_index=first_serving_index,
         )
-        assert await _physical_counts(publication.snapshot_key) == {
+        assert await _physical_counts(self.publication.snapshot_key) == {
             "layouts": 1,
-            "blocks": publication.unique_block_count,
-            "mappings": publication.mapping_count,
+            "blocks": self.publication.unique_block_count,
+            "mappings": self.publication.mapping_count,
             "codes": 2,
             "provider_sets": 1,
             "npis": len(NPIS),
         }
 
+    async def prove_candidate(self) -> None:
+        await self._assert_candidate_prices()
+        await self._assert_candidate_audit()
+        await self._assert_unattested_promotion()
+
+    async def _assert_candidate_prices(self) -> None:
         candidate_prices = await _cold_price_read(
-            client,
-            monkeypatch,
-            snapshot_id=snapshot_a,
+            self.client,
+            self.monkeypatch,
+            snapshot_id=self.snapshot_a,
             source_key=SOURCE_A,
             plan_id=PLAN_A,
             code="99213",
@@ -1023,49 +1054,51 @@ async def test_v3_lifecycle_fails_closed(
         )
         _assert_exact_price_and_membership(
             candidate_prices,
-            snapshot_id=snapshot_a,
+            snapshot_id=self.snapshot_a,
             plan_id=PLAN_A,
             code="99213",
             rate=125.5,
         )
-        candidate_audit = await _candidate_audit_occurrences(
-            client,
-            monkeypatch,
-            snapshot_id=snapshot_a,
+
+    async def _assert_candidate_audit(self) -> None:
+        self.candidate_audit = await _candidate_audit_occurrences(
+            self.client,
+            self.monkeypatch,
+            snapshot_id=self.snapshot_a,
             source_key=SOURCE_A,
             plan_id=PLAN_A,
         )
-        assert candidate_audit["audit_sample"]["sample_digest"] == (
-            publication.serving_index["audit_sample"]["sample_digest"]
+        assert self.candidate_audit["audit_sample"]["sample_digest"] == (
+            self.publication.serving_index["audit_sample"]["sample_digest"]
         )
-        assert candidate_audit["pagination"]["total"] == len(
-            candidate_audit["items"]
+        assert self.candidate_audit["pagination"]["total"] == len(
+            self.candidate_audit["items"]
         )
         assert {
             int(audit_item["tuple"]["npi"])
-            for audit_item in candidate_audit["items"]
+            for audit_item in self.candidate_audit["items"]
         } <= set(NPIS)
         assert {
             audit_item["tuple"]["negotiated_rate"]
-            for audit_item in candidate_audit["items"]
+            for audit_item in self.candidate_audit["items"]
         } == {125.5, 250}
-        assert candidate_audit["provenance"]["snapshot_id"] == snapshot_a
-        assert candidate_audit["source_set"] == source_set
+        assert self.candidate_audit["provenance"]["snapshot_id"] == self.snapshot_a
+        assert self.candidate_audit["source_set"] == self.source_set
 
+    async def _assert_unattested_promotion(self) -> None:
         failed_promotion = await _asgi_request(
-            client,
+            self.client,
             "post",
             "/control/v1/ptg/source-snapshots/promote",
             json={
-                "snapshot_id": snapshot_a,
+                "snapshot_id": self.snapshot_a,
                 "source_key": SOURCE_A,
                 "expected_current_snapshot_id": None,
             },
             headers=_control_headers(),
         )
         assert failed_promotion.status_code == 400
-        state_before_attestation = await _snapshot_state(snapshot_a)
-        assert state_before_attestation == {
+        assert await _snapshot_state(self.snapshot_a) == {
             "status": "validated",
             "activation_state": "validated",
             "source_pointer_snapshot_id": None,
@@ -1074,24 +1107,30 @@ async def test_v3_lifecycle_fails_closed(
             "activated_at": None,
         }
 
+    async def activate_first_candidate(self) -> None:
+        await self._attest_first_candidate()
+        await self._promote_first_candidate()
+        await self._assert_published_prices()
+
+    async def _attest_first_candidate(self) -> None:
         report = await _release_report(
-            client=client,
-            snapshot_id=snapshot_a,
+            client=self.client,
+            snapshot_id=self.snapshot_a,
             source_key=SOURCE_A,
             plan_id=PLAN_A,
-            raw_container_sha256=artifact_digest,
-            audit_sample=candidate_audit["audit_sample"],
-            source_witness=publication.serving_index["source_witness"],
-            provider_identifier_quarantine=publication.serving_index[
+            raw_container_sha256=self.artifact_digest,
+            audit_sample=self.candidate_audit["audit_sample"],
+            source_witness=self.publication.serving_index["source_witness"],
+            provider_identifier_quarantine=self.publication.serving_index[
                 "provider_identifier_quarantine"
             ],
         )
-        attestation_response = await _asgi_request(
-            client,
+        response = await _asgi_request(
+            self.client,
             "post",
             "/control/v1/ptg/source-snapshots/attest",
             json={
-                "snapshot_id": snapshot_a,
+                "snapshot_id": self.snapshot_a,
                 "source_key": SOURCE_A,
                 "plan_id": PLAN_A,
                 "plan_market_type": "group",
@@ -1099,126 +1138,124 @@ async def test_v3_lifecycle_fails_closed(
             },
             headers=_control_headers(),
         )
-        attestation = _response_json(attestation_response)
+        attestation = _response_json(response)
         assert attestation["status"] == "attested"
-        assert attestation["snapshot_id"] == snapshot_a
+        assert attestation["snapshot_id"] == self.snapshot_a
 
-        promotion_response = await _asgi_request(
-            client,
+    async def _promote_first_candidate(self) -> None:
+        response = await _asgi_request(
+            self.client,
             "post",
             "/control/v1/ptg/source-snapshots/promote",
             json={
-                "snapshot_id": snapshot_a,
+                "snapshot_id": self.snapshot_a,
                 "source_key": SOURCE_A,
                 "expected_current_snapshot_id": None,
             },
             headers=_control_headers(),
         )
-        promotion = _response_json(promotion_response)
-        assert promotion == {
+        assert _response_json(response) == {
             "status": "promoted",
             "source_key": SOURCE_A,
-            "snapshot_id": snapshot_a,
+            "snapshot_id": self.snapshot_a,
             "storage_generation": "shared_blocks_v3",
             "previous_snapshot_id": None,
             "plan_source_count": 1,
             "global_pointer": "reconciled",
         }
-        state_after_activation = await _snapshot_state(snapshot_a)
-        assert state_after_activation["status"] == "published"
-        assert state_after_activation["activation_state"] == "activated"
-        assert state_after_activation["source_pointer_snapshot_id"] == snapshot_a
-        assert state_after_activation["plan_pointer_snapshot_id"] == snapshot_a
-        assert state_after_activation["global_pointer_snapshot_id"] == snapshot_a
-        assert state_after_activation["activated_at"] is not None
+        activated_state = await _snapshot_state(self.snapshot_a)
+        assert activated_state["status"] == "published"
+        assert activated_state["activation_state"] == "activated"
+        assert activated_state["source_pointer_snapshot_id"] == self.snapshot_a
+        assert activated_state["plan_pointer_snapshot_id"] == self.snapshot_a
+        assert activated_state["global_pointer_snapshot_id"] == self.snapshot_a
+        assert activated_state["activated_at"] is not None
 
-        published_prices_99213 = await _cold_price_read(
-            client,
-            monkeypatch,
-            snapshot_id=snapshot_a,
-            source_key=SOURCE_A,
-            plan_id=PLAN_A,
-            code="99213",
-            candidate=False,
-        )
-        _assert_exact_price_and_membership(
-            published_prices_99213,
-            snapshot_id=snapshot_a,
-            plan_id=PLAN_A,
-            code="99213",
-            rate=125.5,
-        )
-        published_prices_99214 = await _cold_price_read(
-            client,
-            monkeypatch,
-            snapshot_id=snapshot_a,
-            source_key=SOURCE_A,
-            plan_id=PLAN_A,
-            code="99214",
-            candidate=False,
-        )
-        _assert_exact_price_and_membership(
-            published_prices_99214,
-            snapshot_id=snapshot_a,
-            plan_id=PLAN_A,
-            code="99214",
-            rate=250,
-        )
+    async def _assert_published_prices(self) -> None:
+        for code, rate in (("99213", 125.5), ("99214", 250)):
+            published_prices = await _cold_price_read(
+                self.client,
+                self.monkeypatch,
+                snapshot_id=self.snapshot_a,
+                source_key=SOURCE_A,
+                plan_id=PLAN_A,
+                code=code,
+                candidate=False,
+            )
+            _assert_exact_price_and_membership(
+                published_prices,
+                snapshot_id=self.snapshot_a,
+                plan_id=PLAN_A,
+                code=code,
+                rate=rate,
+            )
 
-        physical_counts_before_reuse = await _physical_counts(publication.snapshot_key)
+    async def reuse_layout(self) -> None:
+        await self._reserve_reused_layout()
+        await self._stage_reused_candidate()
+        await self._assert_reused_candidate()
+        await self._fail_reused_candidate()
+
+    async def _reserve_reused_layout(self) -> None:
+        self.physical_counts_before_reuse = await _physical_counts(
+            self.publication.snapshot_key
+        )
         await _insert_logical_snapshot_prerequisites(
-            snapshot_id=snapshot_b,
+            snapshot_id=self.snapshot_b,
             plan_id=PLAN_B,
-            assignment=assignment,
-            source_trace_row=source_trace_row,
+            assignment=self.assignment,
+            source_trace_row=self.source_trace_row,
         )
         async with db.transaction() as session:
-            second_reservation = await reserve_shared_layout(
+            self.second_reservation = await reserve_shared_layout(
                 session,
                 schema_name=SCHEMA_NAME,
-                semantic_fingerprint=semantic_fingerprint,
+                semantic_fingerprint=self.semantic_fingerprint,
                 build_token="migrated-lifecycle-build-b",
             )
-        assert second_reservation.reused is True
-        assert second_reservation.snapshot_key == publication.snapshot_key
+        assert self.second_reservation.reused is True
+        assert self.second_reservation.snapshot_key == self.publication.snapshot_key
 
+    async def _stage_reused_candidate(self) -> None:
         layout_manifest = await db.scalar(
             f"""
             SELECT layout_manifest
               FROM {_quoted(SCHEMA_NAME)}.ptg2_v3_snapshot_layout
              WHERE snapshot_key = :snapshot_key
             """,
-            snapshot_key=publication.snapshot_key,
+            snapshot_key=self.publication.snapshot_key,
         )
-        second_serving_index = _reused_shared_v3_serving_index(
+        serving_index = _reused_shared_v3_serving_index(
             layout_manifest,
             source_key=SOURCE_B,
-            shared_snapshot_key=publication.snapshot_key,
+            shared_snapshot_key=self.publication.snapshot_key,
         )
-        second_serving_index.update(
+        serving_index.update(
             {
                 "coverage_scope_id": COVERAGE_SCOPE_ID.hex(),
-                "source_set": source_set,
-                "source_trace_set_hash": trace_set_hash,
+                "source_set": self.source_set,
+                "source_trace_set_hash": self.trace_set_hash,
                 "network_names": ["Migrated Lifecycle Network"],
             }
         )
         reused_audit_sample = await validate_reused_snapshot_sources(
             schema_name=SCHEMA_NAME,
-            snapshot_key=publication.snapshot_key,
-            logical_snapshot_id=snapshot_b,
+            snapshot_key=self.publication.snapshot_key,
+            logical_snapshot_id=self.snapshot_b,
         )
-        assert reused_audit_sample == publication.serving_index["audit_sample"]
+        assert reused_audit_sample == self.publication.serving_index["audit_sample"]
         await _stage_candidate(
-            snapshot_id=snapshot_b,
+            snapshot_id=self.snapshot_b,
             source_key=SOURCE_B,
             plan_id=PLAN_B,
-            snapshot_key=publication.snapshot_key,
-            serving_index=second_serving_index,
+            snapshot_key=self.publication.snapshot_key,
+            serving_index=serving_index,
         )
-        assert await _physical_counts(publication.snapshot_key) == (
-            physical_counts_before_reuse
+        assert await _physical_counts(self.publication.snapshot_key) == (
+            self.physical_counts_before_reuse
         )
+
+    async def _assert_reused_candidate(self) -> None:
         bindings = await db.all(
             f"""
             SELECT snapshot_id, snapshot_key
@@ -1228,31 +1265,32 @@ async def test_v3_lifecycle_fails_closed(
         )
         assert [tuple(binding_record) for binding_record in bindings] == sorted(
             [
-                (snapshot_a, publication.snapshot_key),
-                (snapshot_b, publication.snapshot_key),
+                (self.snapshot_a, self.publication.snapshot_key),
+                (self.snapshot_b, self.publication.snapshot_key),
             ]
         )
-
-        reused_candidate_prices = await _cold_price_read(
-            client,
-            monkeypatch,
-            snapshot_id=snapshot_b,
+        candidate_prices = await _cold_price_read(
+            self.client,
+            self.monkeypatch,
+            snapshot_id=self.snapshot_b,
             source_key=SOURCE_B,
             plan_id=PLAN_B,
             code="99213",
             candidate=True,
         )
         _assert_exact_price_and_membership(
-            reused_candidate_prices,
-            snapshot_id=snapshot_b,
+            candidate_prices,
+            snapshot_id=self.snapshot_b,
             plan_id=PLAN_B,
             code="99213",
             rate=125.5,
         )
+
+    async def _fail_reused_candidate(self) -> None:
         await _mark_ptg2_import_failed(
             _FailedImportPersistence(
-                import_run_id=f"run-{snapshot_b}",
-                snapshot_id=snapshot_b,
+                import_run_id=f"run-{self.snapshot_b}",
+                snapshot_id=self.snapshot_b,
                 import_month=datetime.date(2026, 7, 1),
                 started_at=datetime.datetime.now(
                     datetime.timezone.utc
@@ -1264,34 +1302,40 @@ async def test_v3_lifecycle_fails_closed(
             )
         )
         assert await db.scalar(
-            f"""
-            SELECT status
-              FROM {_quoted(SCHEMA_NAME)}.ptg2_snapshot
-             WHERE snapshot_id = :snapshot_id
-            """,
-            snapshot_id=snapshot_b,
+            f"""SELECT status
+                  FROM {_quoted(SCHEMA_NAME)}.ptg2_snapshot
+                 WHERE snapshot_id = :snapshot_id""",
+            snapshot_id=self.snapshot_b,
         ) == "failed"
 
-        first_removal_response = await _asgi_request(
-            client,
+    async def remove_candidates(self) -> None:
+        await self._remove_reused_candidate()
+        await self._assert_surviving_candidate()
+        await self._retire_first_candidate()
+        await self._remove_first_candidate()
+
+    async def _remove_reused_candidate(self) -> None:
+        response = await _asgi_request(
+            self.client,
             "post",
             "/control/v1/ptg/source-snapshots/remove",
-            json={"snapshot_id": snapshot_b, "source_key": SOURCE_B},
+            json={"snapshot_id": self.snapshot_b, "source_key": SOURCE_B},
             headers=_control_headers(),
         )
-        first_removal = _response_json(first_removal_response)
-        assert first_removal["deleted_v3_snapshot_scopes"] == 1
-        assert first_removal["deleted_v3_snapshot_bindings"] == 1
-        assert first_removal["deleted_snapshots"] == 1
-        assert first_removal["released_shared_layouts"] == 0
-        assert await _physical_counts(publication.snapshot_key) == (
-            physical_counts_before_reuse
+        removal = _response_json(response)
+        assert removal["deleted_v3_snapshot_scopes"] == 1
+        assert removal["deleted_v3_snapshot_bindings"] == 1
+        assert removal["deleted_snapshots"] == 1
+        assert removal["released_shared_layouts"] == 0
+        assert await _physical_counts(self.publication.snapshot_key) == (
+            self.physical_counts_before_reuse
         )
 
+    async def _assert_surviving_candidate(self) -> None:
         surviving_prices = await _cold_price_read(
-            client,
-            monkeypatch,
-            snapshot_id=snapshot_a,
+            self.client,
+            self.monkeypatch,
+            snapshot_id=self.snapshot_a,
             source_key=SOURCE_A,
             plan_id=PLAN_A,
             code="99214",
@@ -1299,22 +1343,22 @@ async def test_v3_lifecycle_fails_closed(
         )
         _assert_exact_price_and_membership(
             surviving_prices,
-            snapshot_id=snapshot_a,
+            snapshot_id=self.snapshot_a,
             plan_id=PLAN_A,
             code="99214",
             rate=250,
         )
-
         refused_retirement = await _asgi_request(
-            client,
+            self.client,
             "post",
             "/control/v1/ptg/source-snapshots/retire",
-            json={"snapshot_id": snapshot_a, "source_key": SOURCE_A},
+            json={"snapshot_id": self.snapshot_a, "source_key": SOURCE_A},
             headers=_control_headers(),
         )
         assert refused_retirement.status_code == 400
         assert "global pointer" in refused_retirement.text.lower()
 
+    async def _retire_first_candidate(self) -> None:
         async with db.transaction() as session:
             await acquire_ptg2_lifecycle_lock(session)
             deleted_global_pointer = await session.execute(
@@ -1326,18 +1370,17 @@ async def test_v3_lifecycle_fails_closed(
                     RETURNING snapshot_id
                     """
                 ),
-                {"snapshot_id": snapshot_a},
+                {"snapshot_id": self.snapshot_a},
             )
-            assert deleted_global_pointer.scalar_one() == snapshot_a
-
-        retirement_response = await _asgi_request(
-            client,
+            assert deleted_global_pointer.scalar_one() == self.snapshot_a
+        response = await _asgi_request(
+            self.client,
             "post",
             "/control/v1/ptg/source-snapshots/retire",
-            json={"snapshot_id": snapshot_a, "source_key": SOURCE_A},
+            json={"snapshot_id": self.snapshot_a, "source_key": SOURCE_A},
             headers=_control_headers(),
         )
-        retirement = _response_json(retirement_response)
+        retirement = _response_json(response)
         assert retirement["deleted_source_pointers"] == 1
         assert retirement["deleted_plan_pointers"] == 1
         assert retirement["current_references"] == {
@@ -1351,48 +1394,72 @@ async def test_v3_lifecycle_fails_closed(
             "plan_release_bindings": [],
         }
 
+    async def _remove_first_candidate(self) -> None:
         block_rows = await db.all(
-            f"""
-            SELECT block_hash, stored_byte_count
-              FROM {_quoted(SCHEMA_NAME)}.ptg2_v3_block
-             ORDER BY block_hash
-            """
+            f"""SELECT block_hash, stored_byte_count
+                  FROM {_quoted(SCHEMA_NAME)}.ptg2_v3_block
+                 ORDER BY block_hash"""
         )
-        expected_block_size_by_hash = {
+        block_size_by_hash = {
             bytes(block_record[0]): int(block_record[1])
             for block_record in block_rows
         }
-        assert expected_block_size_by_hash
-
-        final_removal_response = await _asgi_request(
-            client,
+        assert block_size_by_hash
+        response = await _asgi_request(
+            self.client,
             "post",
             "/control/v1/ptg/source-snapshots/remove",
-            json={"snapshot_id": snapshot_a, "source_key": SOURCE_A},
+            json={"snapshot_id": self.snapshot_a, "source_key": SOURCE_A},
             headers=_control_headers(),
         )
-        final_removal = _response_json(final_removal_response)
+        final_removal = _response_json(response)
         assert final_removal["deleted_v3_snapshot_scopes"] == 1
         assert final_removal["deleted_v3_snapshot_bindings"] == 1
         assert final_removal["deleted_snapshots"] == 1
         assert final_removal["released_shared_layouts"] == 1
         assert await _count("ptg2_v3_snapshot_layout") == 0
-        assert await _count("ptg2_v3_block") == len(expected_block_size_by_hash)
-
+        assert await _count("ptg2_v3_block") == len(block_size_by_hash)
         swept = await sweep_ptg2_shared_blocks(
             schema_name=SCHEMA_NAME,
-            max_bytes=sum(expected_block_size_by_hash.values()),
-            max_rows=len(expected_block_size_by_hash),
+            max_bytes=sum(block_size_by_hash.values()),
+            max_rows=len(block_size_by_hash),
         )
-        assert set(swept.selected_hashes) == set(expected_block_size_by_hash)
-        assert swept.stored_bytes == sum(expected_block_size_by_hash.values())
+        assert set(swept.selected_hashes) == set(block_size_by_hash)
+        assert swept.stored_bytes == sum(block_size_by_hash.values())
         for table_name in FINAL_EMPTY_TABLES:
             assert await _count(table_name) == 0
         assert await _count("ptg2_source_trace") == 1
         assert await _count("ptg2_source_trace_set") == 1
-    finally:
-        if stage_table is not None:
+
+    async def cleanup(self) -> None:
+        if self.stage_table is not None:
             await _drop_ptg2_snapshot_table_names(
-                _ptg2_manifest_stage_table_names(stage_table)
+                _ptg2_manifest_stage_table_names(self.stage_table)
             )
         await db.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_v3_lifecycle_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the migrated strict-V3 lifecycle through fail-closed paths."""
+
+    dsn = os.getenv(OPT_IN_DSN_ENV)
+    if not dsn:
+        pytest.skip(
+            f"set {OPT_IN_DSN_ENV} to a pre-migrated disposable "
+            "ptg2_v3_lifecycle_test_<unique-suffix> database"
+        )
+
+    scenario = _MigratedLifecycleScenario(tmp_path, monkeypatch)
+    await scenario.prepare(dsn)
+    try:
+        await scenario.publish_first_layout()
+        await scenario.prove_candidate()
+        await scenario.activate_first_candidate()
+        await scenario.reuse_layout()
+        await scenario.remove_candidates()
+    finally:
+        await scenario.cleanup()

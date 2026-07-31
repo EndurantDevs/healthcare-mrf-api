@@ -37,6 +37,7 @@ def _profile_params_map() -> dict:
         **selection._GLOBAL_PROFILE_PARAMS,
         "provider_directory_profile_generation": 11,
         "provider_directory_profile_selection_attestation": attestation_map,
+        "provider_directory_profile_capacity_attestation": {},
     }
 
 

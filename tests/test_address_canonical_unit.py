@@ -3107,98 +3107,141 @@ def _assert_serving_stage_indexes(statements, index_context_map) -> None:
         )
 
 
+class _StageIndexRecorder:
+    def __init__(self, statements):
+        self._statements = statements
+
+    async def status(self, statement):
+        self._statements.append(statement)
+
+
+class _EntityAddressServingStage:
+    __tablename__ = "entity_address_unified_20260614"
+    __main_table__ = "entity_address_unified"
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "npi"},
+        {"index_elements": ("inferred_npi",), "name": "inferred_npi"},
+        {
+            "index_elements": ("entity_type", "coalesce(npi, inferred_npi)"),
+            "name": "entity_type_coalesced_npi",
+        },
+        {
+            "index_elements": (
+                "COALESCE(NULLIF(phone_number, ''), "
+                "regexp_replace(COALESCE(telephone_number, ''), "
+                "'[^0-9]', '', 'g'))",
+                "npi",
+            ),
+            "name": "service_phone_lookup_npi",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND COALESCE(NULLIF(phone_number, ''), "
+                "regexp_replace(COALESCE(telephone_number, ''), "
+                "'[^0-9]', '', 'g')) <> ''"
+            ),
+        },
+        {
+            "index_elements": (
+                "regexp_replace(COALESCE(telephone_number, ''), "
+                "'[^0-9]', '', 'g')",
+                "npi",
+            ),
+            "name": "primary_phone_digits_npi",
+            "where": "type='primary'",
+        },
+        {
+            "index_elements": ("telephone_number", "npi"),
+            "name": "primary_phone_npi",
+            "where": (
+                "type='primary' AND telephone_number IS NOT NULL "
+                "AND telephone_number <> ''"
+            ),
+        },
+        {
+            "index_elements": (
+                "regexp_replace(COALESCE(telephone_number, ''), "
+                "'[^0-9]', '', 'g')",
+                "npi",
+            ),
+            "name": "service_phone_digits_npi",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND regexp_replace(COALESCE(telephone_number, ''), "
+                "'[^0-9]', '', 'g') <> ''"
+            ),
+        },
+        {
+            "index_elements": ("phone_number", "npi"),
+            "name": "service_phone_number_npi",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND phone_number IS NOT NULL AND phone_number <> ''"
+            ),
+        },
+        {
+            "index_elements": ("address_key", "npi"),
+            "name": "service_address_key_npi",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND address_key IS NOT NULL"
+            ),
+        },
+        {
+            "index_elements": ("premise_key", "npi"),
+            "name": "service_premise_key_npi",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND premise_key IS NOT NULL"
+            ),
+        },
+        {
+            "index_elements": ("address_sources",),
+            "using": "gin",
+            "name": "address_sources",
+        },
+        {"index_elements": ("row_origin",), "name": "row_origin"},
+        {"index_elements": ("zip5",), "name": "zip5"},
+        {
+            "index_elements": ("ptg_plan_array",),
+            "using": "gin",
+            "name": "ptg_plan_array",
+        },
+        {
+            "index_elements": ("procedures_array gin__int_ops",),
+            "using": "gin",
+            "name": "procedures_array",
+        },
+        {
+            "index_elements": (
+                "Geography(ST_MakePoint((long)::double precision, "
+                "(lat)::double precision))",
+            ),
+            "using": "gist",
+            "name": "geo_idx",
+            "where": "lat IS NOT NULL AND long IS NOT NULL",
+        },
+        {
+            "index_elements": ("lat", "long"),
+            "name": "geo_bbox",
+            "where": "lat IS NOT NULL AND long IS NOT NULL",
+        },
+    ]
+
+
 @pytest.mark.asyncio
 async def test_entity_address_unified_serving_stage_index_profile_skips_debug_indexes(monkeypatch):
     """Serving-stage index creation omits diagnostic-only indexes."""
     statements = []
     index_context_map = {}
 
-    class FakeDB:
-        async def status(self, statement):
-            statements.append(statement)
-
-    class FakeStage:
-        __tablename__ = "entity_address_unified_20260614"
-        __main_table__ = "entity_address_unified"
-        __my_additional_indexes__ = [
-            {"index_elements": ("npi",), "name": "npi"},
-            {"index_elements": ("inferred_npi",), "name": "inferred_npi"},
-            {"index_elements": ("entity_type", "coalesce(npi, inferred_npi)"), "name": "entity_type_coalesced_npi"},
-            {
-                "index_elements": (
-                    "COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'))",
-                    "npi",
-                ),
-                "name": "service_phone_lookup_npi",
-                "where": (
-                    "type IN ('primary', 'secondary', 'practice', 'site') "
-                    "AND COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')) <> ''"
-                ),
-            },
-            {
-                "index_elements": (
-                    "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
-                    "npi",
-                ),
-                "name": "primary_phone_digits_npi",
-                "where": "type='primary'",
-            },
-            {
-                "index_elements": ("telephone_number", "npi"),
-                "name": "primary_phone_npi",
-                "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
-            },
-            {
-                "index_elements": (
-                    "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
-                    "npi",
-                ),
-                "name": "service_phone_digits_npi",
-                "where": (
-                    "type IN ('primary', 'secondary', 'practice', 'site') "
-                    "AND regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g') <> ''"
-                ),
-            },
-            {
-                "index_elements": ("phone_number", "npi"),
-                "name": "service_phone_number_npi",
-                "where": (
-                    "type IN ('primary', 'secondary', 'practice', 'site') "
-                    "AND phone_number IS NOT NULL AND phone_number <> ''"
-                ),
-            },
-            {
-                "index_elements": ("address_key", "npi"),
-                "name": "service_address_key_npi",
-                "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
-            },
-            {
-                "index_elements": ("premise_key", "npi"),
-                "name": "service_premise_key_npi",
-                "where": "type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL",
-            },
-            {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
-            {"index_elements": ("row_origin",), "name": "row_origin"},
-            {"index_elements": ("zip5",), "name": "zip5"},
-            {"index_elements": ("ptg_plan_array",), "using": "gin", "name": "ptg_plan_array"},
-            {"index_elements": ("procedures_array gin__int_ops",), "using": "gin", "name": "procedures_array"},
-            {
-                "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
-                "using": "gist",
-                "name": "geo_idx",
-                "where": "lat IS NOT NULL AND long IS NOT NULL",
-            },
-            {
-                "index_elements": ("lat", "long"),
-                "name": "geo_bbox",
-                "where": "lat IS NOT NULL AND long IS NOT NULL",
-            },
-        ]
-
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE", "serving")
-    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "db", _StageIndexRecorder(statements))
 
-    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=index_context_map)
+    await entity_address_unified._create_stage_indexes(
+        _EntityAddressServingStage,
+        "mrf",
+        context=index_context_map,
+    )
 
     _assert_serving_stage_indexes(statements, index_context_map)
 

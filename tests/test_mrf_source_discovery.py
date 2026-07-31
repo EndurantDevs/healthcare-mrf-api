@@ -446,541 +446,121 @@ def test_source_config_loads_specialized_resolvers():
     )
 
 
-def test_classify_hosting_platform_recognizes_public_adapter_pages():
+_PUBLIC_ADAPTER_CLASSIFICATIONS = (
+    ('https://www.anthem.com/machine-readable-file/search/', 'anthem_s3_mrf'),
+    ('https://healthy.kaiserpermanente.org/hawaii/front-door/machine-readable', 'kaiser_hawaii_mrf_inventory'),
+    ('https://healthy.kaiserpermanente.org/northern-california/front-door/machine-readable', 'kaiser_mrf_inventory'),
+    ('https://www.hcsc.com/who-we-are/transparency-in-coverage', 'hcsc_asomrf_landing'),
+    ('https://www.harvardpilgrim.org/public/machine-readable-files', 'point32_azure_mrf_directory'),
+    ('https://www.pbaclaims.com/mrfs/', 'html_delegated_mrf_links'),
+    ('https://www.healthnet.com/content/healthnet/en_us/transparency-files.html', 'html_delegated_mrf_links'),
+    ('https://www.novahealthcare.com/resources/mrf.html', 'html_delegated_mrf_links'),
+    ('https://www.hnas.com/digital-resources/machine-readable-files', 'html_delegated_mrf_links'),
+    ('https://capitalhealth.com/legal/transparency-in-coverage/', 'html_mrf_links'),
+    ('https://transparency.abadmin.com/', 'html_delegated_mrf_links'),
+    ('https://mb.mrf.payercompass.com/', 'payercompass_mrf'),
+    ('https://api.midlandschoice.com/mrf', 'midlandschoice_mrf'),
+    ('https://www.centene.com/price-transparency-files.html', 'html_mrf_links'),
+    ('https://www.bcbsnd.com/employers/group-insurance-101/understanding-transparency-in-coverage-rule', 'html_delegated_mrf_links'),
+    ('https://alliantplans.com/json/pt/latestpt_nlc.html', 'html_mrf_links'),
+    ('https://www.amerihealthcaritas.com/price-transparency/', 'html_mrf_links'),
+    ('https://aultcare.com/price-transparency', 'html_mrf_links'),
+    ('https://www.molinamarketplace.com/marketplace/oh/en-us/About/compinfo/PricingTransparency', 'html_mrf_links'),
+    ('https://www.hioscar.com/transparency-in-coverage-files/oscar', 'oscar_s3_monthly_toc'),
+    ('https://thealliance.health/about-the-alliance/transparency-in-coverage-cms-9915-machine-readable-files/', 'html_mrf_links'),
+    ('https://alamedaalliance.org/about/pricing-transparency/', 'html_mrf_links'),
+    ('https://www.arkansasbluecross.com/interoperability/machine-readable-files', 'html_mrf_links'),
+    ('https://www.healthadvantage-hmo.com/interoperability/machine-readable-files', 'html_mrf_links'),
+    ('https://www.sharphealthplan.com/api-access-for-developers', 'html_mrf_links'),
+    ('https://www.sutterhealthplan.org/healthcare-cost-transparency', 'sutter_health_plan_sitecore'),
+    ('https://group-health.com/price-transparency', 'html_mrf_links'),
+    ('https://sisconosurprise.com/ppo/phcs/index.html', 'html_mrf_links'),
+    ('https://sisconosurprise.com/ppo/hps/index.html', 'html_mrf_links'),
+    ('https://www.simplepayhealth.com/', 'html_delegated_mrf_links'),
+    ('https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles', 'healthspace_machine_readable_files'),
+    ('https://transparency-in-coverage.collectivehealth.com/index.html', 'html_mrf_links'),
+    ('https://www.modahealth.com/privacy-center/machine-readable-files.shtml', 'html_mrf_links'),
+    ('https://caa.ebms.com/', 'ebms_caa_directory'),
+    ('https://boonchapman-mrf.zakipointhealth.com/', 'html_mrf_links_mixed_directories'),
+    ('https://talltreeadmin.com/machine-readable-files', 'html_mrf_links'),
+    ('https://www.ebam.com/machine-readable-files/', 'wordpress_elfinder_mrf_links'),
+    ('https://www.motivhealth.com/machinereadablefiles/', 'html_mrf_links'),
+    ('https://www.cbabluevt.com/employer-resources/', 'html_mrf_links'),
+    ('https://tuition.ebpabenefits.com/employers/machine-readable-file-links', 'html_mrf_links'),
+    ('https://healthezbenefits.com/plandocuments/', 'healthez_benefits_mrf'),
+    ('https://www.sanfordhealthplan.com/transparency-in-coverage-rule', 'html_mrf_links'),
+    ('https://www.optimahealth.com/transparency-in-coverage', 'html_mrf_links'),
+    ('https://www.healthpartners.com/hp/legal-notices/disclosures/transparency/index.html', 'html_mrf_links'),
+    ('https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act', 'html_mrf_links'),
+    ('https://insightba.net/transparency-in-coverage-resources/', 'insightba_html_mrf_links'),
+    ('https://deancare.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/machine-readable-transparency-in-coverage', 'healthsparq'),
+    ('https://mrf.healthsparq.com/example-egress.nophi.kyruushsq.com/prd/mrf/EXAMPLE_I/EXAMPLE/latest_metadata.json', 'healthsparq_direct_metadata'),
+    ('https://www.deancare.com/helpful-links/transparency-in-coverage', 'custom'),
+    ('https://www.avmed.org/transparency-in-coverage', 'custom'),
+    ('https://www.vivahealth.com/transparency-in-coverage/', 'custom'),
+    ('https://www.vivahealth.com/mrf/', 'viva_health_mrf'),
+    ('https://www.vivahealth.com/mrf/employers/', 'viva_health_mrf'),
+    ('https://www.vivahealth.com/files/mrf/viva-health-commercial-in-network-rates', 'viva_health_mrf'),
+    ('https://www.vivahealth.com/files/mrf/viva-health-commercial-out-of-network-rates', 'viva_health_mrf'),
+    ('https://www.scrippshealthplan.com/transparency-in-coverage#component_8a5f07e7c7', 'html_mrf_links'),
+    ('https://chorushealthplans.org/ifp/past-ifp-member-resources/transparency-in-coverage', 'html_mrf_links'),
+    ('https://uhealthplan.utah.edu/machine-readable-data', 'html_mrf_links'),
+    ('https://www.healthplan.org/multiplan_mrfs', 'healthplan_html_mrf_links'),
+    ('https://www.healthplan.org/machine_readable_files', 'healthplan_html_mrf_links'),
+    ('https://www.healthplan.org/thp_mrfs', 'healthplan_html_mrf_links'),
+    ('https://www.healthplan.org/amps_mrfs', 'healthplan_html_mrf_links'),
+    ('https://www.westernhealth.com/mywha/price-transparency/', 'html_mrf_links'),
+    ('https://www.firstchoicenext.com/json', 'html_mrf_links'),
+    ('https://www.amerihealthcaritasnext.com/json', 'html_mrf_links'),
+    ('https://www.avmed.org/en/for-developers', 'avmed_html_mrf_links'),
+    ('https://www.mvphealthcare.com/developers/machine-readable-files', 'html_delegated_mrf_links'),
+    ('https://www.upmchealthplan.com/transparency-in-coverage/mrf/', 'upmc_monthly_toc'),
+    ('https://www.bcbsal.org/web/tcr', 'bcbsal_html_mrf_links'),
+    ('https://d3oz7y1cwsecds.cloudfront.net/member-prod/bcbsal', 'direct_toc'),
+    ('https://www.hmaa.com/wp-content/uploads/2022/06/MRF_HMAA.zip', 'direct_toc'),
+    ('https://example.test/acadirectory/97176/97176Index.json', None),
+    ('https://mydental.guardianlife.com/secure/json/index.json', None),
+    ('https://www.hmsa.com/help-center/transparency-in-coverage-machine-readable-files/', 'hmsa_monthly_toc'),
+    ('https://www.bluecrossmn.com/transparency-coverage-machine-readable-files', 'bcbsmn_monthly_toc'),
+    ('https://www.uhahealth.com/important-notices/transparency-in-coverage-and-no-surprises-act-overview', 'uha_monthly_toc'),
+    ('https://app.uhahealth.com/mrf/', 'uha_monthly_toc'),
+    ('https://www.bcbsri.com/developers', 'bcbsri_azure_mrf_listing'),
+    ('https://www.bswhealthplan.com/transparency', 'html_mrf_links'),
+    ('https://ebu.intermountainhealthcare.org/selecthealth/transparencyincoverage/', 'html_mrf_links'),
+    ('https://www.pehp.org/machinereadablefiles', 'html_mrf_links'),
+    ('https://curative.com/transparency-in-coverage-rates', 'html_mrf_links'),
+    ('https://www.groupadministrators.com/machinereadablefiles/', 'html_mrf_links'),
+    ('https://mrf.mmsanalytics.com/medcost/', 'html_mrf_links'),
+    ('https://alliedbenefit.sapphiremrfhub.com/', 'sapphire'),
+    ('https://www.bcbst.com/tcr', 'json_mrf_directory_links'),
+    ('https://cdn.example.test/tcr/aso_directory.json', 'json_mrf_directory_links'),
+    ('https://price-transparency.webtpa.com/', 'webtpa_mrf_api'),
+    ('https://providermrf.uhc.com/IFP', 'uhc_provider_mrf_files'),
+    ('https://www.ibx.com/cmstic/?brand=qcc', 'cmstic_file_info'),
+    ('https://www.ibx.com/transparency-in-coverage/821410?key=abc123', 'cmstic_keyed_toc_redirect'),
+    ('https://www.reliancematrix.com/privacy-notice/transparency-in-coverage', 'html_delegated_mrf_links'),
+    ('https://www.amerihealth.com/developer-resources/index.html', 'cmstic_file_info'),
+    ('https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json', 'direct_mrf_body'),
+    ('https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/', 'html_delegated_mrf_links'),
+    ('https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html', 'html_mrf_links'),
+    ('https://developers.humana.com/cost-transparency', 'humana_pct_file_list'),
+    ('https://developers.humana.com/syntheticdata/Resource/PCTFilesList?fileType=innetwork', 'humana_pct_file_list'),
+    ('https://www.fchn.com/machine-readable-files', 'fchn_payor_search'),
+    ('https://www.fchn.com/PayorSearch/Home/PayorDetail/64647', 'fchn_payor_search'),
+    ('https://ehptransparency.org/', 'html_mrf_links'),
+    ('https://www.ucare.org/legal-notices/transparency-in-coverage', 'html_mrf_links'),
+    ('https://stmercycaremrf.z14.web.core.windows.net/in_network.html', 'html_mrf_links'),
+    ('https://stmercycaremrf.z14.web.core.windows.net/OON.html', 'html_mrf_links'),
+)
+
+
+@pytest.mark.parametrize(("url", "expected_platform"), _PUBLIC_ADAPTER_CLASSIFICATIONS)
+def test_classify_hosting_platform_recognizes_public_adapter_pages(
+    url,
+    expected_platform,
+):
     """Verify this source-discovery regression contract."""
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.anthem.com/machine-readable-file/search/"
-        )
-        == "anthem_s3_mrf"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://healthy.kaiserpermanente.org/hawaii/front-door/machine-readable"
-        )
-        == "kaiser_hawaii_mrf_inventory"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://healthy.kaiserpermanente.org/"
-            "northern-california/front-door/machine-readable"
-        )
-        == "kaiser_mrf_inventory"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.hcsc.com/who-we-are/transparency-in-coverage"
-        )
-        == "hcsc_asomrf_landing"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.harvardpilgrim.org/public/machine-readable-files"
-        )
-        == "point32_azure_mrf_directory"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.pbaclaims.com/mrfs/")
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.healthnet.com/content/healthnet/en_us/transparency-files.html"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.novahealthcare.com/resources/mrf.html"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.hnas.com/digital-resources/machine-readable-files"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://capitalhealth.com/legal/transparency-in-coverage/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://transparency.abadmin.com/")
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://mb.mrf.payercompass.com/")
-        == "payercompass_mrf"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://api.midlandschoice.com/mrf")
-        == "midlandschoice_mrf"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.centene.com/price-transparency-files.html"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.bcbsnd.com/employers/group-insurance-101/understanding-transparency-in-coverage-rule"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://alliantplans.com/json/pt/latestpt_nlc.html"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.amerihealthcaritas.com/price-transparency/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://aultcare.com/price-transparency")
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.molinamarketplace.com/marketplace/oh/en-us/About/compinfo/PricingTransparency"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.hioscar.com/transparency-in-coverage-files/oscar"
-        )
-        == "oscar_s3_monthly_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://thealliance.health/about-the-alliance/transparency-in-coverage-cms-9915-machine-readable-files/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://alamedaalliance.org/about/pricing-transparency/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.arkansasbluecross.com/interoperability/machine-readable-files"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.healthadvantage-hmo.com/interoperability/machine-readable-files"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.sharphealthplan.com/api-access-for-developers"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.sutterhealthplan.org/healthcare-cost-transparency"
-        )
-        == "sutter_health_plan_sitecore"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://group-health.com/price-transparency"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://sisconosurprise.com/ppo/phcs/index.html"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://sisconosurprise.com/ppo/hps/index.html"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.simplepayhealth.com/")
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles"
-        )
-        == "healthspace_machine_readable_files"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://transparency-in-coverage.collectivehealth.com/index.html"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.modahealth.com/privacy-center/machine-readable-files.shtml"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://caa.ebms.com/")
-        == "ebms_caa_directory"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://boonchapman-mrf.zakipointhealth.com/"
-        )
-        == "html_mrf_links_mixed_directories"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://talltreeadmin.com/machine-readable-files"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.ebam.com/machine-readable-files/"
-        )
-        == "wordpress_elfinder_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.motivhealth.com/machinereadablefiles/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.cbabluevt.com/employer-resources/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://tuition.ebpabenefits.com/employers/machine-readable-file-links"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://healthezbenefits.com/plandocuments/")
-        == "healthez_benefits_mrf"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.sanfordhealthplan.com/transparency-in-coverage-rule"
-        )
-        == "html_mrf_links"
-    )
-    for url in (
-        "https://www.optimahealth.com/transparency-in-coverage",
-        "https://www.healthpartners.com/hp/legal-notices/disclosures/transparency/index.html",
-        "https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act",
-    ):
-        assert discovery.classify_hosting_platform(url) == "html_mrf_links"
-    assert (
-        discovery.classify_hosting_platform(
-            "https://insightba.net/transparency-in-coverage-resources/"
-        )
-        == "insightba_html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://deancare.healthsparq.com/healthsparq/public/#/one/"
-            "insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/"
-            "machine-readable-transparency-in-coverage"
-        )
-        == "healthsparq"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://mrf.healthsparq.com/example-egress.nophi.kyruushsq.com/prd/mrf/"
-            "EXAMPLE_I/EXAMPLE/latest_metadata.json"
-        )
-        == "healthsparq_direct_metadata"
-    )
-    for url in (
-        "https://www.deancare.com/helpful-links/transparency-in-coverage",
-        "https://www.avmed.org/transparency-in-coverage",
-        "https://www.vivahealth.com/transparency-in-coverage/",
-    ):
-        assert discovery.classify_hosting_platform(url) == "custom"
-    for url in (
-        "https://www.vivahealth.com/mrf/",
-        "https://www.vivahealth.com/mrf/employers/",
-        "https://www.vivahealth.com/files/mrf/viva-health-commercial-in-network-rates",
-        "https://www.vivahealth.com/files/mrf/viva-health-commercial-out-of-network-rates",
-    ):
-        assert discovery.classify_hosting_platform(url) == "viva_health_mrf"
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.scrippshealthplan.com/transparency-in-coverage#component_8a5f07e7c7"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://chorushealthplans.org/ifp/past-ifp-member-resources/transparency-in-coverage"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://uhealthplan.utah.edu/machine-readable-data"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.healthplan.org/multiplan_mrfs")
-        == "healthplan_html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.healthplan.org/machine_readable_files"
-        )
-        == "healthplan_html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.healthplan.org/thp_mrfs")
-        == "healthplan_html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.healthplan.org/amps_mrfs")
-        == "healthplan_html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.westernhealth.com/mywha/price-transparency/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.firstchoicenext.com/json")
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.amerihealthcaritasnext.com/json")
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.avmed.org/en/for-developers")
-        == "avmed_html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.mvphealthcare.com/developers/machine-readable-files"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.upmchealthplan.com/transparency-in-coverage/mrf/"
-        )
-        == "upmc_monthly_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.bcbsal.org/web/tcr")
-        == "bcbsal_html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://d3oz7y1cwsecds.cloudfront.net/member-prod/bcbsal"
-        )
-        == "direct_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.hmaa.com/wp-content/uploads/2022/06/MRF_HMAA.zip"
-        )
-        == "direct_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://example.test/acadirectory/97176/97176Index.json"
-        )
-        is None
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://mydental.guardianlife.com/secure/json/index.json"
-        )
-        is None
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.hmsa.com/help-center/transparency-in-coverage-machine-readable-files/"
-        )
-        == "hmsa_monthly_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.bluecrossmn.com/transparency-coverage-machine-readable-files"
-        )
-        == "bcbsmn_monthly_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.uhahealth.com/important-notices/transparency-in-coverage-and-no-surprises-act-overview"
-        )
-        == "uha_monthly_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://app.uhahealth.com/mrf/")
-        == "uha_monthly_toc"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.bcbsri.com/developers")
-        == "bcbsri_azure_mrf_listing"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.bswhealthplan.com/transparency"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://ebu.intermountainhealthcare.org/selecthealth/transparencyincoverage/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.pehp.org/machinereadablefiles")
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://curative.com/transparency-in-coverage-rates"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.groupadministrators.com/machinereadablefiles/"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://mrf.mmsanalytics.com/medcost/")
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://alliedbenefit.sapphiremrfhub.com/")
-        == "sapphire"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.bcbst.com/tcr")
-        == "json_mrf_directory_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://cdn.example.test/tcr/aso_directory.json"
-        )
-        == "json_mrf_directory_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://price-transparency.webtpa.com/")
-        == "webtpa_mrf_api"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://providermrf.uhc.com/IFP")
-        == "uhc_provider_mrf_files"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.ibx.com/cmstic/?brand=qcc")
-        == "cmstic_file_info"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.ibx.com/transparency-in-coverage/821410?key=abc123"
-        )
-        == "cmstic_keyed_toc_redirect"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.reliancematrix.com/privacy-notice/transparency-in-coverage"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.amerihealth.com/developer-resources/index.html"
-        )
-        == "cmstic_file_info"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json"
-        )
-        == "direct_mrf_body"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/"
-        )
-        == "html_delegated_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://developers.humana.com/cost-transparency")
-        == "humana_pct_file_list"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://developers.humana.com/syntheticdata/Resource/PCTFilesList?fileType=innetwork"
-        )
-        == "humana_pct_file_list"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://www.fchn.com/machine-readable-files")
-        == "fchn_payor_search"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.fchn.com/PayorSearch/Home/PayorDetail/64647"
-        )
-        == "fchn_payor_search"
-    )
-    assert (
-        discovery.classify_hosting_platform("https://ehptransparency.org/")
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://www.ucare.org/legal-notices/transparency-in-coverage"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://stmercycaremrf.z14.web.core.windows.net/in_network.html"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://stmercycaremrf.z14.web.core.windows.net/OON.html"
-        )
-        == "html_mrf_links"
-    )
+    assert discovery.classify_hosting_platform(url) == expected_platform
 
 
 def _midlandschoice_catalog_html() -> str:

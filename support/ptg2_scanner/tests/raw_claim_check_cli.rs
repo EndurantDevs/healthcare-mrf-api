@@ -10,6 +10,9 @@ const TARGETS: &str = concat!(
     "1234567890,99213,CPT,11,api_found\n",
     "2345678901,J1234,HCPCS,22,api_found\n",
     "3456789012,00000,CPT,,api_missing\n",
+    "\n",
+    "4567890123,X000,OTHER,,api_edge\n",
+    "5678901234,X000,OTHER,,api_edge_unmatched\n",
 );
 
 const RAW_MRF: &[u8] = br#"{
@@ -22,6 +25,10 @@ const RAW_MRF: &[u8] = br#"{
     {
       "provider_group_id": "8",
       "provider_groups": [{"npi": "1234567890"}]
+    },
+    {
+      "provider_group_id": 9,
+      "provider_groups": [{"npi": [9999999999]}]
     },
     {
       "provider_group_id": "not-an-integer",
@@ -56,6 +63,25 @@ const RAW_MRF: &[u8] = br#"{
       ]
     },
     {
+      "billing_code": "X000",
+      "billing_code_type": "OTHER",
+      "unknown": true,
+      "negotiated_rates": [
+        {
+          "provider_references": [9],
+          "provider_groups": [{"npi": [9999999999]}],
+          "negotiated_prices": []
+        },
+        {
+          "provider_groups": [{"npi": [4567890123]}],
+          "negotiated_prices": [
+            {"negotiated_rate": true},
+            {"service_code": [], "negotiated_rate": "100,50"}
+          ]
+        }
+      ]
+    },
+    {
       "billing_code": "NOT-TARGETED",
       "billing_code_type": "CPT",
       "negotiated_rates": [{"ignored": true}]
@@ -81,7 +107,7 @@ fn assert_success_report(output: Output, raw_path: &Path) {
     );
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 report");
     let rows: Vec<&str> = stdout.lines().collect();
-    assert_eq!(rows.len(), 7, "header plus two rows per target");
+    assert_eq!(rows.len(), 11, "header plus two rows per target");
     assert!(rows[0].starts_with("npi,code,requested_code_system,pos,api_status,"));
 
     let referenced = rows
@@ -108,6 +134,12 @@ fn assert_success_report(output: Output, raw_path: &Path) {
         .find(|row| row.starts_with("3456789012,00000,CPT,,api_missing,CPT,false,"))
         .expect("unmatched evidence row");
     assert!(unmatched.contains(",false,false,false,0,0,,0,,,"));
+
+    let edge = rows
+        .iter()
+        .find(|row| row.starts_with("4567890123,X000,OTHER,,api_edge,OTHER,false,"))
+        .expect("OTHER-system edge evidence row");
+    assert!(edge.contains(",false,true,false,1,0,,1,,\"100,50\","));
 }
 
 #[test]

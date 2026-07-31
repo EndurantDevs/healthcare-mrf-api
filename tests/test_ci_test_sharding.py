@@ -81,12 +81,13 @@ def test_cli_collects_and_assigns_each_temporary_test_once(tmp_path: Path) -> No
     ]
 
 
-def test_workflow_uses_two_unique_main_coverage_artifacts_and_timeouts() -> None:
+def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> None:
     workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
 
-    assert "shard-index: [0, 1]" in workflow
+    assert "shard-index: [0, 1, 2, 3]" in workflow
+    assert "--shard-count 4" in workflow
     assert "scripts/ci/shard_pytest_nodeids.py" in workflow
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow
@@ -96,6 +97,10 @@ def test_workflow_uses_two_unique_main_coverage_artifacts_and_timeouts() -> None
     assert "if: matrix.shard == 'core'" in workflow
     assert "if: matrix.shard == 'provider-directory'" in workflow
     assert "python -m pytest -q -n 1 --dist loadscope" in workflow
+    assert (
+        "cargo build --locked --bins --manifest-path "
+        "support/ptg2_scanner/Cargo.toml &"
+    ) in workflow
     assert "timeout --foreground 295s python -m pytest" in workflow
     assert "timeout --foreground 295s cargo llvm-cov" in workflow
     for workflow_line in workflow.splitlines():

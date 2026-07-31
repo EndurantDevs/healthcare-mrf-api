@@ -126,11 +126,37 @@ def _stub_profile_publish(monkeypatch, fence) -> None:
     )
     monkeypatch.setattr(
         importer,
+        "_provider_directory_profile_resource_scope_fence",
+        AsyncMock(return_value=fence),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_committed_run_replay",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_bootstrap_provider_directory_profile_serving_generation",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_admit_provider_directory_profile_capacity",
+        AsyncMock(return_value=types.SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_assert_no_provider_directory_resource_id_npi_backfill_candidates",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
         "_publish_artifact_bundle_from_fence",
         AsyncMock(
             return_value={
                 "profile": {
                     "generation_id": "pdpb_generation",
+                    "profile_as_of": "2026-07-30",
                     "profile_rows": 3,
                     "evidence_rows": 5,
                     "selected_evidence_rows": 5,
@@ -316,6 +342,7 @@ def test_admission_requires_exact_proof_and_generation(monkeypatch):
         **selection._GLOBAL_PROFILE_PARAMS,
         "provider_directory_profile_generation": 11,
         "provider_directory_profile_selection_attestation": attestation.payload,
+        "provider_directory_profile_capacity_attestation": {},
     }
 
     control_imports._validate_provider_directory_profile_execution_params(
@@ -338,6 +365,7 @@ def test_global_profile_and_independent_acquisition_do_not_block_each_other(
         **selection._GLOBAL_PROFILE_PARAMS,
         "provider_directory_profile_generation": 11,
         "provider_directory_profile_selection_attestation": _attestation().payload,
+        "provider_directory_profile_capacity_attestation": {},
     }
     acquisition_params_map = {
         "import_resources": True,
@@ -407,7 +435,8 @@ async def test_attested_publish_emits_strict_result_and_profile_generation(
     _stub_profile_publish(monkeypatch, fence)
 
     metrics = await importer._publish_attested_provider_directory_profile(
-        run_id="run-profile",
+        run_id="run_" + "1" * 32,
+        control_run_id="run_" + "1" * 32,
         metrics={},
         execution=execution,
     )
@@ -415,6 +444,7 @@ async def test_attested_publish_emits_strict_result_and_profile_generation(
     selection_result_map = metrics[selection.PROFILE_SELECTION_RESULT_METRIC]
     assert selection_result_map["generation"] == 11
     assert selection_result_map["profile_generation_id"] == "pdpb_generation"
+    assert selection_result_map["profile_as_of"] == "2026-07-30"
     assert selection_result_map["status"] == "published"
     assert selection_result_map["row_counts"] == {
         "profile_rows": 3,

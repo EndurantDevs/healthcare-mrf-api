@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, NamedTuple
 
 import aiohttp
 import asyncpg
@@ -48,6 +48,7 @@ from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
 from db.connection import ConnectionProxy
 from db.models import (
+    ImportRun,
     ProviderDirectoryAPIEndpoint,
     ProviderDirectoryBulkAcquisitionCheckpoint,
     ProviderDirectoryBulkOutputCheckpoint,
@@ -69,12 +70,18 @@ from db.models import (
     ProviderDirectoryPractitioner,
     ProviderDirectoryPractitionerRole,
     ProviderDirectoryProfileBuildCheckpoint,
+    ProviderDirectoryProfileCapacityLeaseConsumption,
+    ProviderDirectoryProfileDeltaReceipt,
+    ProviderDirectoryProfileServingGeneration,
     ProviderDirectoryReverseLookupCheckpoint,
     ProviderDirectorySource,
     ProviderDirectorySourceResource,
     db,
 )
-from process.control_lifecycle import mark_control_run
+from process.control_lifecycle import (
+    mark_control_run,
+    suppress_control_run_heartbeat_persistence,
+)
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
@@ -170,12 +177,29 @@ from process.provider_directory_time_partition import (
     parse_utc_instant,
 )
 from process import provider_directory_profile as profile_artifact
+from process import provider_directory_profile_capacity as profile_capacity
+from process import (
+    provider_directory_profile_capacity_runtime as profile_capacity_runtime,
+)
+from process.provider_directory_profile_capacity_attestation import (
+    CapacityLeaseConsumptionBinding,
+    ProviderDirectoryCapacityLeaseError,
+    VerifiedDatabaseCapacityLease,
+    assert_database_capacity_lease_reservation,
+    capacity_lease_consumption_values,
+    verify_database_capacity_lease,
+)
 from process.provider_directory_profile_selection import (
+    PROFILE_EXECUTION_CONTRACT_ID,
+    PROFILE_SELECTION_ATTESTATION_CONTRACT_ID,
+    PROFILE_SELECTION_RESULT_CONTRACT_ID,
     PROFILE_SELECTION_RESULT_METRIC,
     ProviderDirectoryProfileExecution,
+    ProviderDirectoryProfileSelectionError,
     assert_registered_profile_selection_current,
     assert_profile_selection_current_in_transaction,
     profile_selection_result,
+    validated_profile_selection_attestation,
     validated_profile_execution,
 )
 from process.provider_directory_profile_selection_snapshot import (
@@ -188,6 +212,29 @@ from process.provider_directory_refresh_preset import (
 from scripts.provider_directory_support_contract import (
     SupportDocumentationError,
     validate_blocker_registry,
+)
+
+_PROFILE_EVIDENCE_INSERT_SQL_CONTRACT = (
+    profile_artifact.profile_evidence_insert_sql
+)
+_PROFILE_EVIDENCE_COUNT_SQL_CONTRACT = (
+    profile_artifact.profile_evidence_count_sql
+)
+_PROFILE_INSERT_SQL_CONTRACT = profile_artifact.profile_insert_sql
+_PROFILE_DELTA_INSERT_SQL_CONTRACT = (
+    profile_artifact.profile_delta_insert_sql
+)
+_PROFILE_COPY_EVIDENCE_SQL_CONTRACT = (
+    profile_artifact.copy_existing_evidence_sql
+)
+_PROFILE_COPY_PROFILES_SQL_CONTRACT = (
+    profile_artifact.copy_unaffected_profiles_sql
+)
+_PROFILE_AFFECTED_NPI_SOURCE_SQL_CONTRACT = (
+    profile_artifact.affected_npi_source_insert_sql
+)
+_PROFILE_AFFECTED_NPI_DELTA_SQL_CONTRACT = (
+    profile_artifact.affected_npi_delta_insert_sql
 )
 
 
@@ -373,6 +420,18 @@ PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT = "1000ms"
 PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS = 2.0
 PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_BACKOFF_SECONDS = 0.2
 DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_MAX_PROJECTED_ROWS = 50_000_000
+PROVIDER_DIRECTORY_PROFILE_ADMISSION_ROW_LOCK_COUNT = 2
+PROVIDER_DIRECTORY_PROFILE_CUTOVER_FIXED_ROW_LOCK_COUNT = 6
+DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_BATCH_SIZE = 100_000
+DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_WORKERS = 3
+MAX_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_WORKERS = 8
+DEFAULT_PROVIDER_DIRECTORY_PROFILE_EVIDENCE_WINDOW_SIZE = 2
+DEFAULT_PROVIDER_DIRECTORY_PROFILE_COMPACT_WINDOW_SIZE = 2
+MAX_PROVIDER_DIRECTORY_PROFILE_WINDOW_SIZE = 2
+PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_LOCK_TIMEOUT = "5s"
+PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_STATEMENT_TIMEOUT = "15min"
+PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_TIMEOUT_SECONDS = 16 * 60
+PROVIDER_DIRECTORY_PROFILE_DEADLINE_COMMIT_RESERVE_MS = 1_000
 PROVIDER_DIRECTORY_NETWORK_CATALOG_INDEX_SUFFIXES = (
     "source_network_idx",
     "source_idx",
@@ -654,6 +713,12 @@ _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE: contextvars.ContextVar[Any | None] =
         default=None,
     )
 )
+_PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS: contextvars.ContextVar[
+    tuple[str, ...] | None
+] = contextvars.ContextVar(
+    "provider_directory_artifact_resource_scope_source_ids",
+    default=None,
+)
 _PROVIDER_DIRECTORY_ARTIFACT_BUNDLE: contextvars.ContextVar[Any | None] = (
     contextvars.ContextVar(
         "provider_directory_artifact_bundle",
@@ -664,6 +729,12 @@ _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION: contextvars.ContextVar[
     ProviderDirectoryProfileExecution | None
 ] = contextvars.ContextVar(
     "provider_directory_profile_selection_execution",
+    default=None,
+)
+_PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION: contextvars.ContextVar[
+    Any | None
+] = contextvars.ContextVar(
+    "provider_directory_profile_capacity_admission",
     default=None,
 )
 SECRET_ENV_PREFIX = "env:"
@@ -4710,12 +4781,12 @@ def _requested_source_import_empty_error(
     )
 
 
-def _url_with_query_params(url: str, query_params: dict[str, str] | None) -> str:
-    if not query_params:
+def _url_with_query_params(url: str, query_params_by_name: dict[str, str] | None) -> str:
+    if not query_params_by_name:
         return url
     parsed = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    query.extend((key, value) for key, value in query_params.items())
+    query.extend((key, value) for key, value in query_params_by_name.items())
     return urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query), parsed.fragment)
     )
@@ -8083,6 +8154,52 @@ class ProviderDirectoryPreparedArtifactStage:
 
 
 @dataclass(frozen=True)
+class ProviderDirectoryPreparedProfileDelta:
+    """One bounded, replay-safe in-place global Profile generation delta."""
+
+    schema: str
+    build_id: str
+    resume_lineage_hash: str
+    owner_run_id: str | None
+    evidence_stage: str
+    evidence_stage_oid: int
+    profile_stage: str
+    profile_stage_oid: int
+    affected_npi_stage: str
+    affected_npi_stage_oid: int
+    evidence_target_oid: int
+    profile_target_oid: int
+    from_generation_id: str
+    generation_id: str
+    operation: str
+    selection_proof_id: str
+    control_generation: int
+    authority_revision: int
+    profile_schema_version: int
+    profile_strategy_version: str
+    executable_plan_hash: str
+    from_source_vector_hash: str
+    to_source_vector_hash: str
+    to_source_vector: tuple[tuple[str, str], ...]
+    from_source_context_vector_hash: str
+    to_source_context_vector_hash: str
+    to_source_context_vector: tuple[tuple[str, str], ...]
+    refresh_source_ids: tuple[str, ...]
+    removed_source_ids: tuple[str, ...]
+    expected_evidence_rows: int
+    expected_profile_rows: int
+    profile_as_of: str
+    from_capacity_geometry_status: str
+    from_capacity_geometry_hash: str | None
+    from_capacity_geometry_json: str | None
+    capacity_geometry_status: str
+    capacity_geometry_hash: str
+    capacity_geometry_json: str
+    retain_on_failed_bundle: bool = True
+    resume_checkpoint: tuple[str, str] | None = None
+
+
+@dataclass(frozen=True)
 class ProviderDirectoryArtifactPromotionIdentity:
     """Relation identity needed to resolve an ambiguous cutover timeout."""
 
@@ -8097,6 +8214,7 @@ class ProviderDirectoryArtifactBundle:
     stages: list[ProviderDirectoryPreparedArtifactStage] = field(
         default_factory=list
     )
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None = None
     promoted: bool = False
 
     def add(
@@ -8107,6 +8225,17 @@ class ProviderDirectoryArtifactBundle:
         if stage is not None:
             self.stages.append(stage)
 
+    def add_profile_delta(
+        self,
+        profile_delta: ProviderDirectoryPreparedProfileDelta,
+    ) -> None:
+        """Register the single global Profile delta in this bundle."""
+        if self.profile_delta is not None:
+            raise RuntimeError(
+                "provider_directory_profile_delta_duplicate"
+            )
+        self.profile_delta = profile_delta
+
     @property
     def relation_overrides(self) -> dict[str, str]:
         """Map serving relations to their prepared dependency stages."""
@@ -8115,12 +8244,31 @@ class ProviderDirectoryArtifactBundle:
             for stage in self.stages
         }
 
+    @property
+    def target_relations(self) -> set[str]:
+        """Return logical serving relations completed by this bundle."""
+        targets = {stage.target_relation for stage in self.stages}
+        if self.profile_delta is not None:
+            targets.update(
+                {
+                    profile_artifact.PROFILE_EVIDENCE_TABLE,
+                    profile_artifact.PROFILE_TABLE,
+                }
+            )
+        return targets
+
     async def promote(self) -> int:
         """Atomically promote every registered serving stage."""
-        if self.stages:
-            await _retry_provider_directory_artifact_bundle_promotion(
-                tuple(self.stages)
-            )
+        if self.stages or self.profile_delta is not None:
+            if self.profile_delta is None:
+                await _retry_provider_directory_artifact_bundle_promotion(
+                    tuple(self.stages)
+                )
+            else:
+                await _retry_provider_directory_artifact_bundle_promotion(
+                    tuple(self.stages),
+                    profile_delta=self.profile_delta,
+                )
         self.promoted = True
         for schema, build_id in sorted(
             {
@@ -8133,7 +8281,7 @@ class ProviderDirectoryArtifactBundle:
                 schema,
                 build_id,
             )
-        return len(self.stages)
+        return len(self.stages) + int(self.profile_delta is not None)
 
     async def cleanup(self) -> None:
         """Remove every stage name that was not consumed by promotion."""
@@ -8478,15 +8626,27 @@ async def _prepare_provider_directory_artifact_stage(schema: str, stage_table: s
 async def _acquire_provider_directory_artifact_cutover_lock(
     stage: ProviderDirectoryPreparedArtifactStage,
 ) -> None:
+    await _acquire_provider_directory_artifact_target_lock(
+        stage.schema,
+        stage.target_relation,
+    )
+
+
+async def _acquire_provider_directory_artifact_target_lock(
+    schema: str,
+    target_relation: str,
+) -> None:
+    """Acquire one deterministic transaction-scoped artifact lock."""
+
     acquired = await db.scalar(
         "SELECT pg_try_advisory_xact_lock(hashtextextended(:target_lock_key, 0));",
         target_lock_key=(
             "provider-directory-artifact-cutover:"
-            f"{stage.schema}.{stage.target_relation}"
+            f"{schema}.{target_relation}"
         ),
     )
     if not acquired:
-        raise ProviderDirectoryArtifactCutoverConflict(stage.target_relation)
+        raise ProviderDirectoryArtifactCutoverConflict(target_relation)
 
 
 async def _assert_provider_directory_artifact_build_fence(
@@ -8882,6 +9042,2957 @@ async def _promote_provider_directory_artifact_stage_transaction(
             await _promote_provider_directory_artifact_datasets(active_fence)
 
 
+def _provider_directory_profile_delta_stage_identities(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> tuple[tuple[str, int], ...]:
+    return (
+        (
+            profile_delta.evidence_stage,
+            profile_delta.evidence_stage_oid,
+        ),
+        (
+            profile_delta.profile_stage,
+            profile_delta.profile_stage_oid,
+        ),
+        (
+            profile_delta.affected_npi_stage,
+            profile_delta.affected_npi_stage_oid,
+        ),
+    )
+
+
+async def _assert_provider_directory_profile_delta_identity(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> None:
+    """Refuse a delta unless every target, stage, and checkpoint is exact."""
+
+    await _validate_profile_delta_relations(profile_delta)
+    checkpoint = await _lock_profile_delta_checkpoint(profile_delta)
+    _validate_profile_delta_checkpoint_fields(profile_delta, checkpoint)
+    _validate_profile_delta_checkpoint_geometry(profile_delta, checkpoint)
+    _validate_profile_delta_checkpoint_completion(profile_delta, checkpoint)
+
+
+async def _validate_profile_delta_relations(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> None:
+    """Require every serving and scratch relation to keep its frozen OID."""
+    if (
+        await _provider_directory_profile_stage_relation_identity(
+            profile_delta.schema,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        )
+        != (profile_delta.evidence_target_oid, "r", "p")
+        or await _provider_directory_profile_stage_relation_identity(
+            profile_delta.schema,
+            profile_artifact.PROFILE_TABLE,
+        )
+        != (profile_delta.profile_target_oid, "r", "p")
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_target_changed"
+        )
+    for stage_table, expected_oid in (
+        _provider_directory_profile_delta_stage_identities(profile_delta)
+    ):
+        if (
+            await _provider_directory_profile_stage_relation_identity(
+                profile_delta.schema,
+                stage_table,
+            )
+            != (expected_oid, "r", "p")
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_profile_delta_stage_changed:"
+                + stage_table
+            )
+
+
+async def _lock_profile_delta_checkpoint(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> Mapping[str, Any]:
+    """Lock and return the exact ready checkpoint for one prepared delta."""
+    checkpoint_row = await db.first(
+        f"""
+        SELECT *
+          FROM {
+              _provider_directory_profile_checkpoint_ref(
+                  profile_delta.schema
+              )
+          }
+         WHERE build_id = :build_id
+         FOR UPDATE;
+        """,
+        build_id=profile_delta.build_id,
+    )
+    if checkpoint_row is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_checkpoint_missing"
+        )
+    return _pagination_checkpoint_row_mapping(checkpoint_row)
+
+
+def _validate_profile_delta_checkpoint_fields(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    checkpoint: Mapping[str, Any],
+) -> None:
+    """Verify the checkpoint's scalar lineage and source-vector fields."""
+    expected_checkpoint_by_field = {
+        "owner_run_id": profile_delta.owner_run_id,
+        "state": "ready",
+        "resume_lineage_hash": profile_delta.resume_lineage_hash,
+        "executable_plan_hash": profile_delta.executable_plan_hash,
+        "materialization_mode": "source_delta",
+        "evidence_stage": profile_delta.evidence_stage,
+        "profile_stage": profile_delta.profile_stage,
+        "affected_npi_stage": profile_delta.affected_npi_stage,
+        "current_source_vector_hash": (
+            profile_delta.from_source_vector_hash
+        ),
+        "desired_source_vector_hash": profile_delta.to_source_vector_hash,
+        "current_source_context_vector_hash": (
+            profile_delta.from_source_context_vector_hash
+        ),
+        "desired_source_context_vector_hash": (
+            profile_delta.to_source_context_vector_hash
+        ),
+        "profile_as_of": profile_delta.profile_as_of,
+        "capacity_geometry_status": (
+            profile_delta.capacity_geometry_status
+        ),
+        "capacity_geometry_hash": profile_delta.capacity_geometry_hash,
+    }
+    for field_name, expected_value in expected_checkpoint_by_field.items():
+        if checkpoint.get(field_name) != expected_value:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_profile_delta_checkpoint_changed:"
+                + field_name
+            )
+
+
+def _validate_profile_delta_checkpoint_geometry(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    checkpoint: Mapping[str, Any],
+) -> None:
+    """Verify the canonical capacity geometry retained by the checkpoint."""
+    try:
+        checkpoint_capacity_geometry = (
+            _provider_directory_profile_capacity_geometry_identity(
+                status=checkpoint.get("capacity_geometry_status"),
+                geometry_hash=checkpoint.get("capacity_geometry_hash"),
+                geometry_json=checkpoint.get("capacity_geometry_json"),
+            )
+        )
+    except RuntimeError as exc:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_checkpoint_changed:"
+            "capacity_geometry"
+        ) from exc
+    if checkpoint_capacity_geometry != (
+        profile_delta.capacity_geometry_status,
+        profile_delta.capacity_geometry_hash,
+        profile_delta.capacity_geometry_json,
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_checkpoint_changed:"
+            "capacity_geometry"
+        )
+
+
+def _validate_profile_delta_checkpoint_completion(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    checkpoint: Mapping[str, Any],
+) -> None:
+    """Verify checkpoint OIDs, source sets, and terminal batch coordinates."""
+    for field_name, expected_value in {
+        "evidence_stage_oid": profile_delta.evidence_stage_oid,
+        "profile_stage_oid": profile_delta.profile_stage_oid,
+        "affected_npi_stage_oid": profile_delta.affected_npi_stage_oid,
+        "evidence_target_oid": profile_delta.evidence_target_oid,
+        "profile_target_oid": profile_delta.profile_target_oid,
+    }.items():
+        if int(checkpoint.get(field_name) or 0) != expected_value:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_profile_delta_checkpoint_changed:"
+                + field_name
+            )
+    if (
+        _provider_directory_profile_checkpoint_array(
+            checkpoint.get("refresh_source_ids")
+        )
+        != profile_delta.refresh_source_ids
+        or _provider_directory_profile_checkpoint_array(
+            checkpoint.get("removed_source_ids")
+        )
+        != profile_delta.removed_source_ids
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_checkpoint_changed:sources"
+        )
+    checkpoint_state = _provider_directory_profile_checkpoint_state(
+        checkpoint
+    )
+    if (
+        checkpoint_state.evidence_next_batch
+        != checkpoint_state.evidence_total_batches
+        or checkpoint_state.profile_next_batch
+        != checkpoint_state.profile_total_batches
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_checkpoint_incomplete"
+        )
+
+
+def _profile_delta_receipt_values(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> dict[str, Any]:
+    return {
+        "build_id": profile_delta.build_id,
+        "executable_plan_hash": profile_delta.executable_plan_hash,
+        "from_capacity_geometry_status": (
+            profile_delta.from_capacity_geometry_status
+        ),
+        "from_capacity_geometry_hash": (
+            profile_delta.from_capacity_geometry_hash
+        ),
+        "capacity_geometry_status": (
+            profile_delta.capacity_geometry_status
+        ),
+        "capacity_geometry_hash": profile_delta.capacity_geometry_hash,
+        "from_source_vector_hash": (
+            profile_delta.from_source_vector_hash
+        ),
+        "to_source_vector_hash": profile_delta.to_source_vector_hash,
+        "from_source_context_vector_hash": (
+            profile_delta.from_source_context_vector_hash
+        ),
+        "to_source_context_vector_hash": (
+            profile_delta.to_source_context_vector_hash
+        ),
+        "from_generation_id": profile_delta.from_generation_id,
+        "generation_id": profile_delta.generation_id,
+        "operation": profile_delta.operation,
+        "profile_as_of": profile_delta.profile_as_of,
+        "selection_proof_id": profile_delta.selection_proof_id,
+        "control_generation": profile_delta.control_generation,
+        "authority_revision": profile_delta.authority_revision,
+        "evidence_target_oid": profile_delta.evidence_target_oid,
+        "profile_target_oid": profile_delta.profile_target_oid,
+    }
+
+
+def _is_profile_delta_geometry_matching(
+    receipt: Mapping[str, Any],
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> bool:
+    """Return whether both receipt capacity geometries match the delta."""
+    try:
+        receipt_from_geometry = (
+            _provider_directory_profile_capacity_geometry_identity(
+                status=receipt.get(
+                    "from_capacity_geometry_status"
+                ),
+                geometry_hash=receipt.get(
+                    "from_capacity_geometry_hash"
+                ),
+                geometry_json=receipt.get(
+                    "from_capacity_geometry_json"
+                ),
+            )
+        )
+        receipt_geometry = (
+            _provider_directory_profile_capacity_geometry_identity(
+                status=receipt.get("capacity_geometry_status"),
+                geometry_hash=receipt.get("capacity_geometry_hash"),
+                geometry_json=receipt.get("capacity_geometry_json"),
+            )
+        )
+    except RuntimeError:
+        return False
+    return receipt_from_geometry == (
+        profile_delta.from_capacity_geometry_status,
+        profile_delta.from_capacity_geometry_hash,
+        profile_delta.from_capacity_geometry_json,
+    ) and receipt_geometry == (
+        profile_delta.capacity_geometry_status,
+        profile_delta.capacity_geometry_hash,
+        profile_delta.capacity_geometry_json,
+    )
+
+
+def _has_nonnegative_profile_delta_counts(
+    receipt: Mapping[str, Any],
+) -> bool:
+    """Return whether every committed delta counter is present and valid."""
+    for field_name in (
+        "evidence_rows",
+        "profile_rows",
+        "evidence_inserted",
+        "evidence_deleted",
+        "profile_inserted",
+        "profile_deleted",
+    ):
+        raw_value = receipt.get(field_name)
+        if raw_value is None:
+            return False
+        try:
+            if int(raw_value) < 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _is_profile_delta_receipt_matching(
+    receipt: Mapping[str, Any],
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> bool:
+    """Return whether a receipt exactly matches one prepared delta."""
+    for field_name, expected_value in (
+        _provider_directory_profile_delta_receipt_static_values(
+            profile_delta
+        ).items()
+    ):
+        actual_value = receipt.get(field_name)
+        if isinstance(expected_value, int):
+            try:
+                actual_value = int(actual_value)
+            except (TypeError, ValueError):
+                return False
+        if actual_value != expected_value:
+            return False
+    return _is_profile_delta_geometry_matching(
+        receipt,
+        profile_delta,
+    ) and _has_nonnegative_profile_delta_counts(receipt)
+
+
+def _provider_directory_profile_cutover_receipt_identity(
+    receipt: Mapping[str, Any],
+    *,
+    geometry: (
+        profile_capacity.ProviderDirectoryProfileCapacityGeometry | None
+    ) = None,
+    expected_run_id: str | None = None,
+) -> tuple[str, str] | None:
+    """Return the verified forecast and actual cutover hashes."""
+
+    receipt_parts = _profile_cutover_receipt_parts(receipt)
+    if receipt_parts is None:
+        return None
+    cutover_fields_by_name, forecast_by_field, actual_by_field = receipt_parts
+    forecast_hash, actual_hash = _profile_cutover_hashes(
+        forecast_by_field,
+        actual_by_field,
+    )
+    scalar_actual_by_field = _profile_cutover_actual_scalars(
+        cutover_fields_by_name
+    )
+    _validate_profile_cutover_actual(
+        cutover_fields_by_name,
+        forecast_by_field,
+        actual_by_field,
+        forecast_hash,
+        actual_hash,
+        scalar_actual_by_field,
+    )
+    if geometry is not None:
+        _validate_profile_cutover_semantics(
+            receipt,
+            geometry,
+            expected_run_id,
+            forecast_by_field,
+            actual_by_field,
+            forecast_hash,
+        )
+    return forecast_hash, actual_hash
+
+
+def _profile_cutover_receipt_parts(
+    receipt: Mapping[str, Any],
+) -> tuple[
+    dict[str, Any],
+    Mapping[str, Any],
+    Mapping[str, Any],
+] | None:
+    """Decode the complete forecast and actual sections of a receipt."""
+    field_names = (
+        "cutover_forecast_hash",
+        "cutover_forecast_json",
+        "cutover_actual_hash",
+        "cutover_actual_json",
+        "cutover_wal_start_lsn",
+        "cutover_wal_observed_lsn",
+        "cutover_wal_bytes",
+        "evidence_target_bytes_before",
+        "evidence_target_bytes_after",
+        "evidence_target_growth_bytes",
+        "profile_target_bytes_before",
+        "profile_target_bytes_after",
+        "profile_target_growth_bytes",
+    )
+    cutover_fields_by_name = {
+        field_name: receipt.get(field_name)
+        for field_name in field_names
+    }
+    if all(
+        field_value is None
+        for field_value in cutover_fields_by_name.values()
+    ):
+        return None
+    if any(
+        field_value is None
+        for field_value in cutover_fields_by_name.values()
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_receipt_incomplete"
+        )
+    forecast_by_field = cutover_fields_by_name["cutover_forecast_json"]
+    actual_by_field = cutover_fields_by_name["cutover_actual_json"]
+    if isinstance(forecast_by_field, str):
+        forecast_by_field = json.loads(forecast_by_field)
+    if isinstance(actual_by_field, str):
+        actual_by_field = json.loads(actual_by_field)
+    if not isinstance(forecast_by_field, Mapping) or not isinstance(
+        actual_by_field,
+        Mapping,
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_receipt_invalid"
+        )
+    return cutover_fields_by_name, forecast_by_field, actual_by_field
+
+
+def _profile_cutover_hashes(
+    forecast_by_field: Mapping[str, Any],
+    actual_by_field: Mapping[str, Any],
+) -> tuple[str, str]:
+    """Return canonical hashes for the signed forecast and actual payloads."""
+    forecast_hash = _identity_hash(
+        {
+            "contract": (
+                "provider-directory-profile-cutover-forecast-hash-v1"
+            ),
+            "forecast": forecast_by_field,
+        }
+    )
+    actual_hash = _identity_hash(
+        {
+            "contract": (
+                "provider-directory-profile-cutover-actual-hash-v1"
+            ),
+            "actual": actual_by_field,
+        }
+    )
+    return forecast_hash, actual_hash
+
+
+def _profile_cutover_actual_scalars(
+    cutover_fields_by_name: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the receipt scalars embedded in the signed actual payload."""
+    return {
+        "forecast_hash": cutover_fields_by_name["cutover_forecast_hash"],
+        "wal_start_lsn": cutover_fields_by_name["cutover_wal_start_lsn"],
+        "wal_observed_lsn": cutover_fields_by_name[
+            "cutover_wal_observed_lsn"
+        ],
+        "cutover_wal_bytes": int(
+            cutover_fields_by_name["cutover_wal_bytes"]
+        ),
+        "evidence_target_bytes_before": int(
+            cutover_fields_by_name["evidence_target_bytes_before"]
+        ),
+        "evidence_target_bytes_after": int(
+            cutover_fields_by_name["evidence_target_bytes_after"]
+        ),
+        "evidence_target_growth_bytes": int(
+            cutover_fields_by_name["evidence_target_growth_bytes"]
+        ),
+        "profile_target_bytes_before": int(
+            cutover_fields_by_name["profile_target_bytes_before"]
+        ),
+        "profile_target_bytes_after": int(
+            cutover_fields_by_name["profile_target_bytes_after"]
+        ),
+        "profile_target_growth_bytes": int(
+            cutover_fields_by_name["profile_target_growth_bytes"]
+        ),
+    }
+
+
+def _validate_profile_cutover_actual(
+    cutover_fields_by_name: Mapping[str, Any],
+    forecast_by_field: Mapping[str, Any],
+    actual_by_field: Mapping[str, Any],
+    forecast_hash: str,
+    actual_hash: str,
+    scalar_actual_by_field: Mapping[str, Any],
+) -> None:
+    """Require the signed actual payload and growth arithmetic to agree."""
+    if (
+        forecast_hash != cutover_fields_by_name["cutover_forecast_hash"]
+        or actual_hash != cutover_fields_by_name["cutover_actual_hash"]
+        or any(
+            actual_by_field.get(field_name) != expected_value
+            for field_name, expected_value in scalar_actual_by_field.items()
+        )
+        or scalar_actual_by_field["evidence_target_growth_bytes"]
+        != max(
+            scalar_actual_by_field["evidence_target_bytes_after"]
+            - scalar_actual_by_field["evidence_target_bytes_before"],
+            0,
+        )
+        or scalar_actual_by_field["profile_target_growth_bytes"]
+        != max(
+            scalar_actual_by_field["profile_target_bytes_after"]
+            - scalar_actual_by_field["profile_target_bytes_before"],
+            0,
+        )
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_receipt_changed"
+        )
+
+
+def _validate_profile_cutover_semantics(
+    receipt: Mapping[str, Any],
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    expected_run_id: str | None,
+    forecast_by_field: Mapping[str, Any],
+    actual_by_field: Mapping[str, Any],
+    forecast_hash: str,
+) -> None:
+    """Validate one cutover receipt against the admitted capacity geometry."""
+    if expected_run_id is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_run_missing"
+        )
+    try:
+        profile_capacity.validate_profile_delta_cutover_evidence(
+            geometry,
+            forecast_by_field,
+            actual_by_field,
+            build_id=str(receipt.get("build_id") or ""),
+            run_id=expected_run_id,
+            forecast_hash=forecast_hash,
+            evidence_inserted=int(receipt["evidence_inserted"]),
+            evidence_deleted=int(receipt["evidence_deleted"]),
+            profile_inserted=int(receipt["profile_inserted"]),
+            profile_deleted=int(receipt["profile_deleted"]),
+        )
+    except profile_capacity.ProviderDirectoryProfileCapacityError as exc:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_receipt_semantics_invalid"
+        ) from exc
+
+
+def _profile_delta_serving_values(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    receipt: Mapping[str, Any],
+    cutover_identity: tuple[str, str] | None,
+) -> dict[str, Any]:
+    """Return the serving fields that prove one committed source delta."""
+    return {
+        "status": (
+            "published"
+            if profile_delta.operation == "publish"
+            else "purged"
+        ),
+        "operation": profile_delta.operation,
+        "generation_id": profile_delta.generation_id,
+        "selection_proof_id": profile_delta.selection_proof_id,
+        "control_generation": profile_delta.control_generation,
+        "authority_revision": profile_delta.authority_revision,
+        "profile_schema_version": profile_delta.profile_schema_version,
+        "profile_strategy_version": profile_delta.profile_strategy_version,
+        "source_vector": profile_delta.to_source_vector,
+        "source_vector_hash": profile_delta.to_source_vector_hash,
+        "source_context_vector": profile_delta.to_source_context_vector,
+        "source_context_vector_hash": (
+            profile_delta.to_source_context_vector_hash
+        ),
+        "executable_plan_hash": profile_delta.executable_plan_hash,
+        "capacity_geometry_status": profile_delta.capacity_geometry_status,
+        "capacity_geometry_hash": profile_delta.capacity_geometry_hash,
+        "capacity_geometry_json": profile_delta.capacity_geometry_json,
+        "evidence_target_oid": profile_delta.evidence_target_oid,
+        "profile_target_oid": profile_delta.profile_target_oid,
+        "evidence_rows": int(receipt["evidence_rows"]),
+        "profile_rows": int(receipt["profile_rows"]),
+        "profile_as_of": profile_delta.profile_as_of,
+        "cutover_forecast_hash": (
+            cutover_identity[0] if cutover_identity is not None else None
+        ),
+    }
+
+
+def _is_profile_delta_serving_committed(
+    serving_state: _ProviderDirectoryProfileServingState | None,
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    receipt: Mapping[str, Any],
+    cutover_identity: tuple[str, str] | None,
+) -> bool:
+    """Return whether the global singleton exactly records this delta."""
+    if serving_state is None:
+        return False
+    expected_by_field = _profile_delta_serving_values(
+        profile_delta,
+        receipt,
+        cutover_identity,
+    )
+    observed_by_field = {
+        field_name: getattr(serving_state, field_name)
+        for field_name in expected_by_field
+    }
+    return observed_by_field == expected_by_field
+
+
+async def _is_provider_directory_profile_delta_committed(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> bool:
+    """Resolve an ambiguous commit from its receipt and global singleton."""
+
+    receipt_row = await db.first(
+        f"SELECT * FROM "
+        f"{_provider_directory_profile_delta_receipt_ref(profile_delta.schema)} "
+        "WHERE build_id = :build_id;",
+        build_id=profile_delta.build_id,
+    )
+    if receipt_row is None:
+        return False
+    receipt = _pagination_checkpoint_row_mapping(receipt_row)
+    if not _is_provider_directory_profile_delta_receipt_matching(
+        receipt,
+        profile_delta,
+    ):
+        return False
+    serving_state = await _provider_directory_profile_serving_state(
+        profile_delta.schema
+    )
+    evidence_target_identity = (
+        await _provider_directory_profile_stage_relation_identity(
+            profile_delta.schema,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        )
+    )
+    profile_target_identity = (
+        await _provider_directory_profile_stage_relation_identity(
+            profile_delta.schema,
+            profile_artifact.PROFILE_TABLE,
+        )
+    )
+    cutover_identity = (
+        _provider_directory_profile_cutover_receipt_identity(receipt)
+    )
+    return (
+        _is_profile_delta_serving_committed(
+            serving_state,
+            profile_delta,
+            receipt,
+            cutover_identity,
+        )
+        and evidence_target_identity
+        == (profile_delta.evidence_target_oid, "r", "p")
+        and profile_target_identity
+        == (profile_delta.profile_target_oid, "r", "p")
+    )
+
+
+async def _has_provider_directory_profile_delta_replay(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    dataset_fence: ProviderDirectoryArtifactDatasetFence | None,
+) -> bool:
+    """Resolve an exact committed delta before requiring retained scratch."""
+
+    receipt_row = await db.first(
+        f"SELECT * FROM "
+        f"{_provider_directory_profile_delta_receipt_ref(profile_delta.schema)} "
+        "WHERE build_id = :build_id;",
+        build_id=profile_delta.build_id,
+    )
+    if receipt_row is None:
+        return False
+    receipt = _pagination_checkpoint_row_mapping(receipt_row)
+    if not _is_provider_directory_profile_delta_receipt_matching(
+        receipt,
+        profile_delta,
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_receipt_conflict"
+        )
+    if not await _is_provider_directory_profile_delta_committed(
+        profile_delta
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_receipt_incomplete"
+        )
+    if (
+        dataset_fence is not None
+        and not await _is_provider_directory_dataset_cutover_committed(
+            dataset_fence
+        )
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_dataset_pointer_incomplete"
+        )
+    return True
+
+
+_resolve_provider_directory_profile_delta_replay = (
+    _has_provider_directory_profile_delta_replay
+)
+
+
+async def _refresh_provider_directory_profile_delta_metrics(
+    metrics: dict[str, Any],
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> None:
+    """Replace staged estimates with immutable committed delta counts."""
+
+    receipt_row = await db.first(
+        f"SELECT * FROM "
+        f"{_provider_directory_profile_delta_receipt_ref(profile_delta.schema)} "
+        "WHERE build_id = :build_id;",
+        build_id=profile_delta.build_id,
+    )
+    if receipt_row is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_receipt_missing"
+        )
+    receipt = _pagination_checkpoint_row_mapping(receipt_row)
+    if (
+        not _is_provider_directory_profile_delta_receipt_matching(
+            receipt,
+            profile_delta,
+        )
+        or not await _is_provider_directory_profile_delta_committed(
+            profile_delta
+        )
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_receipt_unverified"
+        )
+    committed_counts_by_name = {
+        field_name: int(receipt[field_name])
+        for field_name in (
+            "evidence_rows",
+            "profile_rows",
+            "evidence_inserted",
+            "evidence_deleted",
+            "profile_inserted",
+            "profile_deleted",
+        )
+    }
+    metrics.update(committed_counts_by_name)
+    metrics["selected_evidence_rows"] = committed_counts_by_name[
+        "evidence_rows"
+    ]
+
+
+async def _is_delta_evidence_stage_invalid(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    refs_by_name: Mapping[str, str],
+) -> bool:
+    """Return whether staged evidence escaped its exact source vector."""
+    source_vector_json = json.dumps(
+        _provider_directory_profile_source_vector_json(
+            profile_delta.to_source_vector
+        )
+    )
+    return bool(
+        await db.scalar(
+            f"""
+            WITH expected AS MATERIALIZED (
+                SELECT source_id, dataset_id
+                  FROM jsonb_to_recordset(
+                           CAST(:source_vector_json AS jsonb)
+                       ) AS item(source_id text, dataset_id text)
+            )
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {refs_by_name["evidence_stage"]} AS evidence
+                  LEFT JOIN expected
+                    ON expected.source_id = evidence.source_id
+                   AND expected.dataset_id = evidence.dataset_id
+                 WHERE expected.source_id IS NULL
+                    OR evidence.source_id <> ALL(
+                           CAST(:refreshed_source_ids AS varchar[])
+                       )
+            );
+            """,
+            source_vector_json=source_vector_json,
+            refreshed_source_ids=list(profile_delta.refresh_source_ids),
+        )
+    )
+
+
+async def _is_delta_profile_stage_invalid(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    refs_by_name: Mapping[str, str],
+) -> bool:
+    """Return whether compact rows escaped affected NPIs or generation."""
+    return bool(
+        await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {refs_by_name["profile_stage"]} AS profile
+                  LEFT JOIN {refs_by_name["affected"]} AS affected
+                    ON affected.npi = profile.npi
+                 WHERE affected.npi IS NULL
+                    OR profile.generation_id <> :generation_id
+            );
+            """,
+            generation_id=profile_delta.generation_id,
+        )
+    )
+
+
+async def _is_delta_affected_stage_invalid(
+    refs_by_name: Mapping[str, str],
+    changed_source_ids: list[str],
+) -> bool:
+    """Return whether affected NPIs are invalid or unrelated to the delta."""
+    return bool(
+        await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {refs_by_name["affected"]} AS affected
+                 WHERE affected.npi < :npi_min
+                    OR affected.npi > :npi_max
+                    OR (
+                        NOT EXISTS (
+                            SELECT 1
+                              FROM {refs_by_name["evidence_target"]}
+                                   AS current_evidence
+                             WHERE current_evidence.npi = affected.npi
+                               AND current_evidence.source_id = ANY(
+                                   CAST(:changed_source_ids AS varchar[])
+                               )
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM {refs_by_name["evidence_stage"]}
+                                   AS delta_evidence
+                             WHERE delta_evidence.npi = affected.npi
+                        )
+                    )
+            );
+            """,
+            npi_min=profile_artifact.NPI_MIN,
+            npi_max=profile_artifact.NPI_MAX,
+            changed_source_ids=changed_source_ids,
+        )
+    )
+
+
+async def _is_delta_affected_stage_incomplete(
+    refs_by_name: Mapping[str, str],
+    changed_source_ids: list[str],
+) -> bool:
+    """Return whether any current or staged evidence NPI is missing."""
+    return bool(
+        await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {refs_by_name["evidence_target"]} AS current_evidence
+                 WHERE current_evidence.source_id = ANY(
+                           CAST(:changed_source_ids AS varchar[])
+                       )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM {refs_by_name["affected"]} AS affected
+                        WHERE affected.npi = current_evidence.npi
+                   )
+                UNION ALL
+                SELECT 1
+                  FROM {refs_by_name["evidence_stage"]} AS delta_evidence
+                 WHERE NOT EXISTS (
+                       SELECT 1
+                         FROM {refs_by_name["affected"]} AS affected
+                        WHERE affected.npi = delta_evidence.npi
+                   )
+            );
+            """,
+            changed_source_ids=changed_source_ids,
+        )
+    )
+
+
+async def _assert_profile_delta_stage(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> None:
+    """Fence exact delta source pairs, affected NPIs, and profile generation."""
+
+    refs_by_name = _profile_delta_relation_refs(profile_delta)
+    changed_source_ids = sorted(
+        set(profile_delta.refresh_source_ids)
+        | set(profile_delta.removed_source_ids)
+    )
+    invalid_evidence = await _is_delta_evidence_stage_invalid(
+        profile_delta,
+        refs_by_name,
+    )
+    invalid_profile = await _is_delta_profile_stage_invalid(
+        profile_delta,
+        refs_by_name,
+    )
+    invalid_affected = await _is_delta_affected_stage_invalid(
+        refs_by_name,
+        changed_source_ids,
+    )
+    missing_affected = await _is_delta_affected_stage_incomplete(
+        refs_by_name,
+        changed_source_ids,
+    )
+    if invalid_evidence:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_evidence_stage_content_changed"
+        )
+    if invalid_profile:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_profile_stage_content_changed"
+        )
+    if invalid_affected or missing_affected:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_affected_stage_content_changed"
+        )
+
+
+def _profile_toast_chunk_sql(
+    source_sql: str,
+    chunk_queries: str,
+    compression_queries: str,
+    toast_ref: str,
+) -> str:
+    """Return the exact chunk and compression projection query."""
+    return f"""
+    WITH exact_rows AS MATERIALIZED (
+        {source_sql}
+    ), candidate_chunks AS (
+        {chunk_queries}
+    ), toast_ids AS MATERIALIZED (
+        SELECT DISTINCT chunk_id
+          FROM candidate_chunks
+         WHERE chunk_id IS NOT NULL
+    ), compression_methods AS (
+        {compression_queries}
+    )
+    SELECT (
+               SELECT count(*)::bigint
+                 FROM {toast_ref} AS toast_chunk
+                 JOIN toast_ids
+                   ON toast_ids.chunk_id = toast_chunk.chunk_id
+           ) AS toast_chunk_count,
+           COALESCE(
+               (
+                   SELECT array_agg(
+                              DISTINCT compression_method
+                              ORDER BY compression_method
+                          )
+                     FROM compression_methods
+                    WHERE compression_method IS NOT NULL
+               ),
+               CAST(ARRAY[] AS text[])
+           ) AS compression_methods;
+    """
+
+
+def _profile_toast_column_queries(
+    toastable_columns: tuple[str, ...],
+) -> tuple[str, str]:
+    """Return exact chunk-ID and compression projections for TOAST columns."""
+    chunk_queries = " UNION ALL ".join(
+        "SELECT pg_column_toast_chunk_id("
+        f"exact_rows.{_q(column_name)}) AS chunk_id "
+        "FROM exact_rows"
+        for column_name in toastable_columns
+    )
+    compression_queries = " UNION ALL ".join(
+        "SELECT pg_column_compression("
+        f"exact_rows.{_q(column_name)}) AS compression_method "
+        "FROM exact_rows"
+        for column_name in toastable_columns
+    )
+    return chunk_queries, compression_queries
+
+
+async def _provider_directory_profile_toast_chunk_count(
+    *,
+    source_sql: str,
+    relation_oid: int,
+    toast_oid: int | None,
+    toastable_columns: tuple[str, ...],
+    expected_compression: str,
+    params: Mapping[str, Any] | None = None,
+) -> int:
+    """Count exact PG18 external chunks for a fixed, locked row scope."""
+
+    if not toastable_columns or toast_oid is None:
+        return 0
+    if (
+        relation_oid < 1
+        or toast_oid < 1
+        or expected_compression not in {"pglz", "lz4"}
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_toast_identity_invalid"
+        )
+    toast_ref = _unscoped_qt(
+        "pg_toast",
+        f"pg_toast_{relation_oid}",
+    )
+    chunk_queries, compression_queries = _profile_toast_column_queries(
+        toastable_columns
+    )
+    chunk_row = await db.first(
+        _profile_toast_chunk_sql(
+            source_sql,
+            chunk_queries,
+            compression_queries,
+            toast_ref,
+        ),
+        **dict(params or {}),
+    )
+    if chunk_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_toast_projection_missing"
+        )
+    chunk_map = _pagination_checkpoint_row_mapping(chunk_row)
+    compression_methods = tuple(chunk_map["compression_methods"] or ())
+    if any(
+        compression_method != expected_compression
+        for compression_method in compression_methods
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_toast_compression_changed"
+        )
+    chunk_count = int(chunk_map["toast_chunk_count"])
+    if chunk_count < 0:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_toast_projection_invalid"
+        )
+    return chunk_count
+
+
+async def _provider_directory_profile_current_wal_bytes(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> int:
+    wal_bytes = int(
+        await db.scalar(
+            """
+            SELECT pg_wal_lsn_diff(
+                       pg_current_wal_insert_lsn(),
+                       CAST(CAST(:initial_wal_lsn AS text) AS pg_lsn)
+                   )::bigint;
+            """,
+            initial_wal_lsn=admission.initial_wal_lsn,
+        )
+        or 0
+    )
+    if wal_bytes < 0:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_wal_bytes_invalid"
+        )
+    return wal_bytes
+
+
+def _checked_serialized_metadata_payload_bytes(
+    payload: Mapping[str, Any],
+    *,
+    fixed_row_overhead: int,
+) -> int:
+    encoded_bytes = len(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    )
+    payload_upper_bytes = encoded_bytes + fixed_row_overhead
+    if (
+        fixed_row_overhead < 0
+        or payload_upper_bytes
+        > profile_capacity.METADATA_PAYLOAD_UPPER_BOUND_BYTES
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_metadata_payload_exceeded"
+        )
+    return payload_upper_bytes
+
+
+def _provider_directory_profile_cutover_layout_payload(
+    layout: _ProviderDirectoryProfileRelationStorageLayout,
+    *,
+    inserted_toast_chunks: int | None = None,
+    deleted_toast_chunks: int,
+) -> dict[str, Any]:
+    """Serialize every formula input needed for deterministic replay."""
+
+    payload: dict[str, Any] = {
+        "exact_fingerprint": layout.exact_fingerprint,
+        "main_index_oids": layout.main_index_oids,
+        "main_index_pages": layout.main_index_pages,
+        "toast_index_oids": layout.toast_index_oids,
+        "toast_index_pages": layout.toast_index_pages,
+        "deleted_toast_chunks": deleted_toast_chunks,
+    }
+    if inserted_toast_chunks is not None:
+        payload["inserted_toast_chunks"] = inserted_toast_chunks
+    return payload
+
+
+@dataclass(frozen=True)
+class _ProfileCutoverRefs:
+    evidence_target: str
+    profile_target: str
+    evidence_stage: str
+    profile_stage: str
+    affected_npi: str
+    changed_source_ids: list[str]
+
+
+@dataclass(frozen=True)
+class _ProfileTargetCutoverInput:
+    target_layout: _ProviderDirectoryProfileRelationStorageLayout
+    stage_layout: _ProviderDirectoryProfileRelationStorageLayout
+    inserted_toast_chunks: int
+    deleted_toast_chunks: int
+    delta_input: (
+        profile_capacity.ProviderDirectoryProfileTargetDeltaInput
+    )
+
+
+@dataclass(frozen=True)
+class _ProfileMetadataCutoverInput:
+    projection: profile_capacity.ProviderDirectoryProfileMetadataProjection
+    layouts_by_name: dict[
+        str,
+        _ProviderDirectoryProfileRelationStorageLayout,
+    ]
+    deleted_toast_chunks_by_name: dict[str, int]
+    payload_bytes_by_name: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _ProfileCutoverObservation:
+    wal_start_lsn: str
+    wal_bytes: int
+    evidence_target_bytes: int
+    profile_target_bytes: int
+
+
+async def _validate_profile_cutover_database(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    serving_state: _ProviderDirectoryProfileServingState,
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> None:
+    """Require the admitted PostgreSQL identity to remain exact."""
+    observed_identity = (
+        await _provider_directory_profile_capacity_database_identity(
+            profile_delta.schema,
+            serving_state,
+        )
+    )
+    if replace(
+        observed_identity,
+        wal_lsn=admission.database_identity.wal_lsn,
+    ) != admission.database_identity:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_database_identity_changed"
+        )
+
+
+async def _profile_cutover_layout_pair(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    relation_name: str,
+    target_oid: int,
+    stage_oid: int,
+) -> tuple[
+    _ProviderDirectoryProfileRelationStorageLayout,
+    _ProviderDirectoryProfileRelationStorageLayout,
+]:
+    """Load and verify one target/stage structural layout pair."""
+    target_layout = (
+        await _provider_directory_profile_relation_storage_fingerprint(
+            target_oid,
+            expected_persistence="p",
+        )
+    )
+    stage_layout = (
+        await _provider_directory_profile_relation_storage_fingerprint(
+            stage_oid,
+            expected_persistence="p",
+        )
+    )
+    expected_fingerprint = getattr(
+        admission.geometry,
+        relation_name + "_storage_fingerprint",
+    )
+    if (
+        target_layout.exact_fingerprint != expected_fingerprint
+        or target_layout.structural_fingerprint
+        != stage_layout.structural_fingerprint
+        or target_layout.toastable_columns != stage_layout.toastable_columns
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_stage_layout_changed:"
+            + relation_name
+        )
+    return target_layout, stage_layout
+
+
+async def _profile_cutover_target_layouts(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> dict[
+    str,
+    tuple[
+        _ProviderDirectoryProfileRelationStorageLayout,
+        _ProviderDirectoryProfileRelationStorageLayout,
+    ],
+]:
+    """Load evidence then profile target/stage layout pairs."""
+    evidence_layouts = await _profile_cutover_layout_pair(
+        admission,
+        "evidence_target",
+        profile_delta.evidence_target_oid,
+        profile_delta.evidence_stage_oid,
+    )
+    profile_layouts = await _profile_cutover_layout_pair(
+        admission,
+        "profile_target",
+        profile_delta.profile_target_oid,
+        profile_delta.profile_stage_oid,
+    )
+    return {
+        "evidence_target": evidence_layouts,
+        "profile_target": profile_layouts,
+    }
+
+
+def _profile_cutover_refs(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> _ProfileCutoverRefs:
+    """Return quoted cutover relations and changed source IDs."""
+    schema = profile_delta.schema
+    return _ProfileCutoverRefs(
+        evidence_target=_unscoped_qt(
+            schema,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        ),
+        profile_target=_unscoped_qt(
+            schema,
+            profile_artifact.PROFILE_TABLE,
+        ),
+        evidence_stage=_unscoped_qt(
+            schema,
+            profile_delta.evidence_stage,
+        ),
+        profile_stage=_unscoped_qt(
+            schema,
+            profile_delta.profile_stage,
+        ),
+        affected_npi=_unscoped_qt(
+            schema,
+            profile_delta.affected_npi_stage,
+        ),
+        changed_source_ids=sorted(
+            set(profile_delta.refresh_source_ids)
+            | set(profile_delta.removed_source_ids)
+        ),
+    )
+
+
+async def _profile_evidence_cutover_input(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts: Mapping[str, int],
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    refs: _ProfileCutoverRefs,
+    layouts: tuple[
+        _ProviderDirectoryProfileRelationStorageLayout,
+        _ProviderDirectoryProfileRelationStorageLayout,
+    ],
+) -> _ProfileTargetCutoverInput:
+    """Build the exact evidence-target capacity input."""
+    target_layout, stage_layout = layouts
+    geometry = admission.geometry
+    inserted_toast_chunks = (
+        await _provider_directory_profile_toast_chunk_count(
+            source_sql=f"SELECT * FROM {refs.evidence_stage}",
+            relation_oid=stage_layout.relation_oid,
+            toast_oid=stage_layout.toast_oid,
+            toastable_columns=stage_layout.toastable_columns,
+            expected_compression=(
+                geometry.postgres_default_toast_compression
+            ),
+        )
+    )
+    deleted_toast_chunks = (
+        await _provider_directory_profile_toast_chunk_count(
+            source_sql=(
+                f"SELECT * FROM {refs.evidence_target} "
+                "WHERE source_id = ANY("
+                "CAST(:changed_source_ids AS varchar[]))"
+            ),
+            relation_oid=target_layout.relation_oid,
+            toast_oid=target_layout.toast_oid,
+            toastable_columns=target_layout.toastable_columns,
+            expected_compression=(
+                geometry.postgres_default_toast_compression
+            ),
+            params={"changed_source_ids": refs.changed_source_ids},
+        )
+    )
+    return _ProfileTargetCutoverInput(
+        target_layout=target_layout,
+        stage_layout=stage_layout,
+        inserted_toast_chunks=inserted_toast_chunks,
+        deleted_toast_chunks=deleted_toast_chunks,
+        delta_input=profile_capacity.ProviderDirectoryProfileTargetDeltaInput(
+            relation_name="evidence_target",
+            inserted_rows=counts["evidence_inserted"],
+            inserted_toast_chunks=inserted_toast_chunks,
+            deleted_rows=counts["evidence_deleted"],
+            deleted_logical_bytes=counts[
+                "evidence_deleted_logical_bytes"
+            ],
+            deleted_toast_chunks=deleted_toast_chunks,
+            main_index_pages=target_layout.main_index_pages,
+            toast_index_pages=target_layout.toast_index_pages,
+        ),
+    )
+
+
+async def _profile_target_cutover_input(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts: Mapping[str, int],
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    refs: _ProfileCutoverRefs,
+    layouts: tuple[
+        _ProviderDirectoryProfileRelationStorageLayout,
+        _ProviderDirectoryProfileRelationStorageLayout,
+    ],
+) -> _ProfileTargetCutoverInput:
+    """Build the exact compact-profile target capacity input."""
+    target_layout, stage_layout = layouts
+    compression = admission.geometry.postgres_default_toast_compression
+    inserted_toast_chunks = (
+        await _provider_directory_profile_toast_chunk_count(
+            source_sql=f"SELECT * FROM {refs.profile_stage}",
+            relation_oid=stage_layout.relation_oid,
+            toast_oid=stage_layout.toast_oid,
+            toastable_columns=stage_layout.toastable_columns,
+            expected_compression=compression,
+        )
+    )
+    deleted_toast_chunks = (
+        await _provider_directory_profile_toast_chunk_count(
+            source_sql=(
+                f"SELECT profile.* FROM {refs.profile_target} AS profile "
+                f"JOIN {refs.affected_npi} AS affected "
+                "ON affected.npi = profile.npi"
+            ),
+            relation_oid=target_layout.relation_oid,
+            toast_oid=target_layout.toast_oid,
+            toastable_columns=target_layout.toastable_columns,
+            expected_compression=compression,
+        )
+    )
+    return _ProfileTargetCutoverInput(
+        target_layout=target_layout,
+        stage_layout=stage_layout,
+        inserted_toast_chunks=inserted_toast_chunks,
+        deleted_toast_chunks=deleted_toast_chunks,
+        delta_input=profile_capacity.ProviderDirectoryProfileTargetDeltaInput(
+            relation_name="profile_target",
+            inserted_rows=counts["profile_inserted"],
+            inserted_toast_chunks=inserted_toast_chunks,
+            deleted_rows=counts["profile_deleted"],
+            deleted_logical_bytes=counts[
+                "profile_deleted_logical_bytes"
+            ],
+            deleted_toast_chunks=deleted_toast_chunks,
+            main_index_pages=target_layout.main_index_pages,
+            toast_index_pages=target_layout.toast_index_pages,
+        ),
+    )
+
+
+async def _profile_cutover_metadata_layouts(
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+) -> dict[str, _ProviderDirectoryProfileRelationStorageLayout]:
+    """Load and verify checkpoint, serving, and receipt layouts."""
+    layouts_by_name = {}
+    for relation_name, relation_oid, immutable_error in (
+        ("build_checkpoint", geometry.build_checkpoint_oid, None),
+        ("serving_generation", geometry.serving_generation_oid, None),
+        (
+            "delta_receipt",
+            geometry.delta_receipt_oid,
+            "provider_directory_profile_delta_receipt_immutable",
+        ),
+    ):
+        layouts_by_name[relation_name] = (
+            await _provider_directory_profile_relation_storage_fingerprint(
+                relation_oid,
+                expected_persistence="p",
+                **(
+                    {
+                        "expected_user_trigger_count": 2,
+                        "expected_immutable_trigger_error": immutable_error,
+                    }
+                    if immutable_error is not None
+                    else {}
+                ),
+            )
+        )
+    expected_by_name = {
+        "build_checkpoint": geometry.build_checkpoint_storage_fingerprint,
+        "serving_generation": (
+            geometry.serving_generation_storage_fingerprint
+        ),
+        "delta_receipt": geometry.delta_receipt_storage_fingerprint,
+    }
+    if any(
+        layouts_by_name[name].exact_fingerprint != expected_fingerprint
+        for name, expected_fingerprint in expected_by_name.items()
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_metadata_layout_changed"
+        )
+    return layouts_by_name
+
+
+async def _profile_cutover_metadata_toast_counts(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    layouts_by_name: Mapping[
+        str,
+        _ProviderDirectoryProfileRelationStorageLayout,
+    ],
+) -> dict[str, int]:
+    """Count replaced TOAST chunks for checkpoint and serving updates."""
+    checkpoint_layout = layouts_by_name["build_checkpoint"]
+    serving_layout = layouts_by_name["serving_generation"]
+    checkpoint_ref = _provider_directory_profile_checkpoint_ref(
+        profile_delta.schema
+    )
+    serving_ref = _provider_directory_profile_serving_generation_ref(
+        profile_delta.schema
+    )
+    return {
+        "build_checkpoint": (
+            await _provider_directory_profile_toast_chunk_count(
+                source_sql=(
+                    f"SELECT * FROM {checkpoint_ref} "
+                    "WHERE build_id = :build_id"
+                ),
+                relation_oid=checkpoint_layout.relation_oid,
+                toast_oid=checkpoint_layout.toast_oid,
+                toastable_columns=checkpoint_layout.toastable_columns,
+                expected_compression=(
+                    geometry.postgres_default_toast_compression
+                ),
+                params={"build_id": profile_delta.build_id},
+            )
+        ),
+        "serving_generation": (
+            await _provider_directory_profile_toast_chunk_count(
+                source_sql=(
+                    f"SELECT * FROM {serving_ref} "
+                    "WHERE singleton_key = 'global'"
+                ),
+                relation_oid=serving_layout.relation_oid,
+                toast_oid=serving_layout.toast_oid,
+                toastable_columns=serving_layout.toastable_columns,
+                expected_compression=(
+                    geometry.postgres_default_toast_compression
+                ),
+            )
+        ),
+        "delta_receipt": 0,
+    }
+
+
+def _profile_cutover_metadata_payload_bytes(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts: Mapping[str, int],
+) -> dict[str, int]:
+    """Return exact upper bounds for all cutover metadata payloads."""
+    serving_payload_by_field = {
+        **_provider_directory_profile_delta_receipt_static_values(
+            profile_delta
+        ),
+        "source_vector": profile_delta.to_source_vector,
+        "source_context_vector": profile_delta.to_source_context_vector,
+        "capacity_geometry_json": profile_delta.capacity_geometry_json,
+        "counts": dict(counts),
+    }
+    return {
+        "build_checkpoint": (
+            profile_capacity.METADATA_PAYLOAD_UPPER_BOUND_BYTES
+        ),
+        "serving_generation": (
+            _checked_serialized_metadata_payload_bytes(
+                serving_payload_by_field,
+                fixed_row_overhead=4_096,
+            )
+        ),
+        "delta_receipt": (
+            profile_capacity.METADATA_PAYLOAD_UPPER_BOUND_BYTES
+        ),
+    }
+
+
+def _profile_cutover_metadata_projection(
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    layouts_by_name: Mapping[
+        str,
+        _ProviderDirectoryProfileRelationStorageLayout,
+    ],
+    deleted_toast_chunks_by_name: Mapping[str, int],
+    payload_bytes_by_name: Mapping[str, int],
+    pending_commit_items: int,
+) -> profile_capacity.ProviderDirectoryProfileMetadataProjection:
+    """Project metadata WAL and data bytes for the committed cutover."""
+    mutations = []
+    for relation_name, operation in (
+        ("build_checkpoint", "update"),
+        ("serving_generation", "update"),
+        ("delta_receipt", "insert"),
+    ):
+        layout = layouts_by_name[relation_name]
+        mutations.append(
+            profile_capacity.ProviderDirectoryProfileMetadataMutationInput(
+                relation_name=relation_name,
+                operation=operation,
+                payload_upper_bytes=payload_bytes_by_name[relation_name],
+                deleted_toast_chunks=deleted_toast_chunks_by_name[
+                    relation_name
+                ],
+                main_index_pages=layout.main_index_pages,
+                toast_index_pages=layout.toast_index_pages,
+            )
+        )
+    return profile_capacity.project_profile_delta_metadata_capacity(
+        geometry,
+        tuple(mutations),
+        pending_commit_items=pending_commit_items,
+    )
+
+
+async def _profile_cutover_metadata_input(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts: Mapping[str, int],
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    pending_commit_items: int,
+) -> _ProfileMetadataCutoverInput:
+    """Build exact persistent-metadata cutover inputs and projection."""
+    layouts_by_name = await _profile_cutover_metadata_layouts(geometry)
+    deleted_toast_chunks_by_name = (
+        await _profile_cutover_metadata_toast_counts(
+            profile_delta,
+            geometry,
+            layouts_by_name,
+        )
+    )
+    payload_bytes_by_name = _profile_cutover_metadata_payload_bytes(
+        profile_delta,
+        counts,
+    )
+    return _ProfileMetadataCutoverInput(
+        projection=_profile_cutover_metadata_projection(
+            geometry,
+            layouts_by_name,
+            deleted_toast_chunks_by_name,
+            payload_bytes_by_name,
+            pending_commit_items,
+        ),
+        layouts_by_name=layouts_by_name,
+        deleted_toast_chunks_by_name=deleted_toast_chunks_by_name,
+        payload_bytes_by_name=payload_bytes_by_name,
+    )
+
+
+async def _profile_cutover_observation(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    refs: _ProfileCutoverRefs,
+) -> _ProfileCutoverObservation:
+    """Capture WAL and serving-target bytes immediately before target DML."""
+    wal_state = await db.first(
+        """
+        WITH observed AS MATERIALIZED (
+            SELECT pg_current_wal_insert_lsn() AS wal_lsn
+        )
+        SELECT observed.wal_lsn::text AS wal_start_lsn,
+               pg_wal_lsn_diff(
+                   observed.wal_lsn,
+                   CAST(CAST(:initial_wal_lsn AS text) AS pg_lsn)
+               )::bigint AS wal_bytes_before
+          FROM observed;
+        """,
+        initial_wal_lsn=admission.initial_wal_lsn,
+    )
+    if wal_state is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_wal_state_missing"
+        )
+    wal_map = _pagination_checkpoint_row_mapping(wal_state)
+    return _ProfileCutoverObservation(
+        wal_start_lsn=str(wal_map["wal_start_lsn"]),
+        wal_bytes=int(wal_map["wal_bytes_before"]),
+        evidence_target_bytes=(
+            await _provider_directory_profile_capacity_relation_bytes(
+                (refs.evidence_target,)
+            )
+        ),
+        profile_target_bytes=(
+            await _provider_directory_profile_capacity_relation_bytes(
+                (refs.profile_target,)
+            )
+        ),
+    )
+
+
+def _validate_profile_cutover_budget(
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    target_projection: (
+        profile_capacity.ProviderDirectoryProfileDeltaProjection
+    ),
+    metadata_projection: (
+        profile_capacity.ProviderDirectoryProfileMetadataProjection
+    ),
+    observation: _ProfileCutoverObservation,
+) -> None:
+    """Require pre-DML WAL and data forecasts to fit the signed lease."""
+    forecast_wal_bytes = (
+        target_projection.wal_bytes
+        + metadata_projection.wal_bytes
+        + metadata_projection.commit_envelope_bytes
+    )
+    maximum_wal_bytes = geometry.reservation_bytes_by_storage_class["wal"]
+    if observation.wal_bytes + forecast_wal_bytes > maximum_wal_bytes:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_pre_dml_wal_exceeded:"
+            f"observed={observation.wal_bytes}:"
+            f"forecast={forecast_wal_bytes}:maximum={maximum_wal_bytes}"
+        )
+    maximum_scratch_bytes = sum(
+        relation_cap.max_scratch_bytes
+        for relation_cap in geometry.relation_byte_caps
+    )
+    if (
+        maximum_scratch_bytes
+        + target_projection.target_data_bytes
+        + metadata_projection.data_bytes
+        > geometry.reservation_bytes_by_storage_class["data"]
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_pre_dml_data_exceeded"
+        )
+
+
+def _add_profile_cutover_forecast_layouts(
+    payload_by_name: dict[str, Any],
+    metadata_input: _ProfileMetadataCutoverInput,
+    evidence_input: _ProfileTargetCutoverInput,
+    profile_input: _ProfileTargetCutoverInput,
+) -> None:
+    """Add target and metadata layouts to a cutover forecast payload."""
+    target_inputs_by_name = {
+        "evidence_target": evidence_input,
+        "profile_target": profile_input,
+    }
+    for relation_name, target_input in target_inputs_by_name.items():
+        payload_by_name[f"{relation_name}_layout"] = (
+            _provider_directory_profile_cutover_layout_payload(
+                target_input.target_layout,
+                inserted_toast_chunks=target_input.inserted_toast_chunks,
+                deleted_toast_chunks=target_input.deleted_toast_chunks,
+            )
+        )
+    payload_keys_by_relation = {
+        "build_checkpoint": "build_checkpoint_payload_upper_bytes",
+        "serving_generation": "serving_payload_upper_bytes",
+        "delta_receipt": "receipt_payload_upper_bytes",
+    }
+    for relation_name, layout in metadata_input.layouts_by_name.items():
+        payload_by_name[f"{relation_name}_layout"] = (
+            _provider_directory_profile_cutover_layout_payload(
+                layout,
+                deleted_toast_chunks=(
+                    metadata_input.deleted_toast_chunks_by_name[
+                        relation_name
+                    ]
+                ),
+            )
+        )
+        payload_by_name[payload_keys_by_relation[relation_name]] = (
+            metadata_input.payload_bytes_by_name[relation_name]
+        )
+
+
+def _profile_cutover_forecast_payload(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    target_projection: (
+        profile_capacity.ProviderDirectoryProfileDeltaProjection
+    ),
+    metadata_input: _ProfileMetadataCutoverInput,
+    observation: _ProfileCutoverObservation,
+    evidence_input: _ProfileTargetCutoverInput,
+    profile_input: _ProfileTargetCutoverInput,
+    pending_commit_items: int,
+) -> dict[str, Any]:
+    """Return the canonical signed cutover forecast payload."""
+    payload_by_name = {
+        "contract_id": (
+            "healthporta.provider-directory-profile-cutover-forecast.v1"
+        ),
+        "build_id": profile_delta.build_id,
+        "run_id": admission.run_id,
+        "capacity_geometry_hash": (
+            profile_capacity.capacity_geometry_hash(admission.geometry)
+        ),
+        "target_projection": asdict(target_projection),
+        "metadata_projection": asdict(metadata_input.projection),
+        "wal_start_lsn": observation.wal_start_lsn,
+        "wal_bytes_before": observation.wal_bytes,
+        "evidence_target_bytes_before": observation.evidence_target_bytes,
+        "profile_target_bytes_before": observation.profile_target_bytes,
+        "pending_commit_items": pending_commit_items,
+    }
+    _add_profile_cutover_forecast_layouts(
+        payload_by_name,
+        metadata_input,
+        evidence_input,
+        profile_input,
+    )
+    return payload_by_name
+
+
+def _profile_cutover_forecast(
+    payload_by_name: Mapping[str, Any],
+    target_projection: (
+        profile_capacity.ProviderDirectoryProfileDeltaProjection
+    ),
+    metadata_projection: (
+        profile_capacity.ProviderDirectoryProfileMetadataProjection
+    ),
+    observation: _ProfileCutoverObservation,
+) -> _ProviderDirectoryProfileCutoverCapacityForecast:
+    """Hash and return one canonical pre-DML cutover forecast."""
+    forecast_json = json.dumps(
+        payload_by_name,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    _checked_serialized_metadata_payload_bytes(
+        payload_by_name,
+        fixed_row_overhead=4_096,
+    )
+    forecast_hash = _identity_hash(
+        {
+            "contract": (
+                "provider-directory-profile-cutover-forecast-hash-v1"
+            ),
+            "forecast": payload_by_name,
+        }
+    )
+    return _ProviderDirectoryProfileCutoverCapacityForecast(
+        target_projection=target_projection,
+        metadata_projection=metadata_projection,
+        forecast_hash=forecast_hash,
+        forecast_json=forecast_json,
+        wal_start_lsn=observation.wal_start_lsn,
+        wal_bytes_before=observation.wal_bytes,
+        evidence_target_bytes_before=observation.evidence_target_bytes,
+        profile_target_bytes_before=observation.profile_target_bytes,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileTargetCutoverProjection:
+    """Retain target inputs and their projected cutover capacity."""
+
+    projection: profile_capacity.ProviderDirectoryProfileDeltaProjection
+    evidence_input: _ProfileTargetCutoverInput
+    profile_input: _ProfileTargetCutoverInput
+
+
+async def _profile_target_cutover_projection(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts: Mapping[str, int],
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> _ProfileTargetCutoverProjection:
+    """Project evidence and profile target growth for one delta cutover."""
+    refs = _profile_cutover_refs(profile_delta)
+    layouts_by_name = await _profile_cutover_target_layouts(
+        profile_delta,
+        admission,
+    )
+    evidence_input = await _profile_evidence_cutover_input(
+        profile_delta,
+        counts,
+        admission,
+        refs,
+        layouts_by_name["evidence_target"],
+    )
+    profile_input = await _profile_target_cutover_input(
+        profile_delta,
+        counts,
+        admission,
+        refs,
+        layouts_by_name["profile_target"],
+    )
+    return _ProfileTargetCutoverProjection(
+        projection=profile_capacity.project_profile_delta_capacity(
+            admission.geometry,
+            (evidence_input.delta_input, profile_input.delta_input),
+        ),
+        evidence_input=evidence_input,
+        profile_input=profile_input,
+    )
+
+
+async def _provider_directory_profile_delta_capacity_projection(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts: Mapping[str, int],
+    serving_state: _ProviderDirectoryProfileServingState,
+    *,
+    pending_commit_items: int,
+) -> _ProviderDirectoryProfileCutoverCapacityForecast | None:
+    """Prove strict PG18 target growth and WAL bounds before target DML."""
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return None
+    await _validate_profile_cutover_database(
+        profile_delta,
+        serving_state,
+        admission,
+    )
+    target_cutover = await _profile_target_cutover_projection(
+        profile_delta,
+        counts,
+        admission,
+    )
+    metadata_input = await _profile_cutover_metadata_input(
+        profile_delta,
+        counts,
+        admission.geometry,
+        pending_commit_items,
+    )
+    observation = await _profile_cutover_observation(
+        admission,
+        _profile_cutover_refs(profile_delta),
+    )
+    _validate_profile_cutover_budget(
+        admission.geometry,
+        target_cutover.projection,
+        metadata_input.projection,
+        observation,
+    )
+    payload_by_name = _profile_cutover_forecast_payload(
+        profile_delta,
+        admission,
+        target_cutover.projection,
+        metadata_input,
+        observation,
+        target_cutover.evidence_input,
+        target_cutover.profile_input,
+        pending_commit_items,
+    )
+    return _profile_cutover_forecast(
+        payload_by_name,
+        target_cutover.projection,
+        metadata_input.projection,
+        observation,
+    )
+
+
+def _is_retained_cutover_forecast_matching(
+    checkpoint: Mapping[str, Any],
+    forecast: _ProviderDirectoryProfileCutoverCapacityForecast,
+) -> bool:
+    """Return whether the checkpoint retained this exact forecast."""
+    retained_json = checkpoint.get("cutover_forecast_json")
+    if not isinstance(retained_json, str):
+        retained_json = json.dumps(
+            retained_json,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    return (
+        checkpoint.get("cutover_forecast_hash") == forecast.forecast_hash
+        and retained_json == forecast.forecast_json
+    )
+
+
+async def _persist_provider_directory_profile_cutover_forecast(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    forecast: _ProviderDirectoryProfileCutoverCapacityForecast,
+) -> None:
+    """Persist one immutable cutover forecast before the delta writes."""
+    checkpoint_ref = _provider_directory_profile_checkpoint_ref(
+        profile_delta.schema
+    )
+    checkpoint_row = await db.first(
+        f"""
+        SELECT cutover_forecast_status, cutover_forecast_hash,
+               cutover_forecast_json
+          FROM {checkpoint_ref}
+         WHERE build_id = :build_id
+         FOR UPDATE;
+        """,
+        build_id=profile_delta.build_id,
+    )
+    if checkpoint_row is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_forecast_checkpoint_missing"
+        )
+    checkpoint = _pagination_checkpoint_row_mapping(checkpoint_row)
+    status = checkpoint.get("cutover_forecast_status")
+    if status == "verified":
+        if not _is_retained_cutover_forecast_matching(
+            checkpoint,
+            forecast,
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_profile_cutover_forecast_changed"
+            )
+        return
+    if status != "not_started":
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_forecast_status_invalid"
+        )
+    updated_count = _coerce_rowcount(
+        await db.status(
+            f"""
+            UPDATE {checkpoint_ref}
+               SET cutover_forecast_status = 'verified',
+                   cutover_forecast_hash = :forecast_hash,
+                   cutover_forecast_json =
+                       CAST(:forecast_json AS jsonb),
+                   updated_at = now()
+             WHERE build_id = :build_id
+               AND cutover_forecast_status = 'not_started'
+               AND cutover_forecast_hash IS NULL
+               AND cutover_forecast_json IS NULL;
+            """,
+            build_id=profile_delta.build_id,
+            forecast_hash=forecast.forecast_hash,
+            forecast_json=forecast.forecast_json,
+        )
+    )
+    if updated_count != 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_forecast_cas_failed"
+        )
+
+
+def _profile_delta_relation_refs(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> dict[str, str]:
+    """Return serving and stage relations for one prepared source delta."""
+    schema = profile_delta.schema
+    return {
+        "evidence_target": _unscoped_qt(
+            schema,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        ),
+        "profile_target": _unscoped_qt(
+            schema,
+            profile_artifact.PROFILE_TABLE,
+        ),
+        "evidence_stage": _unscoped_qt(
+            schema,
+            profile_delta.evidence_stage,
+        ),
+        "profile_stage": _unscoped_qt(
+            schema,
+            profile_delta.profile_stage,
+        ),
+        "affected": _unscoped_qt(
+            schema,
+            profile_delta.affected_npi_stage,
+        ),
+    }
+
+
+async def _profile_delta_deletion_projection(
+    projection_sql: str,
+    missing_error: str,
+    params_by_name: Mapping[str, Any] | None = None,
+) -> tuple[int, int]:
+    """Return exact rows and logical bytes deleted by one delta relation."""
+    projection_row = await db.first(
+        projection_sql,
+        **dict(params_by_name or {}),
+    )
+    if projection_row is None:
+        raise RuntimeError(missing_error)
+    projection_map = _pagination_checkpoint_row_mapping(projection_row)
+    return (
+        int(projection_map["row_count"]),
+        int(projection_map["logical_bytes"]),
+    )
+
+
+async def _profile_delta_evidence_deletion(
+    refs_by_name: Mapping[str, str],
+    changed_source_ids: list[str],
+) -> tuple[int, int]:
+    """Project evidence rows and logical bytes removed by source scope."""
+    return await _profile_delta_deletion_projection(
+        f"""
+        SELECT count(*)::bigint AS row_count,
+               COALESCE(sum(pg_column_size(evidence)), 0)::bigint
+                   AS logical_bytes
+          FROM {refs_by_name["evidence_target"]} AS evidence
+         WHERE source_id = ANY(CAST(:changed_source_ids AS varchar[]));
+        """,
+        "provider_directory_profile_delta_evidence_projection_missing",
+        {"changed_source_ids": changed_source_ids},
+    )
+
+
+async def _profile_delta_profile_deletion(
+    refs_by_name: Mapping[str, str],
+) -> tuple[int, int]:
+    """Project compact rows and logical bytes removed by affected NPIs."""
+    return await _profile_delta_deletion_projection(
+        f"""
+        SELECT count(*)::bigint AS row_count,
+               COALESCE(sum(pg_column_size(profile)), 0)::bigint
+                   AS logical_bytes
+          FROM {refs_by_name["profile_target"]} AS profile
+          JOIN {refs_by_name["affected"]} AS affected
+            ON affected.npi = profile.npi;
+        """,
+        "provider_directory_profile_delta_profile_projection_missing",
+    )
+
+
+async def _provider_directory_profile_delta_counts(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> dict[str, int]:
+    """Count the exact serving and staged rows for one prepared delta."""
+
+    refs_by_name = _profile_delta_relation_refs(profile_delta)
+    changed_source_ids = sorted(
+        set(profile_delta.refresh_source_ids)
+        | set(profile_delta.removed_source_ids)
+    )
+    evidence_inserted = int(
+        await db.scalar(
+            f"SELECT count(*) FROM {refs_by_name['evidence_stage']};"
+        )
+        or 0
+    )
+    evidence_deleted, evidence_deleted_logical_bytes = (
+        await _profile_delta_evidence_deletion(
+            refs_by_name,
+            changed_source_ids,
+        )
+    )
+    profile_inserted = int(
+        await db.scalar(
+            f"SELECT count(*) FROM {refs_by_name['profile_stage']};"
+        )
+        or 0
+    )
+    profile_deleted, profile_deleted_logical_bytes = (
+        await _profile_delta_profile_deletion(refs_by_name)
+    )
+    evidence_rows = (
+        profile_delta.expected_evidence_rows
+        - evidence_deleted
+        + evidence_inserted
+    )
+    profile_rows = (
+        profile_delta.expected_profile_rows
+        - profile_deleted
+        + profile_inserted
+    )
+    if evidence_rows < 0 or profile_rows < 0:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_count_invalid"
+        )
+    return {
+        "evidence_rows": evidence_rows,
+        "profile_rows": profile_rows,
+        "evidence_inserted": evidence_inserted,
+        "evidence_deleted": evidence_deleted,
+        "evidence_deleted_logical_bytes": (
+            evidence_deleted_logical_bytes
+        ),
+        "profile_inserted": profile_inserted,
+        "profile_deleted": profile_deleted,
+        "profile_deleted_logical_bytes": (
+            profile_deleted_logical_bytes
+        ),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileDeltaRelations:
+    """Qualified relation references used by one delta transaction."""
+
+    receipt: str
+    evidence_target: str
+    profile_target: str
+    evidence_stage: str
+    profile_stage: str
+    affected_npi_stage: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileDeltaTargetBytes:
+    """Observed target relation bytes after delta DML."""
+
+    evidence_after: int
+    profile_after: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileDeltaLockedState:
+    """Locked base state and counts for one non-replay delta."""
+
+    receipt_ref: str
+    serving_state: _ProviderDirectoryProfileServingState
+    relations: _ProfileDeltaRelations
+    counts_by_name: Mapping[str, int]
+
+
+def _profile_delta_relations(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> _ProfileDeltaRelations:
+    """Return all qualified relation references for one prepared delta."""
+    return _ProfileDeltaRelations(
+        receipt=_provider_directory_profile_delta_receipt_ref(
+            profile_delta.schema
+        ),
+        evidence_target=_unscoped_qt(
+            profile_delta.schema,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        ),
+        profile_target=_unscoped_qt(
+            profile_delta.schema,
+            profile_artifact.PROFILE_TABLE,
+        ),
+        evidence_stage=_unscoped_qt(
+            profile_delta.schema,
+            profile_delta.evidence_stage,
+        ),
+        profile_stage=_unscoped_qt(
+            profile_delta.schema,
+            profile_delta.profile_stage,
+        ),
+        affected_npi_stage=_unscoped_qt(
+            profile_delta.schema,
+            profile_delta.affected_npi_stage,
+        ),
+    )
+
+
+async def _is_profile_delta_receipt_replay(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    receipt_ref: str,
+) -> bool:
+    """Return whether an exact committed receipt makes this a replay."""
+    existing_receipt = await db.first(
+        f"SELECT * FROM {receipt_ref} "
+        "WHERE build_id = :build_id FOR UPDATE;",
+        build_id=profile_delta.build_id,
+    )
+    if existing_receipt is None:
+        return False
+    if not _is_provider_directory_profile_delta_receipt_matching(
+        _pagination_checkpoint_row_mapping(existing_receipt),
+        profile_delta,
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_receipt_conflict"
+        )
+    if not await _is_provider_directory_profile_delta_committed(
+        profile_delta
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_receipt_incomplete"
+        )
+    return True
+
+
+def _validate_profile_delta_serving_state(
+    serving_state: _ProviderDirectoryProfileServingState | None,
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> None:
+    """Require the locked serving row to match the prepared delta base."""
+    if (
+        serving_state is None
+        or (serving_state.status, serving_state.operation)
+        not in {("published", "publish"), ("purged", "purge")}
+        or serving_state.generation_id
+        != profile_delta.from_generation_id
+        or serving_state.source_vector_hash
+        != profile_delta.from_source_vector_hash
+        or serving_state.source_context_vector_hash
+        != profile_delta.from_source_context_vector_hash
+        or serving_state.profile_as_of != profile_delta.profile_as_of
+        or serving_state.capacity_geometry_status
+        != profile_delta.from_capacity_geometry_status
+        or serving_state.capacity_geometry_hash
+        != profile_delta.from_capacity_geometry_hash
+        or serving_state.capacity_geometry_json
+        != profile_delta.from_capacity_geometry_json
+        or serving_state.evidence_target_oid
+        != profile_delta.evidence_target_oid
+        or serving_state.profile_target_oid
+        != profile_delta.profile_target_oid
+        or serving_state.evidence_rows
+        != profile_delta.expected_evidence_rows
+        or serving_state.profile_rows
+        != profile_delta.expected_profile_rows
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_serving_generation_changed"
+        )
+
+
+async def _lock_profile_delta_relations(
+    relations: _ProfileDeltaRelations,
+) -> None:
+    """Lock serving targets for writes and prepared stages for reads."""
+    for relation_ref in (
+        relations.evidence_target,
+        relations.profile_target,
+    ):
+        await db.status(
+            f"LOCK TABLE {relation_ref} "
+            "IN SHARE ROW EXCLUSIVE MODE NOWAIT;"
+        )
+    for stage_ref in (
+        relations.evidence_stage,
+        relations.profile_stage,
+        relations.affected_npi_stage,
+    ):
+        await db.status(f"LOCK TABLE {stage_ref} IN SHARE MODE NOWAIT;")
+
+
+async def _profile_delta_locked_state(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> _ProfileDeltaLockedState | None:
+    """Lock and validate the exact base state, or identify a replay."""
+    await _assert_provider_directory_profile_delta_identity(profile_delta)
+    receipt_ref = _provider_directory_profile_delta_receipt_ref(
+        profile_delta.schema
+    )
+    if await _is_profile_delta_receipt_replay(profile_delta, receipt_ref):
+        return None
+    serving_state = await _provider_directory_profile_serving_state(
+        profile_delta.schema,
+        for_update=True,
+    )
+    _validate_profile_delta_serving_state(serving_state, profile_delta)
+    relations = _profile_delta_relations(profile_delta)
+    await _lock_profile_delta_relations(relations)
+    await _assert_provider_directory_profile_delta_identity(profile_delta)
+    await _assert_provider_directory_profile_delta_stage_content(
+        profile_delta
+    )
+    return _ProfileDeltaLockedState(
+        receipt_ref=receipt_ref,
+        serving_state=serving_state,
+        relations=relations,
+        counts_by_name=(
+            await _provider_directory_profile_delta_counts(profile_delta)
+        ),
+    )
+
+
+async def _prepare_profile_delta_capacity(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts_by_name: Mapping[str, int],
+    serving_state: _ProviderDirectoryProfileServingState,
+    capacity_admission: _ProviderDirectoryProfileCapacityAdmission | None,
+    pending_commit_items: int,
+) -> _ProviderDirectoryProfileCutoverCapacityForecast:
+    """Validate row caps, reserve WAL, and persist the cutover forecast."""
+    if capacity_admission is not None and (
+        counts_by_name["evidence_rows"]
+        > capacity_admission.geometry.max_evidence_rows
+        or counts_by_name["profile_rows"]
+        > capacity_admission.geometry.max_profile_rows
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_serving_rows_exceeded"
+        )
+    capacity_forecast = (
+        await _provider_directory_profile_delta_capacity_projection(
+            profile_delta,
+            counts_by_name,
+            serving_state,
+            pending_commit_items=pending_commit_items,
+        )
+    )
+    if capacity_forecast is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_forecast_required"
+        )
+    await _reserve_provider_directory_profile_wal_budget(
+        capacity_admission,
+        relation_wal_bytes={
+            target_projection.relation_name: target_projection.wal_bytes
+            for target_projection in (
+                capacity_forecast.target_projection.targets
+            )
+        },
+        metadata_wal_bytes=(
+            capacity_forecast.metadata_projection.wal_bytes
+            + capacity_forecast.metadata_projection.commit_envelope_bytes
+        ),
+    )
+    await _persist_provider_directory_profile_cutover_forecast(
+        profile_delta,
+        capacity_forecast,
+    )
+    return capacity_forecast
+
+
+async def _profile_delta_target_wal_start_lsn() -> str:
+    """Return the non-empty WAL position immediately before target DML."""
+    target_wal_start_lsn = str(
+        await db.scalar(
+            "SELECT pg_current_wal_insert_lsn()::text;"
+        )
+        or ""
+    )
+    if not target_wal_start_lsn:
+        raise RuntimeError(
+            "provider_directory_profile_target_wal_start_missing"
+        )
+    return target_wal_start_lsn
+
+
+async def _replace_profile_delta_evidence(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    relations: _ProfileDeltaRelations,
+) -> tuple[int, int]:
+    """Delete changed sources and insert their staged evidence."""
+    changed_source_ids = sorted(
+        set(profile_delta.refresh_source_ids)
+        | set(profile_delta.removed_source_ids)
+    )
+    deleted_evidence = _coerce_rowcount(
+        await db.status(
+            f"DELETE FROM {relations.evidence_target} "
+            "WHERE source_id = ANY("
+            "CAST(:refresh_and_removed_source_ids AS varchar[]));",
+            refresh_and_removed_source_ids=changed_source_ids,
+        )
+    )
+    evidence_columns = ", ".join(
+        _q(column)
+        for column in profile_artifact.profile_evidence_columns()
+    )
+    inserted_evidence = _coerce_rowcount(
+        await db.status(
+            f"INSERT INTO {relations.evidence_target} "
+            f"({evidence_columns}) SELECT {evidence_columns} "
+            f"FROM {relations.evidence_stage};"
+        )
+    )
+    return deleted_evidence, inserted_evidence
+
+
+async def _replace_profile_delta_profiles(
+    relations: _ProfileDeltaRelations,
+) -> tuple[int, int]:
+    """Delete affected compact rows and insert their staged replacements."""
+    deleted_profiles = _coerce_rowcount(
+        await db.status(
+            f"DELETE FROM {relations.profile_target} AS profile "
+            f"USING {relations.affected_npi_stage} AS affected "
+            "WHERE affected.npi = profile.npi;"
+        )
+    )
+    profile_columns = ", ".join(
+        _q(column) for column in profile_artifact.profile_columns()
+    )
+    inserted_profiles = _coerce_rowcount(
+        await db.status(
+            f"INSERT INTO {relations.profile_target} "
+            f"({profile_columns}) SELECT {profile_columns} "
+            f"FROM {relations.profile_stage};"
+        )
+    )
+    return deleted_profiles, inserted_profiles
+
+
+async def _apply_profile_delta_target_rows(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    relations: _ProfileDeltaRelations,
+    expected_counts_by_name: Mapping[str, int],
+) -> None:
+    """Replace changed evidence and affected compact profiles exactly once."""
+    deleted_evidence, inserted_evidence = (
+        await _replace_profile_delta_evidence(profile_delta, relations)
+    )
+    deleted_profiles, inserted_profiles = (
+        await _replace_profile_delta_profiles(relations)
+    )
+    observed_counts_by_name = {
+        "evidence_deleted": deleted_evidence,
+        "evidence_inserted": inserted_evidence,
+        "profile_deleted": deleted_profiles,
+        "profile_inserted": inserted_profiles,
+    }
+    if any(
+        observed_counts_by_name[name] != expected_counts_by_name[name]
+        for name in observed_counts_by_name
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_rowcount_changed"
+        )
+
+
+async def _profile_delta_target_bytes_after(
+    capacity_forecast: _ProviderDirectoryProfileCutoverCapacityForecast,
+    relations: _ProfileDeltaRelations,
+) -> _ProfileDeltaTargetBytes:
+    """Validate both target sizes against the pre-DML projections."""
+    targets_by_name = {
+        target_projection.relation_name: target_projection
+        for target_projection in capacity_forecast.target_projection.targets
+    }
+    evidence_after = await _assert_provider_directory_profile_capacity_target(
+        "evidence_target",
+        relations.evidence_target,
+        bytes_before=capacity_forecast.evidence_target_bytes_before,
+        deleted_logical_bytes=(
+            targets_by_name["evidence_target"].deleted_logical_bytes
+        ),
+        projected_growth_bytes=(
+            targets_by_name["evidence_target"].target_growth_bytes
+        ),
+    )
+    profile_after = await _assert_provider_directory_profile_capacity_target(
+        "profile_target",
+        relations.profile_target,
+        bytes_before=capacity_forecast.profile_target_bytes_before,
+        deleted_logical_bytes=(
+            targets_by_name["profile_target"].deleted_logical_bytes
+        ),
+        projected_growth_bytes=(
+            targets_by_name["profile_target"].target_growth_bytes
+        ),
+    )
+    return _ProfileDeltaTargetBytes(
+        evidence_after=evidence_after,
+        profile_after=profile_after,
+    )
+
+
+def _profile_delta_cutover_actual_values(
+    capacity_forecast: _ProviderDirectoryProfileCutoverCapacityForecast,
+    target_wal_start_lsn: str,
+    wal_observation: Mapping[str, Any],
+    target_wal_bytes: int,
+    target_bytes: _ProfileDeltaTargetBytes,
+) -> dict[str, Any]:
+    """Return canonical observed target DML capacity values."""
+    evidence_before = capacity_forecast.evidence_target_bytes_before
+    profile_before = capacity_forecast.profile_target_bytes_before
+    return {
+        "contract_id": (
+            "healthporta.provider-directory-profile-cutover-actual.v1"
+        ),
+        "forecast_hash": capacity_forecast.forecast_hash,
+        "wal_start_lsn": capacity_forecast.wal_start_lsn,
+        "target_wal_start_lsn": target_wal_start_lsn,
+        "wal_observed_lsn": str(wal_observation["wal_observed_lsn"]),
+        "cutover_wal_bytes": target_wal_bytes,
+        "evidence_target_bytes_before": evidence_before,
+        "evidence_target_bytes_after": target_bytes.evidence_after,
+        "evidence_target_growth_bytes": max(
+            target_bytes.evidence_after - evidence_before,
+            0,
+        ),
+        "profile_target_bytes_before": profile_before,
+        "profile_target_bytes_after": target_bytes.profile_after,
+        "profile_target_growth_bytes": max(
+            target_bytes.profile_after - profile_before,
+            0,
+        ),
+        "metadata_wal_forecast_bytes": (
+            capacity_forecast.metadata_projection.wal_bytes
+        ),
+        "commit_envelope_bytes": (
+            capacity_forecast.metadata_projection.commit_envelope_bytes
+        ),
+    }
+
+
+async def _profile_delta_cutover_actual(
+    capacity_forecast: _ProviderDirectoryProfileCutoverCapacityForecast,
+    target_wal_start_lsn: str,
+    target_bytes: _ProfileDeltaTargetBytes,
+) -> dict[str, Any]:
+    """Measure target WAL and bind it to the persisted forecast."""
+    wal_observed_row = await db.first(
+        """
+        WITH observed AS MATERIALIZED (
+            SELECT pg_current_wal_insert_lsn() AS wal_lsn
+        )
+        SELECT observed.wal_lsn::text AS wal_observed_lsn,
+               pg_wal_lsn_diff(
+                   observed.wal_lsn,
+                   CAST(CAST(:wal_start_lsn AS text) AS pg_lsn)
+               )::bigint AS cutover_wal_bytes
+          FROM observed;
+        """,
+        wal_start_lsn=target_wal_start_lsn,
+    )
+    if wal_observed_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_cutover_actual_wal_missing"
+        )
+    wal_observation = _pagination_checkpoint_row_mapping(wal_observed_row)
+    target_wal_bytes = int(wal_observation["cutover_wal_bytes"])
+    if target_wal_bytes > capacity_forecast.target_projection.wal_bytes:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_target_wal_exceeded:"
+            f"observed={target_wal_bytes}:"
+            f"projected={capacity_forecast.target_projection.wal_bytes}"
+        )
+    actual_by_field = _profile_delta_cutover_actual_values(
+        capacity_forecast,
+        target_wal_start_lsn,
+        wal_observation,
+        target_wal_bytes,
+        target_bytes,
+    )
+    actual_json = json.dumps(
+        actual_by_field,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    return {
+        **actual_by_field,
+        "cutover_forecast_hash": capacity_forecast.forecast_hash,
+        "cutover_forecast_json": capacity_forecast.forecast_json,
+        "cutover_actual_hash": _identity_hash(
+            {
+                "contract": (
+                    "provider-directory-profile-cutover-actual-hash-v1"
+                ),
+                "actual": actual_by_field,
+            }
+        ),
+        "cutover_actual_json": actual_json,
+    }
+
+
+_PROFILE_DELTA_SERVING_UPDATE_SQL = """
+UPDATE {serving_ref}
+   SET status = :status,
+       operation = :operation,
+       control_generation = :control_generation,
+       generation_id = :generation_id,
+       selection_proof_id = :selection_proof_id,
+       authority_revision = :authority_revision,
+       profile_schema_version = :profile_schema_version,
+       profile_strategy_version = :profile_strategy_version,
+       source_vector_hash = :source_vector_hash,
+       source_vector_json = CAST(:source_vector_json AS jsonb),
+       source_context_vector_hash = :source_context_vector_hash,
+       source_context_vector_json =
+           CAST(:source_context_vector_json AS jsonb),
+       executable_plan_hash = :executable_plan_hash,
+       capacity_geometry_status = :capacity_geometry_status,
+       capacity_geometry_hash = :capacity_geometry_hash,
+       capacity_geometry_json = CAST(:capacity_geometry_json AS jsonb),
+       cutover_forecast_hash = :cutover_forecast_hash,
+       evidence_rows = :evidence_rows,
+       profile_rows = :profile_rows,
+       published_at = now(),
+       updated_at = now()
+ WHERE singleton_key = 'global'
+   AND generation_id = :from_generation_id
+   AND source_vector_hash = :from_source_vector_hash
+   AND source_context_vector_hash = :from_source_context_vector_hash
+   AND capacity_geometry_status = :from_capacity_geometry_status
+   AND capacity_geometry_hash IS NOT DISTINCT FROM
+       :from_capacity_geometry_hash
+   AND capacity_geometry_json::jsonb IS NOT DISTINCT FROM
+       CAST(:from_capacity_geometry_json AS jsonb)
+   AND profile_as_of = :profile_as_of
+   AND evidence_target_oid = :evidence_target_oid
+   AND profile_target_oid = :profile_target_oid
+   AND evidence_rows = :expected_evidence_rows
+   AND profile_rows = :expected_profile_rows;
+"""
+
+
+def _profile_delta_serving_update_values(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts_by_name: Mapping[str, int],
+    capacity_forecast: _ProviderDirectoryProfileCutoverCapacityForecast,
+) -> dict[str, Any]:
+    """Return the serving-generation compare-and-swap parameters."""
+    return {
+        "control_generation": profile_delta.control_generation,
+        "status": (
+            "published"
+            if profile_delta.operation == "publish"
+            else "purged"
+        ),
+        "operation": profile_delta.operation,
+        "generation_id": profile_delta.generation_id,
+        "selection_proof_id": profile_delta.selection_proof_id,
+        "authority_revision": profile_delta.authority_revision,
+        "profile_schema_version": profile_delta.profile_schema_version,
+        "profile_strategy_version": profile_delta.profile_strategy_version,
+        "source_vector_hash": profile_delta.to_source_vector_hash,
+        "source_vector_json": json.dumps(
+            _provider_directory_profile_source_vector_json(
+                profile_delta.to_source_vector
+            )
+        ),
+        "source_context_vector_hash": (
+            profile_delta.to_source_context_vector_hash
+        ),
+        "source_context_vector_json": json.dumps(
+            _provider_directory_profile_source_context_vector_json(
+                profile_delta.to_source_context_vector
+            )
+        ),
+        "executable_plan_hash": profile_delta.executable_plan_hash,
+        "capacity_geometry_status": profile_delta.capacity_geometry_status,
+        "capacity_geometry_hash": profile_delta.capacity_geometry_hash,
+        "capacity_geometry_json": profile_delta.capacity_geometry_json,
+        "cutover_forecast_hash": capacity_forecast.forecast_hash,
+        "evidence_rows": counts_by_name["evidence_rows"],
+        "profile_rows": counts_by_name["profile_rows"],
+        "from_generation_id": profile_delta.from_generation_id,
+        "from_source_vector_hash": profile_delta.from_source_vector_hash,
+        "from_source_context_vector_hash": (
+            profile_delta.from_source_context_vector_hash
+        ),
+        "from_capacity_geometry_status": (
+            profile_delta.from_capacity_geometry_status
+        ),
+        "from_capacity_geometry_hash": (
+            profile_delta.from_capacity_geometry_hash
+        ),
+        "from_capacity_geometry_json": (
+            profile_delta.from_capacity_geometry_json
+        ),
+        "profile_as_of": profile_delta.profile_as_of,
+        "evidence_target_oid": profile_delta.evidence_target_oid,
+        "profile_target_oid": profile_delta.profile_target_oid,
+        "expected_evidence_rows": profile_delta.expected_evidence_rows,
+        "expected_profile_rows": profile_delta.expected_profile_rows,
+    }
+
+
+async def _update_profile_delta_serving_generation(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts_by_name: Mapping[str, int],
+    capacity_forecast: _ProviderDirectoryProfileCutoverCapacityForecast,
+) -> None:
+    """Advance the singleton serving generation with an exact CAS."""
+    serving_ref = _provider_directory_profile_serving_generation_ref(
+        profile_delta.schema
+    )
+    updated_count = _coerce_rowcount(
+        await db.status(
+            _PROFILE_DELTA_SERVING_UPDATE_SQL.format(
+                serving_ref=serving_ref
+            ),
+            **_profile_delta_serving_update_values(
+                profile_delta,
+                counts_by_name,
+                capacity_forecast,
+            ),
+        )
+    )
+    if updated_count != 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_delta_serving_generation_changed"
+        )
+
+
+_PROFILE_DELTA_RECEIPT_INSERT_SQL = """
+INSERT INTO {receipt_ref} (
+    build_id, executable_plan_hash,
+    from_capacity_geometry_status,
+    from_capacity_geometry_hash,
+    from_capacity_geometry_json,
+    capacity_geometry_status, capacity_geometry_hash,
+    capacity_geometry_json,
+    from_source_vector_hash, to_source_vector_hash,
+    from_source_context_vector_hash,
+    to_source_context_vector_hash,
+    from_generation_id, generation_id, operation,
+    profile_as_of,
+    selection_proof_id,
+    control_generation, authority_revision,
+    evidence_target_oid, profile_target_oid,
+    evidence_rows, profile_rows,
+    evidence_inserted, evidence_deleted,
+    profile_inserted, profile_deleted,
+    cutover_forecast_hash, cutover_forecast_json,
+    cutover_actual_hash, cutover_actual_json,
+    cutover_wal_start_lsn, cutover_wal_observed_lsn,
+    cutover_wal_bytes,
+    evidence_target_bytes_before,
+    evidence_target_bytes_after,
+    evidence_target_growth_bytes,
+    profile_target_bytes_before,
+    profile_target_bytes_after,
+    profile_target_growth_bytes,
+    committed_at
+) VALUES (
+    :build_id, :executable_plan_hash,
+    :from_capacity_geometry_status,
+    :from_capacity_geometry_hash,
+    CAST(:from_capacity_geometry_json AS jsonb),
+    :capacity_geometry_status, :capacity_geometry_hash,
+    CAST(:capacity_geometry_json AS jsonb),
+    :from_source_vector_hash, :to_source_vector_hash,
+    :from_source_context_vector_hash,
+    :to_source_context_vector_hash,
+    :from_generation_id, :generation_id, :operation,
+    :profile_as_of,
+    :selection_proof_id,
+    :control_generation, :authority_revision,
+    :evidence_target_oid, :profile_target_oid,
+    :evidence_rows, :profile_rows,
+    :evidence_inserted, :evidence_deleted,
+    :profile_inserted, :profile_deleted,
+    :cutover_forecast_hash,
+    CAST(:cutover_forecast_json AS jsonb),
+    :cutover_actual_hash,
+    CAST(:cutover_actual_json AS jsonb),
+    :wal_start_lsn, :wal_observed_lsn,
+    :cutover_wal_bytes,
+    :evidence_target_bytes_before,
+    :evidence_target_bytes_after,
+    :evidence_target_growth_bytes,
+    :profile_target_bytes_before,
+    :profile_target_bytes_after,
+    :profile_target_growth_bytes,
+    now()
+);
+"""
+
+
+def _profile_delta_commit_receipt_values(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    counts_by_name: Mapping[str, int],
+    cutover_actual_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return complete receipt parameters for the committed delta."""
+    return {
+        **_provider_directory_profile_delta_receipt_static_values(
+            profile_delta
+        ),
+        "from_capacity_geometry_json": (
+            profile_delta.from_capacity_geometry_json
+        ),
+        "capacity_geometry_json": profile_delta.capacity_geometry_json,
+        **cutover_actual_by_field,
+        **counts_by_name,
+    }
+
+
+async def _insert_profile_delta_receipt(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    receipt_ref: str,
+    counts_by_name: Mapping[str, int],
+    cutover_actual_by_field: Mapping[str, Any],
+) -> None:
+    """Validate and insert the immutable committed delta receipt."""
+    receipt_values_by_name = _profile_delta_commit_receipt_values(
+        profile_delta,
+        counts_by_name,
+        cutover_actual_by_field,
+    )
+    _checked_serialized_metadata_payload_bytes(
+        receipt_values_by_name,
+        fixed_row_overhead=4_096,
+    )
+    await db.status(
+        _PROFILE_DELTA_RECEIPT_INSERT_SQL.format(receipt_ref=receipt_ref),
+        **receipt_values_by_name,
+    )
+
+
+async def _validate_profile_delta_final_wal(
+    capacity_admission: _ProviderDirectoryProfileCapacityAdmission,
+    capacity_forecast: _ProviderDirectoryProfileCutoverCapacityForecast,
+) -> None:
+    """Validate transaction WAL before admitting the commit envelope."""
+    cutover_wal_bytes = int(
+        await db.scalar(
+            """
+            SELECT pg_wal_lsn_diff(
+                       pg_current_wal_insert_lsn(),
+                       CAST(CAST(:wal_start_lsn AS text) AS pg_lsn)
+                   )::bigint;
+            """,
+            wal_start_lsn=capacity_forecast.wal_start_lsn,
+        )
+        or 0
+    )
+    projected_cutover_wal_bytes = (
+        capacity_forecast.target_projection.wal_bytes
+        + capacity_forecast.metadata_projection.wal_bytes
+    )
+    if not 0 <= cutover_wal_bytes <= projected_cutover_wal_bytes:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_cutover_wal_exceeded:"
+            f"observed={cutover_wal_bytes}:"
+            f"projected={projected_cutover_wal_bytes}"
+        )
+    final_wal_bytes = await _provider_directory_profile_current_wal_bytes(
+        capacity_admission
+    )
+    maximum_wal_bytes = (
+        capacity_admission.geometry.reservation_bytes_by_storage_class["wal"]
+    )
+    commit_envelope_bytes = (
+        capacity_forecast.metadata_projection.commit_envelope_bytes
+    )
+    if final_wal_bytes + commit_envelope_bytes > maximum_wal_bytes:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_final_wal_exceeded:"
+            f"observed={final_wal_bytes}:"
+            f"commit_envelope={commit_envelope_bytes}:"
+            f"maximum={maximum_wal_bytes}"
+        )
+
+
+async def _apply_provider_directory_profile_delta(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+    *,
+    pending_commit_items: int,
+) -> None:
+    """Apply one source delta while readers retain their old MVCC snapshot."""
+
+    if _provider_directory_profile_capacity_admission() is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_admission_required"
+        )
+    locked_state = await _profile_delta_locked_state(profile_delta)
+    if locked_state is None:
+        return
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    capacity_forecast = await _prepare_profile_delta_capacity(
+        profile_delta,
+        locked_state.counts_by_name,
+        locked_state.serving_state,
+        capacity_admission,
+        pending_commit_items,
+    )
+    target_wal_start_lsn = await _profile_delta_target_wal_start_lsn()
+    await _apply_profile_delta_target_rows(
+        profile_delta,
+        locked_state.relations,
+        locked_state.counts_by_name,
+    )
+    target_bytes = await _profile_delta_target_bytes_after(
+        capacity_forecast,
+        locked_state.relations,
+    )
+    cutover_actual_by_field = await _profile_delta_cutover_actual(
+        capacity_forecast,
+        target_wal_start_lsn,
+        target_bytes,
+    )
+    await _update_profile_delta_serving_generation(
+        profile_delta,
+        locked_state.counts_by_name,
+        capacity_forecast,
+    )
+    await _insert_profile_delta_receipt(
+        profile_delta,
+        locked_state.receipt_ref,
+        locked_state.counts_by_name,
+        cutover_actual_by_field,
+    )
+    await _validate_profile_delta_final_wal(
+        capacity_admission,
+        capacity_forecast,
+    )
+
+
+async def _remove_provider_directory_profile_delta_stages(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> None:
+    """Best-effort removal of exact committed delta scratch relations."""
+
+    for stage_table in (
+        profile_delta.profile_stage,
+        profile_delta.evidence_stage,
+        profile_delta.affected_npi_stage,
+    ):
+        capacity_admission = _provider_directory_profile_capacity_admission()
+        try:
+            if capacity_admission is not None:
+                await _reserve_provider_directory_profile_wal_budget(
+                    capacity_admission,
+                    control_operation_counts={"profile_stage_drop": 1},
+                )
+            await _provider_directory_profile_capacity_status(
+                f"DROP TABLE IF EXISTS "
+                f"{_unscoped_qt(profile_delta.schema, stage_table)};"
+            )
+        except Exception:
+            if capacity_admission is not None:
+                raise
+            LOGGER.warning(
+                "Failed to clean Provider Directory Profile delta stage %s",
+                stage_table,
+                exc_info=True,
+            )
+
+
+async def _finalize_provider_directory_profile_delta_scratch(
+    profile_delta: ProviderDirectoryPreparedProfileDelta,
+) -> None:
+    """Atomically remove admitted scratch before retiring its owner checkpoint."""
+
+    expected_checkpoint = (
+        profile_delta.schema,
+        profile_delta.build_id,
+    )
+    if profile_delta.resume_checkpoint != expected_checkpoint:
+        raise RuntimeError(
+            "provider_directory_profile_delta_resume_checkpoint_invalid"
+        )
+    await _remove_provider_directory_profile_delta_stages(profile_delta)
+    await _delete_provider_directory_profile_build_checkpoint(
+        *expected_checkpoint
+    )
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is not None:
+        await _assert_provider_directory_profile_wal_budget(admission)
+
+
 def _ordered_provider_directory_artifact_bundle(
     stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
 ) -> tuple[ProviderDirectoryPreparedArtifactStage, ...]:
@@ -8898,14 +12009,37 @@ def _ordered_provider_directory_artifact_bundle(
     return ordered_stages
 
 
-async def _promote_provider_directory_artifact_bundle_transaction(
-    stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
-) -> None:
-    """Swap every prepared serving relation in one bounded transaction."""
-    ordered_stages = _ordered_provider_directory_artifact_bundle(stages)
-    if not ordered_stages:
-        return
-    schema = ordered_stages[0].schema
+def _provider_directory_artifact_bundle_context(
+    ordered_stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None,
+) -> tuple[str, tuple[str, ...], str, str]:
+    """Validate a bundle and resolve its exact transaction coordinates."""
+    schemas = {stage.schema for stage in ordered_stages}
+    if profile_delta is not None:
+        schemas.add(profile_delta.schema)
+        ordinary_targets = {
+            stage.target_relation for stage in ordered_stages
+        }
+        profile_targets = {
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+            profile_artifact.PROFILE_TABLE,
+        }
+        if ordinary_targets.intersection(profile_targets):
+            raise ValueError(
+                "provider_directory_profile_delta_target_duplicate"
+            )
+    if len(schemas) != 1:
+        raise ValueError(
+            "provider_directory_artifact_bundle_schema_mismatch"
+        )
+    if (
+        profile_delta is not None
+        and _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get() is not None
+        and _provider_directory_profile_capacity_admission() is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_admission_required"
+        )
     relation_names = tuple(
         sorted(
             {
@@ -8917,34 +12051,228 @@ async def _promote_provider_directory_artifact_bundle_transaction(
             }
         )
     )
-    async with db.transaction():
+    if profile_delta is not None:
+        return (
+            next(iter(schemas)),
+            relation_names,
+            PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_LOCK_TIMEOUT,
+            PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_STATEMENT_TIMEOUT,
+        )
+    return (
+        next(iter(schemas)),
+        relation_names,
+        PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT,
+        PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT,
+    )
+
+
+async def _configure_provider_directory_artifact_promotion(
+    lock_timeout: str,
+    statement_timeout: str,
+) -> _ProviderDirectoryProfileCapacityAdmission | None:
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if capacity_admission is None:
         await db.status(
             "SET LOCAL lock_timeout = "
-            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';"
+            f"'{lock_timeout}';"
         )
         await db.status(
             "SET LOCAL statement_timeout = "
-            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
+            f"'{statement_timeout}';"
         )
+    else:
+        await _apply_provider_directory_profile_capacity_settings(
+            capacity_admission
+        )
+    return capacity_admission
+
+
+async def _lock_provider_directory_artifact_bundle_targets(
+    ordered_stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+    schema: str,
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None,
+) -> None:
+    if profile_delta is None:
         for stage in ordered_stages:
             await _acquire_provider_directory_artifact_cutover_lock(stage)
-        await _verify_active_profile_selection_at_cutover()
-        active_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
-        if active_fence is not None:
-            await _lock_and_verify_artifact_dataset_fence(active_fence)
-        for stage in ordered_stages:
-            await _assert_provider_directory_artifact_build_fence(stage)
-        await _lock_provider_directory_artifact_tables(schema, relation_names)
-        for stage in ordered_stages:
-            await _install_provider_directory_prepared_stage(stage)
-        for stage in ordered_stages:
-            await _finish_provider_directory_prepared_stage(stage)
-        if active_fence is not None:
-            await _promote_provider_directory_artifact_datasets(active_fence)
+        return
+    target_relations = {
+        stage.target_relation for stage in ordered_stages
+    }
+    target_relations.update(
+        {
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+            profile_artifact.PROFILE_TABLE,
+        }
+    )
+    for target_relation in sorted(target_relations):
+        await _acquire_provider_directory_artifact_target_lock(
+            schema,
+            target_relation,
+        )
+
+
+async def _reserve_provider_directory_artifact_cutover_budget(
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None,
+    capacity_admission: _ProviderDirectoryProfileCapacityAdmission | None,
+) -> ProviderDirectoryArtifactDatasetFence | None:
+    active_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
+    if profile_delta is None or capacity_admission is None:
+        return active_fence
+    if active_fence is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_fence_missing"
+        )
+    cutover_row_lock_count = (
+        _provider_directory_profile_cutover_row_lock_count(active_fence)
+    )
+    if cutover_row_lock_count * PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS != (
+        _provider_directory_profile_control_operation_count(
+            capacity_admission,
+            "cutover_row_lock",
+        )
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_cutover_row_lock_count_changed"
+        )
+    await _reserve_provider_directory_profile_wal_budget(
+        capacity_admission,
+        control_operation_counts={
+            "cutover_row_lock": cutover_row_lock_count,
+        },
+    )
+    return active_fence
+
+
+async def _apply_locked_provider_directory_artifact_bundle(
+    ordered_stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+    schema: str,
+    relation_names: tuple[str, ...],
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None,
+    active_fence: ProviderDirectoryArtifactDatasetFence | None,
+) -> None:
+    await _verify_active_profile_selection_at_cutover()
+    if (
+        profile_delta is not None
+        and not ordered_stages
+        and await _resolve_provider_directory_profile_delta_replay(
+            profile_delta,
+            active_fence,
+        )
+    ):
+        return
+    if active_fence is not None:
+        await _lock_and_verify_artifact_dataset_fence(active_fence)
+    for stage in ordered_stages:
+        await _assert_provider_directory_artifact_build_fence(stage)
+    if profile_delta is not None:
+        await _assert_provider_directory_profile_delta_identity(profile_delta)
+    await _lock_provider_directory_artifact_tables(schema, relation_names)
+    for stage in ordered_stages:
+        await _install_provider_directory_prepared_stage(stage)
+    for stage in ordered_stages:
+        await _finish_provider_directory_prepared_stage(stage)
+    if active_fence is not None:
+        await _promote_provider_directory_artifact_datasets(active_fence)
+    if profile_delta is None:
+        return
+    await _apply_provider_directory_profile_delta(
+        profile_delta,
+        pending_commit_items=(
+            len(relation_names)
+            + (
+                len(active_fence.datasets)
+                if active_fence is not None
+                else 0
+            )
+        ),
+    )
+    await _finalize_provider_directory_profile_delta_scratch(profile_delta)
+
+
+async def _promote_provider_directory_artifact_bundle_transaction(
+    stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+    *,
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None = None,
+) -> None:
+    """Publish relation swaps and an optional source delta atomically."""
+    ordered_stages = _ordered_provider_directory_artifact_bundle(stages)
+    if not ordered_stages and profile_delta is None:
+        return
+    schema, relation_names, lock_timeout, statement_timeout = (
+        _provider_directory_artifact_bundle_context(
+            ordered_stages,
+            profile_delta,
+        )
+    )
+    async with db.transaction():
+        capacity_admission = await (
+            _configure_provider_directory_artifact_promotion(
+                lock_timeout,
+                statement_timeout,
+            )
+        )
+        await _lock_provider_directory_artifact_bundle_targets(
+            ordered_stages,
+            schema,
+            profile_delta,
+        )
+        active_fence = (
+            await _reserve_provider_directory_artifact_cutover_budget(
+                profile_delta,
+                capacity_admission,
+            )
+        )
+        await _apply_locked_provider_directory_artifact_bundle(
+            ordered_stages,
+            schema,
+            relation_names,
+            profile_delta,
+            active_fence,
+        )
+
+
+async def _is_artifact_bundle_promotion_committed(
+    stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+    promotion_identities: tuple[Any, ...],
+    dataset_fence: ProviderDirectoryArtifactDatasetFence | None,
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None,
+) -> bool:
+    """Verify all atomic cutover components after acknowledgement loss."""
+    try:
+        relation_swap_committed = (
+            not stages
+            or await _is_provider_directory_artifact_promotion_committed(
+                promotion_identities,
+                dataset_fence,
+            )
+        )
+        delta_committed = (
+            profile_delta is None
+            or await _is_provider_directory_profile_delta_committed(
+                profile_delta
+            )
+        )
+        dataset_committed = (
+            dataset_fence is None
+            or await _is_provider_directory_dataset_cutover_committed(
+                dataset_fence
+            )
+        )
+    except Exception:
+        LOGGER.warning(
+            "Provider Directory artifact cutover acknowledgement was "
+            "lost and committed-state verification also failed",
+            exc_info=True,
+        )
+        return False
+    return relation_swap_committed and delta_committed and dataset_committed
 
 
 async def _promote_provider_directory_artifact_bundle(
     stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+    *,
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None = None,
 ) -> None:
     """Apply a hard wall-clock limit to one atomic artifact bundle cutover."""
 
@@ -8952,19 +12280,31 @@ async def _promote_provider_directory_artifact_bundle(
         await _capture_provider_directory_artifact_promotion_identities(stages)
     )
     dataset_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
+    transaction_timeout_seconds = (
+        PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_TIMEOUT_SECONDS
+        if profile_delta is not None
+        else PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+    )
     try:
         async with asyncio.timeout(
-            PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+            transaction_timeout_seconds
         ):
-            await _promote_provider_directory_artifact_bundle_transaction(stages)
-    except TimeoutError:
-        if await _is_provider_directory_artifact_promotion_committed(
+            await _promote_provider_directory_artifact_bundle_transaction(
+                stages,
+                profile_delta=profile_delta,
+            )
+    except Exception as promotion_error:
+        if await _is_artifact_bundle_promotion_committed(
+            stages,
             promotion_identities,
             dataset_fence,
+            profile_delta,
         ):
             LOGGER.warning(
-                "Provider Directory artifact cutover timed out after commit; "
-                "verified promoted targets by relation identity: %s",
+                "Provider Directory artifact cutover acknowledgement "
+                "was lost after commit (%s); verified promoted targets "
+                "by immutable identity: %s",
+                type(promotion_error).__name__,
                 ",".join(stage.target_relation for stage in stages),
             )
             return
@@ -8973,11 +12313,19 @@ async def _promote_provider_directory_artifact_bundle(
 
 async def _retry_provider_directory_artifact_bundle_promotion(
     stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
+    *,
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None = None,
 ) -> None:
     """Retry transient lock conflicts without rebuilding immutable stages."""
     for attempt_index in range(PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS):
         try:
-            await _promote_provider_directory_artifact_bundle(stages)
+            if profile_delta is None:
+                await _promote_provider_directory_artifact_bundle(stages)
+            else:
+                await _promote_provider_directory_artifact_bundle(
+                    stages,
+                    profile_delta=profile_delta,
+                )
             return
         except Exception as exc:
             if not _is_provider_directory_artifact_cutover_retryable(exc):
@@ -8996,8 +12344,10 @@ async def _remove_provider_directory_artifact_stage(
     """Drop an unpromoted stage without masking the publication result."""
     stage_ref = _qt(stage.schema, stage.stage_table)
     try:
-        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-    except Exception:  # pragma: no cover - cleanup best effort
+        await _provider_directory_profile_capacity_status(
+            f"DROP TABLE IF EXISTS {stage_ref};"
+        )
+    except Exception:
         LOGGER.warning(
             "Failed to clean Provider Directory artifact stage %s",
             stage_ref,
@@ -9099,7 +12449,7 @@ async def _cutover_provider_directory_artifact_stage(
     except Exception:
         try:
             await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-        except Exception:  # pragma: no cover - cleanup best effort
+        except Exception:
             LOGGER.warning("Failed to clean Provider Directory artifact stage %s", stage_ref, exc_info=True)
         raise
 
@@ -9219,7 +12569,7 @@ async def _best_effort_drop_address_corroboration_stage(stage_ref: str) -> None:
     """Clean a failed corroboration stage without masking its build error."""
     try:
         await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-    except Exception:  # pragma: no cover - cleanup best effort
+    except Exception:
         LOGGER.warning(
             "Failed to clean provider directory address stage table %s",
             stage_ref,
@@ -9893,6 +13243,93 @@ class ProviderDirectoryArtifactDataset:
     verification_source_ids: tuple[str, ...] = ()
     source_verification_contract: tuple[Any, ...] = ()
     source_verification_contract_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryArtifactScopeBatchProjection:
+    """One ordered source or immutable-dataset projection coordinate."""
+
+    batch_number: int
+    source_id: str
+    dataset_id: str | None
+    evidence_run_id: str | None
+    resource_type: str
+    after_resource_id: str | None
+    last_resource_id: str | None
+    projected_rows: int
+    projected_logical_bytes: int
+
+    def canonical_payload(self) -> dict[str, Any]:
+        """Return this batch coordinate in deterministic hash form."""
+        return {
+            "batch_number": self.batch_number,
+            "source_id": self.source_id,
+            "dataset_id": self.dataset_id,
+            "evidence_run_id": self.evidence_run_id,
+            "resource_type": self.resource_type,
+            "after_resource_id": self.after_resource_id,
+            "last_resource_id": self.last_resource_id,
+            "projected_rows": self.projected_rows,
+            "projected_logical_bytes": self.projected_logical_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryArtifactScopeTableProjection:
+    """Exact projected rows and logical tuple bytes for one scope table."""
+
+    table_name: str
+    resource_type: str
+    projected_rows: int
+    projected_logical_bytes: int
+    batches: tuple[_ProviderDirectoryArtifactScopeBatchProjection, ...] = ()
+
+    def canonical_payload(self) -> dict[str, Any]:
+        """Return this table projection in deterministic hash form."""
+        return {
+            "table_name": self.table_name,
+            "resource_type": self.resource_type,
+            "projected_rows": self.projected_rows,
+            "projected_logical_bytes": self.projected_logical_bytes,
+            "batches": [
+                batch.canonical_payload() for batch in self.batches
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryArtifactScopeExactProjection:
+    """Canonical exact projection for every materialized artifact table."""
+
+    tables: tuple[_ProviderDirectoryArtifactScopeTableProjection, ...]
+
+    @property
+    def projected_rows(self) -> int:
+        """Return total source and resource rows across all scope tables."""
+        return sum(table.projected_rows for table in self.tables)
+
+    @property
+    def projected_logical_bytes(self) -> int:
+        """Return total projected tuple bytes across all scope tables."""
+        return sum(table.projected_logical_bytes for table in self.tables)
+
+    def canonical_payload(self) -> dict[str, Any]:
+        """Return the ordered exact projection payload used for hashing."""
+        return {
+            "projection_schema": (
+                "provider-directory-artifact-scope-exact-v2"
+            ),
+            "projected_rows": self.projected_rows,
+            "projected_logical_bytes": self.projected_logical_bytes,
+            "tables": [
+                table.canonical_payload() for table in self.tables
+            ],
+        }
+
+    @property
+    def projection_hash(self) -> str:
+        """Return the deterministic identity of the exact projection."""
+        return _identity_hash(self.canonical_payload())
 
 
 @dataclass(frozen=True)
@@ -11525,6 +14962,66 @@ def _provider_directory_artifact_scope_row_limit() -> int:
     return configured or DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_MAX_PROJECTED_ROWS
 
 
+def _provider_directory_artifact_scope_batch_size() -> int:
+    configured = _positive_int(
+        os.getenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_BATCH_SIZE")
+    )
+    return (
+        configured
+        or DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_BATCH_SIZE
+    )
+
+
+def _provider_directory_positive_config(
+    env_name: str,
+    default_value: int,
+) -> tuple[int, bool]:
+    raw_value = os.getenv(env_name)
+    if raw_value is None or raw_value == "":
+        return default_value, False
+    configured_value = _positive_int(raw_value)
+    if configured_value is None:
+        raise RuntimeError(
+            "provider_directory_positive_config_invalid:" + env_name
+        )
+    return configured_value, True
+
+
+def _provider_directory_database_pool_capacity() -> int:
+    capacity, _ = _provider_directory_positive_config(
+        "HLTHPRT_DB_POOL_MAX_SIZE",
+        5,
+    )
+    return capacity
+
+
+def _provider_directory_artifact_scope_workers() -> int:
+    capacity_admission = (
+        _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get()
+    )
+    if capacity_admission is not None:
+        return int(
+            capacity_admission.geometry.artifact_scope_worker_count
+        )
+    requested_workers, explicitly_configured = (
+        _provider_directory_positive_config(
+            "HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_WORKERS",
+            DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_WORKERS,
+        )
+    )
+    admitted_workers = min(
+        MAX_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_WORKERS,
+        _provider_directory_database_pool_capacity() - 2,
+    )
+    if admitted_workers < 1 or (
+        explicitly_configured and requested_workers > admitted_workers
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_scope_worker_capacity_exceeded"
+        )
+    return min(requested_workers, admitted_workers)
+
+
 def _artifact_scope_alias_counts(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> dict[str, int]:
@@ -11648,7 +15145,19 @@ def _assert_provider_directory_artifact_scope_capacity(
     projection: dict[str, Any],
 ) -> None:
     projected_rows = int(projection["projected_rows"])
-    capacity = _provider_directory_artifact_scope_row_limit()
+    capacity_admission = (
+        _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get()
+    )
+    capacity = (
+        int(capacity_admission.geometry.max_artifact_scope_rows)
+        if capacity_admission is not None
+        else _provider_directory_artifact_scope_row_limit()
+    )
+    if capacity_admission is not None and projected_rows != capacity:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_artifact_projection_changed:"
+            f"projected={projected_rows}:admitted={capacity}"
+        )
     if projected_rows > capacity:
         raise RuntimeError(
             "provider_directory_artifact_scope_projected_rows_exceeded:"
@@ -11656,11 +15165,46 @@ def _assert_provider_directory_artifact_scope_capacity(
         )
 
 
-async def _reap_provider_directory_artifact_scope_tables(schema: str) -> list[str]:
+def _assert_artifact_scope_projection(
+    projection: _ProviderDirectoryArtifactScopeExactProjection,
+) -> None:
+    """Bind the exact typed scope projection to the signed admission."""
+
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        if (
+            projection.projected_rows
+            > _provider_directory_artifact_scope_row_limit()
+        ):
+            raise RuntimeError(
+                "provider_directory_artifact_scope_projected_rows_exceeded"
+            )
+        return
+    geometry = admission.geometry
+    if (
+        projection.projected_rows != geometry.max_artifact_scope_rows
+        or projection.projected_logical_bytes
+        != geometry.artifact_scope_projected_logical_bytes
+        or projection.projection_hash
+        != geometry.artifact_scope_projection_hash
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_artifact_projection_changed"
+        )
+
+
+async def _discover_provider_directory_artifact_scope_tables(
+    schema: str,
+) -> list[str]:
+    """Return prior scratch tables without mutating admitted state."""
+
     prefixes = tuple(
         sorted(
             {
-                f"{model.__tablename__}_artifact_scope_"
+                _provider_directory_artifact_scope_table_prefix(
+                    model.__tablename__
+                )
+                + "_"
                 for model in (ProviderDirectorySource, *RESOURCE_MODELS)
             }
         )
@@ -11684,8 +15228,17 @@ async def _reap_provider_directory_artifact_scope_tables(schema: str) -> list[st
         ))
         and any(table_name.startswith(prefix) for prefix in prefixes)
     )
+    return table_names
+
+
+async def _reap_provider_directory_artifact_scope_tables(schema: str) -> list[str]:
+    table_names = await _discover_provider_directory_artifact_scope_tables(
+        schema
+    )
     for table_name in table_names:
-        await db.status(f"DROP TABLE IF EXISTS {_qt(schema, table_name)};")
+        await _provider_directory_profile_capacity_status(
+            f"DROP TABLE IF EXISTS {_qt(schema, table_name)};"
+        )
     return table_names
 
 
@@ -11703,12 +15256,226 @@ def _provider_directory_artifact_scope_table_name(
     table_name: str,
     run_id: str | None,
 ) -> str:
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is not None:
+        if run_id != admission.run_id:
+            raise RuntimeError(
+                "provider_directory_artifact_scope_owner_run_changed"
+            )
+        return _owned_artifact_scope_name(
+            table_name,
+            run_id=admission.run_id,
+        )
     identity = (
         f"{table_name}:{run_id or 'artifact'}:{os.getpid()}:"
         f"{time.time_ns()}:{os.urandom(8).hex()}"
     )
     digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:16]
-    return _bounded_identifier(f"{table_name}_artifact_scope_{digest}")
+    return (
+        _provider_directory_artifact_scope_table_prefix(table_name)
+        + "_"
+        + digest
+    )
+
+
+def _provider_directory_artifact_scope_table_prefix(
+    table_name: str,
+) -> str:
+    """Return one stable, discoverable prefix with room for owner identity."""
+
+    raw_prefix = f"{table_name}_artifact_scope"
+    maximum_prefix_length = POSTGRES_IDENTIFIER_MAX_LENGTH - 33
+    if len(raw_prefix) <= maximum_prefix_length:
+        return raw_prefix
+    digest = hashlib.sha1(table_name.encode("utf-8")).hexdigest()[:8]
+    readable_length = maximum_prefix_length - len(digest) - 1
+    return f"{raw_prefix[:readable_length]}_{digest}"
+
+
+def _owned_artifact_scope_name(
+    table_name: str,
+    *,
+    run_id: str,
+) -> str:
+    """Bind one scratch name to its exact immutable control-run owner."""
+
+    owner_match = re.fullmatch(r"run_([0-9a-f]{32})", run_id)
+    if owner_match is None:
+        raise RuntimeError(
+            "provider_directory_artifact_scope_owner_identity_invalid"
+        )
+    return (
+        _provider_directory_artifact_scope_table_prefix(table_name)
+        + "_"
+        + owner_match.group(1)
+    )
+
+
+@dataclass(frozen=True)
+class _ArtifactScopeConsumptionOwner:
+    run_id: str
+    build_id: str
+    capacity_geometry_hash: str
+    status: str
+    finished_at: Any
+    consumption: dict[str, Any]
+
+
+def _artifact_scope_owner_from_row(
+    owner_row: Any,
+) -> _ArtifactScopeConsumptionOwner:
+    """Validate one immutable scratch-owner ledger row."""
+
+    owner_map = dict(_pagination_checkpoint_row_mapping(owner_row))
+    run_id = _clean_text(owner_map.get("run_id"))
+    build_id = _clean_text(owner_map.get("build_id"))
+    geometry_hash = _clean_text(
+        owner_map.get("capacity_geometry_hash")
+    )
+    status = _clean_text(owner_map.get("status"))
+    if (
+        run_id is None
+        or build_id is None
+        or geometry_hash is None
+        or status is None
+        or _clean_text(owner_map.get("importer"))
+        != "provider-directory-fhir"
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_owner_invalid"
+        )
+    return _ArtifactScopeConsumptionOwner(
+        run_id=run_id,
+        build_id=build_id,
+        capacity_geometry_hash=geometry_hash,
+        status=status,
+        finished_at=owner_map.get("finished_at"),
+        consumption=owner_map,
+    )
+
+
+def _artifact_scope_owner_relation_names(
+    owner: _ArtifactScopeConsumptionOwner,
+) -> dict[str, str]:
+    """Return every exact relation name owned by one consumed lease."""
+
+    return {
+        model.__tablename__: _owned_artifact_scope_name(
+            model.__tablename__,
+            run_id=owner.run_id,
+        )
+        for model in (ProviderDirectorySource, *RESOURCE_MODELS)
+    }
+
+
+async def _artifact_scope_owner_rows(
+    schema: str,
+    owner_run_ids: tuple[str, ...],
+) -> tuple[_ArtifactScopeConsumptionOwner, ...]:
+    """Load a bounded exact set of scratch owners from immutable capacity use."""
+    consumption_ref = _unscoped_qt(
+        schema,
+        ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__,
+    )
+    import_run_ref = _unscoped_qt(schema, ImportRun.__tablename__)
+    owner_rows = await db.all(
+        f"""
+        SELECT consumption.attestation_id,
+               consumption.lease_digest,
+               consumption.capacity_geometry_hash,
+               consumption.executable_plan_hash,
+               consumption.selection_proof_id,
+               consumption.source_vector_hash,
+               consumption.source_context_vector_hash,
+               consumption.run_id,
+               consumption.build_id,
+               consumption.profile_as_of,
+               control.importer,
+               control.status,
+               control.finished_at
+          FROM {consumption_ref} AS consumption
+          LEFT JOIN {import_run_ref} AS control
+            ON control.run_id = consumption.run_id
+         WHERE consumption.run_id = ANY(CAST(:owner_run_ids AS varchar[]))
+         ORDER BY consumption.run_id;
+        """,
+        owner_run_ids=list(owner_run_ids),
+    )
+    return tuple(
+        _artifact_scope_owner_from_row(owner_row)
+        for owner_row in owner_rows
+    )
+
+
+def _current_artifact_scope_owner(
+    owners: tuple[_ArtifactScopeConsumptionOwner, ...],
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> _ArtifactScopeConsumptionOwner:
+    """Return the one exact current run owner or refuse ledger drift."""
+    current_owners = tuple(
+        owner for owner in owners if owner.run_id == admission.run_id
+    )
+    expected_consumption = _expected_profile_capacity_consumption(admission)
+    if len(current_owners) != 1 or {
+        field_name: current_owners[0].consumption.get(field_name)
+        for field_name in expected_consumption
+    } != expected_consumption:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_current_owner_invalid"
+        )
+    if current_owners[0].status != "running":
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_current_owner_inactive"
+        )
+    return current_owners[0]
+
+
+def _assert_prior_artifact_scope_owners_terminal(
+    owners: tuple[_ArtifactScopeConsumptionOwner, ...],
+    current_run_id: str,
+) -> None:
+    terminal_statuses = {
+        "succeeded",
+        "failed",
+        "canceled",
+        "cancelled",
+        "dead_letter",
+    }
+    if any(
+        owner.status not in terminal_statuses
+        or owner.finished_at is None
+        for owner in owners
+        if owner.run_id != current_run_id
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_competing_owner"
+        )
+
+
+async def _artifact_scope_consumption_owners(
+    schema: str,
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    prior_run_ids: Iterable[str],
+) -> tuple[_ArtifactScopeConsumptionOwner, ...]:
+    """Validate current and exact prior owners of one bounded scratch set."""
+    owner_run_ids = tuple(
+        sorted({admission.run_id, *prior_run_ids})
+    )
+    if len(owner_run_ids) > 2:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_owner_ambiguous"
+        )
+    owners = await _artifact_scope_owner_rows(schema, owner_run_ids)
+    if {owner.run_id for owner in owners} != set(owner_run_ids):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_owner_invalid"
+        )
+    _current_artifact_scope_owner(owners, admission)
+    _assert_prior_artifact_scope_owners_terminal(
+        owners,
+        admission.run_id,
+    )
+    return owners
 
 
 def _provider_directory_artifact_scope_table_sql(
@@ -11762,13 +15529,58 @@ async def _build_artifact_scope_pk(
     model: Any,
     schema: str,
     table_name: str,
+    *,
+    status_executor: Callable[..., Awaitable[Any]] | None = None,
 ) -> None:
+    execute_status = (
+        status_executor
+        or _provider_directory_profile_capacity_status
+    )
     for statement in _artifact_scope_pk_sql(
         model,
         schema,
         table_name,
     ):
-        await db.status(statement)
+        await execute_status(statement)
+
+
+async def _create_provider_directory_artifact_scope_layout(
+    model: Any,
+    schema: str,
+    table_name: str,
+    *,
+    status_executor: Callable[..., Awaitable[Any]] | None = None,
+) -> None:
+    """Create the complete empty layout before any scope payload write."""
+
+    execute_status = (
+        status_executor
+        or _provider_directory_profile_capacity_status
+    )
+    await execute_status(
+        _provider_directory_artifact_scope_table_sql(
+            model,
+            schema,
+            table_name,
+        )
+    )
+    await _build_artifact_scope_pk(
+        model,
+        schema,
+        table_name,
+        status_executor=execute_status,
+    )
+    if model in {
+        ProviderDirectoryPractitionerRole,
+        ProviderDirectoryOrganizationAffiliation,
+    }:
+        _index_name, index_sql = (
+            _provider_directory_profile_bucket_index_sql(
+                schema,
+                table_name,
+            )
+        )
+        await execute_status(index_sql)
 
 
 def _provider_directory_artifact_payload_column_sql(column: Any) -> str:
@@ -11794,19 +15606,89 @@ def _provider_directory_artifact_payload_column_sql(column: Any) -> str:
     )
 
 
-def _provider_directory_artifact_resource_insert_sql(
+def _provider_directory_artifact_source_select_sql(
+    model: Any,
+    schema: str,
+) -> str:
+    """Select the exact typed source rows used by count and insert."""
+
+    columns = ", ".join(
+        f"source.{_q(column.name)}" for column in model.__table__.columns
+    )
+    return f"""
+        SELECT {columns}
+          FROM {_qt(schema, model.__tablename__)} AS source
+         WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
+         ORDER BY source.source_id
+    """.strip()
+
+
+def _provider_directory_artifact_source_insert_sql(
     model: Any,
     schema: str,
     table_name: str,
 ) -> str:
+    """Insert the exact typed source-row SELECT used by projection."""
+
+    columns = ", ".join(_q(column.name) for column in model.__table__.columns)
+    select_sql = _provider_directory_artifact_source_select_sql(
+        model,
+        schema,
+    )
+    return f"""
+        INSERT INTO {_qt(schema, table_name)} ({columns})
+        {select_sql};
+    """
+
+
+def _provider_directory_artifact_projection_count_sql(
+    select_sql: str,
+    *,
+    cursor_column: str | None = None,
+) -> str:
+    """Measure one exact projected SELECT without materializing its payload."""
+
+    cursor_projection = (
+        f",\n               MAX({_q(cursor_column)})::varchar AS last_cursor"
+        if cursor_column is not None
+        else ""
+    )
+    return f"""
+        WITH projected_rows AS MATERIALIZED (
+            {select_sql}
+        )
+        SELECT COUNT(*)::bigint AS projected_rows,
+               COALESCE(
+                   SUM(pg_column_size(projected_rows)),
+                   0
+               )::bigint AS projected_logical_bytes{cursor_projection}
+          FROM projected_rows;
+    """
+
+
+def _provider_directory_artifact_source_projection_sql(
+    model: Any,
+    schema: str,
+) -> str:
+    """Measure the same typed source-row SELECT used by materialization."""
+
+    return _provider_directory_artifact_projection_count_sql(
+        _provider_directory_artifact_source_select_sql(model, schema)
+    )
+
+
+def _provider_directory_artifact_resource_select_sql(
+    model: Any,
+    schema: str,
+) -> str:
+    """Select the exact typed resource rows used by the unbounded insert."""
+
     columns = list(model.__table__.columns)
-    column_names = ", ".join(_q(column.name) for column in columns)
     selected_columns = ",\n            ".join(
         _provider_directory_artifact_payload_column_sql(column)
         for column in columns
     )
     return f"""
-        INSERT INTO {_qt(schema, table_name)} ({column_names})
         WITH selected(source_id, dataset_id, evidence_run_id) AS (
             SELECT *
               FROM unnest(
@@ -11821,35 +15703,980 @@ def _provider_directory_artifact_resource_insert_sql(
             ON dataset.dataset_id = selected.dataset_id
           JOIN {_qt(schema, ProviderDirectoryDatasetResource.__tablename__)} AS resource
             ON resource.dataset_id = selected.dataset_id
-           AND resource.resource_type = :resource_type;
+           AND resource.resource_type = :resource_type
+    """.strip()
+
+
+def _provider_directory_artifact_resource_insert_sql(
+    model: Any,
+    schema: str,
+    table_name: str,
+) -> str:
+    columns = list(model.__table__.columns)
+    column_names = ", ".join(_q(column.name) for column in columns)
+    select_sql = _provider_directory_artifact_resource_select_sql(
+        model,
+        schema,
+    )
+    return f"""
+        INSERT INTO {_qt(schema, table_name)} ({column_names})
+        {select_sql};
     """
+
+
+def _artifact_resource_batch_select_sql(
+    model: Any,
+    schema: str,
+) -> str:
+    """Select the exact typed keyset batch used by count and insert."""
+
+    columns = list(model.__table__.columns)
+    selected_columns = ",\n            ".join(
+        _provider_directory_artifact_payload_column_sql(column)
+        for column in columns
+    )
+    return f"""
+        WITH selected(source_id, dataset_id, evidence_run_id) AS (
+            VALUES (
+                CAST(:source_id AS varchar),
+                CAST(:dataset_id AS varchar),
+                CAST(:evidence_run_id AS varchar)
+            )
+        ), resource_batch AS MATERIALIZED (
+            SELECT resource.*
+              FROM {_qt(schema, ProviderDirectoryDatasetResource.__tablename__)}
+                   AS resource
+             WHERE resource.dataset_id = CAST(:dataset_id AS varchar)
+               AND resource.resource_type = CAST(:resource_type AS varchar)
+               AND (
+                    CAST(:after_resource_id AS varchar) IS NULL
+                    OR resource.resource_id
+                       > CAST(:after_resource_id AS varchar)
+               )
+             ORDER BY resource.resource_id
+             LIMIT CAST(:scope_batch_size AS integer)
+        )
+        SELECT {selected_columns}
+          FROM selected
+          JOIN {_qt(schema, ProviderDirectoryEndpointDataset.__tablename__)}
+               AS dataset
+            ON dataset.dataset_id = selected.dataset_id
+          JOIN resource_batch AS resource
+            ON resource.dataset_id = selected.dataset_id
+         ORDER BY resource.resource_id
+    """.strip()
+
+
+def _artifact_resource_batch_insert_sql(
+    model: Any,
+    schema: str,
+    table_name: str,
+) -> str:
+    """Build one keyset-bounded immutable dataset projection insert."""
+
+    columns = list(model.__table__.columns)
+    column_names = ", ".join(_q(column.name) for column in columns)
+    select_sql = _artifact_resource_batch_select_sql(
+        model,
+        schema,
+    )
+    return f"""
+        INSERT INTO {_qt(schema, table_name)} ({column_names})
+        {select_sql};
+    """
+
+
+def _artifact_resource_batch_projection_sql(
+    model: Any,
+    schema: str,
+) -> str:
+    """Measure the same typed resource batch used by materialization."""
+
+    return _provider_directory_artifact_projection_count_sql(
+        _artifact_resource_batch_select_sql(
+            model,
+            schema,
+        ),
+        cursor_column="resource_id",
+    )
+
+
+def _provider_directory_artifact_projection_values(
+    row: Any,
+) -> tuple[int, int, str | None]:
+    """Normalize one exact projection result and reject invalid counters."""
+
+    row_map = _pagination_checkpoint_row_mapping(row)
+    projected_rows = int(row_map.get("projected_rows") or 0)
+    projected_logical_bytes = int(
+        row_map.get("projected_logical_bytes") or 0
+    )
+    if projected_rows < 0 or projected_logical_bytes < 0:
+        raise RuntimeError(
+            "provider_directory_artifact_scope_projection_invalid"
+        )
+    return (
+        projected_rows,
+        projected_logical_bytes,
+        _clean_text(row_map.get("last_cursor")),
+    )
+
+
+async def _provider_directory_artifact_source_exact_projection(
+    schema: str,
+    source_ids: list[str],
+) -> _ProviderDirectoryArtifactScopeTableProjection:
+    """Project the exact ProviderDirectorySource rows and logical bytes."""
+
+    model = ProviderDirectorySource
+    projection_sql = _provider_directory_artifact_source_projection_sql(
+        model,
+        schema,
+    )
+    batches: list[_ProviderDirectoryArtifactScopeBatchProjection] = []
+    for batch_number, source_id in enumerate(
+        sorted(set(source_ids)),
+        start=1,
+    ):
+        projection_row = await db.first(
+            projection_sql,
+            source_ids=[source_id],
+        )
+        batch_rows, batch_logical_bytes, _ = (
+            _provider_directory_artifact_projection_values(projection_row)
+        )
+        if batch_rows != 1:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_source_projection_changed"
+            )
+        batches.append(
+            _ProviderDirectoryArtifactScopeBatchProjection(
+                batch_number=batch_number,
+                source_id=source_id,
+                dataset_id=None,
+                evidence_run_id=None,
+                resource_type="source",
+                after_resource_id=None,
+                last_resource_id=None,
+                projected_rows=batch_rows,
+                projected_logical_bytes=batch_logical_bytes,
+            )
+        )
+    return _ProviderDirectoryArtifactScopeTableProjection(
+        table_name=model.__tablename__,
+        resource_type="source",
+        projected_rows=sum(batch.projected_rows for batch in batches),
+        projected_logical_bytes=sum(
+            batch.projected_logical_bytes for batch in batches
+        ),
+        batches=tuple(batches),
+    )
+
+
+async def _artifact_resource_projection_batch(
+    schema: str,
+    model: Any,
+    dataset: ProviderDirectoryArtifactDataset,
+    resource_type: str,
+    *,
+    batch_size: int,
+    after_resource_id: str | None,
+    batch_number: int,
+) -> _ProviderDirectoryArtifactScopeBatchProjection:
+    """Project and validate one typed resource keyset batch."""
+
+    projection_row = await db.first(
+        _artifact_resource_batch_projection_sql(model, schema),
+        source_id=dataset.source_id,
+        dataset_id=dataset.dataset_id,
+        evidence_run_id=dataset.evidence_run_id,
+        resource_type=resource_type,
+        after_resource_id=after_resource_id,
+        scope_batch_size=batch_size,
+    )
+    batch_rows, batch_logical_bytes, next_resource_id = (
+        _provider_directory_artifact_projection_values(projection_row)
+    )
+    if batch_rows > batch_size:
+        raise RuntimeError(
+            "provider_directory_artifact_scope_batch_row_count_invalid"
+        )
+    if batch_rows == 0 and (
+        batch_logical_bytes != 0 or next_resource_id is not None
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_scope_terminal_projection_invalid"
+        )
+    if batch_rows > 0 and (
+        next_resource_id is None
+        or next_resource_id == after_resource_id
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_scope_batch_cursor_invalid"
+        )
+    return _ProviderDirectoryArtifactScopeBatchProjection(
+        batch_number=batch_number,
+        source_id=dataset.source_id,
+        dataset_id=dataset.dataset_id,
+        evidence_run_id=dataset.evidence_run_id,
+        resource_type=resource_type,
+        after_resource_id=after_resource_id,
+        last_resource_id=next_resource_id,
+        projected_rows=batch_rows,
+        projected_logical_bytes=batch_logical_bytes,
+    )
+
+
+async def _artifact_resource_dataset_exact_projection(
+    schema: str,
+    model: Any,
+    dataset: ProviderDirectoryArtifactDataset,
+    resource_type: str,
+    *,
+    batch_size: int,
+) -> tuple[
+    int,
+    int,
+    tuple[_ProviderDirectoryArtifactScopeBatchProjection, ...],
+]:
+    """Project one alias-aware resource dataset in exact keyset batches."""
+
+    batches: list[_ProviderDirectoryArtifactScopeBatchProjection] = []
+    after_resource_id: str | None = None
+    while True:
+        batch = await _artifact_resource_projection_batch(
+            schema,
+            model,
+            dataset,
+            resource_type,
+            batch_size=batch_size,
+            after_resource_id=after_resource_id,
+            batch_number=len(batches) + 1,
+        )
+        batches.append(batch)
+        if batch.projected_rows == 0:
+            break
+        after_resource_id = batch.last_resource_id
+    return (
+        sum(batch.projected_rows for batch in batches),
+        sum(batch.projected_logical_bytes for batch in batches),
+        tuple(batches),
+    )
+
+
+async def _provider_directory_artifact_resource_exact_projection(
+    schema: str,
+    model: Any,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
+    *,
+    batch_size: int,
+) -> _ProviderDirectoryArtifactScopeTableProjection:
+    """Project one resource scope table across all selected aliases."""
+
+    resource_type = RESOURCE_TYPES_BY_MODEL[model]
+    projected_rows = 0
+    projected_logical_bytes = 0
+    batches: list[_ProviderDirectoryArtifactScopeBatchProjection] = []
+    selected_datasets = sorted(
+        (
+            dataset
+            for dataset in fence.datasets
+            if resource_type in resource_types
+            and resource_type in dataset.selected_resources
+        ),
+        key=lambda item: (item.source_id, item.dataset_id),
+    )
+    for dataset in selected_datasets:
+        dataset_rows, dataset_logical_bytes, dataset_batches = (
+            await _artifact_resource_dataset_exact_projection(
+                schema,
+                model,
+                dataset,
+                resource_type,
+                batch_size=batch_size,
+            )
+        )
+        projected_rows += dataset_rows
+        projected_logical_bytes += dataset_logical_bytes
+        batches.extend(dataset_batches)
+    return _ProviderDirectoryArtifactScopeTableProjection(
+        table_name=model.__tablename__,
+        resource_type=resource_type,
+        projected_rows=projected_rows,
+        projected_logical_bytes=projected_logical_bytes,
+        batches=tuple(batches),
+    )
+
+
+async def _provider_directory_artifact_scope_exact_projection(
+    schema: str,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
+    *,
+    source_fence: ProviderDirectoryArtifactDatasetFence | None = None,
+    batch_size: int | None = None,
+) -> _ProviderDirectoryArtifactScopeExactProjection:
+    """Return a canonical exact projection for source and resource tables."""
+
+    resolved_batch_size = (
+        batch_size or _provider_directory_artifact_scope_batch_size()
+    )
+    resolved_source_fence = source_fence or fence
+    source_projection = (
+        await _provider_directory_artifact_source_exact_projection(
+            schema,
+            [
+                dataset.source_id
+                for dataset in resolved_source_fence.datasets
+            ],
+        )
+    )
+    resource_projections: list[
+        _ProviderDirectoryArtifactScopeTableProjection
+    ] = []
+    for model in RESOURCE_MODELS:
+        resource_projections.append(
+            await _provider_directory_artifact_resource_exact_projection(
+                schema,
+                model,
+                fence,
+                resource_types,
+                batch_size=resolved_batch_size,
+            )
+        )
+    return _ProviderDirectoryArtifactScopeExactProjection(
+        tables=(source_projection, *tuple(resource_projections))
+    )
+
+
+def _assert_artifact_source_batches(
+    source_ids: list[str],
+    projection: _ProviderDirectoryArtifactScopeTableProjection,
+) -> None:
+    """Refuse an incomplete or reordered signed source write plan."""
+
+    expected_source_ids = sorted(set(source_ids))
+    if (
+        projection.resource_type != "source"
+        or len(projection.batches) != len(expected_source_ids)
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_scope_batch_projection_invalid"
+        )
+    for batch_number, (source_id, batch) in enumerate(
+        zip(
+            expected_source_ids,
+            projection.batches,
+            strict=True,
+        ),
+        start=1,
+    ):
+        if (
+            batch.batch_number != batch_number
+            or batch.source_id != source_id
+            or batch.dataset_id is not None
+            or batch.evidence_run_id is not None
+            or batch.resource_type != "source"
+            or batch.after_resource_id is not None
+            or batch.last_resource_id is not None
+            or batch.projected_rows != 1
+            or batch.projected_logical_bytes < 1
+        ):
+            raise RuntimeError(
+                "provider_directory_artifact_scope_batch_projection_invalid"
+            )
+
+
+def _assert_artifact_resource_batches(
+    dataset: ProviderDirectoryArtifactDataset,
+    resource_type: str,
+    projection_batches: tuple[
+        _ProviderDirectoryArtifactScopeBatchProjection,
+        ...,
+    ],
+    *,
+    batch_size: int,
+) -> None:
+    """Require a complete ordered plan ending in one signed zero probe."""
+
+    if not projection_batches:
+        raise RuntimeError(
+            "provider_directory_artifact_scope_batch_projection_invalid"
+        )
+    after_resource_id: str | None = None
+    for batch_number, batch in enumerate(projection_batches, start=1):
+        is_terminal = batch_number == len(projection_batches)
+        if (
+            batch.batch_number != batch_number
+            or batch.source_id != dataset.source_id
+            or batch.dataset_id != dataset.dataset_id
+            or batch.evidence_run_id != dataset.evidence_run_id
+            or batch.resource_type != resource_type
+            or batch.after_resource_id != after_resource_id
+        ):
+            raise RuntimeError(
+                "provider_directory_artifact_scope_batch_projection_invalid"
+            )
+        if is_terminal:
+            if (
+                batch.projected_rows != 0
+                or batch.projected_logical_bytes != 0
+                or batch.last_resource_id is not None
+            ):
+                raise RuntimeError(
+                    "provider_directory_artifact_scope_terminal_projection_invalid"
+                )
+            continue
+        if (
+            not 1 <= batch.projected_rows <= batch_size
+            or batch.projected_logical_bytes < 1
+            or batch.last_resource_id is None
+            or batch.last_resource_id == after_resource_id
+        ):
+            raise RuntimeError(
+                "provider_directory_artifact_scope_batch_projection_invalid"
+            )
+        after_resource_id = batch.last_resource_id
+
+
+def _artifact_source_scope_batches(
+    source_ids: Iterable[str],
+    projection: _ProviderDirectoryArtifactScopeTableProjection | None,
+) -> tuple[_ProviderDirectoryArtifactScopeBatchProjection, ...]:
+    """Return frozen or synthetic source-scope batches."""
+    if projection is not None:
+        return projection.batches
+    return tuple(
+        _ProviderDirectoryArtifactScopeBatchProjection(
+            batch_number=batch_number,
+            source_id=source_id,
+            dataset_id=None,
+            evidence_run_id=None,
+            resource_type="source",
+            after_resource_id=None,
+            last_resource_id=None,
+            projected_rows=-1,
+            projected_logical_bytes=0,
+        )
+        for batch_number, source_id in enumerate(
+            sorted(set(source_ids)),
+            start=1,
+        )
+    )
+
+
+def _validate_artifact_source_batch(
+    batch: _ProviderDirectoryArtifactScopeBatchProjection,
+    expected_batch_number: int,
+) -> None:
+    """Require one source batch to retain its frozen coordinate."""
+    if (
+        batch.batch_number != expected_batch_number
+        or batch.resource_type != "source"
+        or batch.dataset_id is not None
+        or batch.evidence_run_id is not None
+        or batch.after_resource_id is not None
+        or batch.last_resource_id is not None
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_scope_batch_projection_invalid"
+        )
+
+
+async def _insert_artifact_source_batch(
+    batch: _ProviderDirectoryArtifactScopeBatchProjection,
+    projection: _ProviderDirectoryArtifactScopeTableProjection | None,
+    projection_sql: str,
+    insert_sql: str,
+) -> int:
+    """Validate and insert one source-scope batch under admission."""
+    if projection is not None:
+        projection_row = await db.first(
+            projection_sql,
+            source_ids=[batch.source_id],
+        )
+        observed_rows, observed_bytes, observed_cursor = (
+            _provider_directory_artifact_projection_values(projection_row)
+        )
+        if (
+            observed_rows != batch.projected_rows
+            or observed_bytes != batch.projected_logical_bytes
+            or observed_cursor is not None
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_source_projection_changed"
+            )
+    return _coerce_rowcount(
+        await db.status(insert_sql, source_ids=[batch.source_id])
+    )
+
+
+async def _execute_artifact_source_batch(
+    batch: _ProviderDirectoryArtifactScopeBatchProjection,
+    projection: _ProviderDirectoryArtifactScopeTableProjection | None,
+    projection_sql: str,
+    insert_sql: str,
+) -> int:
+    """Execute one source batch through its capacity-safe path."""
+    admission = _provider_directory_profile_capacity_admission()
+    if projection is None:
+        return _coerce_rowcount(
+            await _provider_directory_profile_capacity_status(
+                insert_sql,
+                source_ids=[batch.source_id],
+            )
+        )
+    if admission is not None:
+        await _reserve_provider_directory_profile_wal_budget(
+            admission,
+            control_operation_counts={"artifact_scope_payload": 1},
+        )
+        async with _provider_directory_profile_capacity_transaction():
+            return await _insert_artifact_source_batch(
+                batch, projection, projection_sql, insert_sql
+            )
+    return await _insert_artifact_source_batch(
+        batch, projection, projection_sql, insert_sql
+    )
+
+
+async def _analyze_artifact_scope_table(
+    schema: str,
+    table_name: str,
+) -> None:
+    """Analyze one artifact-scope table under its signed WAL budget."""
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is not None:
+        await _reserve_provider_directory_profile_wal_budget(
+            admission,
+            control_operation_counts={"artifact_scope_analyze": 1},
+        )
+    await _provider_directory_profile_capacity_status(
+        f"ANALYZE {_qt(schema, table_name)};"
+    )
 
 
 async def _materialize_provider_directory_artifact_source_scope(
     schema: str,
     table_name: str,
     source_ids: list[str],
-) -> None:
+    *,
+    projection: (
+        _ProviderDirectoryArtifactScopeTableProjection | None
+    ) = None,
+) -> int:
+    """Materialize the exact bounded source rows for an artifact scope."""
+
     model = ProviderDirectorySource
-    await db.status(
-        _provider_directory_artifact_scope_table_sql(model, schema, table_name)
-    )
-    columns = ", ".join(_q(column.name) for column in model.__table__.columns)
-    await db.status(
-        f"""
-        INSERT INTO {_qt(schema, table_name)} ({columns})
-        SELECT {columns}
-          FROM {_qt(schema, model.__tablename__)}
-         WHERE source_id = ANY(CAST(:source_ids AS varchar[]));
-        """,
-        source_ids=source_ids,
-    )
-    await _build_artifact_scope_pk(
+    insert_sql = _provider_directory_artifact_source_insert_sql(
         model,
         schema,
         table_name,
     )
-    await db.status(f"ANALYZE {_qt(schema, table_name)};")
+    projection_sql = _provider_directory_artifact_source_projection_sql(
+        model,
+        schema,
+    )
+    if projection is not None:
+        _assert_provider_directory_artifact_source_projection_batches(
+            source_ids,
+            projection,
+        )
+    batches = _artifact_source_scope_batches(source_ids, projection)
+    total_rows = 0
+    for expected_batch_number, batch in enumerate(batches, start=1):
+        if projection is not None:
+            _validate_artifact_source_batch(batch, expected_batch_number)
+        inserted_rows = await _execute_artifact_source_batch(
+            batch,
+            projection,
+            projection_sql,
+            insert_sql,
+        )
+        if (
+            inserted_rows < 0
+            or (
+                projection is not None
+                and inserted_rows != batch.projected_rows
+            )
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_source_projection_changed"
+            )
+        total_rows += inserted_rows
+    if (
+        projection is not None
+        and total_rows != projection.projected_rows
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_source_projection_changed"
+        )
+    await _analyze_artifact_scope_table(schema, table_name)
+    return total_rows
+
+
+@dataclass
+class _ArtifactResourceMaterializationState:
+    after_resource_id: str | None = None
+    total_rows: int = 0
+    batch_number: int = 0
+    expected_batch_number: int = 0
+    is_terminal_projection_observed: bool = False
+
+
+@dataclass(frozen=True)
+class _ArtifactResourceMaterializationContext:
+    schema: str
+    table_name: str
+    model: Any
+    dataset: ProviderDirectoryArtifactDataset
+    resource_type: str
+    insert_sql: str
+    batch_size: int
+
+
+_ArtifactScopeBatchProjectionPlan = tuple[
+    _ProviderDirectoryArtifactScopeBatchProjection,
+    ...,
+]
+
+
+def _validate_artifact_resource_batch_coordinate(
+    expected_batch: _ProviderDirectoryArtifactScopeBatchProjection | None,
+    state: _ArtifactResourceMaterializationState,
+    dataset: ProviderDirectoryArtifactDataset,
+    resource_type: str,
+) -> None:
+    """Require one projected batch to retain its immutable coordinate."""
+    if expected_batch is not None and (
+        expected_batch.batch_number != state.expected_batch_number
+        or expected_batch.source_id != dataset.source_id
+        or expected_batch.dataset_id != dataset.dataset_id
+        or expected_batch.evidence_run_id != dataset.evidence_run_id
+        or expected_batch.resource_type != resource_type
+        or expected_batch.after_resource_id != state.after_resource_id
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_scope_batch_projection_invalid"
+        )
+
+
+async def _insert_projected_artifact_resource_batch(
+    model: Any,
+    schema: str,
+    insert_sql: str,
+    insert_params_by_name: Mapping[str, Any],
+    expected_batch: _ProviderDirectoryArtifactScopeBatchProjection,
+) -> int:
+    """Insert one projected resource batch after exact preflight."""
+    projection_row = await db.first(
+        _artifact_resource_batch_projection_sql(model, schema),
+        **insert_params_by_name,
+    )
+    observed_rows, observed_bytes, observed_cursor = (
+        _provider_directory_artifact_projection_values(projection_row)
+    )
+    if (
+        observed_rows != expected_batch.projected_rows
+        or observed_bytes != expected_batch.projected_logical_bytes
+        or observed_cursor != expected_batch.last_resource_id
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_resource_projection_changed"
+        )
+    if observed_rows == 0:
+        return 0
+    return _coerce_rowcount(
+        await db.status(insert_sql, **insert_params_by_name)
+    )
+
+
+async def _execute_artifact_resource_batch(
+    model: Any,
+    schema: str,
+    insert_sql: str,
+    insert_params_by_name: Mapping[str, Any],
+    expected_batch: (
+        _ProviderDirectoryArtifactScopeBatchProjection | None
+    ),
+) -> int:
+    """Execute one resource batch through projected or legacy admission."""
+    admission = _provider_directory_profile_capacity_admission()
+    if expected_batch is not None and admission is not None:
+        if expected_batch.projected_rows > 0:
+            await _reserve_provider_directory_profile_wal_budget(
+                admission,
+                control_operation_counts={"artifact_scope_payload": 1},
+            )
+        async with _provider_directory_profile_capacity_transaction():
+            return await _insert_projected_artifact_resource_batch(
+                model,
+                schema,
+                insert_sql,
+                insert_params_by_name,
+                expected_batch,
+            )
+    if expected_batch is not None:
+        return await _insert_projected_artifact_resource_batch(
+            model,
+            schema,
+            insert_sql,
+            insert_params_by_name,
+            expected_batch,
+        )
+    return _coerce_rowcount(
+        await _provider_directory_profile_capacity_status(
+            insert_sql,
+            **insert_params_by_name,
+        )
+    )
+
+
+async def _next_artifact_resource_id(
+    schema: str,
+    table_name: str,
+    dataset: ProviderDirectoryArtifactDataset,
+    previous_resource_id: str | None,
+) -> str:
+    """Return the next strict keyset cursor for a legacy batch."""
+    next_resource_id = _clean_text(
+        await db.scalar(
+            f"SELECT MAX(resource_id) FROM {_qt(schema, table_name)} "
+            "WHERE source_id = :source_id;",
+            source_id=dataset.source_id,
+        )
+    )
+    if (
+        next_resource_id is None
+        or next_resource_id == previous_resource_id
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_scope_batch_cursor_invalid"
+        )
+    return next_resource_id
+
+
+def _log_artifact_resource_batch(
+    context: _ArtifactResourceMaterializationContext,
+    state: _ArtifactResourceMaterializationState,
+    inserted_rows: int,
+    batch_started_at: float,
+) -> None:
+    """Log one completed artifact resource batch."""
+    LOGGER.info(
+        "Materialized Provider Directory artifact scope batch "
+        "table=%s source_id=%s dataset_id=%s resource_type=%s "
+        "batch=%d rows=%d total_rows=%d elapsed_seconds=%.3f",
+        context.table_name,
+        context.dataset.source_id,
+        context.dataset.dataset_id,
+        context.resource_type,
+        state.batch_number,
+        inserted_rows,
+        state.total_rows,
+        time.monotonic() - batch_started_at,
+    )
+
+
+async def _is_artifact_resource_iteration_continuing(
+    context: _ArtifactResourceMaterializationContext,
+    state: _ArtifactResourceMaterializationState,
+    expected_batch: _ProviderDirectoryArtifactScopeBatchProjection | None,
+) -> bool:
+    """Execute one resource batch and advance its bounded cursor."""
+    _validate_artifact_resource_batch_coordinate(
+        expected_batch,
+        state,
+        context.dataset,
+        context.resource_type,
+    )
+    batch_started_at = time.monotonic()
+    insert_params_by_name = {
+        "source_id": context.dataset.source_id,
+        "dataset_id": context.dataset.dataset_id,
+        "evidence_run_id": context.dataset.evidence_run_id,
+        "resource_type": context.resource_type,
+        "after_resource_id": state.after_resource_id,
+        "scope_batch_size": context.batch_size,
+    }
+    inserted_rows = await _execute_artifact_resource_batch(
+        context.model,
+        context.schema,
+        context.insert_sql,
+        insert_params_by_name,
+        expected_batch,
+    )
+    _validate_artifact_resource_inserted_rows(
+        inserted_rows,
+        context.batch_size,
+        expected_batch,
+    )
+    if inserted_rows == 0:
+        state.is_terminal_projection_observed = expected_batch is not None
+        return False
+    state.total_rows += inserted_rows
+    state.batch_number += 1
+    _log_artifact_resource_batch(
+        context,
+        state,
+        inserted_rows,
+        batch_started_at,
+    )
+    if expected_batch is not None:
+        if expected_batch.last_resource_id is None:
+            raise RuntimeError(
+                "provider_directory_artifact_scope_batch_projection_invalid"
+            )
+        state.after_resource_id = expected_batch.last_resource_id
+        return True
+    if inserted_rows < context.batch_size:
+        return False
+    state.after_resource_id = await _next_artifact_resource_id(
+        context.schema,
+        context.table_name,
+        context.dataset,
+        state.after_resource_id,
+    )
+    return True
+
+
+def _validate_artifact_resource_inserted_rows(
+    inserted_rows: int,
+    batch_size: int,
+    expected_batch: (
+        _ProviderDirectoryArtifactScopeBatchProjection | None
+    ),
+) -> None:
+    """Require observed rows to fit both batch and signed projection."""
+    if inserted_rows < 0 or inserted_rows > batch_size:
+        raise RuntimeError(
+            "provider_directory_artifact_scope_batch_row_count_invalid"
+        )
+    if expected_batch is not None and (
+        inserted_rows != expected_batch.projected_rows
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_resource_projection_changed"
+        )
+
+
+def _artifact_resource_materialization_context(
+    schema: str,
+    table_name: str,
+    model: Any,
+    dataset: ProviderDirectoryArtifactDataset,
+    resource_type: str,
+    batch_size: int,
+) -> _ArtifactResourceMaterializationContext:
+    """Return immutable inputs shared by every resource batch."""
+    return _ArtifactResourceMaterializationContext(
+        schema=schema,
+        table_name=table_name,
+        model=model,
+        dataset=dataset,
+        resource_type=resource_type,
+        insert_sql=_artifact_resource_batch_insert_sql(
+            model,
+            schema,
+            table_name,
+        ),
+        batch_size=batch_size,
+    )
+
+
+async def _materialize_provider_directory_artifact_resource_dataset(
+    schema: str,
+    table_name: str,
+    model: Any,
+    dataset: ProviderDirectoryArtifactDataset,
+    resource_type: str,
+    *,
+    batch_size: int,
+    projection_batches: _ArtifactScopeBatchProjectionPlan | None = None,
+) -> int:
+    """Project one immutable source/dataset pair in bounded keyset batches."""
+    context = _artifact_resource_materialization_context(
+        schema,
+        table_name,
+        model,
+        dataset,
+        resource_type,
+        batch_size,
+    )
+    if projection_batches is not None:
+        _assert_provider_directory_artifact_resource_projection_batches(
+            dataset,
+            resource_type,
+            projection_batches,
+            batch_size=batch_size,
+        )
+    expected_batches = iter(projection_batches or ())
+    state = _ArtifactResourceMaterializationState()
+    while True:
+        expected_batch = (
+            next(expected_batches, None)
+            if projection_batches is not None
+            else None
+        )
+        if projection_batches is not None and expected_batch is None:
+            if not state.is_terminal_projection_observed:
+                raise ProviderDirectoryArtifactBuildStale(
+                    "provider_directory_artifact_resource_projection_changed"
+                )
+            break
+        state.expected_batch_number += 1
+        should_continue = await _is_artifact_resource_iteration_continuing(
+            context,
+            state,
+            expected_batch,
+        )
+        if not should_continue:
+            break
+    if (
+        projection_batches is not None
+        and (
+            not state.is_terminal_projection_observed
+            or next(expected_batches, None) is not None
+        )
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_resource_projection_changed"
+        )
+    return state.total_rows
+
+
+def _artifact_scope_resource_datasets(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
+    resource_type: str,
+) -> list[ProviderDirectoryArtifactDataset]:
+    """Return selected datasets that contribute one resource relation."""
+    return sorted(
+        (
+            dataset
+            for dataset in fence.datasets
+            if resource_type in resource_types
+            and resource_type in dataset.selected_resources
+        ),
+        key=lambda dataset: (dataset.source_id, dataset.dataset_id),
+    )
+
+
+def _artifact_dataset_projection_batches(
+    projection: _ProviderDirectoryArtifactScopeTableProjection | None,
+    dataset: ProviderDirectoryArtifactDataset,
+) -> tuple[_ProviderDirectoryArtifactScopeBatchProjection, ...] | None:
+    """Return the frozen projection batches for one selected dataset."""
+    if projection is None:
+        return None
+    return tuple(
+        batch
+        for batch in projection.batches
+        if batch.source_id == dataset.source_id
+        and batch.dataset_id == dataset.dataset_id
+        and batch.evidence_run_id == dataset.evidence_run_id
+    )
 
 
 async def _materialize_provider_directory_artifact_resource_scope(
@@ -11858,37 +16685,47 @@ async def _materialize_provider_directory_artifact_resource_scope(
     model: Any,
     fence: ProviderDirectoryArtifactDatasetFence,
     resource_types: frozenset[str],
-) -> None:
-    await db.status(
-        _provider_directory_artifact_scope_table_sql(model, schema, table_name)
-    )
+    *,
+    batch_size: int | None = None,
+    projection: (
+        _ProviderDirectoryArtifactScopeTableProjection | None
+    ) = None,
+) -> int:
+    """Materialize one bounded resource relation from the fenced datasets."""
     resource_type = RESOURCE_TYPES_BY_MODEL[model]
-    selected_datasets = [
-        dataset
-        for dataset in fence.datasets
-        if resource_type in resource_types
-        and resource_type in dataset.selected_resources
-    ]
-    if selected_datasets:
-        await db.status(
-            _provider_directory_artifact_resource_insert_sql(
-                model,
-                schema,
-                table_name,
-            ),
-            source_ids=[dataset.source_id for dataset in selected_datasets],
-            dataset_ids=[dataset.dataset_id for dataset in selected_datasets],
-            evidence_run_ids=[
-                dataset.evidence_run_id for dataset in selected_datasets
-            ],
-            resource_type=resource_type,
-        )
-    await _build_artifact_scope_pk(
-        model,
-        schema,
-        table_name,
+    resolved_batch_size = (
+        batch_size or _provider_directory_artifact_scope_batch_size()
     )
-    await db.status(f"ANALYZE {_qt(schema, table_name)};")
+    total_rows = 0
+    for dataset in _artifact_scope_resource_datasets(
+        fence, resource_types, resource_type
+    ):
+        total_rows += await _materialize_provider_directory_artifact_resource_dataset(
+            schema,
+            table_name,
+            model,
+            dataset,
+            resource_type,
+            batch_size=resolved_batch_size,
+            projection_batches=_artifact_dataset_projection_batches(
+                projection,
+                dataset,
+            ),
+        )
+    if projection is not None and total_rows != projection.projected_rows:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_resource_projection_changed"
+        )
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if capacity_admission is not None:
+        await _reserve_provider_directory_profile_wal_budget(
+            capacity_admission,
+            control_operation_counts={"artifact_scope_analyze": 1},
+        )
+    await _provider_directory_profile_capacity_status(
+        f"ANALYZE {_qt(schema, table_name)};"
+    )
+    return total_rows
 
 
 async def _verify_provider_directory_artifact_dataset_fence(
@@ -12067,26 +16904,86 @@ def _assert_locked_artifact_source_contract(
 
 
 def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
-    lock_sql = "FOR UPDATE" if for_update else ""
+    dataset_ref = _unscoped_qt(
+        _schema(),
+        ProviderDirectoryEndpointDataset.__tablename__,
+    )
+    if for_update:
+        scope_sql = (
+            "dataset.dataset_id = ANY(CAST(:dataset_ids AS varchar[]))"
+        )
+        current_ids_sql = f"""
+               ARRAY(
+                   SELECT current_dataset.dataset_id
+                     FROM {dataset_ref} AS current_dataset
+                    WHERE current_dataset.endpoint_id = dataset.endpoint_id
+                      AND current_dataset.is_current = true
+                      AND current_dataset.status = :published_status
+                      AND current_dataset.superseded_at IS NULL
+                    ORDER BY current_dataset.dataset_id
+               )::varchar[] AS locked_current_dataset_ids,
+        """
+        lock_sql = "FOR UPDATE OF dataset"
+    else:
+        scope_sql = (
+            "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))"
+        )
+        current_ids_sql = ""
+        lock_sql = ""
     return f"""
-        SELECT dataset_id,
-               endpoint_id,
-               import_run_id,
-               acquisition_root_run_id,
-               previous_dataset_id,
-               dataset_hash,
-               status,
-               is_current,
-               resource_count,
-               validated_at,
-               published_at,
-               superseded_at,
-               publication_metadata_json
-          FROM {_unscoped_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
-         WHERE endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
-         ORDER BY dataset_id
+        SELECT dataset.dataset_id,
+               dataset.endpoint_id,
+               dataset.import_run_id,
+               dataset.acquisition_root_run_id,
+               dataset.previous_dataset_id,
+               dataset.dataset_hash,
+               dataset.status,
+               dataset.is_current,
+               dataset.resource_count,
+               dataset.validated_at,
+               dataset.published_at,
+               dataset.superseded_at,
+               {current_ids_sql}
+               dataset.publication_metadata_json
+          FROM {dataset_ref} AS dataset
+         WHERE {scope_sql}
+         ORDER BY dataset.dataset_id
          {lock_sql};
     """
+
+
+def _locked_artifact_dataset_ids(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> list[str]:
+    """Return the exact selected and incumbent dataset rows locked at cutover."""
+
+    return sorted(
+        {
+            dataset_id
+            for dataset in _unique_artifact_datasets(fence)
+            for dataset_id in (
+                dataset.dataset_id,
+                dataset.expected_incumbent_dataset_id,
+                dataset.previous_dataset_id,
+            )
+            if dataset_id
+        }
+    )
+
+
+def _profile_cutover_lock_count(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> int:
+    """Count every bounded tuple-lock statement in one admitted cutover."""
+
+    return (
+        len(fence.endpoint_ids)
+        + len(fence.locked_source_ids)
+        + len(
+            _provider_directory_artifact_fence_locked_dataset_ids(fence)
+        )
+        + PROVIDER_DIRECTORY_PROFILE_CUTOVER_FIXED_ROW_LOCK_COUNT
+    )
 
 
 async def _artifact_fence_dataset_rows(
@@ -12095,9 +16992,20 @@ async def _artifact_fence_dataset_rows(
     *,
     for_update: bool,
 ) -> list[Any]:
+    query_params_by_name: dict[str, Any]
+    if for_update:
+        locked_dataset_ids = (
+            _provider_directory_artifact_fence_locked_dataset_ids(fence)
+        )
+        query_params_by_name = {
+            "dataset_ids": locked_dataset_ids,
+            "published_status": ENDPOINT_DATASET_PUBLISHED,
+        }
+    else:
+        query_params_by_name = {"endpoint_ids": fence.endpoint_ids}
     return await executor.all(
         _artifact_fence_dataset_rows_sql(for_update=for_update),
-        endpoint_ids=fence.endpoint_ids,
+        **query_params_by_name,
     )
 
 
@@ -12190,9 +17098,9 @@ def _is_artifact_fence_dataset_row_exact(
     dataset_row_map: dict[str, Any],
 ) -> bool:
     actual_identity = _artifact_fence_dataset_row_identity(dataset_row_map)
-    expected_identity = _expected_artifact_fence_dataset_identity(dataset)
+    expected_identity_by_name = _expected_artifact_fence_dataset_identity(dataset)
     for field_index, (actual_value, expected_value) in enumerate(
-        zip(actual_identity, expected_identity)
+        zip(actual_identity, expected_identity_by_name)
     ):
         if field_index >= 5 and expected_value is None:
             continue
@@ -12229,13 +17137,11 @@ def _validated_artifact_dataset_ids(
     )
 
 
-def _assert_locked_artifact_fence_datasets(
-    fence: ProviderDirectoryArtifactDatasetFence,
+def _locked_dataset_rows_by_id(
     locked_dataset_rows: list[Any],
-    eligible_ids_by_endpoint: dict[str, list[str]] | None = None,
-) -> None:
-    """Reverify selected datasets, candidates, and expected incumbents."""
-    dataset_rows_by_id = {
+) -> dict[str, Mapping[str, Any]]:
+    """Index locked dataset rows by their exact nonempty identifier."""
+    return {
         dataset_id: dataset_row_map
         for dataset_row in locked_dataset_rows
         if (
@@ -12243,17 +17149,47 @@ def _assert_locked_artifact_fence_datasets(
         )
         and (dataset_id := _clean_text(dataset_row_map.get("dataset_id")))
     }
+
+
+def _assert_locked_artifact_fence_datasets(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    locked_dataset_rows: list[Any],
+    eligible_ids_by_endpoint: dict[str, list[str]] | None = None,
+) -> None:
+    """Reverify selected datasets, candidates, and expected incumbents."""
+    dataset_rows_by_id = _locked_dataset_rows_by_id(locked_dataset_rows)
     rows_by_endpoint_id: dict[str, list[dict[str, Any]]] = {}
+    current_ids_by_endpoint_id: dict[str, list[str]] = {}
     for dataset_row_map in dataset_rows_by_id.values():
         endpoint_id = _clean_text(dataset_row_map.get("endpoint_id"))
         if endpoint_id:
             rows_by_endpoint_id.setdefault(endpoint_id, []).append(
                 dataset_row_map
             )
+            raw_current_ids = dataset_row_map.get(
+                "locked_current_dataset_ids"
+            )
+            if raw_current_ids is not None:
+                current_ids = sorted(
+                    dataset_id
+                    for candidate in raw_current_ids
+                    if (dataset_id := _clean_text(candidate))
+                )
+                prior_current_ids = current_ids_by_endpoint_id.setdefault(
+                    endpoint_id,
+                    current_ids,
+                )
+                if prior_current_ids != current_ids:
+                    raise ProviderDirectoryArtifactBuildStale(
+                        "provider_directory_endpoint_dataset_current_changed"
+                    )
     for dataset in _unique_artifact_datasets(fence):
         _assert_locked_artifact_endpoint_state(
             dataset,
             rows_by_endpoint_id.get(dataset.endpoint_id, []),
+            actual_current_ids=current_ids_by_endpoint_id.get(
+                dataset.endpoint_id
+            ),
             should_select_validated_candidates=(
                 fence.should_select_validated_candidates
             ),
@@ -12264,8 +17200,11 @@ def _assert_locked_artifact_fence_datasets(
             ),
         )
         selected_dataset_row = dataset_rows_by_id.get(dataset.dataset_id)
-        if selected_dataset_row is None or not _is_artifact_fence_dataset_row_exact(
-            dataset, selected_dataset_row
+        if (
+            selected_dataset_row is None
+            or not _is_artifact_fence_dataset_row_exact(
+                dataset, selected_dataset_row
+            )
         ):
             raise ProviderDirectoryArtifactBuildStale(
                 "provider_directory_endpoint_dataset_metadata_changed"
@@ -12276,14 +17215,16 @@ def _assert_locked_artifact_endpoint_state(
     dataset: ProviderDirectoryArtifactDataset,
     endpoint_dataset_rows: list[dict[str, Any]],
     *,
+    actual_current_ids: list[str] | None = None,
     should_select_validated_candidates: bool,
     eligible_dataset_ids: list[str] | None,
 ) -> None:
     """Require the locked endpoint to retain its selected candidate set."""
-    actual_current_ids = _current_published_artifact_dataset_ids(
-        endpoint_dataset_rows,
-        dataset.endpoint_id,
-    )
+    if actual_current_ids is None:
+        actual_current_ids = _current_published_artifact_dataset_ids(
+            endpoint_dataset_rows,
+            dataset.endpoint_id,
+        )
     expected_incumbent_id = (
         dataset.expected_incumbent_dataset_id
         if dataset.promote_on_cutover
@@ -12324,57 +17265,234 @@ async def _provider_directory_active_artifact_dataset_transaction() -> AsyncIter
         yield
 
 
+async def _artifact_scope_projection_plan(
+    schema: str,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
+    admission: _ProviderDirectoryProfileCapacityAdmission | None,
+) -> tuple[
+    dict[str, Any] | _ProviderDirectoryArtifactScopeExactProjection,
+    _ProviderDirectoryArtifactScopeExactProjection | None,
+    list[str],
+]:
+    """Resolve and validate either legacy or exact artifact-scope projection."""
+    if admission is None:
+        projection = await _provider_directory_artifact_scope_projection(
+            resource_fence,
+            resource_types,
+        )
+        _assert_provider_directory_artifact_scope_capacity(projection)
+        reaped_tables = (
+            await _reap_provider_directory_artifact_scope_tables(schema)
+        )
+        return projection, None, reaped_tables
+    exact_projection = (
+        await _provider_directory_artifact_scope_exact_projection(
+            schema,
+            resource_fence,
+            resource_types,
+            source_fence=fence,
+            batch_size=admission.geometry.artifact_scope_batch_size,
+        )
+    )
+    _assert_provider_directory_artifact_scope_exact_capacity(exact_projection)
+    return exact_projection, exact_projection, []
+
+
+async def _materialize_artifact_scope_plan(
+    schema: str,
+    run_id: str | None,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
+    projection: _ProviderDirectoryArtifactScopeExactProjection | None,
+    admission: _ProviderDirectoryProfileCapacityAdmission | None,
+) -> tuple[dict[str, str], list[str]]:
+    """Materialize one projection under its signed worker geometry."""
+    return await _materialize_artifact_scope_tables(
+        schema,
+        run_id,
+        fence,
+        resource_types,
+        resource_fence=resource_fence,
+        projection=projection,
+        batch_size=(
+            admission.geometry.artifact_scope_batch_size
+            if admission is not None
+            else None
+        ),
+        worker_count=(
+            admission.geometry.artifact_scope_worker_count
+            if admission is not None
+            else None
+        ),
+    )
+
+
+@contextlib.contextmanager
+def _artifact_scope_tokens(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_fence: ProviderDirectoryArtifactDatasetFence,
+    relation_overrides: Mapping[str, str],
+) -> Iterator[None]:
+    """Install and restore artifact-scope context variables together."""
+    relation_token = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        dict(relation_overrides)
+    )
+    fence_token = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
+    resource_scope_token = (
+        _PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.set(
+            tuple(resource_fence.source_ids)
+        )
+    )
+    try:
+        yield
+    finally:
+        _PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.reset(
+            resource_scope_token
+        )
+        _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
+        _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
+
+
+@contextlib.asynccontextmanager
+async def _yield_artifact_dataset_scope(
+    schema: str,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_fence: ProviderDirectoryArtifactDatasetFence,
+    relation_overrides: Mapping[str, str],
+    created_tables: list[str],
+) -> AsyncIterator[ProviderDirectoryArtifactDatasetFence]:
+    """Yield one scoped artifact fence and always drain its scratch tables."""
+    try:
+        with _artifact_scope_tokens(
+            fence,
+            resource_fence,
+            relation_overrides,
+        ):
+            yield fence
+    except BaseException as scope_error:
+        try:
+            await _drain_artifact_scope_cleanup(schema, created_tables)
+        except BaseException as cleanup_error:
+            if not (
+                isinstance(scope_error, asyncio.CancelledError)
+                and isinstance(cleanup_error, asyncio.CancelledError)
+            ):
+                raise BaseExceptionGroup(
+                    "provider_directory_artifact_scope_and_cleanup_failed",
+                    [scope_error, cleanup_error],
+                ) from scope_error
+        raise
+    else:
+        await _drain_artifact_scope_cleanup(schema, created_tables)
+
+
+def _resolved_artifact_scope_resource_types(
+    resource_types: frozenset[str] | None,
+) -> frozenset[str]:
+    """Keep an explicit empty resource selection distinct from the default."""
+    if resource_types is not None:
+        return resource_types
+    return PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES
+
+
 @contextlib.asynccontextmanager
 async def _provider_directory_artifact_dataset_scope(
     *,
     run_id: str | None,
     source_ids: list[str] | tuple[str, ...] | None,
     fence: ProviderDirectoryArtifactDatasetFence | None = None,
+    resource_fence: ProviderDirectoryArtifactDatasetFence | None = None,
     metrics: dict[str, Any] | None = None,
     resource_types: frozenset[str] | None = None,
 ) -> AsyncIterator[ProviderDirectoryArtifactDatasetFence]:
     """Materialize and clean one bounded alias-aware artifact source scope."""
     schema = _schema()
     fence = fence or await _resolve_provider_directory_artifact_datasets(source_ids)
+    materialized_resource_fence = resource_fence or fence
     async with _provider_directory_artifact_scope_guard(schema):
-        reaped_tables = await _reap_provider_directory_artifact_scope_tables(schema)
-        scoped_resource_types = (
+        scoped_resource_types = _resolved_artifact_scope_resource_types(
             resource_types
-            if resource_types is not None
-            else PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES
         )
-        projection = await _provider_directory_artifact_scope_projection(
-            fence,
-            scoped_resource_types,
+        capacity_admission = _provider_directory_profile_capacity_admission()
+        projection, exact_projection, reaped_tables = (
+            await _artifact_scope_projection_plan(
+                schema,
+                fence,
+                materialized_resource_fence,
+                scoped_resource_types,
+                capacity_admission,
+            )
         )
-        _assert_provider_directory_artifact_scope_capacity(projection)
         _record_artifact_scope_metrics(metrics, projection, reaped_tables)
-        relation_overrides, created_tables = await _materialize_artifact_scope_tables(
+        relation_overrides, created_tables = await _materialize_artifact_scope_plan(
             schema,
             run_id,
             fence,
+            materialized_resource_fence,
             scoped_resource_types,
+            exact_projection,
+            capacity_admission,
         )
-        try:
-            relation_token = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
-                relation_overrides
-            )
-            fence_token = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
+        if capacity_admission is not None:
+            assert exact_projection is not None
             try:
-                yield fence
-            finally:
-                _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
-                _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
-        finally:
-            await _drop_artifact_scope_tables(schema, created_tables)
+                await _assert_provider_directory_artifact_scope_observed_capacity(
+                    schema,
+                    relation_overrides,
+                    exact_projection,
+                )
+            except BaseException as capacity_error:
+                await _cleanup_failed_artifact_scope(
+                    schema,
+                    created_tables,
+                    capacity_error,
+                )
+                raise
+        async with _yield_artifact_dataset_scope(
+            schema,
+            fence,
+            materialized_resource_fence,
+            relation_overrides,
+            created_tables,
+        ) as scoped_fence:
+            yield scoped_fence
 
 
 def _record_artifact_scope_metrics(
     metrics: dict[str, Any] | None,
-    projection: dict[str, Any],
+    projection: (
+        dict[str, Any]
+        | _ProviderDirectoryArtifactScopeExactProjection
+    ),
     reaped_tables: list[str],
 ) -> None:
     if metrics is None:
+        return
+    if isinstance(
+        projection,
+        _ProviderDirectoryArtifactScopeExactProjection,
+    ):
+        metrics["artifact_scope_projected_rows"] = (
+            projection.projected_rows
+        )
+        metrics["artifact_scope_projected_logical_bytes"] = (
+            projection.projected_logical_bytes
+        )
+        metrics["artifact_scope_projection_hash"] = (
+            projection.projection_hash
+        )
+        metrics["artifact_scope_projected_rows_by_resource"] = {
+            table.resource_type: table.projected_rows
+            for table in projection.tables
+        }
+        metrics["artifact_scope_projected_bytes_by_resource"] = {
+            table.resource_type: table.projected_logical_bytes
+            for table in projection.tables
+        }
+        metrics["artifact_scope_reaped_table_count"] = len(reaped_tables)
         return
     metrics["artifact_scope_dataset_count"] = projection["dataset_count"]
     metrics["artifact_scope_alias_count"] = projection["alias_count"]
@@ -12393,57 +17511,879 @@ def _record_artifact_scope_metrics(
     metrics["artifact_scope_reaped_table_count"] = len(reaped_tables)
 
 
+async def _artifact_scope_scratch_projection(
+    schema: str,
+    scope_table_name: str,
+    table_projection: _ProviderDirectoryArtifactScopeTableProjection,
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> tuple[
+    str,
+    profile_capacity.ProviderDirectoryProfileScratchProjection,
+]:
+    """Project one exact unlogged artifact-scope relation."""
+    relation_ref = _unscoped_qt(schema, scope_table_name)
+    relation_oid = int(
+        await db.scalar(
+            "SELECT to_regclass(:relation_ref)::oid::bigint;",
+            relation_ref=relation_ref,
+        )
+        or 0
+    )
+    if relation_oid <= 0:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_scratch_oid_changed"
+        )
+    layout = await _provider_directory_profile_relation_storage_fingerprint(
+        relation_oid,
+        expected_persistence="u",
+    )
+    if layout.effective_tablespace_oids != (
+        admission.geometry.tablespace_oid,
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_scratch_tablespace_changed"
+        )
+    scratch_projection = profile_capacity.project_profile_scratch_capacity(
+        admission.geometry,
+        profile_capacity.ProviderDirectoryProfileScratchInput(
+            relation_name="artifact_scope",
+            inserted_rows=table_projection.projected_rows,
+            inserted_logical_bytes=table_projection.projected_logical_bytes,
+            toastable_column_count=len(layout.toastable_columns),
+            main_index_pages=layout.main_index_pages,
+            toast_index_pages=layout.toast_index_pages,
+        ),
+    )
+    return relation_ref, scratch_projection
+
+
+async def _admit_artifact_scope_totals(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    projected_relations: list[
+        tuple[
+            str,
+            profile_capacity.ProviderDirectoryProfileScratchProjection,
+        ]
+    ],
+) -> None:
+    """Admit aggregate artifact-scope data and WAL across all relations."""
+    relation_refs = [
+        relation_ref for relation_ref, _projection in projected_relations
+    ]
+    scratch_projections = [
+        scratch_projection
+        for _relation_ref, scratch_projection in projected_relations
+    ]
+    relation_cap = _provider_directory_profile_capacity_relation_cap(
+        admission,
+        "artifact_scope",
+    )
+    base_bytes = (
+        await _provider_directory_profile_capacity_relation_bytes(
+            relation_refs
+        )
+    )
+    projected_growth_bytes = sum(
+        scratch_projection.growth_bytes
+        for scratch_projection in scratch_projections
+    )
+    projected_wal_bytes = sum(
+        scratch_projection.wal_bytes
+        for scratch_projection in scratch_projections
+    )
+    if (
+        projected_growth_bytes > relation_cap.max_scratch_bytes
+        or base_bytes + projected_growth_bytes
+        > relation_cap.max_scratch_bytes
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_artifact_growth_projected"
+        )
+    if projected_wal_bytes > relation_cap.max_wal_bytes:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_artifact_wal_projected"
+        )
+    await _reserve_provider_directory_profile_wal_budget(
+        admission,
+        relation_wal_bytes={"artifact_scope": projected_wal_bytes},
+    )
+
+
+async def _preflight_provider_directory_artifact_scope_capacity(
+    schema: str,
+    relation_by_table: Mapping[str, str],
+    projection: _ProviderDirectoryArtifactScopeExactProjection,
+) -> None:
+    """Admit the complete nine-table scratch scope before payload DML."""
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return
+    projections_by_table = {
+        table_projection.table_name: table_projection
+        for table_projection in projection.tables
+    }
+    if set(projections_by_table) != set(relation_by_table):
+        raise RuntimeError(
+            "provider_directory_artifact_scope_projection_tables_invalid"
+        )
+    projected_relations = [
+        await _artifact_scope_scratch_projection(
+            schema,
+            scope_table_name,
+            projections_by_table[base_table_name],
+            admission,
+        )
+        for base_table_name, scope_table_name in sorted(
+            relation_by_table.items()
+        )
+    ]
+    await _admit_artifact_scope_totals(admission, projected_relations)
+
+
+async def _assert_artifact_scope_usage(
+    schema: str,
+    relation_by_table: Mapping[str, str],
+    projection: _ProviderDirectoryArtifactScopeExactProjection,
+) -> None:
+    """Verify actual aggregate rows, bytes, and WAL after one worker wave."""
+
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return
+    relation_refs = [
+        _unscoped_qt(schema, scope_table_name)
+        for scope_table_name in relation_by_table.values()
+    ]
+    actual_rows = 0
+    for relation_ref in relation_refs:
+        actual_rows += int(
+            await db.scalar(f"SELECT count(*) FROM {relation_ref};")
+            or 0
+        )
+    if actual_rows > projection.projected_rows:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_observed_rows_exceeded"
+        )
+    relation_cap = _provider_directory_profile_capacity_relation_cap(
+        admission,
+        "artifact_scope",
+    )
+    actual_bytes = (
+        await _provider_directory_profile_capacity_relation_bytes(
+            relation_refs
+        )
+    )
+    if actual_bytes > relation_cap.max_scratch_bytes:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_artifact_bytes_exceeded"
+        )
+    await _assert_provider_directory_profile_wal_budget(admission)
+
+
+@dataclass(frozen=True)
+class _ArtifactScopeMaterializationPlan:
+    source_table: str
+    created_tables: list[str]
+    relation_by_table: dict[str, str]
+    resource_scope_jobs: tuple[tuple[Any, str], ...]
+    model_by_table_name: dict[str, Any]
+
+
+def _artifact_scope_materialization_plan(
+    run_id: str | None,
+) -> _ArtifactScopeMaterializationPlan:
+    """Return all deterministic scratch relation coordinates."""
+    source_table = _provider_directory_artifact_scope_table_name(
+        ProviderDirectorySource.__tablename__,
+        run_id,
+    )
+    created_tables: list[str] = []
+    relation_by_table = {ProviderDirectorySource.__tablename__: source_table}
+    resource_scope_jobs: list[tuple[Any, str]] = []
+    for model in RESOURCE_MODELS:
+        scope_table = _provider_directory_artifact_scope_table_name(
+            model.__tablename__,
+            run_id,
+        )
+        relation_by_table[model.__tablename__] = scope_table
+        resource_scope_jobs.append((model, scope_table))
+    return _ArtifactScopeMaterializationPlan(
+        source_table=source_table,
+        created_tables=created_tables,
+        relation_by_table=relation_by_table,
+        resource_scope_jobs=tuple(resource_scope_jobs),
+        model_by_table_name={
+            model.__tablename__: model
+            for model in (ProviderDirectorySource, *RESOURCE_MODELS)
+        },
+    )
+
+
+async def _create_artifact_scope_layouts(
+    schema: str,
+    plan: _ArtifactScopeMaterializationPlan,
+) -> None:
+    """Create every admitted artifact-scope scratch layout."""
+    await _reserve_artifact_scope_layout_wal()
+    for base_table_name, scope_table_name in sorted(
+        plan.relation_by_table.items()
+    ):
+        plan.created_tables.append(scope_table_name)
+        await _create_provider_directory_artifact_scope_layout(
+            plan.model_by_table_name[base_table_name],
+            schema,
+            scope_table_name,
+        )
+
+
+async def _reserve_artifact_scope_layout_wal() -> None:
+    """Reserve the full empty-layout catalog envelope before any DDL."""
+
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is not None:
+        await _reserve_provider_directory_profile_wal_budget(
+            admission,
+            control_operation_counts={
+                "artifact_scope_layout": (
+                    _provider_directory_profile_control_operation_count(
+                        admission,
+                        "artifact_scope_layout",
+                    )
+                ),
+            },
+        )
+
+
+@dataclass(frozen=True)
+class _ArtifactScopeRecoveryCoordinate:
+    base_table_name: str
+    prior_table_name: str
+    current_table_name: str
+
+
+def _artifact_scope_prior_owner(
+    relation_name: str,
+) -> tuple[str, str]:
+    """Parse one exact base relation and run owner from a scratch name."""
+    matches: list[tuple[str, str]] = []
+    for model in (ProviderDirectorySource, *RESOURCE_MODELS):
+        base_name = model.__tablename__
+        prefix = (
+            _provider_directory_artifact_scope_table_prefix(base_name) + "_"
+        )
+        if not relation_name.startswith(prefix):
+            continue
+        owner_suffix = relation_name.removeprefix(prefix)
+        if re.fullmatch(r"[0-9a-f]{32}", owner_suffix):
+            matches.append((base_name, "run_" + owner_suffix))
+    if len(matches) != 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_artifact_stale_scope_present"
+        )
+    return matches[0]
+
+
+def _artifact_scope_prior_coordinates(
+    relation_names: Iterable[str],
+) -> dict[str, tuple[str, str]]:
+    """Return one complete, unambiguous prior scratch family."""
+    coordinates_by_base: dict[str, tuple[str, str]] = {}
+    for relation_name in relation_names:
+        base_name, owner_run_id = _artifact_scope_prior_owner(
+            relation_name
+        )
+        if base_name in coordinates_by_base:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_scope_owner_collision"
+            )
+        coordinates_by_base[base_name] = (
+            relation_name,
+            owner_run_id,
+        )
+    expected_bases = {
+        model.__tablename__
+        for model in (ProviderDirectorySource, *RESOURCE_MODELS)
+    }
+    if set(coordinates_by_base) != expected_bases:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_artifact_stale_scope_present"
+        )
+    return coordinates_by_base
+
+
+def _assert_artifact_scope_prior_owner(
+    prior_by_base: Mapping[str, tuple[str, str]],
+    owners: tuple[_ArtifactScopeConsumptionOwner, ...],
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> str:
+    """Return the sole terminal prior run and refuse current-run replay."""
+    prior_run_ids = {
+        owner_run_id
+        for _relation_name, owner_run_id in prior_by_base.values()
+    }
+    if prior_run_ids == {admission.run_id}:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_current_owner_present"
+        )
+    if len(prior_run_ids) != 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_owner_ambiguous"
+        )
+    prior_run_id = next(iter(prior_run_ids))
+    prior_owner = next(
+        owner for owner in owners if owner.run_id == prior_run_id
+    )
+    if {
+        base_name: relation_name
+        for base_name, (relation_name, _run_id) in prior_by_base.items()
+    } != _artifact_scope_owner_relation_names(prior_owner):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_owner_invalid"
+        )
+    return prior_run_id
+
+
+async def _artifact_scope_recovery_coordinates(
+    schema: str,
+    plan: _ArtifactScopeMaterializationPlan,
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> tuple[_ArtifactScopeRecoveryCoordinate, ...]:
+    """Resolve only prior terminal-owner names from the immutable ledger."""
+    discovered_names = (
+        await _discover_provider_directory_artifact_scope_tables(schema)
+    )
+    if not discovered_names:
+        return ()
+    prior_by_base = _artifact_scope_prior_coordinates(discovered_names)
+    prior_run_ids = {
+        owner_run_id
+        for _relation_name, owner_run_id in prior_by_base.values()
+    }
+    owners = await _artifact_scope_consumption_owners(
+        schema,
+        admission,
+        prior_run_ids,
+    )
+    _assert_artifact_scope_prior_owner(
+        prior_by_base,
+        owners,
+        admission,
+    )
+    return tuple(
+        _ArtifactScopeRecoveryCoordinate(
+            base_table_name=base_name,
+            prior_table_name=prior_by_base[base_name][0],
+            current_table_name=plan.relation_by_table[base_name],
+        )
+        for base_name in sorted(prior_by_base)
+    )
+
+
+async def _artifact_scope_relation_identities(
+    schema: str,
+    relation_names: Iterable[str],
+) -> dict[str, tuple[int, str, str]]:
+    """Return exact table OID, kind, and persistence for named scratch."""
+
+    names = sorted(set(relation_names))
+    if not names:
+        return {}
+    identity_rows = await db.all(
+        """
+        SELECT relation.relname::text AS relation_name,
+               relation.oid::bigint AS relation_oid,
+               relation.relkind::text AS relkind,
+               relation.relpersistence::text AS relpersistence
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = :schema_name
+           AND relation.relname = ANY(CAST(:relation_names AS text[]))
+         ORDER BY relation.relname;
+        """,
+        schema_name=schema,
+        relation_names=names,
+    )
+    return {
+        str(row_map["relation_name"]): (
+            int(row_map["relation_oid"]),
+            str(row_map["relkind"]),
+            str(row_map["relpersistence"]),
+        )
+        for row_map in (
+            _pagination_checkpoint_row_mapping(identity_row)
+            for identity_row in identity_rows
+        )
+    }
+
+
+async def _assert_artifact_scope_recovery_unreferenced(
+    schema: str,
+    relation_oids: list[int],
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> None:
+    """Refuse scratch that is protected by serving or checkpoint identity."""
+
+    geometry = admission.geometry
+    protected_oids = {
+        geometry.evidence_target_oid,
+        geometry.profile_target_oid,
+        geometry.build_checkpoint_oid,
+        geometry.serving_generation_oid,
+        geometry.delta_receipt_oid,
+        geometry.import_run_oid,
+        geometry.capacity_consumption_oid,
+    }
+    if protected_oids.intersection(relation_oids):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_protected_oid"
+        )
+    if await _is_artifact_scope_recovery_referenced(
+        schema,
+        relation_oids,
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_referenced"
+        )
+
+
+async def _is_artifact_scope_recovery_referenced(
+    schema: str,
+    relation_oids: list[int],
+) -> bool:
+    """Return whether serving or checkpoint state retains any scratch OID."""
+
+    checkpoint_ref = _provider_directory_profile_checkpoint_ref(schema)
+    serving_ref = _provider_directory_profile_serving_generation_ref(schema)
+    receipt_ref = _provider_directory_profile_delta_receipt_ref(schema)
+    return bool(
+        await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {checkpoint_ref}
+                 WHERE evidence_stage_oid = ANY(
+                           CAST(:relation_oids AS bigint[])
+                       )
+                    OR profile_stage_oid = ANY(
+                           CAST(:relation_oids AS bigint[])
+                       )
+                    OR affected_npi_stage_oid = ANY(
+                           CAST(:relation_oids AS bigint[])
+                       )
+                    OR evidence_target_oid = ANY(
+                           CAST(:relation_oids AS bigint[])
+                       )
+                    OR profile_target_oid = ANY(
+                           CAST(:relation_oids AS bigint[])
+                       )
+                UNION ALL
+                SELECT 1
+                  FROM {serving_ref}
+                 WHERE evidence_target_oid = ANY(
+                           CAST(:relation_oids AS bigint[])
+                       )
+                    OR profile_target_oid = ANY(
+                           CAST(:relation_oids AS bigint[])
+                       )
+                UNION ALL
+                SELECT 1
+                  FROM {receipt_ref}
+                 WHERE evidence_target_oid = ANY(
+                           CAST(:relation_oids AS bigint[])
+                       )
+                    OR profile_target_oid = ANY(
+                           CAST(:relation_oids AS bigint[])
+                       )
+            );
+            """,
+            relation_oids=relation_oids,
+        )
+    )
+
+
+def _assert_artifact_scope_recovery_identity(
+    expected_names: Iterable[str],
+    observed: Mapping[str, tuple[int, str, str]],
+) -> None:
+    """Require every recovery relation to remain one unlogged heap."""
+
+    names = set(expected_names)
+    if set(observed) != names or any(
+        identity[1:] != ("r", "u")
+        for identity in observed.values()
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_recovery_identity_changed"
+        )
+
+
+async def _create_recovery_artifact_scope_layouts(
+    schema: str,
+    plan: _ArtifactScopeMaterializationPlan,
+) -> None:
+    """Create current-run layouts inside the atomic ownership takeover."""
+
+    for base_name, current_name in sorted(
+        plan.relation_by_table.items()
+    ):
+        plan.created_tables.append(current_name)
+        await _create_provider_directory_artifact_scope_layout(
+            plan.model_by_table_name[base_name],
+            schema,
+            current_name,
+            status_executor=db.status,
+        )
+
+
+async def _assert_artifact_scope_recovery_layouts(
+    schema: str,
+    coordinates: tuple[_ArtifactScopeRecoveryCoordinate, ...],
+    prior_identities: Mapping[str, tuple[int, str, str]],
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> None:
+    """Match each old layout to its freshly generated model layout."""
+
+    current_identities = await _artifact_scope_relation_identities(
+        schema,
+        (coordinate.current_table_name for coordinate in coordinates),
+    )
+    _assert_artifact_scope_recovery_identity(
+        (coordinate.current_table_name for coordinate in coordinates),
+        current_identities,
+    )
+    for coordinate in coordinates:
+        prior_layout = (
+            await _provider_directory_profile_relation_storage_fingerprint(
+                prior_identities[coordinate.prior_table_name][0],
+                expected_persistence="u",
+            )
+        )
+        current_layout = (
+            await _provider_directory_profile_relation_storage_fingerprint(
+                current_identities[coordinate.current_table_name][0],
+                expected_persistence="u",
+            )
+        )
+        if (
+            prior_layout.structural_fingerprint
+            != current_layout.structural_fingerprint
+            or prior_layout.effective_tablespace_oids
+            != (admission.geometry.tablespace_oid,)
+            or current_layout.effective_tablespace_oids
+            != (admission.geometry.tablespace_oid,)
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_scope_recovery_layout_changed"
+            )
+
+
+async def _recover_provider_directory_artifact_scope(
+    schema: str,
+    plan: _ArtifactScopeMaterializationPlan,
+) -> tuple[str, ...]:
+    """Atomically replace exact hard-crash residue with current-run layouts."""
+
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return ()
+    coordinates = await _artifact_scope_recovery_coordinates(
+        schema,
+        plan,
+        admission,
+    )
+    if not coordinates:
+        return ()
+    prior_names = tuple(
+        coordinate.prior_table_name for coordinate in coordinates
+    )
+    initial_identities = await _artifact_scope_relation_identities(
+        schema,
+        prior_names,
+    )
+    _assert_artifact_scope_recovery_identity(
+        prior_names,
+        initial_identities,
+    )
+    await _reserve_provider_directory_profile_wal_budget(
+        admission,
+        control_operation_counts={
+            "artifact_scope_recovery_drop": len(coordinates),
+        },
+    )
+    await _reserve_artifact_scope_layout_wal()
+    await _replace_terminal_artifact_scope(
+        schema,
+        plan,
+        coordinates,
+        prior_names,
+        initial_identities,
+        admission,
+    )
+    if await _artifact_scope_relation_identities(schema, prior_names):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_scope_recovery_postimage_changed"
+        )
+    LOGGER.warning(
+        "Recovered terminal Provider Directory artifact scope build_id=%s "
+        "relations=%d",
+        admission.build_id,
+        len(prior_names),
+    )
+    return prior_names
+
+
+async def _replace_terminal_artifact_scope(
+    schema: str,
+    plan: _ArtifactScopeMaterializationPlan,
+    coordinates: tuple[_ArtifactScopeRecoveryCoordinate, ...],
+    prior_names: tuple[str, ...],
+    initial_identities: Mapping[str, tuple[int, str, str]],
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> None:
+    """Replace locked prior scratch with current layouts in one transaction."""
+
+    async with _provider_directory_profile_capacity_transaction():
+        await db.status(
+            "LOCK TABLE "
+            + ", ".join(
+                _qt(schema, prior_name)
+                for prior_name in sorted(prior_names)
+            )
+            + " IN ACCESS EXCLUSIVE MODE NOWAIT;"
+        )
+        locked_identities = await _artifact_scope_relation_identities(
+            schema,
+            prior_names,
+        )
+        if locked_identities != initial_identities:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_scope_recovery_oid_changed"
+            )
+        await _assert_artifact_scope_recovery_unreferenced(
+            schema,
+            [
+                identity[0]
+                for identity in locked_identities.values()
+            ],
+            admission,
+        )
+        await _create_recovery_artifact_scope_layouts(schema, plan)
+        await _assert_artifact_scope_recovery_layouts(
+            schema,
+            coordinates,
+            locked_identities,
+            admission,
+        )
+        for prior_name in reversed(sorted(prior_names)):
+            await db.status(f"DROP TABLE {_qt(schema, prior_name)};")
+
+
+async def _materialize_artifact_resource_waves(
+    schema: str,
+    plan: _ArtifactScopeMaterializationPlan,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
+    projection: _ProviderDirectoryArtifactScopeExactProjection | None,
+    projection_by_table: Mapping[
+        str,
+        _ProviderDirectoryArtifactScopeTableProjection,
+    ],
+    batch_size: int | None,
+    worker_count: int | None,
+) -> None:
+    """Materialize resource relations in bounded worker waves."""
+    resolved_worker_count = min(
+        worker_count or _provider_directory_artifact_scope_workers(),
+        len(plan.resource_scope_jobs),
+    )
+    wave_width = max(resolved_worker_count, 1)
+    for wave_start in range(0, len(plan.resource_scope_jobs), wave_width):
+        wave_jobs = plan.resource_scope_jobs[
+            wave_start : wave_start + wave_width
+        ]
+        await _gather_provider_directory_profile_tasks(
+            [
+                asyncio.create_task(
+                    _materialize_provider_directory_artifact_resource_scope(
+                        schema,
+                        scope_table,
+                        model,
+                        fence,
+                        resource_types,
+                        batch_size=batch_size,
+                        projection=projection_by_table.get(
+                            model.__tablename__
+                        ),
+                    )
+                )
+                for model, scope_table in wave_jobs
+            ]
+        )
+        if projection is not None:
+            await _assert_provider_directory_artifact_scope_observed_capacity(
+                schema,
+                plan.relation_by_table,
+                projection,
+            )
+
+
+async def _materialize_artifact_scope_payload(
+    schema: str,
+    plan: _ArtifactScopeMaterializationPlan,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_fence: ProviderDirectoryArtifactDatasetFence,
+    resource_types: frozenset[str],
+    projection: _ProviderDirectoryArtifactScopeExactProjection | None,
+    batch_size: int | None,
+    worker_count: int | None,
+) -> None:
+    """Materialize source and resource payloads under one exact projection."""
+    if not plan.created_tables:
+        await _create_artifact_scope_layouts(schema, plan)
+    if projection is not None:
+        await _preflight_provider_directory_artifact_scope_capacity(
+            schema,
+            plan.relation_by_table,
+            projection,
+        )
+    projection_by_table = (
+        {
+            table_projection.table_name: table_projection
+            for table_projection in projection.tables
+        }
+        if projection is not None
+        else {}
+    )
+    await _materialize_provider_directory_artifact_source_scope(
+        schema,
+        plan.source_table,
+        [dataset.source_id for dataset in fence.datasets],
+        projection=projection_by_table.get(
+            ProviderDirectorySource.__tablename__
+        ),
+    )
+    if projection is not None:
+        await _assert_provider_directory_artifact_scope_observed_capacity(
+            schema,
+            plan.relation_by_table,
+            projection,
+        )
+    await _materialize_artifact_resource_waves(
+        schema,
+        plan,
+        resource_fence,
+        resource_types,
+        projection,
+        projection_by_table,
+        batch_size,
+        worker_count,
+    )
+
+
+async def _cleanup_failed_artifact_scope(
+    schema: str,
+    created_tables: list[str],
+    materialization_error: BaseException,
+) -> None:
+    """Drain partial scratch tables or combine materialization failures."""
+    try:
+        await _drain_artifact_scope_cleanup(schema, created_tables)
+    except BaseException as cleanup_error:
+        if not (
+            isinstance(materialization_error, asyncio.CancelledError)
+            and isinstance(cleanup_error, asyncio.CancelledError)
+        ):
+            raise BaseExceptionGroup(
+                "provider_directory_artifact_materialization_and_cleanup_failed",
+                [materialization_error, cleanup_error],
+            ) from materialization_error
+
+
 async def _materialize_artifact_scope_tables(
     schema: str,
     run_id: str | None,
     fence: ProviderDirectoryArtifactDatasetFence,
     resource_types: frozenset[str],
+    *,
+    resource_fence: ProviderDirectoryArtifactDatasetFence | None = None,
+    projection: (
+        _ProviderDirectoryArtifactScopeExactProjection | None
+    ) = None,
+    batch_size: int | None = None,
+    worker_count: int | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    source_table = _provider_directory_artifact_scope_table_name(
-        ProviderDirectorySource.__tablename__,
-        run_id,
-    )
-    created_tables = [source_table]
-    relation_by_table = {ProviderDirectorySource.__tablename__: source_table}
+    """Materialize all fenced artifact-scope tables for one build."""
+    plan = _artifact_scope_materialization_plan(run_id)
     try:
-        await _materialize_provider_directory_artifact_source_scope(
+        await _recover_provider_directory_artifact_scope(
             schema,
-            source_table,
-            [dataset.source_id for dataset in fence.datasets],
+            plan,
         )
-        for model in RESOURCE_MODELS:
-            scope_table = _provider_directory_artifact_scope_table_name(
-                model.__tablename__,
-                run_id,
-            )
-            created_tables.append(scope_table)
-            await _materialize_provider_directory_artifact_resource_scope(
-                schema,
-                scope_table,
-                model,
-                fence,
-                resource_types,
-            )
-            relation_by_table[model.__tablename__] = scope_table
-    except BaseException:
-        await _drop_artifact_scope_tables(schema, created_tables)
+        await _materialize_artifact_scope_payload(
+            schema,
+            plan,
+            fence,
+            resource_fence or fence,
+            resource_types,
+            projection,
+            batch_size,
+            worker_count,
+        )
+    except BaseException as materialization_error:
+        await _cleanup_failed_artifact_scope(
+            schema,
+            plan.created_tables,
+            materialization_error,
+        )
         raise
-    return relation_by_table, created_tables
+    return plan.relation_by_table, plan.created_tables
+
+
+async def _drain_artifact_scope_cleanup(
+    schema: str,
+    table_names: list[str],
+) -> None:
+    """Finish exact scope cleanup before propagating repeated cancellation."""
+
+    cleanup_task = asyncio.create_task(
+        _drop_artifact_scope_tables(schema, table_names)
+    )
+    cancellation_error: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            cancellation_error = exc
+            continue
+    cleanup_task.result()
+    if cancellation_error is not None:
+        raise cancellation_error
 
 
 async def _drop_artifact_scope_tables(
     schema: str,
     table_names: list[str],
 ) -> None:
+    capacity_admission = _provider_directory_profile_capacity_admission()
     for table_name in reversed(table_names):
         try:
-            await db.status(f"DROP TABLE IF EXISTS {_qt(schema, table_name)};")
-        except Exception:  # pragma: no cover - cleanup best effort
+            if capacity_admission is not None:
+                await _reserve_provider_directory_profile_wal_budget(
+                    capacity_admission,
+                    control_operation_counts={"artifact_scope_drop": 1},
+                )
+            await _provider_directory_profile_capacity_status(
+                f"DROP TABLE IF EXISTS {_qt(schema, table_name)};"
+            )
+        except Exception:
             LOGGER.warning(
                 "Failed to clean Provider Directory artifact scope %s",
                 table_name,
                 exc_info=True,
             )
+            if capacity_admission is not None:
+                raise
 
 
 async def publish_provider_directory_location_address_keys(
@@ -12558,6 +18498,44 @@ async def backfill_provider_directory_resource_id_npis(
             )
         )
     return updated_counts_by_resource
+
+
+async def _assert_no_resource_npi_candidates(
+    schema: str,
+    source_ids: list[str] | tuple[str, ...],
+) -> None:
+    """Refuse admitted publication if canonical NPI repair is still required."""
+
+    cleaned_source_ids = _clean_source_id_list(source_ids)
+    if not cleaned_source_ids:
+        return
+    for resource_type, table_name in (
+        ("Practitioner", "provider_directory_practitioner"),
+        ("Organization", "provider_directory_organization"),
+    ):
+        candidate_exists = bool(
+            await db.scalar(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM {_qt(schema, table_name)} AS resource
+                     WHERE resource.source_id = ANY(
+                               CAST(:source_ids AS varchar[])
+                           )
+                       AND resource.npi IS NULL
+                       AND resource.resource_id ~ '^[0-9]{{10}}$'
+                     LIMIT 1
+                );
+                """,
+                source_ids=cleaned_source_ids,
+            )
+        )
+        if candidate_exists:
+            raise RuntimeError(
+                "provider_directory_profile_resource_id_npi_backfill_"
+                "required_before_capacity_admission:"
+                + resource_type
+            )
 
 
 def _unique_artifact_datasets(
@@ -13625,15 +19603,20 @@ async def _attested_profile_publication_fence(
 
 def _attach_profile_selection_result(
     execution: ProviderDirectoryProfileExecution,
-    published_metrics: dict[str, Any],
+    published_metrics_by_name: dict[str, Any],
 ) -> None:
-    profile_metrics = published_metrics.get("profile")
+    profile_metrics = published_metrics_by_name.get("profile")
     if not isinstance(profile_metrics, dict):
         raise RuntimeError("provider_directory_profile_selection_result_missing")
     profile_generation_id = _clean_text(profile_metrics.get("generation_id"))
+    profile_as_of = _clean_text(profile_metrics.get("profile_as_of"))
     if profile_generation_id is None:
         raise RuntimeError(
             "provider_directory_profile_selection_generation_missing"
+        )
+    if profile_as_of is None:
+        raise RuntimeError(
+            "provider_directory_profile_selection_as_of_missing"
         )
     profile_rows = int(profile_metrics.get("profile_rows") or 0)
     evidence_rows = int(profile_metrics.get("evidence_rows") or 0)
@@ -13644,59 +19627,151 @@ def _attach_profile_selection_result(
         raise RuntimeError(
             "provider_directory_profile_selection_evidence_scope_incomplete"
         )
-    published_metrics[PROFILE_SELECTION_RESULT_METRIC] = profile_selection_result(
+    published_metrics_by_name[PROFILE_SELECTION_RESULT_METRIC] = profile_selection_result(
         execution,
         profile_generation_id=profile_generation_id,
+        profile_as_of=profile_as_of,
         profile_rows=profile_rows,
         profile_source_evidence_rows=evidence_rows,
     )
 
 
+async def _provider_directory_profile_replay_publish_metrics(
+    metrics: dict[str, Any],
+    fence: ProviderDirectoryArtifactDatasetFence,
+    profile_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    published_metrics_by_name = dict(metrics)
+    published_metrics_by_name["profile"] = profile_metrics
+    published_metrics_by_name["artifact_dataset_ids"] = sorted(
+        {dataset.dataset_id for dataset in fence.datasets}
+    )
+    published_metrics_by_name["artifact_dataset_evidence_run_ids"] = sorted(
+        {dataset.evidence_run_id for dataset in fence.datasets}
+    )
+    return await _record_artifact_promotion_metrics(
+        fence,
+        published_metrics_by_name,
+        0,
+    )
+
+
+async def _publish_attested_provider_directory_profile_build(
+    *,
+    run_id: str | None,
+    control_run_id: str | None,
+    metrics: dict[str, Any],
+    execution: ProviderDirectoryProfileExecution,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    source_ids: list[str],
+) -> dict[str, Any]:
+    """Publish a profile build only while its attestation remains current."""
+    if run_id is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_run_id_invalid"
+        )
+    async with suppress_control_run_heartbeat_persistence(run_id):
+        publish_targets = {"profile"}
+        artifact_resource_types = _provider_directory_artifact_resource_types(
+            publish_targets,
+            publish_corroboration=False,
+        )
+        resource_fence = await _provider_directory_profile_resource_scope_fence(
+            fence,
+            publish_targets,
+        )
+        if execution.attestation.operation == "publish":
+            await _assert_no_provider_directory_resource_id_npi_backfill_candidates(
+                _schema(),
+                source_ids,
+            )
+        capacity_admission = await _admit_provider_directory_profile_capacity(
+            run_id=run_id,
+            control_run_id=control_run_id,
+            execution=execution,
+            fence=fence,
+            resource_fence=resource_fence,
+            artifact_resource_types=artifact_resource_types,
+        )
+        capacity_token = _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
+            capacity_admission
+        )
+        try:
+            return await _publish_artifact_bundle_from_fence(
+                fence,
+                run_id=run_id,
+                metrics=metrics,
+                source_ids=source_ids,
+                publish_corroboration=False,
+                publish_artifacts_targets=publish_targets,
+                artifact_resource_types=artifact_resource_types,
+                resource_fence=resource_fence,
+            )
+        finally:
+            _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(
+                capacity_token
+            )
+
+
 async def _publish_attested_provider_directory_profile(
     *,
     run_id: str | None,
+    control_run_id: str | None,
     metrics: dict[str, Any],
     execution: ProviderDirectoryProfileExecution,
 ) -> dict[str, Any]:
     """Stage and atomically publish or purge one proof-bound global Profile."""
-
     catalog = _provider_directory_profile_selection_catalog()
     await assert_registered_profile_selection_current(
         execution.attestation,
         catalog,
     )
-    source_ids = [
-        pair["source_id"] for pair in execution.attestation.pairs
-    ]
-    publish_targets = {"profile"}
-    fence = await _attested_profile_publication_fence(
-        run_id=run_id,
-        metrics=metrics,
-        execution=execution,
-        source_ids=source_ids,
-    )
-    _assert_profile_selection_matches_artifact_fence(execution, fence)
-    artifact_resource_types = _provider_directory_artifact_resource_types(
-        publish_targets,
-        publish_corroboration=False,
-    )
+    source_ids = [pair["source_id"] for pair in execution.attestation.pairs]
     execution_token = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
         execution
     )
     try:
-        published_metrics = await _publish_artifact_bundle_from_fence(
-            fence,
+        await _bootstrap_provider_directory_profile_serving_generation(
+            _schema()
+        )
+        fence = await _attested_profile_publication_fence(
             run_id=run_id,
             metrics=metrics,
+            execution=execution,
             source_ids=source_ids,
-            publish_corroboration=False,
-            publish_artifacts_targets=publish_targets,
-            artifact_resource_types=artifact_resource_types,
         )
+        _assert_profile_selection_matches_artifact_fence(execution, fence)
+        replayed_profile = (
+            await _provider_directory_profile_committed_run_replay(
+                run_id=run_id,
+                control_run_id=control_run_id,
+                execution=execution,
+                fence=fence,
+            )
+        )
+        if replayed_profile is not None:
+            published_metrics_by_name = (
+                await _provider_directory_profile_replay_publish_metrics(
+                    metrics,
+                    fence,
+                    replayed_profile,
+                )
+            )
+        else:
+            published_metrics_by_name = (
+                await _publish_attested_provider_directory_profile_build(
+                    run_id=run_id,
+                    control_run_id=control_run_id,
+                    metrics=metrics,
+                    execution=execution,
+                    fence=fence,
+                    source_ids=source_ids,
+                )
+            )
     finally:
         _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(execution_token)
-    _attach_profile_selection_result(execution, published_metrics)
-    return published_metrics
+    _attach_profile_selection_result(execution, published_metrics_by_name)
+    return published_metrics_by_name
 
 
 async def _prepare_artifact_publication_fence(
@@ -13824,9 +19899,7 @@ def _assert_candidate_artifact_stage_relations_complete(
         enabled_targets,
         publish_metrics_by_name,
     )
-    actual_relations = {
-        stage.target_relation for stage in artifact_bundle.stages
-    }
+    actual_relations = artifact_bundle.target_relations
     if actual_relations != expected_relations:
         missing_relations = sorted(expected_relations - actual_relations)
         unexpected_relations = sorted(actual_relations - expected_relations)
@@ -13901,6 +19974,92 @@ async def _record_artifact_promotion_metrics(
     return publish_metrics_by_name
 
 
+async def _provider_directory_profile_resource_scope_fence(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    publish_artifacts_targets: set[str] | None,
+) -> ProviderDirectoryArtifactDatasetFence:
+    """Narrow typed-resource scratch to changed Profile sources only."""
+
+    execution = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
+    if (
+        execution is None
+        or publish_artifacts_targets != {"profile"}
+        or not await _has_provider_directory_profile_artifacts(_schema())
+    ):
+        return fence
+    desired_source_vector = _provider_directory_profile_source_vector(
+        (
+            str(pair["source_id"]),
+            str(pair["dataset_id"]),
+        )
+        for pair in execution.attestation.pairs
+    )
+    (
+        _selected_source_ids,
+        _retained_source_ids,
+        desired_source_contexts,
+    ) = await _provider_directory_profile_scope_source_ids(
+        _schema(),
+        {source_id for source_id, _dataset_id in desired_source_vector},
+    )
+    desired_source_context_vector = (
+        _provider_directory_profile_source_context_vector(
+            desired_source_contexts
+        )
+    )
+    serving_state = await _provider_directory_profile_delta_serving_state(
+        _schema(),
+        allow_adoption=False,
+    )
+    refresh_source_ids, _removed_source_ids = (
+        _provider_directory_profile_delta_sources(
+            serving_state,
+            desired_source_vector,
+            desired_source_context_vector,
+        )
+    )
+    refresh_source_id_set = set(refresh_source_ids)
+    return ProviderDirectoryArtifactDatasetFence(
+        datasets=tuple(
+            dataset
+            for dataset in fence.datasets
+            if dataset.source_id in refresh_source_id_set
+        ),
+        should_select_validated_candidates=(
+            fence.should_select_validated_candidates
+        ),
+    )
+
+
+def _attach_artifact_fence_metrics(
+    metrics: dict[str, Any],
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> None:
+    """Attach immutable dataset lineage to one publication metric set."""
+    metrics["artifact_dataset_ids"] = sorted(
+        {dataset.dataset_id for dataset in fence.datasets}
+    )
+    metrics["artifact_dataset_evidence_run_ids"] = sorted(
+        {dataset.evidence_run_id for dataset in fence.datasets}
+    )
+
+
+async def _refresh_bundle_profile_delta_metrics(
+    artifact_bundle: ProviderDirectoryArtifactBundle,
+    publish_metrics: Mapping[str, Any],
+) -> None:
+    """Replace staged profile estimates after a committed source delta."""
+    if artifact_bundle.profile_delta is None:
+        return
+    profile_metrics = publish_metrics.get("profile")
+    if not isinstance(profile_metrics, dict):
+        raise RuntimeError("provider_directory_profile_metrics_missing")
+    await _refresh_provider_directory_profile_delta_metrics(
+        profile_metrics,
+        artifact_bundle.profile_delta,
+    )
+
+
 async def _publish_artifact_bundle_from_fence(
     fence: ProviderDirectoryArtifactDatasetFence,
     *,
@@ -13910,22 +20069,26 @@ async def _publish_artifact_bundle_from_fence(
     publish_corroboration: bool,
     publish_artifacts_targets: set[str] | None,
     artifact_resource_types: frozenset[str],
+    resource_fence: ProviderDirectoryArtifactDatasetFence | None = None,
 ) -> dict[str, Any]:
     """Build one immutable serving bundle and publish it behind its fence."""
+    resource_fence = (
+        resource_fence
+        or await _provider_directory_profile_resource_scope_fence(
+            fence,
+            publish_artifacts_targets,
+        )
+    )
     async with _provider_directory_artifact_dataset_scope(
         run_id=run_id,
         source_ids=source_ids,
         fence=fence,
+        resource_fence=resource_fence,
         metrics=metrics,
         resource_types=artifact_resource_types,
     ):
         async with _provider_directory_artifact_bundle_scope() as artifact_bundle:
-            metrics["artifact_dataset_ids"] = sorted(
-                {dataset.dataset_id for dataset in fence.datasets}
-            )
-            metrics["artifact_dataset_evidence_run_ids"] = sorted(
-                {dataset.evidence_run_id for dataset in fence.datasets}
-            )
+            _attach_artifact_fence_metrics(metrics, fence)
             publish_metrics = await _publish_provider_directory_artifacts(
                 run_id=run_id,
                 metrics=metrics,
@@ -13943,6 +20106,10 @@ async def _publish_artifact_bundle_from_fence(
                 publish_artifacts_targets=publish_artifacts_targets,
             )
             promoted_stage_count = await artifact_bundle.promote()
+            await _refresh_bundle_profile_delta_metrics(
+                artifact_bundle,
+                publish_metrics,
+            )
             return await _record_artifact_promotion_metrics(
                 fence,
                 publish_metrics,
@@ -14013,6 +20180,15 @@ def _collect_provider_directory_artifact_stage(
         and len(publish_result) == 2
     ):
         metrics, raw_stages = publish_result
+        if (
+            isinstance(metrics, dict)
+            and isinstance(
+                raw_stages,
+                ProviderDirectoryPreparedProfileDelta,
+            )
+        ):
+            artifact_bundle.add_profile_delta(raw_stages)
+            return metrics
         stages = _normalize_provider_directory_artifact_stages(raw_stages)
         if isinstance(metrics, dict) and stages is not None:
             for stage in stages:
@@ -14203,15 +20379,15 @@ def _profile_source_context_from_row(
 async def _provider_directory_profile_scope_source_ids(
     schema: str,
     allowed_source_ids: set[str],
+    *,
+    expected_source_context_digest: str | None = None,
 ) -> tuple[
     list[str],
     list[str],
     tuple[_ProviderDirectoryProfileSourceContext, ...],
 ]:
     """Resolve retained aliases and exact emitted context for selected ones."""
-    configured_source_ids = list(
-        profile_artifact.configured_profile_source_ids()
-    )
+    configured_source_ids = list(profile_artifact.configured_profile_source_ids())
     source_rows = await db.all(
         profile_artifact.profile_scope_source_ids_sql(
             _qt(schema, ProviderDirectorySource.__tablename__)
@@ -14242,7 +20418,19 @@ async def _provider_directory_profile_scope_source_ids(
         source_context_by_id[source_id]
         for source_id in selected_source_ids
     )
-    _assert_attested_profile_source_contexts(selected_source_contexts)
+    if expected_source_context_digest is None:
+        _assert_attested_profile_source_contexts(
+            selected_source_contexts
+        )
+    elif (
+        _source_context_digest(
+            [asdict(source_context) for source_context in selected_source_contexts]
+        )
+        != expected_source_context_digest
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_source_context_adoption_changed"
+        )
     return (
         selected_source_ids,
         retained_source_ids,
@@ -14265,20 +20453,6 @@ def _assert_attested_profile_source_contexts(
         raise ProviderDirectoryArtifactBuildStale(
             "provider_directory_profile_source_context_attestation_changed"
         )
-
-
-async def _create_provider_directory_profile_indexes(
-    schema: str,
-    table_name: str,
-    *,
-    evidence: bool,
-) -> None:
-    for statement in profile_artifact.profile_index_statements(
-        schema,
-        table_name,
-        evidence=evidence,
-    ):
-        await db.status(statement)
 
 
 async def _rename_provider_directory_profile_indexes(
@@ -14369,7 +20543,7 @@ async def _remove_provider_directory_profile_stage_table(
     stage_ref = _unscoped_qt(schema, stage_table)
     try:
         await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
-    except Exception:  # pragma: no cover - cleanup best effort
+    except Exception:
         LOGGER.warning(
             "Failed to clean Provider Directory profile stage %s",
             stage_ref,
@@ -14387,6 +20561,33 @@ class _ProviderDirectoryProfileSourceContext:
 
 
 @dataclass(frozen=True)
+class _ProviderDirectoryProfileServingState:
+    status: str
+    operation: str
+    control_generation: int
+    generation_id: str
+    selection_proof_id: str
+    authority_revision: int
+    profile_schema_version: int
+    profile_strategy_version: str
+    source_vector: tuple[tuple[str, str], ...]
+    source_vector_hash: str
+    source_context_vector: tuple[tuple[str, str], ...]
+    source_context_vector_hash: str
+    executable_plan_hash: str
+    evidence_target_oid: int
+    profile_target_oid: int
+    evidence_rows: int
+    profile_rows: int
+    profile_as_of: str
+    published_at: str
+    capacity_geometry_status: str = "legacy_unavailable"
+    capacity_geometry_hash: str | None = None
+    capacity_geometry_json: str | None = None
+    cutover_forecast_hash: str | None = None
+
+
+@dataclass(frozen=True)
 class _ProviderDirectoryProfileBuild:
     schema: str
     generation_id: str
@@ -14400,6 +20601,23 @@ class _ProviderDirectoryProfileBuild:
     build_id: str | None = None
     owner_run_id: str | None = None
     batch_plan: _ProviderDirectoryProfileBatchPlan | None = None
+    materialization_mode: str = "full_swap"
+    current_source_vector: tuple[tuple[str, str], ...] = ()
+    desired_source_vector: tuple[tuple[str, str], ...] = ()
+    current_source_vector_hash: str | None = None
+    desired_source_vector_hash: str | None = None
+    current_source_context_vector: tuple[tuple[str, str], ...] = ()
+    desired_source_context_vector: tuple[tuple[str, str], ...] = ()
+    current_source_context_vector_hash: str | None = None
+    desired_source_context_vector_hash: str | None = None
+    removed_source_ids: tuple[str, ...] = ()
+    affected_npi_stage: str | None = None
+    selection_proof_id: str | None = None
+    authority_revision: int | None = None
+    serving_state: _ProviderDirectoryProfileServingState | None = None
+    capacity_geometry_status: str = "legacy_unavailable"
+    capacity_geometry_hash: str | None = None
+    capacity_geometry_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -14410,6 +20628,14 @@ class _ProviderDirectoryProfileEvidenceBatch:
     fact_type: str | None = None
     role_bucket_count: int = 1
     role_bucket: int = 0
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileEvidenceProjection:
+    """Exact read-only cardinality and logical bytes for one fact batch."""
+
+    projected_rows: int
+    projected_logical_bytes: int
 
 
 @dataclass(frozen=True)
@@ -14426,6 +20652,41 @@ class _ProviderDirectoryProfileBatchPlan:
     evidence_batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...]
     compact_batches: tuple[_ProviderDirectoryProfileCompactBatch, ...]
     fingerprint: str
+    evidence_window_size: int = 1
+    compact_window_size: int = 1
+    evidence_waves: tuple[tuple[int, int], ...] = ()
+    compact_waves: tuple[tuple[int, int], ...] = ()
+    materialization_mode: str = "full_swap"
+    current_source_vector_hash: str | None = None
+    desired_source_vector_hash: str | None = None
+    current_source_context_vector_hash: str | None = None
+    desired_source_context_vector_hash: str | None = None
+    removed_source_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileBatchPlanOptions:
+    npi_batch_size: int = profile_artifact.PROFILE_NPI_BATCH_SIZE
+    evidence_window_size: int | None = None
+    compact_window_size: int | None = None
+    materialization_mode: str = "full_swap"
+    current_source_vector_hash: str | None = None
+    desired_source_vector_hash: str | None = None
+    current_source_context_vector_hash: str | None = None
+    desired_source_context_vector_hash: str | None = None
+    removed_source_ids: Iterable[str] = ()
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileBatchExecution:
+    include_copy_batch: bool
+    evidence_batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...]
+    compact_batches: tuple[_ProviderDirectoryProfileCompactBatch, ...]
+    evidence_window_size: int
+    compact_window_size: int
+    evidence_waves: tuple[tuple[int, int], ...]
+    compact_waves: tuple[tuple[int, int], ...]
+    removed_source_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -14435,6 +20696,4377 @@ class _ProviderDirectoryProfileBuildCheckpointState:
     profile_next_batch: int
     profile_total_batches: int
     state: str
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileIdentityInputs:
+    source_ids: list[str]
+    retained_source_ids: list[str]
+    dataset_ids: list[str]
+    resume_lineage_hash: str
+    batch_plan: _ProviderDirectoryProfileBatchPlan
+    materialization_mode: str
+    current_source_vector: tuple[tuple[str, str], ...]
+    desired_source_vector: tuple[tuple[str, str], ...]
+    current_source_vector_hash: str | None
+    desired_source_vector_hash: str | None
+    current_source_context_vector: tuple[tuple[str, str], ...]
+    desired_source_context_vector: tuple[tuple[str, str], ...]
+    current_source_context_vector_hash: str | None
+    desired_source_context_vector_hash: str | None
+    removed_source_ids: tuple[str, ...]
+    serving_state: _ProviderDirectoryProfileServingState | None
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileDesiredIdentity:
+    source_ids: list[str]
+    dataset_ids: list[str]
+    source_vector: tuple[tuple[str, str], ...]
+    source_vector_hash: str
+    source_context_vector: tuple[tuple[str, str], ...]
+    source_context_vector_hash: str
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileMaterializationIdentity:
+    materialization_mode: str
+    serving_state: _ProviderDirectoryProfileServingState | None
+    current_source_vector: tuple[tuple[str, str], ...]
+    current_source_vector_hash: str | None
+    current_source_context_vector: tuple[tuple[str, str], ...]
+    current_source_context_vector_hash: str | None
+    removed_source_ids: tuple[str, ...]
+    source_ids: list[str]
+    dataset_ids: list[str]
+    retained_source_ids: list[str]
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileDatabaseCapacityIdentity:
+    """PostgreSQL identity observed before any Profile scratch mutation."""
+
+    database_system_identifier: str
+    database_oid: int
+    database_name: str
+    tablespace_oid: int
+    tablespace_name: str
+    temp_tablespace_oid: int
+    temp_tablespace_name: str
+    wal_lsn: str
+    postgres_server_version_num: int
+    postgres_block_size_bytes: int
+    postgres_wal_block_size_bytes: int
+    postgres_wal_segment_size_bytes: int
+    postgres_full_page_writes: bool
+    postgres_wal_compression: str
+    postgres_wal_level: str
+    postgres_wal_log_hints: bool
+    postgres_data_checksums: bool
+    postgres_default_toast_compression: str
+    postgres_checkpoint_timeout_seconds: int
+    postgres_max_wal_size_bytes: int
+    evidence_target_storage_fingerprint: str
+    profile_target_storage_fingerprint: str
+    build_checkpoint_oid: int
+    serving_generation_oid: int
+    delta_receipt_oid: int
+    import_run_oid: int
+    capacity_consumption_oid: int
+    build_checkpoint_storage_fingerprint: str
+    serving_generation_storage_fingerprint: str
+    delta_receipt_storage_fingerprint: str
+    import_run_storage_fingerprint: str
+    capacity_consumption_storage_fingerprint: str
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileRelationStorageLayout:
+    """Exact relation identity plus name/OID-free cutover structure."""
+
+    exact_fingerprint: str
+    structural_fingerprint: str
+    relation_oid: int
+    toast_oid: int | None
+    main_index_oids: tuple[int, ...]
+    main_index_pages: tuple[int, ...]
+    toast_index_oids: tuple[int, ...]
+    toast_index_pages: tuple[int, ...]
+    toastable_columns: tuple[str, ...]
+    effective_tablespace_oids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileCapacityAdmission:
+    """Verified one-time lease and its exact executable delta geometry."""
+
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry
+    control_wal_projection: (
+        profile_capacity.ProviderDirectoryProfileControlWalProjection
+    )
+    lease: VerifiedDatabaseCapacityLease
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity
+    build_id: str
+    run_id: str
+    initial_wal_lsn: str
+    wal_tracker: _ProviderDirectoryProfileWalTracker
+    admitted_identity: _ProviderDirectoryProfileIdentityInputs | None = None
+
+
+@dataclass
+class _ProviderDirectoryProfileWalTracker:
+    """Race-safe projected-WAL consumption below one signed reservation."""
+
+    accounted_control_operation_counts: dict[str, int] = field(
+        default_factory=dict
+    )
+    accounted_relation_wal_bytes: dict[str, int] = field(
+        default_factory=dict
+    )
+    accounted_metadata_wal_bytes: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileCutoverCapacityForecast:
+    """Canonical preventive forecast frozen before the first target DML."""
+
+    target_projection: (
+        profile_capacity.ProviderDirectoryProfileDeltaProjection
+    )
+    metadata_projection: (
+        profile_capacity.ProviderDirectoryProfileMetadataProjection
+    )
+    forecast_hash: str
+    forecast_json: str
+    wal_start_lsn: str
+    wal_bytes_before: int
+    evidence_target_bytes_before: int
+    profile_target_bytes_before: int
+
+
+def _provider_directory_profile_capacity_geometry_identity(
+    *,
+    status: Any,
+    geometry_hash: Any,
+    geometry_json: Any,
+) -> tuple[str, str | None, str | None]:
+    """Validate and canonicalize one persisted capacity-geometry identity."""
+
+    normalized_status = _clean_text(status)
+    normalized_hash = _clean_text(geometry_hash)
+    if normalized_status == "legacy_unavailable":
+        if normalized_hash is not None or geometry_json is not None:
+            raise RuntimeError(
+                "provider_directory_profile_capacity_legacy_geometry_invalid"
+            )
+        return normalized_status, None, None
+    if normalized_status != "verified":
+        raise RuntimeError(
+            "provider_directory_profile_capacity_geometry_status_invalid"
+        )
+    if isinstance(geometry_json, str):
+        try:
+            geometry_json = json.loads(geometry_json)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "provider_directory_profile_capacity_geometry_json_invalid"
+            ) from exc
+    if not isinstance(geometry_json, Mapping):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_geometry_json_invalid"
+        )
+    geometry = profile_capacity.validated_capacity_geometry(
+        dict(geometry_json)
+    )
+    canonical_json = (
+        profile_capacity.canonical_capacity_geometry_json(geometry)
+    )
+    computed_hash = profile_capacity.capacity_geometry_hash(geometry)
+    if normalized_hash != computed_hash:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_geometry_hash_invalid"
+        )
+    return "verified", computed_hash, canonical_json
+
+
+def _provider_directory_profile_admitted_capacity_geometry(
+) -> tuple[str, str | None, str | None]:
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return "legacy_unavailable", None, None
+    geometry = profile_capacity.revalidate_capacity_geometry(
+        admission.geometry
+    )
+    return (
+        "verified",
+        profile_capacity.capacity_geometry_hash(geometry),
+        profile_capacity.canonical_capacity_geometry_json(geometry),
+    )
+
+
+def _provider_directory_profile_max_wave_width(
+    waves: tuple[tuple[int, int], ...],
+) -> int:
+    return max((wave_end - wave_start for wave_start, wave_end in waves), default=0)
+
+
+def _provider_directory_profile_capacity_artifact_workers(
+    *,
+    database_pool_size: int,
+    pool_reserve_connections: int,
+) -> int:
+    requested_workers, explicitly_configured = (
+        _provider_directory_positive_config(
+            "HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_WORKERS",
+            DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_WORKERS,
+        )
+    )
+    admitted_workers = min(
+        2,
+        len(RESOURCE_MODELS),
+        database_pool_size - pool_reserve_connections,
+    )
+    if admitted_workers < 1 or (
+        explicitly_configured and requested_workers > admitted_workers
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_artifact_workers_exceeded"
+        )
+    return min(requested_workers, admitted_workers)
+
+
+def _provider_directory_profile_sql_contract_digest() -> str:
+    return _identity_hash(
+        {
+            "contract": "provider-directory-profile-sql-contract-v1",
+            "sql_contract_hashes": (
+                _provider_directory_profile_sql_contract_hashes()
+            ),
+        }
+    )
+
+
+_PROFILE_CAPACITY_RELATION_SQL = """
+    SELECT relation.oid::bigint AS relation_oid,
+           namespace.nspname::text AS schema_name,
+           relation.relname::text AS relation_name,
+           relation.relkind::text AS relkind,
+           relation.relpersistence::text AS relpersistence,
+           table_am.amname::text AS table_am,
+           relation.relreplident::text AS relreplident,
+           relation.reltoastrelid::bigint AS toast_oid,
+           relation.reltablespace::bigint AS tablespace_oid,
+           COALESCE(
+               NULLIF(relation.reltablespace, 0),
+               database_row.dattablespace
+           )::bigint AS effective_tablespace_oid,
+           relation.relfilenode::bigint AS relfilenode,
+           COALESCE(to_jsonb(relation.reloptions), '[]'::jsonb)
+               AS reloptions,
+           relation.relrowsecurity,
+           relation.relforcerowsecurity,
+           relation.relispartition,
+           (
+               SELECT count(*)::bigint
+                 FROM pg_trigger AS trigger_row
+                WHERE trigger_row.tgrelid = relation.oid
+                  AND NOT trigger_row.tgisinternal
+           ) AS user_trigger_count,
+           (
+               SELECT count(*)::bigint
+                 FROM pg_rewrite AS rewrite_row
+                WHERE rewrite_row.ev_class = relation.oid
+           ) AS rule_count,
+           (
+               SELECT count(*)::bigint
+                 FROM pg_inherits AS inheritance
+                WHERE inheritance.inhrelid = relation.oid
+                   OR inheritance.inhparent = relation.oid
+           ) AS inheritance_count,
+           toast_relation.relkind::text AS toast_relkind,
+           toast_relation.relpersistence::text
+               AS toast_relpersistence,
+           toast_am.amname::text AS toast_am,
+           toast_relation.reltablespace::bigint
+               AS toast_tablespace_oid,
+           COALESCE(
+               NULLIF(toast_relation.reltablespace, 0),
+               database_row.dattablespace
+           )::bigint AS toast_effective_tablespace_oid,
+           toast_relation.relfilenode::bigint
+               AS toast_relfilenode,
+           COALESCE(
+               to_jsonb(toast_relation.reloptions),
+               '[]'::jsonb
+           ) AS toast_reloptions
+      FROM pg_class AS relation
+      JOIN pg_namespace AS namespace
+        ON namespace.oid = relation.relnamespace
+      JOIN pg_database AS database_row
+        ON database_row.datname = current_database()
+      JOIN pg_am AS table_am ON table_am.oid = relation.relam
+      LEFT JOIN pg_class AS toast_relation
+        ON toast_relation.oid = relation.reltoastrelid
+      LEFT JOIN pg_am AS toast_am
+        ON toast_am.oid = toast_relation.relam
+     WHERE relation.oid = CAST(:relation_oid AS oid);
+"""
+_PROFILE_CAPACITY_ATTRIBUTE_SQL = """
+    SELECT attribute.attrelid::bigint AS relation_oid,
+           attribute.attnum,
+           attribute.attname::text AS attname,
+           attribute.atttypid::bigint AS atttypid,
+           attribute.atttypmod,
+           attribute.attcollation::bigint AS attcollation,
+           attribute.attnotnull,
+           attribute.attstorage::text AS attstorage,
+           attribute.attcompression::text AS attcompression,
+           attribute.attgenerated::text AS attgenerated,
+           attribute.attidentity::text AS attidentity,
+           attribute.atthasdef,
+           type_row.typlen,
+           COALESCE(
+               pg_get_expr(
+                   default_row.adbin,
+                   default_row.adrelid,
+                   true
+               ),
+               ''
+           ) AS default_expression
+      FROM pg_attribute AS attribute
+      JOIN pg_type AS type_row ON type_row.oid = attribute.atttypid
+      LEFT JOIN pg_attrdef AS default_row
+        ON default_row.adrelid = attribute.attrelid
+       AND default_row.adnum = attribute.attnum
+     WHERE attribute.attrelid = ANY(CAST(:relation_oids AS oid[]))
+       AND attribute.attnum > 0
+       AND NOT attribute.attisdropped
+     ORDER BY attribute.attrelid, attribute.attnum;
+"""
+_PROFILE_CAPACITY_INDEX_SQL = """
+    SELECT index_row.indrelid::bigint AS relation_oid,
+           index_row.indexrelid::bigint AS index_oid,
+           index_relation.relname::text AS index_name,
+           index_relation.relfilenode::bigint AS relfilenode,
+           index_relation.reltablespace::bigint AS tablespace_oid,
+           COALESCE(
+               NULLIF(index_relation.reltablespace, 0),
+               database_row.dattablespace
+           )::bigint AS effective_tablespace_oid,
+           index_am.amname::text AS index_am,
+           COALESCE(
+               to_jsonb(index_relation.reloptions),
+               '[]'::jsonb
+           ) AS reloptions,
+           index_row.indnatts,
+           index_row.indnkeyatts,
+           index_row.indisunique,
+           index_row.indnullsnotdistinct,
+           index_row.indisprimary,
+           index_row.indisexclusion,
+           index_row.indimmediate,
+           index_row.indisclustered,
+           index_row.indisvalid,
+           index_row.indcheckxmin,
+           index_row.indisready,
+           index_row.indislive,
+           index_row.indisreplident,
+           index_row.indkey::text AS indkey,
+           index_row.indcollation::text AS indcollation,
+           index_row.indclass::text AS indclass,
+           index_row.indoption::text AS indoption,
+           COALESCE(
+               pg_get_expr(
+                   index_row.indexprs,
+                   index_row.indrelid,
+                   true
+               ),
+               ''
+           ) AS index_expressions,
+           COALESCE(
+               pg_get_expr(
+                   index_row.indpred,
+                   index_row.indrelid,
+                   true
+               ),
+               ''
+           ) AS index_predicate,
+           pg_relation_size(
+               index_row.indexrelid,
+               'main'
+           )::bigint AS main_bytes
+      FROM pg_index AS index_row
+      JOIN pg_class AS index_relation
+        ON index_relation.oid = index_row.indexrelid
+      JOIN pg_am AS index_am ON index_am.oid = index_relation.relam
+      JOIN pg_database AS database_row
+        ON database_row.datname = current_database()
+     WHERE index_row.indrelid = ANY(CAST(:relation_oids AS oid[]))
+     ORDER BY index_row.indrelid, index_row.indexrelid;
+"""
+_PROFILE_CAPACITY_CONSTRAINT_SQL = """
+    SELECT constraint_row.conrelid::bigint AS relation_oid,
+           constraint_row.contype::text AS constraint_type,
+           constraint_row.condeferrable,
+           constraint_row.condeferred,
+           constraint_row.convalidated,
+           constraint_row.connoinherit,
+           pg_get_constraintdef(
+               constraint_row.oid,
+               true
+           ) AS constraint_definition
+      FROM pg_constraint AS constraint_row
+     WHERE constraint_row.conrelid = ANY(CAST(:relation_oids AS oid[]))
+     ORDER BY constraint_row.conrelid,
+              constraint_row.contype,
+              pg_get_constraintdef(constraint_row.oid, true);
+"""
+_PROFILE_CAPACITY_TRIGGER_SQL = """
+    SELECT trigger_row.tgrelid::bigint AS relation_oid,
+           trigger_row.tgname::text AS trigger_name,
+           trigger_row.tgtype,
+           trigger_row.tgenabled::text AS trigger_enabled,
+           trigger_row.tgfoid::bigint AS trigger_function_oid,
+           trigger_function.prosrc::text
+               AS trigger_function_source,
+           pg_get_functiondef(trigger_row.tgfoid)
+               AS trigger_function_definition,
+           pg_get_triggerdef(
+               trigger_row.oid,
+               true
+           ) AS trigger_definition
+      FROM pg_trigger AS trigger_row
+      JOIN pg_proc AS trigger_function
+        ON trigger_function.oid = trigger_row.tgfoid
+     WHERE trigger_row.tgrelid = ANY(CAST(:relation_oids AS oid[]))
+       AND NOT trigger_row.tgisinternal
+     ORDER BY trigger_row.tgrelid, trigger_row.tgname;
+"""
+
+
+async def _profile_capacity_relation_row(
+    relation_oid: int,
+    expected_persistence: str,
+    expected_user_trigger_count: int,
+) -> tuple[dict[str, Any], int | None]:
+    relation_row = await db.first(
+        _PROFILE_CAPACITY_RELATION_SQL,
+        relation_oid=relation_oid,
+    )
+    if relation_row is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_storage_shape_missing"
+        )
+    relation_map = dict(_pagination_checkpoint_row_mapping(relation_row))
+    has_unsafe_identity = (
+        relation_map.get("relkind") != "r"
+        or relation_map.get("relpersistence") != expected_persistence
+        or relation_map.get("table_am") != "heap"
+        or relation_map.get("relreplident") == "f"
+        or relation_map.get("relrowsecurity") is not False
+        or relation_map.get("relforcerowsecurity") is not False
+        or relation_map.get("relispartition") is not False
+        or int(relation_map.get("user_trigger_count") or 0)
+        != expected_user_trigger_count
+        or int(relation_map.get("rule_count") or 0) != 0
+        or int(relation_map.get("inheritance_count") or 0) != 0
+    )
+    toast_oid = int(relation_map.get("toast_oid") or 0) or None
+    has_unsafe_toast = toast_oid is not None and (
+        relation_map.get("toast_relkind") != "t"
+        or relation_map.get("toast_relpersistence")
+        != expected_persistence
+        or relation_map.get("toast_am") != "heap"
+    )
+    if has_unsafe_identity or has_unsafe_toast:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_storage_shape_unsupported"
+        )
+    return relation_map, toast_oid
+
+
+async def _profile_capacity_relation_catalog(
+    relation_oids: list[int],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    catalog_queries = (
+        _PROFILE_CAPACITY_ATTRIBUTE_SQL,
+        _PROFILE_CAPACITY_INDEX_SQL,
+        _PROFILE_CAPACITY_CONSTRAINT_SQL,
+        _PROFILE_CAPACITY_TRIGGER_SQL,
+    )
+    catalog_rows = [
+        await db.all(catalog_query, relation_oids=relation_oids)
+        for catalog_query in catalog_queries
+    ]
+    return tuple(
+        [
+            dict(_pagination_checkpoint_row_mapping(catalog_row))
+            for catalog_row in relation_rows
+        ]
+        for relation_rows in catalog_rows
+    )
+
+
+def _assert_profile_capacity_trigger_shape(
+    triggers: list[dict[str, Any]],
+    expected_user_trigger_count: int,
+    expected_immutable_trigger_error: str | None,
+) -> None:
+    if len(triggers) != expected_user_trigger_count:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_trigger_shape_changed"
+        )
+    if not expected_user_trigger_count:
+        return
+    expected_trigger_source = (
+        "BEGIN RAISE EXCEPTION "
+        f"'{expected_immutable_trigger_error}'; END;"
+    )
+    observed_trigger_sources = {
+        re.sub(
+            r"\s+",
+            " ",
+            str(trigger.get("trigger_function_source") or ""),
+        ).strip()
+        for trigger in triggers
+    }
+    has_invalid_trigger = (
+        expected_user_trigger_count != 2
+        or not expected_immutable_trigger_error
+        or {int(trigger["tgtype"]) for trigger in triggers} != {26, 34}
+        or any(
+            trigger.get("trigger_enabled") != "A"
+            for trigger in triggers
+        )
+        or len(
+            {
+                int(trigger["trigger_function_oid"])
+                for trigger in triggers
+            }
+        )
+        != 1
+        or observed_trigger_sources != {expected_trigger_source}
+    )
+    if has_invalid_trigger:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_immutable_trigger_"
+            "shape_changed"
+        )
+
+
+def _profile_capacity_structural_indexes(
+    indexes: list[dict[str, Any]],
+    relation_oid: int,
+) -> list[dict[str, Any]]:
+    if not indexes or any(
+        index.get("index_am") != "btree"
+        or index.get("indisvalid") is not True
+        or index.get("indisready") is not True
+        or index.get("indislive") is not True
+        for index in indexes
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_index_shape_unsupported"
+        )
+    structural_indexes = []
+    excluded_fields = {
+        "relation_oid",
+        "index_oid",
+        "index_name",
+        "relfilenode",
+        "tablespace_oid",
+        "main_bytes",
+    }
+    for index in indexes:
+        index_shape_by_name = {
+            field_name: field_value
+            for field_name, field_value in index.items()
+            if field_name not in excluded_fields
+        }
+        index_shape_by_name["relation_kind"] = (
+            "main"
+            if int(index["relation_oid"]) == relation_oid
+            else "toast"
+        )
+        structural_indexes.append(index_shape_by_name)
+    return sorted(
+        structural_indexes,
+        key=lambda index_shape: json.dumps(
+            index_shape,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _profile_capacity_structural_attributes(
+    attributes: list[dict[str, Any]],
+    relation_oid: int,
+) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            {
+                **{
+                    field_name: field_value
+                    for field_name, field_value in attribute.items()
+                    if field_name != "relation_oid"
+                },
+                "relation_kind": (
+                    "main"
+                    if int(attribute["relation_oid"]) == relation_oid
+                    else "toast"
+                ),
+            }
+            for attribute in attributes
+        ),
+        key=lambda attribute_shape: (
+            attribute_shape["relation_kind"],
+            int(attribute_shape["attnum"]),
+        ),
+    )
+
+
+def _profile_capacity_structural_constraints(
+    constraints: list[dict[str, Any]],
+    relation_oid: int,
+) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            {
+                **{
+                    field_name: field_value
+                    for field_name, field_value in constraint.items()
+                    if field_name != "relation_oid"
+                },
+                "relation_kind": (
+                    "main"
+                    if int(constraint["relation_oid"]) == relation_oid
+                    else "toast"
+                ),
+            }
+            for constraint in constraints
+        ),
+        key=lambda constraint_shape: json.dumps(
+            constraint_shape,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _profile_capacity_fingerprint_payloads(
+    relation_map: Mapping[str, Any],
+    attributes: list[dict[str, Any]],
+    indexes: list[dict[str, Any]],
+    constraints: list[dict[str, Any]],
+    triggers: list[dict[str, Any]],
+    relation_oid: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    structural_relation_by_name = {
+        field_name: relation_map.get(field_name)
+        for field_name in (
+            "table_am",
+            "relreplident",
+            "reloptions",
+            "relrowsecurity",
+            "relforcerowsecurity",
+            "toast_am",
+            "toast_reloptions",
+        )
+    }
+    structural_payload_by_field = {
+        "contract": "provider-directory-relation-structure-v2",
+        "relation": structural_relation_by_name,
+        "attributes": _profile_capacity_structural_attributes(
+            attributes,
+            relation_oid,
+        ),
+        "indexes": _profile_capacity_structural_indexes(
+            indexes,
+            relation_oid,
+        ),
+        "constraints": _profile_capacity_structural_constraints(
+            constraints,
+            relation_oid,
+        ),
+    }
+    exact_payload_by_field = {
+        "contract": "provider-directory-relation-identity-v2",
+        "relation": dict(relation_map),
+        "attributes": attributes,
+        "indexes": [
+            {
+                field_name: field_value
+                for field_name, field_value in index.items()
+                if field_name != "main_bytes"
+            }
+            for index in indexes
+        ],
+        "constraints": constraints,
+        "triggers": triggers,
+    }
+    return exact_payload_by_field, structural_payload_by_field
+
+
+def _profile_capacity_index_groups(
+    indexes: list[dict[str, Any]],
+    relation_oid: int,
+    toast_oid: int | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    main_indexes = [
+        index
+        for index in indexes
+        if int(index["relation_oid"]) == relation_oid
+    ]
+    toast_indexes = [
+        index
+        for index in indexes
+        if toast_oid is not None
+        and int(index["relation_oid"]) == toast_oid
+    ]
+    return main_indexes, toast_indexes
+
+
+def _profile_capacity_tablespaces(
+    relation_map: Mapping[str, Any],
+    indexes: list[dict[str, Any]],
+    toast_oid: int | None,
+) -> tuple[int, ...]:
+    tablespace_oids = {
+        int(relation_map["effective_tablespace_oid"]),
+        *(int(index["effective_tablespace_oid"]) for index in indexes),
+    }
+    if toast_oid is not None:
+        tablespace_oids.add(
+            int(relation_map["toast_effective_tablespace_oid"])
+        )
+    return tuple(sorted(tablespace_oids))
+
+
+def _profile_capacity_storage_layout(
+    relation_oid: int,
+    toast_oid: int | None,
+    relation_map: Mapping[str, Any],
+    attributes: list[dict[str, Any]],
+    indexes: list[dict[str, Any]],
+    exact_payload_by_field: dict[str, Any],
+    structural_payload_by_field: dict[str, Any],
+) -> _ProviderDirectoryProfileRelationStorageLayout:
+    main_indexes, toast_indexes = _profile_capacity_index_groups(
+        indexes,
+        relation_oid,
+        toast_oid,
+    )
+    block_size = profile_capacity.POSTGRES_BLOCK_SIZE_BYTES
+    return _ProviderDirectoryProfileRelationStorageLayout(
+        exact_fingerprint=_identity_hash(exact_payload_by_field),
+        structural_fingerprint=_identity_hash(structural_payload_by_field),
+        relation_oid=relation_oid,
+        toast_oid=toast_oid,
+        main_index_oids=tuple(
+            int(index["index_oid"]) for index in main_indexes
+        ),
+        main_index_pages=tuple(
+            max(1, math.ceil(int(index["main_bytes"]) / block_size))
+            for index in main_indexes
+        ),
+        toast_index_oids=tuple(
+            int(index["index_oid"]) for index in toast_indexes
+        ),
+        toast_index_pages=tuple(
+            max(1, math.ceil(int(index["main_bytes"]) / block_size))
+            for index in toast_indexes
+        ),
+        toastable_columns=tuple(
+            str(attribute["attname"])
+            for attribute in attributes
+            if int(attribute["relation_oid"]) == relation_oid
+            and attribute.get("attstorage") != "p"
+            and int(attribute.get("typlen") or 0) == -1
+        ),
+        effective_tablespace_oids=_profile_capacity_tablespaces(
+            relation_map,
+            indexes,
+            toast_oid,
+        ),
+    )
+
+
+async def _provider_directory_profile_relation_storage_fingerprint(
+    relation_oid: int,
+    *,
+    expected_persistence: str,
+    expected_user_trigger_count: int = 0,
+    expected_immutable_trigger_error: str | None = None,
+) -> _ProviderDirectoryProfileRelationStorageLayout:
+    """Prove exact PG18 heap/B-tree identity and cutover structure."""
+    relation_map, toast_oid = await _profile_capacity_relation_row(
+        relation_oid,
+        expected_persistence,
+        expected_user_trigger_count,
+    )
+    relation_oids = [relation_oid]
+    if toast_oid is not None:
+        relation_oids.append(toast_oid)
+    attributes, indexes, constraints, triggers = (
+        await _profile_capacity_relation_catalog(relation_oids)
+    )
+    _assert_profile_capacity_trigger_shape(
+        triggers,
+        expected_user_trigger_count,
+        expected_immutable_trigger_error,
+    )
+    exact_payload, structural_payload = (
+        _profile_capacity_fingerprint_payloads(
+            relation_map,
+            attributes,
+            indexes,
+            constraints,
+            triggers,
+            relation_oid,
+        )
+    )
+    return _profile_capacity_storage_layout(
+        relation_oid,
+        toast_oid,
+        relation_map,
+        attributes,
+        indexes,
+        exact_payload,
+        structural_payload,
+    )
+
+
+_PROFILE_CAPACITY_DATABASE_IDENTITY_SQL = """
+        SELECT control.system_identifier::text
+                   AS database_system_identifier,
+               database_row.oid::bigint AS database_oid,
+               database_row.datname::text AS database_name,
+               database_row.dattablespace::bigint
+                   AS database_tablespace_oid,
+               database_tablespace.spcname::text
+                   AS database_tablespace_name,
+               evidence_relation.oid::bigint AS evidence_target_oid,
+               evidence_namespace.nspname::text AS evidence_schema,
+               evidence_relation.relname::text AS evidence_relation,
+               evidence_relation.relkind::text AS evidence_relkind,
+               evidence_relation.relpersistence::text
+                   AS evidence_relpersistence,
+               COALESCE(
+                   NULLIF(evidence_relation.reltablespace, 0),
+                   database_row.dattablespace
+               )::bigint AS evidence_tablespace_oid,
+               profile_relation.oid::bigint AS profile_target_oid,
+               profile_namespace.nspname::text AS profile_schema,
+               profile_relation.relname::text AS profile_relation,
+               profile_relation.relkind::text AS profile_relkind,
+               profile_relation.relpersistence::text
+                   AS profile_relpersistence,
+               COALESCE(
+                   NULLIF(profile_relation.reltablespace, 0),
+                   database_row.dattablespace
+               )::bigint AS profile_tablespace_oid,
+               current_setting('temp_tablespaces')::text
+                   AS temp_tablespaces,
+               current_setting('server_version_num')::integer
+                   AS postgres_server_version_num,
+               pg_size_bytes(current_setting('block_size'))::bigint
+                   AS postgres_block_size_bytes,
+               pg_size_bytes(current_setting('wal_block_size'))::bigint
+                   AS postgres_wal_block_size_bytes,
+               pg_size_bytes(current_setting('wal_segment_size'))::bigint
+                   AS postgres_wal_segment_size_bytes,
+               current_setting('full_page_writes')::boolean
+                   AS postgres_full_page_writes,
+               current_setting('wal_compression')::text
+                   AS postgres_wal_compression,
+               current_setting('wal_level')::text
+                   AS postgres_wal_level,
+               current_setting('wal_log_hints')::boolean
+                   AS postgres_wal_log_hints,
+               current_setting('data_checksums')::boolean
+                   AS postgres_data_checksums,
+               current_setting('default_toast_compression')::text
+                   AS postgres_default_toast_compression,
+               EXTRACT(
+                   epoch FROM current_setting(
+                       'checkpoint_timeout'
+                   )::interval
+               )::bigint AS postgres_checkpoint_timeout_seconds,
+               pg_size_bytes(current_setting('max_wal_size'))::bigint
+                   AS postgres_max_wal_size_bytes,
+               pg_current_wal_insert_lsn()::text AS wal_lsn
+          FROM pg_database AS database_row
+          CROSS JOIN pg_control_system() AS control
+          JOIN pg_tablespace AS database_tablespace
+            ON database_tablespace.oid = database_row.dattablespace
+          JOIN pg_class AS evidence_relation
+            ON evidence_relation.oid = CAST(
+                :evidence_target_oid AS oid
+            )
+          JOIN pg_namespace AS evidence_namespace
+            ON evidence_namespace.oid = evidence_relation.relnamespace
+          JOIN pg_class AS profile_relation
+            ON profile_relation.oid = CAST(:profile_target_oid AS oid)
+          JOIN pg_namespace AS profile_namespace
+            ON profile_namespace.oid = profile_relation.relnamespace
+         WHERE database_row.datname = current_database();
+        """
+
+_PROFILE_CAPACITY_METADATA_IDENTITY_SQL = """
+        SELECT CAST(:checkpoint_ref AS regclass)::oid::bigint
+                   AS build_checkpoint_oid,
+               CAST(:serving_ref AS regclass)::oid::bigint
+                   AS serving_generation_oid,
+               CAST(:receipt_ref AS regclass)::oid::bigint
+                   AS delta_receipt_oid,
+               CAST(:import_run_ref AS regclass)::oid::bigint
+                   AS import_run_oid,
+               CAST(:capacity_consumption_ref AS regclass)::oid::bigint
+                   AS capacity_consumption_oid;
+        """
+
+
+@dataclass(frozen=True)
+class _ProfileCapacityTargetLayouts:
+    database_tablespace_oid: int
+    temp_tablespace_oid: int
+    temp_tablespace_name: str
+    evidence: _ProviderDirectoryProfileRelationStorageLayout
+    profile: _ProviderDirectoryProfileRelationStorageLayout
+
+
+@dataclass(frozen=True)
+class _ProfileCapacityMetadataLayouts:
+    oids_by_name: dict[str, int]
+    layouts_by_name: dict[
+        str,
+        _ProviderDirectoryProfileRelationStorageLayout,
+    ]
+
+
+async def _profile_capacity_database_row(
+    serving_state: _ProviderDirectoryProfileServingState,
+) -> Mapping[str, Any]:
+    """Load exact PostgreSQL, target, and tablespace identity."""
+    identity_row = await db.first(
+        _PROFILE_CAPACITY_DATABASE_IDENTITY_SQL,
+        evidence_target_oid=serving_state.evidence_target_oid,
+        profile_target_oid=serving_state.profile_target_oid,
+    )
+    if identity_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_database_identity_missing"
+        )
+    return _pagination_checkpoint_row_mapping(identity_row)
+
+
+def _profile_capacity_database_tablespace_oid(
+    identity_map: Mapping[str, Any],
+    schema: str,
+    serving_state: _ProviderDirectoryProfileServingState,
+) -> int:
+    """Validate serving targets and return their shared tablespace OID."""
+    expected_target_identity = (
+        (
+            serving_state.evidence_target_oid,
+            schema,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+            "r",
+            "p",
+        ),
+        (
+            serving_state.profile_target_oid,
+            schema,
+            profile_artifact.PROFILE_TABLE,
+            "r",
+            "p",
+        ),
+    )
+    observed_target_identity = (
+        (
+            int(identity_map["evidence_target_oid"]),
+            str(identity_map["evidence_schema"]),
+            str(identity_map["evidence_relation"]),
+            str(identity_map["evidence_relkind"]),
+            str(identity_map["evidence_relpersistence"]),
+        ),
+        (
+            int(identity_map["profile_target_oid"]),
+            str(identity_map["profile_schema"]),
+            str(identity_map["profile_relation"]),
+            str(identity_map["profile_relkind"]),
+            str(identity_map["profile_relpersistence"]),
+        ),
+    )
+    if observed_target_identity != expected_target_identity:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_target_identity_changed"
+        )
+    database_tablespace_oid = int(identity_map["database_tablespace_oid"])
+    if {
+        int(identity_map["evidence_tablespace_oid"]),
+        int(identity_map["profile_tablespace_oid"]),
+    } != {database_tablespace_oid}:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_target_tablespace_unsupported"
+        )
+    return database_tablespace_oid
+
+
+async def _profile_capacity_temp_tablespace(
+    identity_map: Mapping[str, Any],
+    database_tablespace_oid: int,
+) -> tuple[int, str]:
+    """Resolve one unambiguous effective temp tablespace."""
+    temp_setting = str(identity_map.get("temp_tablespaces") or "").strip()
+    if not temp_setting:
+        return (
+            database_tablespace_oid,
+            str(identity_map["database_tablespace_name"]),
+        )
+    if "," in temp_setting or re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_$]*",
+        temp_setting,
+    ) is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_temp_tablespace_ambiguous"
+        )
+    temp_row = await db.first(
+        """
+        SELECT oid::bigint AS tablespace_oid,
+               spcname::text AS tablespace_name
+          FROM pg_tablespace
+         WHERE spcname = :tablespace_name;
+        """,
+        tablespace_name=temp_setting,
+    )
+    if temp_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_temp_tablespace_missing"
+        )
+    temp_map = _pagination_checkpoint_row_mapping(temp_row)
+    return int(temp_map["tablespace_oid"]), str(temp_map["tablespace_name"])
+
+
+async def _profile_capacity_target_layouts(
+    identity_map: Mapping[str, Any],
+    schema: str,
+    serving_state: _ProviderDirectoryProfileServingState,
+) -> _ProfileCapacityTargetLayouts:
+    """Resolve serving layouts and their effective temp tablespace."""
+    database_tablespace_oid = _profile_capacity_database_tablespace_oid(
+        identity_map,
+        schema,
+        serving_state,
+    )
+    temp_tablespace_oid, temp_tablespace_name = (
+        await _profile_capacity_temp_tablespace(
+            identity_map,
+            database_tablespace_oid,
+        )
+    )
+    return _ProfileCapacityTargetLayouts(
+        database_tablespace_oid=database_tablespace_oid,
+        temp_tablespace_oid=temp_tablespace_oid,
+        temp_tablespace_name=temp_tablespace_name,
+        evidence=(
+            await _provider_directory_profile_relation_storage_fingerprint(
+                serving_state.evidence_target_oid,
+                expected_persistence="p",
+            )
+        ),
+        profile=(
+            await _provider_directory_profile_relation_storage_fingerprint(
+                serving_state.profile_target_oid,
+                expected_persistence="p",
+            )
+        ),
+    )
+
+
+async def _profile_capacity_metadata_oids(
+    schema: str,
+) -> dict[str, int]:
+    """Resolve exact OIDs for every persistent control relation."""
+    identity_row = await db.first(
+        _PROFILE_CAPACITY_METADATA_IDENTITY_SQL,
+        checkpoint_ref=_provider_directory_profile_checkpoint_ref(schema),
+        serving_ref=(
+            _provider_directory_profile_serving_generation_ref(schema)
+        ),
+        receipt_ref=_provider_directory_profile_delta_receipt_ref(schema),
+        import_run_ref=_unscoped_qt(schema, ImportRun.__tablename__),
+        capacity_consumption_ref=_unscoped_qt(
+            schema,
+            ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__,
+        ),
+    )
+    if identity_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_metadata_identity_missing"
+        )
+    identity_map = _pagination_checkpoint_row_mapping(identity_row)
+    return {
+        field_name.removesuffix("_oid"): int(identity_map[field_name])
+        for field_name in (
+            "build_checkpoint_oid",
+            "serving_generation_oid",
+            "delta_receipt_oid",
+            "import_run_oid",
+            "capacity_consumption_oid",
+        )
+    }
+
+
+async def _profile_capacity_metadata_layouts(
+    schema: str,
+) -> _ProfileCapacityMetadataLayouts:
+    """Resolve OIDs and exact layouts for persistent control relations."""
+    oids_by_name = await _profile_capacity_metadata_oids(schema)
+    layouts_by_name = {}
+    for relation_name, immutable_error in (
+        ("build_checkpoint", None),
+        ("serving_generation", None),
+        (
+            "delta_receipt",
+            "provider_directory_profile_delta_receipt_immutable",
+        ),
+        ("import_run", None),
+        (
+            "capacity_consumption",
+            "provider_directory_profile_capacity_consumption_immutable",
+        ),
+    ):
+        layouts_by_name[relation_name] = (
+            await _provider_directory_profile_relation_storage_fingerprint(
+                oids_by_name[relation_name],
+                expected_persistence="p",
+                **(
+                    {
+                        "expected_user_trigger_count": 2,
+                        "expected_immutable_trigger_error": immutable_error,
+                    }
+                    if immutable_error is not None
+                    else {}
+                ),
+            )
+        )
+    return _ProfileCapacityMetadataLayouts(
+        oids_by_name=oids_by_name,
+        layouts_by_name=layouts_by_name,
+    )
+
+
+def _validate_profile_capacity_writable_layouts(
+    target_layouts: _ProfileCapacityTargetLayouts,
+    metadata_layouts: _ProfileCapacityMetadataLayouts,
+) -> None:
+    """Require every writable relation to share the database tablespace."""
+    writable_layouts = (
+        target_layouts.evidence,
+        target_layouts.profile,
+        *metadata_layouts.layouts_by_name.values(),
+    )
+    if any(
+        layout.effective_tablespace_oids
+        != (target_layouts.database_tablespace_oid,)
+        for layout in writable_layouts
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_writable_tablespace_"
+            "unsupported"
+        )
+
+
+def _profile_capacity_postgres_values(
+    identity_map: Mapping[str, Any],
+    target_layouts: _ProfileCapacityTargetLayouts,
+) -> dict[str, Any]:
+    """Return normalized PostgreSQL and tablespace identity values."""
+    converters_by_name = {
+        "database_system_identifier": str,
+        "database_oid": int,
+        "database_name": str,
+        "wal_lsn": str,
+        "postgres_server_version_num": int,
+        "postgres_block_size_bytes": int,
+        "postgres_wal_block_size_bytes": int,
+        "postgres_wal_segment_size_bytes": int,
+        "postgres_full_page_writes": bool,
+        "postgres_wal_compression": str,
+        "postgres_wal_level": str,
+        "postgres_wal_log_hints": bool,
+        "postgres_data_checksums": bool,
+        "postgres_default_toast_compression": str,
+        "postgres_checkpoint_timeout_seconds": int,
+        "postgres_max_wal_size_bytes": int,
+    }
+    values_by_name = {
+        field_name: converter(identity_map[field_name])
+        for field_name, converter in converters_by_name.items()
+    }
+    values_by_name.update(
+        {
+            "tablespace_oid": target_layouts.database_tablespace_oid,
+            "tablespace_name": str(
+                identity_map["database_tablespace_name"]
+            ),
+            "temp_tablespace_oid": target_layouts.temp_tablespace_oid,
+            "temp_tablespace_name": target_layouts.temp_tablespace_name,
+        }
+    )
+    return values_by_name
+
+
+def _profile_capacity_layout_values(
+    target_layouts: _ProfileCapacityTargetLayouts,
+    metadata_layouts: _ProfileCapacityMetadataLayouts,
+) -> dict[str, Any]:
+    """Return target and control OIDs plus exact storage fingerprints."""
+    values_by_name = {
+        "evidence_target_storage_fingerprint": (
+            target_layouts.evidence.exact_fingerprint
+        ),
+        "profile_target_storage_fingerprint": (
+            target_layouts.profile.exact_fingerprint
+        ),
+    }
+    for relation_name, relation_oid in (
+        metadata_layouts.oids_by_name.items()
+    ):
+        values_by_name[f"{relation_name}_oid"] = relation_oid
+        values_by_name[f"{relation_name}_storage_fingerprint"] = (
+            metadata_layouts.layouts_by_name[
+                relation_name
+            ].exact_fingerprint
+        )
+    return values_by_name
+
+
+async def _provider_directory_profile_capacity_database_identity(
+    schema: str,
+    serving_state: _ProviderDirectoryProfileServingState,
+) -> _ProviderDirectoryProfileDatabaseCapacityIdentity:
+    """Resolve exact PostgreSQL and effective tablespace identity."""
+    identity_map = await _profile_capacity_database_row(serving_state)
+    target_layouts = await _profile_capacity_target_layouts(
+        identity_map,
+        schema,
+        serving_state,
+    )
+    metadata_layouts = await _profile_capacity_metadata_layouts(schema)
+    _validate_profile_capacity_writable_layouts(
+        target_layouts,
+        metadata_layouts,
+    )
+    return _ProviderDirectoryProfileDatabaseCapacityIdentity(
+        **_profile_capacity_postgres_values(identity_map, target_layouts),
+        **_profile_capacity_layout_values(target_layouts, metadata_layouts),
+    )
+
+
+def _assert_provider_directory_profile_capacity_tablespaces(
+    lease: VerifiedDatabaseCapacityLease,
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+) -> None:
+    tablespace_by_usage = {
+        tablespace.usage: tablespace for tablespace in lease.tablespaces
+    }
+    if set(tablespace_by_usage) != {"data", "temp"}:
+        raise ProviderDirectoryCapacityLeaseError(
+            "invalid_fields",
+            "tablespaces",
+        )
+    expected_by_usage = {
+        "data": (
+            database_identity.tablespace_oid,
+            database_identity.tablespace_name,
+        ),
+        "temp": (
+            database_identity.temp_tablespace_oid,
+            database_identity.temp_tablespace_name,
+        ),
+    }
+    for usage, expected_identity_by_name in expected_by_usage.items():
+        signed_tablespace = tablespace_by_usage[usage]
+        if (
+            signed_tablespace.tablespace_oid,
+            signed_tablespace.tablespace_name,
+        ) != expected_identity_by_name:
+            raise ProviderDirectoryCapacityLeaseError(
+                "pin_mismatch",
+                usage + "_tablespace",
+            )
+
+
+def _assert_profile_capacity_serving(
+    expected: _ProviderDirectoryProfileServingState,
+    observed: _ProviderDirectoryProfileServingState | None,
+) -> None:
+    if observed != expected:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_serving_generation_changed"
+        )
+
+
+def _provider_directory_profile_capacity_consumption_identity(
+    values_by_name: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        field_name: values_by_name[field_name]
+        for field_name in (
+            "attestation_id",
+            "reservation_id",
+            "lease_digest",
+            "capacity_geometry_hash",
+            "executable_plan_hash",
+            "selection_proof_id",
+            "source_vector_hash",
+            "source_context_vector_hash",
+            "run_id",
+            "build_id",
+            "profile_as_of",
+            "contract_id",
+            "key_id",
+            "environment_id",
+            "attestor_id",
+            "attestor_release_digest",
+            "public_key_fingerprint",
+            "database_system_identifier",
+            "database_oid",
+            "database_name",
+            "tablespace_identity_hash",
+            "volume_identity_hash",
+            "canonical_lease_json",
+            "signature",
+            "observed_at",
+            "issued_at",
+            "accepted_at",
+            "expires_at",
+            "max_build_deadline",
+            "recorded_at",
+        )
+    }
+
+
+def _provider_directory_profile_capacity_metric_map(
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    lease: VerifiedDatabaseCapacityLease,
+) -> dict[str, Any]:
+    """Return the non-secret capacity receipt shared by build and replay."""
+
+    return {
+        "contract_id": geometry.contract_id,
+        "capacity_geometry_hash": (
+            profile_capacity.capacity_geometry_hash(geometry)
+        ),
+        "attestation_id": lease.attestation_id,
+        "reservation_id": lease.reservation_id,
+        "reservation_bytes_by_storage_class": (
+            geometry.reservation_bytes_by_storage_class
+        ),
+        "control_wal_plan_input_hash": (
+            geometry.control_wal_plan_input_hash
+        ),
+        "control_wal_upper_bound_bytes": (
+            geometry.control_wal_upper_bound_bytes
+        ),
+        "control_metadata_data_upper_bound_bytes": (
+            geometry.control_metadata_data_upper_bound_bytes
+        ),
+        "minimum_remaining_bytes": geometry.minimum_remaining_bytes,
+        "database_pool_size": geometry.database_pool_size,
+        "pool_reserve_connections": geometry.pool_reserve_connections,
+        "maximum_worker_count": geometry.maximum_worker_count,
+        "artifact_scope_worker_count": (
+            geometry.artifact_scope_worker_count
+        ),
+        "evidence_worker_count": geometry.evidence_worker_count,
+        "compact_worker_count": geometry.compact_worker_count,
+        "artifact_scope_wave_count": geometry.artifact_scope_wave_count,
+        "evidence_wave_count": geometry.evidence_wave_count,
+        "compact_wave_count": geometry.compact_wave_count,
+        "max_artifact_scope_rows": geometry.max_artifact_scope_rows,
+        "max_evidence_rows": geometry.max_evidence_rows,
+        "max_affected_npis": geometry.max_affected_npis,
+        "max_profile_rows": geometry.max_profile_rows,
+        "temp_file_limit_bytes_per_backend": (
+            geometry.temp_file_limit_bytes
+        ),
+        "max_build_deadline": lease.max_build_deadline.isoformat(),
+    }
+
+
+async def _consume_provider_directory_profile_capacity_lease(
+    *,
+    schema: str,
+    values_by_name: Mapping[str, Any],
+) -> None:
+    """Insert once or accept only an exact immutable replay."""
+    field_names = tuple(values_by_name)
+    field_sql = ", ".join(_q(field_name) for field_name in field_names)
+    value_sql = ", ".join(":" + field_name for field_name in field_names)
+    consumption_ref = _unscoped_qt(
+        schema, ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__
+    )
+    inserted_count = _coerce_rowcount(
+        await db.status(
+            f"""
+            INSERT INTO {consumption_ref} ({field_sql})
+            VALUES ({value_sql})
+            ON CONFLICT DO NOTHING;
+            """,
+            **dict(values_by_name),
+        )
+    )
+    if inserted_count == 1:
+        return
+    existing_rows = await db.all(
+        f"""
+        SELECT attestation_id, reservation_id, lease_digest,
+               capacity_geometry_hash, executable_plan_hash,
+               selection_proof_id, source_vector_hash,
+               source_context_vector_hash, run_id, build_id,
+               profile_as_of, contract_id, key_id, environment_id,
+               attestor_id, attestor_release_digest,
+               public_key_fingerprint, database_system_identifier,
+               database_oid, database_name, tablespace_identity_hash,
+               volume_identity_hash, canonical_lease_json, signature,
+               observed_at, issued_at, accepted_at, expires_at,
+               max_build_deadline, recorded_at
+          FROM {consumption_ref}
+         WHERE attestation_id = :attestation_id
+            OR reservation_id = :reservation_id
+         ORDER BY attestation_id;
+        """,
+        attestation_id=values_by_name["attestation_id"],
+        reservation_id=values_by_name["reservation_id"],
+    )
+    observed_identities = [
+        _provider_directory_profile_capacity_consumption_identity(
+            _pagination_checkpoint_row_mapping(existing_row)
+        )
+        for existing_row in existing_rows
+    ]
+    expected_identity_by_name = (
+        _provider_directory_profile_capacity_consumption_identity(
+            values_by_name
+        )
+    )
+    if observed_identities != [expected_identity_by_name]:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_lease_already_consumed"
+        )
+
+
+async def _lock_profile_capacity_run(
+    *,
+    schema: str,
+    run_id: str,
+) -> None:
+    """Lock and verify the exact active Provider Directory control run."""
+
+    control_row = await db.first(
+        f"""
+        SELECT run_id, importer, status
+          FROM {_unscoped_qt(schema, ImportRun.__tablename__)}
+         WHERE run_id = :run_id
+         FOR UPDATE;
+        """,
+        run_id=run_id,
+    )
+    if control_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_control_run_missing"
+        )
+    control_map = _pagination_checkpoint_row_mapping(control_row)
+    if (
+        _clean_text(control_map.get("run_id")) != run_id
+        or _clean_text(control_map.get("importer"))
+        != "provider-directory-fhir"
+        or _clean_text(control_map.get("status")) != "running"
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_control_run_invalid"
+        )
+
+
+def _provider_directory_profile_control_metadata_input(
+    layout: _ProviderDirectoryProfileRelationStorageLayout,
+    *,
+    relation_name: str,
+    operation: str,
+    observed_deleted_toast_chunks: int = 0,
+) -> profile_capacity.ProviderDirectoryProfileMetadataMutationInput:
+    """Return a fixed 64-KiB mutation envelope for one control relation."""
+
+    deleted_toast_chunks = 0
+    if operation == "update":
+        deleted_toast_chunks = max(
+            observed_deleted_toast_chunks,
+            math.ceil(
+                profile_capacity.METADATA_PAYLOAD_UPPER_BOUND_BYTES
+                / profile_capacity.POSTGRES_TOAST_MAX_CHUNK_SIZE_BYTES
+            )
+            * max(1, len(layout.toastable_columns)),
+        )
+    return profile_capacity.ProviderDirectoryProfileMetadataMutationInput(
+        relation_name=relation_name,
+        operation=operation,
+        payload_upper_bytes=(
+            profile_capacity.METADATA_PAYLOAD_UPPER_BOUND_BYTES
+        ),
+        deleted_toast_chunks=deleted_toast_chunks,
+        main_index_pages=layout.main_index_pages,
+        toast_index_pages=layout.toast_index_pages,
+    )
+
+
+async def _profile_control_layouts(
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+) -> tuple[
+    _ProviderDirectoryProfileRelationStorageLayout,
+    _ProviderDirectoryProfileRelationStorageLayout,
+    _ProviderDirectoryProfileRelationStorageLayout,
+]:
+    """Load and verify the three persistent control relation layouts."""
+    checkpoint_layout = (
+        await _provider_directory_profile_relation_storage_fingerprint(
+            database_identity.build_checkpoint_oid,
+            expected_persistence="p",
+        )
+    )
+    import_run_layout = (
+        await _provider_directory_profile_relation_storage_fingerprint(
+            database_identity.import_run_oid,
+            expected_persistence="p",
+        )
+    )
+    capacity_consumption_layout = (
+        await _provider_directory_profile_relation_storage_fingerprint(
+            database_identity.capacity_consumption_oid,
+            expected_persistence="p",
+            expected_user_trigger_count=2,
+            expected_immutable_trigger_error=(
+                "provider_directory_profile_capacity_consumption_immutable"
+            ),
+        )
+    )
+    observed_layout_identities = (
+        checkpoint_layout.exact_fingerprint,
+        import_run_layout.exact_fingerprint,
+        capacity_consumption_layout.exact_fingerprint,
+    )
+    expected_layout_identities = (
+        database_identity.build_checkpoint_storage_fingerprint,
+        database_identity.import_run_storage_fingerprint,
+        database_identity.capacity_consumption_storage_fingerprint,
+    )
+    if observed_layout_identities != expected_layout_identities:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_control_metadata_layout_changed"
+        )
+    return checkpoint_layout, import_run_layout, capacity_consumption_layout
+
+
+async def _profile_control_deleted_toast_counts(
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    checkpoint_layout: _ProviderDirectoryProfileRelationStorageLayout,
+) -> int:
+    """Count only checkpoint TOAST; run updates use a fixed hard ceiling."""
+
+    build_id = "pdpb_" + identity.resume_lineage_hash[:32]
+    return await _provider_directory_profile_toast_chunk_count(
+        source_sql=(
+            f"SELECT * FROM "
+            f"{_provider_directory_profile_checkpoint_ref(_schema())} "
+            "WHERE build_id = :build_id"
+        ),
+        relation_oid=checkpoint_layout.relation_oid,
+        toast_oid=checkpoint_layout.toast_oid,
+        toastable_columns=checkpoint_layout.toastable_columns,
+        expected_compression=(
+            database_identity.postgres_default_toast_compression
+        ),
+        params={"build_id": build_id},
+    )
+
+
+def _profile_control_metadata_mutations(
+    checkpoint_layout: _ProviderDirectoryProfileRelationStorageLayout,
+    import_run_layout: _ProviderDirectoryProfileRelationStorageLayout,
+    capacity_consumption_layout: (
+        _ProviderDirectoryProfileRelationStorageLayout
+    ),
+    checkpoint_deleted_toast_chunks: int,
+) -> dict[
+    str,
+    profile_capacity.ProviderDirectoryProfileMetadataMutationInput,
+]:
+    """Build the four immutable metadata-mutation inputs."""
+    return {
+        "build_checkpoint_insert": (
+            _provider_directory_profile_control_metadata_input(
+                checkpoint_layout,
+                relation_name="build_checkpoint",
+                operation="insert",
+            )
+        ),
+        "build_checkpoint_update": (
+            _provider_directory_profile_control_metadata_input(
+                checkpoint_layout,
+                relation_name="build_checkpoint",
+                operation="update",
+                observed_deleted_toast_chunks=checkpoint_deleted_toast_chunks,
+            )
+        ),
+        "import_run_update": (
+            _provider_directory_profile_control_metadata_input(
+                import_run_layout,
+                relation_name="import_run",
+                operation="update",
+            )
+        ),
+        "capacity_consumption_insert": (
+            _provider_directory_profile_control_metadata_input(
+                capacity_consumption_layout,
+                relation_name="capacity_consumption",
+                operation="insert",
+            )
+        ),
+    }
+
+
+def _profile_control_artifact_batch_counts(
+    artifact_projection: _ProviderDirectoryArtifactScopeExactProjection,
+) -> tuple[profile_capacity.ProfileControlArtifactBatchCount, ...]:
+    """Return ordered nonterminal artifact batch counts."""
+    return tuple(
+        profile_capacity.ProfileControlArtifactBatchCount(
+            artifact_name=table_projection.resource_type,
+            batch_count=(
+                len(table_projection.batches)
+                if table_projection.resource_type == "source"
+                else sum(
+                    batch.projected_rows > 0
+                    for batch in table_projection.batches
+                )
+            ),
+        )
+        for table_projection in artifact_projection.tables
+    )
+
+
+async def _profile_control_wal_plan(
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+    artifact_projection: _ProviderDirectoryArtifactScopeExactProjection,
+    batch_plan: _ProviderDirectoryProfileBatchPlan,
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> profile_capacity.ProfileControlWalPlanInput:
+    """Freeze exact control coordinates and metadata layouts before admission."""
+    artifact_resource_types = tuple(
+        table_projection.resource_type
+        for table_projection in artifact_projection.tables
+    )
+    if artifact_resource_types != (
+        profile_capacity.CONTROL_WAL_ARTIFACT_SCOPE_NAMES
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_control_artifact_order_changed"
+        )
+    layouts = await _profile_control_layouts(database_identity)
+    checkpoint_deleted_toast_chunks = (
+        await _profile_control_deleted_toast_counts(
+            database_identity,
+            identity,
+            layouts[0],
+        )
+    )
+    metadata_mutations = _profile_control_metadata_mutations(
+        *layouts,
+        checkpoint_deleted_toast_chunks,
+    )
+    return profile_capacity.ProfileControlWalPlanInput(
+        artifact_batch_counts=_profile_control_artifact_batch_counts(
+            artifact_projection
+        ),
+        artifact_scope_recovery_contract_id=(
+            profile_capacity.ARTIFACT_SCOPE_RECOVERY_CONTRACT_ID
+        ),
+        evidence_batch_count=len(batch_plan.evidence_batches),
+        compact_batch_count=len(batch_plan.compact_batches),
+        affected_source_count=len(
+            set(identity.source_ids) | set(identity.removed_source_ids)
+        ),
+        admission_row_lock_count=(
+            PROVIDER_DIRECTORY_PROFILE_ADMISSION_ROW_LOCK_COUNT
+        ),
+        cutover_row_lock_count=(
+            _provider_directory_profile_cutover_row_lock_count(fence) * PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS
+        ),
+        **metadata_mutations,
+    )
+
+
+async def _provider_directory_profile_capacity_acceptance_time(
+    lease: VerifiedDatabaseCapacityLease,
+) -> datetime.datetime:
+    """Read the post-lock PostgreSQL clock and enforce the signed deadline."""
+
+    acceptance_row = await db.first(
+        """
+        WITH observed AS (
+            SELECT clock_timestamp() AS accepted_at
+        )
+        SELECT accepted_at,
+               accepted_at < :expires_at
+               AND accepted_at < :max_build_deadline AS deadline_open
+          FROM observed;
+        """,
+        expires_at=lease.expires_at,
+        max_build_deadline=lease.max_build_deadline,
+    )
+    if acceptance_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_acceptance_time_missing"
+        )
+    acceptance_map = _pagination_checkpoint_row_mapping(acceptance_row)
+    accepted_at = acceptance_map.get("accepted_at")
+    if (
+        acceptance_map.get("deadline_open") is not True
+        or not isinstance(accepted_at, datetime.datetime)
+        or accepted_at.tzinfo is None
+        or accepted_at.utcoffset() is None
+    ):
+        raise ProviderDirectoryCapacityLeaseError(
+            "deadline_reached",
+            "max_build_deadline",
+        )
+    return accepted_at.astimezone(datetime.timezone.utc)
+
+
+class _ProfileAdmissionWorkload(NamedTuple):
+    """Read-only capacity inputs resolved before lease verification."""
+
+    limits: profile_capacity_runtime.ProviderDirectoryProfileCapacityLimits
+    artifact_projection: _ProviderDirectoryArtifactScopeExactProjection
+    database_pool_size: int
+    artifact_worker_count: int
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity
+    batch_plan: _ProviderDirectoryProfileBatchPlan
+    control_wal_plan_input: profile_capacity.ProfileControlWalPlanInput
+
+
+@dataclass(frozen=True)
+class _ProfileAdmissionGeometry:
+    """Capacity geometry and its revalidated control-WAL projection."""
+
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry
+    control_wal_projection: (
+        profile_capacity.ProviderDirectoryProfileControlWalProjection
+    )
+
+
+def _validated_admission_run_id(
+    run_id: str | None,
+    control_run_id: str | None,
+    execution: ProviderDirectoryProfileExecution,
+) -> str:
+    """Validate exact control ownership and strategy identity."""
+    if (
+        run_id is None
+        or control_run_id is None
+        or run_id != control_run_id
+        or re.fullmatch(r"run_[0-9a-f]{32}", run_id) is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_run_id_invalid"
+        )
+    if (
+        execution.attestation.profile_schema_version
+        != profile_artifact.PROFILE_SCHEMA_VERSION
+        or execution.attestation.profile_strategy_version
+        != profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_strategy_mismatch"
+        )
+    return run_id
+
+
+async def _profile_admission_identity(
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> _ProviderDirectoryProfileIdentityInputs:
+    """Resolve and validate the exact source-delta build identity."""
+    identity = await _profile_build_identity_inputs(
+        _schema(),
+        fence,
+        has_existing_artifacts=True,
+        allow_serving_generation_adoption=False,
+    )
+    if (
+        identity.materialization_mode != "source_delta"
+        or identity.serving_state is None
+        or identity.current_source_vector_hash is None
+        or identity.desired_source_vector_hash is None
+        or identity.current_source_context_vector_hash is None
+        or identity.desired_source_context_vector_hash is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_delta_required"
+        )
+    return identity
+
+
+async def _assert_profile_capacity_run_unconsumed(
+    run_id: str,
+) -> None:
+    """Keep worker repair fail-closed until WAL state is durably replayable."""
+    consumption_ref = _unscoped_qt(
+        _schema(),
+        ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__,
+    )
+    if bool(
+        await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM {consumption_ref}
+                 WHERE run_id = :run_id
+            );
+            """,
+            run_id=run_id,
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_same_run_capacity_replay_unsupported"
+        )
+
+
+async def _profile_admission_workload(
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_fence: ProviderDirectoryArtifactDatasetFence,
+    artifact_resource_types: frozenset[str],
+) -> _ProfileAdmissionWorkload:
+    """Resolve exact artifact, worker, database, and control-WAL inputs."""
+    resource_source_ids = tuple(
+        sorted({dataset.source_id for dataset in resource_fence.datasets})
+    )
+    if resource_source_ids != tuple(identity.source_ids):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_resource_scope_changed"
+        )
+    limits = profile_capacity_runtime.configured_capacity_limits()
+    artifact_projection = (
+        await _provider_directory_artifact_scope_exact_projection(
+            _schema(),
+            resource_fence,
+            artifact_resource_types,
+            source_fence=fence,
+            batch_size=limits.artifact_scope_batch_size,
+        )
+    )
+    database_pool_size = _provider_directory_database_pool_capacity()
+    artifact_worker_count = (
+        _provider_directory_profile_capacity_artifact_workers(
+            database_pool_size=database_pool_size,
+            pool_reserve_connections=limits.pool_reserve_connections,
+        )
+    )
+    database_identity = (
+        await _provider_directory_profile_capacity_database_identity(
+            _schema(),
+            identity.serving_state,
+        )
+    )
+    batch_plan = identity.batch_plan
+    control_wal_plan_input = (
+        await _provider_directory_profile_control_wal_plan_input(
+            database_identity,
+            artifact_projection,
+            batch_plan,
+            identity,
+            fence,
+        )
+    )
+    return _ProfileAdmissionWorkload(
+        limits=limits,
+        artifact_projection=artifact_projection,
+        database_pool_size=database_pool_size,
+        artifact_worker_count=artifact_worker_count,
+        database_identity=database_identity,
+        batch_plan=batch_plan,
+        control_wal_plan_input=control_wal_plan_input,
+    )
+
+
+def _geometry_selection_values(
+    execution: ProviderDirectoryProfileExecution,
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    batch_plan: _ProviderDirectoryProfileBatchPlan,
+    control_wal_plan_input: profile_capacity.ProfileControlWalPlanInput,
+) -> dict[str, Any]:
+    """Return selection and source-lineage geometry fields."""
+    return {
+        "selection_proof_id": execution.attestation.proof_id,
+        "profile_input_digest": execution.attestation.profile_input_digest,
+        "profile_schema_version": (
+            execution.attestation.profile_schema_version
+        ),
+        "profile_strategy_version": (
+            execution.attestation.profile_strategy_version
+        ),
+        "executable_plan_hash": batch_plan.fingerprint,
+        "profile_as_of": identity.serving_state.profile_as_of,
+        "current_source_vector_hash": identity.current_source_vector_hash,
+        "desired_source_vector_hash": identity.desired_source_vector_hash,
+        "current_context_vector_hash": (
+            identity.current_source_context_vector_hash
+        ),
+        "desired_context_vector_hash": (
+            identity.desired_source_context_vector_hash
+        ),
+        "sql_contract_digest": (
+            _provider_directory_profile_sql_contract_digest()
+        ),
+        "control_wal_plan_input_hash": (
+            profile_capacity.profile_control_wal_plan_input_hash(
+                control_wal_plan_input
+            )
+        ),
+    }
+
+
+def _geometry_postgres_values(
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+) -> dict[str, Any]:
+    """Return PostgreSQL runtime identity fields for geometry binding."""
+    postgres_fields = (
+        "database_system_identifier",
+        "database_oid",
+        "database_name",
+        "tablespace_oid",
+        "tablespace_name",
+        "postgres_server_version_num",
+        "postgres_block_size_bytes",
+        "postgres_wal_block_size_bytes",
+        "postgres_wal_segment_size_bytes",
+        "postgres_full_page_writes",
+        "postgres_wal_compression",
+        "postgres_wal_level",
+        "postgres_wal_log_hints",
+        "postgres_data_checksums",
+        "postgres_default_toast_compression",
+        "postgres_checkpoint_timeout_seconds",
+        "postgres_max_wal_size_bytes",
+    )
+    return {
+        field_name: getattr(database_identity, field_name)
+        for field_name in postgres_fields
+    }
+
+
+def _geometry_relation_values(
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+) -> dict[str, Any]:
+    """Return serving and metadata relation identities for geometry binding."""
+    relation_fields = (
+        "evidence_target_storage_fingerprint",
+        "profile_target_storage_fingerprint",
+        "build_checkpoint_oid",
+        "serving_generation_oid",
+        "delta_receipt_oid",
+        "import_run_oid",
+        "capacity_consumption_oid",
+        "build_checkpoint_storage_fingerprint",
+        "serving_generation_storage_fingerprint",
+        "delta_receipt_storage_fingerprint",
+        "import_run_storage_fingerprint",
+        "capacity_consumption_storage_fingerprint",
+    )
+    values_by_name = {
+        field_name: getattr(database_identity, field_name)
+        for field_name in relation_fields
+    }
+    values_by_name.update(
+        {
+            "evidence_target_oid": (
+                identity.serving_state.evidence_target_oid
+            ),
+            "profile_target_oid": identity.serving_state.profile_target_oid,
+        }
+    )
+    return values_by_name
+
+
+def _geometry_execution_values(
+    workload: _ProfileAdmissionWorkload,
+) -> dict[str, Any]:
+    """Return bounded wave, worker, pool, and artifact projection fields."""
+    return {
+        "control_wal_upper_bound_bytes": 1,
+        "control_metadata_data_upper_bound_bytes": 1,
+        "artifact_scope_wave_count": (
+            1
+            + math.ceil(
+                len(RESOURCE_MODELS) / workload.artifact_worker_count
+            )
+        ),
+        "evidence_wave_count": len(workload.batch_plan.evidence_waves),
+        "compact_wave_count": len(workload.batch_plan.compact_waves),
+        "artifact_scope_worker_count": workload.artifact_worker_count,
+        "evidence_worker_count": (
+            _provider_directory_profile_max_wave_width(
+                workload.batch_plan.evidence_waves
+            )
+        ),
+        "compact_worker_count": (
+            _provider_directory_profile_max_wave_width(
+                workload.batch_plan.compact_waves
+            )
+        ),
+        "database_pool_size": workload.database_pool_size,
+        "artifact_scope_projected_rows": int(
+            workload.artifact_projection.projected_rows
+        ),
+        "artifact_scope_projected_logical_bytes": int(
+            workload.artifact_projection.projected_logical_bytes
+        ),
+        "artifact_scope_projection_hash": (
+            workload.artifact_projection.projection_hash
+        ),
+    }
+
+
+def _profile_admission_inputs(
+    execution: ProviderDirectoryProfileExecution,
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    workload: _ProfileAdmissionWorkload,
+) -> profile_capacity_runtime.ProviderDirectoryProfileCapacityGeometryInputs:
+    """Assemble the exact immutable capacity-geometry input."""
+    values_by_name = {
+        **_geometry_selection_values(
+            execution,
+            identity,
+            workload.batch_plan,
+            workload.control_wal_plan_input,
+        ),
+        **_geometry_postgres_values(workload.database_identity),
+        **_geometry_relation_values(identity, workload.database_identity),
+        **_geometry_execution_values(workload),
+    }
+    return (
+        profile_capacity_runtime.ProviderDirectoryProfileCapacityGeometryInputs(
+            **values_by_name
+        )
+    )
+
+
+def _profile_admission_geometry(
+    workload: _ProfileAdmissionWorkload,
+    geometry_inputs: (
+        profile_capacity_runtime.ProviderDirectoryProfileCapacityGeometryInputs
+    ),
+) -> _ProfileAdmissionGeometry:
+    """Build and revalidate geometry against its exact control-WAL plan."""
+    seed_geometry = profile_capacity_runtime.build_capacity_geometry(
+        workload.limits,
+        geometry_inputs,
+    )
+    seed_projection = (
+        profile_capacity.project_profile_control_wal_capacity(
+            seed_geometry,
+            workload.control_wal_plan_input,
+        )
+    )
+    geometry = profile_capacity_runtime.build_capacity_geometry(
+        workload.limits,
+        replace(
+            geometry_inputs,
+            control_wal_upper_bound_bytes=(
+                seed_projection.total_control_wal_bytes
+            ),
+            control_metadata_data_upper_bound_bytes=(
+                seed_projection.total_control_metadata_data_bytes
+            ),
+        ),
+    )
+    control_wal_projection = (
+        profile_capacity.revalidate_profile_control_wal_projection(
+            geometry,
+            profile_capacity.project_profile_control_wal_capacity(
+                geometry,
+                workload.control_wal_plan_input,
+            ),
+        )
+    )
+    return _ProfileAdmissionGeometry(
+        geometry=geometry,
+        control_wal_projection=control_wal_projection,
+    )
+
+
+def _assert_admission_lock_projection(
+    control_wal_projection: (
+        profile_capacity.ProviderDirectoryProfileControlWalProjection
+    ),
+) -> None:
+    """Verify the control plan retains the single admission row lock."""
+    admission_lock_operations = [
+        operation
+        for operation in control_wal_projection.operations
+        if operation.operation_name == "admission_row_lock"
+    ]
+    if (
+        len(admission_lock_operations) != 1
+        or admission_lock_operations[0].operation_count
+        != PROVIDER_DIRECTORY_PROFILE_ADMISSION_ROW_LOCK_COUNT
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_admission_row_lock_projection_invalid"
+        )
+
+
+def _verified_admission_lease(
+    execution: ProviderDirectoryProfileExecution,
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+) -> VerifiedDatabaseCapacityLease:
+    """Verify the signed lease and its required storage reservation."""
+    geometry_hash = profile_capacity.capacity_geometry_hash(geometry)
+    lease = verify_database_capacity_lease(
+        execution.capacity_attestation,
+        trust=profile_capacity_runtime.configured_capacity_lease_trust(),
+        now=datetime.datetime.now(datetime.timezone.utc),
+        expected_capacity_geometry_hash=geometry_hash,
+        expected_database_system_identifier=(
+            database_identity.database_system_identifier
+        ),
+        expected_database_oid=database_identity.database_oid,
+        expected_database_name=database_identity.database_name,
+    )
+    _assert_provider_directory_profile_capacity_tablespaces(
+        lease,
+        database_identity,
+    )
+    assert_database_capacity_lease_reservation(
+        lease,
+        required_bytes_by_storage_class=(
+            geometry.reservation_bytes_by_storage_class
+        ),
+        minimum_remaining_bytes=geometry.minimum_remaining_bytes,
+        required_build_seconds=geometry.max_build_seconds,
+    )
+    return lease
+
+
+def _profile_admission_binding(
+    run_id: str,
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    execution: ProviderDirectoryProfileExecution,
+) -> tuple[str, CapacityLeaseConsumptionBinding]:
+    """Bind one run to the admitted source and executable-plan identity."""
+    build_id = "pdpb_" + identity.resume_lineage_hash[:32]
+    return build_id, CapacityLeaseConsumptionBinding(
+        run_id=run_id,
+        build_id=build_id,
+        executable_plan_hash=identity.batch_plan.fingerprint,
+        selection_proof_id=execution.attestation.proof_id,
+        source_vector_hash=identity.desired_source_vector_hash,
+        source_context_vector_hash=(
+            identity.desired_source_context_vector_hash
+        ),
+        profile_as_of=identity.serving_state.profile_as_of,
+    )
+
+
+async def _admission_database_guard(
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    expected_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+) -> _ProviderDirectoryProfileDatabaseCapacityIdentity:
+    """Recheck database identity inside the serialized admission fence."""
+    observed_identity = (
+        await _provider_directory_profile_capacity_database_identity(
+            _schema(),
+            identity.serving_state,
+        )
+    )
+    if replace(
+        observed_identity,
+        wal_lsn=expected_identity.wal_lsn,
+    ) != expected_identity:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_database_identity_changed"
+        )
+    return observed_identity
+
+
+async def _assert_admission_run_toast(
+    run_id: str,
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    control_wal_plan_input: profile_capacity.ProfileControlWalPlanInput,
+) -> None:
+    """Verify the locked import-run update remains within its toast bound."""
+    import_run_layout = (
+        await _provider_directory_profile_relation_storage_fingerprint(
+            database_identity.import_run_oid,
+            expected_persistence="p",
+        )
+    )
+    deleted_toast_chunks = (
+        await _provider_directory_profile_toast_chunk_count(
+            source_sql=(
+                f"SELECT * FROM "
+                f"{_unscoped_qt(_schema(), ImportRun.__tablename__)} "
+                "WHERE run_id = :run_id"
+            ),
+            relation_oid=import_run_layout.relation_oid,
+            toast_oid=import_run_layout.toast_oid,
+            toastable_columns=import_run_layout.toastable_columns,
+            expected_compression=(
+                geometry.postgres_default_toast_compression
+            ),
+            params={"run_id": run_id},
+        )
+    )
+    if (
+        deleted_toast_chunks
+        > control_wal_plan_input.import_run_update.deleted_toast_chunks
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_import_run_toast_changed"
+        )
+
+
+async def _consume_admission_values(
+    lease: VerifiedDatabaseCapacityLease,
+    binding: CapacityLeaseConsumptionBinding,
+) -> None:
+    """Persist one immutable lease consumption after deadline validation."""
+    accepted_at = (
+        await _provider_directory_profile_capacity_acceptance_time(lease)
+    )
+    consumption_values = capacity_lease_consumption_values(
+        lease,
+        binding,
+        accepted_at=accepted_at,
+    )
+    _checked_serialized_metadata_payload_bytes(
+        consumption_values,
+        fixed_row_overhead=4_096,
+    )
+    await _consume_provider_directory_profile_capacity_lease(
+        schema=_schema(),
+        values_by_name=consumption_values,
+    )
+
+
+async def _consume_admission_transaction(
+    run_id: str,
+    execution: ProviderDirectoryProfileExecution,
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    lease: VerifiedDatabaseCapacityLease,
+    binding: CapacityLeaseConsumptionBinding,
+    workload: _ProfileAdmissionWorkload,
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+) -> _ProviderDirectoryProfileDatabaseCapacityIdentity:
+    """Consume the lease under the exact serialized admission fence."""
+    catalog = _provider_directory_profile_selection_catalog()
+    async with db.transaction():
+        await db.status("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+        await _lock_provider_directory_profile_capacity_control_run(
+            schema=_schema(),
+            run_id=run_id,
+        )
+        await assert_profile_selection_current_in_transaction(
+            execution.attestation,
+            catalog,
+        )
+        observed_serving_state = (
+            await _provider_directory_profile_serving_state(
+                _schema(),
+                for_update=True,
+            )
+        )
+        _assert_provider_directory_profile_capacity_serving_state(
+            identity.serving_state,
+            observed_serving_state,
+        )
+        await db.status(
+            f"LOCK TABLE "
+            f"{_unscoped_qt(_schema(), ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__)} "
+            "IN ACCESS SHARE MODE;"
+        )
+        observed_database_identity = await _admission_database_guard(
+            identity,
+            workload.database_identity,
+        )
+        await _assert_admission_run_toast(
+            run_id,
+            observed_database_identity,
+            geometry,
+            workload.control_wal_plan_input,
+        )
+        await _consume_admission_values(lease, binding)
+    return observed_database_identity
+
+
+def _profile_admission_result(
+    run_id: str,
+    build_id: str,
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    geometry_state: _ProfileAdmissionGeometry,
+    lease: VerifiedDatabaseCapacityLease,
+    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
+    initial_wal_lsn: str,
+) -> _ProviderDirectoryProfileCapacityAdmission:
+    """Return the admitted lease, geometry, identity, and WAL tracker."""
+    return _ProviderDirectoryProfileCapacityAdmission(
+        geometry=geometry_state.geometry,
+        control_wal_projection=geometry_state.control_wal_projection,
+        lease=lease,
+        database_identity=database_identity,
+        build_id=build_id,
+        run_id=run_id,
+        initial_wal_lsn=initial_wal_lsn,
+        wal_tracker=_ProviderDirectoryProfileWalTracker(
+            accounted_control_operation_counts={
+                "admission_row_lock": (
+                    PROVIDER_DIRECTORY_PROFILE_ADMISSION_ROW_LOCK_COUNT
+                ),
+                "capacity_consumption_insert": 1,
+            },
+        ),
+        admitted_identity=identity,
+    )
+
+
+async def _admit_provider_directory_profile_capacity(
+    *,
+    run_id: str | None,
+    control_run_id: str | None,
+    execution: ProviderDirectoryProfileExecution,
+    fence: ProviderDirectoryArtifactDatasetFence,
+    resource_fence: ProviderDirectoryArtifactDatasetFence,
+    artifact_resource_types: frozenset[str],
+) -> _ProviderDirectoryProfileCapacityAdmission:
+    """Consume one exact signed lease before any Profile scratch mutation."""
+    run_id = _validated_admission_run_id(
+        run_id,
+        control_run_id,
+        execution,
+    )
+    await _assert_profile_capacity_run_unconsumed(run_id)
+    identity = await _profile_admission_identity(fence)
+    workload = await _profile_admission_workload(
+        identity,
+        fence,
+        resource_fence,
+        artifact_resource_types,
+    )
+    geometry_state = _profile_admission_geometry(
+        workload,
+        _profile_admission_inputs(execution, identity, workload),
+    )
+    lease = _verified_admission_lease(
+        execution,
+        workload.database_identity,
+        geometry_state.geometry,
+    )
+    _assert_admission_lock_projection(
+        geometry_state.control_wal_projection
+    )
+    build_id, binding = _profile_admission_binding(
+        run_id,
+        identity,
+        execution,
+    )
+    database_identity = await _consume_admission_transaction(
+        run_id,
+        execution,
+        identity,
+        lease,
+        binding,
+        workload,
+        geometry_state.geometry,
+    )
+    return _profile_admission_result(
+        run_id,
+        build_id,
+        identity,
+        geometry_state,
+        lease,
+        database_identity,
+        workload.database_identity.wal_lsn,
+    )
+
+
+PROVIDER_DIRECTORY_PROFILE_CAPACITY_PREFLIGHT_CONTRACT_ID = (
+    "healthporta.provider-directory-profile-capacity-preflight.v1"
+)
+
+
+def _provider_directory_profile_capacity_preflight_receipt(
+    execution: ProviderDirectoryProfileExecution,
+    workload: _ProfileAdmissionWorkload,
+    geometry_state: _ProfileAdmissionGeometry,
+) -> dict[str, Any]:
+    """Return the closed read-only input needed by an external attestor."""
+
+    geometry = geometry_state.geometry
+    receipt_by_field = {
+        "contract_id": (
+            PROVIDER_DIRECTORY_PROFILE_CAPACITY_PREFLIGHT_CONTRACT_ID
+        ),
+        "execution_contract_id": PROFILE_EXECUTION_CONTRACT_ID,
+        "selection_proof_id": execution.attestation.proof_id,
+        "generation": execution.generation,
+        "operation": execution.attestation.operation,
+        "capacity_geometry_hash": (
+            profile_capacity.capacity_geometry_hash(geometry)
+        ),
+        "capacity_geometry": (
+            profile_capacity.capacity_geometry_payload(geometry)
+        ),
+        "required_reservation_bytes_by_storage_class": (
+            geometry.reservation_bytes_by_storage_class
+        ),
+        "artifact_scope_projection": {
+            "projected_rows": (
+                workload.artifact_projection.projected_rows
+            ),
+            "projected_logical_bytes": (
+                workload.artifact_projection.projected_logical_bytes
+            ),
+            "projection_hash": (
+                workload.artifact_projection.projection_hash
+            ),
+        },
+    }
+    receipt_by_field["receipt_sha256"] = hashlib.sha256(
+        b"healthporta.provider-directory-profile-capacity-preflight.v1\0"
+        + json.dumps(
+            receipt_by_field,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    return receipt_by_field
+
+
+async def _profile_capacity_preflight_fences(
+    execution: ProviderDirectoryProfileExecution,
+    source_ids: list[str],
+) -> tuple[
+    ProviderDirectoryArtifactDatasetFence,
+    ProviderDirectoryArtifactDatasetFence,
+    frozenset[str],
+]:
+    """Resolve exact selected and changed-source fences without mutation."""
+
+    fence = await _resolve_provider_directory_artifact_datasets(
+        source_ids,
+        should_select_validated_candidates=False,
+    )
+    _assert_profile_selection_matches_artifact_fence(execution, fence)
+    if execution.attestation.operation == "publish":
+        await _assert_no_provider_directory_resource_id_npi_backfill_candidates(
+            _schema(),
+            source_ids,
+        )
+    resource_types = _provider_directory_artifact_resource_types(
+        {"profile"},
+        publish_corroboration=False,
+    )
+    resource_fence = (
+        await _provider_directory_profile_resource_scope_fence(
+            fence,
+            {"profile"},
+        )
+    )
+    return fence, resource_fence, resource_types
+
+
+async def _profile_capacity_preflight_snapshot(
+    execution: ProviderDirectoryProfileExecution,
+    source_ids: list[str],
+) -> dict[str, Any]:
+    """Compute and serialize one exact geometry in the active snapshot."""
+
+    fence, resource_fence, resource_types = (
+        await _profile_capacity_preflight_fences(execution, source_ids)
+    )
+    identity = await _profile_admission_identity(fence)
+    workload = await _profile_admission_workload(
+        identity,
+        fence,
+        resource_fence,
+        resource_types,
+    )
+    geometry_state = _profile_admission_geometry(
+        workload,
+        _profile_admission_inputs(execution, identity, workload),
+    )
+    _assert_admission_lock_projection(
+        geometry_state.control_wal_projection
+    )
+    return _provider_directory_profile_capacity_preflight_receipt(
+        execution,
+        workload,
+        geometry_state,
+    )
+
+
+async def provider_directory_profile_capacity_preflight(
+    execution: ProviderDirectoryProfileExecution,
+) -> dict[str, Any]:
+    """Compute exact Profile capacity geometry without a run or mutation."""
+
+    if not isinstance(execution, ProviderDirectoryProfileExecution):
+        raise ProviderDirectoryProfileSelectionError(
+            "Profile capacity preflight execution is invalid"
+        )
+    catalog = _provider_directory_profile_selection_catalog()
+    source_ids = [
+        pair["source_id"] for pair in execution.attestation.pairs
+    ]
+    execution_token = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
+        execution
+    )
+    try:
+        async with db.transaction():
+            await db.status(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;"
+            )
+            await assert_profile_selection_current_in_transaction(
+                execution.attestation,
+                catalog,
+            )
+            return await _profile_capacity_preflight_snapshot(
+                execution,
+                source_ids,
+            )
+    finally:
+        _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(
+            execution_token
+        )
+
+
+def _provider_directory_profile_capacity_admission(
+) -> _ProviderDirectoryProfileCapacityAdmission | None:
+    admission = _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get()
+    if admission is None:
+        return None
+    if not isinstance(
+        admission,
+        _ProviderDirectoryProfileCapacityAdmission,
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_admission_invalid"
+        )
+    return admission
+
+
+async def _profile_capacity_remaining_ms(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> int:
+    """Return the signed build time remaining inside PostgreSQL."""
+    can_set_temp_file_limit = await db.scalar(
+        "SELECT has_parameter_privilege("
+        "current_user, 'temp_file_limit', 'SET'"
+        ");"
+    )
+    if can_set_temp_file_limit is not True:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_"
+            "temp_file_limit_privilege_missing"
+        )
+    deadline_row = await db.first(
+        """
+        SELECT floor(
+                   EXTRACT(
+                       epoch FROM (
+                           CAST(:max_build_deadline AS timestamptz)
+                           - clock_timestamp()
+                       )
+                   ) * 1000
+               )::bigint AS remaining_ms;
+        """,
+        max_build_deadline=admission.lease.max_build_deadline,
+    )
+    remaining_ms = (
+        int(
+            _pagination_checkpoint_row_mapping(deadline_row)[
+                "remaining_ms"
+            ]
+        )
+        if deadline_row is not None
+        else 0
+    )
+    if remaining_ms <= (
+        PROVIDER_DIRECTORY_PROFILE_DEADLINE_COMMIT_RESERVE_MS
+    ):
+        raise ProviderDirectoryCapacityLeaseError(
+            "deadline_reached",
+            "max_build_deadline",
+        )
+    return remaining_ms
+
+
+def _profile_capacity_timeouts(
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    remaining_ms: int,
+) -> tuple[int, int, int]:
+    """Derive transaction, statement, and lock timeouts from the lease."""
+    statement_timeout_ms = min(
+        geometry.statement_timeout_ms,
+        remaining_ms
+        - PROVIDER_DIRECTORY_PROFILE_DEADLINE_COMMIT_RESERVE_MS,
+    )
+    lock_timeout_ms = min(
+        geometry.lock_timeout_ms,
+        statement_timeout_ms - 1,
+    )
+    if lock_timeout_ms < 1:
+        raise ProviderDirectoryCapacityLeaseError(
+            "deadline_reached",
+            "max_build_deadline",
+        )
+    return remaining_ms, statement_timeout_ms, lock_timeout_ms
+
+
+async def _set_profile_capacity_limits(
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    timeouts: tuple[int, int, int],
+) -> None:
+    """Apply exact memory, compression, and timeout settings."""
+    transaction_timeout_ms, statement_timeout_ms, lock_timeout_ms = timeouts
+    for statement in (
+        "SET LOCAL max_parallel_workers_per_gather = 0;",
+        "SET LOCAL max_parallel_maintenance_workers = 0;",
+        f"SET LOCAL work_mem = '{geometry.work_mem_bytes // 1024}kB';",
+        "SET LOCAL maintenance_work_mem = "
+        f"'{geometry.maintenance_work_mem_bytes // 1024}kB';",
+        "SET LOCAL temp_file_limit = "
+        f"'{geometry.temp_file_limit_bytes // 1024}kB';",
+        "SET LOCAL default_toast_compression = "
+        f"'{geometry.postgres_default_toast_compression}';",
+        "SET LOCAL transaction_timeout = "
+        f"'{transaction_timeout_ms}ms';",
+        f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms';",
+        f"SET LOCAL lock_timeout = '{lock_timeout_ms}ms';",
+    ):
+        await db.status(statement)
+
+
+_PROFILE_CAPACITY_SETTINGS_SQL = """
+        SELECT current_setting(
+                   'max_parallel_workers_per_gather'
+               )::integer AS query_parallel_workers,
+               current_setting(
+                   'max_parallel_maintenance_workers'
+               )::integer AS maintenance_parallel_workers,
+               pg_size_bytes(current_setting('work_mem'))::bigint
+                   AS work_mem_bytes,
+               pg_size_bytes(
+                   current_setting('maintenance_work_mem')
+               )::bigint AS maintenance_work_mem_bytes,
+               pg_size_bytes(current_setting('temp_file_limit'))::bigint
+                   AS temp_file_limit_bytes,
+               current_setting('default_toast_compression')::text
+                   AS default_toast_compression,
+               (
+                   EXTRACT(
+                       epoch FROM current_setting(
+                           'transaction_timeout'
+                       )::interval
+                   ) * 1000
+               )::bigint AS transaction_timeout_ms,
+               (
+                   EXTRACT(
+                       epoch FROM current_setting(
+                           'statement_timeout'
+                       )::interval
+                   ) * 1000
+               )::bigint AS statement_timeout_ms,
+               (
+                   EXTRACT(
+                       epoch FROM current_setting(
+                           'lock_timeout'
+                       )::interval
+                   ) * 1000
+               )::bigint AS lock_timeout_ms;
+        """
+
+
+async def _profile_capacity_observed_settings() -> dict[str, Any]:
+    """Read back all capacity-sensitive PostgreSQL settings."""
+    settings_row = await db.first(
+        _PROFILE_CAPACITY_SETTINGS_SQL
+    )
+    if settings_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_settings_missing"
+        )
+    settings_map = _pagination_checkpoint_row_mapping(settings_row)
+    observed_settings_by_name = {
+        field_name: int(settings_map[field_name])
+        for field_name in (
+            "query_parallel_workers",
+            "maintenance_parallel_workers",
+            "work_mem_bytes",
+            "maintenance_work_mem_bytes",
+            "temp_file_limit_bytes",
+            "transaction_timeout_ms",
+            "statement_timeout_ms",
+            "lock_timeout_ms",
+        )
+    }
+    observed_settings_by_name["default_toast_compression"] = str(
+        settings_map["default_toast_compression"]
+    )
+    return observed_settings_by_name
+
+
+def _profile_capacity_expected_settings(
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    timeouts: tuple[int, int, int],
+) -> dict[str, Any]:
+    """Return the exact settings expected after applying the lease."""
+    transaction_timeout_ms, statement_timeout_ms, lock_timeout_ms = timeouts
+    return {
+        "query_parallel_workers": 0,
+        "maintenance_parallel_workers": 0,
+        "work_mem_bytes": geometry.work_mem_bytes,
+        "maintenance_work_mem_bytes": (
+            geometry.maintenance_work_mem_bytes
+        ),
+        "temp_file_limit_bytes": geometry.temp_file_limit_bytes,
+        "default_toast_compression": (
+            geometry.postgres_default_toast_compression
+        ),
+        "transaction_timeout_ms": transaction_timeout_ms,
+        "statement_timeout_ms": statement_timeout_ms,
+        "lock_timeout_ms": lock_timeout_ms,
+    }
+
+
+async def _apply_provider_directory_profile_capacity_settings(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> None:
+    """Apply and verify the exact finite limits in the current transaction."""
+    geometry = profile_capacity.revalidate_capacity_geometry(
+        admission.geometry
+    )
+    remaining_ms = await _profile_capacity_remaining_ms(admission)
+    timeouts = _profile_capacity_timeouts(geometry, remaining_ms)
+    await _set_profile_capacity_limits(geometry, timeouts)
+    observed_settings = await _profile_capacity_observed_settings()
+    expected_settings = _profile_capacity_expected_settings(
+        geometry,
+        timeouts,
+    )
+    if observed_settings != expected_settings:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_settings_changed"
+        )
+
+
+@contextlib.asynccontextmanager
+async def _provider_directory_profile_capacity_transaction(
+) -> AsyncIterator[None]:
+    """Run one bounded statement group with its admitted PostgreSQL limits."""
+
+    async with db.transaction():
+        admission = _provider_directory_profile_capacity_admission()
+        if admission is not None:
+            await _apply_provider_directory_profile_capacity_settings(
+                admission
+            )
+        yield
+
+
+async def _provider_directory_profile_capacity_status(
+    statement: str,
+    **params: Any,
+) -> Any:
+    """Execute one mutating statement under the admitted finite limits."""
+
+    if _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get() is None:
+        return await db.status(statement, **params)
+    async with _provider_directory_profile_capacity_transaction():
+        return await db.status(statement, **params)
+
+
+def _provider_directory_profile_capacity_relation_cap(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    relation_name: str,
+) -> profile_capacity.ProviderDirectoryProfileRelationByteCaps:
+    matching_caps = [
+        relation_cap
+        for relation_cap in admission.geometry.relation_byte_caps
+        if relation_cap.relation_name == relation_name
+    ]
+    if len(matching_caps) != 1:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_relation_cap_missing:"
+            + relation_name
+        )
+    return matching_caps[0]
+
+
+def _provider_directory_profile_control_operation_count(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    operation_name: str,
+) -> int:
+    matching_operations = [
+        operation
+        for operation in admission.control_wal_projection.operations
+        if operation.operation_name == operation_name
+    ]
+    if len(matching_operations) != 1:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_control_operation_missing:"
+            + operation_name
+        )
+    return matching_operations[0].operation_count
+
+
+def _profile_wal_reservation_inputs(
+    control_operation_counts: Mapping[str, int] | None,
+    relation_wal_bytes: Mapping[str, int] | None,
+    metadata_wal_bytes: int,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Validate and normalize one preventive WAL reservation request."""
+    control_increments_by_name = dict(control_operation_counts or {})
+    relation_increments_by_name = dict(relation_wal_bytes or {})
+    if (
+        any(
+            not isinstance(increment_value, int)
+            or isinstance(increment_value, bool)
+            or increment_value < 0
+            for increment_value in (
+                *control_increments_by_name.values(),
+                *relation_increments_by_name.values(),
+                metadata_wal_bytes,
+            )
+        )
+        or not (
+            control_increments_by_name
+            or relation_increments_by_name
+            or metadata_wal_bytes
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_wal_reservation_invalid"
+        )
+    return control_increments_by_name, relation_increments_by_name
+
+
+def _profile_control_wal_candidate(
+    tracker: _ProviderDirectoryProfileWalTracker,
+    projection: (
+        profile_capacity.ProviderDirectoryProfileControlWalProjection
+    ),
+    increments_by_name: Mapping[str, int],
+) -> tuple[dict[str, int], int, int]:
+    """Return candidate control counts, next WAL, and remaining WAL."""
+    operations_by_name = {
+        operation.operation_name: operation
+        for operation in projection.operations
+    }
+    candidate_counts_by_name = dict(
+        tracker.accounted_control_operation_counts
+    )
+    next_wal_bytes = 0
+    for operation_name, increment in increments_by_name.items():
+        operation = operations_by_name.get(operation_name)
+        if operation is None:
+            raise RuntimeError(
+                "provider_directory_profile_capacity_control_operation_"
+                "unknown:"
+                + operation_name
+            )
+        candidate_counts_by_name[operation_name] = (
+            candidate_counts_by_name.get(operation_name, 0) + increment
+        )
+        next_wal_bytes += increment * operation.wal_bytes_per_operation
+    remaining_wal_bytes = (
+        profile_capacity.remaining_profile_control_wal_bytes(
+            projection,
+            candidate_counts_by_name,
+        )
+    )
+    return candidate_counts_by_name, next_wal_bytes, remaining_wal_bytes
+
+
+def _profile_relation_wal_candidate(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    increments_by_name: Mapping[str, int],
+) -> tuple[dict[str, int], int, int]:
+    """Return candidate relation WAL, next WAL, and remaining WAL."""
+    tracker = admission.wal_tracker
+    caps_by_name = {
+        relation_cap.relation_name: relation_cap
+        for relation_cap in admission.geometry.relation_byte_caps
+    }
+    candidate_by_name = dict(tracker.accounted_relation_wal_bytes)
+    next_wal_bytes = 0
+    for relation_name, increment in increments_by_name.items():
+        relation_cap = caps_by_name.get(relation_name)
+        if relation_cap is None:
+            raise RuntimeError(
+                "provider_directory_profile_capacity_relation_cap_missing:"
+                + relation_name
+            )
+        candidate_value = candidate_by_name.get(relation_name, 0) + increment
+        if candidate_value > relation_cap.max_wal_bytes:
+            raise RuntimeError(
+                "provider_directory_profile_capacity_relation_wal_projected:"
+                f"{relation_name}:projected={candidate_value}:"
+                f"maximum={relation_cap.max_wal_bytes}"
+            )
+        candidate_by_name[relation_name] = candidate_value
+        next_wal_bytes += increment
+    remaining_wal_bytes = sum(
+        relation_cap.max_wal_bytes - candidate_by_name.get(relation_name, 0)
+        for relation_name, relation_cap in caps_by_name.items()
+    )
+    return candidate_by_name, next_wal_bytes, remaining_wal_bytes
+
+
+def _profile_metadata_wal_candidate(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    metadata_wal_bytes: int,
+) -> tuple[int, int]:
+    """Return candidate and remaining metadata WAL."""
+    candidate = (
+        admission.wal_tracker.accounted_metadata_wal_bytes
+        + metadata_wal_bytes
+    )
+    maximum = admission.geometry.metadata_wal_upper_bound_bytes
+    if candidate > maximum:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_metadata_wal_projected"
+        )
+    return candidate, maximum - candidate
+
+
+async def _validate_profile_total_wal_budget(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    next_wal_bytes: int,
+    remaining_wal_bytes: int,
+) -> None:
+    """Require observed, imminent, and reserved WAL to fit the lease."""
+    observed_wal_bytes = (
+        await _provider_directory_profile_current_wal_bytes(admission)
+    )
+    maximum_wal_bytes = (
+        admission.geometry.reservation_bytes_by_storage_class["wal"]
+    )
+    if observed_wal_bytes + next_wal_bytes + remaining_wal_bytes > (
+        maximum_wal_bytes
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_total_wal_projected:"
+            f"observed={observed_wal_bytes}:next={next_wal_bytes}:"
+            f"remaining={remaining_wal_bytes}:"
+            f"maximum={maximum_wal_bytes}"
+        )
+
+
+async def _reserve_provider_directory_profile_wal_budget(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    *,
+    control_operation_counts: Mapping[str, int] | None = None,
+    relation_wal_bytes: Mapping[str, int] | None = None,
+    metadata_wal_bytes: int = 0,
+) -> None:
+    """Atomically account a preventive WAL bound before its mutation starts."""
+    control_increments, relation_increments = (
+        _profile_wal_reservation_inputs(
+            control_operation_counts,
+            relation_wal_bytes,
+            metadata_wal_bytes,
+        )
+    )
+    tracker = admission.wal_tracker
+    async with tracker.lock:
+        projection = (
+            profile_capacity.revalidate_profile_control_wal_projection(
+                admission.geometry,
+                admission.control_wal_projection,
+            )
+        )
+        control_counts, control_next, control_remaining = (
+            _profile_control_wal_candidate(
+                tracker,
+                projection,
+                control_increments,
+            )
+        )
+        relation_counts, relation_next, relation_remaining = (
+            _profile_relation_wal_candidate(admission, relation_increments)
+        )
+        metadata_candidate, metadata_remaining = (
+            _profile_metadata_wal_candidate(admission, metadata_wal_bytes)
+        )
+        await _validate_profile_total_wal_budget(
+            admission,
+            control_next + relation_next + metadata_wal_bytes,
+            control_remaining + relation_remaining + metadata_remaining,
+        )
+        tracker.accounted_control_operation_counts = control_counts
+        tracker.accounted_relation_wal_bytes = relation_counts
+        tracker.accounted_metadata_wal_bytes = metadata_candidate
+
+
+async def _assert_provider_directory_profile_wal_budget(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> None:
+    """Require observed WAL plus every unspent bound to fit the lease."""
+
+    tracker = admission.wal_tracker
+    async with tracker.lock:
+        remaining_control_wal_bytes = (
+            profile_capacity.remaining_profile_control_wal_bytes(
+                admission.control_wal_projection,
+                tracker.accounted_control_operation_counts,
+            )
+        )
+        remaining_relation_wal_bytes = sum(
+            relation_cap.max_wal_bytes
+            - tracker.accounted_relation_wal_bytes.get(
+                relation_cap.relation_name,
+                0,
+            )
+            for relation_cap in admission.geometry.relation_byte_caps
+        )
+        remaining_metadata_wal_bytes = (
+            admission.geometry.metadata_wal_upper_bound_bytes
+            - tracker.accounted_metadata_wal_bytes
+        )
+        observed_wal_bytes = (
+            await _provider_directory_profile_current_wal_bytes(admission)
+        )
+        maximum_wal_bytes = (
+            admission.geometry.reservation_bytes_by_storage_class["wal"]
+        )
+        if (
+            observed_wal_bytes
+            + remaining_control_wal_bytes
+            + remaining_relation_wal_bytes
+            + remaining_metadata_wal_bytes
+            > maximum_wal_bytes
+        ):
+            raise RuntimeError(
+                "provider_directory_profile_capacity_total_wal_exceeded"
+            )
+
+
+async def _provider_directory_profile_capacity_relation_bytes(
+    relation_refs: Iterable[str],
+) -> int:
+    normalized_refs = sorted(set(relation_refs))
+    if not normalized_refs:
+        return 0
+    size_row = await db.first(
+        """
+        WITH selected(relation_ref) AS (
+            SELECT unnest(CAST(:relation_refs AS text[]))
+        ), measured AS (
+            SELECT relation_ref,
+                   to_regclass(relation_ref) AS relation_oid
+              FROM selected
+        )
+        SELECT bool_and(relation_oid IS NOT NULL) AS all_present,
+               COALESCE(
+                   SUM(pg_total_relation_size(relation_oid)),
+                   0
+               )::bigint AS total_bytes
+          FROM measured;
+        """,
+        relation_refs=normalized_refs,
+    )
+    if size_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_relation_size_missing"
+        )
+    size_map = _pagination_checkpoint_row_mapping(size_row)
+    if size_map.get("all_present") is not True:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_relation_missing"
+        )
+    total_bytes = int(size_map["total_bytes"])
+    if total_bytes < 0:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_relation_size_invalid"
+        )
+    return total_bytes
+
+
+async def _project_provider_directory_profile_scratch_window(
+    relation_name: str,
+    relation_ref: str,
+    relation_oid: int,
+    *,
+    inserted_rows: int,
+    inserted_logical_bytes: int,
+    expected_persistence: str,
+) -> profile_capacity.ProviderDirectoryProfileScratchProjection:
+    """Refuse a scratch write before its worst-case data or WAL is emitted."""
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_admission_missing"
+        )
+    layout = (
+        await _provider_directory_profile_relation_storage_fingerprint(
+            relation_oid,
+            expected_persistence=expected_persistence,
+        )
+    )
+    if layout.relation_oid != relation_oid:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_scratch_oid_changed"
+        )
+    projection = profile_capacity.project_profile_scratch_capacity(
+        admission.geometry,
+        profile_capacity.ProviderDirectoryProfileScratchInput(
+            relation_name=relation_name,
+            inserted_rows=inserted_rows,
+            inserted_logical_bytes=inserted_logical_bytes,
+            toastable_column_count=len(layout.toastable_columns),
+            main_index_pages=layout.main_index_pages,
+            toast_index_pages=layout.toast_index_pages,
+        ),
+    )
+    relation_bytes = (
+        await _provider_directory_profile_capacity_relation_bytes(
+            (relation_ref,)
+        )
+    )
+    relation_cap = _provider_directory_profile_capacity_relation_cap(
+        admission,
+        relation_name,
+    )
+    if (
+        relation_bytes + projection.growth_bytes
+        > relation_cap.max_scratch_bytes
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_scratch_growth_projected:"
+            f"{relation_name}:observed={relation_bytes}:"
+            f"projected={projection.growth_bytes}:"
+            f"maximum={relation_cap.max_scratch_bytes}"
+        )
+    await _reserve_provider_directory_profile_wal_budget(
+        admission,
+        relation_wal_bytes={relation_name: projection.wal_bytes},
+    )
+    return projection
+
+
+async def _assert_provider_directory_profile_capacity_scratch(
+    relation_name: str,
+    relation_refs: Iterable[str],
+    *,
+    observed_rows: int | None = None,
+    maximum_rows: int | None = None,
+) -> int:
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return 0
+    if (
+        observed_rows is not None
+        and maximum_rows is not None
+        and not 0 <= observed_rows <= maximum_rows
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_row_limit_exceeded:"
+            f"{relation_name}:observed={observed_rows}:maximum={maximum_rows}"
+        )
+    relation_bytes = (
+        await _provider_directory_profile_capacity_relation_bytes(
+            relation_refs
+        )
+    )
+    relation_cap = _provider_directory_profile_capacity_relation_cap(
+        admission,
+        relation_name,
+    )
+    if relation_bytes > relation_cap.max_scratch_bytes:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_scratch_bytes_exceeded:"
+            f"{relation_name}:observed={relation_bytes}:"
+            f"maximum={relation_cap.max_scratch_bytes}"
+        )
+    await _assert_provider_directory_profile_wal_budget(admission)
+    if (
+        datetime.datetime.now(datetime.timezone.utc)
+        >= admission.lease.max_build_deadline
+    ):
+        raise ProviderDirectoryCapacityLeaseError(
+            "deadline_reached",
+            "max_build_deadline",
+        )
+    return relation_bytes
+
+
+async def _assert_provider_directory_profile_capacity_target(
+    relation_name: str,
+    relation_ref: str,
+    *,
+    bytes_before: int,
+    deleted_logical_bytes: int,
+    projected_growth_bytes: int,
+) -> int:
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return bytes_before
+    relation_cap = _provider_directory_profile_capacity_relation_cap(
+        admission,
+        relation_name,
+    )
+    if not (
+        0
+        <= deleted_logical_bytes
+        <= relation_cap.max_deleted_logical_bytes
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_deleted_logical_bytes_"
+            "exceeded:"
+            f"{relation_name}:observed={deleted_logical_bytes}:"
+            f"maximum={relation_cap.max_deleted_logical_bytes}"
+        )
+    bytes_after = (
+        await _provider_directory_profile_capacity_relation_bytes(
+            (relation_ref,)
+        )
+    )
+    growth_bytes = max(bytes_after - bytes_before, 0)
+    if (
+        projected_growth_bytes < 0
+        or projected_growth_bytes
+        > relation_cap.max_target_growth_bytes
+        or growth_bytes > projected_growth_bytes
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_target_growth_exceeded:"
+            f"{relation_name}:observed={growth_bytes}:"
+            f"projected={projected_growth_bytes}:"
+            f"maximum={relation_cap.max_target_growth_bytes}"
+        )
+    await _assert_provider_directory_profile_wal_budget(admission)
+    return bytes_after
+
+
+def _expected_profile_capacity_consumption(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+) -> dict[str, Any]:
+    """Return the exact capacity-consumption identity for this run."""
+    return {
+        "attestation_id": admission.lease.attestation_id,
+        "lease_digest": admission.lease.lease_digest,
+        "capacity_geometry_hash": (
+            profile_capacity.capacity_geometry_hash(admission.geometry)
+        ),
+        "executable_plan_hash": admission.geometry.executable_plan_hash,
+        "selection_proof_id": admission.geometry.selection_proof_id,
+        "source_vector_hash": admission.geometry.desired_source_vector_hash,
+        "source_context_vector_hash": (
+            admission.geometry.desired_context_vector_hash
+        ),
+        "run_id": admission.run_id,
+        "build_id": admission.build_id,
+        "profile_as_of": admission.geometry.profile_as_of,
+    }
+
+
+async def _assert_terminal_profile_capacity_owners(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    consumption_ref: str,
+    import_run_ref: str,
+) -> None:
+    """Reject a same-build capacity consumption owned by an active run."""
+    prior_owner_rows = await db.all(
+        f"""
+        SELECT consumption.run_id, control.status
+          FROM {consumption_ref} AS consumption
+          LEFT JOIN {import_run_ref} AS control
+            ON control.run_id = consumption.run_id
+         WHERE consumption.build_id = :build_id
+           AND consumption.run_id <> :run_id
+         ORDER BY consumption.run_id;
+        """,
+        build_id=admission.build_id,
+        run_id=admission.run_id,
+    )
+    terminal_statuses = {
+        "succeeded",
+        "failed",
+        "canceled",
+        "cancelled",
+        "dead_letter",
+    }
+    for prior_owner_row in prior_owner_rows:
+        prior_owner_map = _pagination_checkpoint_row_mapping(prior_owner_row)
+        if (
+            _clean_text(prior_owner_map.get("run_id")) is None
+            or _clean_text(prior_owner_map.get("status"))
+            not in terminal_statuses
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_profile_capacity_competing_owner"
+            )
+
+
+async def _assert_provider_directory_profile_capacity_consumption(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    build: _ProviderDirectoryProfileBuild,
+) -> None:
+    """Bind this attempt while retaining terminal same-build lease history."""
+    consumption_ref = _unscoped_qt(
+        build.schema,
+        ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__,
+    )
+    import_run_ref = _unscoped_qt(build.schema, ImportRun.__tablename__)
+    current_rows = await db.all(
+        f"""
+        SELECT attestation_id, lease_digest, capacity_geometry_hash,
+               executable_plan_hash, selection_proof_id,
+               source_vector_hash, source_context_vector_hash,
+               run_id, build_id, profile_as_of
+          FROM {consumption_ref}
+         WHERE run_id = :run_id
+         ORDER BY attestation_id;
+        """,
+        run_id=admission.run_id,
+    )
+    expected_by_field = _expected_profile_capacity_consumption(admission)
+    observed_rows = [
+        {
+            field_name: row_map.get(field_name)
+            for field_name in expected_by_field
+        }
+        for row_map in (
+            _pagination_checkpoint_row_mapping(consumption_row)
+            for consumption_row in current_rows
+        )
+    ]
+    if observed_rows != [expected_by_field]:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_consumption_changed"
+        )
+    await _assert_terminal_profile_capacity_owners(
+        admission,
+        consumption_ref,
+        import_run_ref,
+    )
+
+
+def _provider_directory_profile_replay_timestamp(
+    candidate: Any,
+    field_name: str,
+) -> datetime.datetime:
+    if (
+        not isinstance(candidate, datetime.datetime)
+        or candidate.tzinfo is None
+        or candidate.utcoffset() is None
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_timestamp_invalid:"
+            + field_name
+        )
+    return candidate.astimezone(datetime.timezone.utc)
+
+
+def _provider_directory_profile_replay_geometry(
+    receipt: Mapping[str, Any],
+    execution: ProviderDirectoryProfileExecution,
+) -> profile_capacity.ProviderDirectoryProfileCapacityGeometry:
+    geometry_identity = _provider_directory_profile_capacity_geometry_identity(
+        status=receipt.get("capacity_geometry_status"),
+        geometry_hash=receipt.get("capacity_geometry_hash"),
+        geometry_json=receipt.get("capacity_geometry_json"),
+    )
+    if geometry_identity[0] != "verified" or geometry_identity[2] is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_geometry_unverified"
+        )
+    geometry = profile_capacity.validated_capacity_geometry(
+        json.loads(geometry_identity[2])
+    )
+    expected_identity_by_name = {
+        "selection_proof_id": execution.attestation.proof_id,
+        "profile_input_digest": execution.attestation.profile_input_digest,
+        "profile_schema_version": (
+            execution.attestation.profile_schema_version
+        ),
+        "profile_strategy_version": (
+            execution.attestation.profile_strategy_version
+        ),
+        "executable_plan_hash": receipt.get("executable_plan_hash"),
+        "profile_as_of": receipt.get("profile_as_of"),
+        "current_source_vector_hash": receipt.get(
+            "from_source_vector_hash"
+        ),
+        "desired_source_vector_hash": receipt.get("to_source_vector_hash"),
+        "current_context_vector_hash": receipt.get(
+            "from_source_context_vector_hash"
+        ),
+        "desired_context_vector_hash": receipt.get(
+            "to_source_context_vector_hash"
+        ),
+        "evidence_target_oid": int(receipt.get("evidence_target_oid") or 0),
+        "profile_target_oid": int(receipt.get("profile_target_oid") or 0),
+    }
+    observed_identity_by_name = {
+        field_name: getattr(geometry, field_name)
+        for field_name in expected_identity_by_name
+    }
+    if (
+        observed_identity_by_name != expected_identity_by_name
+        or geometry.materialization_mode != "source_delta"
+        or geometry.sql_contract_digest
+        != _provider_directory_profile_sql_contract_digest()
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_geometry_changed"
+        )
+    return geometry
+
+
+def _profile_replay_lease_binding(
+    consumption: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> CapacityLeaseConsumptionBinding:
+    """Build the immutable receipt binding for replay lease verification."""
+    return CapacityLeaseConsumptionBinding(
+        run_id=str(consumption["run_id"]),
+        build_id=str(receipt["build_id"]),
+        executable_plan_hash=str(receipt["executable_plan_hash"]),
+        selection_proof_id=str(receipt["selection_proof_id"]),
+        source_vector_hash=str(receipt["to_source_vector_hash"]),
+        source_context_vector_hash=str(
+            receipt["to_source_context_vector_hash"]
+        ),
+        profile_as_of=str(receipt["profile_as_of"]),
+    )
+
+
+def _verified_provider_directory_profile_replay_lease(
+    consumption: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+) -> VerifiedDatabaseCapacityLease:
+    """Verify the immutable lease consumed by the receipt's original owner."""
+
+    accepted_at = _provider_directory_profile_replay_timestamp(
+        consumption.get("accepted_at"), "accepted_at",
+    )
+    try:
+        canonical_lease_json = consumption["canonical_lease_json"]
+        if not isinstance(canonical_lease_json, str):
+            raise TypeError("canonical_lease_json")
+        capacity_attestation_by_field = {
+            "lease": json.loads(canonical_lease_json),
+            "signature": consumption["signature"],
+        }
+        lease = verify_database_capacity_lease(
+            capacity_attestation_by_field,
+            trust=profile_capacity_runtime.configured_capacity_lease_trust(),
+            now=accepted_at,
+            expected_capacity_geometry_hash=(
+                profile_capacity.capacity_geometry_hash(geometry)
+            ),
+            expected_database_system_identifier=(
+                geometry.database_system_identifier
+            ),
+            expected_database_oid=geometry.database_oid,
+            expected_database_name=geometry.database_name,
+        )
+        expected_consumption = capacity_lease_consumption_values(
+            lease,
+            _profile_replay_lease_binding(consumption, receipt),
+            accepted_at=accepted_at,
+        )
+        assert_database_capacity_lease_reservation(
+            lease,
+            required_bytes_by_storage_class=(
+                geometry.reservation_bytes_by_storage_class
+            ),
+            minimum_remaining_bytes=geometry.minimum_remaining_bytes,
+            required_build_seconds=geometry.max_build_seconds,
+        )
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_capacity_invalid"
+        ) from exc
+    if (
+        _provider_directory_profile_capacity_consumption_identity(
+            consumption
+        )
+        != _provider_directory_profile_capacity_consumption_identity(
+            expected_consumption
+        )
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_capacity_consumption_changed"
+        )
+    return lease
+
+
+def _assert_provider_directory_profile_replay_receipt(
+    consumption: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    execution: ProviderDirectoryProfileExecution,
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+) -> None:
+    expected_generation_id = "pdprofile_" + hashlib.sha256(
+        f"{receipt.get('build_id')}:{receipt.get('profile_as_of')}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:32]
+    expected_by_field = {
+        "build_id": consumption.get("build_id"),
+        "executable_plan_hash": consumption.get("executable_plan_hash"),
+        "capacity_geometry_status": "verified",
+        "capacity_geometry_hash": consumption.get("capacity_geometry_hash"),
+        "to_source_vector_hash": consumption.get("source_vector_hash"),
+        "to_source_context_vector_hash": consumption.get(
+            "source_context_vector_hash"
+        ),
+        "generation_id": expected_generation_id,
+        "operation": execution.attestation.operation,
+        "profile_as_of": consumption.get("profile_as_of"),
+        "selection_proof_id": execution.attestation.proof_id,
+        "control_generation": execution.generation,
+        "authority_revision": execution.attestation.authority_revision,
+        "evidence_target_oid": geometry.evidence_target_oid,
+        "profile_target_oid": geometry.profile_target_oid,
+    }
+    observed_by_field = {
+        field_name: (
+            int(receipt.get(field_name) or 0)
+            if isinstance(expected_value, int)
+            else receipt.get(field_name)
+        )
+        for field_name, expected_value in expected_by_field.items()
+    }
+    if observed_by_field != expected_by_field:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_receipt_changed"
+        )
+    _provider_directory_profile_replay_counts(receipt)
+    _provider_directory_profile_capacity_geometry_identity(
+        status=receipt.get("from_capacity_geometry_status"),
+        geometry_hash=receipt.get("from_capacity_geometry_hash"),
+        geometry_json=receipt.get("from_capacity_geometry_json"),
+    )
+    if (
+        _provider_directory_profile_cutover_receipt_identity(
+            receipt,
+            geometry=geometry,
+            expected_run_id=str(consumption.get("run_id") or ""),
+        )
+        is None
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_cutover_evidence_missing"
+        )
+
+
+def _provider_directory_profile_replay_counts(
+    receipt: Mapping[str, Any],
+) -> dict[str, int]:
+    field_names = (
+        "evidence_rows",
+        "profile_rows",
+        "evidence_inserted",
+        "evidence_deleted",
+        "profile_inserted",
+        "profile_deleted",
+    )
+    try:
+        counts_by_name = {
+            field_name: int(receipt[field_name])
+            for field_name in field_names
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_counts_invalid"
+        ) from exc
+    if any(value < 0 for value in counts_by_name.values()):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_counts_invalid"
+        )
+    return counts_by_name
+
+
+async def _provider_directory_profile_replay_source_context(
+    execution: ProviderDirectoryProfileExecution,
+) -> tuple[
+    tuple[tuple[str, str], ...],
+    tuple[tuple[str, str], ...],
+]:
+    source_vector = _provider_directory_profile_source_vector(
+        (
+            str(pair["source_id"]),
+            str(pair["dataset_id"]),
+        )
+        for pair in execution.attestation.pairs
+    )
+    selected_source_ids, _retained_source_ids, source_contexts = (
+        await _provider_directory_profile_scope_source_ids(
+            _schema(),
+            {source_id for source_id, _dataset_id in source_vector},
+            expected_source_context_digest=(
+                execution.attestation.source_context_digest
+            ),
+        )
+    )
+    if tuple(selected_source_ids) != tuple(
+        source_id for source_id, _dataset_id in source_vector
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_source_scope_changed"
+        )
+    return (
+        source_vector,
+        _provider_directory_profile_source_context_vector(source_contexts),
+    )
+
+
+def _profile_replay_serving_values(
+    receipt: Mapping[str, Any],
+    execution: ProviderDirectoryProfileExecution,
+    source_vector: tuple[tuple[str, str], ...],
+    source_context_vector: tuple[tuple[str, str], ...],
+) -> dict[str, Any]:
+    """Return the serving fields bound into one committed replay."""
+    cutover_identity = _provider_directory_profile_cutover_receipt_identity(
+        receipt
+    )
+    if cutover_identity is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_cutover_evidence_missing"
+        )
+    return {
+        "status": (
+            "published"
+            if execution.attestation.operation == "publish"
+            else "purged"
+        ),
+        "operation": execution.attestation.operation,
+        "control_generation": execution.generation,
+        "generation_id": receipt.get("generation_id"),
+        "selection_proof_id": execution.attestation.proof_id,
+        "authority_revision": execution.attestation.authority_revision,
+        "profile_schema_version": (
+            execution.attestation.profile_schema_version
+        ),
+        "profile_strategy_version": (
+            execution.attestation.profile_strategy_version
+        ),
+        "source_vector": source_vector,
+        "source_context_vector": source_context_vector,
+        "executable_plan_hash": receipt.get("executable_plan_hash"),
+        "capacity_geometry_status": "verified",
+        "capacity_geometry_hash": receipt.get("capacity_geometry_hash"),
+        "evidence_target_oid": int(receipt.get("evidence_target_oid") or 0),
+        "profile_target_oid": int(receipt.get("profile_target_oid") or 0),
+        "evidence_rows": int(receipt.get("evidence_rows") or 0),
+        "profile_rows": int(receipt.get("profile_rows") or 0),
+        "profile_as_of": receipt.get("profile_as_of"),
+        "cutover_forecast_hash": cutover_identity[0],
+    }
+
+
+def _assert_provider_directory_profile_replay_serving(
+    serving: _ProviderDirectoryProfileServingState,
+    serving_row: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    execution: ProviderDirectoryProfileExecution,
+    source_vector: tuple[tuple[str, str], ...],
+    source_context_vector: tuple[tuple[str, str], ...],
+) -> None:
+    """Verify that replay evidence still names the exact serving state."""
+    expected_by_field = _profile_replay_serving_values(
+        receipt,
+        execution,
+        source_vector,
+        source_context_vector,
+    )
+    observed_by_field = {
+        field_name: getattr(serving, field_name)
+        for field_name in expected_by_field
+    }
+    receipt_geometry = (
+        _provider_directory_profile_capacity_geometry_identity(
+            status=receipt.get("capacity_geometry_status"),
+            geometry_hash=receipt.get("capacity_geometry_hash"),
+            geometry_json=receipt.get("capacity_geometry_json"),
+        )
+    )
+    serving_geometry = (
+        serving.capacity_geometry_status,
+        serving.capacity_geometry_hash,
+        serving.capacity_geometry_json,
+    )
+    receipt_time = _provider_directory_profile_replay_timestamp(
+        receipt.get("committed_at"),
+        "committed_at",
+    )
+    published_time = _provider_directory_profile_replay_timestamp(
+        serving_row.get("published_at"),
+        "published_at",
+    )
+    updated_time = _provider_directory_profile_replay_timestamp(
+        serving_row.get("updated_at"),
+        "updated_at",
+    )
+    if (
+        observed_by_field != expected_by_field
+        or serving_geometry != receipt_geometry
+        or published_time != receipt_time
+        or updated_time != receipt_time
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_serving_generation_changed"
+        )
+
+
+def _provider_directory_profile_replay_metrics(
+    receipt: Mapping[str, Any],
+    serving: _ProviderDirectoryProfileServingState,
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    lease: VerifiedDatabaseCapacityLease,
+    receipt_run_id: str,
+    requested_run_id: str,
+) -> dict[str, Any]:
+    metrics = _provider_directory_profile_replay_counts(receipt)
+    committed_replay_by_field = {
+        "run_id": receipt_run_id,
+        "build_id": receipt["build_id"],
+        "committed_at": _provider_directory_profile_replay_timestamp(
+            receipt["committed_at"],
+            "committed_at",
+        ).isoformat(),
+    }
+    if requested_run_id != receipt_run_id:
+        committed_replay_by_field["replayed_by_run_id"] = requested_run_id
+    metrics.update(
+        {
+            "selected_evidence_rows": metrics["evidence_rows"],
+            "generation_id": serving.generation_id,
+            "profile_as_of": serving.profile_as_of,
+            "dataset_ids": sorted(
+                {dataset_id for _source_id, dataset_id in serving.source_vector}
+            ),
+            "incremental": True,
+            "capacity": _provider_directory_profile_capacity_metric_map(
+                geometry,
+                lease,
+            ),
+            "committed_replay": committed_replay_by_field,
+        }
+    )
+    return metrics
+
+
+async def _provider_directory_profile_committed_receipt(
+    *,
+    schema: str,
+    execution: ProviderDirectoryProfileExecution,
+) -> dict[str, Any] | None:
+    """Resolve one proof-bound receipt and reject reused identities."""
+
+    receipt_rows = await db.all(
+        f"""
+        SELECT *
+          FROM {_provider_directory_profile_delta_receipt_ref(schema)}
+         WHERE control_generation = :control_generation
+            OR selection_proof_id = :selection_proof_id
+         ORDER BY control_generation, selection_proof_id, build_id
+         LIMIT 3;
+        """,
+        control_generation=execution.generation,
+        selection_proof_id=execution.attestation.proof_id,
+    )
+    exact_rows: list[dict[str, Any]] = []
+    has_conflict = False
+    for receipt_row in receipt_rows:
+        receipt = _pagination_checkpoint_row_mapping(receipt_row)
+        try:
+            control_generation = int(receipt.get("control_generation") or 0)
+        except (TypeError, ValueError):
+            has_conflict = True
+            continue
+        is_generation_match = control_generation == execution.generation
+        is_proof_match = (
+            receipt.get("selection_proof_id")
+            == execution.attestation.proof_id
+        )
+        if is_generation_match and is_proof_match:
+            exact_rows.append(receipt)
+        else:
+            has_conflict = True
+    if has_conflict:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_receipt_identity_conflict"
+        )
+    if len(exact_rows) > 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_receipt_ambiguous"
+        )
+    return exact_rows[0] if exact_rows else None
+
+
+def _profile_replay_owner_run_id(
+    receipt: Mapping[str, Any],
+) -> str:
+    """Return the exact run bound into the immutable cutover evidence."""
+
+    if _provider_directory_profile_cutover_receipt_identity(receipt) is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_cutover_evidence_missing"
+        )
+    forecast_by_field = receipt.get("cutover_forecast_json")
+    if isinstance(forecast_by_field, str):
+        try:
+            forecast_by_field = json.loads(forecast_by_field)
+        except (TypeError, ValueError) as exc:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_profile_replay_receipt_owner_invalid"
+            ) from exc
+    owner_run_id = (
+        _clean_text(forecast_by_field.get("run_id"))
+        if isinstance(forecast_by_field, Mapping)
+        else None
+    )
+    if (
+        owner_run_id is None
+        or re.fullmatch(r"run_[0-9a-f]{32}", owner_run_id) is None
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_receipt_owner_invalid"
+        )
+    return owner_run_id
+
+
+async def _replay_control_run(schema: str, run_id: str) -> None:
+    """Verify the requesting control run remains the active importer owner."""
+    control_row = await db.first(
+        f"SELECT run_id, importer, status FROM "
+        f"{_unscoped_qt(schema, ImportRun.__tablename__)} "
+        "WHERE run_id = :run_id;",
+        run_id=run_id,
+    )
+    control_by_field = (
+        _pagination_checkpoint_row_mapping(control_row)
+        if control_row is not None
+        else {}
+    )
+    if (
+        control_by_field.get("run_id") != run_id
+        or control_by_field.get("importer") != "provider-directory-fhir"
+        or control_by_field.get("status") != "running"
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_control_run_changed"
+        )
+
+
+async def _replay_current_consumption(
+    consumption_ref: str,
+    run_id: str,
+) -> Any | None:
+    """Resolve the requesting run's sole retained lease consumption."""
+    consumption_rows = await db.all(
+        f"SELECT * FROM {consumption_ref} "
+        "WHERE run_id = :run_id ORDER BY attestation_id LIMIT 2;",
+        run_id=run_id,
+    )
+    if len(consumption_rows) > 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_consumption_ambiguous"
+        )
+    if not consumption_rows:
+        return None
+    return consumption_rows[0]
+
+
+async def _replay_exact_receipt(
+    schema: str,
+    execution: ProviderDirectoryProfileExecution,
+    current_consumption_row: Any | None,
+) -> dict[str, Any] | None:
+    """Resolve the proof receipt or diagnose an incomplete prior admission."""
+    receipt = await _provider_directory_profile_committed_receipt(
+        schema=schema,
+        execution=execution,
+    )
+    if receipt is not None or current_consumption_row is None:
+        return receipt
+    current_consumption = _pagination_checkpoint_row_mapping(
+        current_consumption_row
+    )
+    receipt_row = await db.first(
+        f"SELECT * FROM "
+        f"{_provider_directory_profile_delta_receipt_ref(schema)} "
+        "WHERE build_id = :build_id;",
+        build_id=current_consumption.get("build_id"),
+    )
+    if receipt_row is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_receipt_missing"
+        )
+    raise ProviderDirectoryArtifactBuildStale(
+        "provider_directory_profile_replay_receipt_identity_conflict"
+    )
+
+
+async def _replay_bound_consumption(
+    consumption_ref: str,
+    receipt_run_id: str,
+    build_id: Any,
+) -> dict[str, Any]:
+    """Resolve the sole immutable lease consumption bound to a receipt."""
+    consumption_rows = await db.all(
+        f"""
+        SELECT *
+          FROM {consumption_ref}
+         WHERE run_id = :receipt_run_id
+           AND build_id = :build_id
+         ORDER BY attestation_id
+         LIMIT 2;
+        """,
+        receipt_run_id=receipt_run_id,
+        build_id=build_id,
+    )
+    if len(consumption_rows) != 1:
+        reason = "missing" if not consumption_rows else "ambiguous"
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_consumption_" + reason
+        )
+    return _pagination_checkpoint_row_mapping(consumption_rows[0])
+
+
+async def _assert_replay_owner(
+    schema: str,
+    receipt_run_id: str,
+    requested_run_id: str,
+) -> None:
+    """Verify a cross-run replay names one terminal importer owner."""
+    if receipt_run_id == requested_run_id:
+        return
+    owner_row = await db.first(
+        f"SELECT run_id, importer, status FROM "
+        f"{_unscoped_qt(schema, ImportRun.__tablename__)} "
+        "WHERE run_id = :receipt_run_id;",
+        receipt_run_id=receipt_run_id,
+    )
+    owner_by_field = (
+        _pagination_checkpoint_row_mapping(owner_row)
+        if owner_row is not None
+        else {}
+    )
+    if (
+        owner_by_field.get("run_id") != receipt_run_id
+        or owner_by_field.get("importer") != "provider-directory-fhir"
+        or owner_by_field.get("status")
+        not in {
+            "succeeded",
+            "failed",
+            "canceled",
+            "cancelled",
+            "dead_letter",
+        }
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_competing_owner"
+        )
+
+
+def _replay_capacity_artifacts(
+    consumption: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    execution: ProviderDirectoryProfileExecution,
+) -> tuple[
+    profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    VerifiedDatabaseCapacityLease,
+]:
+    """Verify the immutable receipt geometry and its consumed lease."""
+    geometry = _provider_directory_profile_replay_geometry(
+        receipt,
+        execution,
+    )
+    _assert_provider_directory_profile_replay_receipt(
+        consumption,
+        receipt,
+        execution,
+        geometry,
+    )
+    lease = _verified_provider_directory_profile_replay_lease(
+        consumption,
+        receipt,
+        geometry,
+    )
+    return geometry, lease
+
+
+async def _replay_serving_state(
+    schema: str,
+    execution: ProviderDirectoryProfileExecution,
+    receipt: Mapping[str, Any],
+) -> _ProviderDirectoryProfileServingState:
+    """Verify and return the serving generation named by the receipt."""
+    serving_row_raw = await db.first(
+        f"SELECT * FROM "
+        f"{_provider_directory_profile_serving_generation_ref(schema)} "
+        "WHERE singleton_key = 'global';"
+    )
+    if serving_row_raw is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_serving_missing"
+        )
+    serving_row = _pagination_checkpoint_row_mapping(serving_row_raw)
+    serving = _provider_directory_profile_serving_state_from_row(serving_row)
+    source_vector, source_context_vector = (
+        await _provider_directory_profile_replay_source_context(execution)
+    )
+    _assert_provider_directory_profile_replay_serving(
+        serving,
+        serving_row,
+        receipt,
+        execution,
+        source_vector,
+        source_context_vector,
+    )
+    return serving
+
+
+async def _assert_replay_database(
+    schema: str,
+    serving: _ProviderDirectoryProfileServingState,
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+    lease: VerifiedDatabaseCapacityLease,
+) -> None:
+    """Verify the replay still targets the database signed by its lease."""
+    database_identity = (
+        await _provider_directory_profile_capacity_database_identity(
+            schema,
+            serving,
+        )
+    )
+    geometry_fields = (
+        "database_system_identifier",
+        "database_oid",
+        "database_name",
+        "tablespace_oid",
+        "tablespace_name",
+        "postgres_server_version_num",
+        "postgres_block_size_bytes",
+        "postgres_wal_block_size_bytes",
+        "postgres_wal_segment_size_bytes",
+        "postgres_full_page_writes",
+        "postgres_wal_compression",
+        "postgres_wal_level",
+        "postgres_wal_log_hints",
+        "postgres_data_checksums",
+        "postgres_default_toast_compression",
+        "postgres_checkpoint_timeout_seconds",
+        "postgres_max_wal_size_bytes",
+        "evidence_target_storage_fingerprint",
+        "profile_target_storage_fingerprint",
+        "build_checkpoint_oid",
+        "serving_generation_oid",
+        "delta_receipt_oid",
+        "build_checkpoint_storage_fingerprint",
+        "serving_generation_storage_fingerprint",
+        "delta_receipt_storage_fingerprint",
+    )
+    expected_by_field = {
+        field_name: getattr(geometry, field_name)
+        for field_name in geometry_fields
+    }
+    observed_by_field = {
+        field_name: getattr(database_identity, field_name)
+        for field_name in expected_by_field
+    }
+    if observed_by_field != expected_by_field:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_database_changed"
+        )
+    _assert_provider_directory_profile_capacity_tablespaces(
+        lease,
+        database_identity,
+    )
+
+
+def _assert_replay_timeline(
+    consumption: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    lease: VerifiedDatabaseCapacityLease,
+) -> None:
+    """Verify acceptance, commit, deadline, and expiry remain ordered."""
+    committed_at = _provider_directory_profile_replay_timestamp(
+        receipt.get("committed_at"),
+        "committed_at",
+    )
+    accepted_at = _provider_directory_profile_replay_timestamp(
+        consumption.get("accepted_at"),
+        "accepted_at",
+    )
+    if not (
+        accepted_at
+        <= committed_at
+        < lease.max_build_deadline
+        <= lease.expires_at
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_timeline_invalid"
+        )
+
+
+async def _committed_replay_result(
+    schema: str,
+    consumption_ref: str,
+    run_id: str,
+    execution: ProviderDirectoryProfileExecution,
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> dict[str, Any] | None:
+    """Verify one committed replay within the caller's read transaction."""
+    await _replay_control_run(schema, run_id)
+    current_consumption_row = await _replay_current_consumption(
+        consumption_ref,
+        run_id,
+    )
+    receipt = await _replay_exact_receipt(
+        schema,
+        execution,
+        current_consumption_row,
+    )
+    if receipt is None:
+        return None
+    receipt_run_id = (
+        _provider_directory_profile_replay_receipt_owner_run_id(receipt)
+    )
+    if receipt_run_id != run_id and current_consumption_row is not None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_current_consumption_conflict"
+        )
+    consumption = await _replay_bound_consumption(
+        consumption_ref,
+        receipt_run_id,
+        receipt.get("build_id"),
+    )
+    await _assert_replay_owner(schema, receipt_run_id, run_id)
+    geometry, lease = _replay_capacity_artifacts(
+        consumption,
+        receipt,
+        execution,
+    )
+    serving = await _replay_serving_state(schema, execution, receipt)
+    await _assert_replay_database(schema, serving, geometry, lease)
+    _assert_replay_timeline(consumption, receipt, lease)
+    if not await _is_provider_directory_dataset_cutover_committed(fence):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_replay_dataset_pointer_changed"
+        )
+    return _provider_directory_profile_replay_metrics(
+        receipt,
+        serving,
+        geometry,
+        lease,
+        receipt_run_id,
+        run_id,
+    )
+
+
+async def _provider_directory_profile_committed_run_replay(
+    *,
+    run_id: str | None,
+    control_run_id: str | None,
+    execution: ProviderDirectoryProfileExecution,
+    fence: ProviderDirectoryArtifactDatasetFence,
+) -> dict[str, Any] | None:
+    """Return an exact committed generation result without new admission."""
+
+    if (
+        run_id is None
+        or control_run_id is None
+        or run_id != control_run_id
+        or re.fullmatch(r"run_[0-9a-f]{32}", run_id) is None
+    ):
+        return None
+    schema = _schema()
+    consumption_ref = _unscoped_qt(
+        schema,
+        ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__,
+    )
+    async with db.transaction():
+        await db.status(
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;"
+        )
+        return await _committed_replay_result(
+            schema,
+            consumption_ref,
+            run_id,
+            execution,
+            fence,
+        )
+
+
+def _expected_profile_capacity_identity(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
+) -> dict[str, Any]:
+    """Return identity fields signed by the admitted capacity geometry."""
+    return {
+        "run_id": admission.run_id,
+        "build_id": admission.build_id,
+        "selection_proof_id": geometry.selection_proof_id,
+        "profile_schema_version": geometry.profile_schema_version,
+        "profile_strategy_version": geometry.profile_strategy_version,
+        "executable_plan_hash": geometry.executable_plan_hash,
+        "profile_as_of": geometry.profile_as_of,
+        "materialization_mode": geometry.materialization_mode,
+        "current_source_vector_hash": (
+            geometry.current_source_vector_hash
+        ),
+        "desired_source_vector_hash": (
+            geometry.desired_source_vector_hash
+        ),
+        "current_context_vector_hash": (
+            geometry.current_context_vector_hash
+        ),
+        "desired_context_vector_hash": (
+            geometry.desired_context_vector_hash
+        ),
+        "evidence_target_oid": geometry.evidence_target_oid,
+        "profile_target_oid": geometry.profile_target_oid,
+        "evidence_wave_count": geometry.evidence_wave_count,
+        "compact_wave_count": geometry.compact_wave_count,
+        "evidence_worker_count": geometry.evidence_worker_count,
+        "compact_worker_count": geometry.compact_worker_count,
+    }
+
+
+def _observed_profile_capacity_identity(
+    build: _ProviderDirectoryProfileBuild,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> dict[str, Any]:
+    """Return the resolved build fields that must match admission."""
+    batch_plan = build.batch_plan
+    return {
+        "run_id": build.owner_run_id,
+        "build_id": _provider_directory_profile_build_id(build),
+        "selection_proof_id": build.selection_proof_id,
+        "profile_schema_version": (
+            profile_artifact.PROFILE_SCHEMA_VERSION
+        ),
+        "profile_strategy_version": (
+            profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+        ),
+        "executable_plan_hash": (
+            batch_plan.fingerprint if batch_plan is not None else None
+        ),
+        "profile_as_of": build.profile_as_of,
+        "materialization_mode": build.materialization_mode,
+        "current_source_vector_hash": build.current_source_vector_hash,
+        "desired_source_vector_hash": build.desired_source_vector_hash,
+        "current_context_vector_hash": (
+            build.current_source_context_vector_hash
+        ),
+        "desired_context_vector_hash": (
+            build.desired_source_context_vector_hash
+        ),
+        "evidence_target_oid": evidence_build_fence.target_oid,
+        "profile_target_oid": profile_build_fence.target_oid,
+        "evidence_wave_count": (
+            len(batch_plan.evidence_waves) if batch_plan is not None else -1
+        ),
+        "compact_wave_count": (
+            len(batch_plan.compact_waves) if batch_plan is not None else -1
+        ),
+        "evidence_worker_count": (
+            _provider_directory_profile_max_wave_width(
+                batch_plan.evidence_waves
+            )
+            if batch_plan is not None
+            else -1
+        ),
+        "compact_worker_count": (
+            _provider_directory_profile_max_wave_width(
+                batch_plan.compact_waves
+            )
+            if batch_plan is not None
+            else -1
+        ),
+    }
+
+
+def _assert_provider_directory_profile_capacity_build(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    build: _ProviderDirectoryProfileBuild,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> None:
+    """Bind the resolved build and target locks to the admitted geometry."""
+    geometry = profile_capacity.revalidate_capacity_geometry(
+        admission.geometry
+    )
+    execution = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
+    expected_identity_by_name = _expected_profile_capacity_identity(
+        admission,
+        geometry,
+    )
+    observed_identity_by_name = _observed_profile_capacity_identity(
+        build,
+        evidence_build_fence,
+        profile_build_fence,
+    )
+    if expected_identity_by_name != observed_identity_by_name or (
+        execution is None
+        or execution.attestation.profile_input_digest
+        != geometry.profile_input_digest
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_build_identity_changed"
+        )
+    admitted_geometry_identity = (
+        "verified",
+        profile_capacity.capacity_geometry_hash(geometry),
+        profile_capacity.canonical_capacity_geometry_json(geometry),
+    )
+    if (
+        _provider_directory_profile_capacity_geometry_identity(
+            status=build.capacity_geometry_status,
+            geometry_hash=build.capacity_geometry_hash,
+            geometry_json=build.capacity_geometry_json,
+        )
+        != admitted_geometry_identity
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_capacity_build_geometry_changed"
+        )
 
 
 _PROFILE_EVIDENCE_PROGRESS_PHASE = (
@@ -14462,6 +25094,51 @@ _PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE = {
 _PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES = tuple(
     _PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE
 )
+_PROVIDER_DIRECTORY_PROFILE_DELTA_COMPATIBLE_STRATEGIES = frozenset(
+    {
+        "source-fact-role32-npi5m-v1",
+        "source-fact-role32-org32-npi5m-v3",
+        profile_artifact.PROFILE_BUILD_STRATEGY_VERSION,
+    }
+)
+
+
+def _provider_directory_profile_window_size(
+    env_name: str,
+    default_value: int,
+) -> int:
+    requested_workers, explicitly_configured = (
+        _provider_directory_positive_config(
+            env_name,
+            default_value,
+        )
+    )
+    admitted_workers = min(
+        MAX_PROVIDER_DIRECTORY_PROFILE_WINDOW_SIZE,
+        _provider_directory_database_pool_capacity() - 4,
+    )
+    if admitted_workers < 1 or (
+        explicitly_configured and requested_workers > admitted_workers
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_worker_capacity_exceeded:"
+            + env_name
+        )
+    return min(requested_workers, admitted_workers)
+
+
+def _provider_directory_profile_evidence_window_size() -> int:
+    return _provider_directory_profile_window_size(
+        "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_EVIDENCE_WORKERS",
+        DEFAULT_PROVIDER_DIRECTORY_PROFILE_EVIDENCE_WINDOW_SIZE,
+    )
+
+
+def _provider_directory_profile_compact_window_size() -> int:
+    return _provider_directory_profile_window_size(
+        "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_COMPACT_WORKERS",
+        DEFAULT_PROVIDER_DIRECTORY_PROFILE_COMPACT_WINDOW_SIZE,
+    )
 
 
 def _profile_batch_detail_by_name(
@@ -14630,6 +25307,8 @@ def _provider_directory_profile_npi_ranges(
 ) -> tuple[tuple[int, int], ...]:
     if npi_batch_size < 1:
         raise ValueError("profile NPI batch size must be positive")
+    if npi_batch_size < profile_artifact.PROFILE_NPI_BATCH_SIZE:
+        raise ValueError("profile NPI batch size is below the bounded minimum")
     return tuple(
         (
             npi_start,
@@ -14706,6 +25385,155 @@ def _provider_directory_profile_compact_plan(
     return tuple(batches)
 
 
+def _provider_directory_profile_plan_waves(
+    batches: tuple[
+        _ProviderDirectoryProfileEvidenceBatch
+        | _ProviderDirectoryProfileCompactBatch,
+        ...,
+    ],
+    *,
+    window_size: int,
+    source_bounded: bool,
+) -> tuple[tuple[int, int], ...]:
+    """Freeze ordered half-open waves independently of retry position."""
+
+    waves: list[tuple[int, int]] = []
+    wave_start = 0
+    while wave_start < len(batches):
+        first_batch = batches[wave_start]
+        if first_batch.kind == "copy":
+            wave_end = wave_start + 1
+        else:
+            wave_end = min(wave_start + window_size, len(batches))
+            if source_bounded and isinstance(
+                first_batch,
+                _ProviderDirectoryProfileEvidenceBatch,
+            ):
+                while (
+                    wave_end > wave_start + 1
+                    and isinstance(
+                        batches[wave_end - 1],
+                        _ProviderDirectoryProfileEvidenceBatch,
+                    )
+                    and batches[wave_end - 1].source_id
+                    != first_batch.source_id
+                ):
+                    wave_end -= 1
+        waves.append((wave_start, wave_end))
+        wave_start = wave_end
+    return tuple(waves)
+
+
+def _profile_evidence_sql_contracts() -> dict[str, str]:
+    """Return evidence insert and count SQL for every frozen fact type."""
+    evidence_refs_by_name = {
+        "target_ref": "profile_delta_target",
+        "source_ref": "profile_source",
+        "practitioner_ref": "profile_practitioner",
+        "role_ref": "profile_role",
+        "organization_ref": "profile_organization",
+        "affiliation_ref": "profile_affiliation",
+        "affiliation_organization_ref": "profile_affiliation_edge",
+        "service_ref": "profile_service",
+        "endpoint_ref": "profile_endpoint",
+    }
+    evidence_sql_by_name = {
+        "evidence_" + fact_type: (
+            _PROFILE_EVIDENCE_INSERT_SQL_CONTRACT(
+                **evidence_refs_by_name,
+                fact_type=fact_type,
+                role_bucket_count=(
+                    profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS
+                    if fact_type
+                    in _PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES
+                    else 1
+                ),
+                role_bucket=0,
+            )
+        )
+        for fact_type in profile_artifact.PROFILE_EVIDENCE_FACT_TYPES
+    }
+    evidence_sql_by_name.update(
+        {
+            "evidence_count_" + fact_type: (
+                _PROFILE_EVIDENCE_COUNT_SQL_CONTRACT(
+                    **evidence_refs_by_name,
+                    fact_type=fact_type,
+                    role_bucket_count=(
+                        profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS
+                        if fact_type
+                        in _PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES
+                        else 1
+                    ),
+                    role_bucket=0,
+                )
+            )
+            for fact_type in profile_artifact.PROFILE_EVIDENCE_FACT_TYPES
+        }
+    )
+    return evidence_sql_by_name
+
+
+def _profile_compact_sql_contracts() -> dict[str, str]:
+    """Return compact, copy, and affected-NPI SQL identity inputs."""
+    return {
+        "compact_delta": _PROFILE_INSERT_SQL_CONTRACT(
+            evidence_ref="profile_combined_evidence",
+            target_ref="profile_delta",
+            old_evidence_ref="profile_evidence",
+            rebuild_all=False,
+            npi_start=profile_artifact.NPI_MIN,
+            npi_end=(
+                profile_artifact.NPI_MIN
+                + profile_artifact.PROFILE_NPI_BATCH_SIZE
+            ),
+        ),
+        "compact_source_delta": _PROFILE_DELTA_INSERT_SQL_CONTRACT(
+            current_evidence_ref="profile_evidence",
+            delta_evidence_ref="profile_delta_evidence",
+            affected_npi_ref="profile_affected_npi",
+            target_ref="profile_delta",
+            npi_start=profile_artifact.NPI_MIN,
+            npi_end=(
+                profile_artifact.NPI_MIN
+                + profile_artifact.PROFILE_NPI_BATCH_SIZE
+            ),
+        ),
+        "copy_evidence": _PROFILE_COPY_EVIDENCE_SQL_CONTRACT(
+            source_ref="profile_evidence",
+            target_ref="profile_evidence_stage",
+        ),
+        "copy_profile": _PROFILE_COPY_PROFILES_SQL_CONTRACT(
+            profile_source_ref="profile",
+            evidence_source_ref="profile_evidence",
+            evidence_stage_ref="profile_evidence_stage",
+            profile_stage_ref="profile_stage",
+        ),
+        "affected_npi_source": (
+            _PROFILE_AFFECTED_NPI_SOURCE_SQL_CONTRACT(
+                evidence_ref="profile_evidence",
+                affected_npi_ref="profile_affected_npi",
+            )
+        ),
+        "affected_npi_delta": (
+            _PROFILE_AFFECTED_NPI_DELTA_SQL_CONTRACT(
+                evidence_stage_ref="profile_delta_evidence",
+                affected_npi_ref="profile_affected_npi",
+            )
+        ),
+    }
+
+
+def _provider_directory_profile_sql_contract_hashes() -> dict[str, str]:
+    """Return hashes for every SQL contract bound into profile identity."""
+    sql_by_name = _profile_evidence_sql_contracts()
+    sql_by_name.update(_profile_compact_sql_contracts())
+    return {
+        sql_name: hashlib.sha256(sql_text.encode("utf-8")).hexdigest()
+        for sql_name, sql_text in sorted(sql_by_name.items())
+    }
+
+
 def _validate_provider_directory_profile_batch_scope(
     selected_sources: tuple[str, ...],
     retained_sources: tuple[str, ...],
@@ -14733,40 +25561,143 @@ def _validate_provider_directory_profile_batch_scope(
         )
 
 
-def _provider_directory_profile_batch_plan(
-    source_ids: Iterable[str],
-    retained_source_ids: Iterable[str],
-    dataset_ids: Iterable[str],
-    *,
-    has_existing_artifacts: bool,
-    npi_batch_size: int = profile_artifact.PROFILE_NPI_BATCH_SIZE,
-) -> _ProviderDirectoryProfileBatchPlan:
-    selected_sources = tuple(source_ids)
-    retained_sources = tuple(retained_source_ids)
-    selected_datasets = tuple(dataset_ids)
-    _validate_provider_directory_profile_batch_scope(
-        selected_sources,
-        retained_sources,
-        selected_datasets,
+def _validate_profile_batch_plan_options(
+    options: _ProviderDirectoryProfileBatchPlanOptions,
+) -> None:
+    """Require a supported materialization mode and complete delta hashes."""
+    if options.materialization_mode not in {"full_swap", "source_delta"}:
+        raise ValueError(
+            "unsupported Provider Directory Profile materialization mode"
+        )
+    if options.materialization_mode == "source_delta" and (
+        options.current_source_vector_hash is None
+        or options.desired_source_vector_hash is None
+        or options.current_source_context_vector_hash is None
+        or options.desired_source_context_vector_hash is None
+    ):
+        raise ValueError(
+            "profile source delta requires source and context-vector hashes"
+        )
+
+
+def _profile_batch_window_sizes(
+    options: _ProviderDirectoryProfileBatchPlanOptions,
+) -> tuple[int, int]:
+    """Resolve and validate evidence and compact wave sizes."""
+    evidence_window_size = (
+        options.evidence_window_size
+        if options.evidence_window_size is not None
+        else _provider_directory_profile_evidence_window_size()
     )
-    include_copy_batch = _is_profile_copy_batch_required(
-        source_ids=selected_sources,
-        retained_source_ids=retained_sources,
-        has_existing_artifacts=has_existing_artifacts,
+    compact_window_size = (
+        options.compact_window_size
+        if options.compact_window_size is not None
+        else _provider_directory_profile_compact_window_size()
+    )
+    for phase_name, window_size in (
+        ("evidence", evidence_window_size),
+        ("compact", compact_window_size),
+    ):
+        if not 1 <= window_size <= (
+            MAX_PROVIDER_DIRECTORY_PROFILE_WINDOW_SIZE
+        ):
+            raise ValueError(
+                f"profile {phase_name} window size is outside "
+                "the configured range"
+            )
+    return evidence_window_size, compact_window_size
+
+
+def _profile_batch_execution(
+    selected_sources: tuple[str, ...],
+    retained_sources: tuple[str, ...],
+    selected_datasets: tuple[str, ...],
+    has_existing_artifacts: bool,
+    options: _ProviderDirectoryProfileBatchPlanOptions,
+) -> _ProviderDirectoryProfileBatchExecution:
+    """Build bounded batch series and their immutable execution waves."""
+    _validate_profile_batch_plan_options(options)
+    normalized_removed_source_ids = tuple(
+        sorted(set(options.removed_source_ids))
+    )
+    include_copy_batch = (
+        options.materialization_mode == "full_swap"
+        and _is_profile_copy_batch_required(
+            source_ids=selected_sources,
+            retained_source_ids=retained_sources,
+            has_existing_artifacts=has_existing_artifacts,
+        )
     )
     evidence_batches = _provider_directory_profile_evidence_plan(
         selected_sources,
         selected_datasets,
         include_copy_batch=include_copy_batch,
     )
-    compact_batches = _provider_directory_profile_compact_plan(
-        npi_batch_size,
-        include_copy_batch=include_copy_batch,
+    compact_batches = (
+        ()
+        if (
+            options.materialization_mode == "source_delta"
+            and not selected_sources
+            and not normalized_removed_source_ids
+        )
+        else _provider_directory_profile_compact_plan(
+            options.npi_batch_size,
+            include_copy_batch=include_copy_batch,
+        )
     )
-    plan_payload_by_name = {
-        "contract": "provider-directory-profile-executable-plan-v1",
+    evidence_window_size, compact_window_size = (
+        _profile_batch_window_sizes(options)
+    )
+    return _ProviderDirectoryProfileBatchExecution(
+        include_copy_batch=include_copy_batch,
+        evidence_batches=evidence_batches,
+        compact_batches=compact_batches,
+        evidence_window_size=evidence_window_size,
+        compact_window_size=compact_window_size,
+        evidence_waves=_provider_directory_profile_plan_waves(
+            evidence_batches,
+            window_size=evidence_window_size,
+            source_bounded=True,
+        ),
+        compact_waves=_provider_directory_profile_plan_waves(
+            compact_batches,
+            window_size=compact_window_size,
+            source_bounded=False,
+        ),
+        removed_source_ids=normalized_removed_source_ids,
+    )
+
+
+def _profile_batch_plan_payload(
+    selected_sources: tuple[str, ...],
+    retained_sources: tuple[str, ...],
+    selected_datasets: tuple[str, ...],
+    has_existing_artifacts: bool,
+    options: _ProviderDirectoryProfileBatchPlanOptions,
+    execution: _ProviderDirectoryProfileBatchExecution,
+) -> dict[str, Any]:
+    """Return the canonical executable-plan identity payload."""
+    return {
+        "contract": "provider-directory-profile-executable-plan-v3",
+        "materialization_mode": options.materialization_mode,
         "has_existing_artifacts": has_existing_artifacts,
-        "include_copy_batch": include_copy_batch,
+        "include_copy_batch": execution.include_copy_batch,
+        "evidence_window_size": execution.evidence_window_size,
+        "compact_window_size": execution.compact_window_size,
+        "evidence_waves": execution.evidence_waves,
+        "compact_waves": execution.compact_waves,
+        "current_source_vector_hash": options.current_source_vector_hash,
+        "desired_source_vector_hash": options.desired_source_vector_hash,
+        "current_source_context_vector_hash": (
+            options.current_source_context_vector_hash
+        ),
+        "desired_source_context_vector_hash": (
+            options.desired_source_context_vector_hash
+        ),
+        "removed_source_ids": execution.removed_source_ids,
+        "sql_contract_hashes": (
+            _provider_directory_profile_sql_contract_hashes()
+        ),
         "bucket_schemes_by_fact_type": (
             _PROVIDER_DIRECTORY_PROFILE_BUCKET_SCHEMES_BY_FACT_TYPE
         ),
@@ -14782,15 +25713,83 @@ def _provider_directory_profile_batch_plan(
             )
         ],
         "retained_source_ids": retained_sources,
-        "evidence_batches": [asdict(batch) for batch in evidence_batches],
-        "compact_batches": [asdict(batch) for batch in compact_batches],
+        "evidence_batches": [
+            asdict(batch) for batch in execution.evidence_batches
+        ],
+        "compact_batches": [
+            asdict(batch) for batch in execution.compact_batches
+        ],
     }
+
+
+def _profile_batch_plan_result(
+    has_existing_artifacts: bool,
+    options: _ProviderDirectoryProfileBatchPlanOptions,
+    execution: _ProviderDirectoryProfileBatchExecution,
+    payload_by_name: Mapping[str, Any],
+) -> _ProviderDirectoryProfileBatchPlan:
+    """Return the immutable plan from its execution series and payload."""
     return _ProviderDirectoryProfileBatchPlan(
         has_existing_artifacts=has_existing_artifacts,
-        include_copy_batch=include_copy_batch,
-        evidence_batches=evidence_batches,
-        compact_batches=compact_batches,
-        fingerprint=_identity_hash(plan_payload_by_name),
+        include_copy_batch=execution.include_copy_batch,
+        evidence_batches=execution.evidence_batches,
+        compact_batches=execution.compact_batches,
+        fingerprint=_identity_hash(payload_by_name),
+        evidence_window_size=execution.evidence_window_size,
+        compact_window_size=execution.compact_window_size,
+        evidence_waves=execution.evidence_waves,
+        compact_waves=execution.compact_waves,
+        materialization_mode=options.materialization_mode,
+        current_source_vector_hash=options.current_source_vector_hash,
+        desired_source_vector_hash=options.desired_source_vector_hash,
+        current_source_context_vector_hash=(
+            options.current_source_context_vector_hash
+        ),
+        desired_source_context_vector_hash=(
+            options.desired_source_context_vector_hash
+        ),
+        removed_source_ids=execution.removed_source_ids,
+    )
+
+
+def _provider_directory_profile_batch_plan(
+    source_ids: Iterable[str],
+    retained_source_ids: Iterable[str],
+    dataset_ids: Iterable[str],
+    *,
+    has_existing_artifacts: bool,
+    **plan_options: Any,
+) -> _ProviderDirectoryProfileBatchPlan:
+    """Build the immutable bounded evidence and compact execution plan."""
+    selected_sources = tuple(source_ids)
+    retained_sources = tuple(retained_source_ids)
+    selected_datasets = tuple(dataset_ids)
+    _validate_provider_directory_profile_batch_scope(
+        selected_sources,
+        retained_sources,
+        selected_datasets,
+    )
+    options = _ProviderDirectoryProfileBatchPlanOptions(**plan_options)
+    execution = _profile_batch_execution(
+        selected_sources,
+        retained_sources,
+        selected_datasets,
+        has_existing_artifacts,
+        options,
+    )
+    payload_by_name = _profile_batch_plan_payload(
+        selected_sources,
+        retained_sources,
+        selected_datasets,
+        has_existing_artifacts,
+        options,
+        execution,
+    )
+    return _profile_batch_plan_result(
+        has_existing_artifacts,
+        options,
+        execution,
+        payload_by_name,
     )
 
 
@@ -14818,46 +25817,30 @@ def _provider_directory_profile_build_plan(
         build.dataset_ids,
         has_existing_artifacts=has_existing_artifacts,
         npi_batch_size=npi_batch_size,
+        materialization_mode=build.materialization_mode,
+        current_source_vector_hash=build.current_source_vector_hash,
+        desired_source_vector_hash=build.desired_source_vector_hash,
+        current_source_context_vector_hash=(
+            build.current_source_context_vector_hash
+        ),
+        desired_source_context_vector_hash=(
+            build.desired_source_context_vector_hash
+        ),
+        removed_source_ids=build.removed_source_ids,
     )
 
 
 def _is_profile_checkpoint_geometry_matching(
     checkpoint_map: Mapping[str, Any],
     *,
-    source_count: int,
+    build: _ProviderDirectoryProfileBuild,
 ) -> bool:
-    """Require checkpoint totals to match the active immutable strategy."""
-    has_existing_artifacts = bool(
-        checkpoint_map.get("has_existing_artifacts")
-    )
-    include_copy_batch_count = int(
-        _is_profile_copy_batch_required(
-            source_ids=_provider_directory_profile_checkpoint_array(
-                checkpoint_map.get("source_ids")
-            ),
-            retained_source_ids=(
-                _provider_directory_profile_checkpoint_array(
-                    checkpoint_map.get("retained_source_ids")
-                )
-            ),
-            has_existing_artifacts=has_existing_artifacts,
-        )
-    )
-    evidence_batches_per_source = sum(
-        (
-            profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS
-            if fact_type
-            in _PROVIDER_DIRECTORY_PROFILE_ROLE_BUCKET_FACT_TYPES
-            else 1
-        )
-        for fact_type in profile_artifact.PROFILE_EVIDENCE_FACT_TYPES
-    )
-    compact_batch_count = len(
-        range(
-            profile_artifact.NPI_MIN,
-            profile_artifact.NPI_MAX + 1,
-            profile_artifact.PROFILE_NPI_BATCH_SIZE,
-        )
+    """Require totals and executable geometry to match the frozen plan."""
+    batch_plan = build.batch_plan or _provider_directory_profile_build_plan(
+        build,
+        has_existing_artifacts=bool(
+            checkpoint_map.get("has_existing_artifacts")
+        ),
     )
     try:
         evidence_total_batches = int(
@@ -14866,14 +25849,34 @@ def _is_profile_checkpoint_geometry_matching(
         profile_total_batches = int(
             checkpoint_map.get("profile_total_batches")
         )
-    except (TypeError, ValueError):
+        observed_capacity_geometry = (
+            _provider_directory_profile_capacity_geometry_identity(
+                status=checkpoint_map.get("capacity_geometry_status"),
+                geometry_hash=checkpoint_map.get(
+                    "capacity_geometry_hash"
+                ),
+                geometry_json=checkpoint_map.get(
+                    "capacity_geometry_json"
+                ),
+            )
+        )
+        expected_capacity_geometry = (
+            _provider_directory_profile_capacity_geometry_identity(
+                status=build.capacity_geometry_status,
+                geometry_hash=build.capacity_geometry_hash,
+                geometry_json=build.capacity_geometry_json,
+            )
+        )
+    except (TypeError, ValueError, RuntimeError):
         return False
     return (
-        evidence_total_batches
-        == include_copy_batch_count
-        + source_count * evidence_batches_per_source
-        and profile_total_batches
-        == include_copy_batch_count + compact_batch_count
+        _clean_text(checkpoint_map.get("executable_plan_hash"))
+        == batch_plan.fingerprint
+        and _clean_text(checkpoint_map.get("materialization_mode"))
+        == build.materialization_mode
+        and evidence_total_batches == len(batch_plan.evidence_batches)
+        and profile_total_batches == len(batch_plan.compact_batches)
+        and observed_capacity_geometry == expected_capacity_geometry
     )
 
 
@@ -14882,6 +25885,32 @@ def _provider_directory_profile_build_ref(
     table_name: str,
 ) -> str:
     return _unscoped_qt(build.schema, table_name)
+
+
+def _canonical_profile_datasets(
+    datasets: Iterable[ProviderDirectoryArtifactDataset],
+) -> list[dict[str, Any]]:
+    """Return full dataset records in deterministic identity order."""
+    return sorted(
+        (asdict(dataset) for dataset in datasets),
+        key=_stable_identity_json,
+    )
+
+
+def _profile_selection_lineage(
+    selection_execution: ProviderDirectoryProfileExecution | None,
+) -> dict[str, Any] | None:
+    """Return the selection coordinates bound into resume lineage."""
+    if selection_execution is None:
+        return None
+    return {
+        "proof_id": selection_execution.attestation.proof_id,
+        "authority_revision": (
+            selection_execution.attestation.authority_revision
+        ),
+        "operation": selection_execution.attestation.operation,
+        "control_generation": selection_execution.generation,
+    }
 
 
 def _provider_directory_profile_resume_lineage_hash(
@@ -14893,6 +25922,7 @@ def _provider_directory_profile_resume_lineage_hash(
     *,
     has_existing_artifacts: bool = False,
     batch_plan: _ProviderDirectoryProfileBatchPlan | None = None,
+    selection_execution: ProviderDirectoryProfileExecution | None = None,
 ) -> str:
     """Hash every immutable input that can affect a resumed Profile build."""
     if tuple(context.source_id for context in source_contexts) != tuple(
@@ -14901,14 +25931,6 @@ def _provider_directory_profile_resume_lineage_hash(
         raise RuntimeError(
             "provider_directory_profile_source_context_scope_changed"
         )
-
-    def canonical_datasets(
-        datasets: Iterable[ProviderDirectoryArtifactDataset],
-    ) -> list[dict[str, Any]]:
-        """Return full dataset records in deterministic identity order."""
-        dataset_contracts = [asdict(dataset) for dataset in datasets]
-        return sorted(dataset_contracts, key=_stable_identity_json)
-
     resolved_batch_plan = batch_plan or (
         _provider_directory_profile_batch_plan(
             source_ids,
@@ -14919,10 +25941,12 @@ def _provider_directory_profile_resume_lineage_hash(
     )
     return _identity_hash(
         {
-            "contract": "provider-directory-profile-resume-lineage-v1",
+            "contract": "provider-directory-profile-resume-lineage-v3",
             "dataset_fence": {
-                "datasets": canonical_datasets(dataset_fence.datasets),
-                "promotion_aliases": canonical_datasets(
+                "datasets": _canonical_profile_datasets(
+                    dataset_fence.datasets
+                ),
+                "promotion_aliases": _canonical_profile_datasets(
                     dataset_fence.promotion_aliases
                 ),
                 "should_select_validated_candidates": (
@@ -14939,6 +25963,9 @@ def _provider_directory_profile_resume_lineage_hash(
             "source_ids": source_ids,
             "strategy_version": (
                 profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+            ),
+            "selection_execution": _profile_selection_lineage(
+                selection_execution
             ),
         }
     )
@@ -14968,14 +25995,46 @@ async def _is_profile_stage_pair_matching(
     evidence_stage: str,
     profile_stage: str,
 ) -> bool:
-    for stage_table, oid_field in (
-        (evidence_stage, "evidence_stage_oid"),
-        (profile_stage, "profile_stage_oid"),
+    for stage_table, oid_field, fingerprint_field in (
+        (
+            evidence_stage,
+            "evidence_stage_oid",
+            "evidence_stage_storage_fingerprint",
+        ),
+        (
+            profile_stage,
+            "profile_stage_oid",
+            "profile_stage_storage_fingerprint",
+        ),
     ):
         expected_oid = _provider_directory_profile_checkpoint_oid(
             checkpoint_map.get(oid_field)
         )
-        if expected_oid is None:
+        expected_fingerprint = _clean_text(
+            checkpoint_map.get(fingerprint_field)
+        )
+        if (
+            expected_oid is None
+            or expected_fingerprint is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                expected_fingerprint,
+            )
+            is None
+        ):
+            return False
+        try:
+            observed_fingerprint = (
+                await _provider_directory_profile_stage_storage_fingerprint(
+                    schema,
+                    stage_table,
+                    expected_oid=expected_oid,
+                    lock_relation=False,
+                )
+            )
+        except ProviderDirectoryArtifactBuildStale:
+            return False
+        if observed_fingerprint != expected_fingerprint:
             return False
         if (
             await _provider_directory_profile_stage_relation_identity(
@@ -14986,6 +26045,64 @@ async def _is_profile_stage_pair_matching(
         ):
             return False
     return True
+
+
+async def _is_profile_build_stage_set_matching(
+    build: _ProviderDirectoryProfileBuild,
+    checkpoint_map: dict[str, Any],
+) -> bool:
+    """Verify every deterministic logged stage in the active build."""
+    if not await _is_profile_stage_pair_matching(
+        build.schema,
+        checkpoint_map,
+        build.evidence_stage,
+        build.profile_stage,
+    ):
+        return False
+    if build.materialization_mode != "source_delta":
+        return (
+            build.affected_npi_stage is None
+            and checkpoint_map.get("affected_npi_stage") is None
+            and checkpoint_map.get("affected_npi_stage_oid") is None
+        )
+    expected_stage = build.affected_npi_stage
+    expected_oid = _provider_directory_profile_checkpoint_oid(
+        checkpoint_map.get("affected_npi_stage_oid")
+    )
+    expected_fingerprint = _clean_text(
+        checkpoint_map.get(
+            "affected_npi_stage_storage_fingerprint"
+        )
+    )
+    if not (
+        expected_stage
+        and _clean_text(checkpoint_map.get("affected_npi_stage"))
+        == expected_stage
+        and expected_oid is not None
+        and expected_fingerprint is not None
+        and re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint)
+        is not None
+    ):
+        return False
+    try:
+        observed_fingerprint = (
+            await _provider_directory_profile_stage_storage_fingerprint(
+                build.schema,
+                expected_stage,
+                expected_oid=expected_oid,
+                lock_relation=False,
+            )
+        )
+    except ProviderDirectoryArtifactBuildStale:
+        return False
+    return bool(
+        observed_fingerprint == expected_fingerprint
+        and await _provider_directory_profile_stage_relation_identity(
+            build.schema,
+            expected_stage,
+        )
+        == (expected_oid, "r", "p")
+    )
 
 
 async def _profile_build_resume_as_of(
@@ -15002,11 +26119,9 @@ async def _profile_build_resume_as_of(
         checkpoint_date = datetime.date.fromisoformat(checkpoint_as_of)
     except ValueError:
         return build.profile_as_of
-    is_stage_pair_logged = await _is_profile_stage_pair_matching(
-        build.schema,
+    is_stage_pair_logged = await _is_profile_build_stage_set_matching(
+        build,
         checkpoint_map,
-        build.evidence_stage,
-        build.profile_stage,
     )
     return checkpoint_date.isoformat() if is_stage_pair_logged else build.profile_as_of
 
@@ -15027,61 +26142,357 @@ def _profile_build_with_as_of(
     )
 
 
+async def _provider_directory_profile_delta_serving_state(
+    schema: str,
+    *,
+    allow_adoption: bool = True,
+) -> _ProviderDirectoryProfileServingState:
+    if not allow_adoption:
+        serving_state = await _provider_directory_profile_serving_state(
+            schema,
+            for_update=False,
+        )
+        if serving_state is None:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_profile_serving_generation_missing"
+            )
+        return serving_state
+    async with db.transaction():
+        serving_state = await _provider_directory_profile_serving_state(
+            schema,
+            for_update=True,
+        )
+        if serving_state is None:
+            serving_state = (
+                await _adopt_provider_directory_profile_serving_generation(
+                    schema
+                )
+            )
+        return serving_state
+
+
+async def _bootstrap_provider_directory_profile_serving_generation(
+    schema: str,
+) -> _ProviderDirectoryProfileServingState:
+    """Adopt only a missing singleton before replay or capacity admission."""
+
+    serving_state = await _provider_directory_profile_serving_state(
+        schema,
+        for_update=False,
+    )
+    if serving_state is not None:
+        return serving_state
+    return await _provider_directory_profile_delta_serving_state(
+        schema,
+        allow_adoption=True,
+    )
+
+
+def _provider_directory_profile_delta_sources(
+    serving_state: _ProviderDirectoryProfileServingState,
+    desired_source_vector: tuple[tuple[str, str], ...],
+    desired_source_context_vector: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return changed desired sources and sources removed from the vector."""
+
+    if (
+        serving_state.profile_schema_version
+        != profile_artifact.PROFILE_SCHEMA_VERSION
+        or serving_state.profile_strategy_version
+        not in _PROVIDER_DIRECTORY_PROFILE_DELTA_COMPATIBLE_STRATEGIES
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_delta_strategy_incompatible"
+        )
+    current_dataset_by_source = dict(serving_state.source_vector)
+    desired_dataset_by_source = dict(desired_source_vector)
+    current_context_by_source = dict(
+        serving_state.source_context_vector
+    )
+    desired_context_by_source = dict(desired_source_context_vector)
+    if set(desired_context_by_source) != set(desired_dataset_by_source):
+        raise RuntimeError(
+            "provider_directory_profile_source_context_vector_invalid"
+        )
+    refresh_source_ids = {
+        source_id
+        for source_id, dataset_id in desired_source_vector
+        if (
+            current_dataset_by_source.get(source_id) != dataset_id
+            or current_context_by_source.get(source_id)
+            != desired_context_by_source[source_id]
+        )
+    }
+    removed_source_ids = set(current_dataset_by_source) - set(
+        desired_dataset_by_source
+    )
+    if (
+        serving_state.profile_strategy_version
+        != profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+        and UHC_RETAINED_SOURCE_ID in desired_dataset_by_source
+        and UHC_RETAINED_SOURCE_ID in current_dataset_by_source
+    ):
+        refresh_source_ids.add(UHC_RETAINED_SOURCE_ID)
+    return (
+        tuple(sorted(refresh_source_ids)),
+        tuple(sorted(removed_source_ids)),
+    )
+
+
+def _profile_desired_identity(
+    dataset_fence: ProviderDirectoryArtifactDatasetFence,
+    selected_source_ids: list[str],
+    source_contexts: tuple[_ProviderDirectoryProfileSourceContext, ...],
+) -> _ProviderDirectoryProfileDesiredIdentity:
+    """Return the desired source, dataset, and context-vector identity."""
+    desired_source_ids, desired_dataset_ids = (
+        profile_artifact.profile_source_dataset_pairs(
+            dataset_fence.datasets,
+            selected_source_ids,
+        )
+    )
+    desired_source_vector = _provider_directory_profile_source_vector(
+        zip(desired_source_ids, desired_dataset_ids, strict=True)
+    )
+    desired_source_vector_hash = (
+        _provider_directory_profile_source_vector_hash(
+            desired_source_vector
+        )
+    )
+    desired_source_context_vector = (
+        _provider_directory_profile_source_context_vector(
+            source_contexts
+        )
+    )
+    return _ProviderDirectoryProfileDesiredIdentity(
+        source_ids=desired_source_ids,
+        dataset_ids=desired_dataset_ids,
+        source_vector=desired_source_vector,
+        source_vector_hash=desired_source_vector_hash,
+        source_context_vector=desired_source_context_vector,
+        source_context_vector_hash=(
+            _provider_directory_profile_source_context_vector_hash(
+                desired_source_context_vector
+            )
+        ),
+    )
+
+
+async def _profile_materialization_identity(
+    schema: str,
+    desired: _ProviderDirectoryProfileDesiredIdentity,
+    *,
+    has_existing_artifacts: bool,
+    allow_serving_generation_adoption: bool,
+) -> _ProviderDirectoryProfileMaterializationIdentity:
+    """Resolve full-swap or exact source-delta materialization coordinates."""
+    serving_state: _ProviderDirectoryProfileServingState | None = None
+    current_source_vector: tuple[tuple[str, str], ...] = ()
+    current_source_vector_hash: str | None = None
+    current_source_context_vector: tuple[tuple[str, str], ...] = ()
+    current_source_context_vector_hash: str | None = None
+    removed_source_ids: tuple[str, ...] = ()
+    source_ids = desired.source_ids
+    dataset_ids = desired.dataset_ids
+    execution = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
+    is_delta = has_existing_artifacts and execution is not None
+    if is_delta:
+        serving_state = (
+            await _provider_directory_profile_delta_serving_state(
+                schema,
+                allow_adoption=allow_serving_generation_adoption,
+            )
+        )
+        current_source_vector = serving_state.source_vector
+        current_source_vector_hash = serving_state.source_vector_hash
+        current_source_context_vector = (
+            serving_state.source_context_vector
+        )
+        current_source_context_vector_hash = (
+            serving_state.source_context_vector_hash
+        )
+        refresh_source_ids, removed_source_ids = (
+            _provider_directory_profile_delta_sources(
+                serving_state,
+                desired.source_vector,
+                desired.source_context_vector,
+            )
+        )
+        desired_dataset_by_source = dict(desired.source_vector)
+        source_ids = list(refresh_source_ids)
+        dataset_ids = [
+            desired_dataset_by_source[source_id]
+            for source_id in source_ids
+        ]
+    return _ProviderDirectoryProfileMaterializationIdentity(
+        materialization_mode="source_delta" if is_delta else "full_swap",
+        serving_state=serving_state,
+        current_source_vector=current_source_vector,
+        current_source_vector_hash=current_source_vector_hash,
+        current_source_context_vector=current_source_context_vector,
+        current_source_context_vector_hash=current_source_context_vector_hash,
+        removed_source_ids=removed_source_ids,
+        source_ids=source_ids,
+        dataset_ids=dataset_ids,
+        retained_source_ids=desired.source_ids,
+    )
+
+
+def _validate_profile_materialized_resource_scope(
+    materialization: _ProviderDirectoryProfileMaterializationIdentity,
+) -> None:
+    """Refuse a source-delta scope that differs from materialized resources."""
+    materialized_resource_source_ids = (
+        _PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.get()
+    )
+    if (
+        materialization.materialization_mode == "source_delta"
+        and
+        materialized_resource_source_ids is not None
+        and tuple(materialization.source_ids)
+        != materialized_resource_source_ids
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_resource_scope_changed"
+        )
+
+
+def _profile_identity_batch_plan(
+    materialization: _ProviderDirectoryProfileMaterializationIdentity,
+    desired: _ProviderDirectoryProfileDesiredIdentity,
+    *,
+    has_existing_artifacts: bool,
+) -> _ProviderDirectoryProfileBatchPlan:
+    """Build the exact plan for one resolved materialization identity."""
+    is_delta = materialization.materialization_mode == "source_delta"
+    return _provider_directory_profile_batch_plan(
+        materialization.source_ids,
+        materialization.retained_source_ids,
+        materialization.dataset_ids,
+        has_existing_artifacts=has_existing_artifacts,
+        materialization_mode=materialization.materialization_mode,
+        current_source_vector_hash=(
+            materialization.current_source_vector_hash
+        ),
+        desired_source_vector_hash=(
+            desired.source_vector_hash if is_delta else None
+        ),
+        current_source_context_vector_hash=(
+            materialization.current_source_context_vector_hash
+        ),
+        desired_source_context_vector_hash=(
+            desired.source_context_vector_hash if is_delta else None
+        ),
+        removed_source_ids=materialization.removed_source_ids,
+    )
+
+
+def _profile_identity_input_result(
+    materialization: _ProviderDirectoryProfileMaterializationIdentity,
+    desired: _ProviderDirectoryProfileDesiredIdentity,
+    batch_plan: _ProviderDirectoryProfileBatchPlan,
+    resume_lineage_hash: str,
+) -> _ProviderDirectoryProfileIdentityInputs:
+    """Return the immutable identity inputs consumed by build admission."""
+    is_delta = materialization.materialization_mode == "source_delta"
+    return _ProviderDirectoryProfileIdentityInputs(
+        source_ids=materialization.source_ids,
+        retained_source_ids=materialization.retained_source_ids,
+        dataset_ids=materialization.dataset_ids,
+        resume_lineage_hash=resume_lineage_hash,
+        batch_plan=batch_plan,
+        materialization_mode=materialization.materialization_mode,
+        current_source_vector=materialization.current_source_vector,
+        desired_source_vector=desired.source_vector,
+        current_source_vector_hash=(
+            materialization.current_source_vector_hash
+        ),
+        desired_source_vector_hash=(
+            desired.source_vector_hash if is_delta else None
+        ),
+        current_source_context_vector=(
+            materialization.current_source_context_vector
+        ),
+        desired_source_context_vector=desired.source_context_vector,
+        current_source_context_vector_hash=(
+            materialization.current_source_context_vector_hash
+        ),
+        desired_source_context_vector_hash=(
+            desired.source_context_vector_hash if is_delta else None
+        ),
+        removed_source_ids=materialization.removed_source_ids,
+        serving_state=materialization.serving_state,
+    )
+
+
 async def _profile_build_identity_inputs(
     schema: str,
     dataset_fence: ProviderDirectoryArtifactDatasetFence,
     *,
     has_existing_artifacts: bool = False,
-) -> tuple[
-    list[str],
-    list[str],
-    list[str],
-    str,
-    _ProviderDirectoryProfileBatchPlan,
-]:
+    allow_serving_generation_adoption: bool = True,
+) -> _ProviderDirectoryProfileIdentityInputs:
     """Resolve the stable source and dataset identity for one Profile build."""
-    selected_source_ids, retained_source_ids, source_contexts = (
+    selected_source_ids, _retained_source_ids, source_contexts = (
         await _provider_directory_profile_scope_source_ids(
             schema,
             {dataset.source_id for dataset in dataset_fence.datasets},
         )
     )
-    source_ids, dataset_ids = profile_artifact.profile_source_dataset_pairs(
-        dataset_fence.datasets,
+    desired = _profile_desired_identity(
+        dataset_fence,
         selected_source_ids,
+        source_contexts,
     )
-    batch_plan = _provider_directory_profile_batch_plan(
-        source_ids,
-        retained_source_ids,
-        dataset_ids,
+    materialization = await _profile_materialization_identity(
+        schema,
+        desired,
+        has_existing_artifacts=has_existing_artifacts,
+        allow_serving_generation_adoption=(
+            allow_serving_generation_adoption
+        ),
+    )
+    _validate_profile_materialized_resource_scope(materialization)
+    source_context_by_id = {
+        source_context.source_id: source_context
+        for source_context in source_contexts
+    }
+    selected_source_contexts = tuple(
+        source_context_by_id[source_id]
+        for source_id in materialization.source_ids
+    )
+    batch_plan = _profile_identity_batch_plan(
+        materialization,
+        desired,
         has_existing_artifacts=has_existing_artifacts,
     )
+    execution = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
     resume_lineage_hash = _provider_directory_profile_resume_lineage_hash(
         dataset_fence,
-        source_ids,
-        retained_source_ids,
-        dataset_ids,
-        source_contexts,
+        materialization.source_ids,
+        materialization.retained_source_ids,
+        materialization.dataset_ids,
+        selected_source_contexts,
         has_existing_artifacts=has_existing_artifacts,
         batch_plan=batch_plan,
+        selection_execution=execution,
     )
-    return (
-        source_ids,
-        retained_source_ids,
-        dataset_ids,
-        resume_lineage_hash,
+    return _profile_identity_input_result(
+        materialization,
+        desired,
         batch_plan,
+        resume_lineage_hash,
     )
 
 
-def _is_profile_build_checkpoint_lineage_matching(
+def _is_checkpoint_core_lineage_matching(
     checkpoint_map: dict[str, Any],
     build: _ProviderDirectoryProfileBuild,
     evidence_build_fence: ProviderDirectoryArtifactBuildFence,
     profile_build_fence: ProviderDirectoryArtifactBuildFence,
 ) -> bool:
-    """Return whether a checkpoint preserves this build's immutable lineage."""
-    return bool(checkpoint_map) and (
+    """Match schema, plan, stage, and target identity for one checkpoint."""
+    return (
         _clean_text(checkpoint_map.get("strategy_version"))
         == profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
         and int(checkpoint_map.get("schema_version") or -1)
@@ -15112,9 +26523,63 @@ def _is_profile_build_checkpoint_lineage_matching(
             checkpoint_map.get("profile_target_oid"),
             profile_build_fence.target_oid,
         )
+    )
+
+
+def _is_checkpoint_source_lineage_matching(
+    checkpoint_map: Mapping[str, Any],
+    build: _ProviderDirectoryProfileBuild,
+) -> bool:
+    """Match source vectors and delta scope for one build checkpoint."""
+    return (
+        _clean_text(checkpoint_map.get("current_source_vector_hash"))
+        == build.current_source_vector_hash
+        and _clean_text(checkpoint_map.get("desired_source_vector_hash"))
+        == build.desired_source_vector_hash
+        and _clean_text(
+            checkpoint_map.get("current_source_context_vector_hash")
+        )
+        == build.current_source_context_vector_hash
+        and _clean_text(
+            checkpoint_map.get("desired_source_context_vector_hash")
+        )
+        == build.desired_source_context_vector_hash
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("refresh_source_ids")
+        )
+        == (
+            build.source_ids
+            if build.materialization_mode == "source_delta"
+            else ()
+        )
+        and _provider_directory_profile_checkpoint_array(
+            checkpoint_map.get("removed_source_ids")
+        )
+        == build.removed_source_ids
+        and _clean_text(checkpoint_map.get("affected_npi_stage"))
+        == build.affected_npi_stage
+    )
+
+
+def _is_profile_build_checkpoint_lineage_matching(
+    checkpoint_map: dict[str, Any],
+    build: _ProviderDirectoryProfileBuild,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> bool:
+    """Return whether a checkpoint preserves this build's immutable lineage."""
+    return (
+        bool(checkpoint_map)
+        and _is_checkpoint_core_lineage_matching(
+            checkpoint_map,
+            build,
+            evidence_build_fence,
+            profile_build_fence,
+        )
+        and _is_checkpoint_source_lineage_matching(checkpoint_map, build)
         and _is_profile_checkpoint_geometry_matching(
             checkpoint_map,
-            source_count=len(build.source_ids),
+            build=build,
         )
     )
 
@@ -15136,6 +26601,175 @@ async def _profile_build_checkpoint_map(
     )
 
 
+def _validate_profile_build_admission(
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> None:
+    """Require the resolved build identity to match admission and targets."""
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if capacity_admission is not None and (
+        capacity_admission.admitted_identity is None
+        or identity != capacity_admission.admitted_identity
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_admitted_identity_changed"
+        )
+    if (
+        identity.materialization_mode == "source_delta"
+        and (
+            identity.serving_state is None
+            or identity.serving_state.evidence_target_oid
+            != evidence_build_fence.target_oid
+            or identity.serving_state.profile_target_oid
+            != profile_build_fence.target_oid
+        )
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_serving_target_changed"
+        )
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileBuildCoordinates:
+    build_id: str
+    evidence_stage: str
+    profile_stage: str
+    affected_npi_stage: str | None
+    profile_as_of: str
+    capacity_geometry_status: str
+    capacity_geometry_hash: str | None
+    capacity_geometry_json: str | None
+
+
+def _profile_build_coordinates(
+    identity: _ProviderDirectoryProfileIdentityInputs,
+) -> _ProviderDirectoryProfileBuildCoordinates:
+    """Derive deterministic scratch names, as-of date, and geometry."""
+    build_id = "pdpb_" + identity.resume_lineage_hash[:32]
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    (
+        capacity_geometry_status,
+        capacity_geometry_hash,
+        capacity_geometry_json,
+    ) = _provider_directory_profile_admitted_capacity_geometry()
+    if identity.materialization_mode == "source_delta" and (
+        capacity_admission is None
+        or capacity_admission.build_id != build_id
+        or capacity_geometry_status != "verified"
+        or capacity_geometry_hash is None
+        or capacity_geometry_json is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_geometry_missing"
+        )
+    return _ProviderDirectoryProfileBuildCoordinates(
+        build_id=build_id,
+        evidence_stage=(
+            profile_artifact.profile_evidence_stage_table_name(build_id)
+        ),
+        profile_stage=profile_artifact.profile_stage_table_name(build_id),
+        affected_npi_stage=(
+            _bounded_identifier(
+                f"provider_directory_profile_affected_{build_id}"
+            )
+            if identity.materialization_mode == "source_delta"
+            else None
+        ),
+        profile_as_of=(
+            identity.serving_state.profile_as_of
+            if identity.materialization_mode == "source_delta"
+            and identity.serving_state is not None
+            else _now().date().isoformat()
+        ),
+        capacity_geometry_status=capacity_geometry_status,
+        capacity_geometry_hash=capacity_geometry_hash,
+        capacity_geometry_json=capacity_geometry_json,
+    )
+
+
+def _profile_build_core_values(
+    schema: str,
+    run_id: str | None,
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    coordinates: _ProviderDirectoryProfileBuildCoordinates,
+) -> dict[str, Any]:
+    """Return common immutable build fields."""
+    execution = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
+    return {
+        "schema": schema,
+        "generation_id": "",
+        "source_ids": tuple(identity.source_ids),
+        "retained_source_ids": tuple(identity.retained_source_ids),
+        "dataset_ids": tuple(identity.dataset_ids),
+        "profile_as_of": coordinates.profile_as_of,
+        "evidence_stage": coordinates.evidence_stage,
+        "profile_stage": coordinates.profile_stage,
+        "resume_lineage_hash": identity.resume_lineage_hash,
+        "build_id": coordinates.build_id,
+        "owner_run_id": _clean_text(run_id),
+        "batch_plan": identity.batch_plan,
+        "materialization_mode": identity.materialization_mode,
+        "selection_proof_id": (
+            execution.attestation.proof_id if execution is not None else None
+        ),
+        "authority_revision": (
+            execution.attestation.authority_revision
+            if execution is not None
+            else None
+        ),
+        "serving_state": identity.serving_state,
+    }
+
+
+def _profile_build_delta_values(
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    coordinates: _ProviderDirectoryProfileBuildCoordinates,
+) -> dict[str, Any]:
+    """Return vectors, affected scope, and capacity geometry fields."""
+    return {
+        "current_source_vector": identity.current_source_vector,
+        "desired_source_vector": identity.desired_source_vector,
+        "current_source_vector_hash": identity.current_source_vector_hash,
+        "desired_source_vector_hash": identity.desired_source_vector_hash,
+        "current_source_context_vector": (
+            identity.current_source_context_vector
+        ),
+        "desired_source_context_vector": (
+            identity.desired_source_context_vector
+        ),
+        "current_source_context_vector_hash": (
+            identity.current_source_context_vector_hash
+        ),
+        "desired_source_context_vector_hash": (
+            identity.desired_source_context_vector_hash
+        ),
+        "removed_source_ids": identity.removed_source_ids,
+        "affected_npi_stage": coordinates.affected_npi_stage,
+        "capacity_geometry_status": coordinates.capacity_geometry_status,
+        "capacity_geometry_hash": coordinates.capacity_geometry_hash,
+        "capacity_geometry_json": coordinates.capacity_geometry_json,
+    }
+
+
+def _profile_build_candidate(
+    schema: str,
+    run_id: str | None,
+    identity: _ProviderDirectoryProfileIdentityInputs,
+    coordinates: _ProviderDirectoryProfileBuildCoordinates,
+) -> _ProviderDirectoryProfileBuild:
+    """Return the deterministic candidate build before resume resolution."""
+    return _ProviderDirectoryProfileBuild(
+        **_profile_build_core_values(
+            schema,
+            run_id,
+            identity,
+            coordinates,
+        ),
+        **_profile_build_delta_values(identity, coordinates),
+    )
+
+
 async def _resolve_provider_directory_profile_build(
     schema: str,
     run_id: str | None,
@@ -15146,37 +26780,29 @@ async def _resolve_provider_directory_profile_build(
     has_existing_artifacts: bool = False,
 ) -> _ProviderDirectoryProfileBuild:
     """Resolve a deterministic build and preserve a valid retry as-of date."""
-    (
-        source_ids,
-        retained_source_ids,
-        dataset_ids,
-        resume_lineage_hash,
-        batch_plan,
-    ) = await _profile_build_identity_inputs(
+    identity = await _profile_build_identity_inputs(
         schema,
         dataset_fence,
         has_existing_artifacts=has_existing_artifacts,
+        allow_serving_generation_adoption=(
+            _provider_directory_profile_capacity_admission() is None
+        ),
     )
-    build_id = "pdpb_" + resume_lineage_hash[:32]
-    evidence_stage = profile_artifact.profile_evidence_stage_table_name(
-        build_id
+    _validate_profile_build_admission(
+        identity,
+        evidence_build_fence,
+        profile_build_fence,
     )
-    profile_stage = profile_artifact.profile_stage_table_name(build_id)
-    profile_as_of = _now().date().isoformat()
-    checkpoint_map = await _profile_build_checkpoint_map(schema, build_id)
-    candidate_build = _ProviderDirectoryProfileBuild(
-        schema=schema,
-        generation_id="",
-        source_ids=tuple(source_ids),
-        retained_source_ids=tuple(retained_source_ids),
-        dataset_ids=tuple(dataset_ids),
-        profile_as_of=profile_as_of,
-        evidence_stage=evidence_stage,
-        profile_stage=profile_stage,
-        resume_lineage_hash=resume_lineage_hash,
-        build_id=build_id,
-        owner_run_id=_clean_text(run_id),
-        batch_plan=batch_plan,
+    coordinates = _profile_build_coordinates(identity)
+    checkpoint_map = await _profile_build_checkpoint_map(
+        schema,
+        coordinates.build_id,
+    )
+    candidate_build = _profile_build_candidate(
+        schema,
+        run_id,
+        identity,
+        coordinates,
     )
     is_checkpoint_lineage_matching = (
         _is_profile_build_checkpoint_lineage_matching(
@@ -15198,6 +26824,985 @@ def _provider_directory_profile_checkpoint_ref(schema: str) -> str:
     return _unscoped_qt(
         schema,
         ProviderDirectoryProfileBuildCheckpoint.__tablename__,
+    )
+
+
+def _provider_directory_profile_serving_generation_ref(
+    schema: str,
+) -> str:
+    return _unscoped_qt(
+        schema,
+        ProviderDirectoryProfileServingGeneration.__tablename__,
+    )
+
+
+def _provider_directory_profile_delta_receipt_ref(schema: str) -> str:
+    return _unscoped_qt(
+        schema,
+        ProviderDirectoryProfileDeltaReceipt.__tablename__,
+    )
+
+
+def _provider_directory_profile_source_vector(
+    pairs: Iterable[tuple[str, str]],
+) -> tuple[tuple[str, str], ...]:
+    normalized_pairs = tuple(
+        sorted(
+            (
+                str(source_id),
+                str(dataset_id),
+            )
+            for source_id, dataset_id in pairs
+        )
+    )
+    if (
+        any(
+            not source_id or not dataset_id
+            for source_id, dataset_id in normalized_pairs
+        )
+        or len({source_id for source_id, _ in normalized_pairs})
+        != len(normalized_pairs)
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_source_vector_invalid"
+        )
+    return normalized_pairs
+
+
+def _provider_directory_profile_source_vector_hash(
+    source_vector: tuple[tuple[str, str], ...],
+) -> str:
+    return _identity_hash(
+        {
+            "contract": "provider-directory-profile-source-vector-v1",
+            "pairs": [
+                {
+                    "source_id": source_id,
+                    "dataset_id": dataset_id,
+                }
+                for source_id, dataset_id in source_vector
+            ],
+        }
+    )
+
+
+def _provider_directory_profile_source_vector_json(
+    source_vector: tuple[tuple[str, str], ...],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "source_id": source_id,
+            "dataset_id": dataset_id,
+        }
+        for source_id, dataset_id in source_vector
+    ]
+
+
+def _provider_directory_profile_source_context_vector(
+    source_contexts: Iterable[_ProviderDirectoryProfileSourceContext],
+) -> tuple[tuple[str, str], ...]:
+    """Hash each emitted source context independently for delta selection."""
+
+    pairs = tuple(
+        sorted(
+            (
+                source_context.source_id,
+                _source_context_digest([asdict(source_context)]),
+            )
+            for source_context in source_contexts
+        )
+    )
+    if (
+        any(not source_id for source_id, _digest in pairs)
+        or len({source_id for source_id, _digest in pairs}) != len(pairs)
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for _source_id, digest in pairs
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_source_context_vector_invalid"
+        )
+    return pairs
+
+
+def _profile_context_vector_hash(
+    source_context_vector: tuple[tuple[str, str], ...],
+) -> str:
+    return _identity_hash(
+        {
+            "contract": (
+                "provider-directory-profile-source-context-vector-v1"
+            ),
+            "pairs": [
+                {
+                    "source_id": source_id,
+                    "context_digest": context_digest,
+                }
+                for source_id, context_digest in source_context_vector
+            ],
+        }
+    )
+
+
+def _profile_context_vector_json(
+    source_context_vector: tuple[tuple[str, str], ...],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "source_id": source_id,
+            "context_digest": context_digest,
+        }
+        for source_id, context_digest in source_context_vector
+    ]
+
+
+def _profile_context_vector_from_json(
+    raw_value: Any,
+) -> tuple[tuple[str, str], ...]:
+    if isinstance(raw_value, str):
+        raw_value = json.loads(raw_value)
+    if not isinstance(raw_value, list):
+        raise RuntimeError(
+            "provider_directory_profile_source_context_vector_invalid"
+        )
+    contexts: list[tuple[str, str]] = []
+    for context_map in raw_value:
+        if not isinstance(context_map, Mapping) or set(context_map) != {
+            "source_id",
+            "context_digest",
+        }:
+            raise RuntimeError(
+                "provider_directory_profile_source_context_vector_invalid"
+            )
+        source_id = _clean_text(context_map.get("source_id"))
+        context_digest = _clean_text(
+            context_map.get("context_digest")
+        )
+        if (
+            source_id is None
+            or context_digest is None
+            or re.fullmatch(r"[0-9a-f]{64}", context_digest) is None
+        ):
+            raise RuntimeError(
+                "provider_directory_profile_source_context_vector_invalid"
+            )
+        contexts.append((source_id, context_digest))
+    normalized_contexts = tuple(sorted(contexts))
+    if len({source_id for source_id, _digest in normalized_contexts}) != len(
+        normalized_contexts
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_source_context_vector_invalid"
+        )
+    return normalized_contexts
+
+
+def _profile_source_vector_from_json(
+    raw_value: Any,
+) -> tuple[tuple[str, str], ...]:
+    if isinstance(raw_value, str):
+        raw_value = json.loads(raw_value)
+    if not isinstance(raw_value, list):
+        raise RuntimeError(
+            "provider_directory_profile_source_vector_invalid"
+        )
+    pairs: list[tuple[str, str]] = []
+    for pair_map in raw_value:
+        if not isinstance(pair_map, Mapping) or set(pair_map) != {
+            "source_id",
+            "dataset_id",
+        }:
+            raise RuntimeError(
+                "provider_directory_profile_source_vector_invalid"
+            )
+        source_id = _clean_text(pair_map.get("source_id"))
+        dataset_id = _clean_text(pair_map.get("dataset_id"))
+        if source_id is None or dataset_id is None:
+            raise RuntimeError(
+                "provider_directory_profile_source_vector_invalid"
+            )
+        pairs.append((source_id, dataset_id))
+    return _provider_directory_profile_source_vector(pairs)
+
+
+def _profile_serving_text_values(
+    serving_map: Mapping[str, Any],
+) -> dict[str, str | None]:
+    """Normalize all textual serving-generation fields."""
+    return {
+        field_name: _clean_text(serving_map.get(field_name))
+        for field_name in (
+            "status",
+            "operation",
+            "source_vector_hash",
+            "source_context_vector_hash",
+            "executable_plan_hash",
+            "generation_id",
+            "selection_proof_id",
+            "profile_strategy_version",
+            "profile_as_of",
+        )
+    }
+
+
+def _profile_serving_vectors(
+    serving_map: Mapping[str, Any],
+) -> dict[str, tuple[tuple[str, str], ...]]:
+    """Decode the signed source and source-context vectors."""
+    return {
+        "source_vector": (
+            _provider_directory_profile_source_vector_from_json(
+                serving_map.get("source_vector_json")
+            )
+        ),
+        "source_context_vector": (
+        _provider_directory_profile_source_context_vector_from_json(
+            serving_map.get("source_context_vector_json")
+            )
+        ),
+    }
+
+
+def _is_canonical_profile_as_of(profile_as_of: str | None) -> bool:
+    """Return whether a Profile as-of value is canonical ISO date text."""
+    try:
+        parsed_profile_as_of = (
+            datetime.date.fromisoformat(profile_as_of)
+            if profile_as_of is not None
+            else None
+        )
+    except ValueError:
+        parsed_profile_as_of = None
+    return bool(
+        parsed_profile_as_of is not None
+        and parsed_profile_as_of.isoformat() == profile_as_of
+    )
+
+
+def _is_profile_serving_lineage_valid(
+    text_values: Mapping[str, str | None],
+    vectors: Mapping[str, tuple[tuple[str, str], ...]],
+    published_at: Any,
+) -> bool:
+    """Return whether serving lineage fields form one canonical identity."""
+    source_vector = vectors["source_vector"]
+    source_context_vector = vectors["source_context_vector"]
+    return not (
+        (text_values["status"], text_values["operation"])
+        not in {("published", "publish"), ("purged", "purge")}
+        or text_values["generation_id"] is None
+        or re.fullmatch(
+            r"pdprofile_[0-9a-f]{32}",
+            text_values["generation_id"] or "",
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            text_values["selection_proof_id"] or "",
+        )
+        is None
+        or text_values["source_vector_hash"]
+        != _provider_directory_profile_source_vector_hash(source_vector)
+        or text_values["source_context_vector_hash"]
+        != _provider_directory_profile_source_context_vector_hash(
+            source_context_vector
+        )
+        or {
+            source_id for source_id, _dataset_id in source_vector
+        }
+        != {
+            source_id
+            for source_id, _context_digest in source_context_vector
+        }
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            text_values["executable_plan_hash"] or "",
+        )
+        is None
+        or text_values["profile_strategy_version"] is None
+        or not _is_canonical_profile_as_of(text_values["profile_as_of"])
+        or published_at is None
+    )
+
+
+def _profile_serving_numeric_values(
+    serving_map: Mapping[str, Any],
+) -> dict[str, int]:
+    """Normalize all integral serving-generation coordinates."""
+    return {
+        field_name: int(serving_map.get(field_name) or 0)
+        for field_name in (
+            "authority_revision",
+            "control_generation",
+            "profile_schema_version",
+            "evidence_rows",
+            "profile_rows",
+            "evidence_target_oid",
+            "profile_target_oid",
+        )
+    }
+
+
+def _is_profile_serving_numeric_valid(
+    numeric_values: Mapping[str, int],
+    cutover_forecast_hash: str | None,
+) -> bool:
+    """Return whether counts, OIDs, revisions, and cutover hash are valid."""
+    return not (
+        numeric_values["control_generation"] < 1
+        or numeric_values["authority_revision"] < 1
+        or numeric_values["profile_schema_version"] < 1
+        or numeric_values["evidence_target_oid"] < 1
+        or numeric_values["profile_target_oid"] < 1
+        or numeric_values["evidence_rows"] < 0
+        or numeric_values["profile_rows"] < 0
+        or (
+            cutover_forecast_hash is not None
+            and re.fullmatch(r"[0-9a-f]{64}", cutover_forecast_hash) is None
+        )
+    )
+
+
+def _profile_serving_state_from_row(
+    serving_row: Any,
+) -> _ProviderDirectoryProfileServingState:
+    """Decode and validate the singleton serving-generation row."""
+    serving_map = _pagination_checkpoint_row_mapping(serving_row)
+    text_values = _profile_serving_text_values(serving_map)
+    vectors = _profile_serving_vectors(serving_map)
+    published_at = serving_map.get("published_at")
+    if not _is_profile_serving_lineage_valid(
+        text_values,
+        vectors,
+        published_at,
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_serving_generation_invalid"
+        )
+    numeric_values = _profile_serving_numeric_values(serving_map)
+    cutover_forecast_hash = _clean_text(
+        serving_map.get("cutover_forecast_hash")
+    )
+    if not _is_profile_serving_numeric_valid(
+        numeric_values,
+        cutover_forecast_hash,
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_serving_generation_invalid"
+        )
+    capacity_geometry_identity = (
+        _provider_directory_profile_capacity_geometry_identity(
+            status=serving_map.get("capacity_geometry_status"),
+            geometry_hash=serving_map.get("capacity_geometry_hash"),
+            geometry_json=serving_map.get("capacity_geometry_json"),
+        )
+    )
+    return _ProviderDirectoryProfileServingState(
+        **text_values,
+        **vectors,
+        **numeric_values,
+        published_at=str(published_at),
+        capacity_geometry_status=capacity_geometry_identity[0],
+        capacity_geometry_hash=capacity_geometry_identity[1],
+        capacity_geometry_json=capacity_geometry_identity[2],
+        cutover_forecast_hash=cutover_forecast_hash,
+    )
+
+
+async def _provider_directory_profile_serving_state(
+    schema: str,
+    *,
+    for_update: bool = False,
+) -> _ProviderDirectoryProfileServingState | None:
+    row = await db.first(
+        f"SELECT * FROM "
+        f"{_provider_directory_profile_serving_generation_ref(schema)} "
+        "WHERE singleton_key = 'global'"
+        + (" FOR UPDATE;" if for_update else ";")
+    )
+    return (
+        _provider_directory_profile_serving_state_from_row(row)
+        if row is not None
+        else None
+    )
+
+
+def _provider_directory_profile_adopted_plan_hash(
+    selection_result: Mapping[str, Any],
+) -> str:
+    return _identity_hash(
+        {
+            "contract": (
+                "provider-directory-profile-serving-adoption-v1"
+            ),
+            "selection_result": selection_result,
+        }
+    )
+
+
+_PROFILE_ADOPTION_ATTESTATION_FIELDS = (
+    "proof_id",
+    "node_id",
+    "catalog_digest",
+    "selection_fingerprint",
+    "authority_revision",
+    "profile_schema_version",
+    "profile_strategy_version",
+    "source_context_digest",
+    "profile_input_digest",
+    "operation",
+    "pairs",
+)
+
+
+def _profile_adoption_attestation(
+    adoption_result_by_name: Mapping[str, Any],
+) -> Any:
+    """Revalidate the selection proof embedded in a terminal result."""
+    return validated_profile_selection_attestation(
+        {
+            "contract_id": PROFILE_SELECTION_ATTESTATION_CONTRACT_ID,
+            **{
+                name: adoption_result_by_name.get(name)
+                for name in _PROFILE_ADOPTION_ATTESTATION_FIELDS
+            },
+        }
+    )
+
+
+def _canonical_profile_adoption_result(
+    adoption_result_by_name: Mapping[str, Any],
+    generation_id: str,
+) -> dict[str, Any]:
+    """Reconstruct the exact terminal result through its producer."""
+    row_counts = adoption_result_by_name.get("row_counts")
+    generation = adoption_result_by_name.get("generation")
+    if (
+        not isinstance(row_counts, Mapping)
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+    ):
+        raise ProviderDirectoryProfileSelectionError(
+            "Profile adoption result coordinates are invalid"
+        )
+    return profile_selection_result(
+        ProviderDirectoryProfileExecution(
+            attestation=_profile_adoption_attestation(
+                adoption_result_by_name
+            ),
+            generation=generation,
+        ),
+        profile_generation_id=generation_id,
+        profile_as_of=adoption_result_by_name.get("profile_as_of"),
+        profile_rows=row_counts.get("profile_rows"),
+        profile_source_evidence_rows=row_counts.get(
+            "profile_source_evidence_rows"
+        ),
+    )
+
+
+def _provider_directory_profile_adoption_result(
+    raw_result: Any,
+    *,
+    generation_id: str,
+) -> dict[str, Any]:
+    """Validate one canonical producer result for legacy adoption."""
+    if isinstance(raw_result, str):
+        raw_result = json.loads(raw_result)
+    if not isinstance(raw_result, Mapping):
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_missing"
+        )
+    adoption_result_by_name = dict(raw_result)
+    try:
+        canonical_result_by_field = (
+            _canonical_profile_adoption_result(
+                adoption_result_by_name,
+                generation_id,
+            )
+        )
+    except (ProviderDirectoryProfileSelectionError, TypeError) as exc:
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_invalid"
+        ) from exc
+    if (
+        adoption_result_by_name.get("contract_id")
+        != PROFILE_SELECTION_RESULT_CONTRACT_ID
+        or adoption_result_by_name != canonical_result_by_field
+        or adoption_result_by_name.get("status") != "published"
+        or adoption_result_by_name.get("operation") != "publish"
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_invalid"
+        )
+    return adoption_result_by_name
+
+
+@dataclass(frozen=True)
+class _ProfileAdoptionTargets:
+    profile_ref: str
+    evidence_ref: str
+    profile_target_oid: int
+    evidence_target_oid: int
+    generation_id: str
+
+
+@dataclass(frozen=True)
+class _ProfileAdoptionCandidate:
+    generation_id: str
+    selection_result: Mapping[str, Any]
+    source_vector: tuple[tuple[str, str], ...]
+    source_context_vector: tuple[tuple[str, str], ...]
+    profile_as_of: str
+    profile_target_oid: int
+    evidence_target_oid: int
+    profile_rows: int
+    evidence_rows: int
+    published_at: Any
+    executable_plan_hash: str
+
+
+async def _locked_profile_adoption_target_oids(
+    schema: str,
+    profile_ref: str,
+    evidence_ref: str,
+) -> tuple[int, int]:
+    """Lock the target pair and return unchanged relation identities."""
+    initial_oids = (
+        await _provider_directory_relation_oid(
+            schema,
+            profile_artifact.PROFILE_TABLE,
+        ),
+        await _provider_directory_relation_oid(
+            schema,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        ),
+    )
+    if None in initial_oids:
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_target_missing"
+        )
+    await db.status(
+        f"LOCK TABLE {profile_ref}, {evidence_ref} "
+        "IN ACCESS SHARE MODE NOWAIT;"
+    )
+    locked_oids = (
+        await _provider_directory_relation_oid(
+            schema,
+            profile_artifact.PROFILE_TABLE,
+        ),
+        await _provider_directory_relation_oid(
+            schema,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        ),
+    )
+    if locked_oids != initial_oids:
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_target_changed"
+        )
+    return int(initial_oids[0]), int(initial_oids[1])
+
+
+async def _profile_adoption_target_presence(
+    profile_ref: str,
+    evidence_ref: str,
+    generation_id: str,
+) -> Mapping[str, Any]:
+    """Return bounded current-target and generation witnesses."""
+    presence_row = await db.first(
+        f"""
+        SELECT EXISTS (
+                   SELECT 1 FROM {profile_ref} LIMIT 1
+               ) AS has_profile_rows,
+               EXISTS (
+                   SELECT 1 FROM {profile_ref}
+                    WHERE generation_id = :generation_id
+                    LIMIT 1
+               ) AS has_profile_generation,
+               EXISTS (
+                   SELECT 1 FROM {evidence_ref} LIMIT 1
+               ) AS has_evidence_rows;
+        """,
+        generation_id=generation_id,
+    )
+    return _pagination_checkpoint_row_mapping(presence_row)
+
+
+async def _profile_adoption_targets(
+    schema: str,
+    *,
+    generation_id: str,
+    profile_rows: int,
+    evidence_rows: int,
+) -> _ProfileAdoptionTargets:
+    """Lock and bind exact serving targets to terminal publication lineage."""
+    profile_ref = _unscoped_qt(schema, profile_artifact.PROFILE_TABLE)
+    evidence_ref = _unscoped_qt(
+        schema,
+        profile_artifact.PROFILE_EVIDENCE_TABLE,
+    )
+    profile_target_oid, evidence_target_oid = (
+        await _locked_profile_adoption_target_oids(
+            schema,
+            profile_ref,
+            evidence_ref,
+        )
+    )
+    presence_by_name = await _profile_adoption_target_presence(
+        profile_ref,
+        evidence_ref,
+        generation_id,
+    )
+    has_expected_profile_rows = profile_rows > 0
+    has_expected_evidence_rows = evidence_rows > 0
+    if (
+        bool(presence_by_name.get("has_profile_rows"))
+        != has_expected_profile_rows
+        or bool(presence_by_name.get("has_profile_generation"))
+        != has_expected_profile_rows
+        or bool(presence_by_name.get("has_evidence_rows"))
+        != has_expected_evidence_rows
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_target_invalid"
+        )
+    return _ProfileAdoptionTargets(
+        profile_ref=profile_ref,
+        evidence_ref=evidence_ref,
+        profile_target_oid=profile_target_oid,
+        evidence_target_oid=evidence_target_oid,
+        generation_id=generation_id,
+    )
+
+
+async def _profile_adoption_result_row(
+    schema: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Load and validate the newest terminal publication result."""
+    result_row = await db.first(
+        f"""
+        SELECT metrics::jsonb -> :result_key AS selection_result,
+               started_at, finished_at
+          FROM {_unscoped_qt(schema, ImportRun.__tablename__)}
+         WHERE importer = 'provider-directory-fhir'
+           AND status = 'succeeded'
+           AND metrics::jsonb -> :result_key IS NOT NULL
+         ORDER BY finished_at DESC NULLS LAST, run_id DESC
+         LIMIT 1;
+        """,
+        result_key=PROFILE_SELECTION_RESULT_METRIC,
+    )
+    if result_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_missing"
+        )
+    result_map = _pagination_checkpoint_row_mapping(result_row)
+    raw_selection_result = result_map.get("selection_result")
+    if isinstance(raw_selection_result, str):
+        raw_selection_result = json.loads(raw_selection_result)
+    generation_id = (
+        _clean_text(raw_selection_result.get("profile_generation_id"))
+        if isinstance(raw_selection_result, Mapping)
+        else None
+    )
+    if (
+        generation_id is None
+        or re.fullmatch(r"pdprofile_[0-9a-f]{32}", generation_id) is None
+        or result_map.get("finished_at") is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_invalid"
+        )
+    selection_result = _provider_directory_profile_adoption_result(
+        raw_selection_result,
+        generation_id=generation_id,
+    )
+    return result_map, selection_result
+
+
+async def _profile_adoption_vectors(
+    schema: str,
+    selection_result: Mapping[str, Any],
+) -> tuple[
+    tuple[tuple[str, str], ...],
+    tuple[tuple[str, str], ...],
+]:
+    """Resolve exact source and source-context vectors for adoption."""
+    source_vector = _provider_directory_profile_source_vector(
+        (
+            str(pair_map.get("source_id") or ""),
+            str(pair_map.get("dataset_id") or ""),
+        )
+        for pair_map in selection_result["pairs"]
+        if isinstance(pair_map, Mapping)
+    )
+    if len(source_vector) != len(selection_result["pairs"]):
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_invalid"
+        )
+    source_context_digest = _clean_text(
+        selection_result.get("source_context_digest")
+    )
+    if (
+        source_context_digest is None
+        or re.fullmatch(r"[0-9a-f]{64}", source_context_digest) is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_invalid"
+        )
+    (
+        _selected_source_ids,
+        _retained_source_ids,
+        source_contexts,
+    ) = await _provider_directory_profile_scope_source_ids(
+        schema,
+        {source_id for source_id, _dataset_id in source_vector},
+        expected_source_context_digest=source_context_digest,
+    )
+    source_context_vector = (
+        _provider_directory_profile_source_context_vector(source_contexts)
+    )
+    return source_vector, source_context_vector
+
+
+def _profile_adoption_as_of(
+    selection_result: Mapping[str, Any],
+) -> str:
+    """Return the canonical terminal publication as-of date."""
+    profile_as_of = _clean_text(selection_result.get("profile_as_of"))
+    try:
+        if profile_as_of is None:
+            raise ValueError
+        parsed_profile_as_of = datetime.date.fromisoformat(profile_as_of)
+        if parsed_profile_as_of.isoformat() != profile_as_of:
+            raise ValueError
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_as_of_ambiguous"
+        ) from exc
+    return profile_as_of
+
+
+def _profile_adoption_attested_row_counts(
+    selection_result: Mapping[str, Any],
+) -> tuple[int, int]:
+    """Return canonical row counts from the terminal selection result."""
+    row_counts = selection_result["row_counts"]
+    profile_row_count = row_counts.get("profile_rows")
+    evidence_row_count = row_counts.get(
+        "profile_source_evidence_rows"
+    )
+    if (
+        not isinstance(profile_row_count, int)
+        or isinstance(profile_row_count, bool)
+        or profile_row_count < 0
+        or not isinstance(evidence_row_count, int)
+        or isinstance(evidence_row_count, bool)
+        or evidence_row_count < 0
+        or int(selection_result.get("generation") or 0) < 1
+        or _clean_text(selection_result.get("proof_id")) is None
+        or int(selection_result.get("authority_revision") or 0) < 1
+        or int(selection_result.get("profile_schema_version") or 0) < 1
+        or _clean_text(
+            selection_result.get("profile_strategy_version")
+        )
+        is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_invalid"
+        )
+    return int(profile_row_count), int(evidence_row_count)
+
+
+def _profile_adoption_candidate(
+    adoption_targets: _ProfileAdoptionTargets,
+    result_map: Mapping[str, Any],
+    selection_result: Mapping[str, Any],
+    source_vector: tuple[tuple[str, str], ...],
+    source_context_vector: tuple[tuple[str, str], ...],
+    profile_as_of: str,
+    row_counts: tuple[int, int],
+) -> _ProfileAdoptionCandidate:
+    """Return the complete legacy serving-generation adoption candidate."""
+    return _ProfileAdoptionCandidate(
+        generation_id=adoption_targets.generation_id,
+        selection_result=selection_result,
+        source_vector=source_vector,
+        source_context_vector=source_context_vector,
+        profile_as_of=profile_as_of,
+        profile_target_oid=adoption_targets.profile_target_oid,
+        evidence_target_oid=adoption_targets.evidence_target_oid,
+        profile_rows=row_counts[0],
+        evidence_rows=row_counts[1],
+        published_at=result_map["finished_at"],
+        executable_plan_hash=(
+            _provider_directory_profile_adopted_plan_hash(selection_result)
+        ),
+    )
+
+
+_INSERT_PROFILE_ADOPTION_SQL = """
+        INSERT INTO __SERVING_GENERATION__ (
+            singleton_key, status, operation, control_generation,
+            generation_id, selection_proof_id,
+            authority_revision, profile_schema_version,
+            profile_strategy_version, source_vector_hash,
+            source_vector_json, source_context_vector_hash,
+            source_context_vector_json, executable_plan_hash,
+            capacity_geometry_status, capacity_geometry_hash,
+            capacity_geometry_json,
+            evidence_target_oid, profile_target_oid,
+            evidence_rows, profile_rows, profile_as_of, published_at,
+            created_at, updated_at
+        ) VALUES (
+            'global', 'published', :operation, :control_generation,
+            :generation_id, :selection_proof_id,
+            :authority_revision, :profile_schema_version,
+            :profile_strategy_version, :source_vector_hash,
+            CAST(:source_vector_json AS jsonb),
+            :source_context_vector_hash,
+            CAST(:source_context_vector_json AS jsonb),
+            :executable_plan_hash,
+            'legacy_unavailable', NULL, NULL,
+            :evidence_target_oid, :profile_target_oid,
+            :evidence_rows, :profile_rows, :profile_as_of, :published_at,
+            now(), now()
+        )
+        ON CONFLICT (singleton_key) DO NOTHING;
+        """
+
+
+async def _insert_profile_adoption(
+    schema: str,
+    candidate: _ProfileAdoptionCandidate,
+) -> None:
+    """Insert one legacy-unavailable serving generation if absent."""
+    selection_result = candidate.selection_result
+    await db.status(
+        _INSERT_PROFILE_ADOPTION_SQL.replace(
+            "__SERVING_GENERATION__",
+            _provider_directory_profile_serving_generation_ref(schema),
+        ),
+        generation_id=candidate.generation_id,
+        operation=selection_result["operation"],
+        control_generation=int(selection_result["generation"]),
+        selection_proof_id=selection_result["proof_id"],
+        authority_revision=int(selection_result["authority_revision"]),
+        profile_schema_version=int(
+            selection_result["profile_schema_version"]
+        ),
+        profile_strategy_version=selection_result[
+            "profile_strategy_version"
+        ],
+        source_vector_hash=(
+            _provider_directory_profile_source_vector_hash(
+                candidate.source_vector
+            )
+        ),
+        source_vector_json=json.dumps(
+            _provider_directory_profile_source_vector_json(
+                candidate.source_vector
+            )
+        ),
+        source_context_vector_hash=(
+            _provider_directory_profile_source_context_vector_hash(
+                candidate.source_context_vector
+            )
+        ),
+        source_context_vector_json=json.dumps(
+            _provider_directory_profile_source_context_vector_json(
+                candidate.source_context_vector
+            )
+        ),
+        executable_plan_hash=candidate.executable_plan_hash,
+        evidence_target_oid=candidate.evidence_target_oid,
+        profile_target_oid=candidate.profile_target_oid,
+        evidence_rows=candidate.evidence_rows,
+        profile_rows=candidate.profile_rows,
+        profile_as_of=candidate.profile_as_of,
+        published_at=candidate.published_at,
+    )
+
+
+def _validate_profile_adoption_serving(
+    serving_state: _ProviderDirectoryProfileServingState | None,
+    candidate: _ProfileAdoptionCandidate,
+) -> _ProviderDirectoryProfileServingState:
+    """Require an inserted or incumbent serving row to match adoption."""
+    selection_result = candidate.selection_result
+    if (
+        serving_state is None
+        or serving_state.status != "published"
+        or serving_state.operation != "publish"
+        or serving_state.control_generation
+        != int(selection_result["generation"])
+        or serving_state.generation_id != candidate.generation_id
+        or serving_state.selection_proof_id
+        != selection_result["proof_id"]
+        or serving_state.authority_revision
+        != int(selection_result["authority_revision"])
+        or serving_state.profile_schema_version
+        != int(selection_result["profile_schema_version"])
+        or serving_state.profile_strategy_version
+        != selection_result["profile_strategy_version"]
+        or serving_state.source_vector != candidate.source_vector
+        or serving_state.source_context_vector
+        != candidate.source_context_vector
+        or serving_state.executable_plan_hash
+        != candidate.executable_plan_hash
+        or serving_state.capacity_geometry_status
+        != "legacy_unavailable"
+        or serving_state.capacity_geometry_hash is not None
+        or serving_state.capacity_geometry_json is not None
+        or serving_state.evidence_target_oid != candidate.evidence_target_oid
+        or serving_state.profile_target_oid != candidate.profile_target_oid
+        or serving_state.evidence_rows != candidate.evidence_rows
+        or serving_state.profile_rows != candidate.profile_rows
+        or serving_state.profile_as_of != candidate.profile_as_of
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_serving_adoption_conflict"
+        )
+    return serving_state
+
+
+async def _adopt_provider_directory_profile_serving_generation(
+    schema: str,
+) -> _ProviderDirectoryProfileServingState:
+    """Adopt the exact last successful full-swap result without scanning it."""
+    result_map, selection_result = await _profile_adoption_result_row(schema)
+    row_counts = _profile_adoption_attested_row_counts(selection_result)
+    generation_id = str(selection_result["profile_generation_id"])
+    adoption_targets = await _profile_adoption_targets(
+        schema,
+        generation_id=generation_id,
+        profile_rows=row_counts[0],
+        evidence_rows=row_counts[1],
+    )
+    source_vector, source_context_vector = await _profile_adoption_vectors(
+        schema,
+        selection_result,
+    )
+    profile_as_of = _profile_adoption_as_of(selection_result)
+    candidate = _profile_adoption_candidate(
+        adoption_targets,
+        result_map,
+        selection_result,
+        source_vector,
+        source_context_vector,
+        profile_as_of,
+        row_counts,
+    )
+    await _insert_profile_adoption(schema, candidate)
+    serving_state = await _provider_directory_profile_serving_state(
+        schema,
+        for_update=True,
+    )
+    return _validate_profile_adoption_serving(
+        serving_state,
+        candidate,
     )
 
 
@@ -15270,14 +27875,13 @@ async def _assert_provider_directory_profile_checkpoint_ready(
         == checkpoint_state.evidence_total_batches
         and checkpoint_state.profile_next_batch
         == checkpoint_state.profile_total_batches
+        and _is_profile_checkpoint_geometry_matching(
+            checkpoint_map,
+            build=build,
+        )
     )
     if not is_ready or not (
-        await _is_profile_stage_pair_matching(
-            build.schema,
-            checkpoint_map,
-            build.evidence_stage,
-            build.profile_stage,
-        )
+        await _is_profile_build_stage_set_matching(build, checkpoint_map)
     ):
         raise RuntimeError(
             "provider_directory_profile_ready_checkpoint_stale"
@@ -15392,12 +27996,52 @@ async def _is_profile_build_checkpoint_reusable(
         profile_total_batches=profile_total_batches,
     ):
         return False
-    return await _is_profile_stage_pair_matching(
-        build.schema,
+    return await _is_profile_build_stage_set_matching(
+        build,
         checkpoint_map,
-        build.evidence_stage,
-        build.profile_stage,
     )
+
+
+async def _validate_profile_checkpoint_layout(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    checkpoint_ref: str,
+    build_id: str,
+) -> None:
+    """Require checkpoint layout and replaceable TOAST to match admission."""
+    checkpoint_layout = (
+        await _provider_directory_profile_relation_storage_fingerprint(
+            admission.geometry.build_checkpoint_oid,
+            expected_persistence="p",
+        )
+    )
+    if checkpoint_layout.exact_fingerprint != (
+        admission.geometry.build_checkpoint_storage_fingerprint
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_checkpoint_layout_changed"
+        )
+    deleted_toast_chunks = (
+        await _provider_directory_profile_toast_chunk_count(
+            source_sql=(
+                f"SELECT * FROM {checkpoint_ref} "
+                "WHERE build_id = :build_id"
+            ),
+            relation_oid=checkpoint_layout.relation_oid,
+            toast_oid=checkpoint_layout.toast_oid,
+            toastable_columns=checkpoint_layout.toastable_columns,
+            expected_compression=(
+                admission.geometry.postgres_default_toast_compression
+            ),
+            params={"build_id": build_id},
+        )
+    )
+    if deleted_toast_chunks > (
+        admission.control_wal_projection.plan_input
+        .build_checkpoint_update.deleted_toast_chunks
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_checkpoint_toast_changed"
+        )
 
 
 async def _claim_provider_directory_profile_build_checkpoint(
@@ -15413,11 +28057,79 @@ async def _claim_provider_directory_profile_build_checkpoint(
         build,
         has_existing_artifacts=has_existing_artifacts,
     )
-    evidence_batches = resolved_batch_plan.evidence_batches
-    profile_batches = resolved_batch_plan.compact_batches
     checkpoint_ref = _provider_directory_profile_checkpoint_ref(build.schema)
     build_id = _provider_directory_profile_build_id(build)
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if capacity_admission is not None:
+        _checked_serialized_metadata_payload_bytes(
+            {
+                "build_id": build_id,
+                "strategy_version": (
+                    profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+                ),
+                "schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
+                "resume_lineage_hash": build.resume_lineage_hash,
+                "owner_run_id": build.owner_run_id,
+                "profile_as_of": build.profile_as_of,
+                "executable_plan_hash": resolved_batch_plan.fingerprint,
+                "materialization_mode": build.materialization_mode,
+                "capacity_geometry_status": (
+                    build.capacity_geometry_status
+                ),
+                "capacity_geometry_hash": build.capacity_geometry_hash,
+                "capacity_geometry_json": build.capacity_geometry_json,
+                "source_ids": build.source_ids,
+                "retained_source_ids": build.retained_source_ids,
+                "dataset_ids": build.dataset_ids,
+                "evidence_stage": build.evidence_stage,
+                "profile_stage": build.profile_stage,
+                "current_source_vector_hash": (
+                    build.current_source_vector_hash
+                ),
+                "desired_source_vector_hash": (
+                    build.desired_source_vector_hash
+                ),
+                "current_source_context_vector_hash": (
+                    build.current_source_context_vector_hash
+                ),
+                "desired_source_context_vector_hash": (
+                    build.desired_source_context_vector_hash
+                ),
+                "refresh_source_ids": build.source_ids,
+                "removed_source_ids": build.removed_source_ids,
+                "affected_npi_stage": build.affected_npi_stage,
+                "has_existing_artifacts": has_existing_artifacts,
+                "evidence_total_batches": len(
+                    resolved_batch_plan.evidence_batches
+                ),
+                "profile_total_batches": len(
+                    resolved_batch_plan.compact_batches
+                ),
+            },
+            fixed_row_overhead=4_096,
+        )
+        await _reserve_provider_directory_profile_wal_budget(
+            capacity_admission,
+            control_operation_counts={
+                "profile_stage_reinitialize": 1,
+                "profile_stage_initialize": 1,
+            },
+        )
     async with db.transaction():
+        if capacity_admission is not None:
+            _assert_provider_directory_profile_capacity_build(
+                capacity_admission,
+                build,
+                evidence_build_fence,
+                profile_build_fence,
+            )
+            await _assert_provider_directory_profile_capacity_consumption(
+                capacity_admission,
+                build,
+            )
+            await _apply_provider_directory_profile_capacity_settings(
+                capacity_admission
+            )
         checkpoint_row = await db.first(
             f"SELECT * FROM {checkpoint_ref} "
             "WHERE build_id = :build_id FOR UPDATE;",
@@ -15428,6 +28140,12 @@ async def _claim_provider_directory_profile_build_checkpoint(
             if checkpoint_row is not None
             else {}
         )
+        if capacity_admission is not None:
+            await _validate_profile_checkpoint_layout(
+                capacity_admission,
+                checkpoint_ref,
+                build_id,
+            )
         reusable = bool(checkpoint_map) and (
             await _is_profile_build_checkpoint_reusable(
                 build,
@@ -15435,8 +28153,12 @@ async def _claim_provider_directory_profile_build_checkpoint(
                 has_existing_artifacts=has_existing_artifacts,
                 evidence_build_fence=evidence_build_fence,
                 profile_build_fence=profile_build_fence,
-                evidence_total_batches=len(evidence_batches),
-                profile_total_batches=len(profile_batches),
+                evidence_total_batches=len(
+                    resolved_batch_plan.evidence_batches
+                ),
+                profile_total_batches=len(
+                    resolved_batch_plan.compact_batches
+                ),
             )
         )
         if not reusable:
@@ -15462,6 +28184,31 @@ async def _claim_provider_directory_profile_build_checkpoint(
                     logged=True,
                 )
             )
+            # Build every secondary index while the logged stages are empty.
+            # Scratch projections below then see the complete write layout and
+            # no bulk index build can emit unforecast data, temp files, or WAL.
+            for statement in profile_artifact.profile_index_statements(
+                build.schema,
+                build.evidence_stage,
+                evidence=True,
+            ):
+                await db.status(statement)
+            for statement in profile_artifact.profile_index_statements(
+                build.schema,
+                build.profile_stage,
+                evidence=False,
+            ):
+                await db.status(statement)
+            if build.materialization_mode == "source_delta":
+                if build.affected_npi_stage is None:
+                    raise RuntimeError(
+                        "provider_directory_profile_affected_stage_missing"
+                    )
+                await db.status(
+                    f"CREATE TABLE "
+                    f"{_provider_directory_profile_build_ref(build, build.affected_npi_stage)} "
+                    "(npi bigint PRIMARY KEY);"
+                )
             evidence_stage_oid = (
                 await _require_provider_directory_profile_stage_oid(
                     build.schema,
@@ -15474,14 +28221,65 @@ async def _claim_provider_directory_profile_build_checkpoint(
                     build.profile_stage,
                 )
             )
+            affected_npi_stage_oid = (
+                await _require_provider_directory_profile_stage_oid(
+                    build.schema,
+                    build.affected_npi_stage,
+                )
+                if build.affected_npi_stage is not None
+                else None
+            )
+            evidence_stage_storage_fingerprint = (
+                await _provider_directory_profile_stage_storage_fingerprint(
+                    build.schema,
+                    build.evidence_stage,
+                    expected_oid=evidence_stage_oid,
+                    lock_relation=True,
+                )
+            )
+            profile_stage_storage_fingerprint = (
+                await _provider_directory_profile_stage_storage_fingerprint(
+                    build.schema,
+                    build.profile_stage,
+                    expected_oid=profile_stage_oid,
+                    lock_relation=True,
+                )
+            )
+            affected_npi_stage_storage_fingerprint = (
+                await (
+                    _provider_directory_profile_stage_storage_fingerprint(
+                        build.schema,
+                        build.affected_npi_stage,
+                        expected_oid=affected_npi_stage_oid,
+                        lock_relation=True,
+                    )
+                )
+                if (
+                    build.affected_npi_stage is not None
+                    and affected_npi_stage_oid is not None
+                )
+                else None
+            )
             await db.status(
                 f"""
                 INSERT INTO {checkpoint_ref} (
                     build_id, strategy_version, schema_version,
                     resume_lineage_hash, owner_run_id, state, profile_as_of,
+                    executable_plan_hash, materialization_mode,
+                    capacity_geometry_status, capacity_geometry_hash,
+                    capacity_geometry_json,
                     source_ids, retained_source_ids, dataset_ids,
                     evidence_stage, profile_stage, evidence_stage_oid,
-                    profile_stage_oid, evidence_target_oid, profile_target_oid,
+                    profile_stage_oid,
+                    evidence_stage_storage_fingerprint,
+                    profile_stage_storage_fingerprint,
+                    affected_npi_stage_storage_fingerprint,
+                    evidence_target_oid, profile_target_oid,
+                    current_source_vector_hash, desired_source_vector_hash,
+                    current_source_context_vector_hash,
+                    desired_source_context_vector_hash,
+                    refresh_source_ids, removed_source_ids,
+                    affected_npi_stage, affected_npi_stage_oid,
                     has_existing_artifacts, evidence_next_batch,
                     evidence_total_batches, profile_next_batch,
                     profile_total_batches, created_at, updated_at
@@ -15489,11 +28287,24 @@ async def _claim_provider_directory_profile_build_checkpoint(
                     :build_id, :strategy_version, :schema_version,
                     :resume_lineage_hash, :owner_run_id,
                     'building_evidence', :profile_as_of,
+                    :executable_plan_hash, :materialization_mode,
+                    :capacity_geometry_status, :capacity_geometry_hash,
+                    CAST(:capacity_geometry_json AS jsonb),
                     CAST(:source_ids AS jsonb),
                     CAST(:retained_source_ids AS jsonb),
                     CAST(:dataset_ids AS jsonb), :evidence_stage,
                     :profile_stage, :evidence_stage_oid, :profile_stage_oid,
+                    :evidence_stage_storage_fingerprint,
+                    :profile_stage_storage_fingerprint,
+                    :affected_npi_stage_storage_fingerprint,
                     :evidence_target_oid, :profile_target_oid,
+                    :current_source_vector_hash,
+                    :desired_source_vector_hash,
+                    :current_source_context_vector_hash,
+                    :desired_source_context_vector_hash,
+                    CAST(:refresh_source_ids AS jsonb),
+                    CAST(:removed_source_ids AS jsonb),
+                    :affected_npi_stage, :affected_npi_stage_oid,
                     :has_existing_artifacts, 0,
                     :evidence_total_batches, 0, :profile_total_batches,
                     now(), now()
@@ -15505,6 +28316,13 @@ async def _claim_provider_directory_profile_build_checkpoint(
                 ),
                 schema_version=profile_artifact.PROFILE_SCHEMA_VERSION,
                 resume_lineage_hash=build.resume_lineage_hash,
+                executable_plan_hash=resolved_batch_plan.fingerprint,
+                materialization_mode=build.materialization_mode,
+                capacity_geometry_status=(
+                    build.capacity_geometry_status
+                ),
+                capacity_geometry_hash=build.capacity_geometry_hash,
+                capacity_geometry_json=build.capacity_geometry_json,
                 owner_run_id=build.owner_run_id,
                 profile_as_of=build.profile_as_of,
                 source_ids=json.dumps(list(build.source_ids)),
@@ -15518,15 +28336,50 @@ async def _claim_provider_directory_profile_build_checkpoint(
                 profile_stage_oid=profile_stage_oid,
                 evidence_target_oid=evidence_build_fence.target_oid,
                 profile_target_oid=profile_build_fence.target_oid,
+                current_source_vector_hash=build.current_source_vector_hash,
+                desired_source_vector_hash=build.desired_source_vector_hash,
+                current_source_context_vector_hash=(
+                    build.current_source_context_vector_hash
+                ),
+                desired_source_context_vector_hash=(
+                    build.desired_source_context_vector_hash
+                ),
+                refresh_source_ids=json.dumps(
+                    list(build.source_ids)
+                    if build.materialization_mode == "source_delta"
+                    else []
+                ),
+                removed_source_ids=json.dumps(
+                    list(build.removed_source_ids)
+                ),
+                affected_npi_stage=build.affected_npi_stage,
+                affected_npi_stage_oid=affected_npi_stage_oid,
+                evidence_stage_storage_fingerprint=(
+                    evidence_stage_storage_fingerprint
+                ),
+                profile_stage_storage_fingerprint=(
+                    profile_stage_storage_fingerprint
+                ),
+                affected_npi_stage_storage_fingerprint=(
+                    affected_npi_stage_storage_fingerprint
+                ),
                 has_existing_artifacts=has_existing_artifacts,
-                evidence_total_batches=len(evidence_batches),
-                profile_total_batches=len(profile_batches),
+                evidence_total_batches=len(
+                    resolved_batch_plan.evidence_batches
+                ),
+                profile_total_batches=len(
+                    resolved_batch_plan.compact_batches
+                ),
             )
             return _ProviderDirectoryProfileBuildCheckpointState(
                 evidence_next_batch=0,
-                evidence_total_batches=len(evidence_batches),
+                evidence_total_batches=len(
+                    resolved_batch_plan.evidence_batches
+                ),
                 profile_next_batch=0,
-                profile_total_batches=len(profile_batches),
+                profile_total_batches=len(
+                    resolved_batch_plan.compact_batches
+                ),
                 state="building_evidence",
             )
 
@@ -15570,14 +28423,28 @@ async def _claim_provider_directory_profile_build_checkpoint(
                    last_error = NULL,
                    updated_at = now()
              WHERE build_id = :build_id
+               AND capacity_geometry_status = :capacity_geometry_status
+               AND capacity_geometry_hash IS NOT DISTINCT FROM
+                   :capacity_geometry_hash
+               AND capacity_geometry_json::jsonb IS NOT DISTINCT FROM
+                   CAST(:capacity_geometry_json AS jsonb)
                AND to_regclass(:evidence_stage_relation)::oid::bigint
                    = evidence_stage_oid
                AND to_regclass(:profile_stage_relation)::oid::bigint
-                   = profile_stage_oid;
+                   = profile_stage_oid
+               AND (
+                    materialization_mode <> 'source_delta'
+                    OR to_regclass(
+                        :affected_npi_stage_relation
+                    )::oid::bigint = affected_npi_stage_oid
+               );
             """,
             owner_run_id=build.owner_run_id,
             state=claimed_state,
             build_id=build_id,
+            capacity_geometry_status=build.capacity_geometry_status,
+            capacity_geometry_hash=build.capacity_geometry_hash,
+            capacity_geometry_json=build.capacity_geometry_json,
             evidence_stage_relation=_provider_directory_profile_build_ref(
                 build,
                 build.evidence_stage,
@@ -15585,6 +28452,14 @@ async def _claim_provider_directory_profile_build_checkpoint(
             profile_stage_relation=_provider_directory_profile_build_ref(
                 build,
                 build.profile_stage,
+            ),
+            affected_npi_stage_relation=(
+                _provider_directory_profile_build_ref(
+                    build,
+                    build.affected_npi_stage,
+                )
+                if build.affected_npi_stage is not None
+                else None
             ),
         )
         if _coerce_rowcount(claimed_count) != 1:
@@ -15594,6 +28469,35 @@ async def _claim_provider_directory_profile_build_checkpoint(
         return replace(checkpoint_state, state=claimed_state)
 
 
+def _profile_checkpoint_relation_params(
+    build: _ProviderDirectoryProfileBuild,
+) -> dict[str, Any]:
+    """Return exact owner, geometry, and relation identities for checkpoint CAS."""
+    return {
+        "build_id": _provider_directory_profile_build_id(build),
+        "owner_run_id": build.owner_run_id,
+        "capacity_geometry_status": build.capacity_geometry_status,
+        "capacity_geometry_hash": build.capacity_geometry_hash,
+        "capacity_geometry_json": build.capacity_geometry_json,
+        "evidence_stage_relation": _provider_directory_profile_build_ref(
+            build,
+            build.evidence_stage,
+        ),
+        "profile_stage_relation": _provider_directory_profile_build_ref(
+            build,
+            build.profile_stage,
+        ),
+        "affected_npi_stage_relation": (
+            _provider_directory_profile_build_ref(
+                build,
+                build.affected_npi_stage,
+            )
+            if build.affected_npi_stage is not None
+            else None
+        ),
+    }
+
+
 async def _advance_provider_directory_profile_build_checkpoint(
     build: _ProviderDirectoryProfileBuild,
     *,
@@ -15601,12 +28505,22 @@ async def _advance_provider_directory_profile_build_checkpoint(
     expected_batch: int,
     total_batches: int,
 ) -> None:
+    """Advance one exact durable phase cursor under its expected value."""
+
     if phase not in {"evidence", "profile"}:
         raise ValueError(f"unsupported profile checkpoint phase: {phase}")
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if capacity_admission is not None:
+        await _reserve_provider_directory_profile_wal_budget(
+            capacity_admission,
+            control_operation_counts={
+                f"{phase}_checkpoint_advance": 1,
+            },
+        )
     next_column = f"{phase}_next_batch"
     total_column = f"{phase}_total_batches"
     state = "building_evidence" if phase == "evidence" else "building_profile"
-    updated_count = await db.status(
+    updated_count = await _provider_directory_profile_capacity_status(
         f"""
         UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
            SET {next_column} = :next_batch,
@@ -15615,27 +28529,29 @@ async def _advance_provider_directory_profile_build_checkpoint(
                updated_at = now()
          WHERE build_id = :build_id
            AND owner_run_id IS NOT DISTINCT FROM :owner_run_id
+           AND capacity_geometry_status = :capacity_geometry_status
+           AND capacity_geometry_hash IS NOT DISTINCT FROM
+               :capacity_geometry_hash
+           AND capacity_geometry_json::jsonb IS NOT DISTINCT FROM
+               CAST(:capacity_geometry_json AS jsonb)
            AND {next_column} = :expected_batch
            AND {total_column} = :total_batches
            AND to_regclass(:evidence_stage_relation)::oid::bigint
                = evidence_stage_oid
            AND to_regclass(:profile_stage_relation)::oid::bigint
-               = profile_stage_oid;
+               = profile_stage_oid
+           AND (
+                materialization_mode <> 'source_delta'
+                OR to_regclass(
+                    :affected_npi_stage_relation
+                )::oid::bigint = affected_npi_stage_oid
+           );
         """,
         next_batch=expected_batch + 1,
         state=state,
-        build_id=_provider_directory_profile_build_id(build),
-        owner_run_id=build.owner_run_id,
         expected_batch=expected_batch,
         total_batches=total_batches,
-        evidence_stage_relation=_provider_directory_profile_build_ref(
-            build,
-            build.evidence_stage,
-        ),
-        profile_stage_relation=_provider_directory_profile_build_ref(
-            build,
-            build.profile_stage,
-        ),
+        **_profile_checkpoint_relation_params(build),
     )
     if _coerce_rowcount(updated_count) != 1:
         raise RuntimeError(
@@ -15647,7 +28563,26 @@ async def _mark_profile_build_checkpoint_state(
     build: _ProviderDirectoryProfileBuild,
     state: str,
 ) -> None:
-    updated_count = await db.status(
+    """Transition a build checkpoint to one explicitly supported state."""
+
+    capacity_operation_by_state = {
+        "evidence_complete": "evidence_checkpoint_complete",
+        "ready": "profile_checkpoint_ready",
+    }
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if capacity_admission is not None:
+        operation_name = capacity_operation_by_state.get(state)
+        if operation_name is None:
+            raise RuntimeError(
+                "provider_directory_profile_capacity_checkpoint_state_"
+                "unplanned:"
+                + state
+            )
+        await _reserve_provider_directory_profile_wal_budget(
+            capacity_admission,
+            control_operation_counts={operation_name: 1},
+        )
+    updated_count = await _provider_directory_profile_capacity_status(
         f"""
         UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
            SET state = CAST(:state AS varchar),
@@ -15658,22 +28593,24 @@ async def _mark_profile_build_checkpoint_state(
                updated_at = now()
          WHERE build_id = :build_id
            AND owner_run_id IS NOT DISTINCT FROM :owner_run_id
+           AND capacity_geometry_status = :capacity_geometry_status
+           AND capacity_geometry_hash IS NOT DISTINCT FROM
+               :capacity_geometry_hash
+           AND capacity_geometry_json::jsonb IS NOT DISTINCT FROM
+               CAST(:capacity_geometry_json AS jsonb)
            AND to_regclass(:evidence_stage_relation)::oid::bigint
                = evidence_stage_oid
            AND to_regclass(:profile_stage_relation)::oid::bigint
-               = profile_stage_oid;
+               = profile_stage_oid
+           AND (
+                materialization_mode <> 'source_delta'
+                OR to_regclass(
+                    :affected_npi_stage_relation
+                )::oid::bigint = affected_npi_stage_oid
+           );
         """,
         state=state,
-        build_id=_provider_directory_profile_build_id(build),
-        owner_run_id=build.owner_run_id,
-        evidence_stage_relation=_provider_directory_profile_build_ref(
-            build,
-            build.evidence_stage,
-        ),
-        profile_stage_relation=_provider_directory_profile_build_ref(
-            build,
-            build.profile_stage,
-        ),
+        **_profile_checkpoint_relation_params(build),
     )
     if _coerce_rowcount(updated_count) != 1:
         raise RuntimeError(
@@ -15685,8 +28622,16 @@ async def _mark_profile_build_checkpoint_failed(
     build: _ProviderDirectoryProfileBuild,
     exc: BaseException,
 ) -> None:
+    capacity_admission = _provider_directory_profile_capacity_admission()
     try:
-        await db.status(
+        if capacity_admission is not None:
+            await _reserve_provider_directory_profile_wal_budget(
+                capacity_admission,
+                control_operation_counts={
+                    "profile_checkpoint_failure_reserve": 1,
+                },
+            )
+        updated_count = await _provider_directory_profile_capacity_status(
             f"""
             UPDATE {_provider_directory_profile_checkpoint_ref(build.schema)}
                SET state = 'failed',
@@ -15694,13 +28639,30 @@ async def _mark_profile_build_checkpoint_failed(
                        || ' [checkpoint_state=' || state || ']',
                    updated_at = now()
              WHERE build_id = :build_id
-               AND owner_run_id IS NOT DISTINCT FROM :owner_run_id;
+               AND owner_run_id IS NOT DISTINCT FROM :owner_run_id
+               AND capacity_geometry_status = :capacity_geometry_status
+               AND capacity_geometry_hash IS NOT DISTINCT FROM
+                   :capacity_geometry_hash
+               AND capacity_geometry_json::jsonb IS NOT DISTINCT FROM
+                   CAST(:capacity_geometry_json AS jsonb);
             """,
             last_error=f"{type(exc).__name__}: {exc}"[:2000],
             build_id=_provider_directory_profile_build_id(build),
             owner_run_id=build.owner_run_id,
+            capacity_geometry_status=build.capacity_geometry_status,
+            capacity_geometry_hash=build.capacity_geometry_hash,
+            capacity_geometry_json=build.capacity_geometry_json,
         )
+        if (
+            capacity_admission is not None
+            and _coerce_rowcount(updated_count) != 1
+        ):
+            raise RuntimeError(
+                "provider_directory_profile_failure_checkpoint_ownership_lost"
+            )
     except Exception:
+        if capacity_admission is not None:
+            raise
         LOGGER.warning(
             "Failed to mark Provider Directory Profile checkpoint failed",
             exc_info=True,
@@ -15711,13 +28673,30 @@ async def _delete_provider_directory_profile_build_checkpoint(
     schema: str,
     build_id: str,
 ) -> None:
+    capacity_admission = _provider_directory_profile_capacity_admission()
     try:
-        await db.status(
+        if capacity_admission is not None:
+            await _reserve_provider_directory_profile_wal_budget(
+                capacity_admission,
+                control_operation_counts={
+                    "profile_checkpoint_retire": 1,
+                },
+            )
+        deleted_count = await _provider_directory_profile_capacity_status(
             f"DELETE FROM {_provider_directory_profile_checkpoint_ref(schema)} "
             "WHERE build_id = :build_id;",
             build_id=build_id,
         )
+        if (
+            capacity_admission is not None
+            and _coerce_rowcount(deleted_count) != 1
+        ):
+            raise RuntimeError(
+                "provider_directory_profile_checkpoint_retire_ownership_lost"
+            )
     except Exception:
+        if capacity_admission is not None:
+            raise
         LOGGER.warning(
             "Failed to delete completed Provider Directory Profile checkpoint",
             exc_info=True,
@@ -15771,6 +28750,157 @@ async def _require_provider_directory_profile_stage_oid(
     return identity[0]
 
 
+async def _provider_directory_profile_stage_storage_fingerprint(
+    schema: str,
+    stage_table: str,
+    *,
+    expected_oid: int,
+    lock_relation: bool,
+) -> str:
+    """Return one exact logged-stage layout, optionally DDL-fenced."""
+
+    identity = await _provider_directory_profile_stage_relation_identity(
+        schema,
+        stage_table,
+    )
+    if identity != (expected_oid, "r", "p"):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_stage_storage_identity_changed:"
+            + stage_table
+        )
+    if lock_relation:
+        await db.status(
+            f"LOCK TABLE {_unscoped_qt(schema, stage_table)} "
+            "IN ACCESS SHARE MODE;"
+        )
+        if (
+            await _provider_directory_profile_stage_relation_identity(
+                schema,
+                stage_table,
+            )
+            != identity
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_profile_stage_storage_identity_changed:"
+                + stage_table
+            )
+    layout = await _provider_directory_profile_relation_storage_fingerprint(
+        expected_oid,
+        expected_persistence="p",
+    )
+    return layout.exact_fingerprint
+
+
+async def _assert_profile_stage_storage(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    stage_table: str,
+    oid_field: str,
+    fingerprint_field: str,
+) -> None:
+    """Lock and verify one persisted stage layout before payload DML."""
+
+    checkpoint_row = await db.first(
+        f"SELECT {oid_field}, {fingerprint_field} "
+        f"FROM {_provider_directory_profile_checkpoint_ref(build.schema)} "
+        "WHERE build_id = :build_id "
+        "AND owner_run_id IS NOT DISTINCT FROM :owner_run_id "
+        "FOR SHARE;",
+        build_id=_provider_directory_profile_build_id(build),
+        owner_run_id=build.owner_run_id,
+    )
+    if checkpoint_row is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_stage_storage_checkpoint_missing"
+        )
+    checkpoint_map = _pagination_checkpoint_row_mapping(checkpoint_row)
+    expected_oid = _provider_directory_profile_checkpoint_oid(
+        checkpoint_map.get(oid_field)
+    )
+    expected_fingerprint = _clean_text(
+        checkpoint_map.get(fingerprint_field)
+    )
+    if (
+        expected_oid is None
+        or expected_fingerprint is None
+        or re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint) is None
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_stage_storage_checkpoint_invalid"
+        )
+    observed_fingerprint = (
+        await _provider_directory_profile_stage_storage_fingerprint(
+            build.schema,
+            stage_table,
+            expected_oid=expected_oid,
+            lock_relation=True,
+        )
+    )
+    if observed_fingerprint != expected_fingerprint:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_stage_storage_layout_changed:"
+            + stage_table
+        )
+
+
+def _profile_reinitialize_stage_fields(
+    build: _ProviderDirectoryProfileBuild,
+) -> list[tuple[str, str]]:
+    """Return every stage and checkpoint OID field owned by one build."""
+    stage_fields = [
+        (build.profile_stage, "profile_stage_oid"),
+        (build.evidence_stage, "evidence_stage_oid"),
+    ]
+    if build.affected_npi_stage is not None:
+        stage_fields.append(
+            (build.affected_npi_stage, "affected_npi_stage_oid")
+        )
+    return stage_fields
+
+
+async def _is_reinit_stage_locked(
+    build: _ProviderDirectoryProfileBuild,
+    checkpoint_map: Mapping[str, Any],
+    stage_table: str,
+    oid_field: str,
+) -> bool:
+    """Lock one stage only when its exact checkpoint identity still matches."""
+    identity = await _provider_directory_profile_stage_relation_identity(
+        build.schema,
+        stage_table,
+    )
+    if identity is None:
+        return False
+    if not checkpoint_map:
+        raise RuntimeError(
+            "provider_directory_profile_unowned_stage_exists:" + stage_table
+        )
+    expected_oid = _provider_directory_profile_checkpoint_oid(
+        checkpoint_map.get(oid_field)
+    )
+    if identity != (expected_oid, "r", "p"):
+        raise RuntimeError(
+            "provider_directory_profile_reinitialize_stage_oid_mismatch:"
+            + stage_table
+        )
+    await db.status(
+        f"LOCK TABLE {_unscoped_qt(build.schema, stage_table)} "
+        "IN ACCESS EXCLUSIVE MODE;"
+    )
+    observed_identity = (
+        await _provider_directory_profile_stage_relation_identity(
+            build.schema,
+            stage_table,
+        )
+    )
+    if observed_identity != identity:
+        raise RuntimeError(
+            "provider_directory_profile_reinitialize_stage_identity_changed:"
+            + stage_table
+        )
+    return True
+
+
 async def _drop_profile_stages_for_reinitialize(
     build: _ProviderDirectoryProfileBuild,
     checkpoint_map: dict[str, Any],
@@ -15781,50 +28911,22 @@ async def _drop_profile_stages_for_reinitialize(
         != build.evidence_stage
         or _clean_text(checkpoint_map.get("profile_stage"))
         != build.profile_stage
+        or _clean_text(checkpoint_map.get("affected_npi_stage"))
+        != build.affected_npi_stage
     ):
         raise RuntimeError(
             "provider_directory_profile_reinitialize_stage_name_mismatch"
         )
-    locked_stages: list[str] = []
-    for stage_table, oid_field in (
-        (build.profile_stage, "profile_stage_oid"),
-        (build.evidence_stage, "evidence_stage_oid"),
-    ):
-        identity = await _provider_directory_profile_stage_relation_identity(
-            build.schema,
+    locked_stages = [
+        stage_table
+        for stage_table, oid_field in _profile_reinitialize_stage_fields(build)
+        if await _is_reinit_stage_locked(
+            build,
+            checkpoint_map,
             stage_table,
+            oid_field,
         )
-        if identity is None:
-            continue
-        if not checkpoint_map:
-            raise RuntimeError(
-                "provider_directory_profile_unowned_stage_exists:"
-                + stage_table
-            )
-        expected_oid = _provider_directory_profile_checkpoint_oid(
-            checkpoint_map.get(oid_field)
-        )
-        if identity != (expected_oid, "r", "p"):
-            raise RuntimeError(
-                "provider_directory_profile_reinitialize_stage_oid_mismatch:"
-                + stage_table
-            )
-        await db.status(
-            f"LOCK TABLE {_unscoped_qt(build.schema, stage_table)} "
-            "IN ACCESS EXCLUSIVE MODE;"
-        )
-        if (
-            await _provider_directory_profile_stage_relation_identity(
-                build.schema,
-                stage_table,
-            )
-            != identity
-        ):
-            raise RuntimeError(
-                "provider_directory_profile_reinitialize_stage_identity_changed:"
-                + stage_table
-            )
-        locked_stages.append(stage_table)
+    ]
     for stage_table in locked_stages:
         await db.status(
             f"DROP TABLE {_unscoped_qt(build.schema, stage_table)};"
@@ -15833,7 +28935,7 @@ async def _drop_profile_stages_for_reinitialize(
 
 def _validated_profile_checkpoint_stage_names(
     checkpoint_map: dict[str, Any],
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None]:
     build_id = _clean_text(checkpoint_map.get("build_id"))
     if not build_id or re.fullmatch(r"pdpb_[0-9a-f]{32}", build_id) is None:
         raise RuntimeError(
@@ -15841,12 +28943,21 @@ def _validated_profile_checkpoint_stage_names(
         )
     evidence_stage = _clean_text(checkpoint_map.get("evidence_stage"))
     profile_stage = _clean_text(checkpoint_map.get("profile_stage"))
+    affected_npi_stage = _clean_text(
+        checkpoint_map.get("affected_npi_stage")
+    )
     expected_evidence_stage = (
         profile_artifact.profile_evidence_stage_table_name(build_id)
     )
     expected_profile_stage = profile_artifact.profile_stage_table_name(
         build_id
     )
+    expected_affected_npi_stage = _bounded_identifier(
+        f"provider_directory_profile_affected_{build_id}"
+    )
+    materialization_mode = _clean_text(
+        checkpoint_map.get("materialization_mode")
+    ) or "full_swap"
     if (
         evidence_stage != expected_evidence_stage
         or profile_stage != expected_profile_stage
@@ -15856,11 +28967,19 @@ def _validated_profile_checkpoint_stage_names(
         or not profile_stage.startswith(
             f"{profile_artifact.PROFILE_STAGE_PREFIX}_"
         )
+        or (
+            materialization_mode == "source_delta"
+            and affected_npi_stage != expected_affected_npi_stage
+        )
+        or (
+            materialization_mode != "source_delta"
+            and affected_npi_stage is not None
+        )
     ):
         raise RuntimeError(
             "provider_directory_profile_stale_checkpoint_stage_invalid"
         )
-    return evidence_stage, profile_stage
+    return evidence_stage, profile_stage, affected_npi_stage
 
 
 async def _reap_stale_provider_directory_profile_builds(
@@ -15870,11 +28989,47 @@ async def _reap_stale_provider_directory_profile_builds(
 ) -> int:
     """Remove exact logged stages for superseded Profile build lineages."""
     checkpoint_ref = _provider_directory_profile_checkpoint_ref(schema)
+    capacity_admission = _provider_directory_profile_capacity_admission()
     checkpoint_rows = await db.all(
-        f"SELECT build_id FROM {checkpoint_ref} "
+        f"SELECT * FROM {checkpoint_ref} "
         "WHERE build_id <> :current_build_id ORDER BY created_at, build_id;",
         current_build_id=current_build_id,
     )
+    if capacity_admission is not None:
+        for checkpoint_summary in checkpoint_rows:
+            checkpoint_map = _pagination_checkpoint_row_mapping(
+                checkpoint_summary
+            )
+            stale_build_id = _clean_text(checkpoint_map.get("build_id"))
+            if not stale_build_id or stale_build_id == current_build_id:
+                continue
+            has_cleanup_marker = (
+                "[provider_directory_failed_profile_cleanup_v1"
+                in (_clean_text(checkpoint_map.get("last_error")) or "")
+            )
+            if not has_cleanup_marker:
+                raise RuntimeError(
+                    "provider_directory_profile_stale_build_present_during_"
+                    "capacity_admission"
+                )
+            evidence_stage, profile_stage, affected_npi_stage = (
+                _validated_profile_checkpoint_stage_names(checkpoint_map)
+            )
+            stage_tables = [profile_stage, evidence_stage]
+            if affected_npi_stage is not None:
+                stage_tables.append(affected_npi_stage)
+            present_stages = [
+                await _provider_directory_profile_stage_relation_identity(
+                    schema,
+                    stage_table,
+                )
+                for stage_table in stage_tables
+            ]
+            if any(present_stages):
+                raise RuntimeError(
+                    "provider_directory_profile_disposed_checkpoint_stage_present"
+                )
+        return 0
     reaped_count = 0
     for checkpoint_summary in checkpoint_rows:
         stale_build_id = _clean_text(
@@ -15895,11 +29050,31 @@ async def _reap_stale_provider_directory_profile_builds(
             checkpoint_map = _pagination_checkpoint_row_mapping(
                 checkpoint_row
             )
-            evidence_stage, profile_stage = (
+            evidence_stage, profile_stage, affected_npi_stage = (
                 _validated_profile_checkpoint_stage_names(
                     checkpoint_map
                 )
             )
+            stage_tables = [profile_stage, evidence_stage]
+            if affected_npi_stage is not None:
+                stage_tables.append(affected_npi_stage)
+            has_cleanup_marker = (
+                "[provider_directory_failed_profile_cleanup_v1"
+                in (_clean_text(checkpoint_map.get("last_error")) or "")
+            )
+            if has_cleanup_marker:
+                present_stages = [
+                    await _provider_directory_profile_stage_relation_identity(
+                        schema,
+                        stage_table,
+                    )
+                    for stage_table in stage_tables
+                ]
+                if not any(present_stages):
+                    continue
+                raise RuntimeError(
+                    "provider_directory_profile_disposed_checkpoint_stage_present"
+                )
             stage_oid_by_name = {
                 evidence_stage: _provider_directory_profile_checkpoint_oid(
                     checkpoint_map.get("evidence_stage_oid")
@@ -15908,6 +29083,12 @@ async def _reap_stale_provider_directory_profile_builds(
                     checkpoint_map.get("profile_stage_oid")
                 ),
             }
+            if affected_npi_stage is not None:
+                stage_oid_by_name[affected_npi_stage] = (
+                    _provider_directory_profile_checkpoint_oid(
+                        checkpoint_map.get("affected_npi_stage_oid")
+                    )
+                )
             if any(
                 stage_oid is None
                 for stage_oid in stage_oid_by_name.values()
@@ -15916,7 +29097,7 @@ async def _reap_stale_provider_directory_profile_builds(
                     "provider_directory_profile_stale_checkpoint_oid_invalid"
                 )
             locked_stages: list[str] = []
-            for stage_table in (profile_stage, evidence_stage):
+            for stage_table in stage_tables:
                 initial_identity = (
                     await _provider_directory_profile_stage_relation_identity(
                         schema,
@@ -15925,12 +29106,12 @@ async def _reap_stale_provider_directory_profile_builds(
                 )
                 if initial_identity is None:
                     continue
-                expected_identity = (
+                expected_identity_by_name = (
                     stage_oid_by_name[stage_table],
                     "r",
                     "p",
                 )
-                if initial_identity != expected_identity:
+                if initial_identity != expected_identity_by_name:
                     raise RuntimeError(
                         "provider_directory_profile_stale_stage_oid_mismatch"
                     )
@@ -15959,12 +29140,22 @@ async def _reap_stale_provider_directory_profile_builds(
                 "AND evidence_stage = :evidence_stage "
                 "AND profile_stage = :profile_stage "
                 "AND evidence_stage_oid = :evidence_stage_oid "
-                "AND profile_stage_oid = :profile_stage_oid;",
+                "AND profile_stage_oid = :profile_stage_oid "
+                "AND affected_npi_stage IS NOT DISTINCT FROM "
+                ":affected_npi_stage "
+                "AND affected_npi_stage_oid IS NOT DISTINCT FROM "
+                ":affected_npi_stage_oid;",
                 build_id=stale_build_id,
                 evidence_stage=evidence_stage,
                 profile_stage=profile_stage,
                 evidence_stage_oid=stage_oid_by_name[evidence_stage],
                 profile_stage_oid=stage_oid_by_name[profile_stage],
+                affected_npi_stage=affected_npi_stage,
+                affected_npi_stage_oid=(
+                    stage_oid_by_name.get(affected_npi_stage)
+                    if affected_npi_stage is not None
+                    else None
+                ),
             )
             if _coerce_rowcount(deleted_count) != 1:
                 raise RuntimeError(
@@ -16008,7 +29199,7 @@ def _provider_directory_profile_bucket_index_sql(
     )
     return (
         index_name,
-        f"CREATE INDEX IF NOT EXISTS {_q(index_name)} "
+        f"CREATE INDEX {_q(index_name)} "
         f"ON {_unscoped_qt(schema, scope_table)} "
         f"({_q('source_id')}, "
         f"({_provider_directory_profile_bucket_expression()}));",
@@ -16034,26 +29225,173 @@ async def _prepare_provider_directory_profile_bucket_index(
     schema: str,
     relation_name: str,
 ) -> dict[str, Any] | None:
-    scope_table = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
-        relation_name
+    """Verify the bucket index built on the empty artifact layout."""
+
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is not None:
+        async with _provider_directory_profile_capacity_transaction():
+            return await _assert_provider_directory_profile_bucket_index(
+                schema,
+                relation_name,
+                lock_relation=True,
+            )
+    return await _assert_provider_directory_profile_bucket_index(
+        schema,
+        relation_name,
+        lock_relation=False,
     )
-    if scope_table is None:
-        return None
-    if not scope_table.startswith(f"{relation_name}_artifact_"):
-        raise RuntimeError(
-            "provider_directory_profile_bucket_scope_relation_invalid"
+
+
+_PROFILE_BUCKET_INDEX_IDENTITY_SQL = """
+        SELECT table_relation.oid::bigint AS table_oid,
+               table_relation.relkind::text AS table_kind,
+               table_relation.relpersistence::text
+                   AS table_persistence,
+               index_relation.oid::bigint AS index_oid,
+               index_am.amname::text AS index_am,
+               index_row.indnatts,
+               index_row.indnkeyatts,
+               index_row.indisunique,
+               index_row.indnullsnotdistinct,
+               index_row.indisprimary,
+               index_row.indisexclusion,
+               index_row.indimmediate,
+               index_row.indisclustered,
+               index_row.indisvalid,
+               index_row.indcheckxmin,
+               index_row.indisready,
+               index_row.indislive,
+               index_row.indisreplident,
+               pg_get_indexdef(
+                   index_row.indexrelid,
+                   1,
+                   true
+               ) AS first_key,
+               pg_get_indexdef(
+                   index_row.indexrelid,
+                   2,
+                   true
+               ) AS second_key,
+               COALESCE(
+                   pg_get_expr(
+                       index_row.indpred,
+                       index_row.indrelid,
+                       true
+                   ),
+                   ''
+               ) AS index_predicate,
+               COALESCE(
+                   NULLIF(index_relation.reltablespace, 0),
+                   database_row.dattablespace
+               )::bigint AS effective_tablespace_oid,
+               pg_relation_size(index_relation.oid)::bigint
+                   AS index_bytes
+          FROM pg_class AS table_relation
+          JOIN pg_namespace AS table_namespace
+            ON table_namespace.oid = table_relation.relnamespace
+          JOIN pg_index AS index_row
+            ON index_row.indrelid = table_relation.oid
+          JOIN pg_class AS index_relation
+            ON index_relation.oid = index_row.indexrelid
+          JOIN pg_am AS index_am ON index_am.oid = index_relation.relam
+          JOIN pg_database AS database_row
+            ON database_row.datname = current_database()
+         WHERE table_namespace.nspname = :schema_name
+           AND table_relation.relname = :table_name
+           AND index_relation.relname = :index_name;
+        """
+
+
+async def _profile_bucket_index_row(
+    schema: str,
+    scope_table: str,
+    index_name: str,
+    relation_name: str,
+) -> Mapping[str, Any]:
+    """Load one exact artifact-scope bucket-index identity."""
+    index_row = await db.first(
+        _PROFILE_BUCKET_INDEX_IDENTITY_SQL,
+        schema_name=schema,
+        table_name=scope_table,
+        index_name=index_name,
+    )
+    if index_row is None:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_bucket_index_missing:"
+            + relation_name
         )
-    index_name, index_sql = (
-        _provider_directory_profile_bucket_index_sql(schema, scope_table)
+    return _pagination_checkpoint_row_mapping(index_row)
+
+
+def _validate_profile_bucket_index_shape(
+    index_map: Mapping[str, Any],
+    relation_name: str,
+) -> None:
+    """Require the exact two-key nonunique btree contract."""
+    expected_expression = (
+        "mod(hashtextextended(resource_id::text, 0::bigint) & "
+        "'9223372036854775807'::bigint, "
+        f"{profile_artifact.PROFILE_AFFILIATION_ROLE_BUCKETS}::bigint)"
     )
-    started_at = time.monotonic()
-    temp_bytes_before = await _provider_directory_profile_temp_bytes()
-    await db.status(index_sql)
+    expected_shape_by_name = {
+        "table_kind": "r",
+        "table_persistence": "u",
+        "index_am": "btree",
+        "indnatts": 2,
+        "indnkeyatts": 2,
+        "indisunique": False,
+        "indnullsnotdistinct": False,
+        "indisprimary": False,
+        "indisexclusion": False,
+        "indimmediate": True,
+        "indisclustered": False,
+        "indisvalid": True,
+        "indcheckxmin": False,
+        "indisready": True,
+        "indislive": True,
+        "indisreplident": False,
+        "first_key": "source_id",
+        "second_key": expected_expression,
+        "index_predicate": "",
+    }
+    observed_shape_by_name = {
+        field_name: index_map.get(field_name)
+        for field_name in expected_shape_by_name
+    }
+    if observed_shape_by_name != expected_shape_by_name:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_bucket_index_changed:"
+            + relation_name
+        )
+
+
+def _validate_profile_bucket_index_tablespace(
+    index_map: Mapping[str, Any],
+    relation_name: str,
+) -> None:
+    """Require an admitted bucket index to remain on its signed tablespace."""
+    admission = _provider_directory_profile_capacity_admission()
+    if (
+        admission is not None
+        and int(index_map["effective_tablespace_oid"])
+        != admission.geometry.tablespace_oid
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_bucket_index_tablespace_changed:"
+            + relation_name
+        )
+
+
+async def _profile_bucket_index_metrics(
+    index_map: Mapping[str, Any],
+    relation_name: str,
+    scope_table: str,
+    index_name: str,
+    started_at: float,
+    temp_bytes_before: int | None,
+) -> dict[str, Any]:
+    """Return and log bounded bucket-index build measurements."""
     temp_bytes_after = await _provider_directory_profile_temp_bytes()
-    index_bytes = await db.scalar(
-        "SELECT pg_relation_size(to_regclass(:index_ref));",
-        index_ref=_unscoped_qt(schema, index_name),
-    )
     temp_bytes_delta = (
         max(temp_bytes_after - temp_bytes_before, 0)
         if temp_bytes_before is not None and temp_bytes_after is not None
@@ -16063,7 +29401,7 @@ async def _prepare_provider_directory_profile_bucket_index(
         "relation_name": relation_name,
         "scope_table": scope_table,
         "index_name": index_name,
-        "index_bytes": int(index_bytes or 0),
+        "index_bytes": int(index_map.get("index_bytes") or 0),
         "temp_bytes_delta": temp_bytes_delta,
         "elapsed_seconds": time.monotonic() - started_at,
     }
@@ -16081,13 +29419,152 @@ async def _prepare_provider_directory_profile_bucket_index(
     return metrics_by_name
 
 
+async def _assert_provider_directory_profile_bucket_index(
+    schema: str,
+    relation_name: str,
+    *,
+    lock_relation: bool,
+) -> dict[str, Any] | None:
+    """Refuse a missing/replaced bucket index without a repair DDL path."""
+    scope_table = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
+        relation_name
+    )
+    if scope_table is None:
+        return None
+    expected_scope_prefix = (
+        _provider_directory_artifact_scope_table_prefix(relation_name) + "_"
+    )
+    if not scope_table.startswith(expected_scope_prefix):
+        raise RuntimeError(
+            "provider_directory_profile_bucket_scope_relation_invalid"
+        )
+    index_name, _index_sql = (
+        _provider_directory_profile_bucket_index_sql(schema, scope_table)
+    )
+    started_at = time.monotonic()
+    temp_bytes_before = await _provider_directory_profile_temp_bytes()
+    if lock_relation:
+        await db.status(
+            f"LOCK TABLE {_unscoped_qt(schema, scope_table)} "
+            "IN ACCESS SHARE MODE;"
+        )
+    index_map = await _profile_bucket_index_row(
+        schema,
+        scope_table,
+        index_name,
+        relation_name,
+    )
+    _validate_profile_bucket_index_shape(index_map, relation_name)
+    _validate_profile_bucket_index_tablespace(index_map, relation_name)
+    return await _profile_bucket_index_metrics(
+        index_map,
+        relation_name,
+        scope_table,
+        index_name,
+        started_at,
+        temp_bytes_before,
+    )
+
+
 async def _execute_profile_evidence_batch(
     build: _ProviderDirectoryProfileBuild,
     batch: _ProviderDirectoryProfileEvidenceBatch,
     copy_evidence_sql: Any,
     evidence_sql_refs_by_name: Mapping[str, str],
+    projection: _ProviderDirectoryProfileEvidenceProjection | None = None,
+) -> int:
+    """Execute one bounded evidence batch under finite session limits."""
+
+    if _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get() is None:
+        return await _execute_profile_evidence_batch_statement(
+            build,
+            batch,
+            copy_evidence_sql,
+            evidence_sql_refs_by_name,
+            projection,
+        )
+    async with _provider_directory_profile_capacity_transaction():
+        return await _execute_profile_evidence_batch_statement(
+            build,
+            batch,
+            copy_evidence_sql,
+            evidence_sql_refs_by_name,
+            projection,
+        )
+
+
+async def _assert_evidence_batch_storage(
+    build: _ProviderDirectoryProfileBuild,
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+) -> None:
+    """Reverify stage and scoped bucket indexes before evidence DML."""
+    if _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get() is None:
+        return
+    await _assert_provider_directory_profile_stage_storage_identity(
+        build,
+        stage_table=build.evidence_stage,
+        oid_field="evidence_stage_oid",
+        fingerprint_field="evidence_stage_storage_fingerprint",
+    )
+    if batch.role_bucket_count <= 1:
+        return
+    for relation_name in _provider_directory_profile_bucket_relations(
+        batch.fact_type
+    ):
+        await _assert_provider_directory_profile_bucket_index(
+            build.schema,
+            relation_name,
+            lock_relation=True,
+        )
+
+
+def _profile_evidence_batch_params(
+    build: _ProviderDirectoryProfileBuild,
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+) -> dict[str, Any]:
+    """Return exact SQL parameters for one immutable fact coordinate."""
+    params_by_name = {
+        "source_ids": [batch.source_id],
+        "dataset_ids": [batch.dataset_id],
+        "profile_as_of": build.profile_as_of,
+    }
+    if batch.role_bucket_count > 1:
+        params_by_name.update(
+            {
+                "profile_role_bucket_count": batch.role_bucket_count,
+                "profile_role_bucket": batch.role_bucket,
+            }
+        )
+    return params_by_name
+
+
+async def _resolve_evidence_batch_projection(
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+    evidence_sql_refs_by_name: Mapping[str, str],
+    params_by_name: Mapping[str, Any],
+    projection: _ProviderDirectoryProfileEvidenceProjection | None,
+) -> _ProviderDirectoryProfileEvidenceProjection | None:
+    """Use a supplied projection or compute one under capacity admission."""
+    if projection is not None:
+        return projection
+    if _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get() is None:
+        return None
+    return await _project_profile_evidence_batch(
+        batch,
+        evidence_sql_refs_by_name,
+        params_by_name,
+    )
+
+
+async def _execute_profile_evidence_batch_statement(
+    build: _ProviderDirectoryProfileBuild,
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+    copy_evidence_sql: Any,
+    evidence_sql_refs_by_name: Mapping[str, str],
+    projection: _ProviderDirectoryProfileEvidenceProjection | None,
 ) -> int:
     """Execute one bounded evidence batch and return its affected rows."""
+    await _assert_evidence_batch_storage(build, batch)
     if batch.kind == "copy":
         return _coerce_rowcount(
             await db.status(
@@ -16106,19 +29583,14 @@ async def _execute_profile_evidence_batch(
         raise RuntimeError(
             "provider_directory_profile_evidence_batch_invalid"
         )
-    insert_params_by_name = {
-        "source_ids": [batch.source_id],
-        "dataset_ids": [batch.dataset_id],
-        "profile_as_of": build.profile_as_of,
-    }
-    if batch.role_bucket_count > 1:
-        insert_params_by_name.update(
-            {
-                "profile_role_bucket_count": batch.role_bucket_count,
-                "profile_role_bucket": batch.role_bucket,
-            }
-        )
-    return _coerce_rowcount(
+    insert_params_by_name = _profile_evidence_batch_params(build, batch)
+    resolved_projection = await _resolve_evidence_batch_projection(
+        batch,
+        evidence_sql_refs_by_name,
+        insert_params_by_name,
+        projection,
+    )
+    inserted_rows = _coerce_rowcount(
         await db.status(
             profile_artifact.profile_evidence_insert_sql(
                 **evidence_sql_refs_by_name,
@@ -16129,6 +29601,67 @@ async def _execute_profile_evidence_batch(
             **insert_params_by_name,
         )
     )
+    if (
+        resolved_projection is not None
+        and inserted_rows > resolved_projection.projected_rows
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_evidence_projection_exceeded"
+        )
+    return inserted_rows
+
+
+async def _project_profile_evidence_batch(
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+    evidence_sql_refs_by_name: Mapping[str, str],
+    insert_params_by_name: Mapping[str, Any],
+) -> _ProviderDirectoryProfileEvidenceProjection:
+    """Count the exact normalized rows and bytes before one fact insert."""
+
+    projection_row = await db.first(
+        profile_artifact.profile_evidence_count_sql(
+            **evidence_sql_refs_by_name,
+            fact_type=batch.fact_type,
+            role_bucket_count=batch.role_bucket_count,
+            role_bucket=batch.role_bucket,
+        ),
+        **insert_params_by_name,
+    )
+    if projection_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_evidence_projection_missing"
+        )
+    projection_map = _pagination_checkpoint_row_mapping(projection_row)
+    try:
+        projected_rows = int(projection_map["projected_rows"])
+        projected_logical_bytes = int(
+            projection_map["projected_logical_bytes"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "provider_directory_profile_evidence_projection_invalid"
+        ) from exc
+    if projected_rows < 0 or projected_logical_bytes < 0:
+        raise RuntimeError(
+            "provider_directory_profile_evidence_projection_invalid"
+        )
+    return _ProviderDirectoryProfileEvidenceProjection(
+        projected_rows=projected_rows,
+        projected_logical_bytes=projected_logical_bytes,
+    )
+
+
+async def _project_profile_evidence_batch_with_capacity(
+    batch: _ProviderDirectoryProfileEvidenceBatch,
+    evidence_sql_refs_by_name: Mapping[str, str],
+    insert_params_by_name: Mapping[str, Any],
+) -> _ProviderDirectoryProfileEvidenceProjection:
+    async with _provider_directory_profile_capacity_transaction():
+        return await _project_profile_evidence_batch(
+            batch,
+            evidence_sql_refs_by_name,
+            insert_params_by_name,
+        )
 
 
 async def _prepare_profile_evidence_bucket_indexes(
@@ -16195,16 +29728,344 @@ async def _advance_profile_evidence_batch_progress(
     )
 
 
-async def _execute_bounded_profile_evidence_plan(
-    build: _ProviderDirectoryProfileBuild,
-    batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...],
+def _provider_directory_profile_window_end(
+    batches: tuple[
+        _ProviderDirectoryProfileEvidenceBatch
+        | _ProviderDirectoryProfileCompactBatch,
+        ...,
+    ],
+    start_batch: int,
+    window_size: int,
+) -> int:
+    """Return one copy-safe half-open execution window."""
+
+    if start_batch >= len(batches):
+        return start_batch
+    if batches[start_batch].kind == "copy":
+        return start_batch + 1
+    return min(start_batch + window_size, len(batches))
+
+
+def _provider_directory_profile_frozen_wave_end(
+    waves: tuple[tuple[int, int], ...],
     *,
     start_batch: int,
+    total_batches: int,
+) -> int:
+    """Return the immutable wave boundary containing a resume cursor."""
+
+    for wave_start, wave_end in waves:
+        if (
+            0 <= wave_start < wave_end <= total_batches
+            and wave_start <= start_batch < wave_end
+        ):
+            return wave_end
+    if start_batch == total_batches:
+        return start_batch
+    raise RuntimeError(
+        "provider_directory_profile_checkpoint_wave_invalid"
+    )
+
+
+async def _gather_provider_directory_profile_tasks(
+    tasks: list[asyncio.Task[Any]],
+) -> list[Any]:
+    """Gather one bounded window and cancel siblings on first failure."""
+
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def _evidence_window_projections(
+    build: _ProviderDirectoryProfileBuild,
+    window_coordinates: list[
+        tuple[int, _ProviderDirectoryProfileEvidenceBatch]
+    ],
+    evidence_sql_refs_by_name: Mapping[str, str],
+) -> dict[int, _ProviderDirectoryProfileEvidenceProjection]:
+    """Project every fact coordinate in one frozen evidence wave."""
+    projections = await _gather_provider_directory_profile_tasks(
+        [
+            asyncio.create_task(
+                _project_profile_evidence_batch_with_capacity(
+                    batch,
+                    evidence_sql_refs_by_name,
+                    {
+                        "source_ids": [batch.source_id],
+                        "dataset_ids": [batch.dataset_id],
+                        "profile_as_of": build.profile_as_of,
+                        **(
+                            {
+                                "profile_role_bucket_count": (
+                                    batch.role_bucket_count
+                                ),
+                                "profile_role_bucket": batch.role_bucket,
+                            }
+                            if batch.role_bucket_count > 1
+                            else {}
+                        ),
+                    },
+                )
+            )
+            for _, batch in window_coordinates
+        ]
+    )
+    return {
+        batch_number: projection
+        for (batch_number, _batch), projection in zip(
+            window_coordinates,
+            projections,
+            strict=True,
+        )
+    }
+
+
+def _profile_projection_totals(
+    projections_by_batch: Mapping[
+        int,
+        _ProviderDirectoryProfileEvidenceProjection,
+    ],
+) -> tuple[int, int]:
+    """Return total rows and logical bytes across one frozen wave."""
+    return (
+        sum(projection.projected_rows for projection in projections_by_batch.values()),
+        sum(
+            projection.projected_logical_bytes
+            for projection in projections_by_batch.values()
+        ),
+    )
+
+
+async def _preflight_profile_evidence_window_capacity(
+    build: _ProviderDirectoryProfileBuild,
+    window_coordinates: list[
+        tuple[int, _ProviderDirectoryProfileEvidenceBatch]
+    ],
+    evidence_sql_refs_by_name: Mapping[str, str],
+) -> dict[int, _ProviderDirectoryProfileEvidenceProjection]:
+    """Project and reserve capacity for one immutable evidence wave."""
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return {}
+    if any(batch.kind != "fact" for _, batch in window_coordinates):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_copy_batch_unsupported"
+        )
+    projection_by_batch = await _evidence_window_projections(
+        build,
+        window_coordinates,
+        evidence_sql_refs_by_name,
+    )
+    evidence_stage_ref = _provider_directory_profile_build_ref(
+        build,
+        build.evidence_stage,
+    )
+    existing_rows = int(
+        await db.scalar(f"SELECT count(*) FROM {evidence_stage_ref};")
+        or 0
+    )
+    projected_rows, projected_logical_bytes = _profile_projection_totals(
+        projection_by_batch
+    )
+    if (
+        existing_rows + projected_rows
+        > admission.geometry.max_evidence_rows
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_evidence_rows_projected"
+        )
+    evidence_stage_oid = (
+        await _require_provider_directory_profile_stage_oid(
+            build.schema,
+            build.evidence_stage,
+        )
+    )
+    await _project_provider_directory_profile_scratch_window(
+        "evidence_stage",
+        evidence_stage_ref,
+        evidence_stage_oid,
+        inserted_rows=projected_rows,
+        inserted_logical_bytes=projected_logical_bytes,
+        expected_persistence="p",
+    )
+    await _reserve_provider_directory_profile_wal_budget(
+        admission,
+        control_operation_counts={
+            "evidence_payload": len(window_coordinates),
+        },
+    )
+    return projection_by_batch
+
+
+def _profile_evidence_window_end(
+    build: _ProviderDirectoryProfileBuild,
+    batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...],
+    batch_number: int,
+) -> int:
+    """Return the frozen or configured end of one evidence wave."""
+    frozen_waves = (
+        build.batch_plan.evidence_waves
+        if build.batch_plan is not None
+        else ()
+    )
+    if frozen_waves:
+        return (
+            _provider_directory_profile_frozen_wave_end(
+                frozen_waves,
+                start_batch=batch_number,
+                total_batches=len(batches),
+            )
+        )
+    return _provider_directory_profile_window_end(
+        batches,
+        batch_number,
+        _provider_directory_profile_evidence_window_size(),
+    )
+
+
+async def _start_profile_evidence_window(
+    build: _ProviderDirectoryProfileBuild,
+    batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...],
+    batch_number: int,
+    window_end: int,
+    prepared_relations: set[str],
+) -> tuple[
+    list[tuple[int, _ProviderDirectoryProfileEvidenceBatch]],
+    dict[int, float],
+]:
+    """Log and prepare every coordinate in one evidence wave."""
+    window_coordinates = list(
+        enumerate(batches[batch_number:window_end], batch_number)
+    )
+    started_at_by_batch: dict[int, float] = {}
+    for window_batch_number, batch in window_coordinates:
+        started_at_by_batch[window_batch_number] = time.monotonic()
+        _log_profile_evidence_batch_started(
+            batch,
+            window_batch_number,
+            len(batches),
+        )
+        await _prepare_profile_evidence_bucket_indexes(
+            build,
+            batch,
+            prepared_relations,
+        )
+    return window_coordinates, started_at_by_batch
+
+
+async def _validate_profile_evidence_artifact_scope(
+    build: _ProviderDirectoryProfileBuild,
+    prepared_relations: set[str],
+) -> None:
+    """Recheck admitted artifact scratch after bucket-index preparation."""
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is not None and prepared_relations:
+        await _assert_provider_directory_profile_capacity_scratch(
+            "artifact_scope",
+            (
+                _unscoped_qt(build.schema, relation_name)
+                for relation_name in (
+                    _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES
+                    .get()
+                    .values()
+                )
+            )
+        )
+
+
+async def _finish_profile_evidence_window(
+    build: _ProviderDirectoryProfileBuild,
+    batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...],
+    window_coordinates: list[
+        tuple[int, _ProviderDirectoryProfileEvidenceBatch]
+    ],
+    affected_rows_by_batch: list[Any],
+    started_at_by_batch: Mapping[int, float],
+    *,
     checkpointed: bool,
+    start_batch: int,
+) -> None:
+    """Advance, log, and capacity-check one completed evidence wave."""
+    for (window_batch_number, batch), affected_rows in zip(
+        window_coordinates,
+        affected_rows_by_batch,
+        strict=True,
+    ):
+        if checkpointed:
+            await _advance_profile_evidence_batch_progress(
+                build,
+                batch,
+                batch_number=window_batch_number,
+                total_batches=len(batches),
+                start_batch=start_batch,
+            )
+        LOGGER.info(
+            "Completed Provider Directory Profile evidence batch "
+            "%d/%d rows=%d elapsed_seconds=%.3f",
+            window_batch_number + 1,
+            len(batches),
+            affected_rows,
+            time.monotonic() - started_at_by_batch[window_batch_number],
+        )
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is not None:
+        evidence_stage_ref = _provider_directory_profile_build_ref(
+            build,
+            build.evidence_stage,
+        )
+        evidence_rows = int(
+            await db.scalar(f"SELECT count(*) FROM {evidence_stage_ref};")
+            or 0
+        )
+        await _assert_provider_directory_profile_capacity_scratch(
+            "evidence_stage",
+            (evidence_stage_ref,),
+            observed_rows=evidence_rows,
+            maximum_rows=admission.geometry.max_evidence_rows,
+        )
+
+
+async def _run_profile_evidence_window(
+    build: _ProviderDirectoryProfileBuild,
+    window_coordinates: list[
+        tuple[int, _ProviderDirectoryProfileEvidenceBatch]
+    ],
     copy_evidence_sql: Any,
     evidence_sql_refs_by_name: Mapping[str, str],
+    projection_by_batch: Mapping[
+        int,
+        _ProviderDirectoryProfileEvidenceProjection,
+    ],
+) -> list[Any]:
+    """Execute all fact coordinates in one admitted evidence wave."""
+    return await _gather_provider_directory_profile_tasks(
+        [
+            asyncio.create_task(
+                _execute_profile_evidence_batch(
+                    build,
+                    batch,
+                    copy_evidence_sql,
+                    evidence_sql_refs_by_name,
+                    projection_by_batch.get(window_batch_number),
+                )
+            )
+            for window_batch_number, batch in window_coordinates
+        ]
+    )
+
+
+async def _initialize_profile_evidence_plan(
+    build: _ProviderDirectoryProfileBuild,
+    batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...],
+    start_batch: int,
+    checkpointed: bool,
 ) -> None:
-    """Execute one bounded evidence plan from its durable checkpoint."""
+    """Validate and publish the starting evidence checkpoint coordinate."""
     if start_batch < 0 or start_batch > len(batches):
         raise RuntimeError(
             "provider_directory_profile_evidence_checkpoint_invalid"
@@ -16217,41 +30078,67 @@ async def _execute_bounded_profile_evidence_plan(
             total_batches=len(batches),
             resumed_from_batch=start_batch,
         )
+
+
+async def _execute_bounded_profile_evidence_plan(
+    build: _ProviderDirectoryProfileBuild,
+    batches: tuple[_ProviderDirectoryProfileEvidenceBatch, ...],
+    *,
+    start_batch: int,
+    checkpointed: bool,
+    copy_evidence_sql: Any,
+    evidence_sql_refs_by_name: Mapping[str, str],
+) -> None:
+    """Execute one bounded evidence plan from its durable checkpoint."""
+    await _initialize_profile_evidence_plan(
+        build,
+        batches,
+        start_batch,
+        checkpointed,
+    )
     prepared_relations: set[str] = set()
-    for batch_number, batch in enumerate(batches[start_batch:], start_batch):
-        batch_started_at = time.monotonic()
-        _log_profile_evidence_batch_started(
-            batch,
-            batch_number,
-            len(batches),
-        )
-        await _prepare_profile_evidence_bucket_indexes(
+    batch_number = start_batch
+    while batch_number < len(batches):
+        window_end = _profile_evidence_window_end(
             build,
-            batch,
+            batches,
+            batch_number,
+        )
+        window_coordinates, started_at_by_batch = (
+            await _start_profile_evidence_window(
+                build,
+                batches,
+                batch_number,
+                window_end,
+                prepared_relations,
+            )
+        )
+        await _validate_profile_evidence_artifact_scope(
+            build,
             prepared_relations,
         )
-        affected_rows = await _execute_profile_evidence_batch(
+        projection_by_batch = await _preflight_profile_evidence_window_capacity(
             build,
-            batch,
-            copy_evidence_sql,
+            window_coordinates,
             evidence_sql_refs_by_name,
         )
-        if checkpointed:
-            await _advance_profile_evidence_batch_progress(
-                build,
-                batch,
-                batch_number=batch_number,
-                total_batches=len(batches),
-                start_batch=start_batch,
-            )
-        LOGGER.info(
-            "Completed Provider Directory Profile evidence batch "
-            "%d/%d rows=%d elapsed_seconds=%.3f",
-            batch_number + 1,
-            len(batches),
-            affected_rows,
-            time.monotonic() - batch_started_at,
+        affected_rows_by_batch = await _run_profile_evidence_window(
+            build,
+            window_coordinates,
+            copy_evidence_sql,
+            evidence_sql_refs_by_name,
+            projection_by_batch,
         )
+        await _finish_profile_evidence_window(
+            build,
+            batches,
+            window_coordinates,
+            affected_rows_by_batch,
+            started_at_by_batch,
+            checkpointed=checkpointed,
+            start_batch=start_batch,
+        )
+        batch_number = window_end
 
 
 async def _populate_provider_directory_profile_evidence_stage(
@@ -16347,28 +30234,662 @@ async def _populate_provider_directory_profile_evidence_stage(
             copy_evidence_sql=copy_evidence_sql,
             evidence_sql_refs_by_name=evidence_sql_refs_by_name,
         )
-    index_started_at = time.monotonic()
-    LOGGER.info(
-        "Starting Provider Directory Profile evidence indexes stage=%s",
-        build.evidence_stage,
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if capacity_admission is not None:
+        await _reserve_provider_directory_profile_wal_budget(
+            capacity_admission,
+            control_operation_counts={"evidence_stage_analyze": 1},
+        )
+    await _provider_directory_profile_capacity_status(
+        f"ANALYZE {evidence_stage_ref};"
     )
-    await _create_provider_directory_profile_indexes(
-        build.schema,
-        build.evidence_stage,
-        evidence=True,
-    )
-    await db.status(f"ANALYZE {evidence_stage_ref};")
-    LOGGER.info(
-        "Completed Provider Directory Profile evidence indexes stage=%s "
-        "elapsed_seconds=%.3f",
-        build.evidence_stage,
-        time.monotonic() - index_started_at,
-    )
+    if capacity_admission is not None:
+        evidence_rows = int(
+            await db.scalar(
+                f"SELECT count(*) FROM {evidence_stage_ref};"
+            )
+            or 0
+        )
+        await _assert_provider_directory_profile_capacity_scratch(
+            "evidence_stage",
+            (evidence_stage_ref,),
+            observed_rows=evidence_rows,
+            maximum_rows=capacity_admission.geometry.max_evidence_rows,
+        )
     if checkpointed:
         await _mark_profile_build_checkpoint_state(
             build,
             "evidence_complete",
         )
+
+
+def _affected_npi_projection_values(
+    projection_row: Any,
+) -> tuple[int, int]:
+    """Decode one affected-NPI projection row and enforce eight-byte NPIs."""
+    if projection_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_affected_projection_missing"
+        )
+    projection_map = _pagination_checkpoint_row_mapping(projection_row)
+    try:
+        projected_rows = int(projection_map["projected_rows"])
+        projected_logical_bytes = int(
+            projection_map["projected_logical_bytes"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "provider_directory_profile_affected_projection_invalid"
+        ) from exc
+    if projected_rows < 0 or projected_logical_bytes != projected_rows * 8:
+        raise RuntimeError(
+            "provider_directory_profile_affected_projection_invalid"
+        )
+    return projected_rows, projected_logical_bytes
+
+
+async def _admit_affected_npi_projection(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    build: _ProviderDirectoryProfileBuild,
+    affected_stage: str,
+    affected_ref: str,
+    projected_rows: int,
+    projected_logical_bytes: int,
+) -> None:
+    """Reserve scratch and WAL for one exact affected-NPI projection."""
+    existing_rows = int(
+        await db.scalar(f"SELECT count(*) FROM {affected_ref};") or 0
+    )
+    maximum_rows = min(
+        admission.geometry.max_affected_npis,
+        admission.geometry.max_profile_rows,
+    )
+    if existing_rows + projected_rows > maximum_rows:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_affected_rows_projected"
+        )
+    affected_stage_oid = await _require_provider_directory_profile_stage_oid(
+        build.schema,
+        affected_stage,
+    )
+    await _project_provider_directory_profile_scratch_window(
+        "affected_npi_stage",
+        affected_ref,
+        affected_stage_oid,
+        inserted_rows=projected_rows,
+        inserted_logical_bytes=projected_logical_bytes,
+        expected_persistence="p",
+    )
+    await _reserve_provider_directory_profile_wal_budget(
+        admission,
+        control_operation_counts={"affected_npi_payload": 1},
+    )
+
+
+async def _execute_affected_npi_insert(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    projection_sql: str,
+    insert_sql: str,
+    params: Mapping[str, Any],
+) -> int:
+    """Pre-admit one exact affected-NPI write under the signed geometry."""
+
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return _coerce_rowcount(
+            await db.status(insert_sql, **dict(params))
+        )
+    affected_stage = build.affected_npi_stage
+    if affected_stage is None:
+        raise RuntimeError(
+            "provider_directory_profile_affected_stage_missing"
+        )
+    affected_ref = _provider_directory_profile_build_ref(
+        build,
+        affected_stage,
+    )
+    async with _provider_directory_profile_capacity_transaction():
+        await _assert_provider_directory_profile_stage_storage_identity(
+            build,
+            stage_table=affected_stage,
+            oid_field="affected_npi_stage_oid",
+            fingerprint_field=(
+                "affected_npi_stage_storage_fingerprint"
+            ),
+        )
+        projection_row = await db.first(
+            projection_sql,
+            **dict(params),
+        )
+        projected_rows, projected_logical_bytes = (
+            _affected_npi_projection_values(
+                projection_row
+            )
+        )
+        await _admit_affected_npi_projection(
+            admission,
+            build,
+            affected_stage,
+            affected_ref,
+            projected_rows,
+            projected_logical_bytes,
+        )
+        inserted_rows = _coerce_rowcount(
+            await db.status(insert_sql, **dict(params))
+        )
+        if inserted_rows > projected_rows:
+            raise RuntimeError(
+                "provider_directory_profile_affected_projection_exceeded"
+            )
+        return inserted_rows
+
+
+async def _populate_affected_npi_sources(
+    build: _ProviderDirectoryProfileBuild,
+    affected_ref: str,
+    evidence_target_ref: str,
+) -> int:
+    """Populate affected NPIs from refreshed and removed source evidence."""
+    insert_sql = profile_artifact.affected_npi_source_insert_sql(
+        evidence_ref=evidence_target_ref,
+        affected_npi_ref=affected_ref,
+    )
+    count_sql = profile_artifact.affected_npi_source_count_sql(
+        evidence_ref=evidence_target_ref,
+        affected_npi_ref=affected_ref,
+    )
+    inserted_count = 0
+    for source_id in sorted(
+        set(build.source_ids) | set(build.removed_source_ids)
+    ):
+        inserted_count += (
+            await _execute_provider_directory_profile_affected_npi_insert(
+                build,
+                projection_sql=count_sql,
+                insert_sql=insert_sql,
+                params={"source_id": source_id},
+            )
+        )
+    return inserted_count
+
+
+async def _populate_affected_npi_delta(
+    build: _ProviderDirectoryProfileBuild,
+    affected_ref: str,
+    evidence_stage_ref: str,
+) -> int:
+    """Populate affected NPIs introduced by the staged evidence delta."""
+    return await _execute_provider_directory_profile_affected_npi_insert(
+        build,
+        projection_sql=profile_artifact.affected_npi_delta_count_sql(
+            evidence_stage_ref=evidence_stage_ref,
+            affected_npi_ref=affected_ref,
+        ),
+        insert_sql=profile_artifact.affected_npi_delta_insert_sql(
+            evidence_stage_ref=evidence_stage_ref,
+            affected_npi_ref=affected_ref,
+        ),
+        params={},
+    )
+
+
+async def _analyze_affected_npi_stage(
+    build: _ProviderDirectoryProfileBuild,
+    affected_ref: str,
+) -> None:
+    """Analyze and reverify the admitted affected-NPI relation."""
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if capacity_admission is not None:
+        await _reserve_provider_directory_profile_wal_budget(
+            capacity_admission,
+            control_operation_counts={"affected_npi_analyze": 1},
+        )
+    await _provider_directory_profile_capacity_status(
+        f"ANALYZE {affected_ref};"
+    )
+    if capacity_admission is None:
+        return
+    affected_rows = int(
+        await db.scalar(f"SELECT count(*) FROM {affected_ref};") or 0
+    )
+    await _assert_provider_directory_profile_capacity_scratch(
+        "affected_npi_stage",
+        (affected_ref,),
+        observed_rows=affected_rows,
+        maximum_rows=min(
+            capacity_admission.geometry.max_affected_npis,
+            capacity_admission.geometry.max_profile_rows,
+        ),
+    )
+
+
+async def _populate_affected_npi_stage(
+    build: _ProviderDirectoryProfileBuild,
+) -> int:
+    """Materialize the exact NPI set touched by one source delta."""
+
+    if (
+        build.materialization_mode != "source_delta"
+        or build.affected_npi_stage is None
+    ):
+        return 0
+    affected_ref = _provider_directory_profile_build_ref(
+        build,
+        build.affected_npi_stage,
+    )
+    evidence_target_ref = _provider_directory_profile_build_ref(
+        build,
+        profile_artifact.PROFILE_EVIDENCE_TABLE,
+    )
+    evidence_stage_ref = _provider_directory_profile_build_ref(
+        build,
+        build.evidence_stage,
+    )
+    inserted_count = await _populate_affected_npi_sources(
+        build,
+        affected_ref,
+        evidence_target_ref,
+    )
+    inserted_count += await _populate_affected_npi_delta(
+        build,
+        affected_ref,
+        evidence_stage_ref,
+    )
+    await _analyze_affected_npi_stage(build, affected_ref)
+    return inserted_count
+
+
+async def _project_provider_directory_profile_compact_batch(
+    build: _ProviderDirectoryProfileBuild,
+    batch: _ProviderDirectoryProfileCompactBatch,
+    *,
+    profile_count_sql: Callable[..., str],
+    profile_sql_args_by_name: Mapping[str, Any],
+    profile_params_by_name: Mapping[str, Any],
+) -> _ProviderDirectoryProfileEvidenceProjection:
+    """Read the exact row and logical-byte output for one compact batch."""
+
+    if (
+        batch.kind != "npi"
+        or batch.npi_start is None
+        or batch.npi_end is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_copy_batch_unsupported"
+        )
+    async with _provider_directory_profile_capacity_transaction():
+        projection_row = await db.first(
+            profile_count_sql(
+                **profile_sql_args_by_name,
+                npi_start=batch.npi_start,
+                npi_end=batch.npi_end,
+            ),
+            **profile_params_by_name,
+            profile_npi_start=batch.npi_start,
+            profile_npi_end=batch.npi_end,
+        )
+    if projection_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_compact_projection_missing"
+        )
+    projection_map = _pagination_checkpoint_row_mapping(projection_row)
+    try:
+        projected_rows = int(projection_map["projected_rows"])
+        projected_logical_bytes = int(
+            projection_map["projected_logical_bytes"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "provider_directory_profile_compact_projection_invalid"
+        ) from exc
+    if projected_rows < 0 or projected_logical_bytes < 0:
+        raise RuntimeError(
+            "provider_directory_profile_compact_projection_invalid"
+        )
+    return _ProviderDirectoryProfileEvidenceProjection(
+        projected_rows=projected_rows,
+        projected_logical_bytes=projected_logical_bytes,
+    )
+
+
+async def _compact_window_projections(
+    build: _ProviderDirectoryProfileBuild,
+    window_coordinates: list[
+        tuple[int, _ProviderDirectoryProfileCompactBatch]
+    ],
+    *,
+    profile_count_sql: Callable[..., str],
+    profile_sql_args_by_name: Mapping[str, Any],
+    profile_params_by_name: Mapping[str, Any],
+) -> dict[int, _ProviderDirectoryProfileEvidenceProjection]:
+    """Project every compact coordinate in one frozen worker wave."""
+    projections = await _gather_provider_directory_profile_tasks(
+        [
+            asyncio.create_task(
+                _project_provider_directory_profile_compact_batch(
+                    build,
+                    batch,
+                    profile_count_sql=profile_count_sql,
+                    profile_sql_args_by_name=profile_sql_args_by_name,
+                    profile_params_by_name=profile_params_by_name,
+                )
+            )
+            for _, batch in window_coordinates
+        ]
+    )
+    return {
+        batch_number: projection
+        for (batch_number, _batch), projection in zip(
+            window_coordinates,
+            projections,
+            strict=True,
+        )
+    }
+
+
+async def _preflight_profile_compact_window_capacity(
+    build: _ProviderDirectoryProfileBuild,
+    window_coordinates: list[
+        tuple[int, _ProviderDirectoryProfileCompactBatch]
+    ],
+    *,
+    profile_count_sql: Callable[..., str],
+    profile_sql_args_by_name: Mapping[str, Any],
+    profile_params_by_name: Mapping[str, Any],
+) -> dict[int, _ProviderDirectoryProfileEvidenceProjection]:
+    """Admit one compact wave before either worker can write."""
+    admission = _provider_directory_profile_capacity_admission()
+    if admission is None:
+        return {}
+    projection_by_batch = await _compact_window_projections(
+        build,
+        window_coordinates,
+        profile_count_sql=profile_count_sql,
+        profile_sql_args_by_name=profile_sql_args_by_name,
+        profile_params_by_name=profile_params_by_name,
+    )
+    profile_stage_ref = _provider_directory_profile_build_ref(
+        build,
+        build.profile_stage,
+    )
+    existing_rows = int(
+        await db.scalar(f"SELECT count(*) FROM {profile_stage_ref};")
+        or 0
+    )
+    projected_rows, projected_logical_bytes = _profile_projection_totals(
+        projection_by_batch
+    )
+    if (
+        existing_rows + projected_rows
+        > admission.geometry.max_profile_rows
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_capacity_profile_rows_projected"
+        )
+    profile_stage_oid = (
+        await _require_provider_directory_profile_stage_oid(
+            build.schema,
+            build.profile_stage,
+        )
+    )
+    await _project_provider_directory_profile_scratch_window(
+        "profile_stage",
+        profile_stage_ref,
+        profile_stage_oid,
+        inserted_rows=projected_rows,
+        inserted_logical_bytes=projected_logical_bytes,
+        expected_persistence="p",
+    )
+    await _reserve_provider_directory_profile_wal_budget(
+        admission,
+        control_operation_counts={
+            "profile_payload": len(window_coordinates),
+        },
+    )
+    return projection_by_batch
+
+
+async def _execute_provider_directory_profile_compact_batch(
+    build: _ProviderDirectoryProfileBuild,
+    batch: _ProviderDirectoryProfileCompactBatch,
+    *,
+    copy_profiles_sql: str,
+    profile_insert_sql: Callable[..., str],
+    profile_sql_args_by_name: Mapping[str, Any],
+    profile_params_by_name: Mapping[str, Any],
+    projection: _ProviderDirectoryProfileEvidenceProjection | None = None,
+) -> int:
+    """Execute one compact batch under finite session limits."""
+
+    if _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get() is None:
+        affected_rows = (
+            await _execute_provider_directory_profile_compact_statement(
+                build,
+                batch,
+                copy_profiles_sql=copy_profiles_sql,
+                profile_insert_sql=profile_insert_sql,
+                profile_sql_args_by_name=profile_sql_args_by_name,
+                profile_params_by_name=profile_params_by_name,
+            )
+        )
+    else:
+        async with _provider_directory_profile_capacity_transaction():
+            await _assert_provider_directory_profile_stage_storage_identity(
+                build,
+                stage_table=build.profile_stage,
+                oid_field="profile_stage_oid",
+                fingerprint_field=(
+                    "profile_stage_storage_fingerprint"
+                ),
+            )
+            affected_rows = (
+                await _execute_provider_directory_profile_compact_statement(
+                    build,
+                    batch,
+                    copy_profiles_sql=copy_profiles_sql,
+                    profile_insert_sql=profile_insert_sql,
+                    profile_sql_args_by_name=profile_sql_args_by_name,
+                    profile_params_by_name=profile_params_by_name,
+                )
+            )
+    if (
+        projection is not None
+        and affected_rows > projection.projected_rows
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_compact_projection_exceeded"
+        )
+    return affected_rows
+
+
+async def _execute_provider_directory_profile_compact_statement(
+    build: _ProviderDirectoryProfileBuild,
+    batch: _ProviderDirectoryProfileCompactBatch,
+    *,
+    copy_profiles_sql: str,
+    profile_insert_sql: Callable[..., str],
+    profile_sql_args_by_name: Mapping[str, Any],
+    profile_params_by_name: Mapping[str, Any],
+) -> int:
+    """Execute one immutable compact-plan coordinate."""
+
+    if batch.kind == "copy":
+        return _coerce_rowcount(
+            await db.status(
+                copy_profiles_sql,
+                source_ids=list(build.source_ids),
+                retained_source_ids=list(build.retained_source_ids),
+                profile_as_of=build.profile_as_of,
+            )
+        )
+    if (
+        batch.kind != "npi"
+        or batch.npi_start is None
+        or batch.npi_end is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_compact_batch_invalid"
+        )
+    return _coerce_rowcount(
+        await db.status(
+            profile_insert_sql(
+                **profile_sql_args_by_name,
+                npi_start=batch.npi_start,
+                npi_end=batch.npi_end,
+            ),
+            **profile_params_by_name,
+            profile_npi_start=batch.npi_start,
+            profile_npi_end=batch.npi_end,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _ProfileCompactStageContext:
+    evidence_stage_ref: str
+    profile_stage_ref: str
+    evidence_target_ref: str
+    affected_npi_ref: str | None
+    is_source_delta: bool
+    should_copy_unaffected_profiles: bool
+    copy_profiles_sql: str
+    profile_sql_args_by_name: dict[str, Any]
+    profile_insert_sql: Any
+    profile_count_sql: Any
+    profile_params_by_name: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ProfileCompactStageRefs:
+    evidence_stage_ref: str
+    profile_stage_ref: str
+    evidence_target_ref: str
+    affected_npi_ref: str | None
+    is_source_delta: bool
+
+
+def _profile_compact_stage_refs(
+    build: _ProviderDirectoryProfileBuild,
+) -> _ProfileCompactStageRefs:
+    """Resolve exact target, scratch, and affected-NPI references."""
+    evidence_stage_ref = _provider_directory_profile_build_ref(
+        build, build.evidence_stage
+    )
+    profile_stage_ref = _provider_directory_profile_build_ref(
+        build,
+        build.profile_stage,
+    )
+    evidence_target_ref = _provider_directory_profile_build_ref(
+        build,
+        profile_artifact.PROFILE_EVIDENCE_TABLE,
+    )
+    is_source_delta = build.materialization_mode == "source_delta"
+    if is_source_delta and build.affected_npi_stage is None:
+        raise RuntimeError(
+            "provider_directory_profile_affected_stage_missing"
+        )
+    affected_npi_ref = (
+        _provider_directory_profile_build_ref(
+            build,
+            build.affected_npi_stage,
+        )
+        if build.affected_npi_stage is not None
+        else None
+    )
+    return _ProfileCompactStageRefs(
+        evidence_stage_ref=evidence_stage_ref,
+        profile_stage_ref=profile_stage_ref,
+        evidence_target_ref=evidence_target_ref,
+        affected_npi_ref=affected_npi_ref,
+        is_source_delta=is_source_delta,
+    )
+
+
+def _profile_compact_sql_args(
+    refs: _ProfileCompactStageRefs,
+    *,
+    has_existing_artifacts: bool,
+    should_rebuild_all_profiles: bool,
+) -> dict[str, Any]:
+    """Return exact delta or full-swap compact SQL references."""
+    if refs.is_source_delta:
+        return {
+            "current_evidence_ref": refs.evidence_target_ref,
+            "delta_evidence_ref": refs.evidence_stage_ref,
+            "affected_npi_ref": refs.affected_npi_ref,
+            "target_ref": refs.profile_stage_ref,
+        }
+    return {
+        "evidence_ref": refs.evidence_stage_ref,
+        "target_ref": refs.profile_stage_ref,
+        "old_evidence_ref": (
+            refs.evidence_target_ref if has_existing_artifacts else None
+        ),
+        "rebuild_all": should_rebuild_all_profiles,
+    }
+
+
+def _profile_compact_stage_context(
+    build: _ProviderDirectoryProfileBuild,
+    *,
+    has_existing_artifacts: bool,
+) -> _ProfileCompactStageContext:
+    """Resolve immutable SQL references and parameters for compacting."""
+    refs = _profile_compact_stage_refs(build)
+    should_rebuild_all_profiles = (
+        not has_existing_artifacts and not refs.is_source_delta
+    )
+    should_copy_unaffected_profiles = (
+        not refs.is_source_delta
+        and
+        _is_profile_copy_batch_required(
+            source_ids=build.source_ids,
+            retained_source_ids=build.retained_source_ids,
+            has_existing_artifacts=has_existing_artifacts,
+        )
+    )
+    return _ProfileCompactStageContext(
+        evidence_stage_ref=refs.evidence_stage_ref,
+        profile_stage_ref=refs.profile_stage_ref,
+        evidence_target_ref=refs.evidence_target_ref,
+        affected_npi_ref=refs.affected_npi_ref,
+        is_source_delta=refs.is_source_delta,
+        should_copy_unaffected_profiles=should_copy_unaffected_profiles,
+        copy_profiles_sql=profile_artifact.copy_unaffected_profiles_sql(
+            profile_source_ref=_provider_directory_profile_build_ref(
+                build,
+                profile_artifact.PROFILE_TABLE,
+            ),
+            evidence_source_ref=refs.evidence_target_ref,
+            evidence_stage_ref=refs.evidence_stage_ref,
+            profile_stage_ref=refs.profile_stage_ref,
+        ),
+        profile_sql_args_by_name=_profile_compact_sql_args(
+            refs,
+            has_existing_artifacts=has_existing_artifacts,
+            should_rebuild_all_profiles=should_rebuild_all_profiles,
+        ),
+        profile_insert_sql=(
+            profile_artifact.profile_delta_insert_sql
+            if refs.is_source_delta
+            else profile_artifact.profile_insert_sql
+        ),
+        profile_count_sql=(
+            profile_artifact.profile_delta_count_sql
+            if refs.is_source_delta
+            else profile_artifact.profile_count_sql
+        ),
+        profile_params_by_name={
+            "source_ids": list(build.source_ids),
+            "retained_source_ids": list(build.retained_source_ids),
+            "refresh_and_removed_source_ids": sorted(
+                set(build.source_ids) | set(build.removed_source_ids)
+            ),
+            "profile_as_of": build.profile_as_of,
+            "generation_id": build.generation_id,
+        },
+    )
 
 
 async def _populate_provider_directory_profile_compact_stage(
@@ -16383,59 +30904,27 @@ async def _populate_provider_directory_profile_compact_stage(
     """Populate compact profiles while preserving unaffected NPIs."""
     if npi_batch_size is not None and npi_batch_size < 1:
         raise ValueError("profile NPI batch size must be positive")
-    evidence_stage_ref = _provider_directory_profile_build_ref(
-        build, build.evidence_stage
-    )
-    profile_stage_ref = _provider_directory_profile_build_ref(
+    context = _profile_compact_stage_context(
         build,
-        build.profile_stage,
+        has_existing_artifacts=has_existing_artifacts,
     )
-    evidence_target_ref = _provider_directory_profile_build_ref(
-        build,
-        profile_artifact.PROFILE_EVIDENCE_TABLE,
-    )
-    should_rebuild_all_profiles = not has_existing_artifacts
-    should_copy_unaffected_profiles = (
-        _is_profile_copy_batch_required(
-            source_ids=build.source_ids,
-            retained_source_ids=build.retained_source_ids,
-            has_existing_artifacts=has_existing_artifacts,
-        )
-    )
-    copy_profiles_sql = profile_artifact.copy_unaffected_profiles_sql(
-        profile_source_ref=_provider_directory_profile_build_ref(
-            build,
-            profile_artifact.PROFILE_TABLE,
-        ),
-        evidence_source_ref=evidence_target_ref,
-        evidence_stage_ref=evidence_stage_ref,
-        profile_stage_ref=profile_stage_ref,
-    )
-    profile_sql_args_by_name = {
-        "evidence_ref": evidence_stage_ref,
-        "target_ref": profile_stage_ref,
-        "old_evidence_ref": (
-            evidence_target_ref if has_existing_artifacts else None
-        ),
-        "rebuild_all": should_rebuild_all_profiles,
-    }
-    profile_params_by_name = {
-        "source_ids": list(build.source_ids),
-        "retained_source_ids": list(build.retained_source_ids),
-        "profile_as_of": build.profile_as_of,
-        "generation_id": build.generation_id,
-    }
     if npi_batch_size is None:
-        if should_copy_unaffected_profiles:
+        if _provider_directory_profile_capacity_admission() is not None:
+            raise RuntimeError(
+                "provider_directory_profile_capacity_unbounded_compact"
+            )
+        if context.should_copy_unaffected_profiles:
             await db.status(
-                copy_profiles_sql,
+                context.copy_profiles_sql,
                 source_ids=list(build.source_ids),
                 retained_source_ids=list(build.retained_source_ids),
                 profile_as_of=build.profile_as_of,
             )
         await db.status(
-            profile_artifact.profile_insert_sql(**profile_sql_args_by_name),
-            **profile_params_by_name,
+            context.profile_insert_sql(
+                **context.profile_sql_args_by_name
+            ),
+            **context.profile_params_by_name,
         )
     else:
         batches = (
@@ -16461,89 +30950,169 @@ async def _populate_provider_directory_profile_compact_stage(
                 total_batches=len(batches),
                 resumed_from_batch=start_batch,
             )
-        for batch_number, batch in enumerate(batches):
-            if batch_number < start_batch:
-                continue
-            batch_started_at = time.monotonic()
-            LOGGER.info(
-                "Starting Provider Directory Profile compact batch "
-                "%d/%d kind=%s npi_start=%s npi_end=%s",
-                batch_number + 1,
-                len(batches),
-                batch.kind,
-                batch.npi_start if batch.npi_start is not None else "-",
-                batch.npi_end if batch.npi_end is not None else "-",
-            )
-            if batch.kind == "copy":
-                affected_rows = _coerce_rowcount(
-                    await db.status(
-                        copy_profiles_sql,
-                        source_ids=list(build.source_ids),
-                        retained_source_ids=list(build.retained_source_ids),
-                        profile_as_of=build.profile_as_of,
-                    )
+        frozen_waves = (
+            batch_plan.compact_waves
+            if batch_plan is not None
+            else ()
+        )
+        fallback_window_size = (
+            1
+            if frozen_waves
+            else _provider_directory_profile_compact_window_size()
+        )
+        batch_number = start_batch
+        while batch_number < len(batches):
+            window_end = (
+                _provider_directory_profile_frozen_wave_end(
+                    frozen_waves,
+                    start_batch=batch_number,
+                    total_batches=len(batches),
                 )
-            elif (
-                batch.kind == "npi"
-                and batch.npi_start is not None
-                and batch.npi_end is not None
+                if frozen_waves
+                else _provider_directory_profile_window_end(
+                    batches,
+                    batch_number,
+                    fallback_window_size,
+                )
+            )
+            window_coordinates = list(
+                enumerate(
+                    batches[batch_number:window_end],
+                    batch_number,
+                )
+            )
+            started_at_by_batch = {
+                window_batch_number: time.monotonic()
+                for window_batch_number, _batch in window_coordinates
+            }
+            for window_batch_number, batch in window_coordinates:
+                LOGGER.info(
+                    "Starting Provider Directory Profile compact batch "
+                    "%d/%d kind=%s npi_start=%s npi_end=%s",
+                    window_batch_number + 1,
+                    len(batches),
+                    batch.kind,
+                    (
+                        batch.npi_start
+                        if batch.npi_start is not None
+                        else "-"
+                    ),
+                    (
+                        batch.npi_end
+                        if batch.npi_end is not None
+                        else "-"
+                    ),
+                )
+            projection_by_batch = (
+                await _preflight_profile_compact_window_capacity(
+                    build,
+                    window_coordinates,
+                    profile_count_sql=context.profile_count_sql,
+                    profile_sql_args_by_name=(
+                        context.profile_sql_args_by_name
+                    ),
+                    profile_params_by_name=(
+                        context.profile_params_by_name
+                    ),
+                )
+            )
+            affected_rows_by_batch = (
+                await _gather_provider_directory_profile_tasks(
+                    [
+                        asyncio.create_task(
+                            _execute_provider_directory_profile_compact_batch(
+                                build,
+                                batch,
+                                copy_profiles_sql=context.copy_profiles_sql,
+                                profile_insert_sql=context.profile_insert_sql,
+                                profile_sql_args_by_name=(
+                                    context.profile_sql_args_by_name
+                                ),
+                                profile_params_by_name=(
+                                    context.profile_params_by_name
+                                ),
+                                projection=projection_by_batch.get(
+                                    window_batch_number
+                                ),
+                            )
+                        )
+                        for window_batch_number, batch in window_coordinates
+                    ]
+                )
+            )
+            for (
+                window_batch_number,
+                batch,
+            ), affected_rows in zip(
+                window_coordinates,
+                affected_rows_by_batch,
+                strict=True,
             ):
-                affected_rows = _coerce_rowcount(
-                    await db.status(
-                        profile_artifact.profile_insert_sql(
-                            **profile_sql_args_by_name,
-                            npi_start=batch.npi_start,
-                            npi_end=batch.npi_end,
-                        ),
-                        **profile_params_by_name,
-                        profile_npi_start=batch.npi_start,
-                        profile_npi_end=batch.npi_end,
+                if checkpointed:
+                    await _advance_provider_directory_profile_build_checkpoint(
+                        build,
+                        phase="profile",
+                        expected_batch=window_batch_number,
+                        total_batches=len(batches),
                     )
+                    await _mark_provider_directory_profile_batch_progress(
+                        build,
+                        phase="profile",
+                        completed_batches=window_batch_number + 1,
+                        total_batches=len(batches),
+                        resumed_from_batch=start_batch,
+                        batch=batch,
+                    )
+                LOGGER.info(
+                    "Completed Provider Directory Profile compact batch "
+                    "%d/%d rows=%d elapsed_seconds=%.3f",
+                    window_batch_number + 1,
+                    len(batches),
+                    affected_rows,
+                    time.monotonic()
+                    - started_at_by_batch[window_batch_number],
                 )
-            else:
-                raise RuntimeError(
-                    "provider_directory_profile_compact_batch_invalid"
-                )
-            if checkpointed:
-                await _advance_provider_directory_profile_build_checkpoint(
-                    build,
-                    phase="profile",
-                    expected_batch=batch_number,
-                    total_batches=len(batches),
-                )
-                await _mark_provider_directory_profile_batch_progress(
-                    build,
-                    phase="profile",
-                    completed_batches=batch_number + 1,
-                    total_batches=len(batches),
-                    resumed_from_batch=start_batch,
-                    batch=batch,
-                )
-            LOGGER.info(
-                "Completed Provider Directory Profile compact batch "
-                "%d/%d rows=%d elapsed_seconds=%.3f",
-                batch_number + 1,
-                len(batches),
-                affected_rows,
-                time.monotonic() - batch_started_at,
+            capacity_admission = (
+                _provider_directory_profile_capacity_admission()
             )
-    index_started_at = time.monotonic()
-    LOGGER.info(
-        "Starting Provider Directory Profile compact indexes stage=%s",
-        build.profile_stage,
+            if capacity_admission is not None:
+                profile_rows = int(
+                    await db.scalar(
+                        f"SELECT count(*) FROM {context.profile_stage_ref};"
+                    )
+                    or 0
+                )
+                await _assert_provider_directory_profile_capacity_scratch(
+                    "profile_stage",
+                    (context.profile_stage_ref,),
+                    observed_rows=profile_rows,
+                    maximum_rows=(
+                        capacity_admission.geometry.max_profile_rows
+                    ),
+                )
+            batch_number = window_end
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if capacity_admission is not None:
+        await _reserve_provider_directory_profile_wal_budget(
+            capacity_admission,
+            control_operation_counts={"profile_stage_analyze": 1},
+        )
+    await _provider_directory_profile_capacity_status(
+        f"ANALYZE {context.profile_stage_ref};"
     )
-    await _create_provider_directory_profile_indexes(
-        build.schema,
-        build.profile_stage,
-        evidence=False,
-    )
-    await db.status(f"ANALYZE {profile_stage_ref};")
-    LOGGER.info(
-        "Completed Provider Directory Profile compact indexes stage=%s "
-        "elapsed_seconds=%.3f",
-        build.profile_stage,
-        time.monotonic() - index_started_at,
-    )
+    if capacity_admission is not None:
+        profile_rows = int(
+            await db.scalar(
+                f"SELECT count(*) FROM {context.profile_stage_ref};"
+            )
+            or 0
+        )
+        await _assert_provider_directory_profile_capacity_scratch(
+            "profile_stage",
+            (context.profile_stage_ref,),
+            observed_rows=profile_rows,
+            maximum_rows=capacity_admission.geometry.max_profile_rows,
+        )
     if checkpointed:
         await _mark_profile_build_checkpoint_state(
             build,
@@ -16551,7 +31120,162 @@ async def _populate_provider_directory_profile_compact_stage(
         )
 
 
-async def _prepare_provider_directory_profile_stages(
+async def _profile_delta_preparation_context(
+    build: _ProviderDirectoryProfileBuild,
+) -> tuple[
+    Mapping[str, Any],
+    _ProviderDirectoryProfileServingState,
+    ProviderDirectoryProfileExecution,
+]:
+    """Return exact checkpoint, serving, and selection identities."""
+    if build.affected_npi_stage is None:
+        raise RuntimeError(
+            "provider_directory_profile_affected_stage_missing"
+        )
+    await _assert_provider_directory_logged_relation(
+        build.schema,
+        build.affected_npi_stage,
+    )
+    checkpoint_row = await db.first(
+        f"SELECT * FROM "
+        f"{_provider_directory_profile_checkpoint_ref(build.schema)} "
+        "WHERE build_id = :build_id;",
+        build_id=_provider_directory_profile_build_id(build),
+    )
+    if checkpoint_row is None:
+        raise RuntimeError(
+            "provider_directory_profile_ready_checkpoint_missing"
+        )
+    serving_state = build.serving_state
+    execution = _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
+    if (
+        serving_state is None
+        or execution is None
+        or build.selection_proof_id != execution.attestation.proof_id
+        or build.authority_revision
+        != execution.attestation.authority_revision
+        or build.current_source_vector_hash is None
+        or build.desired_source_vector_hash is None
+        or build.capacity_geometry_status != "verified"
+        or build.capacity_geometry_hash is None
+        or build.capacity_geometry_json is None
+    ):
+        raise RuntimeError(
+            "provider_directory_profile_delta_identity_missing"
+        )
+    return (
+        _pagination_checkpoint_row_mapping(checkpoint_row),
+        serving_state,
+        execution,
+    )
+
+
+def _prepared_profile_delta_relation_values(
+    build: _ProviderDirectoryProfileBuild,
+    checkpoint: Mapping[str, Any],
+    serving: _ProviderDirectoryProfileServingState,
+) -> dict[str, Any]:
+    """Return scratch and serving relation identities for a delta."""
+    return {
+        "schema": build.schema,
+        "build_id": _provider_directory_profile_build_id(build),
+        "resume_lineage_hash": build.resume_lineage_hash,
+        "owner_run_id": build.owner_run_id,
+        "evidence_stage": build.evidence_stage,
+        "evidence_stage_oid": int(checkpoint["evidence_stage_oid"]),
+        "profile_stage": build.profile_stage,
+        "profile_stage_oid": int(checkpoint["profile_stage_oid"]),
+        "affected_npi_stage": build.affected_npi_stage,
+        "affected_npi_stage_oid": int(
+            checkpoint["affected_npi_stage_oid"]
+        ),
+        "evidence_target_oid": serving.evidence_target_oid,
+        "profile_target_oid": serving.profile_target_oid,
+    }
+
+
+def _prepared_profile_delta_selection_values(
+    build: _ProviderDirectoryProfileBuild,
+    serving: _ProviderDirectoryProfileServingState,
+    execution: ProviderDirectoryProfileExecution,
+) -> dict[str, Any]:
+    """Return selection, generation, and executable-plan identities."""
+    return {
+        "from_generation_id": serving.generation_id,
+        "generation_id": build.generation_id,
+        "operation": execution.attestation.operation,
+        "selection_proof_id": build.selection_proof_id,
+        "control_generation": execution.generation,
+        "authority_revision": build.authority_revision,
+        "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
+        "profile_strategy_version": (
+            profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+        ),
+        "executable_plan_hash": (
+            build.batch_plan.fingerprint
+            if build.batch_plan is not None
+            else ""
+        ),
+    }
+
+
+def _prepared_profile_delta_source_values(
+    build: _ProviderDirectoryProfileBuild,
+    serving: _ProviderDirectoryProfileServingState,
+) -> dict[str, Any]:
+    """Return source vectors, counts, geometry, and resume coordinates."""
+    return {
+        "from_source_vector_hash": build.current_source_vector_hash,
+        "to_source_vector_hash": build.desired_source_vector_hash,
+        "to_source_vector": build.desired_source_vector,
+        "from_source_context_vector_hash": (
+            build.current_source_context_vector_hash
+        ),
+        "to_source_context_vector_hash": (
+            build.desired_source_context_vector_hash
+        ),
+        "to_source_context_vector": build.desired_source_context_vector,
+        "refresh_source_ids": build.source_ids,
+        "removed_source_ids": build.removed_source_ids,
+        "expected_evidence_rows": serving.evidence_rows,
+        "expected_profile_rows": serving.profile_rows,
+        "profile_as_of": build.profile_as_of,
+        "from_capacity_geometry_status": serving.capacity_geometry_status,
+        "from_capacity_geometry_hash": serving.capacity_geometry_hash,
+        "from_capacity_geometry_json": serving.capacity_geometry_json,
+        "capacity_geometry_status": build.capacity_geometry_status,
+        "capacity_geometry_hash": build.capacity_geometry_hash,
+        "capacity_geometry_json": build.capacity_geometry_json,
+        "resume_checkpoint": (
+            build.schema,
+            _provider_directory_profile_build_id(build),
+        ),
+    }
+
+
+async def _prepare_profile_delta_stage(
+    build: _ProviderDirectoryProfileBuild,
+) -> ProviderDirectoryPreparedProfileDelta:
+    """Prepare one exact source-delta descriptor."""
+    checkpoint, serving, execution = (
+        await _profile_delta_preparation_context(build)
+    )
+    return ProviderDirectoryPreparedProfileDelta(
+        **_prepared_profile_delta_relation_values(
+            build,
+            checkpoint,
+            serving,
+        ),
+        **_prepared_profile_delta_selection_values(
+            build,
+            serving,
+            execution,
+        ),
+        **_prepared_profile_delta_source_values(build, serving),
+    )
+
+
+def _prepare_profile_full_swap_stages(
     build: _ProviderDirectoryProfileBuild,
     evidence_build_fence: ProviderDirectoryArtifactBuildFence,
     profile_build_fence: ProviderDirectoryArtifactBuildFence,
@@ -16559,19 +31283,7 @@ async def _prepare_provider_directory_profile_stages(
     ProviderDirectoryPreparedArtifactStage,
     ProviderDirectoryPreparedArtifactStage,
 ]:
-    await _assert_provider_directory_profile_checkpoint_ready(
-        build,
-        evidence_build_fence,
-        profile_build_fence,
-    )
-    await _assert_provider_directory_logged_relation(
-        build.schema,
-        build.evidence_stage,
-    )
-    await _assert_provider_directory_logged_relation(
-        build.schema,
-        build.profile_stage,
-    )
+    """Prepare evidence and profile stages for one full relation swap."""
     return (
         ProviderDirectoryPreparedArtifactStage(
             schema=build.schema,
@@ -16604,33 +31316,180 @@ async def _prepare_provider_directory_profile_stages(
     )
 
 
+async def _prepare_provider_directory_profile_stages(
+    build: _ProviderDirectoryProfileBuild,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> (
+    tuple[
+        ProviderDirectoryPreparedArtifactStage,
+        ProviderDirectoryPreparedArtifactStage,
+    ]
+    | ProviderDirectoryPreparedProfileDelta
+):
+    """Prepare either a full-swap pair or an exact source delta."""
+    await _assert_provider_directory_profile_checkpoint_ready(
+        build,
+        evidence_build_fence,
+        profile_build_fence,
+    )
+    await _assert_provider_directory_logged_relation(
+        build.schema,
+        build.evidence_stage,
+    )
+    await _assert_provider_directory_logged_relation(
+        build.schema,
+        build.profile_stage,
+    )
+    if build.materialization_mode == "source_delta":
+        return await _prepare_profile_delta_stage(build)
+    return _prepare_profile_full_swap_stages(
+        build,
+        evidence_build_fence,
+        profile_build_fence,
+    )
+
+
+def _profile_delta_metric_refs(
+    build: _ProviderDirectoryProfileBuild,
+) -> tuple[str, str, str]:
+    """Return serving evidence, profile, and affected-NPI relations."""
+    if build.affected_npi_stage is None:
+        raise RuntimeError("provider_directory_profile_delta_identity_missing")
+    return (
+        _provider_directory_profile_build_ref(
+            build,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        ),
+        _provider_directory_profile_build_ref(
+            build,
+            profile_artifact.PROFILE_TABLE,
+        ),
+        _provider_directory_profile_build_ref(
+            build,
+            build.affected_npi_stage,
+        ),
+    )
+
+
+async def _attach_profile_delta_metrics(
+    build: _ProviderDirectoryProfileBuild,
+    metrics: dict[str, Any],
+) -> None:
+    """Replace staged counts with the exact projected source-delta totals."""
+    serving_state = build.serving_state
+    if serving_state is None or build.affected_npi_stage is None:
+        raise RuntimeError("provider_directory_profile_delta_identity_missing")
+    changed_source_ids = sorted(
+        set(build.source_ids) | set(build.removed_source_ids)
+    )
+    evidence_target_ref, profile_target_ref, affected_ref = (
+        _profile_delta_metric_refs(build)
+    )
+    evidence_deleted = int(
+        await db.scalar(
+            f"SELECT count(*) FROM {evidence_target_ref} "
+            "WHERE source_id = ANY(CAST(:changed_source_ids AS varchar[]));",
+            changed_source_ids=changed_source_ids,
+        )
+        or 0
+    )
+    profile_deleted = int(
+        await db.scalar(
+            f"SELECT count(*) FROM {profile_target_ref} AS profile "
+            f"JOIN {affected_ref} AS affected ON affected.npi = profile.npi;"
+        )
+        or 0
+    )
+    evidence_inserted = int(metrics["evidence_rows"])
+    profile_inserted = int(metrics["profile_rows"])
+    metrics.update(
+        {
+            "evidence_inserted": evidence_inserted,
+            "evidence_deleted": evidence_deleted,
+            "profile_inserted": profile_inserted,
+            "profile_deleted": profile_deleted,
+            "affected_npi_rows": int(
+                await db.scalar(f"SELECT count(*) FROM {affected_ref};") or 0
+            ),
+            "evidence_rows": (
+                serving_state.evidence_rows
+                - evidence_deleted
+                + evidence_inserted
+            ),
+            "profile_rows": (
+                serving_state.profile_rows
+                - profile_deleted
+                + profile_inserted
+            ),
+        }
+    )
+    metrics["selected_evidence_rows"] = metrics["evidence_rows"]
+
+
+def _attach_profile_capacity_metrics(
+    build: _ProviderDirectoryProfileBuild,
+    metrics: dict[str, Any],
+) -> None:
+    """Attach only capacity geometry bound to this exact build."""
+    if build.capacity_geometry_status == "verified":
+        admission = _provider_directory_profile_capacity_admission()
+        if (
+            admission is None
+            or build.capacity_geometry_hash
+            != profile_capacity.capacity_geometry_hash(
+                admission.geometry
+            )
+        ):
+            raise RuntimeError(
+                "provider_directory_profile_capacity_metrics_unbound"
+            )
+        geometry = profile_capacity.revalidate_capacity_geometry(
+            admission.geometry
+        )
+        metrics["capacity"] = (
+            _provider_directory_profile_capacity_metric_map(
+                geometry,
+                admission.lease,
+            )
+        )
+
+
 async def _provider_directory_profile_metrics(
     build: _ProviderDirectoryProfileBuild,
     *,
     should_rebuild_all_profiles: bool,
 ) -> dict[str, Any]:
+    """Return publication metrics bound to the completed profile stages."""
     metrics = await _provider_directory_profile_stage_metrics(
         build.schema,
         build.evidence_stage,
         build.profile_stage,
         list(build.source_ids),
     )
+    if build.materialization_mode == "source_delta":
+        await _attach_profile_delta_metrics(build, metrics)
     metrics.update(
         {
             "generation_id": build.generation_id,
+            "profile_as_of": build.profile_as_of,
             "dataset_ids": sorted(set(build.dataset_ids)),
             "incremental": not should_rebuild_all_profiles,
         }
     )
+    _attach_profile_capacity_metrics(build, metrics)
     return metrics
 
 
 async def _finalize_provider_directory_profile_stages(
     metrics: dict[str, Any],
-    stages: tuple[
-        ProviderDirectoryPreparedArtifactStage,
-        ProviderDirectoryPreparedArtifactStage,
-    ],
+    stages: (
+        tuple[
+            ProviderDirectoryPreparedArtifactStage,
+            ProviderDirectoryPreparedArtifactStage,
+        ]
+        | ProviderDirectoryPreparedProfileDelta
+    ),
     *,
     defer_cutover: bool,
 ) -> dict[str, Any] | tuple[
@@ -16638,19 +31497,33 @@ async def _finalize_provider_directory_profile_stages(
     tuple[
         ProviderDirectoryPreparedArtifactStage,
         ProviderDirectoryPreparedArtifactStage,
-    ],
+    ]
+    | ProviderDirectoryPreparedProfileDelta,
 ]:
     if defer_cutover:
         return metrics, stages
+    is_delta = isinstance(
+        stages,
+        ProviderDirectoryPreparedProfileDelta,
+    )
+    if is_delta:
+        await _retry_provider_directory_artifact_bundle_promotion(
+            (),
+            profile_delta=stages,
+        )
+        await _refresh_provider_directory_profile_delta_metrics(
+            metrics,
+            stages,
+        )
+        return metrics
     await _retry_provider_directory_artifact_bundle_promotion(stages)
     try:
-        for schema, build_id in sorted(
-            {
-                    stage.resume_checkpoint
-                    for stage in stages
-                    if getattr(stage, "resume_checkpoint", None) is not None
-            }
-        ):
+        checkpoints = {
+            stage.resume_checkpoint
+            for stage in stages
+            if stage.resume_checkpoint is not None
+        }
+        for schema, build_id in sorted(checkpoints):
             await _delete_provider_directory_profile_build_checkpoint(
                 schema,
                 build_id,
@@ -16691,6 +31564,33 @@ async def _has_provider_directory_profile_artifacts(schema: str) -> bool:
             "LIMIT 1);"
         )
     )
+    if not has_evidence_rows and not has_profile_rows:
+        serving_state = await _provider_directory_profile_serving_state(
+            schema
+        )
+        if serving_state is None:
+            return False
+        evidence_target_oid = await _provider_directory_relation_oid(
+            schema,
+            profile_artifact.PROFILE_EVIDENCE_TABLE,
+        )
+        profile_target_oid = await _provider_directory_relation_oid(
+            schema,
+            profile_artifact.PROFILE_TABLE,
+        )
+        if (
+            (serving_state.status, serving_state.operation)
+            in {("published", "publish"), ("purged", "purge")}
+            and serving_state.evidence_rows == 0
+            and serving_state.profile_rows == 0
+            and serving_state.evidence_target_oid
+            == evidence_target_oid
+            and serving_state.profile_target_oid == profile_target_oid
+        ):
+            return True
+        raise RuntimeError(
+            "provider_directory_profile_empty_serving_generation_invalid"
+        )
     if has_evidence_rows != has_profile_rows:
         raise RuntimeError(
             "provider_directory_profile_artifact_pair_empty_incomplete"
@@ -16726,6 +31626,10 @@ async def _populate_claimed_provider_directory_profile_stages(
             checkpointed=True,
             batch_plan=batch_plan,
         )
+    if build.materialization_mode == "source_delta":
+        await _populate_provider_directory_profile_affected_npi_stage(
+            build
+        )
     await _populate_provider_directory_profile_compact_stage(
         build,
         has_existing_artifacts=has_existing_artifacts,
@@ -16744,6 +31648,26 @@ async def _populate_claimed_provider_directory_profile_stages(
         profile_build_fence,
     )
     return metrics, stages
+
+
+async def _mark_profile_build_failure_drained(
+    build: _ProviderDirectoryProfileBuild,
+    failure: BaseException,
+) -> BaseException | None:
+    """Drain the failure marker despite repeated task cancellation."""
+    marker_task = asyncio.create_task(
+        _mark_profile_build_checkpoint_failed(build, failure)
+    )
+    try:
+        while not marker_task.done():
+            try:
+                await asyncio.shield(marker_task)
+            except asyncio.CancelledError:
+                continue
+        marker_task.result()
+    except BaseException as marker_error:
+        return marker_error
+    return None
 
 
 async def _build_provider_directory_profile_stages(
@@ -16787,14 +31711,75 @@ async def _build_provider_directory_profile_stages(
             batch_plan,
         )
     except BaseException as exc:
-        with contextlib.suppress(BaseException):
-            await asyncio.shield(
-                _mark_profile_build_checkpoint_failed(
-                    build,
-                    exc,
-                )
-            )
+        marker_error = await _mark_profile_build_failure_drained(build, exc)
+        if (
+            marker_error is not None
+            and _provider_directory_profile_capacity_admission() is not None
+        ):
+            raise BaseExceptionGroup(
+                "provider_directory_profile_build_and_failure_marker_failed",
+                [exc, marker_error],
+            ) from exc
         raise
+
+
+@contextlib.asynccontextmanager
+async def _provider_directory_profile_build_guards(
+    schema: str,
+) -> AsyncIterator[
+    tuple[
+        ProviderDirectoryArtifactBuildFence,
+        ProviderDirectoryArtifactBuildFence,
+    ]
+]:
+    """Hold the evidence and compact target guards as one scope."""
+    async with contextlib.AsyncExitStack() as build_guards:
+        evidence_fence = await build_guards.enter_async_context(
+            _provider_directory_artifact_build_guard(
+                schema,
+                profile_artifact.PROFILE_EVIDENCE_TABLE,
+            )
+        )
+        profile_fence = await build_guards.enter_async_context(
+            _provider_directory_artifact_build_guard(
+                schema,
+                profile_artifact.PROFILE_TABLE,
+            )
+        )
+        yield evidence_fence, profile_fence
+
+
+def _assert_profile_build_capacity_admitted(
+    build: _ProviderDirectoryProfileBuild,
+    has_existing_artifacts: bool,
+    evidence_build_fence: ProviderDirectoryArtifactBuildFence,
+    profile_build_fence: ProviderDirectoryArtifactBuildFence,
+) -> None:
+    """Require and bind capacity admission before retained-delta scratch."""
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if has_existing_artifacts and capacity_admission is None:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_admission_required"
+        )
+    if capacity_admission is not None:
+        _assert_provider_directory_profile_capacity_build(
+            capacity_admission,
+            build,
+            evidence_build_fence,
+            profile_build_fence,
+        )
+
+
+_ProviderDirectoryProfilePublishResult = (
+    dict[str, Any]
+    | tuple[
+        dict[str, Any],
+        tuple[
+            ProviderDirectoryPreparedArtifactStage,
+            ProviderDirectoryPreparedArtifactStage,
+        ],
+    ]
+)
 
 
 async def publish_provider_directory_profile(
@@ -16802,34 +31787,27 @@ async def publish_provider_directory_profile(
     *,
     run_id: str | None = None,
     defer_cutover: bool = False,
-) -> dict[str, Any] | tuple[
-    dict[str, Any],
-    tuple[
-        ProviderDirectoryPreparedArtifactStage,
-        ProviderDirectoryPreparedArtifactStage,
-    ],
-]:
+) -> _ProviderDirectoryProfilePublishResult:
     """Build source evidence and compact NPI profiles behind one atomic cutover."""
     schema = db_schema or _schema()
     dataset_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
     if dataset_fence is None:
         return {"skipped": True, "reason": "immutable_dataset_scope_required"}
-    async with contextlib.AsyncExitStack() as build_guards:
-        evidence_build_fence = await build_guards.enter_async_context(
-            _provider_directory_artifact_build_guard(
-                schema,
-                profile_artifact.PROFILE_EVIDENCE_TABLE,
-            )
-        )
-        profile_build_fence = await build_guards.enter_async_context(
-            _provider_directory_artifact_build_guard(
-                schema,
-                profile_artifact.PROFILE_TABLE,
-            )
-        )
+    async with _provider_directory_profile_build_guards(schema) as (
+        evidence_build_fence,
+        profile_build_fence,
+    ):
         has_existing_artifacts = (
             await _has_provider_directory_profile_artifacts(schema)
         )
+        if (
+            has_existing_artifacts
+            and _PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
+            is None
+        ):
+            raise RuntimeError(
+                "provider_directory_profile_delta_attestation_required"
+            )
         build = await _resolve_provider_directory_profile_build(
             schema,
             run_id,
@@ -16837,6 +31815,12 @@ async def publish_provider_directory_profile(
             evidence_build_fence,
             profile_build_fence,
             has_existing_artifacts=has_existing_artifacts,
+        )
+        _assert_profile_build_capacity_admitted(
+            build,
+            has_existing_artifacts,
+            evidence_build_fence,
+            profile_build_fence,
         )
         await _reap_stale_provider_directory_profile_builds(
             schema,
@@ -16961,7 +31945,17 @@ async def _publish_provider_directory_artifacts(
             "corroboration",
         )
     )
-    if should_backfill_resource_id_npis:
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if should_backfill_resource_id_npis and capacity_admission is not None:
+        await _assert_no_provider_directory_resource_id_npi_backfill_candidates(
+            _schema(),
+            source_ids,
+        )
+        metrics["resource_id_npis_backfilled"] = {
+            "skipped": True,
+            "reason": "capacity_admitted_preflight_zero",
+        }
+    elif should_backfill_resource_id_npis:
         resource_id_npi_backfill_run_id = address_key_run_id if address_key_run_id is not None else None
         metrics["resource_id_npis_backfilled"] = await backfill_provider_directory_resource_id_npis(
             run_id=resource_id_npi_backfill_run_id,
@@ -20730,7 +35724,7 @@ def _fetch_json_sync(
     *,
     timeout: int,
     extra_headers: dict[str, str] | None = None,
-    query_params: dict[str, str] | None = None,
+    query_params_by_name: dict[str, str] | None = None,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     headers_by_name = {
         "Accept": "application/fhir+json, application/json;q=0.9, */*;q=0.1",
@@ -20738,7 +35732,7 @@ def _fetch_json_sync(
     }
     if extra_headers:
         headers_by_name.update(extra_headers)
-    fetch_url = _url_with_query_params(url, query_params)
+    fetch_url = _url_with_query_params(url, query_params_by_name)
     started = time.monotonic()
     request = urllib.request.Request(fetch_url, headers=headers_by_name)
     try:
@@ -20804,14 +35798,14 @@ async def _fetch_json_with_options(
     *,
     timeout: int,
     extra_headers: dict[str, str] | None = None,
-    query_params: dict[str, str] | None = None,
+    query_params_by_name: dict[str, str] | None = None,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     return await asyncio.to_thread(
         _fetch_json_sync,
         url,
         timeout=timeout,
         extra_headers=extra_headers,
-        query_params=query_params,
+        query_params_by_name=query_params_by_name,
     )
 
 
@@ -21136,7 +36130,7 @@ async def _fetch_source_json_once(
         url,
         timeout=timeout,
         extra_headers=options["headers"],
-        query_params=options["query_params"],
+        query_params_by_name=options["query_params"],
     )
 
 
@@ -33834,21 +48828,15 @@ def _partition_fetch_concurrency() -> int:
     return max(1, _env_int("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", 16))
 
 
-async def _mark_provider_directory_progress(
-    run_id: str | None,
-    *,
+def _profile_progress_payload(
     phase: str,
     done: int,
     total: int,
-    overall_pct: float | None = None,
+    overall_pct: float | None,
     message: str,
-    details: dict[str, Any] | None = None,
-    metrics: dict[str, Any] | None = None,
-) -> None:
-    if not run_id:
-        return
-    total = max(total, 1)
-    done = max(0, min(done, total))
+    details: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build normalized progress and remaining detail mappings."""
     progress_details_by_name = dict(details or {})
     progress_unit = (
         _clean_text(progress_details_by_name.pop("_progress_unit", None))
@@ -33868,16 +48856,184 @@ async def _mark_provider_directory_progress(
     }
     if progress_details_by_name:
         progress_by_name["detail"] = progress_details_by_name
-    try:
-        await mark_control_run(
+    return progress_by_name, progress_details_by_name
+
+
+async def _reserve_profile_progress(
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    phase: str,
+    done: int,
+    message: str,
+    progress_by_name: Mapping[str, Any],
+    details_by_name: Mapping[str, Any],
+    metrics: Mapping[str, Any] | None,
+) -> None:
+    """Reserve the exact signed control-row WAL for one progress write."""
+    phase_name = (
+        "evidence"
+        if phase == _PROFILE_EVIDENCE_PROGRESS_PHASE
+        else "profile"
+    )
+    is_phase_start = done == int(details_by_name.get("resumed_from_batch") or 0)
+    operation_name = (
+        f"{phase_name}_progress_start"
+        if is_phase_start
+        else f"{phase_name}_import_run_progress"
+    )
+    _checked_serialized_metadata_payload_bytes(
+        {
+            "status": "running",
+            "phase_detail": phase,
+            "progress_message": message,
+            "progress": progress_by_name,
+            "metrics": metrics,
+        },
+        fixed_row_overhead=4_096,
+    )
+    await _reserve_provider_directory_profile_wal_budget(
+        admission,
+        control_operation_counts={operation_name: 1},
+    )
+
+
+async def _is_admitted_profile_progress_written(
+    run_id: str,
+    admission: _ProviderDirectoryProfileCapacityAdmission,
+    *,
+    phase: str,
+    message: str,
+    progress_by_name: Mapping[str, Any],
+    metrics: Mapping[str, Any] | None,
+) -> bool:
+    """Lock the signed import-run layout and persist one progress row."""
+    async with _provider_directory_profile_capacity_transaction():
+        import_run_ref = _unscoped_qt(_schema(), ImportRun.__tablename__)
+        await db.status(
+            f"LOCK TABLE {import_run_ref} IN ACCESS SHARE MODE;"
+        )
+        import_run_layout = (
+            await _provider_directory_profile_relation_storage_fingerprint(
+                admission.geometry.import_run_oid,
+                expected_persistence="p",
+            )
+        )
+        if (
+            import_run_layout.exact_fingerprint
+            != admission.geometry.import_run_storage_fingerprint
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_profile_import_run_layout_changed"
+            )
+        return await mark_control_run(
             run_id,
             status="running",
             phase_detail=phase,
             progress_message=message,
-            progress=progress_by_name,
+            progress=dict(progress_by_name),
+            metrics=dict(metrics) if metrics is not None else None,
+        )
+
+
+async def _persist_provider_directory_progress(
+    run_id: str,
+    admission: _ProviderDirectoryProfileCapacityAdmission | None,
+    *,
+    phase: str,
+    message: str,
+    progress_by_name: Mapping[str, Any],
+    metrics: Mapping[str, Any] | None,
+) -> None:
+    """Persist one progress row and enforce signed ownership when admitted."""
+    if admission is not None:
+        marked = await _is_admitted_profile_progress_written(
+            run_id,
+            admission,
+            phase=phase,
+            message=message,
+            progress_by_name=progress_by_name,
+            metrics=metrics,
+        )
+    else:
+        marked = await mark_control_run(
+            run_id,
+            status="running",
+            phase_detail=phase,
+            progress_message=message,
+            progress=dict(progress_by_name),
+            metrics=dict(metrics) if metrics is not None else None,
+        )
+    if admission is not None and marked is not True:
+        raise RuntimeError(
+            "provider_directory_profile_capacity_progress_ownership_lost"
+        )
+
+
+def _is_profile_progress_phase_admitted(
+    admission: _ProviderDirectoryProfileCapacityAdmission | None,
+    phase: str,
+) -> bool:
+    """Return whether this progress phase may write under admission."""
+    return admission is None or phase in {
+        _PROFILE_EVIDENCE_PROGRESS_PHASE,
+        _PROFILE_COMPACT_PROGRESS_PHASE,
+    }
+
+
+async def _mark_provider_directory_progress(
+    run_id: str | None,
+    *,
+    phase: str,
+    done: int,
+    total: int,
+    overall_pct: float | None = None,
+    message: str,
+    details: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> None:
+    """Persist one bounded progress observation for the active run."""
+
+    if not run_id:
+        return
+    capacity_admission = _provider_directory_profile_capacity_admission()
+    if not _is_profile_progress_phase_admitted(capacity_admission, phase):
+        # The signed Profile ledger owns only its bounded nested progress
+        # writes. Outer publishing progress remains in memory and the control
+        # wrapper records the terminal state after admitted execution.
+        return
+    total = max(total, 1)
+    done = max(0, min(done, total))
+    progress_by_name, progress_details_by_name = _profile_progress_payload(
+        phase,
+        done,
+        total,
+        overall_pct,
+        message,
+        details,
+    )
+    if capacity_admission is not None:
+        await _reserve_profile_progress(
+            capacity_admission,
+            phase,
+            done,
+            message,
+            progress_by_name,
+            progress_details_by_name,
+            metrics,
+        )
+    try:
+        await _persist_provider_directory_progress(
+            run_id,
+            capacity_admission,
+            phase=phase,
+            message=message,
+            progress_by_name=progress_by_name,
             metrics=metrics,
         )
     except Exception as exc:
+        if _provider_directory_profile_capacity_admission() is not None:
+            raise RuntimeError(
+                "provider_directory_profile_capacity_progress_update_failed"
+            ) from exc
         print(f"Provider Directory progress update failed: {type(exc).__name__}: {exc}")
 
 
@@ -42465,7 +57621,17 @@ async def process_provider_directory_fhir_data(
         await _ensure_provider_directory_tables()
         ctx["context"]["provider_directory_tables_ready"] = True
 
-    run_id = _clean_text(task.get("run_id")) or _clean_text(ctx.get("control_run_id"))
+    task_run_id = _clean_text(task.get("run_id"))
+    control_run_id = _clean_text(ctx.get("control_run_id"))
+    if (
+        task_run_id is not None
+        and control_run_id is not None
+        and task_run_id != control_run_id
+    ):
+        raise ValueError(
+            "provider_directory_task_control_run_id_mismatch"
+        )
+    run_id = control_run_id or task_run_id
     retry_of_run_id = _clean_text(task.get("retry_of_run_id"))
     pagination_root_run_id = _clean_text(
         task.get("provider_directory_pagination_root_run_id")
@@ -42615,6 +57781,7 @@ async def process_provider_directory_fhir_data(
         else:
             publish_metric_by_name = await _publish_attested_provider_directory_profile(
                 run_id=run_id,
+                control_run_id=control_run_id,
                 metrics=publish_metric_by_name,
                 execution=profile_execution,
             )
@@ -45230,3 +60397,72 @@ async def publish_provider_directory_address_overlay(
             build_fence,
             defer_cutover,
         )
+
+
+# Stable private names retained for callers and monkeypatched contract tests.
+_assert_no_provider_directory_resource_id_npi_backfill_candidates = (
+    _assert_no_resource_npi_candidates
+)
+_assert_provider_directory_artifact_resource_projection_batches = (
+    _assert_artifact_resource_batches
+)
+_assert_provider_directory_artifact_scope_exact_capacity = (
+    _assert_artifact_scope_projection
+)
+_assert_provider_directory_artifact_scope_observed_capacity = (
+    _assert_artifact_scope_usage
+)
+_assert_provider_directory_artifact_source_projection_batches = (
+    _assert_artifact_source_batches
+)
+_assert_provider_directory_profile_capacity_serving_state = (
+    _assert_profile_capacity_serving
+)
+_assert_provider_directory_profile_delta_stage_content = (
+    _assert_profile_delta_stage
+)
+_assert_provider_directory_profile_stage_storage_identity = (
+    _assert_profile_stage_storage
+)
+_execute_provider_directory_profile_affected_npi_insert = (
+    _execute_affected_npi_insert
+)
+_is_provider_directory_profile_delta_receipt_matching = (
+    _is_profile_delta_receipt_matching
+)
+_lock_provider_directory_profile_capacity_control_run = (
+    _lock_profile_capacity_run
+)
+_populate_provider_directory_profile_affected_npi_stage = (
+    _populate_affected_npi_stage
+)
+_provider_directory_artifact_fence_locked_dataset_ids = (
+    _locked_artifact_dataset_ids
+)
+_provider_directory_profile_control_wal_plan_input = (
+    _profile_control_wal_plan
+)
+_provider_directory_profile_cutover_row_lock_count = (
+    _profile_cutover_lock_count
+)
+_provider_directory_profile_delta_receipt_static_values = (
+    _profile_delta_receipt_values
+)
+_provider_directory_profile_replay_receipt_owner_run_id = (
+    _profile_replay_owner_run_id
+)
+_provider_directory_profile_serving_state_from_row = (
+    _profile_serving_state_from_row
+)
+_provider_directory_profile_source_context_vector_from_json = (
+    _profile_context_vector_from_json
+)
+_provider_directory_profile_source_context_vector_hash = (
+    _profile_context_vector_hash
+)
+_provider_directory_profile_source_context_vector_json = (
+    _profile_context_vector_json
+)
+_provider_directory_profile_source_vector_from_json = (
+    _profile_source_vector_from_json
+)

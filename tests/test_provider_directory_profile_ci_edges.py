@@ -151,7 +151,7 @@ async def test_profile_cleanup_and_stale_oid_rejection(monkeypatch):
     monkeypatch.setattr(
         importer.db,
         "all",
-        AsyncMock(return_value=[{"build_id": build.build_id}]),
+        AsyncMock(return_value=[_checkpoint_map(build)]),
     )
     monkeypatch.setattr(
         importer.db,
@@ -163,6 +163,47 @@ async def test_profile_cleanup_and_stale_oid_rejection(monkeypatch):
             "mrf",
             current_build_id=f"pdpb_{'b' * 32}",
         )
+
+
+@pytest.mark.asyncio
+async def test_capacity_admission_refuses_to_reap_stale_profile_build(
+    monkeypatch,
+):
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    build = _build()
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(
+        importer.db,
+        "all",
+        AsyncMock(return_value=[{"build_id": build.build_id}]),
+    )
+    monkeypatch.setattr(
+        importer.db,
+        "first",
+        AsyncMock(return_value=_checkpoint_map(build)),
+    )
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_capacity_admission",
+        lambda: SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="stale_build_present_during_capacity_admission",
+    ):
+        await importer._reap_stale_provider_directory_profile_builds(
+            "mrf",
+            current_build_id=f"pdpb_{'b' * 32}",
+        )
+
+    status.assert_not_awaited()
+    importer.db.first.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -310,7 +351,10 @@ async def test_artifact_scope_helpers_cover_empty_and_guarded_paths(monkeypatch)
         "provider_directory_dataset_resource",
         "run-a",
     )
-    assert table_name.startswith("provider_directory_dataset_resource_artifact_scope_")
+    expected_prefix = importer._provider_directory_artifact_scope_table_prefix(
+        "provider_directory_dataset_resource"
+    )
+    assert table_name.startswith(f"{expected_prefix}_")
     assert len(table_name) <= 63
 
     model_without_pk = SimpleNamespace(

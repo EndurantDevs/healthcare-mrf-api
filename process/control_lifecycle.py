@@ -8,11 +8,13 @@ import hashlib
 import logging
 import os
 import uuid
-from contextlib import suppress
+import weakref
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
 from functools import lru_cache
 from inspect import signature
 from importlib import import_module
-from typing import Any
+from typing import Any, AsyncIterator
 
 import redis
 from sqlalchemy import and_, func, or_, update
@@ -43,6 +45,105 @@ _TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_lett
 _CONTROL_RUN_MARKED = True
 _CONTROL_RUN_NOT_MARKED = False
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ControlRunHeartbeatPersistenceGate:
+    """Coordinate heartbeat persistence and exact-run suppression."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    suppression_depth: int = 0
+    users: int = 0
+
+
+_CONTROL_RUN_HEARTBEAT_PERSISTENCE_GATES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, _ControlRunHeartbeatPersistenceGate],
+] = weakref.WeakKeyDictionary()
+
+
+def _control_run_heartbeat_persistence_gate(
+    run_id: str,
+) -> tuple[
+    asyncio.AbstractEventLoop,
+    dict[str, _ControlRunHeartbeatPersistenceGate],
+    _ControlRunHeartbeatPersistenceGate,
+]:
+    loop = asyncio.get_running_loop()
+    gates_by_run_id = _CONTROL_RUN_HEARTBEAT_PERSISTENCE_GATES.setdefault(
+        loop,
+        {},
+    )
+    gate = gates_by_run_id.get(run_id)
+    if gate is None:
+        gate = _ControlRunHeartbeatPersistenceGate()
+        gates_by_run_id[run_id] = gate
+    gate.users += 1
+    return loop, gates_by_run_id, gate
+
+
+def _release_control_run_heartbeat_persistence_gate(
+    loop: asyncio.AbstractEventLoop,
+    gates_by_run_id: dict[str, _ControlRunHeartbeatPersistenceGate],
+    run_id: str,
+    gate: _ControlRunHeartbeatPersistenceGate,
+) -> None:
+    gate.users -= 1
+    if gate.users or gate.suppression_depth:
+        return
+    if gates_by_run_id.get(run_id) is gate:
+        gates_by_run_id.pop(run_id)
+    if not gates_by_run_id:
+        _CONTROL_RUN_HEARTBEAT_PERSISTENCE_GATES.pop(loop, None)
+
+
+@asynccontextmanager
+async def _locked_control_run_heartbeat_persistence_gate(
+    run_id: str,
+) -> AsyncIterator[_ControlRunHeartbeatPersistenceGate]:
+    loop, gates_by_run_id, gate = _control_run_heartbeat_persistence_gate(run_id)
+    try:
+        async with gate.lock:
+            yield gate
+    finally:
+        _release_control_run_heartbeat_persistence_gate(
+            loop,
+            gates_by_run_id,
+            run_id,
+            gate,
+        )
+
+
+@asynccontextmanager
+async def suppress_control_run_heartbeat_persistence(
+    run_id: str,
+) -> AsyncIterator[None]:
+    """Temporarily suppress persistent heartbeat writes for one exact run.
+
+    Entry waits for an in-flight heartbeat write for the same run to finish.
+    Nested scopes remain suppressed until their outermost scope exits. Live
+    progress heartbeats continue to be emitted while only the database write
+    is paused.
+    """
+
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        raise ValueError("run_id is required for heartbeat persistence suppression")
+    async with _locked_control_run_heartbeat_persistence_gate(
+        normalized_run_id
+    ) as gate:
+        gate.suppression_depth += 1
+    try:
+        yield
+    finally:
+        async with _locked_control_run_heartbeat_persistence_gate(
+            normalized_run_id
+        ) as gate:
+            if gate.suppression_depth <= 0:
+                raise RuntimeError(
+                    "control-run heartbeat persistence suppression underflow"
+                )
+            gate.suppression_depth -= 1
 
 
 async def control_single_job_start(
@@ -274,18 +375,26 @@ async def _live_progress_heartbeat(
     while True:
         await asyncio.sleep(interval)
         has_heartbeat_ownership = False
+        is_persistence_suppressed = False
         try:
-            has_heartbeat_ownership = (
-                await _is_control_run_heartbeat_persisted(
-                    run_id,
-                    target_function,
-                    attempt_id=attempt_id,
-                    attempt_started_at=attempt_started_at,
-                )
-            )
+            async with _locked_control_run_heartbeat_persistence_gate(
+                run_id
+            ) as gate:
+                is_persistence_suppressed = gate.suppression_depth > 0
+                if not is_persistence_suppressed:
+                    has_heartbeat_ownership = (
+                        await _is_control_run_heartbeat_persisted(
+                            run_id,
+                            target_function,
+                            attempt_id=attempt_id,
+                            attempt_started_at=attempt_started_at,
+                        )
+                    )
         except Exception:
             logger.debug("Failed to persist live import heartbeat for run %s", run_id, exc_info=True)
-        if not has_heartbeat_ownership:
+        if not (
+            has_heartbeat_ownership or is_persistence_suppressed
+        ):
             continue
         enqueue_live_progress(
             run_id=run_id,

@@ -35,6 +35,9 @@ from api.provider_directory_source_outcomes import (
 from api.provider_directory_profile_selection_attestation import (
     register_profile_selection_route,
 )
+from api.provider_directory_profile_capacity_preflight import (
+    register_profile_capacity_preflight_route,
+)
 from api.uhc_provider_file_catalog import register_uhc_provider_file_catalog_routes
 from api.mrf_discovery_catalog import (
     DEFAULT_FILE_PAGE_SIZE,
@@ -59,6 +62,7 @@ register_source_snapshot_rollback_route(blueprint)
 register_v4_control_routes(blueprint)
 register_uhc_provider_file_catalog_routes(blueprint)
 register_profile_selection_route(blueprint)
+register_profile_capacity_preflight_route(blueprint)
 logger = logging.getLogger(__name__)
 
 

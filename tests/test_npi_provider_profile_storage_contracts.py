@@ -61,6 +61,7 @@ def test_profile_payload_ignores_malformed_optional_evidence():
         "profile": {
             "categories": {},
             "generation_id": "generation-1",
+            "profile_as_of": None,
             "published_at": None,
         }
     }

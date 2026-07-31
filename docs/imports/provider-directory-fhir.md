@@ -608,12 +608,12 @@ outside the selected source set prepends one copy batch to each phase. A
 global refresh where selected and retained sources are identical omits both
 physical copy batches.
 
-Before the first bucketed statement, the build creates source-plus-hash
-expression indexes on the already materialized unlogged PractitionerRole and
-OrganizationAffiliation scope tables. The indexes never target serving tables,
-share the scope tables' bounded lifecycle, and are reused after a checkpointed
-resume. Worker logs report index bytes, elapsed build time, and the observed
-PostgreSQL temp-byte delta.
+Before artifact payload insertion, the build creates source-plus-hash
+expression indexes on the empty unlogged PractitionerRole and
+OrganizationAffiliation scope tables. The indexes never target serving tables
+and share the scope tables' bounded lifecycle. Creating them empty lets the
+preventive scope projection include their complete write layout and avoids an
+unforecast bulk index build before the first bucketed statement.
 
 The durable Profile checkpoint records the exact next and total batch for both
 phases. Its resume lineage includes a fingerprint of the ordered executable
@@ -648,6 +648,48 @@ fraction, not an elapsed-time prediction or ETA. Status writes occur only at
 batch boundaries,
 never per evidence row or NPI. The enclosing `provider-directory publishing
 artifacts` phase resumes after Profile publication completes.
+
+### Profile capacity admission
+
+An attested global Profile build has no implicit capacity defaults. Deployments
+must provide both
+`HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_LIMITS_JSON` and
+`HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON`. The limits document
+uses contract `healthporta.provider-directory-profile-capacity-limits.v2` and
+closes the artifact batch size, database-pool reserve, `work_mem`,
+`maintenance_work_mem`, per-backend temp limit, build and statement deadlines,
+lock timeout, minimum free-space floor, row ceilings, and byte ceilings for
+all six relation classes: `artifact_scope`, `evidence_stage`,
+`affected_npi_stage`, `profile_stage`, `evidence_target`, and
+`profile_target`. Each relation cap includes scratch bytes, target growth,
+deleted logical bytes, temp bytes, and WAL bytes as applicable.
+
+The mandatory public trust document uses contract
+`provider-directory-database-capacity-trust-v2`. It pins the stable
+environment and attestor, observed database and tablespace/volume identity,
+and a bounded, key-id-sorted Ed25519 verification-key set. Exactly one key is
+active. A retired public key is retained only for a bounded verification
+window: an already-assigned lease must have been issued no later than the
+recorded retirement, and its expiry and build deadline must fit inside that
+window. Unknown fields, duplicate JSON fields, signing/private material,
+unknown keys, and post-retirement leases fail closed. Healthcare receives no
+capacity signing key.
+
+The worker derives the exact source-delta execution geometry, typed
+artifact-scope row/byte projection, ordered batch-plan fingerprint, PostgreSQL
+storage identity, worker/pool geometry, and required data/temp/WAL reservation.
+It selects the public verification key by the assigned envelope's exact
+`lease.key_id`, then verifies and consumes the signed lease before creating
+scratch payloads. A missing variable, malformed document, stale signature,
+identity mismatch, insufficient reservation, expired deadline, or changed
+projection fails closed; it cannot fall back to the legacy full rebuild.
+
+All scratch tables and their required indexes are created empty before payload
+DML. The worker projects aggregate physical growth and WAL across the complete
+artifact scope before starting either admitted worker, then repeats physical,
+row, and WAL checks after every frozen worker wave. Logged Profile stages use
+the same pre-created-index rule, so the build never performs an unforecast
+bulk index build after writing a large UHC payload.
 
 ## Provider Profile API Verification Matrix
 
@@ -1302,6 +1344,18 @@ real-time acceptance. Profile source entries retain both `endpoint_id` and
 `dataset_id`, and evidence retains the concrete Organization or
 OrganizationAffiliation resource ID. Stale dataset edges and self-referential
 ownership-looking affiliations cannot produce these membership facts.
+
+UHC readiness is proved in two stages. Publishing the current endpoint dataset
+and typed resources is an intermediate checkpoint: it can support catalog
+evidence and raw Provider Directory-backed role, candidate-address, and plan
+overlays, but it is not full consumer readiness. Full acceptance additionally
+requires the bounded v4 source-delta Profile cutover for that exact dataset
+vector and public `/v1/npi/id/{npi}/profile` evidence for the facility
+Organization, `tin_status: unavailable_from_uhc_source`, and
+`relationship_type: payer_reported_provider_plan_membership`. Operators must
+keep any legacy full-rebuild schedule held and dispatch only the signed,
+capacity-admitted source-delta geometry; the intermediate dataset checkpoint
+must never be reported as a completed UHC Profile import.
 
 Capital Blue Cross publishes seven populated Plan-Net collections and an empty
 `Endpoint` collection at `https://providerdirectory-api.capbluecross.com/r4`.

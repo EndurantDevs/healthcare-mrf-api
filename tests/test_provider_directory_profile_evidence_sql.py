@@ -178,6 +178,18 @@ def test_profile_evidence_sql_partitions_direct_organization_memberships():
     assert "fact_type = 'plan_membership'" in sql
     assert "hashtextextended(affiliation.resource_id, 0)" in sql
     assert "hashtextextended(organization.resource_id, 0)" not in sql
+    bounded_affiliation = sql.index(
+        "membership_affiliation_rows AS MATERIALIZED"
+    )
+    membership_join = sql.index("plan_membership_rows AS MATERIALIZED")
+    assert bounded_affiliation < membership_join
+    assert (
+        'FROM "fixture"."provider_directory_organization_affiliation" '
+        "AS affiliation"
+    ) in sql[bounded_affiliation:membership_join]
+    assert (
+        "FROM membership_affiliation_rows AS affiliation"
+    ) in sql[membership_join:]
 
 
 def test_profile_evidence_sql_accepts_exact_dataset_scoped_affiliations():
@@ -197,6 +209,27 @@ def test_profile_evidence_sql_accepts_exact_dataset_scoped_affiliations():
     assert 'JOIN "fixture"."affiliation_edge" AS affiliation_edge' in sql
     assert "provider_directory_organization_affiliation" not in sql
     assert "affiliation_edge.dataset_id = role_rows.dataset_id" in sql
+
+
+def test_profile_evidence_count_sql_is_read_only_and_uses_normalized_rows():
+    sql = profile.profile_evidence_count_sql(
+        target_ref='"fixture"."must_not_be_written"',
+        source_ref='"fixture"."source"',
+        practitioner_ref='"fixture"."practitioner"',
+        role_ref='"fixture"."role"',
+        organization_ref='"fixture"."organization"',
+        service_ref='"fixture"."service"',
+        fact_type="plan_membership",
+        role_bucket_count=32,
+        role_bucket=7,
+    )
+
+    assert "INSERT INTO" not in sql
+    assert "ON CONFLICT" not in sql
+    assert "count(*)::bigint AS projected_rows" in sql
+    assert "sum(pg_column_size(normalized_facts))" in sql
+    assert 'fact_type = \'plan_membership\'' in sql
+    assert '"fixture"."must_not_be_written"' not in sql
 
 
 def test_profile_evidence_sql_rejects_invalid_bounded_scopes():

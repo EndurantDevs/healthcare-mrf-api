@@ -1,4 +1,4 @@
-INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "value_json", "source_id", "endpoint_id", "dataset_id", "canonical_api_base", "source_org_name", "source_plan_name", "resource_type", "resource_id", "role_resource_id", "active", "effective_start", "effective_end", "observed_at")
+{{WRITE_PREFIX_SQL}}
         WITH selected_dataset(source_id, dataset_id) AS MATERIALIZED (
             SELECT *
               FROM unnest(
@@ -270,6 +270,12 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                AND participating_organization.resource_id = affiliation_edge.participating_organization_resource_id
              WHERE normalized_affiliation.participating_organization_resource_id = affiliation_edge.participating_organization_resource_id
                AND normalized_affiliation.participating_organization_resource_id = normalized_role.organization_resource_id
+        ), membership_affiliation_rows AS MATERIALIZED (
+            SELECT affiliation.*
+              FROM {{AFFILIATION_REF}} AS affiliation
+              JOIN source_context
+                ON source_context.source_id = affiliation.source_id
+             WHERE {{AFFILIATION_BUCKET_SQL}}
         ), plan_membership_rows AS MATERIALIZED (
             SELECT organization.npi,
                    affiliation.source_id,
@@ -337,7 +343,7 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                            'active', affiliation.active
                        )
                    ) AS membership_value
-              FROM {{AFFILIATION_REF}} AS affiliation
+              FROM membership_affiliation_rows AS affiliation
               JOIN source_context
                 ON source_context.source_id = affiliation.source_id
               CROSS JOIN LATERAL (
@@ -471,7 +477,6 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                            48
                        )
                    )
-               AND {{AFFILIATION_BUCKET_SQL}}
         ), facts AS (
             SELECT practitioner.npi,
                    'name'::varchar AS fact_type,
@@ -1031,10 +1036,5 @@ INSERT INTO {{TARGET_REF}} ("evidence_key", "npi", "fact_type", "fact_key", "val
                       resource_type, resource_id,
                       COALESCE(role_resource_id, ''), observed_at DESC NULLS LAST
         )
-        SELECT evidence_key, npi, fact_type, fact_key, value_json,
-               source_id, endpoint_id, dataset_id, canonical_api_base,
-               source_org_name, source_plan_name, resource_type,
-               resource_id, role_resource_id, active, effective_start,
-               effective_end, observed_at
-          FROM normalized_facts
-        ON CONFLICT (evidence_key) DO NOTHING;
+        {{RESULT_SQL}}
+        {{CONFLICT_SQL}}

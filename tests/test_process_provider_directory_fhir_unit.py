@@ -7815,9 +7815,11 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
         json.dumps({"sources": {"source_a": {"bearer_token": "env:PAYER_DIRECTORY_TOKEN"}}}),
     )
 
-    async def fake_fetch_json_with_options(url, *, timeout, extra_headers=None, query_params=None):
+    async def fake_fetch_json_with_options(
+        url, *, timeout, extra_headers=None, query_params_by_name=None
+    ):
         assert extra_headers == {"Authorization": "Bearer secret-token"}
-        assert query_params == {}
+        assert query_params_by_name == {}
         if url == "https://payer.example/fhir/Practitioner?_count=1":
             return 200, {"resourceType": "Bundle", "entry": []}, None, 5
         assert url == "https://payer.example/fhir/metadata?_format=json"
@@ -10298,6 +10300,14 @@ async def test_artifact_scope_materialization_cleans_partial_tables(
         "_materialize_provider_directory_artifact_resource_scope",
         AsyncMock(side_effect=materialization_failure),
     )
+    async def create_layouts(_schema, plan):
+        plan.created_tables.extend(plan.relation_by_table.values())
+
+    monkeypatch.setattr(
+        importer,
+        "_create_artifact_scope_layouts",
+        create_layouts,
+    )
     cleanup = AsyncMock()
     monkeypatch.setattr(importer, "_drop_artifact_scope_tables", cleanup)
 
@@ -10309,12 +10319,10 @@ async def test_artifact_scope_materialization_cleans_partial_tables(
             frozenset({"Location"}),
         )
 
+    expected_plan = importer._artifact_scope_materialization_plan("run_1")
     cleanup.assert_awaited_once_with(
         "mrf",
-        [
-            "provider_directory_source_scope",
-            "provider_directory_insurance_plan_scope",
-        ],
+        list(expected_plan.relation_by_table.values()),
     )
 
 
@@ -10578,24 +10586,15 @@ async def test_artifact_resource_scope_does_not_copy_unrequested_model(monkeypat
         frozenset({"Location"}),
     )
 
-    assert len(status.await_args_list) == 4
-    assert status.await_args_list[0].args[0].startswith(
-        'CREATE UNLOGGED TABLE "mrf"."practitioner_scope"'
-    )
-    assert status.await_args_list[1].args[0].startswith(
-        'CREATE UNIQUE INDEX "practitioner_scope_pk_build_idx"'
-    )
-    assert status.await_args_list[2].args[0].startswith(
-        'ALTER TABLE "mrf"."practitioner_scope"'
-    )
-    assert status.await_args_list[3].args[0] == (
+    assert len(status.await_args_list) == 1
+    assert status.await_args_list[0].args[0] == (
         'ANALYZE "mrf"."practitioner_scope";'
     )
 
 
 @pytest.mark.asyncio
-async def test_artifact_source_scope_builds_primary_key_after_insert(monkeypatch):
-    status = AsyncMock()
+async def test_artifact_source_scope_writes_into_prebuilt_layout(monkeypatch):
+    status = AsyncMock(side_effect=["INSERT 0 1", "ANALYZE"])
     monkeypatch.setattr(importer.db, "status", status)
 
     await importer._materialize_provider_directory_artifact_source_scope(
@@ -10605,22 +10604,17 @@ async def test_artifact_source_scope_builds_primary_key_after_insert(monkeypatch
     )
 
     statements = [call.args[0].strip() for call in status.await_args_list]
-    assert len(statements) == 5
-    assert statements[0].startswith('CREATE UNLOGGED TABLE "mrf"."source_scope"')
-    assert statements[1].startswith('INSERT INTO "mrf"."source_scope"')
-    assert statements[2].startswith(
-        'CREATE UNIQUE INDEX "source_scope_pk_build_idx"'
-    )
-    assert statements[3].startswith('ALTER TABLE "mrf"."source_scope"')
-    assert statements[4] == 'ANALYZE "mrf"."source_scope";'
+    assert len(statements) == 2
+    assert statements[0].startswith('INSERT INTO "mrf"."source_scope"')
+    assert statements[1] == 'ANALYZE "mrf"."source_scope";'
 
 
 @pytest.mark.asyncio
-async def test_artifact_resource_scope_builds_primary_key_after_insert(monkeypatch):
+async def test_artifact_resource_scope_writes_into_prebuilt_layout(monkeypatch):
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (_artifact_dataset(selected_resources=("Location",)),)
     )
-    status = AsyncMock()
+    status = AsyncMock(side_effect=["INSERT 0 1", "ANALYZE"])
     monkeypatch.setattr(importer.db, "status", status)
 
     await importer._materialize_provider_directory_artifact_resource_scope(
@@ -10632,14 +10626,9 @@ async def test_artifact_resource_scope_builds_primary_key_after_insert(monkeypat
     )
 
     statements = [call.args[0].strip() for call in status.await_args_list]
-    assert len(statements) == 5
-    assert statements[0].startswith('CREATE UNLOGGED TABLE "mrf"."location_scope"')
-    assert statements[1].startswith('INSERT INTO "mrf"."location_scope"')
-    assert statements[2].startswith(
-        'CREATE UNIQUE INDEX "location_scope_pk_build_idx"'
-    )
-    assert statements[3].startswith('ALTER TABLE "mrf"."location_scope"')
-    assert statements[4] == 'ANALYZE "mrf"."location_scope";'
+    assert len(statements) == 2
+    assert statements[0].startswith('INSERT INTO "mrf"."location_scope"')
+    assert statements[1] == 'ANALYZE "mrf"."location_scope";'
 
 
 @pytest.mark.asyncio
@@ -11079,8 +11068,18 @@ async def test_artifact_scope_projection_measures_alias_amplification_and_capaci
 
 @pytest.mark.asyncio
 async def test_artifact_scope_reaper_removes_only_sorted_scope_prefixes(monkeypatch):
-    source_prefix = "provider_directory_source_artifact_scope_"
-    location_prefix = "provider_directory_location_artifact_scope_"
+    source_prefix = (
+        importer._provider_directory_artifact_scope_table_prefix(
+            "provider_directory_source"
+        )
+        + "_"
+    )
+    location_prefix = (
+        importer._provider_directory_artifact_scope_table_prefix(
+            "provider_directory_location"
+        )
+        + "_"
+    )
     monkeypatch.setattr(
         importer.db,
         "all",
@@ -30265,6 +30264,7 @@ async def test_process_data_publish_artifacts_only_uses_attested_profile(
     assert metrics == {"profile": {"profile_rows": 2}}
     publish.assert_awaited_once_with(
         run_id=None,
+        control_run_id=None,
         metrics={
             "publish_artifacts": True,
             "publish_artifacts_only": True,

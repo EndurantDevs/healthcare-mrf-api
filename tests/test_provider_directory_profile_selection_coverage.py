@@ -355,6 +355,7 @@ def test_contract_rejects_noncanonical_attestation_execution_and_results(
         contract.profile_selection_result(
             _execution(),
             profile_generation_id=" ",
+            profile_as_of="2026-07-30",
             profile_rows=0,
             profile_source_evidence_rows=0,
         )
@@ -444,7 +445,6 @@ def test_snapshot_source_indexes_and_record_guards_cover_invalid_rows():
 async def test_snapshot_database_queries_and_optional_lock(monkeypatch):
     status = AsyncMock()
     all_rows = AsyncMock(side_effect=[
-        [],
         [SimpleNamespace(_mapping={"source_id": "a"})],
         [{"dataset_id": "d"}],
     ])
@@ -455,6 +455,7 @@ async def test_snapshot_database_queries_and_optional_lock(monkeypatch):
     assert await snapshot._selection_source_rows() == [{"source_id": "a"}]
     assert await snapshot._selection_dataset_rows() == [{"dataset_id": "d"}]
     assert status.await_count == 3
+    assert all_rows.await_count == 2
 
     lock = AsyncMock()
     monkeypatch.setattr(snapshot, "_lock_profile_selection_tables", lock)

@@ -29,6 +29,16 @@ from process.uhc_provider_file_identity import (
     logical_scope_for_file,
 )
 from process.uhc_retained_dataset import _provider_resource_rows
+from tests.provider_directory_profile_resume_completion import (
+    complete_resumed_build,
+    interrupt_after_completed_batches,
+)
+from tests.provider_directory_profile_resume_test_support import (
+    create_resume_context,
+    interrupt_at_phase_boundary,
+    interrupt_first_compact_batch,
+    interrupt_first_evidence_batch,
+)
 
 
 FIXTURE_DIRECTORY = Path(__file__).parent / "fixtures"
@@ -766,14 +776,13 @@ async def _create_profile_bucket_probe_scopes(
         row_count=row_count,
         include_affiliation_edges=include_affiliation_edges,
     )
-    for model, scope_table in (
+    for _model, scope_table in (
         (importer.ProviderDirectoryPractitionerRole, role_scope),
         (
             importer.ProviderDirectoryOrganizationAffiliation,
             affiliation_scope,
         ),
     ):
-        await importer._build_artifact_scope_pk(model, schema, scope_table)
         await database.status(
             f"ANALYZE {profile.qualified_table(schema, scope_table)};"
         )
@@ -794,12 +803,10 @@ async def _create_profile_bucket_probe_tables(
             affiliation_scope,
         ),
     ):
-        await database.status(
-            importer._provider_directory_artifact_scope_table_sql(
-                model,
-                schema,
-                scope_table,
-            )
+        await importer._create_provider_directory_artifact_scope_layout(
+            model,
+            schema,
+            scope_table,
         )
 
 
@@ -1241,10 +1248,17 @@ async def _materialize_attested_a_scope(database, schema, monkeypatch):
         scope_schema: str,
         table_name: str,
         source_ids: list[str],
+        *,
+        projection: Any = None,
     ) -> None:
+        del projection
         await database.status(
-            f"CREATE UNLOGGED TABLE {scope_schema}.{table_name} AS "
-            f"SELECT * FROM {scope_schema}.provider_directory_source "
+            f"INSERT INTO {scope_schema}.{table_name} "
+            "(source_id, endpoint_id, canonical_api_base, org_name, "
+            "plan_name, requires_registration, requires_api_key) "
+            "SELECT source_id, endpoint_id, canonical_api_base, org_name, "
+            f"plan_name, false, false "
+            f"FROM {scope_schema}.provider_directory_source "
             "WHERE source_id = ANY(CAST(:source_ids AS varchar[]));",
             source_ids=source_ids,
         )
@@ -1441,7 +1455,17 @@ async def _populate_bounded_profile_evidence(
                             "profile_role_bucket": role_bucket,
                         }
                     )
-                await database.status(
+                projection_row = await database.first(
+                    profile.profile_evidence_count_sql(
+                        **evidence_sql_refs_by_name,
+                        fact_type=fact_type,
+                        role_bucket_count=role_bucket_count,
+                        role_bucket=role_bucket,
+                    ),
+                    **params_by_name,
+                )
+                projection_map = projection_row._mapping
+                inserted_rows = await database.status(
                     profile.profile_evidence_insert_sql(
                         **evidence_sql_refs_by_name,
                         fact_type=fact_type,
@@ -1450,6 +1474,8 @@ async def _populate_bounded_profile_evidence(
                     ),
                     **params_by_name,
                 )
+                assert inserted_rows <= int(projection_map["projected_rows"])
+                assert int(projection_map["projected_logical_bytes"]) >= 0
 
 
 async def _populate_bounded_profiles(
@@ -1993,6 +2019,7 @@ async def test_bounded_build_populates_an_initial_empty_serving_pair(
                 build,
                 fence,
                 fence,
+                has_existing_artifacts=False,
             )
         )
 
@@ -2130,8 +2157,6 @@ async def _capture_profile_bucket_probe(
         "profile_role_bucket_count": profile.PROFILE_AFFILIATION_ROLE_BUCKETS,
         "profile_role_bucket": 7,
     }
-    before_plan = await database.scalar(explain_sql, **explain_params_by_name)
-    await database.status(f"TRUNCATE TABLE {table_ref('profile_evidence')};")
     role_metrics = await importer._prepare_provider_directory_profile_bucket_index(
         schema,
         importer.ProviderDirectoryPractitionerRole.__tablename__,
@@ -2156,7 +2181,6 @@ async def _capture_profile_bucket_probe(
         role_scope=role_scope,
         affiliation_scope=affiliation_scope,
         fact_type=fact_type,
-        before_plan=before_plan,
         after_plan=after_plan,
         affiliation_plan=affiliation_plan,
         role_metrics=role_metrics,
@@ -2170,7 +2194,6 @@ def _assert_profile_bucket_probe(probe: SimpleNamespace) -> None:
     assert probe.affiliation_metrics is not None
     role_index_name = str(probe.role_metrics["index_name"])
     affiliation_index_name = str(probe.affiliation_metrics["index_name"])
-    assert not _plan_index_nodes(probe.before_plan, role_index_name)
     role_index_nodes = _plan_index_nodes(probe.after_plan, role_index_name)
     affiliation_index_nodes = _plan_index_nodes(
         probe.affiliation_plan,
@@ -2182,23 +2205,13 @@ def _assert_profile_bucket_probe(probe: SimpleNamespace) -> None:
         node["Node Type"] in {"Index Scan", "Bitmap Index Scan"}
         for node in [*role_index_nodes, *affiliation_index_nodes]
     )
-    before_role_nodes = _plan_relation_nodes(
-        probe.before_plan,
-        probe.role_scope,
-    )
     after_role_nodes = _plan_relation_nodes(probe.after_plan, probe.role_scope)
-    before_rows_inspected = max(
-        int(node.get("Actual Rows", 0))
-        + int(node.get("Rows Removed by Filter", 0))
-        for node in before_role_nodes
-    )
     after_rows_inspected = max(
         int(node.get("Actual Rows", 0))
         + int(node.get("Rows Removed by Filter", 0))
         for node in after_role_nodes
     )
-    assert before_rows_inspected >= 190_000
-    assert 0 < after_rows_inspected < before_rows_inspected // 8
+    assert 0 < after_rows_inspected < 25_000
     assert _plan_temp_blocks(probe.after_plan) == 0
     assert _plan_temp_blocks(probe.affiliation_plan) == 0
     for metrics_by_name in (
@@ -2409,457 +2422,26 @@ async def test_five_million_npi_batch_uses_evidence_range_indexes(monkeypatch):
 async def test_profile_build_resumes_after_committed_batch_interruption(
     monkeypatch,
 ):
-    """Resume exact logged stages without replaying completed fact batches."""
+    """Resume exact logged stages without replaying completed batches."""
     async with _profile_database(monkeypatch) as (database, schema):
         await _build_profile_artifacts(database, schema)
-        monkeypatch.setattr(importer, "db", database)
-        progress_events: list[tuple[str | None, dict[str, Any]]] = []
-
-        async def record_progress(
-            run_id: str | None,
-            **progress_by_name: Any,
-        ) -> None:
-            progress_events.append((run_id, progress_by_name))
-
-        monkeypatch.setattr(
-            importer,
-            "_mark_provider_directory_progress",
-            record_progress,
+        context = await create_resume_context(monkeypatch, database, schema)
+        interrupted_evidence_count = await interrupt_first_evidence_batch(
+            context
         )
-        build = importer._ProviderDirectoryProfileBuild(
-            schema=schema,
-            generation_id="profile-affiliation-test",
-            source_ids=(
-                "profile-source-a",
-                "profile-source-b",
-                "profile-source-uhc",
-            ),
-            retained_source_ids=(
-                "profile-source-a",
-                "profile-source-b",
-                "profile-source-uhc",
-            ),
-            dataset_ids=(
-                "profile-dataset-a",
-                "profile-dataset-b",
-                "profile-dataset-uhc",
-            ),
-            profile_as_of="2026-07-19",
-            evidence_stage="profile_evidence_resume_stage",
-            profile_stage="profile_resume_stage",
-            build_id="profile-resume-build",
-            owner_run_id="profile-run-first",
+        resumed_build = await interrupt_first_compact_batch(context)
+        stage_oids_before = await interrupt_at_phase_boundary(
+            context, resumed_build
         )
-        expected_evidence_total = len(
-            importer._provider_directory_profile_batch_plan(
-                build.source_ids,
-                build.retained_source_ids,
-                build.dataset_ids,
-                has_existing_artifacts=True,
-            ).evidence_batches
+        prepare_profile_stages = await interrupt_after_completed_batches(
+            context, resumed_build, stage_oids_before
         )
-        assert expected_evidence_total == 345
-        fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
-        original_status = database.status
-        fact_statement_starts: list[None] = []
-
-        async def interrupting_status(sql: Any, **params: Any):
-            if (
-                f'INSERT INTO "{schema}"."{build.evidence_stage}"' in str(sql)
-                and "ON CONFLICT (evidence_key) DO NOTHING" in str(sql)
-            ):
-                if len(fact_statement_starts) == 1:
-                    raise RuntimeError("forced resumable interruption")
-                fact_statement_starts.append(None)
-            return await original_status(sql, **params)
-
-        monkeypatch.setattr(database, "status", interrupting_status)
-        with pytest.raises(RuntimeError, match="forced resumable interruption"):
-            await importer._build_provider_directory_profile_stages(
-                build,
-                fence,
-                fence,
-            )
-
-        checkpoint_ref = profile.qualified_table(
-            schema,
-            "provider_directory_profile_build_checkpoint",
+        await complete_resumed_build(
+            context,
+            resumed_build,
+            prepare_profile_stages,
+            interrupted_evidence_count,
         )
-        interrupted_checkpoint = await database.first(
-            f"SELECT state, evidence_next_batch, profile_next_batch "
-            f"FROM {checkpoint_ref} WHERE build_id = :build_id;",
-            build_id=build.build_id,
-        )
-        assert interrupted_checkpoint is not None
-        assert interrupted_checkpoint.state == "failed"
-        assert interrupted_checkpoint.evidence_next_batch == 1
-        assert interrupted_checkpoint.profile_next_batch == 0
-        first_run_progress = [
-            progress
-            for progress_run_id, progress in progress_events
-            if progress_run_id == "profile-run-first"
-        ]
-        assert [
-            (progress["done"], progress["total"])
-            for progress in first_run_progress
-        ] == [
-            (0, expected_evidence_total),
-            (1, expected_evidence_total),
-        ]
-        assert {
-            progress["phase"] for progress in first_run_progress
-        } == {importer._PROFILE_EVIDENCE_PROGRESS_PHASE}
-        assert {
-            progress["details"]["_progress_unit"]
-            for progress in first_run_progress
-        } == {"batches"}
-        interrupted_evidence_count = int(
-            await database.scalar(
-                f"SELECT count(*) FROM "
-                f"{profile.qualified_table(schema, build.evidence_stage)};"
-            )
-            or 0
-        )
-
-        resumed_fact_statements: list[str] = []
-        compact_statement_starts: list[None] = []
-
-        async def tracking_status(sql: Any, **params: Any):
-            if (
-                f'INSERT INTO "{schema}"."{build.evidence_stage}"' in str(sql)
-                and "ON CONFLICT (evidence_key) DO NOTHING" in str(sql)
-            ):
-                resumed_fact_statements.append(str(sql))
-            if (
-                f'INSERT INTO "{schema}"."{build.profile_stage}"' in str(sql)
-                and "ON CONFLICT (npi) DO NOTHING" in str(sql)
-            ):
-                if len(compact_statement_starts) == 0:
-                    raise RuntimeError("forced compact interruption")
-                compact_statement_starts.append(None)
-            return await original_status(sql, **params)
-
-        monkeypatch.setattr(database, "status", tracking_status)
-        resumed_build = replace(
-            build,
-            owner_run_id="profile-run-retry",
-        )
-        with pytest.raises(RuntimeError, match="forced compact interruption"):
-            await importer._build_provider_directory_profile_stages(
-                resumed_build,
-                fence,
-                fence,
-            )
-        compact_checkpoint = await database.first(
-            f"SELECT state, evidence_next_batch, evidence_total_batches, "
-            f"profile_next_batch FROM {checkpoint_ref} "
-            f"WHERE build_id = :build_id;",
-            build_id=build.build_id,
-        )
-        assert compact_checkpoint is not None
-        assert compact_checkpoint.state == "failed"
-        assert (
-            compact_checkpoint.evidence_next_batch
-            == compact_checkpoint.evidence_total_batches
-        )
-        assert compact_checkpoint.profile_next_batch == 0
-        assert len(resumed_fact_statements) == (
-            compact_checkpoint.evidence_total_batches - 1
-        )
-        retry_evidence_progress = [
-            progress
-            for progress_run_id, progress in progress_events
-            if progress_run_id == "profile-run-retry"
-            and progress["phase"]
-            == importer._PROFILE_EVIDENCE_PROGRESS_PHASE
-        ]
-        assert [
-            progress["done"] for progress in retry_evidence_progress
-        ] == list(range(1, expected_evidence_total + 1))
-        retry_profile_progress = [
-            progress
-            for progress_run_id, progress in progress_events
-            if progress_run_id == "profile-run-retry"
-            and progress["phase"]
-            == importer._PROFILE_COMPACT_PROGRESS_PHASE
-        ]
-        assert [
-            (progress["done"], progress["total"])
-            for progress in retry_profile_progress
-        ] == [(0, 400)]
-
-        evidence_population = (
-            importer._populate_provider_directory_profile_evidence_stage
-        )
-        compact_population = (
-            importer._populate_provider_directory_profile_compact_stage
-        )
-        mark_checkpoint_failed = (
-            importer._mark_profile_build_checkpoint_failed
-        )
-
-        async def stage_oids() -> tuple[int, int]:
-            relation_oids: list[int] = []
-            for stage_table in (
-                build.evidence_stage,
-                build.profile_stage,
-            ):
-                relation_oids.append(
-                    int(
-                        await database.scalar(
-                            "SELECT to_regclass(:relation_name)::oid;",
-                            relation_name=f"{schema}.{stage_table}",
-                        )
-                        or 0
-                    )
-                )
-            return relation_oids[0], relation_oids[1]
-
-        stage_oids_before_interrupt = await stage_oids()
-        evidence_reopen_attempts: list[None] = []
-
-        async def reject_evidence_reopen(*_args: Any, **_params: Any):
-            evidence_reopen_attempts.append(None)
-            raise AssertionError("completed evidence phase was reopened")
-
-        async def interrupt_before_next_compact_batch(
-            *_args: Any,
-            **_params: Any,
-        ):
-            raise RuntimeError("hard stop before next compact batch")
-
-        async def preserve_hard_stop_state(
-            *_args: Any,
-            **_params: Any,
-        ) -> None:
-            return None
-
-        monkeypatch.setattr(
-            importer,
-            "_populate_provider_directory_profile_evidence_stage",
-            reject_evidence_reopen,
-        )
-        monkeypatch.setattr(
-            importer,
-            "_populate_provider_directory_profile_compact_stage",
-            interrupt_before_next_compact_batch,
-        )
-        monkeypatch.setattr(
-            importer,
-            "_mark_profile_build_checkpoint_failed",
-            preserve_hard_stop_state,
-        )
-        with pytest.raises(
-            RuntimeError,
-            match="hard stop before next compact batch",
-        ):
-            await importer._build_provider_directory_profile_stages(
-                replace(
-                    resumed_build,
-                    owner_run_id="profile-run-boundary-stop",
-                ),
-                fence,
-                fence,
-            )
-        assert evidence_reopen_attempts == []
-        boundary_checkpoint = await database.first(
-            f"SELECT state, evidence_next_batch, evidence_total_batches, "
-            f"profile_next_batch FROM {checkpoint_ref} "
-            f"WHERE build_id = :build_id;",
-            build_id=build.build_id,
-        )
-        assert boundary_checkpoint is not None
-        assert boundary_checkpoint.state == "building_profile"
-        assert (
-            boundary_checkpoint.evidence_next_batch
-            == boundary_checkpoint.evidence_total_batches
-        )
-        assert boundary_checkpoint.profile_next_batch == 0
-        assert await stage_oids() == stage_oids_before_interrupt
-        monkeypatch.setattr(
-            importer,
-            "_populate_provider_directory_profile_evidence_stage",
-            evidence_population,
-        )
-        monkeypatch.setattr(
-            importer,
-            "_populate_provider_directory_profile_compact_stage",
-            compact_population,
-        )
-        monkeypatch.setattr(
-            importer,
-            "_mark_profile_build_checkpoint_failed",
-            mark_checkpoint_failed,
-        )
-
-        last_batch_evidence_statements: list[str] = []
-        last_batch_profile_statements: list[str] = []
-        profile_index_interruptions: list[None] = []
-
-        async def last_batch_status(sql: Any, **params: Any):
-            if (
-                f'INSERT INTO "{schema}"."{build.evidence_stage}"' in str(sql)
-                and "ON CONFLICT (evidence_key) DO NOTHING" in str(sql)
-            ):
-                last_batch_evidence_statements.append(str(sql))
-            if (
-                f'INSERT INTO "{schema}"."{build.profile_stage}"' in str(sql)
-                and "ON CONFLICT (npi) DO NOTHING" in str(sql)
-            ):
-                last_batch_profile_statements.append(str(sql))
-            if (
-                "CREATE INDEX IF NOT EXISTS" in str(sql)
-                and f'"{build.profile_stage}_generation_idx"' in str(sql)
-                and not profile_index_interruptions
-            ):
-                profile_index_interruptions.append(None)
-                raise RuntimeError("forced profile index interruption")
-            return await original_status(sql, **params)
-
-        monkeypatch.setattr(database, "status", last_batch_status)
-        with pytest.raises(
-            RuntimeError,
-            match="forced profile index interruption",
-        ):
-            await importer._build_provider_directory_profile_stages(
-                replace(
-                    resumed_build,
-                    owner_run_id="profile-run-last-batch",
-                ),
-                fence,
-                fence,
-            )
-        last_batch_checkpoint = await database.first(
-            f"SELECT state, evidence_next_batch, evidence_total_batches, "
-            f"profile_next_batch, profile_total_batches "
-            f"FROM {checkpoint_ref} WHERE build_id = :build_id;",
-            build_id=build.build_id,
-        )
-        assert last_batch_checkpoint is not None
-        assert last_batch_evidence_statements == []
-        assert len(last_batch_profile_statements) == (
-            last_batch_checkpoint.profile_total_batches
-        )
-        assert last_batch_checkpoint.state == "failed"
-        assert (
-            last_batch_checkpoint.profile_next_batch
-            == last_batch_checkpoint.profile_total_batches
-        )
-        assert await stage_oids() == stage_oids_before_interrupt
-
-        final_evidence_statements: list[str] = []
-        final_profile_statements: list[str] = []
-
-        async def final_status(sql: Any, **params: Any):
-            if (
-                f'INSERT INTO "{schema}"."{build.evidence_stage}"' in str(sql)
-                and "ON CONFLICT (evidence_key) DO NOTHING" in str(sql)
-            ):
-                final_evidence_statements.append(str(sql))
-            if (
-                f'INSERT INTO "{schema}"."{build.profile_stage}"' in str(sql)
-                and "ON CONFLICT (npi) DO NOTHING" in str(sql)
-            ):
-                final_profile_statements.append(str(sql))
-            return await original_status(sql, **params)
-
-        monkeypatch.setattr(database, "status", final_status)
-        _metrics, _stages = await importer._build_provider_directory_profile_stages(
-            replace(resumed_build, owner_run_id="profile-run-final"),
-            fence,
-            fence,
-        )
-        completed_checkpoint = await database.first(
-            f"SELECT state, evidence_next_batch, evidence_total_batches, "
-            f"profile_next_batch, profile_total_batches "
-            f"FROM {checkpoint_ref} WHERE build_id = :build_id;",
-            build_id=build.build_id,
-        )
-        assert completed_checkpoint is not None
-        assert final_evidence_statements == []
-        assert final_profile_statements == []
-        assert completed_checkpoint.state == "ready"
-        assert (
-            completed_checkpoint.evidence_next_batch
-            == completed_checkpoint.evidence_total_batches
-        )
-        assert (
-            completed_checkpoint.profile_next_batch
-            == completed_checkpoint.profile_total_batches
-        )
-        last_batch_progress = [
-            progress["done"]
-            for progress_run_id, progress in progress_events
-            if progress_run_id == "profile-run-last-batch"
-            and progress["phase"]
-            == importer._PROFILE_COMPACT_PROGRESS_PHASE
-        ]
-        assert last_batch_progress == list(range(401))
-        final_progress = [
-            (progress["done"], progress["total"])
-            for progress_run_id, progress in progress_events
-            if progress_run_id == "profile-run-final"
-            and progress["phase"]
-            == importer._PROFILE_COMPACT_PROGRESS_PHASE
-        ]
-        assert final_progress == [(400, 400)]
-        assert int(
-            await database.scalar(
-                f"SELECT count(*) FROM "
-                f"{profile.qualified_table(schema, build.evidence_stage)};"
-            )
-            or 0
-        ) >= interrupted_evidence_count
-
-        baseline_evidence_ref = profile.qualified_table(
-            schema,
-            "profile_evidence",
-        )
-        resumed_evidence_ref = profile.qualified_table(
-            schema,
-            build.evidence_stage,
-        )
-        baseline_profile_ref = profile.qualified_table(schema, "profile")
-        resumed_profile_ref = profile.qualified_table(
-            schema,
-            build.profile_stage,
-        )
-        assert await database.scalar(
-            f"""
-            SELECT count(*) FROM (
-                (SELECT * FROM {baseline_evidence_ref}
-                 EXCEPT ALL SELECT * FROM {resumed_evidence_ref})
-                UNION ALL
-                (SELECT * FROM {resumed_evidence_ref}
-                 EXCEPT ALL SELECT * FROM {baseline_evidence_ref})
-            ) AS difference;
-            """
-        ) == 0
-        assert await database.scalar(
-            f"""
-            SELECT count(*) FROM (
-                (SELECT npi, profile_json, evidence_json, source_ids,
-                        endpoint_ids, dataset_ids, source_count,
-                        independent_source_count, fact_count, generation_id
-                   FROM {baseline_profile_ref}
-                 EXCEPT ALL
-                 SELECT npi, profile_json, evidence_json, source_ids,
-                        endpoint_ids, dataset_ids, source_count,
-                        independent_source_count, fact_count, generation_id
-                   FROM {resumed_profile_ref})
-                UNION ALL
-                (SELECT npi, profile_json, evidence_json, source_ids,
-                        endpoint_ids, dataset_ids, source_count,
-                        independent_source_count, fact_count, generation_id
-                   FROM {resumed_profile_ref}
-                 EXCEPT ALL
-                 SELECT npi, profile_json, evidence_json, source_ids,
-                        endpoint_ids, dataset_ids, source_count,
-                        independent_source_count, fact_count, generation_id
-                   FROM {baseline_profile_ref})
-            ) AS difference;
-            """
-        ) == 0
 
 
 def _reaper_profile_build(

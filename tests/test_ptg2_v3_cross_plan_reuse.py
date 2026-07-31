@@ -164,6 +164,213 @@ def test_identical_full_input_reuses_physical_identity_across_logical_plans():
     assert len(identity_a.coverage_scope_id) == 32
 
 
+async def _reserve_reused_cross_plan_layout(
+    database,
+    *,
+    schema_name,
+    identity_a,
+    identity_b,
+):
+    schema = f'"{schema_name}"'
+    async with database.transaction() as session:
+        first = await reserve_shared_layout(
+            session,
+            schema_name=schema_name,
+            semantic_fingerprint=identity_a.semantic_fingerprint,
+            build_token="build-a",
+        )
+        assert not first.reused
+        await session.execute(
+            text(
+                f"""
+                UPDATE {schema}.ptg2_v3_snapshot_layout
+                   SET state = 'sealed',
+                       lease_until = transaction_timestamp() - INTERVAL '1 second'
+                 WHERE snapshot_key = :snapshot_key
+                """
+            ),
+            {"snapshot_key": first.snapshot_key},
+        )
+        second = await reserve_shared_layout(
+            session,
+            schema_name=schema_name,
+            semantic_fingerprint=identity_b.semantic_fingerprint,
+            build_token="build-b",
+        )
+        assert second.reused
+        assert second.snapshot_key == first.snapshot_key
+    return first.snapshot_key
+
+
+async def _bind_cross_plan_layout(
+    database,
+    *,
+    schema_name,
+    snapshot_key,
+    identity_a,
+    identity_b,
+):
+    schema = f'"{schema_name}"'
+    async with database.transaction() as session:
+        for snapshot_id, plan_id, coverage_scope_id in (
+            (SNAPSHOT_A, PLAN_A, identity_a.coverage_scope_id),
+            (SNAPSHOT_B, PLAN_B, identity_b.coverage_scope_id),
+        ):
+            await _bind_logical_snapshot(
+                session,
+                schema_name=schema_name,
+                snapshot_id=snapshot_id,
+                snapshot_key=snapshot_key,
+                plan_id=plan_id,
+                coverage_scope_id=coverage_scope_id,
+            )
+        await session.execute(
+            text(
+                f"""
+                INSERT INTO {schema}.ptg2_v3_code
+                    (snapshot_key, code_key, code_global_id_128,
+                     coverage_scope_id, reported_code_system,
+                     reported_code, negotiation_arrangement, rate_count)
+                VALUES
+                    (:snapshot_key, 7, :code_global_id_128,
+                     :coverage_scope_id, 'CPT', '99213', 'ffs', 1)
+                """
+            ),
+            {
+                "snapshot_key": snapshot_key,
+                "code_global_id_128": bytes.fromhex("07" * 16),
+                "coverage_scope_id": identity_a.coverage_scope_id,
+            },
+        )
+
+
+async def _assert_cross_plan_bindings(
+    session,
+    *,
+    schema,
+    snapshot_key,
+    coverage_scope_id,
+):
+    bindings = (
+        await session.execute(
+            text(
+                f"""
+                SELECT snapshot_id, snapshot_key
+                  FROM {schema}.ptg2_v3_snapshot_binding
+                 ORDER BY snapshot_id
+                """
+            )
+        )
+    ).all()
+    scopes = (
+        await session.execute(
+            text(
+                f"""
+                SELECT snapshot_id, plan_id, plan_market_type, coverage_scope_id
+                  FROM {schema}.ptg2_v3_snapshot_scope
+                 ORDER BY snapshot_id
+                """
+            )
+        )
+    ).all()
+    assert [tuple(binding_row) for binding_row in bindings] == [
+        (SNAPSHOT_A, snapshot_key),
+        (SNAPSHOT_B, snapshot_key),
+    ]
+    assert [tuple(scope_row) for scope_row in scopes] == [
+        (SNAPSHOT_A, PLAN_A, "group", coverage_scope_id),
+        (SNAPSHOT_B, PLAN_B, "group", coverage_scope_id),
+    ]
+
+
+async def _assert_cross_plan_scoped_reads(session, *, schema_name, snapshot_key):
+    own_rows, own_sql, own_params = await _scoped_plan_rows(
+        session,
+        schema_name=schema_name,
+        snapshot_id=SNAPSHOT_A,
+        snapshot_key=snapshot_key,
+        requested_plan=PLAN_A,
+    )
+    cross_rows, cross_sql, cross_params = await _scoped_plan_rows(
+        session,
+        schema_name=schema_name,
+        snapshot_id=SNAPSHOT_A,
+        snapshot_key=snapshot_key,
+        requested_plan=PLAN_B,
+    )
+    other_rows, _, _ = await _scoped_plan_rows(
+        session,
+        schema_name=schema_name,
+        snapshot_id=SNAPSHOT_B,
+        snapshot_key=snapshot_key,
+        requested_plan=PLAN_B,
+    )
+    assert own_rows == [PLAN_A]
+    assert cross_rows == []
+    assert other_rows == [PLAN_B]
+    assert "physical_scope.snapshot_id = :logical_snapshot_id" in own_sql
+    assert "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id" in own_sql
+    assert "plan_scope.plan_id = :plan_id" in cross_sql
+    assert own_params["logical_snapshot_id"] == SNAPSHOT_A
+    assert own_params["plan_id"] == PLAN_A
+    assert cross_params["logical_snapshot_id"] == SNAPSHOT_A
+    assert cross_params["plan_id"] == PLAN_B
+
+
+async def _assert_cross_plan_layout_retention(
+    database,
+    *,
+    schema_name,
+    snapshot_key,
+    coverage_scope_id,
+):
+    schema = f'"{schema_name}"'
+    async with database.acquire() as connection:
+        planned = await shared_gc.build_shared_layout_release_plan(
+            schema_name=schema_name,
+            executor=connection,
+            removing_snapshot_ids=(SNAPSHOT_A,),
+            all_eligible_layouts=True,
+            require_shared=True,
+        )
+        assert planned.logical_layout_count == 0
+        for relation in ("ptg2_v3_snapshot_scope", "ptg2_v3_snapshot_binding"):
+            await connection.status(
+                f"DELETE FROM {schema}.{relation} WHERE snapshot_id = :snapshot_id",
+                snapshot_id=SNAPSHOT_A,
+            )
+        released = await shared_gc.release_unbound_ptg2_shared_layouts(
+            schema_name=schema_name,
+            executor=connection,
+            building_max_age_seconds=0,
+            grace_seconds=0,
+            max_layouts=10,
+            require_shared=True,
+        )
+        assert released.logical_layout_count == 0
+        assert await connection.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout"
+        ) == 1
+        assert await connection.scalar(
+            f"""
+            SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_binding
+             WHERE snapshot_id = :snapshot_id AND snapshot_key = :snapshot_key
+            """,
+            snapshot_id=SNAPSHOT_B,
+            snapshot_key=snapshot_key,
+        ) == 1
+        assert await connection.scalar(
+            f"""
+            SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_scope
+             WHERE snapshot_id = :snapshot_id AND plan_id = :plan_id
+               AND coverage_scope_id = :coverage_scope_id
+            """,
+            snapshot_id=SNAPSHOT_B,
+            plan_id=PLAN_B,
+            coverage_scope_id=coverage_scope_id,
+        ) == 1
+
+
 @pytest.mark.asyncio
 async def test_postgres_cross_plan_scope_isolation_and_bound_layout_retention(monkeypatch):
     """Ensure cross-plan reuse preserves logical scope isolation and retention."""
@@ -185,191 +392,39 @@ async def test_postgres_cross_plan_scope_isolation_and_bound_layout_retention(mo
         async with database.acquire() as connection:
             await create_cross_plan_test_schema(connection, schema_name)
 
-        async with database.transaction() as session:
-            first = await reserve_shared_layout(
-                session,
-                schema_name=schema_name,
-                semantic_fingerprint=identity_a.semantic_fingerprint,
-                build_token="build-a",
-            )
-            assert not first.reused
-            await session.execute(
-                text(
-                    f"""
-                    UPDATE {schema}.ptg2_v3_snapshot_layout
-                       SET state = 'sealed',
-                           lease_until = transaction_timestamp() - INTERVAL '1 second'
-                     WHERE snapshot_key = :snapshot_key
-                    """
-                ),
-                {"snapshot_key": first.snapshot_key},
-            )
-            second = await reserve_shared_layout(
-                session,
-                schema_name=schema_name,
-                semantic_fingerprint=identity_b.semantic_fingerprint,
-                build_token="build-b",
-            )
-            assert second.reused
-            assert second.snapshot_key == first.snapshot_key
+        snapshot_key = await _reserve_reused_cross_plan_layout(
+            database,
+            schema_name=schema_name,
+            identity_a=identity_a,
+            identity_b=identity_b,
+        )
+        await _bind_cross_plan_layout(
+            database,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            identity_a=identity_a,
+            identity_b=identity_b,
+        )
 
-            await _bind_logical_snapshot(
+        async with database.transaction() as session:
+            await _assert_cross_plan_bindings(
                 session,
-                schema_name=schema_name,
-                snapshot_id=SNAPSHOT_A,
-                snapshot_key=first.snapshot_key,
-                plan_id=PLAN_A,
+                schema=schema,
+                snapshot_key=snapshot_key,
                 coverage_scope_id=identity_a.coverage_scope_id,
             )
-            await _bind_logical_snapshot(
+            await _assert_cross_plan_scoped_reads(
                 session,
                 schema_name=schema_name,
-                snapshot_id=SNAPSHOT_B,
-                snapshot_key=first.snapshot_key,
-                plan_id=PLAN_B,
-                coverage_scope_id=identity_b.coverage_scope_id,
-            )
-            await session.execute(
-                text(
-                    f"""
-                    INSERT INTO {schema}.ptg2_v3_code
-                        (snapshot_key, code_key, code_global_id_128,
-                         coverage_scope_id, reported_code_system,
-                         reported_code, negotiation_arrangement, rate_count)
-                    VALUES
-                        (:snapshot_key, 7, :code_global_id_128,
-                         :coverage_scope_id, 'CPT', '99213', 'ffs', 1)
-                    """
-                ),
-                {
-                    "snapshot_key": first.snapshot_key,
-                    "code_global_id_128": bytes.fromhex("07" * 16),
-                    "coverage_scope_id": identity_a.coverage_scope_id,
-                },
+                snapshot_key=snapshot_key,
             )
 
-        async with database.transaction() as session:
-            bindings = (
-                await session.execute(
-                    text(
-                        f"""
-                        SELECT snapshot_id, snapshot_key
-                          FROM {schema}.ptg2_v3_snapshot_binding
-                         ORDER BY snapshot_id
-                        """
-                    )
-                )
-            ).all()
-            scopes = (
-                await session.execute(
-                    text(
-                        f"""
-                        SELECT snapshot_id, plan_id, plan_market_type,
-                               coverage_scope_id
-                          FROM {schema}.ptg2_v3_snapshot_scope
-                         ORDER BY snapshot_id
-                        """
-                    )
-                )
-            ).all()
-            assert [tuple(binding_row) for binding_row in bindings] == [
-                (SNAPSHOT_A, first.snapshot_key),
-                (SNAPSHOT_B, first.snapshot_key),
-            ]
-            assert [tuple(scope_row) for scope_row in scopes] == [
-                (SNAPSHOT_A, PLAN_A, "group", identity_a.coverage_scope_id),
-                (SNAPSHOT_B, PLAN_B, "group", identity_a.coverage_scope_id),
-            ]
-
-            own_rows, own_sql, own_params = await _scoped_plan_rows(
-                session,
-                schema_name=schema_name,
-                snapshot_id=SNAPSHOT_A,
-                snapshot_key=first.snapshot_key,
-                requested_plan=PLAN_A,
-            )
-            cross_plan_rows, cross_plan_sql, cross_plan_params = await _scoped_plan_rows(
-                session,
-                schema_name=schema_name,
-                snapshot_id=SNAPSHOT_A,
-                snapshot_key=first.snapshot_key,
-                requested_plan=PLAN_B,
-            )
-            other_rows, _, _ = await _scoped_plan_rows(
-                session,
-                schema_name=schema_name,
-                snapshot_id=SNAPSHOT_B,
-                snapshot_key=first.snapshot_key,
-                requested_plan=PLAN_B,
-            )
-
-            assert own_rows == [PLAN_A]
-            assert cross_plan_rows == []
-            assert other_rows == [PLAN_B]
-            assert "physical_scope.snapshot_id = :logical_snapshot_id" in own_sql
-            assert (
-                "physical_scope.coverage_scope_id = code_metadata.coverage_scope_id"
-                in own_sql
-            )
-            assert "plan_scope.plan_id = :plan_id" in cross_plan_sql
-            assert own_params["logical_snapshot_id"] == SNAPSHOT_A
-            assert own_params["plan_id"] == PLAN_A
-            assert cross_plan_params["logical_snapshot_id"] == SNAPSHOT_A
-            assert cross_plan_params["plan_id"] == PLAN_B
-
-        async with database.acquire() as connection:
-            planned = await shared_gc.build_shared_layout_release_plan(
-                schema_name=schema_name,
-                executor=connection,
-                removing_snapshot_ids=(SNAPSHOT_A,),
-                all_eligible_layouts=True,
-                require_shared=True,
-            )
-            assert planned.logical_layout_count == 0
-
-            await connection.status(
-                f"DELETE FROM {schema}.ptg2_v3_snapshot_scope WHERE snapshot_id = :snapshot_id",
-                snapshot_id=SNAPSHOT_A,
-            )
-            await connection.status(
-                f"DELETE FROM {schema}.ptg2_v3_snapshot_binding WHERE snapshot_id = :snapshot_id",
-                snapshot_id=SNAPSHOT_A,
-            )
-            released = await shared_gc.release_unbound_ptg2_shared_layouts(
-                schema_name=schema_name,
-                executor=connection,
-                building_max_age_seconds=0,
-                grace_seconds=0,
-                max_layouts=10,
-                require_shared=True,
-            )
-
-            assert released.logical_layout_count == 0
-            assert await connection.scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_layout"
-            ) == 1
-            assert await connection.scalar(
-                f"""
-                SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_snapshot_binding
-                 WHERE snapshot_id = :snapshot_id
-                   AND snapshot_key = :snapshot_key
-                """,
-                snapshot_id=SNAPSHOT_B,
-                snapshot_key=first.snapshot_key,
-            ) == 1
-            assert await connection.scalar(
-                f"""
-                SELECT COUNT(*)
-                  FROM {schema}.ptg2_v3_snapshot_scope
-                 WHERE snapshot_id = :snapshot_id
-                   AND plan_id = :plan_id
-                   AND coverage_scope_id = :coverage_scope_id
-                """,
-                snapshot_id=SNAPSHOT_B,
-                plan_id=PLAN_B,
-                coverage_scope_id=identity_b.coverage_scope_id,
-            ) == 1
+        await _assert_cross_plan_layout_retention(
+            database,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            coverage_scope_id=identity_b.coverage_scope_id,
+        )
     finally:
         try:
             async with database.acquire() as connection:

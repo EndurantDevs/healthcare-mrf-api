@@ -58,6 +58,9 @@ __all__ = (
     "ProviderDirectoryOrganizationAffiliation",
     "ProviderDirectoryPaginationCheckpoint",
     "ProviderDirectoryProfileBuildCheckpoint",
+    "ProviderDirectoryProfileCapacityLeaseConsumption",
+    "ProviderDirectoryProfileDeltaReceipt",
+    "ProviderDirectoryProfileServingGeneration",
     "ProviderDirectoryProfileSelectionAuthority",
     "ProviderDirectoryProfileSelectionObservation",
     "ProviderDirectoryProfileSelectionProof",
@@ -1533,6 +1536,21 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
             name="pd_profile_build_checkpoint_oid_check",
         ),
         CheckConstraint(
+            "(evidence_stage_storage_fingerprint IS NULL "
+            "AND profile_stage_storage_fingerprint IS NULL "
+            "AND affected_npi_stage_storage_fingerprint IS NULL) "
+            "OR (evidence_stage_storage_fingerprint "
+            "~ '^[0-9a-f]{64}$' "
+            "AND profile_stage_storage_fingerprint "
+            "~ '^[0-9a-f]{64}$' "
+            "AND ((materialization_mode = 'source_delta' "
+            "AND affected_npi_stage_storage_fingerprint "
+            "~ '^[0-9a-f]{64}$') "
+            "OR (materialization_mode = 'full_swap' "
+            "AND affected_npi_stage_storage_fingerprint IS NULL)))",
+            name="pd_profile_build_checkpoint_stage_storage_check",
+        ),
+        CheckConstraint(
             "state IN ('building_evidence', 'evidence_complete', "
             "'building_profile', 'ready', 'failed')",
             name="pd_profile_build_checkpoint_state_check",
@@ -1550,6 +1568,47 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
             name="pd_profile_build_checkpoint_phase_order_check",
         ),
         CheckConstraint(
+            "executable_plan_hash IS NULL "
+            "OR executable_plan_hash ~ '^[0-9a-f]{64}$'",
+            name="pd_profile_build_checkpoint_plan_hash_check",
+        ),
+        CheckConstraint(
+            "materialization_mode IN ('full_swap', 'source_delta')",
+            name="pd_profile_build_checkpoint_mode_check",
+        ),
+        CheckConstraint(
+            "(materialization_mode = 'full_swap' "
+            "AND current_source_vector_hash IS NULL "
+            "AND desired_source_vector_hash IS NULL "
+            "AND current_source_context_vector_hash IS NULL "
+            "AND desired_source_context_vector_hash IS NULL "
+            "AND affected_npi_stage IS NULL "
+            "AND affected_npi_stage_oid IS NULL "
+            "AND capacity_geometry_status = 'legacy_unavailable' "
+            "AND capacity_geometry_hash IS NULL "
+            "AND capacity_geometry_json IS NULL) "
+            "OR (materialization_mode = 'source_delta' "
+            "AND current_source_vector_hash IS NOT NULL "
+            "AND current_source_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND desired_source_vector_hash IS NOT NULL "
+            "AND desired_source_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND current_source_context_vector_hash IS NOT NULL "
+            "AND current_source_context_vector_hash "
+            "~ '^[0-9a-f]{64}$' "
+            "AND desired_source_context_vector_hash IS NOT NULL "
+            "AND desired_source_context_vector_hash "
+            "~ '^[0-9a-f]{64}$' "
+            "AND affected_npi_stage IS NOT NULL "
+            "AND affected_npi_stage_oid IS NOT NULL "
+            "AND affected_npi_stage_oid > 0 "
+            "AND capacity_geometry_status = 'verified' "
+            "AND capacity_geometry_hash IS NOT NULL "
+            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
+            "AND capacity_geometry_json IS NOT NULL "
+            "AND jsonb_typeof(capacity_geometry_json::jsonb) = 'object')",
+            name="pd_profile_build_checkpoint_delta_identity_check",
+        ),
+        CheckConstraint(
             "state = 'failed' "
             "OR (state = 'building_evidence' AND profile_next_batch = 0) "
             "OR (state = 'evidence_complete' "
@@ -1561,6 +1620,17 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
             "AND evidence_next_batch = evidence_total_batches "
             "AND profile_next_batch = profile_total_batches)",
             name="pd_profile_build_checkpoint_state_progress_check",
+        ),
+        CheckConstraint(
+            "(cutover_forecast_status = 'not_started' "
+            "AND cutover_forecast_hash IS NULL "
+            "AND cutover_forecast_json IS NULL) "
+            "OR (cutover_forecast_status = 'verified' "
+            "AND cutover_forecast_hash IS NOT NULL "
+            "AND cutover_forecast_hash ~ '^[0-9a-f]{64}$' "
+            "AND cutover_forecast_json IS NOT NULL "
+            "AND jsonb_typeof(cutover_forecast_json::jsonb) = 'object')",
+            name="pd_profile_build_checkpoint_forecast_check",
         ),
         {
             "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
@@ -1583,8 +1653,14 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     strategy_version = Column(String(64), nullable=False)
     schema_version = Column(Integer, nullable=False)
     resume_lineage_hash = Column(String(64), nullable=False)
+    executable_plan_hash = Column(String(64))
     owner_run_id = Column(String(64))
     state = Column(String(32), nullable=False)
+    materialization_mode = Column(
+        String(16),
+        nullable=False,
+        default="full_swap",
+    )
     profile_as_of = Column(String(10), nullable=False)
     source_ids = Column(JSON, nullable=False)
     retained_source_ids = Column(JSON, nullable=False)
@@ -1593,8 +1669,35 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     profile_stage = Column(String(63), nullable=False)
     evidence_stage_oid = Column(BigInteger, nullable=False)
     profile_stage_oid = Column(BigInteger, nullable=False)
+    evidence_stage_storage_fingerprint = Column(String(64))
+    profile_stage_storage_fingerprint = Column(String(64))
+    affected_npi_stage_storage_fingerprint = Column(String(64))
     evidence_target_oid = Column(BigInteger)
     profile_target_oid = Column(BigInteger)
+    current_source_vector_hash = Column(String(64))
+    desired_source_vector_hash = Column(String(64))
+    current_source_context_vector_hash = Column(String(64))
+    desired_source_context_vector_hash = Column(String(64))
+    refresh_source_ids = Column(JSON)
+    removed_source_ids = Column(JSON)
+    affected_npi_stage = Column(String(63))
+    affected_npi_stage_oid = Column(BigInteger)
+    capacity_geometry_status = Column(
+        String(32),
+        nullable=False,
+        default="legacy_unavailable",
+        server_default=text("'legacy_unavailable'"),
+    )
+    capacity_geometry_hash = Column(String(64))
+    capacity_geometry_json = Column(JSON)
+    cutover_forecast_status = Column(
+        String(32),
+        nullable=False,
+        default="not_started",
+        server_default=text("'not_started'"),
+    )
+    cutover_forecast_hash = Column(String(64))
+    cutover_forecast_json = Column(JSON)
     has_existing_artifacts = Column(Boolean, nullable=False)
     evidence_next_batch = Column(Integer, nullable=False, default=0)
     evidence_total_batches = Column(Integer, nullable=False)
@@ -1604,6 +1707,306 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     created_at = Column(TIMESTAMP, nullable=False)
     updated_at = Column(TIMESTAMP, nullable=False)
     completed_at = Column(TIMESTAMP)
+
+
+class ProviderDirectoryProfileServingGeneration(Base, JSONOutputMixin):
+    """One exact global generation over incrementally materialized profiles."""
+
+    __tablename__ = "provider_directory_profile_serving_generation"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("singleton_key"),
+        CheckConstraint(
+            "singleton_key = 'global' "
+            "AND ((status = 'published' AND operation = 'publish') "
+            "OR (status = 'purged' AND operation = 'purge')) "
+            "AND generation_id ~ '^pdprofile_[0-9a-f]{32}$' "
+            "AND selection_proof_id ~ '^[0-9a-f]{64}$' "
+            "AND source_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND source_context_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND executable_plan_hash ~ '^[0-9a-f]{64}$' "
+            "AND ((capacity_geometry_status = 'legacy_unavailable' "
+            "AND capacity_geometry_hash IS NULL "
+            "AND capacity_geometry_json IS NULL) "
+            "OR (capacity_geometry_status = 'verified' "
+            "AND capacity_geometry_hash IS NOT NULL "
+            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
+            "AND capacity_geometry_json IS NOT NULL "
+            "AND jsonb_typeof(capacity_geometry_json::jsonb) = 'object')) "
+            "AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' "
+            "AND control_generation > 0 "
+            "AND authority_revision > 0 "
+            "AND profile_schema_version > 0 "
+            "AND evidence_target_oid > 0 "
+            "AND profile_target_oid > 0 "
+            "AND evidence_rows >= 0 "
+            "AND profile_rows >= 0 "
+            "AND (cutover_forecast_hash IS NULL "
+            "OR cutover_forecast_hash ~ '^[0-9a-f]{64}$')",
+            name="pd_profile_serving_generation_values_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    __my_index_elements__ = ["singleton_key"]
+
+    singleton_key = Column(String(16), nullable=False)
+    status = Column(String(16), nullable=False)
+    operation = Column(String(16), nullable=False)
+    control_generation = Column(BigInteger, nullable=False)
+    generation_id = Column(String(64), nullable=False)
+    selection_proof_id = Column(String(64), nullable=False)
+    authority_revision = Column(BigInteger, nullable=False)
+    profile_schema_version = Column(Integer, nullable=False)
+    profile_strategy_version = Column(String(128), nullable=False)
+    source_vector_hash = Column(String(64), nullable=False)
+    source_vector_json = Column(JSON, nullable=False)
+    source_context_vector_hash = Column(String(64), nullable=False)
+    source_context_vector_json = Column(JSON, nullable=False)
+    executable_plan_hash = Column(String(64), nullable=False)
+    capacity_geometry_status = Column(String(32), nullable=False)
+    capacity_geometry_hash = Column(String(64))
+    capacity_geometry_json = Column(JSON)
+    cutover_forecast_hash = Column(String(64))
+    evidence_target_oid = Column(BigInteger, nullable=False)
+    profile_target_oid = Column(BigInteger, nullable=False)
+    evidence_rows = Column(BigInteger, nullable=False)
+    profile_rows = Column(BigInteger, nullable=False)
+    profile_as_of = Column(String(10), nullable=False)
+    published_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class ProviderDirectoryProfileDeltaReceipt(Base, JSONOutputMixin):
+    """Replay-safe receipt for one committed source-vector delta."""
+
+    __tablename__ = "provider_directory_profile_delta_receipt"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("build_id"),
+        UniqueConstraint(
+            "control_generation",
+            "selection_proof_id",
+            name="pd_profile_delta_receipt_control_proof_key",
+        ),
+        CheckConstraint(
+            "build_id ~ '^pdpb_[0-9a-f]{32}$' "
+            "AND executable_plan_hash ~ '^[0-9a-f]{64}$' "
+            "AND ((from_capacity_geometry_status = 'legacy_unavailable' "
+            "AND from_capacity_geometry_hash IS NULL "
+            "AND from_capacity_geometry_json IS NULL) "
+            "OR (from_capacity_geometry_status = 'verified' "
+            "AND from_capacity_geometry_hash IS NOT NULL "
+            "AND from_capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
+            "AND from_capacity_geometry_json IS NOT NULL "
+            "AND jsonb_typeof("
+            "from_capacity_geometry_json::jsonb) = 'object')) "
+            "AND capacity_geometry_status = 'verified' "
+            "AND capacity_geometry_hash IS NOT NULL "
+            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
+            "AND capacity_geometry_json IS NOT NULL "
+            "AND jsonb_typeof(capacity_geometry_json::jsonb) = 'object' "
+            "AND from_source_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND to_source_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND from_source_context_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND to_source_context_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND from_generation_id ~ '^pdprofile_[0-9a-f]{32}$' "
+            "AND generation_id ~ '^pdprofile_[0-9a-f]{32}$' "
+            "AND operation IN ('publish', 'purge') "
+            "AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' "
+            "AND selection_proof_id ~ '^[0-9a-f]{64}$' "
+            "AND control_generation > 0 "
+            "AND authority_revision > 0 "
+            "AND evidence_target_oid > 0 "
+            "AND profile_target_oid > 0 "
+            "AND evidence_rows >= 0 "
+            "AND profile_rows >= 0 "
+            "AND evidence_inserted >= 0 "
+            "AND evidence_deleted >= 0 "
+            "AND profile_inserted >= 0 "
+            "AND profile_deleted >= 0 "
+            "AND cutover_forecast_hash ~ '^[0-9a-f]{64}$' "
+            "AND jsonb_typeof(cutover_forecast_json::jsonb) = 'object' "
+            "AND cutover_actual_hash ~ '^[0-9a-f]{64}$' "
+            "AND jsonb_typeof(cutover_actual_json::jsonb) = 'object' "
+            "AND cutover_wal_start_lsn IS NOT NULL "
+            "AND cutover_wal_observed_lsn IS NOT NULL "
+            "AND cutover_wal_bytes >= 0 "
+            "AND evidence_target_bytes_before >= 0 "
+            "AND evidence_target_bytes_after >= 0 "
+            "AND evidence_target_growth_bytes >= 0 "
+            "AND profile_target_bytes_before >= 0 "
+            "AND profile_target_bytes_after >= 0 "
+            "AND profile_target_growth_bytes >= 0",
+            name="pd_profile_delta_receipt_values_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    __my_index_elements__ = ["build_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("to_source_vector_hash",),
+            "name": "pd_profile_delta_receipt_vector_idx",
+        }
+    ]
+
+    build_id = Column(String(64), nullable=False)
+    executable_plan_hash = Column(String(64), nullable=False)
+    from_capacity_geometry_status = Column(String(32), nullable=False)
+    from_capacity_geometry_hash = Column(String(64))
+    from_capacity_geometry_json = Column(JSON)
+    capacity_geometry_status = Column(String(32), nullable=False)
+    capacity_geometry_hash = Column(String(64), nullable=False)
+    capacity_geometry_json = Column(JSON, nullable=False)
+    from_source_vector_hash = Column(String(64), nullable=False)
+    to_source_vector_hash = Column(String(64), nullable=False)
+    from_source_context_vector_hash = Column(String(64), nullable=False)
+    to_source_context_vector_hash = Column(String(64), nullable=False)
+    from_generation_id = Column(String(64), nullable=False)
+    generation_id = Column(String(64), nullable=False)
+    operation = Column(String(16), nullable=False)
+    profile_as_of = Column(String(10), nullable=False)
+    selection_proof_id = Column(String(64), nullable=False)
+    control_generation = Column(BigInteger, nullable=False)
+    authority_revision = Column(BigInteger, nullable=False)
+    evidence_target_oid = Column(BigInteger, nullable=False)
+    profile_target_oid = Column(BigInteger, nullable=False)
+    evidence_rows = Column(BigInteger, nullable=False)
+    profile_rows = Column(BigInteger, nullable=False)
+    evidence_inserted = Column(BigInteger, nullable=False)
+    evidence_deleted = Column(BigInteger, nullable=False)
+    profile_inserted = Column(BigInteger, nullable=False)
+    profile_deleted = Column(BigInteger, nullable=False)
+    cutover_forecast_hash = Column(String(64), nullable=False)
+    cutover_forecast_json = Column(JSON, nullable=False)
+    cutover_actual_hash = Column(String(64), nullable=False)
+    cutover_actual_json = Column(JSON, nullable=False)
+    cutover_wal_start_lsn = Column(String(64), nullable=False)
+    cutover_wal_observed_lsn = Column(String(64), nullable=False)
+    cutover_wal_bytes = Column(BigInteger, nullable=False)
+    evidence_target_bytes_before = Column(BigInteger, nullable=False)
+    evidence_target_bytes_after = Column(BigInteger, nullable=False)
+    evidence_target_growth_bytes = Column(BigInteger, nullable=False)
+    profile_target_bytes_before = Column(BigInteger, nullable=False)
+    profile_target_bytes_after = Column(BigInteger, nullable=False)
+    profile_target_growth_bytes = Column(BigInteger, nullable=False)
+    committed_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class ProviderDirectoryProfileCapacityLeaseConsumption(
+    Base,
+    JSONOutputMixin,
+):
+    """Immutable one-time use of a signed database-capacity lease."""
+
+    __tablename__ = "provider_directory_profile_capacity_lease_consumption"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("attestation_id"),
+        UniqueConstraint(
+            "reservation_id",
+            name="pd_profile_capacity_consumption_reservation_key",
+        ),
+        UniqueConstraint(
+            "run_id",
+            name="pd_profile_capacity_consumption_run_key",
+        ),
+        CheckConstraint(
+            "attestation_id ~ '^[0-9a-f]{64}$' "
+            "AND reservation_id ~ "
+            "'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' "
+            "AND lease_digest ~ '^[0-9a-f]{64}$' "
+            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
+            "AND executable_plan_hash ~ '^[0-9a-f]{64}$' "
+            "AND selection_proof_id ~ '^[0-9a-f]{64}$' "
+            "AND source_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND source_context_vector_hash ~ '^[0-9a-f]{64}$' "
+            "AND run_id ~ '^run_[0-9a-f]{32}$' "
+            "AND build_id ~ '^pdpb_[0-9a-f]{32}$' "
+            "AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' "
+            "AND contract_id = "
+            "'provider-directory-database-capacity-lease-v1' "
+            "AND key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
+            "AND environment_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
+            "AND attestor_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
+            "AND attestor_release_digest ~ '^[0-9a-f]{64}$' "
+            "AND public_key_fingerprint ~ '^[0-9a-f]{64}$' "
+            "AND database_system_identifier ~ '^[1-9][0-9]{0,19}$' "
+            "AND database_system_identifier::numeric "
+            "<= 18446744073709551615 "
+            "AND database_oid BETWEEN 1 AND 4294967295 "
+            "AND database_name ~ "
+            "'^[A-Za-z0-9_$][A-Za-z0-9_$.-]{0,62}$' "
+            "AND tablespace_identity_hash ~ '^[0-9a-f]{64}$' "
+            "AND volume_identity_hash ~ '^[0-9a-f]{64}$' "
+            "AND signature ~ '^[A-Za-z0-9_-]{86}$' "
+            "AND observed_at <= issued_at "
+            "AND issued_at - observed_at <= interval '300 seconds' "
+            "AND accepted_at + interval '5 seconds' >= issued_at "
+            "AND accepted_at - observed_at <= interval '305 seconds' "
+            "AND accepted_at < expires_at "
+            "AND accepted_at < max_build_deadline "
+            "AND recorded_at = accepted_at "
+            "AND recorded_at < expires_at "
+            "AND recorded_at < max_build_deadline "
+            "AND issued_at < max_build_deadline "
+            "AND max_build_deadline <= expires_at "
+            "AND expires_at - issued_at <= interval '86400 seconds'",
+            name="pd_profile_capacity_consumption_values_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    __my_index_elements__ = ["attestation_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("build_id",),
+            "name": "pd_profile_capacity_consumption_build_idx",
+        },
+    ]
+
+    attestation_id = Column(String(64), nullable=False)
+    reservation_id = Column(String(128), nullable=False)
+    lease_digest = Column(String(64), nullable=False)
+    capacity_geometry_hash = Column(String(64), nullable=False)
+    executable_plan_hash = Column(String(64), nullable=False)
+    selection_proof_id = Column(String(64), nullable=False)
+    source_vector_hash = Column(String(64), nullable=False)
+    source_context_vector_hash = Column(String(64), nullable=False)
+    run_id = Column(String(64), nullable=False)
+    build_id = Column(String(64), nullable=False)
+    profile_as_of = Column(String(10), nullable=False)
+    contract_id = Column(String(64), nullable=False)
+    key_id = Column(String(64), nullable=False)
+    environment_id = Column(String(64), nullable=False)
+    attestor_id = Column(String(64), nullable=False)
+    attestor_release_digest = Column(String(64), nullable=False)
+    public_key_fingerprint = Column(String(64), nullable=False)
+    database_system_identifier = Column(String(20), nullable=False)
+    database_oid = Column(BigInteger, nullable=False)
+    database_name = Column(String(63), nullable=False)
+    tablespace_identity_hash = Column(String(64), nullable=False)
+    volume_identity_hash = Column(String(64), nullable=False)
+    canonical_lease_json = Column(TEXT, nullable=False)
+    signature = Column(String(86), nullable=False)
+    observed_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    issued_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    accepted_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    expires_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    max_build_deadline = Column(TIMESTAMP(timezone=True), nullable=False)
+    recorded_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
 
 
 class ProviderDirectoryProfileSelectionAuthority(Base, JSONOutputMixin):
