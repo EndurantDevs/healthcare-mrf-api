@@ -338,7 +338,7 @@ fn run_v3_finalizer(
         .expect("run V3 finalizer")
 }
 
-fn run_compact_v4(source: &Path, output: &Path) -> Output {
+fn compact_v4_command(source: &Path, output: &Path) -> Command {
     let serving = output.join("serving");
     let witness_scratch = output.join("witness-scratch");
     let tax_secret = output.join("tin-token-secret.bin");
@@ -347,7 +347,8 @@ fn run_compact_v4(source: &Path, output: &Path) -> Output {
     fs::create_dir_all(&serving).expect("create serving directory");
     fs::create_dir_all(&witness_scratch).expect("create witness scratch directory");
     fs::write(&tax_secret, [17u8; 32]).expect("write exact test token secret");
-    Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"));
+    command
         .args(["--compact-serving", source.to_str().expect("UTF-8 source")])
         .env("HLTHPRT_PTG2_SNAPSHOT_ARCH", "postgres_binary_v3")
         .env("HLTHPRT_PTG2_V3_SERVING_RUN_DIR", &serving)
@@ -395,7 +396,12 @@ fn run_compact_v4(source: &Path, output: &Path) -> Output {
             "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH",
             "trace-v4-test",
         )
-        .env("HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE", "coverage-test")
+        .env("HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE", "coverage-test");
+    command
+}
+
+fn run_compact_v4(source: &Path, output: &Path) -> Output {
+    compact_v4_command(source, output)
         .output()
         .expect("run compact V4 scanner")
 }
@@ -510,6 +516,77 @@ fn compact_cli_reports_primary_producer_failures() {
     let stderr = String::from_utf8_lossy(&completed.stderr);
     assert!(stderr.contains("PTG2_SCANNER_PRIMARY_FAILED"), "{stderr}");
     assert!(stderr.contains("producer_error"), "{stderr}");
+}
+
+#[test]
+fn compact_cli_reports_fail_closed_provider_and_sidecar_boundaries() {
+    fn run_case<F>(root: &Path, name: &str, source_bytes: &[u8], configure: F, expected: &str)
+    where
+        F: FnOnce(&mut Command),
+    {
+        let case_root = root.join(name);
+        let source = case_root.join("rates.json");
+        let output = case_root.join("output");
+        fs::create_dir_all(&output).expect("create case output directory");
+        fs::write(&source, source_bytes).expect("write fail-closed fixture");
+        let mut command = compact_v4_command(&source, &output);
+        configure(&mut command);
+        let completed = command.output().expect("run fail-closed compact scanner");
+        assert!(!completed.status.success(), "{name} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&completed.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{name} stderr did not contain {expected:?}: {stderr}"
+        );
+    }
+
+    let temporary = tempfile::tempdir().expect("temporary fail-closed fixture root");
+    let root = temporary.path();
+    let no_overrides = |_: &mut Command| {};
+    run_case(
+        root,
+        "missing-groups",
+        br#"{"provider_references":[{"provider_group_id":7}],"in_network":[]}"#,
+        no_overrides,
+        "provider_groups must be an array",
+    );
+    run_case(
+        root,
+        "non-object-group",
+        br#"{"provider_references":[{"provider_group_id":7,"provider_groups":[7]}],"in_network":[]}"#,
+        no_overrides,
+        "provider_groups elements must be JSON objects",
+    );
+    run_case(
+        root,
+        "missing-group-id",
+        br#"{"provider_references":[{"provider_groups":[{"tin":{"type":"ein","value":"111223333"},"npi":[1234567890]}]}],"in_network":[]}"#,
+        no_overrides,
+        "provider reference is missing provider_group_id",
+    );
+
+    run_case(
+        root,
+        "non-array-inline-groups",
+        br#"{"provider_references":[],"in_network":[{"billing_code_type":"CPT","billing_code":"99213","negotiated_rates":[{"provider_groups":{},"negotiated_prices":[{"negotiated_rate":125}]}]}]}"#,
+        no_overrides,
+        "expected JSON value type Array",
+    );
+
+    let blocked_parent = root.join("sidecar-parent-is-a-file");
+    fs::write(&blocked_parent, b"not a directory").expect("write blocked sidecar parent");
+    run_case(
+        root,
+        "blocked-sidecar-parent",
+        RAW_MRF,
+        |command| {
+            command.env(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH",
+                blocked_parent.join("provider-set-component.ptg2sc"),
+            );
+        },
+        "failed to create manifest sidecar directory",
+    );
 }
 
 #[test]

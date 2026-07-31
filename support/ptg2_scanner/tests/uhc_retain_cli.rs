@@ -1,4 +1,6 @@
-use ptg2_scanner::uhc_retained::{retain_uhc_artifact, UHCRetainRequest};
+use ptg2_scanner::uhc_retained::{
+    open_verified_uhc_replay, retain_uhc_artifact, UHCRetainRequest, UHCVerifiedReplayRequest,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -145,6 +147,66 @@ fn uhc_retain_cli_reuses_verified_artifacts_without_the_source() {
     assert_eq!(reused.record_count, 4);
     assert!(reused.raw_reused);
     assert!(reused.manifest_reused);
+}
+
+#[test]
+fn verified_replay_public_contract_is_bound_to_the_published_summary() {
+    let fixture = br#"[
+{"id":1,"score":1.25},
+{"id":2,"score":2.5},
+{"id":3,"score":3.75},
+{"id":4,"score":4.125}
+]"#;
+    let directory = tempfile::tempdir().expect("temporary verified-replay root");
+    let source = directory.path().join("source.json");
+    let retained = directory.path().join("retained");
+    fs::write(&source, fixture).expect("write verified-replay fixture");
+    fs::create_dir(&retained).expect("create retained root");
+    let summary =
+        retain_uhc_artifact(&request(&source, &retained, fixture, 4)).expect("retain fixture");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(&summary.manifest_path).expect("read retained manifest"))
+            .expect("decode retained manifest");
+    let range_set_sha256 = manifest["range_set_sha256"]
+        .as_str()
+        .expect("manifest range-set SHA-256")
+        .to_owned();
+    let replay = open_verified_uhc_replay(&UHCVerifiedReplayRequest {
+        raw_path: summary.raw_artifact_path.clone().into(),
+        manifest_path: summary.manifest_path.clone().into(),
+        expected_artifact_sha256: summary.raw_artifact_sha256.clone(),
+        expected_artifact_byte_count: summary.raw_artifact_byte_count,
+        expected_manifest_sha256: summary.manifest_sha256.clone(),
+        expected_range_set_sha256: range_set_sha256,
+        expected_record_count: summary.record_count,
+        expected_range_count: summary.range_count as usize,
+    })
+    .expect("open verified replay");
+
+    assert_eq!(replay.manifest_sha256(), summary.manifest_sha256);
+    let mut observed_ordinals = Vec::new();
+    let out_of_range = {
+        let mut visitor = |ordinal, record: &[u8]| {
+            assert!(serde_json::from_slice::<Value>(record)
+                .expect("decode verified record")
+                .is_object());
+            observed_ordinals.push(ordinal);
+            Ok(())
+        };
+        for range_ordinal in 0..replay.manifest().ranges.len() {
+            replay
+                .visit_verified_range_records(range_ordinal, &mut visitor)
+                .expect("visit verified replay range");
+        }
+        replay
+            .visit_verified_range_records(replay.manifest().ranges.len(), &mut visitor)
+            .expect_err("out-of-range replay rejected")
+    };
+    assert_eq!(
+        observed_ordinals,
+        (0..summary.record_count).collect::<Vec<_>>()
+    );
+    assert!(out_of_range.to_string().contains("out of bounds"));
 }
 
 #[test]

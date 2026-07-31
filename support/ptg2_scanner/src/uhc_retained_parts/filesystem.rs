@@ -249,8 +249,10 @@ impl RootDirectory {
                 return Ok(RootTemporaryFile {
                     root: Arc::clone(self),
                     name,
-                    file: unsafe { File::from_raw_fd(descriptor) },
+                    file: Some(unsafe { File::from_raw_fd(descriptor) }),
                     cleanup_required: true,
+                    #[cfg(test)]
+                    pre_unlink_probe: None,
                 });
             }
             let error = io::Error::last_os_error();
@@ -285,20 +287,37 @@ impl RootDirectory {
 struct RootTemporaryFile {
     root: Arc<RootDirectory>,
     name: String,
-    file: File,
+    file: Option<File>,
     cleanup_required: bool,
+    #[cfg(test)]
+    pre_unlink_probe: Option<Box<dyn Fn()>>,
 }
 
 impl RootTemporaryFile {
     fn file(&self) -> &File {
-        &self.file
+        self.file
+            .as_ref()
+            .expect("retained temporary file descriptor must be open")
     }
 
     fn file_mut(&mut self) -> &mut File {
-        &mut self.file
+        self.file
+            .as_mut()
+            .expect("retained temporary file descriptor must be open")
     }
 
-    fn publish_noclobber(&mut self, final_name: &str) -> io::Result<bool> {
+    fn close_and_unlink(&mut self) -> io::Result<()> {
+        drop(self.file.take());
+        #[cfg(test)]
+        if let Some(probe) = self.pre_unlink_probe.take() {
+            probe();
+        }
+        self.root.unlink(&self.name)?;
+        self.cleanup_required = false;
+        Ok(())
+    }
+
+    fn publish_noclobber(mut self, final_name: &str) -> io::Result<bool> {
         self.root.verify_path_identity()?;
         let temporary_name = c_string(&self.name, "UHC retained temporary file name")?;
         let encoded_final = c_string(final_name, "UHC retained final file name")?;
@@ -314,12 +333,12 @@ impl RootTemporaryFile {
         if linked != 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EEXIST) {
+                self.close_and_unlink()?;
                 return Ok(false);
             }
             return Err(error);
         }
-        self.root.unlink(&self.name)?;
-        self.cleanup_required = false;
+        self.close_and_unlink()?;
         Ok(true)
     }
 }
@@ -327,7 +346,7 @@ impl RootTemporaryFile {
 impl Drop for RootTemporaryFile {
     fn drop(&mut self) {
         if self.cleanup_required {
-            let _ = self.root.unlink(&self.name);
+            let _ = self.close_and_unlink();
         }
     }
 }
