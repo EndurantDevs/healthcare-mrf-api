@@ -2141,6 +2141,37 @@ async def test_autocomplete_procedures_dedupes_terms_across_systems():
     assert pricing_item["term"] == "Magnetic resonance imaging"
     assert set(pricing_item["code_systems"]) == {"CPT", "HCPCS", "HP_PROCEDURE_CODE"}
     assert "123456" in pricing_item["internal_codes"]
+    assert "matches" not in pricing_item
+    assert pricing_response["query"]["include_matches"] is False
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_procedures_includes_match_details_when_requested(
+    monkeypatch,
+):
+    match_by_field = {
+        "term": "knee replacement",
+        "canonical_term": "Knee replacement",
+        "target_system": "CPT",
+        "target_code": "27447",
+        "target_display": "Total knee arthroplasty",
+        "source": "synthetic_terminology",
+    }
+    monkeypatch.setattr(
+        pricing_module,
+        "_query_terminology",
+        AsyncMock(return_value=[match_by_field]),
+    )
+    request = make_request(
+        [FakeResult(rows=[])],
+        args={"q": "knee", "include_matches": "true"},
+    )
+
+    response = await autocomplete_procedures(request)
+    pricing_response = json.loads(response.body)
+
+    assert pricing_response["query"]["include_matches"] is True
+    assert pricing_response["items"][0]["matches"] == [match_by_field]
 
 
 @pytest.mark.asyncio

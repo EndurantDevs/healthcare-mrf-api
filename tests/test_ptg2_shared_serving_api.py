@@ -1498,6 +1498,7 @@ async def _search_forward_response(
     session: _Session,
     *,
     include_sources: bool,
+    include_details: bool = False,
 ):
     query_by_name = {
         "plan_id": "plan-a",
@@ -1510,6 +1511,8 @@ async def _search_forward_response(
             source_key="logical-source",
             include_sources=True,
         )
+    if include_details:
+        query_by_name["include_details"] = True
     return await ptg2_serving._search_manifest_serving_table(
         session,
         "logical-plan-a",
@@ -1611,6 +1614,7 @@ async def test_multi_file_forward_rows_keep_per_artifact_source_provenance(
     response = await _search_forward_response(
         _forward_code_session(2),
         include_sources=True,
+        include_details=True,
     )
     assert response is not None
     assert {

@@ -3685,10 +3685,12 @@ paths:
           in: query
           schema:
             type: boolean
+          description: Return compact source, snapshot, and network attribution.
         - name: include_details
           in: query
           schema:
             type: boolean
+          description: Return full diagnostic and source trace/hash details.
         - name: include_debug
           in: query
           schema:
@@ -4040,6 +4042,12 @@ paths:
           in: query
           schema:
             type: integer
+        - name: include_matches
+          in: query
+          description: Include the full terminology match records used to build each item.
+          schema:
+            type: boolean
+            default: false
       responses:
         '200':
           description: Procedure autocomplete results
@@ -4288,6 +4296,7 @@ paths:
         - name: include_sources
           in: query
           schema: { type: boolean }
+          description: Return compact source, snapshot, and network attribution.
         - name: include_unverified_addresses
           in: query
           schema: { type: boolean, default: true }
@@ -4316,6 +4325,7 @@ paths:
         - name: include_details
           in: query
           schema: { type: boolean }
+          description: Return full diagnostic and source trace/hash details.
         - name: include_debug
           in: query
           schema: { type: boolean }
@@ -4574,6 +4584,7 @@ paths:
           in: query
           schema:
             type: boolean
+          description: Return compact source, snapshot, and network attribution.
         - name: include_unverified_addresses
           in: query
           schema:
@@ -4608,6 +4619,7 @@ paths:
           in: query
           schema:
             type: boolean
+          description: Return full diagnostic and source trace/hash details.
         - name: include_debug
           in: query
           schema:
@@ -7119,6 +7131,16 @@ components:
           type: array
           items:
             type: string
+        matches:
+          type: array
+          description: Full terminology matches, present only when include_matches=true.
+          items:
+            type: object
+            additionalProperties: true
+        terminology_match:
+          type: object
+          description: Full terminology match for non-deduplicated results when requested.
+          additionalProperties: true
     PricingProcedureAutocompleteResponse:
       type: object
       properties:
@@ -7142,6 +7164,8 @@ components:
               type: string
               nullable: true
             dedupe_terms:
+              type: boolean
+            include_matches:
               type: boolean
             max_codes_per_term:
               type: integer

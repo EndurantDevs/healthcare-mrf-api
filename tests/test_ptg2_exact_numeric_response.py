@@ -88,6 +88,17 @@ def test_source_identity_fields_are_opt_in():
         {"items": [source_field_map]},
         {"include_sources": "true"},
     )
+    detailed = _shape_ptg2_response(
+        {"items": [source_field_map]},
+        {"include_details": "true"},
+    )
 
     assert hidden["items"] == [{}]
-    assert included["items"] == [source_field_map]
+    assert included["items"] == [
+        {
+            "source_artifact_key": 1,
+            "source_key": "synthetic-source",
+            "source_type": "in_network",
+        }
+    ]
+    assert detailed["items"] == [source_field_map]

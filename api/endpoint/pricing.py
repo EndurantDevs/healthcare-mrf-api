@@ -9755,6 +9755,9 @@ async def autocomplete_procedures(request):
     year = _parse_int(args.get("year"), "year", minimum=2013)
     code_system_raw = str(args.get("code_system", "")).strip()
     dedupe_terms = _parse_bool(args.get("dedupe_terms"), "dedupe_terms", default=True)
+    include_matches = _parse_bool(
+        args.get("include_matches"), "include_matches", default=False
+    )
     max_codes_per_term = _parse_int(args.get("max_codes_per_term"), "max_codes_per_term", minimum=1) or 5
     max_codes_per_term = min(max_codes_per_term, 25)
 
@@ -9862,7 +9865,7 @@ async def autocomplete_procedures(request):
                     "codes": [{"code_system": code_system, "code": code_value}] if code_system and code_value else [],
                     "internal_codes": [code_value] if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value) else [],
                     "sources": [term_row.get("source")] if term_row.get("source") else [],
-                    "terminology_match": term_row,
+                    **({"terminology_match": term_row} if include_matches else {}),
                 }
             )
         for code_catalog_row in code_catalog_rows:
@@ -10003,7 +10006,11 @@ async def autocomplete_procedures(request):
                     "codes": codes,
                     "internal_codes": internal_codes,
                     "sources": source_names,
-                    "matches": procedure_item_by_field.get("matches") or [],
+                    **(
+                        {"matches": procedure_item_by_field.get("matches") or []}
+                        if include_matches
+                        else {}
+                    ),
                     "_rank": procedure_item_by_field["_rank"],
                 }
             )
@@ -10034,6 +10041,7 @@ async def autocomplete_procedures(request):
                 "year_source": year_source,
                 "code_system": _normalize_code_system(code_system_raw) if code_system_raw else None,
                 "dedupe_terms": dedupe_terms,
+                "include_matches": include_matches,
                 "max_codes_per_term": max_codes_per_term,
             },
         }
