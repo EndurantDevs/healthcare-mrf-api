@@ -67,6 +67,33 @@ PTG2_V3_AUDIT_METHOD = "publish_time_stratified_v1"
 PTG2_V3_AUDIT_MAX_SAMPLE_ROWS = 2560
 PTG2_DATABASE_EVIDENCE_CONTRACT = "postgresql_session_v1"
 _COVERAGE_SCOPE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_V4_ONLINE_OWNER_INTEGER_FIELDS = (
+    "worst_online_groups_to_target",
+    "worst_online_group_work_bound",
+    "worst_online_member_count",
+    "worst_online_source_owner_work",
+    "worst_online_source_member_work",
+    "worst_online_source_page_work",
+    "worst_online_source_byte_work",
+    "worst_online_group_npi_member_work",
+    "worst_online_group_npi_locator_page_work",
+    "worst_online_group_npi_member_page_work",
+    "worst_online_group_npi_byte_work",
+    "worst_online_group_npi_batch_work",
+)
+_V4_WORST_OWNER_INTEGER_FIELDS = (
+    "worst_groups_to_target",
+    "worst_member_count",
+    "worst_source_owner_work",
+    "worst_source_member_work",
+    "worst_source_page_work",
+    "worst_source_byte_work",
+    "worst_group_npi_member_work",
+    "worst_group_npi_locator_page_work",
+    "worst_group_npi_member_page_work",
+    "worst_group_npi_byte_work",
+    "worst_group_npi_batch_work",
+)
 
 
 def _row_mapping(row: Any) -> dict[str, Any]:
@@ -151,7 +178,100 @@ def _has_valid_v4_fields(manifest: Any) -> bool:
     return True
 
 
-def _has_valid_v4_relations(manifest: dict[str, Any]) -> bool:
+def _has_empty_v4_online_owner(manifest: dict[str, Any]) -> bool:
+    """Require the direct layout's unused ordinary-online canary to be empty."""
+
+    return (
+        manifest["worst_online_provider_set_key"] is None
+        and manifest["worst_online_member_digest"] is None
+        and manifest["worst_online_groups_to_target_exact"] is False
+        and manifest["worst_online_uses_component_fallback"] is False
+        and not any(
+            int(manifest[field_name])
+            for field_name in _V4_ONLINE_OWNER_INTEGER_FIELDS
+        )
+    )
+
+
+def _has_valid_v4_direct_prefix(
+    manifest: dict[str, Any],
+    *,
+    owner_count: int,
+    simulated_set_count: int,
+) -> bool:
+    """Validate the writer's complete direct-prefix representation."""
+
+    has_simulated_sets = simulated_set_count > 0
+    has_worst_owner = manifest["worst_provider_set_key"] is not None
+    has_worst_digest = manifest["worst_member_digest"] is not None
+    if has_simulated_sets:
+        has_valid_worst_owner = (
+            has_worst_owner
+            and has_worst_digest
+            and manifest["worst_uses_override"] is True
+        )
+    else:
+        has_valid_worst_owner = (
+            not has_worst_owner
+            and not has_worst_digest
+            and manifest["worst_uses_override"] is False
+            and manifest["worst_uses_component_fallback"] is False
+            and not any(
+                int(manifest[field_name])
+                for field_name in _V4_WORST_OWNER_INTEGER_FIELDS
+            )
+        )
+    return (
+        owner_count == simulated_set_count
+        and has_valid_worst_owner
+        and _has_empty_v4_online_owner(manifest)
+    )
+
+
+def _has_valid_v4_prefix_owners(
+    manifest: dict[str, Any],
+    *,
+    representation: str,
+) -> bool:
+    """Validate complete direct prefixes or sparse pattern overrides."""
+
+    owner_count = int(manifest["override_owner_count"])
+    member_count = int(manifest["override_member_count"])
+    simulated_set_count = int(manifest["simulated_set_count"])
+    unsafe_set_lower_bound = max(
+        int(manifest["group_unsafe_set_count"]),
+        int(manifest["physical_unsafe_set_count"]),
+    )
+    if (
+        unsafe_set_lower_bound > simulated_set_count
+        or owner_count > simulated_set_count
+        or member_count > owner_count * int(manifest["npi_prefix_target"])
+        or int(manifest["override_raw_bytes"]) != member_count * 4
+    ):
+        return False
+    if representation == "direct_v1":
+        return _has_valid_v4_direct_prefix(
+            manifest,
+            owner_count=owner_count,
+            simulated_set_count=simulated_set_count,
+        )
+    if representation != "pattern_v1":
+        return False
+    return (
+        owner_count >= unsafe_set_lower_bound
+        and owner_count
+        <= (
+            int(manifest["group_unsafe_set_count"])
+            + int(manifest["physical_unsafe_set_count"])
+        )
+    )
+
+
+def _has_valid_v4_relations(
+    manifest: dict[str, Any],
+    *,
+    representation: str,
+) -> bool:
     prefix_target = _optional_integer(manifest.get("npi_prefix_target")) or 0
     worst_key = _optional_integer(manifest.get("worst_provider_set_key"))
     online_key = _optional_integer(manifest.get("worst_online_provider_set_key"))
@@ -197,22 +317,23 @@ def _has_valid_v4_relations(manifest: dict[str, Any]) -> bool:
             not bool(manifest["worst_uses_override"])
             or int(manifest["override_owner_count"]) > 0
         )
-        and int(manifest["override_owner_count"])
-        >= max(
-            int(manifest["group_unsafe_set_count"]),
-            int(manifest["physical_unsafe_set_count"]),
-        )
-        and int(manifest["override_owner_count"])
-        <= (
-            int(manifest["group_unsafe_set_count"])
-            + int(manifest["physical_unsafe_set_count"])
+        and _has_valid_v4_prefix_owners(
+            manifest,
+            representation=representation,
         )
     )
 
 
-def _has_valid_v4_manifest(manifest: Any) -> bool:
+def _has_valid_v4_manifest(
+    manifest: Any,
+    *,
+    representation: str,
+) -> bool:
     return _has_valid_v4_fields(manifest) and (
-        _has_valid_v4_relations(manifest)
+        _has_valid_v4_relations(
+            manifest,
+            representation=representation,
+        )
     )
 
 
@@ -708,7 +829,10 @@ def _strict_v3_manifest_fields(
             or provider_graph.get("diagnostic_table")
             != PTG2_V4_GRAPH_DIAGNOSTIC_TABLE
             or not _has_valid_v4_manifest(
-                provider_graph.get("hot_prefix")
+                provider_graph.get("hot_prefix"),
+                representation=str(provider_graph.get("representation") or "")
+                .strip()
+                .lower(),
             )
             or not _has_valid_v4_resources(
                 provider_graph.get("resource_admission")
@@ -1298,7 +1422,12 @@ async def snapshot_serving_tables(
             if isinstance(provider_graph, dict)
             else None
         )
-        if not _has_valid_v4_manifest(raw_hot_prefix):
+        if not _has_valid_v4_manifest(
+            raw_hot_prefix,
+            representation=str(provider_graph.get("representation") or "")
+            .strip()
+            .lower(),
+        ):
             raise PTG2ManifestArtifactError(
                 "PTG2 V4 snapshot is missing sealed hot-prefix limits; "
                 "reimport the snapshot"
