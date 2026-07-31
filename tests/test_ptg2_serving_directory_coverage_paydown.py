@@ -191,6 +191,35 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
 
 
 @pytest.mark.asyncio
+async def test_membership_location_query_does_not_let_exact_zip_bypass_assurance(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        serving,
+        "_ptg2_address_serving_table",
+        AsyncMock(return_value="mrf.entity_address_unified"),
+    )
+
+    query = await serving._membership_location_query(
+        object(),
+        strict_v3_tables(),
+        {
+            "zip5": "00000",
+            "lat": "41.9",
+            "long": "-87.6",
+            "radius_miles": "12",
+        },
+        candidate_npis=None,
+        limit=10,
+    )
+
+    assert query is not None
+    assert "OR" in query.filter_sql
+    assert "source_issuer_names" in query.address_assurance_sql
+    assert "geo_doctor_anchor" in query.address_assurance_sql
+
+
+@pytest.mark.asyncio
 async def test_membership_location_query_uses_v4_local_npi_dictionary(monkeypatch):
     monkeypatch.setattr(
         serving,
