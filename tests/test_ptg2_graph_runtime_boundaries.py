@@ -322,6 +322,16 @@ async def test_manifest_location_window_is_bounded_and_exhaustive(monkeypatch):
         {_PROVIDER_SET_ID},
         {_PROVIDER_SET_ID: [{"npi": 1}, {"npi": 2}, {"npi": 3}]},
     )
+    coverage = await serving._ptg2_manifest_location_provider_matches(
+        object(),
+        strict_v3_tables(),
+        {},
+        require_exhaustive=True,
+        require_provider_set_coverage=True,
+    )
+    assert coverage == graph_matches.return_value
+    assert graph_matches.await_args.kwargs["require_provider_set_coverage"] is True
+
     with pytest.raises(serving.PTG2ManifestArtifactError, match="traversal reached"):
         await serving._ptg2_manifest_location_provider_matches(
             object(), strict_v3_tables(), {}, require_exhaustive=True

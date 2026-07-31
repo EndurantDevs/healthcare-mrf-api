@@ -110,6 +110,35 @@ def make_request(results, args=None):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("param_name", ("clinical_intent", "intent"))
+async def test_raw_procedure_search_rejects_resolver_only_intent(param_name):
+    """Give direct callers the resolver-first reproduction contract."""
+
+    request = make_request(
+        [],
+        args={
+            "code": "99213",
+            "code_system": "CPT",
+            param_name: "synthetic office visit",
+        },
+    )
+
+    with pytest.raises(
+        pricing_module.InvalidUsage,
+        match=(
+            rf"Parameter '{param_name}' is resolver-only.*"
+            r"procedure-taxonomy/resolve.*recommended_mode=hard_filter.*"
+            r"provider_filter.taxonomy_codes.*"
+            r"provider_filter.primary_only.*"
+            r"provider_filter.include_subspecialties"
+        ),
+    ):
+        await list_providers_by_procedure(request)
+
+    assert request.ctx.sa_session.executions == []
+
+
 async def fake_plan_snapshot_pairs(_session, _plan_fields):
     return [("ptg_test", "ptg2:test")]
 
@@ -2770,6 +2799,45 @@ async def test_plan_pricing_translates_only_online_work_budget_to_503(
             ),
             "dimension": budget_dimension,
         }
+    }
+
+
+@pytest.mark.asyncio
+async def test_g0289_geo_candidate_budget_returns_structured_503(monkeypatch):
+    """Never translate an unproven broad geo bound into a backend 500."""
+
+    async def rejected_search(*_args, **_kwargs):
+        raise pricing_module.PTG2OnlineWorkBudgetExceeded("candidate_members")
+
+    monkeypatch.setattr(
+        pricing_module,
+        "search_current_ptg2_index",
+        rejected_search,
+    )
+    request = make_request(
+        [FakeResult(scalar=1)],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "G0289",
+            "code_system": "HCPCS",
+            "zip5": "48201",
+            "zip_radius_miles": "30",
+            "order_by": "rate",
+            "limit": "3",
+            "offset": "0",
+        },
+    )
+
+    endpoint_response = await list_providers_by_procedure(request)
+
+    assert endpoint_response.status == 503
+    assert json.loads(endpoint_response.body)["error"] == {
+        "code": "ptg2_online_work_budget_exceeded",
+        "message": (
+            "The exact query exceeds this snapshot's sealed online work budget."
+        ),
+        "dimension": "candidate_members",
     }
 
 

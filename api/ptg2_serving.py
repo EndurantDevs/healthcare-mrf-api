@@ -10738,6 +10738,38 @@ class _GraphLocationProbeState:
     )
     seen_candidate_npis: set[int] = field(default_factory=set)
     filtered_candidates: _GraphLocationCandidates | None = None
+    provider_set_coverage_required: bool = False
+
+    def _retain_provider_set_witnesses(self) -> None:
+        """Keep the first geo-qualified witness for each priced provider set."""
+
+        covered_provider_set_keys: set[int] = set()
+        witness_location_rows: list[dict[str, Any]] = []
+        witness_provider_set_keys_by_npi: dict[int, set[int]] = {}
+        for location_data in self.matched_location_rows:
+            npi = int(location_data["npi"])
+            uncovered_provider_set_keys = set(
+                self.provider_set_keys_by_npi.get(npi, ())
+            ).difference(covered_provider_set_keys)
+            if not uncovered_provider_set_keys:
+                continue
+            witness_location_rows.append(location_data)
+            witness_provider_set_keys_by_npi[npi] = uncovered_provider_set_keys
+            covered_provider_set_keys.update(uncovered_provider_set_keys)
+        self.matched_location_rows = witness_location_rows
+        self.provider_set_keys_by_npi = defaultdict(
+            set,
+            witness_provider_set_keys_by_npi,
+        )
+
+    def covered_provider_set_keys(self) -> set[int]:
+        """Return priced provider sets proven to have a qualifying location."""
+
+        return {
+            int(provider_set_key)
+            for provider_set_keys in self.provider_set_keys_by_npi.values()
+            for provider_set_key in provider_set_keys
+        }
 
     async def has_enough_after_append(
         self,
@@ -10760,6 +10792,15 @@ class _GraphLocationProbeState:
             self.provider_set_keys_by_npi,
             self.seen_candidate_npis,
         )
+        if self.provider_set_coverage_required:
+            if taxonomy_filter_requested:
+                raise PTG2ManifestArtifactError(
+                    "PTG2 provider-set coverage cannot bypass a taxonomy filter"
+                )
+            self._retain_provider_set_witnesses()
+            return rate_provider_set_keys.issubset(
+                self.covered_provider_set_keys()
+            )
         if not appended_count:
             return False
         current_candidates = _GraphLocationCandidates(
@@ -10776,11 +10817,37 @@ class _GraphLocationProbeState:
         )
         return len(self.filtered_candidates.location_rows) >= candidate_limit
 
-    def observed_match_count(self, *, taxonomy_filter_requested: bool) -> int:
+    def observed_match_count(
+        self,
+        *,
+        taxonomy_filter_requested: bool,
+    ) -> int:
         """Return matches relevant to the next density projection."""
+        if self.provider_set_coverage_required:
+            return len(self.covered_provider_set_keys())
         if taxonomy_filter_requested and self.filtered_candidates is not None:
             return len(self.filtered_candidates.location_rows)
         return len(self.matched_location_rows)
+
+    def required_match_count(
+        self,
+        rate_provider_set_keys: frozenset[int],
+        candidate_limit: int,
+    ) -> int:
+        """Return the exact target for the active traversal mode."""
+
+        if self.provider_set_coverage_required:
+            return len(rate_provider_set_keys)
+        return candidate_limit
+
+    def raise_unproven_bound(self) -> None:
+        """Raise the typed failure for an unconsumed address source."""
+
+        if self.provider_set_coverage_required:
+            raise PTG2OnlineWorkBudgetExceeded("candidate_members")
+        raise PTG2ManifestArtifactError(
+            "PTG2 location traversal reached its configured exactness bound"
+        )
 
     def result(self, *, taxonomy_filter_requested: bool) -> _GraphLocationCandidates:
         """Build the final candidate view after the bounded probe loop."""
@@ -10844,6 +10911,8 @@ async def _paged_graph_candidates(
     args: dict[str, Any],
     rate_provider_set_keys: frozenset[int],
     candidate_limit: int,
+    *,
+    require_provider_set_coverage: bool = False,
 ) -> _GraphLocationCandidates | None:
     """Scan indexed addresses in bounded pages and reverse-check graph membership."""
     is_provider_filter_requested = _is_ptg2_provider_filter_requested(args)
@@ -10852,7 +10921,7 @@ async def _paged_graph_candidates(
     )
     max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
     probe_limit = batch_size
-    probe_state = _GraphLocationProbeState()
+    probe_state = _GraphLocationProbeState(provider_set_coverage_required=require_provider_set_coverage)
     while probe_limit <= max_candidates:
         candidate_location_rows = await _membership_location_rows(
             session,
@@ -10877,24 +10946,23 @@ async def _paged_graph_candidates(
         )
         if has_enough_matches:
             return probe_state.result(taxonomy_filter_requested=is_provider_filter_requested)
-        is_source_exhausted = _is_graph_location_source_exhausted(
-            candidate_location_rows,
-            probe_limit,
-        )
-        if is_source_exhausted:
+        if _is_graph_location_source_exhausted(
+            candidate_location_rows, probe_limit
+        ):
             break
         if probe_limit >= max_candidates:
-            raise PTG2ManifestArtifactError(
-                "PTG2 location traversal reached its configured exactness bound"
-            )
+            probe_state.raise_unproven_bound()
         probe_limit = _next_graph_location_probe_limit(
             probe_limit,
             batch_size=batch_size,
             max_candidates=max_candidates,
             observed_matches=probe_state.observed_match_count(
-                taxonomy_filter_requested=is_provider_filter_requested
+                taxonomy_filter_requested=is_provider_filter_requested,
             ),
-            required_matches=candidate_limit,
+            required_matches=probe_state.required_match_count(
+                rate_provider_set_keys,
+                candidate_limit,
+            ),
         )
     return probe_state.result(taxonomy_filter_requested=is_provider_filter_requested)
 
@@ -10905,6 +10973,8 @@ async def _graph_location_candidates(
     args: dict[str, Any],
     rate_provider_set_keys: frozenset[int],
     candidate_limit: int,
+    *,
+    require_provider_set_coverage: bool = False,
 ) -> _GraphLocationCandidates | None:
     """Resolve nearby NPIs before intersecting the dense rate scope."""
 
@@ -10914,6 +10984,7 @@ async def _graph_location_candidates(
         args,
         rate_provider_set_keys,
         candidate_limit,
+        require_provider_set_coverage=require_provider_set_coverage,
     )
 
 
@@ -11044,6 +11115,7 @@ async def _project_graph_candidates(
     plan_id: str,
     snapshot_id: str | None,
     source_key: str | None,
+    include_provider_rows: bool = True,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
     """Enrich candidate NPIs and map dense provider-set keys to IDs."""
     provider_set_keys = tuple(
@@ -11066,6 +11138,9 @@ async def _project_graph_candidates(
         raise PTG2ManifestArtifactError(
             "PTG2 shared graph references a missing provider-set dictionary key"
         )
+    provider_set_ids = set(provider_set_ids_by_key.values())
+    if not include_provider_rows:
+        return provider_set_ids, {}
     enriched_provider_rows = await _enriched_provider_rows_for_npis(
         session,
         npis=tuple(int(location["npi"]) for location in candidates.location_rows),
@@ -11302,6 +11377,8 @@ async def _graph_candidates_for_rate_scope(
     rate_provider_set_keys: frozenset[int],
     candidate_limit: int,
     explicit_npi_scope: _ExplicitNpiGraphScope | None,
+    *,
+    require_provider_set_coverage: bool = False,
 ) -> _GraphLocationCandidates | None:
     """Use exact-NPI membership when available, otherwise retain broad traversal."""
 
@@ -11312,6 +11389,7 @@ async def _graph_candidates_for_rate_scope(
             args,
             rate_provider_set_keys,
             candidate_limit,
+            require_provider_set_coverage=require_provider_set_coverage,
         )
     matching_provider_set_keys = rate_provider_set_keys.intersection(
         explicit_npi_scope.provider_set_keys
@@ -11412,6 +11490,9 @@ async def _graph_candidates_for_request(
         rate_provider_set_keys,
         candidate_limit,
         explicit_npi_scope,
+        require_provider_set_coverage=bool(
+            request_options.get("require_provider_set_coverage", False)
+        ),
     )
 
 
@@ -11428,6 +11509,9 @@ async def _graph_location_matches(
     source_key = request_options.get("source_key")
     provider_set_keys = request_options.get("provider_set_keys")
     explicit_npi_scope = request_options.get("explicit_npi_scope")
+    require_provider_set_coverage = bool(
+        request_options.get("require_provider_set_coverage", False)
+    )
     requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
     requested_code = (
         canonical_catalog_code(requested_system, args.get("code") or args.get("reported_code"))
@@ -11446,10 +11530,20 @@ async def _graph_location_matches(
         candidate_limit=candidate_limit,
         provider_set_keys=provider_set_keys,
         explicit_npi_scope=explicit_npi_scope,
+        require_provider_set_coverage=require_provider_set_coverage,
     )
     if candidates is None:
         return None
-    filtered_candidates = await _taxonomy_filtered_candidates(session, args, candidates, candidate_limit)
+    filtered_candidates = (
+        candidates
+        if require_provider_set_coverage
+        else await _taxonomy_filtered_candidates(
+            session,
+            args,
+            candidates,
+            candidate_limit,
+        )
+    )
     if not filtered_candidates.location_rows:
         return set(), {}
     return await _project_graph_candidates(
@@ -11459,6 +11553,7 @@ async def _graph_location_matches(
         plan_id=plan_id,
         snapshot_id=snapshot_id,
         source_key=source_key,
+        include_provider_rows=not require_provider_set_coverage,
     )
 
 
@@ -11477,6 +11572,9 @@ async def _ptg2_manifest_location_provider_matches(
     provider_set_keys = request_options.get("provider_set_keys")
     explicit_npi_scope = request_options.get("explicit_npi_scope")
     require_exhaustive = bool(request_options.get("require_exhaustive", False))
+    require_provider_set_coverage = bool(
+        request_options.get("require_provider_set_coverage", False)
+    )
     _require_strict_shared_v3(serving_tables)
     configured_match_limit = _ptg2_manifest_location_match_limit()
     graph_candidate_limit = configured_match_limit
@@ -11499,8 +11597,13 @@ async def _ptg2_manifest_location_provider_matches(
         source_key=source_key,
         provider_set_keys=provider_set_keys,
         explicit_npi_scope=explicit_npi_scope,
+        require_provider_set_coverage=require_provider_set_coverage,
     )
-    if matches is None or not require_exhaustive:
+    if (
+        matches is None
+        or not require_exhaustive
+        or require_provider_set_coverage
+    ):
         return matches
     provider_set_ids, providers_by_set = matches
     matched_npis = {
@@ -15767,6 +15870,9 @@ async def _search_manifest_serving_table(
             provider_set_keys=provider_set_keys,
             explicit_npi_scope=explicit_npi_scope,
             require_exhaustive=location_requires_exhaustive,
+            require_provider_set_coverage=(
+                location_requires_exhaustive and not include_providers
+            ),
         )
         if location_matches is None:
             return None
@@ -16000,6 +16106,9 @@ async def _search_manifest_serving_table(
             provider_set_keys=filtered_provider_set_keys,
             explicit_npi_scope=explicit_npi_scope,
             require_exhaustive=location_requires_exhaustive,
+            require_provider_set_coverage=(
+                location_requires_exhaustive and not include_providers
+            ),
         )
         if location_matches is None:
             return None
