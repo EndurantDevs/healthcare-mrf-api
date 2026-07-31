@@ -176,6 +176,39 @@ def _worst_v4_owner_diagnostic() -> dict:
     }
 
 
+def _empty_worst_v4_owner_diagnostic() -> dict:
+    """Return empty highest-risk canary evidence for a zero-set graph."""
+
+    return {
+        "maximum_group_npi_member_work": 0,
+        "maximum_group_npi_locator_page_work": 0,
+        "maximum_group_npi_member_page_work": 0,
+        "maximum_group_npi_byte_work": 0,
+        "maximum_group_npi_batch_work": 0,
+        "group_unsafe_set_count": 0,
+        "physical_unsafe_set_count": 0,
+        "simulated_set_count": 0,
+        "override_owner_count": 0,
+        "override_member_count": 0,
+        "override_raw_bytes": 0,
+        "worst_provider_set_key": None,
+        "worst_groups_to_target": 0,
+        "worst_uses_override": False,
+        "worst_uses_component_fallback": False,
+        "worst_member_count": 0,
+        "worst_member_digest": None,
+        "worst_source_owner_work": 0,
+        "worst_source_member_work": 0,
+        "worst_source_page_work": 0,
+        "worst_source_byte_work": 0,
+        "worst_group_npi_member_work": 0,
+        "worst_group_npi_locator_page_work": 0,
+        "worst_group_npi_member_page_work": 0,
+        "worst_group_npi_byte_work": 0,
+        "worst_group_npi_batch_work": 0,
+    }
+
+
 def _online_v4_owner_diagnostic() -> dict:
     """Return the bounded online canary evidence for the strict fixture."""
 
@@ -196,6 +229,29 @@ def _online_v4_owner_diagnostic() -> dict:
         "worst_online_group_npi_member_page_work": 1,
         "worst_online_group_npi_byte_work": 1000,
         "worst_online_group_npi_batch_work": 1,
+    }
+
+
+def _empty_online_v4_owner_diagnostic() -> dict:
+    """Return the empty ordinary-online canary required by direct coverage."""
+
+    return {
+        "worst_online_provider_set_key": None,
+        "worst_online_groups_to_target": 0,
+        "worst_online_groups_to_target_exact": False,
+        "worst_online_uses_component_fallback": False,
+        "worst_online_group_work_bound": 0,
+        "worst_online_member_count": 0,
+        "worst_online_member_digest": None,
+        "worst_online_source_owner_work": 0,
+        "worst_online_source_member_work": 0,
+        "worst_online_source_page_work": 0,
+        "worst_online_source_byte_work": 0,
+        "worst_online_group_npi_member_work": 0,
+        "worst_online_group_npi_locator_page_work": 0,
+        "worst_online_group_npi_member_page_work": 0,
+        "worst_online_group_npi_byte_work": 0,
+        "worst_online_group_npi_batch_work": 0,
     }
 
 
@@ -244,6 +300,36 @@ def strict_v4_serving_index(snapshot_key=43):
         },
         "hot_prefix": _strict_v4_hot_prefix_manifest(),
     }
+    return serving_index_by_field
+
+
+def strict_direct_v4_serving_index(snapshot_key=43):
+    """Build a direct layout with one complete prefix and no unsafe sets."""
+
+    serving_index_by_field = strict_v4_serving_index(snapshot_key)
+    provider_graph_by_field = serving_index_by_field["serving_binary"][
+        "provider_graph_v4"
+    ]
+    provider_graph_by_field["representation"] = "direct_v1"
+    provider_graph_by_field["hot_prefix"].update(
+        group_unsafe_set_count=0,
+        physical_unsafe_set_count=0,
+        **_empty_online_v4_owner_diagnostic(),
+    )
+    return serving_index_by_field
+
+
+def empty_direct_v4_serving_index(snapshot_key=43):
+    """Build a writer-shaped direct graph without provider sets."""
+
+    serving_index_by_field = strict_direct_v4_serving_index(snapshot_key)
+    hot_prefix = serving_index_by_field["serving_binary"]["provider_graph_v4"][
+        "hot_prefix"
+    ]
+    hot_prefix.update(
+        **_empty_worst_v4_owner_diagnostic(),
+        **_empty_online_v4_owner_diagnostic(),
+    )
     return serving_index_by_field
 
 
@@ -543,6 +629,77 @@ def test_v4_manifest_accepts_v3_price_contract() -> None:
     assert cold_contract == "ptg_v3_cold_v2"
 
 
+def test_v4_manifest_accepts_complete_direct_prefix() -> None:
+    serving_index = strict_direct_v4_serving_index()
+
+    _shared_snapshot_key, generation, _cold_contract, _audit = (
+        ptg2_tables._strict_v3_manifest_fields(serving_index)
+    )
+
+    assert generation == "shared_blocks_v4"
+
+
+def test_v4_manifest_accepts_empty_direct_prefix() -> None:
+    serving_index = empty_direct_v4_serving_index()
+
+    _shared_snapshot_key, generation, _cold_contract, _audit = (
+        ptg2_tables._strict_v3_manifest_fields(serving_index)
+    )
+
+    assert generation == "shared_blocks_v4"
+
+
+@pytest.mark.parametrize(
+    "hot_prefix_updates",
+    [
+        {"override_owner_count": 0},
+        {"override_owner_count": 2},
+        {"group_unsafe_set_count": 2},
+        {"worst_online_group_work_bound": 1},
+        {"override_member_count": 202, "override_raw_bytes": 808},
+        {"override_raw_bytes": 13},
+        {"worst_uses_override": False},
+        {"worst_provider_set_key": None, "worst_member_digest": None},
+    ],
+)
+def test_v4_manifest_rejects_incomplete_direct_prefix(
+    hot_prefix_updates,
+) -> None:
+    serving_index = strict_direct_v4_serving_index()
+    hot_prefix = serving_index["serving_binary"]["provider_graph_v4"]["hot_prefix"]
+    hot_prefix.update(hot_prefix_updates)
+
+    with pytest.raises(ptg2_tables.PTG2ManifestArtifactError, match="V4"):
+        ptg2_tables._strict_v3_manifest_fields(serving_index)
+
+
+@pytest.mark.parametrize(
+    "hot_prefix_updates",
+    [
+        {
+            "group_unsafe_set_count": 0,
+            "physical_unsafe_set_count": 0,
+        },
+        {"override_owner_count": 0},
+        {
+            "simulated_set_count": 3,
+            "group_unsafe_set_count": 1,
+            "physical_unsafe_set_count": 1,
+            "override_owner_count": 3,
+        },
+    ],
+)
+def test_v4_manifest_retains_sparse_pattern_prefix_contract(
+    hot_prefix_updates,
+) -> None:
+    serving_index = strict_v4_serving_index()
+    hot_prefix = serving_index["serving_binary"]["provider_graph_v4"]["hot_prefix"]
+    hot_prefix.update(hot_prefix_updates)
+
+    with pytest.raises(ptg2_tables.PTG2ManifestArtifactError, match="V4"):
+        ptg2_tables._strict_v3_manifest_fields(serving_index)
+
+
 def test_legacy_v4_manifest_without_taxonomy_projection_remains_servable() -> None:
     serving_index = strict_v4_serving_index()
     provider_graph = serving_index["serving_binary"]["provider_graph_v4"]
@@ -613,6 +770,24 @@ async def test_snapshot_serving_tables_binds_v4_manifest_to_completed_root() -> 
     )
     assert tables.storage_generation == "shared_blocks_v4"
     assert tables.shared_block_layout == "packed_snapshot_maps_v4"
+    assert tables.uses_v4_graph is True
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_binds_complete_direct_prefix() -> None:
+    serving_index = strict_direct_v4_serving_index()
+
+    tables = await ptg2_tables.snapshot_serving_tables(
+        FakeSession(
+            [
+                strict_snapshot_row(serving_index),
+                strict_v4_root_row(serving_index),
+            ]
+        ),
+        "strict-direct-v4",
+    )
+
+    assert tables.storage_generation == "shared_blocks_v4"
     assert tables.uses_v4_graph is True
 
 
