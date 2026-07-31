@@ -28279,7 +28279,8 @@ mod tests {
             .unwrap();
         }
 
-        compact_copy_writer.take().unwrap().finish_silent().unwrap();
+        let sink = compact_copy_writer.take().unwrap();
+        sink.finish(&mut writer).unwrap();
         dictionary_copy_sinks.finish_silent().unwrap();
 
         assert_eq!(

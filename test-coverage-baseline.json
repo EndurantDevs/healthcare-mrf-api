@@ -597,16 +597,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 3557,
+          "covered": 3558,
           "total": 3971
         },
         "lines": {
-          "covered": 56030,
-          "total": 62488
+          "covered": 56049,
+          "total": 62489
         },
         "regions": {
-          "covered": 82557,
-          "total": 92248
+          "covered": 82587,
+          "total": 92251
         }
       },
       "one_time_floor_reset": {

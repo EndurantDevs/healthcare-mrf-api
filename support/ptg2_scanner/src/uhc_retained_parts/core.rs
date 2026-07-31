@@ -33,7 +33,7 @@ const RANGE_BATCH_QUEUE_DEPTH: usize = 8;
 // NFS attribute caching can outlive the publishing process's final unlink by several seconds.
 // Keep the wait bounded while leaving ample margin beyond the prior five-second window.
 const PUBLICATION_LINK_RETRIES: usize = 1_501;
-const PUBLICATION_LINK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const PUBLICATION_LINK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_RECORD_COUNT: u64 = 250_000_000;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_BUILD_ID_BYTES: usize = 160;
