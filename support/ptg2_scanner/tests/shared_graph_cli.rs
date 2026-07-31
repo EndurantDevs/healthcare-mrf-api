@@ -83,10 +83,8 @@ fn artifact(
     })
 }
 
-#[test]
-fn shared_graph_converter_cli_publishes_all_exact_directions() {
-    let temporary = tempfile::tempdir().expect("temporary graph root");
-    let input = temporary.path().join("input");
+fn shared_graph_manifest(root: &Path) -> Value {
+    let input = root.join("input");
     fs::create_dir(&input).expect("create graph input");
     let group_a = global(0xa0);
     let group_b = global(0xb0);
@@ -103,17 +101,15 @@ fn shared_graph_converter_cli_publishes_all_exact_directions() {
     let npi_group = reverse(&group_npi);
     let provider_set_group = reverse(&group_provider_set);
 
-    let provider_map = temporary.path().join("provider-set-key-map.copy");
+    let provider_map = root.join("provider-set-key-map.copy");
     let mut provider_writer = BufWriter::new(File::create(&provider_map).unwrap());
     writeln!(provider_writer, "{}\t0", hex(provider_a)).unwrap();
     writeln!(provider_writer, "{}\t1", hex(provider_b)).unwrap();
     provider_writer.flush().unwrap();
 
-    let output = temporary.path().join("output");
-    let manifest_path = temporary.path().join("manifest.json");
-    let manifest = json!({
+    json!({
         "provider_set_key_map_path": provider_map,
-        "output_directory": output,
+        "output_directory": root.join("output"),
         "shards": [{
             "shard_id": "source-a",
             "group_npi": artifact(&input, "group-npi.bin", "provider_group_npi", "source-a", &group_npi, false),
@@ -121,13 +117,28 @@ fn shared_graph_converter_cli_publishes_all_exact_directions() {
             "group_provider_set": artifact(&input, "group-provider.bin", "provider_inverted", "source-a", &group_provider_set, true),
             "provider_set_group": artifact(&input, "provider-group.bin", "provider_forward", "source-a", &provider_set_group, false),
         }],
-    });
-    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    })
+}
 
-    let completed = Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
+fn run_shared_graph_converter(root: &Path, manifest: &Value) -> std::process::Output {
+    let manifest_path = root.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(manifest).expect("encode graph manifest"),
+    )
+    .expect("write graph manifest");
+    Command::new(env!("CARGO_BIN_EXE_ptg2_scanner"))
         .args(["--convert-shared-graph", manifest_path.to_str().unwrap()])
         .output()
-        .expect("run shared graph converter");
+        .expect("run shared graph converter")
+}
+
+#[test]
+fn shared_graph_converter_cli_publishes_all_exact_directions() {
+    let temporary = tempfile::tempdir().expect("temporary graph root");
+    let manifest = shared_graph_manifest(temporary.path());
+    let output = temporary.path().join("output");
+    let completed = run_shared_graph_converter(temporary.path(), &manifest);
     assert!(
         completed.status.success(),
         "converter failed: {}\nstdout:\n{}",
@@ -156,4 +167,111 @@ fn shared_graph_converter_cli_publishes_all_exact_directions() {
     ] {
         assert!(output.join(name).is_file(), "missing {name}");
     }
+}
+
+#[test]
+fn shared_graph_converter_cli_rejects_invalid_descriptor_boundaries() {
+    fn run_case<F>(name: &str, mutate: F, expected: &str)
+    where
+        F: FnOnce(&mut Value),
+    {
+        let temporary = tempfile::tempdir().expect("temporary invalid graph root");
+        let mut manifest = shared_graph_manifest(temporary.path());
+        mutate(&mut manifest);
+        let completed = run_shared_graph_converter(temporary.path(), &manifest);
+        assert!(!completed.status.success(), "{name} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&completed.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{name} stderr did not contain {expected:?}: {stderr}"
+        );
+    }
+
+    run_case(
+        "empty-shards",
+        |manifest| manifest["shards"] = json!([]),
+        "manifest.shards must contain at least one shard",
+    );
+    run_case(
+        "missing-artifact",
+        |manifest| {
+            let existing = manifest["shards"][0]["group_npi"]["path"]
+                .as_str()
+                .expect("membership sidecar path");
+            let missing = Path::new(existing).with_file_name("missing-sidecar.bin");
+            manifest["shards"][0]["group_npi"]["path"] = json!(missing);
+        },
+        "membership sidecar is unavailable",
+    );
+    run_case(
+        "invalid-provider-key",
+        |manifest| {
+            let provider_map = manifest["provider_set_key_map_path"]
+                .as_str()
+                .expect("provider-set key map path");
+            fs::write(
+                provider_map,
+                b"00000000000000000000000000001000\tnot-a-key\n",
+            )
+            .expect("replace provider-set key map");
+        },
+        "provider-set dictionary export has an invalid row",
+    );
+    run_case(
+        "duplicate-artifact",
+        |manifest| {
+            manifest["shards"][0]["npi_group"]["path"] =
+                manifest["shards"][0]["group_npi"]["path"].clone();
+        },
+        "reuses an artifact for multiple directions",
+    );
+    run_case(
+        "wrong-artifact-name",
+        |manifest| {
+            manifest["shards"][0]["group_npi"]["metadata"]["name"] = json!("provider_forward");
+        },
+        "wrong provider_group_npi artifact",
+    );
+    run_case(
+        "contradictory-shard-identities",
+        |manifest| {
+            manifest["shards"][0]["group_npi"]["metadata"]["shard_id"] = json!("source-b");
+        },
+        "contradictory shard identities",
+    );
+    run_case(
+        "mismatched-shard-identity",
+        |manifest| {
+            manifest["shards"][0]["group_npi"]["metadata"]["source_shard_id"] = json!("source-b");
+        },
+        "shared graph shard identity mismatch",
+    );
+    run_case(
+        "sidecar-byte-count",
+        |manifest| {
+            let byte_count = manifest["shards"][0]["group_npi"]["metadata"]["byte_count"]
+                .as_u64()
+                .expect("sidecar byte count");
+            manifest["shards"][0]["group_npi"]["metadata"]["byte_count"] = json!(byte_count + 1);
+        },
+        "membership sidecar byte count mismatch",
+    );
+    run_case(
+        "missing-dense-dictionary-count",
+        |manifest| {
+            manifest["shards"][0]["npi_group"]["metadata"]["member_global_count"] = Value::Null;
+        },
+        "requires member_global_count",
+    );
+    run_case(
+        "mismatched-dense-dictionary-count",
+        |manifest| {
+            let count = manifest["shards"][0]["npi_group"]["metadata"]["member_global_count"]
+                .as_u64()
+                .expect("dense dictionary count");
+            manifest["shards"][0]["npi_group"]["metadata"]["member_global_count"] =
+                json!(count + 1);
+        },
+        "dense membership dictionary count mismatch",
+    );
 }

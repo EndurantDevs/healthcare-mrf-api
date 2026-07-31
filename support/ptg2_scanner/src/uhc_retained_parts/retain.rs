@@ -104,7 +104,7 @@ pub fn retain_uhc_artifact(request: &UHCRetainRequest) -> io::Result<UHCRetainSu
     let raw_reverification = Duration::ZERO;
 
     let raw_publish_started = Instant::now();
-    let (raw_reused, authoritative_raw_identity) = if let Some(mut temporary) = raw_temporary.take()
+    let (raw_reused, authoritative_raw_identity) = if let Some(temporary) = raw_temporary.take()
     {
         let temporary_identity = FileIdentity::from_file(temporary.file())?;
         if temporary.publish_noclobber(&raw_name)? {

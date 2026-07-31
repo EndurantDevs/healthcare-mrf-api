@@ -238,19 +238,32 @@ impl ConcurrentRangeWorkers {
         self.senders.clear();
         let mut ranges = Vec::with_capacity(self.handles.len());
         let mut worker_max = Duration::ZERO;
+        let mut first_error = None;
         for handle in self.handles.drain(..) {
-            let (result, elapsed) = match handle.join() {
-                Ok(result) => result,
-                Err(_) => {
-                    return Err(io::Error::other(
-                        "UHC concurrent range worker panicked",
-                    ))
+            match handle.join() {
+                Ok((result, elapsed)) => {
+                    worker_max = worker_max.max(elapsed);
+                    match result {
+                        Ok(Some(range)) => ranges.push(range),
+                        Ok(None) => {}
+                        Err(error) => {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
                 }
-            };
-            worker_max = worker_max.max(elapsed);
-            if let Some(range) = result? {
-                ranges.push(range);
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(io::Error::other(
+                            "UHC concurrent range worker panicked",
+                        ));
+                    }
+                }
             }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         ranges.sort_by_key(|range| range.range_ordinal);
         Ok((ranges, worker_max))
@@ -264,6 +277,33 @@ impl Drop for ConcurrentRangeWorkers {
             let _ = handle.join();
         }
     }
+}
+
+fn finish_scan_workers(
+    range_workers: Option<ConcurrentRangeWorkers>,
+    raw_sync: Option<thread::JoinHandle<(io::Result<()>, Duration)>>,
+) -> io::Result<(Vec<UHCRawRangeManifest>, Duration, Duration, Duration)> {
+    let range_tail_started = Instant::now();
+    let range_result = match range_workers {
+        Some(workers) => workers.finish(),
+        None => Ok((Vec::new(), Duration::ZERO)),
+    };
+    let range_verification_tail = range_tail_started.elapsed();
+    let raw_sync_result = match raw_sync {
+        Some(handle) => match handle.join() {
+            Ok((result, elapsed)) => result.map(|()| elapsed),
+            Err(_) => Err(io::Error::other("UHC retained raw fsync worker panicked")),
+        },
+        None => Ok(Duration::ZERO),
+    };
+    let (ranges, concurrent_range_worker_max) = range_result?;
+    let raw_fsync = raw_sync_result?;
+    Ok((
+        ranges,
+        concurrent_range_worker_max,
+        range_verification_tail,
+        raw_fsync,
+    ))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -396,23 +436,8 @@ fn scan_raw_and_build_ranges(
     } else {
         None
     };
-    let range_tail_started = Instant::now();
-    let (ranges, concurrent_range_worker_max) = if let Some(workers) = range_workers {
-        workers.finish()?
-    } else {
-        (Vec::new(), Duration::ZERO)
-    };
-    let range_verification_tail = range_tail_started.elapsed();
-    let raw_fsync = if let Some(handle) = raw_sync {
-        let (result, elapsed) = match handle.join() {
-            Ok(result) => result,
-            Err(_) => return Err(io::Error::other("UHC retained raw fsync worker panicked")),
-        };
-        result?;
-        elapsed
-    } else {
-        Duration::ZERO
-    };
+    let (ranges, concurrent_range_worker_max, range_verification_tail, raw_fsync) =
+        finish_scan_workers(range_workers, raw_sync)?;
     if ranges.len() != boundary_count {
         return Err(invalid_data(
             "retained UHC concurrent range proof count is incomplete",

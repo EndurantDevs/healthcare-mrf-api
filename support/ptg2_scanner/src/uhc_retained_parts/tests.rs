@@ -4,6 +4,7 @@
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::sync::atomic::AtomicBool;
 
     const FIXTURE: &[u8] = br#"[
   {"id":1,"text":"brace } and bracket [ inside a string"},
@@ -75,6 +76,69 @@ mod tests {
         files
     }
 
+    fn descriptor_device_inode(descriptor: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(descriptor, status.as_mut_ptr()) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let status = unsafe { status.assume_init() };
+        Ok((status.st_dev, status.st_ino))
+    }
+
+    fn assert_descriptor_closed(
+        descriptor: RawFd,
+        original_device_inode: (libc::dev_t, libc::ino_t),
+    ) {
+        match descriptor_device_inode(descriptor) {
+            Ok(device_inode) => assert_ne!(
+                device_inode, original_device_inode,
+                "the temporary file descriptor remained open",
+            ),
+            Err(error) => assert!(
+                matches!(error.raw_os_error(), Some(libc::EBADF)),
+                "unexpected closed descriptor error: {error}",
+            ),
+        }
+    }
+
+    fn assert_no_open_descriptor_for_identity(identity: (libc::dev_t, libc::ino_t)) {
+        for entry in fs::read_dir("/dev/fd").expect("read process descriptor directory") {
+            let Ok(descriptor) = entry
+                .expect("read process descriptor entry")
+                .file_name()
+                .to_string_lossy()
+                .parse::<RawFd>()
+            else {
+                continue;
+            };
+            if let Ok(observed_identity) = descriptor_device_inode(descriptor) {
+                assert_ne!(
+                    observed_identity, identity,
+                    "a temporary-file descriptor clone remained open",
+                );
+            }
+        }
+    }
+
+    fn probe_close_before_unlink(
+        temporary: &mut RootTemporaryFile,
+        temporary_path: PathBuf,
+    ) -> Arc<AtomicBool> {
+        let temporary_file = temporary.file();
+        let descriptor = temporary_file.as_raw_fd();
+        let original_device_inode =
+            descriptor_device_inode(descriptor).expect("temporary descriptor identity");
+        let observed = Arc::new(AtomicBool::new(false));
+        let probe_observed = Arc::clone(&observed);
+        temporary.pre_unlink_probe = Some(Box::new(move || {
+            assert_descriptor_closed(descriptor, original_device_inode);
+            assert_no_open_descriptor_for_identity(original_device_inode);
+            assert!(temporary_path.exists());
+            probe_observed.store(true, Ordering::SeqCst);
+        }));
+        observed
+    }
+
     #[test]
     fn retains_one_raw_artifact_and_deterministic_logical_ranges() {
         let fixture = Fixture::new(FIXTURE);
@@ -130,6 +194,79 @@ mod tests {
         assert!(files.iter().any(|name| name.ends_with(".json")));
         assert!(!files.iter().any(|name| name.ends_with(".ndjson")));
         assert!(!files.iter().any(|name| name.ends_with(".partial")));
+    }
+
+    #[test]
+    fn closes_temporary_descriptors_before_publication_cleanup_returns() {
+        let fixture = Fixture::new(FIXTURE);
+        let root = RootDirectory::open(&fixture.output).expect("open retained root");
+
+        let mut published = root.create_temporary("published").expect("temporary file");
+        published
+            .file_mut()
+            .write_all(b"published")
+            .expect("write publication candidate");
+        published
+            .file()
+            .sync_all()
+            .expect("sync publication candidate");
+        let published_name = published.name.clone();
+        let published_path = fixture.output.join(&published_name);
+        let published_probe = probe_close_before_unlink(&mut published, published_path.clone());
+        assert!(published
+            .publish_noclobber("published.json")
+            .expect("publish candidate"));
+        assert!(published_probe.load(Ordering::SeqCst));
+        assert!(!published_path.exists());
+        assert_eq!(
+            FileIdentity::from_metadata(
+                &fs::metadata(fixture.output.join("published.json"))
+                    .expect("published file metadata"),
+            )
+            .link_count,
+            1,
+        );
+
+        fs::write(fixture.output.join("incumbent.json"), b"incumbent")
+            .expect("write incumbent");
+        let mut collision = root.create_temporary("collision").expect("temporary file");
+        collision
+            .file_mut()
+            .write_all(b"candidate")
+            .expect("write collision candidate");
+        collision
+            .file()
+            .sync_all()
+            .expect("sync collision candidate");
+        let collision_name = collision.name.clone();
+        let collision_path = fixture.output.join(&collision_name);
+        let collision_probe = probe_close_before_unlink(&mut collision, collision_path.clone());
+        assert!(!collision
+            .publish_noclobber("incumbent.json")
+            .expect("resolve publication collision"));
+        assert!(collision_probe.load(Ordering::SeqCst));
+        assert!(!collision_path.exists());
+        assert_eq!(
+            fs::read(fixture.output.join("incumbent.json")).expect("read incumbent"),
+            b"incumbent",
+        );
+
+        let mut link_failure = root.create_temporary("link-failure").expect("temporary file");
+        let link_failure_path = fixture.output.join(&link_failure.name);
+        let link_failure_probe =
+            probe_close_before_unlink(&mut link_failure, link_failure_path.clone());
+        assert!(link_failure.publish_noclobber("missing/child").is_err());
+        assert!(link_failure_probe.load(Ordering::SeqCst));
+        assert!(!link_failure_path.exists());
+
+        let mut abandoned = root.create_temporary("abandoned").expect("temporary file");
+        let abandoned_path = fixture.output.join(&abandoned.name);
+        let abandoned_probe =
+            probe_close_before_unlink(&mut abandoned, abandoned_path.clone());
+        drop(abandoned);
+        assert!(abandoned_probe.load(Ordering::SeqCst));
+        assert!(!abandoned_path.exists());
+
     }
 
     #[test]
@@ -698,12 +835,16 @@ mod tests {
             expected_range_count: summary.range_count as usize,
         })
         .expect("open verified replay");
+        let mut visitor = |_ordinal, _record: &[u8]| Ok(());
+        source
+            .visit_verified_range_records(0, &mut visitor)
+            .expect("visit verified range before path replacement");
         let moved_path = raw_path.with_extension("moved");
         fs::rename(&raw_path, &moved_path).expect("move admitted raw path");
         fs::write(&raw_path, FIXTURE).expect("replace admitted raw path");
 
         let error = source
-            .visit_verified_range_records(0, |_ordinal, _record| Ok(()))
+            .visit_verified_range_records(0, &mut visitor)
             .expect_err("replaced path must fail");
         assert!(error
             .to_string()
@@ -1232,7 +1373,7 @@ mod tests {
             .to_string()
             .contains("not a regular file"));
         root.unlink("already-absent").expect("absent unlink is idempotent");
-        let mut temporary = root.create_temporary("link-failure").expect("temporary file");
+        let temporary = root.create_temporary("link-failure").expect("temporary file");
         assert!(temporary.publish_noclobber("missing/child").is_err());
         let original_permissions = fs::metadata(&two_bytes.output)
             .expect("filesystem root metadata")

@@ -107,3 +107,100 @@ fn worker_and_partition_error_adapters_are_deterministic() {
         .to_string()
         .contains("worker panicked"));
 }
+
+#[test]
+fn background_worker_failures_join_every_descriptor_before_cleanup() {
+    let fixture = Fixture::new(FIXTURE);
+    let root = RootDirectory::open(&fixture.output).expect("open retained root");
+    let mut temporary = root.create_temporary("worker-failure").expect("temporary file");
+    temporary
+        .file_mut()
+        .write_all(FIXTURE)
+        .expect("write temporary fixture");
+    let temporary_path = fixture.output.join(&temporary.name);
+    let cleanup_probe =
+        probe_close_before_unlink(&mut temporary, temporary_path.clone());
+
+    let failed_worker = thread::spawn(
+        || -> (io::Result<Option<UHCRawRangeManifest>>, Duration) {
+            (Err(invalid_data("first range worker failure")), Duration::ZERO)
+        },
+    );
+    let delayed_worker_file = temporary.file().try_clone().expect("clone worker file");
+    let worker_joined = Arc::new(AtomicBool::new(false));
+    let worker_joined_signal = Arc::clone(&worker_joined);
+    let (worker_started_sender, worker_started_receiver) = sync_channel(0);
+    let (worker_release_sender, worker_release_receiver) = sync_channel(0);
+    let delayed_worker = thread::spawn(move || {
+        worker_started_sender
+            .send(())
+            .expect("signal descriptor-holding worker start");
+        let _ = worker_release_receiver.recv();
+        drop(delayed_worker_file);
+        worker_joined_signal.store(true, Ordering::SeqCst);
+        (Ok(None), Duration::ZERO)
+    });
+    let workers = ConcurrentRangeWorkers {
+        senders: Vec::new(),
+        pending: Vec::new(),
+        handles: vec![failed_worker, delayed_worker],
+    };
+
+    let sync_file = temporary.file().try_clone().expect("clone sync file");
+    let sync_joined = Arc::new(AtomicBool::new(false));
+    let sync_joined_signal = Arc::clone(&sync_joined);
+    let (sync_finished_sender, sync_finished_receiver) = sync_channel(0);
+    let raw_sync = thread::spawn(move || {
+        drop(sync_file);
+        sync_joined_signal.store(true, Ordering::SeqCst);
+        sync_finished_sender
+            .send(())
+            .expect("signal raw-sync worker finish");
+        (
+            Err(io::Error::other("raw sync failure")),
+            Duration::ZERO,
+        )
+    });
+
+    let (finisher_started_sender, finisher_started_receiver) = sync_channel(0);
+    let (finish_result_sender, finish_result_receiver) = sync_channel(1);
+    let finish_handle = thread::spawn(move || {
+        finisher_started_sender
+            .send(())
+            .expect("signal background finisher start");
+        let result = finish_scan_workers(Some(workers), Some(raw_sync));
+        finish_result_sender
+            .send(result)
+            .expect("return background finisher result");
+    });
+    finisher_started_receiver
+        .recv()
+        .expect("background finisher started");
+    worker_started_receiver
+        .recv()
+        .expect("descriptor-holding worker started");
+    sync_finished_receiver
+        .recv()
+        .expect("raw-sync worker finished");
+    assert!(
+        matches!(
+            finish_result_receiver.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "range-worker error detached a descriptor-holding peer"
+    );
+    worker_release_sender
+        .send(())
+        .expect("release descriptor-holding worker");
+    let error = finish_result_receiver
+        .recv()
+        .expect("receive background finisher result")
+        .expect_err("range failure must win after every join");
+    finish_handle.join().expect("join background finisher");
+    assert!(error.to_string().contains("first range worker failure"));
+    assert!(worker_joined.load(Ordering::SeqCst));
+    assert!(sync_joined.load(Ordering::SeqCst));
+    drop(temporary);
+    assert!(cleanup_probe.load(Ordering::SeqCst));
+    assert!(!temporary_path.exists());
+}
