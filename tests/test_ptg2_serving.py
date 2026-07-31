@@ -1769,16 +1769,20 @@ async def test_knn_duplicate_addresses_do_not_signal_location_exhaustion(monkeyp
 @pytest.mark.asyncio
 async def test_lineage_dropped_prefix_grows_to_later_valid_candidates(monkeypatch):
     location_calls = []
-    dropped_prefix = [
+    lineage_rejected_rows = [
         {"_ptg_probe_empty": True, "_ptg_source_exhausted": False},
     ]
-    expanded_prefix = [
+    lineage_valid_rows = [
         {"npi": 1000000002, "_ptg_source_exhausted": True},
     ]
 
     async def fake_location_rows(*_args, limit, **_kwargs):
         location_calls.append(limit)
-        return dropped_prefix if len(location_calls) == 1 else expanded_prefix
+        return (
+            lineage_rejected_rows
+            if len(location_calls) == 1
+            else lineage_valid_rows
+        )
 
     async def fake_append(
         _session,
@@ -1813,7 +1817,9 @@ async def test_lineage_dropped_prefix_grows_to_later_valid_candidates(monkeypatc
     )
 
     assert candidates is not None
-    assert [row["npi"] for row in candidates.location_rows] == [1000000002]
+    assert [candidate_row["npi"] for candidate_row in candidates.location_rows] == [
+        1000000002
+    ]
     assert len(location_calls) == 2
 
 

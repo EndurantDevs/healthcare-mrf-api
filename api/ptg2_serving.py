@@ -397,7 +397,7 @@ def _ptg2_mrf_lineage_complete_sql(alias: str) -> str:
     )"""
 
 
-def _ptg2_geo_evidence_level_case_sql(
+def _geo_evidence_level_case_sql(
     *,
     nppes_condition_sql: str,
     mrf_condition_sql: str,
@@ -461,14 +461,14 @@ def _ptg2_geo_evidence_level_sql(alias: str) -> str:
                )
         )
     )"""
-    return _ptg2_geo_evidence_level_case_sql(
+    return _geo_evidence_level_case_sql(
         nppes_condition_sql=nppes_condition_sql,
         mrf_condition_sql=mrf_condition_sql,
         cms_condition_sql=cms_condition_sql,
     )
 
 
-def _ptg2_geo_evidence_source_id_sql(evidence_level_sql: str) -> str:
+def _geo_evidence_source_id_sql(evidence_level_sql: str) -> str:
     """Map one admitted evidence class to its originating source identity."""
 
     return f"""CASE ({evidence_level_sql})
@@ -9830,7 +9830,7 @@ def _provenance_run_retrieved_at(value: Any) -> str | None:
         return None
 
 
-def _ptg2_valid_compact_run_date_sql(value_sql: str) -> str:
+def _valid_compact_run_date_sql(value_sql: str) -> str:
     """Validate a compact YYYYMMDD run ID without raising in PostgreSQL."""
 
     run_id_sql = f"NULLIF(BTRIM({value_sql}), '')"
@@ -9861,7 +9861,7 @@ def _ptg2_provenance_retrieval_time_sql(alias: str) -> str:
     run_id_sql = f"{alias}.source_run_id"
     return (
         f"COALESCE({alias}.last_seen_at, {alias}.observed_at, "
-        f"CASE WHEN {_ptg2_valid_compact_run_date_sql(run_id_sql)} "
+        f"CASE WHEN {_valid_compact_run_date_sql(run_id_sql)} "
         f"THEN TO_TIMESTAMP(BTRIM({run_id_sql}), 'YYYYMMDD') END)"
     )
 
@@ -10029,7 +10029,7 @@ WITH requested(location_key, admitted_source_id) AS (
        AND (
            stored.last_seen_at IS NOT NULL
            OR stored.observed_at IS NOT NULL
-           OR {_ptg2_valid_compact_run_date_sql('stored.source_run_id')}
+           OR {_valid_compact_run_date_sql('stored.source_run_id')}
        )
      ORDER BY stored.location_key,
            stored.source_id,
@@ -10187,7 +10187,7 @@ WITH requested(location_key, admitted_source_id) AS (
            OR candidate.doctor_updated_at IS NOT NULL
            OR candidate.last_seen_at IS NOT NULL
            OR candidate.observed_at IS NOT NULL
-           OR {_ptg2_valid_compact_run_date_sql('candidate.source_run_id')}
+           OR {_valid_compact_run_date_sql('candidate.source_run_id')}
        )
      ORDER BY candidate.location_key,
            candidate.source_id,
@@ -10290,7 +10290,7 @@ def _apply_address_provenance(
         address_payload.pop("address_provenance", None)
         address_payload.pop("geo_evidence_level", None)
         location_key = str(address_payload.get("location_key") or "")
-        provenance = [
+        provenance_entries = [
             entry
             for entry in provenance_by_location_key.get(location_key, [])
             if _is_complete_address_provenance_entry(entry)
@@ -10299,16 +10299,16 @@ def _apply_address_provenance(
             admitted_source_id in {1, 2, 3}
             and _coerce_int_payload(entry.get("source_id")) == admitted_source_id
             and _is_complete_address_provenance_entry(entry)
-            for entry in provenance
+            for entry in provenance_entries
         )
         if evidence_level and not has_complete_admitted_lineage:
             continue
-        if not provenance:
+        if not provenance_entries:
             _redact_unproven_location_address(location_row)
             retained_location_rows.append(location_row)
             continue
         if include_response_evidence:
-            address_payload["address_provenance"] = provenance
+            address_payload["address_provenance"] = provenance_entries
         if evidence_level and include_response_evidence:
             address_payload["geo_evidence_level"] = str(evidence_level)
         location_row["address_payload"] = json.dumps(address_payload, default=str)
@@ -10368,13 +10368,10 @@ def _membership_provenance_sql(address_table: str) -> dict[str, str]:
     }
 
 
-def _membership_location_sql(
+def _membership_sql_values(
     query_context: _MembershipLocationQuery,
-    *,
-    limit: int,
-    offset: int,
-) -> str:
-    """Render the bounded location SQL for the chosen address source."""
+) -> tuple[dict[str, str], bool]:
+    """Build location-template values and report unified-address use."""
 
     location_hash_sql = _ptg2_address_location_hash_sql(
         "addr", query_context.address_table
@@ -10405,17 +10402,17 @@ def _membership_location_sql(
                 "COALESCE(addr.type, '')"
             )
         ),
-        "selected_geo_evidence_source_id_sql": _ptg2_geo_evidence_source_id_sql(
+        "selected_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
             "selected.geo_evidence_level"
         ),
-        "knn_geo_evidence_source_id_sql": _ptg2_geo_evidence_source_id_sql(
+        "knn_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
             "addr.geo_evidence_level"
         ),
         "mrf_issuer_assurance_sql": _ptg2_independent_issuer_sql(
             "mrf.source_issuer_names"
         ),
         "mrf_lineage_complete_sql": _ptg2_mrf_lineage_complete_sql("mrf"),
-        "assured_geo_evidence_level_sql": _ptg2_geo_evidence_level_case_sql(
+        "assured_geo_evidence_level_sql": _geo_evidence_level_case_sql(
             nppes_condition_sql=(
                 "(located.address_source_mask & 1) <> 0 AND nppes.npi IS NOT NULL"
             ),
@@ -10425,9 +10422,23 @@ def _membership_location_sql(
             ),
         ),
     }
+    return format_values_by_name, uses_unified_addresses
+
+
+def _membership_location_sql(
+    query_context: _MembershipLocationQuery,
+    *,
+    limit: int,
+    offset: int,
+) -> str:
+    """Render the bounded location SQL for the chosen address source."""
+
+    format_values_by_name, uses_unified_addresses = _membership_sql_values(
+        query_context
+    )
     if query_context.knn_order_sql is None or offset != 0:
         if (
-            _is_unified_address_table(query_context.address_table)
+            uses_unified_addresses
             and query_context.address_assurance_sql != "TRUE"
         ):
             return _MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL.format(
@@ -10465,6 +10476,60 @@ async def _execute_membership_location_sql(
             await _restore_knn_planning(session, prior_planner_settings)
 
 
+async def _finalize_location_rows(
+    session,
+    query_context: _MembershipLocationQuery,
+    args: dict[str, Any],
+    location_rows: list[dict[str, Any]],
+    *,
+    candidate_npis: tuple[int, ...] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Validate lineage and preserve probe-exhaustion semantics."""
+
+    raw_location_count = len(location_rows)
+    raw_source_exhausted = next(
+        (
+            bool(location_row["_ptg_source_exhausted"])
+            for location_row in location_rows
+            if "_ptg_source_exhausted" in location_row
+        ),
+        None,
+    )
+    uses_unified_addresses = _is_unified_address_table(query_context.address_table)
+    include_response_evidence = (
+        _is_request_flag_enabled(args.get("include_evidence"))
+        or _is_request_flag_enabled(args.get("include_debug"))
+        or _is_request_flag_enabled(args.get("include_details"))
+    )
+    if uses_unified_addresses:
+        await _hydrate_address_provenance(
+            session,
+            location_rows,
+            include_response_evidence=include_response_evidence,
+        )
+    else:
+        for location_row in location_rows:
+            location_row.pop("_geo_evidence_level", None)
+            location_row.pop("_geo_evidence_source_id", None)
+    if candidate_npis is None and raw_location_count > len(location_rows):
+        source_exhausted = (
+            raw_source_exhausted
+            if raw_source_exhausted is not None
+            else raw_location_count < max(int(limit), 1)
+        )
+        if location_rows:
+            location_rows[0]["_ptg_source_exhausted"] = source_exhausted
+        else:
+            location_rows.append(
+                {
+                    "_ptg_probe_empty": True,
+                    "_ptg_source_exhausted": source_exhausted,
+                }
+            )
+    return location_rows
+
+
 async def _membership_location_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -10499,50 +10564,14 @@ async def _membership_location_rows(
         location_sql,
         offset=offset,
     )
-    raw_location_count = len(location_rows)
-    raw_source_exhausted = next(
-        (
-            bool(location_row["_ptg_source_exhausted"])
-            for location_row in location_rows
-            if "_ptg_source_exhausted" in location_row
-        ),
-        None,
+    return await _finalize_location_rows(
+        session,
+        query_context,
+        args,
+        location_rows,
+        candidate_npis=candidate_npis,
+        limit=limit,
     )
-    uses_unified_addresses = _is_unified_address_table(query_context.address_table)
-    include_response_evidence = (
-        _is_request_flag_enabled(args.get("include_evidence"))
-        or _is_request_flag_enabled(args.get("include_debug"))
-        or _is_request_flag_enabled(args.get("include_details"))
-    )
-    if uses_unified_addresses:
-        await _hydrate_address_provenance(
-            session,
-            location_rows,
-            include_response_evidence=include_response_evidence,
-        )
-    else:
-        for location_row in location_rows:
-            location_row.pop("_geo_evidence_level", None)
-            location_row.pop("_geo_evidence_source_id", None)
-    if (
-        candidate_npis is None
-        and raw_location_count > len(location_rows)
-    ):
-        source_exhausted = (
-            raw_source_exhausted
-            if raw_source_exhausted is not None
-            else raw_location_count < max(int(limit), 1)
-        )
-        if location_rows:
-            location_rows[0]["_ptg_source_exhausted"] = source_exhausted
-        else:
-            location_rows.append(
-                {
-                    "_ptg_probe_empty": True,
-                    "_ptg_source_exhausted": source_exhausted,
-                }
-            )
-    return location_rows
 
 
 @dataclass
@@ -10934,8 +10963,8 @@ def _graph_provider_data(
     npi = int(location_data["npi"])
     provider_data_map = dict(enriched_data or {"npi": npi, "provider_name": "TiC provider"})
     location_fields = ("distance_miles", "location_hash")
-    address_is_unproven = location_data.get(_PTG_UNPROVEN_ADDRESS_MARKER) is True
-    if address_is_unproven:
+    is_address_unproven = location_data.get(_PTG_UNPROVEN_ADDRESS_MARKER) is True
+    if is_address_unproven:
         provider_data_map.update(
             {
                 "state": None,
@@ -10949,7 +10978,7 @@ def _graph_provider_data(
     ) or not _has_street_address_payload(provider_data_map.get("address_payload")):
         location_fields += ("state", "city", "zip5", "address_payload")
     provider_data_map.update({field: location_data.get(field) for field in location_fields})
-    if address_is_unproven:
+    if is_address_unproven:
         provider_data_map.update(
             {field: None for field in _PTG_LOCATION_CONTACT_FIELDS}
         )
