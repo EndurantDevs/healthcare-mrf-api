@@ -30,6 +30,7 @@ PTG2_LEGACY_ADDRESS_COLUMNS = {
 PTG2_UNIFIED_ADDRESS_COLUMNS = PTG2_LEGACY_ADDRESS_COLUMNS | {
     "address_precision",
     "location_key",
+    "premise_key",
     "address_sources",
     "source_record_ids",
     "source_count",
