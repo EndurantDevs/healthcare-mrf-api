@@ -2907,6 +2907,45 @@ class SourceIndex:
         if cursor.rowcount:
             self._mark_write()
 
+    def _insert_pending_provider_npis(
+        self, spec: SourceSpec, state: ProviderReferenceState
+    ) -> int:
+        pending_npis = self.connection.execute(
+            """SELECT npi FROM provider_ref_pending
+               WHERE file_id = ? AND ref_ordinal = ? ORDER BY npi""",
+            (spec.file_id, state.current_ordinal),
+        )
+        inserted_count = 0
+        for pending_npi in pending_npis:
+            cursor = self.connection.execute(
+                """INSERT OR IGNORE INTO provider_ref_npi(file_id, ref_id, npi)
+                   VALUES (?, ?, ?)""",
+                (spec.file_id, state.reference_id, int(pending_npi["npi"])),
+            )
+            inserted_count += max(cursor.rowcount, 0)
+            self._mark_write()
+        return inserted_count
+
+    def _insert_pending_provider_network_names(
+        self, spec: SourceSpec, state: ProviderReferenceState
+    ) -> int:
+        pending_names = self.connection.execute(
+            """SELECT network_name FROM provider_ref_network_name_pending
+               WHERE file_id = ? AND ref_ordinal = ? ORDER BY network_name""",
+            (spec.file_id, state.current_ordinal),
+        )
+        inserted_count = 0
+        for pending_name in pending_names:
+            cursor = self.connection.execute(
+                """INSERT OR IGNORE INTO provider_ref_network_name(
+                       file_id, ref_id, network_name
+                   ) VALUES (?, ?, ?)""",
+                (spec.file_id, state.reference_id, str(pending_name["network_name"])),
+            )
+            inserted_count += max(cursor.rowcount, 0)
+            self._mark_write()
+        return inserted_count
+
     def _persist_provider_reference(
         self,
         spec: SourceSpec,
@@ -2938,40 +2977,9 @@ class SourceIndex:
                 (spec.file_id, state.reference_id),
             )
             self._mark_write()
-        pending_npis = self.connection.execute(
-            """SELECT npi FROM provider_ref_pending
-               WHERE file_id = ? AND ref_ordinal = ? ORDER BY npi""",
-            (spec.file_id, state.current_ordinal),
-        )
-        inserted_count = 0
-        for pending_npi in pending_npis:
-            cursor = self.connection.execute(
-                """INSERT OR IGNORE INTO provider_ref_npi(file_id, ref_id, npi)
-                   VALUES (?, ?, ?)""",
-                (spec.file_id, state.reference_id, int(pending_npi["npi"])),
-            )
-            inserted_count += max(cursor.rowcount, 0)
-            self._mark_write()
+        inserted_count = self._insert_pending_provider_npis(spec, state)
         self.metrics["provider_reference_npis"] += inserted_count
-        pending_network_names = self.connection.execute(
-            """SELECT network_name FROM provider_ref_network_name_pending
-               WHERE file_id = ? AND ref_ordinal = ? ORDER BY network_name""",
-            (spec.file_id, state.current_ordinal),
-        )
-        network_name_count = 0
-        for pending_network_name in pending_network_names:
-            cursor = self.connection.execute(
-                """INSERT OR IGNORE INTO provider_ref_network_name(
-                       file_id, ref_id, network_name
-                   ) VALUES (?, ?, ?)""",
-                (
-                    spec.file_id,
-                    state.reference_id,
-                    str(pending_network_name["network_name"]),
-                ),
-            )
-            network_name_count += max(cursor.rowcount, 0)
-            self._mark_write()
+        network_name_count = self._insert_pending_provider_network_names(spec, state)
         self.metrics["provider_reference_network_names"] += network_name_count
         if inserted_count == 0 and not has_tin_marker:
             self.metrics["provider_references_without_valid_npi"] += 1
@@ -3518,6 +3526,37 @@ class SourceIndex:
         self._mark_write()
         state.is_item_open = False
 
+    def _is_in_network_item_field_consumed(
+        self,
+        state: InNetworkState,
+        prefix: str,
+        event: str,
+        raw_value: Any,
+    ) -> bool:
+        required_field_by_prefix = {
+            f"{IN_NETWORK_ITEM_PREFIX}.billing_code_type": "code_system",
+            f"{IN_NETWORK_ITEM_PREFIX}.billing_code": "code",
+            f"{IN_NETWORK_ITEM_PREFIX}.negotiation_arrangement": "arrangement",
+        }
+        optional_field_by_prefix = {
+            f"{IN_NETWORK_ITEM_PREFIX}.billing_code_type_version": "billing_code_type_version",
+            f"{IN_NETWORK_ITEM_PREFIX}.name": "name",
+            f"{IN_NETWORK_ITEM_PREFIX}.description": "description",
+        }
+        if event not in SCALAR_EVENTS | {"start_map", "start_array"}:
+            return False
+        if prefix in required_field_by_prefix:
+            self._capture_item_field(
+                state, required_field_by_prefix[prefix], event, raw_value
+            )
+            return True
+        if prefix in optional_field_by_prefix:
+            self._capture_optional_item_field(
+                state, optional_field_by_prefix[prefix], event, raw_value
+            )
+            return True
+        return False
+
     def _consume_in_network_event(
         self,
         spec: SourceSpec,
@@ -3533,31 +3572,7 @@ class SourceIndex:
             return
         if not state.is_item_open:
             return
-        item_field_map = {
-            f"{IN_NETWORK_ITEM_PREFIX}.billing_code_type": "code_system",
-            f"{IN_NETWORK_ITEM_PREFIX}.billing_code": "code",
-            f"{IN_NETWORK_ITEM_PREFIX}.negotiation_arrangement": "arrangement",
-        }
-        if prefix in item_field_map and event in SCALAR_EVENTS | {"start_map", "start_array"}:
-            self._capture_item_field(state, item_field_map[prefix], event, raw_value)
-            return
-        optional_item_field_map = {
-            f"{IN_NETWORK_ITEM_PREFIX}.billing_code_type_version": (
-                "billing_code_type_version"
-            ),
-            f"{IN_NETWORK_ITEM_PREFIX}.name": "name",
-            f"{IN_NETWORK_ITEM_PREFIX}.description": "description",
-        }
-        if (
-            prefix in optional_item_field_map
-            and event in SCALAR_EVENTS | {"start_map", "start_array"}
-        ):
-            self._capture_optional_item_field(
-                state,
-                optional_item_field_map[prefix],
-                event,
-                raw_value,
-            )
+        if self._is_in_network_item_field_consumed(state, prefix, event, raw_value):
             return
         if prefix == NEGOTIATED_RATE_PREFIX and event == "start_map":
             self._start_negotiated_rate(spec, state)
@@ -3644,13 +3659,7 @@ class SourceIndex:
         except (OSError, EOFError, ValueError, ijson.JSONError) as exc:
             raise SourceFormatError(f"in_network_parse:{type(exc).__name__}") from exc
 
-    def _sample_source_occurrences(self) -> None:
-        """Populate the bounded deterministic sample of eligible occurrences once."""
-
-        if self._occurrence_sample_prepared:
-            return
-        occurrence_rows = self.connection.execute(
-            """
+    _SOURCE_OCCURRENCE_ROWS_SQL = """
             WITH rate_member AS (
                 SELECT rate_id, npi FROM rate_inline_npi
                 UNION
@@ -3680,7 +3689,13 @@ class SourceIndex:
             WHERE rate.eligible = 1
             ORDER BY rate.rate_id, price.price_ordinal, member.npi
             """
-        )
+
+    def _sample_source_occurrences(self) -> None:
+        """Populate the bounded deterministic sample of eligible occurrences once."""
+
+        if self._occurrence_sample_prepared:
+            return
+        occurrence_rows = self.connection.execute(self._SOURCE_OCCURRENCE_ROWS_SQL)
         occurrence_count = 0
         for occurrence_row in occurrence_rows:
             query = QueryKey(
@@ -3782,12 +3797,7 @@ class SourceIndex:
         ).fetchone()
         return row is not None
 
-    def expected_tuples(self, query: QueryKey) -> collections.Counter[str]:
-        """Return the exact source multiset for one code-and-provider query."""
-
-        self.metrics["expected_tuple_query_scans"] += 1
-        tuple_rows = self.connection.execute(
-            """
+    _EXPECTED_TUPLE_ROWS_SQL = """
             SELECT rate.file_id,
                    rate.arrangement,
                    item_metadata.billing_code_type_version,
@@ -3831,7 +3841,14 @@ class SourceIndex:
                      item_metadata.description,
                      rate.network_names_json,
                      price.price_json
-            """,
+            """
+
+    def expected_tuples(self, query: QueryKey) -> collections.Counter[str]:
+        """Return the exact source multiset for one code-and-provider query."""
+
+        self.metrics["expected_tuple_query_scans"] += 1
+        tuple_rows = self.connection.execute(
+            self._EXPECTED_TUPLE_ROWS_SQL,
             (query.code_system, query.code, query.npi, query.npi),
         )
         counter: collections.Counter[str] = collections.Counter()
@@ -4509,9 +4526,7 @@ class HttpApiFetcher:
         }
 
     @staticmethod
-    def _provenance_contract_fields(provenance: Mapping[str, Any]) -> dict[str, Any]:
-        """Validate and flatten required V3 provenance and database evidence fields."""
-
+    def _validated_database_evidence(provenance: Mapping[str, Any]) -> dict[str, Any]:
         database_evidence = _required_mapping(
             provenance.get("database_evidence"),
             field="provenance_database_evidence",
@@ -4530,6 +4545,25 @@ class HttpApiFetcher:
                     f"provenance_{field_name}_must_be_boolean"
                 )
         return {
+            "provenance_database_evidence_contract": str(
+                _strict_string(
+                    database_evidence.get("contract"),
+                    field="provenance_database_evidence_contract",
+                )
+            ),
+            "provenance_postgres_server_version_num": server_version_num,
+            "provenance_database_selected": database_evidence["database_selected"],
+            "provenance_backend_session_active": database_evidence["backend_session_active"],
+            "provenance_transaction_snapshot_observed": database_evidence[
+                "transaction_snapshot_observed"
+            ],
+        }
+
+    @staticmethod
+    def _provenance_contract_fields(provenance: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate and flatten required V3 provenance and database evidence fields."""
+
+        return {
             "provenance_arch_version": str(
                 _strict_string(provenance.get("arch_version"), field="provenance_arch_version")
             ),
@@ -4545,22 +4579,7 @@ class HttpApiFetcher:
                     field="provenance_database_backend",
                 )
             ),
-            "provenance_database_evidence_contract": str(
-                _strict_string(
-                    database_evidence.get("contract"),
-                    field="provenance_database_evidence_contract",
-                )
-            ),
-            "provenance_postgres_server_version_num": server_version_num,
-            "provenance_database_selected": database_evidence[
-                "database_selected"
-            ],
-            "provenance_backend_session_active": database_evidence[
-                "backend_session_active"
-            ],
-            "provenance_transaction_snapshot_observed": database_evidence[
-                "transaction_snapshot_observed"
-            ],
+            **HttpApiFetcher._validated_database_evidence(provenance),
             "provenance_plan_id": str(
                 _strict_string(provenance.get("plan_id"), field="provenance_plan_id")
             ),
@@ -5996,6 +6015,30 @@ class HttpApiOccurrenceSource:
             state.sampler.offer(occurrence.occurrence_id, occurrence)
             state.observed_count += 1
 
+    def _completed_api_occurrence_sample(
+        self,
+        state: _ApiSampleState,
+        page_number: int,
+        metadata: _AuditSampleMetadata,
+        total: int,
+    ) -> ApiOccurrenceSample:
+        if state.observed_count != total:
+            raise ApiSchemaError("audit_pagination_total_does_not_match_returned_rows")
+        if state.observed_digest.hexdigest() != metadata.sample_digest:
+            raise ApiSchemaError("audit_sample_digest_does_not_match_returned_rows")
+        return ApiOccurrenceSample(
+            occurrences=tuple(state.sampler.values()),
+            sample_count=state.observed_count,
+            pages=page_number,
+            retries=state.retries + self._preflight_retries,
+            sample_digest=metadata.sample_digest,
+            contract=metadata.contract,
+            method=metadata.method,
+            complete_population=metadata.is_complete_population,
+            sample_digest_validated=True,
+            source_set_validated=self._source_set_validated,
+        )
+
     def sample_occurrences(
         self,
         *,
@@ -6041,23 +6084,8 @@ class HttpApiOccurrenceSource:
             self._validate_audit_contract(response_payload, total)
             self._consume_audit_items(page_items, state)
             if not has_more:
-                if state.observed_count != total:
-                    raise ApiSchemaError("audit_pagination_total_does_not_match_returned_rows")
-                if state.observed_digest.hexdigest() != metadata.sample_digest:
-                    raise ApiSchemaError(
-                        "audit_sample_digest_does_not_match_returned_rows"
-                    )
-                return ApiOccurrenceSample(
-                    occurrences=tuple(state.sampler.values()),
-                    sample_count=state.observed_count,
-                    pages=page_number,
-                    retries=state.retries + self._preflight_retries,
-                    sample_digest=metadata.sample_digest,
-                    contract=metadata.contract,
-                    method=metadata.method,
-                    complete_population=metadata.is_complete_population,
-                    sample_digest_validated=True,
-                    source_set_validated=self._source_set_validated,
+                return self._completed_api_occurrence_sample(
+                    state, page_number, metadata, total
                 )
             state.offset += len(page_items)
         raise ApiSchemaError("audit_pagination_exceeded_max_pages")
@@ -6243,6 +6271,58 @@ def _record_positive_schema_errors(
         )
 
 
+def _positive_capacity_intent(
+    config: AuditConfig, initial_phase: str
+) -> CapacityObservationIntent | None:
+    if config.capacity_evidence_trust is None or initial_phase != "cold":
+        return None
+    return CapacityObservationIntent(
+        cohort=CAPACITY_POSITIVE_COHORT,
+        first_for_query=True,
+    )
+
+
+def _record_initial_positive_contract(
+    initial: FetchResult,
+    state: _QueryAuditState,
+    config: AuditConfig,
+    initial_phase: str,
+) -> None:
+    _record_query_fetch(state, initial, is_cold=initial_phase == "cold")
+    state.matched_initial_traversal = bool(initial.contracts) and all(
+        contract.result_state == "matched" for contract in initial.contracts
+    )
+    state.matched_first_observation = (
+        initial_phase == "cold" and state.matched_initial_traversal
+    )
+    state.schema_errors.extend(
+        _validate_contracts(initial.contracts, config, positive=True)
+    )
+
+
+def _record_positive_capacity_outcome(
+    fetcher: ApiFetcher,
+    initial: FetchResult,
+    state: _QueryAuditState,
+    comparison: CounterComparison,
+) -> None:
+    _mark_capacity_semantic_outcome(
+        fetcher,
+        initial.capacity_observations,
+        successful=(
+            state.matched_initial_traversal
+            and not state.schema_errors
+            and not comparison.failure_counts
+        ),
+    )
+
+
+def _new_positive_query_state(initial_phase: str) -> _QueryAuditState:
+    if initial_phase not in {"cold", "warm"}:
+        raise ConfigurationError("positive_initial_phase_invalid")
+    return _QueryAuditState()
+
+
 def _audit_positive_query(
     query: QueryKey,
     expected_counts: collections.Counter[str],
@@ -6254,38 +6334,19 @@ def _audit_positive_query(
 ) -> QueryAuditResult:
     """Audit one source-positive query across an initial and repeated traversal."""
 
-    if initial_phase not in {"cold", "warm"}:
-        raise ConfigurationError("positive_initial_phase_invalid")
-    state = _QueryAuditState()
+    state = _new_positive_query_state(initial_phase)
     try:
         initial = _fetch_all_with_capacity_intent(
             fetcher,
             config.api_params(query),
             phase=initial_phase,
-            capacity_intent=(
-                CapacityObservationIntent(
-                    cohort=CAPACITY_POSITIVE_COHORT,
-                    first_for_query=True,
-                )
-                if config.capacity_evidence_trust is not None
-                and initial_phase == "cold"
-                else None
-            ),
+            capacity_intent=_positive_capacity_intent(config, initial_phase),
         )
     except AuditError as exc:
         state.failure_counts[exc.code] += 1
         state.examples.append(_safe_http_example(query, exc))
         return _failed_query_audit_result(query, expected_counts, state)
-    _record_query_fetch(state, initial, is_cold=initial_phase == "cold")
-    state.matched_initial_traversal = bool(initial.contracts) and all(
-        contract.result_state == "matched" for contract in initial.contracts
-    )
-    state.matched_first_observation = (
-        initial_phase == "cold" and state.matched_initial_traversal
-    )
-    state.schema_errors.extend(
-        _validate_contracts(initial.contracts, config, positive=True)
-    )
+    _record_initial_positive_contract(initial, state, config, initial_phase)
     initial_extracted = extract_api_tuples(
         initial.items,
         registry=identity_registry,
@@ -6299,15 +6360,7 @@ def _audit_positive_query(
     )
     state.failure_counts.update(comparison.failure_counts)
     state.examples.extend(comparison.examples)
-    _mark_capacity_semantic_outcome(
-        fetcher,
-        initial.capacity_observations,
-        successful=(
-            state.matched_initial_traversal
-            and not state.schema_errors
-            and not comparison.failure_counts
-        ),
-    )
+    _record_positive_capacity_outcome(fetcher, initial, state, comparison)
     _audit_positive_warm_repeats(
         query,
         initial,
@@ -6615,6 +6668,41 @@ def _failed_random_audit_result(
     )
 
 
+def _successful_random_audit_result(
+    request: RandomApiRequest,
+    response: FetchResult,
+    extracted: ExtractedTuples,
+    failure_counts: collections.Counter[str],
+    examples: Sequence[dict[str, Any]],
+    config: AuditConfig,
+) -> RandomApiResult:
+    return RandomApiResult(
+        request=request,
+        response_occurrences=sum(extracted.counter.values()),
+        latency_ms=response.total_latency_ms,
+        first_page_latency_ms=(
+            response.page_latencies_ms[0] if response.page_latencies_ms else None
+        ),
+        retries=response.retries,
+        http_requests=response.pages + response.retries,
+        failure_counts=dict(failure_counts),
+        examples=tuple(examples[: config.failure_example_limit]),
+        response_fingerprint=response.response_fingerprint,
+        capacity_observations=response.capacity_observations,
+    )
+
+
+def _random_capacity_intent(
+    config: AuditConfig, request: RandomApiRequest
+) -> CapacityObservationIntent | None:
+    if config.capacity_evidence_trust is None:
+        return None
+    return CapacityObservationIntent(
+        cohort=CAPACITY_RANDOM_COHORT,
+        first_for_query=request.phase == "cold",
+    )
+
+
 def _audit_random_api_request(
     request: RandomApiRequest,
     expected_full: collections.Counter[str],
@@ -6633,14 +6721,7 @@ def _audit_random_api_request(
             config.api_params(request.query),
             phase=request.phase,
             page_size=request.page_size,
-            capacity_intent=(
-                CapacityObservationIntent(
-                    cohort=CAPACITY_RANDOM_COHORT,
-                    first_for_query=request.phase == "cold",
-                )
-                if config.capacity_evidence_trust is not None
-                else None
-            ),
+            capacity_intent=_random_capacity_intent(config, request),
         )
     except AuditError as exc:
         failures[exc.code] += 1
@@ -6675,21 +6756,8 @@ def _audit_random_api_request(
         response.capacity_observations,
         successful=not failures,
     )
-    return RandomApiResult(
-        request=request,
-        response_occurrences=sum(extracted.counter.values()),
-        latency_ms=response.total_latency_ms,
-        first_page_latency_ms=(
-            response.page_latencies_ms[0]
-            if response.page_latencies_ms
-            else None
-        ),
-        retries=response.retries,
-        http_requests=response.pages + response.retries,
-        failure_counts=dict(failures),
-        examples=tuple(examples[: config.failure_example_limit]),
-        response_fingerprint=response.response_fingerprint,
-        capacity_observations=response.capacity_observations,
+    return _successful_random_audit_result(
+        request, response, extracted, failures, examples, config
     )
 
 
@@ -6901,29 +6969,26 @@ class AuditRunner:
             )
         return random_query_keys, random_request_shape_keys, plan_fingerprint.hexdigest()
 
-    def _prepare_samples(self) -> _AuditSamples:
-        """Validate source seals and prepare bounded audit samples and request plans."""
-
-        if self.api_occurrence_source.is_source_set_valid() is not True:
-            raise ApiSchemaError("snapshot_source_set_was_not_validated")
-        self.source_index.prepare_occurrence_sample()
-        source_occurrences = self.source_index.source_occurrences(
-            self.config.source_occurrence_samples
-        )
+    def _select_random_requests(
+        self, source_occurrences: Sequence[SourceOccurrence]
+    ) -> list[RandomApiRequest]:
         if self.config.capacity_evidence_trust is not None:
-            random_requests = build_capacity_random_api_requests(
+            return build_capacity_random_api_requests(
                 self.source_index.capacity_query_occurrences(
                     self.config.random_api_calls
                 ),
                 count=self.config.random_api_calls,
             )
-        else:
-            random_requests = build_random_api_requests(
-                source_occurrences,
-                count=self.config.random_api_calls,
-                max_limit=self.config.random_api_max_limit,
-                seed=self.config.seed,
-            )
+        return build_random_api_requests(
+            source_occurrences,
+            count=self.config.random_api_calls,
+            max_limit=self.config.random_api_max_limit,
+            seed=self.config.seed,
+        )
+
+    def _validated_api_occurrence_sample(
+        self,
+    ) -> tuple[ApiOccurrenceSample, list[ApiOccurrence]]:
         api_sample = self.api_occurrence_source.sample_occurrences(
             sample_target=self.config.api_occurrence_samples,
             seed=self.config.seed,
@@ -6935,9 +7000,22 @@ class AuditRunner:
         api_occurrences = list(api_sample.occurrences)
         for occurrence in api_occurrences:
             self.identity_registry.register(occurrence.source_identity)
-        api_occurrence_ids = [occurrence.occurrence_id for occurrence in api_occurrences]
-        if len(api_occurrence_ids) != len(set(api_occurrence_ids)):
+        occurrence_ids = [occurrence.occurrence_id for occurrence in api_occurrences]
+        if len(occurrence_ids) != len(set(occurrence_ids)):
             raise ApiSchemaError("api_occurrence_sample_contains_duplicate_ids")
+        return api_sample, api_occurrences
+
+    def _prepare_samples(self) -> _AuditSamples:
+        """Validate source seals and prepare bounded audit samples and request plans."""
+
+        if self.api_occurrence_source.is_source_set_valid() is not True:
+            raise ApiSchemaError("snapshot_source_set_was_not_validated")
+        self.source_index.prepare_occurrence_sample()
+        source_occurrences = self.source_index.source_occurrences(
+            self.config.source_occurrence_samples
+        )
+        random_requests = self._select_random_requests(source_occurrences)
+        api_sample, api_occurrences = self._validated_api_occurrence_sample()
         grouped = self._group_occurrences(source_occurrences, api_occurrences)
         source_by_query, api_by_query, positive_queries, source_queries = grouped
         negative_queries = self.source_index.negative_queries(

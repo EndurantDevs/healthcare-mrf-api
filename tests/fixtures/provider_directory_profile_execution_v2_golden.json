@@ -3,11 +3,11 @@
   "probe": false,
   "provider_directory_profile_capacity_attestation": {
     "lease": {
-      "attestation_id": "7ef089ca3c1e2e28d62d93e92c13b60942cd8305a7bbd30dcd7715c1d362177d",
+      "attestation_id": "782944a410a135bb7708e0b9f08ca0d2f12cb70faeb1bb1a4cdd42c414638ebb",
       "attestor_id": "capacity-authority-dev",
       "attestor_release_digest": "1111111111111111111111111111111111111111111111111111111111111111",
       "capacity_geometry_hash": "5555555555555555555555555555555555555555555555555555555555555555",
-      "contract_id": "provider-directory-database-capacity-lease-v1",
+      "contract_id": "provider-directory-database-capacity-lease-v2",
       "database_name": "healthporta_test",
       "database_oid": 16401,
       "database_system_identifier": "7527713908662902214",
@@ -19,6 +19,25 @@
       "nonce": "2222222222222222222222222222222222222222222222222222222222222222",
       "observed_at": "2026-07-30T12:00:00Z",
       "reservation_id": "pd-capacity-reservation-7",
+      "runtime_witness": {
+        "healthcare_source_commit": "1212121212121212121212121212121212121212",
+        "healthcare_image_digest": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
+        "import\u005fcontrol_source_commit": "1414141414141414141414141414141414141414",
+        "import\u005fcontrol_image_digest": "sha256:1515151515151515151515151515151515151515151515151515151515151515",
+        "profile_migration_revision": "20260801130000_provider_directory_capacity_lease_v2",
+        "profile_schema_version": 1,
+        "profile_strategy_version": "source-fact-role32-org32-membership32-npi5m-v4",
+        "postgres_server_version_num": 180002
+      },
+      "runtime_witness_sha256": "2fc84fa853db9ba85d0b431be6f6a3496a9d3fefba6e1cf4049412c3b262eefb",
+      "deployment_witness": {
+        "flux_revision": "main@sha1:1616161616161616161616161616161616161616",
+        "bootstrap_config_sha256": "1717171717171717171717171717171717171717171717171717171717171717",
+        "kubernetes_snapshot_sha256": "1818181818181818181818181818181818181818181818181818181818181818",
+        "preflight_pod_name": "healthcare-mrf-api-abc123",
+        "preflight_pod_uid": "11111111-2222-3333-4444-555555555555",
+        "preflight_transport": "kubectl_exec_loopback_8080"
+      },
       "signature_algorithm": "Ed25519",
       "tablespaces": [
         {
@@ -58,7 +77,7 @@
         }
       ]
     },
-    "signature": "RxmvWgphpLXZPJaLybyCd8b8uVEDcbIo5aT6PbcYkzMndX8afD3rXtG1RUdDf8Tnh8BzRUHm-J9ekEoCmaerCQ"
+    "signature": "I301AWv8hICFgRNw7kh6CIYIkx_koApdGDfQYx004qUhD6tAQc1qE_ReSisMpdx4X7LM1CL22xDgQg1qUfMcCA"
   },
   "provider_directory_profile_contract_id": "healthporta.provider-directory-profile-execution.v2",
   "provider_directory_profile_generation": 11,

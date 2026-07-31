@@ -55,6 +55,7 @@ RUN apt-get update \
 ARG HLTHPRT_LOG_CFG=./logging.yaml
 ARG HLTHPRT_RELEASE="dev"
 ARG HLTHPRT_ENVIRONMENT=test
+ARG HLTHPRT_SOURCE_COMMIT
 
 ARG HLTHPRT_DB_POOL_MIN_SIZE=1
 ARG HLTHPRT_DB_POOL_MAX_SIZE=10
@@ -68,6 +69,15 @@ ARG HLTHPRT_REDIS_ADDRESS=redis://localhost:6379
 
 ARG HLTHPRT_SAVE_PER_PACK=100
 
+RUN test "${#HLTHPRT_SOURCE_COMMIT}" -eq 40 \
+    && printf '%s' "${HLTHPRT_SOURCE_COMMIT}" \
+        | grep -Eq '^[0-9a-f]{40}$' \
+    && test "${HLTHPRT_SOURCE_COMMIT}" != "0000000000000000000000000000000000000000" \
+    && install -d -o root -g root -m 0555 /opt/healthporta/build-identity \
+    && printf '%s\n' "${HLTHPRT_SOURCE_COMMIT}" \
+        > /opt/healthporta/build-identity/healthcare-source-commit \
+    && chown root:root /opt/healthporta/build-identity/healthcare-source-commit \
+    && chmod 0444 /opt/healthporta/build-identity/healthcare-source-commit
 
 ENV HLTHPRT_LOG_CFG=${HLTHPRT_LOG_CFG}
 ENV HLTHPRT_RELEASE=${HLTHPRT_RELEASE}

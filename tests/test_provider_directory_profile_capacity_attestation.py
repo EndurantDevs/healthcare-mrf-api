@@ -5,13 +5,17 @@
 from __future__ import annotations
 
 import base64
-import copy
 import datetime
+import hashlib
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from process import provider_directory_profile_capacity_attestation as lease
+from tests.provider_directory_profile_capacity_runtime_test_support import (
+    golden_capacity_storage,
+    golden_runtime_witnesses,
+)
 from tests.provider_directory_profile_capacity_trust_fixtures import (
     PUBLIC_KEY_HEX,
     capacity_trust as _trust,
@@ -22,47 +26,24 @@ UTC = datetime.timezone.utc
 VALIDATION_TIME = datetime.datetime(2026, 7, 30, 12, 0, 2, tzinfo=UTC)
 PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
 GOLDEN_ATTESTATION_ID = (
-    "7ef089ca3c1e2e28d62d93e92c13b609"
-    "42cd8305a7bbd30dcd7715c1d362177d"
+    "782944a410a135bb7708e0b9f08ca0d2"
+    "f12cb70faeb1bb1a4cdd42c414638ebb"
 )
 GOLDEN_SIGNATURE = (
-    "RxmvWgphpLXZPJaLybyCd8b8uVEDcbIo5aT6PbcYkzMndX8afD3rXtG1"
-    "RUdDf8Tnh8BzRUHm-J9ekEoCmaerCQ"
+    "I301AWv8hICFgRNw7kh6CIYIkx_koApdGDfQYx004qUhD6tAQc1qE_Re"
+    "SisMpdx4X7LM1CL22xDgQg1qUfMcCA"
 )
-GOLDEN_CANONICAL_BODY = (
-    '{"attestation_id":"7ef089ca3c1e2e28d62d93e92c13b60942cd8305'
-    'a7bbd30dcd7715c1d362177d","attestor_id":"capacity-authority-dev"'
-    ',"attestor_release_digest":"111111111111111111111111111111111111'
-    '1111111111111111111111111111","capacity_geometry_hash":"5555555555'
-    '555555555555555555555555555555555555555555555555555555","contract_id"'
-    ':"provider-directory-database-capacity-lease-v1","database_name":'
-    '"healthporta_test","database_oid":16401,"database_system_identifier":'
-    '"7527713908662902214","environment_id":"dev-us","expires_at":'
-    '"2026-07-30T13:00:00Z","issued_at":"2026-07-30T12:00:01Z",'
-    '"key_id":"capacity-key-2026-07","max_build_deadline":'
-    '"2026-07-30T12:55:00Z","nonce":"22222222222222222222222222222222'
-    '22222222222222222222222222222222","observed_at":"2026-07-30T12:'
-    '00:00Z","reservation_id":"pd-capacity-reservation-7",'
-    '"signature_algorithm":"Ed25519","tablespaces":[{"tablespace_name":'
-    '"pg_default","tablespace_oid":1663,"usage":"data","volume_digest":'
-    '"3333333333333333333333333333333333333333333333333333333333333333"'
-    '},{"tablespace_name":"pg_default","tablespace_oid":1663,"usage":"temp",'
-    '"volume_digest":"333333333333333333333333333333333333333333333333333333'
-    '3333333333"}],"volumes":[{"available_after_all_reservations_bytes":'
-    '700000000000,"available_bytes":1000000000000,"reserved_bytes":'
-    '180000000000,"volume_class":"data","volume_digest":"333333333333333333'
-    '3333333333333333333333333333333333333333333333"},{"available_after_all'
-    '_reservations_bytes":700000000000,"available_bytes":1000000000000,'
-    '"reserved_bytes":20000000000,"volume_class":"temp","volume_digest":'
-    '"3333333333333333333333333333333333333333333333333333333333333333"'
-    '},{"available_after_all_reservations_bytes":300000000000,'
-    '"available_bytes":500000000000,"reserved_bytes":150000000000,'
-    '"volume_class":"wal","volume_digest":"4444444444444444444444444444444444'
-    '444444444444444444444444444444"}]}'
+GOLDEN_CANONICAL_BODY_SHA256 = (
+    "1047eac11297a78e49ffe6a6bf913506"
+    "3c6b1b00b172e126b826c4d284612042"
 )
 
 
 def _golden_body() -> dict[str, object]:
+    runtime_witness_by_field, deployment_witness_by_field = (
+        golden_runtime_witnesses()
+    )
+    tablespace_rows, volume_rows = golden_capacity_storage()
     return {
         "attestation_id": GOLDEN_ATTESTATION_ID,
         "attestor_id": "capacity-authority-dev",
@@ -80,44 +61,17 @@ def _golden_body() -> dict[str, object]:
         "nonce": "22" * 32,
         "observed_at": "2026-07-30T12:00:00Z",
         "reservation_id": "pd-capacity-reservation-7",
+        "runtime_witness": runtime_witness_by_field,
+        "runtime_witness_sha256": (
+            lease.capacity_runtime_witness_sha256(
+                runtime_witness_by_field,
+                deployment_witness_by_field,
+            )
+        ),
+        "deployment_witness": deployment_witness_by_field,
         "signature_algorithm": lease.CAPACITY_LEASE_SIGNATURE_ALGORITHM,
-        "tablespaces": [
-            {
-                "tablespace_name": "pg_default",
-                "tablespace_oid": 1663,
-                "usage": "data",
-                "volume_digest": "33" * 32,
-            },
-            {
-                "tablespace_name": "pg_default",
-                "tablespace_oid": 1663,
-                "usage": "temp",
-                "volume_digest": "33" * 32,
-            },
-        ],
-        "volumes": [
-            {
-                "available_after_all_reservations_bytes": 700_000_000_000,
-                "available_bytes": 1_000_000_000_000,
-                "reserved_bytes": 180_000_000_000,
-                "volume_class": "data",
-                "volume_digest": "33" * 32,
-            },
-            {
-                "available_after_all_reservations_bytes": 700_000_000_000,
-                "available_bytes": 1_000_000_000_000,
-                "reserved_bytes": 20_000_000_000,
-                "volume_class": "temp",
-                "volume_digest": "33" * 32,
-            },
-            {
-                "available_after_all_reservations_bytes": 300_000_000_000,
-                "available_bytes": 500_000_000_000,
-                "reserved_bytes": 150_000_000_000,
-                "volume_class": "wal",
-                "volume_digest": "44" * 32,
-            },
-        ],
+        "tablespaces": tablespace_rows,
+        "volumes": volume_rows,
     }
 
 
@@ -169,17 +123,27 @@ def test_golden_vector_verifies_exact_canonical_schema_and_signature():
 
     assert verified.attestation_id == GOLDEN_ATTESTATION_ID
     assert verified.signature == GOLDEN_SIGNATURE
-    assert verified.canonical_lease_json == GOLDEN_CANONICAL_BODY
+    assert hashlib.sha256(
+        verified.canonical_lease_json.encode("ascii")
+    ).hexdigest() == GOLDEN_CANONICAL_BODY_SHA256
     assert verified.capacity_geometry_hash == "55" * 32
     assert verified.database_system_identifier == "7527713908662902214"
+    assert verified.runtime_witness.healthcare_source_commit == "12" * 20
+    assert verified.runtime_witness_sha256 == (
+        "2fc84fa853db9ba85d0b431be6f6a349"
+        "6a9d3fefba6e1cf4049412c3b262eefb"
+    )
+    assert verified.deployment_witness.preflight_transport == (
+        "kubectl_exec_loopback_8080"
+    )
     assert verified.reservation_bytes_by_storage_class == {
         "data": 180_000_000_000,
         "temp": 20_000_000_000,
         "wal": 150_000_000_000,
     }
     assert verified.lease_digest == (
-        "f0e53a34fabd3b8e4a0c1657a984c68e"
-        "070977b5f7133314a201c0ef1e10b1af"
+        "1ca1811886741ee9397f6b4bf8c42ff8"
+        "c4085baeacb27e0bd77fbebf8b9330a9"
     )
     assert verified.public_key_fingerprint == (
         "05549452c2988321a6d9e7daa9a7704b"
@@ -213,6 +177,10 @@ def test_attestation_id_golden_vector_is_independent_of_mapping_order():
     ("tablespace", "extra"),
     ("volume", "missing"),
     ("volume", "extra"),
+    ("runtime_witness", "missing"),
+    ("runtime_witness", "extra"),
+    ("deployment_witness", "missing"),
+    ("deployment_witness", "extra"),
 ])
 def test_closed_wire_schema_rejects_missing_and_extra_fields(target, mutation):
     envelope = _signed_envelope()
@@ -221,6 +189,8 @@ def test_closed_wire_schema_rejects_missing_and_extra_fields(target, mutation):
         selected = selected["tablespaces"][0]
     elif target == "volume":
         selected = selected["volumes"][0]
+    elif target in {"runtime_witness", "deployment_witness"}:
+        selected = selected[target]
     if mutation == "missing":
         selected.pop(next(iter(selected)))
     else:

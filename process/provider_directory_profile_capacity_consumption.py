@@ -8,6 +8,7 @@ import datetime
 from typing import Any
 
 from process.provider_directory_profile_capacity_attestation_contract import (
+    CAPACITY_LEASE_CONTRACT_ID,
     CapacityLeaseConsumptionBinding,
     VerifiedDatabaseCapacityLease,
     _BUILD_ID,
@@ -71,6 +72,8 @@ def capacity_lease_consumption_values(
 
     if not isinstance(capacity_lease, VerifiedDatabaseCapacityLease):
         raise _error("invalid_type", "lease")
+    if capacity_lease.contract_id != CAPACITY_LEASE_CONTRACT_ID:
+        raise _error("unsupported_contract", "contract_id")
     if not isinstance(binding, CapacityLeaseConsumptionBinding):
         raise _error("invalid_type", "binding")
     if (

@@ -25,9 +25,12 @@ from process.provider_directory_profile_capacity_attestation_contract import (
     CAPACITY_LEASE_PUBLIC_KEY_DOMAIN,
     CAPACITY_LEASE_SIGNATURE_ALGORITHM,
     CAPACITY_LEASE_SIGNATURE_DOMAIN,
+    CAPACITY_RUNTIME_WITNESS_DOMAIN,
     CAPACITY_TABLESPACE_IDENTITY_DOMAIN,
     CAPACITY_VOLUME_IDENTITY_DOMAIN,
     CapacityLeaseConsumptionBinding,
+    CapacityLeaseDeploymentWitness,
+    CapacityLeaseRuntimeWitness,
     CapacityLeaseTrust,
     CapacityLeaseTrustKey,
     CapacityLeaseTrustTablespace,
@@ -55,10 +58,13 @@ from process.provider_directory_profile_capacity_attestation_contract import (
     _opaque_id,
     _parse_capacity_tablespace_list,
     _parse_capacity_volume_list,
+    _parse_capacity_deployment_witness,
+    _parse_capacity_runtime_witness,
     _text,
     _timestamp,
     _validation_time,
     canonical_capacity_lease_json,
+    capacity_runtime_witness_sha256,
 )
 from process.provider_directory_profile_capacity_consumption import (
     capacity_lease_consumption_values,
@@ -154,6 +160,7 @@ def _parse_capacity_lease_fields(
 
     return {
         **_parse_capacity_lease_identity(lease_body),
+        **_parse_capacity_runtime_evidence(lease_body),
         "expires_at": _timestamp(
             lease_body["expires_at"], field="expires_at"
         ),
@@ -171,6 +178,32 @@ def _parse_capacity_lease_fields(
             lease_body["tablespaces"]
         ),
         "volumes": _parse_capacity_volume_list(lease_body["volumes"]),
+    }
+
+
+def _parse_capacity_runtime_evidence(
+    lease_body: Mapping[str, Any],
+) -> dict[str, Any]:
+    runtime_witness = _parse_capacity_runtime_witness(
+        lease_body["runtime_witness"]
+    )
+    deployment_witness = _parse_capacity_deployment_witness(
+        lease_body["deployment_witness"]
+    )
+    supplied_digest = _hex_digest(
+        lease_body["runtime_witness_sha256"],
+        field="runtime_witness_sha256",
+    )
+    expected_digest = capacity_runtime_witness_sha256(
+        lease_body["runtime_witness"],
+        lease_body["deployment_witness"],
+    )
+    if not hmac.compare_digest(supplied_digest, expected_digest):
+        raise _error("identity_mismatch", "runtime_witness_sha256")
+    return {
+        "runtime_witness": runtime_witness,
+        "runtime_witness_sha256": supplied_digest,
+        "deployment_witness": deployment_witness,
     }
 
 
@@ -428,13 +461,16 @@ __all__ = (
     "CAPACITY_LEASE_MAX_OBSERVATION_AGE_SECONDS",
     "CAPACITY_LEASE_MAX_VALIDITY_SECONDS", "CAPACITY_LEASE_PUBLIC_KEY_DOMAIN",
     "CAPACITY_LEASE_SIGNATURE_ALGORITHM", "CAPACITY_LEASE_SIGNATURE_DOMAIN",
+    "CAPACITY_RUNTIME_WITNESS_DOMAIN",
     "CAPACITY_TABLESPACE_IDENTITY_DOMAIN", "CAPACITY_VOLUME_IDENTITY_DOMAIN",
     "CapacityLeaseConsumptionBinding", "CapacityLeaseTrust",
+    "CapacityLeaseDeploymentWitness", "CapacityLeaseRuntimeWitness",
     "CapacityLeaseTrustKey",
     "CapacityLeaseTrustTablespace", "CapacityLeaseTrustVolume",
     "DatabaseCapacityTablespace", "DatabaseCapacityVolume",
     "ProviderDirectoryCapacityLeaseError", "VerifiedDatabaseCapacityLease",
     "assert_database_capacity_lease_reservation",
     "canonical_capacity_lease_json", "capacity_attestation_id",
+    "capacity_runtime_witness_sha256",
     "capacity_lease_consumption_values", "verify_database_capacity_lease",
 )

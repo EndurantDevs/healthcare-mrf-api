@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
-import json
+import hashlib
 import importlib
+import json
 import types
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
@@ -14,7 +15,9 @@ import pytest
 from sanic.exceptions import BadRequest, SanicException
 
 from api import provider_directory_profile_capacity_preflight as preflight_api
+from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_capacity as capacity
+from process import provider_directory_profile_runtime_observation as runtime
 from tests.test_provider_directory_profile_capacity import _geometry_payload
 from tests.test_provider_directory_profile_selection_attestation import (
     _execution,
@@ -24,7 +27,11 @@ importer = importlib.import_module("process.provider_directory_fhir")
 
 
 def _geometry():
-    return capacity.validated_capacity_geometry(_geometry_payload())
+    payload = _geometry_payload()
+    payload["profile_schema_version"] = (
+        profile_artifact.PROFILE_SCHEMA_VERSION
+    )
+    return capacity.validated_capacity_geometry(payload)
 
 
 def _workload():
@@ -99,6 +106,77 @@ def _patch_geometry_dependencies(
     return workload_builder
 
 
+def _assert_runtime_receipt(receipt, geometry) -> None:
+    expected_observation_by_field = {
+        "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
+        "healthcare_source_commit": "a" * 40,
+        "profile_migration_revision": (
+            "20260730110000_provider_directory_profile_delta"
+        ),
+        "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
+        "profile_strategy_version": (
+            profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
+        ),
+        "postgres_server_version_num": geometry.postgres_server_version_num,
+    }
+    assert receipt["contract_id"] == (
+        "healthporta.provider-directory-profile-capacity-preflight.v2"
+    )
+    assert receipt["runtime_observation"] == expected_observation_by_field
+    receipt_by_field_without_hash = dict(receipt)
+    receipt_hash = receipt_by_field_without_hash.pop("receipt_sha256")
+    expected_hash = hashlib.sha256(
+        b"healthporta.provider-directory-profile-capacity-preflight.v2\0"
+        + json.dumps(
+            receipt_by_field_without_hash,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    assert receipt_hash == expected_hash
+
+
+@asynccontextmanager
+async def _read_only_transaction():
+    yield
+
+
+def _patch_runtime_snapshot(monkeypatch, geometry):
+    status = AsyncMock()
+    runtime_rows = AsyncMock(
+        return_value=[
+            {
+                "profile_migration_revision": (
+                    "20260730110000_provider_directory_profile_delta"
+                ),
+                "postgres_server_version_num": (
+                    geometry.postgres_server_version_num
+                ),
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        importer.db,
+        "transaction",
+        _read_only_transaction,
+    )
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "assert_profile_selection_current_in_transaction",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "build_baked_healthcare_source_commit",
+        lambda: "a" * 40,
+    )
+    monkeypatch.setattr(runtime.db, "all", runtime_rows)
+    return status, runtime_rows
+
+
 @pytest.mark.asyncio
 async def test_preflight_computes_geometry_inside_read_only_snapshot(
     monkeypatch,
@@ -112,18 +190,9 @@ async def test_preflight_computes_geometry_inside_read_only_snapshot(
         geometry=_geometry(),
         control_wal_projection=types.SimpleNamespace(),
     )
-
-    @asynccontextmanager
-    async def transaction():
-        yield
-
-    monkeypatch.setattr(importer.db, "transaction", transaction)
-    status = AsyncMock()
-    monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(
-        importer,
-        "assert_profile_selection_current_in_transaction",
-        AsyncMock(),
+    status, runtime_rows = _patch_runtime_snapshot(
+        monkeypatch,
+        geometry_state.geometry,
     )
     _patch_fence_dependencies(monkeypatch, fence)
     workload_builder = _patch_geometry_dependencies(
@@ -144,11 +213,23 @@ async def test_preflight_computes_geometry_inside_read_only_snapshot(
         capacity.capacity_geometry_hash(geometry_state.geometry)
     )
     assert receipt["artifact_scope_projection"]["projected_rows"] == 45
-    assert len(receipt["receipt_sha256"]) == 64
+    _assert_runtime_receipt(receipt, geometry_state.geometry)
+    runtime_rows.assert_awaited_once_with(
+        runtime.profile_runtime_observation_sql()
+    )
     assert (
         importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get()
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_invalid_execution():
+    with pytest.raises(
+        importer.ProviderDirectoryProfileSelectionError,
+        match="Profile capacity preflight execution is invalid",
+    ):
+        await importer.provider_directory_profile_capacity_preflight(object())
 
 
 @pytest.mark.asyncio
@@ -229,3 +310,47 @@ async def test_control_preflight_maps_selection_drift_to_conflict(monkeypatch):
             )
         )
     assert conflict.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_control_preflight_maps_runtime_observation_failure_to_conflict(
+    monkeypatch,
+):
+    """Missing build provenance must fail closed with a stable conflict."""
+
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    request = types.SimpleNamespace(
+        headers={"Authorization": "Bearer secret"},
+        json={
+            "provider_directory_profile_capacity_attestation": {},
+        },
+    )
+    monkeypatch.setattr(
+        preflight_api,
+        "validated_profile_execution",
+        lambda _payload: _execution(),
+    )
+    monkeypatch.setattr(
+        preflight_api,
+        "provider_directory_profile_capacity_preflight",
+        AsyncMock(
+            side_effect=(
+                runtime.ProviderDirectoryProfileRuntimeObservationError(
+                    "provider_directory_profile_runtime_observation_"
+                    "healthcare_source_commit_invalid"
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(SanicException) as conflict:
+        await (
+            preflight_api.control_provider_directory_profile_capacity_preflight(
+                request
+            )
+        )
+    assert conflict.value.status_code == 409
+    assert str(conflict.value) == (
+        "provider_directory_profile_runtime_observation_"
+        "healthcare_source_commit_invalid"
+    )

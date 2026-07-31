@@ -677,6 +677,39 @@ def _merge_credential_spec(base: dict[str, Any], overlay: dict[str, Any], *, mat
     return merged_spec_dict
 
 
+def _credential_section_match(
+    source_configs: dict[str, Any],
+    section_names: tuple[str, ...],
+    match_value: str | None,
+    key_normalizer: Any,
+) -> tuple[dict[str, Any], str | None]:
+    section = _mapping(next((source_configs.get(name) for name in section_names if source_configs.get(name)), None))
+    if not match_value:
+        return {}, None
+    keys_by_normalized_value = {key_normalizer(key): key for key in section}
+    key = keys_by_normalized_value.get(match_value)
+    return (_mapping(section.get(key)), str(match_value)) if key is not None else ({}, None)
+
+
+def _merge_matching_credential_section(
+    credential_spec: dict[str, Any],
+    source_configs: dict[str, Any],
+    section_names: tuple[str, ...],
+    match_value: str | None,
+    key_normalizer: Any,
+) -> dict[str, Any]:
+    overlay, matched_value = _credential_section_match(
+        source_configs, section_names, match_value, key_normalizer
+    )
+    if not overlay or matched_value is None:
+        return credential_spec
+    return _merge_credential_spec(
+        credential_spec,
+        overlay,
+        matched_by=f"{section_names[0]}:{matched_value}",
+    )
+
+
 def _credential_spec_for_source(
     source_record_dict: dict[str, Any],
     source_configs: dict[str, Any],
@@ -702,54 +735,19 @@ def _credential_spec_for_source(
     host = urllib.parse.urlsplit(canonical_api_base or "").netloc.lower()
     org_name = _normalize_credential_key(source_record_dict.get("org_name"))
 
-    credential_specs_by_host = _mapping(source_configs.get("hosts"))
-    host_key_by_normalized_host = {
-        str(key).lower(): key for key in credential_specs_by_host
-    }
-    if host and host in host_key_by_normalized_host:
-        key = host_key_by_normalized_host[host]
-        credential_spec_dict = _merge_credential_spec(
-            credential_spec_dict,
-            _mapping(credential_specs_by_host.get(key)),
-            matched_by=f"hosts:{host}",
-        )
-
-    credential_specs_by_api_base = _mapping(
-        source_configs.get("api_bases") or source_configs.get("apiBases")
+    matches = (
+        (("hosts",), host, lambda key: str(key).lower()),
+        (("api_bases", "apiBases"), canonical_api_base, lambda key: _canonical_base(str(key)) or str(key).rstrip("/")),
+        (("org_names", "orgNames"), org_name, _normalize_credential_key),
+        (("sources",), source_id, str),
     )
-    api_base_key_by_normalized_base = {
-        _canonical_base(str(key)) or str(key).rstrip("/"): key
-        for key in credential_specs_by_api_base
-    }
-    if canonical_api_base and canonical_api_base in api_base_key_by_normalized_base:
-        key = api_base_key_by_normalized_base[canonical_api_base]
-        credential_spec_dict = _merge_credential_spec(
+    for section_names, match_value, key_normalizer in matches:
+        credential_spec_dict = _merge_matching_credential_section(
             credential_spec_dict,
-            _mapping(credential_specs_by_api_base.get(key)),
-            matched_by=f"api_bases:{canonical_api_base}",
-        )
-
-    credential_specs_by_org_name = _mapping(
-        source_configs.get("org_names") or source_configs.get("orgNames")
-    )
-    org_key_by_normalized_name = {
-        _normalize_credential_key(key): key
-        for key in credential_specs_by_org_name
-    }
-    if org_name and org_name in org_key_by_normalized_name:
-        key = org_key_by_normalized_name[org_name]
-        credential_spec_dict = _merge_credential_spec(
-            credential_spec_dict,
-            _mapping(credential_specs_by_org_name.get(key)),
-            matched_by=f"org_names:{org_name}",
-        )
-
-    credential_specs_by_source_id = _mapping(source_configs.get("sources"))
-    if source_id and source_id in credential_specs_by_source_id:
-        credential_spec_dict = _merge_credential_spec(
-            credential_spec_dict,
-            _mapping(credential_specs_by_source_id.get(source_id)),
-            matched_by=f"sources:{source_id}",
+            source_configs,
+            section_names,
+            match_value,
+            key_normalizer,
         )
     if credential_spec_dict.get("enabled") is False:
         return {}
@@ -923,15 +921,10 @@ async def _column_distinct_estimate(
     return max(0, int(round(distinct)))
 
 
-async def _source_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
-    """Summarize catalog source validation and market coverage."""
-    if not await _has_relation(conn, schema, "provider_directory_source"):
-        return {"available": False}
+def _source_summary_sql(schema: str) -> str:
     gateway_hosts = _sql_string_array(FHIR_ONBOARDING_GATEWAY_HOSTS)
     credential_markers = _sql_string_array(FHIR_CREDENTIAL_AUTH_MARKERS)
-    source_summary = await _fetch_mapping(
-        conn,
-        f"""
+    return f"""
         WITH src AS (
             SELECT *,
                    split_part(
@@ -967,8 +960,14 @@ async def _source_summary(conn: asyncpg.Connection, schema: str) -> dict[str, An
             count(*) FILTER (WHERE is_qhp IS TRUE)::bigint AS qhp_count,
             max(last_probed_at) AS last_probed_at
           FROM src
-        """,
-    )
+        """
+
+
+async def _source_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
+    """Summarize catalog source validation and market coverage."""
+    if not await _has_relation(conn, schema, "provider_directory_source"):
+        return {"available": False}
+    source_summary = await _fetch_mapping(conn, _source_summary_sql(schema))
     source_count = _int(source_summary.get("source_count"))
     source_summary["available"] = True
     source_summary["api_base_pct"] = _pct(
@@ -989,18 +988,8 @@ async def _source_summary(conn: asyncpg.Connection, schema: str) -> dict[str, An
     return source_summary
 
 
-async def _probe_timeout_summary(
-    conn: asyncpg.Connection,
-    schema: str,
-    *,
-    sample_limit: int,
-) -> dict[str, Any]:
-    """Group timed-out source probes by host and authentication mode."""
-    if not await _has_relation(conn, schema, "provider_directory_source"):
-        return {"available": False, "timeout_source_count": 0, "groups": []}
-    limit = max(1, sample_limit)
-    timeout_rows = await conn.fetch(
-        f"""
+def _probe_timeout_sql(schema: str, limit: int) -> str:
+    return f"""
         WITH timeout_sources AS (
             SELECT source_id,
                    org_name,
@@ -1056,7 +1045,18 @@ async def _probe_timeout_summary(
          GROUP BY source_host, auth_type
          ORDER BY source_count DESC, source_host, auth_type
         """
-    )
+
+
+async def _probe_timeout_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    *,
+    sample_limit: int,
+) -> dict[str, Any]:
+    """Group timed-out source probes by host and authentication mode."""
+    if not await _has_relation(conn, schema, "provider_directory_source"):
+        return {"available": False, "timeout_source_count": 0, "groups": []}
+    timeout_rows = await conn.fetch(_probe_timeout_sql(schema, max(1, sample_limit)))
     timeout_groups = []
     for timeout_row in timeout_rows:
         timeout_group_dict = dict(timeout_row)
@@ -1454,15 +1454,9 @@ async def _credential_onboarding_backlog(
     }
 
 
-def _credential_backlog_export(report: dict[str, Any]) -> dict[str, Any]:
-    """Normalize credential backlog groups for JSON export."""
-    backlog = report.get("credential_onboarding_backlog") or {}
-    groups = []
-    for group in backlog.get("groups") or []:
-        source_host = _clean_text(group.get("source_host"))
-        suggested_rule_dict = None
-        if source_host and source_host != "(missing host)":
-            suggested_rule_dict = {
+def _suggested_credential_rule(source_host: str | None) -> dict[str, Any] | None:
+    if source_host and source_host != "(missing host)":
+        return {
                 "section": "hosts",
                 "key": source_host,
                 "template": {
@@ -1475,8 +1469,12 @@ def _credential_backlog_export(report: dict[str, Any]) -> dict[str, Any]:
                     }
                 },
             }
-        groups.append(
-            {
+    return None
+
+
+def _credential_backlog_group_export(group: dict[str, Any]) -> dict[str, Any]:
+    source_host = _clean_text(group.get("source_host"))
+    return {
                 "host": source_host,
                 "source_host": source_host,
                 "probe_status": group.get("probe_status"),
@@ -1503,9 +1501,17 @@ def _credential_backlog_export(report: dict[str, Any]) -> dict[str, Any]:
                 "api_base_count": group.get("api_base_count"),
                 "sample_api_base_count": group.get("sample_api_base_count"),
                 "api_base_sample_complete": group.get("api_base_sample_complete"),
-                "suggested_credential_rule": suggested_rule_dict,
+                "suggested_credential_rule": _suggested_credential_rule(source_host),
             }
-        )
+
+
+def _credential_backlog_export(report: dict[str, Any]) -> dict[str, Any]:
+    """Normalize credential backlog groups for JSON export."""
+    backlog = report.get("credential_onboarding_backlog") or {}
+    groups = [
+        _credential_backlog_group_export(group)
+        for group in backlog.get("groups") or []
+    ]
     return {
         "generated_at": report.get("generated_at"),
         "schema": report.get("schema"),
@@ -1728,18 +1734,11 @@ def _credential_config_template_export(report: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def _credential_api_base_targets_export(report: dict[str, Any]) -> dict[str, Any]:
-    """Flatten credential work into API-base-specific onboarding targets."""
-    backlog = report.get("credential_onboarding_backlog") or {}
-    api_base_targets: list[dict[str, Any]] = []
-    for group in backlog.get("groups") or []:
-        for api_base_target in group.get("api_base_targets") or []:
-            api_base = _clean_text(api_base_target.get("api_base"))
-            if not api_base:
-                continue
-            env_prefix = _credential_api_base_env_prefix(api_base)
-            api_base_targets.append(
-                {
+def _build_credential_api_base_row(
+    group: dict[str, Any], api_base_target: dict[str, Any], api_base: str
+) -> dict[str, Any]:
+    env_prefix = _credential_api_base_env_prefix(api_base)
+    return {
                     "host": group.get("source_host"),
                     "source_host": group.get("source_host"),
                     "probe_status": group.get("probe_status"),
@@ -1765,7 +1764,19 @@ def _credential_api_base_targets_export(report: dict[str, Any]) -> dict[str, Any
                     "sample_endpoint_discovery_sources": _list(api_base_target.get("sample_endpoint_discovery_sources")),
                     "credential_rule_template": _credential_template_rule_for_group(group, env_prefix),
                 }
-            )
+
+
+def _credential_api_base_targets_export(report: dict[str, Any]) -> dict[str, Any]:
+    """Flatten credential work into API-base-specific onboarding targets."""
+    backlog = report.get("credential_onboarding_backlog") or {}
+    api_base_targets: list[dict[str, Any]] = []
+    for group in backlog.get("groups") or []:
+        for api_base_target in group.get("api_base_targets") or []:
+            api_base = _clean_text(api_base_target.get("api_base"))
+            if api_base:
+                api_base_targets.append(
+                    _build_credential_api_base_row(group, api_base_target, api_base)
+                )
     api_base_targets.sort(
         key=lambda target_record: (
             str(target_record.get("source_host")),
@@ -2090,6 +2101,49 @@ async def _resource_import_metadata_summary(conn: asyncpg.Connection, schema: st
     }
 
 
+async def _resource_column_availability(
+    conn: asyncpg.Connection, schema: str, table: str
+) -> dict[str, bool]:
+    return {
+        "npi": await _has_column(conn, schema, table, "npi"),
+        "address_key": await _has_column(conn, schema, table, "address_key"),
+        "telephone_number": await _has_column(conn, schema, table, "telephone_number"),
+        "network_refs": await _has_column(conn, schema, table, "network_refs"),
+    }
+
+
+async def _exact_resource_summary_row(
+    conn: asyncpg.Connection,
+    schema: str,
+    table: str,
+    columns: dict[str, bool],
+) -> dict[str, Any]:
+    return await _fetch_mapping(
+        conn,
+        f"""
+        SELECT count(*)::bigint AS row_count,
+               count(DISTINCT source_id)::bigint AS source_count
+               {", count(*) FILTER (WHERE npi IS NOT NULL)::bigint AS npi_count" if columns["npi"] else ""}
+               {", count(*) FILTER (WHERE address_key IS NOT NULL)::bigint AS address_key_count" if columns["address_key"] else ""}
+               {", count(*) FILTER (WHERE telephone_number IS NOT NULL AND BTRIM(telephone_number) <> '')::bigint AS phone_count" if columns["telephone_number"] else ""}
+               {", count(*) FILTER (WHERE jsonb_array_length(COALESCE(network_refs::jsonb, '[]'::jsonb)) > 0)::bigint AS network_ref_row_count" if columns["network_refs"] else ""}
+          FROM {_qt(schema, table)}
+        """,
+    )
+
+
+def _finish_resource_summary_row(
+    summary: dict[str, Any], columns: dict[str, bool]
+) -> dict[str, Any]:
+    summary["available"] = True
+    summary["columns"] = columns
+    if columns["address_key"]:
+        summary["address_key_pct"] = _pct(
+            _int(summary.get("address_key_count")), _int(summary.get("row_count"))
+        )
+    return summary
+
+
 async def _resource_summary(
     conn: asyncpg.Connection,
     schema: str,
@@ -2106,12 +2160,7 @@ async def _resource_summary(
         if not await _has_relation(conn, schema, table):
             summary_by_table[table] = {"available": False}
             continue
-        availability_by_column = {
-            "npi": await _has_column(conn, schema, table, "npi"),
-            "address_key": await _has_column(conn, schema, table, "address_key"),
-            "telephone_number": await _has_column(conn, schema, table, "telephone_number"),
-            "network_refs": await _has_column(conn, schema, table, "network_refs"),
-        }
+        availability_by_column = await _resource_column_availability(conn, schema, table)
         resource_type = resource_type_by_table.get(table)
         if use_estimates:
             summary_by_table[table] = await _estimated_resource_summary_row(
@@ -2139,18 +2188,8 @@ async def _resource_summary(
             summary_by_table[table] = resource_summary_record_dict
             continue
         try:
-            resource_summary_record_dict = await _fetch_mapping(
-                conn,
-                f"""
-                SELECT
-                    count(*)::bigint AS row_count,
-                    count(DISTINCT source_id)::bigint AS source_count
-                    {", count(*) FILTER (WHERE npi IS NOT NULL)::bigint AS npi_count" if availability_by_column["npi"] else ""}
-                    {", count(*) FILTER (WHERE address_key IS NOT NULL)::bigint AS address_key_count" if availability_by_column["address_key"] else ""}
-                    {", count(*) FILTER (WHERE telephone_number IS NOT NULL AND BTRIM(telephone_number) <> '')::bigint AS phone_count" if availability_by_column["telephone_number"] else ""}
-                    {", count(*) FILTER (WHERE jsonb_array_length(COALESCE(network_refs::jsonb, '[]'::jsonb)) > 0)::bigint AS network_ref_row_count" if availability_by_column["network_refs"] else ""}
-                  FROM {_qt(schema, table)}
-                """,
+            resource_summary_record_dict = await _exact_resource_summary_row(
+                conn, schema, table, availability_by_column
             )
         except asyncpg.exceptions.QueryCanceledError as exc:
             resource_summary_record_dict = await _estimated_resource_summary_row(
@@ -2160,15 +2199,9 @@ async def _resource_summary(
                 columns=availability_by_column,
             )
             resource_summary_record_dict["exact_error"] = str(exc)
-        resource_summary_record_dict["available"] = True
-        resource_summary_record_dict["columns"] = availability_by_column
-        row_count = _int(resource_summary_record_dict.get("row_count"))
-        if availability_by_column["address_key"]:
-            resource_summary_record_dict["address_key_pct"] = _pct(
-                _int(resource_summary_record_dict.get("address_key_count")),
-                row_count,
-            )
-        summary_by_table[table] = resource_summary_record_dict
+        summary_by_table[table] = _finish_resource_summary_row(
+            resource_summary_record_dict, availability_by_column
+        )
     return summary_by_table
 
 
@@ -4212,11 +4245,51 @@ def _skipped_ptg_summary() -> dict[str, Any]:
     }
 
 
+def _ptg_matched_network_cte_sql() -> str:
+    return """
+        matched AS (
+            SELECT DISTINCT snapshot_id, plan_id,
+                   provider_directory_source_id,
+                   provider_directory_network_name,
+                   provider_directory_network_key, ptg_network_name
+              FROM pairs
+             WHERE network_name_matched IS TRUE
+        )
+    """
+
+
+def _ptg_network_pairs_cte_sql() -> str:
+    return """
+        pairs AS (
+            SELECT pd.snapshot_id, pd.plan_id,
+                   pd.provider_directory_source_id,
+                   pd.provider_directory_org_name,
+                   pd.provider_directory_network_name,
+                   pd.provider_directory_network_key,
+                   ptg.ptg_network_name, ptg.ptg_network_key,
+                   (
+                       pd.provider_directory_network_key <> ''
+                       AND pd.provider_directory_network_key = ptg.ptg_network_key
+                   ) AS network_name_matched
+              FROM provider_directory_networks pd
+              LEFT JOIN ptg_networks ptg
+                ON ptg.snapshot_id = pd.snapshot_id AND ptg.plan_id = pd.plan_id
+        ),
+    """
+
+
+def _ptg_network_sql_names(schema: str) -> tuple[str, str, str, str]:
+    return (
+        _qt(schema, "provider_directory_address_corroboration"),
+        _qt(schema, "ptg2_serving_rate_compact"),
+        _network_name_key_sql("pd_network_name.value"),
+        _network_name_key_sql("ptg_network_name.value"),
+    )
+
+
 def _ptg_network_name_overlap_cte_sql(schema: str, *, ptg_plan_filter: str) -> str:
     """Build the shared SQL CTE for provider and PTG network-name pairs."""
-    view = "provider_directory_address_corroboration"
-    pd_name_key = _network_name_key_sql("pd_network_name.value")
-    ptg_name_key = _network_name_key_sql("ptg_network_name.value")
+    quoted_view, quoted_rates, pd_name_key, ptg_name_key = _ptg_network_sql_names(schema)
     return f"""
         WITH provider_directory_networks AS (
             SELECT DISTINCT
@@ -4226,7 +4299,7 @@ def _ptg_network_name_overlap_cte_sql(schema: str, *, ptg_plan_filter: str) -> s
                    corr.provider_directory_org_name,
                    pd_network_name.value AS provider_directory_network_name,
                    {pd_name_key} AS provider_directory_network_key
-              FROM {_qt(schema, view)} corr
+              FROM {quoted_view} corr
               CROSS JOIN LATERAL (
                     VALUES (NULLIF(corr.plan_id, '')), (NULLIF(corr.ptg_plan_id, ''))
               ) AS plan_ids(plan_id)
@@ -4248,7 +4321,7 @@ def _ptg_network_name_overlap_cte_sql(schema: str, *, ptg_plan_filter: str) -> s
                    rates.plan_id,
                    ptg_network_name.value AS ptg_network_name,
                    {ptg_name_key} AS ptg_network_key
-              FROM {_qt(schema, "ptg2_serving_rate_compact")} rates
+              FROM {quoted_rates} rates
               JOIN plan_pairs
                 ON plan_pairs.snapshot_id = rates.snapshot_id
                AND plan_pairs.plan_id = rates.plan_id
@@ -4257,35 +4330,8 @@ def _ptg_network_name_overlap_cte_sql(schema: str, *, ptg_plan_filter: str) -> s
               ) AS ptg_network_name(value)
              WHERE NULLIF(BTRIM(ptg_network_name.value), '') IS NOT NULL
         ),
-        pairs AS (
-            SELECT pd.snapshot_id,
-                   pd.plan_id,
-                   pd.provider_directory_source_id,
-                   pd.provider_directory_org_name,
-                   pd.provider_directory_network_name,
-                   pd.provider_directory_network_key,
-                   ptg.ptg_network_name,
-                   ptg.ptg_network_key,
-                   (
-                       pd.provider_directory_network_key <> ''
-                       AND pd.provider_directory_network_key = ptg.ptg_network_key
-                   ) AS network_name_matched
-              FROM provider_directory_networks pd
-              LEFT JOIN ptg_networks ptg
-                ON ptg.snapshot_id = pd.snapshot_id
-               AND ptg.plan_id = pd.plan_id
-        ),
-        matched AS (
-            SELECT DISTINCT
-                   snapshot_id,
-                   plan_id,
-                   provider_directory_source_id,
-                   provider_directory_network_name,
-                   provider_directory_network_key,
-                   ptg_network_name
-              FROM pairs
-             WHERE network_name_matched IS TRUE
-        )
+        {_ptg_network_pairs_cte_sql()}
+        {_ptg_matched_network_cte_sql()}
     """
 
 
@@ -4384,6 +4430,44 @@ async def _ptg_network_name_overlap_summary(
     return network_overlap_metrics
 
 
+async def _unresolved_network_references(
+    conn: asyncpg.Connection,
+    schema: str,
+    ref_resource_id: str,
+    sample_limit: int,
+) -> list[Any]:
+    return await conn.fetch(
+        f"""
+        WITH refs_raw AS (
+            SELECT source_id, jsonb_array_elements_text(COALESCE(network_refs::jsonb, '[]'::jsonb)) AS ref
+              FROM {_qt(schema, "provider_directory_practitioner_role")}
+            UNION ALL
+            SELECT source_id, jsonb_array_elements_text(COALESCE(network_refs::jsonb, '[]'::jsonb)) AS ref
+              FROM {_qt(schema, "provider_directory_organization_affiliation")}
+            UNION ALL
+            SELECT source_id, jsonb_array_elements_text(COALESCE(network_refs::jsonb, '[]'::jsonb)) AS ref
+              FROM {_qt(schema, "provider_directory_insurance_plan")}
+        ),
+        refs AS MATERIALIZED (
+            SELECT source_id, ref, {ref_resource_id} AS ref_resource_id
+              FROM refs_raw
+             WHERE NULLIF(BTRIM(ref), '') IS NOT NULL
+        )
+        SELECT refs.source_id, src.org_name, refs.ref, count(*)::bigint AS reference_count
+          FROM refs
+          LEFT JOIN {_qt(schema, "provider_directory_organization")} org
+            ON org.source_id = refs.source_id AND org.resource_id = refs.ref_resource_id
+          LEFT JOIN {_qt(schema, "provider_directory_source")} src
+            ON src.source_id = refs.source_id
+         WHERE org.resource_id IS NULL
+         GROUP BY refs.source_id, src.org_name, refs.ref
+         ORDER BY count(*) DESC, src.org_name, refs.ref
+         LIMIT $1
+        """,
+        sample_limit,
+    )
+
+
 async def _network_resolution_summary(conn: asyncpg.Connection, schema: str, *, sample_limit: int) -> dict[str, Any]:
     """Measure resolution of network references to organization records."""
     required = (
@@ -4436,38 +4520,8 @@ async def _network_resolution_summary(conn: asyncpg.Connection, schema: str, *, 
           FROM resolved
         """,
     )
-    unresolved = await conn.fetch(
-        f"""
-        WITH refs_raw AS (
-            SELECT source_id, jsonb_array_elements_text(COALESCE(network_refs::jsonb, '[]'::jsonb)) AS ref
-              FROM {_qt(schema, "provider_directory_practitioner_role")}
-            UNION ALL
-            SELECT source_id, jsonb_array_elements_text(COALESCE(network_refs::jsonb, '[]'::jsonb)) AS ref
-              FROM {_qt(schema, "provider_directory_organization_affiliation")}
-            UNION ALL
-            SELECT source_id, jsonb_array_elements_text(COALESCE(network_refs::jsonb, '[]'::jsonb)) AS ref
-              FROM {_qt(schema, "provider_directory_insurance_plan")}
-        ),
-        refs AS MATERIALIZED (
-            SELECT source_id,
-                   ref,
-                   {ref_resource_id} AS ref_resource_id
-              FROM refs_raw
-             WHERE NULLIF(BTRIM(ref), '') IS NOT NULL
-        )
-        SELECT refs.source_id, src.org_name, refs.ref, count(*)::bigint AS reference_count
-          FROM refs
-          LEFT JOIN {_qt(schema, "provider_directory_organization")} org
-            ON org.source_id = refs.source_id
-           AND org.resource_id = refs.ref_resource_id
-          LEFT JOIN {_qt(schema, "provider_directory_source")} src
-            ON src.source_id = refs.source_id
-         WHERE org.resource_id IS NULL
-         GROUP BY refs.source_id, src.org_name, refs.ref
-         ORDER BY count(*) DESC, src.org_name, refs.ref
-         LIMIT $1
-        """,
-        sample_limit,
+    unresolved = await _unresolved_network_references(
+        conn, schema, ref_resource_id, sample_limit
     )
     total_distinct = _int(resolution_summary_metrics.get("distinct_network_refs"))
     resolution_summary_metrics["available"] = True
@@ -4589,6 +4643,29 @@ def _plan_network_context_cte_sql(schema: str) -> str:
     """
 
 
+async def _plan_network_context_samples(
+    conn: asyncpg.Connection, cte_sql: str, sample_limit: int
+) -> list[Any]:
+    return await conn.fetch(
+        f"""
+        {cte_sql}
+        SELECT source_id, org_name, plan_name, canonical_api_base,
+               insurance_plan_rows, insurance_plan_rows_with_network_refs,
+               network_ref_rows, insurance_plan_network_ref_rows,
+               practitioner_role_network_ref_rows,
+               organization_affiliation_network_ref_rows,
+               distinct_network_refs, resolved_network_refs,
+               resolved_network_names, sample_resolved_network_names
+          FROM source_context
+         WHERE insurance_plan_rows > 0 OR network_ref_rows > 0
+         ORDER BY resolved_network_names DESC, network_ref_rows DESC,
+                  insurance_plan_rows DESC, org_name, source_id
+         LIMIT $1
+        """,
+        sample_limit,
+    )
+
+
 async def _plan_network_context_summary(
     conn: asyncpg.Connection,
     schema: str,
@@ -4628,35 +4705,7 @@ async def _plan_network_context_summary(
           FROM source_context
         """,
     )
-    sample_rows = await conn.fetch(
-        f"""
-        {cte_sql}
-        SELECT source_id,
-               org_name,
-               plan_name,
-               canonical_api_base,
-               insurance_plan_rows,
-               insurance_plan_rows_with_network_refs,
-               network_ref_rows,
-               insurance_plan_network_ref_rows,
-               practitioner_role_network_ref_rows,
-               organization_affiliation_network_ref_rows,
-               distinct_network_refs,
-               resolved_network_refs,
-               resolved_network_names,
-               sample_resolved_network_names
-          FROM source_context
-         WHERE insurance_plan_rows > 0
-            OR network_ref_rows > 0
-         ORDER BY resolved_network_names DESC,
-                  network_ref_rows DESC,
-                  insurance_plan_rows DESC,
-                  org_name,
-                  source_id
-         LIMIT $1
-        """,
-        sample_limit,
-    )
+    sample_rows = await _plan_network_context_samples(conn, cte_sql, sample_limit)
     gap_summary_metrics["available"] = True
     gap_summary_metrics["insurance_plan_source_pct"] = _pct(
         _int(gap_summary_metrics.get("sources_with_insurance_plans")),
@@ -4848,6 +4897,19 @@ async def _alias_fanout_summary(conn: asyncpg.Connection, schema: str, *, sample
     }
 
 
+def _build_canonical_resource_rows(resources: Any) -> list[dict[str, Any]]:
+    resource_summaries = []
+    for canonical_resource_row in resources:
+        resource_summary_record_dict = dict(canonical_resource_row)
+        resource_summary_record_dict["edge_surplus_rows"] = max(
+            0,
+            _int(resource_summary_record_dict["source_edge_rows"])
+            - _int(resource_summary_record_dict["canonical_rows"]),
+        )
+        resource_summaries.append(resource_summary_record_dict)
+    return resource_summaries
+
+
 async def _canonical_resource_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
     """Measure deduplication between canonical resources and source edges."""
     if not await _has_relation(conn, schema, "provider_directory_canonical_resource"):
@@ -4896,15 +4958,7 @@ async def _canonical_resource_summary(conn: asyncpg.Connection, schema: str) -> 
     source_edge_rows = _int(
         canonical_totals["source_edge_rows"] if canonical_totals else 0
     )
-    resource_summaries = []
-    for canonical_resource_row in resources:
-        resource_summary_record_dict = dict(canonical_resource_row)
-        resource_summary_record_dict["edge_surplus_rows"] = max(
-            0,
-            _int(resource_summary_record_dict["source_edge_rows"])
-            - _int(resource_summary_record_dict["canonical_rows"]),
-        )
-        resource_summaries.append(resource_summary_record_dict)
+    resource_summaries = _build_canonical_resource_rows(resources)
     return {
         "available": True,
         "canonical_rows": canonical_rows,
@@ -5090,6 +5144,62 @@ async def _advertised_resource_gap_summary(
     return {"available": True, **metrics_by_name, "resources": resources}
 
 
+async def _resource_gap_diagnostics(
+    conn: asyncpg.Connection, schema: str, resource_source_union: str
+) -> tuple[int, dict[str, int]]:
+    rows = await conn.fetch(
+        f"""
+        WITH resource_sources AS ({resource_source_union})
+        SELECT src.metadata_json->'last_resource_import' AS last_resource_import
+          FROM {_qt(schema, "provider_directory_source")} src
+         WHERE src.last_probe_status = 'valid'
+           AND NOT EXISTS (
+                SELECT 1 FROM resource_sources rows WHERE rows.source_id = src.source_id
+           )
+        """
+    )
+    auth_blocked_count = 0
+    error_count_by_message: dict[str, int] = {}
+    for row in rows:
+        diagnostics = _resource_import_diagnostics(row["last_resource_import"])
+        is_source_auth_blocked = False
+        for error, error_count in _resource_error_counts(diagnostics).items():
+            error_count_by_message[error] = (
+                error_count_by_message.get(error, 0) + error_count
+            )
+            is_source_auth_blocked |= _is_resource_auth_error(error)
+        auth_blocked_count += int(is_source_auth_blocked)
+    return auth_blocked_count, error_count_by_message
+
+
+async def _count_valid_sources_without_rows(
+    conn: asyncpg.Connection, schema: str, resource_source_union: str
+) -> int:
+    return _int(
+        await conn.fetchval(
+            f"""
+            WITH resource_sources AS ({resource_source_union})
+            SELECT count(*)::bigint
+              FROM {_qt(schema, "provider_directory_source")} src
+             WHERE src.last_probe_status = 'valid'
+               AND NOT EXISTS (
+                    SELECT 1 FROM resource_sources rows WHERE rows.source_id = src.source_id
+               )
+            """
+        )
+    )
+
+
+async def _available_provider_directory_resource_tables(
+    conn: asyncpg.Connection, schema: str
+) -> list[str]:
+    return [
+        table
+        for table in PROVIDER_DIRECTORY_RESOURCE_TABLES
+        if await _has_relation(conn, schema, table)
+    ]
+
+
 async def _valid_sources_without_resource_rows(
     conn: asyncpg.Connection,
     schema: str,
@@ -5099,29 +5209,15 @@ async def _valid_sources_without_resource_rows(
     """Find valid source endpoints that produced no resource records."""
     if not await _has_relation(conn, schema, "provider_directory_source"):
         return {"available": False, "source_count": 0, "samples": []}
-    existing_tables = [
-        table
-        for table in PROVIDER_DIRECTORY_RESOURCE_TABLES
-        if await _has_relation(conn, schema, table)
-    ]
+    existing_tables = await _available_provider_directory_resource_tables(conn, schema)
     if not existing_tables:
         return {"available": True, "source_count": 0, "samples": []}
     resource_source_union = " UNION ".join(
         f"SELECT source_id FROM {_qt(schema, table)}"
         for table in existing_tables
     )
-    count = await conn.fetchval(
-        f"""
-        WITH resource_sources AS ({resource_source_union})
-        SELECT count(*)::bigint
-          FROM {_qt(schema, "provider_directory_source")} src
-         WHERE src.last_probe_status = 'valid'
-           AND NOT EXISTS (
-                SELECT 1
-                  FROM resource_sources rows
-                 WHERE rows.source_id = src.source_id
-           )
-        """
+    count = await _count_valid_sources_without_rows(
+        conn, schema, resource_source_union
     )
     source_rows = await conn.fetch(
         f"""
@@ -5149,32 +5245,9 @@ async def _valid_sources_without_resource_rows(
         sample_limit,
     )
     samples = [dict(source_row) for source_row in source_rows]
-    auth_blocked_count = 0
-    error_count_by_message: dict[str, int] = {}
-    count_rows = await conn.fetch(
-        f"""
-        WITH resource_sources AS ({resource_source_union})
-        SELECT src.metadata_json->'last_resource_import' AS last_resource_import
-          FROM {_qt(schema, "provider_directory_source")} src
-         WHERE src.last_probe_status = 'valid'
-           AND NOT EXISTS (
-                SELECT 1
-                  FROM resource_sources rows
-                 WHERE rows.source_id = src.source_id
-           )
-        """
+    auth_blocked_count, error_count_by_message = await _resource_gap_diagnostics(
+        conn, schema, resource_source_union
     )
-    for source_record_dict in count_rows:
-        diagnostics = _resource_import_diagnostics(source_record_dict["last_resource_import"])
-        is_source_auth_blocked = False
-        for error, error_count in _resource_error_counts(diagnostics).items():
-            error_count_by_message[error] = (
-                error_count_by_message.get(error, 0) + error_count
-            )
-            if _is_resource_auth_error(error):
-                is_source_auth_blocked = True
-        if is_source_auth_blocked:
-            auth_blocked_count += 1
     for sample in samples:
         sample["last_resource_import"] = _json_object(sample.get("last_resource_import"))
     return {

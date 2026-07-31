@@ -9,12 +9,17 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from db.models.system import (
     ProviderDirectoryProfileBuildCheckpoint,
     ProviderDirectoryProfileCapacityLeaseConsumption,
     ProviderDirectoryProfileDeltaReceipt,
     ProviderDirectoryProfileServingGeneration,
+)
+from tests.provider_directory_profile_capacity_v2_migration_support import (
+    load_capacity_v2_migration as _load_capacity_v2_migration,
 )
 
 
@@ -77,6 +82,64 @@ def _load_migration():
     migration = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(migration)
     return migration
+
+
+def test_capacity_v2_migration_is_the_unique_repository_head():
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    assert script.get_heads() == [
+        "20260801130000_provider_directory_capacity_lease_v2"
+    ]
+    migration = _load_capacity_v2_migration()
+    assert migration.down_revision == (
+        "20260801010000_uhc_semantic_layout_identity"
+    )
+
+
+def test_capacity_v2_migration_replaces_only_the_guarded_constraint(
+    monkeypatch,
+):
+    migration = _load_capacity_v2_migration()
+    recorder = _OperationsRecorder()
+    monkeypatch.setattr(migration, "op", recorder)
+
+    migration.upgrade()
+
+    statements = "\n".join(recorder.statements)
+    assert "provider-directory-database-capacity-lease-v1" in statements
+    assert "provider-directory-database-capacity-lease-v2" in statements
+    assert statements.count("ADD CONSTRAINT") == 3
+    assert statements.count("NOT VALID") == 3
+    assert statements.count("VALIDATE CONSTRAINT") == 1
+    assert statements.count("DROP CONSTRAINT") == 3
+    assert statements.count("RENAME CONSTRAINT") == 1
+    assert "provider_directory_capacity_lease_constraint_drift" in statements
+    assert "IN ACCESS EXCLUSIVE MODE NOWAIT" in statements
+    assert statements.index("LOCK TABLE") < statements.index(
+        "ADD CONSTRAINT"
+    )
+    assert "UPDATE " not in statements
+    assert "DELETE " not in statements
+    assert "TRUNCATE " not in statements
+
+
+def test_capacity_v2_downgrade_refuses_consumed_v2_history(monkeypatch):
+    migration = _load_capacity_v2_migration()
+    recorder = _OperationsRecorder()
+    monkeypatch.setattr(migration, "op", recorder)
+
+    migration.downgrade()
+
+    statements = "\n".join(recorder.statements)
+    assert "provider_directory_capacity_lease_v2_history_exists" in statements
+    assert "WHERE contract_id =" in statements
+    assert "LOCK TABLE" in statements
+    assert "IN ACCESS EXCLUSIVE MODE NOWAIT" in statements
+    assert statements.index("LOCK TABLE") < statements.index(
+        "v2_history_exists"
+    )
+    assert statements.index("v2_history_exists") < statements.index(
+        "ADD CONSTRAINT"
+    )
 
 
 def test_delta_migration_supports_legacy_schema_name(monkeypatch):
@@ -282,6 +345,7 @@ def test_capacity_consumption_constraints_bind_full_build_and_lease_identity():
     ):
         assert field_name in constraints
     assert "provider-directory-database-capacity-lease-v1" in constraints
+    assert "provider-directory-database-capacity-lease-v2" in constraints
     assert "interval '300 seconds'" in constraints
     assert "interval '305 seconds'" in constraints
     assert "interval '5 seconds'" in constraints

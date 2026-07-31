@@ -353,8 +353,23 @@ jobs:
         run: >
           docker build
           --platform linux/amd64
+          --build-arg "HLTHPRT_SOURCE_COMMIT=${GITHUB_SHA}"
           --tag healthcare-mrf-api:ptg-v4-gate
           .
+      - name: Prove source identity is image-baked
+        run: |
+          if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            healthcare-mrf-api:ptg-v4-gate \
+            | grep -q '^HLTHPRT_SOURCE_COMMIT='; then
+            exit 1
+          fi
+          docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/sh \
+            healthcare-mrf-api:ptg-v4-gate \
+            -ec '
+              test "$(cat /opt/healthporta/build-identity/healthcare-source-commit)" = "$1"
+              test "$(stat -c "%u:%g:%a:%h:%s" /opt/healthporta/build-identity/healthcare-source-commit)" = "0:0:444:1:41"
+            ' sh "${GITHUB_SHA}"
       - name: Smoke packaged scanner, graph compiler, and native decoder
         run: |
           docker run --rm --platform linux/amd64 \
@@ -766,6 +781,7 @@ jobs:
           tests/test_provider_directory_profile_artifact_recovery_postgres.py
           tests/test_provider_directory_profile_capacity_attestation_postgres.py
           tests/test_provider_directory_profile_capacity_attestation_schema.py
+          tests/test_provider_directory_profile_capacity_preflight_postgres.py
           tests/test_provider_directory_profile_capacity_runtime.py
           tests/test_provider_directory_profile_delta_db.py
           tests/test_provider_directory_profile_delta_downgrade_postgres.py

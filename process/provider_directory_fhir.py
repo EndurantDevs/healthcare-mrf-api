@@ -208,6 +208,11 @@ from process.provider_directory_profile_selection import (
 from process.provider_directory_profile_selection_snapshot import (
     _source_context_digest,
 )
+from process.provider_directory_profile_runtime_observation import (
+    assert_capacity_lease_matches_runtime_observation,
+    assert_runtime_observation_matches_geometry,
+    observe_profile_runtime,
+)
 from process.provider_directory_refresh_preset import (
     PROVIDER_DIRECTORY_REFRESH_PRESETS,
     apply_provider_directory_refresh_preset as _apply_provider_directory_refresh_preset,
@@ -23016,6 +23021,15 @@ async def _consume_admission_transaction(
             identity,
             workload.database_identity,
         )
+        runtime_observation = await observe_profile_runtime()
+        assert_runtime_observation_matches_geometry(
+            runtime_observation,
+            geometry,
+        )
+        assert_capacity_lease_matches_runtime_observation(
+            lease,
+            runtime_observation,
+        )
         await _assert_admission_run_toast(
             run_id,
             observed_database_identity,
@@ -23117,7 +23131,7 @@ async def _admit_provider_directory_profile_capacity(
 
 
 PROVIDER_DIRECTORY_PROFILE_CAPACITY_PREFLIGHT_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-preflight.v1"
+    "healthporta.provider-directory-profile-capacity-preflight.v2"
 )
 
 
@@ -23125,6 +23139,7 @@ def _provider_directory_profile_capacity_preflight_receipt(
     execution: ProviderDirectoryProfileExecution,
     workload: _ProfileAdmissionWorkload,
     geometry_state: _ProfileAdmissionGeometry,
+    runtime_observation: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return the closed read-only input needed by an external attestor."""
 
@@ -23157,9 +23172,10 @@ def _provider_directory_profile_capacity_preflight_receipt(
                 workload.artifact_projection.projection_hash
             ),
         },
+        "runtime_observation": dict(runtime_observation),
     }
     receipt_by_field["receipt_sha256"] = hashlib.sha256(
-        b"healthporta.provider-directory-profile-capacity-preflight.v1\0"
+        b"healthporta.provider-directory-profile-capacity-preflight.v2\0"
         + json.dumps(
             receipt_by_field,
             allow_nan=False,
@@ -23227,10 +23243,16 @@ async def _profile_capacity_preflight_snapshot(
     _assert_admission_lock_projection(
         geometry_state.control_wal_projection
     )
+    runtime_observation = await observe_profile_runtime()
+    assert_runtime_observation_matches_geometry(
+        runtime_observation,
+        geometry_state.geometry,
+    )
     return _provider_directory_profile_capacity_preflight_receipt(
         execution,
         workload,
         geometry_state,
+        runtime_observation,
     )
 
 
