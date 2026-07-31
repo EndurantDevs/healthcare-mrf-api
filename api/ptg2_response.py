@@ -128,6 +128,8 @@ def _shape_ptg2_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[
     include_sources = _include_ptg2_sources(args)
     hidden_item_fields = set(PTG2_ITEM_DIAGNOSTIC_FIELDS)
     hidden_item_fields.update(PTG2_ITEM_SOURCE_DETAIL_FIELDS)
+    if _is_request_flag_enabled(args.get("include_evidence")):
+        hidden_item_fields.discard("confidence")
     if not include_sources:
         hidden_item_fields.update(PTG2_ITEM_SOURCE_SUMMARY_FIELDS)
     hidden_query_fields = set(PTG2_QUERY_DIAGNOSTIC_FIELDS)

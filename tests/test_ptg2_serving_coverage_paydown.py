@@ -115,6 +115,133 @@ def test_membership_filter_appends_geo_clauses_without_zip(monkeypatch):
     assert distance_sql == "distance_expression"
 
 
+def test_geo_address_assurance_five_npi_regression_fixture():
+    fixture_by_npi = {
+        # A single marketplace-directory issuer is insufficient.
+        1000000001: ("mrf", ["Issuer A"], False, None),
+        # An unanchored CMS location is insufficient.
+        1000000002: ("cms_doctors", [], False, None),
+        # A secondary NPPES practice location is accepted.
+        1000000003: ("nppes", [], False, "nppes_registry_address"),
+        # A CMS source with a matching NPPES premise is accepted.
+        1000000004: (
+            "cms_doctors",
+            [],
+            True,
+            "cms_doctors_source_with_nppes_identity_anchor",
+        ),
+        # An exact marketplace address reported by three issuers is accepted.
+        1000000005: (
+            "mrf",
+            ["Issuer A", "Issuer B", "Issuer C"],
+            False,
+            "multi_issuer_marketplace_address",
+        ),
+    }
+
+    actual_by_npi = {
+        npi: serving._geo_address_evidence_level(
+            [source_name],
+            mrf_issuer_names=issuers,
+            cms_source_has_nppes_anchor=cms_anchor,
+        )
+        for npi, (source_name, issuers, cms_anchor, _expected) in fixture_by_npi.items()
+    }
+
+    assert actual_by_npi == {
+        npi: expected
+        for npi, (_source, _issuers, _cms_anchor, expected) in fixture_by_npi.items()
+    }
+
+
+def test_unified_geo_sql_requires_record_level_evidence():
+    sql = serving._ptg2_geo_assured_address_sql("addr")
+
+    assert "(addr.address_source_mask & 1) <> 0" in sql
+    assert "mrf_address AS geo_mrf" in sql
+    assert "source_issuer_names" in sql
+    assert "CARDINALITY" in sql
+    assert "entity_address_unified AS geo_doctor_anchor" in sql
+    assert "entity_address_unified AS geo_nppes_anchor" in sql
+    assert "geo_nppes_anchor.premise_key = geo_doctor_anchor.premise_key" in sql
+
+
+def test_unified_location_identity_uses_collision_resistant_location_key():
+    assert serving._ptg2_address_location_hash_sql(
+        "addr", "mrf.entity_address_unified"
+    ) == "CONCAT('entity_address_unified:', addr.location_key)"
+    assert "checksum" in serving._ptg2_address_location_hash_sql(
+        "addr", "mrf.npi_address"
+    )
+
+
+def test_address_provenance_exposes_dataset_version_and_retrieval_time():
+    entry = serving._address_provenance_entry(
+        {
+            "source_id": 2,
+            "source_record_key": "mrf:1000000005:fixture",
+            "source_import_ids": ["20260710"],
+            "source_import_dates": ["2026-07-10"],
+            "source_issuer_names": ["Issuer A", "Issuer B"],
+            "source_urls": ["https://example.test/providers.json"],
+        }
+    )
+
+    assert entry == {
+        "dataset_id": "marketplace_provider_directory",
+        "source_id": 2,
+        "source_record_id": "mrf:1000000005:fixture",
+        "record_version_id": "20260710",
+        "record_version_ids": ["20260710"],
+        "retrieved_at": "2026-07-10",
+        "issuer_names": ["Issuer A", "Issuer B"],
+        "source_urls": ["https://example.test/providers.json"],
+    }
+
+
+def test_nullish_contact_values_become_json_null_without_changing_rates():
+    address_by_field = {
+        "telephone_number": "null",
+        "phone_number": "None",
+        "fax_number": "undefined",
+    }
+    prices = [{"negotiated_rate": "405.60"}]
+
+    serving._sanitize_address_contact_payload(address_by_field)
+
+    assert address_by_field == {
+        "telephone_number": None,
+        "phone_number": None,
+        "fax_number": None,
+    }
+    assert prices == [{"negotiated_rate": "405.60"}]
+
+
+def test_include_evidence_exposes_truthful_location_confidence():
+    payload = {
+        "items": [
+            {
+                "npi": 1000000003,
+                "confidence": {
+                    "network": "tic_rate_npi_tin",
+                    "location": "nppes_provider_address",
+                },
+            }
+        ],
+        "query": {},
+    }
+
+    default_response = serving._shape_ptg2_response(payload, {})
+    evidence_response = serving._shape_ptg2_response(
+        payload, {"include_evidence": True}
+    )
+
+    assert "confidence" not in default_response["items"][0]
+    assert evidence_response["items"][0]["confidence"]["location"] == (
+        "nppes_provider_address"
+    )
+
+
 @pytest.mark.asyncio
 async def test_membership_location_rows_short_circuits_empty_and_unavailable_queries(
     monkeypatch,

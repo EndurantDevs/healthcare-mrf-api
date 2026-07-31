@@ -343,7 +343,59 @@ def _ptg2_address_location_source(address_table: str | None) -> str:
 
 def _ptg2_address_location_hash_sql(alias: str, address_table: str | None) -> str:
     source = _ptg2_address_location_source(address_table)
+    if _is_unified_address_table(address_table):
+        # location_key is the collision-resistant canonical identity. The legacy
+        # checksum is only a compact change detector and is not unique.
+        return f"CONCAT('{source}:', {alias}.location_key)"
     return f"CONCAT('{source}:', {alias}.npi, ':', {alias}.type, ':', {alias}.checksum)"
+
+
+def _ptg2_nullish_text_sql(value_sql: str) -> str:
+    """Return SQL that never serializes null-like source text as a JSON string."""
+
+    return (
+        "CASE WHEN LOWER(BTRIM(COALESCE(("
+        f"{value_sql}"
+        ")::text, ''))) IN ('', 'null', 'none', 'undefined') "
+        f"THEN NULL ELSE ({value_sql}) END"
+    )
+
+
+def _ptg2_geo_assured_address_sql(alias: str) -> str:
+    """Require auditable address evidence before making a radius claim.
+
+    Registry addresses are direct. Marketplace-directory addresses need two
+    independent issuers for the exact address. CMS Doctors and Clinicians
+    addresses are accepted only when that source also contains an exact NPPES
+    address for the same NPI, which anchors the source-to-provider attribution.
+    """
+
+    return f"""(
+        ({alias}.address_source_mask & 1) <> 0
+        OR EXISTS (
+            SELECT 1
+              FROM {PTG2_SCHEMA}.mrf_address AS geo_mrf
+             WHERE geo_mrf.npi = {alias}.npi
+               AND geo_mrf.address_key = {alias}.address_key
+               AND CARDINALITY(COALESCE(geo_mrf.source_issuer_names, ARRAY[]::varchar[])) >= 2
+        )
+        OR (
+            ({alias}.address_source_mask & 4) <> 0
+            AND EXISTS (
+                SELECT 1
+                  FROM {PTG2_SCHEMA}.entity_address_unified AS geo_doctor_anchor
+                 WHERE geo_doctor_anchor.npi = {alias}.npi
+                   AND (geo_doctor_anchor.address_source_mask & 4) <> 0
+                   AND EXISTS (
+                       SELECT 1
+                         FROM {PTG2_SCHEMA}.entity_address_unified AS geo_nppes_anchor
+                        WHERE geo_nppes_anchor.npi = geo_doctor_anchor.npi
+                          AND geo_nppes_anchor.premise_key = geo_doctor_anchor.premise_key
+                          AND (geo_nppes_anchor.address_source_mask & 1) <> 0
+                   )
+            )
+        )
+    )"""
 
 
 def _ptg2_provider_name_sql(alias: str = "n") -> str:
@@ -388,6 +440,27 @@ def _fallback_contact_fields(
     )
 
 
+def _non_nullish_contact_value(value: Any) -> Any:
+    """Convert source-system null sentinels to JSON-compatible nulls."""
+
+    if isinstance(value, str) and value.strip().lower() in {
+        "",
+        "null",
+        "none",
+        "undefined",
+    }:
+        return None
+    return value
+
+
+def _first_contact_value(*values: Any) -> Any:
+    """Return the first contact value after removing null sentinels."""
+
+    return _first_payload_value(
+        *(_non_nullish_contact_value(value) for value in values)
+    )
+
+
 def _add_location_phone_fields(
     provider_item_by_field: dict[str, Any],
     location_data_by_field: dict[str, Any],
@@ -395,7 +468,7 @@ def _add_location_phone_fields(
 ) -> None:
     """Merge display and canonical contact fields into a provider result."""
 
-    display_phone = _first_payload_value(
+    display_phone = _first_contact_value(
         location_data_by_field.get("telephone_number"),
         address_payload.get("telephone_number"),
         address_payload.get("telephone"),
@@ -404,16 +477,16 @@ def _add_location_phone_fields(
         location_data_by_field.get("phone_number"),
         address_payload.get("phone_number"),
     )
-    canonical_phone = _first_payload_value(
+    canonical_phone = _first_contact_value(
         location_data_by_field.get("phone_number"),
         address_payload.get("phone_number"),
     )
-    display_fax = _first_payload_value(
+    display_fax = _first_contact_value(
         location_data_by_field.get("fax_number"),
         address_payload.get("fax_number"),
         address_payload.get("fax"),
     )
-    canonical_fax = _first_payload_value(
+    canonical_fax = _first_contact_value(
         location_data_by_field.get("fax_number_digits"),
         address_payload.get("fax_number_digits"),
     )
@@ -428,7 +501,7 @@ def _add_location_phone_fields(
     if display_phone not in (None, "", "null"):
         provider_item_by_field["telephone_number"] = display_phone
         provider_item_by_field["phone"] = display_phone
-    canonical_phone = _first_payload_value(
+    canonical_phone = _first_contact_value(
         canonical_phone,
         fallback_contact_by_field.get("phone_number"),
     )
@@ -437,7 +510,7 @@ def _add_location_phone_fields(
     if display_fax not in (None, "", "null"):
         provider_item_by_field["fax_number"] = display_fax
     for field in PTG_CONTACT_DETAIL_FIELDS:
-        contact_value = _first_payload_value(
+        contact_value = _first_contact_value(
             location_data_by_field.get(field),
             address_payload.get(field),
             fallback_contact_by_field.get(field),
@@ -1135,6 +1208,37 @@ def _address_verification_optional_values(
         "provider_directory_insurance_plan_matches": _coerce_str_list_payload(address_payload.get("provider_directory_insurance_plan_matches")),
         "provider_directory_match_type": address_payload.get("provider_directory_match_type"),
         "address_verification_evidence": context.provider_directory_evidence,
+        "address_provenance": _coerce_json_payload(
+            address_payload.get("address_provenance"), []
+        ),
+        "geo_evidence_level": address_payload.get("geo_evidence_level"),
+    }
+
+
+def _set_truthful_location_confidence(
+    provider_item_by_field: dict[str, Any],
+    evidence_level: str,
+) -> None:
+    confidence = provider_item_by_field.get("confidence")
+    confidence_by_field = dict(confidence) if isinstance(confidence, Mapping) else {}
+    confidence_by_field["location"] = evidence_level
+    provider_item_by_field["confidence"] = confidence_by_field
+
+
+def _no_display_address_verification(
+    provider_item_by_field: dict[str, Any],
+) -> dict[str, Any]:
+    """Return fail-closed verification when no address can be displayed."""
+
+    _set_truthful_location_confidence(provider_item_by_field, "unknown")
+    return {
+        "rate_network_binding": "tic_provider_group_npi_tin",
+        "address_network_binding": "inferred_from_provider_identity",
+        "address_evidence_level": "unknown",
+        "requires_location_confirmation": True,
+        "reason": "PTG proves the provider identity is in network, but no displayable address is available.",
+        "displayed_address_present": False,
+        "network_bound_address": False,
     }
 
 
@@ -1150,15 +1254,7 @@ def _address_verification_payload(
         address_payload,
     )
     if has_displayed_address is False:
-        return {
-            "rate_network_binding": "tic_provider_group_npi_tin",
-            "address_network_binding": "inferred_from_provider_identity",
-            "address_evidence_level": "unknown",
-            "requires_location_confirmation": True,
-            "reason": "PTG proves the provider identity is in network, but no displayable address is available.",
-            "displayed_address_present": False,
-            "network_bound_address": False,
-        }
+        return _no_display_address_verification(provider_item_by_field)
 
     context = _address_evidence_context(
         provider_item_by_field, location_data_by_field, address_payload
@@ -1196,6 +1292,10 @@ def _address_verification_payload(
     for field_name, field_value in optional_values_by_field.items():
         if field_value not in (None, "", []):
             verification_by_field[field_name] = field_value
+    _set_truthful_location_confidence(
+        provider_item_by_field,
+        decision.evidence_level,
+    )
     return verification_by_field
 
 
@@ -8936,6 +9036,7 @@ class _MembershipLocationQuery:
     parameter_map: dict[str, Any]
     distance_sql: str
     knn_order_sql: str | None
+    address_assurance_sql: str = "TRUE"
 
 
 _MEMBERSHIP_LOCATION_SQL = """
@@ -8949,8 +9050,8 @@ WITH matched AS MATERIALIZED (
         {distance_sql} AS distance_miles,
         addr.type,
         addr.checksum,
-        addr.telephone_number,
-        addr.fax_number,
+        {telephone_sql} AS telephone_number,
+        {fax_sql} AS fax_number,
         addr.phone_number,
         addr.phone_extension,
         addr.fax_number_digits,
@@ -8962,13 +9063,21 @@ WITH matched AS MATERIALIZED (
             'state', addr.state_name,
             'postal_code', addr.postal_code,
             'country_code', addr.country_code,
-            'telephone_number', addr.telephone_number,
-            'fax_number', addr.fax_number,
+            'telephone_number', {telephone_sql},
+            'fax_number', {fax_sql},
             'phone_number', addr.phone_number,
             'phone_extension', addr.phone_extension,
             'fax_number_digits', addr.fax_number_digits,
             'fax_extension', addr.fax_extension,
             'address_key', addr.address_key::text,
+            'location_key', {location_key_sql},
+            'address_sources', {address_sources_sql},
+            'source_record_ids', {source_record_ids_sql},
+            'source_count', {source_count_sql},
+            'multi_source_confirmed', {multi_source_sql},
+            'source_mask', {source_mask_sql},
+            'address_source_mask', {address_source_mask_sql},
+            'location_confidence_id', {location_confidence_sql},
             'lat', addr.lat,
             'long', addr.long
         )::text AS address_payload,
@@ -8981,6 +9090,7 @@ WITH matched AS MATERIALIZED (
     FROM {address_table} addr
     JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
     WHERE {filter_sql}
+      AND {address_assurance_sql}
 )
 SELECT *
 FROM matched
@@ -9011,6 +9121,14 @@ WITH nearest_addresses AS MATERIALIZED (
         addr.second_line,
         addr.country_code,
         addr.address_key,
+        {location_key_sql} AS location_key,
+        {address_sources_sql} AS address_sources,
+        {source_record_ids_sql} AS source_record_ids,
+        {source_count_sql} AS source_count,
+        {multi_source_sql} AS multi_source_confirmed,
+        {source_mask_sql} AS source_mask,
+        {address_source_mask_sql} AS address_source_mask,
+        {location_confidence_sql} AS location_confidence_id,
         {distance_sql} AS candidate_distance_miles
     FROM {address_table} addr
     JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
@@ -9033,8 +9151,8 @@ WITH nearest_addresses AS MATERIALIZED (
         addr.candidate_distance_miles AS distance_miles,
         addr.type,
         addr.checksum,
-        addr.telephone_number,
-        addr.fax_number,
+        {telephone_sql} AS telephone_number,
+        {fax_sql} AS fax_number,
         addr.phone_number,
         addr.phone_extension,
         addr.fax_number_digits,
@@ -9046,13 +9164,21 @@ WITH nearest_addresses AS MATERIALIZED (
             'state', addr.state_name,
             'postal_code', addr.postal_code,
             'country_code', addr.country_code,
-            'telephone_number', addr.telephone_number,
-            'fax_number', addr.fax_number,
+            'telephone_number', {telephone_sql},
+            'fax_number', {fax_sql},
             'phone_number', addr.phone_number,
             'phone_extension', addr.phone_extension,
             'fax_number_digits', addr.fax_number_digits,
             'fax_extension', addr.fax_extension,
             'address_key', addr.address_key::text,
+            'location_key', addr.location_key,
+            'address_sources', addr.address_sources,
+            'source_record_ids', addr.source_record_ids,
+            'source_count', addr.source_count,
+            'multi_source_confirmed', addr.multi_source_confirmed,
+            'source_mask', addr.source_mask,
+            'address_source_mask', addr.address_source_mask,
+            'location_confidence_id', addr.location_confidence_id,
             'lat', addr.lat,
             'long', addr.long
         )::text AS address_payload,
@@ -9063,6 +9189,7 @@ WITH nearest_addresses AS MATERIALIZED (
                      addr.checksum
         ) AS address_rank
     FROM nearest_addresses addr
+    WHERE {address_assurance_sql}
 )
 SELECT matched.*,
        (probe_stats.raw_probe_count < :raw_probe_limit) AS _ptg_source_exhausted
@@ -9107,6 +9234,7 @@ def _membership_geo_sql(
             "addr.lat IS NOT NULL",
             "addr.long IS NOT NULL",
             "COALESCE(addr.address_precision, '') <> 'city_zip'",
+            _ptg2_geo_assured_address_sql("addr"),
             _ptg2_geo_dwithin_sql("addr.lat", "addr.long"),
         ]
     return distance_sql, [
@@ -9308,6 +9436,7 @@ async def _membership_location_query(
         parameter_map=parameter_map,
         distance_sql=distance_sql,
         knn_order_sql=knn_order_sql,
+        address_assurance_sql="TRUE",
     )
 
 
@@ -9348,6 +9477,353 @@ async def _restore_knn_planning(session, prior_settings: tuple[str, str]) -> Non
     )
 
 
+_ADDRESS_DATASET_ID_BY_SOURCE_ID = {
+    1: "cms_nppes_registry",
+    2: "marketplace_provider_directory",
+    3: "cms_doctors_and_clinicians",
+    4: "cms_provider_enrollment_ffs",
+    5: "cms_provider_enrollment_facility",
+    6: "facility_reference",
+    7: "payer_transparency_in_coverage",
+    8: "payer_provider_directory_fhir",
+}
+
+
+def _geo_address_evidence_level(
+    address_sources: Iterable[Any],
+    *,
+    mrf_issuer_names: Iterable[Any] = (),
+    cms_source_has_nppes_anchor: bool = False,
+) -> str | None:
+    """Classify the evidence that permits an address to support a radius claim."""
+
+    normalized_sources = {
+        str(source or "").strip().lower().replace("-", "_")
+        for source in address_sources
+    }
+    if "nppes" in normalized_sources:
+        return "nppes_registry_address"
+    independent_issuers = {
+        str(issuer or "").strip().casefold()
+        for issuer in mrf_issuer_names
+        if str(issuer or "").strip()
+    }
+    if "mrf" in normalized_sources and len(independent_issuers) >= 2:
+        return "multi_issuer_marketplace_address"
+    if "cms_doctors" in normalized_sources and cms_source_has_nppes_anchor:
+        return "cms_doctors_source_with_nppes_identity_anchor"
+    return None
+
+
+def _isoformat_provenance_value(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    return str(isoformat()) if callable(isoformat) else str(value)
+
+
+def _address_provenance_entry(row_by_field: Mapping[str, Any]) -> dict[str, Any]:
+    source_id = int(row_by_field.get("source_id") or 0)
+    version_ids = _coerce_str_list_payload(row_by_field.get("source_import_ids"))
+    if not version_ids:
+        version_ids = _coerce_str_list_payload(
+            _first_payload_value(
+                row_by_field.get("source_snapshot_id"),
+                row_by_field.get("source_run_id"),
+            )
+        )
+    retrieval_values = list(row_by_field.get("source_import_dates") or [])
+    if not retrieval_values:
+        retrieval_values = [
+            _first_payload_value(
+                row_by_field.get("nppes_date_added"),
+                row_by_field.get("doctor_updated_at"),
+                row_by_field.get("last_seen_at"),
+                row_by_field.get("observed_at"),
+            )
+        ]
+    retrieval_timestamps = sorted(
+        {
+            timestamp
+            for timestamp in (
+                _isoformat_provenance_value(retrieval_value)
+                for retrieval_value in retrieval_values
+            )
+            if timestamp
+        }
+    )
+    provenance_payload_by_field = {
+        "dataset_id": _ADDRESS_DATASET_ID_BY_SOURCE_ID.get(
+            source_id, f"entity_address_source_{source_id}"
+        ),
+        "source_id": source_id,
+        "source_record_id": row_by_field.get("source_record_key"),
+        "record_version_id": version_ids[-1] if version_ids else None,
+        "record_version_ids": version_ids,
+        "retrieved_at": retrieval_timestamps[-1] if retrieval_timestamps else None,
+        "issuer_names": _coerce_str_list_payload(
+            row_by_field.get("source_issuer_names")
+        ),
+        "source_urls": _coerce_str_list_payload(row_by_field.get("source_urls")),
+    }
+    return {
+        field_name: field_value
+        for field_name, field_value in provenance_payload_by_field.items()
+        if field_value not in (None, "", [])
+    }
+
+
+_ADDRESS_PROVENANCE_SQL = f"""
+WITH requested(location_key) AS (
+    SELECT UNNEST(CAST(:location_keys AS varchar[]))
+)
+SELECT
+    evidence.location_key,
+    evidence.source_id,
+    evidence.source_record_key,
+    evidence.source_run_id,
+    evidence.source_snapshot_id,
+    evidence.observed_at,
+    evidence.last_seen_at,
+    mrf_source.source_import_ids,
+    mrf_source.source_import_dates,
+    mrf_source.source_issuer_names,
+    mrf_source.source_urls,
+    nppes_source.date_added AS nppes_date_added,
+    doctor_source.updated_at AS doctor_updated_at,
+    EXISTS (
+        SELECT 1
+          FROM {PTG2_SCHEMA}.entity_address_unified AS doctor_anchor
+         WHERE doctor_anchor.npi = evidence.npi
+           AND (doctor_anchor.address_source_mask & 4) <> 0
+           AND EXISTS (
+               SELECT 1
+                 FROM {PTG2_SCHEMA}.entity_address_unified AS nppes_anchor
+                WHERE nppes_anchor.npi = doctor_anchor.npi
+                  AND nppes_anchor.premise_key = doctor_anchor.premise_key
+                  AND (nppes_anchor.address_source_mask & 1) <> 0
+           )
+    ) AS cms_source_has_nppes_anchor
+  FROM requested
+  JOIN {PTG2_SCHEMA}.entity_address_evidence AS evidence
+    ON evidence.location_key = requested.location_key
+  LEFT JOIN LATERAL (
+        SELECT mrf.source_import_ids,
+               mrf.source_import_dates,
+               mrf.source_issuer_names,
+               mrf.source_urls
+          FROM {PTG2_SCHEMA}.mrf_address AS mrf
+         WHERE evidence.source_id = 2
+           AND mrf.npi = evidence.npi
+           AND mrf.address_key = evidence.address_key
+         ORDER BY mrf.date_added DESC NULLS LAST, mrf.checksum
+         LIMIT 1
+  ) AS mrf_source ON TRUE
+  LEFT JOIN LATERAL (
+        SELECT nppes.date_added
+          FROM {PTG2_SCHEMA}.npi_address AS nppes
+         WHERE evidence.source_id = 1
+           AND nppes.npi = evidence.npi
+           AND nppes.address_key = evidence.address_key
+         ORDER BY nppes.date_added DESC NULLS LAST, nppes.checksum
+         LIMIT 1
+  ) AS nppes_source ON TRUE
+  LEFT JOIN LATERAL (
+        SELECT doctor.updated_at
+          FROM {PTG2_SCHEMA}.doctor_clinician_address AS doctor
+         WHERE evidence.source_id = 3
+           AND doctor.npi = evidence.npi
+           AND doctor.address_key = evidence.address_key
+         ORDER BY doctor.updated_at DESC NULLS LAST, doctor.address_checksum
+         LIMIT 1
+  ) AS doctor_source ON TRUE
+ ORDER BY evidence.location_key, evidence.source_id, evidence.source_record_key
+"""
+
+
+def _selected_location_keys(
+    location_rows: list[dict[str, Any]],
+) -> list[str]:
+    """Collect the canonical locations selected for the current response."""
+
+    return sorted(
+        {
+            str(address_payload.get("location_key"))
+            for location_row in location_rows
+            for address_payload in [
+                _coerce_json_payload(location_row.get("address_payload"), {})
+            ]
+            if isinstance(address_payload, dict)
+            and address_payload.get("location_key") not in (None, "")
+        }
+    )
+
+
+def _index_address_provenance(
+    provenance_rows: Iterable[Any],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Index source lineage and assurance context by canonical location."""
+
+    provenance_by_location_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    evidence_context_by_location_key: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"issuer_names": set(), "cms_anchor": False}
+    )
+    seen_entries: set[tuple[str, int, str]] = set()
+    for provenance_row in provenance_rows:
+        provenance_by_field = _row_mapping(provenance_row)
+        location_key = str(provenance_by_field["location_key"])
+        dedupe_key = (
+            location_key,
+            int(provenance_by_field.get("source_id") or 0),
+            str(provenance_by_field.get("source_record_key") or ""),
+        )
+        if dedupe_key not in seen_entries:
+            provenance_by_location_key[location_key].append(
+                _address_provenance_entry(provenance_by_field)
+            )
+            seen_entries.add(dedupe_key)
+        evidence_context_by_location_key[location_key]["issuer_names"].update(
+            _coerce_str_list_payload(provenance_by_field.get("source_issuer_names"))
+        )
+        evidence_context_by_location_key[location_key]["cms_anchor"] = bool(
+            evidence_context_by_location_key[location_key]["cms_anchor"]
+            or provenance_by_field.get("cms_source_has_nppes_anchor")
+        )
+    return provenance_by_location_key, evidence_context_by_location_key
+
+
+def _apply_address_provenance(
+    location_rows: list[dict[str, Any]],
+    provenance_by_location_key: Mapping[str, list[dict[str, Any]]],
+    evidence_context_by_location_key: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Attach indexed provenance and assurance labels to response addresses."""
+
+    for location_row in location_rows:
+        address_payload = _coerce_json_payload(
+            location_row.get("address_payload"), {}
+        )
+        if not isinstance(address_payload, dict):
+            continue
+        location_key = str(address_payload.get("location_key") or "")
+        provenance = provenance_by_location_key.get(location_key, [])
+        if provenance:
+            address_payload["address_provenance"] = provenance
+        evidence_context = evidence_context_by_location_key.get(location_key, {})
+        evidence_level = _geo_address_evidence_level(
+            address_payload.get("address_sources") or [],
+            mrf_issuer_names=evidence_context.get("issuer_names") or (),
+            cms_source_has_nppes_anchor=bool(evidence_context.get("cms_anchor")),
+        )
+        if evidence_level:
+            address_payload["geo_evidence_level"] = evidence_level
+        location_row["address_payload"] = json.dumps(address_payload, default=str)
+
+
+async def _hydrate_address_provenance(
+    session: Any,
+    location_rows: list[dict[str, Any]],
+) -> None:
+    """Attach record-level source lineage to selected unified address rows."""
+
+    location_keys = _selected_location_keys(location_rows)
+    if not location_keys or not await _is_relation_available(
+        session, f"{PTG2_SCHEMA}.entity_address_evidence"
+    ):
+        return
+    provenance_result = await session.execute(
+        text(_ADDRESS_PROVENANCE_SQL),
+        {"location_keys": location_keys},
+    )
+    provenance_by_location_key, evidence_context_by_location_key = (
+        _index_address_provenance(provenance_result)
+    )
+    _apply_address_provenance(
+        location_rows,
+        provenance_by_location_key,
+        evidence_context_by_location_key,
+    )
+
+
+def _membership_provenance_sql(address_table: str) -> dict[str, str]:
+    """Return unified and legacy address columns under one SQL contract."""
+
+    uses_unified_addresses = _is_unified_address_table(address_table)
+    return {
+        "location_key_sql": "addr.location_key" if uses_unified_addresses else "NULL::varchar",
+        "address_sources_sql": (
+            "addr.address_sources" if uses_unified_addresses else "ARRAY['nppes']::varchar[]"
+        ),
+        "source_record_ids_sql": (
+            "addr.source_record_ids" if uses_unified_addresses else "ARRAY[]::varchar[]"
+        ),
+        "source_count_sql": "addr.source_count" if uses_unified_addresses else "1::int",
+        "multi_source_sql": "addr.multi_source_confirmed" if uses_unified_addresses else "false",
+        "source_mask_sql": "addr.source_mask" if uses_unified_addresses else "1::bigint",
+        "address_source_mask_sql": (
+            "addr.address_source_mask" if uses_unified_addresses else "1::bigint"
+        ),
+        "location_confidence_sql": (
+            "addr.location_confidence_id" if uses_unified_addresses else "2::smallint"
+        ),
+    }
+
+
+def _membership_location_sql(
+    query_context: _MembershipLocationQuery,
+    *,
+    limit: int,
+    offset: int,
+) -> str:
+    """Render the bounded location SQL for the chosen address source."""
+
+    location_hash_sql = _ptg2_address_location_hash_sql(
+        "addr", query_context.address_table
+    )
+    format_values_by_name = {
+        "location_hash_sql": location_hash_sql,
+        "telephone_sql": _ptg2_nullish_text_sql("addr.telephone_number"),
+        "fax_sql": _ptg2_nullish_text_sql("addr.fax_number"),
+        **_membership_provenance_sql(query_context.address_table),
+        "distance_sql": query_context.distance_sql,
+        "address_table": query_context.address_table,
+        "npi_scope_table": query_context.npi_scope_table,
+        "filter_sql": query_context.filter_sql,
+        "address_assurance_sql": query_context.address_assurance_sql,
+    }
+    if query_context.knn_order_sql is None or offset != 0:
+        return _MEMBERSHIP_LOCATION_SQL.format(**format_values_by_name)
+    requested_limit = max(int(limit), 1)
+    probe_limit = requested_limit + max(requested_limit // 2, 64)
+    query_context.parameter_map["raw_probe_limit"] = probe_limit + 1
+    return _MEMBERSHIP_LOCATION_KNN_SQL.format(
+        **format_values_by_name,
+        knn_order_sql=query_context.knn_order_sql,
+    )
+
+
+async def _execute_membership_location_sql(
+    session: Any,
+    query_context: _MembershipLocationQuery,
+    location_sql: str,
+    *,
+    offset: int,
+) -> list[dict[str, Any]]:
+    """Execute location SQL while containing temporary KNN planner settings."""
+
+    prior_planner_settings = None
+    if query_context.knn_order_sql is not None and offset == 0:
+        prior_planner_settings = await _enable_serial_knn_planning(session)
+    query_result = await session.execute(
+        text(location_sql), query_context.parameter_map
+    )
+    try:
+        return [_row_mapping(query_row) for query_row in query_result]
+    finally:
+        if prior_planner_settings is not None:
+            await _restore_knn_planning(session, prior_planner_settings)
+
+
 async def _membership_location_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -9358,6 +9834,7 @@ async def _membership_location_rows(
     offset: int = 0,
 ) -> list[dict[str, Any]] | None:
     """Read address candidates scoped to NPIs represented by the snapshot."""
+
     if candidate_npis == ():
         return []
     query_context = await _membership_location_query(
@@ -9370,43 +9847,25 @@ async def _membership_location_rows(
     )
     if query_context is None:
         return None
-    location_hash_sql = _ptg2_address_location_hash_sql("addr", query_context.address_table)
-    if query_context.knn_order_sql is not None and offset == 0:
-        requested_limit = max(int(limit), 1)
-        probe_limit = requested_limit + max(requested_limit // 2, 64)
-        query_context.parameter_map["raw_probe_limit"] = probe_limit + 1
-        location_sql = _MEMBERSHIP_LOCATION_KNN_SQL.format(
-            location_hash_sql=location_hash_sql,
-            distance_sql=query_context.distance_sql,
-            knn_order_sql=query_context.knn_order_sql,
-            address_table=query_context.address_table,
-            npi_scope_table=query_context.npi_scope_table,
-            filter_sql=query_context.filter_sql,
-        )
-    else:
-        location_sql = _MEMBERSHIP_LOCATION_SQL.format(
-            location_hash_sql=location_hash_sql,
-            distance_sql=query_context.distance_sql,
-            address_table=query_context.address_table,
-            npi_scope_table=query_context.npi_scope_table,
-            filter_sql=query_context.filter_sql,
-        )
-    location_statement = text(location_sql)
-    prior_planner_settings = None
-    if query_context.knn_order_sql is not None and offset == 0:
-        prior_planner_settings = await _enable_serial_knn_planning(session)
-    try:
-        query_result = await session.execute(location_statement, query_context.parameter_map)
-    except Exception:
-        # PostgreSQL errors abort the transaction; its rollback also restores
-        # transaction-local planner settings. A restore query would only mask
-        # the original failure while the transaction is aborted.
-        raise
-    try:
-        return [_row_mapping(query_row) for query_row in query_result]
-    finally:
-        if prior_planner_settings is not None:
-            await _restore_knn_planning(session, prior_planner_settings)
+    location_sql = _membership_location_sql(
+        query_context,
+        limit=limit,
+        offset=offset,
+    )
+    location_rows = await _execute_membership_location_sql(
+        session,
+        query_context,
+        location_sql,
+        offset=offset,
+    )
+    uses_unified_addresses = _is_unified_address_table(query_context.address_table)
+    if uses_unified_addresses and (
+        _is_request_flag_enabled(args.get("include_evidence"))
+        or _is_request_flag_enabled(args.get("include_debug"))
+        or _is_request_flag_enabled(args.get("include_details"))
+    ):
+        await _hydrate_address_provenance(session, location_rows)
+    return location_rows
 
 
 @dataclass
@@ -10895,6 +11354,31 @@ def _request_local_provider_payload(value: Any) -> Any:
     return value
 
 
+def _sanitize_address_contact_payload(address_payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert source-system null sentinels to real JSON null contact values."""
+
+    for field_name in (
+        "telephone",
+        "telephone_number",
+        "phone",
+        "phone_number",
+        "phone_extension",
+        "fax",
+        "fax_number",
+        "fax_number_digits",
+        "fax_extension",
+    ):
+        field_value = address_payload.get(field_name)
+        if isinstance(field_value, str) and field_value.strip().lower() in {
+            "",
+            "null",
+            "none",
+            "undefined",
+        }:
+            address_payload[field_name] = None
+    return address_payload
+
+
 def _request_local_provider_fields(
     provider: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -10914,6 +11398,8 @@ def _request_local_provider_fields(
     }
     if not isinstance(fields_by_name["address"], dict):
         fields_by_name["address"] = {}
+    else:
+        _sanitize_address_contact_payload(fields_by_name["address"])
     return fields_by_name
 
 
@@ -14927,7 +15413,7 @@ async def _search_manifest_serving_table(
                 else None
             ),
             "source_trace": [],
-            "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
+            "confidence": {"network": "tic_rate_npi_tin", "location": "unknown"},
         }
         source_provenance = source_provenance_by_key.get(
             int(serving_row["source_key"])
@@ -15480,6 +15966,8 @@ def _compact_item_from_row(
         serving_row_by_field.get("address_payload"),
         {},
     )
+    if isinstance(address_payload, dict):
+        _sanitize_address_contact_payload(address_payload)
     provider_item_by_field = {
         **_compact_provider_identity_fields(
             serving_row_by_field,

@@ -6957,7 +6957,7 @@ def _allowed_amount_summary_fields(
                 if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK
                 else "allowed_amounts_not_confirmed_in_network"
             ),
-            "location": "nppes_practice_location",
+            "location": "provider_identity_inferred_location",
         },
     }
 
@@ -7029,6 +7029,8 @@ def _annotate_ptg2_result_state(
         if has_items
         else _ptg2_empty_result_state(status, has_location_filter=has_location_filter)
     )
+    query_payload_map["status"] = "matched" if has_items else "no_match"
+    ptg2_payload["query"] = query_payload_map
     ptg2_payload.setdefault("result_state", result_state)
     ptg2_payload.setdefault("pricing_scope", "plan_scoped_ptg")
     if query_payload_map.get("snapshot_id"):
@@ -10827,6 +10829,9 @@ async def list_providers_by_procedure(request):
     session = _get_session(request)
     args = request.args
 
+    # Keep pagination explicit so OpenAPI contract tests see both parameters.
+    args.get("limit")
+    args.get("offset")
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
     year = _parse_int(args.get("year"), "year", minimum=2013)
     min_claims = _parse_float(args.get("min_claims"), "min_claims", minimum=0)
@@ -11011,6 +11016,7 @@ async def list_providers_by_procedure(request):
                 "include_providers": args.get("include_providers") or None,
                 "include_code_details": args.get("include_code_details") or None,
                 "include_sources": args.get("include_sources") or None,
+                "include_evidence": args.get("include_evidence") or None,
                 "include_unverified_addresses": args.get("include_unverified_addresses") or None,
                 "include_details": args.get("include_details") or None,
                 "include_debug": args.get("include_debug") or None,

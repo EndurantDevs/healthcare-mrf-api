@@ -325,10 +325,40 @@ def test_address_verification_classifies_address_provenance(
     assert verification["requires_location_confirmation"] is (
         expected != "payer_confirmed_location"
     )
+    assert provider_data_map["confidence"]["location"] == expected
+
+
+def test_address_verification_returns_selected_address_record_lineage():
+    provenance_rows = [
+        {
+            "dataset_id": "cms_nppes_registry",
+            "source_record_id": "nppes:1000000003:secondary:fixture",
+            "record_version_id": "20260628",
+            "retrieved_at": "2026-06-28",
+        }
+    ]
+    provider_data_map = {"provider_name": "Fixture Provider"}
+
+    verification = serving._address_verification_payload(
+        provider_data_map,
+        {"location_source": "entity_address_unified"},
+        {
+            "first_line": "100 TEST ST",
+            "address_sources": ["nppes"],
+            "address_provenance": provenance_rows,
+            "geo_evidence_level": "nppes_registry_address",
+        },
+    )
+
+    assert verification["address_provenance"] == provenance_rows
+    assert verification["geo_evidence_level"] == "nppes_registry_address"
+    assert verification["address_evidence_level"] == "nppes_provider_address"
+    assert provider_data_map["confidence"]["location"] == "nppes_provider_address"
 
 
 def test_address_verification_marks_missing_display_address_unknown():
-    verification = serving._address_verification_payload({}, {}, {})
+    provider_data_map = {}
+    verification = serving._address_verification_payload(provider_data_map, {}, {})
 
     assert verification == {
         "rate_network_binding": "tic_provider_group_npi_tin",
@@ -339,6 +369,7 @@ def test_address_verification_marks_missing_display_address_unknown():
         "displayed_address_present": False,
         "network_bound_address": False,
     }
+    assert provider_data_map["confidence"]["location"] == "unknown"
 
 
 def test_provider_directory_network_matches_aliases_and_pre_shaped_rows():

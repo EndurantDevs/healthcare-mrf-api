@@ -712,6 +712,8 @@ def _normalize_upper(value):
 
 def _coerce_text(value):
     cleaned = _clean_name_part(value)
+    if cleaned.lower() in {"null", "none", "undefined"}:
+        return None
     return cleaned or None
 
 
