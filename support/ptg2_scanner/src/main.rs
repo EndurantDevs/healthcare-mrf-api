@@ -29266,6 +29266,20 @@ mod tests {
 
         assert_eq!(scratch, br#""tail""#);
         assert_eq!(scratch.capacity(), retained_capacity);
+
+        let deep = format!("{}0{}", "[".repeat(65), "]".repeat(65));
+        let mut deep_reader = BufferedJsonByteReader::new(deep.as_bytes());
+        deep_reader.capture_value_bytes_into(&mut scratch).unwrap();
+        assert_eq!(scratch, deep.as_bytes());
+
+        let mut mismatched_reader = BufferedJsonByteReader::new(&b"x"[..]);
+        let mismatch = mismatched_reader.expect_byte(b'y').unwrap_err();
+        assert_eq!(mismatch.kind(), io::ErrorKind::InvalidData);
+        assert!(mismatch.to_string().contains("expected JSON byte"));
+
+        let mut empty_reader = BufferedJsonByteReader::new(&b""[..]);
+        let missing = empty_reader.expect_byte(b'y').unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     fn capture_array_objects(input: &[u8]) -> io::Result<Vec<Vec<u8>>> {
@@ -35225,6 +35239,7 @@ mod tests {
         assert!(inverted
             .iter()
             .all(|entry| entry.members == vec![provider_set_id]));
+        assert_eq!(collector.provider_npi_entries().unwrap().len(), 1);
     }
 
     #[test]

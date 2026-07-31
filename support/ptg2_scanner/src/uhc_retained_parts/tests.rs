@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_retained_file_after_publication_link_settles() {
+    fn accepts_retained_file_after_delayed_publication_link_settles() {
         let fixture = Fixture::new(FIXTURE);
         let raw_path = fixture.raw_path();
         fs::write(&raw_path, FIXTURE).expect("preseed raw artifact");
@@ -580,7 +580,8 @@ mod tests {
         fs::hard_link(&raw_path, &alias).expect("link retained raw during publication");
         let alias_for_removal = alias.clone();
         let remover = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
+            // Exercise convergence beyond the former five-second retry budget.
+            thread::sleep(Duration::from_millis(5_250));
             fs::remove_file(alias_for_removal).expect("settle publication link");
         });
 
