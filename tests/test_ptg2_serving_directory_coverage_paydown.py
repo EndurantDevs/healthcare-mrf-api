@@ -183,8 +183,9 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
     if unified:
         assert query.knn_order_sql is not None
         assert "ST_DWithin" in query.filter_sql
-        assert "source_issuer_names" in query.filter_sql
-        assert "geo_doctor_anchor" in query.filter_sql
+        assert "source_issuer_names" not in query.filter_sql
+        assert "source_issuer_names" in query.address_assurance_sql
+        assert "geo_doctor_anchor" in query.address_assurance_sql
     else:
         assert query.knn_order_sql is None
         assert query.parameter_map["state_value"] == "IL"
@@ -217,6 +218,12 @@ async def test_membership_location_query_does_not_let_exact_zip_bypass_assurance
     assert "OR" in query.filter_sql
     assert "source_issuer_names" in query.address_assurance_sql
     assert "geo_doctor_anchor" in query.address_assurance_sql
+    rendered_sql = serving._membership_location_sql(query, limit=10, offset=0)
+    assert "mrf_requested AS MATERIALIZED" in rendered_sql
+    assert "cms_doctor_rows AS MATERIALIZED" in rendered_sql
+    assert "assured_location_keys AS MATERIALIZED" in rendered_sql
+    assert "ROW_NUMBER() OVER" in rendered_sql
+    assert "geo_doctor_anchor" not in rendered_sql
 
 
 @pytest.mark.asyncio

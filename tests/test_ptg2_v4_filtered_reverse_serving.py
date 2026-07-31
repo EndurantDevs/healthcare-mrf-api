@@ -122,6 +122,22 @@ def _tables(projection_manifest: dict[str, object] | None) -> PTG2ServingTables:
     )
 
 
+def test_direct_taxonomy_io_compatibility_multiplier_is_hard_bounded() -> None:
+    assert serving._v4_direct_io_multiplier(_tables(None)) == 5
+    excessive_tables = replace(
+        _tables(None),
+        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(
+            max_online_group_npi_batches_per_set=5
+        ),
+    )
+
+    with pytest.raises(
+        PTG2ManifestArtifactError,
+        match="compatibility multiplier exceeds its cap",
+    ):
+        serving._v4_direct_io_multiplier(excessive_tables)
+
+
 def _observe_projection_fixture() -> dict[str, object]:
     rule = serving._inferred_provider_taxonomy_rule(
         {"code_system": "CPT", "code": "70553"}
@@ -378,8 +394,8 @@ async def test_inferred_taxonomy_v4_uses_exact_scoped_reverse_selection(
     assert taxonomy_scope_calls == [
         {
             "maximum_members": 131_072,
-            "maximum_pages": 256,
-            "maximum_bytes": 4_194_304,
+            "maximum_pages": 1_280,
+            "maximum_bytes": 20_971_520,
             "maximum_batches": 32,
         }
     ]

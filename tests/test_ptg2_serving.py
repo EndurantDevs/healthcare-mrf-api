@@ -1706,6 +1706,8 @@ def test_knn_order_requires_unscoped_first_page_coordinate_search():
 def test_knn_query_carries_bounded_raw_probe_exhaustion_marker():
     assert "LIMIT :raw_probe_limit" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     assert "_ptg_source_exhausted" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    assert "_ptg_probe_empty" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
+    assert "LEFT JOIN LATERAL" in ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     assert "probe_stats.raw_probe_count < :raw_probe_limit" in (
         ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
     )

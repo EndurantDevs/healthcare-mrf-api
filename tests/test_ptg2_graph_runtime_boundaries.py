@@ -105,6 +105,47 @@ async def test_paged_graph_candidates_stop_at_proven_source_exhaustion(
 
 
 @pytest.mark.asyncio
+async def test_paged_graph_candidates_expand_after_empty_unexhausted_knn_probe(
+    monkeypatch,
+):
+    """Do not mistake an unsupported nearest prefix for source exhaustion."""
+
+    location_limits: list[int] = []
+
+    async def location_rows(*_args, limit, **_kwargs):
+        location_limits.append(limit)
+        if len(location_limits) == 1:
+            return [
+                {
+                    "_ptg_probe_empty": True,
+                    "_ptg_source_exhausted": False,
+                }
+            ]
+        return [{"npi": 1234567890, "_ptg_source_exhausted": True}]
+
+    monkeypatch.setattr(serving, "_membership_location_rows", location_rows)
+    monkeypatch.setattr(
+        serving,
+        "_shared_provider_set_keys_by_npi",
+        AsyncMock(return_value={1234567890: {7}}),
+    )
+
+    candidates = await serving._paged_graph_candidates(
+        object(),
+        strict_v3_tables(),
+        {},
+        frozenset({7}),
+        1,
+    )
+
+    assert candidates == serving._GraphLocationCandidates(
+        [{"npi": 1234567890, "_ptg_source_exhausted": True}],
+        {1234567890: {7}},
+    )
+    assert location_limits == [64, 256]
+
+
+@pytest.mark.asyncio
 async def test_paged_graph_candidates_reject_unproven_bound_exhaustion(
     monkeypatch,
 ):
