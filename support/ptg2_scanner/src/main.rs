@@ -35240,6 +35240,7 @@ mod tests {
             .iter()
             .all(|entry| entry.members == vec![provider_set_id]));
         assert_eq!(collector.provider_npi_entries().unwrap().len(), 1);
+        assert!(collector.price_forward_entries().unwrap().is_empty());
     }
 
     #[test]
@@ -35250,11 +35251,13 @@ mod tests {
         };
 
         let spools = ManifestSidecarSpools::for_paths(&paths).unwrap();
+        let import = ManifestSidecarCollector::for_import(&paths).unwrap();
 
         assert!(spools.provider_forward.is_some());
         assert!(spools.provider_inverted.is_none());
         assert!(spools.provider_npi.is_none());
         assert!(spools.price_forward.is_none());
+        assert!(import.spools.is_some());
     }
 
     #[test]
@@ -35692,6 +35695,7 @@ mod tests {
 
         drop(tx);
         let jobs: Vec<_> = rx.try_iter().collect();
+        stats.merge_from(&RawChunkStats::default());
         assert_eq!(rate_count, 3);
         assert_eq!(stats.chunk_count, 3);
         assert_eq!(stats.max_rates, 1);
