@@ -44,6 +44,10 @@ from api.ptg2_code_filters import (
     _ptg2_code_query_fields,
 )
 from api.ptg2_code_details import _enrich_ptg2_code_details
+from api.ptg2_geo_policy import (
+    is_provider_address_geo_capability_available,
+    provider_address_location_filter_sql,
+)
 from api.ptg2_candidate_audit import (
     PTG2CandidateAuditAccess,
     candidate_audit_access_from_args,
@@ -538,6 +542,12 @@ def _non_nullish_contact_value(value: Any) -> Any:
     }:
         return None
     return value
+
+
+def _request_value_or_none(value: Any) -> Any:
+    """Preserve explicit numeric zero while normalizing request null sentinels."""
+
+    return None if value in (None, "", "null") else value
 
 
 def _first_contact_value(*values: Any) -> Any:
@@ -9535,7 +9545,11 @@ def _membership_geo_sql(
     try:
         geo_lat = float(args.get("lat"))
         geo_long = float(args.get("long"))
-        geo_radius = max(float(args.get("radius_miles") or 25.0), 0.0)
+        requested_radius = _request_value_or_none(args.get("radius_miles"))
+        geo_radius = max(
+            float(25.0 if requested_radius is None else requested_radius),
+            0.0,
+        )
     except (TypeError, ValueError):
         return None
     parameter_map.update(
@@ -9605,6 +9619,50 @@ def _membership_taxonomy_filters(
     return filter_clauses
 
 
+def _membership_spatial_filter_sql(
+    request_arg_map: Mapping[str, Any],
+    *,
+    uses_unified_addresses: bool,
+    address_zip5_sql: str,
+    parameter_map: dict[str, Any],
+) -> tuple[str | None, str] | None:
+    """Build one coherent ZIP/radius predicate and distance projection."""
+
+    geo_sql_parts = _membership_geo_sql(
+        request_arg_map,
+        uses_unified_addresses=uses_unified_addresses,
+        parameter_map=parameter_map,
+    )
+    if geo_sql_parts is None:
+        return None
+    distance_sql, geo_clauses = geo_sql_parts
+    zip5 = _normalize_zip5(
+        request_arg_map.get("zip5") or request_arg_map.get("zip")
+    )
+    zip_clause = None
+    if zip5:
+        parameter_map["zip5"] = zip5
+        zip_clause = f"{address_zip5_sql} = :zip5"
+    if uses_unified_addresses and (zip_clause or geo_clauses):
+        return (
+            provider_address_location_filter_sql(
+                "addr",
+                schema_name=PTG2_SCHEMA,
+                exact_zip_predicate=zip_clause,
+                radius_predicates=geo_clauses,
+            ),
+            distance_sql,
+        )
+    if zip_clause:
+        legacy_spatial_filter = (
+            f"({zip_clause} OR ({' AND '.join(geo_clauses)}))"
+            if geo_clauses
+            else zip_clause
+        )
+        return legacy_spatial_filter, distance_sql
+    return (" AND ".join(geo_clauses) or None), distance_sql
+
+
 def _membership_filter_sql(
     args: dict[str, Any],
     *,
@@ -9615,7 +9673,7 @@ def _membership_filter_sql(
     literal_service_address_types: bool = False,
     include_taxonomy_filters: bool = True,
 ) -> tuple[str, str] | None:
-    """Build address filters while preserving ZIP-or-radius semantics."""
+    """Build address filters with source-backed spatial coherence."""
     address_type_filter = (
         "addr.type IN ('primary', 'secondary', 'practice', 'site')"
         if literal_service_address_types
@@ -9631,27 +9689,23 @@ def _membership_filter_sql(
         filter_clauses.extend(_membership_taxonomy_filters(args, parameter_map))
     state_code = str(args.get("state") or "").strip().upper()
     city_name = str(args.get("city") or "").strip().upper()
-    zip5 = _normalize_zip5(args.get("zip5") or args.get("zip"))
     if state_code:
         filter_clauses.append("UPPER(COALESCE(addr.state_name, '')) = :state_value")
         parameter_map["state_value"] = state_code
     if city_name:
         filter_clauses.append("UPPER(COALESCE(addr.city_name, '')) = :city_value")
         parameter_map["city_value"] = city_name
-    geo_sql_parts = _membership_geo_sql(
+    spatial_sql_parts = _membership_spatial_filter_sql(
         args,
         uses_unified_addresses=uses_unified_addresses,
+        address_zip5_sql=address_zip5_sql,
         parameter_map=parameter_map,
     )
-    if geo_sql_parts is None:
+    if spatial_sql_parts is None:
         return None
-    distance_sql, geo_clauses = geo_sql_parts
-    if zip5:
-        parameter_map["zip5"] = zip5
-        zip_clause = f"{address_zip5_sql} = :zip5"
-        filter_clauses.append(f"({zip_clause} OR ({' AND '.join(geo_clauses)}))" if geo_clauses else zip_clause)
-    elif geo_clauses:
-        filter_clauses.extend(geo_clauses)
+    spatial_filter_sql, distance_sql = spatial_sql_parts
+    if spatial_filter_sql:
+        filter_clauses.append(spatial_filter_sql)
     if args.get("npi") not in (None, "", "null"):
         try:
             parameter_map["provider_npi"] = int(args["npi"])
@@ -9711,6 +9765,55 @@ def _membership_address_assurance_sql(
     return _ptg2_geo_assured_address_sql("addr")
 
 
+async def _membership_address_table_for_request(
+    session: Any,
+    request_arg_map: Mapping[str, Any],
+) -> str | None:
+    """Select an address table and require spatial reference capability."""
+
+    has_geo_filter = request_arg_map.get("lat") not in (
+        None,
+        "",
+        "null",
+    ) or request_arg_map.get("long") not in (None, "", "null")
+    has_zip_filter = bool(
+        _normalize_zip5(
+            request_arg_map.get("zip5") or request_arg_map.get("zip")
+        )
+    )
+    has_spatial_filter = has_geo_filter or has_zip_filter
+    has_address_filter = any(
+        request_arg_map.get(parameter_name) not in (None, "", "null")
+        for parameter_name in ("state", "city", "zip5", "zip", "lat", "long")
+    )
+    required_columns = (
+        _PTG2_UNIFIED_ADDRESS_COLUMNS
+        if has_address_filter
+        else _PTG2_LEGACY_ADDRESS_COLUMNS
+    )
+    address_table = await _ptg2_address_serving_table(
+        session,
+        required_columns,
+        require_legacy_available=True,
+    )
+    if not address_table or not has_address_filter:
+        return address_table
+    if not _is_unified_address_table(address_table):
+        raise PTG2ManifestArtifactError(
+            "PTG2 location filtering requires unified source-backed addresses"
+        )
+    if not has_spatial_filter:
+        return address_table
+    if not await is_provider_address_geo_capability_available(
+        session,
+        schema_name=PTG2_SCHEMA,
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 spatial filtering requires canonical ZIP geometry"
+        )
+    return address_table
+
+
 async def _membership_location_query(
     session,
     serving_tables: PTG2ServingTables,
@@ -9723,12 +9826,7 @@ async def _membership_location_query(
     """Build one bounded address lookup against immutable snapshot membership."""
     _require_strict_shared_v3(serving_tables)
     provider_npi_scope_table = _ptg2_npi_scope_table(serving_tables)
-    has_geo_filter = args.get("lat") not in (None, "", "null") or args.get("long") not in (None, "", "null")
-    address_table = await _ptg2_address_serving_table(
-        session,
-        _PTG2_UNIFIED_ADDRESS_COLUMNS if has_geo_filter else _PTG2_LEGACY_ADDRESS_COLUMNS,
-        require_legacy_available=True,
-    )
+    address_table = await _membership_address_table_for_request(session, args)
     if not address_table:
         return None
     uses_unified_addresses = _is_unified_address_table(address_table)
@@ -16288,9 +16386,11 @@ async def _search_manifest_serving_table(
                     "state": args.get("state") or None,
                     "city": args.get("city") or None,
                     "zip5": args.get("zip5") or None,
-                    "lat": args.get("lat") or None,
-                    "long": args.get("long") or None,
-                    "radius_miles": args.get("radius_miles") or None,
+                    "lat": _request_value_or_none(args.get("lat")),
+                    "long": _request_value_or_none(args.get("long")),
+                    "radius_miles": _request_value_or_none(
+                        args.get("radius_miles")
+                    ),
                     "npi": args.get("npi") or None,
                     "provider_sex_code": args.get("provider_sex_code") or None,
                     "source": "ptg2_db",
@@ -16967,9 +17067,11 @@ async def _search_manifest_serving_table(
                 "state": args.get("state") or None,
                 "city": args.get("city") or None,
                 "zip5": args.get("zip5") or None,
-                "lat": args.get("lat") or None,
-                "long": args.get("long") or None,
-                "radius_miles": args.get("radius_miles") or None,
+                "lat": _request_value_or_none(args.get("lat")),
+                "long": _request_value_or_none(args.get("long")),
+                "radius_miles": _request_value_or_none(
+                    args.get("radius_miles")
+                ),
                 "npi": args.get("npi") or None,
                 "provider_sex_code": args.get("provider_sex_code") or None,
                 "source": "ptg2_db",

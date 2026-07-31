@@ -29,6 +29,8 @@ PTG2_LEGACY_ADDRESS_COLUMNS = {
 }
 PTG2_UNIFIED_ADDRESS_COLUMNS = PTG2_LEGACY_ADDRESS_COLUMNS | {
     "address_precision",
+    "zip5",
+    "state_code",
     "location_key",
     "premise_key",
     "address_sources",

@@ -2826,6 +2826,8 @@ paths:
         `plan_id` plus `market_type`, then enumerates the snapshot provider scope
         in strict shared V3 storage as keyset-paginated 10-digit NPI values.
         `plan_release_id` cannot be combined with raw plan/source/snapshot selectors.
+        Its ZIP filter expands to a ZIP-code set and does not apply the
+        point-within-own-ZCTA contract used by search-by-procedure.
       parameters:
         - name: plan_id
           in: query
@@ -4156,6 +4158,14 @@ paths:
         `recommended_mode=hard_filter`, copy `provider_filter.taxonomy_codes`,
         `provider_filter.primary_only`, and
         `provider_filter.include_subspecialties` into this search.
+
+        Address-bearing spatial matches also fail closed on postal coherence.
+        A coordinate-bearing address must agree with its canonical ZIP, state,
+        and country, its point must fall inside its own ZCTA, and the point must
+        be inside the requested radius. Exact-ZIP fallback is limited to
+        coherent addresses that have no coordinates. Allowed-amount fallback
+        applies these filters internally but does not return provider address
+        or distance fields.
       parameters:
         - name: year
           in: query
@@ -4175,9 +4185,16 @@ paths:
         - name: zip5
           in: query
           schema: { type: string }
+          description: |
+            Exact ZIP anchor. A coherent address without coordinates may match
+            this ZIP directly; a coordinate-bearing address must instead pass
+            its own-ZCTA and requested-radius checks.
         - name: zip_radius_miles
           in: query
           schema: { type: number, minimum: 0, default: 10 }
+          description: |
+            Radius around the ZIP anchor. Coordinate-bearing addresses must be
+            inside both their canonical ZCTA and this requested radius.
         - name: specialty
           in: query
           schema: { type: string }
@@ -4316,9 +4333,9 @@ paths:
           description: |
             When true or omitted, returns best-known PTG provider addresses
             when available. Set false to suppress unverified address fields.
-            For allowed-amount fallback results, this also suppresses distance
-            and location-verification metadata while requested location filters
-            still apply internally.
+            Allowed-amount fallback never returns provider address, distance,
+            or contact fields; requested location filters still apply
+            internally, and explicit no-address-binding metadata remains.
         - name: include_evidence
           in: query
           schema: { type: boolean }
@@ -4326,7 +4343,8 @@ paths:
             Include truthful location confidence and record-level provenance
             for the selected address, including dataset identifier, source
             record/version identifiers, retrieval timestamp, and source URLs
-            when available.
+            when available. Allowed-amount fallback does not expose a selected
+            provider address.
         - name: include_allowed_amounts
           in: query
           schema: { type: boolean, default: true }
@@ -4400,6 +4418,13 @@ paths:
         first. Only when `recommended_mode=hard_filter`, copy
         `provider_filter.taxonomy_codes`, `provider_filter.primary_only`, and
         `provider_filter.include_subspecialties` into this search.
+
+        Address-bearing spatial matches require coherent canonical ZIP, state,
+        and country identity. Coordinate-bearing addresses must fall inside
+        their own ZCTA and the requested radius; exact-ZIP fallback is limited
+        to coherent addresses without coordinates. Allowed-amount fallback
+        applies location filters internally but does not return provider
+        address, contact, or distance fields.
       parameters:
         - name: year
           in: query
@@ -4425,6 +4450,10 @@ paths:
           in: query
           schema:
             type: string
+          description: |
+            Exact ZIP anchor. A coherent address without coordinates may match
+            this ZIP directly; a coordinate-bearing address must instead pass
+            its own-ZCTA and requested-radius checks.
         - name: zip_radius_miles
           in: query
           schema:
@@ -4432,7 +4461,10 @@ paths:
             minimum: 0
             default: 10
           description: |
-            Optional ZIP-based search radius (miles). Defaults to 10 when `zip5` is provided; set `0` for same-ZIP-only matching.
+            Optional ZIP-based radius in miles. Coordinate-bearing addresses
+            must be inside their canonical ZCTA and this radius. Defaults to
+            10 when `zip5` is provided; set `0` for exact-ZIP fallback, which
+            only admits coherent addresses without coordinates.
         - name: specialty
           in: query
           schema:
@@ -4632,13 +4664,17 @@ paths:
           description: |
             When true or omitted, returns best-known PTG provider addresses
             when available. Set false to suppress unverified address fields.
-            For allowed-amount fallback results, this also suppresses distance
-            and location-verification metadata while requested location filters
-            still apply internally.
+            Allowed-amount fallback never returns provider address, distance,
+            or contact fields; requested location filters still apply
+            internally, and explicit no-address-binding metadata remains.
         - name: include_evidence
           in: query
           schema:
             type: boolean
+          description: |
+            Include truthful location confidence and record-level provenance
+            for a selected provider address. Allowed-amount fallback does not
+            expose a selected provider address.
         - name: include_allowed_amounts
           in: query
           schema:

@@ -682,6 +682,9 @@ async def _search_geo_price_response(session):
             "code_system": "CPT",
             "code": "99213",
             "state": "IL",
+            "lat": 0.0,
+            "long": 0.0,
+            "radius_miles": 0.0,
             "pos": "22",
             "include_providers": True,
         },
@@ -1633,6 +1636,26 @@ def test_membership_geo_sql_uses_postgis_for_unified_addresses():
     assert params_by_name["geo_radius_miles"] == 12.0
 
 
+def test_membership_geo_sql_preserves_explicit_zero_coordinates_and_radius():
+    params_by_name = {}
+
+    _, filters = ptg2_serving._membership_geo_sql(
+        {"lat": 0.0, "long": 0.0, "radius_miles": 0.0},
+        uses_unified_addresses=True,
+        parameter_map=params_by_name,
+    )
+
+    assert any("ST_DWithin" in sql for sql in filters)
+    assert params_by_name["geo_lat"] == 0.0
+    assert params_by_name["geo_long"] == 0.0
+    assert params_by_name["geo_radius_miles"] == 0.0
+
+
+def test_request_value_or_none_preserves_numeric_zero():
+    assert ptg2_serving._request_value_or_none(0.0) == 0.0
+    assert ptg2_serving._request_value_or_none("null") is None
+
+
 def test_membership_geo_sql_uses_bounded_non_unified_predicates():
     params_by_name = {}
 
@@ -1649,7 +1672,7 @@ def test_membership_geo_sql_uses_bounded_non_unified_predicates():
     assert any(":geo_radius_miles" in sql for sql in filters)
 
 
-def test_membership_filter_preserves_zip_or_radius_semantics():
+def test_membership_filter_requires_coherence_before_zip_or_radius():
     params_by_name = {"address_types": ["practice", "primary"]}
 
     filter_sql, distance_sql = ptg2_serving._membership_filter_sql(
@@ -1666,7 +1689,14 @@ def test_membership_filter_preserves_zip_or_radius_semantics():
         parameter_map=params_by_name,
     )
 
-    assert "LEFT(addr.postal_code, 5) = :zip5 OR" in filter_sql
+    assert "addr.address_key IS NOT NULL" in filter_sql
+    assert "FROM mrf.geo_zip_lookup AS address_zip" in filter_sql
+    assert "FROM tiger.zip_state AS address_zip_state" in filter_sql
+    assert "FROM tiger.zcta5 AS address_zcta" in filter_sql
+    assert (
+        "LEFT(addr.postal_code, 5) = :zip5 AND "
+        "(addr.lat IS NULL AND addr.long IS NULL)"
+    ) in filter_sql
     assert "ST_DWithin" in filter_sql
     assert "addr.npi = ANY(CAST(:candidate_npis AS bigint[]))" in filter_sql
     assert "addr.npi = :provider_npi" in filter_sql
@@ -2658,6 +2688,9 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
     ]
     assert response["pagination"]["has_more"] is False
     assert response["pagination"]["total_is_exact"] is True
+    assert response["query"]["lat"] == 0.0
+    assert response["query"]["long"] == 0.0
+    assert response["query"]["radius_miles"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -2682,6 +2715,9 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch
             "code_system": "CPT",
             "code": "99213",
             "state": "IL",
+            "lat": 0.0,
+            "long": 0.0,
+            "radius_miles": 0.0,
             "include_providers": True,
             "order_by": "negotiated_rate",
         },
@@ -2691,6 +2727,9 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch
     )
 
     assert response["items"] == []
+    assert response["query"]["lat"] == 0.0
+    assert response["query"]["long"] == 0.0
+    assert response["query"]["radius_miles"] == 0.0
     assert location_call_by_field["require_exhaustive"] is True
     assert location_call_by_field["require_provider_set_coverage"] is False
 
