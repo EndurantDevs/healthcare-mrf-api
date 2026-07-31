@@ -181,7 +181,7 @@ async def test_v4_exact_npi_and_group_directions(monkeypatch) -> None:
         _tables(),
         "provider_group_npi",
         [first_group, second_group],
-        max_members=2,
+        max_members=None,
     ) == {
         first_group: (serving._ptg2_npi_member_id(1234567890),),
         second_group: (serving._ptg2_npi_member_id(2234567890),),
@@ -236,7 +236,7 @@ async def test_v4_exact_directions_fail_closed_for_bad_owners_and_dictionaries(
     monkeypatch.setattr(serving, "v4_npi_values_for_keys", AsyncMock(return_value={}))
     with pytest.raises(serving.PTG2ManifestArtifactError, match="missing NPI"):
         await serving._v4_shared_graph_members_many(
-            object(), _tables(), "provider_group_npi", [group_id], max_members=1
+            object(), _tables(), "provider_group_npi", [group_id], max_members=None
         )
 
 
