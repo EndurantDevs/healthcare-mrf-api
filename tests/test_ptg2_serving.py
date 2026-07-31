@@ -2692,6 +2692,55 @@ async def test_geo_cost_order_requires_exhaustive_location_selection(monkeypatch
 
     assert response["items"] == []
     assert location_call_by_field["require_exhaustive"] is True
+    assert location_call_by_field["require_provider_set_coverage"] is False
+
+
+@pytest.mark.asyncio
+async def test_g0289_geo_rate_search_uses_exact_provider_set_coverage(monkeypatch):
+    """Use rate-set witnesses instead of enumerating every broad HCPCS NPI."""
+
+    location_call_by_field = {}
+
+    async def fake_location(*_args, **kwargs):
+        location_call_by_field.update(kwargs)
+        return set(), {}
+
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_location_provider_matches",
+        fake_location,
+    )
+
+    response = await ptg2_serving._search_manifest_serving_table(
+        object(),
+        "ptg2:209901:synthetic",
+        {
+            "plan_id": "TEST-PLAN-001",
+            "code_system": "HCPCS",
+            "code": "G0289",
+            "zip5": "48201",
+            "zip_radius_miles": 30,
+            "order_by": "rate",
+        },
+        SimpleNamespace(limit=3, offset=0),
+        _strict_v3_tables(),
+        "product_search",
+    )
+
+    assert response["items"] == []
+    assert location_call_by_field["require_exhaustive"] is True
+    assert location_call_by_field["require_provider_set_coverage"] is True
+
+
+def test_g0289_does_not_inherit_a_numeric_cpt_taxonomy_rule():
+    """Keep broad HCPCS facility contexts eligible for exact geo selection."""
+
+    assert (
+        ptg2_serving._inferred_provider_taxonomy_rule(
+            {"code_system": "HCPCS", "code": "G0289"}
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

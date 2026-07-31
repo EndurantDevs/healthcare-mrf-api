@@ -4149,6 +4149,13 @@ paths:
         directory issuers, or come from CMS Doctors and Clinicians whose NPI
         attribution is anchored by an exact NPPES premise. Rate-file evidence
         proves network participation and price, not practice location.
+
+        `clinical_intent` and its `intent` alias are resolver-only inputs, not
+        pricing-search filters. To reproduce MCP orchestration directly, call
+        `/pricing/procedure-taxonomy/resolve` first. Only when
+        `recommended_mode=hard_filter`, copy `provider_filter.taxonomy_codes`,
+        `provider_filter.primary_only`, and
+        `provider_filter.include_subspecialties` into this search.
       parameters:
         - name: year
           in: query
@@ -4377,10 +4384,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingProcedureProviderListResponse'
+        '400':
+          description: Invalid raw pricing-search parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /pricing/providers/by-procedure:
     get:
       operationId: getPricingProvidersByProcedure
       summary: Find providers by procedure/service text or code
+      description: |
+        `clinical_intent` and its `intent` alias are resolver-only inputs, not
+        pricing-search filters. Call `/pricing/procedure-taxonomy/resolve`
+        first. Only when `recommended_mode=hard_filter`, copy
+        `provider_filter.taxonomy_codes`, `provider_filter.primary_only`, and
+        `provider_filter.include_subspecialties` into this search.
       parameters:
         - name: year
           in: query
@@ -4683,6 +4702,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingProcedureProviderListResponse'
+        '400':
+          description: Invalid raw pricing-search parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /pricing/providers/by-prescription:
     get:
       operationId: getPricingProvidersByPrescription

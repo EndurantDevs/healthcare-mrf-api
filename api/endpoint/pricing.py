@@ -10815,6 +10815,28 @@ async def audit_ptg2_source_witness_batch(request):
 # After the route was renamed to /by-procedure, that path fell through to
 # /providers/<npi> -> "Parameter 'npi' must be an integer", 500-ing every
 # plan-scoped pricing search. Keep the old path pointed at this handler.
+def _reject_resolver_only_procedure_search_params(args) -> None:
+    """Direct callers must resolve clinical intent before pricing search."""
+
+    resolver_only_param = next(
+        (
+            param_name
+            for param_name in ("clinical_intent", "intent")
+            if args.get(param_name) is not None
+        ),
+        None,
+    )
+    if resolver_only_param is None:
+        return
+    raise InvalidUsage(
+        f"Parameter '{resolver_only_param}' is resolver-only. Call "
+        "/pricing/procedure-taxonomy/resolve first. When "
+        "recommended_mode=hard_filter, copy provider_filter.taxonomy_codes, "
+        "provider_filter.primary_only, and "
+        "provider_filter.include_subspecialties into the pricing search."
+    )
+
+
 @blueprint.get("/providers/search-by-procedure", name="pricing.providers.search_by_procedure")
 @blueprint.get(
     "/providers/audit-search-by-procedure",
@@ -10825,6 +10847,7 @@ async def audit_ptg2_source_witness_batch(request):
 @blueprint.get("/physicians/by-service", name="pricing.physicians.by_service")
 async def list_providers_by_procedure(request):
     """List providers with pricing records matching a procedure or service code."""
+    _reject_resolver_only_procedure_search_params(request.args)
     begin_capacity_evidence(request)
     session = _get_session(request)
     args = request.args
