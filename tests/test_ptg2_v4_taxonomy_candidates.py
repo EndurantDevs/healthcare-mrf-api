@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import struct
 from types import SimpleNamespace
@@ -21,14 +24,16 @@ from process.ptg_parts import ptg2_v4_taxonomy_candidates as candidates
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
 )
-from tests.ptg2_v4_coverage_support import _metadata, _summary
+from tests.ptg2_v4_coverage_support import (
+    _metadata,
+    _summary,
+    synthetic_adaptive_layout_decision,
+)
 
 
 def test_candidate_codec_helpers_reject_noncanonical_inputs() -> None:
     rule = _rules()[0]
-    assert candidates._row_mapping(SimpleNamespace(_mapping={"key": 1})) == {
-        "key": 1
-    }
+    assert candidates._row_mapping(SimpleNamespace(_mapping={"key": 1})) == {"key": 1}
     assert candidates._row_mapping({"key": 2}) == {"key": 2}
     assert candidates._row_mapping(None) == {}
     assert candidates._digest_bytes(b"d" * 32, label="digest") == b"d" * 32
@@ -88,9 +93,12 @@ def _pattern_payload(
     member_count=1,
     body=b"",
 ) -> bytes:
-    return candidates._PATTERN_PAYLOAD_HEADER.pack(
-        magic, version, pattern_count, member_count
-    ) + body
+    return (
+        candidates._PATTERN_PAYLOAD_HEADER.pack(
+            magic, version, pattern_count, member_count
+        )
+        + body
+    )
 
 
 @pytest.mark.parametrize(
@@ -105,16 +113,12 @@ def _pattern_payload(
         (_pattern_payload(member_count=2), 1, 1),
         (_pattern_payload(), 1, 1),
         (
-            _pattern_payload(
-                body=candidates._PATTERN_PAYLOAD_RECORD.pack(1, 0)
-            ),
+            _pattern_payload(body=candidates._PATTERN_PAYLOAD_RECORD.pack(1, 0)),
             1,
             1,
         ),
         (
-            _pattern_payload(
-                body=candidates._PATTERN_PAYLOAD_RECORD.pack(1, 1)
-            ),
+            _pattern_payload(body=candidates._PATTERN_PAYLOAD_RECORD.pack(1, 1)),
             1,
             1,
         ),
@@ -252,7 +256,7 @@ def test_projection_shaper_rejects_root_projection_and_digest_drift() -> None:
         rule,
         npi_keys_by_pattern={1: (0,), 2: (2,)},
     )
-    cases = (
+    projection_cases = (
         ((direct_row,), 2, 0, "NPI root"),
         ((direct_row,), 3, 1, "projection is missing"),
         ((pattern_row,), 3, 2, "pattern root"),
@@ -265,12 +269,17 @@ def test_projection_shaper_rejects_root_projection_and_digest_drift() -> None:
         (({**direct_row, "catalog_contract": "bad"},), 3, 0, "manifest changed"),
         (({**direct_row, "vector_format": "bad"},), 3, 0, "manifest changed"),
         (({**direct_row, "member_digest": b"x" * 32},), 3, 0, "manifest changed"),
-        (({**direct_row, "pattern_member_digest": b"x" * 32},), 3, 0, "manifest changed"),
+        (
+            ({**direct_row, "pattern_member_digest": b"x" * 32},),
+            3,
+            0,
+            "manifest changed",
+        ),
     )
-    for rows, npi_count, pattern_count, message in cases:
+    for projection_rows, npi_count, pattern_count, message in projection_cases:
         with pytest.raises(RuntimeError, match=message):
             candidates.shape_v4_inferred_taxonomy_projection_manifest(
-                rows,
+                projection_rows,
                 npi_count=npi_count,
                 pattern_count=pattern_count,
             )
@@ -300,10 +309,9 @@ class _PublicationSession:
     def __init__(
         self,
         *,
-        catalog_rows_by_codes: dict[
-            tuple[str, ...], tuple[dict[str, Any], ...]
-        ]
-        | None = None,
+        catalog_rows_by_codes: (
+            dict[tuple[str, ...], tuple[dict[str, Any], ...]] | None
+        ) = None,
     ) -> None:
         self.catalog_sql = ""
         self.catalog_calls: list[dict[str, Any]] = []
@@ -344,13 +352,303 @@ class _PublicationSession:
         if "ARRAY_AGG" in sql:
             return self._execute_catalog_query(sql, parameters)
         if "INSERT INTO" in sql:
-            self.stored_rows = [
-                dict(stored_row) for stored_row in parameters
-            ]
+            self.stored_rows = [dict(stored_row) for stored_row in parameters]
             return _Result()
         if "SELECT rule_digest" in sql:
             return _Result(self.stored_rows)
         raise AssertionError(f"unexpected SQL: {sql}")
+
+
+def _compiler_rules() -> tuple[InferredProviderTaxonomyRule, ...]:
+    return tuple(
+        InferredProviderTaxonomyRule(
+            ranges=((index * 10, index * 10 + 9),),
+            taxonomy_codes=(f"T{index:02d}",),
+            display_terms=(f"compiler rule {index}",),
+        )
+        for index in range(10)
+    )
+
+
+class _PreparedCompilerInputSession:
+    def __init__(self, *, common_count: int, observe_count: int) -> None:
+        self.common_count = common_count
+        self.observe_count = observe_count
+        self.calls: list[tuple[str, Any]] = []
+
+    async def execute(self, statement, parameters=None):
+        sql = str(statement)
+        self.calls.append((sql, parameters))
+        if "current_setting('transaction_isolation')" in sql:
+            return _Result(({"isolation": "repeatable read", "read_only": "on"},))
+        code = tuple(parameters["taxonomy_codes"])[0]
+        rule_index = int(code[1:])
+        row_count = self.common_count if rule_index < 5 else self.observe_count
+        return _Result(
+            {
+                "npi_key": npi_key,
+                "npi": 1_000_000_000 + npi_key,
+                "matched_taxonomy_codes": [code],
+            }
+            for npi_key in range(row_count)
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepared_compiler_input_reads_ten_rules_once_and_fsyncs(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Prepare five retained and five bounded observe vectors in one snapshot."""
+
+    monkeypatch.setattr(
+        candidates,
+        "PTG2_V4_MAX_ONLINE_INFERRED_TAXONOMY_CANDIDATES",
+        1,
+    )
+    session = _PreparedCompilerInputSession(
+        common_count=1,
+        observe_count=2,
+    )
+    artifact_path = tmp_path / "taxonomy-members.u32le"
+    prepared = await candidates.prepare_v4_inferred_taxonomy_compiler_input(
+        session,
+        schema_name="mrf",
+        npi_scope_stage_table="ptg2_v4_npi_scope_test",
+        npi_scope_sha256="a" * 64,
+        rules=_compiler_rules(),
+        members_path=artifact_path,
+    )
+
+    assert prepared["contract"] == ("ptg2_v4_inferred_taxonomy_compiler_input_v1")
+    assert prepared["npi_scope_sha256"] == "a" * 64
+    assert len(prepared["rules"]) == 10
+    assert sorted(rule["member_count"] for rule in prepared["rules"]) == (
+        [1] * 5 + [2] * 5
+    )
+    assert prepared["members"]["byte_count"] == 60
+    assert (
+        prepared["members"]["sha256"]
+        == hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    )
+    assert os.stat(artifact_path).st_mode & 0o777 == 0o600
+    assert "current_setting('transaction_isolation')" in session.calls[0][0]
+    catalog_calls = session.calls[1:]
+    assert len(catalog_calls) == 10
+    assert all("ptg2_v4_npi_scope_test" in sql for sql, _ in catalog_calls)
+    assert {parameters["candidate_limit"] for _sql, parameters in catalog_calls} == {2}
+    expected_offset = 0
+    for rule in prepared["rules"]:
+        assert rule["member_offset_bytes"] == expected_offset
+        assert rule["member_byte_count"] == rule["member_count"] * 4
+        expected_offset += rule["member_byte_count"]
+    assert expected_offset == prepared["members"]["byte_count"]
+
+
+@pytest.mark.asyncio
+async def test_prepared_compiler_input_does_not_replace_existing_artifact(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        candidates,
+        "PTG2_V4_MAX_ONLINE_INFERRED_TAXONOMY_CANDIDATES",
+        1,
+    )
+    artifact_path = tmp_path / "taxonomy-members.u32le"
+    artifact_path.write_bytes(b"retained")
+    with pytest.raises(FileExistsError):
+        await candidates.prepare_v4_inferred_taxonomy_compiler_input(
+            _PreparedCompilerInputSession(
+                common_count=1,
+                observe_count=2,
+            ),
+            schema_name="mrf",
+            npi_scope_stage_table="ptg2_v4_npi_scope_test",
+            npi_scope_sha256="a" * 64,
+            rules=_compiler_rules(),
+            members_path=artifact_path,
+        )
+    assert artifact_path.read_bytes() == b"retained"
+
+
+@pytest.mark.asyncio
+async def test_prepared_compiler_input_rejects_dangling_member_symlink(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        candidates,
+        "PTG2_V4_MAX_ONLINE_INFERRED_TAXONOMY_CANDIDATES",
+        1,
+    )
+    artifact_path = tmp_path / "taxonomy-members.u32le"
+    artifact_path.symlink_to(tmp_path / "missing-members")
+    with pytest.raises(RuntimeError, match="member artifact is unsafe"):
+        await candidates.prepare_v4_taxonomy_input(
+            _PreparedCompilerInputSession(
+                common_count=1,
+                observe_count=2,
+            ),
+            schema_name="mrf",
+            npi_scope_stage_table="ptg2_v4_npi_scope_test",
+            npi_scope_sha256="a" * 64,
+            rules=_compiler_rules(),
+            members_path=artifact_path,
+        )
+    assert artifact_path.is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_prepared_compiler_input_requires_stable_read_transaction(
+    tmp_path,
+) -> None:
+    session = _ScriptedSession(
+        _Result(({"isolation": "read committed", "read_only": "off"},))
+    )
+    with pytest.raises(RuntimeError, match="transaction is not stable"):
+        await candidates.prepare_v4_taxonomy_input(
+            session,
+            schema_name="mrf",
+            npi_scope_stage_table="ptg2_v4_npi_scope_test",
+            npi_scope_sha256="a" * 64,
+            rules=_compiler_rules(),
+            members_path=tmp_path / "taxonomy-members.u32le",
+        )
+    assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_prepared_publication_uses_only_selected_copy_rows(
+    monkeypatch,
+) -> None:
+    """Publish an exact staged COPY without issuing a mutable catalog query."""
+
+    monkeypatch.setattr(
+        snapshot_maps,
+        "lock_v4_shared_layout_for_map_write",
+        _noop_map_write_lock,
+    )
+    rules = _compiler_rules()
+    stage_rows = tuple(
+        sorted(
+            (_projection_row(rule, npi_keys=(0,)) for rule in rules),
+            key=lambda row: row["rule_digest"],
+        )
+    )
+    session = _ScriptedSession(
+        _Result(stage_rows),
+        _Result(),
+        _Result(stage_rows),
+    )
+    publication = await candidates.publish_prepared_v4_inferred_taxonomy_candidates(
+        session,
+        schema_name="mrf",
+        snapshot_key=41,
+        build_token="build-token",
+        stage_table="ptg2_v4_taxonomy_selected_test",
+        rules=rules,
+        npi_count=1,
+        pattern_count=0,
+    )
+
+    assert publication.rule_count == 10
+    assert publication.member_count == 10
+    assert publication.observe_only_rule_count == 0
+    sql_calls = tuple(sql for sql, _parameters in session.calls)
+    assert len(sql_calls) == 3
+    assert all("npi_taxonomy" not in sql for sql in sql_calls)
+    assert "ptg2_v4_taxonomy_selected_test" in sql_calls[0]
+    assert "INSERT INTO" in sql_calls[1]
+    assert "ptg2_v4_inferred_taxonomy_candidate" in sql_calls[1]
+
+
+@pytest.mark.asyncio
+async def test_compiler_copy_stage_reauthenticates_and_drops_on_drift(
+    tmp_path,
+) -> None:
+    """Do not retain a stage when the selected COPY differs from its summary."""
+
+    copy_path = tmp_path / "selected.copy"
+    copy_path.write_bytes(b"compiler-selected-copy")
+    session = _ScriptedSession(_Result(), _Result())
+    with pytest.raises(RuntimeError, match="COPY changed"):
+        await candidates.stage_v4_inferred_taxonomy_compiler_copy(
+            session,
+            copy_path=copy_path,
+            expected_byte_count=copy_path.stat().st_size,
+            expected_sha256="0" * 64,
+        )
+
+    sql_calls = tuple(sql for sql, _parameters in session.calls)
+    assert len(sql_calls) == 2
+    assert "CREATE TEMP TABLE" in sql_calls[0]
+    assert "ON COMMIT DROP" in sql_calls[0]
+    assert 'DROP TABLE IF EXISTS "pg_temp"' in sql_calls[1]
+
+
+@pytest.mark.asyncio
+async def test_compiler_copy_stage_rejects_dangling_symlink(
+    tmp_path,
+) -> None:
+    copy_path = tmp_path / "selected.copy"
+    copy_path.symlink_to(tmp_path / "missing.copy")
+    with pytest.raises(RuntimeError, match="compiler COPY is invalid"):
+        await candidates.stage_v4_taxonomy_copy(
+            object(),
+            copy_path=copy_path,
+            expected_byte_count=1,
+            expected_sha256="0" * 64,
+        )
+    assert copy_path.is_symlink()
+
+
+@pytest.mark.parametrize("exit_mode", ("success", "failure", "cancel"))
+@pytest.mark.asyncio
+async def test_managed_compiler_copy_stage_always_drops(
+    monkeypatch,
+    tmp_path,
+    exit_mode,
+) -> None:
+    stage = candidates.V4InferredTaxonomyCopyStage(
+        table_name="ptg2_v4_taxonomy_test",
+        copy_path=tmp_path / "selected.copy",
+        byte_count=7,
+        row_count=10,
+    )
+    create_stage = AsyncMock(return_value=stage)
+    drop_stage = AsyncMock()
+    monkeypatch.setattr(candidates, "stage_v4_taxonomy_copy", create_stage)
+    monkeypatch.setattr(candidates, "remove_v4_taxonomy_stage", drop_stage)
+
+    async def use_stage() -> None:
+        async with candidates.managed_v4_taxonomy_copy_stage(
+            object(),
+            copy_path=stage.copy_path,
+            expected_byte_count=7,
+            expected_sha256="a" * 64,
+        ) as opened_stage:
+            assert opened_stage is stage
+            if exit_mode == "failure":
+                raise ValueError("injected publication failure")
+            if exit_mode == "cancel":
+                raise asyncio.CancelledError
+
+    if exit_mode == "failure":
+        with pytest.raises(ValueError, match="injected"):
+            await use_stage()
+    elif exit_mode == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await use_stage()
+    else:
+        await use_stage()
+
+    create_stage.assert_awaited_once()
+    created_session = create_stage.await_args.args[0]
+    drop_stage.assert_awaited_once_with(
+        created_session,
+        stage_table=stage.table_name,
+    )
 
 
 def _rules() -> tuple[InferredProviderTaxonomyRule, ...]:
@@ -415,12 +713,8 @@ def _tampered_pattern_projection():
         _rules()[0],
         npi_keys_by_pattern={9: (0, 2)},
     )
-    pattern_manifest = candidates._candidate_projection_manifest(
-        (pattern_row,)
-    )
-    tampered_pattern_payload = bytearray(
-        pattern_row["pattern_member_payload"]
-    )
+    pattern_manifest = candidates._candidate_projection_manifest((pattern_row,))
+    tampered_pattern_payload = bytearray(pattern_row["pattern_member_payload"])
     tampered_pattern_payload[-1] ^= 1
     pattern_session = _ScriptedSession(
         _Result(
@@ -442,15 +736,16 @@ def _assert_direct_publication_contract(publication, session) -> None:
         ("AAA",),
         ("BBB",),
     }
-    assert {call["candidate_limit"] for call in session.catalog_calls} == {
-        37_001
-    }
+    assert {call["candidate_limit"] for call in session.catalog_calls} == {37_001}
     assert publication.rule_count == 2
     assert publication.member_count == 3
     assert publication.packed_byte_count == 12
-    assert candidates.validate_v4_inferred_taxonomy_projection_manifest(
-        publication.manifest
-    ) == publication.manifest
+    assert (
+        candidates.validate_v4_inferred_taxonomy_projection_manifest(
+            publication.manifest
+        )
+        == publication.manifest
+    )
     expected_caps_by_name = {
         "max_online_filtered_reverse_code_sets": 6_600,
         "max_online_filtered_reverse_code_occurrences": 6_700,
@@ -468,8 +763,7 @@ def _assert_direct_publication_contract(publication, session) -> None:
         name: publication.manifest[name] for name in expected_caps_by_name
     } == expected_caps_by_name
     assert {
-        stored_projection["representation"]
-        for stored_projection in session.stored_rows
+        stored_projection["representation"] for stored_projection in session.stored_rows
     } == {"direct_v1"}
 
 
@@ -490,14 +784,11 @@ def _projection_row(
         else candidates.PTG2_V4_INFERRED_TAXONOMY_DIRECT_REPRESENTATION
     )
     pattern_member_count = sum(
-        len(pattern_npi_keys)
-        for pattern_npi_keys in pattern_members.values()
+        len(pattern_npi_keys) for pattern_npi_keys in pattern_members.values()
     )
     return {
         "rule_digest": rule_digest,
-        "catalog_contract": (
-            candidates.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT
-        ),
+        "catalog_contract": (candidates.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT),
         "catalog_digest": b"c" * 32,
         "vector_format": candidates.PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT,
         "member_count": len(npi_keys),
@@ -530,14 +821,10 @@ def _observe_projection_row(
 ) -> dict[str, Any]:
     rule_digest = candidates.inferred_provider_taxonomy_rule_digest(rule)
     member_payload = candidates.pack_inferred_taxonomy_npi_keys(npi_keys)
-    representation = (
-        candidates.PTG2_V4_INFERRED_TAXONOMY_OBSERVE_REPRESENTATION
-    )
+    representation = candidates.PTG2_V4_INFERRED_TAXONOMY_OBSERVE_REPRESENTATION
     return {
         "rule_digest": rule_digest,
-        "catalog_contract": (
-            candidates.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT
-        ),
+        "catalog_contract": (candidates.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT),
         "catalog_digest": b"o" * 32,
         "vector_format": candidates.PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT,
         "member_count": len(npi_keys),
@@ -548,9 +835,7 @@ def _observe_projection_row(
         ),
         "member_keys": member_payload,
         "representation": representation,
-        "observe_reason": (
-            candidates.PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_CAP_REASON
-        ),
+        "observe_reason": (candidates.PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_CAP_REASON),
         "observe_count_lower_bound": len(npi_keys),
         "pattern_count": 0,
         "pattern_member_count": 0,
@@ -611,9 +896,7 @@ def _reader_row(
     root_pattern_count: int | None = None,
 ) -> dict[str, Any]:
     candidate_payload = (
-        projection_row["member_keys"]
-        if member_keys is None
-        else member_keys
+        projection_row["member_keys"] if member_keys is None else member_keys
     )
     pattern_payload = (
         projection_row["pattern_member_payload"]
@@ -710,9 +993,7 @@ async def test_publication_rejects_invalid_catalog_evidence(
         "lock_v4_shared_layout_for_map_write",
         no_op_lock,
     )
-    session = _PublicationSession(
-        catalog_rows_by_codes={("AAA",): (catalog_row,)}
-    )
+    session = _PublicationSession(catalog_rows_by_codes={("AAA",): (catalog_row,)})
     with pytest.raises(RuntimeError, match=message):
         await candidates.publish_v4_inferred_taxonomy_candidates(
             session,
@@ -787,9 +1068,7 @@ async def test_publication_accepts_rule_scoped_pattern_projection(
         "lookup_building_v4_relation_members",
         lookup_building_patterns,
     )
-    first_rule_digest = candidates.inferred_provider_taxonomy_rule_digest(
-        _rules()[0]
-    )
+    first_rule_digest = candidates.inferred_provider_taxonomy_rule_digest(_rules()[0])
     session = _PublicationSession()
     publication = await _publish_candidate_projection(
         session,
@@ -798,8 +1077,7 @@ async def test_publication_accepts_rule_scoped_pattern_projection(
     )
 
     row_by_rule_digest = {
-        stored_row["rule_digest"]: stored_row
-        for stored_row in session.stored_rows
+        stored_row["rule_digest"]: stored_row for stored_row in session.stored_rows
     }
     factored = row_by_rule_digest[first_rule_digest]
     assert factored["representation"] == "pattern_v1"
@@ -812,16 +1090,14 @@ async def test_publication_accepts_rule_scoped_pattern_projection(
     ) == {2: (0, 2), 9: (0,)}
     assert publication.pattern_count == 3
     assert publication.pattern_member_count == 4
-    assert {
-        stored_row["representation"] for stored_row in session.stored_rows
-    } == {"pattern_v1"}
+    assert {stored_row["representation"] for stored_row in session.stored_rows} == {
+        "pattern_v1"
+    }
     assert len(graph_calls) == 2
     assert all(call["relation"] == "npi_patterns" for call in graph_calls)
     assert all(call["build_token"] == "build-token" for call in graph_calls)
     assert all(call["snapshot_key"] == 41 for call in graph_calls)
-    assert all(
-        call["max_members"] == 131_072 for call in graph_calls
-    )
+    assert all(call["max_members"] == 131_072 for call in graph_calls)
 
 
 @pytest.mark.asyncio
@@ -854,23 +1130,20 @@ async def test_publication_bounds_rule_catalog_before_materialization(
     )
 
     assert all(call["candidate_limit"] == 2 for call in session.catalog_calls)
-    assert all(
-        len(call["taxonomy_codes"]) == 1 for call in session.catalog_calls
-    )
+    assert all(len(call["taxonomy_codes"]) == 1 for call in session.catalog_calls)
     assert publication.rule_count == 1
     assert publication.observe_only_rule_count == 1
-    assert {
-        stored_row["representation"] for stored_row in session.stored_rows
-    } == {"direct_v1", "observe_v1"}
-    assert publication.manifest["observe_only_rules"][0]["status"] == (
-        "observe_only"
-    )
+    assert {stored_row["representation"] for stored_row in session.stored_rows} == {
+        "direct_v1",
+        "observe_v1",
+    }
+    assert publication.manifest["observe_only_rules"][0]["status"] == ("observe_only")
     assert publication.manifest["observe_only_rules"][0]["reason"] == (
         "candidate_cap_exceeded"
     )
-    assert publication.manifest["observe_only_rules"][0][
-        "observed_count_lower_bound"
-    ] == 2
+    assert (
+        publication.manifest["observe_only_rules"][0]["observed_count_lower_bound"] == 2
+    )
     summarized = await candidates.summarize_v4_inferred_taxonomy_candidates(
         session,
         schema_name="mrf",
@@ -934,12 +1207,15 @@ async def test_publication_can_seal_an_all_observe_rule_set(monkeypatch) -> None
     assert publication.observe_only_rule_count == 2
     assert publication.manifest["rules"] == []
     assert len(publication.manifest["observe_only_rules"]) == 2
-    assert {
-        stored_row["representation"] for stored_row in session.stored_rows
-    } == {"observe_v1"}
-    assert candidates.validate_v4_inferred_taxonomy_projection_manifest(
-        publication.manifest
-    ) == publication.manifest
+    assert {stored_row["representation"] for stored_row in session.stored_rows} == {
+        "observe_v1"
+    }
+    assert (
+        candidates.validate_v4_inferred_taxonomy_projection_manifest(
+            publication.manifest
+        )
+        == publication.manifest
+    )
 
 
 @pytest.mark.asyncio
@@ -1052,8 +1328,7 @@ async def test_pattern_publication_empty_evidence_is_explicit(
     assert publication.member_count == 0
     assert publication.pattern_member_count == 0
     assert {
-        stored_row["representation"]
-        for stored_row in empty_session.stored_rows
+        stored_row["representation"] for stored_row in empty_session.stored_rows
     } == {"direct_v1"}
 
 
@@ -1120,14 +1395,17 @@ async def test_pattern_projection_short_circuits_empty_and_rejects_gaps(
 ) -> None:
     """Avoid graph work for empty candidates and reject incomplete graph replies."""
 
-    assert await candidates._candidate_pattern_postings_for_rule(
-        object(),
-        schema_name="mrf",
-        snapshot_key=41,
-        build_token="build-token",
-        candidate_npi_keys=(),
-        root_pattern_count=3,
-    ) == {}
+    assert (
+        await candidates._candidate_pattern_postings_for_rule(
+            object(),
+            schema_name="mrf",
+            snapshot_key=41,
+            build_token="build-token",
+            candidate_npi_keys=(),
+            root_pattern_count=3,
+        )
+        == {}
+    )
     monkeypatch.setattr(
         v4_graph,
         "lookup_building_v4_relation_members",
@@ -1249,9 +1527,7 @@ def test_manifest_validator_enforces_per_rule_caps(cap_field: str) -> None:
     manifest[cap_field] = 1
 
     with pytest.raises(PTG2ManifestArtifactError, match="projection rule"):
-        candidates.validate_v4_inferred_taxonomy_projection_manifest(
-            manifest
-        )
+        candidates.validate_v4_inferred_taxonomy_projection_manifest(manifest)
 
 
 def test_observe_rule_is_explicit_fallback_and_status_is_authenticated(
@@ -1269,10 +1545,13 @@ def test_observe_rule_is_explicit_fallback_and_status_is_authenticated(
         pattern_count=0,
     )
 
-    assert candidates.resolve_inferred_taxonomy_projection_rule_manifest(
-        manifest,
-        observe_row["rule_digest"],
-    ) is None
+    assert (
+        candidates.resolve_inferred_taxonomy_projection_rule_manifest(
+            manifest,
+            observe_row["rule_digest"],
+        )
+        is None
+    )
     with pytest.raises(PTG2ManifestArtifactError, match="observe-only"):
         candidates.inferred_taxonomy_projection_rule_manifest(
             manifest,
@@ -1403,9 +1682,7 @@ async def test_reader_rejects_manifest_payload_and_cap_tamper() -> None:
         payload_session, projection_row, manifest, "digest changed"
     )
 
-    pattern_row, pattern_manifest, pattern_session = (
-        _tampered_pattern_projection()
-    )
+    pattern_row, pattern_manifest, pattern_session = _tampered_pattern_projection()
     await _assert_candidate_load_rejected(
         pattern_session,
         pattern_row,
@@ -1476,7 +1753,14 @@ def _sealed_taxonomy_reservation_fixture() -> tuple[
         inferred_taxonomy_candidates=projection,
     )
     layout_manifest = snapshot_maps._manifest_with_v4_root(
-        {},
+        {
+            "serving_index": {
+                "provider_graph": {
+                    "representation": "pattern_v1",
+                    "adaptive_layout": synthetic_adaptive_layout_decision(),
+                }
+            }
+        },
         representation="pattern_v1",
         summary=summary,
         metadata=metadata,
@@ -1510,10 +1794,9 @@ def test_seal_and_reuse_validation_reject_projection_manifest_drift() -> None:
     """Sealed reuse rejects a taxonomy projection changed after publication."""
 
     layout_manifest, existing_root_map = _sealed_taxonomy_reservation_fixture()
-    assert snapshot_maps._validate_sealed_reservation(
-        existing_root_map
-    ) == layout_manifest
-
+    assert (
+        snapshot_maps._validate_sealed_reservation(existing_root_map) == layout_manifest
+    )
 
     tampered = deepcopy(existing_root_map)
     projection_manifest = tampered["layout_manifest"]["serving_index"][
@@ -1529,12 +1812,8 @@ def test_sealed_reservation_without_snapshot_map_has_no_object_kinds() -> None:
 
     _, existing_root_map = _sealed_taxonomy_reservation_fixture()
     absent_snapshot_map = deepcopy(existing_root_map)
-    absent_snapshot_map["layout_manifest"]["serving_index"].pop(
-        "snapshot_map"
-    )
-    _, absent_map_summary, _ = snapshot_maps._sealed_root_summaries(
-        absent_snapshot_map
-    )
+    absent_snapshot_map["layout_manifest"]["serving_index"].pop("snapshot_map")
+    _, absent_map_summary, _ = snapshot_maps._sealed_root_summaries(absent_snapshot_map)
     assert absent_map_summary.object_kinds == ()
 
 
@@ -1574,9 +1853,7 @@ def test_migration_installs_guard_and_cascading_snapshot_ownership() -> None:
     migration.op = recorder
     migration._schema = lambda: "mrf"
     migration.upgrade()
-    upgrade_sql = " ".join(
-        " ".join(statement.split()) for statement in recorder.sql
-    )
+    upgrade_sql = " ".join(" ".join(statement.split()) for statement in recorder.sql)
     assert "ptg2_v4_inferred_taxonomy_candidate_root_fkey" in upgrade_sql
     assert "ON DELETE CASCADE" in upgrade_sql
     assert "guard_ptg2_v4_snapshot_metadata" in upgrade_sql

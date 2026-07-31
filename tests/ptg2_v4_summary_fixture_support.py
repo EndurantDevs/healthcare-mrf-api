@@ -13,7 +13,10 @@ EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _DIRECT_RELATIONS = ("set_components", "set_npi_prefix_override")
 _EMPTY_OBSERVE_NAMES = """
 maximum_patterns_per_set maximum_components_per_set pattern_overflow_set_count
-maximum_components_per_pattern_overflow_set unsafe_pattern_component_set_count
+maximum_components_per_pattern_overflow_set
+pattern_component_over_cap_set_count
+pattern_component_over_cap_prefix_covered_set_count
+unsafe_pattern_component_set_count
 provider_set_count npi_prefix_group_unsafe_set_count
 npi_prefix_physical_unsafe_set_count npi_prefix_simulated_set_count
 npi_prefix_override_owner_count npi_prefix_override_member_count
@@ -39,9 +42,7 @@ _COPY_ARTIFACT_NAMES = (
 def empty_observe_fixture() -> dict[str, Any]:
     """Build internally consistent diagnostics for an empty graph."""
 
-    observed_by_name: dict[str, Any] = {
-        name: 0 for name in _EMPTY_OBSERVE_NAMES
-    }
+    observed_by_name: dict[str, Any] = {name: 0 for name in _EMPTY_OBSERVE_NAMES}
     for suffix in ("p50", "p95", "p99", "max"):
         observed_by_name[f"npi_prefix_groups_to_target_{suffix}"] = 0
     for suffix in ("p50", "p95", "p99"):
@@ -113,9 +114,7 @@ def empty_tax_identity_summary() -> dict[str, Any]:
         "token_policy_descriptor_sha256": policy_digest,
         "normalization_contract": compiler._TAX_IDENTITY_NORMALIZATION_CONTRACT,
         "hmac_contract": compiler._TAX_IDENTITY_HMAC_CONTRACT,
-        "candidate_prefix_contract": (
-            compiler._TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT
-        ),
+        "candidate_prefix_contract": (compiler._TAX_IDENTITY_CANDIDATE_PREFIX_CONTRACT),
         "authority_contract": compiler._TAX_IDENTITY_AUTHORITY_CONTRACT,
         "source_ordinal_contract": compiler._TAX_SOURCE_ORDINAL_CONTRACT,
         "source_ordinal_map": [{"shard_id": "source", "ordinal": 0}],
@@ -203,12 +202,19 @@ def pattern_summary_fixture(
             "row_count": 0,
         }
     )
-    selected_bytes = int(changed["selected_encoded_bytes"]) + len(pattern_payload)
+    selected_graph_bytes = int(changed["selected_graph_encoded_bytes"]) + len(
+        pattern_payload
+    )
+    mapping_bytes = int(changed["pattern_mapping_persistence_encoded_bytes"])
+    selected_bytes = selected_graph_bytes + mapping_bytes
     changed.update(
         {
             "selected_layout": "pattern",
+            "direct_graph_encoded_bytes": selected_graph_bytes + 1,
+            "pattern_graph_encoded_bytes": selected_graph_bytes,
             "direct_complete_encoded_bytes": selected_bytes + 1,
             "pattern_complete_encoded_bytes": selected_bytes,
+            "selected_graph_encoded_bytes": selected_graph_bytes,
             "selected_encoded_bytes": selected_bytes,
             "pattern_copy_path": str(pattern_path),
         }

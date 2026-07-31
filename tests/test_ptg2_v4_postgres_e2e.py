@@ -24,6 +24,7 @@ import sqlalchemy as sa
 
 from api import ptg2_candidate_audit_v4 as candidate_v4
 from api import ptg2_v4_graph as graph
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
 )
@@ -36,6 +37,7 @@ from process.ptg_parts import (
     frozen_rate_binding_store,
     ptg2_shared_publish,
     ptg2_v4_audit,
+    ptg2_v4_taxonomy_candidates,
     source_download,
 )
 from process.ptg_parts import ptg2_shared_snapshot_publish as snapshot_publish
@@ -69,6 +71,7 @@ from process.ptg_parts.ptg2_shared_gc import (
     abandon_owned_v4_layout,
 )
 from process.ptg_parts.ptg2_v4_graph_compiler import (
+    V4GraphCompilationResult,
     compile_provider_graph_v4_rust,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
@@ -82,7 +85,12 @@ from tests.ptg2_v4_migration_catalog_support import (
     attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
 )
-from tests.ptg2_v4_graph_compiler_test_support import _write_tax_identity
+from tests.ptg2_v4_graph_compiler_test_support import (
+    _write_membership as _write_compiler_membership,
+    _write_npi_scope,
+    _write_tax_identity,
+    compiler_inputs as _compiler_inputs,
+)
 from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 from tests import test_ptg2_scanner_v3_runs as scanner_support
 
@@ -90,22 +98,13 @@ from tests import test_ptg2_scanner_v3_runs as scanner_support
 ROOT = Path(__file__).resolve().parents[1]
 ptg_candidate_audit = importlib.import_module("process.ptg_candidate_audit")
 MIGRATION_PATH = (
-    ROOT
-    / "alembic"
-    / "versions"
-    / "20260723100000_ptg2_v4_snapshot_map_pack.py"
+    ROOT / "alembic" / "versions" / "20260723100000_ptg2_v4_snapshot_map_pack.py"
 )
 TAXONOMY_MIGRATION_PATH = (
-    ROOT
-    / "alembic"
-    / "versions"
-    / "20260724120000_ptg2_v4_taxonomy_candidates.py"
+    ROOT / "alembic" / "versions" / "20260724120000_ptg2_v4_taxonomy_candidates.py"
 )
 TAX_IDENTITY_MIGRATION_PATH = (
-    ROOT
-    / "alembic"
-    / "versions"
-    / "20260727100000_ptg2_provider_tax_identity.py"
+    ROOT / "alembic" / "versions" / "20260727100000_ptg2_provider_tax_identity.py"
 )
 _STANDARD_FORMAT = (
     "magic8:uint32_le_version:uint64_le_entry_count:"
@@ -179,8 +178,7 @@ def _write_membership(
     for owner, member in pairs:
         by_owner.setdefault(owner, set()).add(member)
     normalized_memberships = [
-        (owner, sorted(members))
-        for owner, members in sorted(by_owner.items())
+        (owner, sorted(members)) for owner, members in sorted(by_owner.items())
     ]
     membership_payload = bytearray(b"PTG2MNSC")
     membership_payload.extend(struct.pack("<IQ", 1, len(normalized_memberships)))
@@ -205,6 +203,98 @@ def _write_membership(
     }
 
 
+def _npi_scope_artifacts(
+    tmp_path: Path,
+    *,
+    prefix: str,
+    npi_group_pairs: list[tuple[bytes, bytes]],
+) -> list[dict[str, object]]:
+    reciprocal = _write_compiler_membership(
+        tmp_path / f"{prefix}npi-group.sidecar",
+        name="provider_npi_group",
+        shard_id="postgres-e2e",
+        pairs=npi_group_pairs,
+        dense=True,
+    )
+    npi_values = sorted(
+        {int.from_bytes(owner[8:], "big") for owner, _group in npi_group_pairs}
+    )
+    return [
+        reciprocal,
+        _write_npi_scope(
+            tmp_path / f"{prefix}npi-scope.copy",
+            shard_id="postgres-e2e",
+            reciprocal=reciprocal,
+            npis=npi_values,
+        ),
+    ]
+
+
+async def _publication_compiler_inputs(
+    tmp_path: Path,
+    artifacts: list[dict[str, object]],
+):
+    npi_scope, _unused_taxonomy = await _compiler_inputs(tmp_path, artifacts)
+    members_path = tmp_path / "publication-taxonomy-members.u32le"
+    members_path.write_bytes(b"")
+    rule_digests = sorted(
+        ptg2_v4_taxonomy_candidates.inferred_provider_taxonomy_rule_digest(rule)
+        for rule in INFERRED_PROVIDER_TAXONOMY_RULES
+    )
+    return npi_scope, {
+        "contract": ("ptg2_v4_inferred_taxonomy_compiler_input_v1"),
+        "catalog_contract": "snapshot_npi_live_catalog_individual_v1",
+        "vector_format": "sorted_u32le_v1",
+        "npi_scope_sha256": npi_scope.manifest["output_sha256"],
+        "rule_set_digest": (
+            ptg2_v4_taxonomy_candidates.inferred_provider_taxonomy_rule_set_digest(
+                INFERRED_PROVIDER_TAXONOMY_RULES
+            ).hex()
+        ),
+        "members": {
+            "path": str(members_path),
+            "byte_count": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        },
+        "rules": [
+            {
+                "rule_digest": rule_digest.hex(),
+                "catalog_digest": hashlib.sha256(
+                    b"postgres-e2e-catalog:" + rule_digest
+                ).hexdigest(),
+                "member_count": 0,
+                "member_offset_bytes": 0,
+                "member_byte_count": 0,
+            }
+            for rule_digest in rule_digests
+        ],
+    }
+
+
+async def _compile_publication_fixture(
+    tmp_path: Path,
+    artifacts: list[dict[str, object]],
+    provider_map: Path,
+    *,
+    output_name: str,
+    options: dict[str, int] | None = None,
+) -> V4GraphCompilationResult:
+    binary_path = _compiler_binary()
+    assert binary_path.is_file(), f"missing V4 compiler binary: {binary_path}"
+    npi_scope, inferred_taxonomy = await _publication_compiler_inputs(
+        tmp_path, artifacts
+    )
+    return await compile_provider_graph_v4_rust(
+        graph_artifact_entries=artifacts,
+        provider_set_key_map_path=provider_map,
+        npi_scope=npi_scope,
+        inferred_taxonomy=inferred_taxonomy,
+        output_directory=tmp_path / output_name,
+        options=options,
+        binary_path=binary_path,
+    )
+
+
 def _factor_fixture(tmp_path: Path) -> tuple[list[dict[str, object]], Path]:
     component = _global(2, 1)
     groups = [_global(3, index + 1) for index in range(_GROUP_COUNT)]
@@ -226,10 +316,10 @@ def _factor_fixture(tmp_path: Path) -> tuple[list[dict[str, object]], Path]:
             name="provider_group_npi",
             pairs=[(group, npi) for group in groups],
         ),
-        _write_membership(
-            tmp_path / "npi-group.sidecar",
-            name="provider_npi_group",
-            pairs=[(npi, group) for group in groups],
+        *_npi_scope_artifacts(
+            tmp_path,
+            prefix="",
+            npi_group_pairs=[(npi, group) for group in groups],
         ),
         _write_tax_identity(
             tmp_path / "group-tax-identity.sidecar",
@@ -271,10 +361,10 @@ def _direct_factor_fixture(
             name="provider_group_npi",
             pairs=list(zip(groups, npis, strict=True)),
         ),
-        _write_membership(
-            tmp_path / "direct-npi-group.sidecar",
-            name="provider_npi_group",
-            pairs=list(zip(npis, groups, strict=True)),
+        *_npi_scope_artifacts(
+            tmp_path,
+            prefix="direct-",
+            npi_group_pairs=list(zip(npis, groups, strict=True)),
         ),
         _write_tax_identity(
             tmp_path / "direct-group-tax-identity.sidecar",
@@ -302,9 +392,7 @@ class _FrozenScanBatch:
 
 
 def _multipart_scanner_payloads() -> tuple[dict[str, object], ...]:
-    first_payload = scanner_support._fixture_payload(
-        provider_references_first=True
-    )
+    first_payload = scanner_support._fixture_payload(provider_references_first=True)
     second_payload = copy.deepcopy(first_payload)
     second_payload["provider_references"][0]["provider_group_id"] = 2
     second_payload["provider_references"][0]["provider_groups"][0]["npi"] = [
@@ -316,9 +404,7 @@ def _multipart_scanner_payloads() -> tuple[dict[str, object], ...]:
         "value": "98-7654321",
     }
     second_payload["in_network"][0]["billing_code"] = "99214"
-    second_payload["in_network"][0]["negotiated_rates"][0][
-        "provider_references"
-    ] = [2]
+    second_payload["in_network"][0]["negotiated_rates"][0]["provider_references"] = [2]
     return first_payload, second_payload
 
 
@@ -328,10 +414,7 @@ def _frozen_descriptor(
     ordinal: int,
 ) -> dict[str, object]:
     raw_payload = artifact_path.read_bytes()
-    canonical_url = (
-        "https://rates.example.test/frozen/"
-        f"part-{ordinal:03d}.json"
-    )
+    canonical_url = "https://rates.example.test/frozen/" f"part-{ordinal:03d}.json"
     raw_sha256 = hashlib.sha256(raw_payload).hexdigest()
     return {
         "source_type": "in_network",
@@ -362,8 +445,8 @@ async def _acquire_and_scan_frozen_parts(
 
     artifact_paths, descriptors = _write_frozen_rate_inputs(tmp_path)
     set_digest = frozen_rate_file_set_sha256(descriptors)
-    normalized_descriptors, normalized_digest = (
-        normalize_frozen_rate_file_set(descriptors, set_digest)
+    normalized_descriptors, normalized_digest = normalize_frozen_rate_file_set(
+        descriptors, set_digest
     )
     raw_artifacts_by_url = _frozen_raw_artifacts_by_url(
         normalized_descriptors,
@@ -542,10 +625,10 @@ def _write_provider_graph_artifacts(
             name="provider_group_npi",
             pairs=group_npi_pairs,
         ),
-        _write_membership(
-            tmp_path / "frozen-npi-group.sidecar",
-            name="provider_npi_group",
-            pairs=npi_group_pairs,
+        *_npi_scope_artifacts(
+            tmp_path,
+            prefix="frozen-",
+            npi_group_pairs=npi_group_pairs,
         ),
         _write_tax_identity(
             tmp_path / "frozen-group-tax-identity.sidecar",
@@ -617,9 +700,7 @@ def _scan_provider_graph_fixture(
     npi_group_pairs = []
     tax_observations = []
     for provider_set_key, scan in enumerate(scans):
-        provider_set_id, provider_group_id, npi_ids = (
-            _provider_graph_identities(scan)
-        )
+        provider_set_id, provider_group_id, npi_ids = _provider_graph_identities(scan)
         provider_sets_by_key[provider_set_key] = provider_set_id
         component_id = hashlib.blake2b(
             b"frozen-component:" + provider_group_id,
@@ -627,12 +708,8 @@ def _scan_provider_graph_fixture(
         ).digest()
         set_component_pairs.append((provider_set_id, component_id))
         component_group_pairs.append((component_id, provider_group_id))
-        group_npi_pairs.extend(
-            (provider_group_id, npi_id) for npi_id in npi_ids
-        )
-        npi_group_pairs.extend(
-            (npi_id, provider_group_id) for npi_id in npi_ids
-        )
+        group_npi_pairs.extend((provider_group_id, npi_id) for npi_id in npi_ids)
+        npi_group_pairs.extend((npi_id, provider_group_id) for npi_id in npi_ids)
         tax_observations.append((provider_group_id, 2, None))
     artifacts = _write_provider_graph_artifacts(
         tmp_path,
@@ -943,12 +1020,8 @@ async def _seed_frozen_candidate_sources(
 
     schema = _quoted(schema_name)
     for source_key, descriptor in enumerate(descriptors):
-        trace_hash = hashlib.sha256(
-            f"trace:{source_key}".encode()
-        )
-        trace_set_hash = hashlib.sha256(
-            f"trace-set:{source_key}".encode()
-        )
+        trace_hash = hashlib.sha256(f"trace:{source_key}".encode())
+        trace_set_hash = hashlib.sha256(f"trace-set:{source_key}".encode())
         await _seed_frozen_source_trace(
             database,
             schema=schema,
@@ -975,12 +1048,8 @@ async def _seed_frozen_source_trace(
 ) -> None:
     """Persist one exact source identity, version, and trace chain."""
 
-    source_file_version_id = str(
-        descriptor["engine_source_file_version_id"]
-    )
-    source_identity_hash = str(
-        descriptor["engine_source_identity_hash"]
-    )
+    source_file_version_id = str(descriptor["engine_source_file_version_id"])
+    source_identity_hash = str(descriptor["engine_source_identity_hash"])
     await _insert_frozen_source_identity(
         database,
         schema=schema,
@@ -1058,9 +1127,7 @@ async def _insert_frozen_source_version(
         payload=json.dumps(
             {
                 "raw_byte_count": descriptor["content_length"],
-                "logical_hash_deferred": descriptor[
-                    "logical_hash_deferred"
-                ],
+                "logical_hash_deferred": descriptor["logical_hash_deferred"],
             },
             sort_keys=True,
         ),
@@ -1185,19 +1252,12 @@ async def _complete_shared_gc_test_schema(
         schema_name=schema_name,
     )
     existing_names = {
-        str(table_record._mapping["table_name"])
-        for table_record in existing_rows
+        str(table_record._mapping["table_name"]) for table_record in existing_rows
     }
     columns_by_table = {
-        "ptg2_v3_snapshot_binding": (
-            "snapshot_id varchar(96), snapshot_key bigint"
-        ),
-        "ptg2_v3_snapshot_scope": (
-            "snapshot_id varchar(96), snapshot_key bigint"
-        ),
-        "ptg2_v3_snapshot_source": (
-            "snapshot_id varchar(96), snapshot_key bigint"
-        ),
+        "ptg2_v3_snapshot_binding": ("snapshot_id varchar(96), snapshot_key bigint"),
+        "ptg2_v3_snapshot_scope": ("snapshot_id varchar(96), snapshot_key bigint"),
+        "ptg2_v3_snapshot_source": ("snapshot_id varchar(96), snapshot_key bigint"),
         "ptg2_v3_candidate_audit_attestation": (
             "snapshot_id varchar(96), snapshot_key bigint"
         ),
@@ -1213,8 +1273,7 @@ async def _complete_shared_gc_test_schema(
         if table_name in existing_names:
             continue
         await database.execute_ddl(
-            f"CREATE TABLE {schema}.{_quoted(table_name)} "
-            "(snapshot_key bigint)"
+            f"CREATE TABLE {schema}.{_quoted(table_name)} " "(snapshot_key bigint)"
         )
 
 
@@ -1281,9 +1340,7 @@ class _FailedRecoverySeed:
 
 
 def _recovery_block(object_kind: str, payload: bytes) -> SharedBlock:
-    return SharedBlock(
-        object_kind, 0, 0, 1, "none", len(payload), payload
-    )
+    return SharedBlock(object_kind, 0, 0, 1, "none", len(payload), payload)
 
 
 async def _insert_recovery_blocks(
@@ -1509,10 +1566,7 @@ async def _recover_failed_seed(
     """Recover one active-lease seed and prove every exact fence."""
 
     cas_count_before = int(
-        await database.scalar(
-            f"SELECT COUNT(*) FROM {seed.schema}.ptg2_v3_block"
-        )
-        or 0
+        await database.scalar(f"SELECT COUNT(*) FROM {seed.schema}.ptg2_v3_block") or 0
     )
     assert await database.scalar(
         f"""
@@ -1561,12 +1615,16 @@ async def _assert_recovered_seed(
     seed: _FailedRecoverySeed,
     cas_count_before: int,
 ) -> None:
-    assert await database.scalar(
-        f"SELECT COUNT(*) FROM {seed.schema}.ptg2_v3_block"
-    ) == cas_count_before
-    assert await database.scalar(
-        f"SELECT COUNT(*) FROM {seed.schema}.ptg2_v3_gc_candidate"
-    ) == 3
+    assert (
+        await database.scalar(f"SELECT COUNT(*) FROM {seed.schema}.ptg2_v3_block")
+        == cas_count_before
+    )
+    assert (
+        await database.scalar(
+            f"SELECT COUNT(*) FROM {seed.schema}.ptg2_v3_gc_candidate"
+        )
+        == 3
+    )
     assert await database.scalar(
         f"""
         SELECT bool_and(eligible_at > transaction_timestamp())
@@ -1581,11 +1639,14 @@ async def _assert_recovered_seed(
         "ptg2_v4_snapshot_map_root",
         "ptg2_v4_snapshot_map_pack",
     ):
-        assert await database.scalar(
-            f'SELECT COUNT(*) FROM {seed.schema}."{table_name}" '
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=seed.snapshot_key,
-        ) == 0
+        assert (
+            await database.scalar(
+                f'SELECT COUNT(*) FROM {seed.schema}."{table_name}" '
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=seed.snapshot_key,
+            )
+            == 0
+        )
     async with database.transaction() as session:
         replacement = await reserve_v4_shared_layout(
             session,
@@ -1596,7 +1657,9 @@ async def _assert_recovered_seed(
     assert replacement.snapshot_key != seed.snapshot_key
 
 
-def _base_layout_manifest() -> dict[str, object]:
+def _base_layout_manifest(
+    adaptive_layout: dict[str, object],
+) -> dict[str, object]:
     return {
         "serving_index": {
             "arch_version": "postgres_binary_v3",
@@ -1604,6 +1667,9 @@ def _base_layout_manifest() -> dict[str, object]:
             "storage_generation": "shared_blocks_v3",
             "provider_scope_strategy": "postgres_shared_graph",
             "shared_block_layout": "dense_shared_blocks_v3",
+            "provider_graph": {
+                "adaptive_layout": dict(adaptive_layout),
+            },
             "serving_binary": {
                 "format": "postgres_binary_v3",
                 "price_dictionary": {"preserved": True},
@@ -1646,7 +1712,9 @@ async def _prove_candidates_in_postgres(
 
 
 @pytest.mark.asyncio
-async def test_v4_storage_relation_lookup_accepts_bound_identifiers_on_postgres() -> None:
+async def test_v4_storage_relation_lookup_accepts_bound_identifiers_on_postgres() -> (
+    None
+):
     """Prove the canary storage catalog lookup against real PostgreSQL."""
 
     if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
@@ -1679,16 +1747,14 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
     if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
 
-    binary_path = _compiler_binary()
-    assert binary_path.is_file(), f"missing V4 compiler binary: {binary_path}"
     artifacts, provider_map = _factor_fixture(tmp_path)
     compilation_started = time.perf_counter()
-    compilation = await compile_provider_graph_v4_rust(
-        graph_artifact_entries=artifacts,
-        provider_set_key_map_path=provider_map,
-        output_directory=tmp_path / "compiled-v4",
+    compilation = await _compile_publication_fixture(
+        tmp_path,
+        artifacts,
+        provider_map,
+        output_name="compiled-v4",
         options={"member_page_bytes": 64},
-        binary_path=binary_path,
     )
     compilation_ms = (time.perf_counter() - compilation_started) * 1_000
     assert compilation.selected_layout == "pattern"
@@ -1766,12 +1832,15 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
         assert taxonomy_manifest["rule_count"] > 0
         assert taxonomy_manifest["observe_only_rule_count"] == 0
         assert taxonomy_manifest["member_count"] == 0
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM "
-            f"{schema}.ptg2_v4_inferred_taxonomy_candidate "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=reservation.snapshot_key,
-        ) == taxonomy_manifest["rule_count"]
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM "
+                f"{schema}.ptg2_v4_inferred_taxonomy_candidate "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=reservation.snapshot_key,
+            )
+            == taxonomy_manifest["rule_count"]
+        )
         async with database.transaction() as session:
             sealed = await seal_v4_shared_layout(
                 session,
@@ -1780,7 +1849,9 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
                 build_token=build_token,
                 expected_summary=publication.map_summary,
                 support_digest=publication.support_digest,
-                layout_manifest=_base_layout_manifest(),
+                layout_manifest=_base_layout_manifest(
+                    dict(publication.adaptive_layout)
+                ),
             )
         publication_ms = (time.perf_counter() - publication_started) * 1_000
         progress_by_metric: dict[str, int] = {}
@@ -1793,26 +1864,38 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
         assert publication.representation == "pattern_v1"
         assert publication.mapping_count > 0
         assert publication.unique_block_count > 0
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=sealed.snapshot_key,
-        ) == 0
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_npi_scope "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=sealed.snapshot_key,
-        ) == 0
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_npi_scope "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=sealed.snapshot_key,
-        ) == 1
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_set "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=sealed.snapshot_key,
-        ) == _SET_COUNT
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=sealed.snapshot_key,
+            )
+            == 0
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_npi_scope "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=sealed.snapshot_key,
+            )
+            == 0
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_npi_scope "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=sealed.snapshot_key,
+            )
+            == 1
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_set "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=sealed.snapshot_key,
+            )
+            == _SET_COUNT
+        )
 
         expected_groups = tuple(range(_GROUP_COUNT))
         before_metrics = graph.v4_graph_metrics_snapshot()
@@ -1874,8 +1957,7 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
         assert pattern_groups == {0: expected_groups}
         assert pattern_sets == {0: tuple(range(1, _SET_COUNT + 1))}
         assert set_patterns == {
-            provider_set_key: (0,)
-            for provider_set_key in range(1, _SET_COUNT + 1)
+            provider_set_key: (0,) for provider_set_key in range(1, _SET_COUNT + 1)
         }
         candidate_sets = await _prove_candidates_in_postgres(
             database,
@@ -1904,11 +1986,13 @@ async def test_v4_compiler_publish_seal_and_reader_are_exact_on_postgres(
                 assert warm == {0: expected_groups}
         warm_metrics_after = graph.v4_graph_metrics_snapshot()
         warm_p50_ms = statistics.median(warm_durations_ms)
-        assert warm_metrics_after["database_bytes"] == warm_metrics_before["database_bytes"]
         assert (
-            warm_metrics_after["bitmap_owner_hits"]
-            == warm_metrics_before["bitmap_owner_hits"] + len(warm_durations_ms)
+            warm_metrics_after["database_bytes"]
+            == warm_metrics_before["database_bytes"]
         )
+        assert warm_metrics_after["bitmap_owner_hits"] == warm_metrics_before[
+            "bitmap_owner_hits"
+        ] + len(warm_durations_ms)
         assert warm_p50_ms < 50
 
         physical_bytes = int(
@@ -2003,16 +2087,14 @@ async def _compile_frozen_provider_graph(
     tmp_path: Path,
     batch: _FrozenScanBatch,
 ):
-    artifacts, provider_map, provider_sets_by_key = (
-        _scan_provider_graph_fixture(tmp_path, batch.scans)
+    artifacts, provider_map, provider_sets_by_key = _scan_provider_graph_fixture(
+        tmp_path, batch.scans
     )
-    binary_path = _compiler_binary()
-    assert binary_path.is_file(), f"missing V4 compiler binary: {binary_path}"
-    compilation = await compile_provider_graph_v4_rust(
-        graph_artifact_entries=artifacts,
-        provider_set_key_map_path=provider_map,
-        output_directory=tmp_path / "compiled-frozen-v4",
-        binary_path=binary_path,
+    compilation = await _compile_publication_fixture(
+        tmp_path,
+        artifacts,
+        provider_map,
+        output_name="compiled-frozen-v4",
     )
     assert compilation.observe["provider_set_count"] == 2
     assert compilation.observe["group_count"] == 2
@@ -2051,8 +2133,7 @@ async def _publish_frozen_provider_graph_with_patches(
         snapshot_key=snapshot_key,
         build_token=build_token,
         compressed_acquisition_bytes=sum(
-            int(descriptor["content_length"])
-            for descriptor in batch.descriptors
+            int(descriptor["content_length"]) for descriptor in batch.descriptors
         ),
         empty_npi_tin_only_normalization_count=0,
     )
@@ -2077,9 +2158,7 @@ async def _reserve_frozen_layout(
         reservation = await reserve_v4_shared_layout(
             session,
             schema_name=schema_name,
-            semantic_fingerprint=hashlib.sha256(
-                build_token.encode()
-            ).digest(),
+            semantic_fingerprint=hashlib.sha256(build_token.encode()).digest(),
             build_token=build_token,
         )
         await _insert_provider_set_rows(
@@ -2108,14 +2187,17 @@ async def _seal_frozen_publication(
             build_token=build_token,
             expected_summary=publication.map_summary,
             support_digest=publication.support_digest,
-            layout_manifest=_base_layout_manifest(),
+            layout_manifest=_base_layout_manifest(dict(publication.adaptive_layout)),
         )
     assert publication.representation == "direct_v1"
-    assert await database.scalar(
-        f"SELECT state FROM {schema}.ptg2_v4_snapshot_map_root "
-        "WHERE snapshot_key = :snapshot_key",
-        snapshot_key=sealed.snapshot_key,
-    ) == "complete"
+    assert (
+        await database.scalar(
+            f"SELECT state FROM {schema}.ptg2_v4_snapshot_map_root "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=sealed.snapshot_key,
+        )
+        == "complete"
+    )
 
 
 async def _store_frozen_candidate_binding(
@@ -2156,26 +2238,20 @@ async def _assert_frozen_candidate_replay(
     manifest: dict[str, object],
     stored_binding: dict[str, object],
 ) -> None:
-    raw_sources = await ptg_candidate_audit._candidate_raw_sources(
-        snapshot_id
-    )
+    raw_sources = await ptg_candidate_audit._candidate_raw_sources(snapshot_id)
     identity = ptg_candidate_audit._validated_frozen_candidate_identity(
         manifest,
         {"frozen_binding_payload": stored_binding},
         candidate_run_id=candidate_run_id,
         raw_container_sha256=raw_sources,
     )
-    replayed_identity = (
-        ptg_candidate_audit._validated_frozen_candidate_identity(
-            manifest,
-            {"frozen_binding_payload": stored_binding},
-            candidate_run_id=candidate_run_id,
-            raw_container_sha256=(
-                await ptg_candidate_audit._candidate_raw_sources(
-                    snapshot_id
-                )
-            ),
-        )
+    replayed_identity = ptg_candidate_audit._validated_frozen_candidate_identity(
+        manifest,
+        {"frozen_binding_payload": stored_binding},
+        candidate_run_id=candidate_run_id,
+        raw_container_sha256=(
+            await ptg_candidate_audit._candidate_raw_sources(snapshot_id)
+        ),
     )
     assert identity == replayed_identity
     assert "ptg_frozen_candidate_identity_v1" in str(identity)
@@ -2203,9 +2279,7 @@ async def _assert_frozen_candidate_drift_rejected(
                 {"frozen_binding_payload": stored_binding},
                 candidate_run_id=candidate_run_id,
                 raw_container_sha256=(
-                    await ptg_candidate_audit._candidate_raw_sources(
-                        snapshot_id
-                    )
+                    await ptg_candidate_audit._candidate_raw_sources(snapshot_id)
                 ),
             )
 
@@ -2238,9 +2312,7 @@ async def _assert_candidate_version_length_drift(
 ) -> None:
     """Change and restore a frozen source-version content length."""
 
-    drifted_version_id = str(
-        drifted_descriptor["engine_source_file_version_id"]
-    )
+    drifted_version_id = str(drifted_descriptor["engine_source_file_version_id"])
     await database.status(
         f"""
         UPDATE {schema}.ptg2_source_file_version
@@ -2271,9 +2343,7 @@ async def _assert_candidate_source_url_drift(
 ) -> None:
     """Change and restore the canonical URL behind a frozen source."""
 
-    source_identity_hash = str(
-        drifted_descriptor["engine_source_identity_hash"]
-    )
+    source_identity_hash = str(drifted_descriptor["engine_source_identity_hash"])
     await database.status(
         f"""
         UPDATE {schema}.ptg2_source_identity
@@ -2304,9 +2374,7 @@ async def _assert_candidate_raw_hash_drift(
 ) -> None:
     """Change the retained raw hash and require candidate rejection."""
 
-    drifted_version_id = str(
-        drifted_descriptor["engine_source_file_version_id"]
-    )
+    drifted_version_id = str(drifted_descriptor["engine_source_file_version_id"])
     await database.status(
         f"""
         UPDATE {schema}.ptg2_source_file_version
@@ -2414,9 +2482,7 @@ async def test_frozen_multipart_scans_publish_and_candidate_audit_exactly(
     finally:
         compilation.cleanup()
         try:
-            await database.execute_ddl(
-                f"DROP SCHEMA IF EXISTS {schema} CASCADE"
-            )
+            await database.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         finally:
             await database.disconnect()
 
@@ -2431,20 +2497,17 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
     if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
         pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
 
-    binary_path = _compiler_binary()
-    assert binary_path.is_file(), f"missing V4 compiler binary: {binary_path}"
     artifacts, provider_map = _direct_factor_fixture(tmp_path)
-    compilation = await compile_provider_graph_v4_rust(
-        graph_artifact_entries=artifacts,
-        provider_set_key_map_path=provider_map,
-        output_directory=tmp_path / "compiled-direct-v4",
-        binary_path=binary_path,
+    compilation = await _compile_publication_fixture(
+        tmp_path,
+        artifacts,
+        provider_map,
+        output_name="compiled-direct-v4",
     )
     assert compilation.selected_layout == "direct"
     assert compilation.observe["pattern_count"] == 2
     relation_names = {
-        str(relation["relation"])
-        for relation in compilation.relation_summaries
+        str(relation["relation"]) for relation in compilation.relation_summaries
     }
     assert {"group_sets_direct", "set_groups_direct"} <= relation_names
     assert not relation_names.intersection(graph.PTG2_V4_PATTERN_RELATIONS)
@@ -2495,29 +2558,32 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
                 build_token=build_token,
                 expected_summary=publication.map_summary,
                 support_digest=publication.support_digest,
-                layout_manifest=_base_layout_manifest(),
-        )
+                layout_manifest=_base_layout_manifest(
+                    dict(publication.adaptive_layout)
+                ),
+            )
 
         assert publication.representation == "direct_v1"
         assert publication.inferred_taxonomy_candidates["rule_count"] > 0
-        assert (
-            publication.inferred_taxonomy_candidates[
-                "observe_only_rule_count"
-            ]
-            == 0
-        )
+        assert publication.inferred_taxonomy_candidates["observe_only_rule_count"] == 0
         assert publication.inferred_taxonomy_candidates["member_count"] == 0
         assert publication.inferred_taxonomy_candidates["pattern_count"] == 0
-        assert await database.scalar(
-            f"SELECT representation FROM {schema}.ptg2_v4_snapshot_map_root "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=sealed.snapshot_key,
-        ) == "direct_v1"
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_pattern "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=sealed.snapshot_key,
-        ) == 0
+        assert (
+            await database.scalar(
+                f"SELECT representation FROM {schema}.ptg2_v4_snapshot_map_root "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=sealed.snapshot_key,
+            )
+            == "direct_v1"
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v4_pattern "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=sealed.snapshot_key,
+            )
+            == 0
+        )
         async with database.transaction() as session:
             set_groups = await graph.lookup_v4_relation_members(
                 session,
@@ -2584,16 +2650,22 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
         }
         assert persisted_relations == relation_names
         assert not persisted_relations.intersection(graph.PTG2_V4_PATTERN_RELATIONS)
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=sealed.snapshot_key,
-        ) == 0
-        assert await database.scalar(
-            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_set "
-            "WHERE snapshot_key = :snapshot_key",
-            snapshot_key=sealed.snapshot_key,
-        ) == 2
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=sealed.snapshot_key,
+            )
+            == 0
+        )
+        assert (
+            await database.scalar(
+                f"SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_set "
+                "WHERE snapshot_key = :snapshot_key",
+                snapshot_key=sealed.snapshot_key,
+            )
+            == 2
+        )
     finally:
         compilation.cleanup()
         try:

@@ -1,5 +1,6 @@
 use ptg2_scanner::provider_graph_v4::{
-    compile_provider_graph_v4_manifest, ProviderGraphV4Manifest,
+    compile_provider_graph_v4_manifest, extract_provider_graph_v4_npi_scope,
+    ProviderGraphV4Manifest, ProviderGraphV4NpiScopeManifest,
 };
 use std::env;
 use std::fs::File;
@@ -12,24 +13,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .and_then(|value| value.into_string().ok())
         .unwrap_or_else(|| "ptg2_provider_graph_v4".to_owned());
-    let manifest_path = arguments.next().map(PathBuf::from).ok_or_else(|| {
+    let first = arguments.next().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("usage: {program} <manifest.json>"),
+            format!("usage: {program} [--extract-npi-scope] <manifest.json>"),
         )
     })?;
+    let (extract_scope, manifest_path) = if first == "--extract-npi-scope" {
+        (
+            true,
+            arguments.next().map(PathBuf::from).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("usage: {program} --extract-npi-scope <manifest.json>"),
+                )
+            })?,
+        )
+    } else {
+        (false, PathBuf::from(first))
+    };
     if arguments.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("usage: {program} <manifest.json>"),
+            format!("usage: {program} [--extract-npi-scope] <manifest.json>"),
         )
         .into());
     }
-    let manifest: ProviderGraphV4Manifest =
-        serde_json::from_reader(BufReader::new(File::open(&manifest_path)?))?;
-    let summary = compile_provider_graph_v4_manifest(manifest)?;
     let mut output = BufWriter::new(io::stdout().lock());
-    serde_json::to_writer(&mut output, &summary)?;
+    if extract_scope {
+        let manifest: ProviderGraphV4NpiScopeManifest =
+            serde_json::from_reader(BufReader::new(File::open(&manifest_path)?))?;
+        let summary = extract_provider_graph_v4_npi_scope(&manifest.shards, manifest.output_path)?;
+        serde_json::to_writer(&mut output, &summary)?;
+    } else {
+        let manifest: ProviderGraphV4Manifest =
+            serde_json::from_reader(BufReader::new(File::open(&manifest_path)?))?;
+        let summary = compile_provider_graph_v4_manifest(manifest)?;
+        serde_json::to_writer(&mut output, &summary)?;
+    }
     output.write_all(b"\n")?;
     output.flush()?;
     Ok(())

@@ -24432,6 +24432,114 @@ fn global_id_from_hex_bytes(value: &[u8]) -> io::Result<GlobalId128> {
     Ok(GlobalId128(decoded))
 }
 
+fn write_provider_npi_scope_from_dense_sidecar(
+    npi_group_path: &Path,
+    npi_scope_copy_path: &Path,
+    expected_owner_count: u64,
+    expected_member_count: u64,
+    expected_member_global_count: u64,
+) -> io::Result<()> {
+    let mut input = BufReader::new(File::open(npi_group_path)?);
+    let mut header = [0u8; 28];
+    input.read_exact(&mut header)?;
+    if &header[..8] != b"PTG2MNDS"
+        || u32::from_le_bytes(header[8..12].try_into().expect("version width")) != 1
+        || u64::from_le_bytes(header[12..20].try_into().expect("owner width"))
+            != expected_owner_count
+        || u64::from_le_bytes(header[20..28].try_into().expect("member-global width"))
+            != expected_member_global_count
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider NPI scope source has an invalid dense header",
+        ));
+    }
+    let scope_parent = npi_scope_copy_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider NPI scope output has no parent directory",
+        )
+    })?;
+    let scope_file = tempfile::NamedTempFile::new_in(scope_parent)?;
+    let mut output = BufWriter::new(scope_file);
+    write_pg_binary_copy_header(&mut output)?;
+    let mut expected_offset = 0u64;
+    let mut previous_npi = 0i64;
+    for _owner_index in 0..expected_owner_count {
+        let mut owner = [0u8; GLOBAL_ID_BYTES];
+        let mut offset = [0u8; 8];
+        let mut count = [0u8; 4];
+        input.read_exact(&mut owner)?;
+        input.read_exact(&mut offset)?;
+        input.read_exact(&mut count)?;
+        let owner_offset = u64::from_le_bytes(offset);
+        let owner_count = u32::from_le_bytes(count);
+        let npi = i64::try_from(u64::from_be_bytes(
+            owner[8..].try_into().expect("NPI global id width"),
+        ))
+        .map_err(to_io_error)?;
+        if owner[..8] != [0; 8]
+            || !(1_000_000_000..=9_999_999_999).contains(&npi)
+            || npi <= previous_npi
+            || owner_offset != expected_offset
+            || owner_count == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider NPI scope source index is inconsistent",
+            ));
+        }
+        output.write_all(&1i16.to_be_bytes())?;
+        write_pg_binary_copy_i64_field(&mut output, npi)?;
+        expected_offset = expected_offset.saturating_add(u64::from(owner_count));
+        previous_npi = npi;
+    }
+    if expected_offset != expected_member_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider NPI scope source member count changed",
+        ));
+    }
+    write_pg_binary_copy_trailer(&mut output)?;
+    output.flush()?;
+    output.get_ref().as_file().sync_all()?;
+    let scope_file = output.into_inner().map_err(|error| error.into_error())?;
+    scope_file
+        .persist_noclobber(npi_scope_copy_path)
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn parse_provider_membership_npi(value: &[u8]) -> io::Result<Option<i64>> {
+    if value == b"0" {
+        return Ok(None);
+    }
+    if value.len() != 10 || !value.iter().all(u8::is_ascii_digit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider membership NPI must be the exact zero sentinel or ten ASCII digits",
+        ));
+    }
+    let npi = value.iter().try_fold(0i64, |result, digit| {
+        result
+            .checked_mul(10)
+            .and_then(|current| current.checked_add(i64::from(digit - b'0')))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider membership NPI exceeds int64",
+                )
+            })
+    })?;
+    if !(1_000_000_000..=9_999_999_999).contains(&npi) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider membership NPI must contain exactly ten digits",
+        ));
+    }
+    Ok(Some(npi))
+}
+
 fn write_provider_membership_sidecars(
     group_npi_path: &Path,
     npi_group_path: &Path,
@@ -24440,7 +24548,6 @@ fn write_provider_membership_sidecars(
 ) -> io::Result<()> {
     let mut group_npi_pairs = ManifestPairSpool::new("provider_group_npi")?;
     let mut npi_group_pairs = ManifestPairSpool::new("provider_npi_group")?;
-    let mut npis = HashSet::new();
     let mut input_rows = 0u64;
     for input_path in input_paths {
         let file = match File::open(input_path) {
@@ -24464,13 +24571,10 @@ fn write_provider_membership_sidecars(
                 ));
             }
             let provider_group_id = global_id_from_hex_bytes(group_value)?;
-            let npi_text = std::str::from_utf8(npi_value).map_err(to_io_error)?;
-            let npi = npi_text.parse::<i64>().map_err(to_io_error)?;
-            if npi > 0 {
+            if let Some(npi) = parse_provider_membership_npi(npi_value)? {
                 let provider_npi_id = npi_member_id(npi);
                 group_npi_pairs.push(provider_group_id, provider_npi_id)?;
                 npi_group_pairs.push(provider_npi_id, provider_group_id)?;
-                npis.insert(npi);
             }
             input_rows = input_rows.saturating_add(1);
             line.clear();
@@ -24490,13 +24594,13 @@ fn write_provider_membership_sidecars(
         ));
     }
 
-    let mut sorted_npis: Vec<i64> = npis.into_iter().collect();
-    sorted_npis.sort_unstable();
-    let mut npi_scope_writer = BufWriter::new(File::create(npi_scope_copy_path)?);
-    for npi in &sorted_npis {
-        writeln!(npi_scope_writer, "{npi}")?;
-    }
-    npi_scope_writer.flush()?;
+    write_provider_npi_scope_from_dense_sidecar(
+        npi_group_path,
+        npi_scope_copy_path,
+        npi_count,
+        reverse_membership_count,
+        group_count,
+    )?;
 
     emit_json_record(
         &mut io::stdout().lock(),
@@ -24507,12 +24611,16 @@ fn write_provider_membership_sidecars(
             "membership_count": membership_count,
             "provider_group_count": group_count,
             "provider_npi_count": npi_count,
-            "npi_scope_count": sorted_npis.len(),
+            "npi_scope_count": npi_count,
             "provider_group_npi_path": group_npi_path.display().to_string(),
             "provider_group_npi_bytes": group_npi_path.metadata()?.len(),
             "provider_npi_group_path": npi_group_path.display().to_string(),
             "provider_npi_group_bytes": npi_group_path.metadata()?.len(),
             "provider_npi_scope_copy_path": npi_scope_copy_path.display().to_string(),
+            "provider_npi_scope_copy_format":
+                "ptg2_provider_npi_scope_pg_binary_int8_v1",
+            "provider_npi_scope_copy_bytes": npi_scope_copy_path.metadata()?.len(),
+            "provider_npi_scope_copy_rows": npi_count,
         }),
     )
 }
@@ -24881,6 +24989,20 @@ mod tests {
         reader.read_to_string(&mut output).unwrap();
 
         assert_eq!(output, r#"{"provider_references":[],"in_network":[]}"#);
+
+        let nested = br#"{"items":[1,{"value":"two"}]}"#;
+        let wrapped_nested = WrappedIndexedRangeReader::new(
+            Box::new(Cursor::new(nested.to_vec())),
+            nested.len() as u64,
+            b"",
+            b"",
+        );
+        let mut byte_reader = BufferedJsonByteReader::new(wrapped_nested);
+        let mut captured = Vec::new();
+        byte_reader
+            .capture_value_bytes_into(&mut captured)
+            .expect("capture nested indexed range");
+        assert_eq!(captured, nested);
     }
 
     #[test]
@@ -25037,6 +25159,40 @@ mod tests {
             "{{\"in_network\":{in_network},\"provider_references\":{provider_references}}}"
         );
         std::fs::write(path, payload).unwrap();
+    }
+
+    fn write_forward_provider_reference_fixture(path: &Path) {
+        std::fs::write(
+            path,
+            r#"{
+                "provider_references":[{
+                    "provider_group_id":7,
+                    "provider_groups":[{
+                        "tin":{"type":"ein","value":"123456789"},
+                        "npi":[1234567890]
+                    }],
+                    "network_name":["Provider Network"]
+                }],
+                "in_network":[{
+                    "billing_code_type":"CPT",
+                    "billing_code":"99213",
+                    "negotiation_arrangement":"ffs",
+                    "name":"Office visit",
+                    "negotiated_rates":[{
+                        "provider_references":[7],
+                        "network_name":"Rate Network",
+                        "negotiated_prices":[{
+                            "negotiated_type":"negotiated",
+                            "negotiated_rate":123.45,
+                            "expiration_date":"2026-12-31",
+                            "service_code":["11"],
+                            "billing_class":"professional"
+                        }]
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
     }
 
     fn read_worker_copy_text(base_path: &Path) -> io::Result<String> {
@@ -25425,15 +25581,34 @@ mod tests {
 
     #[test]
     fn top_level_range_scan_preserves_bom_and_multibyte_byte_offsets() {
+        struct OneByteReader(Cursor<Vec<u8>>);
+
+        impl Read for OneByteReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if buffer.is_empty() {
+                    return Ok(0);
+                }
+                let mut byte = [0u8; 1];
+                let read = self.0.read(&mut byte)?;
+                if read > 0 {
+                    buffer[0] = byte[0];
+                }
+                Ok(read)
+            }
+        }
+
         let mut payload = b"\xef\xbb\xbf".to_vec();
         payload.extend_from_slice(
             "{\"label\":\"é\",\"in_network\":[{\"billing_code\":\"10000\",\"negotiated_rates\":[]}],\"provider_references\":[{\"provider_group_id\":1,\"provider_groups\":[]}]}"
                 .as_bytes(),
         );
 
-        let scan = scan_compact_top_level_array_ranges(Box::new(Cursor::new(payload.clone())), 2)
-            .unwrap()
-            .unwrap();
+        let scan = scan_compact_top_level_array_ranges(
+            Box::new(OneByteReader(Cursor::new(payload.clone()))),
+            2,
+        )
+        .unwrap()
+        .unwrap();
         let provider_range = &payload[scan.provider_references.offset as usize
             ..scan
                 .provider_references
@@ -28409,6 +28584,108 @@ mod tests {
     }
 
     #[test]
+    fn parallel_struson_scanner_fails_closed_after_worker_and_inline_parsing() {
+        let _env_lock = scanner_env_lock().lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let input_path = temporary.path().join("input.json");
+        write_forward_provider_reference_fixture(&input_path);
+        let _factor_mode = TestEnvVar::remove(PROVIDER_GRAPH_V4_ENV);
+
+        for (name, parse_in_workers) in [("worker-parsed", "true"), ("inline-parsed", "false")] {
+            let serving_run_directory = temporary.path().join(name);
+            std::fs::create_dir(&serving_run_directory).unwrap();
+            let _strict_env = strict_scan_env(&serving_run_directory);
+            let _scan_env = [
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", "true"),
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", "1"),
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE", "2"),
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS", "1"),
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES", "256"),
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", parse_in_workers),
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES", "1"),
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES", "256"),
+                TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "1"),
+                TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "1"),
+            ];
+            let copy_paths = CopyPathConfig::from_env().unwrap();
+            let context = test_compact_context();
+            context.source_witness.configure_provider_spools(1).unwrap();
+            context.source_witness.configure_rate_spools(2).unwrap();
+            let result = scan_compact_struson_parallel(
+                &input_path,
+                context,
+                2,
+                2,
+                copy_paths,
+                1_024,
+                CompactParallelScanSelection {
+                    preflight_metrics: CompactPreflightMetrics {
+                        order_detection_seconds: 0.001,
+                        order_detection_compressed_bytes: 1,
+                    },
+                    top_level_byte_scan_requested: false,
+                    top_level_byte_scan_fallback_reason: "coverage",
+                },
+            );
+            if parse_in_workers == "true" {
+                let error = result.unwrap_err();
+                let message = error.to_string();
+                assert!(
+                    message.contains("provider")
+                        && (message.contains("source spools are not sealed")
+                            || message.contains("source occurrence is missing linked")),
+                    "{name} returned an unexpected failure: {error}",
+                );
+            } else {
+                result.unwrap();
+                assert!(
+                    std::fs::read_dir(&serving_run_directory)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .any(|entry| entry.metadata().unwrap().len() > 0),
+                    "{name} did not emit serving output",
+                );
+            }
+        }
+
+        let _progress_env = [
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "1"),
+            TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "1"),
+        ];
+        scan(
+            &input_path,
+            &["provider_references".to_owned(), "in_network".to_owned()],
+        )
+        .unwrap();
+
+        let integer_bytes = [0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut integer_cursor = Cursor::new(&integer_bytes);
+        assert_eq!(read_i32_be(&mut integer_cursor).unwrap(), 7);
+        assert_eq!(
+            to_io_error(<[u8; 2]>::try_from(&[1u8][..]).unwrap_err()).kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            to_io_error("invalid".parse::<u64>().unwrap_err()).kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            to_io_error(u8::try_from(256u16).unwrap_err()).kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert_eq!(
+            to_io_error(io::Error::other("coverage")).kind(),
+            io::ErrorKind::InvalidData,
+        );
+        let mut array_reader = BufferedJsonByteReader::new(&b"]"[..]);
+        assert!(!next_array_value(&mut array_reader, &mut true).unwrap());
+        let mut wrapped_reader =
+            WrappedIndexedRangeReader::new(Box::new(Cursor::new(b"[]".to_vec())), 2, b"", b"");
+        drain_reader_to_eof(&mut wrapped_reader).unwrap();
+        emit_plain_reorder_progress(&input_path, 2, 1, 1, Instant::now(), false);
+    }
+
+    #[test]
     fn reversed_top_level_order_quarantines_dangling_rate_end_to_end() {
         let _env_lock = scanner_env_lock().lock().unwrap();
         let base = std::env::temp_dir().join(format!(
@@ -29127,6 +29404,14 @@ mod tests {
         let mut reader = BufferedJsonByteReader::new(fragmented);
         captured.clear();
         reader.capture_object_bytes_append(&mut captured).unwrap();
+        assert_eq!(captured, first);
+
+        let direct: &[u8] = first;
+        let mut direct_reader = BufferedJsonByteReader::new(direct);
+        captured.clear();
+        direct_reader
+            .capture_object_bytes_append(&mut captured)
+            .unwrap();
         assert_eq!(captured, first);
     }
 
@@ -35526,10 +35811,59 @@ mod tests {
 
         assert_eq!(&std::fs::read(&group_npi).unwrap()[..8], b"PTG2MNDS");
         assert_eq!(&std::fs::read(&npi_group).unwrap()[..8], b"PTG2MNDS");
+        let scope = std::fs::read(&npi_scope).unwrap();
+        let copy_header = [b"PGCOPY\n\xff\r\n\0".as_slice(), &[0u8; 8]].concat();
+        assert_eq!(&scope[..copy_header.len()], copy_header);
+        assert_eq!(scope.len(), copy_header.len() + 2 * 14 + 2);
         assert_eq!(
-            std::fs::read_to_string(&npi_scope).unwrap(),
-            "1234567890\n2222222222\n"
+            i64::from_be_bytes(scope[25..33].try_into().unwrap()),
+            1_234_567_890,
         );
+        assert_eq!(
+            i64::from_be_bytes(scope[39..47].try_into().unwrap()),
+            2_222_222_222,
+        );
+        assert_eq!(&scope[47..], &(-1i16).to_be_bytes());
+
+        let tampered_npi_group = temporary.path().join("tampered-npi-group.sidecar");
+        let tampered_scope = temporary.path().join("tampered-scope.copy");
+        let mut tampered = std::fs::read(&npi_group).unwrap();
+        tampered[20..28].copy_from_slice(&99u64.to_le_bytes());
+        std::fs::write(&tampered_npi_group, tampered).unwrap();
+        assert!(write_provider_npi_scope_from_dense_sidecar(
+            &tampered_npi_group,
+            &tampered_scope,
+            2,
+            2,
+            2,
+        )
+        .is_err());
+        assert!(!tampered_scope.exists());
+
+        let existing_scope = temporary.path().join("existing-scope.copy");
+        std::fs::write(&existing_scope, b"caller-owned").unwrap();
+        assert!(
+            write_provider_npi_scope_from_dense_sidecar(&npi_group, &existing_scope, 2, 2, 2,)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&existing_scope).unwrap(), b"caller-owned");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let target = temporary.path().join("scope-link-target.copy");
+            let link = temporary.path().join("scope-link.copy");
+            symlink(&target, &link).unwrap();
+            assert!(
+                write_provider_npi_scope_from_dense_sidecar(&npi_group, &link, 2, 2, 2,).is_err()
+            );
+            assert!(std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(!target.exists());
+        }
 
         assert!(global_id_from_hex_bytes(b"short").is_err());
         assert!(global_id_from_hex_bytes(&[b'g'; GLOBAL_ID_BYTES * 2]).is_err());
@@ -35548,6 +35882,38 @@ mod tests {
                 b"05050505050505050505050505050505\tnot-an-npi\n".as_slice(),
             ),
             (
+                "short-npi",
+                b"05050505050505050505050505050505\t123456789\n".as_slice(),
+            ),
+            (
+                "plus-npi",
+                b"05050505050505050505050505050505\t+1234567890\n".as_slice(),
+            ),
+            (
+                "leading-zero-eleven",
+                b"05050505050505050505050505050505\t01234567890\n".as_slice(),
+            ),
+            (
+                "plus-zero",
+                b"05050505050505050505050505050505\t+0\n".as_slice(),
+            ),
+            (
+                "minus-zero",
+                b"05050505050505050505050505050505\t-0\n".as_slice(),
+            ),
+            (
+                "multiple-zero",
+                b"05050505050505050505050505050505\t00\n".as_slice(),
+            ),
+            (
+                "ten-zero",
+                b"05050505050505050505050505050505\t0000000000\n".as_slice(),
+            ),
+            (
+                "leading-zero-ten",
+                b"05050505050505050505050505050505\t0123456789\n".as_slice(),
+            ),
+            (
                 "invalid-utf8",
                 b"05050505050505050505050505050505\t\xff\n".as_slice(),
             ),
@@ -35561,6 +35927,34 @@ mod tests {
                 &[input.display().to_string()],
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn provider_membership_npi_parser_accepts_only_exact_wire_values() {
+        assert_eq!(parse_provider_membership_npi(b"0").unwrap(), None);
+        assert_eq!(
+            parse_provider_membership_npi(b"1234567890").unwrap(),
+            Some(1_234_567_890),
+        );
+        assert_eq!(
+            parse_provider_membership_npi(b"9999999999").unwrap(),
+            Some(9_999_999_999),
+        );
+        for value in [
+            b"".as_slice(),
+            b"+0",
+            b"-0",
+            b"00",
+            b"0000000000",
+            b"0123456789",
+            b"+1234567890",
+            b"01234567890",
+            b"123456789",
+            b"123456789a",
+            b"\xff234567890",
+        ] {
+            assert!(parse_provider_membership_npi(value).is_err(), "{value:?}",);
         }
     }
 

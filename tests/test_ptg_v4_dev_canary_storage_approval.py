@@ -9,7 +9,7 @@ import pytest
 
 from scripts import ptg_v4_dev_canary_storage_budget as storage_policy
 from scripts.ptg_v4_dev_canary_storage_budget import STORAGE_CANARY_CASES
-from tests.test_ptg_v4_dev_canary_storage_budget import (
+from tests.test_ptg_v4_dev_canary_storage_physical import (
     _physical_storage_approval,
 )
 

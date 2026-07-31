@@ -14,6 +14,10 @@ from scripts.ptg_v4_dev_canary_graph_budget import (
     GraphReadApproval,
     evaluate_graph_read_budget,
 )
+from scripts.ptg_v4_dev_canary_support import (
+    PTG_V4_FOLLOWUP_LATENCY_TARGET_MS,
+    PTG_V4_RELEASE_LATENCY_CEILING_MS,
+)
 
 
 _CASE = GRAPH_READ_CANARY_CASES[0]
@@ -156,9 +160,7 @@ def test_first_measurement_reports_all_series_but_blocks_acceptance() -> None:
     report = _evaluate()
 
     assert report["passed"] is False
-    assert report["failures"] == [
-        UNAPPROVED_GRAPH_READ_CEILING_FAILURE
-    ]
+    assert report["failures"] == [UNAPPROVED_GRAPH_READ_CEILING_FAILURE]
     assert report["promotion_state"] == "measurement_only_pending_review"
     assert report["measurement_evidence"] == {
         "contract": graph_policy.GRAPH_READ_MEASUREMENT_EVIDENCE_CONTRACT,
@@ -207,8 +209,7 @@ def test_checked_in_measured_ceiling_uses_exact_two_percent_tolerance(
 def test_approval_rejects_extra_headroom_or_non_two_percent_tolerance() -> None:
     with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
         graph_policy._validate_graph_read_approval(
-            _CASE,
-            replace(_approval(), approved_public_database_bytes=1_021)
+            _CASE, replace(_approval(), approved_public_database_bytes=1_021)
         )
     with pytest.raises(RuntimeError, match="incomplete or inconsistent"):
         graph_policy._validate_graph_read_approval(
@@ -257,8 +258,7 @@ def test_internal_measurement_cannot_exceed_hard_envelope() -> None:
 
     assert report["passed"] is False
     assert any(
-        "internal graph-read hard envelope" in failure
-        for failure in report["failures"]
+        "internal graph-read hard envelope" in failure for failure in report["failures"]
     )
 
 
@@ -302,3 +302,22 @@ def test_cli_has_no_operator_graph_read_ceiling() -> None:
         "--reference-snapshot-id"
         in subparsers.choices["internal-owner-probe"]._option_string_actions
     )
+
+
+def test_cli_defaults_to_release_latency_ceiling() -> None:
+    arguments = build_parser().parse_args(
+        [
+            "internal-owner-probe",
+            "--snapshot-id",
+            "snapshot-1",
+            "--reference-snapshot-id",
+            "reference-1",
+            "--output",
+            "unused.json",
+        ]
+    )
+
+    assert PTG_V4_RELEASE_LATENCY_CEILING_MS == 70.0
+    assert PTG_V4_FOLLOWUP_LATENCY_TARGET_MS == 50.0
+    assert arguments.cold_p95_limit_ms == PTG_V4_RELEASE_LATENCY_CEILING_MS
+    assert arguments.warm_p95_limit_ms == PTG_V4_RELEASE_LATENCY_CEILING_MS

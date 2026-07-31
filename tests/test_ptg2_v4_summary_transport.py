@@ -4,6 +4,9 @@ import pytest
 
 from process.ptg_parts.ptg2_v4_graph_compiler import compile_provider_graph_v4_rust
 from tests.test_ptg2_v4_graph_compiler import _binary, _fixture
+from tests.ptg2_v4_graph_compiler_test_support import (
+    compiler_inputs as _compiler_inputs,
+)
 
 
 def _summary_bridge_binary(
@@ -59,6 +62,7 @@ async def test_wrapper_accepts_equivalent_summary_larger_than_legacy_envelope(
     tmp_path: Path,
 ) -> None:
     artifacts, provider_map = _fixture(tmp_path)
+    npi_scope, inferred_taxonomy = await _compiler_inputs(tmp_path, artifacts)
     padding_bytes = 2 * 1024 * 1024 + 1
     output = tmp_path / "compiled"
     binary = _summary_bridge_binary(tmp_path, padding_bytes=padding_bytes)
@@ -66,6 +70,8 @@ async def test_wrapper_accepts_equivalent_summary_larger_than_legacy_envelope(
     compilation = await compile_provider_graph_v4_rust(
         graph_artifact_entries=artifacts,
         provider_set_key_map_path=provider_map,
+        npi_scope=npi_scope,
+        inferred_taxonomy=inferred_taxonomy,
         output_directory=output,
         binary_path=binary,
     )
@@ -73,6 +79,8 @@ async def test_wrapper_accepts_equivalent_summary_larger_than_legacy_envelope(
     reused = await compile_provider_graph_v4_rust(
         graph_artifact_entries=artifacts,
         provider_set_key_map_path=provider_map,
+        npi_scope=npi_scope,
+        inferred_taxonomy=inferred_taxonomy,
         output_directory=output,
         binary_path=binary,
     )
@@ -83,12 +91,15 @@ async def test_wrapper_accepts_equivalent_summary_larger_than_legacy_envelope(
 @pytest.mark.asyncio
 async def test_wrapper_rejects_summary_digest_disagreement(tmp_path: Path) -> None:
     artifacts, provider_map = _fixture(tmp_path)
+    npi_scope, inferred_taxonomy = await _compiler_inputs(tmp_path, artifacts)
     output = tmp_path / "compiled"
 
     with pytest.raises(RuntimeError, match="stdout and summary file disagree"):
         await compile_provider_graph_v4_rust(
             graph_artifact_entries=artifacts,
             provider_set_key_map_path=provider_map,
+            npi_scope=npi_scope,
+            inferred_taxonomy=inferred_taxonomy,
             output_directory=output,
             binary_path=_summary_bridge_binary(
                 tmp_path,
@@ -103,12 +114,15 @@ async def test_wrapper_rejects_summary_digest_disagreement(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_wrapper_rejects_missing_summary_file(tmp_path: Path) -> None:
     artifacts, provider_map = _fixture(tmp_path)
+    npi_scope, inferred_taxonomy = await _compiler_inputs(tmp_path, artifacts)
     output = tmp_path / "compiled"
 
     with pytest.raises(RuntimeError, match="did not publish its summary"):
         await compile_provider_graph_v4_rust(
             graph_artifact_entries=artifacts,
             provider_set_key_map_path=provider_map,
+            npi_scope=npi_scope,
+            inferred_taxonomy=inferred_taxonomy,
             output_directory=output,
             binary_path=_summary_bridge_binary(
                 tmp_path,

@@ -154,10 +154,19 @@ fn v4_provider_membership_cli_emits_exact_bidirectional_sidecars() {
     );
     assert_eq!(&fs::read(&group_npi).unwrap()[..8], b"PTG2MNDS");
     assert_eq!(&fs::read(&npi_group).unwrap()[..8], b"PTG2MNDS");
+    let scope = fs::read(&npi_scope).unwrap();
+    let copy_header = [b"PGCOPY\n\xff\r\n\0".as_slice(), &[0u8; 8]].concat();
+    assert_eq!(&scope[..copy_header.len()], copy_header);
+    assert_eq!(scope.len(), copy_header.len() + 2 * 14 + 2);
     assert_eq!(
-        fs::read_to_string(&npi_scope).unwrap(),
-        "1234567890\n2222222222\n"
+        i64::from_be_bytes(scope[25..33].try_into().unwrap()),
+        1_234_567_890,
     );
+    assert_eq!(
+        i64::from_be_bytes(scope[39..47].try_into().unwrap()),
+        2_222_222_222,
+    );
+    assert_eq!(&scope[47..], &(-1i16).to_be_bytes());
     assert!(String::from_utf8_lossy(&completed.stdout).contains("membership_count\":2"));
 
     for missing_count in 0..3 {

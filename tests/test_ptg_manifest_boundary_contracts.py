@@ -50,18 +50,19 @@ def test_manifest_copy_collection_skips_malformed_entries():
 
     assert paths_by_kind == {"price_atom": [Path("/tmp/price.copy")]}
     assert emitted_rows_by_kind == {"price_atom": 0}
-    assert entries == {
-        "price_atom": [{"path": "/tmp/price.copy", "row_count": "bad"}]
-    }
+    assert entries == {"price_atom": [{"path": "/tmp/price.copy", "row_count": "bad"}]}
     assert ptg._count_manifest_copy_sources(
         [{"summary": {"manifest": {"copy_files": "bad"}}}],
         ["price_atom"],
     ) == {"price_atom": 0}
     assert ptg._manifest_summary_payloads({"summary": "bad"}) == ({}, {})
-    assert ptg._manifest_serving_row_count(
-        {"serving_rates": "bad"},
-        {},
-    ) == 0
+    assert (
+        ptg._manifest_serving_row_count(
+            {"serving_rates": "bad"},
+            {},
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -198,18 +199,16 @@ def test_file_result_and_allowed_metric_shapes_are_explicit():
     ],
 )
 def test_published_manifest_accepts_only_objects(manifest_value, expected):
-    assert ptg._published_snapshot_manifest(
-        {"manifest": manifest_value}
-    ) == expected
+    assert ptg._published_snapshot_manifest({"manifest": manifest_value}) == expected
 
 
 def test_manifest_sidecars_and_fallback_trace_are_deterministic(monkeypatch):
     assert ptg._manifest_sidecars_list(
         {"sidecars": {"a": {"path": "/a"}, "b": "bad"}}
     ) == [{"path": "/a"}]
-    assert ptg._manifest_sidecars_list(
-        {"sidecars": [{"path": "/b"}, "bad"]}
-    ) == [{"path": "/b"}]
+    assert ptg._manifest_sidecars_list({"sidecars": [{"path": "/b"}, "bad"]}) == [
+        {"path": "/b"}
+    ]
     assert ptg._manifest_sidecars_list({"sidecars": "bad"}) == []
 
     fallback = ptg._collect_manifest_artifacts(
@@ -232,7 +231,7 @@ def test_manifest_sidecars_and_fallback_trace_are_deterministic(monkeypatch):
     monkeypatch.setattr(
         ptg,
         "_collect_ptg2_manifest_sidecar_artifacts",
-        lambda _paths: {"x": {"path": "/fallback"}},
+        lambda _paths, **_kwargs: {"x": {"path": "/fallback"}},
     )
     artifacts = ptg._collect_manifest_artifacts(
         [
@@ -249,9 +248,7 @@ def test_manifest_sidecars_and_fallback_trace_are_deterministic(monkeypatch):
         ]
     )
     assert artifacts["network_names"] == ["Network A"]
-    assert artifacts["sidecars"] == [
-        {"path": "/fallback", "source_shard_id": "file:7"}
-    ]
+    assert artifacts["sidecars"] == [{"path": "/fallback", "source_shard_id": "file:7"}]
 
 
 @pytest.mark.asyncio
@@ -303,11 +300,7 @@ def test_v3_identity_metadata_rejects_malformed_and_conflicting_rows():
         )
     with pytest.raises(RuntimeError, match="source-run contract"):
         ptg._bind_provider_metadata_contract(
-            {
-                "provider_set_metadata": [
-                    {"source_run_contract_sha256": "wrong"}
-                ]
-            },
+            {"provider_set_metadata": [{"source_run_contract_sha256": "wrong"}]},
             identity_payload=identity_payload_by_field,
             source_run_contract_sha256="c" * 64,
         )
@@ -317,24 +310,30 @@ def test_shared_preflight_requires_complete_in_network_plan(tmp_path):
     descriptor = frozen_descriptor_by_ordinal(1)
     raw_artifact, logical_artifact = frozen_artifacts(descriptor, tmp_path)
     assert ptg._is_shared_v3_preflight_eligible([]) is False
-    assert ptg._is_shared_v3_preflight_eligible(
-        [
-            PTG2DownloadedJob(
-                job={"type": "in_network", "plan_info": []},
-                raw_artifact=raw_artifact,
-                logical_artifact=logical_artifact,
-            )
-        ]
-    ) is False
-    assert ptg._is_shared_v3_preflight_eligible(
-        [
-            PTG2DownloadedJob(
-                job={"type": "allowed_amounts", "plan_info": [{"plan_id": "x"}]},
-                raw_artifact=raw_artifact,
-                logical_artifact=logical_artifact,
-            )
-        ]
-    ) is False
+    assert (
+        ptg._is_shared_v3_preflight_eligible(
+            [
+                PTG2DownloadedJob(
+                    job={"type": "in_network", "plan_info": []},
+                    raw_artifact=raw_artifact,
+                    logical_artifact=logical_artifact,
+                )
+            ]
+        )
+        is False
+    )
+    assert (
+        ptg._is_shared_v3_preflight_eligible(
+            [
+                PTG2DownloadedJob(
+                    job={"type": "allowed_amounts", "plan_info": [{"plan_id": "x"}]},
+                    raw_artifact=raw_artifact,
+                    logical_artifact=logical_artifact,
+                )
+            ]
+        )
+        is False
+    )
 
 
 def test_small_publication_and_identity_helpers_fail_closed(tmp_path):
@@ -365,17 +364,23 @@ def test_small_publication_and_identity_helpers_fail_closed(tmp_path):
 def test_default_import_ids_keep_legacy_month_without_source_inputs():
     import_month = ptg.datetime.date(2026, 7, 1)
     assert ptg._default_ptg2_import_id(import_month, None) == "20260701"
-    assert ptg._default_ptg2_import_id(
-        import_month,
-        "source-a",
-    ) == "20260701"
-    assert ptg._frozen_ptg2_import_id(
-        import_month,
-        None,
-        frozen_rate_file_set_sha256="a" * 64,
-        frozen_rate_file_count=2,
-        arch_variant="shared_blocks_v4",
-    ) == "20260701"
+    assert (
+        ptg._default_ptg2_import_id(
+            import_month,
+            "source-a",
+        )
+        == "20260701"
+    )
+    assert (
+        ptg._frozen_ptg2_import_id(
+            import_month,
+            None,
+            frozen_rate_file_set_sha256="a" * 64,
+            frozen_rate_file_count=2,
+            arch_variant="shared_blocks_v4",
+        )
+        == "20260701"
+    )
 
 
 def test_json_scanner_and_toc_loader_reject_non_object(monkeypatch):

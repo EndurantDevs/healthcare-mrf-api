@@ -16,12 +16,18 @@ from scripts.ptg_v4_dev_canary_internal_evaluation import (
     compiler_work_failures as _compiler_work_failures,
     metric_delta as _metric_delta,
     metric_failures as _metric_failures,
+    owner_latency_failures as _owner_latency_failures,
     owner_mode as _owner_mode,
+    owner_prefix_failures as _owner_prefix_failures,
     prefix_digest as _prefix_digest,
     series_report as _series_report,
 )
 from scripts.ptg_v4_dev_canary_io import write_json
-from scripts.ptg_v4_dev_canary_support import nearest_rank, validate_identifier
+from scripts.ptg_v4_dev_canary_support import (
+    PTG_V4_RELEASE_LATENCY_CEILING_MS,
+    nearest_rank,
+    validate_identifier,
+)
 
 
 INTERNAL_OWNER_EVIDENCE_CONTRACT = "ptg_v4_internal_owner_probe_v1"
@@ -90,9 +96,7 @@ async def run_internal_owner_probe(
                 snapshot_key=snapshot_key,
                 diagnostic=diagnostic,
                 owner_spec=owner_spec,
-                provider_set_id=provider_set_id_by_key[
-                    owner_spec.provider_set_key
-                ],
+                provider_set_id=provider_set_id_by_key[owner_spec.provider_set_key],
             )
             for owner_spec in owner_specs
         ]
@@ -143,9 +147,7 @@ def _validated_runtime_identity_by_field(
     for field_name in identity_fields:
         raw_value = identity_by_field.get(field_name)
         if not isinstance(raw_value, str) or not raw_value.strip():
-            raise RuntimeError(
-                f"internal owner probe runtime {field_name} is missing"
-            )
+            raise RuntimeError(f"internal owner probe runtime {field_name} is missing")
         validated_identity_by_field[field_name] = raw_value.strip()
     return validated_identity_by_field
 
@@ -169,10 +171,10 @@ def _validate_probe_arguments(args: Any) -> None:
     if any(float(value) <= 0 for value in positive_values):
         raise ValueError("internal owner probe gates must be positive")
     if (
-        float(args.cold_p95_limit_ms) > 50
-        or float(args.warm_p95_limit_ms) > 50
+        float(args.cold_p95_limit_ms) > PTG_V4_RELEASE_LATENCY_CEILING_MS
+        or float(args.warm_p95_limit_ms) > PTG_V4_RELEASE_LATENCY_CEILING_MS
     ):
-        raise ValueError("internal owner latency gates cannot exceed 50ms")
+        raise ValueError("internal owner latency gates exceed the release ceiling")
 
 
 def _serving_contract(
@@ -241,9 +243,7 @@ def _build_owner_spec(
             f"compiler diagnostic lacks exact 201-member {role} evidence"
         )
     uses_override = (
-        bool(diagnostic.get("worst_uses_override"))
-        if prefix == "worst"
-        else False
+        bool(diagnostic.get("worst_uses_override")) if prefix == "worst" else False
     )
     return _OwnerSpec(
         role=role,
@@ -287,9 +287,7 @@ async def _provider_set_ids(
         int(record_by_field["provider_set_key"]): str(
             record_by_field["provider_set_id"]
         )
-        for record_by_field in (
-            _row_mapping(raw_record) for raw_record in query_result
-        )
+        for record_by_field in (_row_mapping(raw_record) for raw_record in query_result)
     }
     if set(provider_set_id_by_key) != set(owner_keys):
         raise RuntimeError("compiler-selected provider-set dictionary row is missing")
@@ -420,28 +418,25 @@ def _evaluate_owner(
     """Apply exact prefix, latency, metric, and compiler-work gates."""
 
     actual_digest = _prefix_digest(dense_keys)
-    failures: list[str] = []
-    if (
-        not cold.is_prefix_stable
-        or not warm.is_prefix_stable
-        or warm.prefix_npis != cold.prefix_npis
-    ):
-        failures.append(f"{owner_spec.role} exact prefix changed across samples")
-    if (
-        len(dense_keys) != owner_spec.expected_member_count
-        or actual_digest != owner_spec.expected_member_digest
-    ):
-        failures.append(f"{owner_spec.role} prefix differs from compiler digest")
-    if len(dense_keys) != _EXACT_PREFIX_LIMIT:
-        failures.append(
-            f"{owner_spec.role} prefix is not the exact 201-member workload"
-        )
     cold_p95 = nearest_rank(cold.latencies_ms, 0.95)
     warm_p95 = nearest_rank(warm.latencies_ms, 0.95)
-    if cold_p95 > float(args.cold_p95_limit_ms):
-        failures.append(f"{owner_spec.role} cold p95 exceeds 50ms gate")
-    if warm_p95 > float(args.warm_p95_limit_ms):
-        failures.append(f"{owner_spec.role} warm p95 exceeds 50ms gate")
+    failures = _owner_prefix_failures(
+        owner_spec,
+        cold=cold,
+        warm=warm,
+        dense_keys=dense_keys,
+        actual_digest=actual_digest,
+        exact_prefix_limit=_EXACT_PREFIX_LIMIT,
+    )
+    failures.extend(
+        _owner_latency_failures(
+            args,
+            owner_spec=owner_spec,
+            cold_p95=cold_p95,
+            warm_p95=warm_p95,
+            release_latency_ceiling_ms=(PTG_V4_RELEASE_LATENCY_CEILING_MS),
+        )
+    )
     for phase_name, series in (("cold", cold), ("warm", warm)):
         failures.extend(
             _metric_failures(

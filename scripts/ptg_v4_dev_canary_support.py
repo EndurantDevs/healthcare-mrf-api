@@ -21,6 +21,8 @@ from scripts.ptg_v4_dev_canary_metrics import (
 
 
 GIBIBYTE = 1 << 30
+PTG_V4_RELEASE_LATENCY_CEILING_MS = 70.0
+PTG_V4_FOLLOWUP_LATENCY_TARGET_MS = 50.0
 ROOT_COUNT_FIELDS = frozenset(
     {
         "object_kind_count",
@@ -237,7 +239,9 @@ def parse_count_expectations(
             or (not relation_scoped and "." in key)
         ):
             scope = "RELATION.FIELD" if relation_scoped else "FIELD"
-            raise CanaryConfigurationError(f"count expectations must use {scope}=INTEGER")
+            raise CanaryConfigurationError(
+                f"count expectations must use {scope}=INTEGER"
+            )
         try:
             count = int(count_text)
         except ValueError as exc:
@@ -293,8 +297,7 @@ def evaluate_api_probe(
         semantic_reference,
     )
     failures.extend(
-        str(graph_failure)
-        for graph_failure in graph_read_evidence.get("failures", [])
+        str(graph_failure) for graph_failure in graph_read_evidence.get("failures", [])
     )
     cold_samples_ms = validated_cold_latencies(
         cold_sample_evidence,
@@ -345,12 +348,10 @@ def _response_failures(
             compare_v4_document_to_reference,
         )
 
-        semantic_failures, _semantic_page = (
-            compare_v4_document_to_reference(
-                document_by_field,
-                spec,
-                semantic_reference,
-            )
+        semantic_failures, _semantic_page = compare_v4_document_to_reference(
+            document_by_field,
+            spec,
+            semantic_reference,
         )
         failures.extend(semantic_failures)
     return failures
@@ -366,9 +367,7 @@ def _cold_evidence_expectation(
 ) -> ColdEvidenceExpectation:
     """Bind persisted samples to the exact V3 page, V4 build, and query."""
 
-    runtime_identity_by_field = _mapping(
-        graph_read_evidence.get("runtime_identity")
-    )
+    runtime_identity_by_field = _mapping(graph_read_evidence.get("runtime_identity"))
     return ColdEvidenceExpectation(
         minimum_sample_count=spec.minimum_cold_process_samples,
         semantic_page_digest=(

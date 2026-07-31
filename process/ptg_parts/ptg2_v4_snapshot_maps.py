@@ -33,6 +33,9 @@ from process.ptg_parts.ptg2_shared_blocks import (
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     lock_writable_snapshot,
 )
+from process.ptg_parts.ptg2_v4_graph_compiler import (
+    validate_v4_adaptive_layout_decision,
+)
 from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
     PTG2_V4_INFERRED_TAXONOMY_CANDIDATE_TABLE,
     summarize_v4_inferred_taxonomy_candidates,
@@ -171,7 +174,9 @@ def _env_non_negative_seconds(name: str, default: int) -> int:
 
 
 def _lease_deadline(*, sealed: bool = False) -> datetime:
-    name = PTG2_V3_SEALED_LEASE_SECONDS_ENV if sealed else PTG2_V3_BUILD_LEASE_SECONDS_ENV
+    name = (
+        PTG2_V3_SEALED_LEASE_SECONDS_ENV if sealed else PTG2_V3_BUILD_LEASE_SECONDS_ENV
+    )
     default = (
         PTG2_V3_SEALED_LEASE_SECONDS_DEFAULT
         if sealed
@@ -234,9 +239,13 @@ class V4SnapshotMapCoordinate:
         if not 0 <= int(self.block_key) <= (2**63 - 1):
             raise ValueError("PTG V4 map block_key is outside PostgreSQL bigint range")
         if not 0 <= int(self.fragment_no) <= (2**31 - 1):
-            raise ValueError("PTG V4 map fragment_no is outside PostgreSQL integer range")
+            raise ValueError(
+                "PTG V4 map fragment_no is outside PostgreSQL integer range"
+            )
         if not 0 <= int(self.entry_count) <= (2**63 - 1):
-            raise ValueError("PTG V4 map entry_count is outside PostgreSQL bigint range")
+            raise ValueError(
+                "PTG V4 map entry_count is outside PostgreSQL bigint range"
+            )
         if len(bytes(self.block_hash)) != 32:
             raise ValueError("PTG V4 map block_hash must contain 32 bytes")
 
@@ -313,9 +322,7 @@ class V4SnapshotMetadataSummary:
     heavy_owner_count: int
     provider_graph_diagnostics: Mapping[str, Any] = field(default_factory=dict)
     provider_graph_resources: Mapping[str, int] = field(default_factory=dict)
-    inferred_taxonomy_candidates: Mapping[str, Any] = field(
-        default_factory=dict
-    )
+    inferred_taxonomy_candidates: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -359,7 +366,10 @@ class _V4SnapshotMapSummaryAccumulator:
                 int(reference.block_key),
                 int(reference.fragment_no),
             )
-            if self._previous_coordinate is not None and coordinate <= self._previous_coordinate:
+            if (
+                self._previous_coordinate is not None
+                and coordinate <= self._previous_coordinate
+            ):
                 raise ValueError("PTG V4 snapshot mappings must be strictly ordered")
             self._previous_coordinate = coordinate
             kind_bytes = reference.object_kind.encode("utf-8")
@@ -410,7 +420,9 @@ def encode_v4_snapshot_map_pack(
     if not kind_bytes or len(kind_bytes) > 64:
         raise ValueError("PTG V4 map object_kind must contain 1 to 64 UTF-8 bytes")
     if not references or len(references) > PTG2_V4_MAX_COORDINATES_PER_PACK:
-        raise ValueError("PTG V4 map pack coordinate count is outside the supported range")
+        raise ValueError(
+            "PTG V4 map pack coordinate count is outside the supported range"
+        )
     encoded_pack = bytearray(
         _MAP_HEADER.pack(
             _MAP_MAGIC,
@@ -450,8 +462,8 @@ def decode_v4_snapshot_map_pack(
     raw_payload = bytes(encoded_pack)
     if len(raw_payload) < _MAP_HEADER.size:
         raise ValueError("PTG V4 map pack is truncated")
-    magic, version, kind_length, coordinate_count, padded_kind = _MAP_HEADER.unpack_from(
-        raw_payload
+    magic, version, kind_length, coordinate_count, padded_kind = (
+        _MAP_HEADER.unpack_from(raw_payload)
     )
     if magic != _MAP_MAGIC or version != PTG2_V4_MAP_FORMAT_VERSION:
         raise ValueError("PTG V4 map pack has an incompatible format")
@@ -681,19 +693,18 @@ def _apply_v4_index_markers(serving_index: dict[str, Any]) -> None:
         },
     }
     for field_name, expected_value in marker_by_field.items():
-        if serving_index.get(field_name) not in compatible_existing_by_field[field_name]:
+        if (
+            serving_index.get(field_name)
+            not in compatible_existing_by_field[field_name]
+        ):
             raise ValueError(f"PTG V4 layout manifest has incompatible {field_name}")
         serving_index[field_name] = expected_value
 
 
-def _provider_graph_v4_map(
-    representation: str,
-    summary: V4SnapshotMapSummary,
+def _validated_graph_resources(
     metadata: V4SnapshotMetadataSummary,
-) -> dict[str, Any]:
-    if set(metadata.provider_graph_resources) != set(
-        PTG2_V4_GRAPH_RESOURCE_FIELDS
-    ):
+) -> dict[str, int]:
+    if set(metadata.provider_graph_resources) != set(PTG2_V4_GRAPH_RESOURCE_FIELDS):
         raise ValueError("PTG V4 graph resource admission is invalid")
     resources_by_field = {
         field_name: int(metadata.provider_graph_resources[field_name])
@@ -706,18 +717,47 @@ def _provider_graph_v4_map(
         or resources_by_field["empty_npi_tin_only_normalization_count"] < 0
     ):
         raise ValueError("PTG V4 graph resource admission is invalid")
-    inferred_taxonomy_manifest_map = dict(
-        metadata.inferred_taxonomy_candidates
-    )
+    return resources_by_field
+
+
+def _validated_inferred_taxonomy_manifest(
+    metadata: V4SnapshotMetadataSummary,
+) -> dict[str, Any]:
+    inferred_taxonomy_manifest_map = dict(metadata.inferred_taxonomy_candidates)
     if inferred_taxonomy_manifest_map:
-        inferred_taxonomy_manifest_map = (
-            validate_v4_inferred_taxonomy_projection_manifest(
-                inferred_taxonomy_manifest_map
-            )
+        return validate_v4_inferred_taxonomy_projection_manifest(
+            inferred_taxonomy_manifest_map
         )
+    return inferred_taxonomy_manifest_map
+
+
+def _validated_adaptive_layout(
+    adaptive_layout: Mapping[str, Any],
+    *,
+    representation: str,
+) -> dict[str, Any]:
+    validated_adaptive_layout = validate_v4_adaptive_layout_decision(adaptive_layout)
+    if validated_adaptive_layout["selected_representation"] != str(representation):
+        raise ValueError("PTG V4 adaptive layout differs from map representation")
+    return validated_adaptive_layout
+
+
+def _provider_graph_v4_map(
+    representation: str,
+    summary: V4SnapshotMapSummary,
+    metadata: V4SnapshotMetadataSummary,
+    adaptive_layout: Mapping[str, Any],
+) -> dict[str, Any]:
+    resources_by_field = _validated_graph_resources(metadata)
+    inferred_taxonomy_manifest_map = _validated_inferred_taxonomy_manifest(metadata)
+    validated_adaptive_layout = _validated_adaptive_layout(
+        adaptive_layout,
+        representation=representation,
+    )
     return {
         "contract": PTG2_V4_PROVIDER_GRAPH_CONTRACT,
         "representation": str(representation),
+        "adaptive_layout": validated_adaptive_layout,
         "map_format": PTG2_V4_MAP_FORMAT,
         "projection_id_scope": PTG2_V4_PROJECTION_ID_SCOPE,
         "map_digest": summary.map_digest.hex(),
@@ -756,8 +796,15 @@ def _serving_binary_v4_map(
     if serving_binary_map.get("format") not in (None, "postgres_binary_v3"):
         raise ValueError("PTG V4 price serving binary must remain postgres_binary_v3")
     serving_binary_map["format"] = "postgres_binary_v3"
+    provisional_provider_graph = serving_index.get("provider_graph")
+    if not isinstance(provisional_provider_graph, Mapping):
+        raise ValueError("PTG V4 layout manifest lacks compiler graph evidence")
+    adaptive_layout = provisional_provider_graph.get("adaptive_layout")
     provider_graph_v4_map = _provider_graph_v4_map(
-        representation, summary, metadata
+        representation,
+        summary,
+        metadata,
+        adaptive_layout,
     )
     existing_provider_graph = serving_binary_map.get("provider_graph_v4")
     if existing_provider_graph not in (None, provider_graph_v4_map):
@@ -826,12 +873,21 @@ def _validate_v4_manifest_root(
     if serving_index.get("snapshot_map") != expected_root:
         raise RuntimeError("sealed PTG V4 layout manifest root is inconsistent")
     serving_binary_map = serving_index.get("serving_binary")
-    if not isinstance(serving_binary_map, Mapping) or serving_binary_map.get("format") != (
-        "postgres_binary_v3"
-    ):
+    if not isinstance(serving_binary_map, Mapping) or serving_binary_map.get(
+        "format"
+    ) != ("postgres_binary_v3"):
         raise RuntimeError("sealed PTG V4 price serving binary is inconsistent")
+    existing_provider_graph_map = serving_binary_map.get("provider_graph_v4")
+    adaptive_layout = (
+        existing_provider_graph_map.get("adaptive_layout")
+        if isinstance(existing_provider_graph_map, Mapping)
+        else None
+    )
     expected_provider_graph_map = _provider_graph_v4_map(
-        representation, summary, metadata
+        representation,
+        summary,
+        metadata,
+        adaptive_layout,
     )
     if serving_binary_map.get("provider_graph_v4") != expected_provider_graph_map:
         raise RuntimeError("sealed PTG V4 provider graph manifest is inconsistent")
@@ -839,9 +895,7 @@ def _validate_v4_manifest_root(
 
 def _summary_from_root_row(root: Mapping[str, Any]) -> V4SnapshotMapSummary:
     raw_object_kinds = root.get("object_kinds")
-    object_kinds = tuple(
-        str(object_kind) for object_kind in (raw_object_kinds or ())
-    )
+    object_kinds = tuple(str(object_kind) for object_kind in (raw_object_kinds or ()))
     return V4SnapshotMapSummary(
         map_digest=bytes(root.get("map_digest") or b""),
         object_kinds=object_kinds,
@@ -953,8 +1007,7 @@ def _decode_persisted_map_payload(
 ) -> tuple[V4SnapshotMapCoordinate, ...]:
     map_payload = bytes(pack_row.get("map_payload") or b"")
     if (
-        int(pack_row.get("map_format_version") or -1)
-        != PTG2_V3_SHARED_FORMAT_VERSION
+        int(pack_row.get("map_format_version") or -1) != PTG2_V3_SHARED_FORMAT_VERSION
         or pack_row.get("map_object_kind") != PTG2_V4_MAP_BLOCK_KIND
         or pack_row.get("map_codec") != "none"
         or int(pack_row.get("map_raw_byte_count") or -1) != len(map_payload)
@@ -1157,9 +1210,7 @@ async def summarize_persisted_v4_snapshot_maps(
             target_hashes=target_hashes,
         )
         if cancel_gc_candidates:
-            map_hashes = {
-                bytes(pack_row["map_block_hash"]) for pack_row in pack_rows
-            }
+            map_hashes = {bytes(pack_row["map_block_hash"]) for pack_row in pack_rows}
             await _cancel_map_gc_candidates(
                 session,
                 schema=schema,
@@ -1295,8 +1346,7 @@ async def _load_locator_payloads(
         identity_fields = identity_by_hash.get(block_hash)
         if (
             identity_fields is None
-            or int(block.get("format_version") or -1)
-            != PTG2_V3_SHARED_FORMAT_VERSION
+            or int(block.get("format_version") or -1) != PTG2_V3_SHARED_FORMAT_VERSION
             or str(block.get("object_kind") or "") != identity_fields[0]
             or block.get("codec") != "none"
             or int(block.get("entry_count") or -1) != identity_fields[1]
@@ -1663,10 +1713,9 @@ def _validate_heavy_owners(
             raise RuntimeError("PTG V4 heavy-owner member count is inconsistent")
         if int(owner["member_base"]) + int(owner["member_span"]) > 2**63:
             raise RuntimeError("PTG V4 heavy-owner member range exceeds bigint")
-        member_count_by_relation[relation_name] = (
-            member_count_by_relation.get(relation_name, 0)
-            + int(owner["member_count"])
-        )
+        member_count_by_relation[relation_name] = member_count_by_relation.get(
+            relation_name, 0
+        ) + int(owner["member_count"])
     return member_count_by_relation
 
 
@@ -1777,9 +1826,7 @@ async def _load_canary_prefixes(
         ),
         {
             "snapshot_key": int(snapshot_key),
-            "worst_provider_set_key": diagnostic.get(
-                "worst_provider_set_key"
-            ),
+            "worst_provider_set_key": diagnostic.get("worst_provider_set_key"),
             "worst_online_provider_set_key": diagnostic.get(
                 "worst_online_provider_set_key"
             ),
@@ -1803,20 +1850,22 @@ def _validate_canary_prefixes(
         prefix_by_owner.get(int(worst_key)) if worst_key is not None else None
     )
     expected_worst_prefix = (
-        int(diagnostic["worst_member_count"]),
-        bytes(diagnostic["worst_member_digest"]),
-    ) if diagnostic.get("worst_member_digest") is not None else None
+        (
+            int(diagnostic["worst_member_count"]),
+            bytes(diagnostic["worst_member_digest"]),
+        )
+        if diagnostic.get("worst_member_digest") is not None
+        else None
+    )
     if (
-        bool(diagnostic["worst_uses_override"])
-        != (worst_prefix is not None)
+        bool(diagnostic["worst_uses_override"]) != (worst_prefix is not None)
         or (
             bool(diagnostic["worst_uses_override"])
             and worst_prefix != expected_worst_prefix
         )
         or (
             diagnostic.get("worst_online_provider_set_key") is not None
-            and int(diagnostic["worst_online_provider_set_key"])
-            in prefix_by_owner
+            and int(diagnostic["worst_online_provider_set_key"]) in prefix_by_owner
         )
     ):
         raise RuntimeError("PTG V4 graph canary-owner diagnostics changed")
@@ -1937,8 +1986,64 @@ async def _validate_persisted_heavy_owners(
     return len(observed_by_owner)
 
 
+async def _load_provider_graph_metadata(
+    session: Any,
+    *,
+    schema_name: str,
+    schema: str,
+    snapshot_key: int,
+    counts: _MetadataCounts,
+) -> tuple[dict[str, int], dict[str, int], dict[str, Any]]:
+    provider_graph_diagnostics = await _load_provider_graph_diagnostics(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+    )
+    provider_graph_resources = await _load_provider_graph_resources(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+    )
+    inferred_taxonomy_candidates = await summarize_v4_inferred_taxonomy_candidates(
+        session,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        npi_count=counts.npi_count,
+        pattern_count=counts.pattern_count,
+        rules=INFERRED_PROVIDER_TAXONOMY_RULES,
+    )
+    return (
+        provider_graph_diagnostics,
+        provider_graph_resources,
+        inferred_taxonomy_candidates,
+    )
+
+
+async def _load_validated_relation_metadata(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    map_object_kinds: set[str],
+) -> dict[str, Mapping[str, Any]]:
+    relation_by_name = await _load_relation_metadata(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        map_object_kinds=map_object_kinds,
+    )
+    entry_count_by_kind = await _load_entry_counts_by_kind(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+    )
+    _validate_relation_entry_counts(relation_by_name, entry_count_by_kind)
+    return relation_by_name
+
+
 async def summarize_persisted_v4_snapshot_metadata(
-    session: Any, *,
+    session: Any,
+    *,
     schema_name: str,
     snapshot_key: int,
     map_summary: V4SnapshotMapSummary,
@@ -1959,18 +2064,12 @@ async def summarize_persisted_v4_snapshot_metadata(
     )
     counts = _validated_metadata_counts(aggregate)
     map_object_kinds = set(map_summary.object_kinds)
-    relation_by_name = await _load_relation_metadata(
+    relation_by_name = await _load_validated_relation_metadata(
         session,
         schema=schema,
         snapshot_key=int(snapshot_key),
         map_object_kinds=map_object_kinds,
     )
-    entry_count_by_kind = await _load_entry_counts_by_kind(
-        session,
-        schema=schema,
-        snapshot_key=int(snapshot_key),
-    )
-    _validate_relation_entry_counts(relation_by_name, entry_count_by_kind)
     heavy_owner_count = await _validate_persisted_heavy_owners(
         session,
         schema=schema,
@@ -1978,25 +2077,16 @@ async def summarize_persisted_v4_snapshot_metadata(
         map_object_kinds=map_object_kinds,
         relation_by_name=relation_by_name,
     )
-    provider_graph_diagnostics = await _load_provider_graph_diagnostics(
+    (
+        provider_graph_diagnostics,
+        provider_graph_resources,
+        inferred_taxonomy_candidates,
+    ) = await _load_provider_graph_metadata(
         session,
+        schema_name=schema_name,
         schema=schema,
         snapshot_key=int(snapshot_key),
-    )
-    provider_graph_resources = await _load_provider_graph_resources(
-        session,
-        schema=schema,
-        snapshot_key=int(snapshot_key),
-    )
-    inferred_taxonomy_candidates = (
-        await summarize_v4_inferred_taxonomy_candidates(
-            session,
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-            npi_count=counts.npi_count,
-            pattern_count=counts.pattern_count,
-            rules=INFERRED_PROVIDER_TAXONOMY_RULES,
-        )
+        counts=counts,
     )
     return V4SnapshotMetadataSummary(
         npi_count=counts.npi_count,
@@ -2085,8 +2175,7 @@ def _sealed_map_summary(
     object_kinds = ()
     if isinstance(snapshot_map, Mapping):
         object_kinds = tuple(
-            str(object_kind)
-            for object_kind in snapshot_map.get("object_kinds") or ()
+            str(object_kind) for object_kind in snapshot_map.get("object_kinds") or ()
         )
     return V4SnapshotMapSummary(
         map_digest=bytes(existing.get("map_digest") or b""),
@@ -2111,21 +2200,21 @@ def _sealed_metadata_summary(
         pattern_count=int(existing.get("pattern_count") or 0),
         relation_count=int(existing.get("relation_count") or 0),
         heavy_owner_count=int(existing.get("heavy_owner_count") or 0),
-        provider_graph_diagnostics=dict(
-            provider_graph.get("hot_prefix") or {}
-        )
-        if isinstance(provider_graph, Mapping)
-        else {},
-        provider_graph_resources=dict(
-            provider_graph.get("resource_admission") or {}
-        )
-        if isinstance(provider_graph, Mapping)
-        else {},
-        inferred_taxonomy_candidates=dict(
-            provider_graph.get("inferred_taxonomy_candidates") or {}
-        )
-        if isinstance(provider_graph, Mapping)
-        else {},
+        provider_graph_diagnostics=(
+            dict(provider_graph.get("hot_prefix") or {})
+            if isinstance(provider_graph, Mapping)
+            else {}
+        ),
+        provider_graph_resources=(
+            dict(provider_graph.get("resource_admission") or {})
+            if isinstance(provider_graph, Mapping)
+            else {}
+        ),
+        inferred_taxonomy_candidates=(
+            dict(provider_graph.get("inferred_taxonomy_candidates") or {})
+            if isinstance(provider_graph, Mapping)
+            else {}
+        ),
     )
 
 
@@ -2133,8 +2222,7 @@ def _validate_sealed_reservation(existing: Mapping[str, Any]) -> Mapping[str, An
     manifest, sealed_summary, sealed_metadata = _sealed_root_summaries(existing)
     if (
         existing.get("root_state") != "complete"
-        or int(existing.get("root_format_version") or -1)
-        != PTG2_V4_MAP_FORMAT_VERSION
+        or int(existing.get("root_format_version") or -1) != PTG2_V4_MAP_FORMAT_VERSION
         or existing.get("map_format") != PTG2_V4_MAP_FORMAT
         or existing.get("projection_id_scope") != PTG2_V4_PROJECTION_ID_SCOPE
         or bytes(existing.get("layout_mapping_digest") or b"")
@@ -2400,10 +2488,7 @@ async def _verify_dense_table_keys(
 
 
 def _npi_pairs(npi_rows: Iterable[Mapping[str, Any]]) -> list[tuple[int, int]]:
-    return [
-        (int(npi_row["npi_key"]), int(npi_row["npi"]))
-        for npi_row in npi_rows
-    ]
+    return [(int(npi_row["npi_key"]), int(npi_row["npi"])) for npi_row in npi_rows]
 
 
 def _normalized_npi_row(
@@ -2472,7 +2557,9 @@ async def _publish_v4_npi_batch(
             "last_key": last_key,
         },
     )
-    observed_pairs = _npi_pairs(_row_mapping(stored_row) for stored_row in stored_result)
+    observed_pairs = _npi_pairs(
+        _row_mapping(stored_row) for stored_row in stored_result
+    )
     expected_pairs = _npi_pairs(npi_rows)
     if observed_pairs != expected_pairs:
         raise RuntimeError("PTG V4 NPI dictionary conflicts with stored dense keys")
@@ -2960,18 +3047,14 @@ async def _load_relation_rows(
         "locator_owner_span",
     )
     observed_rows = [
-        {
-            field_name: _row_mapping(stored_row)[field_name]
-            for field_name in field_names
-        }
+        {field_name: _row_mapping(stored_row)[field_name] for field_name in field_names}
         for stored_row in stored_result
     ]
     return [
         {
             key: (
                 str(field_value)
-                if key
-                in {"relation", "member_object_kind", "locator_object_kind"}
+                if key in {"relation", "member_object_kind", "locator_object_kind"}
                 else int(field_value)
             )
             for key, field_value in observed_row.items()
@@ -3175,7 +3258,6 @@ async def _initialize_v4_snapshot_map_root(
     representation: str,
 ) -> None:
     """Create or validate the building root for one V4 representation."""
-
     schema = _quote_ident(schema_name)
     normalized_representation = str(representation or "").strip()
     if normalized_representation not in PTG2_V4_REPRESENTATIONS:
@@ -3225,7 +3307,9 @@ async def _initialize_v4_snapshot_map_root(
         root.get(field_name) != expected_value
         for field_name, expected_value in expected_by_field.items()
     ):
-        raise RuntimeError("PTG V4 snapshot map root conflicts with the requested layout")
+        raise RuntimeError(
+            "PTG V4 snapshot map root conflicts with the requested layout"
+        )
 
 
 def _target_metadata_by_hash(
@@ -3531,24 +3615,34 @@ async def publish_v4_snapshot_maps(
     return accumulator.finish()
 
 
-async def seal_v4_shared_layout(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-    build_token: str,
-    expected_summary: V4SnapshotMapSummary,
-    support_digest: bytes,
-    layout_manifest: Mapping[str, Any],
-    summary_batch_rows: int = 32,
-    progress_callback: Callable[[str, int], None] | None = None,
-) -> SealedSharedLayout:
-    """Authoritatively re-read, complete, and atomically seal one V4 root."""
+def _v4_seal_options(
+    options_by_name: dict[str, Any],
+) -> tuple[int, Callable[[str, int], None] | None]:
+    summary_batch_rows = options_by_name.pop("summary_batch_rows", 32)
+    progress_callback = options_by_name.pop("progress_callback", None)
+    if options_by_name:
+        unexpected_name = sorted(options_by_name)[0]
+        raise TypeError(
+            "seal_v4_shared_layout() got an unexpected keyword argument "
+            f"'{unexpected_name}'"
+        )
+    return int(summary_batch_rows), progress_callback
 
+
+def _normalized_v4_support_digest(support_digest: bytes) -> bytes:
     normalized_support_digest = bytes(support_digest)
     if len(normalized_support_digest) != 32:
         raise ValueError("PTG V4 support digest must contain 32 bytes")
-    schema = _quote_ident(schema_name)
+    return normalized_support_digest
+
+
+async def _lock_v4_build_owner(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    build_token: str,
+) -> str:
     owner_result = await session.execute(
         text(
             f"""
@@ -3556,12 +3650,7 @@ async def seal_v4_shared_layout(
                    root.state AS root_state,
                    root.format_version AS root_format_version,
                    root.map_format, root.representation,
-                   root.projection_id_scope, root.map_digest,
-                   root.object_kind_count, root.map_pack_count,
-                   root.coordinate_count, root.entry_count,
-                   root.logical_byte_count, root.stored_map_byte_count,
-                   root.npi_count, root.component_count, root.pattern_count,
-                   root.relation_count, root.heavy_owner_count
+                   root.projection_id_scope
               FROM {schema}.ptg2_v3_snapshot_layout AS layout
               JOIN {schema}.ptg2_v4_snapshot_map_root AS root
                 ON root.snapshot_key = layout.snapshot_key
@@ -3573,9 +3662,9 @@ async def seal_v4_shared_layout(
             """
         ),
         {
-            "snapshot_key": int(snapshot_key),
+            "snapshot_key": snapshot_key,
             "generation": PTG2_V4_SHARED_GENERATION,
-            "build_token": str(build_token),
+            "build_token": build_token,
         },
     )
     owner_row = owner_result.first()
@@ -3583,25 +3672,36 @@ async def seal_v4_shared_layout(
     representation = str(owner.get("representation") or "")
     if (
         owner.get("root_state") != "building"
-        or int(owner.get("root_format_version") or -1)
-        != PTG2_V4_MAP_FORMAT_VERSION
+        or int(owner.get("root_format_version") or -1) != PTG2_V4_MAP_FORMAT_VERSION
         or owner.get("map_format") != PTG2_V4_MAP_FORMAT
         or representation not in PTG2_V4_REPRESENTATIONS
         or owner.get("projection_id_scope") != PTG2_V4_PROJECTION_ID_SCOPE
     ):
         raise RuntimeError("PTG V4 seal requires one building compatible map root")
+    return representation
 
+
+async def _summarize_v4_seal_state(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    expected_summary: V4SnapshotMapSummary,
+    summary_batch_rows: int,
+    progress_callback: Callable[[str, int], None] | None,
+) -> tuple[V4SnapshotMapSummary, V4SnapshotMetadataSummary]:
+    progress_options = (
+        {"progress_callback": progress_callback}
+        if progress_callback is not None
+        else {}
+    )
     observed_summary = await summarize_persisted_v4_snapshot_maps(
         session,
         schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
+        snapshot_key=snapshot_key,
         batch_rows=summary_batch_rows,
         cancel_gc_candidates=True,
-        **(
-            {"progress_callback": progress_callback}
-            if progress_callback is not None
-            else {}
-        ),
+        **progress_options,
     )
     _require_matching_summaries(
         expected_summary,
@@ -3611,16 +3711,22 @@ async def seal_v4_shared_layout(
     observed_metadata = await summarize_persisted_v4_snapshot_metadata(
         session,
         schema_name=schema_name,
-        snapshot_key=int(snapshot_key),
+        snapshot_key=snapshot_key,
         map_summary=observed_summary,
-        **(
-            {"progress_callback": progress_callback}
-            if progress_callback is not None
-            else {}
-        ),
+        **progress_options,
     )
-    if representation == "pattern_v1" and observed_metadata.pattern_count <= 0:
-        raise RuntimeError("PTG V4 pattern representation has no pattern metadata")
+    return observed_summary, observed_metadata
+
+
+async def _complete_v4_map_root(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    representation: str,
+    summary: V4SnapshotMapSummary,
+    metadata: V4SnapshotMetadataSummary,
+) -> None:
     completion_result = await session.execute(
         text(
             f"""
@@ -3649,19 +3755,19 @@ async def seal_v4_shared_layout(
             """
         ),
         {
-            "snapshot_key": int(snapshot_key),
-            "map_digest": observed_summary.map_digest,
-            "object_kind_count": observed_summary.object_kind_count,
-            "map_pack_count": observed_summary.map_pack_count,
-            "coordinate_count": observed_summary.coordinate_count,
-            "entry_count": observed_summary.entry_count,
-            "logical_byte_count": observed_summary.logical_byte_count,
-            "stored_map_byte_count": observed_summary.stored_map_byte_count,
-            "npi_count": observed_metadata.npi_count,
-            "component_count": observed_metadata.component_count,
-            "pattern_count": observed_metadata.pattern_count,
-            "relation_count": observed_metadata.relation_count,
-            "heavy_owner_count": observed_metadata.heavy_owner_count,
+            "snapshot_key": snapshot_key,
+            "map_digest": summary.map_digest,
+            "object_kind_count": summary.object_kind_count,
+            "map_pack_count": summary.map_pack_count,
+            "coordinate_count": summary.coordinate_count,
+            "entry_count": summary.entry_count,
+            "logical_byte_count": summary.logical_byte_count,
+            "stored_map_byte_count": summary.stored_map_byte_count,
+            "npi_count": metadata.npi_count,
+            "component_count": metadata.component_count,
+            "pattern_count": metadata.pattern_count,
+            "relation_count": metadata.relation_count,
+            "heavy_owner_count": metadata.heavy_owner_count,
             "completed_at": _utcnow(),
             "format_version": PTG2_V4_MAP_FORMAT_VERSION,
             "map_format": PTG2_V4_MAP_FORMAT,
@@ -3672,15 +3778,18 @@ async def seal_v4_shared_layout(
     if completion_result.scalar() is None:
         raise RuntimeError("PTG V4 map root could not be completed during seal")
 
-    sealed_manifest = _manifest_with_v4_root(
-        layout_manifest,
-        representation=representation,
-        summary=observed_summary,
-        metadata=observed_metadata,
-    )
+
+async def _load_reusable_v4_layout(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    mapping_digest: bytes,
+    support_digest: bytes,
+) -> dict[str, Any] | None:
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:lock_key)"),
-        {"lock_key": v4_layout_advisory_lock_key(observed_summary.map_digest)},
+        {"lock_key": v4_layout_advisory_lock_key(mapping_digest)},
     )
     reusable_result = await session.execute(
         text(
@@ -3709,103 +3818,134 @@ async def seal_v4_shared_layout(
         ),
         {
             "generation": PTG2_V4_SHARED_GENERATION,
-            "mapping_digest": observed_summary.map_digest,
-            "support_digest": normalized_support_digest,
-            "snapshot_key": int(snapshot_key),
+            "mapping_digest": mapping_digest,
+            "support_digest": support_digest,
+            "snapshot_key": snapshot_key,
         },
     )
     reusable_row = reusable_result.first()
-    if reusable_row is not None:
-        reusable = _row_mapping(reusable_row)
-        _reusable_manifest, reusable_summary, reusable_metadata = (
-            _sealed_root_summaries(reusable)
-        )
-        if (
-            reusable.get("root_state") != "complete"
-            or int(reusable.get("root_format_version") or -1)
-            != PTG2_V4_MAP_FORMAT_VERSION
-            or reusable.get("map_format") != PTG2_V4_MAP_FORMAT
-            or reusable.get("representation") != representation
-            or reusable.get("projection_id_scope")
-            != PTG2_V4_PROJECTION_ID_SCOPE
-            or int(reusable.get("object_kind_count") or 0)
-            != observed_summary.object_kind_count
-            or reusable_metadata != observed_metadata
-        ):
-            raise RuntimeError("reusable PTG V4 layout root is incompatible")
-        _require_matching_summaries(
-            observed_summary,
-            reusable_summary,
-            context="reusable root",
-        )
-        _validate_v4_manifest_root(
-            reusable.get("layout_manifest") or {},
-            representation=representation,
-            summary=reusable_summary,
-            metadata=reusable_metadata,
-        )
-        reusable_snapshot_key = int(reusable["snapshot_key"])
-        await session.execute(
-            text(
-                f"""
-                UPDATE {schema}.ptg2_v3_snapshot_layout
-                   SET heartbeat_at = :heartbeat_at,
-                       lease_until = :lease_until
-                 WHERE snapshot_key = :snapshot_key
-                   AND state = 'sealed'
-                   AND generation = :generation
-                """
-            ),
-            {
-                "snapshot_key": reusable_snapshot_key,
-                "generation": PTG2_V4_SHARED_GENERATION,
-                "heartbeat_at": _utcnow(),
-                "lease_until": _lease_deadline(sealed=True),
-            },
-        )
-        await session.execute(
-            text(
-                f"""
-                UPDATE {schema}.ptg2_v3_layout_fingerprint
-                   SET snapshot_key = :reusable_snapshot_key
-                 WHERE snapshot_key = :snapshot_key
-                """
-            ),
-            {
-                "reusable_snapshot_key": reusable_snapshot_key,
-                "snapshot_key": int(snapshot_key),
-            },
-        )
-        await delete_shared_layout_dense_rows(
-            session,
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-        )
-        delete_result = await session.execute(
-            text(
-                f"""
-                DELETE FROM {schema}.ptg2_v3_snapshot_layout
-                 WHERE snapshot_key = :snapshot_key
-                   AND generation = :generation
-                   AND state = 'building'
-                   AND build_token = :build_token
-                RETURNING snapshot_key
-                """
-            ),
-            {
-                "snapshot_key": int(snapshot_key),
-                "generation": PTG2_V4_SHARED_GENERATION,
-                "build_token": str(build_token),
-            },
-        )
-        if delete_result.scalar() is None:
-            raise RuntimeError("PTG V4 duplicate build changed before reuse")
-        return SealedSharedLayout(
-            reusable_snapshot_key,
-            observed_summary.map_digest,
-            True,
-        )
+    return _row_mapping(reusable_row) if reusable_row is not None else None
 
+
+def _validate_reusable_v4_layout(
+    reusable: Mapping[str, Any],
+    *,
+    representation: str,
+    observed_summary: V4SnapshotMapSummary,
+    observed_metadata: V4SnapshotMetadataSummary,
+) -> None:
+    _reusable_manifest, reusable_summary, reusable_metadata = _sealed_root_summaries(
+        reusable
+    )
+    if (
+        reusable.get("root_state") != "complete"
+        or int(reusable.get("root_format_version") or -1) != PTG2_V4_MAP_FORMAT_VERSION
+        or reusable.get("map_format") != PTG2_V4_MAP_FORMAT
+        or reusable.get("representation") != representation
+        or reusable.get("projection_id_scope") != PTG2_V4_PROJECTION_ID_SCOPE
+        or int(reusable.get("object_kind_count") or 0)
+        != observed_summary.object_kind_count
+        or reusable_metadata != observed_metadata
+    ):
+        raise RuntimeError("reusable PTG V4 layout root is incompatible")
+    _require_matching_summaries(
+        observed_summary,
+        reusable_summary,
+        context="reusable root",
+    )
+    _validate_v4_manifest_root(
+        reusable.get("layout_manifest") or {},
+        representation=representation,
+        summary=reusable_summary,
+        metadata=reusable_metadata,
+    )
+
+
+async def _refresh_reusable_v4_layout(
+    session: Any,
+    *,
+    schema: str,
+    reusable_snapshot_key: int,
+) -> None:
+    await session.execute(
+        text(
+            f"""
+            UPDATE {schema}.ptg2_v3_snapshot_layout
+               SET heartbeat_at = :heartbeat_at,
+                   lease_until = :lease_until
+             WHERE snapshot_key = :snapshot_key
+               AND state = 'sealed'
+               AND generation = :generation
+            """
+        ),
+        {
+            "snapshot_key": reusable_snapshot_key,
+            "generation": PTG2_V4_SHARED_GENERATION,
+            "heartbeat_at": _utcnow(),
+            "lease_until": _lease_deadline(sealed=True),
+        },
+    )
+
+
+async def _discard_duplicate_v4_layout(
+    session: Any,
+    *,
+    schema_name: str,
+    schema: str,
+    snapshot_key: int,
+    build_token: str,
+    reusable_snapshot_key: int,
+) -> None:
+    await session.execute(
+        text(
+            f"""
+            UPDATE {schema}.ptg2_v3_layout_fingerprint
+               SET snapshot_key = :reusable_snapshot_key
+             WHERE snapshot_key = :snapshot_key
+            """
+        ),
+        {
+            "reusable_snapshot_key": reusable_snapshot_key,
+            "snapshot_key": snapshot_key,
+        },
+    )
+    await delete_shared_layout_dense_rows(
+        session,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+    )
+    delete_result = await session.execute(
+        text(
+            f"""
+            DELETE FROM {schema}.ptg2_v3_snapshot_layout
+             WHERE snapshot_key = :snapshot_key
+               AND generation = :generation
+               AND state = 'building'
+               AND build_token = :build_token
+            RETURNING snapshot_key
+            """
+        ),
+        {
+            "snapshot_key": snapshot_key,
+            "generation": PTG2_V4_SHARED_GENERATION,
+            "build_token": build_token,
+        },
+    )
+    if delete_result.scalar() is None:
+        raise RuntimeError("PTG V4 duplicate build changed before reuse")
+
+
+async def _seal_new_v4_layout(
+    session: Any,
+    *,
+    schema: str,
+    snapshot_key: int,
+    build_token: str,
+    mapping_digest: bytes,
+    support_digest: bytes,
+    sealed_manifest: Mapping[str, Any],
+    logical_byte_count: int,
+) -> None:
     update_result = await session.execute(
         text(
             f"""
@@ -3826,18 +3966,18 @@ async def seal_v4_shared_layout(
             """
         ),
         {
-            "snapshot_key": int(snapshot_key),
+            "snapshot_key": snapshot_key,
             "generation": PTG2_V4_SHARED_GENERATION,
-            "build_token": str(build_token),
-            "mapping_digest": observed_summary.map_digest,
-            "support_digest": normalized_support_digest,
+            "build_token": build_token,
+            "mapping_digest": mapping_digest,
+            "support_digest": support_digest,
             "layout_manifest": json.dumps(
                 sealed_manifest,
                 ensure_ascii=True,
                 sort_keys=True,
                 separators=(",", ":"),
             ),
-            "logical_byte_count": observed_summary.logical_byte_count,
+            "logical_byte_count": logical_byte_count,
             "heartbeat_at": _utcnow(),
             "lease_until": _lease_deadline(sealed=True),
             "published_at": _utcnow(),
@@ -3845,9 +3985,166 @@ async def seal_v4_shared_layout(
     )
     if update_result.scalar() is None:
         raise RuntimeError("PTG V4 layout was not in the expected building generation")
+
+
+@dataclass(frozen=True)
+class _V4SealState:
+    schema_name: str
+    schema: str
+    snapshot_key: int
+    build_token: str
+    support_digest: bytes
+    representation: str
+    summary: V4SnapshotMapSummary
+    metadata: V4SnapshotMetadataSummary
+    sealed_manifest: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _V4SealRequest:
+    schema_name: str
+    schema: str
+    snapshot_key: int
+    build_token: str
+    expected_summary: V4SnapshotMapSummary
+    support_digest: bytes
+    layout_manifest: Mapping[str, Any]
+    summary_batch_rows: int
+    progress_callback: Callable[[str, int], None] | None
+
+
+async def _prepare_v4_seal_state(
+    session: Any,
+    request: _V4SealRequest,
+) -> _V4SealState:
+    representation = await _lock_v4_build_owner(
+        session,
+        schema=request.schema,
+        snapshot_key=request.snapshot_key,
+        build_token=request.build_token,
+    )
+    summary, metadata = await _summarize_v4_seal_state(
+        session,
+        schema_name=request.schema_name,
+        snapshot_key=request.snapshot_key,
+        expected_summary=request.expected_summary,
+        summary_batch_rows=request.summary_batch_rows,
+        progress_callback=request.progress_callback,
+    )
+    if representation == "pattern_v1" and metadata.pattern_count <= 0:
+        raise RuntimeError("PTG V4 pattern representation has no pattern metadata")
+    await _complete_v4_map_root(
+        session,
+        schema=request.schema,
+        snapshot_key=request.snapshot_key,
+        representation=representation,
+        summary=summary,
+        metadata=metadata,
+    )
+    return _V4SealState(
+        schema_name=request.schema_name,
+        schema=request.schema,
+        snapshot_key=request.snapshot_key,
+        build_token=request.build_token,
+        support_digest=request.support_digest,
+        representation=representation,
+        summary=summary,
+        metadata=metadata,
+        sealed_manifest=_manifest_with_v4_root(
+            request.layout_manifest,
+            representation=representation,
+            summary=summary,
+            metadata=metadata,
+        ),
+    )
+
+
+async def _reuse_v4_layout_if_available(
+    session: Any,
+    state: _V4SealState,
+) -> int | None:
+    reusable = await _load_reusable_v4_layout(
+        session,
+        schema=state.schema,
+        snapshot_key=state.snapshot_key,
+        mapping_digest=state.summary.map_digest,
+        support_digest=state.support_digest,
+    )
+    if reusable is None:
+        return None
+    _validate_reusable_v4_layout(
+        reusable,
+        representation=state.representation,
+        observed_summary=state.summary,
+        observed_metadata=state.metadata,
+    )
+    reusable_snapshot_key = int(reusable["snapshot_key"])
+    await _refresh_reusable_v4_layout(
+        session,
+        schema=state.schema,
+        reusable_snapshot_key=reusable_snapshot_key,
+    )
+    await _discard_duplicate_v4_layout(
+        session,
+        schema_name=state.schema_name,
+        schema=state.schema,
+        snapshot_key=state.snapshot_key,
+        build_token=state.build_token,
+        reusable_snapshot_key=reusable_snapshot_key,
+    )
+    return reusable_snapshot_key
+
+
+async def seal_v4_shared_layout(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+    expected_summary: V4SnapshotMapSummary,
+    support_digest: bytes,
+    layout_manifest: Mapping[str, Any],
+    **seal_options_by_name: Any,
+) -> SealedSharedLayout:
+    """Authoritatively re-read, complete, and atomically seal one V4 root."""
+
+    summary_batch_rows, progress_callback = _v4_seal_options(seal_options_by_name)
+    request = _V4SealRequest(
+        schema_name=schema_name,
+        schema=_quote_ident(schema_name),
+        snapshot_key=int(snapshot_key),
+        build_token=str(build_token),
+        expected_summary=expected_summary,
+        support_digest=_normalized_v4_support_digest(support_digest),
+        layout_manifest=layout_manifest,
+        summary_batch_rows=summary_batch_rows,
+        progress_callback=progress_callback,
+    )
+    state = await _prepare_v4_seal_state(session, request)
+    reusable_snapshot_key = await _reuse_v4_layout_if_available(
+        session,
+        state,
+    )
+    if reusable_snapshot_key is not None:
+        return SealedSharedLayout(
+            reusable_snapshot_key,
+            state.summary.map_digest,
+            True,
+        )
+
+    await _seal_new_v4_layout(
+        session,
+        schema=state.schema,
+        snapshot_key=state.snapshot_key,
+        build_token=state.build_token,
+        mapping_digest=state.summary.map_digest,
+        support_digest=state.support_digest,
+        sealed_manifest=state.sealed_manifest,
+        logical_byte_count=state.summary.logical_byte_count,
+    )
     return SealedSharedLayout(
-        int(snapshot_key),
-        observed_summary.map_digest,
+        state.snapshot_key,
+        state.summary.map_digest,
         False,
     )
 
@@ -3906,7 +4203,9 @@ async def bind_snapshot_to_v4_layout(
         {"snapshot_id": str(snapshot_id)},
     )
     existing_snapshot_key = existing_result.scalar()
-    if existing_snapshot_key is not None and int(existing_snapshot_key) == int(snapshot_key):
+    if existing_snapshot_key is not None and int(existing_snapshot_key) == int(
+        snapshot_key
+    ):
         return
     raise RuntimeError("logical PTG snapshot is not bindable to the sealed V4 layout")
 

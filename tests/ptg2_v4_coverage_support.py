@@ -126,6 +126,195 @@ def _metadata(
     )
 
 
+def _adaptive_direct_evidence(direct_bytes: int) -> dict[str, Any]:
+    return {
+        "eligible": True,
+        "complete_prefix_eligible": True,
+        "complete_prefix_projection_encoded_bytes": 10,
+        "graph_encoded_bytes": direct_bytes - 200,
+        "mapping_persistence_encoded_bytes": 200,
+        "inferred_taxonomy_encoded_bytes": 0,
+        "inferred_taxonomy_eligible": True,
+        "inferred_taxonomy_rejection_reason": None,
+        "inferred_taxonomy_rejection_rule_digest": None,
+        "inferred_taxonomy_rejection_observed_count": None,
+        "inferred_taxonomy_rejection_cap": None,
+        "map_payload_encoded_bytes": 132,
+        "map_coordinate_count": 1,
+        "map_pack_count": 1,
+        "map_object_kind_count": 1,
+        "complete_persistent_encoded_bytes": direct_bytes,
+    }
+
+
+def _adaptive_pattern_evidence(pattern_bytes: int) -> dict[str, Any]:
+    return {
+        "eligible": True,
+        "component_fallback_eligible": True,
+        "unsafe_component_set_count": 0,
+        "sparse_prefix_eligible": True,
+        "sparse_prefix_owner_count": 0,
+        "sparse_prefix_member_count": 0,
+        "sparse_prefix_raw_bytes": 0,
+        "sparse_prefix_projection_encoded_bytes": 10,
+        "graph_encoded_bytes": pattern_bytes - 200,
+        "mapping_persistence_encoded_bytes": 200,
+        "inferred_taxonomy_encoded_bytes": 0,
+        "inferred_taxonomy_eligible": True,
+        "inferred_taxonomy_rejection_reason": None,
+        "inferred_taxonomy_rejection_rule_digest": None,
+        "inferred_taxonomy_rejection_observed_count": None,
+        "inferred_taxonomy_rejection_cap": None,
+        "map_payload_encoded_bytes": 132,
+        "map_coordinate_count": 1,
+        "map_pack_count": 1,
+        "map_object_kind_count": 1,
+        "complete_persistent_encoded_bytes": pattern_bytes,
+    }
+
+
+def synthetic_adaptive_layout_decision(
+    representation: str = "pattern_v1",
+) -> dict[str, Any]:
+    """Build source-neutral sealed evidence for one shape-selected layout."""
+
+    direct_bytes = 301 if representation == "pattern_v1" else 300
+    pattern_bytes = 299 if representation == "pattern_v1" else 301
+    layout_evidence_by_field = {
+        "contract": compiler.PTG2_V4_ADAPTIVE_LAYOUT_DECISION_CONTRACT,
+        "cost_contract": compiler.PTG2_V4_ADAPTIVE_LAYOUT_COST_CONTRACT,
+        "selection_policy": compiler.PTG2_V4_ADAPTIVE_LAYOUT_SELECTION_POLICY,
+        "compiler_options": compiler._effective_compiler_options(None),
+        "selected_representation": representation,
+        "selected_encoded_bytes": (
+            pattern_bytes if representation == "pattern_v1" else direct_bytes
+        ),
+        "direct": _adaptive_direct_evidence(direct_bytes),
+        "pattern": _adaptive_pattern_evidence(pattern_bytes),
+    }
+    return {
+        **layout_evidence_by_field,
+        "decision_digest": compiler._adaptive_layout_evidence_digest(
+            layout_evidence_by_field
+        ),
+    }
+
+
+def write_empty_taxonomy_artifact(
+    output_directory: Path,
+    artifact_by_name: dict[str, dict[str, Any]],
+) -> None:
+    """Add an authenticated zero-row taxonomy COPY artifact to a fixture."""
+
+    template = artifact_by_name["provider_groups"]
+    taxonomy_filename = compiler._OUTPUT_FILE_BY_NAME["inferred_taxonomy_candidates"][0]
+    taxonomy_path = output_directory / taxonomy_filename
+    taxonomy_path.write_bytes(Path(template["path"]).read_bytes())
+    artifact_by_name["inferred_taxonomy_candidates"] = {
+        "name": "inferred_taxonomy_candidates",
+        "path": str(taxonomy_path),
+        "byte_count": template["byte_count"],
+        "sha256": template["sha256"],
+        "row_count": 0,
+    }
+
+
+def taxonomy_summary_fields() -> dict[str, Any]:
+    """Return an eligible zero-row taxonomy decision for both layouts."""
+
+    rejection_field_by_name = {
+        "inferred_taxonomy_rejection_reason": None,
+        "inferred_taxonomy_rejection_rule_digest": None,
+        "inferred_taxonomy_rejection_observed_count": None,
+        "inferred_taxonomy_rejection_cap": None,
+    }
+    return {
+        "direct_inferred_taxonomy_encoded_bytes": 0,
+        "pattern_inferred_taxonomy_encoded_bytes": 0,
+        "direct_inferred_taxonomy_eligible": True,
+        "pattern_inferred_taxonomy_eligible": True,
+        **{f"direct_{name}": value for name, value in rejection_field_by_name.items()},
+        **{f"pattern_{name}": value for name, value in rejection_field_by_name.items()},
+    }
+
+
+def snapshot_manifest_fixture(
+    summary: snapshot_maps.V4SnapshotMapSummary,
+) -> tuple[dict[str, Any], snapshot_maps.V4SnapshotMetadataSummary]:
+    """Build and authenticate one valid pattern-layout snapshot manifest."""
+
+    metadata = _metadata()
+    manifest = snapshot_maps._manifest_with_v4_root(
+        {
+            "serving_index": {
+                "provider_graph": {
+                    "adaptive_layout": synthetic_adaptive_layout_decision()
+                }
+            }
+        },
+        representation="pattern_v1",
+        summary=summary,
+        metadata=metadata,
+    )
+    snapshot_maps._validate_v4_manifest_root(
+        manifest,
+        representation="pattern_v1",
+        summary=summary,
+        metadata=metadata,
+    )
+    assert manifest["serving_index"]["snapshot_map"]["map_digest"] == (
+        summary.map_digest.hex()
+    )
+    return manifest, metadata
+
+
+def assert_snapshot_manifest_builder_rejections(
+    summary: snapshot_maps.V4SnapshotMapSummary,
+    metadata: snapshot_maps.V4SnapshotMetadataSummary,
+) -> None:
+    """Exercise conflicting snapshot-manifest builder inputs."""
+
+    graph_index = {
+        "provider_graph": {"adaptive_layout": synthetic_adaptive_layout_decision()}
+    }
+    builder_arguments_by_name = {
+        "representation": "pattern_v1",
+        "summary": summary,
+        "metadata": metadata,
+    }
+    with pytest.raises(ValueError, match="serving_index"):
+        snapshot_maps._manifest_copy_with_index({"serving_index": "bad"})
+    with pytest.raises(ValueError, match="storage generation"):
+        snapshot_maps._manifest_copy_with_index(
+            {"serving_index": {"storage_generation": "foreign"}}
+        )
+    with pytest.raises(ValueError, match="incompatible type"):
+        snapshot_maps._apply_v4_index_markers({"type": "foreign"})
+    with pytest.raises(ValueError, match="serving_binary"):
+        snapshot_maps._serving_binary_v4_map(
+            {"serving_binary": "bad", **graph_index},
+            **builder_arguments_by_name,
+        )
+    with pytest.raises(ValueError, match="must remain"):
+        snapshot_maps._serving_binary_v4_map(
+            {"serving_binary": {"format": "gzip"}, **graph_index},
+            **builder_arguments_by_name,
+        )
+    with pytest.raises(ValueError, match="conflicting provider_graph"):
+        snapshot_maps._serving_binary_v4_map(
+            {
+                "serving_binary": {"provider_graph_v4": {"bad": True}},
+                **graph_index,
+            },
+            **builder_arguments_by_name,
+        )
+    with pytest.raises(ValueError, match="conflicting snapshot-map"):
+        snapshot_maps._manifest_with_v4_root(
+            {"serving_index": {"snapshot_map": {"bad": True}, **graph_index}},
+            **builder_arguments_by_name,
+        )
+
+
 def _relation_row(relation: str = "group_patterns") -> dict[str, Any]:
     return {
         "relation": relation,
@@ -157,7 +346,6 @@ def _owner_row(
     }
 
 
-
 __all__ = [
     "Any",
     "AuditCandidate",
@@ -177,6 +365,9 @@ __all__ = [
     "_reference",
     "_relation_row",
     "_summary",
+    "assert_snapshot_manifest_builder_rejections",
+    "snapshot_manifest_fixture",
+    "synthetic_adaptive_layout_decision",
     "asynccontextmanager",
     "audit",
     "compiler",
@@ -188,4 +379,6 @@ __all__ = [
     "shared_block_hash",
     "snapshot_maps",
     "struct",
+    "taxonomy_summary_fields",
+    "write_empty_taxonomy_artifact",
 ]
