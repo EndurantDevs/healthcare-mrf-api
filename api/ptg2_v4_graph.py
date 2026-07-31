@@ -1975,22 +1975,10 @@ async def _lookup_v4_heavy_members(
     }
 
 
-async def _lookup_v4_heavy_member_intersections(
-    session: Any,
-    *,
-    snapshot_key: int,
-    schema_name: str,
+def _heavy_bitmap_fragment_content_bytes(
     relation_manifest: V4RelationManifest,
-    heavy_owners: Mapping[int, V4HeavyOwner],
-    allowed_member_keys: tuple[int, ...],
-) -> dict[int, tuple[int, ...]]:
-    """Probe only the authenticated bitmap fragments containing allowed keys."""
-
-    if not heavy_owners:
-        return {}
-    if not allowed_member_keys:
-        return {owner_key: () for owner_key in heavy_owners}
-
+) -> int:
+    """Return the logical bytes carried by one framed bitmap page."""
     fragment_content_bytes = (
         int(relation_manifest.member_page_bytes)
         - PTG2_V4_HEAVY_BITMAP_FRAGMENT_HEADER_BYTES
@@ -1999,11 +1987,20 @@ async def _lookup_v4_heavy_member_intersections(
         raise PTG2SharedBlockError(
             "PTG V4 heavy bitmap page cannot contain its logical header"
         )
+    return fragment_content_bytes
 
-    allowed_keys_by_owner_fragment: dict[
+
+def _selected_heavy_bitmap_keys_by_fragment(
+    heavy_owners: Mapping[int, V4HeavyOwner],
+    allowed_member_keys: tuple[int, ...],
+    fragment_content_bytes: int,
+) -> tuple[dict[tuple[int, int], tuple[int, ...]], int]:
+    """Map allowed keys to the exact owner fragments that contain their bits."""
+
+    selected_keys_by_fragment: dict[
         tuple[int, int], tuple[int, ...]
     ] = {}
-    selected_member_count = 0
+    probe_count = 0
     for owner_key, owner in heavy_owners.items():
         member_limit = owner.member_base + owner.member_span
         keys_by_fragment: dict[int, list[int]] = {}
@@ -2022,16 +2019,28 @@ async def _lookup_v4_heavy_member_intersections(
                     "PTG V4 heavy bitmap member falls outside its fragments"
                 )
             keys_by_fragment.setdefault(fragment_no, []).append(member_key)
-            selected_member_count += 1
+            probe_count += 1
         for fragment_no, member_keys in keys_by_fragment.items():
-            allowed_keys_by_owner_fragment[(owner_key, fragment_no)] = tuple(
+            selected_keys_by_fragment[(owner_key, fragment_no)] = tuple(
                 member_keys
             )
+    return selected_keys_by_fragment, probe_count
+
+
+async def _load_selected_heavy_bitmap_fragments(
+    session: Any,
+    *,
+    snapshot_key: int,
+    schema_name: str,
+    relation_manifest: V4RelationManifest,
+    heavy_owners: Mapping[int, V4HeavyOwner],
+    selected_keys_by_fragment: Mapping[tuple[int, int], tuple[int, ...]],
+    probe_count: int,
+) -> tuple[dict[tuple[int, int], Any], dict[bytes, _CachedPhysicalBlock]]:
+    """Load and charge only the physical fragments needed for selected probes."""
 
     object_kind = _common_heavy_object_kind(heavy_owners)
-    selected_pairs = tuple(sorted(allowed_keys_by_owner_fragment))
-    if not selected_pairs:
-        return {owner_key: () for owner_key in heavy_owners}
+    selected_pairs = tuple(sorted(selected_keys_by_fragment))
     coordinates = await _load_map_coordinate_pairs(
         session,
         schema_name=schema_name,
@@ -2046,18 +2055,18 @@ async def _lookup_v4_heavy_member_intersections(
     _charge_v4_hot_source_work(
         relation_manifest.relation,
         owner_count=len(heavy_owners),
-        member_count=selected_member_count,
+        member_count=probe_count,
         page_count=selected_page_count,
         byte_count=selected_byte_count,
     )
     _charge_v4_hot_npi_work(
         relation_manifest.relation,
-        member_count=selected_member_count,
+        member_count=probe_count,
         member_page_count=selected_page_count,
         byte_count=selected_byte_count,
     )
     _charge_v4_taxonomy_projection_work(
-        member_count=selected_member_count,
+        member_count=probe_count,
         page_count=selected_page_count,
         byte_count=selected_byte_count,
     )
@@ -2068,12 +2077,23 @@ async def _lookup_v4_heavy_member_intersections(
         coordinates=coordinates.values(),
         maximum_raw_bytes=relation_manifest.member_page_bytes,
     )
+    return coordinates, blocks
+
+
+def _decode_selected_heavy_bitmap_fragments(
+    heavy_owners: Mapping[int, V4HeavyOwner],
+    selected_keys_by_fragment: Mapping[tuple[int, int], tuple[int, ...]],
+    coordinates: Mapping[tuple[int, int], Any],
+    blocks: Mapping[bytes, _CachedPhysicalBlock],
+    fragment_content_bytes: int,
+) -> dict[int, tuple[int, ...]]:
+    """Authenticate selected fragments and test the requested member bits."""
 
     matches_by_owner: dict[int, list[int]] = {
         owner_key: [] for owner_key in heavy_owners
     }
     for (owner_key, fragment_no), member_keys in (
-        allowed_keys_by_owner_fragment.items()
+        selected_keys_by_fragment.items()
     ):
         owner = heavy_owners[owner_key]
         coordinate = coordinates[(owner_key, fragment_no)]
@@ -2104,6 +2124,51 @@ async def _lookup_v4_heavy_member_intersections(
         owner_key: tuple(matches_by_owner[owner_key])
         for owner_key in heavy_owners
     }
+
+
+async def _lookup_v4_heavy_member_intersections(
+    session: Any,
+    *,
+    snapshot_key: int,
+    schema_name: str,
+    relation_manifest: V4RelationManifest,
+    heavy_owners: Mapping[int, V4HeavyOwner],
+    allowed_member_keys: tuple[int, ...],
+) -> dict[int, tuple[int, ...]]:
+    """Probe only the authenticated bitmap fragments containing allowed keys."""
+
+    if not heavy_owners:
+        return {}
+    if not allowed_member_keys:
+        return {owner_key: () for owner_key in heavy_owners}
+    fragment_content_bytes = _heavy_bitmap_fragment_content_bytes(
+        relation_manifest
+    )
+    selected_keys_by_fragment, probe_count = (
+        _selected_heavy_bitmap_keys_by_fragment(
+            heavy_owners,
+            allowed_member_keys,
+            fragment_content_bytes,
+        )
+    )
+    if not selected_keys_by_fragment:
+        return {owner_key: () for owner_key in heavy_owners}
+    coordinates, blocks = await _load_selected_heavy_bitmap_fragments(
+        session,
+        snapshot_key=snapshot_key,
+        schema_name=schema_name,
+        relation_manifest=relation_manifest,
+        heavy_owners=heavy_owners,
+        selected_keys_by_fragment=selected_keys_by_fragment,
+        probe_count=probe_count,
+    )
+    return _decode_selected_heavy_bitmap_fragments(
+        heavy_owners,
+        selected_keys_by_fragment,
+        coordinates,
+        blocks,
+        fragment_content_bytes,
+    )
 
 
 def _decode_heavy_bitmap_prefix(

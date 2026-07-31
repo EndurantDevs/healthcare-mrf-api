@@ -2149,7 +2149,7 @@ async def test_autocomplete_procedures_dedupes_terms_across_systems():
 async def test_autocomplete_procedures_includes_match_details_when_requested(
     monkeypatch,
 ):
-    terminology_match = {
+    match_by_field = {
         "term": "knee replacement",
         "canonical_term": "Knee replacement",
         "target_system": "CPT",
@@ -2160,7 +2160,7 @@ async def test_autocomplete_procedures_includes_match_details_when_requested(
     monkeypatch.setattr(
         pricing_module,
         "_query_terminology",
-        AsyncMock(return_value=[terminology_match]),
+        AsyncMock(return_value=[match_by_field]),
     )
     request = make_request(
         [FakeResult(rows=[])],
@@ -2171,7 +2171,7 @@ async def test_autocomplete_procedures_includes_match_details_when_requested(
     pricing_response = json.loads(response.body)
 
     assert pricing_response["query"]["include_matches"] is True
-    assert pricing_response["items"][0]["matches"] == [terminology_match]
+    assert pricing_response["items"][0]["matches"] == [match_by_field]
 
 
 @pytest.mark.asyncio
