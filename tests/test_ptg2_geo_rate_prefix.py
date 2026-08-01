@@ -11,16 +11,17 @@ from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 
 
 def _tables(**limit_overrides):
+    sealed_limits_by_name = {
+        "provider_expansion_rate_page_rows": 4,
+        "max_online_provider_expansion_rate_rows": 12,
+        "max_online_provider_expansion_provider_sets": 12,
+        "max_online_provider_expansion_graph_batches": 3,
+    }
+    sealed_limits_by_name.update(limit_overrides)
     return strict_v3_tables(
         storage_generation="shared_blocks_v4",
         shared_block_layout="packed_snapshot_maps_v4",
-        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(
-            provider_expansion_rate_page_rows=4,
-            max_online_provider_expansion_rate_rows=12,
-            max_online_provider_expansion_provider_sets=12,
-            max_online_provider_expansion_graph_batches=3,
-            **limit_overrides,
-        ),
+        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(**sealed_limits_by_name),
     )
 
 
@@ -99,6 +100,41 @@ async def test_geo_rate_prefix_reads_disjoint_pages_and_preserves_rate_order(
     assert selection.exhausted is False
     assert [call.kwargs["offset"] for call in page_reads.await_args_list] == [0, 4]
     assert [call.kwargs["limit"] for call in page_reads.await_args_list] == [4, 4]
+    assert member_reads.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_geo_rate_prefix_descending_pages_preserve_dense_tie_order(
+    monkeypatch,
+):
+    rate_rows = [_rate_row(rank) for rank in (5, 4, 3, 2, 1, 0)]
+    qualifying_npis = {rank + 101 for rank in (5, 4, 3, 2, 1, 0)}
+    page_reads, member_reads = _install_geo_prefix_reads(
+        monkeypatch,
+        rate_rows,
+        qualifying_npis,
+    )
+
+    selection = await serving._select_geo_filtered_rate_prefix(
+        object(),
+        _tables(provider_expansion_rate_page_rows=2),
+        code_rows=_code_rows(len(rate_rows)),
+        args={"zip5": "48201", "zip_radius_miles": 30},
+        network_names=[],
+        target_count=4,
+        descending=True,
+    )
+
+    assert selection is not None
+    assert [rate_record["price_key"] for rate_record in selection.row_data] == [
+        6,
+        5,
+        4,
+        3,
+    ]
+    assert [call.kwargs["offset"] for call in page_reads.await_args_list] == [0, 2]
+    assert [call.kwargs["limit"] for call in page_reads.await_args_list] == [2, 2]
+    assert all(call.kwargs["descending"] is True for call in page_reads.await_args_list)
     assert member_reads.await_count == 2
 
 

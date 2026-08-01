@@ -8554,13 +8554,16 @@ def _ptg2_cost_sort_key(
 
     price = _ptg2_provider_price_sort_value(provider_item)
     ordered_price = -price if is_descending and price.is_finite() else price
+    raw_price_key = provider_item.get("_ptg_price_key")
+    price_key = int(raw_price_key) if raw_price_key is not None else None
+    ordered_price_key = (
+        -price_key
+        if is_descending and price_key is not None
+        else price_key if price_key is not None else 2**32
+    )
     return (
         ordered_price,
-        int(
-            provider_item["_ptg_price_key"]
-            if provider_item.get("_ptg_price_key") is not None
-            else 2**32
-        ),
+        ordered_price_key,
         _ptg2_provider_distance_sort_value(provider_item),
         str(provider_item.get("provider_name") or ""),
         int(provider_item.get("npi") or 2**63 - 1),

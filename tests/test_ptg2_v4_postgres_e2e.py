@@ -24,6 +24,7 @@ import pytest
 import sqlalchemy as sa
 
 from api import ptg2_candidate_audit_v4 as candidate_v4
+from api import ptg2_serving as serving
 from api import ptg2_v4_graph as graph
 from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.ptg2_candidate_audit_capacity import (
@@ -2681,6 +2682,172 @@ async def _assert_direct_v4_persisted_layout(
     ) == 2
 
 
+async def _assert_v4_packed_layout(database, schema, snapshot_key):
+    layout_rows = await database.all(
+        f"""
+        SELECT layout.generation,
+               layout.state,
+               root.state,
+               root.representation,
+               layout.mapping_digest = root.map_digest AS digest_matches,
+               root.map_pack_count
+          FROM {schema}.ptg2_v3_snapshot_layout layout
+          JOIN {schema}.ptg2_v4_snapshot_map_root root
+            ON root.snapshot_key = layout.snapshot_key
+         WHERE layout.snapshot_key = :snapshot_key
+        """,
+        snapshot_key=snapshot_key,
+    )
+    assert len(layout_rows) == 1
+    layout_fields = tuple(layout_rows[0])
+    assert layout_fields[:5] == (
+        "shared_blocks_v4",
+        "sealed",
+        "complete",
+        "direct_v1",
+        True,
+    )
+    assert int(layout_fields[5]) > 0
+    assert (
+        await database.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_pack "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=snapshot_key,
+        )
+        > 0
+    )
+    assert (
+        await database.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_block "
+            "WHERE snapshot_key = :snapshot_key",
+            snapshot_key=snapshot_key,
+        )
+        == 0
+    )
+
+
+def _v4_geo_prefix_tables(snapshot_key):
+    return PTG2ServingTables(
+        arch_version="postgres_binary_v3",
+        shared_snapshot_key=snapshot_key,
+        storage_generation="shared_blocks_v4",
+        cold_lookup_contract="ptg_v3_cold_v2",
+        shared_block_layout="packed_snapshot_maps_v4",
+        source_count=1,
+        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(),
+    )
+
+
+def _v4_geo_rate_rows():
+    provider_set_ids_by_key = {
+        provider_set_key: _global(1, provider_set_key + 1).hex()
+        for provider_set_key in range(2)
+    }
+    return [
+        {
+            "provider_set_global_id_128": provider_set_ids_by_key[provider_set_key],
+            "provider_count": 1,
+            "price_key": provider_set_key + 1,
+            "_ptg_provider_set_key": provider_set_key,
+            "serving_content_hash_128": _global(4, provider_set_key + 1).hex(),
+        }
+        for provider_set_key in (1, 0)
+    ]
+
+
+def _install_v4_geo_reads(monkeypatch, schema_name, rate_rows):
+    rate_read_calls = []
+    location_read_calls = []
+
+    async def read_rate_page(*_args, **kwargs):
+        rate_read_calls.append(dict(kwargs))
+        start = int(kwargs["offset"])
+        end = start + int(kwargs["limit"])
+        return rate_rows[start:end]
+
+    async def admitted_location_rows(*_args, **kwargs):
+        location_read_calls.append(dict(kwargs))
+        assert kwargs["candidate_npis"] == (1_111_111_111, 2_222_222_222)
+        return [{"npi": 2_222_222_222}]
+
+    async def reject_cold_fallback(*_args, **_kwargs):
+        raise AssertionError("V4 geo prefix used the retained V3/cold graph")
+
+    _isolate_graph_caches(monkeypatch)
+    monkeypatch.setattr(
+        serving,
+        "_PTG2_PROVIDER_NPI_PREFIX_CACHE",
+        OrderedDict(),
+    )
+    monkeypatch.setattr(serving, "PTG2_SCHEMA", schema_name)
+    monkeypatch.setattr(
+        serving,
+        "_merge_manifest_code_variant_rows",
+        read_rate_page,
+    )
+    monkeypatch.setattr(
+        serving,
+        "_membership_location_rows",
+        admitted_location_rows,
+    )
+    monkeypatch.setattr(
+        serving,
+        "_cold_provider_npi_member_ids_by_set",
+        reject_cold_fallback,
+    )
+    return rate_read_calls, location_read_calls
+
+
+def _assert_v4_geo_metrics(before_metrics, after_metrics):
+    assert after_metrics["hot_prefix_requests"] == (
+        before_metrics["hot_prefix_requests"] + 1
+    )
+    assert after_metrics["cold_exact_requests"] == before_metrics["cold_exact_requests"]
+    assert after_metrics["database_blocks"] > before_metrics["database_blocks"]
+    assert (
+        after_metrics["hot_group_npi_members"] > before_metrics["hot_group_npi_members"]
+    )
+
+
+async def _assert_v4_geo_prefix_reader(
+    database,
+    schema_name,
+    snapshot_key,
+    monkeypatch,
+):
+    """Prove geo rate selection through the atomically published V4 maps."""
+
+    schema = _quoted(schema_name)
+    await _assert_v4_packed_layout(database, schema, snapshot_key)
+    serving_tables = _v4_geo_prefix_tables(snapshot_key)
+    rate_rows = _v4_geo_rate_rows()
+    rate_read_calls, location_read_calls = _install_v4_geo_reads(
+        monkeypatch,
+        schema_name,
+        rate_rows,
+    )
+    before_metrics = graph.v4_graph_metrics_snapshot()
+    async with database.transaction() as session:
+        selection = await serving._select_geo_filtered_rate_prefix(
+            session,
+            serving_tables,
+            code_rows=[{"code_key": 1, "rate_count": 2}],
+            args={"zip5": "48201", "zip_radius_miles": 30},
+            network_names=[],
+            target_count=2,
+            descending=False,
+        )
+    after_metrics = graph.v4_graph_metrics_snapshot()
+
+    assert selection == serving._GeoRateSelection((rate_rows[1],), True)
+    assert len(rate_read_calls) == 1
+    assert rate_read_calls[0]["offset"] == 0
+    assert rate_read_calls[0]["limit"] == 2
+    assert rate_read_calls[0]["descending"] is False
+    assert len(location_read_calls) == 1
+    _assert_v4_geo_metrics(before_metrics, after_metrics)
+
+
 @pytest.mark.asyncio
 async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgres(
     tmp_path: Path,
@@ -2730,6 +2897,9 @@ async def test_v4_direct_layout_publishes_only_exact_direct_relations_on_postgre
             schema_name=schema_name,
             snapshot_key=sealed.snapshot_key,
             relation_names=relation_names,
+        )
+        await _assert_v4_geo_prefix_reader(
+            database, schema_name, sealed.snapshot_key, monkeypatch
         )
     finally:
         compilation.cleanup()

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Corruption, routing, and public paging contracts for geo rate prefixes."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -141,6 +142,33 @@ def test_geo_rate_prefix_routes_only_v4_aggregate_cost_geo():
 
 
 @pytest.mark.parametrize(
+    ("is_descending", "expected_price_keys"),
+    ((False, [7, 8, 9, None]), (True, [9, 8, 7, None])),
+)
+def test_cost_sort_tied_prices_follow_dense_prefix_direction(
+    is_descending,
+    expected_price_keys,
+):
+    provider_items = [
+        {
+            "prices": [{"negotiated_rate": "30.00"}],
+            "_ptg_price_key": price_key,
+        }
+        for price_key in (8, None, 7, 9)
+    ]
+
+    ordered_items = sorted(
+        provider_items,
+        key=lambda item: serving._ptg2_cost_sort_key(
+            item,
+            is_descending=is_descending,
+        ),
+    )
+
+    assert [item["_ptg_price_key"] for item in ordered_items] == expected_price_keys
+
+
+@pytest.mark.parametrize(
     ("query_args_by_name", "route_flags_by_name"),
     (
         ({"zip5": "48201", "order_by": "rate"}, {"location_filter_requested": False}),
@@ -212,6 +240,85 @@ async def test_g0289_geo_response_uses_prefix_lower_bound_and_stable_offsets(
     assert [call.kwargs["target_count"] for call in selection.await_args_list] == [
         3,
         3,
+    ]
+
+
+def _tied_prefix_selector(prefix_rows, order):
+    async def select_prefix(*_args, **kwargs):
+        assert kwargs["descending"] is (order == "desc")
+        return serving._GeoRateSelection(
+            prefix_rows[: kwargs["target_count"]],
+            len(prefix_rows) < kwargs["target_count"],
+        )
+
+    return select_prefix
+
+
+async def _tied_geo_response(harness, *, order, limit, offset):
+    return await serving._search_manifest_serving_table(
+        harness.session(),
+        "ptg2:209901:synthetic",
+        {
+            "plan_id": "TEST-PLAN-001",
+            "plan_market_type": "group",
+            "code_system": "HCPCS",
+            "code": "G0289",
+            "zip5": "48201",
+            "zip_radius_miles": 30,
+            "order_by": "rate",
+            "order": order,
+        },
+        SimpleNamespace(limit=limit, offset=offset),
+        strict_v3_tables(snapshot_id="ptg2:209901:synthetic"),
+        "product_search",
+    )
+
+
+@pytest.mark.parametrize(
+    ("order", "provider_set_order"),
+    (("asc", (7, 8, 9)), ("desc", (9, 8, 7))),
+)
+@pytest.mark.asyncio
+async def test_geo_rate_prefix_price_ties_keep_stable_offsets(
+    monkeypatch,
+    order,
+    provider_set_order,
+):
+    """Keep tied dense-price prefixes stable as their requested window grows."""
+
+    harness = _G0289ServingHarness()
+    harness.rates_by_key = {7: "30.00", 8: "30.00", 9: "30.00"}
+    harness.install(monkeypatch)
+    prefix_rows_by_key = {
+        provider_set_key: {
+            **harness._rate_row(provider_set_key),
+            "source_procedure_name": f"Synthetic rate {provider_set_key}",
+        }
+        for provider_set_key in provider_set_order
+    }
+    prefix_rows = tuple(prefix_rows_by_key.values())
+    selection = AsyncMock(side_effect=_tied_prefix_selector(prefix_rows, order))
+    monkeypatch.setattr(
+        serving,
+        "_uses_geo_rate_prefix_selection",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(serving, "_select_geo_filtered_rate_prefix", selection)
+
+    first_page = await _tied_geo_response(harness, order=order, limit=1, offset=0)
+    second_page = await _tied_geo_response(harness, order=order, limit=1, offset=1)
+    third_page = await _tied_geo_response(harness, order=order, limit=1, offset=2)
+
+    assert [
+        page["items"][0]["procedure_name"]
+        for page in (first_page, second_page, third_page)
+    ] == [
+        f"Synthetic rate {provider_set_key}" for provider_set_key in provider_set_order
+    ]
+    assert [call.kwargs["target_count"] for call in selection.await_args_list] == [
+        2,
+        3,
+        4,
     ]
 
 
