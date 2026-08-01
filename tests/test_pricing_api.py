@@ -3751,6 +3751,40 @@ async def test_allowed_amount_spatial_lookup_fails_without_geo_capability(
 
 
 @pytest.mark.asyncio
+async def test_allowed_amount_spatial_lookup_returns_unified_table_when_geo_capable(
+    monkeypatch,
+):
+    session = object()
+    address_table = "mrf.entity_address_unified"
+    address_table_lookup = AsyncMock(return_value=address_table)
+    capability_check = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        pricing_module,
+        "_ptg2_address_serving_table",
+        address_table_lookup,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "is_provider_address_geo_capability_available",
+        capability_check,
+    )
+
+    assert await pricing_module._allowed_amount_address_table(
+        session,
+        {"lat": 0.0, "long": 0.0},
+    ) == address_table
+    address_table_lookup.assert_awaited_once_with(
+        session,
+        pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS,
+        require_legacy_available=True,
+    )
+    capability_check.assert_awaited_once_with(
+        session,
+        schema_name=pricing_module.PTG2_SCHEMA,
+    )
+
+
+@pytest.mark.asyncio
 async def test_unfiltered_allowed_amounts_skip_address_lookup(monkeypatch):
     address_table_lookup = AsyncMock()
     monkeypatch.setattr(
@@ -3793,6 +3827,34 @@ async def test_allowed_amount_text_filter_requires_complete_unified_schema(
         pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS
     )
     capability_check.assert_not_awaited()
+
+
+def test_allowed_amount_legacy_spatial_filter_combines_zip_and_geo():
+    parameter_map = {}
+
+    _distance_sql, spatial_predicates = (
+        pricing_module._allowed_amount_spatial_filter_sql(
+            {
+                "zip5": "00000",
+                "lat": 0.0,
+                "long": 0.0,
+                "radius_miles": 0.0,
+            },
+            uses_unified_addresses=False,
+            parameter_map=parameter_map,
+        )
+    )
+
+    assert len(spatial_predicates) == 1
+    assert ":allowed_zip5" in spatial_predicates[0]
+    assert " OR " in spatial_predicates[0]
+    assert ":allowed_geo_radius_miles" in spatial_predicates[0]
+    assert parameter_map == {
+        "allowed_geo_lat": 0.0,
+        "allowed_geo_long": 0.0,
+        "allowed_geo_radius_miles": 0.0,
+        "allowed_zip5": "00000",
+    }
 
 
 def test_allowed_amount_sql_uses_stable_current_source_parameters():

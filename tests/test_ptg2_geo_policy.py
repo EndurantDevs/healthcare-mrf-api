@@ -102,6 +102,14 @@ async def test_geo_capability_probe_rejects_non_session_test_double():
 
 
 @pytest.mark.asyncio
+async def test_geo_capability_probe_fails_closed_for_non_mapping_result():
+    assert not await is_provider_address_geo_capability_available(
+        _CapabilitySession([]),
+        schema_name="tenant_data",
+    )
+
+
+@pytest.mark.asyncio
 async def test_geo_capability_probe_rejects_incomplete_reference_schema():
     capabilities = _available_capabilities()
     capabilities["has_zcta_columns"] = False
@@ -170,6 +178,18 @@ def test_exact_zip_without_radius_only_allows_rows_without_points():
     assert "addr.lat IS NULL AND addr.long IS NULL" in filter_sql
     assert "COALESCE(addr.country_code, '')" in filter_sql
     assert "ST_Covers" not in filter_sql
+
+
+def test_location_filter_without_zip_or_radius_returns_none():
+    assert (
+        provider_address_location_filter_sql(
+            "addr",
+            schema_name="tenant_data",
+            exact_zip_predicate=None,
+            radius_predicates=[],
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
