@@ -5,7 +5,7 @@ import hashlib
 import importlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -17,7 +17,6 @@ from process.ptg_parts.ptg2_shared_publish import (
     create_shared_block_stage,
     publish_shared_block_stage,
     publish_shared_finalizer_dictionaries,
-    publish_v4_cas_block_stage,
     shared_block_stage_name,
 )
 from process.ptg_parts import ptg2_shared_publish
@@ -564,13 +563,13 @@ async def test_finalizer_code_stage_uses_fixed_coverage_scope_id(tmp_path, monke
                     "support_digest": (b"s" * 32).hex(),
                 },
                 "preservation": {"encoded_records": 1},
-        },
+            },
             schema_name="mrf",
             snapshot_key=7,
             build_token="attempt-7",
             expected_coverage_scope_id=b"s" * 32,
             provider_set_metadata_entries=_provider_set_metadata_entries(tmp_path),
-    )
+        )
 
     code_stage_sql = status.await_args_list[0].args[0]
     assert "coverage_scope_id bytea NOT NULL" in code_stage_sql
@@ -633,6 +632,11 @@ class _SlowSharedBlockSQLDriver:
     async def execute_stage_statement(self, statement, params=None):
         statement_text = str(statement)
         if statement_text.startswith("FETCH FORWARD"):
+            if (
+                "reuse_protection_cursor" in statement_text
+                or "reuse_hash_cursor" in statement_text
+            ):
+                return _RowsResult(())
             return await self._fetch_stage_rows()
         if "LEFT JOIN \"mrf\".ptg2_v3_snapshot_block AS mapping" in statement_text:
             batch_size = self.batch_sizes[self.fetch_index - 1]
@@ -697,6 +701,11 @@ class _SlowV4CASSQLDriver:
     async def execute_stage_statement(self, statement, params=None):
         statement_text = str(statement)
         if statement_text.startswith("FETCH FORWARD"):
+            if (
+                "reuse_protection_cursor" in statement_text
+                or "reuse_hash_cursor" in statement_text
+            ):
+                return _RowsResult(())
             return await self._fetch_stage_rows()
         batch_index = max(self.fetch_index - 1, 0)
         if "SUM(staged.entry_count)" in statement_text:
@@ -775,6 +784,26 @@ def test_batched_stage_summary_rejects_invalid_batch_proof(flag_index, message):
             unique_blocks=1,
             unique_coordinates=1,
         )
+
+
+@pytest.mark.asyncio
+async def test_batched_stage_rejects_a_remaining_gc_candidate():
+    """The final candidate intersection is an exact transaction stop gate."""
+
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_OneRowResult((1,)))
+    )
+
+    with pytest.raises(RuntimeError, match="retains a GC candidate"):
+        await ptg2_shared_publish._require_no_batched_stage_gc_candidates(
+            session,
+            schema='"mrf"',
+            reuse_hash='"reuse_hashes"',
+        )
+
+    statement = str(session.execute.await_args.args[0])
+    assert 'FROM "mrf".ptg2_v3_gc_candidate' in statement
+    assert 'JOIN "reuse_hashes" AS reused USING (block_hash)' in statement
 
 
 @pytest.mark.parametrize(
@@ -1266,154 +1295,96 @@ async def test_slow_sql_stage_reports_exact_bounded_rows_before_completion(
     )
 
 
-def _v4_cas_publication_session():
-    return SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=[
-                None,
-                None,
-                _OneRowResult(
-                    (
-                        3,
-                        18,
-                        2,
-                        30,
-                        20,
-                        20,
-                        14,
-                        ["a_kind", "z_kind"],
-                        False,
-                        False,
-                        False,
-                    )
-                ),
-                None,
-            ]
-        )
-    )
-
-
-def _assert_v4_cas_publication(publication, session):
-    assert publication.object_kinds == ("a_kind", "z_kind")
-    assert publication.staged_row_count == 3
-    assert publication.staged_entry_count == 18
-    assert publication.unique_block_count == 2
-    assert publication.logical_byte_count == 30
-    assert publication.stored_byte_count == 20
-    assert publication.unique_logical_byte_count == 20
-    assert publication.unique_stored_byte_count == 14
-    statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert "FOR KEY SHARE OF stored" in statements[0]
-    assert 'INSERT INTO "mrf".ptg2_v3_block' in statements[1]
-    assert "WITH canonical AS MATERIALIZED" in statements[2]
-    assert 'DELETE FROM "mrf".ptg2_v3_gc_candidate' in statements[3]
-    assert not any("ptg2_v3_snapshot_block" in statement for statement in statements)
-
-
 @pytest.mark.asyncio
-async def test_v4_cas_stage_publishes_exact_totals_without_snapshot_mappings(
+@pytest.mark.parametrize("with_progress", (False, True))
+async def test_v4_cas_session_helper_restores_lock_timeout_for_both_paths(
     monkeypatch,
+    with_progress,
 ):
-    """Prove V4 publishes deduplicated CAS totals without legacy mappings."""
+    """Callback-free and reporting paths share one bounded transaction body."""
 
-    session = _v4_cas_publication_session()
-
-    @asynccontextmanager
-    async def transaction():
-        yield session
-
-    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
-    drop_stage = AsyncMock()
-    monkeypatch.setattr(ptg2_shared_publish.db, "status", drop_stage)
-    layout_lock = AsyncMock()
+    publication = object()
+    publish_batched = AsyncMock(return_value=publication)
     monkeypatch.setattr(
         ptg2_shared_publish,
-        "lock_v4_shared_layout_for_map_write",
-        layout_lock,
+        "_publish_v4_cas_stage_batched",
+        publish_batched,
     )
-
-    publication = await publish_v4_cas_block_stage(
-        schema_name="mrf",
-        stage_table="ptg2_v3_block_stage_v4proof",
-        snapshot_key=42,
-        build_token="build-v4",
-    )
-
-    _assert_v4_cas_publication(publication, session)
-    layout_lock.assert_awaited_once_with(
-        session,
-        schema_name="mrf",
-        snapshot_key=42,
-        build_token="build-v4",
-    )
-    drop_stage.assert_awaited_once_with(
-        'DROP TABLE IF EXISTS "mrf"."ptg2_v3_block_stage_v4proof";'
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("aggregate_row", "message"),
-    (
-        (
-            (1, 1, 1, 3, 3, 3, 3, ["serving"], True, False, False),
-            "incompatible format version",
-        ),
-        (
-            (1, 1, 1, 3, 3, 3, 3, ["serving"], False, True, False),
-            "no payload or durable CAS row",
-        ),
-        (
-            (1, 1, 1, 3, 3, 3, 3, ["serving"], False, False, True),
-            "conflicts with stored content metadata",
-        ),
-        (
-            (1, 1, 2, 3, 3, 3, 3, ["serving"], False, False, False),
-            "invalid aggregates",
-        ),
-        (
-            (2, 2, 2, 3, 3, 3, 3, ["z_kind", "a_kind"], False, False, False),
-            "invalid object kinds",
-        ),
-    ),
-    ids=(
-        "format-version",
-        "missing-cas",
-        "metadata-conflict",
-        "invalid-totals",
-        "invalid-kinds",
-    ),
-)
-async def test_v4_cas_stage_rejects_invalid_aggregate_proof(
-    monkeypatch,
-    aggregate_row,
-    message,
-):
     session = SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=[None, None, _OneRowResult(aggregate_row), None]
-        )
+        scalar=AsyncMock(return_value="2750ms"),
+        execute=AsyncMock(),
     )
+    progress_callback = AsyncMock() if with_progress else None
 
-    monkeypatch.setattr(
-        ptg2_shared_publish.db,
-        "transaction",
-        lambda: _session_transaction(session),
-    )
-    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
-    monkeypatch.setattr(
-        ptg2_shared_publish,
-        "lock_v4_shared_layout_for_map_write",
-        AsyncMock(),
-    )
-
-    with pytest.raises(RuntimeError, match=message):
-        await publish_v4_cas_block_stage(
+    publication_result = (
+        await ptg2_shared_publish._publish_v4_cas_block_stage_in_session(
+            session,
             schema_name="mrf",
             stage_table="ptg2_v3_block_stage_v4proof",
-            snapshot_key=42,
-            build_token="build-v4",
+            progress_callback=progress_callback,
         )
+    )
+
+    assert publication_result is publication
+    publish_batched.assert_awaited_once_with(
+        session,
+        schema='"mrf"',
+        stage='"ptg2_v3_block_stage_v4proof"',
+        progress_callback=(
+            progress_callback
+            if progress_callback is not None
+            else ptg2_shared_publish._discard_publish_work
+        ),
+    )
+    session.scalar.assert_awaited_once()
+    restore_statement = str(session.execute.await_args.args[0])
+    assert "set_config('lock_timeout'" in restore_statement
+    assert session.execute.await_args.args[1] == {"lock_timeout": "2750ms"}
+
+
+@pytest.mark.asyncio
+async def test_public_v4_cas_publisher_fails_closed_without_db_work(
+    monkeypatch,
+):
+    """Older imports receive a safe error instead of a partial CAS commit."""
+
+    transaction_mock = Mock()
+    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction_mock)
+
+    with pytest.raises(RuntimeError, match="complete atomic V4 graph"):
+        await ptg2_shared_publish.publish_v4_cas_block_stage(
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_retired",
+            snapshot_key=17,
+            build_token="retired-contract",
+        )
+
+    transaction_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_v4_cas_session_helper_preserves_publication_failure(monkeypatch):
+    """A failed transaction body is rolled back without a masking restore."""
+
+    publish_batched = AsyncMock(side_effect=RuntimeError("CAS failed"))
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_publish_v4_cas_stage_batched",
+        publish_batched,
+    )
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value="4s"),
+        execute=AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="CAS failed"):
+        await ptg2_shared_publish._publish_v4_cas_block_stage_in_session(
+            session,
+            schema_name="mrf",
+            stage_table="ptg2_v3_block_stage_v4proof",
+        )
+
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1424,26 +1395,15 @@ async def test_slow_v4_cas_sql_reports_exact_batches_before_completion(
 
     sql_driver = _SlowV4CASSQLDriver()
     session = SimpleNamespace(
-        execute=AsyncMock(side_effect=sql_driver.execute_stage_statement)
-    )
-    monkeypatch.setattr(
-        ptg2_shared_publish.db,
-        "transaction",
-        lambda: _session_transaction(session),
-    )
-    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
-    monkeypatch.setattr(
-        ptg2_shared_publish,
-        "lock_v4_shared_layout_for_map_write",
-        AsyncMock(),
+        scalar=AsyncMock(return_value="0"),
+        execute=AsyncMock(side_effect=sql_driver.execute_stage_statement),
     )
     progress_capture = _FirstBatchProgress()
     publish_task = asyncio.create_task(
-        publish_v4_cas_block_stage(
+        ptg2_shared_publish._publish_v4_cas_block_stage_in_session(
+            session,
             schema_name="mrf",
             stage_table="ptg2_v3_block_stage_v4_slow_sql",
-            snapshot_key=42,
-            build_token="build-v4",
             progress_callback=progress_capture,
         )
     )

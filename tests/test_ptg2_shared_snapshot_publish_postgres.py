@@ -10,6 +10,7 @@ import os
 import struct
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -28,6 +29,8 @@ from api.ptg2_shared_blocks import fetch_shared_blocks, fetch_shared_graph_membe
 from db.connection import Database, db
 from process.ptg_parts import ptg2_shared_publish
 from process.ptg_parts import ptg2_shared_gc
+from process.ptg_parts import ptg2_shared_snapshot_publish
+from process.ptg_parts import ptg2_v4_snapshot_maps
 from process.ptg_parts.ptg2_manifest_artifacts import write_global_membership_sidecar
 from process.ptg_parts.ptg2_manifest_publish import (
     PTG2_MANIFEST_SERVING_LAYOUT_LEAN_PROVIDER_KEY,
@@ -42,6 +45,7 @@ from process.ptg_parts.ptg2_candidate_attestation import (
 )
 from process.ptg_parts.ptg2_shared_blocks import (
     SharedBlock,
+    SharedBlockReference,
     bind_snapshot_to_shared_layout,
     insert_shared_blocks,
     reserve_shared_layout,
@@ -103,6 +107,55 @@ MIGRATION_PATHS = (
 SCANNER_TEST_PATH = Path(__file__).with_name("test_ptg2_scanner_v3_runs.py")
 SERVING_RECORD = struct.Struct(">16s16s16sI")
 SHARED_BLOCK_COPY_HEADER = b"PGCOPY\n\xff\r\n\x00" + struct.pack(">ii", 0, 0)
+
+_SELECTIVE_V4_LAYOUT_DDL = """
+CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
+    snapshot_key bigint PRIMARY KEY,
+    generation varchar(32) NOT NULL,
+    state varchar(16) NOT NULL,
+    build_token varchar(96) NOT NULL
+)
+"""
+_SELECTIVE_V4_MAP_ROOT_DDL = """
+CREATE TABLE {schema}.ptg2_v4_snapshot_map_root (
+    snapshot_key bigint PRIMARY KEY,
+    state varchar(16) NOT NULL,
+    format_version smallint NOT NULL,
+    map_format varchar(32) NOT NULL,
+    representation varchar(32) NOT NULL,
+    projection_id_scope varchar(32) NOT NULL,
+    map_digest bytea,
+    object_kind_count integer NOT NULL DEFAULT 0,
+    map_pack_count bigint NOT NULL DEFAULT 0,
+    coordinate_count bigint NOT NULL DEFAULT 0,
+    entry_count bigint NOT NULL DEFAULT 0,
+    logical_byte_count bigint NOT NULL DEFAULT 0,
+    stored_map_byte_count bigint NOT NULL DEFAULT 0,
+    npi_count bigint NOT NULL DEFAULT 0,
+    component_count bigint NOT NULL DEFAULT 0,
+    pattern_count bigint NOT NULL DEFAULT 0,
+    relation_count integer NOT NULL DEFAULT 0,
+    heavy_owner_count bigint NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    completed_at timestamptz
+)
+"""
+_SELECTIVE_V4_MAP_PACK_DDL = """
+CREATE TABLE {schema}.ptg2_v4_snapshot_map_pack (
+    snapshot_key bigint NOT NULL,
+    object_kind varchar(64) NOT NULL,
+    pack_no integer NOT NULL,
+    first_block_key bigint NOT NULL,
+    first_fragment_no integer NOT NULL,
+    last_block_key bigint NOT NULL,
+    last_fragment_no integer NOT NULL,
+    coordinate_count integer NOT NULL,
+    entry_count bigint NOT NULL,
+    logical_byte_count bigint NOT NULL,
+    map_block_hash bytea NOT NULL,
+    PRIMARY KEY (snapshot_key, object_kind, pack_no)
+)
+"""
 
 
 def _shared_block_copy_field(value: bytes) -> bytes:
@@ -265,6 +318,20 @@ async def _create_selective_block_schema(schema_name: str) -> None:
         )
         """
     )
+    fixture_tables = {
+        "ptg2_v3_block",
+        "ptg2_v3_snapshot_block",
+        "ptg2_v3_gc_candidate",
+    }
+    for table_name in (
+        set(ptg2_shared_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES)
+        - fixture_tables
+    ):
+        await db.execute_ddl(
+            f'CREATE TABLE {quoted_schema}."{table_name}" (snapshot_key bigint)'
+        )
+
+
 async def _insert_selective_durable_block(
     schema_name: str,
     payload: bytes,
@@ -313,11 +380,11 @@ async def _stage_selective_block_copy(
     tmp_path: Path,
     schema_name: str,
     *block_rows: tuple[int, bytes, int],
+    stage_table: str = "block_stage",
 ):
-    stage_table = "block_stage"
     quoted_schema = '"' + schema_name.replace('"', '""') + '"'
     copy_payload = _shared_block_copy_payload(*block_rows)
-    copy_path = tmp_path / f"{schema_name}.copy"
+    copy_path = tmp_path / f"{schema_name}-{stage_table}.copy"
     copy_path.write_bytes(copy_payload)
     await create_shared_block_stage(
         schema_name=schema_name,
@@ -341,6 +408,48 @@ async def _stage_selective_block_copy(
         """
     )
     return metrics, tuple(map(int, stage_counts))
+
+
+async def _stage_null_reuses_before_payload(schema_name: str) -> bytes:
+    """Stage one payload after enough null reuses to cross a publish batch."""
+
+    quoted_schema = '"' + schema_name.replace('"', '""') + '"'
+    payload_bytes = b"payload-after-null-reuses"
+    block_hash = shared_block_hash(
+        format_version=2,
+        object_kind="serving",
+        codec="none",
+        payload=payload_bytes,
+    )
+    await create_shared_block_stage(
+        schema_name=schema_name,
+        stage_table="block_stage",
+    )
+    await db.status(
+        f"""
+        INSERT INTO {quoted_schema}.block_stage
+            (block_hash, format_version, object_kind, block_key, fragment_no,
+             entry_count, codec, raw_byte_count, stored_byte_count, payload)
+        SELECT :block_hash, 2, 'serving', block_key, 0,
+               1, 'none', :byte_count, :byte_count, NULL
+          FROM generate_series(1, 4096) AS block_key
+        """,
+        block_hash=block_hash,
+        byte_count=len(payload_bytes),
+    )
+    await db.status(
+        f"""
+        INSERT INTO {quoted_schema}.block_stage
+            (block_hash, format_version, object_kind, block_key, fragment_no,
+             entry_count, codec, raw_byte_count, stored_byte_count, payload)
+        VALUES (:block_hash, 2, 'serving', 4097, 0,
+                1, 'none', :byte_count, :byte_count, :payload)
+        """,
+        block_hash=block_hash,
+        byte_count=len(payload_bytes),
+        payload=payload_bytes,
+    )
+    return block_hash
 
 
 @asynccontextmanager
@@ -810,6 +919,103 @@ async def test_real_postgres_selective_copy_stages_each_new_hash_once(
 
 
 @pytest.mark.asyncio
+async def test_real_postgres_batched_shared_publish_orders_payload_before_reuses(
+    monkeypatch,
+):
+    """A later payload row protects null reuses split into an earlier batch."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        block_hash = await _stage_null_reuses_before_payload(schema_name)
+        progress_events = []
+        publication = await publish_shared_block_stage(
+            schema_name=schema_name,
+            stage_table="block_stage",
+            snapshot_key=11,
+            build_token="payload-first-shared",
+            progress_callback=lambda metric, amount: progress_events.append(
+                (metric, amount)
+            ),
+        )
+        assert publication.mapping_count == 4097
+        assert publication.unique_block_count == 1
+        assert progress_events == [
+            ("reuse_inventory_batches", 1),
+            ("reuse_inventory_batches", 1),
+            ("reuse_protection_batches", 1),
+            ("sql_stage_rows", 1),
+            ("publish_batches", 1),
+            ("sql_stage_rows", 4096),
+            ("publish_batches", 1),
+        ]
+        assert (
+            await db.scalar(
+                f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_block "
+                "WHERE block_hash = :block_hash",
+                block_hash=block_hash,
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_batched_v4_cas_orders_payload_before_reuses(
+    monkeypatch,
+):
+    """The V4 CAS publisher uses the same bounded payload-first contract."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_v4_shared_layout_for_map_write",
+        AsyncMock(),
+    )
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        block_hash = await _stage_null_reuses_before_payload(schema_name)
+        progress_events = []
+        publication = await (
+            ptg2_shared_publish._publish_v4_cas_block_stage_compatibility(
+                schema_name=schema_name,
+                stage_table="block_stage",
+                snapshot_key=12,
+                build_token="payload-first-v4",
+                progress_callback=lambda metric, amount: progress_events.append(
+                    (metric, amount)
+                ),
+            )
+        )
+        assert publication.staged_row_count == 4097
+        assert publication.unique_block_count == 1
+        assert progress_events == [
+            ("reuse_inventory_batches", 1),
+            ("reuse_inventory_batches", 1),
+            ("reuse_protection_batches", 1),
+            ("sql_stage_rows", 1),
+            ("publish_batches", 1),
+            ("sql_stage_rows", 4096),
+            ("publish_batches", 1),
+        ]
+        assert (
+            await db.scalar(
+                f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_block "
+                "WHERE block_hash = :block_hash",
+                block_hash=block_hash,
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
 async def test_real_postgres_shared_block_existence_lateral_batches_are_exact(
     monkeypatch,
 ):
@@ -1010,6 +1216,97 @@ def _hold_shared_mapping_upsert(monkeypatch):
     return mapping_started, allow_mapping
 
 
+def _hold_batched_reuse_protection(monkeypatch):
+    """Pause after reuse targets are protected and return its two events."""
+
+    protection_finished = asyncio.Event()
+    allow_publication = asyncio.Event()
+    original_protection = ptg2_shared_publish._protect_batched_stage_reuses
+
+    async def held_protection(*args, **kwargs):
+        reuse_hash = await original_protection(*args, **kwargs)
+        protection_finished.set()
+        await allow_publication.wait()
+        return reuse_hash
+
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_protect_batched_stage_reuses",
+        held_protection,
+    )
+    return protection_finished, allow_publication
+
+
+def _synchronize_batched_reuse_protection(monkeypatch):
+    """Release two publishers into reuse protection at the same time."""
+
+    both_started = asyncio.Barrier(2)
+    original_protection = ptg2_shared_publish._protect_batched_stage_reuses
+
+    async def synchronized_protection(*args, **kwargs):
+        await both_started.wait()
+        return await original_protection(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_protect_batched_stage_reuses",
+        synchronized_protection,
+    )
+
+
+async def _stage_reverse_order_reuse_publishers(tmp_path, schema_name: str):
+    """Create two durable reuse stages with opposite physical row order."""
+
+    first_payload = b"concurrent-reuse-first"
+    second_payload = b"concurrent-reuse-second"
+    first_hash = await _insert_selective_durable_block(
+        schema_name,
+        first_payload,
+    )
+    second_hash = await _insert_selective_durable_block(
+        schema_name,
+        second_payload,
+    )
+    await _queue_selective_gc_candidate(schema_name, first_hash)
+    await _queue_selective_gc_candidate(schema_name, second_hash)
+    await _stage_selective_block_copy(
+        tmp_path,
+        schema_name,
+        (1, first_payload, 1),
+        (2, second_payload, 1),
+        stage_table="block_stage_forward",
+    )
+    await _stage_selective_block_copy(
+        tmp_path,
+        schema_name,
+        (1, second_payload, 1),
+        (2, first_payload, 1),
+        stage_table="block_stage_reverse",
+    )
+
+
+async def _assert_concurrent_reuse_publication(
+    quoted_schema: str,
+    forward,
+    reverse,
+) -> None:
+    """Verify both overlapping publishers committed without GC residue."""
+
+    assert forward.mapping_count == reverse.mapping_count == 2
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_block",
+    ) == 2
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_snapshot_block",
+    ) == 4
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_gc_candidate",
+    ) == 0
+
+
 async def _sweep_selective_blocks_once(schema_name: str):
     """Run one independent shared-block sweep transaction."""
 
@@ -1017,12 +1314,15 @@ async def _sweep_selective_blocks_once(schema_name: str):
     await gc_database.connect()
     try:
         async with gc_database.acquire() as connection:
-            return await ptg2_shared_gc.sweep_ptg2_shared_blocks(
+            sweep = await ptg2_shared_gc.sweep_ptg2_shared_blocks(
                 schema_name=schema_name,
                 executor=connection,
                 max_bytes=1024,
                 max_rows=10,
+                require_shared=True,
             )
+            assert sweep.tables_available is True
+            return sweep
     finally:
         await gc_database.disconnect()
 
@@ -1039,6 +1339,1040 @@ async def _selective_relation_count(
         )
         or 0
     )
+
+
+async def _install_selective_v4_map_schema(
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+) -> None:
+    """Add the minimum real packed-map relations to the selective fixture."""
+
+    schema = f'"{schema_name}"'
+    await db.execute_ddl(f"DROP TABLE {schema}.ptg2_v3_snapshot_layout")
+    for ddl_template in (
+        _SELECTIVE_V4_LAYOUT_DDL,
+        _SELECTIVE_V4_MAP_ROOT_DDL,
+        _SELECTIVE_V4_MAP_PACK_DDL,
+    ):
+        await db.execute_ddl(ddl_template.format(schema=schema))
+    await db.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_snapshot_layout
+            (snapshot_key, generation, state, build_token)
+        VALUES (:snapshot_key, 'shared_blocks_v4', 'building', :build_token)
+        """,
+        snapshot_key=int(snapshot_key),
+        build_token=build_token,
+    )
+
+
+async def _stage_selective_v4_reuse(
+    schema_name: str,
+    *,
+    block_payload: bytes,
+    object_kind: str = "v4_atomic_test",
+) -> bytes:
+    """Create one durable V4 target and a null-payload reuse stage row."""
+
+    schema = f'"{schema_name}"'
+    block_hash = shared_block_hash(
+        format_version=2,
+        object_kind=object_kind,
+        codec="none",
+        payload=block_payload,
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.ptg2_v3_block
+            (block_hash, format_version, object_kind, codec, entry_count,
+             raw_byte_count, stored_byte_count, payload, created_at)
+        VALUES (:block_hash, 2, :object_kind, 'none', 1,
+                :byte_count, :byte_count, :payload, now())
+        """,
+        block_hash=block_hash,
+        object_kind=object_kind,
+        byte_count=len(block_payload),
+        payload=block_payload,
+    )
+    await create_shared_block_stage(
+        schema_name=schema_name,
+        stage_table="block_stage",
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.block_stage
+            (block_hash, format_version, object_kind, block_key, fragment_no,
+             entry_count, codec, raw_byte_count, stored_byte_count, payload)
+        VALUES (:block_hash, 2, :object_kind, 1, 0,
+                1, 'none', :byte_count, :byte_count, NULL)
+        """,
+        block_hash=block_hash,
+        object_kind=object_kind,
+        byte_count=len(block_payload),
+    )
+    return block_hash
+
+
+async def _append_selective_v4_payload(
+    schema_name: str,
+    *,
+    payload: bytes,
+    object_kind: str = "v4_atomic_test",
+) -> bytes:
+    """Add a new payload-bearing coordinate to the active V4 stage."""
+
+    schema = f'"{schema_name}"'
+    block_hash = shared_block_hash(
+        format_version=2,
+        object_kind=object_kind,
+        codec="none",
+        payload=payload,
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.block_stage
+            (block_hash, format_version, object_kind, block_key, fragment_no,
+             entry_count, codec, raw_byte_count, stored_byte_count, payload)
+        VALUES (:block_hash, 2, :object_kind, 2, 0,
+                1, 'none', :byte_count, :byte_count, :payload)
+        """,
+        block_hash=block_hash,
+        object_kind=object_kind,
+        byte_count=len(payload),
+        payload=payload,
+    )
+    return block_hash
+
+
+def _selective_v4_reference(
+    block_hash: bytes,
+    *,
+    raw_byte_count: int,
+    object_kind: str = "v4_atomic_test",
+    block_key: int = 1,
+) -> SharedBlockReference:
+    """Describe the single target in the packed-map publication stream."""
+
+    return SharedBlockReference(
+        object_kind=object_kind,
+        block_key=int(block_key),
+        fragment_no=0,
+        entry_count=1,
+        block_hash=block_hash,
+        raw_byte_count=int(raw_byte_count),
+    )
+
+
+@dataclass(frozen=True)
+class _ReferenceManifestProof:
+    """Expected authentication contract for one reference artifact."""
+
+    path: Path
+    byte_count: int
+    sha256: str
+    row_count: int
+
+
+async def _publish_v4_fixture(
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+    reference: SharedBlockReference,
+    cas_ready: asyncio.Event | None = None,
+    allow_map: asyncio.Event | None = None,
+    manifest_proof: _ReferenceManifestProof | None = None,
+    expected_block_count: int | None = None,
+):
+    """Run the production CAS and packed-map writers in one transaction."""
+
+    async with db.transaction() as session:
+        await ptg2_v4_snapshot_maps.lock_v4_shared_layout_for_map_write(
+            session,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=build_token,
+        )
+        cas_publication = (
+            await ptg2_shared_publish._publish_v4_cas_block_stage_in_session(
+                session,
+                schema_name=schema_name,
+                stage_table="block_stage",
+                progress_callback=lambda _metric, _amount: None,
+            )
+        )
+        if cas_ready is not None:
+            cas_ready.set()
+        if allow_map is not None:
+            await allow_map.wait()
+        references = (reference,)
+        if manifest_proof is not None:
+            references = ptg2_shared_snapshot_publish._iter_v4_block_references(
+                manifest_proof.path,
+                expected_byte_count=manifest_proof.byte_count,
+                expected_sha256=manifest_proof.sha256,
+                expected_row_count=manifest_proof.row_count,
+            )
+        map_summary = await ptg2_v4_snapshot_maps.publish_v4_snapshot_maps(
+            session,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=build_token,
+            representation="direct_v1",
+            references=references,
+        )
+        if expected_block_count is not None:
+            ptg2_shared_snapshot_publish._require_v4_atomic_coordinate_counts(
+                expected_block_count,
+                cas_publication,
+                map_summary,
+            )
+    return cas_publication, map_summary
+
+
+def _encode_selective_v4_reference(
+    reference: SharedBlockReference,
+) -> bytes:
+    """Encode one canonical failed-build cleanup reference record."""
+
+    return (
+        json.dumps(
+            {
+                "object_kind": reference.object_kind,
+                "block_key": int(reference.block_key),
+                "fragment_no": int(reference.fragment_no),
+                "entry_count": int(reference.entry_count),
+                "raw_byte_count": int(reference.raw_byte_count),
+                "stored_byte_count": int(reference.raw_byte_count),
+                "hash": bytes(reference.block_hash).hex(),
+                "codec": "none",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _write_selective_v4_reference_manifest(
+    path: Path,
+    *references: SharedBlockReference,
+) -> bytes:
+    """Write canonical failed-build cleanup reference records."""
+
+    encoded_manifest = b"".join(
+        _encode_selective_v4_reference(reference) for reference in references
+    )
+    path.write_bytes(encoded_manifest)
+    return encoded_manifest
+
+
+def _reorder_selective_v4_reference_bytes(encoded_reference: bytes) -> bytes:
+    """Reorder one JSON object without changing its values or byte count."""
+
+    reference_record = json.loads(encoded_reference)
+    reordered_reference_map = dict(
+        reversed(tuple(reference_record.items()))
+    )
+    reordered_bytes = (
+        json.dumps(
+            reordered_reference_map,
+            sort_keys=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    assert len(reordered_bytes) == len(encoded_reference)
+    assert json.loads(reordered_bytes) == reference_record
+    return reordered_bytes
+
+
+def _observe_v4_map_pack_publication(monkeypatch) -> list[bytes]:
+    """Record map blocks written before a later transactional failure."""
+
+    published_map_blocks: list[bytes] = []
+    original_publish = ptg2_v4_snapshot_maps._publish_v4_map_pack
+
+    async def publish_and_record(session, **kwargs):
+        await original_publish(session, **kwargs)
+        published_map_blocks.append(bytes(kwargs["pack"].map_block.block_hash))
+
+    monkeypatch.setattr(
+        ptg2_v4_snapshot_maps,
+        "_publish_v4_map_pack",
+        publish_and_record,
+    )
+    return published_map_blocks
+
+
+def _observe_candidate_cancellation_before_map_validation(
+    monkeypatch,
+    quoted_schema: str,
+) -> asyncio.Event:
+    """Prove map validation runs after CAS candidate cancellation."""
+
+    cancellation_observed = asyncio.Event()
+    original_verify = ptg2_v4_snapshot_maps._verify_target_blocks
+
+    async def verify_after_cancellation(session, **kwargs):
+        candidate_count = await session.scalar(
+            db.text(
+                f"SELECT COUNT(*) FROM "
+                f"{quoted_schema}.ptg2_v3_gc_candidate"
+            )
+        )
+        assert int(candidate_count or 0) == 0
+        cancellation_observed.set()
+        return await original_verify(session, **kwargs)
+
+    monkeypatch.setattr(
+        ptg2_v4_snapshot_maps,
+        "_verify_target_blocks",
+        verify_after_cancellation,
+    )
+    return cancellation_observed
+
+
+async def _wait_for_failed_enqueue_block(schema_name: str) -> None:
+    """Observe the failed-build candidate writer waiting on CAS locks."""
+
+    query_pattern = f"%{schema_name}%ptg2_v3_gc_candidate%"
+    for _attempt in range(100):
+        waiting_count = await db.scalar(
+            """
+            SELECT COUNT(*)
+              FROM pg_stat_activity
+             WHERE pid <> pg_backend_pid()
+               AND state = 'active'
+               AND wait_event_type = 'Lock'
+               AND query LIKE :query_pattern
+            """,
+            query_pattern=query_pattern,
+        )
+        if int(waiting_count or 0) > 0:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("failed V4 enqueue did not reach the CAS lock wait")
+
+
+async def _settle_atomic_test_tasks(
+    allow_map: asyncio.Event,
+    *tasks: asyncio.Task | None,
+) -> None:
+    """Release the map gate and consume every task on success or failure."""
+
+    allow_map.set()
+    active_tasks = tuple(task for task in tasks if task is not None)
+    for task in active_tasks:
+        if not task.done():
+            task.cancel()
+    if active_tasks:
+        await asyncio.gather(*active_tasks, return_exceptions=True)
+
+
+async def _selective_block_count(
+    quoted_schema: str,
+    block_hash: bytes,
+) -> int:
+    """Return the exact durable count for one content hash."""
+
+    return int(
+        await db.scalar(
+            f"SELECT COUNT(*) FROM {quoted_schema}.ptg2_v3_block "
+            "WHERE block_hash = :block_hash",
+            block_hash=block_hash,
+        )
+        or 0
+    )
+
+
+async def _assert_v4_atomic_rollback(
+    quoted_schema: str,
+    *,
+    new_block_hash: bytes,
+    map_block_hashes: tuple[bytes, ...] = (),
+) -> None:
+    """Prove failed atomic publication left only the original CAS row."""
+
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_block",
+    ) == 1
+    assert await _selective_block_count(
+        quoted_schema,
+        new_block_hash,
+    ) == 0
+    for map_block_hash in map_block_hashes:
+        assert await _selective_block_count(
+            quoted_schema,
+            map_block_hash,
+        ) == 0
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_gc_candidate",
+    ) == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v4_snapshot_map_root",
+    ) == 0
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v4_snapshot_map_pack",
+    ) == 0
+
+
+def _write_drifted_v4_manifest(
+    path: Path,
+    *,
+    manifest_case: str,
+    reused_reference: SharedBlockReference,
+    new_reference: SharedBlockReference,
+) -> _ReferenceManifestProof:
+    """Write one authenticated reference manifest failure fixture."""
+
+    reused_bytes = _encode_selective_v4_reference(reused_reference)
+    new_bytes = _encode_selective_v4_reference(new_reference)
+    canonical_manifest = reused_bytes + new_bytes
+    if manifest_case == "same_row_count_drift":
+        drifted_manifest = (
+            _reorder_selective_v4_reference_bytes(reused_bytes) + new_bytes
+        )
+    else:
+        drifted_manifest = reused_bytes
+    path.write_bytes(drifted_manifest)
+    return _ReferenceManifestProof(
+        path=path,
+        byte_count=len(canonical_manifest),
+        sha256=hashlib.sha256(canonical_manifest).hexdigest(),
+        row_count=2,
+    )
+
+
+async def _stage_v4_manifest_blocks(
+    schema_name: str,
+) -> tuple[bytes, SharedBlockReference, SharedBlockReference]:
+    """Stage two object kinds for authenticated manifest rollback tests."""
+
+    reused_payload = b"atomic-manifest-reused-target"
+    new_payload = b"atomic-manifest-new-target"
+    reused_hash = await _stage_selective_v4_reuse(
+        schema_name,
+        block_payload=reused_payload,
+        object_kind="v4_atomic_test_a",
+    )
+    new_hash = await _append_selective_v4_payload(
+        schema_name,
+        payload=new_payload,
+        object_kind="v4_atomic_test_z",
+    )
+    await _queue_selective_gc_candidate(schema_name, reused_hash)
+    reused_reference = _selective_v4_reference(
+        reused_hash,
+        raw_byte_count=len(reused_payload),
+        object_kind="v4_atomic_test_a",
+    )
+    new_reference = _selective_v4_reference(
+        new_hash,
+        raw_byte_count=len(new_payload),
+        object_kind="v4_atomic_test_z",
+        block_key=2,
+    )
+    return new_hash, reused_reference, new_reference
+
+
+async def _assert_v4_before_map(quoted_schema: str) -> None:
+    """Prove CAS protection is active before map validation completes."""
+
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_block",
+    ) == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_gc_candidate",
+    ) == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v4_snapshot_map_root",
+    ) == 0
+
+
+async def _assert_v4_after_map(quoted_schema: str) -> None:
+    """Prove the atomic map transaction committed its reachable state."""
+
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_block",
+    ) == 2
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_gc_candidate",
+    ) == 0
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v4_snapshot_map_root",
+    ) == 1
+
+
+async def _assert_v4_gc_safe(
+    schema_name: str,
+    quoted_schema: str,
+    block_hash: bytes,
+) -> None:
+    """Prove committed maps keep their CAS blocks through a real sweep."""
+
+    reachable = await ptg2_shared_gc._v4_reachable_hashes(
+        db,
+        schema_name=schema_name,
+        candidate_hashes={block_hash},
+    )
+    assert reachable == {block_hash}
+    sweep = await _sweep_selective_blocks_once(schema_name)
+    assert sweep.selected_hashes == ()
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_block",
+    ) == 2
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_gc_candidate",
+    ) == 0
+
+
+async def _assert_v4_mapped_candidate(quoted_schema: str) -> None:
+    """Prove a failed enqueue remains queued until the committed sweep."""
+
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v4_snapshot_map_root",
+    ) == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v4_snapshot_map_pack",
+    ) == 1
+    assert await _selective_relation_count(
+        quoted_schema,
+        "ptg2_v3_gc_candidate",
+    ) == 1
+
+
+async def _start_blocked_enqueue(
+    schema_name: str,
+    reference_manifest: Path,
+    cas_ready: asyncio.Event,
+) -> asyncio.Task:
+    """Start and prove one failed-build enqueue is waiting on CAS locks."""
+
+    await asyncio.wait_for(cas_ready.wait(), timeout=3)
+    failed_enqueue = asyncio.create_task(
+        ptg2_shared_snapshot_publish._queue_failed_v4_graph_blocks(
+            schema_name=schema_name,
+            reference_manifest_path=reference_manifest,
+        )
+    )
+    await _wait_for_failed_enqueue_block(schema_name)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            asyncio.shield(failed_enqueue),
+            timeout=0.2,
+        )
+    return failed_enqueue
+
+
+async def _finish_v4_publish(
+    allow_map: asyncio.Event,
+    publisher: asyncio.Task,
+    failed_enqueue: asyncio.Task,
+):
+    """Commit the map, then consume the unblocked failed-build enqueue."""
+
+    allow_map.set()
+    publication = await asyncio.wait_for(publisher, timeout=3)
+    await asyncio.wait_for(failed_enqueue, timeout=3)
+    return publication
+
+
+def _start_gated_v4_publish(
+    schema_name: str,
+    snapshot_key: int,
+    build_token: str,
+    reference: SharedBlockReference,
+) -> tuple[asyncio.Event, asyncio.Event, asyncio.Task]:
+    """Start one atomic publisher behind explicit CAS and map gates."""
+
+    cas_ready = asyncio.Event()
+    allow_map = asyncio.Event()
+    publisher = asyncio.create_task(
+        _publish_v4_fixture(
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+            reference=reference,
+            cas_ready=cas_ready,
+            allow_map=allow_map,
+        )
+    )
+    return cas_ready, allow_map, publisher
+
+
+async def _stage_v4_reuse_reference(
+    schema_name: str,
+    block_payload: bytes,
+) -> tuple[bytes, SharedBlockReference]:
+    """Stage one reused block and return its exact map reference."""
+
+    block_hash = await _stage_selective_v4_reuse(
+        schema_name,
+        block_payload=block_payload,
+    )
+    return block_hash, _selective_v4_reference(
+        block_hash,
+        raw_byte_count=len(block_payload),
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_batched_shared_publish_preprotects_reuses_from_gc(
+    tmp_path,
+    monkeypatch,
+):
+    """The mapping publisher protects every reuse before payload batches."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        reused_hash = await _insert_selective_durable_block(
+            schema_name,
+            b"reuse-before-payload-lane",
+        )
+        await _queue_selective_gc_candidate(schema_name, reused_hash)
+        await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"reuse-before-payload-lane", 1),
+            (2, b"new-payload", 1),
+        )
+        protection_finished, allow_publication = (
+            _hold_batched_reuse_protection(monkeypatch)
+        )
+        publisher = asyncio.create_task(
+            publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table="block_stage",
+                snapshot_key=13,
+                build_token="preprotect-shared",
+                progress_callback=lambda _metric, _amount: None,
+            )
+        )
+        await asyncio.wait_for(protection_finished.wait(), timeout=3)
+        swept = await _sweep_selective_blocks_once(schema_name)
+        assert swept.selected_hashes == ()
+        allow_publication.set()
+        publication = await asyncio.wait_for(publisher, timeout=3)
+        assert publication.mapping_count == 2
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_v3_block",
+        ) == 2
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_v3_gc_candidate",
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_batched_v4_cas_preprotects_reuses_from_gc(
+    tmp_path,
+    monkeypatch,
+):
+    """The V4 CAS publisher protects every reuse before payload batches."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_v4_shared_layout_for_map_write",
+        AsyncMock(),
+    )
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        reused_hash = await _insert_selective_durable_block(
+            schema_name,
+            b"v4-reuse-before-payload-lane",
+        )
+        await _queue_selective_gc_candidate(schema_name, reused_hash)
+        await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"v4-reuse-before-payload-lane", 1),
+            (2, b"new-v4-payload", 1),
+        )
+        protection_finished, allow_publication = (
+            _hold_batched_reuse_protection(monkeypatch)
+        )
+        publisher = asyncio.create_task(
+            ptg2_shared_publish._publish_v4_cas_block_stage_compatibility(
+                schema_name=schema_name,
+                stage_table="block_stage",
+                snapshot_key=14,
+                build_token="preprotect-v4",
+                progress_callback=lambda _metric, _amount: None,
+            )
+        )
+        await asyncio.wait_for(protection_finished.wait(), timeout=3)
+        swept = await _sweep_selective_blocks_once(schema_name)
+        assert swept.selected_hashes == ()
+        allow_publication.set()
+        publication = await asyncio.wait_for(publisher, timeout=3)
+        assert publication.staged_row_count == 2
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_v3_block",
+        ) == 2
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_v3_gc_candidate",
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_atomic_v4_map_failure_rolls_back_cas_protection(
+    monkeypatch,
+):
+    """A post-CAS map failure restores candidates and leaves no map residue."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    snapshot_key = 21
+    build_token = "atomic-map-failure"
+    reused_payload = b"atomic-map-failure-target"
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        await _install_selective_v4_map_schema(
+            schema_name, snapshot_key, build_token
+        )
+        block_hash = await _stage_selective_v4_reuse(
+            schema_name,
+            block_payload=reused_payload,
+        )
+        new_block_hash = await _append_selective_v4_payload(
+            schema_name,
+            payload=b"atomic-map-failure-new-cas-row",
+        )
+        await _queue_selective_gc_candidate(schema_name, block_hash)
+        invalid_reference = _selective_v4_reference(
+            block_hash,
+            raw_byte_count=len(reused_payload) + 1,
+        )
+        cancellation_observed = (
+            _observe_candidate_cancellation_before_map_validation(
+                monkeypatch,
+                quoted_schema,
+            )
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="could not resolve every target CAS block",
+        ):
+            await _publish_v4_fixture(
+                schema_name=schema_name,
+                snapshot_key=snapshot_key,
+                build_token=build_token,
+                reference=invalid_reference,
+            )
+
+        assert cancellation_observed.is_set()
+        await _assert_v4_atomic_rollback(
+            quoted_schema,
+            new_block_hash=new_block_hash,
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_v4_coordinate_mismatch_rolls_back_atomic_publish(
+    monkeypatch,
+):
+    """A post-map CAS/reference count mismatch rolls all publication back."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    snapshot_key = 25
+    build_token = "atomic-coordinate-mismatch"
+    reused_payload = b"atomic-coordinate-reused-target"
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        await _install_selective_v4_map_schema(
+            schema_name, snapshot_key, build_token
+        )
+        reused_hash = await _stage_selective_v4_reuse(
+            schema_name,
+            block_payload=reused_payload,
+        )
+        new_hash = await _append_selective_v4_payload(
+            schema_name,
+            payload=b"atomic-coordinate-unreferenced-cas-row",
+        )
+        await _queue_selective_gc_candidate(schema_name, reused_hash)
+        reference = _selective_v4_reference(
+            reused_hash,
+            raw_byte_count=len(reused_payload),
+        )
+        published_map_blocks = _observe_v4_map_pack_publication(monkeypatch)
+
+        with pytest.raises(
+            RuntimeError,
+            match="CAS and packed-map coordinate counts changed",
+        ):
+            await _publish_v4_fixture(
+                schema_name=schema_name,
+                snapshot_key=snapshot_key,
+                build_token=build_token,
+                reference=reference,
+                expected_block_count=1,
+            )
+
+        assert len(published_map_blocks) == 1
+        await _assert_v4_atomic_rollback(
+            quoted_schema,
+            new_block_hash=new_hash,
+            map_block_hashes=tuple(published_map_blocks),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "manifest_case",
+    ("same_row_count_drift", "truncated"),
+)
+async def test_real_postgres_v4_manifest_auth_failure_rolls_back_atomic_publish(
+    tmp_path,
+    monkeypatch,
+    manifest_case,
+):
+    """Authenticated reference drift rolls CAS and packed-map state back."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    snapshot_key = 24
+    build_token = f"atomic-manifest-{manifest_case}"
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        await _install_selective_v4_map_schema(
+            schema_name, snapshot_key, build_token
+        )
+        new_hash, reused_reference, new_reference = (
+            await _stage_v4_manifest_blocks(schema_name)
+        )
+        manifest_path = tmp_path / f"references-{manifest_case}.jsonl"
+        manifest_proof = _write_drifted_v4_manifest(
+            manifest_path,
+            manifest_case=manifest_case,
+            reused_reference=reused_reference,
+            new_reference=new_reference,
+        )
+        published_map_blocks = _observe_v4_map_pack_publication(monkeypatch)
+
+        with pytest.raises(
+            RuntimeError,
+            match="graph reference authentication changed",
+        ):
+            await _publish_v4_fixture(
+                schema_name=schema_name,
+                snapshot_key=snapshot_key,
+                build_token=build_token,
+                reference=reused_reference,
+                manifest_proof=manifest_proof,
+            )
+
+        expected_published_packs = (
+            1 if manifest_case == "same_row_count_drift" else 0
+        )
+        assert len(published_map_blocks) == expected_published_packs
+        await _assert_v4_atomic_rollback(
+            quoted_schema,
+            new_block_hash=new_hash,
+            map_block_hashes=tuple(published_map_blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_v4_cas_precedes_validation_gc_window(
+    monkeypatch,
+):
+    """A reused target is protected throughout pre-map validation work."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    snapshot_key, build_token = 22, "atomic-validation-window"
+    reused_payload = b"atomic-validation-window-target"
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        await _install_selective_v4_map_schema(
+            schema_name, snapshot_key, build_token
+        )
+        block_hash = await _stage_selective_v4_reuse(
+            schema_name,
+            block_payload=reused_payload,
+        )
+        await _queue_selective_gc_candidate(schema_name, block_hash)
+        reference = _selective_v4_reference(
+            block_hash,
+            raw_byte_count=len(reused_payload),
+        )
+        validation_started = asyncio.Event()
+        allow_validation = asyncio.Event()
+        publisher = asyncio.create_task(
+            _publish_v4_fixture(
+                schema_name=schema_name,
+                snapshot_key=snapshot_key,
+                build_token=build_token,
+                reference=reference,
+                cas_ready=validation_started,
+                allow_map=allow_validation,
+            )
+        )
+        try:
+            await asyncio.wait_for(validation_started.wait(), timeout=3)
+            sweep = await asyncio.wait_for(
+                _sweep_selective_blocks_once(schema_name),
+                timeout=3,
+            )
+            assert sweep.selected_hashes == ()
+            await _assert_v4_before_map(quoted_schema)
+
+            allow_validation.set()
+            cas_publication, map_summary = await asyncio.wait_for(
+                publisher,
+                timeout=3,
+            )
+            assert cas_publication.staged_row_count == 1
+            assert map_summary.coordinate_count == 1
+            await _assert_v4_after_map(quoted_schema)
+        finally:
+            await _settle_atomic_test_tasks(
+                allow_validation,
+                publisher,
+            )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_atomic_v4_map_wins_failed_enqueue_gc_race(
+    tmp_path,
+    monkeypatch,
+):
+    """A late failed enqueue cannot make an atomically mapped block collectible."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    snapshot_key, build_token = 23, "atomic-failed-enqueue-race"
+    reused_payload = b"atomic-failed-enqueue-target"
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        await _install_selective_v4_map_schema(
+            schema_name, snapshot_key, build_token
+        )
+        block_hash, reference = await _stage_v4_reuse_reference(
+            schema_name, reused_payload
+        )
+        reference_manifest = tmp_path / "failed-v4-references.jsonl"
+        _write_selective_v4_reference_manifest(reference_manifest, reference)
+        cas_ready, allow_map, publisher = _start_gated_v4_publish(
+            schema_name,
+            snapshot_key,
+            build_token,
+            reference,
+        )
+        failed_enqueue = None
+        try:
+            failed_enqueue = await _start_blocked_enqueue(
+                schema_name,
+                reference_manifest,
+                cas_ready,
+            )
+            publication = await _finish_v4_publish(
+                allow_map, publisher, failed_enqueue
+            )
+            cas_publication, map_summary = publication
+
+            assert cas_publication.staged_row_count == 1
+            assert map_summary.coordinate_count == 1
+            await _assert_v4_mapped_candidate(quoted_schema)
+
+            await _assert_v4_gc_safe(
+                schema_name,
+                quoted_schema,
+                block_hash,
+            )
+        finally:
+            await _settle_atomic_test_tasks(
+                allow_map,
+                publisher,
+                failed_enqueue,
+            )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_batched_publishers_order_overlapping_reuse_locks(
+    tmp_path,
+    monkeypatch,
+):
+    """Reverse stage order cannot deadlock two overlapping publishers."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        await _stage_reverse_order_reuse_publishers(tmp_path, schema_name)
+        _synchronize_batched_reuse_protection(monkeypatch)
+
+        async def publish(stage_table: str, snapshot_key: int):
+            return await publish_shared_block_stage(
+                schema_name=schema_name,
+                stage_table=stage_table,
+                snapshot_key=snapshot_key,
+                build_token=f"concurrent-publisher-{snapshot_key}",
+                progress_callback=lambda _metric, _amount: None,
+            )
+
+        forward, reverse = await asyncio.wait_for(
+            asyncio.gather(
+                publish("block_stage_forward", 15),
+                publish("block_stage_reverse", 16),
+            ),
+            timeout=5,
+        )
+        await _assert_concurrent_reuse_publication(
+            quoted_schema,
+            forward,
+            reverse,
+        )
 
 
 @pytest.mark.asyncio
@@ -1127,6 +2461,92 @@ async def _delete_selective_block_under_gc_lock(
         await allow_gc_commit.wait()
 
 
+async def _hold_selective_candidate_then_rollback(
+    lock_database: Database,
+    *,
+    quoted_schema: str,
+    block_hash: bytes,
+    locks_acquired: asyncio.Event,
+    allow_rollback: asyncio.Event,
+) -> None:
+    """Hold publisher-conflicting block/candidate locks, then roll back."""
+
+    try:
+        async with lock_database.transaction() as session:
+            await session.execute(
+                lock_database.text(
+                    f"SELECT block_hash FROM {quoted_schema}.ptg2_v3_block "
+                    "WHERE block_hash = :block_hash FOR KEY SHARE"
+                ),
+                {"block_hash": block_hash},
+            )
+            await session.execute(
+                lock_database.text(
+                    f"SELECT block_hash FROM "
+                    f"{quoted_schema}.ptg2_v3_gc_candidate "
+                    "WHERE block_hash = :block_hash FOR UPDATE"
+                ),
+                {"block_hash": block_hash},
+            )
+            locks_acquired.set()
+            await allow_rollback.wait()
+            raise RuntimeError("intentional candidate-lock rollback")
+    except RuntimeError as rollback_error:
+        assert str(rollback_error) == "intentional candidate-lock rollback"
+
+
+def _start_v4_reuse_publication(schema_name: str):
+    """Start the batched V4 CAS publisher for the selective fixture."""
+
+    return asyncio.create_task(
+        ptg2_shared_publish._publish_v4_cas_block_stage_compatibility(
+            schema_name=schema_name,
+            stage_table="block_stage",
+            snapshot_key=17,
+            build_token="v4-candidate-lock-race",
+            progress_callback=lambda _metric, _amount: None,
+        )
+    )
+
+
+async def _start_candidate_lock_rollback(
+    quoted_schema: str,
+    block_hash: bytes,
+):
+    """Start and prove an independent candidate lock-holder transaction."""
+
+    lock_database = Database()
+    await lock_database.connect()
+    locks_acquired = asyncio.Event()
+    allow_rollback = asyncio.Event()
+    lock_holder = asyncio.create_task(
+        _hold_selective_candidate_then_rollback(
+            lock_database,
+            quoted_schema=quoted_schema,
+            block_hash=block_hash,
+            locks_acquired=locks_acquired,
+            allow_rollback=allow_rollback,
+        )
+    )
+    await asyncio.wait_for(locks_acquired.wait(), timeout=3)
+    return lock_database, allow_rollback, lock_holder
+
+
+async def _finish_candidate_lock_rollback(
+    lock_database: Database,
+    allow_rollback: asyncio.Event,
+    lock_holder,
+) -> None:
+    """Release, verify, and disconnect the candidate lock-holder."""
+
+    allow_rollback.set()
+    try:
+        await asyncio.wait_for(lock_holder, timeout=3)
+    finally:
+        allow_rollback.set()
+        await lock_database.disconnect()
+
+
 async def _assert_missing_cas_publication_error(publisher) -> None:
     """Require controlled validation before a foreign-key mapping attempt."""
 
@@ -1138,6 +2558,120 @@ async def _assert_missing_cas_publication_error(publisher) -> None:
     assert type(missing_cas.value) is RuntimeError
     assert getattr(missing_cas.value, "sqlstate", None) != "23503"
     assert "ForeignKeyViolation" not in type(missing_cas.value).__name__
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_v4_waits_for_candidate_lock_rollback(
+    tmp_path,
+    monkeypatch,
+):
+    """V4 blocks, then cancels a candidate whose lock-holder rolls back."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_v4_shared_layout_for_map_write",
+        AsyncMock(),
+    )
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        block_hash = await _insert_selective_durable_block(
+            schema_name,
+            b"v4-candidate-lock-rollback",
+        )
+        await _queue_selective_gc_candidate(schema_name, block_hash)
+        await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"v4-candidate-lock-rollback", 1),
+        )
+        lock_state = await _start_candidate_lock_rollback(
+            quoted_schema,
+            block_hash,
+        )
+        publisher = _start_v4_reuse_publication(schema_name)
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(publisher), timeout=0.2)
+        finally:
+            await _finish_candidate_lock_rollback(*lock_state)
+        publication = await asyncio.wait_for(publisher, timeout=3)
+        assert publication.staged_row_count == 1
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_v3_gc_candidate",
+        ) == 0
+        swept = await _sweep_selective_blocks_once(schema_name)
+        assert swept.selected_hashes == ()
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_v3_block",
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_v4_candidate_lock_timeout_rolls_back(
+    tmp_path,
+    monkeypatch,
+):
+    """A bounded candidate-lock timeout fails the entire V4 CAS transaction."""
+
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "lock_v4_shared_layout_for_map_write",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_SHARED_BLOCK_PUBLISH_LOCK_TIMEOUT_MS",
+        100,
+    )
+    async with _selective_block_database(monkeypatch) as (
+        schema_name,
+        quoted_schema,
+    ):
+        block_hash = await _insert_selective_durable_block(
+            schema_name,
+            b"v4-candidate-lock-timeout",
+        )
+        await _queue_selective_gc_candidate(schema_name, block_hash)
+        await _stage_selective_block_copy(
+            tmp_path,
+            schema_name,
+            (1, b"v4-candidate-lock-timeout", 1),
+        )
+        lock_state = await _start_candidate_lock_rollback(
+            quoted_schema,
+            block_hash,
+        )
+        try:
+            with pytest.raises(Exception, match="lock timeout") as caught:
+                await (
+                    ptg2_shared_publish._publish_v4_cas_block_stage_compatibility(
+                        schema_name=schema_name,
+                        stage_table="block_stage",
+                        snapshot_key=18,
+                        build_token="v4-candidate-lock-timeout",
+                        progress_callback=lambda _metric, _amount: None,
+                    )
+                )
+            lock_error = getattr(caught.value, "orig", caught.value)
+            assert getattr(lock_error, "sqlstate", None) == "55P03"
+        finally:
+            await _finish_candidate_lock_rollback(*lock_state)
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_v3_block",
+        ) == 1
+        assert await _selective_relation_count(
+            quoted_schema,
+            "ptg2_v3_gc_candidate",
+        ) == 1
 
 
 @pytest.mark.asyncio

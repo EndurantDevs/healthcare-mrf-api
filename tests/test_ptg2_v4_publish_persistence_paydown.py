@@ -311,7 +311,11 @@ async def test_graph_publication_rejects_selected_layout_drift(
 
     compilation, cas_publication, map_summary = _v4_graph_publication_fixture(tmp_path)
     compilation = SimpleNamespace(**{**vars(compilation), "selected_layout": "direct"})
-    _patch_v4_graph_publication(monkeypatch, cas_publication, map_summary)
+    publish_maps = _patch_v4_graph_publication(
+        monkeypatch,
+        cas_publication,
+        map_summary,
+    )
     with pytest.raises(RuntimeError, match="publication selection changed"):
         await publication._publish_v4_graph(
             compilation,
@@ -321,3 +325,6 @@ async def test_graph_publication_rejects_selected_layout_drift(
             compressed_acquisition_bytes=1,
             empty_npi_tin_only_normalization_count=0,
         )
+    publication.create_shared_block_stage.assert_not_awaited()
+    publication.copy_shared_block_binary_file.assert_not_awaited()
+    publish_maps.assert_not_awaited()

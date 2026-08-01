@@ -72,6 +72,7 @@ from process.ptg_parts.ptg2_shared_price import (
 )
 from process.ptg_parts.ptg2_shared_publish import (
     SharedBlockCopyMetrics,
+    V4CASBlockStagePublication,
     _validated_coverage_scope_id,
     copy_shared_block_binary_file,
     create_shared_block_stage,
@@ -79,7 +80,7 @@ from process.ptg_parts.ptg2_shared_publish import (
     publish_shared_block_stage,
     publish_shared_finalizer_dictionaries,
     publish_shared_graph,
-    publish_v4_cas_block_stage,
+    _publish_v4_cas_in_session,
     shared_block_stage_name,
     shared_graph_bundles_from_artifacts,
 )
@@ -462,6 +463,16 @@ class _V4GraphPublication:
     inferred_taxonomy_candidates: Mapping[str, Any]
     provider_tax_identity: Mapping[str, Any]
     audit_witness_path: Path
+
+
+@dataclass(frozen=True)
+class _V4AtomicPublishContext:
+    """Immutable database coordinates for one atomic V4 publication."""
+
+    schema_name: str
+    block_stage: str
+    snapshot_key: int
+    build_token: str
 
 
 def _completed_prepared_price(
@@ -1235,55 +1246,212 @@ def _v4_compiler_artifact(
     return matches[0]
 
 
-def _iter_v4_block_references(path: Path) -> Iterable[SharedBlockReference]:
-    """Re-read the authenticated compiler coordinates as a bounded stream."""
+@dataclass(frozen=True)
+class _V4ReferenceContract:
+    """Authenticated compiler-file measurements checked after streaming."""
 
+    byte_count: int
+    sha256: str
+    row_count: int
+
+
+def _v4_reference_contract(
+    expected_byte_count: int | None,
+    expected_sha256: str | None,
+    expected_row_count: int | None,
+) -> _V4ReferenceContract | None:
+    """Require either every reference measurement or no measurements."""
+
+    if (
+        expected_byte_count is None
+        and expected_sha256 is None
+        and expected_row_count is None
+    ):
+        return None
+    if (
+        expected_byte_count is None
+        or expected_sha256 is None
+        or expected_row_count is None
+    ):
+        raise ValueError("PTG V4 graph reference authentication is incomplete")
+    return _V4ReferenceContract(
+        byte_count=expected_byte_count,
+        sha256=expected_sha256,
+        row_count=expected_row_count,
+    )
+
+
+def _parse_v4_reference_line(
+    reference_line: bytes,
+    line_number: int,
+    previous_coordinate: tuple[str, int, int] | None,
+) -> tuple[SharedBlockReference, tuple[str, int, int]]:
+    """Parse and validate one bounded, monotonically ordered reference."""
+
+    if not reference_line or len(reference_line) > 64 * 1024:
+        raise RuntimeError("PTG V4 graph reference record is not bounded")
+    try:
+        reference_fields = json.loads(reference_line)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"PTG V4 graph reference {line_number} is invalid JSON"
+        ) from exc
+    if (
+        not isinstance(reference_fields, dict)
+        or reference_fields.get("codec") != "none"
+    ):
+        raise RuntimeError("PTG V4 graph reference has an invalid codec")
+    try:
+        object_kind = str(reference_fields["object_kind"])
+        block_key = int(reference_fields["block_key"])
+        fragment_no = int(reference_fields["fragment_no"])
+        entry_count = int(reference_fields["entry_count"])
+        raw_byte_count = int(reference_fields["raw_byte_count"])
+        stored_byte_count = int(reference_fields["stored_byte_count"])
+        block_hash = bytes.fromhex(str(reference_fields["hash"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("PTG V4 graph reference fields are invalid") from exc
+    coordinate = (object_kind, block_key, fragment_no)
+    if (
+        not object_kind.startswith("v4_")
+        or min(block_key, fragment_no, entry_count, raw_byte_count) < 0
+        or stored_byte_count != raw_byte_count
+        or len(block_hash) != 32
+        or (
+            previous_coordinate is not None
+            and coordinate <= previous_coordinate
+        )
+    ):
+        raise RuntimeError("PTG V4 graph reference ordering or metadata changed")
+    return (
+        SharedBlockReference(
+            object_kind=object_kind,
+            block_key=block_key,
+            fragment_no=fragment_no,
+            entry_count=entry_count,
+            block_hash=block_hash,
+            raw_byte_count=raw_byte_count,
+        ),
+        coordinate,
+    )
+
+
+def _require_v4_reference_digest(
+    contract: _V4ReferenceContract | None,
+    observed_byte_count: int,
+    observed_row_count: int,
+    observed_digest: str,
+) -> None:
+    """Authenticate the fully consumed reference stream when requested."""
+
+    if contract is None:
+        return
+    if (
+        observed_byte_count != int(contract.byte_count)
+        or observed_row_count != int(contract.row_count)
+        or not hmac.compare_digest(
+            observed_digest,
+            str(contract.sha256),
+        )
+    ):
+        raise RuntimeError("PTG V4 graph reference authentication changed")
+
+
+def _iter_v4_block_references(
+    path: Path,
+    *,
+    expected_byte_count: int | None = None,
+    expected_sha256: str | None = None,
+    expected_row_count: int | None = None,
+) -> Iterable[SharedBlockReference]:
+    """Re-read compiler coordinates as a bounded, optionally authenticated stream."""
+
+    reference_contract = _v4_reference_contract(
+        expected_byte_count,
+        expected_sha256,
+        expected_row_count,
+    )
     previous_coordinate: tuple[str, int, int] | None = None
+    observed_byte_count = 0
+    observed_row_count = 0
+    observed_sha256 = hashlib.sha256()
     with path.open("rb") as reference_file:
-        for line_number, line in enumerate(reference_file, 1):
-            if not line or len(line) > 64 * 1024:
-                raise RuntimeError("PTG V4 graph reference record is not bounded")
-            try:
-                raw = json.loads(line)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"PTG V4 graph reference {line_number} is invalid JSON"
-                ) from exc
-            if not isinstance(raw, dict) or raw.get("codec") != "none":
-                raise RuntimeError("PTG V4 graph reference has an invalid codec")
-            try:
-                object_kind = str(raw["object_kind"])
-                block_key = int(raw["block_key"])
-                fragment_no = int(raw["fragment_no"])
-                entry_count = int(raw["entry_count"])
-                raw_byte_count = int(raw["raw_byte_count"])
-                stored_byte_count = int(raw["stored_byte_count"])
-                block_hash = bytes.fromhex(str(raw["hash"]))
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError("PTG V4 graph reference fields are invalid") from exc
-            coordinate = (object_kind, block_key, fragment_no)
-            if (
-                not object_kind.startswith("v4_")
-                or min(block_key, fragment_no, entry_count, raw_byte_count) < 0
-                or stored_byte_count != raw_byte_count
-                or len(block_hash) != 32
-                or (
-                    previous_coordinate is not None
-                    and coordinate <= previous_coordinate
-                )
-            ):
-                raise RuntimeError(
-                    "PTG V4 graph reference ordering or metadata changed"
-                )
-            previous_coordinate = coordinate
-            yield SharedBlockReference(
-                object_kind=object_kind,
-                block_key=block_key,
-                fragment_no=fragment_no,
-                entry_count=entry_count,
-                block_hash=block_hash,
-                raw_byte_count=raw_byte_count,
+        for line_number, reference_line in enumerate(reference_file, 1):
+            observed_byte_count += len(reference_line)
+            observed_row_count += 1
+            observed_sha256.update(reference_line)
+            reference, coordinate = _parse_v4_reference_line(
+                reference_line,
+                line_number,
+                previous_coordinate,
             )
+            previous_coordinate = coordinate
+            yield reference
+    _require_v4_reference_digest(
+        reference_contract,
+        observed_byte_count,
+        observed_row_count,
+        observed_sha256.hexdigest(),
+    )
+
+
+def _require_v4_atomic_coordinate_counts(
+    expected_block_count: int,
+    cas_publication: V4CASBlockStagePublication,
+    map_summary: V4SnapshotMapSummary,
+) -> None:
+    """Require compiler, CAS-stage, and packed-map coordinate parity."""
+
+    if (
+        int(cas_publication.staged_row_count) != int(expected_block_count)
+        or int(map_summary.coordinate_count) != int(expected_block_count)
+    ):
+        raise RuntimeError("PTG V4 CAS and packed-map coordinate counts changed")
+
+
+def _require_v4_compilation_layout_selection(
+    compilation: V4GraphCompilationResult,
+) -> Mapping[str, Any]:
+    """Reject disagreement between the compiler result and adaptive summary."""
+
+    adaptive_layout = v4_adaptive_layout_decision_from_summary(compilation.summary)
+    expected_representation = (
+        "pattern_v1" if compilation.selected_layout == "pattern" else "direct_v1"
+    )
+    if adaptive_layout["selected_representation"] != expected_representation:
+        raise RuntimeError("PTG V4 adaptive layout publication selection changed")
+    return adaptive_layout
+
+
+def _require_v4_atomic_map_publication(
+    compilation: V4GraphCompilationResult,
+    cas_publication: V4CASBlockStagePublication,
+    map_summary: V4SnapshotMapSummary,
+) -> None:
+    """Reject CAS/map count or adaptive-plan drift before atomic commit."""
+
+    _require_v4_atomic_coordinate_counts(
+        int(compilation.block_count),
+        cas_publication,
+        map_summary,
+    )
+    adaptive_layout = _require_v4_compilation_layout_selection(compilation)
+    selected_layout_evidence = adaptive_layout[
+        "pattern" if compilation.selected_layout == "pattern" else "direct"
+    ]
+    if (
+        int(map_summary.stored_map_byte_count)
+        != int(selected_layout_evidence["map_payload_encoded_bytes"])
+        or int(map_summary.coordinate_count)
+        != int(selected_layout_evidence["map_coordinate_count"])
+        or int(map_summary.map_pack_count)
+        != int(selected_layout_evidence["map_pack_count"])
+        or int(map_summary.object_kind_count)
+        != int(selected_layout_evidence["map_object_kind_count"])
+    ):
+        raise RuntimeError(
+            "PTG V4 adaptive layout packed-map plan differs from publication"
+        )
 
 
 async def _queue_failed_v4_graph_blocks(
@@ -3499,19 +3667,18 @@ async def _drop_v4_dictionary_stages(
 async def _publish_v4_dictionaries_and_maps(
     compilation: V4GraphCompilationResult,
     *,
-    schema_name: str,
-    snapshot_key: int,
-    build_token: str,
+    publication_context: _V4AtomicPublishContext,
     compressed_acquisition_bytes: int,
     empty_npi_tin_only_normalization_count: int,
     progress_callback: Callable[[str, int], None] | None = None,
     heartbeat_callback: Callable[[], None] | None = None,
 ) -> tuple[
+    V4CASBlockStagePublication,
     V4SnapshotMapSummary,
     V4InferredTaxonomyPublication,
     _V4TaxIdentityPublication,
 ]:
-    """Bulk-copy dense dictionaries, then publish exact metadata and packed maps."""
+    """Atomically publish CAS reachability, dictionaries, metadata, and maps."""
 
     if int(compressed_acquisition_bytes) <= 0:
         raise RuntimeError("PTG V4 compressed acquisition bytes must be positive")
@@ -3519,6 +3686,10 @@ async def _publish_v4_dictionaries_and_maps(
         raise RuntimeError(
             "PTG V4 empty-NPI TIN-only normalization count cannot be negative"
         )
+    schema_name = publication_context.schema_name
+    block_stage = publication_context.block_stage
+    snapshot_key = publication_context.snapshot_key
+    build_token = publication_context.build_token
     schema = _quote_ident(schema_name)
     token = uuid.uuid4().hex[:20]
     expected_group_count = int(compilation.observe.get("group_count") or 0)
@@ -3543,6 +3714,10 @@ async def _publish_v4_dictionaries_and_maps(
     taxonomy_artifact = _v4_compiler_artifact(
         compilation,
         "inferred_taxonomy_candidates",
+    )
+    reference_artifact = _v4_compiler_artifact(
+        compilation,
+        "graph_references",
     )
     prefix_target = int(compilation.summary["npi_prefix_target"])
     group_stage = f"ptg2_v4_group_stage_{token}"
@@ -3744,6 +3919,18 @@ async def _publish_v4_dictionaries_and_maps(
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
             )
+            # Protect payload-free reuse rows as soon as the layout fence is
+            # held. GC does not acquire that layout fence, so delaying these
+            # globally ordered block locks until after dictionary validation
+            # would let it remove a reused CAS row during a long validation.
+            # The helper restores the caller's prior lock_timeout before the
+            # remaining publication SQL proceeds.
+            cas_publication = await _publish_v4_cas_in_session(
+                session,
+                schema_name=schema_name,
+                stage_table=block_stage,
+                progress_callback=progress_callback,
+            )
             taxonomy_stage = await stage_v4_inferred_taxonomy_compiler_copy(
                 session,
                 copy_path=compilation.inferred_taxonomy_copy_path,
@@ -3776,9 +3963,11 @@ async def _publish_v4_dictionaries_and_maps(
                 heartbeat_callback=heartbeat_callback,
             )
 
-            # Metadata tables are trigger-fenced by the building map root.
-            # Publish the authenticated coordinate map first in this same
-            # transaction, then attach dictionaries/manifests beneath it.
+            # The CAS rows and candidate cancellation above remain locked
+            # until this authenticated map makes them durably reachable.  The
+            # transaction therefore exposes neither half of the publication
+            # without the other. Metadata tables are trigger-fenced by the
+            # building map root and attach beneath it later in this transaction.
             map_summary = await publish_v4_snapshot_maps(
                 session,
                 schema_name=schema_name,
@@ -3786,9 +3975,17 @@ async def _publish_v4_dictionaries_and_maps(
                 build_token=build_token,
                 representation=root_representation,
                 references=_iter_v4_block_references(
-                    compilation.reference_manifest_path
+                    compilation.reference_manifest_path,
+                    expected_byte_count=int(reference_artifact.byte_count),
+                    expected_sha256=str(reference_artifact.sha256),
+                    expected_row_count=int(reference_artifact.row_count),
                 ),
                 **_progress_callback_kwargs(progress_callback),
+            )
+            _require_v4_atomic_map_publication(
+                compilation,
+                cas_publication,
+                map_summary,
             )
 
             tax_identity_manifest = await _publish_v4_tax_identity_manifest(
@@ -4142,6 +4339,7 @@ async def _publish_v4_dictionaries_and_maps(
                 )
                 progress_callback("publish_batches", 1)
             return (
+                cas_publication,
                 map_summary,
                 taxonomy_publication,
                 _V4TaxIdentityPublication(
@@ -4171,6 +4369,7 @@ async def _publish_v4_graph(
 ) -> _V4GraphPublication:
     """Publish graph blocks only to CAS, then make packed maps authoritative."""
 
+    _require_v4_compilation_layout_selection(compilation)
     block_artifact = _v4_compiler_artifact(compilation, "graph_blocks")
     block_stage = shared_block_stage_name(f"v4-graph-{snapshot_key}")
     await create_shared_block_stage(schema_name=schema_name, stage_table=block_stage)
@@ -4184,22 +4383,19 @@ async def _publish_v4_graph(
             reuse_existing=True,
             **_progress_callback_kwargs(progress_callback),
         )
-        cas_publication = await publish_v4_cas_block_stage(
-            schema_name=schema_name,
-            stage_table=block_stage,
-            snapshot_key=int(snapshot_key),
-            build_token=build_token,
-            **_progress_callback_kwargs(progress_callback),
-        )
         (
+            cas_publication,
             map_summary,
             taxonomy_publication,
             tax_identity_publication,
         ) = await _publish_v4_dictionaries_and_maps(
             compilation,
-            schema_name=schema_name,
-            snapshot_key=int(snapshot_key),
-            build_token=build_token,
+            publication_context=_V4AtomicPublishContext(
+                schema_name=schema_name,
+                block_stage=block_stage,
+                snapshot_key=int(snapshot_key),
+                build_token=build_token,
+            ),
             compressed_acquisition_bytes=int(compressed_acquisition_bytes),
             empty_npi_tin_only_normalization_count=int(
                 empty_npi_tin_only_normalization_count
@@ -4229,27 +4425,6 @@ async def _publish_v4_graph(
         for artifact in compilation.output_artifacts
     )
     adaptive_layout = v4_adaptive_layout_decision_from_summary(compilation.summary)
-    expected_representation = (
-        "pattern_v1" if compilation.selected_layout == "pattern" else "direct_v1"
-    )
-    if adaptive_layout["selected_representation"] != expected_representation:
-        raise RuntimeError("PTG V4 adaptive layout publication selection changed")
-    selected_layout_evidence = adaptive_layout[
-        "pattern" if compilation.selected_layout == "pattern" else "direct"
-    ]
-    if (
-        int(map_summary.stored_map_byte_count)
-        != int(selected_layout_evidence["map_payload_encoded_bytes"])
-        or int(map_summary.coordinate_count)
-        != int(selected_layout_evidence["map_coordinate_count"])
-        or int(map_summary.map_pack_count)
-        != int(selected_layout_evidence["map_pack_count"])
-        or int(map_summary.object_kind_count)
-        != int(selected_layout_evidence["map_object_kind_count"])
-    ):
-        raise RuntimeError(
-            "PTG V4 adaptive layout packed-map plan differs from publication"
-        )
     support_digest = shared_support_digest(
         {
             "contract_version": 2,

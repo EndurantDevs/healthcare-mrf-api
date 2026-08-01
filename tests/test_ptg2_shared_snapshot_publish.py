@@ -714,7 +714,7 @@ async def test_sealed_layout_requires_a_serving_index(monkeypatch):
 
 def test_v4_reference_manifest_streams_exact_sorted_coordinates(tmp_path):
     path = tmp_path / "references.jsonl"
-    rows = [
+    reference_records = [
         {
             "object_kind": "v4_group_npis_exact_members_v1",
             "block_key": block_key,
@@ -727,13 +727,63 @@ def test_v4_reference_manifest_streams_exact_sorted_coordinates(tmp_path):
         }
         for block_key in (0, 4)
     ]
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path.write_text(
+        "".join(
+            json.dumps(reference_record) + "\n"
+            for reference_record in reference_records
+        )
+    )
+    reference_bytes = path.read_bytes()
 
-    references = tuple(shared_snapshot_publish._iter_v4_block_references(path))
+    references = tuple(
+        shared_snapshot_publish._iter_v4_block_references(
+            path,
+            expected_byte_count=len(reference_bytes),
+            expected_sha256=hashlib.sha256(reference_bytes).hexdigest(),
+            expected_row_count=2,
+        )
+    )
 
     assert tuple(reference.block_key for reference in references) == (0, 4)
     assert tuple(reference.entry_count for reference in references) == (2, 2)
     assert references[0].block_hash == b"\x01" * 32
+
+
+def test_v4_reference_manifest_authentication_rejects_drift(tmp_path):
+    """Require the complete byte, digest, and row contract while streaming."""
+
+    path = tmp_path / "references.jsonl"
+    reference_map = {
+        "object_kind": "v4_group_npis_exact_members_v1",
+        "block_key": 0,
+        "fragment_no": 0,
+        "entry_count": 2,
+        "raw_byte_count": 8,
+        "stored_byte_count": 8,
+        "codec": "none",
+        "hash": (b"a" * 32).hex(),
+    }
+    path.write_text(json.dumps(reference_map) + "\n")
+    reference_bytes = path.read_bytes()
+    expected_sha256 = hashlib.sha256(reference_bytes).hexdigest()
+    path.write_bytes(reference_bytes.replace(b"61" * 32, b"62" * 32))
+
+    with pytest.raises(RuntimeError, match="authentication changed"):
+        tuple(
+            shared_snapshot_publish._iter_v4_block_references(
+                path,
+                expected_byte_count=len(reference_bytes),
+                expected_sha256=expected_sha256,
+                expected_row_count=1,
+            )
+        )
+    with pytest.raises(ValueError, match="authentication is incomplete"):
+        tuple(
+            shared_snapshot_publish._iter_v4_block_references(
+                path,
+                expected_byte_count=len(reference_bytes),
+            )
+        )
 
 
 def test_v4_reference_manifest_rejects_noncanonical_order(tmp_path):
@@ -887,6 +937,7 @@ def _v4_graph_publication_fixture(tmp_path):
         provider_set_audit_npi_copy_path=tmp_path / "audit.copy",
     )
     cas_publication = SimpleNamespace(
+        staged_row_count=1,
         unique_block_count=1,
         logical_byte_count=12,
         stored_byte_count=12,
@@ -907,7 +958,6 @@ def _patch_v4_graph_publication(
     cas_publication,
     map_summary,
 ):
-    publish_cas_mock = AsyncMock(return_value=cas_publication)
     taxonomy_publication = SimpleNamespace(
         packed_byte_count=12,
         pattern_member_bytes=40,
@@ -924,6 +974,7 @@ def _patch_v4_graph_publication(
     )
     publish_maps_mock = AsyncMock(
         return_value=(
+            cas_publication,
             map_summary,
             taxonomy_publication,
             tax_identity_publication,
@@ -932,7 +983,6 @@ def _patch_v4_graph_publication(
     replacements_by_name = {
         "create_shared_block_stage": AsyncMock(),
         "copy_shared_block_binary_file": AsyncMock(),
-        "publish_v4_cas_block_stage": publish_cas_mock,
         "_publish_v4_dictionaries_and_maps": publish_maps_mock,
     }
     for name, replacement in replacements_by_name.items():
@@ -942,7 +992,7 @@ def _patch_v4_graph_publication(
         "status",
         AsyncMock(),
     )
-    return publish_cas_mock, publish_maps_mock
+    return publish_maps_mock
 
 
 @pytest.mark.asyncio
@@ -953,7 +1003,7 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
     """Seal acquisition bytes with graph diagnostics, not the CAS stage."""
 
     compilation, cas_publication, map_summary = _v4_graph_publication_fixture(tmp_path)
-    publish_cas_mock, publish_maps_mock = _patch_v4_graph_publication(
+    publish_maps_mock = _patch_v4_graph_publication(
         monkeypatch,
         cas_publication,
         map_summary,
@@ -971,12 +1021,13 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
     assert publication.logical_byte_count == 88
     assert publication.stored_byte_count == 220
     assert publication.provider_tax_identity["tax_identity_count"] == 1
-    assert publish_cas_mock.await_args.kwargs == {
-        "schema_name": "mrf",
-        "stage_table": publish_cas_mock.await_args.kwargs["stage_table"],
-        "snapshot_key": 17,
-        "build_token": "token",
-    }
+    publication_context = publish_maps_mock.await_args.kwargs[
+        "publication_context"
+    ]
+    assert publication_context.block_stage.startswith(
+        "ptg2_v3_block_stage_"
+    )
+    assert not hasattr(shared_snapshot_publish, "publish_v4_cas_block_stage")
     assert publish_maps_mock.await_args.kwargs["compressed_acquisition_bytes"] == 4_096
     assert (
         publish_maps_mock.await_args.kwargs["empty_npi_tin_only_normalization_count"]
@@ -984,12 +1035,10 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
     )
 
 
-@pytest.mark.asyncio
-async def test_v4_graph_publish_rejects_packed_map_plan_drift(
-    monkeypatch,
+def test_v4_graph_publish_rejects_packed_map_plan_drift(
     tmp_path,
 ):
-    """Require the selected estimator to match real coordinate-map packs."""
+    """Reject estimator drift inside the CAS/map publication transaction."""
 
     compilation, cas_publication, map_summary = _v4_graph_publication_fixture(tmp_path)
     drifted_map_summary = SimpleNamespace(
@@ -998,23 +1047,33 @@ async def test_v4_graph_publish_rejects_packed_map_plan_drift(
             "stored_map_byte_count": map_summary.stored_map_byte_count + 1,
         }
     )
-    _patch_v4_graph_publication(
-        monkeypatch,
-        cas_publication,
-        drifted_map_summary,
-    )
-
     with pytest.raises(
         RuntimeError,
         match="packed-map plan differs from publication",
     ):
-        await shared_snapshot_publish._publish_v4_graph(
+        shared_snapshot_publish._require_v4_atomic_map_publication(
             compilation,
-            schema_name="mrf",
-            snapshot_key=17,
-            build_token="token",
-            compressed_acquisition_bytes=4_096,
-            empty_npi_tin_only_normalization_count=2,
+            cas_publication,
+            drifted_map_summary,
+        )
+
+
+@pytest.mark.parametrize(
+    ("cas_count", "map_count"),
+    ((2, 1), (1, 2)),
+    ids=("extra-cas-stage-row", "extra-map-coordinate"),
+)
+def test_v4_atomic_publication_rejects_coordinate_count_drift(
+    cas_count,
+    map_count,
+):
+    """CAS and map coordinates must both equal the compiler block count."""
+
+    with pytest.raises(RuntimeError, match="coordinate counts changed"):
+        shared_snapshot_publish._require_v4_atomic_coordinate_counts(
+            1,
+            SimpleNamespace(staged_row_count=cas_count),
+            SimpleNamespace(coordinate_count=map_count),
         )
 
 
@@ -1066,6 +1125,7 @@ def _failed_tax_stage_compilation(tmp_path):
     """Return the minimum compilation needed to reach the build fence."""
 
     taxonomy_path = tmp_path / "inferred-taxonomy.copy"
+    references_path = tmp_path / "graph-references.jsonl"
     return SimpleNamespace(
         observe={
             "group_count": 4,
@@ -1088,6 +1148,14 @@ def _failed_tax_stage_compilation(tmp_path):
             SimpleNamespace(
                 name="inferred_taxonomy_candidates",
                 path=taxonomy_path,
+                byte_count=0,
+                sha256="e3b0c44298fc1c149afbf4c8996fb924"
+                "27ae41e4649b934ca495991b7852b855",
+                row_count=0,
+            ),
+            SimpleNamespace(
+                name="graph_references",
+                path=references_path,
                 byte_count=0,
                 sha256="e3b0c44298fc1c149afbf4c8996fb924"
                 "27ae41e4649b934ca495991b7852b855",
@@ -1258,9 +1326,12 @@ async def test_v4_tax_stages_are_removed_after_transaction_failure(
     with pytest.raises(RuntimeError, match="fenced publication"):
         await shared_snapshot_publish._publish_v4_dictionaries_and_maps(
             _failed_tax_stage_compilation(tmp_path),
-            schema_name="mrf",
-            snapshot_key=41,
-            build_token="exact-build",
+            publication_context=shared_snapshot_publish._V4AtomicPublishContext(
+                schema_name="mrf",
+                block_stage="ptg2_v3_block_stage_exact",
+                snapshot_key=41,
+                build_token="exact-build",
+            ),
             compressed_acquisition_bytes=1,
             empty_npi_tin_only_normalization_count=0,
         )
@@ -1304,9 +1375,12 @@ async def test_v4_partial_stage_creation_is_removed(
     with pytest.raises(RuntimeError, match="stage create failed"):
         await shared_snapshot_publish._publish_v4_dictionaries_and_maps(
             _failed_tax_stage_compilation(tmp_path),
-            schema_name="mrf",
-            snapshot_key=42,
-            build_token="exact-build",
+            publication_context=shared_snapshot_publish._V4AtomicPublishContext(
+                schema_name="mrf",
+                block_stage="ptg2_v3_block_stage_exact",
+                snapshot_key=42,
+                build_token="exact-build",
+            ),
             compressed_acquisition_bytes=1,
             empty_npi_tin_only_normalization_count=0,
         )
@@ -1339,9 +1413,12 @@ async def test_v4_first_stage_creation_failure_preserves_original_error(
     with pytest.raises(RuntimeError, match="first stage create failed"):
         await shared_snapshot_publish._publish_v4_dictionaries_and_maps(
             _failed_tax_stage_compilation(tmp_path),
-            schema_name="mrf",
-            snapshot_key=43,
-            build_token="exact-build",
+            publication_context=shared_snapshot_publish._V4AtomicPublishContext(
+                schema_name="mrf",
+                block_stage="ptg2_v3_block_stage_exact",
+                snapshot_key=43,
+                build_token="exact-build",
+            ),
             compressed_acquisition_bytes=1,
             empty_npi_tin_only_normalization_count=0,
         )
