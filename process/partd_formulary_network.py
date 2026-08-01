@@ -115,6 +115,14 @@ class SourceArtifact:
 
 
 @dataclass(frozen=True)
+class _ArtifactMembers:
+    activity: tuple[tuple[Path, str], ...]
+    pricing: tuple[tuple[Path, str], ...]
+    plan_to_formulary: dict[tuple[str, str, str], str]
+    formulary_ndc_to_rxnorm: dict[tuple[str, str], str]
+
+
+@dataclass(frozen=True)
 class ActivityChunkProgress:
     total_chunks: int
     done_chunks: int
@@ -1939,6 +1947,264 @@ async def _process_activity_file(
     return activity_count
 
 
+def _classify_artifact_members(
+    extracted_file_list: list[tuple[Path, str]],
+    source_type: str,
+) -> _ArtifactMembers:
+    classified_entry_list = [
+        (path, logical_name, _entry_kind(logical_name))
+        for path, logical_name in extracted_file_list
+    ]
+    plan_to_formulary_map: dict[tuple[str, str, str], str] = {}
+    formulary_ndc_to_rxnorm_map: dict[tuple[str, str], str] = {}
+    for file_path, _logical_name, kind in classified_entry_list:
+        if kind == "plan_info":
+            plan_to_formulary_map.update(_load_plan_formulary_map(file_path))
+        elif kind == "formulary_map":
+            formulary_ndc_to_rxnorm_map.update(_load_formulary_ndc_map(file_path))
+
+    activity_member_list = [
+        (path, logical_name)
+        for path, logical_name, kind in classified_entry_list
+        if kind == "activity"
+    ]
+    pricing_member_list = [
+        (path, logical_name)
+        for path, logical_name, kind in classified_entry_list
+        if kind == "pricing"
+    ]
+    unknown_member_list = [
+        (path, logical_name)
+        for path, logical_name, kind in classified_entry_list
+        if kind == "unknown"
+    ]
+    if not activity_member_list and unknown_member_list:
+        activity_member_list = unknown_member_list[:3]
+    if source_type == "quarterly" and not pricing_member_list and unknown_member_list:
+        pricing_member_list = unknown_member_list[:3]
+    return _ArtifactMembers(
+        activity=tuple(activity_member_list),
+        pricing=tuple(pricing_member_list),
+        plan_to_formulary=plan_to_formulary_map,
+        formulary_ndc_to_rxnorm=formulary_ndc_to_rxnorm_map,
+    )
+
+
+async def _enqueue_activity_chunks(
+    redis,
+    run_id: str,
+    snapshot_id: str,
+    artifact: SourceArtifact,
+    activity_member_list: tuple[tuple[Path, str], ...],
+    test_mode: bool,
+) -> list[tuple[str, Path]]:
+    snapshot_hash = hashlib.sha1(snapshot_id.encode("utf-8")).hexdigest()[:10]
+    chunk_definition_list: list[tuple[str, Path]] = []
+    for index, (file_path, _logical_name) in enumerate(activity_member_list):
+        chunk_id = f"{snapshot_id}:{index}"
+        chunk_definition_list.append((chunk_id, file_path))
+        await redis.enqueue_job(
+            "partd_formulary_network_process_chunk",
+            {
+                "run_id": run_id,
+                "snapshot_id": snapshot_id,
+                "chunk_id": chunk_id,
+                "chunk_path": str(file_path),
+                "source_type": artifact.source_type,
+                "cutoff_month": artifact.cutoff_month.isoformat(),
+                "test_mode": bool(test_mode),
+            },
+            _queue_name=PARTD_QUEUE_NAME,
+            _job_id=f"partd_activity_{run_id}_{snapshot_hash}_{index}",
+        )
+    return chunk_definition_list
+
+
+async def _recover_incomplete_activity_chunks(
+    redis,
+    run_id: str,
+    snapshot_id: str,
+    artifact: SourceArtifact,
+    chunk_definition_list: list[tuple[str, Path]],
+    done_chunk_id_set: set[str],
+    test_mode: bool,
+) -> int:
+    accepted_total = 0
+    for chunk_id, file_path in chunk_definition_list:
+        if chunk_id in done_chunk_id_set:
+            continue
+        accepted = await _process_activity_file(
+            file_path,
+            snapshot_id=snapshot_id,
+            source_type=artifact.source_type,
+            default_date=artifact.cutoff_month,
+            test_mode=test_mode,
+            progress_callback=(
+                lambda _processed, accepted_rows, processed_bytes, total_bytes, _chunk_id=chunk_id: _mark_activity_chunk_progress(
+                    redis,
+                    run_id,
+                    snapshot_id,
+                    _chunk_id,
+                    processed_bytes=processed_bytes,
+                    accepted_rows=accepted_rows,
+                    total_bytes=total_bytes,
+                )
+            ),
+        )
+        accepted_total += accepted
+        await _mark_activity_chunk_done(
+            redis,
+            run_id,
+            snapshot_id,
+            chunk_id,
+            accepted,
+            total_bytes=file_path.stat().st_size,
+        )
+    return accepted_total
+
+
+async def _process_activity_members_locally(
+    activity_member_list: tuple[tuple[Path, str], ...],
+    artifact: SourceArtifact,
+    snapshot_id: str,
+    test_mode: bool,
+) -> int:
+    activity_count = 0
+    for file_index, (file_path, _logical_name) in enumerate(activity_member_list):
+        activity_count += await _process_activity_file(
+            file_path,
+            snapshot_id=snapshot_id,
+            source_type=artifact.source_type,
+            default_date=artifact.cutoff_month,
+            test_mode=test_mode,
+        )
+        if test_mode and file_index + 1 >= PARTD_TEST_MAX_ROWS_PER_FILE:
+            break
+    return activity_count
+
+
+async def _import_activity_members(
+    activity_member_list: tuple[tuple[Path, str], ...],
+    artifact: SourceArtifact,
+    snapshot_id: str,
+    test_mode: bool,
+    redis,
+    run_id: str,
+) -> int:
+    max_partd_jobs = max(int(os.getenv("HLTHPRT_MAX_PARTD_JOBS", "4")), 1)
+    if redis is None or not run_id or not activity_member_list or max_partd_jobs <= 1:
+        return await _process_activity_members_locally(
+            activity_member_list,
+            artifact,
+            snapshot_id,
+            test_mode,
+        )
+
+    total_activity_bytes = sum(path.stat().st_size for path, _ in activity_member_list)
+    await _init_activity_chunk_state(
+        redis,
+        run_id,
+        snapshot_id,
+        len(activity_member_list),
+        total_bytes=total_activity_bytes,
+    )
+    chunk_definition_list = await _enqueue_activity_chunks(
+        redis,
+        run_id,
+        snapshot_id,
+        artifact,
+        activity_member_list,
+        test_mode,
+    )
+    activity_count, done_chunk_id_set = await _wait_for_activity_chunks(
+        redis,
+        run_id,
+        snapshot_id,
+        len(activity_member_list),
+    )
+    return activity_count + await _recover_incomplete_activity_chunks(
+        redis,
+        run_id,
+        snapshot_id,
+        artifact,
+        chunk_definition_list,
+        done_chunk_id_set,
+        test_mode,
+    )
+
+
+async def _process_pricing_file(
+    file_path: Path,
+    artifact: SourceArtifact,
+    snapshot_id: str,
+    plan_to_formulary_map: dict[tuple[str, str, str], str],
+    formulary_ndc_to_rxnorm_map: dict[tuple[str, str], str],
+    pricing_batch_row_list: list[dict[str, Any]],
+    activity_batch_row_list: list[dict[str, Any]],
+    max_source_rows: int | None,
+) -> tuple[int, int]:
+    pricing_count = 0
+    processed_rows = 0
+    delimiter = _detect_delimiter(file_path)
+    with file_path.open("r", encoding="utf-8", errors="replace") as handle:
+        reader = csv.DictReader(handle, delimiter=delimiter)
+        for pricing_source_row in reader:
+            pricing_row_list = _pricing_rows_from_source(
+                pricing_source_row,
+                snapshot_id=snapshot_id,
+                source_type=artifact.source_type,
+                default_date=artifact.cutoff_month,
+                plan_to_formulary=plan_to_formulary_map,
+                formulary_ndc_to_rxnorm=formulary_ndc_to_rxnorm_map,
+            )
+            if not pricing_row_list:
+                continue
+            pricing_batch_row_list.extend(pricing_row_list)
+            pricing_count += len(pricing_row_list)
+            processed_rows += 1
+            if len(pricing_batch_row_list) >= PARTD_BATCH_SIZE:
+                await _flush_batches(activity_batch_row_list, pricing_batch_row_list)
+            if max_source_rows is not None and processed_rows >= max_source_rows:
+                break
+    return pricing_count, processed_rows
+
+
+async def _import_pricing_members(
+    pricing_member_list: tuple[tuple[Path, str], ...],
+    artifact: SourceArtifact,
+    snapshot_id: str,
+    plan_to_formulary_map: dict[tuple[str, str, str], str],
+    formulary_ndc_to_rxnorm_map: dict[tuple[str, str], str],
+    test_mode: bool,
+) -> int:
+    activity_batch_row_list: list[dict[str, Any]] = []
+    pricing_batch_row_list: list[dict[str, Any]] = []
+    pricing_count = 0
+    processed_rows = 0
+    for file_path, _logical_name in pricing_member_list:
+        remaining_rows = (
+            PARTD_TEST_MAX_ROWS_PER_FILE - processed_rows
+            if test_mode
+            else None
+        )
+        added_count, added_rows = await _process_pricing_file(
+            file_path,
+            artifact,
+            snapshot_id,
+            plan_to_formulary_map,
+            formulary_ndc_to_rxnorm_map,
+            pricing_batch_row_list,
+            activity_batch_row_list,
+            remaining_rows,
+        )
+        pricing_count += added_count
+        processed_rows += added_rows
+        if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
+            break
+    await _flush_batches(activity_batch_row_list, pricing_batch_row_list)
+    return pricing_count
+
+
 async def _import_artifact(
     artifact: SourceArtifact,
     snapshot_id: str,
@@ -1956,135 +2222,26 @@ async def _import_artifact(
 
         extraction_root = Path(tmpdir) / "expanded"
         extraction_root.mkdir(parents=True, exist_ok=True)
-        extracted_files = _extract_data_files(Path(zip_path), extraction_root)
-        classified_files = [(path, logical_name, _entry_kind(logical_name)) for path, logical_name in extracted_files]
-
-        activity_count = 0
-        pricing_count = 0
-        activity_batch_rows: list[dict[str, Any]] = []
-        pricing_batch_rows: list[dict[str, Any]] = []
-        plan_to_formulary_map: dict[tuple[str, str, str], str] = {}
-        formulary_ndc_to_rxnorm_map: dict[tuple[str, str], str] = {}
-        for file_path, _logical_name, kind in classified_files:
-            if kind == "plan_info":
-                plan_to_formulary_map.update(_load_plan_formulary_map(file_path))
-            elif kind == "formulary_map":
-                formulary_ndc_to_rxnorm_map.update(_load_formulary_ndc_map(file_path))
-
-        activity_members = [(path, logical_name) for path, logical_name, kind in classified_files if kind == "activity"]
-        pricing_members = [(path, logical_name) for path, logical_name, kind in classified_files if kind == "pricing"]
-        unknown_members = [(path, logical_name) for path, logical_name, kind in classified_files if kind == "unknown"]
-        if not activity_members and unknown_members:
-            activity_members = unknown_members[:3]
-        if artifact.source_type == "quarterly" and not pricing_members and unknown_members:
-            pricing_members = unknown_members[:3]
-
-        max_partd_jobs = max(int(os.getenv("HLTHPRT_MAX_PARTD_JOBS", "4")), 1)
-        if redis is not None and run_id and activity_members and max_partd_jobs > 1:
-            total_activity_bytes = sum(path.stat().st_size for path, _logical_name in activity_members)
-            await _init_activity_chunk_state(
-                redis,
-                run_id,
-                snapshot_id,
-                len(activity_members),
-                total_bytes=total_activity_bytes,
-            )
-            snapshot_hash = hashlib.sha1(snapshot_id.encode("utf-8")).hexdigest()[:10]
-            chunk_defs: list[tuple[str, Path]] = []
-            for idx, (file_path, _logical_name) in enumerate(activity_members):
-                chunk_id = f"{snapshot_id}:{idx}"
-                chunk_defs.append((chunk_id, file_path))
-                await redis.enqueue_job(
-                    "partd_formulary_network_process_chunk",
-                    {
-                        "run_id": run_id,
-                        "snapshot_id": snapshot_id,
-                        "chunk_id": chunk_id,
-                        "chunk_path": str(file_path),
-                        "source_type": artifact.source_type,
-                        "cutoff_month": artifact.cutoff_month.isoformat(),
-                        "test_mode": bool(test_mode),
-                    },
-                    _queue_name=PARTD_QUEUE_NAME,
-                    _job_id=f"partd_activity_{run_id}_{snapshot_hash}_{idx}",
-                )
-            activity_count, done_chunk_ids = await _wait_for_activity_chunks(
-                redis,
-                run_id,
-                snapshot_id,
-                len(activity_members),
-            )
-            for chunk_id, file_path in chunk_defs:
-                if chunk_id in done_chunk_ids:
-                    continue
-                accepted = await _process_activity_file(
-                    file_path,
-                    snapshot_id=snapshot_id,
-                    source_type=artifact.source_type,
-                    default_date=artifact.cutoff_month,
-                    test_mode=test_mode,
-                    progress_callback=(
-                        lambda _processed, accepted, processed_bytes, total_bytes, _chunk_id=chunk_id: _mark_activity_chunk_progress(
-                            redis,
-                            run_id,
-                            snapshot_id,
-                            _chunk_id,
-                            processed_bytes=processed_bytes,
-                            accepted_rows=accepted,
-                            total_bytes=total_bytes,
-                        )
-                    ),
-                )
-                activity_count += accepted
-                await _mark_activity_chunk_done(
-                    redis,
-                    run_id,
-                    snapshot_id,
-                    chunk_id,
-                    accepted,
-                    total_bytes=file_path.stat().st_size,
-                )
-        else:
-            processed_rows = 0
-            for file_path, _logical_name in activity_members:
-                activity_count += await _process_activity_file(
-                    file_path,
-                    snapshot_id=snapshot_id,
-                    source_type=artifact.source_type,
-                    default_date=artifact.cutoff_month,
-                    test_mode=test_mode,
-                )
-                processed_rows += 1
-                if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
-                    break
-
-        processed_rows = 0
-        for file_path, _logical_name in pricing_members:
-            delimiter = _detect_delimiter(file_path)
-            with file_path.open("r", encoding="utf-8", errors="replace") as handle:
-                reader = csv.DictReader(handle, delimiter=delimiter)
-                for pricing_source_row in reader:
-                    pricing_rows = _pricing_rows_from_source(
-                        pricing_source_row,
-                        snapshot_id=snapshot_id,
-                        source_type=artifact.source_type,
-                        default_date=artifact.cutoff_month,
-                        plan_to_formulary=plan_to_formulary_map,
-                        formulary_ndc_to_rxnorm=formulary_ndc_to_rxnorm_map,
-                    )
-                    if not pricing_rows:
-                        continue
-                    pricing_batch_rows.extend(pricing_rows)
-                    pricing_count += len(pricing_rows)
-                    processed_rows += 1
-                    if len(pricing_batch_rows) >= PARTD_BATCH_SIZE:
-                        await _flush_batches(activity_batch_rows, pricing_batch_rows)
-                    if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
-                        break
-            if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
-                break
-
-        await _flush_batches(activity_batch_rows, pricing_batch_rows)
+        artifact_members = _classify_artifact_members(
+            _extract_data_files(Path(zip_path), extraction_root),
+            artifact.source_type,
+        )
+        activity_count = await _import_activity_members(
+            artifact_members.activity,
+            artifact,
+            snapshot_id,
+            test_mode,
+            redis,
+            run_id,
+        )
+        pricing_count = await _import_pricing_members(
+            artifact_members.pricing,
+            artifact,
+            snapshot_id,
+            artifact_members.plan_to_formulary,
+            artifact_members.formulary_ndc_to_rxnorm,
+            test_mode,
+        )
         await _materialize_activity_snapshot(schema, snapshot_id)
         await _materialize_pricing_snapshot(schema, snapshot_id)
         return activity_count, pricing_count

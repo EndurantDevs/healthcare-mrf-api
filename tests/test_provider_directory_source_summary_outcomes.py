@@ -136,6 +136,57 @@ def test_sealed_uhc_outcome_exposes_only_aggregate_rejection_proof():
     assert "source_file_id" not in serialized
 
 
+def test_sealed_uhc_outcome_exposes_structural_reason_without_identity():
+    source_summary_map = _uhc_summary()
+    source_summary_map["invalid_npi_count"] = 1
+    source_summary_map["rejected_counts"] = {
+        "invalid_npi_checksum": 0,
+        "invalid_npi_checksum_individual_records": 0,
+        "invalid_npi_checksum_facility_records": 0,
+        "invalid_npi_checksum_address_rows": 0,
+        "invalid_npi_checksum_provider_plan_rows": 0,
+        "invalid_npi_structure": 1,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 1,
+        "invalid_npi_structure_address_rows": 1,
+        "invalid_npi_structure_provider_plan_rows": 1,
+    }
+    for resource_type in (
+        "Organization",
+        "Location",
+        "OrganizationAffiliation",
+    ):
+        source_summary_map["resource_counts"][resource_type] -= 1
+    source_summary_map["total_resources"] = sum(
+        source_summary_map["resource_counts"].values()
+    )
+    source_summary_map["summary_sha256"] = source_summary_sha256(
+        source_summary_map
+    )
+    resource_count_by_type = source_summary_map["resource_counts"]
+    dataset = SimpleNamespace(
+        acquisition_root_run_id="uhc-root",
+        dataset_id="uhc-dataset",
+        endpoint_id="uhc-endpoint",
+        dataset_hash="d" * 64,
+        source_ids=("provider-directory-uhc",),
+        resource_count=sum(resource_count_by_type.values()),
+        publication_metadata={"source_summary_v1": source_summary_map},
+    )
+
+    outcome_map = outcomes.source_summary_outcome_counts(
+        dataset,
+        tuple(resource_count_by_type),
+        resource_count_by_type,
+        {},
+    )
+
+    assert outcome_map["rejected_counts"]["invalid_npi_structure"] == 1
+    serialized = repr(outcome_map)
+    assert "record_sha256" not in serialized
+    assert "source_file_id" not in serialized
+
+
 def test_fhir_validator_accepts_only_the_fhir_semantic_contract():
     fhir_summary_map = _sealed_source_summary()
 

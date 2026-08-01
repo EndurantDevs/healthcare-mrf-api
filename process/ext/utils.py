@@ -7,6 +7,7 @@ import os
 import re
 import ssl
 import time
+from dataclasses import dataclass
 from pathlib import Path, PurePath
 from random import choice
 from urllib.parse import unquote, urlparse
@@ -267,6 +268,123 @@ def _is_parallel_download_disabled_for_url(url: str) -> bool:
 _parallel_download_disabled_for_url = _is_parallel_download_disabled_for_url
 
 
+@dataclass
+class _RangeDownloadProgress:
+    downloaded_bytes: int
+    start_time: float
+    last_progress_time: float
+
+
+@dataclass(frozen=True)
+class _RangeDownloadContext:
+    client: aiohttp.ClientSession
+    url: str
+    file_fd: int
+    semaphore: asyncio.Semaphore
+    progress_lock: asyncio.Lock
+    size_bytes: int
+    request_timeout: aiohttp.ClientTimeout
+    progress: _RangeDownloadProgress
+
+
+def _write_range(file_fd: int, offset: int, range_bytes: bytes) -> None:
+    os.pwrite(file_fd, range_bytes, offset)
+
+
+def _range_attempt_timeout(
+    request_timeout: aiohttp.ClientTimeout,
+    attempt: int,
+) -> aiohttp.ClientTimeout:
+    base_total_timeout = float(request_timeout.total or MAX_STREAM_TIMEOUT)
+    base_sock_read_timeout = float(request_timeout.sock_read or base_total_timeout)
+    growth = 1.0 + (attempt - 1) * 0.5
+    return aiohttp.ClientTimeout(
+        total=min(base_total_timeout * growth, MAX_STREAM_TIMEOUT),
+        connect=CONNECT_TIMEOUT_SECONDS,
+        sock_read=min(base_sock_read_timeout * growth, MAX_STREAM_TIMEOUT),
+    )
+
+
+async def _record_range_download_progress(
+    context: _RangeDownloadContext,
+    byte_count: int,
+) -> None:
+    async with context.progress_lock:
+        context.progress.downloaded_bytes += byte_count
+        now = time.monotonic()
+        is_complete = context.progress.downloaded_bytes >= context.size_bytes
+        if (
+            now - context.progress.last_progress_time < PROGRESS_INTERVAL_SECONDS
+            and not is_complete
+        ):
+            return
+        elapsed = max(now - context.progress.start_time, 0.001)
+        speed = context.progress.downloaded_bytes / elapsed
+        _print_progress_line(
+            context.progress.downloaded_bytes,
+            context.size_bytes,
+            speed,
+            final=is_complete,
+        )
+        context.progress.last_progress_time = now
+
+
+async def _download_range_once(
+    context: _RangeDownloadContext,
+    start_byte: int,
+    end_byte: int,
+    attempt: int,
+) -> None:
+    range_headers_by_name = {
+        "Range": f"bytes={start_byte}-{end_byte}",
+        "Accept-Encoding": "identity",
+    }
+    async with context.client.get(
+        context.url,
+        headers=range_headers_by_name,
+        timeout=_range_attempt_timeout(context.request_timeout, attempt),
+    ) as response:
+        if response.status != 206:
+            raise RuntimeError(f"Range request not honored (status={response.status})")
+        range_bytes = await response.read()
+        expected_byte_count = end_byte - start_byte + 1
+        if len(range_bytes) != expected_byte_count:
+            raise RuntimeError(
+                f"Range payload mismatch for {context.url}: got {len(range_bytes)} "
+                f"bytes, expected {expected_byte_count}"
+            )
+        await asyncio.to_thread(
+            _write_range,
+            context.file_fd,
+            start_byte,
+            range_bytes,
+        )
+        await _record_range_download_progress(context, len(range_bytes))
+
+
+async def _download_range(
+    context: _RangeDownloadContext,
+    start_byte: int,
+    end_byte: int,
+) -> None:
+    last_error = None
+    async with context.semaphore:
+        for attempt in range(1, PARALLEL_CHUNK_RETRIES + 1):
+            try:
+                await _download_range_once(context, start_byte, end_byte, attempt)
+                return
+            except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as err:
+                last_error = err
+                if attempt >= PARALLEL_CHUNK_RETRIES:
+                    break
+                backoff = PARALLEL_CHUNK_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                await asyncio.sleep(min(backoff, 20.0))
+    raise RuntimeError(
+        f"Failed to download range {start_byte}-{end_byte} after "
+        f"{PARALLEL_CHUNK_RETRIES} attempts: {last_error!r}"
+    )
+
+
 async def _download_parallel_by_ranges(
     client: aiohttp.ClientSession,
     url: str,
@@ -292,92 +410,23 @@ async def _download_parallel_by_ranges(
         start = end + 1
     with open(filepath, "wb") as fp:
         fp.truncate(size_bytes)
-    semaphore = asyncio.Semaphore(PARALLEL_DOWNLOAD_WORKERS)
-    progress_lock = asyncio.Lock()
-    downloaded_bytes = 0
     start_time = time.monotonic()
-    last_progress_time = start_time
-
     file_fd = os.open(filepath, os.O_RDWR)
-
-    def _write_range(fd: int, offset: int, range_bytes: bytes) -> None:
-        # pwrite avoids fd seek contention across parallel workers.
-        os.pwrite(fd, range_bytes, offset)
-
-    async def _download_range(start_byte: int, end_byte: int) -> None:
-        """Download and persist one inclusive byte range."""
-        nonlocal downloaded_bytes, last_progress_time
-        range_headers_by_name = {
-            "Range": f"bytes={start_byte}-{end_byte}",
-            # Range math requires identity representation for deterministic byte offsets.
-            "Accept-Encoding": "identity",
-        }
-        base_total_timeout = float(request_timeout.total or MAX_STREAM_TIMEOUT)
-        base_sock_read_timeout = float(request_timeout.sock_read or base_total_timeout)
-
-        async with semaphore:
-            last_error = None
-            for attempt in range(1, PARALLEL_CHUNK_RETRIES + 1):
-                # Increase timeout on each retry for this specific chunk.
-                growth = 1.0 + (attempt - 1) * 0.5
-                attempt_total = min(base_total_timeout * growth, MAX_STREAM_TIMEOUT)
-                attempt_sock_read = min(
-                    base_sock_read_timeout * growth, MAX_STREAM_TIMEOUT
-                )
-                attempt_timeout = aiohttp.ClientTimeout(
-                    total=attempt_total,
-                    connect=CONNECT_TIMEOUT_SECONDS,
-                    sock_read=attempt_sock_read,
-                )
-                try:
-                    async with client.get(
-                        url, headers=range_headers_by_name, timeout=attempt_timeout
-                    ) as response:
-                        if response.status not in (206,):
-                            raise RuntimeError(
-                                f"Range request not honored (status={response.status})"
-                            )
-                        range_bytes = await response.read()
-                        expected = end_byte - start_byte + 1
-                        if len(range_bytes) != expected:
-                            raise RuntimeError(
-                                f"Range payload mismatch for {url}: got {len(range_bytes)} bytes, expected {expected}"
-                            )
-                        await asyncio.to_thread(
-                            _write_range, file_fd, start_byte, range_bytes
-                        )
-                        async with progress_lock:
-                            downloaded_bytes += len(range_bytes)
-                            now = time.monotonic()
-                            if (
-                                now - last_progress_time >= PROGRESS_INTERVAL_SECONDS
-                                or downloaded_bytes >= size_bytes
-                            ):
-                                elapsed = max(now - start_time, 0.001)
-                                speed = downloaded_bytes / elapsed
-                                _print_progress_line(
-                                    downloaded_bytes,
-                                    size_bytes,
-                                    speed,
-                                    final=downloaded_bytes >= size_bytes,
-                                )
-                                last_progress_time = now
-                        return
-                except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as err:
-                    last_error = err
-                    if attempt >= PARALLEL_CHUNK_RETRIES:
-                        break
-                    backoff = PARALLEL_CHUNK_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                    await asyncio.sleep(min(backoff, 20.0))
-            raise RuntimeError(
-                f"Failed to download range {start_byte}-{end_byte} after "
-                f"{PARALLEL_CHUNK_RETRIES} attempts: {last_error!r}"
-            )
+    context = _RangeDownloadContext(
+        client=client,
+        url=url,
+        file_fd=file_fd,
+        semaphore=asyncio.Semaphore(PARALLEL_DOWNLOAD_WORKERS),
+        progress_lock=asyncio.Lock(),
+        size_bytes=size_bytes,
+        request_timeout=request_timeout,
+        progress=_RangeDownloadProgress(0, start_time, start_time),
+    )
 
     try:
         await asyncio.gather(
             *(
-                _download_range(range_start, range_end)
+                _download_range(context, range_start, range_end)
                 for range_start, range_end in ranges
             )
         )

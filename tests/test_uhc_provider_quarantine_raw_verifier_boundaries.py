@@ -252,4 +252,9 @@ def test_raw_verifier_empty_quarantine_is_an_exact_zero_census(tmp_path):
         "invalid_npi_facility_records": 0,
         "invalid_npi_address_rows": 0,
         "invalid_npi_provider_plan_rows": 0,
+        "invalid_npi_structure_count": 0,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 0,
+        "invalid_npi_structure_address_rows": 0,
+        "invalid_npi_structure_provider_plan_rows": 0,
     }

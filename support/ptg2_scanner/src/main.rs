@@ -35959,6 +35959,59 @@ mod tests {
         let stdout = io::stdout();
         let mut events = BufWriter::new(stdout.lock());
         sinks.finish(&mut events).unwrap();
+
+        let mut closed_sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
+        closed_sinks.price_code_set.as_mut().unwrap().writer = None;
+        closed_sinks.price_set_entry.as_mut().unwrap().writer = None;
+        closed_sinks.provider_set.as_mut().unwrap().writer = None;
+        closed_sinks.manifest_code_count.as_mut().unwrap().writer = None;
+        closed_sinks.provider_set_entry.as_mut().unwrap().writer = None;
+
+        assert_eq!(
+            closed_sinks
+                .write_price_code_set("price-code-set", &["12345".to_owned()])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe,
+        );
+        let mut emitted_price_set_entries = HashSet::new();
+        assert_eq!(
+            closed_sinks
+                .write_price_set_entries(
+                    GlobalId128([2; GLOBAL_ID_BYTES]),
+                    &[GlobalId128([3; GLOBAL_ID_BYTES])],
+                    &mut emitted_price_set_entries,
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe,
+        );
+        assert_eq!(
+            closed_sinks
+                .write_provider_set("provider-set", 1, &[1])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe,
+        );
+        assert_eq!(
+            closed_sinks
+                .write_manifest_code_count("plan", Some("CPT"), Some("12345"), 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe,
+        );
+        let mut emitted_provider_set_entries = HashSet::new();
+        assert_eq!(
+            closed_sinks
+                .write_provider_set_entries(
+                    "provider-set",
+                    &[1],
+                    &mut emitted_provider_set_entries,
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe,
+        );
     }
 
     #[test]

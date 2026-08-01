@@ -29,6 +29,7 @@ pub const UHC_SEMANTIC_COPY_COLUMN_COUNT: i16 = 11;
 
 const UHC_PROVIDER_QUARANTINE_CONTRACT_ID: &str = "healthporta.uhc.provider-quarantine.v1";
 const UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM: &str = "invalid_npi_checksum";
+const UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE: &str = "invalid_npi_structure";
 const UHC_PROVIDER_QUARANTINE_MAX_COUNT: u64 = 32;
 const UHC_PROVIDER_QUARANTINE_RATE_DENOMINATOR: u64 = 1_000_000;
 
@@ -380,6 +381,7 @@ fn clean(value: Option<&str>, upper: bool) -> Option<String> {
 enum NpiValidity {
     Valid,
     ChecksumInvalid,
+    StructuralInvalid,
     Invalid,
 }
 
@@ -387,11 +389,14 @@ fn npi_validity(value: &str) -> NpiValidity {
     if value.len() != 10 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return NpiValidity::Invalid;
     }
-    if !matches!(
-        value.parse::<u64>(),
-        Ok(parsed) if (1_000_000_000..=2_999_999_999).contains(&parsed)
-    ) {
+    let Ok(parsed) = value.parse::<u64>() else {
         return NpiValidity::Invalid;
+    };
+    if parsed == 0 {
+        return NpiValidity::Invalid;
+    }
+    if !(1_000_000_000..=2_999_999_999).contains(&parsed) {
+        return NpiValidity::StructuralInvalid;
     }
     let digits: Vec<u64> = value.bytes().map(|byte| u64::from(byte - b'0')).collect();
     let mut digit_sum = 24 + digits[9];
@@ -545,6 +550,11 @@ pub struct UhcFileCounters {
     pub invalid_npi_facility_records: u64,
     pub invalid_npi_address_rows: u64,
     pub invalid_npi_provider_plan_rows: u64,
+    pub invalid_npi_structure_count: u64,
+    pub invalid_npi_structure_individual_records: u64,
+    pub invalid_npi_structure_facility_records: u64,
+    pub invalid_npi_structure_address_rows: u64,
+    pub invalid_npi_structure_provider_plan_rows: u64,
 }
 
 impl UhcFileCounters {
@@ -571,6 +581,14 @@ impl UhcFileCounters {
         self.invalid_npi_facility_records += incoming.invalid_npi_facility_records;
         self.invalid_npi_address_rows += incoming.invalid_npi_address_rows;
         self.invalid_npi_provider_plan_rows += incoming.invalid_npi_provider_plan_rows;
+        self.invalid_npi_structure_count += incoming.invalid_npi_structure_count;
+        self.invalid_npi_structure_individual_records +=
+            incoming.invalid_npi_structure_individual_records;
+        self.invalid_npi_structure_facility_records +=
+            incoming.invalid_npi_structure_facility_records;
+        self.invalid_npi_structure_address_rows += incoming.invalid_npi_structure_address_rows;
+        self.invalid_npi_structure_provider_plan_rows +=
+            incoming.invalid_npi_structure_provider_plan_rows;
     }
 }
 
@@ -594,6 +612,7 @@ fn provider_quarantine_identity(
     source_file_id: &str,
     range_ordinal: u64,
     occurrence_ordinal: u64,
+    reason: &'static str,
     record_sha256: &str,
 ) -> Vec<u8> {
     serde_json::to_vec(&(
@@ -601,7 +620,7 @@ fn provider_quarantine_identity(
         source_file_id,
         range_ordinal,
         occurrence_ordinal,
-        UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+        reason,
         record_sha256,
     ))
     .expect("UHC provider quarantine identity is serializable")
@@ -933,7 +952,12 @@ impl RangeWorker {
         Ok(())
     }
 
-    fn append_provider_quarantine(&mut self, ordinal: u64, record_bytes: &[u8]) -> io::Result<()> {
+    fn append_provider_quarantine(
+        &mut self,
+        ordinal: u64,
+        record_bytes: &[u8],
+        reason: &'static str,
+    ) -> io::Result<()> {
         if self.quarantine_identity_count >= UHC_PROVIDER_QUARANTINE_MAX_COUNT {
             return Err(invalid(
                 "UHC provider quarantine exceeds its bounded identity buffer",
@@ -943,7 +967,7 @@ impl RangeWorker {
         let payload = canonical_value_bytes(&ProviderQuarantineFact {
             quarantine: ProviderQuarantinePayload {
                 contract_id: UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
-                reason: UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+                reason,
                 source_file_id: &self.source_file_id,
                 range_ordinal: self.range.range_ordinal,
                 occurrence_ordinal: ordinal,
@@ -959,6 +983,7 @@ impl RangeWorker {
             &self.source_file_id,
             self.range.range_ordinal,
             ordinal,
+            reason,
             &record_sha256,
         );
         let separator_bytes = usize::from(self.quarantine_identity_count != 0);
@@ -1166,14 +1191,26 @@ impl RangeWorker {
         }
         self.counters.plan_year_rows += provider_plan_year_rows;
         self.counters.raw_provider_plan_rows += provider_plan_year_rows;
-        if npi_validity == NpiValidity::ChecksumInvalid {
+        if npi_validity != NpiValidity::Valid {
             self.counters.invalid_npi_count += 1;
             self.counters.invalid_npi_individual_records +=
                 u64::from(provider_type == "INDIVIDUAL");
             self.counters.invalid_npi_facility_records += u64::from(provider_type == "FACILITY");
             self.counters.invalid_npi_address_rows += record.addresses.len() as u64;
             self.counters.invalid_npi_provider_plan_rows += provider_plan_year_rows;
-            return self.append_provider_quarantine(ordinal, bytes);
+            let reason = if npi_validity == NpiValidity::StructuralInvalid {
+                self.counters.invalid_npi_structure_count += 1;
+                self.counters.invalid_npi_structure_individual_records +=
+                    u64::from(provider_type == "INDIVIDUAL");
+                self.counters.invalid_npi_structure_facility_records +=
+                    u64::from(provider_type == "FACILITY");
+                self.counters.invalid_npi_structure_address_rows += record.addresses.len() as u64;
+                self.counters.invalid_npi_structure_provider_plan_rows += provider_plan_year_rows;
+                UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE
+            } else {
+                UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM
+            };
+            return self.append_provider_quarantine(ordinal, bytes, reason);
         }
         let evidence = EvidenceRow {
             occurrence_ordinal: ordinal,
@@ -1862,6 +1899,31 @@ mod tests {
         "last_updated_on":"2026-07-01"
     }"#;
 
+    const STRUCTURAL_INVALID_PROVIDER_RECORD: &[u8] = br#"{
+        "type":"FACILITY",
+        "npi":"3000000000",
+        "name":null,
+        "facility_name":"Example Clinic",
+        "facility_type":["Clinic"],
+        "gender":null,
+        "accepting":"accepting",
+        "addresses":[{
+            "address":"1 Main St",
+            "city":"Chicago",
+            "state":"IL",
+            "zip":"60601",
+            "phone":"3125551212"
+        }],
+        "plans":[{
+            "plan_id_type":"HIOS-PLAN-ID",
+            "plan_id":"12345IL0010001",
+            "years":[2026],
+            "network_tier":"PREFERRED"
+        }],
+        "specialty":["Clinic"],
+        "last_updated_on":"2026-07-01"
+    }"#;
+
     struct SyntheticSource {
         lineage: AdmittedSemanticLineage,
         ranges: Vec<AdmittedSemanticRange>,
@@ -1925,6 +1987,7 @@ mod tests {
     struct MixedProviderSource {
         inner: SyntheticSource,
         invalid_ordinals: Vec<u64>,
+        invalid_record: &'static [u8],
     }
 
     impl AdmittedRangeSource for MixedProviderSource {
@@ -1944,7 +2007,7 @@ mod tests {
             for offset in 0..range.record_count {
                 let ordinal = range.record_start + offset;
                 let record = if self.invalid_ordinals.contains(&ordinal) {
-                    CHECKSUM_INVALID_PROVIDER_RECORD
+                    self.invalid_record
                 } else {
                     PROVIDER_RECORD
                 };
@@ -2049,6 +2112,7 @@ mod tests {
         let source = MixedProviderSource {
             inner: SyntheticSource::new(4, UhcCollectionKind::ProviderMembership),
             invalid_ordinals: vec![1],
+            invalid_record: CHECKSUM_INVALID_PROVIDER_RECORD,
         };
         let mut serial_budget = test_budget();
         serial_budget.worker_count = 1;
@@ -2131,10 +2195,288 @@ mod tests {
     }
 
     #[test]
+    fn structurally_invalid_string_npi_is_redacted_after_other_predicates() {
+        let source = MixedProviderSource {
+            inner: SyntheticSource::new(4, UhcCollectionKind::ProviderMembership),
+            invalid_ordinals: vec![1],
+            invalid_record: STRUCTURAL_INVALID_PROVIDER_RECORD,
+        };
+        let mut serial_budget = test_budget();
+        serial_budget.worker_count = 1;
+        let mut serial_copy = Vec::new();
+        let serial_report =
+            encode_admitted_ranges_to_copy(&source, &mut serial_copy, &serial_budget).unwrap();
+        let mut parallel_copy = Vec::new();
+        let parallel_report =
+            encode_admitted_ranges_to_copy(&source, &mut parallel_copy, &test_budget()).unwrap();
+
+        assert_eq!(serial_copy, parallel_copy);
+        assert_eq!(serial_report.evidence_count, 3);
+        assert_eq!(serial_report.counters.invalid_npi_count, 1);
+        assert_eq!(serial_report.counters.invalid_npi_structure_count, 1);
+        assert_eq!(
+            serial_report
+                .counters
+                .invalid_npi_structure_facility_records,
+            1
+        );
+        assert_eq!(
+            serial_report
+                .counters
+                .invalid_npi_structure_individual_records,
+            0
+        );
+        assert_eq!(serial_report.counters.invalid_npi_structure_address_rows, 1);
+        assert_eq!(
+            serial_report
+                .counters
+                .invalid_npi_structure_provider_plan_rows,
+            1
+        );
+        assert_eq!(
+            serial_report.quarantine_identity_set_sha256,
+            parallel_report.quarantine_identity_set_sha256
+        );
+
+        let invalid_range = &source.ranges()[1];
+        let mut worker = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            invalid_range,
+            &test_budget(),
+        )
+        .unwrap();
+        worker
+            .process_provider(1, STRUCTURAL_INVALID_PROVIDER_RECORD)
+            .unwrap();
+        let mut result = worker.finish(Instant::now()).unwrap();
+        let mut decoded = String::new();
+        flate2::read::ZlibDecoder::new(&mut result.fact_payload)
+            .read_to_string(&mut decoded)
+            .unwrap();
+        let fact: serde_json::Value = serde_json::from_str(decoded.trim()).unwrap();
+        assert_eq!(
+            fact["_healthporta_quarantine"]["reason"],
+            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE
+        );
+        assert!(!decoded.contains("3000000000"));
+        assert!(!decoded.contains("Example Clinic"));
+
+        let malformed = String::from_utf8(STRUCTURAL_INVALID_PROVIDER_RECORD.to_vec())
+            .unwrap()
+            .replace("\"accepting\":\"accepting\"", "\"accepting\":\"sometimes\"")
+            .into_bytes();
+        let mut malformed_worker = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            invalid_range,
+            &test_budget(),
+        )
+        .unwrap();
+        assert!(malformed_worker
+            .process_provider(1, &malformed)
+            .unwrap_err()
+            .to_string()
+            .contains("accepting status is unsupported"));
+    }
+
+    #[test]
+    fn quarantine_buffer_guards_and_structural_dimensions_are_exact() {
+        let source = SyntheticSource::new(4, UhcCollectionKind::ProviderMembership);
+        let range = &source.ranges()[0];
+
+        let mut count_limited = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            range,
+            &test_budget(),
+        )
+        .unwrap();
+        count_limited.quarantine_identity_count = UHC_PROVIDER_QUARANTINE_MAX_COUNT;
+        assert!(count_limited
+            .append_provider_quarantine(
+                0,
+                CHECKSUM_INVALID_PROVIDER_RECORD,
+                UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("bounded identity buffer"));
+
+        let mut tiny_budget = test_budget();
+        tiny_budget.max_record_bytes = 1;
+        let mut record_limited = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            range,
+            &tiny_budget,
+        )
+        .unwrap();
+        assert!(record_limited
+            .append_provider_quarantine(
+                0,
+                CHECKSUM_INVALID_PROVIDER_RECORD,
+                UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds max record bytes"));
+
+        let mut byte_limited = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            range,
+            &test_budget(),
+        )
+        .unwrap();
+        byte_limited
+            .quarantine_identity_bytes
+            .resize(QUARANTINE_IDENTITY_BUFFER_BYTES, b'x');
+        assert!(byte_limited
+            .append_provider_quarantine(
+                0,
+                CHECKSUM_INVALID_PROVIDER_RECORD,
+                UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("bounded identity bytes"));
+
+        let empty_source = SyntheticSource::new(0, UhcCollectionKind::ProviderMembership);
+        let mut mismatched = RangeWorker::new(
+            &empty_source.lineage().source_file_id,
+            empty_source.lineage().collection_kind,
+            &empty_source.ranges()[0],
+            &test_budget(),
+        )
+        .unwrap();
+        mismatched.counters.invalid_npi_count = 1;
+        assert!(mismatched
+            .finish(Instant::now())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("quarantine count does not match"));
+
+        let mut quarantine_overflow = RangeWorker::new(
+            &empty_source.lineage().source_file_id,
+            empty_source.lineage().collection_kind,
+            &empty_source.ranges()[0],
+            &test_budget(),
+        )
+        .unwrap();
+        quarantine_overflow.quarantine_identity_count = 1;
+        quarantine_overflow.counters.invalid_npi_count = 1;
+        assert!(quarantine_overflow
+            .finish(Instant::now())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("quarantine count overflowed"));
+
+        let mut evidence_mismatch = RangeWorker::new(
+            &empty_source.lineage().source_file_id,
+            empty_source.lineage().collection_kind,
+            &empty_source.ranges()[0],
+            &test_budget(),
+        )
+        .unwrap();
+        evidence_mismatch.evidence_count = 1;
+        evidence_mismatch.evidence_identity_count = 1;
+        assert!(evidence_mismatch
+            .finish(Instant::now())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("evidence count does not match"));
+
+        let mut sealed = RangeWorker::new(
+            &empty_source.lineage().source_file_id,
+            empty_source.lineage().collection_kind,
+            &empty_source.ranges()[0],
+            &test_budget(),
+        )
+        .unwrap();
+        sealed.fact_encoder.take().unwrap();
+        assert!(sealed
+            .finish(Instant::now())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("fact encoder is already sealed"));
+
+        let structural_record = br#"{
+            "type":"INDIVIDUAL","npi":"3000000000",
+            "name":{"first":"Ada","middle":null,"last":"Lovelace"},
+            "facility_name":null,"facility_type":null,"gender":"F","accepting":"closed",
+            "addresses":[
+                {"address":"1 Main","city":"Chicago","state":"IL","zip":"60601","phone":"3125551212"},
+                {"address":"2 Main","city":"Chicago","state":"IL","zip":"60602","phone":"555-1212"}
+            ],
+            "plans":[{"plan_id_type":"H","plan_id":"P","years":[2025,2026],"network_tier":null}],
+            "specialty":null,"last_updated_on":null
+        }"#;
+
+        let empty_plan_type = String::from_utf8(structural_record.to_vec())
+            .unwrap()
+            .replace("\"plan_id_type\":\"H\"", "\"plan_id_type\":\" \"");
+        let mut invalid_plan_worker = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            range,
+            &test_budget(),
+        )
+        .unwrap();
+        assert!(invalid_plan_worker
+            .process_provider(0, empty_plan_type.as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("plan ID type is empty"));
+
+        let empty_plan_id = String::from_utf8(structural_record.to_vec())
+            .unwrap()
+            .replace("\"plan_id\":\"P\"", "\"plan_id\":\" \"");
+        let mut invalid_plan_worker = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            range,
+            &test_budget(),
+        )
+        .unwrap();
+        assert!(invalid_plan_worker
+            .process_provider(0, empty_plan_id.as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("plan ID is empty"));
+
+        let mut two_record_range = range.clone();
+        two_record_range.record_count = 2;
+        let mut worker = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            &two_record_range,
+            &test_budget(),
+        )
+        .unwrap();
+        worker.process_provider(0, structural_record).unwrap();
+        worker.process_provider(1, structural_record).unwrap();
+        let result = worker.finish(Instant::now()).unwrap();
+        assert_eq!(result.counters.invalid_npi_structure_count, 2);
+        assert_eq!(result.counters.invalid_npi_structure_individual_records, 2);
+        assert_eq!(result.counters.invalid_npi_structure_facility_records, 0);
+        assert_eq!(result.counters.invalid_npi_structure_address_rows, 4);
+        assert_eq!(result.counters.invalid_npi_structure_provider_plan_rows, 4);
+        assert_eq!(result.counters.accepting_nopt_records, 2);
+        assert_eq!(result.counters.valid_phone_count, 2);
+        assert_eq!(result.counters.invalid_phone_count, 2);
+    }
+
+    #[test]
     fn encoder_enforces_quarantine_rate_and_other_fields_still_fail_closed() {
         let excessive = MixedProviderSource {
             inner: SyntheticSource::new(4, UhcCollectionKind::ProviderMembership),
             invalid_ordinals: vec![1, 2],
+            invalid_record: CHECKSUM_INVALID_PROVIDER_RECORD,
         };
         assert!(
             encode_admitted_ranges_to_copy(&excessive, io::sink(), &test_budget())
@@ -2402,6 +2744,8 @@ mod tests {
         assert_eq!(npi_validity("123"), NpiValidity::Invalid);
         assert_eq!(npi_validity("100382138x"), NpiValidity::Invalid);
         assert_eq!(npi_validity("0000000000"), NpiValidity::Invalid);
+        assert_eq!(npi_validity("3000000000"), NpiValidity::StructuralInvalid);
+        assert_eq!(npi_validity("0999999999"), NpiValidity::StructuralInvalid);
         assert_eq!(npi_validity("1003821381"), NpiValidity::ChecksumInvalid);
         assert_eq!(npi_validity("1003821380"), NpiValidity::Valid);
         assert_eq!(provider_quarantine_limit(0), 0);
@@ -2594,8 +2938,20 @@ mod tests {
 
         let provider_failures: &[(&[u8], &str)] = &[
             (
+                br#"{"type":"INDIVIDUAL","npi":123,"name":null,"facility_name":null,"facility_type":null,"gender":null,"accepting":null,"addresses":[{}],"plans":[{"plan_id_type":"H","plan_id":"P","years":[2026],"network_tier":null}],"specialty":null,"last_updated_on":null}"#,
+                "invalid retained UHC provider JSON",
+            ),
+            (
                 br#"{"type":"INDIVIDUAL","npi":"123","name":null,"facility_name":null,"facility_type":null,"gender":null,"accepting":null,"addresses":[{}],"plans":[{"plan_id_type":"H","plan_id":"P","years":[2026],"network_tier":null}],"specialty":null,"last_updated_on":null}"#,
-                "structurally valid",
+                "NPI is not structurally valid",
+            ),
+            (
+                br#"{"type":"INDIVIDUAL","npi":"abcdefghij","name":null,"facility_name":null,"facility_type":null,"gender":null,"accepting":null,"addresses":[{}],"plans":[{"plan_id_type":"H","plan_id":"P","years":[2026],"network_tier":null}],"specialty":null,"last_updated_on":null}"#,
+                "NPI is not structurally valid",
+            ),
+            (
+                br#"{"type":"INDIVIDUAL","npi":"0000000000","name":null,"facility_name":null,"facility_type":null,"gender":null,"accepting":null,"addresses":[{}],"plans":[{"plan_id_type":"H","plan_id":"P","years":[2026],"network_tier":null}],"specialty":null,"last_updated_on":null}"#,
+                "NPI is not structurally valid",
             ),
             (
                 br#"{"type":"UNKNOWN","npi":"1003821380","name":null,"facility_name":null,"facility_type":null,"gender":null,"accepting":null,"addresses":[{}],"plans":[{"plan_id_type":"H","plan_id":"P","years":[2026],"network_tier":null}],"specialty":null,"last_updated_on":null}"#,

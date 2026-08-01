@@ -2158,6 +2158,178 @@ async def _plan_summary_dependencies_ready(db_schema: str) -> tuple[bool, list[s
     return (len(missing_tables) == 0, missing_tables)
 
 
+async def _log_formulary_row_error(task, import_log, message: str) -> None:
+    await log_error(
+        "err",
+        message,
+        task.get("issuer_array"),
+        task.get("url"),
+        "formulary",
+        "json",
+        import_log,
+    )
+
+
+def _formulary_record_identity(formulary_record: dict) -> tuple[str, str, list] | None:
+    rxnorm_id = str(formulary_record.get("rxnorm_id", "")).strip()
+    drug_name = str(formulary_record.get("drug_name", "")).strip()
+    plan_entry_list = formulary_record.get("plans") or []
+    if not rxnorm_id or not drug_name or not isinstance(plan_entry_list, list) or not plan_entry_list:
+        return None
+    return rxnorm_id, drug_name, plan_entry_list
+
+
+def _formulary_plan_row(
+    formulary_record: dict,
+    plan_entry: dict,
+    rxnorm_id: str,
+    drug_name: str,
+) -> dict | None:
+    plan_id = str(plan_entry.get("plan_id", "")).strip()
+    plan_id_type = str(plan_entry.get("plan_id_type", "")).strip()
+    if not plan_id or not plan_id_type:
+        return None
+    drug_tier = plan_entry.get("drug_tier")
+    if isinstance(drug_tier, str):
+        drug_tier = drug_tier.strip().upper()
+    last_updated_on = None
+    if formulary_record.get("last_updated_on"):
+        try:
+            last_updated_on = datetime.datetime.combine(
+                parse_date(formulary_record["last_updated_on"], fuzzy=True),
+                datetime.datetime.min.time(),
+            )
+        except (ValueError, TypeError):
+            last_updated_on = None
+    return {
+        "plan_id": plan_id,
+        "plan_id_type": plan_id_type,
+        "rxnorm_id": rxnorm_id,
+        "drug_name": drug_name,
+        "drug_tier": drug_tier,
+        "prior_authorization": _parse_optional_bool(plan_entry.get("prior_authorization")),
+        "step_therapy": _parse_optional_bool(plan_entry.get("step_therapy")),
+        "quantity_limit": _parse_optional_bool(plan_entry.get("quantity_limit")),
+        "last_updated_on": last_updated_on,
+    }
+
+
+async def _append_formulary_record_rows(
+    task,
+    import_log,
+    formulary_record: dict,
+    drug_row_list: list[dict],
+) -> int:
+    record_identity = _formulary_record_identity(formulary_record)
+    if record_identity is None:
+        rxnorm_id = str(formulary_record.get("rxnorm_id", "")).strip()
+        await _log_formulary_row_error(
+            task,
+            import_log,
+            f"Missing required drug fields. rxnorm_id={rxnorm_id!r}",
+        )
+        return 0
+    rxnorm_id, drug_name, plan_entry_list = record_identity
+    for plan_entry in plan_entry_list:
+        drug_row = _formulary_plan_row(
+            formulary_record,
+            plan_entry,
+            rxnorm_id,
+            drug_name,
+        )
+        if drug_row is None:
+            await _log_formulary_row_error(
+                task,
+                import_log,
+                f"Plan entry missing identifiers for rxnorm_id={rxnorm_id}",
+            )
+            continue
+        drug_row_list.append(drug_row)
+    return 1
+
+
+async def _read_formulary_file(
+    task,
+    import_log,
+    plan_drug_model,
+    tmp_filename: str,
+    drug_limit: int | None,
+    formulary_flush_rows: int,
+) -> None:
+    drug_row_list: list[dict] = []
+    processed = 0
+    async with async_open(tmp_filename, "rb") as afp:
+        async for formulary_record in ijson.items(afp, "item", use_float=True):
+            accepted_record_count = await _append_formulary_record_rows(
+                task,
+                import_log,
+                formulary_record,
+                drug_row_list,
+            )
+            if not accepted_record_count:
+                continue
+            processed += 1
+            if drug_limit and processed >= drug_limit:
+                break
+            if len(drug_row_list) > formulary_flush_rows:
+                await _push_mrf_duplicate_tolerant_rows(drug_row_list, plan_drug_model)
+                drug_row_list.clear()
+    if drug_row_list:
+        await _push_mrf_duplicate_tolerant_rows(drug_row_list, plan_drug_model)
+
+
+async def _is_formulary_file_staged(
+    ctx,
+    task,
+    source_url: str,
+    download_url: str,
+    tmp_filename: str,
+    import_log,
+) -> bool:
+    try:
+        await download_it_and_save(
+            download_url,
+            tmp_filename,
+            context={"issuer_array": task["issuer_array"], "source": "formulary"},
+            logger=import_log,
+        )
+    except Exception as exc:
+        logger.warning("Failed to download formulary data from %s: %s", source_url, exc)
+        await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
+        return False
+    return True
+
+
+async def _is_formulary_file_imported(
+    ctx,
+    task,
+    import_log,
+    plan_drug_model,
+    tmp_filename: str,
+    drug_limit: int | None,
+    formulary_flush_rows: int,
+) -> bool:
+    try:
+        await _read_formulary_file(
+            task,
+            import_log,
+            plan_drug_model,
+            tmp_filename,
+            drug_limit,
+            formulary_flush_rows,
+        )
+    except (ijson.IncompleteJSONError, ijson.JSONError) as exc:
+        message = (
+            f"Incomplete JSON: can't read expected data. {exc}"
+            if isinstance(exc, ijson.IncompleteJSONError)
+            else f"JSON Parsing Error: {exc}"
+        )
+        await _log_formulary_row_error(task, import_log, message)
+        await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
+        return False
+    return True
+
+
 async def process_formulary(ctx, task):
     """
     Download and store formulary (drugs.json) data for an issuer.
@@ -2180,114 +2352,32 @@ async def process_formulary(ctx, task):
     with tempfile.TemporaryDirectory() as tmpdirname:
         source_path = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
         tmp_filename = str(PurePath(str(tmpdirname), source_path.name))
-        try:
-            await download_it_and_save(
-                download_url,
-                tmp_filename,
-                context={"issuer_array": task["issuer_array"], "source": "formulary"},
-                logger=myimportlog,
-            )
-        except Exception as exc:
-            logger.warning("Failed to download formulary data from %s: %s", source_url, exc)
-            await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
+        is_staged = await _is_formulary_file_staged(
+            ctx,
+            task,
+            source_url,
+            download_url,
+            tmp_filename,
+            myimportlog,
+        )
+        if not is_staged:
             return
 
         if await _has_enqueued_mrf_file_chunks(ctx, task, tmp_filename, "formulary", "process_formulary"):
             await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "formulary"))
             return 1
 
-        drug_rows = []
-        processed = 0
-        try:
-            async with async_open(tmp_filename, "rb") as afp:
-                async for formulary_record in ijson.items(afp, "item", use_float=True):
-                    rxnorm_id = str(formulary_record.get("rxnorm_id", "")).strip()
-                    drug_name = str(formulary_record.get("drug_name", "")).strip()
-                    plans = formulary_record.get("plans") or []
-                    if not rxnorm_id or not drug_name or not isinstance(plans, list) or not plans:
-                        await log_error(
-                            "err",
-                            f"Missing required drug fields. rxnorm_id={rxnorm_id!r}",
-                            task.get("issuer_array"),
-                            task.get("url"),
-                            "formulary",
-                            "json",
-                            myimportlog,
-                        )
-                        continue
-
-                    for plan_entry in plans:
-                        plan_id = str(plan_entry.get("plan_id", "")).strip()
-                        plan_id_type = str(plan_entry.get("plan_id_type", "")).strip()
-                        if not plan_id or not plan_id_type:
-                            await log_error(
-                                "err",
-                                f"Plan entry missing identifiers for rxnorm_id={rxnorm_id}",
-                                task.get("issuer_array"),
-                                task.get("url"),
-                                "formulary",
-                                "json",
-                                myimportlog,
-                            )
-                            continue
-                        drug_tier = plan_entry.get("drug_tier")
-                        if isinstance(drug_tier, str):
-                            drug_tier = drug_tier.strip().upper()
-                        drug_row_dict = {
-                            "plan_id": plan_id,
-                            "plan_id_type": plan_id_type,
-                            "rxnorm_id": rxnorm_id,
-                            "drug_name": drug_name,
-                            "drug_tier": drug_tier,
-                            "prior_authorization": _parse_optional_bool(plan_entry.get("prior_authorization")),
-                            "step_therapy": _parse_optional_bool(plan_entry.get("step_therapy")),
-                            "quantity_limit": _parse_optional_bool(plan_entry.get("quantity_limit")),
-                            "last_updated_on": None,
-                        }
-                        if formulary_record.get("last_updated_on"):
-                            try:
-                                drug_row_dict["last_updated_on"] = datetime.datetime.combine(
-                                    parse_date(formulary_record["last_updated_on"], fuzzy=True),
-                                    datetime.datetime.min.time(),
-                                )
-                            except (ValueError, TypeError):
-                                drug_row_dict["last_updated_on"] = None
-                        drug_rows.append(drug_row_dict)
-
-                    processed += 1
-                    if drug_limit and processed >= drug_limit:
-                        break
-                    if len(drug_rows) > formulary_flush_rows:
-                        await _push_mrf_duplicate_tolerant_rows(drug_rows, myplan_drug)
-                        drug_rows.clear()
-
-        except ijson.IncompleteJSONError as exc:
-            await log_error(
-                "err",
-                f"Incomplete JSON: can't read expected data. {exc}",
-                task.get("issuer_array"),
-                task.get("url"),
-                "formulary",
-                "json",
-                myimportlog,
-            )
-            await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
+        is_imported = await _is_formulary_file_imported(
+            ctx,
+            task,
+            myimportlog,
+            myplan_drug,
+            tmp_filename,
+            drug_limit,
+            formulary_flush_rows,
+        )
+        if not is_imported:
             return
-        except ijson.JSONError as exc:
-            await log_error(
-                "err",
-                f"JSON Parsing Error: {exc}",
-                task.get("issuer_array"),
-                task.get("url"),
-                "formulary",
-                "json",
-                myimportlog,
-            )
-            await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
-            return
-
-        if drug_rows:
-            await _push_mrf_duplicate_tolerant_rows(drug_rows, myplan_drug)
 
     await flush_error_log(myimportlog)
     await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "formulary"))

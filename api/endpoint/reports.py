@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 from sanic import Blueprint, response
@@ -125,6 +126,60 @@ _US_STATE_NORMALIZATION = {
     "D.C.": "DC",
     "WASHINGTON DC": "DC",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _MarketSummaryQuery:
+    scope: str
+    sort: str
+    order: str
+    as_of: datetime.date
+    include_staffing: bool
+    limit: int
+    offset: int
+    state: str | None = None
+    city: str | None = None
+    county: str | None = None
+    zip_code: str | None = None
+    chain: str | None = None
+    market_id: str | None = None
+
+
+_MARKET_INTEGER_METRICS = (
+    ("pharmacy_count", "pharmacy_count"),
+    ("active_medicare_pharmacy_count", "active_medicare_pharmacy_count"),
+    ("chain_count", "chain_count"),
+    ("independent_count", "independent_count"),
+    ("mail_order_count", "mail_order_count"),
+    ("retail_count", "retail_count"),
+    ("license_coverage_count", "license_coverage_count"),
+    ("disciplinary_flag_count", "disciplinary_flag_count"),
+    ("ncpdp_registered_count", "ncpdp_registered_count"),
+    ("medicaid_identifier_count", "medicaid_identifier_count"),
+    ("railroad_medicare_identifier_count", "railroad_medicare_identifier_count"),
+    ("ptan_identifier_count", "ptan_identifier_count"),
+    ("clia_identifier_count", "clia_identifier_count"),
+    ("medicare_identifier_count", "medicare_identifier_count"),
+    ("medicare_license_count", "medicare_identifier_count"),
+    ("other_identifier_npi_count", "other_identifier_npi_count"),
+    ("population", "population"),
+)
+_MARKET_FLOAT_METRICS = (
+    ("pharmacies_per_100k", "pharmacies_per_100k"),
+    ("active_medicare_share", "active_medicare_share"),
+    ("license_coverage_share", "license_coverage_share"),
+    ("mail_order_share", "mail_order_share"),
+    ("ncpdp_registered_share", "ncpdp_registered_share"),
+    ("medicaid_identifier_share", "medicaid_identifier_share"),
+    ("railroad_medicare_identifier_share", "railroad_medicare_identifier_share"),
+    ("ptan_identifier_share", "ptan_identifier_share"),
+    ("clia_identifier_share", "clia_identifier_share"),
+    ("medicare_identifier_share", "medicare_identifier_share"),
+    ("medicare_license_share", "medicare_identifier_share"),
+    ("other_identifier_share", "other_identifier_share"),
+    ("chain_concentration", "chain_concentration"),
+    ("access_score", "access_score"),
+)
 
 
 def _get_session(request):
@@ -1497,163 +1552,102 @@ LIMIT :limit OFFSET :offset;
     return count_sql, data_sql, parameter_map
 
 
-async def _query_market_summaries(
-    session,
-    *,
-    scope: str,
-    sort: str,
-    order: str,
-    as_of: datetime.date,
-    include_staffing: bool,
-    limit: int,
-    offset: int,
-    state: str | None = None,
-    city: str | None = None,
-    county: str | None = None,
-    zip_code: str | None = None,
-    chain: str | None = None,
-    market_id: str | None = None,
-) -> tuple[int, list[dict[str, Any]]]:
-    """Query market summaries."""
+async def _build_market_summary_query_sql(session, query: _MarketSummaryQuery):
     has_partd = await _is_table_available(session, PartDPharmacyActivity.__table__)
     has_license = await _is_table_available(session, PharmacyLicenseRecord.__table__)
     has_other_id = await _is_table_available(session, NPIDataOtherIdentifier.__table__)
     address_table_sql = await _resolve_pharmacy_address_table_sql(session)
     count_sql, data_sql, parameter_map = _build_market_sql(
-        scope=scope,
-        sort=sort,
-        order=order,
-        include_staffing=include_staffing,
+        scope=query.scope,
+        sort=query.sort,
+        order=query.order,
+        include_staffing=query.include_staffing,
         has_partd=has_partd,
         has_license=has_license,
         has_other_id=has_other_id,
-        market_id_filter=market_id,
-        state=state,
-        city=city,
-        county=county,
-        zip_code=zip_code,
-        chain=chain,
+        market_id_filter=query.market_id,
+        state=query.state,
+        city=query.city,
+        county=query.county,
+        zip_code=query.zip_code,
+        chain=query.chain,
         address_table_sql=address_table_sql,
     )
     parameter_map = dict(parameter_map)
     parameter_map.update(
         {
-            "as_of": as_of,
-            "limit": limit,
-            "offset": offset,
+            "as_of": query.as_of,
+            "limit": query.limit,
+            "offset": query.offset,
         }
     )
+    return count_sql, data_sql, parameter_map
+
+
+async def _load_market_summary_rows(session, query: _MarketSummaryQuery):
+    count_sql, data_sql, parameter_map = await _build_market_summary_query_sql(session, query)
     market_rows = (await session.execute(text(data_sql), parameter_map)).mappings().all()
     total = _coerce_int(market_rows[0].get("total_count")) if market_rows else 0
-    if not market_rows and offset > 0:
+    if not market_rows and query.offset > 0:
         total = _coerce_int((await session.execute(text(count_sql), parameter_map)).scalar())
-    market_items: list[dict[str, Any]] = []
-    for market_row in market_rows:
-        market_row_dict = dict(market_row)
-        market_row_dict.pop("total_count", None)
-        top_chains = _hydrate_top_chains(market_row_dict.get("top_chains"))
-        metric_by_name = {
-            "pharmacy_count": _coerce_int(market_row_dict.get("pharmacy_count")),
-            "active_medicare_pharmacy_count": _coerce_int(
-                market_row_dict.get("active_medicare_pharmacy_count")
-            ),
-            "chain_count": _coerce_int(market_row_dict.get("chain_count")),
-            "independent_count": _coerce_int(market_row_dict.get("independent_count")),
-            "mail_order_count": _coerce_int(market_row_dict.get("mail_order_count")),
-            "retail_count": _coerce_int(market_row_dict.get("retail_count")),
-            "license_coverage_count": _coerce_int(
-                market_row_dict.get("license_coverage_count")
-            ),
-            "disciplinary_flag_count": _coerce_int(
-                market_row_dict.get("disciplinary_flag_count")
-            ),
-            "ncpdp_registered_count": _coerce_int(
-                market_row_dict.get("ncpdp_registered_count")
-            ),
-            "medicaid_identifier_count": _coerce_int(
-                market_row_dict.get("medicaid_identifier_count")
-            ),
-            "railroad_medicare_identifier_count": _coerce_int(
-                market_row_dict.get("railroad_medicare_identifier_count")
-            ),
-            "ptan_identifier_count": _coerce_int(market_row_dict.get("ptan_identifier_count")),
-            "clia_identifier_count": _coerce_int(market_row_dict.get("clia_identifier_count")),
-            "medicare_identifier_count": _coerce_int(
-                market_row_dict.get("medicare_identifier_count")
-            ),
-            "medicare_license_count": _coerce_int(
-                market_row_dict.get("medicare_identifier_count")
-            ),
-            "other_identifier_npi_count": _coerce_int(
-                market_row_dict.get("other_identifier_npi_count")
-            ),
-            "population": _coerce_int(market_row_dict.get("population")),
-            "pharmacies_per_100k": _coerce_float(
-                market_row_dict.get("pharmacies_per_100k")
-            ),
-            "active_medicare_share": _coerce_float(
-                market_row_dict.get("active_medicare_share")
-            ),
-            "license_coverage_share": _coerce_float(
-                market_row_dict.get("license_coverage_share")
-            ),
-            "mail_order_share": _coerce_float(market_row_dict.get("mail_order_share")),
-            "ncpdp_registered_share": _coerce_float(
-                market_row_dict.get("ncpdp_registered_share")
-            ),
-            "medicaid_identifier_share": _coerce_float(
-                market_row_dict.get("medicaid_identifier_share")
-            ),
-            "railroad_medicare_identifier_share": _coerce_float(
-                market_row_dict.get("railroad_medicare_identifier_share")
-            ),
-            "ptan_identifier_share": _coerce_float(
-                market_row_dict.get("ptan_identifier_share")
-            ),
-            "clia_identifier_share": _coerce_float(
-                market_row_dict.get("clia_identifier_share")
-            ),
-            "medicare_identifier_share": _coerce_float(
-                market_row_dict.get("medicare_identifier_share")
-            ),
-            "medicare_license_share": _coerce_float(
-                market_row_dict.get("medicare_identifier_share")
-            ),
-            "other_identifier_share": _coerce_float(
-                market_row_dict.get("other_identifier_share")
-            ),
-            "chain_concentration": _coerce_float(
-                market_row_dict.get("chain_concentration")
-            ),
-            "access_score": _coerce_float(market_row_dict.get("access_score")),
-            "estimated_pharmacist_count_proxy": (
-                _coerce_int(market_row_dict.get("estimated_pharmacist_count_proxy"))
-                if include_staffing
-                else None
-            ),
-            "top_chains": top_chains,
-        }
-        # Ensure score components stay consistent even when DB precision differs.
-        score = _score_components(metric_by_name)
-        metric_by_name["pharmacies_per_100k"] = score["density_per_100k"]
-        metric_by_name["active_medicare_share"] = score["medicare_share"]
-        metric_by_name["mail_order_share"] = score["mail_order_share"]
-        metric_by_name["license_coverage_share"] = score["license_share"]
-        metric_by_name["access_score"] = score["access_score"]
+    return total, market_rows
 
-        market_items.append(
-            {
-                "market_id": str(market_row_dict.get("market_id") or ""),
-                "market_scope": str(market_row_dict.get("market_scope") or scope),
-                "market_name": market_row_dict.get("market_name"),
-                "state": market_row_dict.get("state"),
-                "city": market_row_dict.get("city"),
-                "county": market_row_dict.get("county"),
-                "zip_code": market_row_dict.get("zip_code"),
-                "metrics": metric_by_name,
-            }
-        )
-    return total, market_items
+
+def _normalize_market_summary_metrics(market_row_dict, *, include_staffing: bool):
+    metric_by_name = {
+        metric_name: _coerce_int(market_row_dict.get(column_name))
+        for metric_name, column_name in _MARKET_INTEGER_METRICS
+    }
+    metric_by_name.update(
+        {
+            metric_name: _coerce_float(market_row_dict.get(column_name))
+            for metric_name, column_name in _MARKET_FLOAT_METRICS
+        }
+    )
+    metric_by_name["estimated_pharmacist_count_proxy"] = (
+        _coerce_int(market_row_dict.get("estimated_pharmacist_count_proxy"))
+        if include_staffing
+        else None
+    )
+    metric_by_name["top_chains"] = _hydrate_top_chains(market_row_dict.get("top_chains"))
+    score = _score_components(metric_by_name)
+    metric_by_name.update(
+        {
+            "pharmacies_per_100k": score["density_per_100k"],
+            "active_medicare_share": score["medicare_share"],
+            "mail_order_share": score["mail_order_share"],
+            "license_coverage_share": score["license_share"],
+            "access_score": score["access_score"],
+        }
+    )
+    return metric_by_name
+
+
+def _normalize_market_summary(market_row, query: _MarketSummaryQuery) -> dict[str, Any]:
+    market_row_dict = dict(market_row)
+    market_row_dict.pop("total_count", None)
+    return {
+        "market_id": str(market_row_dict.get("market_id") or ""),
+        "market_scope": str(market_row_dict.get("market_scope") or query.scope),
+        "market_name": market_row_dict.get("market_name"),
+        "state": market_row_dict.get("state"),
+        "city": market_row_dict.get("city"),
+        "county": market_row_dict.get("county"),
+        "zip_code": market_row_dict.get("zip_code"),
+        "metrics": _normalize_market_summary_metrics(
+            market_row_dict,
+            include_staffing=query.include_staffing,
+        ),
+    }
+
+
+async def _query_market_summaries(
+    session,
+    query: _MarketSummaryQuery,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Query market summaries."""
+    total, market_rows = await _load_market_summary_rows(session, query)
+    return total, [_normalize_market_summary(market_row, query) for market_row in market_rows]
 
 
 async def _fetch_pharmacy_context(session, *, npi: int, as_of: datetime.date) -> dict[str, Any] | None:
@@ -1892,18 +1886,20 @@ async def list_pharmacy_markets(request):
 
     total, market_items = await _query_market_summaries(
         session,
-        scope=scope,
-        sort=sort,
-        order=order,
-        as_of=as_of,
-        include_staffing=include_staffing,
-        limit=pagination.limit,
-        offset=pagination.offset,
-        state=(str(state).strip().upper() if state else None),
-        city=(str(city).strip().upper() if city else None),
-        county=(str(county).strip() if county else None),
-        zip_code=zip_code,
-        chain=chain,
+        _MarketSummaryQuery(
+            scope=scope,
+            sort=sort,
+            order=order,
+            as_of=as_of,
+            include_staffing=include_staffing,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            state=(str(state).strip().upper() if state else None),
+            city=(str(city).strip().upper() if city else None),
+            county=(str(county).strip() if county else None),
+            zip_code=zip_code,
+            chain=chain,
+        ),
     )
     return response.json(
         {
@@ -1943,14 +1939,16 @@ async def get_pharmacy_market_by_id(request, market_id):
     include_staffing = _is_boolean_parameter_enabled(request.args.get("include_staffing"), default=False)
     total, market_items = await _query_market_summaries(
         session,
-        scope=scope,
-        sort="access_score",
-        order="desc",
-        as_of=as_of,
-        include_staffing=include_staffing,
-        limit=1,
-        offset=0,
-        market_id=market_id,
+        _MarketSummaryQuery(
+            scope=scope,
+            sort="access_score",
+            order="desc",
+            as_of=as_of,
+            include_staffing=include_staffing,
+            limit=1,
+            offset=0,
+            market_id=market_id,
+        ),
     )
     if total <= 0 or not market_items:
         raise NotFound("Unknown market_id")
@@ -2000,18 +1998,20 @@ async def list_pharmacy_access_rankings(request):
     chain = _canonical_chain(args.get("chain"))
     total, market_items = await _query_market_summaries(
         session,
-        scope=scope,
-        sort="access_score",
-        order="desc",
-        as_of=as_of,
-        include_staffing=include_staffing,
-        limit=pagination.limit,
-        offset=pagination.offset,
-        state=(str(state).strip().upper() if state else None),
-        city=(str(city).strip().upper() if city else None),
-        county=(str(county).strip() if county else None),
-        zip_code=zip_code,
-        chain=chain,
+        _MarketSummaryQuery(
+            scope=scope,
+            sort="access_score",
+            order="desc",
+            as_of=as_of,
+            include_staffing=include_staffing,
+            limit=pagination.limit,
+            offset=pagination.offset,
+            state=(str(state).strip().upper() if state else None),
+            city=(str(city).strip().upper() if city else None),
+            county=(str(county).strip() if county else None),
+            zip_code=zip_code,
+            chain=chain,
+        ),
     )
     ranked_markets = []
     for idx, market_item in enumerate(market_items, start=1):
@@ -2130,17 +2130,19 @@ async def get_pharmacy_market_context(request, npi):
 
     total, market_items = await _query_market_summaries(
         session,
-        scope=scope,
-        sort="access_score",
-        order="desc",
-        as_of=as_of,
-        include_staffing=include_staffing,
-        limit=1,
-        offset=0,
-        state=(str(pharmacy.get("state") or "").strip().upper() or None),
-        city=(str(pharmacy.get("city") or "").strip().upper() or None),
-        county=(str(pharmacy.get("county") or "").strip() or None),
-        zip_code=(str(pharmacy.get("zip_code") or "").strip() or None),
+        _MarketSummaryQuery(
+            scope=scope,
+            sort="access_score",
+            order="desc",
+            as_of=as_of,
+            include_staffing=include_staffing,
+            limit=1,
+            offset=0,
+            state=(str(pharmacy.get("state") or "").strip().upper() or None),
+            city=(str(pharmacy.get("city") or "").strip().upper() or None),
+            county=(str(pharmacy.get("county") or "").strip() or None),
+            zip_code=(str(pharmacy.get("zip_code") or "").strip() or None),
+        ),
     )
     market = market_items[0] if total > 0 and market_items else None
     return response.json(

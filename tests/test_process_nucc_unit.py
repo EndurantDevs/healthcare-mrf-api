@@ -26,6 +26,51 @@ def nucc_module():
 
 
 @pytest.mark.asyncio
+async def test_prepare_nucc_import_requires_import_date(nucc_module):
+    with pytest.raises(KeyError, match="import_date"):
+        await nucc_module._prepare_nucc_import({}, {})
+
+
+def test_nucc_taxonomy_row_preserves_nullable_columns(nucc_module):
+    taxonomy_by_field = {"Code": "1234", "Classification": None}
+    csv_map = {"Code": "code", "Classification": "classification"}
+
+    normalized_row = nucc_module._nucc_taxonomy_row(taxonomy_by_field, csv_map)
+
+    assert normalized_row["code"] == "1234"
+    assert normalized_row["classification"] is None
+    assert "int_code" in normalized_row
+
+
+def test_report_nucc_source_progress_preserves_lifecycle(monkeypatch, nucc_module):
+    progress_event_list = []
+    monkeypatch.setattr(
+        nucc_module,
+        "enqueue_live_progress",
+        lambda **event_by_name: progress_event_list.append(event_by_name),
+    )
+
+    for completed in (False, True):
+        nucc_module._report_nucc_source_progress(
+            "run_123",
+            "nucc.csv",
+            file_index=0,
+            file_count=1,
+            completed=completed,
+        )
+
+    assert [event["phase"] for event in progress_event_list] == [
+        "nucc downloading source",
+        "nucc source processed",
+    ]
+    assert [event["done"] for event in progress_event_list] == [0, 1]
+    assert [event["message"] for event in progress_event_list] == [
+        "downloading file 1/1",
+        "processed file 1/1",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_process_data_extracts_records(monkeypatch, nucc_module, tmp_path):
     html = '<a href="/images/stories/CSV/nucc_taxonomy_001.csv">download</a>'
 

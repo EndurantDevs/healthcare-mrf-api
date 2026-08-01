@@ -34,9 +34,8 @@ def is_test_mode(ctx: dict) -> bool:
     return bool(ctx.get("context", {}).get("test_mode"))
 
 
-async def process_nucc_data(ctx, task=None):
-    """Process one queued NUCC taxonomy import task."""
-    task = task or {}
+async def _prepare_nucc_import(ctx: dict, task: dict) -> tuple[str, str, bool]:
+    """Initialize one NUCC import and return its execution settings."""
     await raise_if_cancelled(ctx, task)
     import_date = ctx['import_date']
     ctx.setdefault('context', {})
@@ -45,11 +44,19 @@ async def process_nucc_data(ctx, task=None):
     test_mode = bool(task.get('test_mode', context.get('test_mode', False)))
     context['test_mode'] = test_mode
     await ensure_database(test_mode)
+    return import_date, run_id, test_mode
+
+
+async def _discover_nucc_source_files(test_mode: bool) -> list[str]:
+    """Download the NUCC index and select source files for this run."""
     html_source = await download_it(
         os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_FILE'])
-
     source_files = re.findall(r'\"(.*?nucc_taxonomy.*?\.csv)\"', html_source)
-    selected_files = source_files[:TEST_NUCC_MAX_FILES] if test_mode else source_files
+    return source_files[:TEST_NUCC_MAX_FILES] if test_mode else source_files
+
+
+def _report_nucc_sources_discovered(run_id: str, selected_files: list[str]) -> None:
+    """Publish the discovered-source progress event when this run is tracked."""
     if run_id:
         enqueue_live_progress(
             run_id=run_id,
@@ -61,104 +68,175 @@ async def process_nucc_data(ctx, task=None):
             total=len(selected_files),
             message=f"{len(selected_files)} source files discovered",
         )
-    for file_index, source_file in enumerate(selected_files):
-        if run_id:
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="nucc",
-                status="running",
-                phase="nucc downloading source",
-                unit="files",
-                done=file_index,
-                total=len(selected_files),
-                message=f"downloading file {file_index + 1}/{len(selected_files)}",
-                label=source_file,
-            )
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            print(f"Found: {source_file}")
-            file_name = source_file.split('/')[-1]
-            tmp_filename = str(PurePath(str(tmpdirname), file_name))
-            await download_it_and_save(
-                os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_DIR'] + source_file,
-                tmp_filename,
-                chunk_size=10 * 1024 * 1024,
-                cache_dir='/tmp',
-            )
-            print(f"Downloaded: {source_file}")
-            csv_map, csv_map_reverse = ({}, {})
-            async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
-                async for header_row in AsyncDictReader(afp, delimiter=","):
-                    for key in header_row:
-                        normalized_column_name = (
-                            re.sub(r"\(.*\)", r"", key.lower())
-                            .strip()
-                            .replace(' ', '_')
-                        )
-                        csv_map[key] = normalized_column_name
-                        csv_map_reverse[normalized_column_name] = key
-                    break
-
-            count = 0
 
 
-            row_list = []
-            nucc_taxonomy_cls = make_class(NUCCTaxonomy, import_date)
-            async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
-                async for taxonomy_row in AsyncDictReader(afp, delimiter=","):
-                    if not taxonomy_row['Code']:
-                        continue
-                    count += 1
-                    if test_mode and count > TEST_NUCC_ROWS:
-                        break
-                    if not count % 100_000:
-                        print(f"Processed: {count}")
-                        await raise_if_cancelled(ctx, task)
-                    if run_id and count and count % (100 if test_mode else 100_000) == 0:
-                        enqueue_live_progress(
-                            run_id=run_id,
-                            importer="nucc",
-                            status="running",
-                            phase="nucc parsing rows",
-                            unit="rows",
-                            done=count,
-                            total=TEST_NUCC_ROWS if test_mode else None,
-                            message=f"parsed {count} rows",
-                            label=source_file,
-                        )
-                    taxonomy_dict = {}
-                    for key, mapped_key in csv_map.items():
-                        cell_value = taxonomy_row[key]
-                        if not cell_value:
-                            taxonomy_dict[mapped_key] = None
-                            continue
-                        taxonomy_dict[mapped_key] = cell_value
-                    taxonomy_dict['int_code'] = return_checksum(
-                        [taxonomy_dict['code']], crc=32
-                    )
-                    row_list.append(taxonomy_dict)
-                    if count % 9999 == 0:
-                        await raise_if_cancelled(ctx, task)
-                        await push_objects(row_list, nucc_taxonomy_cls)
-                        row_list.clear()
+async def _read_nucc_csv_map(tmp_filename: str) -> dict[str, str]:
+    """Read the NUCC header and normalize its column names."""
+    csv_map = {}
+    async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
+        async for header_row in AsyncDictReader(afp, delimiter=","):
+            csv_map = {
+                key: re.sub(r"\(.*\)", r"", key.lower()).strip().replace(' ', '_')
+                for key in header_row
+            }
+            break
+    return csv_map
 
 
-            await raise_if_cancelled(ctx, task)
-            await push_objects(row_list, nucc_taxonomy_cls)
-            print(f"Processed: {count}")
-            context["run"] = context.get("run", 0) + 1
-            context["rows"] = count
-            if run_id:
+def _nucc_taxonomy_row(taxonomy_row: dict, csv_map: dict[str, str]) -> dict:
+    """Normalize one non-empty NUCC taxonomy row for staging."""
+    taxonomy_dict = {
+        mapped_key: taxonomy_row[key] or None
+        for key, mapped_key in csv_map.items()
+    }
+    taxonomy_dict['int_code'] = return_checksum([taxonomy_dict['code']], crc=32)
+    return taxonomy_dict
+
+
+async def _stage_nucc_taxonomy_rows(
+    ctx: dict,
+    task: dict,
+    tmp_filename: str,
+    csv_map: dict[str, str],
+    nucc_taxonomy_cls,
+    *,
+    test_mode: bool,
+    run_id: str,
+    source_file: str,
+) -> int:
+    """Parse and stage taxonomy rows, retaining original cancellation and batch points."""
+    count = 0
+    row_list = []
+    async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
+        async for taxonomy_row in AsyncDictReader(afp, delimiter=","):
+            if not taxonomy_row['Code']:
+                continue
+            count += 1
+            if test_mode and count > TEST_NUCC_ROWS:
+                break
+            if not count % 100_000:
+                print(f"Processed: {count}")
+                await raise_if_cancelled(ctx, task)
+            if run_id and count and count % (100 if test_mode else 100_000) == 0:
                 enqueue_live_progress(
                     run_id=run_id,
                     importer="nucc",
                     status="running",
-                    phase="nucc source processed",
-                    unit="files",
-                    done=file_index + 1,
-                    total=len(selected_files),
-                    message=f"processed file {file_index + 1}/{len(selected_files)}",
+                    phase="nucc parsing rows",
+                    unit="rows",
+                    done=count,
+                    total=TEST_NUCC_ROWS if test_mode else None,
+                    message=f"parsed {count} rows",
                     label=source_file,
                 )
+            row_list.append(_nucc_taxonomy_row(taxonomy_row, csv_map))
+            if count % 9999 == 0:
+                await raise_if_cancelled(ctx, task)
+                await push_objects(row_list, nucc_taxonomy_cls)
+                row_list.clear()
+    await raise_if_cancelled(ctx, task)
+    await push_objects(row_list, nucc_taxonomy_cls)
+    print(f"Processed: {count}")
+    return count
+
+
+def _report_nucc_source_progress(
+    run_id: str,
+    source_file: str,
+    *,
+    file_index: int,
+    file_count: int,
+    completed: bool,
+) -> None:
+    """Publish a source-file progress event for a tracked NUCC run."""
+    enqueue_live_progress(
+        run_id=run_id,
+        importer="nucc",
+        status="running",
+        phase="nucc source processed" if completed else "nucc downloading source",
+        unit="files",
+        done=file_index + int(completed),
+        total=file_count,
+        message=(
+            f"processed file {file_index + 1}/{file_count}"
+            if completed
+            else f"downloading file {file_index + 1}/{file_count}"
+        ),
+        label=source_file,
+    )
+
+
+async def _process_nucc_source(
+    ctx: dict,
+    task: dict,
+    source_file: str,
+    *,
+    import_date: str,
+    file_index: int,
+    file_count: int,
+) -> None:
+    """Download, parse, and stage one NUCC source file."""
+    context = ctx['context']
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    test_mode = bool(context.get('test_mode'))
+    if run_id:
+        _report_nucc_source_progress(
+            run_id,
+            source_file,
+            file_index=file_index,
+            file_count=file_count,
+            completed=False,
+        )
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        print(f"Found: {source_file}")
+        file_name = source_file.split('/')[-1]
+        tmp_filename = str(PurePath(str(tmpdirname), file_name))
+        await download_it_and_save(
+            os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_DIR'] + source_file,
+            tmp_filename,
+            chunk_size=10 * 1024 * 1024,
+            cache_dir='/tmp',
+        )
+        print(f"Downloaded: {source_file}")
+        csv_map = await _read_nucc_csv_map(tmp_filename)
+        nucc_taxonomy_cls = make_class(NUCCTaxonomy, import_date)
+        count = await _stage_nucc_taxonomy_rows(
+            ctx,
+            task,
+            tmp_filename,
+            csv_map,
+            nucc_taxonomy_cls,
+            test_mode=test_mode,
+            run_id=run_id,
+            source_file=source_file,
+        )
+        context["run"] = context.get("run", 0) + 1
+        context["rows"] = count
+        if run_id:
+            _report_nucc_source_progress(
+                run_id,
+                source_file,
+                file_index=file_index,
+                file_count=file_count,
+                completed=True,
+            )
+
+
+async def process_nucc_data(ctx, task=None):
+    """Process one queued NUCC taxonomy import task."""
+    task = task or {}
+    import_date, run_id, test_mode = await _prepare_nucc_import(ctx, task)
+    selected_files = await _discover_nucc_source_files(test_mode)
+    _report_nucc_sources_discovered(run_id, selected_files)
+    for file_index, source_file in enumerate(selected_files):
+        await _process_nucc_source(
+            ctx,
+            task,
+            source_file,
+            import_date=import_date,
+            file_index=file_index,
+            file_count=len(selected_files),
+        )
         return 1
 
 

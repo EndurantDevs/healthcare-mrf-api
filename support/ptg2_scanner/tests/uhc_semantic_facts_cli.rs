@@ -311,15 +311,11 @@ fn native_quarantine_tombstone_passes_python_sparse_raw_verification() {
         String::from_utf8_lossy(&verified.stderr)
     );
     let census: Value = serde_json::from_slice(&verified.stdout).expect("Python census JSON");
-    assert_eq!(
-        census,
-        serde_json::json!({
-            "invalid_npi_address_rows": 1,
-            "invalid_npi_facility_records": 0,
-            "invalid_npi_individual_records": 1,
-            "invalid_npi_provider_plan_rows": 1,
-        })
-    );
+    let expected_census: Value = serde_json::from_str(
+        r#"{"invalid_npi_address_rows":1,"invalid_npi_facility_records":0,"invalid_npi_individual_records":1,"invalid_npi_provider_plan_rows":1,"invalid_npi_structure_address_rows":0,"invalid_npi_structure_count":0,"invalid_npi_structure_facility_records":0,"invalid_npi_structure_individual_records":0,"invalid_npi_structure_provider_plan_rows":0}"#,
+    )
+    .expect("expected native quarantine census");
+    assert_eq!(census, expected_census);
 }
 
 #[test]

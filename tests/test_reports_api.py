@@ -256,6 +256,38 @@ async def test_fetch_pharmacy_context_uses_unified_address_table_by_default_when
     assert "a.zip5 AS zip_code" in session.sql
 
 
+def _assert_normalized_market_summary(market_summary):
+    assert market_summary == {
+        "market_id": "city:TX:austin",
+        "market_scope": "city",
+        "market_name": "Austin",
+        "state": "TX",
+        "city": "Austin",
+        "county": None,
+        "zip_code": None,
+        "metrics": {
+            "pharmacy_count": 10, "active_medicare_pharmacy_count": 9,
+            "chain_count": 6, "independent_count": 4,
+            "mail_order_count": 1, "retail_count": 9,
+            "license_coverage_count": 10, "disciplinary_flag_count": 0,
+            "ncpdp_registered_count": 0, "medicaid_identifier_count": 0,
+            "railroad_medicare_identifier_count": 0, "ptan_identifier_count": 0,
+            "clia_identifier_count": 0, "medicare_identifier_count": 0,
+            "medicare_license_count": 0, "other_identifier_npi_count": 0,
+            "population": 100000, "pharmacies_per_100k": 10.0,
+            "active_medicare_share": 0.9, "license_coverage_share": 1.0,
+            "mail_order_share": 0.1, "ncpdp_registered_share": 0.0,
+            "medicaid_identifier_share": 0.0,
+            "railroad_medicare_identifier_share": 0.0,
+            "ptan_identifier_share": 0.0, "clia_identifier_share": 0.0,
+            "medicare_identifier_share": 0.0, "medicare_license_share": 0.0,
+            "other_identifier_share": 0.0, "chain_concentration": 0.6,
+            "access_score": 53.25, "estimated_pharmacist_count_proxy": None,
+            "top_chains": [],
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_query_market_summaries_avoids_count_query_when_data_present(monkeypatch):
     monkeypatch.setattr(reports, "_is_table_available", AsyncMock(return_value=False))
@@ -297,16 +329,19 @@ async def test_query_market_summaries_avoids_count_query_when_data_present(monke
 
     total, market_summaries = await reports._query_market_summaries(
         Session(),
-        scope="city",
-        sort="access_score",
-        order="desc",
-        as_of=reports.datetime.date(2026, 3, 18),
-        include_staffing=False,
-        limit=25,
-        offset=0,
+        reports._MarketSummaryQuery(
+            scope="city",
+            sort="access_score",
+            order="desc",
+            as_of=reports.datetime.date(2026, 3, 18),
+            include_staffing=False,
+            limit=25,
+            offset=0,
+        ),
     )
     assert total == 123
-    assert market_summaries and market_summaries[0]["market_id"] == "city:TX:austin"
+    assert len(market_summaries) == 1
+    _assert_normalized_market_summary(market_summaries[0])
 
 
 @pytest.mark.asyncio
@@ -324,13 +359,15 @@ async def test_query_market_summaries_uses_count_fallback_for_empty_offset_page(
 
     total, items = await reports._query_market_summaries(
         Session(),
-        scope="city",
-        sort="access_score",
-        order="desc",
-        as_of=reports.datetime.date(2026, 3, 18),
-        include_staffing=False,
-        limit=25,
-        offset=25,
+        reports._MarketSummaryQuery(
+            scope="city",
+            sort="access_score",
+            order="desc",
+            as_of=reports.datetime.date(2026, 3, 18),
+            include_staffing=False,
+            limit=25,
+            offset=25,
+        ),
     )
     assert total == 77
     assert items == []

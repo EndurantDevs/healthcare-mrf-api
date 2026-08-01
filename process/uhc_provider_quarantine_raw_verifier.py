@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 """Sparse independent raw-byte proof for redacted UHC provider tombstones."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,7 +19,7 @@ from process.uhc_provider_quarantine_record import (
     UhcProviderQuarantineRecordCensus,
     UhcProviderQuarantineRecordError,
     combine_provider_quarantine_census,
-    validate_checksum_invalid_provider_record,
+    validate_provider_quarantine_record,
 )
 from process.uhc_retained_range_manifest import load_verified_range_manifest
 from process.uhc_retained_types import (
@@ -229,10 +228,13 @@ def _validate_target_record(
             "retained UHC quarantine record JSON is invalid"
         ) from error
     try:
-        return validate_checksum_invalid_provider_record(decoded)
+        return validate_provider_quarantine_record(
+            decoded,
+            quarantine.reason,
+        )
     except UhcProviderQuarantineRecordError as error:
         raise UhcProviderQuarantineRawError(
-            "retained UHC quarantine is not checksum-invalid-only"
+            "retained UHC quarantine reason does not match raw source"
         ) from error
 
 
@@ -474,7 +476,7 @@ def verify_provider_quarantine_source_records(
     quarantines: tuple[UhcProviderQuarantine, ...],
     max_record_bytes: int,
 ) -> UhcProviderQuarantineRecordCensus:
-    """Re-read only affected verified ranges and prove checksum-only rejection."""
+    """Re-read affected verified ranges and prove each exact rejection."""
 
     if type(source) is not UhcProviderQuarantineRawSource:
         raise UhcProviderQuarantineRawError(

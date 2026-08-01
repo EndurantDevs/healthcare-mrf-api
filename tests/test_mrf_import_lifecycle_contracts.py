@@ -388,6 +388,39 @@ async def test_formulary_import_normalizes_flags_and_rejects_incomplete_rows(
 
 
 @pytest.mark.parametrize(
+    ("parse_error", "message_prefix"),
+    [
+        (initial.ijson.IncompleteJSONError("truncated"), "Incomplete JSON"),
+        (initial.ijson.JSONError("malformed"), "JSON Parsing Error"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_formulary_parse_errors_preserve_terminal_messages(
+    monkeypatch,
+    parse_error,
+    message_prefix,
+):
+    monkeypatch.setattr(
+        initial,
+        "_read_formulary_file",
+        AsyncMock(side_effect=parse_error),
+    )
+    monkeypatch.setattr(initial, "_log_formulary_row_error", AsyncMock())
+    monkeypatch.setattr(initial, "_mark_mrf_task_terminal", AsyncMock())
+    task = _import_task("formulary")
+
+    is_imported = await initial._is_formulary_file_imported(
+        _import_context(), task, object(), object(), "formulary.json", None, 1
+    )
+
+    assert is_imported is False
+    assert initial._log_formulary_row_error.await_args.args[2].startswith(message_prefix)
+    initial._mark_mrf_task_terminal.assert_awaited_once_with(
+        ANY, task, "formulary", cleanup_chunk=True
+    )
+
+
+@pytest.mark.parametrize(
     ("importer", "kind"),
     [
         (initial.process_plan, "plan"),

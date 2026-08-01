@@ -126,7 +126,7 @@ async def test_report_market_handlers_select_zip_and_county_defaults(
             )
             market_response = await handler(request)
             assert market_response.status == 200
-            assert market_query.await_args.kwargs["scope"] == expected_scope
+            assert market_query.await_args.args[1].scope == expected_scope
 
 
 @pytest.mark.asyncio
@@ -170,7 +170,7 @@ async def test_report_endpoint_error_and_context_scope_edges(monkeypatch) -> Non
             "1234567890",
         )
         assert context_response.status == 200
-        assert market_query.await_args.kwargs["scope"] == expected_scope
+        assert market_query.await_args.args[1].scope == expected_scope
 
 
 def test_catalog_paging_mapping_and_identity_edges() -> None:

@@ -152,6 +152,51 @@ def test_validate_semantic_source_summary_accepts_aggregate_rejection_proof():
     assert "source_file_id" not in serialized
 
 
+def test_validate_semantic_source_summary_accounts_for_structural_rejection():
+    summary = _uhc_summary()
+    summary["invalid_npi_count"] = 1
+    summary["rejected_counts"] = {
+        "invalid_npi_checksum": 0,
+        "invalid_npi_checksum_individual_records": 0,
+        "invalid_npi_checksum_facility_records": 0,
+        "invalid_npi_checksum_address_rows": 0,
+        "invalid_npi_checksum_provider_plan_rows": 0,
+        "invalid_npi_structure": 1,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 1,
+        "invalid_npi_structure_address_rows": 1,
+        "invalid_npi_structure_provider_plan_rows": 1,
+    }
+    for resource_type in (
+        "Organization",
+        "Location",
+        "OrganizationAffiliation",
+    ):
+        summary["resource_counts"][resource_type] -= 1
+    summary["total_resources"] = sum(summary["resource_counts"].values())
+    summary["summary_sha256"] = source_summary_sha256(summary)
+
+    validated = validate_semantic_source_summary(
+        summary,
+        expected_by_field={},
+    )
+
+    assert validated["rejected_counts"]["invalid_npi_structure"] == 1
+    assert "record_sha256" not in repr(validated)
+
+
+def test_validate_semantic_source_summary_rejects_partial_current_reason_map():
+    summary = _uhc_summary_with_one_rejection()
+    summary["rejected_counts"]["invalid_npi_structure"] = 0
+    summary["summary_sha256"] = source_summary_sha256(summary)
+
+    with pytest.raises(
+        ProviderDirectorySourceSummaryError,
+        match="provider_directory_source_summary_uhc_metrics_inconsistent",
+    ):
+        validate_semantic_source_summary(summary, expected_by_field={})
+
+
 def test_validate_uhc_summary_preserves_per_file_quarantine_rate() -> None:
     summary = _uhc_summary()
     summary["invalid_npi_count"] = 2

@@ -10,7 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from process.uhc_provider_quarantine_contract import UhcProviderQuarantine
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE,
+    UhcProviderQuarantine,
+)
 from process.uhc_provider_quarantine_raw_verifier import (
     UhcProviderQuarantineRawError,
     UhcProviderQuarantineRawSource,
@@ -19,6 +23,7 @@ from process.uhc_provider_quarantine_raw_verifier import (
 from process.uhc_provider_quarantine_record import (
     UhcProviderQuarantineRecordError,
     validate_checksum_invalid_provider_record,
+    validate_structurally_invalid_provider_record,
 )
 from process.uhc_retained_range_manifest import (
     RANGE_CANONICALIZATION_ID,
@@ -167,11 +172,22 @@ def _write_fixture_manifest(
     return manifest_path, manifest_bytes, range_set_sha256
 
 
-def _fixture(tmp_path, plan_years: tuple[int, ...] = (2026,)):
+def _fixture(
+    tmp_path,
+    plan_years: tuple[int, ...] = (2026,),
+    *,
+    rejected_npi: str = "1003821381",
+    reason: str = UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+):
     """Create exact admitted raw/manifest fixtures for sparse verification."""
 
     tmp_path.mkdir(parents=True, exist_ok=True)
     record_bytes = _fixture_record_bytes(plan_years)
+    if rejected_npi != "1003821381":
+        record_bytes[1] = record_bytes[1].replace(
+            b"1003821381",
+            rejected_npi.encode(),
+        )
     raw_bytes = b"[" + b",".join(record_bytes) + b"]"
     artifact_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     raw_path = tmp_path / f"raw-{artifact_sha256}.json"
@@ -196,6 +212,7 @@ def _fixture(tmp_path, plan_years: tuple[int, ...] = (2026,)):
         range_ordinal=1,
         occurrence_ordinal=1,
         record_sha256=hashlib.sha256(record_bytes[1]).hexdigest(),
+        reason=reason,
     )
     argument_by_field = {
         "source": UhcProviderQuarantineRawSource(
@@ -227,7 +244,28 @@ def test_sparse_raw_verifier_binds_exact_checksum_invalid_record(tmp_path):
         "invalid_npi_facility_records": 0,
         "invalid_npi_address_rows": 1,
         "invalid_npi_provider_plan_rows": 1,
+        "invalid_npi_structure_count": 0,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 0,
+        "invalid_npi_structure_address_rows": 0,
+        "invalid_npi_structure_provider_plan_rows": 0,
     }
+
+
+def test_sparse_raw_verifier_binds_structural_reason_and_census(tmp_path):
+    arguments, _records = _fixture(
+        tmp_path,
+        rejected_npi="3000000000",
+        reason=UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE,
+    )
+
+    census = verify_provider_quarantine_source_records(**arguments)
+
+    assert census.structural_count == 1
+    assert census.structural_individual_records == 1
+    assert census.structural_facility_records == 0
+    assert census.structural_address_rows == 1
+    assert census.structural_provider_plan_rows == 1
 
 
 def test_sparse_raw_verifier_rejects_overridden_source_contract(tmp_path):
@@ -314,6 +352,34 @@ def test_checksum_invalid_record_matches_native_permissive_plan_text() -> None:
     assert census.provider_plan_rows == 2
 
 
+def test_structural_record_requires_a_string_shape_failure_only() -> None:
+    census = validate_structurally_invalid_provider_record(
+        _provider_record("3000000000")
+    )
+
+    assert census.structural_count == 1
+    assert census.structural_individual_records == 1
+
+    for npi in (
+        None,
+        3_000_000_000,
+        "123",
+        "abcdefghij",
+        "0000000000",
+        "1003821380",
+        "1003821381",
+    ):
+        with pytest.raises(UhcProviderQuarantineRecordError):
+            validate_structurally_invalid_provider_record(
+                _provider_record(npi)
+            )
+
+    malformed = _provider_record("3000000000")
+    malformed["plans"] = []
+    with pytest.raises(UhcProviderQuarantineRecordError, match="plans"):
+        validate_structurally_invalid_provider_record(malformed)
+
+
 @pytest.mark.parametrize("npi", [None, "123", "abcdefghij", "9999999999", "1003821380"])
 def test_quarantine_record_rejects_non_checksum_only_npi_classes(npi):
     with pytest.raises(UhcProviderQuarantineRecordError):
@@ -344,7 +410,7 @@ def test_sparse_raw_verifier_rejects_hash_and_checksum_class_drift(tmp_path):
             record_sha256=hashlib.sha256(records[0]).hexdigest(),
         ),
     )
-    with pytest.raises(UhcProviderQuarantineRawError, match="checksum-invalid-only"):
+    with pytest.raises(UhcProviderQuarantineRawError, match="reason does not match"):
         verify_provider_quarantine_source_records(**arguments)
 
 

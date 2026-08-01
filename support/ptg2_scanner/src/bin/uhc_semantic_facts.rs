@@ -263,5 +263,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not an object"));
+
+        let directory = tempfile::tempdir().expect("temporary encoder fixture");
+        let fixture = directory.path().join("encoder.bin");
+        std::fs::write(&fixture, b"healthporta-uhc-encoder").unwrap();
+        assert_eq!(
+            file_sha256(&fixture).unwrap(),
+            "4cdbf6d3a5a6fdaf006be81d06afe01554e95d1c97636701295d4d93d3c33cde"
+        );
+
+        assert_eq!(parse_u64("42".to_owned(), "--count").unwrap(), 42);
+        assert!(parse_u64("-1".to_owned(), "--count").is_err());
+        assert_eq!(parse_usize("7".to_owned(), "--workers").unwrap(), 7);
+        assert!(parse_usize("many".to_owned(), "--workers").is_err());
+
+        let mut fields = BTreeMap::from([
+            ("--required".to_owned(), "value".to_owned()),
+            ("--workers".to_owned(), "3".to_owned()),
+        ]);
+        assert_eq!(take_required(&mut fields, "--required").unwrap(), "value");
+        assert!(take_required(&mut fields, "--missing").is_err());
+        assert_eq!(take_optional_usize(&mut fields, "--workers", 1).unwrap(), 3);
+        assert_eq!(take_optional_usize(&mut fields, "--default", 5).unwrap(), 5);
     }
 }
