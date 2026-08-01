@@ -87,7 +87,7 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260801140000_ptg2_legacy_v3_metadata_reconcile"
+        "20260731190000_tiger_zcta5_zip_index"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (

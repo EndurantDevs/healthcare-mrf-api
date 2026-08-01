@@ -1,7 +1,7 @@
 """Add the TIGER ZCTA ZIP lookup index required by spatial serving.
 
 Revision ID: 20260731190000_tiger_zcta5_zip_index
-Revises: 20260801010000_uhc_semantic_layout_identity
+Revises: 20260801140000_ptg2_legacy_v3_metadata_reconcile
 """
 
 from __future__ import annotations
