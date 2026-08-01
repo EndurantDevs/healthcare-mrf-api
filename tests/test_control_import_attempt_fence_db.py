@@ -112,6 +112,14 @@ def _install_frozen_failure_harness(
     monkeypatch,
     harness: _FrozenValidationFailureHarness,
 ) -> None:
+    async def admit_worker_start(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        ptg_control,
+        "guard_ptg_worker_start",
+        admit_worker_start,
+    )
     monkeypatch.setattr(
         ptg_control,
         "_stale_ptg_job_result",

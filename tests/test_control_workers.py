@@ -1,6 +1,129 @@
 from __future__ import annotations
 
+import pytest
+
 from api import control_workers
+
+
+@pytest.mark.asyncio
+async def test_guarded_ptg_ensure_requires_exact_source_identity(monkeypatch):
+    admitted_calls: list[dict[str, object]] = []
+
+    async def admit(**kwargs):
+        admitted_calls.append(kwargs)
+        return {"importer": "ptg"}
+
+    monkeypatch.setattr(
+        control_workers,
+        "admit_existing_outer_run_action",
+        admit,
+    )
+    monkeypatch.setattr(
+        control_workers,
+        "ensure_worker",
+        lambda _worker_payload: {"status": "already_running", "items": []},
+    )
+
+    response = await control_workers.guarded_ensure_worker(
+        {
+            "run_id": "run_source_attempt",
+            "importer": "ptg",
+            "source_file_import_id": "source-attempt-1",
+            "import_id": "source-attempt-1",
+        }
+    )
+
+    assert response["status"] == "already_running"
+    assert admitted_calls[0]["expected_source_file_import_id"] == (
+        "source-attempt-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_guarded_ptg_ensure_rejects_missing_source_identity(monkeypatch):
+    async def reject_missing_identity(**kwargs):
+        assert kwargs["expected_source_file_import_id"] is None
+        raise control_workers.PTGSourceAttemptIdentityError("mismatch")
+
+    monkeypatch.setattr(
+        control_workers,
+        "admit_existing_outer_run_action",
+        reject_missing_identity,
+    )
+
+    response = await control_workers.guarded_ensure_worker(
+        {
+            "run_id": "run_source_attempt",
+            "importer": "ptg",
+            "import_id": "ordinary-import-id",
+        }
+    )
+
+    assert response["status"] == "failed"
+    assert response["message"] == (
+        "PTG source-attempt identity is invalid or changed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_guarded_ptg_ensure_rejects_conflicting_source_aliases(
+    monkeypatch,
+):
+    async def fail_admission(**_kwargs):
+        raise AssertionError("conflicting identity must fail before admission")
+
+    monkeypatch.setattr(
+        control_workers,
+        "admit_existing_outer_run_action",
+        fail_admission,
+    )
+
+    response = await control_workers.guarded_ensure_worker(
+        {
+            "run_id": "run_source_attempt",
+            "importer": "ptg",
+            "source_file_import_id": "source-attempt-1",
+            "import_id": "source-attempt-2",
+        }
+    )
+
+    assert response["status"] == "failed"
+    assert response["message"] == (
+        "PTG source-attempt identity is invalid or changed"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_importer", [None, "claims-pricing"])
+async def test_ptg_run_rejects_non_ptg_worker_selector(
+    monkeypatch,
+    request_importer,
+):
+    async def reject_selector(**kwargs):
+        selection = kwargs["worker_selection"]
+        assert "ptg" not in selection.allowed_importers
+        raise control_workers.PTGSourceAttemptIdentityError("selector")
+
+    monkeypatch.setattr(
+        control_workers,
+        "admit_existing_outer_run_action",
+        reject_selector,
+    )
+    worker_request_by_field = {
+        "run_id": "run_source_attempt",
+        "queue": "arq:ClaimsPricing",
+    }
+    if request_importer is not None:
+        worker_request_by_field["importer"] = request_importer
+
+    response = await control_workers.guarded_ensure_worker(
+        worker_request_by_field
+    )
+
+    assert response["status"] == "failed"
+    assert response["message"] == (
+        "PTG source-attempt identity is invalid or changed"
+    )
 
 
 def test_worker_registry_exposes_shared_and_finish_workers():

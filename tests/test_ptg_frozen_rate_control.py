@@ -241,41 +241,61 @@ async def test_frozen_binding_database_cas_rejects_legacy_retry():
         )
 
 
+class _AdmissionOrderConnection:
+    def __init__(self, event_list):
+        self.event_list = event_list
+
+    async def scalar(self, *_args, **_kwargs):
+        self.event_list.append("admission_lock")
+        return 1
+
+    async def status(self, *_args, **_kwargs):
+        self.event_list.append("control_row_insert")
+        return 1
+
+
+@asynccontextmanager
+async def _admission_order_connection(event_list):
+    yield _AdmissionOrderConnection(event_list)
+
+
+def _async_test_hook(event_list, event_name, result=None):
+    async def hook(*_args, **_kwargs):
+        if event_name:
+            event_list.append(event_name)
+        return result
+
+    return hook
+
+
 @pytest.mark.asyncio
 async def test_control_admission_binds_before_lifecycle_row_insert(
     monkeypatch,
 ):
+    """Fence and bind the exact source attempt before lifecycle insertion."""
+
     events = []
-
-    class Connection:
-        async def scalar(self, *_args, **_kwargs):
-            events.append("admission_lock")
-            return 1
-
-        async def status(self, *_args, **_kwargs):
-            events.append("control_row_insert")
-            return 1
-
-    @asynccontextmanager
-    async def acquire():
-        yield Connection()
-
-    async def bind(_connection, _params):
-        events.append("binding_cas")
-
-    async def active_runs(_connection, _importer):
-        return []
-
-    monkeypatch.setattr(control_imports.db, "acquire", acquire)
     monkeypatch.setattr(
-        control_imports,
-        "insert_or_compare_frozen_binding",
-        bind,
+        control_imports.db,
+        "acquire",
+        lambda: _admission_order_connection(events),
     )
+    hook_event_by_name = {
+        "insert_or_compare_frozen_binding": "binding_cas",
+        "require_source_attempt_capabilities": "capability_check",
+        "guard_source_attempt": "source_attempt_guard",
+        "record_source_attempt_event": "source_attempt_event",
+    }
+    for function_name, event_name in hook_event_by_name.items():
+        monkeypatch.setattr(
+            control_imports,
+            function_name,
+            _async_test_hook(events, event_name),
+        )
     monkeypatch.setattr(
         control_imports,
         "_active_importer_runs",
-        active_runs,
+        _async_test_hook(events, None, []),
     )
     request = control._validated_control_import_payload(
         _protected_payload()
@@ -294,9 +314,12 @@ async def test_control_admission_binds_before_lifecycle_row_insert(
 
     assert blocking is None
     assert events == [
+        "capability_check",
+        "source_attempt_guard",
         "admission_lock",
         "binding_cas",
         "control_row_insert",
+        "source_attempt_event",
     ]
 
 

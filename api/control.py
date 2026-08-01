@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-
 from __future__ import annotations
 
 import asyncio
@@ -24,8 +23,11 @@ from api.control_frozen_rate_files import (
     ptg_import_file_payload as _ptg_import_file_payload,
     validated_control_import_payload as _validated_control_import_payload,
 )
-from api.control_workers import ensure_worker, worker_registry
+from api.control_workers import guarded_ensure_worker, worker_registry
 from api.control_auth import require_control_auth as _require_control_auth
+from api.control_ptg_source_attempt_errors import (
+    register_source_attempt_error_handler,
+)
 from api.control_snapshot_rollback import register_source_snapshot_rollback_route
 from api.control_ptg_v4 import register_v4_control_routes
 from api.provider_directory_sources import provider_directory_source_catalog
@@ -58,6 +60,7 @@ from process.ptg_parts.source_snapshot_control import (
 )
 
 blueprint = Blueprint("control", url_prefix="/control/v1")
+register_source_attempt_error_handler(blueprint)
 register_source_snapshot_rollback_route(blueprint)
 register_v4_control_routes(blueprint)
 register_uhc_provider_file_catalog_routes(blueprint)
@@ -128,7 +131,7 @@ async def control_ensure_worker(request):
 
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
-    return response.json(ensure_worker(payload), status=202, default=str)
+    return response.json(await guarded_ensure_worker(payload), status=202, default=str)
 
 
 @blueprint.get("/mrf/discovery/sources")
@@ -479,7 +482,6 @@ def _error_payload(request, exc: SanicException) -> dict:
             "request_id": _request_id(request),
         }
     }
-
 
 def _error_code(status_code: int) -> str:
     return {

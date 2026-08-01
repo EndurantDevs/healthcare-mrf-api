@@ -80,8 +80,16 @@ async def test_ptg_control_start_skips_stale_terminal_run(monkeypatch):
     async def canceled_database_row(*_arguments, **_arguments_by_name):
         return ("canceled",)
 
+    async def allow_worker_start(*_arguments, **_arguments_by_name):
+        return None
+
     monkeypatch.setattr(ptg_control, "ptg_main", fail_if_scanner_starts)
     monkeypatch.setattr(ptg_control, "mark_control_run", fail_if_run_is_marked)
+    monkeypatch.setattr(
+        ptg_control,
+        "guard_ptg_worker_start",
+        allow_worker_start,
+    )
     monkeypatch.setattr(
         ptg_control_runtime.db,
         "first",

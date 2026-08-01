@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 from api.control_ptg2_v4_stale_metadata import register_v4_stale_routes
+from api.control_ptg2_legacy_v3_metadata import (
+    register_legacy_v3_metadata_routes,
+)
 from api.control_ptg_v4_recovery import register_v4_recovery_routes
 
 
@@ -12,6 +15,7 @@ def register_v4_control_routes(control_blueprint) -> None:
 
     register_v4_stale_routes(control_blueprint)
     register_v4_recovery_routes(control_blueprint)
+    register_legacy_v3_metadata_routes(control_blueprint)
 
 
 __all__ = ["register_v4_control_routes"]

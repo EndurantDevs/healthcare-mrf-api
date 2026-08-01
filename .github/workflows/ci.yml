@@ -685,6 +685,10 @@ jobs:
           tests/test_ptg2_v4_attempt_migration_adoption_postgres.py
           tests/test_ptg2_v4_attempt_migration_downgrade_postgres.py
           tests/test_ptg2_v4_attempt_model_autogenerate_postgres.py
+          tests/test_ptg2_legacy_v3_metadata_reconcile_postgres.py
+          tests/test_ptg2_legacy_v3_migration_postgres.py
+          tests/test_ptg2_legacy_v3_v4_compat_postgres.py
+          tests/test_ptg_source_attempt_action_postgres.py
       - name: Run strict shared PTG PostgreSQL GC and removal tests
         if: matrix.shard == 'core'
         env:

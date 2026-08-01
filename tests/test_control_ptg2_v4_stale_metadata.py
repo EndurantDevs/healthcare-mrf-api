@@ -45,7 +45,7 @@ def _request(payload_by_field: dict, *, authenticated: bool = True):
     )
 
 
-def test_v4_control_registration_preserves_both_recovery_families():
+def test_control_registration_preserves_all_recovery_families():
     route_recorder = _RouteRecorder()
 
     register_v4_control_routes(route_recorder)
@@ -55,6 +55,8 @@ def test_v4_control_registration_preserves_both_recovery_families():
         "/ptg/v4/stale-metadata/reconcile",
         "/ptg/v4/failed-layouts/recovery-plan",
         "/ptg/v4/failed-layouts/recover",
+        "/ptg/v3/stale-metadata/reconcile-plan",
+        "/ptg/v3/stale-metadata/reconcile",
     }
 
 

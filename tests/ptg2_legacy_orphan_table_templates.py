@@ -102,6 +102,12 @@ MRF_TABLE_TEMPLATES = (
         state text NOT NULL
     )
     """,
+    """
+    CREATE TABLE {schema}.ptg2_legacy_v3_metadata_reconcile_audit (
+        snapshot_id text NOT NULL,
+        internal_run_id text NOT NULL
+    )
+    """,
     "CREATE TABLE {schema}.ptg2_plan_month (snapshot_id text)",
     "CREATE TABLE {schema}.ptg2_allowed_amount_plan (snapshot_id text)",
     "CREATE TABLE {schema}.ptg2_allowed_amount_item (snapshot_id text)",
@@ -123,6 +129,5 @@ MRF_TABLE_TEMPLATES = (
     )
     """,
 )
-
 
 

@@ -25,6 +25,10 @@ async def _allow_active_run(_run_id):
     return None
 
 
+async def _allow_worker_start(*_args, **_kwargs):
+    return None
+
+
 @pytest.fixture
 def control_observations(monkeypatch):
     ptg_calls = []
@@ -53,6 +57,11 @@ def control_observations(monkeypatch):
         fake_flush_terminal_status_events,
     )
     monkeypatch.setattr(ptg_control, "_stale_ptg_job_result", _allow_active_run)
+    monkeypatch.setattr(
+        ptg_control,
+        "guard_ptg_worker_start",
+        _allow_worker_start,
+    )
     return ptg_calls, run_marks
 
 

@@ -43,6 +43,9 @@ from process.ptg_parts.config import (
     PTG2_RUST_WORK_QUEUE_ENV,
     PTG2_RUST_WORKERS_ENV,
 )
+from process.ptg_parts.ptg_source_worker_admission import (
+    guard_ptg_worker_start,
+)
 from process.ptg_frozen_control import (
     frozen_rate_main_kwargs,
     validated_worker_frozen_rate_params,
@@ -72,6 +75,13 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         timespec="microseconds"
     )
     attempt_id = f"{run_id}:{uuid.uuid4().hex}" if run_id else None
+    admission_failure = await guard_ptg_worker_start(
+        task_payload,
+        run_id=run_id,
+        attempt_id=attempt_id,
+    )
+    if admission_failure is not None:
+        return admission_failure
     stale_result = await _stale_ptg_job_result(run_id)
     if stale_result is not None:
         return stale_result

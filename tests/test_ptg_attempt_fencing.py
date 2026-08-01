@@ -20,6 +20,18 @@ async def _skip_terminal_flush() -> None:
     return None
 
 
+@pytest.fixture(autouse=True)
+def _admit_attempt_fencing_ptg_run(monkeypatch):
+    async def admit_run(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        ptg_control,
+        "guard_ptg_worker_start",
+        admit_run,
+    )
+
+
 def _statement_values_by_field(statement: Any) -> dict[str, Any]:
     return {
         getattr(key, "key", str(key)): getattr(field_value, "value", field_value)
