@@ -386,18 +386,24 @@ async def test_graph_wait_heartbeats_and_resource_guards(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="compressed acquisition"):
         await publication._publish_v4_dictionaries_and_maps(
             compilation,
-            schema_name="mrf",
-            snapshot_key=1,
-            build_token="token",
+            publication_context=publication._V4AtomicPublishContext(
+                schema_name="mrf",
+                block_stage="ptg2_v3_block_stage_exact",
+                snapshot_key=1,
+                build_token="token",
+            ),
             compressed_acquisition_bytes=0,
             empty_npi_tin_only_normalization_count=0,
         )
     with pytest.raises(RuntimeError, match="normalization count"):
         await publication._publish_v4_dictionaries_and_maps(
             compilation,
-            schema_name="mrf",
-            snapshot_key=1,
-            build_token="token",
+            publication_context=publication._V4AtomicPublishContext(
+                schema_name="mrf",
+                block_stage="ptg2_v3_block_stage_exact",
+                snapshot_key=1,
+                build_token="token",
+            ),
             compressed_acquisition_bytes=1,
             empty_npi_tin_only_normalization_count=-1,
         )

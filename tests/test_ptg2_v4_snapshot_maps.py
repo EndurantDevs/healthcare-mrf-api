@@ -32,7 +32,9 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_DENSE_LAYOUT_TABLES,
     SharedBlock,
 )
-from process.ptg_parts.ptg2_shared_publish import publish_v4_cas_block_stage
+from process.ptg_parts.ptg2_shared_publish import (
+    _publish_v4_cas_block_stage_compatibility,
+)
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
     PTG2_V4_MAP_BLOCK_KIND,
@@ -1383,7 +1385,7 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                 payload=cas_block.payload,
             )
         monkeypatch.setattr(ptg2_shared_publish, "db", database)
-        cas_publication = await publish_v4_cas_block_stage(
+        cas_publication = await _publish_v4_cas_block_stage_compatibility(
             schema_name=schema_name,
             stage_table=cas_stage,
             snapshot_key=cas_snapshot_key,
@@ -1449,7 +1451,7 @@ async def test_real_postgres_v4_root_pack_overlap_and_publication(monkeypatch):
                 """,
                 block_hash=cas_block.block_hash,
             )
-        reused_cas_publication = await publish_v4_cas_block_stage(
+        reused_cas_publication = await _publish_v4_cas_block_stage_compatibility(
             schema_name=schema_name,
             stage_table=reused_cas_stage,
             snapshot_key=reused_cas_snapshot_key,

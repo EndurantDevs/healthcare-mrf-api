@@ -384,6 +384,34 @@ hashes, and sends full rows for missing blocks; rows already present carry only
 validated metadata through the temporary stage. Promotion fails if any hash is
 unresolved or its immutable metadata conflicts.
 
+Batched publication first protects every currently durable reuse target from
+GC, then drains payload-bearing stage rows before payload-free reuse rows. All
+bounded cursor phases share one transaction and the publication phases share
+the same hash and coordinate sets. Protection locks hashes in global order,
+waits for matching GC candidates without `SKIP LOCKED`, and requires an exact
+zero-candidate postcondition before commit. Lock contention is bounded by a
+transaction-local timeout of at most 30 seconds and rolls back the complete
+publication. A reuse row therefore remains protected during a long payload
+lane and cannot be rejected merely because the payload for that hash appears
+later than one batch in physical stage order. Missing CAS payloads and
+immutable-metadata conflicts still fail closed, and progress counters advance
+only after each bounded protection or publication batch.
+
+For V4 graph publication, the CAS phase is private to the packed-map publisher:
+immediately after taking the layout fence, the publisher protects/publishes CAS
+rows and cancels matching GC candidates, then validates dictionary and tax-
+identity stages and creates packed-map reachability in one database transaction.
+The early block locks prevent GC from removing a payload-free reuse target during
+long validation. The prior transaction-local lock timeout is restored after
+bounded CAS protection, before validation, map, and dictionary SQL proceeds.
+There is no supported standalone V4 CAS commit in the production graph path, so
+GC cannot observe committed graph blocks without their authenticated map root and
+packs. The reference JSONL is rehashed and byte/row-counted while the packed map
+consumes it; CAS stage rows, map coordinates, compiler block count, and the
+adaptive packed-map plan must agree before commit. Any CAS, reference, map, or
+dictionary failure rolls back that entire publication; the failed-build cleanup
+path runs only after rollback.
+
 Physical-source keys are not caller-selected identifiers. Python normalizes
 each source identity as a lowercase ASCII token, one supported digest kind,
 and a 32-byte digest; sorting that tuple assigns the contiguous keys. Rust
