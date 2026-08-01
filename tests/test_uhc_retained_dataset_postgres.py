@@ -5,11 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+import uuid
 import zlib
 
 import pytest
 
+from api.endpoint import npi as npi_endpoint
+from process import provider_directory_profile as profile
 from process.provider_directory_source_summary import (
     SOURCE_SUMMARY_CONTRACT_ID,
     SOURCE_SUMMARY_CONTRACT_VERSION,
@@ -31,12 +37,21 @@ from process.uhc_retained_dataset import (
     UhcSealedSemanticFile,
     build_uhc_canonical_stage,
     cleanup_uhc_canonical_stage,
+    ensure_sealed_uhc_semantic_set,
     load_complete_admitted_uhc_catalog_set,
 )
 from process.uhc_canonical_proof import (
     UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
     bind_uhc_canonical_content_proof,
 )
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+    UHC_PROVIDER_QUARANTINE_FIELD,
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UhcProviderQuarantine,
+    quarantine_identity_set_sha256,
+)
+from process.uhc_retained_native import retain_source_native
 from process.uhc_semantic_build_store import (
     UHC_SEMANTIC_CONTRACT_ID,
     UHC_SEMANTIC_CONTRACT_VERSION,
@@ -45,6 +60,12 @@ from process.uhc_semantic_build_store import (
 from tests.test_provider_directory_dataset_serving_relations_db import (
     _dataset_database,
     importer,
+)
+from tests.test_provider_directory_profile_affiliations_db import (
+    _build_profile_artifacts,
+    _create_fixture_tables as _create_profile_fixture_tables,
+    _insert_uhc_membership_edges,
+    _insert_uhc_profile_source,
 )
 
 
@@ -97,6 +118,29 @@ def _provider_fact(ordinal: int) -> dict[str, object]:
     }
 
 
+def _provider_quarantine() -> UhcProviderQuarantine:
+    return UhcProviderQuarantine(
+        source_file_id=_digest("provider_membership"),
+        range_ordinal=2,
+        occurrence_ordinal=2,
+        record_sha256=_digest("provider_membership:raw-record:2"),
+    )
+
+
+def _provider_quarantine_fact() -> dict[str, object]:
+    quarantine = _provider_quarantine()
+    return {
+        UHC_PROVIDER_QUARANTINE_FIELD: {
+            "contract_id": UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+            "reason": UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+            "source_file_id": quarantine.source_file_id,
+            "range_ordinal": quarantine.range_ordinal,
+            "occurrence_ordinal": quarantine.occurrence_ordinal,
+            "record_sha256": quarantine.record_sha256,
+        }
+    }
+
+
 def _plan_fact(_ordinal: int) -> dict[str, object]:
     return {
         "plan_id_type": "HIOS-PLAN-ID",
@@ -113,11 +157,107 @@ def _plan_fact(_ordinal: int) -> dict[str, object]:
     }
 
 
-def _counter_map(collection_kind: str) -> dict[str, int]:
+_NATIVE_VALID_FACILITY_NPI = "1000000491"
+_NATIVE_INVALID_FACILITY_NPI = "1000000492"
+_NATIVE_INVALID_PRIVATE_VALUES = (
+    _NATIVE_INVALID_FACILITY_NPI,
+    "Rejected Secret Facility",
+    "999 Private Lane",
+    "Never Expose",
+    "3125559999",
+)
+
+
+def _native_facility_records() -> list[dict[str, object]]:
+    """Return rejected/valid facilities plus the paired individual shape."""
+
+    valid = _provider_fact(1)
+    valid["facility_name"] = "Example UHC Facility"
+    invalid = json.loads(json.dumps(valid))
+    invalid.update(
+        npi=_NATIVE_INVALID_FACILITY_NPI,
+        facility_name="Rejected Secret Facility",
+    )
+    invalid["addresses"] = [
+        {
+            "address": "999 Private Lane",
+            "city": "Never Expose",
+            "state": "IL",
+            "zip": "60699",
+            "phone": "3125559999",
+        }
+    ]
+    individual = _provider_fact(0)
+    return [
+        invalid,
+        valid,
+        individual,
+        json.loads(json.dumps(individual)),
+    ]
+
+
+async def _native_admitted_file(
+    root: Path,
+    catalog_hash: str,
+    collection_kind: str,
+    source_records: list[dict[str, object]],
+) -> UhcAdmittedFile:
+    """Write exact retained bytes and return their admitted file identity."""
+
+    root.mkdir(parents=True)
+    source_bytes = json.dumps(
+        source_records,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    source_path = root / "source.json"
+    source_path.write_bytes(source_bytes)
+    retained_root = root / "retained"
+    retained_root.mkdir()
+    retained = await retain_source_native(
+        source_path=source_path,
+        output_root=retained_root,
+        expected_sha256=hashlib.sha256(source_bytes).hexdigest(),
+        expected_byte_count=len(source_bytes),
+        range_count=4,
+    )
+    raw = retained.raw_artifact
+    is_provider = collection_kind == "provider_membership"
+    return UhcAdmittedFile(
+        catalog_set_sha256=catalog_hash,
+        source_file_id=_digest(f"native-chain:{collection_kind}"),
+        family="ifp",
+        collection_kind=collection_kind,
+        file_name=(
+            "JSON_Providers_ILIEX.json"
+            if is_provider
+            else "JSON_PLANS_IL.json"
+        ),
+        artifact_sha256=raw.sha256,
+        artifact_byte_count=raw.byte_count,
+        raw_contract_version=raw.contract_version,
+        raw_range_count=raw.range_count,
+        record_count=raw.record_count,
+        range_set_sha256=raw.range_set_sha256,
+        manifest_sha256=raw.manifest_sha256,
+        raw_producer_build_id=raw.producer_build_id,
+        raw_path=Path(raw.path),
+        manifest_path=Path(raw.manifest_path),
+    )
+
+
+def _counter_map(collection_kind: str) -> dict[str, object]:
     counter_by_field = {
         field_name: 0
         for field_name in SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS
     }
+    counter_by_field.update(
+        invalid_npi_individual_records=0,
+        invalid_npi_facility_records=0,
+        invalid_npi_address_rows=0,
+        invalid_npi_provider_plan_rows=0,
+        quarantine_identity_set_sha256=hashlib.sha256(b"").hexdigest(),
+    )
     if collection_kind == "provider_membership":
         counter_by_field.update(
             raw_provider_records=4,
@@ -131,6 +271,13 @@ def _counter_map(collection_kind: str) -> dict[str, int]:
             accepting_newpt_records=4,
             valid_phone_count=4,
             plan_year_rows=4,
+            invalid_npi_count=1,
+            invalid_npi_individual_records=1,
+            invalid_npi_address_rows=1,
+            invalid_npi_provider_plan_rows=1,
+            quarantine_identity_set_sha256=quarantine_identity_set_sha256(
+                [_provider_quarantine()]
+            ),
         )
     else:
         counter_by_field.update(
@@ -176,11 +323,7 @@ async def _insert_semantic_fixture_rows(
     """Insert exact fact and evidence rows and return block descriptors."""
     blocks = []
     for ordinal in range(4):
-        fact = (
-            _provider_fact(ordinal)
-            if collection_kind == "provider_membership"
-            else _plan_fact(ordinal)
-        )
+        fact = _semantic_fixture_fact(collection_kind, ordinal)
         raw_payload = json.dumps(
             fact, separators=(",", ":"), sort_keys=True
         ).encode() + b"\n"
@@ -209,23 +352,51 @@ async def _insert_semantic_fixture_rows(
             semantic_hash,
             compressed,
         )
-        if collection_kind == "provider_membership":
-            signature = b"".join(
-                hashlib.sha256(f"{ordinal}:{field}".encode()).digest()
-                for field in range(9)
-            )
-            await connection.execute(
-                f"""
-                INSERT INTO {schema}.{relation} (
-                    row_kind, range_ordinal, run_ordinal,
-                    occurrence_ordinal, npi, conflict_signature_pack
-                ) VALUES (2, $1, 0, $1, $2, $3)
-                """,
-                ordinal,
-                _provider_npi(ordinal),
-                signature,
-            )
+        await _insert_semantic_evidence_row(
+            connection,
+            schema,
+            relation,
+            collection_kind,
+            ordinal,
+        )
     return blocks
+
+
+def _semantic_fixture_fact(
+    collection_kind: str,
+    ordinal: int,
+) -> dict[str, object]:
+    if collection_kind != "provider_membership":
+        return _plan_fact(ordinal)
+    if ordinal == 2:
+        return _provider_quarantine_fact()
+    return _provider_fact(ordinal)
+
+
+async def _insert_semantic_evidence_row(
+    connection,
+    schema: str,
+    relation: str,
+    collection_kind: str,
+    ordinal: int,
+) -> None:
+    if collection_kind != "provider_membership" or ordinal == 2:
+        return
+    signature = b"".join(
+        hashlib.sha256(f"{ordinal}:{field}".encode()).digest()
+        for field in range(9)
+    )
+    await connection.execute(
+        f"""
+        INSERT INTO {schema}.{relation} (
+            row_kind, range_ordinal, run_ordinal,
+            occurrence_ordinal, npi, conflict_signature_pack
+        ) VALUES (2, $1, 0, $1, $2, $3)
+        """,
+        ordinal,
+        _provider_npi(ordinal),
+        signature,
+    )
 
 
 def _semantic_fixture_identity_and_admission(
@@ -241,6 +412,10 @@ def _semantic_fixture_identity_and_admission(
         artifact_sha256=artifact_sha256,
         raw_contract_version=2,
         raw_range_count=4,
+        manifest_sha256=_digest(collection_kind + ":manifest"),
+        range_set_sha256=_digest(collection_kind + ":ranges"),
+        raw_record_count=4,
+        raw_producer_build_id="postgres-canonical-proof-v1",
         collection_kind=collection_kind,
         encoder_sha256=_digest("encoder"),
     )
@@ -261,6 +436,7 @@ def _semantic_fixture_identity_and_admission(
         record_count=4,
         range_set_sha256=_digest(collection_kind + ":ranges"),
         manifest_sha256=_digest(collection_kind + ":manifest"),
+        raw_producer_build_id="postgres-canonical-proof-v1",
         raw_path=Path(__file__),
         manifest_path=Path(__file__),
     )
@@ -286,17 +462,19 @@ def _semantic_fixture_build_row(
         "evidence_ranges_json": [
             {
                 "range_ordinal": ordinal,
-                "evidence_count": int(is_provider_file),
-                "run_count": int(is_provider_file),
-                "layout_sha256": _digest(
-                    f"{collection_kind}:evidence-layout:{ordinal}"
+                "evidence_count": int(is_provider_file and ordinal != 2),
+                "run_count": int(is_provider_file and ordinal != 2),
+                "layout_sha256": (
+                    _digest(f"{collection_kind}:evidence-layout:{ordinal}")
+                    if not is_provider_file or ordinal != 2
+                    else hashlib.sha256(b"").hexdigest()
                 ),
             }
             for ordinal in range(4)
         ],
         "verifier_sha256": _digest("verifier"),
         "counters_json": _counter_map(collection_kind),
-        "evidence_count": 4 if is_provider_file else 0,
+        "evidence_count": 3 if is_provider_file else 0,
     }
 
 
@@ -363,6 +541,7 @@ _ADMITTED_CATALOG_SCHEMA_SQL = """
             contract_version integer NOT NULL,
             range_count integer NOT NULL,
             record_count bigint NOT NULL,
+            producer_build_id varchar(256) NOT NULL,
             range_set_sha256 varchar(64) NOT NULL,
             manifest_sha256 varchar(64) NOT NULL,
             manifest_storage_uri text NOT NULL,
@@ -385,6 +564,50 @@ _ADMITTED_CATALOG_SCHEMA_SQL = """
             source_file_id varchar(64) NOT NULL,
             storage_uri text NOT NULL,
             released_at timestamptz
+        );
+"""
+
+
+_SEMANTIC_BUILD_SCHEMA_SQL = """
+        CREATE TABLE __SCHEMA__.provider_directory_uhc_semantic_build (
+            semantic_build_id varchar(64) PRIMARY KEY,
+            catalog_set_sha256 varchar(64) NOT NULL,
+            source_file_id varchar(64) NOT NULL,
+            artifact_sha256 varchar(64) NOT NULL,
+            raw_contract_version integer NOT NULL,
+            raw_range_count integer NOT NULL,
+            manifest_sha256 varchar(64) NOT NULL,
+            range_set_sha256 varchar(64) NOT NULL,
+            raw_record_count bigint NOT NULL,
+            raw_producer_build_id varchar(256) NOT NULL,
+            collection_kind varchar(32) NOT NULL,
+            semantic_contract_id varchar(128) NOT NULL,
+            semantic_contract_version integer NOT NULL,
+            copy_format_id varchar(128) NOT NULL,
+            encoder_sha256 varchar(64) NOT NULL,
+            semantic_verifier_sha256 varchar(64),
+            status varchar(16) NOT NULL,
+            attempt_count integer NOT NULL,
+            lease_token varchar(64),
+            lease_expires_at timestamptz,
+            heartbeat_at timestamptz,
+            stage_schema varchar(63) NOT NULL,
+            stage_relation varchar(63) NOT NULL,
+            fact_count bigint,
+            evidence_count bigint,
+            fact_set_sha256 varchar(64),
+            record_identity_set_sha256 varchar(64),
+            evidence_identity_set_sha256 varchar(64),
+            evidence_layout_set_sha256 varchar(64),
+            verifier_sha256 varchar(64),
+            counters_json jsonb,
+            fact_blocks_json jsonb,
+            evidence_ranges_json jsonb,
+            failure_code varchar(128),
+            verified_at timestamptz,
+            sealed_at timestamptz,
+            created_at timestamptz NOT NULL,
+            updated_at timestamptz NOT NULL
         );
 """
 
@@ -473,8 +696,9 @@ async def _install_admitted_file(
     )
     await connection.execute(
         f"INSERT INTO {schema}.provider_directory_uhc_raw_layout "
-        "VALUES ($1, 2, 4, 4, $2, $3, $4, 'verified')",
+        "VALUES ($1, 2, 4, 4, $2, $3, $4, $5, 'verified')",
         admitted_file.artifact_sha256,
+        admitted_file.raw_producer_build_id,
         admitted_file.range_set_sha256,
         admitted_file.manifest_sha256,
         manifest_path.as_uri(),
@@ -514,6 +738,84 @@ async def _install_admitted_catalog(
             admitted_file,
             tmp_path,
         )
+
+
+async def _install_native_admitted_file(
+    connection,
+    schema: str,
+    admitted: UhcAdmittedFile,
+) -> None:
+    """Install the actual retained fixture paths into the admission registry."""
+
+    await connection.execute(
+        f"INSERT INTO {schema}.provider_directory_uhc_catalog_file "
+        "VALUES ($1, $2, $3, $4, $5, 'published', 'cataloged')",
+        admitted.catalog_set_sha256,
+        admitted.source_file_id,
+        admitted.family,
+        admitted.collection_kind,
+        admitted.file_name,
+    )
+    await connection.execute(
+        f"INSERT INTO {schema}.provider_directory_uhc_source_binding ("
+        "catalog_set_sha256, source_file_id, artifact_sha256, released_at, "
+        "collection_kind) VALUES ($1, $2, $3, NULL, $4)",
+        admitted.catalog_set_sha256,
+        admitted.source_file_id,
+        admitted.artifact_sha256,
+        admitted.collection_kind,
+    )
+    await connection.execute(
+        f"INSERT INTO {schema}.provider_directory_uhc_raw_artifact "
+        "VALUES ($1, $2, $3, 'verified')",
+        admitted.artifact_sha256,
+        admitted.artifact_byte_count,
+        admitted.raw_path.resolve().as_uri(),
+    )
+    await connection.execute(
+        f"INSERT INTO {schema}.provider_directory_uhc_raw_layout "
+        "VALUES ($1, 2, 4, $2, $3, $4, $5, $6, 'verified')",
+        admitted.artifact_sha256,
+        admitted.record_count,
+        admitted.raw_producer_build_id,
+        admitted.range_set_sha256,
+        admitted.manifest_sha256,
+        admitted.manifest_path.resolve().as_uri(),
+    )
+    await _install_admitted_artifact_references(
+        connection,
+        schema,
+        admitted.catalog_set_sha256,
+        admitted,
+        admitted.raw_path,
+        admitted.manifest_path,
+    )
+
+
+async def _install_native_admitted_catalog(
+    connection,
+    schema: str,
+    admitted_files: tuple[UhcAdmittedFile, UhcAdmittedFile],
+) -> None:
+    """Install one complete native-backed catalog and semantic registry."""
+
+    await connection.execute(
+        _ADMITTED_CATALOG_SCHEMA_SQL.replace("__SCHEMA__", schema)
+    )
+    await connection.execute(
+        f"ALTER TABLE {schema}.provider_directory_uhc_source_binding "
+        "ADD COLUMN collection_kind varchar(32) NOT NULL"
+    )
+    await connection.execute(
+        _SEMANTIC_BUILD_SCHEMA_SQL.replace("__SCHEMA__", schema)
+    )
+    await connection.execute(
+        f"INSERT INTO {schema}.provider_directory_uhc_catalog_set "
+        "VALUES ($1, 2, 1, 1)",
+        admitted_files[0].catalog_set_sha256,
+    )
+    for admitted in admitted_files:
+        await _install_native_admitted_file(connection, schema, admitted)
 
 
 def _publication_outcome(
@@ -680,6 +982,154 @@ async def _build_canonical_fixture(
         )
 
 
+async def _build_native_quarantine_stage(
+    database,
+    schema: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Run retained bytes through the native encoder and canonical builder."""
+
+    catalog_hash = _digest("native-quarantine-chain-catalog")
+    scanner_root = (
+        Path(__file__).resolve().parents[1]
+        / "support"
+        / "ptg2_scanner"
+        / "target"
+        / "debug"
+    )
+    scanner_binary = scanner_root / "ptg2_scanner"
+    binary = scanner_root / "uhc_semantic_facts"
+    assert scanner_binary.is_file(), (
+        f"native retained scanner is not built: {scanner_binary}"
+    )
+    assert binary.is_file(), f"native semantic binary is not built: {binary}"
+    monkeypatch.setenv("HLTHPRT_PTG2_RUST_SCANNER_BIN", str(scanner_binary))
+    provider = await _native_admitted_file(
+        tmp_path / "native-provider",
+        catalog_hash,
+        "provider_membership",
+        _native_facility_records(),
+    )
+    plan = await _native_admitted_file(
+        tmp_path / "native-plan",
+        catalog_hash,
+        "plan_reference",
+        [_plan_fact(ordinal) for ordinal in range(4)],
+    )
+    async with database.acquire_driver() as connection:
+        await _install_native_admitted_catalog(
+            connection,
+            schema,
+            (provider, plan),
+        )
+        admitted_set = await load_complete_admitted_uhc_catalog_set(
+            connection,
+            catalog_hash,
+        )
+        sealed_files = await ensure_sealed_uhc_semantic_set(
+            connection,
+            admitted_set,
+            binary=binary,
+        )
+        return await build_uhc_canonical_stage(
+            connection,
+            admitted_set,
+            sealed_files,
+        )
+
+
+def _decode_json(raw_value):
+    return json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+
+
+async def _native_profile_resources(database, stage):
+    organization = await database.first(
+        f"SELECT resource_type, resource_id, payload_json "
+        f"FROM {stage.resource_ref} WHERE resource_type='Organization' "
+        "AND payload_json->>'npi'=:npi;",
+        npi=_NATIVE_VALID_FACILITY_NPI,
+    )
+    assert organization is not None
+    affiliation = await database.first(
+        f"SELECT resource_type, resource_id, payload_json "
+        f"FROM {stage.resource_ref} "
+        "WHERE resource_type='OrganizationAffiliation' "
+        "AND payload_json->>'participating_organization_ref'=:reference;",
+        reference=f"Organization/{organization.resource_id}",
+    )
+    assert affiliation is not None
+    return organization, affiliation
+
+
+async def _insert_native_profile_resources(
+    database,
+    schema: str,
+    canonical_rows,
+) -> None:
+    """Carry the exact canonical payloads into typed Profile relations."""
+
+    resource_id_by_type = {}
+    for canonical_row in canonical_rows:
+        model = importer.RESOURCE_MODELS_BY_TYPE[canonical_row.resource_type]
+        table_ref = profile.qualified_table(schema, model.__tablename__)
+        typed_field_map = {
+            **_decode_json(canonical_row.payload_json),
+            "source_id": "profile-source-uhc",
+            "updated_at": datetime(2026, 7, 19),
+        }
+        await database.status(
+            f"INSERT INTO {table_ref} SELECT * FROM jsonb_populate_record("
+            f"NULL::{table_ref}, CAST(:typed_fields AS jsonb));",
+            typed_fields=json.dumps(
+                typed_field_map,
+                default=str,
+                sort_keys=True,
+            ),
+        )
+        resource_id_by_type[canonical_row.resource_type] = canonical_row.resource_id
+    await _insert_uhc_membership_edges(
+        database,
+        schema,
+        organization_resource_id=resource_id_by_type["Organization"],
+        affiliation_resource_id=resource_id_by_type["OrganizationAffiliation"],
+        dataset_id="profile-dataset-uhc",
+    )
+
+
+async def _native_profile_row(database, stage):
+    """Project the exact canonical facility through production Profile SQL."""
+
+    schema = f"uhc_native_profile_{uuid.uuid4().hex[:12]}"
+    await database.status(f"CREATE SCHEMA {profile.quote_identifier(schema)};")
+    try:
+        await _create_profile_fixture_tables(database, schema)
+        await _insert_uhc_profile_source(database, schema)
+        canonical_rows = await _native_profile_resources(database, stage)
+        await _insert_native_profile_resources(database, schema, canonical_rows)
+        await _build_profile_artifacts(
+            database,
+            schema,
+            source_ids=("profile-source-uhc",),
+            dataset_ids=("profile-dataset-uhc",),
+        )
+        evidence_ref = profile.qualified_table(schema, "profile_evidence")
+        profile_ref = profile.qualified_table(schema, "profile")
+        evidence_rows = await database.all(
+            f"SELECT fact_type, value_json FROM {evidence_ref} "
+            "WHERE npi=1000000491 ORDER BY fact_type;"
+        )
+        profile_row = await database.first(
+            f"SELECT profile_json, evidence_json FROM {profile_ref} "
+            "WHERE npi=1000000491;"
+        )
+        return evidence_rows, profile_row
+    finally:
+        await database.status(
+            f"DROP SCHEMA IF EXISTS {profile.quote_identifier(schema)} CASCADE;"
+        )
+
+
 async def _prepare_candidate_fixture_tables(database, schema: str) -> None:
     """Add candidate timestamps, endpoint identity, and proof shards."""
     await database.status(
@@ -754,6 +1204,58 @@ async def _assert_canonical_facility_evidence(database, stage) -> None:
     assert affiliation["source_lineage"] == lineage
 
 
+async def _assert_quarantined_provider_is_private(database, stage) -> None:
+    """Prove canonical/public state omits one exact rejected source ordinal."""
+
+    ordinal_rows = await database.all(
+        f"""
+        SELECT DISTINCT
+               (payload_json -> 'source_lineage' ->> 'record_ordinal')::bigint
+                   AS record_ordinal
+          FROM {stage.resource_ref}
+         WHERE payload_json -> 'source_lineage' ->> 'source_file_id' =
+               :source_file_id
+         ORDER BY record_ordinal;
+        """,
+        source_file_id=_digest("provider_membership"),
+    )
+    assert [ordinal_row.record_ordinal for ordinal_row in ordinal_rows] == [1, 3]
+
+    provider_resource_rows = await database.all(
+        f"""
+        SELECT resource_type, payload_json ->> 'npi' AS npi
+          FROM {stage.resource_ref}
+         WHERE resource_type IN ('Organization', 'Practitioner')
+         ORDER BY resource_type, npi;
+        """
+    )
+    assert [
+        (resource_row.resource_type, resource_row.npi)
+        for resource_row in provider_resource_rows
+    ] == [
+        ("Organization", _provider_npi(1)),
+        ("Organization", _provider_npi(3)),
+        ("Practitioner", _provider_npi(0)),
+    ]
+    assert await database.scalar(
+        f"SELECT count(*) FROM {stage.resource_ref} "
+        "WHERE payload_json::text LIKE :rejected_npi;",
+        rejected_npi=f"%{_provider_npi(2)}%",
+    ) == 0
+
+    rejected = stage.summary_input["count_by_category"]["rejected_counts"]
+    assert rejected == {
+        "invalid_npi_checksum": 1,
+        "invalid_npi_checksum_address_rows": 1,
+        "invalid_npi_checksum_facility_records": 0,
+        "invalid_npi_checksum_individual_records": 1,
+        "invalid_npi_checksum_provider_plan_rows": 1,
+    }
+    public_summary = json.dumps(stage.summary_input, sort_keys=True)
+    assert _provider_quarantine().record_sha256 not in public_summary
+    assert _provider_npi(2) not in public_summary
+
+
 async def _assert_candidate_retry_and_validation(database, stage):
     """Assert candidate replacement is replayable and then immutable."""
     source_by_field = {
@@ -784,7 +1286,7 @@ async def _assert_candidate_retry_and_validation(database, stage):
     replay_proof = await importer._assert_uhc_candidate_content(
         replay_candidate, stage
     )
-    assert first_count == replay_count == 13
+    assert first_count == replay_count == 10
     assert replay_proof == first_proof
     publication_identity = importer._expected_uhc_publication_identity(
         stage.summary_input,
@@ -809,7 +1311,7 @@ async def _assert_candidate_retry_and_validation(database, stage):
     ] == stage.summary_input
     assert validation_metadata[importer.SOURCE_SUMMARY_METADATA_KEY][
         "semantic_contract_id"
-    ] == "healthporta.uhc.semantic-facts.v2"
+    ] == "healthporta.uhc.semantic-facts.v3"
     return candidate, first_proof
 
 
@@ -871,7 +1373,7 @@ async def _insert_publish_gate_candidate(
             publication_metadata_json
         ) VALUES (
             :dataset_id, 'endpoint-a', 'gate-root', 'gate-root',
-            :previous_dataset_id, :dataset_hash, 13, 'validated', false,
+            :previous_dataset_id, :dataset_hash, 10, 'validated', false,
             now(), CAST(:metadata AS jsonb)
         )
         """,
@@ -901,7 +1403,7 @@ def _good_gate_artifact_dataset(
         is_current=False,
         promote_on_cutover=True,
         dataset_hash=dataset_hash,
-        resource_count=13,
+        resource_count=10,
     )
 
 
@@ -1002,6 +1504,115 @@ async def _assert_bad_gate_candidate_rejected(
     ) == "validated"
 
 
+async def _assert_native_quarantine_stage(database, stage) -> None:
+    rejected_counts = stage.summary_input["count_by_category"][
+        "rejected_counts"
+    ]
+    assert rejected_counts == {
+        "invalid_npi_checksum": 1,
+        "invalid_npi_checksum_address_rows": 1,
+        "invalid_npi_checksum_facility_records": 1,
+        "invalid_npi_checksum_individual_records": 0,
+        "invalid_npi_checksum_provider_plan_rows": 1,
+    }
+    canonical_rows = await database.all(
+        f"SELECT payload_json FROM {stage.resource_ref} ORDER BY resource_type, "
+        "resource_id;"
+    )
+    public_summary = json.dumps(stage.summary_input, sort_keys=True)
+    public_canonical = json.dumps(
+        [_decode_json(row.payload_json) for row in canonical_rows],
+        sort_keys=True,
+    )
+    assert UHC_PROVIDER_QUARANTINE_FIELD not in public_summary
+    assert "record_sha256" not in public_summary
+    for private_value in _NATIVE_INVALID_PRIVATE_VALUES:
+        assert private_value not in public_summary
+        assert private_value not in public_canonical
+
+
+def _assert_native_profile_rows(evidence_rows, profile_row) -> None:
+    assert profile_row is not None
+    assert [evidence_row.fact_type for evidence_row in evidence_rows] == [
+        "organization",
+        "plan_membership",
+    ]
+    organization = _decode_json(evidence_rows[0].value_json)
+    membership = _decode_json(evidence_rows[1].value_json)
+    assert organization["npi"] == 1000000491
+    assert organization["name"] == "Example UHC Facility"
+    assert organization["type_codes"] == ["Clinic"]
+    assert organization["address_status"] == "payer_directory_candidate"
+    assert organization["candidate_addresses"][0]["city"] == "Chicago"
+    assert organization["tax_id"] is None
+    assert organization["tin_status"] == "unavailable_from_uhc_source"
+    assert (
+        membership["relationship_type"]
+        == "payer_reported_provider_plan_membership"
+    )
+    assert membership["ownership_status"] == "not_asserted"
+    assert membership["plan_scope"]["plan_id"] == "12345IL0010001"
+    encoded_profile = json.dumps(
+        {
+            "profile": _decode_json(profile_row.profile_json),
+            "evidence": _decode_json(profile_row.evidence_json),
+        },
+        sort_keys=True,
+    )
+    for private_value in _NATIVE_INVALID_PRIVATE_VALUES:
+        assert private_value not in encoded_profile
+
+
+async def _assert_native_profile_api(monkeypatch, profile_row) -> None:
+    compact_profile = _decode_json(profile_row.profile_json)
+    evidence_profile = _decode_json(profile_row.evidence_json)
+    monkeypatch.setattr(
+        npi_endpoint,
+        "fetch_state_profile_projection",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        npi_endpoint,
+        "_fetch_provider_directory_profile_map",
+        AsyncMock(
+            return_value={
+                1000000491: {
+                    "profile": compact_profile,
+                    "evidence": evidence_profile,
+                }
+            }
+        ),
+    )
+    response = await npi_endpoint.get_provider_profile(
+        SimpleNamespace(args={"include_evidence": "true"}),
+        _NATIVE_VALID_FACILITY_NPI,
+    )
+    assert response.status == 200
+    response_payload = json.loads(response.body)
+    public_profile = response_payload["provider_profile"]
+    organization = public_profile["categories"]["organizations"]["items"][0][
+        "value"
+    ]
+    membership = public_profile["categories"]["network_participation"][
+        "items"
+    ][0]["value"]
+    assert organization["npi"] == 1000000491
+    assert organization["name"] == "Example UHC Facility"
+    assert organization["type_codes"] == ["Clinic"]
+    assert organization["candidate_addresses"][0]["city"] == "Chicago"
+    assert organization["tax_id"] is None
+    assert organization["tin_status"] == "unavailable_from_uhc_source"
+    assert (
+        membership["relationship_type"]
+        == "payer_reported_provider_plan_membership"
+    )
+    assert membership["ownership_status"] == "not_asserted"
+    encoded_response = json.dumps(response_payload, sort_keys=True)
+    assert "rejected_counts" not in encoded_response
+    for private_value in _NATIVE_INVALID_PRIVATE_VALUES:
+        assert private_value not in encoded_response
+
+
 @pytest.mark.asyncio
 async def test_postgres_canonical_stage_retry_idempotency_and_publish_gate(
     monkeypatch,
@@ -1018,6 +1629,7 @@ async def test_postgres_canonical_stage_retry_idempotency_and_publish_gate(
                 "raw_provider_records"
             ] == 4
             await _assert_canonical_facility_evidence(database, stage)
+            await _assert_quarantined_provider_is_private(database, stage)
             await _prepare_candidate_fixture_tables(database, schema)
             candidate, first_proof = (
                 await _assert_candidate_retry_and_validation(database, stage)
@@ -1042,6 +1654,36 @@ async def test_postgres_canonical_stage_retry_idempotency_and_publish_gate(
                 stage,
                 good,
             )
+        finally:
+            async with database.acquire_driver() as connection:
+                await cleanup_uhc_canonical_stage(connection, stage)
+
+
+@pytest.mark.asyncio
+async def test_native_invalid_facility_is_private_through_profile_api(
+    monkeypatch,
+    tmp_path,
+):
+    """One native raw chain suppresses invalid facility PII at every boundary."""
+
+    assert profile.is_valid_npi(_NATIVE_VALID_FACILITY_NPI)
+    assert not profile.is_valid_npi(_NATIVE_INVALID_FACILITY_NPI)
+    async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(importer, "db", database)
+        stage = await _build_native_quarantine_stage(
+            database,
+            schema,
+            tmp_path,
+            monkeypatch,
+        )
+        try:
+            await _assert_native_quarantine_stage(database, stage)
+            evidence_rows, profile_row = await _native_profile_row(
+                database,
+                stage,
+            )
+            _assert_native_profile_rows(evidence_rows, profile_row)
+            await _assert_native_profile_api(monkeypatch, profile_row)
         finally:
             async with database.acquire_driver() as connection:
                 await cleanup_uhc_canonical_stage(connection, stage)

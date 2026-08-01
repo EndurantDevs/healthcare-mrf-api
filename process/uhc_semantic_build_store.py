@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import json
@@ -16,14 +16,23 @@ from typing import Any, AsyncIterator, Mapping
 import asyncpg
 
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_MAX_COUNT,
+    UhcProviderQuarantineError,
+    provider_quarantine_limit,
+    provider_quarantine_rejected_counts,
+)
 from process.uhc_semantic_evidence import (
     UhcNpiEvidenceSummary,
     summarize_uhc_npi_evidence,
 )
+from process.uhc_semantic_verifier_identity import (
+    semantic_verifier_identity_sha256,
+)
 
 
-UHC_SEMANTIC_CONTRACT_ID = "healthporta.uhc.semantic-facts.v2"
-UHC_SEMANTIC_CONTRACT_VERSION = 2
+UHC_SEMANTIC_CONTRACT_ID = "healthporta.uhc.semantic-facts.v3"
+UHC_SEMANTIC_CONTRACT_VERSION = 3
 UHC_SEMANTIC_COPY_FORMAT_ID = "postgres-copy-binary-uhc-fact-evidence-v2"
 UHC_SEMANTIC_SOURCE_ID = UHC_PROVIDER_FILE_SOURCE_ID
 UHC_SEMANTIC_COPY_COLUMNS = (
@@ -91,8 +100,15 @@ class UhcSemanticBuildIdentity:
     artifact_sha256: str
     raw_contract_version: int
     raw_range_count: int
+    manifest_sha256: str
+    range_set_sha256: str
+    raw_record_count: int
+    raw_producer_build_id: str
     collection_kind: str
     encoder_sha256: str
+    semantic_verifier_sha256: str = field(
+        default_factory=semantic_verifier_identity_sha256
+    )
 
     def validate(self) -> None:
         """Reject any semantic identity outside the immutable contract."""
@@ -100,11 +116,26 @@ class UhcSemanticBuildIdentity:
         _require_sha256(self.catalog_set_sha256, "catalog_set_sha256")
         _require_sha256(self.source_file_id, "source_file_id")
         _require_sha256(self.artifact_sha256, "artifact_sha256")
+        _require_sha256(self.manifest_sha256, "manifest_sha256")
+        _require_sha256(self.range_set_sha256, "range_set_sha256")
         _require_sha256(self.encoder_sha256, "encoder_sha256")
+        _require_sha256(
+            self.semantic_verifier_sha256,
+            "semantic_verifier_sha256",
+        )
         if self.raw_contract_version <= 0:
             raise ValueError("raw_contract_version must be positive")
         if not 4 <= self.raw_range_count <= 256:
             raise ValueError("raw_range_count must be in 4..=256")
+        if self.raw_record_count <= 0:
+            raise ValueError("raw_record_count must be positive")
+        if (
+            not self.raw_producer_build_id
+            or len(self.raw_producer_build_id) > 256
+            or not self.raw_producer_build_id.isascii()
+            or not self.raw_producer_build_id.isprintable()
+        ):
+            raise ValueError("raw_producer_build_id must be printable ASCII")
         if self.collection_kind not in _COLLECTION_KINDS:
             raise ValueError("collection_kind is unsupported")
 
@@ -121,11 +152,16 @@ class UhcSemanticBuildIdentity:
                 self.artifact_sha256,
                 self.raw_contract_version,
                 self.raw_range_count,
+                self.manifest_sha256,
+                self.range_set_sha256,
+                self.raw_record_count,
+                self.raw_producer_build_id,
                 self.collection_kind,
                 UHC_SEMANTIC_CONTRACT_ID,
                 UHC_SEMANTIC_CONTRACT_VERSION,
                 UHC_SEMANTIC_COPY_FORMAT_ID,
                 self.encoder_sha256,
+                self.semantic_verifier_sha256,
             ],
             separators=(",", ":"),
         ).encode()
@@ -184,11 +220,16 @@ def _identity_fields(identity: UhcSemanticBuildIdentity) -> dict[str, Any]:
         "artifact_sha256": identity.artifact_sha256,
         "raw_contract_version": identity.raw_contract_version,
         "raw_range_count": identity.raw_range_count,
+        "manifest_sha256": identity.manifest_sha256,
+        "range_set_sha256": identity.range_set_sha256,
+        "raw_record_count": identity.raw_record_count,
+        "raw_producer_build_id": identity.raw_producer_build_id,
         "collection_kind": identity.collection_kind,
         "semantic_contract_id": UHC_SEMANTIC_CONTRACT_ID,
         "semantic_contract_version": UHC_SEMANTIC_CONTRACT_VERSION,
         "copy_format_id": UHC_SEMANTIC_COPY_FORMAT_ID,
         "encoder_sha256": identity.encoder_sha256,
+        "semantic_verifier_sha256": identity.semantic_verifier_sha256,
     }
 
 
@@ -218,15 +259,22 @@ async def _assert_active_raw_layout(
         f"""
         SELECT binding.catalog_set_sha256, binding.source_file_id,
                binding.artifact_sha256, binding.collection_kind,
-               layout.contract_version, layout.range_count
+               layout.contract_version, layout.range_count,
+               layout.manifest_sha256, layout.range_set_sha256,
+               layout.record_count, layout.producer_build_id
           FROM {binding_table} AS binding
           JOIN {layout_table} AS layout
             ON layout.artifact_sha256=binding.artifact_sha256
-           AND layout.contract_version=$4 AND layout.range_count=$5
+           AND layout.contract_version=$4
+           AND layout.range_count=$5
+           AND layout.manifest_sha256=$6
+           AND layout.range_set_sha256=$7
+           AND layout.record_count=$8
+           AND layout.producer_build_id=$9
          WHERE binding.catalog_set_sha256=$1
            AND binding.source_file_id=$2
            AND binding.artifact_sha256=$3
-           AND binding.collection_kind=$6
+           AND binding.collection_kind=$10
            AND binding.released_at IS NULL
            AND layout.status='verified'
          FOR SHARE OF binding, layout
@@ -236,6 +284,10 @@ async def _assert_active_raw_layout(
         identity.artifact_sha256,
         identity.raw_contract_version,
         identity.raw_range_count,
+        identity.manifest_sha256,
+        identity.range_set_sha256,
+        identity.raw_record_count,
+        identity.raw_producer_build_id,
         identity.collection_kind,
     )
     if gate is None:
@@ -286,15 +338,19 @@ async def _insert_semantic_build(
         INSERT INTO {build_table} (
             semantic_build_id, catalog_set_sha256, source_file_id,
             artifact_sha256, raw_contract_version, raw_range_count,
+            manifest_sha256, range_set_sha256, raw_record_count,
+            raw_producer_build_id,
             collection_kind, semantic_contract_id,
             semantic_contract_version, copy_format_id, encoder_sha256,
+            semantic_verifier_sha256,
             status, attempt_count, lease_token, lease_expires_at,
             heartbeat_at, stage_schema, stage_relation, created_at, updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-            'building', 1, $12,
-            now() + ($13::double precision * interval '1 second'),
-            now(), $14, $15, now(), now()
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16,
+            'building', 1, $17,
+            now() + ($18::double precision * interval '1 second'),
+            now(), $19, $20, now(), now()
         )
         """,
         identity.semantic_build_id,
@@ -303,11 +359,16 @@ async def _insert_semantic_build(
         identity.artifact_sha256,
         identity.raw_contract_version,
         identity.raw_range_count,
+        identity.manifest_sha256,
+        identity.range_set_sha256,
+        identity.raw_record_count,
+        identity.raw_producer_build_id,
         identity.collection_kind,
         UHC_SEMANTIC_CONTRACT_ID,
         UHC_SEMANTIC_CONTRACT_VERSION,
         UHC_SEMANTIC_COPY_FORMAT_ID,
         identity.encoder_sha256,
+        identity.semantic_verifier_sha256,
         lease_token,
         lease_seconds,
         schema,
@@ -592,10 +653,10 @@ def _report_sha256(report: Mapping[str, Any], field: str) -> str:
     return value
 
 
-def _validate_native_report(
+def _assert_native_contract_and_lineage(
     identity: UhcSemanticBuildIdentity,
     report: Mapping[str, Any],
-) -> tuple[int, int, Mapping[str, Any], list[Any], list[Any]]:
+) -> None:
     if (
         report.get("contract_id") != UHC_SEMANTIC_CONTRACT_ID
         or report.get("contract_version") != UHC_SEMANTIC_CONTRACT_VERSION
@@ -607,7 +668,12 @@ def _validate_native_report(
     lineage = _mapping(report.get("lineage"), "lineage")
     expected_lineage_by_field = {
         "artifact_sha256": identity.artifact_sha256,
+        "manifest_sha256": identity.manifest_sha256,
+        "range_set_sha256": identity.range_set_sha256,
         "source_file_id": identity.source_file_id,
+        "source_binding_id": (
+            f"{identity.catalog_set_sha256}/{identity.source_file_id}"
+        ),
         "collection_kind": identity.collection_kind,
     }
     if any(
@@ -615,13 +681,89 @@ def _validate_native_report(
         for field, expected_value in expected_lineage_by_field.items()
     ):
         raise UhcSemanticBuildError("UHC semantic native lineage mismatch")
-    fact_count = _report_int(report, "fact_count", positive=True)
+
+
+def _native_evidence_count(
+    identity: UhcSemanticBuildIdentity,
+    report: Mapping[str, Any],
+    fact_count: int,
+    quarantine_count: int,
+) -> int:
     evidence_count = _report_int(report, "evidence_count")
-    expected_evidence = (
-        fact_count if identity.collection_kind == "provider_membership" else 0
-    )
+    expected_evidence = 0
+    if identity.collection_kind == "provider_membership":
+        expected_evidence = fact_count - quarantine_count
+    elif quarantine_count:
+        raise UhcSemanticBuildError(
+            "UHC semantic plan facts cannot contain provider quarantine"
+        )
     if evidence_count != expected_evidence:
         raise UhcSemanticBuildError("UHC semantic native evidence count mismatch")
+    return evidence_count
+
+
+def _validated_native_counters(
+    report: Mapping[str, Any],
+    fact_count: int,
+    quarantine_count: int,
+) -> Mapping[str, Any]:
+    counters = _mapping(report.get("counters"), "counters")
+    if _report_int(counters, "invalid_npi_count") != quarantine_count:
+        raise UhcSemanticBuildError(
+            "UHC semantic native quarantine counters do not balance"
+        )
+    provider_count = _report_int(counters, "raw_provider_records")
+    if quarantine_count > provider_quarantine_limit(provider_count):
+        raise UhcSemanticBuildError(
+            "UHC semantic native quarantine rate exceeds its ceiling"
+        )
+    try:
+        provider_quarantine_rejected_counts(counters)
+    except UhcProviderQuarantineError as error:
+        raise UhcSemanticBuildError(
+            "UHC semantic native quarantine counters are invalid"
+        ) from error
+    if provider_count + _report_int(counters, "raw_plan_records") != fact_count:
+        raise UhcSemanticBuildError("UHC semantic native counters do not balance")
+    return counters
+
+
+def _validated_native_ranges(
+    identity: UhcSemanticBuildIdentity,
+    report: Mapping[str, Any],
+) -> tuple[list[Any], list[Any]]:
+    fact_blocks = report.get("fact_blocks")
+    evidence_ranges = report.get("evidence_ranges")
+    if (
+        not isinstance(fact_blocks, list)
+        or len(fact_blocks) != identity.raw_range_count
+        or not isinstance(evidence_ranges, list)
+        or len(evidence_ranges) != identity.raw_range_count
+    ):
+        raise UhcSemanticBuildError("UHC semantic range proof count mismatch")
+    return fact_blocks, evidence_ranges
+
+
+def _validate_native_report(
+    identity: UhcSemanticBuildIdentity,
+    report: Mapping[str, Any],
+) -> tuple[int, int, Mapping[str, Any], list[Any], list[Any]]:
+    """Validate one native report against the exact admitted raw identity."""
+    _assert_native_contract_and_lineage(identity, report)
+    fact_count = _report_int(report, "fact_count", positive=True)
+    if fact_count != identity.raw_record_count:
+        raise UhcSemanticBuildError(
+            "UHC semantic native fact count does not match admitted raw layout"
+        )
+    quarantine_count = _report_int(report, "quarantine_count")
+    _report_sha256(report, "quarantine_identity_set_sha256")
+    if quarantine_count > UHC_PROVIDER_QUARANTINE_MAX_COUNT:
+        raise UhcSemanticBuildError(
+            "UHC semantic native quarantine count exceeds its ceiling"
+        )
+    evidence_count = _native_evidence_count(
+        identity, report, fact_count, quarantine_count
+    )
     for field in (
         "fact_set_sha256",
         "record_identity_set_sha256",
@@ -634,31 +776,26 @@ def _validate_native_report(
     copy_row_count = _report_int(report, "copy_row_count", positive=True)
     if output_bytes <= 0 or copy_row_count != evidence_count + identity.raw_range_count:
         raise UhcSemanticBuildError("UHC semantic native COPY proof mismatch")
-    counters = _mapping(report.get("counters"), "counters")
-    fact_blocks = report.get("fact_blocks")
-    evidence_ranges = report.get("evidence_ranges")
-    if (
-        not isinstance(fact_blocks, list)
-        or len(fact_blocks) != identity.raw_range_count
-        or not isinstance(evidence_ranges, list)
-        or len(evidence_ranges) != identity.raw_range_count
-    ):
-        raise UhcSemanticBuildError("UHC semantic range proof count mismatch")
-    if _report_int(counters, "raw_provider_records") + _report_int(
-        counters, "raw_plan_records"
-    ) != fact_count:
-        raise UhcSemanticBuildError("UHC semantic native counters do not balance")
+    counters = _validated_native_counters(report, fact_count, quarantine_count)
+    fact_blocks, evidence_ranges = _validated_native_ranges(identity, report)
     return fact_count, evidence_count, counters, fact_blocks, evidence_ranges
 
 
 def _assert_verifier_report(
+    identity: UhcSemanticBuildIdentity,
     native_report: Mapping[str, Any],
     verifier_report: Mapping[str, Any],
 ) -> str:
     verifier_sha256 = _report_sha256(verifier_report, "verifier_sha256")
+    if verifier_sha256 != identity.semantic_verifier_sha256:
+        raise UhcSemanticBuildError(
+            "independent UHC semantic verifier identity changed"
+        )
     for field in (
         "fact_count",
         "evidence_count",
+        "quarantine_count",
+        "quarantine_identity_set_sha256",
         "fact_set_sha256",
         "record_identity_set_sha256",
         "evidence_identity_set_sha256",
@@ -741,6 +878,7 @@ def _combined_counters(
             "duplicate_npi_groups": evidence.duplicate_npi_groups,
             "conflicting_npi_groups": evidence.conflicting_npi_groups,
             "conflict_counts": evidence.conflict_counts,
+            "rejected_counts": provider_quarantine_rejected_counts(counters),
             "unknown_field_counts": {},
             "intentional_drop_counts": {},
         }
@@ -756,6 +894,9 @@ def _combined_counters(
         }
         combined_count_by_field["npi_evidence_proof_sha256"] = (
             evidence.proof_sha256
+        )
+        combined_count_by_field["quarantine_identity_set_sha256"] = (
+            verifier_report["quarantine_identity_set_sha256"]
         )
     return combined_count_by_field
 
@@ -794,7 +935,11 @@ def _semantic_seal_proof(
         counters=counters,
         fact_blocks=fact_blocks,
         evidence_ranges=evidence_ranges,
-        verifier_sha256=_assert_verifier_report(native_report, verifier_report),
+        verifier_sha256=_assert_verifier_report(
+            identity,
+            native_report,
+            verifier_report,
+        ),
     )
 
 

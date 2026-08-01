@@ -21,21 +21,28 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-pub const UHC_SEMANTIC_FACT_CONTRACT_ID: &str = "healthporta.uhc.semantic-facts.v2";
-pub const UHC_SEMANTIC_FACT_CONTRACT_VERSION: u64 = 2;
+pub const UHC_SEMANTIC_FACT_CONTRACT_ID: &str = "healthporta.uhc.semantic-facts.v3";
+pub const UHC_SEMANTIC_FACT_CONTRACT_VERSION: u64 = 3;
 pub const UHC_SEMANTIC_COPY_FORMAT_ID: &str = "postgres-copy-binary-uhc-fact-evidence-v2";
 pub const UHC_SEMANTIC_SOURCE_ID: &str = "pdfhir_2754e999dd691175821ec26e";
 pub const UHC_SEMANTIC_COPY_COLUMN_COUNT: i16 = 11;
 
+const UHC_PROVIDER_QUARANTINE_CONTRACT_ID: &str = "healthporta.uhc.provider-quarantine.v1";
+const UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM: &str = "invalid_npi_checksum";
+const UHC_PROVIDER_QUARANTINE_MAX_COUNT: u64 = 32;
+const UHC_PROVIDER_QUARANTINE_RATE_DENOMINATOR: u64 = 1_000_000;
+
 const COPY_ROW_FACT_BLOCK: i16 = 1;
 const COPY_ROW_NPI_EVIDENCE: i16 = 2;
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
-const WORKER_FIXED_BYTES: usize = 2 * 1024 * 1024;
+const QUARANTINE_IDENTITY_BUFFER_BYTES: usize = 8 * 1024;
+const WORKER_FIXED_BYTES: usize = 2 * 1024 * 1024 + QUARANTINE_IDENTITY_BUFFER_BYTES;
 const RECORD_EXPANSION_FACTOR: usize = 8;
 const RECORD_FIXED_BYTES: usize = 256 * 1024;
 const MAX_WORKERS: usize = 64;
 const MIN_EVIDENCE_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_RANGE_COUNT: usize = 256;
+const PENDING_QUARANTINE_IDENTITY_BYTES: usize = MAX_RANGE_COUNT * QUARANTINE_IDENTITY_BUFFER_BYTES;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -259,7 +266,10 @@ impl SemanticMemoryBudget {
         let Some(worker_total) = self.per_worker_bytes.checked_mul(self.worker_count) else {
             return Err(invalid("UHC semantic total budget overflowed"));
         };
-        let Some(required_total) = worker_total.checked_add(COPY_BUFFER_BYTES) else {
+        let Some(required_total) = worker_total
+            .checked_add(COPY_BUFFER_BYTES)
+            .and_then(|total| total.checked_add(PENDING_QUARANTINE_IDENTITY_BYTES))
+        else {
             return Err(invalid("UHC semantic total budget overflowed"));
         };
         if required_total > self.total_bytes {
@@ -366,14 +376,23 @@ fn clean(value: Option<&str>, upper: bool) -> Option<String> {
     }
 }
 
-fn valid_npi(value: &str) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NpiValidity {
+    Valid,
+    ChecksumInvalid,
+    Invalid,
+}
+
+fn npi_validity(value: &str) -> NpiValidity {
     if value.len() != 10 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
+        return NpiValidity::Invalid;
     }
-    let parsed = match value.parse::<u64>() {
-        Ok(parsed) if (1_000_000_000..=2_999_999_999).contains(&parsed) => parsed,
-        _ => return false,
-    };
+    if !matches!(
+        value.parse::<u64>(),
+        Ok(parsed) if (1_000_000_000..=2_999_999_999).contains(&parsed)
+    ) {
+        return NpiValidity::Invalid;
+    }
     let digits: Vec<u64> = value.bytes().map(|byte| u64::from(byte - b'0')).collect();
     let mut digit_sum = 24 + digits[9];
     for (index, digit) in digits[..9].iter().enumerate() {
@@ -384,7 +403,17 @@ fn valid_npi(value: &str) -> bool {
             digit_sum += digit;
         }
     }
-    parsed > 0 && digit_sum.is_multiple_of(10)
+    if digit_sum.is_multiple_of(10) {
+        NpiValidity::Valid
+    } else {
+        NpiValidity::ChecksumInvalid
+    }
+}
+
+fn provider_quarantine_limit(provider_count: u64) -> u64 {
+    let rate_limit = provider_count / UHC_PROVIDER_QUARANTINE_RATE_DENOMINATOR
+        + u64::from(!provider_count.is_multiple_of(UHC_PROVIDER_QUARANTINE_RATE_DENOMINATOR));
+    UHC_PROVIDER_QUARANTINE_MAX_COUNT.min(rate_limit)
 }
 
 fn accepting_code(value: Option<&str>) -> io::Result<Option<&'static str>> {
@@ -512,6 +541,10 @@ pub struct UhcFileCounters {
     pub multi_address_provider_records: u64,
     pub plan_year_rows: u64,
     pub invalid_npi_count: u64,
+    pub invalid_npi_individual_records: u64,
+    pub invalid_npi_facility_records: u64,
+    pub invalid_npi_address_rows: u64,
+    pub invalid_npi_provider_plan_rows: u64,
 }
 
 impl UhcFileCounters {
@@ -534,7 +567,44 @@ impl UhcFileCounters {
         self.multi_address_provider_records += incoming.multi_address_provider_records;
         self.plan_year_rows += incoming.plan_year_rows;
         self.invalid_npi_count += incoming.invalid_npi_count;
+        self.invalid_npi_individual_records += incoming.invalid_npi_individual_records;
+        self.invalid_npi_facility_records += incoming.invalid_npi_facility_records;
+        self.invalid_npi_address_rows += incoming.invalid_npi_address_rows;
+        self.invalid_npi_provider_plan_rows += incoming.invalid_npi_provider_plan_rows;
     }
+}
+
+#[derive(Serialize)]
+struct ProviderQuarantineFact<'a> {
+    #[serde(rename = "_healthporta_quarantine")]
+    quarantine: ProviderQuarantinePayload<'a>,
+}
+
+#[derive(Serialize)]
+struct ProviderQuarantinePayload<'a> {
+    contract_id: &'static str,
+    reason: &'static str,
+    source_file_id: &'a str,
+    range_ordinal: u64,
+    occurrence_ordinal: u64,
+    record_sha256: String,
+}
+
+fn provider_quarantine_identity(
+    source_file_id: &str,
+    range_ordinal: u64,
+    occurrence_ordinal: u64,
+    record_sha256: &str,
+) -> Vec<u8> {
+    serde_json::to_vec(&(
+        UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+        source_file_id,
+        range_ordinal,
+        occurrence_ordinal,
+        UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+        record_sha256,
+    ))
+    .expect("UHC provider quarantine identity is serializable")
 }
 
 #[derive(Clone, Debug)]
@@ -677,6 +747,8 @@ pub struct SemanticEncodeReport {
     pub counters: UhcFileCounters,
     pub fact_count: u64,
     pub evidence_count: u64,
+    pub quarantine_count: u64,
+    pub quarantine_identity_set_sha256: String,
     pub fact_set_sha256: String,
     pub record_identity_set_sha256: String,
     pub evidence_identity_set_sha256: String,
@@ -692,6 +764,7 @@ pub struct SemanticEncodeReport {
     pub total_memory_budget_bytes: usize,
     pub max_record_bytes: usize,
     pub evidence_buffer_bytes: usize,
+    pub pending_quarantine_identity_budget_bytes: usize,
     pub peak_worker_reserved_bytes: usize,
     pub peak_pending_range_results: usize,
     pub range_cpu_seconds: f64,
@@ -726,6 +799,7 @@ struct RangeWorkResult {
     evidence_spool: File,
     fact_identity_spool: File,
     evidence_identity_spool: File,
+    quarantine_identity_bytes: Vec<u8>,
     counters: UhcFileCounters,
     fact_block: FactBlockProof,
     evidence_range: EvidenceRangeProof,
@@ -743,6 +817,7 @@ struct RangeWorker {
     fact_encoder: Option<ZlibEncoder<HashingWriter<BufWriter<File>>>>,
     fact_identity_spool: BufWriter<File>,
     evidence_identity_spool: BufWriter<File>,
+    quarantine_identity_bytes: Vec<u8>,
     evidence_spool: BufWriter<File>,
     evidence_rows: Vec<EvidenceRow>,
     evidence_rows_bytes: usize,
@@ -753,6 +828,7 @@ struct RangeWorker {
     semantic_fact_count: u64,
     fact_identity_count: u64,
     evidence_identity_count: u64,
+    quarantine_identity_count: u64,
     peak_reserved_bytes: usize,
 }
 
@@ -779,6 +855,7 @@ impl RangeWorker {
                 COPY_BUFFER_BYTES,
                 tempfile::tempfile()?,
             ),
+            quarantine_identity_bytes: Vec::with_capacity(QUARANTINE_IDENTITY_BUFFER_BYTES),
             evidence_spool: BufWriter::with_capacity(COPY_BUFFER_BYTES, tempfile::tempfile()?),
             evidence_rows: Vec::new(),
             evidence_rows_bytes: 0,
@@ -789,6 +866,7 @@ impl RangeWorker {
             semantic_fact_count: 0,
             fact_identity_count: 0,
             evidence_identity_count: 0,
+            quarantine_identity_count: 0,
             peak_reserved_bytes: WORKER_FIXED_BYTES,
         })
     }
@@ -853,6 +931,57 @@ impl RangeWorker {
         encoder.write_all(b"\n")?;
         self.semantic_fact_count += 1;
         Ok(())
+    }
+
+    fn append_provider_quarantine(&mut self, ordinal: u64, record_bytes: &[u8]) -> io::Result<()> {
+        if self.quarantine_identity_count >= UHC_PROVIDER_QUARANTINE_MAX_COUNT {
+            return Err(invalid(
+                "UHC provider quarantine exceeds its bounded identity buffer",
+            ));
+        }
+        let record_sha256 = sha256(record_bytes);
+        let payload = canonical_value_bytes(&ProviderQuarantineFact {
+            quarantine: ProviderQuarantinePayload {
+                contract_id: UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+                reason: UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+                source_file_id: &self.source_file_id,
+                range_ordinal: self.range.range_ordinal,
+                occurrence_ordinal: ordinal,
+                record_sha256: record_sha256.clone(),
+            },
+        })?;
+        if payload.len() > self.budget.max_record_bytes {
+            return Err(invalid(
+                "canonical UHC provider quarantine exceeds max record bytes",
+            ));
+        }
+        let identity = provider_quarantine_identity(
+            &self.source_file_id,
+            self.range.range_ordinal,
+            ordinal,
+            &record_sha256,
+        );
+        let separator_bytes = usize::from(self.quarantine_identity_count != 0);
+        let Some(required_bytes) = self
+            .quarantine_identity_bytes
+            .len()
+            .checked_add(separator_bytes)
+            .and_then(|value| value.checked_add(identity.len()))
+        else {
+            return Err(invalid("UHC provider quarantine identity bytes overflowed"));
+        };
+        if required_bytes > QUARANTINE_IDENTITY_BUFFER_BYTES {
+            return Err(invalid(
+                "UHC provider quarantine exceeds its bounded identity bytes",
+            ));
+        }
+        if separator_bytes != 0 {
+            self.quarantine_identity_bytes.push(b'\n');
+        }
+        self.quarantine_identity_bytes.extend_from_slice(&identity);
+        self.quarantine_identity_count += 1;
+        self.append_fact(ordinal, &payload)?;
+        self.observe_peak(record_bytes.len())
     }
 
     fn push_evidence(&mut self, mut row: EvidenceRow, record_bytes: usize) -> io::Result<()> {
@@ -978,9 +1107,9 @@ impl RangeWorker {
                 )))
             }
         };
-        if !valid_npi(&record.npi) {
-            self.counters.invalid_npi_count += 1;
-            return Err(invalid("UHC provider NPI is not CMS-valid"));
+        let npi_validity = npi_validity(&record.npi);
+        if npi_validity == NpiValidity::Invalid {
+            return Err(invalid("UHC provider NPI is not structurally valid"));
         }
         let Some(provider_type) = clean(Some(&record.provider_type), true) else {
             return Err(invalid("UHC provider type is empty"));
@@ -993,7 +1122,6 @@ impl RangeWorker {
         }
         self.counters.raw_provider_records += 1;
         self.counters.raw_address_rows += record.addresses.len() as u64;
-        self.counters.raw_provider_plan_rows += record.plans.len() as u64;
         self.counters.multi_address_provider_records += u64::from(record.addresses.len() > 1);
         self.counters.dated_records += u64::from(record.last_updated_on.is_some());
         if provider_type == "INDIVIDUAL" {
@@ -1023,6 +1151,7 @@ impl RangeWorker {
                 }
             }
         }
+        let mut provider_plan_year_rows = 0u64;
         for plan in &record.plans {
             required_years(&plan.years)?;
             if clean(plan.plan_id_type.as_deref(), false).is_none() {
@@ -1031,7 +1160,20 @@ impl RangeWorker {
             if clean(plan.plan_id.as_deref(), false).is_none() {
                 return Err(invalid("UHC provider plan ID is empty"));
             }
-            self.counters.plan_year_rows += plan.years.len() as u64;
+            provider_plan_year_rows = provider_plan_year_rows
+                .checked_add(plan.years.len() as u64)
+                .ok_or_else(|| invalid("UHC provider plan-year count overflow"))?;
+        }
+        self.counters.plan_year_rows += provider_plan_year_rows;
+        self.counters.raw_provider_plan_rows += provider_plan_year_rows;
+        if npi_validity == NpiValidity::ChecksumInvalid {
+            self.counters.invalid_npi_count += 1;
+            self.counters.invalid_npi_individual_records +=
+                u64::from(provider_type == "INDIVIDUAL");
+            self.counters.invalid_npi_facility_records += u64::from(provider_type == "FACILITY");
+            self.counters.invalid_npi_address_rows += record.addresses.len() as u64;
+            self.counters.invalid_npi_provider_plan_rows += provider_plan_year_rows;
+            return self.append_provider_quarantine(ordinal, bytes);
         }
         let evidence = EvidenceRow {
             occurrence_ordinal: ordinal,
@@ -1104,8 +1246,17 @@ impl RangeWorker {
         {
             return Err(invalid("UHC semantic range fact count does not match"));
         }
+        if self.quarantine_identity_count != self.counters.invalid_npi_count {
+            return Err(invalid(
+                "UHC semantic range quarantine count does not match",
+            ));
+        }
         let expected_evidence = match self.collection_kind {
-            UhcCollectionKind::ProviderMembership => self.range.record_count,
+            UhcCollectionKind::ProviderMembership => self
+                .range
+                .record_count
+                .checked_sub(self.counters.invalid_npi_count)
+                .ok_or_else(|| invalid("UHC semantic quarantine count overflowed"))?,
             UhcCollectionKind::PlanReference => 0,
         };
         if self.evidence_count != expected_evidence
@@ -1148,6 +1299,7 @@ impl RangeWorker {
             evidence_spool,
             fact_identity_spool,
             evidence_identity_spool,
+            quarantine_identity_bytes: self.quarantine_identity_bytes,
             counters: self.counters,
             fact_block: FactBlockProof {
                 range_ordinal: self.range.range_ordinal,
@@ -1348,6 +1500,24 @@ fn append_spool_digest(digest: &mut Sha256, count: &mut u64, spool: &mut File) -
     Ok(())
 }
 
+fn append_identity_bytes_digest(
+    digest: &mut Sha256,
+    count: &mut u64,
+    identity_bytes: &[u8],
+) -> io::Result<()> {
+    if identity_bytes.is_empty() {
+        return Ok(());
+    }
+    if *count != 0 {
+        digest.update(b"\n");
+    }
+    digest.update(identity_bytes);
+    *count = (*count)
+        .checked_add(1)
+        .ok_or_else(|| invalid("UHC identity spool count overflowed"))?;
+    Ok(())
+}
+
 fn fact_set_sha256(blocks: &[FactBlockProof]) -> String {
     let mut digest = Sha256::new();
     for (index, block) in blocks.iter().enumerate() {
@@ -1464,8 +1634,10 @@ where
     let mut evidence_ranges = Vec::with_capacity(ranges.len());
     let mut fact_identity_digest = Sha256::new();
     let mut evidence_identity_digest = Sha256::new();
+    let mut quarantine_identity_digest = Sha256::new();
     let mut fact_identity_spools = 0u64;
     let mut evidence_identity_spools = 0u64;
+    let mut quarantine_identity_spools = 0u64;
     let mut fact_count = 0u64;
     let mut evidence_count = 0u64;
     let mut evidence_run_count = 0u64;
@@ -1525,6 +1697,13 @@ where
                                     &mut range.evidence_identity_spool,
                                 );
                             }
+                            if write_result.is_ok() {
+                                write_result = append_identity_bytes_digest(
+                                    &mut quarantine_identity_digest,
+                                    &mut quarantine_identity_spools,
+                                    &range.quarantine_identity_bytes,
+                                );
+                            }
                             if let Err(error) = write_result {
                                 first_error = Some(error);
                             }
@@ -1559,8 +1738,15 @@ where
             "UHC semantic fact total does not match admitted records",
         ));
     }
+    if counters.invalid_npi_count > provider_quarantine_limit(fact_count) {
+        return Err(invalid(
+            "UHC provider quarantine exceeds the file rate ceiling",
+        ));
+    }
     let expected_evidence = match source.lineage().collection_kind {
-        UhcCollectionKind::ProviderMembership => fact_count,
+        UhcCollectionKind::ProviderMembership => fact_count
+            .checked_sub(counters.invalid_npi_count)
+            .ok_or_else(|| invalid("UHC semantic quarantine total overflowed"))?,
         UhcCollectionKind::PlanReference => 0,
     };
     if evidence_count != expected_evidence {
@@ -1568,6 +1754,7 @@ where
             "UHC semantic evidence total does not match admitted provider records",
         ));
     }
+    let quarantine_count = counters.invalid_npi_count;
 
     Ok(SemanticEncodeReport {
         contract_id: UHC_SEMANTIC_FACT_CONTRACT_ID,
@@ -1578,6 +1765,10 @@ where
         counters,
         fact_count,
         evidence_count,
+        quarantine_count,
+        quarantine_identity_set_sha256: hex_digest(
+            quarantine_identity_digest.finalize().as_slice(),
+        ),
         fact_set_sha256: fact_set_sha256(&fact_blocks),
         record_identity_set_sha256: hex_digest(fact_identity_digest.finalize().as_slice()),
         evidence_identity_set_sha256: hex_digest(evidence_identity_digest.finalize().as_slice()),
@@ -1593,6 +1784,7 @@ where
         total_memory_budget_bytes: budget.total_bytes,
         max_record_bytes: budget.max_record_bytes,
         evidence_buffer_bytes: budget.evidence_buffer_bytes,
+        pending_quarantine_identity_budget_bytes: PENDING_QUARANTINE_IDENTITY_BYTES,
         peak_worker_reserved_bytes,
         peak_pending_range_results,
         range_cpu_seconds,
@@ -1642,6 +1834,31 @@ mod tests {
         "plan_contact":"8005551212",
         "network":[{"network_tier":"PREFERRED"}],
         "formulary":[{"drug_tier":"GENERIC","mail_order":true}],
+        "last_updated_on":"2026-07-01"
+    }"#;
+
+    const CHECKSUM_INVALID_PROVIDER_RECORD: &[u8] = br#"{
+        "type":"INDIVIDUAL",
+        "npi":"1003821381",
+        "name":{"first":"Ada","middle":null,"last":"Lovelace"},
+        "facility_name":null,
+        "facility_type":null,
+        "gender":"F",
+        "accepting":"accepting",
+        "addresses":[{
+            "address":"1 Main St",
+            "city":"Chicago",
+            "state":"IL",
+            "zip":"60601",
+            "phone":"3125551212"
+        }],
+        "plans":[{
+            "plan_id_type":"HIOS-PLAN-ID",
+            "plan_id":"12345IL0010001",
+            "years":[2026],
+            "network_tier":"PREFERRED"
+        }],
+        "specialty":["Family Medicine"],
         "last_updated_on":"2026-07-01"
     }"#;
 
@@ -1705,11 +1922,43 @@ mod tests {
         }
     }
 
+    struct MixedProviderSource {
+        inner: SyntheticSource,
+        invalid_ordinals: Vec<u64>,
+    }
+
+    impl AdmittedRangeSource for MixedProviderSource {
+        fn lineage(&self) -> &AdmittedSemanticLineage {
+            self.inner.lineage()
+        }
+
+        fn ranges(&self) -> &[AdmittedSemanticRange] {
+            self.inner.ranges()
+        }
+
+        fn visit_verified_records(
+            &self,
+            range: &AdmittedSemanticRange,
+            visitor: &mut dyn FnMut(u64, &[u8]) -> io::Result<()>,
+        ) -> io::Result<()> {
+            for offset in 0..range.record_count {
+                let ordinal = range.record_start + offset;
+                let record = if self.invalid_ordinals.contains(&ordinal) {
+                    CHECKSUM_INVALID_PROVIDER_RECORD
+                } else {
+                    PROVIDER_RECORD
+                };
+                visitor(ordinal, record)?;
+            }
+            Ok(())
+        }
+    }
+
     fn test_budget() -> SemanticMemoryBudget {
         SemanticMemoryBudget {
             worker_count: 2,
             per_worker_bytes: 4 * 1024 * 1024,
-            total_bytes: 10 * 1024 * 1024,
+            total_bytes: 11 * 1024 * 1024,
             max_record_bytes: 16 * 1024,
             evidence_buffer_bytes: 64 * 1024,
         }
@@ -1796,6 +2045,118 @@ mod tests {
     }
 
     #[test]
+    fn checksum_invalid_npi_is_redacted_without_shifting_fact_ordinals() {
+        let source = MixedProviderSource {
+            inner: SyntheticSource::new(4, UhcCollectionKind::ProviderMembership),
+            invalid_ordinals: vec![1],
+        };
+        let mut serial_budget = test_budget();
+        serial_budget.worker_count = 1;
+        let mut serial_copy = Vec::new();
+        let serial_report =
+            encode_admitted_ranges_to_copy(&source, &mut serial_copy, &serial_budget).unwrap();
+        let mut parallel_copy = Vec::new();
+        let parallel_report =
+            encode_admitted_ranges_to_copy(&source, &mut parallel_copy, &test_budget()).unwrap();
+
+        assert_eq!(serial_copy, parallel_copy);
+        assert_eq!(serial_report.fact_count, 4);
+        assert_eq!(serial_report.evidence_count, 3);
+        assert_eq!(serial_report.quarantine_count, 1);
+        assert_eq!(serial_report.counters.invalid_npi_count, 1);
+        assert_eq!(serial_report.counters.invalid_npi_individual_records, 1);
+        assert_eq!(serial_report.counters.invalid_npi_facility_records, 0);
+        assert_eq!(serial_report.counters.invalid_npi_address_rows, 1);
+        assert_eq!(serial_report.counters.invalid_npi_provider_plan_rows, 1);
+        assert_eq!(
+            serial_report.quarantine_identity_set_sha256,
+            parallel_report.quarantine_identity_set_sha256
+        );
+        assert_eq!(serial_report.fact_blocks[1].record_start, 1);
+        assert_eq!(serial_report.fact_blocks[2].record_start, 2);
+
+        let invalid_range = &source.ranges()[1];
+        let mut worker = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            invalid_range,
+            &test_budget(),
+        )
+        .unwrap();
+        worker
+            .process_provider(1, CHECKSUM_INVALID_PROVIDER_RECORD)
+            .unwrap();
+        let mut result = worker.finish(Instant::now()).unwrap();
+        let mut decoded = String::new();
+        flate2::read::ZlibDecoder::new(&mut result.fact_payload)
+            .read_to_string(&mut decoded)
+            .unwrap();
+        let fact: serde_json::Value = serde_json::from_str(decoded.trim()).unwrap();
+        let payload = &fact["_healthporta_quarantine"];
+        assert_eq!(fact.as_object().unwrap().len(), 1);
+        assert_eq!(payload["contract_id"], UHC_PROVIDER_QUARANTINE_CONTRACT_ID);
+        assert_eq!(
+            payload["reason"],
+            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM
+        );
+        assert_eq!(payload["range_ordinal"], 1);
+        assert_eq!(payload["occurrence_ordinal"], 1);
+        assert_eq!(
+            payload["record_sha256"],
+            sha256(CHECKSUM_INVALID_PROVIDER_RECORD)
+        );
+        assert!(!decoded.contains("1003821381"));
+        assert!(!decoded.contains("Lovelace"));
+        assert!(!decoded.contains("addresses"));
+        assert!(!decoded.contains("plans"));
+
+        let multi_year_record = String::from_utf8(CHECKSUM_INVALID_PROVIDER_RECORD.to_vec())
+            .unwrap()
+            .replace("\"years\":[2026]", "\"years\":[2025,2026]")
+            .into_bytes();
+        let mut multi_year_worker = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            invalid_range,
+            &test_budget(),
+        )
+        .unwrap();
+        multi_year_worker
+            .process_provider(1, &multi_year_record)
+            .unwrap();
+        let multi_year_result = multi_year_worker.finish(Instant::now()).unwrap();
+        assert_eq!(multi_year_result.counters.raw_provider_plan_rows, 2);
+        assert_eq!(multi_year_result.counters.plan_year_rows, 2);
+        assert_eq!(multi_year_result.counters.invalid_npi_provider_plan_rows, 2);
+    }
+
+    #[test]
+    fn encoder_enforces_quarantine_rate_and_other_fields_still_fail_closed() {
+        let excessive = MixedProviderSource {
+            inner: SyntheticSource::new(4, UhcCollectionKind::ProviderMembership),
+            invalid_ordinals: vec![1, 2],
+        };
+        assert!(
+            encode_admitted_ranges_to_copy(&excessive, io::sink(), &test_budget())
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds the file rate ceiling")
+        );
+
+        let mut malformed = SyntheticSource::new(4, UhcCollectionKind::ProviderMembership);
+        malformed.record = String::from_utf8(CHECKSUM_INVALID_PROVIDER_RECORD.to_vec())
+            .unwrap()
+            .replace("\"accepting\":\"accepting\"", "\"accepting\":\"sometimes\"")
+            .into_bytes();
+        assert!(
+            encode_admitted_ranges_to_copy(&malformed, io::sink(), &test_budget())
+                .unwrap_err()
+                .to_string()
+                .contains("accepting status is unsupported")
+        );
+    }
+
+    #[test]
     fn failed_copy_has_no_report_and_retry_is_byte_identical() {
         let source = SyntheticSource::new(400, UhcCollectionKind::ProviderMembership);
         let budget = test_budget();
@@ -1829,6 +2190,8 @@ mod tests {
         assert_eq!(report.fact_count, 40);
         assert_eq!(report.evidence_count, 0);
         assert_eq!(report.evidence_run_count, 0);
+        assert_eq!(report.quarantine_count, 0);
+        assert_eq!(report.quarantine_identity_set_sha256, sha256(b""));
         assert_eq!(report.counters.raw_plan_records, 40);
         assert_eq!(report.counters.raw_formulary_entries, 40);
         assert_eq!(report.counters.plan_year_rows, 40);
@@ -1947,6 +2310,17 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("total budget is too small"));
+        let exact_total = budget.per_worker_bytes * budget.worker_count
+            + COPY_BUFFER_BYTES
+            + PENDING_QUARANTINE_IDENTITY_BYTES;
+        budget.total_bytes = exact_total - 1;
+        assert!(budget
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("total budget is too small"));
+        budget.total_bytes = exact_total;
+        budget.validate().expect("accept exact total memory bound");
 
         let valid = SyntheticSource::new(4, UhcCollectionKind::ProviderMembership);
         let mut invalid_lineage = valid.lineage.clone();
@@ -2025,11 +2399,17 @@ mod tests {
             clean(Some(" mixed Case "), true).as_deref(),
             Some("MIXED CASE")
         );
-        assert!(!valid_npi("123"));
-        assert!(!valid_npi("100382138x"));
-        assert!(!valid_npi("0000000000"));
-        assert!(!valid_npi("1003821381"));
-        assert!(valid_npi("1003821380"));
+        assert_eq!(npi_validity("123"), NpiValidity::Invalid);
+        assert_eq!(npi_validity("100382138x"), NpiValidity::Invalid);
+        assert_eq!(npi_validity("0000000000"), NpiValidity::Invalid);
+        assert_eq!(npi_validity("1003821381"), NpiValidity::ChecksumInvalid);
+        assert_eq!(npi_validity("1003821380"), NpiValidity::Valid);
+        assert_eq!(provider_quarantine_limit(0), 0);
+        assert_eq!(provider_quarantine_limit(1), 1);
+        assert_eq!(provider_quarantine_limit(1_000_000), 1);
+        assert_eq!(provider_quarantine_limit(1_000_001), 2);
+        assert_eq!(provider_quarantine_limit(32_000_000), 32);
+        assert_eq!(provider_quarantine_limit(u64::MAX), 32);
 
         assert_eq!(accepting_code(None).unwrap(), None);
         assert_eq!(accepting_code(Some("yes")).unwrap(), Some("newpt"));
@@ -2194,6 +2574,7 @@ mod tests {
         assert_eq!(report.counters.valid_phone_count, 4);
         assert_eq!(report.counters.invalid_phone_count, 4);
         assert_eq!(report.counters.multi_address_provider_records, 4);
+        assert_eq!(report.counters.raw_provider_plan_rows, 8);
         assert_eq!(report.counters.plan_year_rows, 8);
 
         let mut facility_without_types =
@@ -2214,7 +2595,7 @@ mod tests {
         let provider_failures: &[(&[u8], &str)] = &[
             (
                 br#"{"type":"INDIVIDUAL","npi":"123","name":null,"facility_name":null,"facility_type":null,"gender":null,"accepting":null,"addresses":[{}],"plans":[{"plan_id_type":"H","plan_id":"P","years":[2026],"network_tier":null}],"specialty":null,"last_updated_on":null}"#,
-                "CMS-valid",
+                "structurally valid",
             ),
             (
                 br#"{"type":"UNKNOWN","npi":"1003821380","name":null,"facility_name":null,"facility_type":null,"gender":null,"accepting":null,"addresses":[{}],"plans":[{"plan_id_type":"H","plan_id":"P","years":[2026],"network_tier":null}],"specialty":null,"last_updated_on":null}"#,
@@ -2851,6 +3232,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("COPY byte count overflowed"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = File::create(directory.path().join("counted.copy")).unwrap();
+        let mut persisted = CountingWriter::new(BufWriter::new(output));
+        persisted.write_all(b"ok").unwrap();
+        persisted.flush().unwrap();
+        assert_eq!(persisted.bytes, 2);
+
         let mut failing = FailAfter {
             remaining: 1,
             bytes: Vec::new(),

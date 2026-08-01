@@ -627,6 +627,7 @@ jobs:
             uhc_semantic_test_ci_runner
           timeout --foreground 295s python -m pytest -q \
             tests/test_uhc_semantic_build_postgres.py \
+            tests/test_uhc_semantic_build_lifecycle.py \
             tests/test_uhc_retained_dataset_postgres.py
       - name: Run strict shared PTG PostgreSQL publish, graph, and cold-read smoke
         if: matrix.shard == 'core'

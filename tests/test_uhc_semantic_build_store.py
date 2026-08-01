@@ -6,13 +6,41 @@ import asyncio
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
+import json
+from pathlib import Path
+import struct
 from types import SimpleNamespace
+from typing import AsyncIterator
 from unittest.mock import AsyncMock
+import zlib
 
+import asyncpg
 import pytest
 
 import process.uhc_semantic_build_store as store
+import process.uhc_semantic_stage_verifier as stage_verifier
+import process.uhc_semantic_verifier_identity as verifier_identity
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UhcProviderQuarantine,
+    quarantine_identity_set_sha256,
+    validate_provider_quarantine_fact,
+)
+from process.uhc_provider_quarantine_raw_verifier import (
+    UhcProviderQuarantineRawSource,
+)
+from process.uhc_provider_quarantine_record import (
+    UhcProviderQuarantineRecordCensus,
+)
 from process.uhc_semantic_evidence import UhcNpiEvidenceSummary
+from process.uhc_semantic_stage_verifier import (
+    _evidence_identity,
+    _fact_identity,
+    verify_sealed_uhc_semantic_build,
+    verify_uhc_semantic_stage,
+)
 
 
 def _digest(label: str) -> str:
@@ -26,6 +54,10 @@ def _identity(**overrides: object) -> store.UhcSemanticBuildIdentity:
         "artifact_sha256": _digest("artifact"),
         "raw_contract_version": 2,
         "raw_range_count": 4,
+        "manifest_sha256": _digest("manifest"),
+        "range_set_sha256": _digest("ranges"),
+        "raw_record_count": 4,
+        "raw_producer_build_id": "fixture-producer-v1",
         "collection_kind": "provider_membership",
         "encoder_sha256": _digest("encoder"),
     }
@@ -34,6 +66,8 @@ def _identity(**overrides: object) -> store.UhcSemanticBuildIdentity:
 
 
 def _native_report(identity: store.UhcSemanticBuildIdentity) -> dict[str, object]:
+    """Build one exact native-report fixture for the supplied identity."""
+
     blocks = [
         {
             "range_ordinal": ordinal,
@@ -64,11 +98,18 @@ def _native_report(identity: store.UhcSemanticBuildIdentity) -> dict[str, object
         "encoder_sha256": identity.encoder_sha256,
         "lineage": {
             "artifact_sha256": identity.artifact_sha256,
+            "manifest_sha256": identity.manifest_sha256,
+            "range_set_sha256": identity.range_set_sha256,
             "source_file_id": identity.source_file_id,
+            "source_binding_id": (
+                f"{identity.catalog_set_sha256}/{identity.source_file_id}"
+            ),
             "collection_kind": identity.collection_kind,
         },
         "fact_count": fact_count,
         "evidence_count": fact_count,
+        "quarantine_count": 0,
+        "quarantine_identity_set_sha256": hashlib.sha256(b"").hexdigest(),
         "fact_set_sha256": _digest("facts"),
         "record_identity_set_sha256": _digest("records"),
         "evidence_identity_set_sha256": _digest("evidence"),
@@ -76,23 +117,76 @@ def _native_report(identity: store.UhcSemanticBuildIdentity) -> dict[str, object
         "output_bytes": 1024,
         "output_sha256": _digest("copy-output"),
         "copy_row_count": fact_count + identity.raw_range_count,
-        "counters": {
-            "raw_provider_records": fact_count,
-            "raw_plan_records": 0,
-        },
+        "counters": _native_counter_by_field(fact_count),
         "fact_blocks": blocks,
         "evidence_ranges": evidence_ranges,
     }
 
 
-def test_build_identity_is_exact_and_stage_is_private() -> None:
-    identity = _identity()
+def _native_counter_by_field(fact_count: int) -> dict[str, int]:
+    return {
+        "raw_provider_records": fact_count,
+        "raw_plan_records": 0,
+        "raw_individual_records": fact_count,
+        "raw_facility_records": 0,
+        "raw_address_rows": fact_count,
+        "raw_provider_plan_rows": fact_count,
+        "invalid_npi_count": 0,
+        "invalid_npi_individual_records": 0,
+        "invalid_npi_facility_records": 0,
+        "invalid_npi_address_rows": 0,
+        "invalid_npi_provider_plan_rows": 0,
+    }
 
-    assert len(identity.semantic_build_id) == 64
-    assert identity.semantic_build_id == _identity().semantic_build_id
-    assert identity.semantic_build_id != _identity(
-        encoder_sha256=_digest("other encoder")
-    ).semantic_build_id
+
+def _native_report_with_quarantine(
+    identity: store.UhcSemanticBuildIdentity,
+) -> dict[str, object]:
+    report = deepcopy(_native_report(identity))
+    report["evidence_count"] = 3
+    report["quarantine_count"] = 1
+    report["quarantine_identity_set_sha256"] = _digest("quarantine")
+    report["copy_row_count"] = 7
+    report["evidence_ranges"][1]["evidence_count"] = 0
+    report["evidence_ranges"][1]["run_count"] = 0
+    report["counters"].update(
+        invalid_npi_count=1,
+        invalid_npi_individual_records=1,
+        invalid_npi_facility_records=0,
+        invalid_npi_address_rows=1,
+        invalid_npi_provider_plan_rows=1,
+    )
+    return report
+
+
+def test_build_identity_is_exact_and_stage_is_private(monkeypatch) -> None:
+    identity = _identity()
+    original_build_id = identity.semantic_build_id
+
+    assert len(original_build_id) == 64
+    assert original_build_id == _identity().semantic_build_id
+    identity_mutations = (
+        {"catalog_set_sha256": _digest("other catalog")},
+        {"source_file_id": _digest("other source")},
+        {"artifact_sha256": _digest("other artifact")},
+        {"raw_contract_version": 3},
+        {"raw_range_count": 5},
+        {"manifest_sha256": _digest("other manifest")},
+        {"range_set_sha256": _digest("other ranges")},
+        {"raw_record_count": 5},
+        {"raw_producer_build_id": "fixture-producer-v2"},
+        {"collection_kind": "plan_reference"},
+        {"encoder_sha256": _digest("other encoder")},
+        {
+            "semantic_verifier_sha256": _digest(
+                "other verifier dependency set"
+            )
+        },
+    )
+    assert all(
+        original_build_id != _identity(**mutation).semantic_build_id
+        for mutation in identity_mutations
+    )
     assert identity.stage_relation.startswith("provider_directory_uhc_sem_")
     assert len(identity.stage_relation) <= 63
     assert len(store.UHC_SEMANTIC_COPY_COLUMNS) == 11
@@ -102,6 +196,42 @@ def test_build_identity_is_exact_and_stage_is_private() -> None:
     assert "conflict_signature_pack bytea" in create_sql
     assert "PRIMARY KEY" not in create_sql
     assert "UNIQUE" not in create_sql
+
+
+def test_verifier_identity_binds_actual_dependency_bytes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    dependency_names = verifier_identity._DEPENDENCY_NAMES
+    assert {
+        "uhc_provider_quarantine_contract.py",
+        "uhc_provider_quarantine_record.py",
+        "uhc_provider_quarantine_raw_verifier.py",
+        "uhc_retained_range_manifest.py",
+        "uhc_retained_types.py",
+        "uhc_semantic_build_store.py",
+        "uhc_semantic_evidence.py",
+        "uhc_semantic_stage_verifier.py",
+    } <= set(dependency_names)
+    for dependency_name in dependency_names:
+        (tmp_path / dependency_name).write_text(
+            f"dependency={dependency_name}\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        verifier_identity,
+        "__file__",
+        str(tmp_path / "uhc_semantic_verifier_identity.py"),
+    )
+    verifier_identity.semantic_verifier_identity_sha256.cache_clear()
+    first_identity = verifier_identity.semantic_verifier_identity_sha256()
+    changed_path = tmp_path / "uhc_retained_range_manifest.py"
+    changed_path.write_text("dependency=changed\n", encoding="utf-8")
+    verifier_identity.semantic_verifier_identity_sha256.cache_clear()
+    second_identity = verifier_identity.semantic_verifier_identity_sha256()
+
+    assert first_identity != second_identity
+    verifier_identity.semantic_verifier_identity_sha256.cache_clear()
 
 
 def test_native_and_independent_reports_must_match_exactly() -> None:
@@ -120,6 +250,8 @@ def test_native_and_independent_reports_must_match_exactly() -> None:
         for field in (
             "fact_count",
             "evidence_count",
+            "quarantine_count",
+            "quarantine_identity_set_sha256",
             "fact_set_sha256",
             "record_identity_set_sha256",
             "evidence_identity_set_sha256",
@@ -129,18 +261,129 @@ def test_native_and_independent_reports_must_match_exactly() -> None:
             "copy_row_count",
         )
     }
-    verifier_by_field["verifier_sha256"] = _digest("verifier")
+    verifier_by_field["verifier_sha256"] = identity.semantic_verifier_sha256
     assert store._assert_verifier_report(
+        identity,
         native,
         verifier_by_field,
-    ) == _digest("verifier")
+    ) == identity.semantic_verifier_sha256
     verifier_by_field["fact_set_sha256"] = _digest("wrong")
     with pytest.raises(store.UhcSemanticBuildError, match="fact_set_sha256"):
-        store._assert_verifier_report(native, verifier_by_field)
+        store._assert_verifier_report(identity, native, verifier_by_field)
+
+    verifier_by_field["fact_set_sha256"] = native["fact_set_sha256"]
+    verifier_by_field["verifier_sha256"] = _digest("wrong verifier")
+    with pytest.raises(store.UhcSemanticBuildError, match="identity changed"):
+        store._assert_verifier_report(identity, native, verifier_by_field)
+
+
+def test_nonzero_quarantine_report_is_exactly_balanced_and_publicly_aggregated():
+    identity = _identity()
+    native = _native_report_with_quarantine(identity)
+
+    fact_count, evidence_count, counters, _blocks, _ranges = (
+        store._validate_native_report(identity, native)
+    )
+    combined = store._combined_counters(
+        counters,
+        UhcNpiEvidenceSummary(
+            evidence_count=3,
+            distinct_npis=3,
+            duplicate_npi_groups=0,
+            conflicting_npi_groups=0,
+            conflict_counts={},
+        ),
+    )
+
+    assert (fact_count, evidence_count) == (4, 3)
+    assert combined["rejected_counts"] == {
+        "invalid_npi_checksum": 1,
+        "invalid_npi_checksum_individual_records": 1,
+        "invalid_npi_checksum_facility_records": 0,
+        "invalid_npi_checksum_address_rows": 1,
+        "invalid_npi_checksum_provider_plan_rows": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "quarantine_count",
+        "quarantine_digest",
+        "evidence_count",
+        "copy_rows",
+        "dimension_balance",
+        "rate_ceiling",
+        "plan_quarantine",
+    ),
+)
+def test_nonzero_quarantine_report_rejects_contract_drift(mutation):
+    identity, native_report_by_field = _quarantine_report_for_mutation(
+        mutation
+    )
+
+    with pytest.raises(store.UhcSemanticBuildError):
+        store._validate_native_report(identity, native_report_by_field)
+
+
+def _quarantine_report_for_mutation(mutation: str):
+    identity = _identity()
+    native_report_by_field = _native_report_with_quarantine(identity)
+    top_level_change_by_name = {
+        "quarantine_count": {"quarantine_count": 2},
+        "quarantine_digest": {"quarantine_identity_set_sha256": "bad"},
+        "evidence_count": {"evidence_count": 4},
+        "copy_rows": {"copy_row_count": 8},
+    }
+    if mutation in top_level_change_by_name:
+        native_report_by_field.update(top_level_change_by_name[mutation])
+        return identity, native_report_by_field
+    if mutation == "dimension_balance":
+        native_report_by_field["counters"][
+            "invalid_npi_address_rows"
+        ] = 0
+        return identity, native_report_by_field
+    if mutation == "rate_ceiling":
+        native_report_by_field.update(
+            quarantine_count=2,
+            evidence_count=2,
+            copy_row_count=6,
+        )
+        native_report_by_field["counters"].update(
+            invalid_npi_count=2,
+            invalid_npi_individual_records=2,
+            invalid_npi_address_rows=2,
+            invalid_npi_provider_plan_rows=2,
+        )
+        return identity, native_report_by_field
+    if mutation == "plan_quarantine":
+        identity = _identity(collection_kind="plan_reference")
+        native_report_by_field = _native_report_with_quarantine(identity)
+        native_report_by_field["counters"].update(
+            raw_provider_records=0,
+            raw_plan_records=4,
+            raw_individual_records=0,
+            raw_address_rows=0,
+            raw_provider_plan_rows=0,
+        )
+        return identity, native_report_by_field
+    raise AssertionError(mutation)
 
 
 def test_setwise_evidence_is_the_only_source_of_npi_group_counts() -> None:
-    counter_by_field = {"raw_provider_records": 10, "raw_plan_records": 0}
+    counter_by_field = {
+        "raw_provider_records": 10,
+        "raw_plan_records": 0,
+        "raw_individual_records": 10,
+        "raw_facility_records": 0,
+        "raw_address_rows": 10,
+        "raw_provider_plan_rows": 10,
+        "invalid_npi_count": 0,
+        "invalid_npi_individual_records": 0,
+        "invalid_npi_facility_records": 0,
+        "invalid_npi_address_rows": 0,
+        "invalid_npi_provider_plan_rows": 0,
+    }
     evidence = UhcNpiEvidenceSummary(
         evidence_count=10,
         distinct_npis=8,
@@ -210,9 +453,9 @@ class _ClaimConnection:
             "semantic_build_id": identity.semantic_build_id,
             "status": "building",
             "attempt_count": 1,
-            "lease_token": arguments[11],
-            "stage_schema": arguments[13],
-            "stage_relation": arguments[14],
+            "lease_token": arguments[16],
+            "stage_schema": arguments[18],
+            "stage_relation": arguments[19],
         }
         self.lease_active = True
         return "INSERT 0 1"
@@ -283,6 +526,8 @@ def _verifier_report(identity):
         for field in (
             "fact_count",
             "evidence_count",
+            "quarantine_count",
+            "quarantine_identity_set_sha256",
             "fact_set_sha256",
             "record_identity_set_sha256",
             "evidence_identity_set_sha256",
@@ -292,7 +537,7 @@ def _verifier_report(identity):
             "copy_row_count",
         )
     }
-    report_by_field["verifier_sha256"] = _digest("verifier")
+    report_by_field["verifier_sha256"] = identity.semantic_verifier_sha256
     return report_by_field
 
 
@@ -319,6 +564,8 @@ def test_schema_identifier_and_hash_guards(monkeypatch):
         {"raw_contract_version": 0},
         {"raw_range_count": 3},
         {"raw_range_count": 257},
+        {"raw_record_count": 0},
+        {"raw_producer_build_id": ""},
         {"collection_kind": "unsupported"},
     ],
 )
@@ -529,12 +776,28 @@ def _mutated_native_report(mutation):
             report[mutation] = "wrong"
         case "lineage_type":
             report["lineage"] = []
-        case "lineage":
+        case "lineage_source_file":
             report["lineage"]["source_file_id"] = "wrong"
+        case "lineage_artifact":
+            report["lineage"]["artifact_sha256"] = _digest("wrong artifact")
+        case "lineage_manifest":
+            report["lineage"]["manifest_sha256"] = _digest("wrong manifest")
+        case "lineage_range_set":
+            report["lineage"]["range_set_sha256"] = _digest("wrong ranges")
+        case "lineage_source_binding":
+            report["lineage"]["source_binding_id"] = "wrong"
+        case "lineage_collection_kind":
+            report["lineage"]["collection_kind"] = "plan_reference"
         case "fact_count":
             report["fact_count"] = 0
+        case "fact_count_layout":
+            report["fact_count"] = identity.raw_record_count - 1
         case "evidence_count":
             report["evidence_count"] = 3
+        case "quarantine_count_ceiling":
+            report["quarantine_count"] = (
+                store.UHC_PROVIDER_QUARANTINE_MAX_COUNT + 1
+            )
         case "proof_hash":
             report["fact_set_sha256"] = "bad"
         case "output_bytes":
@@ -553,6 +816,8 @@ def _mutated_native_report(mutation):
             report["evidence_ranges"] = []
         case "counter_balance":
             report["counters"]["raw_provider_records"] += 1
+        case "quarantine_counter_balance":
+            report["counters"]["invalid_npi_count"] = 1
         case _:
             raise AssertionError(mutation)
     return identity, report
@@ -567,7 +832,12 @@ def _mutated_native_report(mutation):
         "source_id",
         "encoder_sha256",
         "lineage_type",
-        "lineage",
+        "lineage_source_file",
+        "lineage_artifact",
+        "lineage_manifest",
+        "lineage_range_set",
+        "lineage_source_binding",
+        "lineage_collection_kind",
         "fact_count",
         "evidence_count",
         "proof_hash",
@@ -587,6 +857,32 @@ def test_native_report_rejects_every_contract_mutation(mutation):
         store._validate_native_report(identity, report)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            "fact_count_layout",
+            "fact count does not match admitted raw layout",
+        ),
+        (
+            "quarantine_count_ceiling",
+            "quarantine count exceeds its ceiling",
+        ),
+        (
+            "quarantine_counter_balance",
+            "quarantine counters do not balance",
+        ),
+    ],
+)
+def test_native_report_rejects_each_bounded_quarantine_guard(
+    mutation,
+    message,
+):
+    identity, report = _mutated_native_report(mutation)
+    with pytest.raises(store.UhcSemanticBuildError, match=message):
+        store._validate_native_report(identity, report)
+
+
 def test_plan_reference_report_requires_zero_evidence():
     identity = _identity(collection_kind="plan_reference")
     report = _native_report(identity)
@@ -595,6 +891,15 @@ def test_plan_reference_report_requires_zero_evidence():
     report["counters"] = {
         "raw_provider_records": 0,
         "raw_plan_records": identity.raw_range_count,
+        "raw_individual_records": 0,
+        "raw_facility_records": 0,
+        "raw_address_rows": 0,
+        "raw_provider_plan_rows": 0,
+        "invalid_npi_count": 0,
+        "invalid_npi_individual_records": 0,
+        "invalid_npi_facility_records": 0,
+        "invalid_npi_address_rows": 0,
+        "invalid_npi_provider_plan_rows": 0,
     }
     assert store._validate_native_report(identity, report)[1] == 0
 
@@ -615,7 +920,7 @@ def test_counter_proof_and_seal_proof_include_verifier_evidence():
     assert combined["copy_proof"]["output_bytes"] == native["output_bytes"]
     assert combined["npi_evidence_proof_sha256"] == _digest("npi-proof")
     proof = store._semantic_seal_proof(identity, native, verifier)
-    assert proof.verifier_sha256 == _digest("verifier")
+    assert proof.verifier_sha256 == identity.semantic_verifier_sha256
     assert len(store._stage_index_sql(_claim())) == 4
     assert "rows_valid" in store._stage_shape_sql(_claim().stage_ref)
 
@@ -828,3 +1133,614 @@ async def test_load_sealed_build_covers_absent_invalid_and_valid_proof():
         connection,
         identity,
     ) == valid_build_by_field
+
+
+def _postgres_json_bytes(encoded_value: object) -> bytes:
+    return json.dumps(
+        encoded_value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+
+
+def _postgres_line_hash(encoded_values: list[bytes]) -> str:
+    return hashlib.sha256(b"\n".join(encoded_values)).hexdigest()
+
+
+def _postgres_signature_pack(encoded_values: list[str]) -> bytes:
+    assert len(encoded_values) == 9
+    return b"".join(
+        hashlib.sha256(encoded_value.encode()).digest()
+        for encoded_value in encoded_values
+    )
+
+
+def _postgres_fixture_fact(
+    identity: store.UhcSemanticBuildIdentity,
+    ordinal: int,
+) -> tuple[tuple[object, ...], dict[str, object], bytes, object | None]:
+    quarantine = None
+    if ordinal == 1:
+        fact_by_field = {
+            "_healthporta_quarantine": {
+                "contract_id": UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+                "reason": UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+                "source_file_id": identity.source_file_id,
+                "range_ordinal": ordinal,
+                "occurrence_ordinal": ordinal,
+                "record_sha256": _digest("rejected-source-record"),
+            }
+        }
+        quarantine = validate_provider_quarantine_fact(
+            fact_by_field,
+            expected_source_file_id=identity.source_file_id,
+            expected_range_ordinal=ordinal,
+            expected_occurrence_ordinal=ordinal,
+        )
+        assert quarantine is not None
+    else:
+        fact_by_field = {"npi": "1003821380", "ordinal": ordinal}
+    fact_payload = _postgres_json_bytes(fact_by_field)
+    payload_hash = hashlib.sha256(fact_payload).hexdigest()
+    fact_identity = _fact_identity(
+        identity.source_file_id,
+        "ProviderMembershipRecord",
+        ordinal,
+        payload_hash,
+    )
+    semantic_hash = hashlib.sha256(fact_identity).hexdigest()
+    compressed = zlib.compress(fact_payload + b"\n", level=1)
+    compressed_hash = hashlib.sha256(compressed).hexdigest()
+    fact_block_by_field = {
+        "range_ordinal": ordinal,
+        "record_start": ordinal,
+        "record_count": 1,
+        "fact_count": 1,
+        "compressed_bytes": len(compressed),
+        "compressed_payload_sha256": compressed_hash,
+        "semantic_block_sha256": semantic_hash,
+    }
+    stage_record = (
+        1, ordinal, None, None, ordinal, 1, None, None,
+        compressed_hash, semantic_hash, compressed,
+    )
+    return stage_record, fact_block_by_field, fact_identity, quarantine
+
+
+def _postgres_fixture_evidence(
+    ordinal: int,
+) -> tuple[tuple[object, ...], dict[str, object], bytes]:
+    signature_pack = _postgres_signature_pack(
+        [
+            '"accepting"', '[{\\"address\\":\\"1 Main St\\"}]',
+            '"2026-07-01"', "null", "null", '"F"',
+            '"Ada"' if ordinal < 2 else '"Augusta"',
+            "INDIVIDUAL", '["Family Medicine"]',
+        ]
+    )
+    evidence_by_field = {
+        "occurrence_ordinal": ordinal,
+        "npi": "1003821380",
+        "conflict_signature_pack": signature_pack,
+    }
+    evidence_identity = _evidence_identity(evidence_by_field)
+    stage_record = (
+        2, ordinal, 0, ordinal, None, None, "1003821380",
+        signature_pack, None, None, None,
+    )
+    layout_hash = hashlib.sha256(
+        _postgres_json_bytes(
+            [ordinal, 0, 1, hashlib.sha256(evidence_identity).hexdigest()]
+        )
+    ).hexdigest()
+    evidence_range_by_field = {
+        "range_ordinal": ordinal,
+        "evidence_count": 1,
+        "run_count": 1,
+        "layout_sha256": layout_hash,
+    }
+    return stage_record, evidence_range_by_field, evidence_identity
+
+
+def _postgres_fixture_counters() -> dict[str, int]:
+    return {
+        "raw_provider_records": 4, "raw_plan_records": 0,
+        "raw_individual_records": 4, "raw_facility_records": 0,
+        "raw_address_rows": 4, "raw_provider_plan_rows": 4,
+        "raw_formulary_entries": 0, "named_facility_records": 0,
+        "facility_type_values": 0, "dated_records": 4,
+        "accepting_newpt_records": 4, "accepting_nopt_records": 0,
+        "accepting_null_records": 0, "invalid_phone_count": 0,
+        "valid_phone_count": 4, "multi_address_provider_records": 0,
+        "plan_year_rows": 4, "invalid_npi_count": 1,
+        "invalid_npi_individual_records": 1,
+        "invalid_npi_facility_records": 0,
+        "invalid_npi_address_rows": 1,
+        "invalid_npi_provider_plan_rows": 1,
+    }
+
+
+def _postgres_fixture_proof_hash(
+    proof_records: list[dict[str, object]],
+    fields: tuple[str, ...],
+    *,
+    contract_prefix: bool,
+) -> str:
+    return _postgres_line_hash(
+        [
+            _postgres_json_bytes(
+                [
+                    *([store.UHC_SEMANTIC_CONTRACT_ID] if contract_prefix else []),
+                    *(proof_record[field] for field in fields),
+                ]
+            )
+            for proof_record in proof_records
+        ]
+    )
+
+
+def _postgres_fixture_native_report(
+    identity: store.UhcSemanticBuildIdentity,
+    fact_blocks: list[dict[str, object]],
+    evidence_ranges: list[dict[str, object]],
+    fact_identities: list[bytes],
+    evidence_identities: list[bytes],
+    quarantines: list[UhcProviderQuarantine],
+) -> dict[str, object]:
+    fact_fields = (
+        "range_ordinal", "record_start", "record_count", "fact_count",
+        "compressed_payload_sha256", "semantic_block_sha256",
+    )
+    evidence_fields = (
+        "range_ordinal", "evidence_count", "run_count", "layout_sha256",
+    )
+    return {
+        "contract_id": store.UHC_SEMANTIC_CONTRACT_ID,
+        "contract_version": store.UHC_SEMANTIC_CONTRACT_VERSION,
+        "copy_format_id": store.UHC_SEMANTIC_COPY_FORMAT_ID,
+        "source_id": UHC_PROVIDER_FILE_SOURCE_ID,
+        "encoder_sha256": identity.encoder_sha256,
+        "lineage": {
+            "artifact_sha256": identity.artifact_sha256,
+            "manifest_sha256": identity.manifest_sha256,
+            "range_set_sha256": identity.range_set_sha256,
+            "source_file_id": identity.source_file_id,
+            "source_binding_id": (
+                f"{identity.catalog_set_sha256}/{identity.source_file_id}"
+            ),
+            "collection_kind": identity.collection_kind,
+        },
+        "counters": _postgres_fixture_counters(),
+        "fact_count": 4,
+        "evidence_count": 3,
+        "quarantine_count": 1,
+        "quarantine_identity_set_sha256": quarantine_identity_set_sha256(
+            quarantines
+        ),
+        "fact_set_sha256": _postgres_fixture_proof_hash(
+            fact_blocks, fact_fields, contract_prefix=True
+        ),
+        "record_identity_set_sha256": _postgres_line_hash(fact_identities),
+        "evidence_identity_set_sha256": _postgres_line_hash(
+            evidence_identities
+        ),
+        "evidence_layout_set_sha256": _postgres_fixture_proof_hash(
+            evidence_ranges, evidence_fields, contract_prefix=False
+        ),
+        "fact_blocks": fact_blocks,
+        "evidence_ranges": evidence_ranges,
+        "max_record_bytes": 1024 * 1024,
+    }
+
+
+def _postgres_semantic_fixture(
+    identity: store.UhcSemanticBuildIdentity,
+) -> tuple[list[tuple[object, ...]], dict[str, object]]:
+    stage_records: list[tuple[object, ...]] = []
+    fact_blocks: list[dict[str, object]] = []
+    evidence_ranges: list[dict[str, object]] = []
+    fact_identities: list[bytes] = []
+    evidence_identities: list[bytes] = []
+    quarantines: list[UhcProviderQuarantine] = []
+    for ordinal in range(4):
+        fact_record, fact_block, fact_identity, quarantine = (
+            _postgres_fixture_fact(identity, ordinal)
+        )
+        stage_records.append(fact_record)
+        fact_blocks.append(fact_block)
+        fact_identities.append(fact_identity)
+        if quarantine is not None:
+            quarantines.append(quarantine)
+            evidence_ranges.append(
+                {
+                    "range_ordinal": ordinal,
+                    "evidence_count": 0,
+                    "run_count": 0,
+                    "layout_sha256": hashlib.sha256(b"").hexdigest(),
+                }
+            )
+            continue
+        evidence_record, evidence_range, evidence_identity = (
+            _postgres_fixture_evidence(ordinal)
+        )
+        stage_records.append(evidence_record)
+        evidence_ranges.append(evidence_range)
+        evidence_identities.append(evidence_identity)
+    native_report_by_field = _postgres_fixture_native_report(
+        identity,
+        fact_blocks,
+        evidence_ranges,
+        fact_identities,
+        evidence_identities,
+        quarantines,
+    )
+    assert all(
+        len(stage_record) == len(store.UHC_SEMANTIC_COPY_COLUMNS)
+        for stage_record in stage_records
+    )
+    return stage_records, native_report_by_field
+
+
+def _postgres_binary_copy_field(index: int, field_value: object) -> bytes:
+    if index == 0:
+        return struct.pack(">h", int(field_value))
+    if index in {1, 2, 3, 4, 5}:
+        return struct.pack(">q", int(field_value))
+    if index in {7, 10}:
+        return bytes(field_value)
+    return str(field_value).encode()
+
+
+def _postgres_binary_copy(stage_records: list[tuple[object, ...]]) -> bytes:
+    encoded = bytearray(b"PGCOPY\n\xff\r\n\0")
+    encoded.extend(struct.pack(">ii", 0, 0))
+    for stage_record in stage_records:
+        encoded.extend(struct.pack(">h", len(stage_record)))
+        for index, field_value in enumerate(stage_record):
+            if field_value is None:
+                encoded.extend(struct.pack(">i", -1))
+                continue
+            field_bytes = _postgres_binary_copy_field(index, field_value)
+            encoded.extend(struct.pack(">i", len(field_bytes)))
+            encoded.extend(field_bytes)
+    encoded.extend(struct.pack(">h", -1))
+    return bytes(encoded)
+
+
+async def _postgres_copy_chunks(payload: bytes) -> AsyncIterator[bytes]:
+    for offset in range(0, len(payload), 4096):
+        yield payload[offset : offset + 4096]
+
+
+async def _postgres_broken_chunks(payload: bytes) -> AsyncIterator[bytes]:
+    yield payload[: max(20, len(payload) // 3)]
+    raise RuntimeError("injected semantic COPY crash")
+
+
+async def _postgres_install_semantic_identity(
+    connection: asyncpg.Connection,
+    identity: store.UhcSemanticBuildIdentity,
+    schema: str,
+) -> None:
+    await connection.execute(
+        f"""
+        INSERT INTO "{schema}".provider_directory_uhc_source_binding (
+            catalog_set_sha256, source_file_id, artifact_sha256,
+            collection_kind, released_at
+        ) VALUES ($1, $2, $3, $4, NULL)
+        """,
+        identity.catalog_set_sha256,
+        identity.source_file_id,
+        identity.artifact_sha256,
+        identity.collection_kind,
+    )
+    await connection.execute(
+        f"""
+        INSERT INTO "{schema}".provider_directory_uhc_raw_layout (
+            artifact_sha256, contract_version, range_count, record_count,
+            producer_build_id, range_set_sha256, manifest_sha256, status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'verified')
+        """,
+        identity.artifact_sha256,
+        identity.raw_contract_version,
+        identity.raw_range_count,
+        identity.raw_record_count,
+        identity.raw_producer_build_id,
+        identity.range_set_sha256,
+        identity.manifest_sha256,
+    )
+
+
+async def _postgres_crash_and_recover_semantic_build(
+    connection: asyncpg.Connection,
+    identity: store.UhcSemanticBuildIdentity,
+    binary_copy_payload: bytes,
+    schema: str,
+):
+    first_claim = await store.claim_uhc_semantic_build(connection, identity)
+    with pytest.raises(RuntimeError, match="injected semantic COPY crash"):
+        await store.copy_uhc_semantic_stage(
+            connection,
+            first_claim,
+            _postgres_broken_chunks(binary_copy_payload),
+        )
+    assert await connection.fetchval(
+        f"SELECT count(*) FROM {first_claim.stage_ref}"
+    ) == 0
+    await store.copy_uhc_semantic_stage(
+        connection,
+        first_claim,
+        _postgres_copy_chunks(binary_copy_payload),
+    )
+    assert await connection.fetchval(
+        f"SELECT count(*) FROM {first_claim.stage_ref}"
+    ) == 7
+    await connection.execute(
+        f"""
+        UPDATE "{schema}".provider_directory_uhc_semantic_build
+           SET lease_expires_at=now() - interval '1 second'
+         WHERE semantic_build_id=$1
+        """,
+        first_claim.semantic_build_id,
+    )
+    recovered_claim = await store.claim_uhc_semantic_build(
+        connection,
+        identity,
+    )
+    assert recovered_claim.attempt_count == 2
+    assert await connection.fetchval(
+        f"SELECT count(*) FROM {recovered_claim.stage_ref}"
+    ) == 0
+    return recovered_claim
+
+
+async def _postgres_assert_overlap_rejected(
+    connection: asyncpg.Connection,
+    recovered_claim,
+    identity: store.UhcSemanticBuildIdentity,
+    native_report_by_field: dict[str, object],
+    copy_observation_by_field: dict[str, object],
+    quarantine_source: UhcProviderQuarantineRawSource,
+) -> None:
+    overlap_record = _postgres_fixture_evidence(1)[0]
+    await connection.execute(
+        f"""
+        INSERT INTO {recovered_claim.stage_ref} (
+            row_kind, range_ordinal, run_ordinal, occurrence_ordinal,
+            record_start, record_count, npi, conflict_signature_pack,
+            payload_hash, semantic_hash, payload_bytes
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        """,
+        *overlap_record,
+    )
+    with pytest.raises(
+        store.UhcSemanticBuildError,
+        match="ordinal partition changed",
+    ):
+        await verify_uhc_semantic_stage(
+            connection,
+            recovered_claim,
+            identity,
+            native_report_by_field,
+            copy_observation=copy_observation_by_field,
+            quarantine_source=quarantine_source,
+        )
+    await connection.execute(
+        f"DELETE FROM {recovered_claim.stage_ref} "
+        "WHERE row_kind=2 AND occurrence_ordinal=1"
+    )
+
+
+async def _postgres_assert_census_drift_rejected(
+    connection: asyncpg.Connection,
+    recovered_claim,
+    identity: store.UhcSemanticBuildIdentity,
+    native_report_by_field: dict[str, object],
+    copy_observation_by_field: dict[str, object],
+    quarantine_source: UhcProviderQuarantineRawSource,
+    monkeypatch,
+) -> None:
+    def _wrong_raw_census(source, quarantines, max_record_bytes):
+        assert source is quarantine_source
+        assert quarantines
+        assert max_record_bytes == native_report_by_field["max_record_bytes"]
+        return UhcProviderQuarantineRecordCensus(
+            individual_records=1,
+            address_rows=2,
+            provider_plan_rows=1,
+        )
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            stage_verifier,
+            "verify_provider_quarantine_source_records",
+            _wrong_raw_census,
+        )
+        with pytest.raises(
+            store.UhcSemanticBuildError,
+            match="raw census disagrees",
+        ):
+            await verify_uhc_semantic_stage(
+                connection,
+                recovered_claim,
+                identity,
+                native_report_by_field,
+                copy_observation=copy_observation_by_field,
+                quarantine_source=quarantine_source,
+            )
+
+
+async def _postgres_assert_sealed_semantic_build(
+    connection: asyncpg.Connection,
+    identity: store.UhcSemanticBuildIdentity,
+    sealed,
+) -> None:
+    assert sealed.attempt_count == 2
+    assert sealed.fact_count == 4
+    assert sealed.evidence_count == 3
+    assert sealed.source_summary["rejected_counts"] == {
+        "invalid_npi_checksum": 1,
+        "invalid_npi_checksum_individual_records": 1,
+        "invalid_npi_checksum_facility_records": 0,
+        "invalid_npi_checksum_address_rows": 1,
+        "invalid_npi_checksum_provider_plan_rows": 1,
+    }
+    assert sealed.source_summary["distinct_npis"] == 1
+    assert sealed.source_summary["duplicate_npi_groups"] == 1
+    assert sealed.source_summary["conflicting_npi_groups"] == 1
+    assert sealed.source_summary["conflict_counts"]["names"] == 1
+    sealed_row = await store.load_sealed_uhc_semantic_build(
+        connection,
+        identity,
+    )
+    assert sealed_row
+    sealed_verifier_report = await verify_sealed_uhc_semantic_build(
+        connection,
+        identity,
+        sealed_row,
+    )
+    assert sealed_verifier_report["fact_count"] == 4
+    assert sealed_verifier_report["evidence_count"] == 3
+    assert sealed_verifier_report["quarantine_count"] == 1
+    reused_claim = await store.claim_uhc_semantic_build(connection, identity)
+    assert reused_claim.sealed_reuse
+    assert reused_claim.attempt_count == 2
+
+
+def _postgres_quarantine_source(
+    identity: store.UhcSemanticBuildIdentity,
+) -> UhcProviderQuarantineRawSource:
+    """Return the exact typed raw identity used by the stage verifier test."""
+
+    return UhcProviderQuarantineRawSource(
+        raw_path=Path("/test/raw.json"),
+        manifest_path=Path("/test/manifest.json"),
+        artifact_sha256=identity.artifact_sha256,
+        artifact_byte_count=1,
+        raw_contract_version=identity.raw_contract_version,
+        manifest_sha256=identity.manifest_sha256,
+        range_set_sha256=identity.range_set_sha256,
+        record_count=identity.raw_record_count,
+        range_count=identity.raw_range_count,
+        raw_producer_build_id=identity.raw_producer_build_id,
+        source_file_id=identity.source_file_id,
+    )
+
+
+def _postgres_quarantine_census(
+    native_report_by_field,
+    quarantine_source: UhcProviderQuarantineRawSource,
+):
+    """Return a deterministic stand-in for already unit-proven raw replay."""
+
+    def _verify_raw_quarantine(source, quarantines, max_record_bytes):
+        """Validate stage invocation and return the expected raw census."""
+
+        assert source is quarantine_source
+        assert len(quarantines) == 1
+        assert max_record_bytes == native_report_by_field["max_record_bytes"]
+        assert quarantines[0].occurrence_ordinal == 1
+        assert quarantines[0].record_sha256 == _digest(
+            "rejected-source-record"
+        )
+        return UhcProviderQuarantineRecordCensus(
+            individual_records=1,
+            address_rows=1,
+            provider_plan_rows=1,
+        )
+
+    return _verify_raw_quarantine
+
+
+async def _postgres_prepare_quarantine_proof(
+    connection: asyncpg.Connection,
+    identity: store.UhcSemanticBuildIdentity,
+    recovered_claim,
+    binary_copy_payload: bytes,
+    native_report_by_field: dict[str, object],
+    monkeypatch,
+) -> tuple[dict[str, object], UhcProviderQuarantineRawSource]:
+    """Copy the recovered stage and bind its typed raw-verifier stand-in."""
+
+    copied_row_count = await store.copy_uhc_semantic_stage(
+        connection,
+        recovered_claim,
+        _postgres_copy_chunks(binary_copy_payload),
+    )
+    copy_observation_by_field = {
+        "output_bytes": len(binary_copy_payload),
+        "output_sha256": hashlib.sha256(binary_copy_payload).hexdigest(),
+        "copy_row_count": copied_row_count,
+    }
+    native_report_by_field.update(copy_observation_by_field)
+    await store.prepare_uhc_semantic_stage_indexes(connection, recovered_claim)
+    quarantine_source = _postgres_quarantine_source(identity)
+    monkeypatch.setattr(
+        stage_verifier,
+        "verify_provider_quarantine_source_records",
+        _postgres_quarantine_census(
+            native_report_by_field,
+            quarantine_source,
+        ),
+    )
+    return copy_observation_by_field, quarantine_source
+
+
+async def _postgres_seal_and_reuse_semantic_build(
+    connection: asyncpg.Connection,
+    identity: store.UhcSemanticBuildIdentity,
+    recovered_claim,
+    binary_copy_payload: bytes,
+    native_report_by_field: dict[str, object],
+    monkeypatch,
+) -> None:
+    """Verify, seal, reread, and reuse one crash-recovered semantic build."""
+
+    copy_observation_by_field, quarantine_source = (
+        await _postgres_prepare_quarantine_proof(
+            connection,
+            identity,
+            recovered_claim,
+            binary_copy_payload,
+            native_report_by_field,
+            monkeypatch,
+        )
+    )
+
+    await _postgres_assert_overlap_rejected(
+        connection,
+        recovered_claim,
+        identity,
+        native_report_by_field,
+        copy_observation_by_field,
+        quarantine_source,
+    )
+    await _postgres_assert_census_drift_rejected(
+        connection,
+        recovered_claim,
+        identity,
+        native_report_by_field,
+        copy_observation_by_field,
+        quarantine_source,
+        monkeypatch,
+    )
+    verifier_report = await verify_uhc_semantic_stage(
+        connection,
+        recovered_claim,
+        identity,
+        native_report_by_field,
+        copy_observation=copy_observation_by_field,
+        quarantine_source=quarantine_source,
+    )
+    sealed = await store.seal_uhc_semantic_build(
+        connection,
+        recovered_claim,
+        identity,
+        native_report_by_field,
+        verifier_report,
+    )
+    await _postgres_assert_sealed_semantic_build(
+        connection,
+        identity,
+        sealed,
+    )

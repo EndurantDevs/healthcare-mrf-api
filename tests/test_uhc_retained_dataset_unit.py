@@ -25,6 +25,11 @@ from process.uhc_provider_file_identity import (
     UHCSourceFileDescriptor,
     logical_scope_for_file,
 )
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+)
 from process.uhc_retained_dataset import (
     UHC_RETAINED_CANONICAL_CONTRACT_ID,
     UHC_RETAINED_SOURCE_ID,
@@ -230,12 +235,14 @@ def _valid_summary_input() -> dict[str, object]:
         "input_set_sha256": "e" * 64,
         "layout_set_sha256": "f" * 64,
         "encoder_digest": "1" * 64,
+        "quarantine_proof_sha256": "2" * 64,
         "count_by_field": {
             field_name: 0
             for field_name in SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS
         },
         "count_by_category": {
             "conflict_counts": {},
+            "rejected_counts": {},
             "intentional_drop_counts": {
                 drop_key: (
                     1
@@ -253,7 +260,7 @@ def _valid_summary_input() -> dict[str, object]:
     return summary_input_by_field
 
 
-def test_summary_input_requires_exact_semantic_v2_identity():
+def test_summary_input_requires_exact_semantic_v3_identity():
     value = _valid_summary_input()
     assert validate_uhc_summary_input(value) == value
 
@@ -283,6 +290,7 @@ def _admitted_file(tmp_path: Path, *, source_file_id: str = "a" * 64):
         record_count=1,
         range_set_sha256="c" * 64,
         manifest_sha256=hashlib.sha256(b"{}").hexdigest(),
+        raw_producer_build_id="unit-fixture-producer-v1",
         raw_path=raw_path,
         manifest_path=manifest_path,
     )
@@ -1206,34 +1214,93 @@ async def test_fact_record_stream_rejects_missing_hash_and_count(
 
 
 @pytest.mark.asyncio
-async def test_copy_and_retained_only_fact_paths(monkeypatch):
+async def test_copy_and_retained_only_fact_paths():
+    """Empty copies and retained-only facts remain publication no-ops."""
+
     connection = SimpleNamespace(copy_records_to_table=AsyncMock())
     await retained._copy_batches(connection, "stage", (), [])
     connection.copy_records_to_table.assert_not_awaited()
 
-    buffers = retained._CanonicalLandingBuffers([], [], [])
-    proof_builder = Mock()
-    retained_scope = SimpleNamespace(
-        pairing_status=retained.PAIRING_UNPAIRED_RETAINED_ONLY
-    )
-    admitted = SimpleNamespace(
-        logical_scope=retained_scope,
-        collection_kind="provider_membership",
-    )
+    buffers, proof_builder, admitted, _ = _retained_only_fact_fixture()
     retained._append_canonical_fact(
         buffers,
         admitted,
+        0,
         0,
         {},
         proof_builder,
         (),
     )
     proof_builder.observe_rows.assert_not_called()
+
+
+def _retained_only_fact_fixture():
+    buffers = retained._CanonicalLandingBuffers([], [], [])
+    proof_builder = Mock()
+    retained_scope = SimpleNamespace(
+        pairing_status=retained.PAIRING_UNPAIRED_RETAINED_ONLY
+    )
+    admitted = SimpleNamespace(
+        source_file_id="a" * 64,
+        logical_scope=retained_scope,
+        collection_kind="provider_membership",
+    )
+    tombstone_by_field = {
+        "_healthporta_quarantine": {
+            "contract_id": UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+            "reason": UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+            "source_file_id": admitted.source_file_id,
+            "range_ordinal": 0,
+            "occurrence_ordinal": 1,
+            "record_sha256": "b" * 64,
+        }
+    }
+    return buffers, proof_builder, admitted, tombstone_by_field
+
+
+def test_retained_only_quarantine_paths() -> None:
+    """Retained-only tombstones stay private and lineage-bound."""
+
+    buffers, proof_builder, admitted, tombstone_by_field = (
+        _retained_only_fact_fixture()
+    )
+    retained._append_canonical_fact(
+        buffers,
+        admitted,
+        0,
+        1,
+        tombstone_by_field,
+        proof_builder,
+        (),
+    )
+    assert buffers == retained._CanonicalLandingBuffers([], [], [])
+    proof_builder.observe_rows.assert_not_called()
+    with pytest.raises(UhcRetainedDatasetError, match="lineage mismatch"):
+        retained._append_canonical_fact(
+            buffers,
+            admitted,
+            1,
+            1,
+            tombstone_by_field,
+            proof_builder,
+            (),
+        )
     admitted.collection_kind = "plan_reference"
+    with pytest.raises(UhcRetainedDatasetError, match="plan fact"):
+        retained._append_canonical_fact(
+            buffers,
+            admitted,
+            0,
+            1,
+            tombstone_by_field,
+            proof_builder,
+            (),
+        )
     with pytest.raises(UhcRetainedDatasetError, match="collection kind"):
         retained._append_canonical_fact(
             buffers,
             admitted,
+            0,
             0,
             {},
             proof_builder,
@@ -1394,10 +1461,18 @@ def test_semantic_set_and_evidence_shards_reject_mixed_shapes(tmp_path):
 
 
 def _summary_counters():
-    return {
+    counter_by_field = {
         field_name: 0
         for field_name in retained._SUMMARY_ADDITIVE_COUNTERS
     }
+    counter_by_field.update(
+        invalid_npi_individual_records=0,
+        invalid_npi_facility_records=0,
+        invalid_npi_address_rows=0,
+        invalid_npi_provider_plan_rows=0,
+        quarantine_identity_set_sha256="0" * 64,
+    )
+    return counter_by_field
 
 
 def test_summary_accumulator_counts_retained_only_provider_evidence():
@@ -1409,12 +1484,17 @@ def test_summary_accumulator_counts_retained_only_provider_evidence():
         SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS,
         0,
     )
+    rejected = dict.fromkeys(
+        UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+        0,
+    )
     counters = _summary_counters()
     for counter_field in SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS.values():
         counters[counter_field] = 1
     files = (
         SimpleNamespace(
             admitted=SimpleNamespace(
+                source_file_id="a" * 64,
                 collection_kind="plan_reference",
                 logical_scope=SimpleNamespace(pairing_status="paired"),
             ),
@@ -1423,6 +1503,7 @@ def test_summary_accumulator_counts_retained_only_provider_evidence():
         ),
         SimpleNamespace(
             admitted=SimpleNamespace(
+                source_file_id="b" * 64,
                 collection_kind="provider_membership",
                 logical_scope=SimpleNamespace(
                     pairing_status=retained.PAIRING_UNPAIRED_RETAINED_ONLY
@@ -1435,14 +1516,102 @@ def test_summary_accumulator_counts_retained_only_provider_evidence():
             stage_ref="mrf.provider",
         ),
     )
-    expected, stages = retained._accumulate_sealed_summary_counts(
-        files,
-        count_by_field,
-        retained_only,
+    expected, stages, quarantine_proof = (
+        retained._accumulate_sealed_summary_counts(
+            files,
+            count_by_field,
+            retained_only,
+            rejected,
+        )
     )
     assert expected == 1
     assert stages == ["mrf.provider"]
+    assert len(quarantine_proof) == 64
     assert retained_only[SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY] == 1
+
+
+def _quarantined_provider_file(source_file_id: str, invalid_count: int):
+    counters = _summary_counters()
+    counters.update(
+        raw_provider_records=invalid_count,
+        raw_individual_records=invalid_count,
+        raw_address_rows=invalid_count,
+        raw_provider_plan_rows=invalid_count,
+        invalid_npi_count=invalid_count,
+        invalid_npi_individual_records=invalid_count,
+        invalid_npi_address_rows=invalid_count,
+        invalid_npi_provider_plan_rows=invalid_count,
+        quarantine_identity_set_sha256=hashlib.sha256(
+            source_file_id.encode()
+        ).hexdigest(),
+    )
+    return SimpleNamespace(
+        admitted=SimpleNamespace(
+            source_file_id=source_file_id,
+            collection_kind="provider_membership",
+            logical_scope=SimpleNamespace(pairing_status="paired"),
+        ),
+        build_row={"counters_json": counters, "evidence_count": 0},
+        stage_ref=f"mrf.provider_{source_file_id[0]}",
+    )
+
+
+def test_summary_accumulator_applies_quarantine_rate_per_provider_file():
+    count_by_field = dict.fromkeys(
+        SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS,
+        0,
+    )
+    retained_only = dict.fromkeys(
+        SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS,
+        0,
+    )
+    rejected = dict.fromkeys(
+        UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+        0,
+    )
+    files = (
+        _quarantined_provider_file("a" * 64, 1),
+        _quarantined_provider_file("b" * 64, 1),
+    )
+
+    expected, stages, quarantine_proof = (
+        retained._accumulate_sealed_summary_counts(
+            files,
+            count_by_field,
+            retained_only,
+            rejected,
+        )
+    )
+
+    assert expected == 0
+    assert stages == ["mrf.provider_a", "mrf.provider_b"]
+    assert count_by_field["raw_provider_records"] == 2
+    assert count_by_field["invalid_npi_count"] == 2
+    assert rejected["invalid_npi_checksum"] == 2
+    assert len(quarantine_proof) == 64
+
+
+def test_summary_accumulator_rejects_over_rate_provider_file():
+    count_by_field = dict.fromkeys(
+        SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS,
+        0,
+    )
+    retained_only = dict.fromkeys(
+        SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS,
+        0,
+    )
+    rejected = dict.fromkeys(
+        UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+        0,
+    )
+
+    with pytest.raises(UhcRetainedDatasetError, match="file ceiling"):
+        retained._accumulate_sealed_summary_counts(
+            (_quarantined_provider_file("a" * 64, 2),),
+            count_by_field,
+            retained_only,
+            rejected,
+        )
 
 
 @pytest.mark.asyncio
@@ -1452,7 +1621,7 @@ async def test_combined_summary_rejects_disagreeing_provider_census(
     monkeypatch.setattr(
         retained,
         "_accumulate_sealed_summary_counts",
-        Mock(return_value=(1, [])),
+        Mock(return_value=(1, [], "a" * 64)),
     )
     monkeypatch.setattr(
         retained,
@@ -1488,7 +1657,66 @@ async def test_combined_summary_rejects_disagreeing_provider_census(
         )
 
 
-def test_summary_validation_rejects_each_outer_contract_boundary():
+@pytest.mark.asyncio
+async def test_combined_summary_enforces_catalog_quarantine_ceiling(monkeypatch):
+    def accumulate(_files, counts, _retained_only, rejected):
+        counts.update(
+            raw_provider_records=35,
+            raw_individual_records=35,
+            raw_address_rows=35,
+            raw_provider_plan_rows=35,
+            invalid_npi_count=33,
+        )
+        rejected.update(
+            invalid_npi_checksum=33,
+            invalid_npi_checksum_individual_records=33,
+            invalid_npi_checksum_facility_records=0,
+            invalid_npi_checksum_address_rows=33,
+            invalid_npi_checksum_provider_plan_rows=33,
+        )
+        return 2, [], "a" * 64
+
+    monkeypatch.setattr(
+        retained,
+        "_accumulate_sealed_summary_counts",
+        accumulate,
+    )
+    monkeypatch.setattr(
+        retained,
+        "summarize_uhc_npi_evidence_stages",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                distinct_npis=2,
+                duplicate_npi_groups=0,
+                conflicting_npi_groups=0,
+                conflict_counts={},
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        retained,
+        "_plan_key_counts",
+        AsyncMock(
+            return_value={
+                "membership_plan_key_count": 0,
+                "detail_plan_key_count": 0,
+                "matched_plan_key_count": 0,
+                "missing_plan_detail_count": 0,
+                "orphan_plan_detail_count": 0,
+            }
+        ),
+    )
+
+    with pytest.raises(UhcRetainedDatasetError, match="publication ceiling"):
+        await retained._combined_summary_counts(
+            object(),
+            SimpleNamespace(provider_file_count=1, plan_file_count=1),
+            (),
+            ("resource", "plan", "key", "evidence", "sealed"),
+        )
+
+
+def _assert_summary_shape_rejections() -> None:
     summary_by_field = _valid_summary_input()
     missing_field_summary_by_name = dict(summary_by_field)
     missing_field_summary_by_name.pop("complete")
@@ -1521,6 +1749,38 @@ def test_summary_validation_rejects_each_outer_contract_boundary():
     with pytest.raises(UhcRetainedDatasetError, match="unaccounted"):
         validate_uhc_summary_input(unknown)
 
+
+def _assert_summary_dimension_rejections() -> None:
+    for rejected_field in (
+        "invalid_npi_checksum_address_rows",
+        "invalid_npi_checksum_provider_plan_rows",
+    ):
+        invalid_rejection = _valid_summary_input()
+        invalid_rejection["count_by_field"].update(
+            raw_provider_records=1,
+            raw_individual_records=1,
+            raw_address_rows=1,
+            raw_provider_plan_rows=1,
+            invalid_npi_count=1,
+        )
+        invalid_rejection["count_by_category"]["rejected_counts"] = {
+            "invalid_npi_checksum": 1,
+            "invalid_npi_checksum_individual_records": 1,
+            "invalid_npi_checksum_facility_records": 0,
+            "invalid_npi_checksum_address_rows": 1,
+            "invalid_npi_checksum_provider_plan_rows": 1,
+        }
+        invalid_rejection["count_by_category"]["rejected_counts"][
+            rejected_field
+        ] = 0
+        invalid_rejection["input_sha256"] = _summary_input_hash(
+            invalid_rejection
+        )
+        with pytest.raises(UhcRetainedDatasetError, match="unaccounted"):
+            validate_uhc_summary_input(invalid_rejection)
+
+
+def _assert_summary_identity_rejections() -> None:
     changed_hash = _valid_summary_input()
     changed_hash["input_sha256"] = "0" * 64
     with pytest.raises(UhcRetainedDatasetError, match="hash is invalid"):
@@ -1529,6 +1789,14 @@ def test_summary_validation_rejects_each_outer_contract_boundary():
     admitted_set = SimpleNamespace(files=(SimpleNamespace(source_file_id="a"),))
     with pytest.raises(UhcRetainedDatasetError, match="partial semantic set"):
         retained._assert_complete_semantic_set(admitted_set, ())
+
+
+def test_summary_validation_rejects_each_outer_contract_boundary() -> None:
+    """Summary validation rejects shape, dimension, and identity drift."""
+
+    _assert_summary_shape_rejections()
+    _assert_summary_dimension_rejections()
+    _assert_summary_identity_rejections()
 
 
 @pytest.mark.asyncio

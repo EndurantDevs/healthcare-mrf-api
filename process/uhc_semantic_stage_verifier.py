@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
-from pathlib import Path
 import re
 from typing import Any, Mapping
 import zlib
@@ -15,22 +15,37 @@ import zlib
 import asyncpg
 
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_MAX_COUNT,
+    UhcProviderQuarantine,
+    UhcProviderQuarantineError,
+    validate_provider_quarantine_fact,
+)
+from process.uhc_provider_quarantine_raw_verifier import (
+    UhcProviderQuarantineRawError,
+    UhcProviderQuarantineRawSource,
+    verify_provider_quarantine_source_records,
+)
 from process.uhc_semantic_build_store import (
     UHC_SEMANTIC_CONTRACT_ID,
+    UHC_SEMANTIC_CONTRACT_VERSION,
     UhcSemanticBuildClaim,
     UhcSemanticBuildError,
     UhcSemanticBuildIdentity,
+)
+from process.uhc_semantic_verifier_identity import (
+    semantic_verifier_identity_sha256,
 )
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _VERIFY_CHUNK_BYTES = 1024 * 1024
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(_VERIFY_CHUNK_BYTES):
-            digest.update(chunk)
-    return digest.hexdigest()
+_QUARANTINE_COUNTER_FIELDS = (
+    "invalid_npi_individual_records",
+    "invalid_npi_facility_records",
+    "invalid_npi_address_rows",
+    "invalid_npi_provider_plan_rows",
+)
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -88,25 +103,79 @@ def _update_line_digest(
     return count + 1
 
 
+@dataclass
+class _QuarantineState:
+    digest: Any = field(default_factory=hashlib.sha256)
+    quarantines: list[UhcProviderQuarantine] = field(default_factory=list)
+
+    def observe(self, quarantine: UhcProviderQuarantine) -> None:
+        """Record one ordered, independently validated tombstone."""
+
+        if (
+            len(self.quarantines) >= UHC_PROVIDER_QUARANTINE_MAX_COUNT
+            or (
+                self.quarantines
+                and quarantine.occurrence_ordinal
+                <= self.quarantines[-1].occurrence_ordinal
+            )
+        ):
+            raise UhcSemanticBuildError(
+                "UHC provider quarantine order or ceiling is invalid"
+            )
+        if self.quarantines:
+            self.digest.update(b"\n")
+        self.digest.update(quarantine.identity_bytes)
+        self.quarantines.append(quarantine)
+
+    @property
+    def occurrences(self) -> list[int]:
+        """Return rejected occurrence ordinals in verified source order."""
+
+        return [item.occurrence_ordinal for item in self.quarantines]
+
+    @property
+    def count(self) -> int:
+        """Return the number of independently validated tombstones."""
+
+        return len(self.quarantines)
+
+    @property
+    def identity_set_sha256(self) -> str:
+        """Return the ordered tombstone identity-set digest."""
+
+        return self.digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class _FactBlockContext:
+    source_file_id: str
+    fact_type: str
+    max_record_bytes: int
+    global_identity_digest: Any
+    global_identity_count: int
+    quarantine_state: _QuarantineState
+    collection_kind: str
+
+
 class _FactBlockVerifier:
     def __init__(
         self,
+        context: _FactBlockContext,
         *,
-        source_file_id: str,
-        fact_type: str,
         record_start: int,
         expected_record_count: int,
-        max_record_bytes: int,
-        global_identity_digest: Any,
-        global_identity_count: int,
+        range_ordinal: int = 0,
     ) -> None:
-        self.source_file_id = source_file_id
-        self.fact_type = fact_type
+        self.source_file_id = context.source_file_id
+        self.fact_type = context.fact_type
         self.next_ordinal = record_start
         self.expected_record_count = expected_record_count
-        self.max_record_bytes = max_record_bytes
-        self.global_identity_digest = global_identity_digest
-        self.global_identity_count = global_identity_count
+        self.max_record_bytes = context.max_record_bytes
+        self.global_identity_digest = context.global_identity_digest
+        self.global_identity_count = context.global_identity_count
+        self.quarantine_state = context.quarantine_state
+        self.range_ordinal = range_ordinal
+        self.collection_kind = context.collection_kind
         self.block_identity_digest = hashlib.sha256()
         self.block_identity_count = 0
         self.line_buffer = bytearray()
@@ -135,6 +204,21 @@ class _FactBlockVerifier:
                 raise UhcSemanticBuildError(
                     "UHC semantic fact payload is not an object"
                 )
+            try:
+                quarantine = validate_provider_quarantine_fact(
+                    decoded,
+                    expected_source_file_id=self.source_file_id,
+                    expected_range_ordinal=self.range_ordinal,
+                    expected_occurrence_ordinal=self.next_ordinal,
+                )
+            except UhcProviderQuarantineError as error:
+                raise UhcSemanticBuildError(str(error)) from error
+            if quarantine is not None:
+                if self.collection_kind != "provider_membership":
+                    raise UhcSemanticBuildError(
+                        "UHC plan fact contains provider quarantine"
+                    )
+                self.quarantine_state.observe(quarantine)
             identity = _fact_identity(
                 self.source_file_id,
                 self.fact_type,
@@ -269,24 +353,16 @@ async def _verify_fact_block(
     connection: asyncpg.Connection,
     stage_ref: str,
     metadata: Mapping[str, Any],
-    *,
-    source_file_id: str,
-    fact_type: str,
-    max_record_bytes: int,
-    global_identity_digest: Any,
-    global_identity_count: int,
+    context: _FactBlockContext,
 ) -> tuple[dict[str, Any], int]:
     """Independently stream and verify one committed fact block."""
 
     block = _fact_block_metadata(metadata)
     verifier = _FactBlockVerifier(
-        source_file_id=source_file_id,
-        fact_type=fact_type,
+        context,
         record_start=block.record_start,
         expected_record_count=block.record_count,
-        max_record_bytes=max_record_bytes,
-        global_identity_digest=global_identity_digest,
-        global_identity_count=global_identity_count,
+        range_ordinal=block.range_ordinal,
     )
     compressed_digest = await _read_compressed_fact_block(
         connection,
@@ -405,12 +481,16 @@ class _EvidenceRunAccumulator:
 async def _verify_evidence_identities(
     connection: asyncpg.Connection,
     stage_ref: str,
+    *,
+    fact_count: int,
+    quarantine_occurrences: tuple[int, ...],
 ) -> tuple[int, str]:
-    """Verify contiguous global evidence identities in occurrence order."""
+    """Verify evidence and tombstones exactly partition fact ordinals."""
 
     identity_digest = hashlib.sha256()
     identity_count = 0
     expected_occurrence = 0
+    quarantine_index = 0
     query = f"""
         SELECT occurrence_ordinal, npi, conflict_signature_pack
           FROM {stage_ref}
@@ -418,9 +498,15 @@ async def _verify_evidence_identities(
          ORDER BY occurrence_ordinal
     """
     async for evidence_row in connection.cursor(query, prefetch=128):
+        while (
+            quarantine_index < len(quarantine_occurrences)
+            and quarantine_occurrences[quarantine_index] == expected_occurrence
+        ):
+            quarantine_index += 1
+            expected_occurrence += 1
         if int(evidence_row["occurrence_ordinal"]) != expected_occurrence:
             raise UhcSemanticBuildError(
-                "UHC semantic evidence occurrence ordinals are not contiguous"
+                "UHC semantic evidence and quarantine ordinals do not partition facts"
             )
         identity_count = _update_line_digest(
             identity_digest,
@@ -428,6 +514,19 @@ async def _verify_evidence_identities(
             _evidence_identity(evidence_row),
         )
         expected_occurrence += 1
+    while (
+        quarantine_index < len(quarantine_occurrences)
+        and quarantine_occurrences[quarantine_index] == expected_occurrence
+    ):
+        quarantine_index += 1
+        expected_occurrence += 1
+    if (
+        expected_occurrence != fact_count
+        or quarantine_index != len(quarantine_occurrences)
+    ):
+        raise UhcSemanticBuildError(
+            "UHC semantic evidence and quarantine ordinals do not cover facts"
+        )
     return identity_count, identity_digest.hexdigest()
 
 
@@ -492,12 +591,16 @@ async def _verify_evidence(
     stage_ref: str,
     *,
     range_count: int,
+    fact_count: int,
+    quarantine_occurrences: tuple[int, ...],
 ) -> tuple[int, str, str, list[dict[str, Any]]]:
     """Verify global evidence identity plus deterministic range/run layout."""
 
     identity_count, identity_sha256 = await _verify_evidence_identities(
         connection,
         stage_ref,
+        fact_count=fact_count,
+        quarantine_occurrences=quarantine_occurrences,
     )
     evidence_ranges = await _verify_evidence_ranges(
         connection,
@@ -547,27 +650,33 @@ async def _verify_all_fact_blocks(
     native_blocks: list[Mapping[str, Any]],
     fact_type: str,
     max_record_bytes: int,
-) -> tuple[list[dict[str, Any]], Any]:
+) -> tuple[list[dict[str, Any]], Any, _QuarantineState]:
     fact_identity_digest = hashlib.sha256()
     fact_identity_count = 0
+    quarantine_state = _QuarantineState()
     verified_blocks = []
     for expected_ordinal, metadata in enumerate(native_blocks):
         if metadata.get("range_ordinal") != expected_ordinal:
             raise UhcSemanticBuildError(
                 "UHC semantic native fact blocks are unordered"
             )
-        verified, fact_identity_count = await _verify_fact_block(
-            connection,
-            claim.stage_ref,
-            metadata,
+        context = _FactBlockContext(
             source_file_id=identity.source_file_id,
             fact_type=fact_type,
             max_record_bytes=max_record_bytes,
             global_identity_digest=fact_identity_digest,
             global_identity_count=fact_identity_count,
+            quarantine_state=quarantine_state,
+            collection_kind=identity.collection_kind,
+        )
+        verified, fact_identity_count = await _verify_fact_block(
+            connection,
+            claim.stage_ref,
+            metadata,
+            context,
         )
         verified_blocks.append(verified)
-    return verified_blocks, fact_identity_digest
+    return verified_blocks, fact_identity_digest, quarantine_state
 
 
 def _assert_verifier_agreement(
@@ -591,26 +700,77 @@ def _assert_verifier_agreement(
         )
 
 
+def _evidence_partition_contract(
+    identity: UhcSemanticBuildIdentity,
+    fact_count: int,
+    quarantine_occurrences: tuple[int, ...],
+) -> tuple[bool, int]:
+    """Return whether evidence partitions facts and its expected count."""
+
+    has_provider_partition = identity.collection_kind == "provider_membership"
+    if not has_provider_partition and quarantine_occurrences:
+        raise UhcSemanticBuildError(
+            "UHC plan reference facts cannot carry provider quarantine"
+        )
+    evidence_count = (
+        fact_count - len(quarantine_occurrences)
+        if has_provider_partition
+        else 0
+    )
+    return has_provider_partition, evidence_count
+
+
 async def _verified_evidence_fields(
     connection: asyncpg.Connection,
     claim: UhcSemanticBuildClaim,
     identity: UhcSemanticBuildIdentity,
     native_report_by_field: Mapping[str, Any],
     copy_observation: Mapping[str, Any] | None,
+    *,
+    fact_count: int,
+    quarantine_occurrences: tuple[int, ...],
 ) -> tuple[int, str, str, list[dict[str, Any]]]:
     """Verify evidence from rows or accept an exactly bound COPY proof."""
 
+    has_provider_evidence_partition, expected_evidence_count = (
+        _evidence_partition_contract(
+            identity,
+            fact_count,
+            quarantine_occurrences,
+        )
+    )
+    await _assert_evidence_ordinal_partition(
+        connection,
+        claim.stage_ref,
+        fact_count=fact_count,
+        quarantine_occurrences=quarantine_occurrences,
+        expected_evidence_count=expected_evidence_count,
+    )
     if copy_observation is None:
         return await _verify_evidence(
             connection,
             claim.stage_ref,
             range_count=identity.raw_range_count,
+            fact_count=(fact_count if has_provider_evidence_partition else 0),
+            quarantine_occurrences=(
+                quarantine_occurrences
+                if has_provider_evidence_partition
+                else ()
+            ),
         )
     _assert_copy_observation(
         native_report_by_field,
         copy_observation,
         range_count=identity.raw_range_count,
     )
+    if not has_provider_evidence_partition:
+        return await _verify_evidence(
+            connection,
+            claim.stage_ref,
+            range_count=identity.raw_range_count,
+            fact_count=0,
+            quarantine_occurrences=(),
+        )
     return (
         int(native_report_by_field["evidence_count"]),
         str(native_report_by_field["evidence_identity_set_sha256"]),
@@ -619,27 +779,42 @@ async def _verified_evidence_fields(
     )
 
 
-async def verify_uhc_semantic_stage(
+@dataclass(frozen=True)
+class _VerifiedStageRows:
+    blocks: list[dict[str, Any]]
+    fact_identity_digest: Any
+    quarantine_state: _QuarantineState
+    fact_count: int
+    evidence_count: int
+    evidence_identity_set_sha256: str
+    evidence_layout_set_sha256: str
+    evidence_ranges: list[dict[str, Any]]
+
+
+async def _verify_stage_rows(
     connection: asyncpg.Connection,
     claim: UhcSemanticBuildClaim,
     identity: UhcSemanticBuildIdentity,
     native_report_by_field: Mapping[str, Any],
-    *,
-    copy_observation: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Recompute semantic proofs from committed rows with bounded buffers."""
+    copy_observation: Mapping[str, Any] | None,
+    max_record_bytes: int,
+    native_blocks: list[Mapping[str, Any]],
+    fact_type: str,
+) -> _VerifiedStageRows:
+    """Verify all fact and evidence rows within one read transaction."""
 
-    if claim.sealed_reuse:
-        raise UhcSemanticBuildError("sealed UHC semantic build needs no verifier")
-    max_record_bytes, native_blocks, fact_type = _verifier_inputs(
-        identity,
-        native_report_by_field,
-    )
     async with connection.transaction():
-        verified_blocks, fact_identity_digest = await _verify_all_fact_blocks(
-            connection, claim, identity, native_blocks,
-            fact_type, max_record_bytes,
+        blocks, fact_identity_digest, quarantine_state = (
+            await _verify_all_fact_blocks(
+                connection,
+                claim,
+                identity,
+                native_blocks,
+                fact_type,
+                max_record_bytes,
+            )
         )
+        fact_count = sum(block["fact_count"] for block in blocks)
         (
             evidence_count,
             evidence_identity_set_sha256,
@@ -651,30 +826,206 @@ async def verify_uhc_semantic_stage(
             identity,
             native_report_by_field,
             copy_observation,
+            fact_count=fact_count,
+            quarantine_occurrences=tuple(quarantine_state.occurrences),
+        )
+    return _VerifiedStageRows(
+        blocks=blocks,
+        fact_identity_digest=fact_identity_digest,
+        quarantine_state=quarantine_state,
+        fact_count=fact_count,
+        evidence_count=evidence_count,
+        evidence_identity_set_sha256=evidence_identity_set_sha256,
+        evidence_layout_set_sha256=evidence_layout_set_sha256,
+        evidence_ranges=evidence_ranges,
+    )
+
+
+def _assert_quarantine_source_identity(
+    identity: UhcSemanticBuildIdentity,
+    source: UhcProviderQuarantineRawSource,
+) -> None:
+    """Bind the raw verifier input to the semantic build's full identity."""
+
+    expected_by_field = {
+        "artifact_sha256": identity.artifact_sha256,
+        "raw_contract_version": identity.raw_contract_version,
+        "manifest_sha256": identity.manifest_sha256,
+        "range_set_sha256": identity.range_set_sha256,
+        "record_count": identity.raw_record_count,
+        "range_count": identity.raw_range_count,
+        "raw_producer_build_id": identity.raw_producer_build_id,
+        "source_file_id": identity.source_file_id,
+    }
+    if any(
+        getattr(source, field_name) != expected_value
+        for field_name, expected_value in expected_by_field.items()
+    ):
+        raise UhcSemanticBuildError(
+            "UHC provider quarantine raw source identity changed"
         )
 
-    fact_count = sum(block["fact_count"] for block in verified_blocks)
-    verifier_report_by_field = {
-        "fact_count": fact_count,
-        "evidence_count": evidence_count,
-        "fact_set_sha256": _fact_set_sha256(verified_blocks),
-        "record_identity_set_sha256": fact_identity_digest.hexdigest(),
-        "evidence_identity_set_sha256": evidence_identity_set_sha256,
-        "evidence_layout_set_sha256": evidence_layout_set_sha256,
-        **(
-            dict(copy_observation)
-            if copy_observation is not None
-            else {}
+
+async def _verify_quarantine_census(
+    identity: UhcSemanticBuildIdentity,
+    quarantine_state: _QuarantineState,
+    max_record_bytes: int,
+    native_report_by_field: Mapping[str, Any],
+    quarantine_source: UhcProviderQuarantineRawSource | None,
+    sealed_quarantine_proof: bool,
+) -> None:
+    """Require admitted raw proof and exact rejected-dimension counters."""
+
+    if not quarantine_state.count:
+        return
+    if quarantine_source is None:
+        if not sealed_quarantine_proof:
+            raise UhcSemanticBuildError(
+                "UHC provider quarantine requires admitted raw verification"
+            )
+        return
+    if type(quarantine_source) is not UhcProviderQuarantineRawSource:
+        raise UhcSemanticBuildError(
+            "UHC provider quarantine raw source contract is invalid"
+        )
+    _assert_quarantine_source_identity(identity, quarantine_source)
+    try:
+        raw_census = await asyncio.to_thread(
+            verify_provider_quarantine_source_records,
+            quarantine_source,
+            tuple(quarantine_state.quarantines),
+            max_record_bytes,
+        )
+    except UhcProviderQuarantineRawError as error:
+        raise UhcSemanticBuildError(str(error)) from error
+    raw_counter_map = raw_census.counter_map
+    native_counter_map = native_report_by_field.get("counters")
+    expected_counter_map = (
+        {
+            field_name: native_counter_map.get(field_name)
+            for field_name in _QUARANTINE_COUNTER_FIELDS
+        }
+        if isinstance(native_counter_map, Mapping)
+        else {}
+    )
+    if dict(raw_counter_map) != expected_counter_map:
+        raise UhcSemanticBuildError(
+            "UHC provider quarantine raw census disagrees"
+        )
+
+
+def _stage_verifier_report(
+    verified: _VerifiedStageRows,
+    copy_observation: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the deterministic independent verifier report."""
+
+    return {
+        "fact_count": verified.fact_count,
+        "evidence_count": verified.evidence_count,
+        "quarantine_count": verified.quarantine_state.count,
+        "quarantine_identity_set_sha256": (
+            verified.quarantine_state.identity_set_sha256
         ),
-        "verifier_sha256": _sha256_file(Path(__file__).resolve()),
+        "fact_set_sha256": _fact_set_sha256(verified.blocks),
+        "record_identity_set_sha256": (
+            verified.fact_identity_digest.hexdigest()
+        ),
+        "evidence_identity_set_sha256": (
+            verified.evidence_identity_set_sha256
+        ),
+        "evidence_layout_set_sha256": verified.evidence_layout_set_sha256,
+        **(dict(copy_observation) if copy_observation is not None else {}),
+        "verifier_sha256": semantic_verifier_identity_sha256(),
     }
+
+
+async def verify_uhc_semantic_stage(
+    connection: asyncpg.Connection,
+    claim: UhcSemanticBuildClaim,
+    identity: UhcSemanticBuildIdentity,
+    native_report_by_field: Mapping[str, Any],
+    *,
+    copy_observation: Mapping[str, Any] | None = None,
+    quarantine_source: UhcProviderQuarantineRawSource | None = None,
+    _sealed_quarantine_proof: bool = False,
+) -> dict[str, Any]:
+    """Recompute semantic proofs from committed rows with bounded buffers."""
+
+    if claim.sealed_reuse:
+        raise UhcSemanticBuildError("sealed UHC semantic build needs no verifier")
+    max_record_bytes, native_blocks, fact_type = _verifier_inputs(
+        identity,
+        native_report_by_field,
+    )
+    verified = await _verify_stage_rows(
+        connection,
+        claim,
+        identity,
+        native_report_by_field,
+        copy_observation,
+        max_record_bytes,
+        native_blocks,
+        fact_type,
+    )
+    await _verify_quarantine_census(
+        identity,
+        verified.quarantine_state,
+        max_record_bytes,
+        native_report_by_field,
+        quarantine_source,
+        _sealed_quarantine_proof,
+    )
+    verifier_report_by_field = _stage_verifier_report(
+        verified,
+        copy_observation,
+    )
     _assert_verifier_agreement(
         verifier_report_by_field,
         native_report_by_field,
-        verified_blocks,
-        evidence_ranges,
+        verified.blocks,
+        verified.evidence_ranges,
     )
     return verifier_report_by_field
+
+
+async def _assert_evidence_ordinal_partition(
+    connection: asyncpg.Connection,
+    stage_ref: str,
+    *,
+    fact_count: int,
+    quarantine_occurrences: tuple[int, ...],
+    expected_evidence_count: int | None = None,
+) -> None:
+    """Prove indexed evidence ordinals are the exact tombstone complement."""
+
+    if expected_evidence_count is None:
+        expected_evidence_count = fact_count - len(quarantine_occurrences)
+    partition = await connection.fetchrow(
+        f"""
+        SELECT count(*)::bigint AS evidence_count,
+               count(*) FILTER (
+                   WHERE occurrence_ordinal < 0
+                      OR occurrence_ordinal >= $1
+               )::bigint AS out_of_bounds_count,
+               count(*) FILTER (
+                   WHERE occurrence_ordinal=ANY($2::bigint[])
+               )::bigint AS quarantine_overlap_count
+          FROM {stage_ref}
+         WHERE row_kind=2
+        """,
+        fact_count,
+        list(quarantine_occurrences),
+    )
+    if (
+        partition is None
+        or int(partition["evidence_count"]) != expected_evidence_count
+        or int(partition["out_of_bounds_count"]) != 0
+        or int(partition["quarantine_overlap_count"]) != 0
+    ):
+        raise UhcSemanticBuildError(
+            "UHC semantic evidence and quarantine ordinal partition changed"
+        )
 
 
 def _assert_copy_observation(
@@ -718,8 +1069,11 @@ def _assert_sealed_identity(
         build_row.get("status") != "sealed"
         or build_row.get("semantic_build_id") != identity.semantic_build_id
         or build_row.get("semantic_contract_id") != UHC_SEMANTIC_CONTRACT_ID
-        or build_row.get("semantic_contract_version") != 2
+        or build_row.get("semantic_contract_version")
+        != UHC_SEMANTIC_CONTRACT_VERSION
         or build_row.get("encoder_sha256") != identity.encoder_sha256
+        or build_row.get("verifier_sha256")
+        != semantic_verifier_identity_sha256()
         or isinstance(max_record_bytes, bool)
         or not 1 <= max_record_bytes <= 64 * 1024 * 1024
     ):
@@ -760,7 +1114,7 @@ def _sealed_native_report(
         )
     return {
         "contract_id": UHC_SEMANTIC_CONTRACT_ID,
-        "contract_version": 2,
+        "contract_version": UHC_SEMANTIC_CONTRACT_VERSION,
         "copy_format_id": build_row.get("copy_format_id"),
         "source_id": UHC_PROVIDER_FILE_SOURCE_ID,
         "encoder_sha256": identity.encoder_sha256,
@@ -772,6 +1126,10 @@ def _sealed_native_report(
         "counters": _decoded_sealed_field(build_row, "counters"),
         "fact_count": build_row.get("fact_count"),
         "evidence_count": build_row.get("evidence_count"),
+        "quarantine_count": counters.get("invalid_npi_count"),
+        "quarantine_identity_set_sha256": counters.get(
+            "quarantine_identity_set_sha256"
+        ),
         "fact_set_sha256": build_row.get("fact_set_sha256"),
         "record_identity_set_sha256": build_row.get(
             "record_identity_set_sha256"
@@ -827,4 +1185,5 @@ async def verify_sealed_uhc_semantic_build(
                 "copy_row_count",
             )
         },
+        _sealed_quarantine_proof=True,
     )

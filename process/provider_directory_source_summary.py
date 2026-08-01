@@ -10,6 +10,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+    provider_quarantine_catalog_limit,
+)
+
 
 SOURCE_SUMMARY_CONTRACT_ID = "healthporta.provider-directory.source-summary.v1"
 SOURCE_SUMMARY_CONTRACT_VERSION = 1
@@ -18,7 +24,7 @@ SOURCE_SUMMARY_FHIR_SEMANTIC_CONTRACT_ID = (
     "healthporta.provider-directory.fhir-normalized-resource.v1"
 )
 SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID = (
-    "healthporta.uhc.semantic-facts.v2"
+    "healthporta.uhc.semantic-facts.v3"
 )
 SOURCE_SUMMARY_UHC_SELECTED_RESOURCES = (
     "InsurancePlan",
@@ -84,6 +90,7 @@ SOURCE_SUMMARY_OPTIONAL_TEXT_FIELDS = (
     "layout_set_sha256",
     "semantic_contract_id",
     "encoder_digest",
+    "quarantine_proof_sha256",
 )
 SOURCE_SUMMARY_REQUIRED_FIELDS = frozenset(
     {
@@ -167,6 +174,7 @@ SOURCE_SUMMARY_SEMANTIC_COUNT_MAP_FIELDS = {
     ),
     SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID: (
         "conflict_counts",
+        "rejected_counts",
         "intentional_drop_counts",
         "unknown_field_counts",
     ),
@@ -178,14 +186,17 @@ SOURCE_SUMMARY_SEMANTIC_OUTCOME_FIELDS = {
     SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID: (
         *SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS,
         "conflict_counts",
+        "rejected_counts",
         "intentional_drop_counts",
         "unknown_field_counts",
+        "quarantine_proof_sha256",
     ),
 }
 SOURCE_SUMMARY_UHC_REQUIRED_IDENTITY_FIELDS = (
     "input_set_sha256",
     "layout_set_sha256",
     "encoder_digest",
+    "quarantine_proof_sha256",
 )
 SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY = (
     "ifp_unpaired_retained_only_provider_records"
@@ -650,15 +661,73 @@ def _validate_fhir_semantic_relationships(
         )
 
 
-def _validate_uhc_semantic_relationships(
-    summary_map: dict[str, Any],
-) -> None:
-    """Enforce algebra guaranteed by the strict setwise UHC builder."""
+def _is_uhc_rejection_map_valid(summary_map: Mapping[str, Any]) -> bool:
+    rejected_count_by_field = summary_map["rejected_counts"]
+    invalid_npi_count = summary_map["invalid_npi_count"]
+    if not rejected_count_by_field:
+        return invalid_npi_count == 0
+    return (
+        set(rejected_count_by_field)
+        == set(UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS)
+        and rejected_count_by_field[
+            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM
+        ]
+        == invalid_npi_count
+        and rejected_count_by_field[
+            "invalid_npi_checksum_individual_records"
+        ]
+        + rejected_count_by_field["invalid_npi_checksum_facility_records"]
+        == invalid_npi_count
+        and invalid_npi_count
+        <= rejected_count_by_field["invalid_npi_checksum_address_rows"]
+        <= summary_map["raw_address_rows"]
+        and invalid_npi_count
+        <= rejected_count_by_field[
+            "invalid_npi_checksum_provider_plan_rows"
+        ]
+        <= summary_map["raw_provider_plan_rows"]
+        and rejected_count_by_field[
+            "invalid_npi_checksum_individual_records"
+        ]
+        <= summary_map["raw_individual_records"]
+        and rejected_count_by_field["invalid_npi_checksum_facility_records"]
+        <= summary_map["raw_facility_records"]
+    )
+
+
+def _uhc_excluded_counts(summary_map: Mapping[str, Any]) -> tuple[int, ...]:
+    rejected_count_by_field = summary_map["rejected_counts"]
+    drop_count_by_field = summary_map["intentional_drop_counts"]
+    return (
+        rejected_count_by_field.get(
+            "invalid_npi_checksum_individual_records", 0
+        ),
+        rejected_count_by_field.get(
+            "invalid_npi_checksum_facility_records", 0
+        ),
+        rejected_count_by_field.get("invalid_npi_checksum_address_rows", 0),
+        rejected_count_by_field.get(
+            "invalid_npi_checksum_provider_plan_rows", 0
+        ),
+        drop_count_by_field.get(
+            "ifp_unpaired_retained_only_individual_records", 0
+        ),
+        drop_count_by_field.get(
+            "ifp_unpaired_retained_only_facility_records", 0
+        ),
+        drop_count_by_field.get(
+            "ifp_unpaired_retained_only_address_rows", 0
+        ),
+        drop_count_by_field.get(
+            "ifp_unpaired_retained_only_provider_plan_rows", 0
+        ),
+    )
+
+
+def _is_uhc_provider_census_valid(summary_map: Mapping[str, Any]) -> bool:
     provider_count = summary_map["raw_provider_records"]
-    membership_key_count = summary_map["membership_plan_key_count"]
-    detail_key_count = summary_map["detail_plan_key_count"]
-    matched_key_count = summary_map["matched_plan_key_count"]
-    is_relationship_set_valid = (
+    accepted_provider_count = provider_count - summary_map["invalid_npi_count"]
+    return (
         summary_map["raw_individual_records"]
         + summary_map["raw_facility_records"]
         == provider_count
@@ -666,24 +735,40 @@ def _validate_uhc_semantic_relationships(
         + summary_map["accepting_nopt_records"]
         + summary_map["accepting_null_records"]
         == provider_count
-        and summary_map["distinct_npis"] <= provider_count
-        and provider_count
-        >= summary_map["distinct_npis"]
-        + summary_map["duplicate_npi_groups"]
+        and summary_map["invalid_npi_count"]
+        <= provider_quarantine_catalog_limit(summary_map["provider_file_count"])
+        and summary_map["distinct_npis"] <= accepted_provider_count
+        and accepted_provider_count
+        >= summary_map["distinct_npis"] + summary_map["duplicate_npi_groups"]
         and summary_map["conflicting_npi_groups"]
         <= summary_map["duplicate_npi_groups"]
         and summary_map["multi_address_provider_records"] <= provider_count
         and summary_map["named_facility_records"]
         <= summary_map["raw_facility_records"]
-        and summary_map["valid_phone_count"]
-        + summary_map["invalid_phone_count"]
+        and summary_map["valid_phone_count"] + summary_map["invalid_phone_count"]
         <= summary_map["raw_address_rows"]
-        and summary_map["invalid_npi_count"] == 0
-        and summary_map["dated_records"]
-        <= provider_count + summary_map["raw_plan_records"]
+    )
+
+
+def _is_uhc_plan_census_valid(
+    summary_map: Mapping[str, Any],
+    rejected_membership_count: int,
+    dropped_membership_count: int,
+) -> bool:
+    accepted_membership_count = (
+        summary_map["raw_provider_plan_rows"]
+        - rejected_membership_count
+        - dropped_membership_count
+    )
+    membership_key_count = summary_map["membership_plan_key_count"]
+    detail_key_count = summary_map["detail_plan_key_count"]
+    matched_key_count = summary_map["matched_plan_key_count"]
+    return (
+        summary_map["dated_records"]
+        <= summary_map["raw_provider_records"] + summary_map["raw_plan_records"]
         and summary_map["plan_year_rows"]
-        >= summary_map["raw_plan_records"]
-        and membership_key_count <= summary_map["raw_provider_plan_rows"]
+        >= summary_map["raw_provider_plan_rows"] + summary_map["raw_plan_records"]
+        and membership_key_count <= accepted_membership_count
         and detail_key_count <= summary_map["raw_plan_records"]
         and matched_key_count <= min(membership_key_count, detail_key_count)
         and summary_map["missing_plan_detail_count"] + matched_key_count
@@ -692,6 +777,62 @@ def _validate_uhc_semantic_relationships(
         == detail_key_count
         and summary_map["provider_file_count"] > 0
         and summary_map["plan_file_count"] > 0
+    )
+
+
+def _is_uhc_resource_census_valid(
+    summary_map: Mapping[str, Any],
+    excluded_counts: tuple[int, ...],
+) -> bool:
+    (
+        rejected_individuals,
+        rejected_facilities,
+        rejected_addresses,
+        rejected_memberships,
+        dropped_individuals,
+        dropped_facilities,
+        dropped_addresses,
+        dropped_memberships,
+    ) = excluded_counts
+    resource_count_by_type = summary_map["resource_counts"]
+    accepted_membership_count = (
+        summary_map["raw_provider_plan_rows"]
+        - rejected_memberships
+        - dropped_memberships
+    )
+    return (
+        resource_count_by_type.get("Practitioner", 0)
+        == summary_map["raw_individual_records"]
+        - rejected_individuals
+        - dropped_individuals
+        and resource_count_by_type.get("Organization", 0)
+        == summary_map["raw_facility_records"]
+        - rejected_facilities
+        - dropped_facilities
+        and resource_count_by_type.get("Location", 0)
+        == summary_map["raw_address_rows"]
+        - rejected_addresses
+        - dropped_addresses
+        and resource_count_by_type.get("PractitionerRole", 0)
+        + resource_count_by_type.get("OrganizationAffiliation", 0)
+        == accepted_membership_count
+    )
+
+
+def _validate_uhc_semantic_relationships(
+    summary_map: dict[str, Any],
+) -> None:
+    """Enforce algebra guaranteed by the strict setwise UHC builder."""
+    excluded_counts = _uhc_excluded_counts(summary_map)
+    is_relationship_set_valid = (
+        _is_uhc_rejection_map_valid(summary_map)
+        and _is_uhc_provider_census_valid(summary_map)
+        and _is_uhc_plan_census_valid(
+            summary_map,
+            excluded_counts[3],
+            excluded_counts[7],
+        )
+        and _is_uhc_resource_census_valid(summary_map, excluded_counts)
     )
     conflict_bound = summary_map["conflicting_npi_groups"]
     if not is_relationship_set_valid or any(

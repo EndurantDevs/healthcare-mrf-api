@@ -11,9 +11,11 @@ import datetime
 import email.utils
 import hashlib
 import io
+import inspect
 import json
 import importlib
 import string
+import typing
 import urllib.error
 import urllib.parse
 from types import SimpleNamespace
@@ -61,6 +63,28 @@ def _uhc_admission_params(**overrides):
     }
     params_by_name.update(overrides)
     return params_by_name
+
+
+def test_command_wrapper_preserves_public_reflection_contract():
+    """Keep the compact wrapper indistinguishable from its public contract."""
+
+    options = importer._ProviderDirectoryFhirCommandOptions
+    options_signature = inspect.signature(options)
+    command = importer.run_provider_directory_fhir_command
+    command_signature = inspect.signature(command)
+    expected_annotation_map = {
+        **options.__annotations__,
+        "return": "dict[str, Any]",
+    }
+    assert len(command_signature.parameters) == 48
+    assert command_signature.parameters == options_signature.parameters
+    assert command_signature.return_annotation == "dict[str, Any]"
+    assert command.__annotations__ == expected_annotation_map
+    assert "command_fields" not in command.__annotations__
+    assert typing.get_type_hints(command) == {
+        **typing.get_type_hints(options),
+        "return": dict[str, Any],
+    }
 
 
 def _stub_uhc_normal_import_lifecycle(monkeypatch):
@@ -29207,17 +29231,44 @@ def test_uhc_summary_resource_relationship_guards():
             proof,
             {**count_by_field, "raw_individual_records": 0},
             {},
+            {},
         )
     with pytest.raises(RuntimeError, match="relationship_counts_inconsistent"):
         importer._assert_uhc_canonical_summary_counts(
             proof,
             {**count_by_field, "raw_provider_plan_rows": 1},
             {},
+            {},
         )
     importer._assert_uhc_canonical_summary_counts(
         proof,
         count_by_field,
         {},
+        {},
+    )
+
+    rejected_count_by_field = {
+        "invalid_npi_checksum": 1,
+        "invalid_npi_checksum_individual_records": 1,
+        "invalid_npi_checksum_facility_records": 0,
+        "invalid_npi_checksum_address_rows": 1,
+        "invalid_npi_checksum_provider_plan_rows": 1,
+    }
+    rejected_proof = dataclasses.replace(
+        proof,
+        resource_count=3,
+        resource_counts={
+            **resource_counts,
+            "Practitioner": 0,
+            "Location": 0,
+            "PractitionerRole": 0,
+        },
+    )
+    importer._assert_uhc_canonical_summary_counts(
+        rejected_proof,
+        count_by_field,
+        {},
+        rejected_count_by_field,
     )
 
 
@@ -29266,6 +29317,8 @@ async def test_uhc_candidate_summary_input_maps_missing_invalid_and_identity(
 
 @pytest.mark.asyncio
 async def test_uhc_endpoint_summary_requires_input_and_root(monkeypatch):
+    """UHC source summaries fail closed without valid input and root lineage."""
+
     candidate = _uhc_candidate_for_summary()
     proof = importer.EndpointDatasetContentProof(
         dataset_hash="a" * 64,
@@ -29278,40 +29331,68 @@ async def test_uhc_endpoint_summary_requires_input_and_root(monkeypatch):
         "_uhc_candidate_summary_input",
         AsyncMock(return_value=None),
     )
-    assert await importer._uhc_endpoint_dataset_source_summary(
-        object(),
-        candidate,
-        proof,
-    ) is None
+    assert await _uhc_endpoint_summary(candidate, proof) is None
 
     importer._uhc_candidate_summary_input.return_value = {
         "count_by_field": {},
         "count_by_category": {
-            "intentional_drop_counts": {"unexpected_drop": 1}
+            "intentional_drop_counts": {"unexpected_drop": 1},
+            "rejected_counts": {},
         },
     }
-    with pytest.raises(RuntimeError, match="drop_scope_invalid"):
-        await importer._uhc_endpoint_dataset_source_summary(
-            object(),
-            candidate,
-            proof,
-        )
+    await _assert_uhc_endpoint_summary_error(
+        candidate,
+        proof,
+        "drop_scope_invalid",
+    )
 
     importer._uhc_candidate_summary_input.return_value = {
         "count_by_field": {},
-        "count_by_category": {"intentional_drop_counts": {}},
+        "count_by_category": {
+            "intentional_drop_counts": {},
+            "rejected_counts": {"unexpected_rejection": 1},
+        },
+    }
+    await _assert_uhc_endpoint_summary_error(
+        candidate,
+        proof,
+        "rejection_scope_invalid",
+    )
+
+    importer._uhc_candidate_summary_input.return_value = {
+        "count_by_field": {},
+        "count_by_category": {
+            "intentional_drop_counts": {},
+            "rejected_counts": {},
+        },
     }
     monkeypatch.setattr(
         importer,
         "_assert_uhc_canonical_summary_counts",
         Mock(),
     )
-    with pytest.raises(RuntimeError, match="acquisition_root_required"):
-        await importer._uhc_endpoint_dataset_source_summary(
-            object(),
-            dataclasses.replace(candidate, acquisition_root_run_id=None),
-            proof,
-        )
+    await _assert_uhc_endpoint_summary_error(
+        dataclasses.replace(candidate, acquisition_root_run_id=None),
+        proof,
+        "acquisition_root_required",
+    )
+
+
+async def _uhc_endpoint_summary(candidate, proof):
+    return await importer._uhc_endpoint_dataset_source_summary(
+        object(),
+        candidate,
+        proof,
+    )
+
+
+async def _assert_uhc_endpoint_summary_error(
+    candidate,
+    proof,
+    message: str,
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        await _uhc_endpoint_summary(candidate, proof)
 
 
 @pytest.mark.asyncio

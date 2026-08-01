@@ -63,6 +63,23 @@ class RawRangeProof:
 
 
 @dataclass(frozen=True)
+class UhcProviderQuarantineRawSource:
+    """Exact immutable retained-source identity for sparse raw verification."""
+
+    raw_path: Path
+    manifest_path: Path
+    artifact_sha256: str
+    artifact_byte_count: int
+    raw_contract_version: int
+    manifest_sha256: str
+    range_set_sha256: str
+    record_count: int
+    range_count: int
+    raw_producer_build_id: str
+    source_file_id: str
+
+
+@dataclass(frozen=True)
 class VerifiedRetainedSource:
     """Opaque native-attested source returned by the retention boundary."""
 
