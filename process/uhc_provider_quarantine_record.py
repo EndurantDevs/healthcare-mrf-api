@@ -1,12 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Independent strict validation for checksum-invalid UHC provider records."""
+"""Independent strict validation for quarantined UHC provider records."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import re
 from typing import Any, Iterable, Mapping
+
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE,
+)
 
 
 _PROVIDER_FIELDS = frozenset(
@@ -40,7 +45,7 @@ _SUPPORTED_ACCEPTING_CODES = frozenset(
     }
 )
 class UhcProviderQuarantineRecordError(ValueError):
-    """Reject a record with any defect beyond its NPI checksum."""
+    """Reject a record with any defect beyond its exact NPI reason."""
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,11 @@ class UhcProviderQuarantineRecordCensus:
     facility_records: int = 0
     address_rows: int = 0
     provider_plan_rows: int = 0
+    structural_count: int = 0
+    structural_individual_records: int = 0
+    structural_facility_records: int = 0
+    structural_address_rows: int = 0
+    structural_provider_plan_rows: int = 0
 
     @property
     def counter_map(self) -> dict[str, int]:
@@ -61,6 +71,19 @@ class UhcProviderQuarantineRecordCensus:
             "invalid_npi_facility_records": self.facility_records,
             "invalid_npi_address_rows": self.address_rows,
             "invalid_npi_provider_plan_rows": self.provider_plan_rows,
+            "invalid_npi_structure_count": self.structural_count,
+            "invalid_npi_structure_individual_records": (
+                self.structural_individual_records
+            ),
+            "invalid_npi_structure_facility_records": (
+                self.structural_facility_records
+            ),
+            "invalid_npi_structure_address_rows": (
+                self.structural_address_rows
+            ),
+            "invalid_npi_structure_provider_plan_rows": (
+                self.structural_provider_plan_rows
+            ),
         }
 
 
@@ -73,16 +96,37 @@ def combine_provider_quarantine_census(
     facility_records = 0
     address_rows = 0
     provider_plan_rows = 0
+    structural_count = 0
+    structural_individual_records = 0
+    structural_facility_records = 0
+    structural_address_rows = 0
+    structural_provider_plan_rows = 0
     for census_value in census_values:
         individual_records += census_value.individual_records
         facility_records += census_value.facility_records
         address_rows += census_value.address_rows
         provider_plan_rows += census_value.provider_plan_rows
+        structural_count += census_value.structural_count
+        structural_individual_records += (
+            census_value.structural_individual_records
+        )
+        structural_facility_records += (
+            census_value.structural_facility_records
+        )
+        structural_address_rows += census_value.structural_address_rows
+        structural_provider_plan_rows += (
+            census_value.structural_provider_plan_rows
+        )
     return UhcProviderQuarantineRecordCensus(
         individual_records=individual_records,
         facility_records=facility_records,
         address_rows=address_rows,
         provider_plan_rows=provider_plan_rows,
+        structural_count=structural_count,
+        structural_individual_records=structural_individual_records,
+        structural_facility_records=structural_facility_records,
+        structural_address_rows=structural_address_rows,
+        structural_provider_plan_rows=structural_provider_plan_rows,
     )
 
 
@@ -215,10 +259,49 @@ def is_checksum_invalid_npi(raw_npi: Any) -> bool:
     return not digit_sum % 10 == 0
 
 
+def is_structurally_invalid_npi(raw_npi: Any) -> bool:
+    """Return true only for an exact nonzero numeric out-of-range NPI."""
+
+    if (
+        not isinstance(raw_npi, str)
+        or len(raw_npi) != 10
+        or not raw_npi.isascii()
+        or not raw_npi.isdigit()
+    ):
+        return False
+    numeric_npi = int(raw_npi)
+    return numeric_npi != 0 and not (
+        1_000_000_000 <= numeric_npi <= 2_999_999_999
+    )
+
+
 def validate_checksum_invalid_provider_record(
     raw_record: Any,
 ) -> UhcProviderQuarantineRecordCensus:
     """Replay every native semantic predicate that precedes quarantine."""
+
+    return validate_provider_quarantine_record(
+        raw_record,
+        UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    )
+
+
+def validate_structurally_invalid_provider_record(
+    raw_record: Any,
+) -> UhcProviderQuarantineRecordCensus:
+    """Prove a string NPI shape is the record's only semantic rejection."""
+
+    return validate_provider_quarantine_record(
+        raw_record,
+        UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE,
+    )
+
+
+def validate_provider_quarantine_record(
+    raw_record: Any,
+    expected_reason: str,
+) -> UhcProviderQuarantineRecordCensus:
+    """Replay all native predicates for one exact quarantine reason."""
 
     if (
         not isinstance(raw_record, Mapping)
@@ -233,9 +316,9 @@ def validate_checksum_invalid_provider_record(
         raise UhcProviderQuarantineRecordError(
             "UHC provider quarantine type is invalid"
         )
-    if not is_checksum_invalid_npi(raw_record.get("npi")):
+    if not _is_expected_npi_reason(raw_record.get("npi"), expected_reason):
         raise UhcProviderQuarantineRecordError(
-            "UHC provider quarantine is not checksum-invalid-only"
+            "UHC provider quarantine NPI reason does not match"
         )
     _validate_name(raw_record.get("name"))
     _validate_optional_string_fields(
@@ -255,9 +338,48 @@ def validate_checksum_invalid_provider_record(
             )
     address_rows = _validate_addresses(raw_record.get("addresses"))
     provider_plan_rows = _validate_plans(raw_record.get("plans"))
+    return _provider_quarantine_record_census(
+        provider_type,
+        address_rows,
+        provider_plan_rows,
+        expected_reason,
+    )
+
+
+def _provider_quarantine_record_census(
+    provider_type: str,
+    address_rows: int,
+    provider_plan_rows: int,
+    expected_reason: str,
+) -> UhcProviderQuarantineRecordCensus:
+    individual_records = int(provider_type == "INDIVIDUAL")
+    facility_records = int(provider_type == "FACILITY")
+    structural_multiplier = int(
+        expected_reason
+        == UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE
+    )
     return UhcProviderQuarantineRecordCensus(
-        individual_records=int(provider_type == "INDIVIDUAL"),
-        facility_records=int(provider_type == "FACILITY"),
+        individual_records=individual_records,
+        facility_records=facility_records,
         address_rows=address_rows,
         provider_plan_rows=provider_plan_rows,
+        structural_count=structural_multiplier,
+        structural_individual_records=(
+            structural_multiplier * individual_records
+        ),
+        structural_facility_records=structural_multiplier * facility_records,
+        structural_address_rows=structural_multiplier * address_rows,
+        structural_provider_plan_rows=(
+            structural_multiplier * provider_plan_rows
+        ),
+    )
+
+
+def _is_expected_npi_reason(raw_npi: Any, expected_reason: str) -> bool:
+    return (
+        expected_reason == UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM
+        and is_checksum_invalid_npi(raw_npi)
+    ) or (
+        expected_reason == UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE
+        and is_structurally_invalid_npi(raw_npi)
     )

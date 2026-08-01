@@ -2952,111 +2952,261 @@ async def migrate_legacy_archive_to_v2(
     )
 
 
+@dataclass(frozen=True)
+class ArchiveSwapOptions:
+    schema: str | None = None
+    current_table: str = "address_archive"
+    archive_table: str = "address_archive_v2"
+    backup_table: str = "address_archive_legacy"
+    checksum_map_table: str = "address_checksum_map"
+    checksum_collision_table: str = "address_checksum_collision"
+    allow_replace_backup: bool = False
+    dry_run: bool = False
+    timeout: str = "5min"
+
+
+@dataclass(frozen=True)
+class _ArchiveSwapTables:
+    schema: str
+    current: str
+    archive: str
+    backup: str
+    checksum_map: str
+    checksum_collision: str
+
+
+@dataclass(frozen=True)
+class _ArchiveSwapPreflight:
+    legacy_fingerprint: dict[str, Any]
+    legacy_rows: int
+    archive_rows: int
+    checksum_map_rows: int
+    checksum_collision_rows: int
+    missing_map_targets: int
+    backup_exists: bool
+
+
+def _archive_swap_options(
+    options: ArchiveSwapOptions | None,
+    option_overrides: dict[str, Any],
+) -> ArchiveSwapOptions:
+    if options is not None and option_overrides:
+        raise TypeError("archive swap options and keyword overrides are mutually exclusive")
+    return options or ArchiveSwapOptions(**option_overrides)
+
+
+def _archive_swap_tables(options: ArchiveSwapOptions) -> _ArchiveSwapTables:
+    schema = options.schema or _schema_name()
+    return _ArchiveSwapTables(
+        schema=schema,
+        current=_qtable(schema, options.current_table),
+        archive=_qtable(schema, options.archive_table),
+        backup=_qtable(schema, options.backup_table),
+        checksum_map=_qtable(schema, options.checksum_map_table),
+        checksum_collision=_qtable(schema, options.checksum_collision_table),
+    )
+
+
+async def _has_archive_swap_backup(
+    session: Any,
+    options: ArchiveSwapOptions,
+    tables: _ArchiveSwapTables,
+) -> bool:
+    required_table_list = (
+        options.current_table,
+        options.archive_table,
+        options.checksum_map_table,
+        options.checksum_collision_table,
+    )
+    for table_name in required_table_list:
+        if not await _has_session_table(session, tables.schema, table_name):
+            raise RuntimeError(f"required table is missing: {tables.schema}.{table_name}")
+    if await _has_session_table_column(session, tables.schema, options.current_table, "address_key"):
+        raise RuntimeError(f"{tables.schema}.{options.current_table} already appears to be canonical")
+    if not await _has_session_table_column(session, tables.schema, options.current_table, "checksum"):
+        raise RuntimeError(f"{tables.schema}.{options.current_table} is not the legacy checksum archive")
+    if not await _has_session_table_column(session, tables.schema, options.archive_table, "address_key"):
+        raise RuntimeError(f"{tables.schema}.{options.archive_table} is not the canonical archive")
+    backup_exists = await _has_session_table(
+        session,
+        tables.schema,
+        options.backup_table,
+    )
+    if backup_exists and not options.allow_replace_backup:
+        raise RuntimeError(f"backup table already exists: {tables.schema}.{options.backup_table}")
+    return backup_exists
+
+
+async def _archive_swap_preflight(
+    session: Any,
+    options: ArchiveSwapOptions,
+    tables: _ArchiveSwapTables,
+) -> _ArchiveSwapPreflight:
+    backup_exists = await _has_archive_swap_backup(
+        session,
+        options,
+        tables,
+    )
+    legacy_fingerprint = await _legacy_archive_fingerprint(session, tables.current)
+    archive_rows = int(
+        (await session.execute(text(f"SELECT count(*) FROM {tables.archive};"))).scalar()
+        or 0
+    )
+    checksum_map_rows = int(
+        (await session.execute(text(f"SELECT count(*) FROM {tables.checksum_map};"))).scalar()
+        or 0
+    )
+    checksum_collision_rows = int(
+        (await session.execute(text(f"SELECT count(*) FROM {tables.checksum_collision};"))).scalar()
+        or 0
+    )
+    missing_map_targets = int(
+        (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT count(*)
+                      FROM {tables.checksum_map} m
+                      LEFT JOIN {tables.archive} a ON a.address_key = m.address_key
+                     WHERE a.address_key IS NULL;
+                    """
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    preflight = _ArchiveSwapPreflight(
+        legacy_fingerprint=legacy_fingerprint,
+        legacy_rows=int(legacy_fingerprint["rows"] or 0),
+        archive_rows=archive_rows,
+        checksum_map_rows=checksum_map_rows,
+        checksum_collision_rows=checksum_collision_rows,
+        missing_map_targets=missing_map_targets,
+        backup_exists=backup_exists,
+    )
+    _require_archive_swap_preflight(options, tables, preflight)
+    return preflight
+
+
+def _require_archive_swap_preflight(
+    options: ArchiveSwapOptions,
+    tables: _ArchiveSwapTables,
+    preflight: _ArchiveSwapPreflight,
+) -> None:
+    if preflight.legacy_rows <= 0:
+        raise RuntimeError(f"{tables.schema}.{options.current_table} is empty")
+    if preflight.archive_rows <= 0:
+        raise RuntimeError(f"{tables.schema}.{options.archive_table} is empty")
+    if preflight.checksum_map_rows <= 0:
+        raise RuntimeError(f"{tables.schema}.{options.checksum_map_table} is empty")
+    if preflight.missing_map_targets:
+        raise RuntimeError(
+            f"checksum bridge has {preflight.missing_map_targets} missing canonical target(s)"
+        )
+
+
+async def _is_archive_swap_applied(
+    session: Any,
+    options: ArchiveSwapOptions,
+    tables: _ArchiveSwapTables,
+    preflight: _ArchiveSwapPreflight,
+) -> bool:
+    if options.dry_run:
+        return False
+    if preflight.backup_exists and options.allow_replace_backup:
+        await session.execute(text(f"DROP TABLE {tables.backup};"))
+    await session.execute(
+        text(
+            f"ALTER TABLE {tables.current} "
+            f"RENAME TO {_quote_ident(options.backup_table)};"
+        )
+    )
+    await session.execute(
+        text(
+            f"ALTER TABLE {tables.archive} "
+            f"RENAME TO {_quote_ident(options.current_table)};"
+        )
+    )
+    return True
+
+
+async def _verify_archive_swap(
+    session: Any,
+    tables: _ArchiveSwapTables,
+    preflight: _ArchiveSwapPreflight,
+    is_swapped: bool,
+) -> tuple[int, int]:
+    legacy_table = tables.backup if is_swapped else tables.current
+    current_table = tables.current if is_swapped else tables.archive
+    after_fingerprint = await _legacy_archive_fingerprint(session, legacy_table)
+    current_rows = int(
+        (await session.execute(text(f"SELECT count(*) FROM {current_table};"))).scalar()
+        or 0
+    )
+    if dict(after_fingerprint) != dict(preflight.legacy_fingerprint):
+        raise RuntimeError("legacy archive fingerprint changed during swap")
+    if current_rows != preflight.archive_rows:
+        raise RuntimeError("canonical archive row count changed during swap")
+    return int(after_fingerprint["rows"] or 0), current_rows
+
+
 async def swap_archive_v2_to_current(
-    *,
-    schema: str | None = None,
-    current_table: str = "address_archive",
-    archive_table: str = "address_archive_v2",
-    backup_table: str = "address_archive_legacy",
-    checksum_map_table: str = "address_checksum_map",
-    checksum_collision_table: str = "address_checksum_collision",
-    allow_replace_backup: bool = False,
-    dry_run: bool = False,
-    timeout: str = "5min",
+    options: ArchiveSwapOptions | None = None,
+    **option_overrides: Any,
 ) -> ArchiveSwapStats:
     """Atomically rename canonical v2 archive into the current archive name."""
     started = time.monotonic()
-    schema = schema or _schema_name()
-    current = _qtable(schema, current_table)
-    archive = _qtable(schema, archive_table)
-    backup = _qtable(schema, backup_table)
-    checksum_map = _qtable(schema, checksum_map_table)
-    checksum_collision = _qtable(schema, checksum_collision_table)
+    options = _archive_swap_options(options, option_overrides)
+    tables = _archive_swap_tables(options)
 
     async with db.transaction() as session:
         await session.execute(
             text("SELECT pg_advisory_xact_lock(hashtext(:lock_key));"),
-            {"lock_key": _archive_lock_key(schema, f"{archive_table}->{current_table}", "swap")},
-        )
-        await session.execute(text(f"SET LOCAL statement_timeout = '{_setting_value(timeout)}';"))
-
-        for table_name in (current_table, archive_table, checksum_map_table, checksum_collision_table):
-            if not await _has_session_table(session, schema, table_name):
-                raise RuntimeError(f"required table is missing: {schema}.{table_name}")
-        if await _has_session_table_column(session, schema, current_table, "address_key"):
-            raise RuntimeError(f"{schema}.{current_table} already appears to be canonical")
-        if not await _has_session_table_column(session, schema, current_table, "checksum"):
-            raise RuntimeError(f"{schema}.{current_table} is not the legacy checksum archive")
-        if not await _has_session_table_column(session, schema, archive_table, "address_key"):
-            raise RuntimeError(f"{schema}.{archive_table} is not the canonical archive")
-        backup_exists = await _has_session_table(session, schema, backup_table)
-        if backup_exists and not allow_replace_backup:
-            raise RuntimeError(f"backup table already exists: {schema}.{backup_table}")
-
-        legacy_fingerprint = await _legacy_archive_fingerprint(session, current)
-        legacy_rows_before = int(legacy_fingerprint["rows"] or 0)
-        archive_rows_before = int((await session.execute(text(f"SELECT count(*) FROM {archive};"))).scalar() or 0)
-        checksum_map_rows = int((await session.execute(text(f"SELECT count(*) FROM {checksum_map};"))).scalar() or 0)
-        checksum_collision_rows = int((await session.execute(text(f"SELECT count(*) FROM {checksum_collision};"))).scalar() or 0)
-        missing_map_targets = int(
-            (
-                await session.execute(
-                    text(
-                        f"""
-                        SELECT count(*)
-                          FROM {checksum_map} m
-                          LEFT JOIN {archive} a ON a.address_key = m.address_key
-                         WHERE a.address_key IS NULL;
-                        """
-                    )
+            {
+                "lock_key": _archive_lock_key(
+                    tables.schema,
+                    f"{options.archive_table}->{options.current_table}",
+                    "swap",
                 )
-            ).scalar()
-            or 0
+            },
         )
-        if legacy_rows_before <= 0:
-            raise RuntimeError(f"{schema}.{current_table} is empty")
-        if archive_rows_before <= 0:
-            raise RuntimeError(f"{schema}.{archive_table} is empty")
-        if checksum_map_rows <= 0:
-            raise RuntimeError(f"{schema}.{checksum_map_table} is empty")
-        if missing_map_targets:
-            raise RuntimeError(f"checksum bridge has {missing_map_targets} missing canonical target(s)")
-
-        is_swapped = False
-        if not dry_run:
-            if backup_exists and allow_replace_backup:
-                await session.execute(text(f"DROP TABLE {backup};"))
-            await session.execute(text(f"ALTER TABLE {current} RENAME TO {_quote_ident(backup_table)};"))
-            await session.execute(text(f"ALTER TABLE {archive} RENAME TO {_quote_ident(current_table)};"))
-            is_swapped = True
-
-        after_legacy_table = backup if is_swapped else current
-        after_current_table = current if is_swapped else archive
-        after_fingerprint = await _legacy_archive_fingerprint(session, after_legacy_table)
-        legacy_rows_after = int(after_fingerprint["rows"] or 0)
-        current_rows_after = int((await session.execute(text(f"SELECT count(*) FROM {after_current_table};"))).scalar() or 0)
-        if dict(after_fingerprint) != dict(legacy_fingerprint):
-            raise RuntimeError("legacy archive fingerprint changed during swap")
-        if current_rows_after != archive_rows_before:
-            raise RuntimeError("canonical archive row count changed during swap")
+        timeout = _setting_value(options.timeout)
+        await session.execute(text(f"SET LOCAL statement_timeout = '{timeout}';"))
+        preflight = await _archive_swap_preflight(session, options, tables)
+        is_swapped = await _is_archive_swap_applied(
+            session,
+            options,
+            tables,
+            preflight,
+        )
+        legacy_rows_after, current_rows_after = await _verify_archive_swap(
+            session,
+            tables,
+            preflight,
+            is_swapped,
+        )
 
     return ArchiveSwapStats(
-        current_table=current_table,
-        archive_table=archive_table,
-        backup_table=backup_table,
-        legacy_rows_before=legacy_rows_before,
+        current_table=options.current_table,
+        archive_table=options.archive_table,
+        backup_table=options.backup_table,
+        legacy_rows_before=preflight.legacy_rows,
         legacy_rows_after=legacy_rows_after,
-        legacy_checksum_min=legacy_fingerprint["checksum_min"],
-        legacy_checksum_max=legacy_fingerprint["checksum_max"],
-        legacy_checksum_sum=str(legacy_fingerprint["checksum_sum"]) if legacy_fingerprint["checksum_sum"] is not None else None,
-        archive_rows_before=archive_rows_before,
+        legacy_checksum_min=preflight.legacy_fingerprint["checksum_min"],
+        legacy_checksum_max=preflight.legacy_fingerprint["checksum_max"],
+        legacy_checksum_sum=(
+            str(preflight.legacy_fingerprint["checksum_sum"])
+            if preflight.legacy_fingerprint["checksum_sum"] is not None
+            else None
+        ),
+        archive_rows_before=preflight.archive_rows,
         current_rows_after=current_rows_after,
-        checksum_map_rows=checksum_map_rows,
-        checksum_collision_rows=checksum_collision_rows,
-        missing_map_targets=missing_map_targets,
+        checksum_map_rows=preflight.checksum_map_rows,
+        checksum_collision_rows=preflight.checksum_collision_rows,
+        missing_map_targets=preflight.missing_map_targets,
         swapped=is_swapped,
         runtime_seconds=round(time.monotonic() - started, 3),
-        dry_run=dry_run,
+        dry_run=options.dry_run,
     )
 
 

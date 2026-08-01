@@ -23,6 +23,7 @@ from process.uhc_semantic_build_store import (
 from process.uhc_provider_quarantine_contract import (
     UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
     UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE,
     UhcProviderQuarantine,
 )
 from process.uhc_provider_quarantine_raw_verifier import (
@@ -64,7 +65,10 @@ def _fact_context(
     )
 
 
-def _quarantine(occurrence_ordinal: int) -> UhcProviderQuarantine:
+def _quarantine(
+    occurrence_ordinal: int,
+    reason: str = UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+) -> UhcProviderQuarantine:
     return UhcProviderQuarantine(
         source_file_id=hashlib.sha256(b"source").hexdigest(),
         range_ordinal=0,
@@ -72,6 +76,7 @@ def _quarantine(occurrence_ordinal: int) -> UhcProviderQuarantine:
         record_sha256=hashlib.sha256(
             f"record-{occurrence_ordinal}".encode()
         ).hexdigest(),
+        reason=reason,
     )
 
 
@@ -163,16 +168,14 @@ def test_fact_verifier_accepts_exact_tombstone_without_ordinal_shift() -> None:
 
 def test_quarantine_state_hashes_ordered_items_and_rejects_duplicates() -> None:
     quarantine_state = verifier_module._QuarantineState()
-    first_quarantine = _quarantine(0)
-    second_quarantine = _quarantine(1)
-    quarantine_state.observe(first_quarantine)
-    quarantine_state.observe(second_quarantine)
+    q0 = _quarantine(0)
+    q1 = _quarantine(1)
+    quarantine_state.observe(q0)
+    quarantine_state.observe(q1)
 
     assert quarantine_state.occurrences == [0, 1]
     assert quarantine_state.identity_set_sha256 == hashlib.sha256(
-        first_quarantine.identity_bytes
-        + b"\n"
-        + second_quarantine.identity_bytes
+        q0.identity_bytes + b"\n" + q1.identity_bytes
     ).hexdigest()
     with pytest.raises(UhcSemanticBuildError, match="order or ceiling"):
         quarantine_state.observe(_quarantine(1))
@@ -803,33 +806,68 @@ async def test_evidence_identity_accepts_trailing_quarantine_and_rejects_gap():
 
 
 @pytest.mark.asyncio
-async def test_quarantine_census_requires_raw_proof_and_exact_source_type():
+async def test_quarantine_census_requires_admitted_raw_proof():
     quarantine_state = verifier_module._QuarantineState()
     quarantine_state.observe(_quarantine(0))
-    arguments = (
+
+    with pytest.raises(UhcSemanticBuildError, match="requires admitted raw"):
+        await verifier_module._verify_quarantine_census(
+            _identity(),
+            quarantine_state,
+            1024,
+            {},
+            None,
+            False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_quarantine_census_rejects_noncanonical_raw_source_type():
+    quarantine_state = verifier_module._QuarantineState()
+    quarantine_state.observe(_quarantine(0))
+    with pytest.raises(UhcSemanticBuildError, match="contract is invalid"):
+        await verifier_module._verify_quarantine_census(
+            _identity(),
+            quarantine_state,
+            1024,
+            {},
+            SimpleNamespace(),
+            False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_quarantine_census_allows_sealed_reuse_without_raw_source():
+    quarantine_state = verifier_module._QuarantineState()
+    quarantine_state.observe(_quarantine(0))
+    await verifier_module._verify_quarantine_census(
         _identity(),
         quarantine_state,
         1024,
         {},
-    )
-
-    with pytest.raises(UhcSemanticBuildError, match="requires admitted raw"):
-        await verifier_module._verify_quarantine_census(
-            *arguments,
-            None,
-            False,
-        )
-    with pytest.raises(UhcSemanticBuildError, match="contract is invalid"):
-        await verifier_module._verify_quarantine_census(
-            *arguments,
-            SimpleNamespace(),
-            False,
-        )
-    await verifier_module._verify_quarantine_census(
-        *arguments,
         None,
         True,
     )
+
+
+def _quarantine_counter_by_field(
+    include_structural_fields: bool = True,
+) -> dict[str, int]:
+    counter_by_field = {
+        "invalid_npi_individual_records": 1,
+        "invalid_npi_facility_records": 0,
+        "invalid_npi_address_rows": 1,
+        "invalid_npi_provider_plan_rows": 1,
+    }
+    if include_structural_fields:
+        counter_by_field.update(
+            invalid_npi_structure_count=0,
+            invalid_npi_structure_individual_records=0,
+            invalid_npi_structure_facility_records=0,
+            invalid_npi_structure_address_rows=0,
+            invalid_npi_structure_provider_plan_rows=0,
+        )
+    return counter_by_field
 
 
 @pytest.mark.asyncio
@@ -837,12 +875,8 @@ async def test_quarantine_census_binds_exact_raw_counter_map(monkeypatch):
     identity = _identity()
     quarantine_state = verifier_module._QuarantineState()
     quarantine_state.observe(_quarantine(0))
-    counter_by_field = {
-        "invalid_npi_individual_records": 1,
-        "invalid_npi_facility_records": 0,
-        "invalid_npi_address_rows": 1,
-        "invalid_npi_provider_plan_rows": 1,
-    }
+    quarantine_source = _quarantine_source(identity)
+    counter_by_field = _quarantine_counter_by_field()
     verify_raw = Mock(
         return_value=SimpleNamespace(counter_map=counter_by_field)
     )
@@ -857,14 +891,99 @@ async def test_quarantine_census_binds_exact_raw_counter_map(monkeypatch):
         quarantine_state,
         1024,
         {"counters": counter_by_field},
-        _quarantine_source(identity),
+        quarantine_source,
         False,
     )
 
     verify_raw.assert_called_once_with(
-        _quarantine_source(identity),
+        quarantine_source,
         tuple(quarantine_state.quarantines),
         1024,
+    )
+
+
+@pytest.mark.asyncio
+async def test_quarantine_census_requires_atomic_structural_counter_group(
+    monkeypatch,
+):
+    identity = _identity()
+    quarantine_state = verifier_module._QuarantineState()
+    quarantine_state.observe(_quarantine(0))
+    quarantine_source = _quarantine_source(identity)
+    legacy_counter_by_field = _quarantine_counter_by_field(False)
+    verify_raw = Mock(
+        return_value=SimpleNamespace(
+            counter_map=_quarantine_counter_by_field()
+        )
+    )
+    monkeypatch.setattr(
+        verifier_module,
+        "verify_provider_quarantine_source_records",
+        verify_raw,
+    )
+
+    await verifier_module._verify_quarantine_census(
+        identity,
+        quarantine_state,
+        1024,
+        {"counters": legacy_counter_by_field},
+        quarantine_source,
+        False,
+    )
+    verify_raw.assert_called_once_with(
+        quarantine_source,
+        tuple(quarantine_state.quarantines),
+        1024,
+    )
+    partial_counter_by_field = {
+        **legacy_counter_by_field,
+        "invalid_npi_structure_count": 0,
+    }
+    with pytest.raises(UhcSemanticBuildError, match="counters are incomplete"):
+        await verifier_module._verify_quarantine_census(
+            identity,
+            quarantine_state,
+            1024,
+            {"counters": partial_counter_by_field},
+            quarantine_source,
+            False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_quarantine_census_binds_structural_reason_counters(monkeypatch):
+    identity = _identity()
+    quarantine_state = verifier_module._QuarantineState()
+    quarantine_state.observe(
+        _quarantine(
+            0,
+            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE,
+        )
+    )
+    counter_by_field = {
+        "invalid_npi_individual_records": 0,
+        "invalid_npi_facility_records": 1,
+        "invalid_npi_address_rows": 1,
+        "invalid_npi_provider_plan_rows": 1,
+        "invalid_npi_structure_count": 1,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 1,
+        "invalid_npi_structure_address_rows": 1,
+        "invalid_npi_structure_provider_plan_rows": 1,
+    }
+    monkeypatch.setattr(
+        verifier_module,
+        "verify_provider_quarantine_source_records",
+        Mock(return_value=SimpleNamespace(counter_map=counter_by_field)),
+    )
+
+    await verifier_module._verify_quarantine_census(
+        identity,
+        quarantine_state,
+        1024,
+        {"counters": counter_by_field},
+        _quarantine_source(identity),
+        False,
     )
 
 
@@ -879,7 +998,7 @@ async def test_quarantine_census_translates_raw_verifier_error(monkeypatch):
         Mock(side_effect=UhcProviderQuarantineRawError("raw proof failed")),
     )
 
-    with pytest.raises(UhcSemanticBuildError, match="raw proof failed"):
+    with pytest.raises(UhcSemanticBuildError, match="^raw proof failed$"):
         await verifier_module._verify_quarantine_census(
             identity,
             quarantine_state,
@@ -895,10 +1014,25 @@ async def test_quarantine_census_rejects_native_counter_drift(monkeypatch):
     identity = _identity()
     quarantine_state = verifier_module._QuarantineState()
     quarantine_state.observe(_quarantine(0))
+    native_counter_by_field = {
+        "invalid_npi_individual_records": 1,
+        "invalid_npi_facility_records": 0,
+        "invalid_npi_address_rows": 1,
+        "invalid_npi_provider_plan_rows": 1,
+        "invalid_npi_structure_count": 0,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 0,
+        "invalid_npi_structure_address_rows": 0,
+        "invalid_npi_structure_provider_plan_rows": 0,
+    }
+    raw_counter_by_field = {
+        **native_counter_by_field,
+        "invalid_npi_address_rows": 2,
+    }
     monkeypatch.setattr(
         verifier_module,
         "verify_provider_quarantine_source_records",
-        Mock(return_value=SimpleNamespace(counter_map={"unexpected": 1})),
+        Mock(return_value=SimpleNamespace(counter_map=raw_counter_by_field)),
     )
 
     with pytest.raises(UhcSemanticBuildError, match="census disagrees"):
@@ -906,7 +1040,7 @@ async def test_quarantine_census_rejects_native_counter_drift(monkeypatch):
             identity,
             quarantine_state,
             1024,
-            {"counters": {}},
+            {"counters": native_counter_by_field},
             _quarantine_source(identity),
             False,
         )

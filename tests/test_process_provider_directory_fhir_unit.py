@@ -29212,6 +29212,7 @@ def _uhc_summary_count_fixture():
         "raw_facility_records": 1,
         "raw_address_rows": 1,
         "raw_provider_plan_rows": 2,
+        "invalid_npi_count": 0,
         "membership_plan_key_count": 1,
         "orphan_plan_detail_count": 0,
     }
@@ -29266,9 +29267,115 @@ def test_uhc_summary_resource_relationship_guards():
     )
     importer._assert_uhc_canonical_summary_counts(
         rejected_proof,
-        count_by_field,
+        {**count_by_field, "invalid_npi_count": 1},
         {},
         rejected_count_by_field,
+    )
+
+
+@pytest.mark.parametrize(
+    ("count_by_field", "intentional_drops", "rejected_counts"),
+    [
+        ({}, {}, {}),
+        (None, {}, {}),
+        (_uhc_summary_count_fixture()[1], None, {}),
+        (_uhc_summary_count_fixture()[1], {}, None),
+    ],
+)
+def test_uhc_summary_counts_reject_malformed_maps_with_controlled_error(
+    count_by_field,
+    intentional_drops,
+    rejected_counts,
+):
+    resource_counts, _ = _uhc_summary_count_fixture()
+    proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=6,
+        resource_hashes={},
+        resource_counts=resource_counts,
+    )
+
+    with pytest.raises(RuntimeError, match="summary_.*scope_invalid"):
+        importer._assert_uhc_canonical_summary_counts(
+            proof,
+            count_by_field,
+            intentional_drops,
+            rejected_counts,
+        )
+
+
+@pytest.mark.parametrize(
+    "summary_input",
+    [
+        {},
+        {"count_by_field": None, "count_by_category": {}},
+        {"count_by_field": {}, "count_by_category": None},
+        {"count_by_field": {}, "count_by_category": {}},
+    ],
+)
+def test_uhc_summary_categories_reject_malformed_maps_with_controlled_error(
+    summary_input,
+):
+    with pytest.raises(RuntimeError, match="provider_directory_uhc_summary_"):
+        importer._uhc_summary_category_counts(summary_input)
+
+
+@pytest.mark.parametrize("invalid_count", [None, "1", True, -1])
+def test_uhc_summary_drop_counts_require_nonnegative_integers(invalid_count):
+    resource_counts, count_by_field = _uhc_summary_count_fixture()
+    proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=6,
+        resource_hashes={},
+        resource_counts=resource_counts,
+    )
+    for field_name in importer.SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS:
+        drop_counts = dict.fromkeys(
+            importer.SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS,
+            0,
+        )
+        drop_counts[field_name] = invalid_count
+        with pytest.raises(RuntimeError, match="summary_drop_scope_invalid"):
+            importer._assert_uhc_canonical_summary_counts(
+                proof,
+                count_by_field,
+                drop_counts,
+                {},
+            )
+
+
+def test_uhc_structural_rejection_counts_balance_canonical_resources():
+    """Exclude a facility structural rejection from every emitted family."""
+
+    resource_counts, count_by_field = _uhc_summary_count_fixture()
+    proof = importer.EndpointDatasetContentProof(
+        dataset_hash="a" * 64,
+        resource_count=3,
+        resource_hashes={},
+        resource_counts={
+            **resource_counts,
+            "Organization": 0,
+            "Location": 0,
+            "OrganizationAffiliation": 0,
+        },
+    )
+    structural_rejected_count_by_field = {
+        "invalid_npi_checksum": 0,
+        "invalid_npi_checksum_individual_records": 0,
+        "invalid_npi_checksum_facility_records": 0,
+        "invalid_npi_checksum_address_rows": 0,
+        "invalid_npi_checksum_provider_plan_rows": 0,
+        "invalid_npi_structure": 1,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 1,
+        "invalid_npi_structure_address_rows": 1,
+        "invalid_npi_structure_provider_plan_rows": 1,
+    }
+    importer._assert_uhc_canonical_summary_counts(
+        proof,
+        {**count_by_field, "invalid_npi_count": 1},
+        {},
+        structural_rejected_count_by_field,
     )
 
 

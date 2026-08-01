@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 import struct
 from types import SimpleNamespace
 from typing import AsyncIterator
@@ -302,7 +303,58 @@ def test_nonzero_quarantine_report_is_exactly_balanced_and_publicly_aggregated()
         "invalid_npi_checksum_facility_records": 0,
         "invalid_npi_checksum_address_rows": 1,
         "invalid_npi_checksum_provider_plan_rows": 1,
+        "invalid_npi_structure": 0,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 0,
+        "invalid_npi_structure_address_rows": 0,
+        "invalid_npi_structure_provider_plan_rows": 0,
     }
+
+
+def test_structural_quarantine_is_a_bounded_subset_of_native_totals() -> None:
+    identity = _identity()
+    native = _native_report_with_quarantine(identity)
+    native["counters"].update(
+        raw_individual_records=3,
+        raw_facility_records=1,
+        invalid_npi_individual_records=0,
+        invalid_npi_facility_records=1,
+        invalid_npi_structure_count=1,
+        invalid_npi_structure_individual_records=0,
+        invalid_npi_structure_facility_records=1,
+        invalid_npi_structure_address_rows=1,
+        invalid_npi_structure_provider_plan_rows=1,
+    )
+
+    _fact_count, _evidence_count, counters, _blocks, _ranges = (
+        store._validate_native_report(identity, native)
+    )
+    rejected = store._combined_counters(
+        counters,
+        UhcNpiEvidenceSummary(
+            evidence_count=3,
+            distinct_npis=3,
+            duplicate_npi_groups=0,
+            conflicting_npi_groups=0,
+            conflict_counts={},
+        ),
+    )["rejected_counts"]
+
+    assert rejected["invalid_npi_checksum"] == 0
+    assert rejected["invalid_npi_structure"] == 1
+    assert rejected["invalid_npi_structure_facility_records"] == 1
+
+
+def test_native_report_rejects_partial_structural_counter_group() -> None:
+    identity = _identity()
+    native = _native_report_with_quarantine(identity)
+    native["counters"]["invalid_npi_structure_count"] = 1
+
+    with pytest.raises(
+        store.UhcSemanticBuildError,
+        match="native quarantine counters are invalid",
+    ):
+        store._validate_native_report(identity, native)
 
 
 @pytest.mark.parametrize(
@@ -862,15 +914,15 @@ def test_native_report_rejects_every_contract_mutation(mutation):
     [
         (
             "fact_count_layout",
-            "fact count does not match admitted raw layout",
+            "UHC semantic native fact count does not match admitted raw layout",
         ),
         (
             "quarantine_count_ceiling",
-            "quarantine count exceeds its ceiling",
+            "UHC semantic native quarantine count exceeds its ceiling",
         ),
         (
             "quarantine_counter_balance",
-            "quarantine counters do not balance",
+            "UHC semantic native quarantine counters do not balance",
         ),
     ],
 )
@@ -879,7 +931,10 @@ def test_native_report_rejects_each_bounded_quarantine_guard(
     message,
 ):
     identity, report = _mutated_native_report(mutation)
-    with pytest.raises(store.UhcSemanticBuildError, match=message):
+    with pytest.raises(
+        store.UhcSemanticBuildError,
+        match=f"^{re.escape(message)}$",
+    ):
         store._validate_native_report(identity, report)
 
 
@@ -1584,6 +1639,11 @@ async def _postgres_assert_sealed_semantic_build(
         "invalid_npi_checksum_facility_records": 0,
         "invalid_npi_checksum_address_rows": 1,
         "invalid_npi_checksum_provider_plan_rows": 1,
+        "invalid_npi_structure": 0,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 0,
+        "invalid_npi_structure_address_rows": 0,
+        "invalid_npi_structure_provider_plan_rows": 0,
     }
     assert sealed.source_summary["distinct_npis"] == 1
     assert sealed.source_summary["duplicate_npi_groups"] == 1

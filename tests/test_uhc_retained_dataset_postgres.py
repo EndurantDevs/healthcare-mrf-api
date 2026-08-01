@@ -1250,6 +1250,11 @@ async def _assert_quarantined_provider_is_private(database, stage) -> None:
         "invalid_npi_checksum_facility_records": 0,
         "invalid_npi_checksum_individual_records": 1,
         "invalid_npi_checksum_provider_plan_rows": 1,
+        "invalid_npi_structure": 0,
+        "invalid_npi_structure_address_rows": 0,
+        "invalid_npi_structure_facility_records": 0,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_provider_plan_rows": 0,
     }
     public_summary = json.dumps(stage.summary_input, sort_keys=True)
     assert _provider_quarantine().record_sha256 not in public_summary
@@ -1514,6 +1519,11 @@ async def _assert_native_quarantine_stage(database, stage) -> None:
         "invalid_npi_checksum_facility_records": 1,
         "invalid_npi_checksum_individual_records": 0,
         "invalid_npi_checksum_provider_plan_rows": 1,
+        "invalid_npi_structure": 0,
+        "invalid_npi_structure_address_rows": 0,
+        "invalid_npi_structure_facility_records": 0,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_provider_plan_rows": 0,
     }
     canonical_rows = await database.all(
         f"SELECT payload_json FROM {stage.resource_ref} ORDER BY resource_type, "
@@ -1521,7 +1531,10 @@ async def _assert_native_quarantine_stage(database, stage) -> None:
     )
     public_summary = json.dumps(stage.summary_input, sort_keys=True)
     public_canonical = json.dumps(
-        [_decode_json(row.payload_json) for row in canonical_rows],
+        [
+            _decode_json(resource_row.payload_json)
+            for resource_row in canonical_rows
+        ],
         sort_keys=True,
     )
     assert UHC_PROVIDER_QUARANTINE_FIELD not in public_summary

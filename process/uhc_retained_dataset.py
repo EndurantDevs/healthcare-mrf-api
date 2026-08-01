@@ -62,12 +62,13 @@ from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_I
 from process.uhc_provider_quarantine_contract import (
     UHC_PROVIDER_QUARANTINE_COUNTER_BY_RAW_FIELD,
     UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
-    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UHC_PROVIDER_QUARANTINE_REASONS,
     UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
     UhcProviderQuarantineError,
     provider_quarantine_catalog_limit,
     provider_quarantine_limit,
     provider_quarantine_rejected_counts,
+    provider_quarantine_rejected_totals,
     validate_provider_quarantine_fact,
 )
 from process.uhc_provider_quarantine_raw_verifier import (
@@ -2430,9 +2431,10 @@ def _summary_count_categories(
 ) -> dict[str, dict[str, int]]:
     rejected_counts = (
         dict(rejected_count_by_field)
-        if rejected_count_by_field[
-            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM
-        ]
+        if any(
+            rejected_count_by_field[reason]
+            for reason in UHC_PROVIDER_QUARANTINE_REASONS
+        )
         else {}
     )
     intentional_drop_counts = (
@@ -2664,32 +2666,21 @@ def _is_summary_rejected_count_map_valid(
     rejected_count_by_field: Mapping[str, Any],
 ) -> bool:
     invalid_npi_count = count_by_field["invalid_npi_count"]
-    if rejected_count_by_field and set(rejected_count_by_field) == set(
-        UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS
-    ):
-        for field_name, count in rejected_count_by_field.items():
-            _positive_int(count, field_name, allow_zero=True)
-    return (not rejected_count_by_field and invalid_npi_count == 0) or (
-        set(rejected_count_by_field)
-        == set(UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS)
-        and rejected_count_by_field.get(
-            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM
+    try:
+        rejected_totals = provider_quarantine_rejected_totals(
+            rejected_count_by_field,
+            invalid_npi_count,
         )
-        == invalid_npi_count
-        and rejected_count_by_field.get(
-            "invalid_npi_checksum_individual_records"
-        )
-        + rejected_count_by_field.get(
-            "invalid_npi_checksum_facility_records"
-        )
-        == invalid_npi_count
-        and invalid_npi_count
-        <= rejected_count_by_field.get("invalid_npi_checksum_address_rows")
+    except UhcProviderQuarantineError:
+        return False
+    return (
+        rejected_totals["individual_records"]
+        <= count_by_field["raw_individual_records"]
+        and rejected_totals["facility_records"]
+        <= count_by_field["raw_facility_records"]
+        and rejected_totals["address_rows"]
         <= count_by_field["raw_address_rows"]
-        and invalid_npi_count
-        <= rejected_count_by_field.get(
-            "invalid_npi_checksum_provider_plan_rows"
-        )
+        and rejected_totals["provider_plan_rows"]
         <= count_by_field["raw_provider_plan_rows"]
         and invalid_npi_count
         <= provider_quarantine_catalog_limit(

@@ -45,6 +45,16 @@ _QUARANTINE_COUNTER_FIELDS = (
     "invalid_npi_facility_records",
     "invalid_npi_address_rows",
     "invalid_npi_provider_plan_rows",
+    "invalid_npi_structure_count",
+    "invalid_npi_structure_individual_records",
+    "invalid_npi_structure_facility_records",
+    "invalid_npi_structure_address_rows",
+    "invalid_npi_structure_provider_plan_rows",
+)
+_STRUCTURAL_QUARANTINE_COUNTER_FIELDS = frozenset(
+    field_name
+    for field_name in _QUARANTINE_COUNTER_FIELDS
+    if field_name.startswith("invalid_npi_structure_")
 )
 
 
@@ -900,18 +910,42 @@ async def _verify_quarantine_census(
         raise UhcSemanticBuildError(str(error)) from error
     raw_counter_map = raw_census.counter_map
     native_counter_map = native_report_by_field.get("counters")
-    expected_counter_map = (
-        {
-            field_name: native_counter_map.get(field_name)
-            for field_name in _QUARANTINE_COUNTER_FIELDS
-        }
-        if isinstance(native_counter_map, Mapping)
-        else {}
+    expected_counter_map = _expected_quarantine_counter_map(
+        native_counter_map
     )
     if dict(raw_counter_map) != expected_counter_map:
         raise UhcSemanticBuildError(
             "UHC provider quarantine raw census disagrees"
         )
+
+
+def _expected_quarantine_counter_map(
+    native_counter_map: Any,
+) -> dict[str, Any]:
+    """Normalize only the complete legacy structural-counter absence."""
+
+    if not isinstance(native_counter_map, Mapping):
+        return {}
+    present_structural_fields = (
+        _STRUCTURAL_QUARANTINE_COUNTER_FIELDS.intersection(native_counter_map)
+    )
+    if present_structural_fields and (
+        present_structural_fields != _STRUCTURAL_QUARANTINE_COUNTER_FIELDS
+    ):
+        raise UhcSemanticBuildError(
+            "UHC provider quarantine structural counters are incomplete"
+        )
+    is_legacy_structural_counter_map = not present_structural_fields
+    return {
+        field_name: native_counter_map.get(
+            field_name,
+            0
+            if is_legacy_structural_counter_map
+            and field_name in _STRUCTURAL_QUARANTINE_COUNTER_FIELDS
+            else None,
+        )
+        for field_name in _QUARANTINE_COUNTER_FIELDS
+    }
 
 
 def _stage_verifier_report(

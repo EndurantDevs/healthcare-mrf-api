@@ -1780,6 +1780,34 @@ def _assert_summary_dimension_rejections() -> None:
             validate_uhc_summary_input(invalid_rejection)
 
 
+def test_summary_input_accepts_complete_structural_rejection_map() -> None:
+    summary_input = _valid_summary_input()
+    summary_input["count_by_field"].update(
+        raw_provider_records=1,
+        raw_individual_records=0,
+        raw_facility_records=1,
+        raw_address_rows=1,
+        raw_provider_plan_rows=1,
+        invalid_npi_count=1,
+        provider_file_count=1,
+    )
+    summary_input["count_by_category"]["rejected_counts"] = {
+        "invalid_npi_checksum": 0,
+        "invalid_npi_checksum_individual_records": 0,
+        "invalid_npi_checksum_facility_records": 0,
+        "invalid_npi_checksum_address_rows": 0,
+        "invalid_npi_checksum_provider_plan_rows": 0,
+        "invalid_npi_structure": 1,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 1,
+        "invalid_npi_structure_address_rows": 1,
+        "invalid_npi_structure_provider_plan_rows": 1,
+    }
+    summary_input["input_sha256"] = _summary_input_hash(summary_input)
+
+    assert validate_uhc_summary_input(summary_input) == summary_input
+
+
 def _assert_summary_identity_rejections() -> None:
     changed_hash = _valid_summary_input()
     changed_hash["input_sha256"] = "0" * 64

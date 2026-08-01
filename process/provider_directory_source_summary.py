@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from process.uhc_provider_quarantine_contract import (
-    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
-    UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+    UhcProviderQuarantineError,
     provider_quarantine_catalog_limit,
+    provider_quarantine_rejected_totals,
 )
 
 
@@ -664,51 +664,36 @@ def _validate_fhir_semantic_relationships(
 def _is_uhc_rejection_map_valid(summary_map: Mapping[str, Any]) -> bool:
     rejected_count_by_field = summary_map["rejected_counts"]
     invalid_npi_count = summary_map["invalid_npi_count"]
-    if not rejected_count_by_field:
-        return invalid_npi_count == 0
-    return (
-        set(rejected_count_by_field)
-        == set(UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS)
-        and rejected_count_by_field[
-            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM
-        ]
-        == invalid_npi_count
-        and rejected_count_by_field[
-            "invalid_npi_checksum_individual_records"
-        ]
-        + rejected_count_by_field["invalid_npi_checksum_facility_records"]
-        == invalid_npi_count
-        and invalid_npi_count
-        <= rejected_count_by_field["invalid_npi_checksum_address_rows"]
-        <= summary_map["raw_address_rows"]
-        and invalid_npi_count
-        <= rejected_count_by_field[
-            "invalid_npi_checksum_provider_plan_rows"
-        ]
-        <= summary_map["raw_provider_plan_rows"]
-        and rejected_count_by_field[
-            "invalid_npi_checksum_individual_records"
-        ]
-        <= summary_map["raw_individual_records"]
-        and rejected_count_by_field["invalid_npi_checksum_facility_records"]
-        <= summary_map["raw_facility_records"]
+    try:
+        rejected_totals = provider_quarantine_rejected_totals(
+            rejected_count_by_field,
+            invalid_npi_count,
+        )
+    except UhcProviderQuarantineError:
+        return False
+    return all(
+        rejected_totals[dimension] <= summary_map[raw_field]
+        for dimension, raw_field in (
+            ("individual_records", "raw_individual_records"),
+            ("facility_records", "raw_facility_records"),
+            ("address_rows", "raw_address_rows"),
+            ("provider_plan_rows", "raw_provider_plan_rows"),
+        )
     )
 
 
 def _uhc_excluded_counts(summary_map: Mapping[str, Any]) -> tuple[int, ...]:
     rejected_count_by_field = summary_map["rejected_counts"]
     drop_count_by_field = summary_map["intentional_drop_counts"]
+    rejected_totals = provider_quarantine_rejected_totals(
+        rejected_count_by_field,
+        summary_map["invalid_npi_count"],
+    )
     return (
-        rejected_count_by_field.get(
-            "invalid_npi_checksum_individual_records", 0
-        ),
-        rejected_count_by_field.get(
-            "invalid_npi_checksum_facility_records", 0
-        ),
-        rejected_count_by_field.get("invalid_npi_checksum_address_rows", 0),
-        rejected_count_by_field.get(
-            "invalid_npi_checksum_provider_plan_rows", 0
-        ),
+        rejected_totals["individual_records"],
+        rejected_totals["facility_records"],
+        rejected_totals["address_rows"],
+        rejected_totals["provider_plan_rows"],
         drop_count_by_field.get(
             "ifp_unpaired_retained_only_individual_records", 0
         ),
@@ -823,10 +808,13 @@ def _validate_uhc_semantic_relationships(
     summary_map: dict[str, Any],
 ) -> None:
     """Enforce algebra guaranteed by the strict setwise UHC builder."""
+    if not _is_uhc_rejection_map_valid(summary_map):
+        raise ProviderDirectorySourceSummaryError(
+            "provider_directory_source_summary_uhc_metrics_inconsistent"
+        )
     excluded_counts = _uhc_excluded_counts(summary_map)
     is_relationship_set_valid = (
-        _is_uhc_rejection_map_valid(summary_map)
-        and _is_uhc_provider_census_valid(summary_map)
+        _is_uhc_provider_census_valid(summary_map)
         and _is_uhc_plan_census_valid(
             summary_map,
             excluded_counts[3],

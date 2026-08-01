@@ -113,7 +113,8 @@ from process.provider_directory_source_summary_sql import (
     source_summary_metrics_sql,
 )
 from process.uhc_provider_quarantine_contract import (
-    UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+    UhcProviderQuarantineError,
+    provider_quarantine_rejected_totals,
 )
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
@@ -54235,15 +54236,14 @@ def _build_endpoint_dataset_source_summary(
 def _expected_uhc_resource_count(
     count_by_field: Mapping[str, int],
     intentional_drop_count_by_field: Mapping[str, int],
-    rejected_count_by_field: Mapping[str, int],
     count_field: str,
     drop_field: str,
-    rejection_field: str,
+    rejected_count: int,
 ) -> int:
     return (
         count_by_field[count_field]
         - int(intentional_drop_count_by_field.get(drop_field, 0))
-        - int(rejected_count_by_field.get(rejection_field, 0))
+        - rejected_count
     )
 
 
@@ -54251,15 +54251,11 @@ def _assert_uhc_relationship_summary_counts(
     resource_count_by_type: Mapping[str, int],
     count_by_field: Mapping[str, int],
     intentional_drop_count_by_field: Mapping[str, int],
-    rejected_count_by_field: Mapping[str, int],
+    rejected_totals: Mapping[str, int],
 ) -> None:
     membership_count = (
         count_by_field["raw_provider_plan_rows"]
-        - int(
-            rejected_count_by_field.get(
-                "invalid_npi_checksum_provider_plan_rows", 0
-            )
-        )
+        - rejected_totals["provider_plan_rows"]
         - int(
             intentional_drop_count_by_field.get(
                 "ifp_unpaired_retained_only_provider_plan_rows", 0
@@ -54281,6 +54277,87 @@ def _assert_uhc_relationship_summary_counts(
         )
 
 
+_UHC_CANONICAL_COUNT_FIELDS = (
+    "raw_individual_records",
+    "raw_facility_records",
+    "raw_address_rows",
+    "raw_provider_plan_rows",
+    "invalid_npi_count",
+    "membership_plan_key_count",
+    "orphan_plan_detail_count",
+)
+
+
+def _uhc_summary_mapping(value: Any, error_code: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeError(error_code)
+    try:
+        return dict(value)
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(error_code) from error
+
+
+def _validated_uhc_canonical_counts(
+    count_by_field: Mapping[str, Any],
+) -> dict[str, int]:
+    count_map = _uhc_summary_mapping(
+        count_by_field,
+        "provider_directory_uhc_summary_count_scope_invalid",
+    )
+    if any(
+        isinstance(count_map.get(field_name), bool)
+        or not isinstance(count_map.get(field_name), int)
+        or count_map[field_name] < 0
+        for field_name in _UHC_CANONICAL_COUNT_FIELDS
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_summary_count_scope_invalid"
+        )
+    return count_map
+
+
+def _validated_uhc_drop_counts(
+    intentional_drop_counts: Mapping[str, Any],
+) -> dict[str, int]:
+    drop_map = _uhc_summary_mapping(
+        intentional_drop_counts,
+        "provider_directory_uhc_summary_drop_scope_invalid",
+    )
+    if drop_map and set(drop_map) != set(
+        SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS
+    ):
+        raise RuntimeError("provider_directory_uhc_summary_drop_scope_invalid")
+    if any(
+        isinstance(count, bool) or not isinstance(count, int) or count < 0
+        for count in drop_map.values()
+    ):
+        raise RuntimeError("provider_directory_uhc_summary_drop_scope_invalid")
+    return drop_map
+
+
+def _validated_uhc_summary_count_inputs(
+    count_by_field: Mapping[str, Any],
+    intentional_drop_counts: Mapping[str, Any],
+    rejected_counts: Mapping[str, Any],
+) -> tuple[dict[str, int], dict[str, Any], dict[str, int]]:
+    count_map = _validated_uhc_canonical_counts(count_by_field)
+    drop_map = _validated_uhc_drop_counts(intentional_drop_counts)
+    rejected_map = _uhc_summary_mapping(
+        rejected_counts,
+        "provider_directory_uhc_summary_rejection_scope_invalid",
+    )
+    try:
+        rejected_totals = provider_quarantine_rejected_totals(
+            rejected_map,
+            count_map["invalid_npi_count"],
+        )
+    except UhcProviderQuarantineError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_summary_rejection_scope_invalid"
+        ) from error
+    return count_map, drop_map, rejected_totals
+
+
 def _assert_uhc_canonical_summary_counts(
     content_proof: EndpointDatasetContentProof,
     count_by_field: dict[str, int],
@@ -54289,22 +54366,29 @@ def _assert_uhc_canonical_summary_counts(
 ) -> None:
     """Bind retained semantic counters to the six emitted resource families."""
 
+    count_by_field, intentional_drop_counts, rejected_totals = (
+        _validated_uhc_summary_count_inputs(
+            count_by_field,
+            intentional_drop_counts,
+            rejected_counts,
+        )
+    )
     resource_count_by_type = content_proof.resource_counts
     exact_field_by_resource_type = {
         "Practitioner": (
             "raw_individual_records",
             "ifp_unpaired_retained_only_individual_records",
-            "invalid_npi_checksum_individual_records",
+            "individual_records",
         ),
         "Organization": (
             "raw_facility_records",
             "ifp_unpaired_retained_only_facility_records",
-            "invalid_npi_checksum_facility_records",
+            "facility_records",
         ),
         "Location": (
             "raw_address_rows",
             "ifp_unpaired_retained_only_address_rows",
-            "invalid_npi_checksum_address_rows",
+            "address_rows",
         ),
     }
     if any(
@@ -54312,10 +54396,9 @@ def _assert_uhc_canonical_summary_counts(
         != _expected_uhc_resource_count(
             count_by_field,
             intentional_drop_counts,
-            rejected_counts,
             field_name,
             drop_key,
-            rejected_key,
+            rejected_totals[rejected_key],
         )
         for resource_type, (
             field_name,
@@ -54330,7 +54413,7 @@ def _assert_uhc_canonical_summary_counts(
         resource_count_by_type,
         count_by_field,
         intentional_drop_counts,
-        rejected_counts,
+        rejected_totals,
     )
 
 
@@ -54388,23 +54471,34 @@ async def _uhc_candidate_summary_input(
 def _uhc_summary_category_counts(
     summary_input: Mapping[str, Any],
 ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
-    count_by_field = dict(summary_input["count_by_field"])
-    intentional_drop_count_by_field = dict(
-        summary_input["count_by_category"]["intentional_drop_counts"]
+    summary_map = _uhc_summary_mapping(
+        summary_input,
+        "provider_directory_uhc_summary_input_invalid",
     )
-    rejected_count_by_field = dict(
-        summary_input["count_by_category"]["rejected_counts"]
+    count_by_field = _uhc_summary_mapping(
+        summary_map.get("count_by_field"),
+        "provider_directory_uhc_summary_input_invalid",
     )
-    if intentional_drop_count_by_field and set(
-        intentional_drop_count_by_field
-    ) != set(SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS):
-        raise RuntimeError("provider_directory_uhc_summary_drop_scope_invalid")
-    if rejected_count_by_field and set(rejected_count_by_field) != set(
-        UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS
-    ):
+    category_map = _uhc_summary_mapping(
+        summary_map.get("count_by_category"),
+        "provider_directory_uhc_summary_input_invalid",
+    )
+    intentional_drop_count_by_field = _validated_uhc_drop_counts(
+        category_map.get("intentional_drop_counts"),
+    )
+    rejected_count_by_field = _uhc_summary_mapping(
+        category_map.get("rejected_counts"),
+        "provider_directory_uhc_summary_rejection_scope_invalid",
+    )
+    try:
+        provider_quarantine_rejected_totals(
+            rejected_count_by_field,
+            count_by_field.get("invalid_npi_count", 0),
+        )
+    except UhcProviderQuarantineError as error:
         raise RuntimeError(
             "provider_directory_uhc_summary_rejection_scope_invalid"
-        )
+        ) from error
     return (
         count_by_field,
         intentional_drop_count_by_field,

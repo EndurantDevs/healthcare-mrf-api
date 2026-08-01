@@ -12,10 +12,12 @@ from process.uhc_provider_quarantine_contract import (
     UHC_PROVIDER_QUARANTINE_FIELD,
     UHC_PROVIDER_QUARANTINE_MAX_COUNT,
     UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE,
     UhcProviderQuarantineError,
     provider_quarantine_catalog_limit,
     provider_quarantine_limit,
     provider_quarantine_rejected_counts,
+    provider_quarantine_rejected_totals,
     quarantine_identity_set_sha256,
     validate_provider_quarantine_fact,
 )
@@ -25,11 +27,13 @@ SOURCE_FILE_ID = hashlib.sha256(b"source-file").hexdigest()
 RECORD_SHA256 = hashlib.sha256(b"source-record").hexdigest()
 
 
-def _tombstone() -> dict[str, object]:
+def _tombstone(
+    reason: str = UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+) -> dict[str, object]:
     return {
         UHC_PROVIDER_QUARANTINE_FIELD: {
             "contract_id": UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
-            "reason": UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+            "reason": reason,
             "source_file_id": SOURCE_FILE_ID,
             "range_ordinal": 2,
             "occurrence_ordinal": 17,
@@ -66,6 +70,9 @@ def test_exact_tombstone_is_lineage_bound_and_hashable() -> None:
 
     assert quarantine is not None
     assert quarantine.record_sha256 == RECORD_SHA256
+    assert hashlib.sha256(quarantine.identity_bytes).hexdigest() == (
+        "1a8864ce4f33c942b1abf878a274e783e3700a2e494b5bf2bd37e76d4c0496d5"
+    )
     assert quarantine_identity_set_sha256([quarantine]) == hashlib.sha256(
         quarantine.identity_bytes
     ).hexdigest()
@@ -76,19 +83,20 @@ def test_exact_tombstone_is_lineage_bound_and_hashable() -> None:
     second_payload["record_sha256"] = hashlib.sha256(
         b"second-source-record"
     ).hexdigest()
-    second_quarantine = validate_provider_quarantine_fact(
+    second_validated_quarantine = validate_provider_quarantine_fact(
         second_tombstone,
         expected_source_file_id=SOURCE_FILE_ID,
         expected_range_ordinal=3,
         expected_occurrence_ordinal=18,
     )
-    assert second_quarantine is not None
+    assert second_validated_quarantine is not None
+    assert second_validated_quarantine != quarantine
     assert quarantine_identity_set_sha256(
-        [quarantine, second_quarantine]
+        [quarantine, second_validated_quarantine]
     ) == hashlib.sha256(
         quarantine.identity_bytes
         + b"\n"
-        + second_quarantine.identity_bytes
+        + second_validated_quarantine.identity_bytes
     ).hexdigest()
     assert validate_provider_quarantine_fact(
         {"npi": "1003821380"},
@@ -96,6 +104,25 @@ def test_exact_tombstone_is_lineage_bound_and_hashable() -> None:
         expected_range_ordinal=2,
         expected_occurrence_ordinal=17,
     ) is None
+
+
+def test_structural_reason_is_identity_bound_without_source_value() -> None:
+    quarantine = validate_provider_quarantine_fact(
+        _tombstone(UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE),
+        expected_source_file_id=SOURCE_FILE_ID,
+        expected_range_ordinal=2,
+        expected_occurrence_ordinal=17,
+    )
+
+    assert quarantine is not None
+    assert quarantine.reason == UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE
+    assert quarantine.identity_bytes != validate_provider_quarantine_fact(
+        _tombstone(),
+        expected_source_file_id=SOURCE_FILE_ID,
+        expected_range_ordinal=2,
+        expected_occurrence_ordinal=17,
+    ).identity_bytes
+    assert b"invalid_npi_structure" in quarantine.identity_bytes
 
 
 @pytest.mark.parametrize(
@@ -224,16 +251,16 @@ def test_catalog_ceiling_rejects_invalid_file_census(provider_file_count) -> Non
         provider_quarantine_catalog_limit(provider_file_count)
 
 
-@pytest.mark.parametrize(
-    ("provider_file_count", "expected_limit"),
-    ((0, 0), (1, 32), (3, 96)),
-)
-def test_catalog_ceiling_scales_by_validated_file_count(
+def test_catalog_ceiling_returns_zero_for_empty_catalog() -> None:
+    assert provider_quarantine_catalog_limit(0) == 0
+
+
+@pytest.mark.parametrize("provider_file_count", (1, 3))
+def test_catalog_ceiling_multiplies_validated_file_census(
     provider_file_count,
-    expected_limit,
 ) -> None:
     assert provider_quarantine_catalog_limit(provider_file_count) == (
-        expected_limit
+        provider_file_count * UHC_PROVIDER_QUARANTINE_MAX_COUNT
     )
 
 
@@ -246,6 +273,11 @@ def test_public_rejection_counts_are_aggregate_only() -> None:
         "invalid_npi_checksum_facility_records": 1,
         "invalid_npi_checksum_address_rows": 3,
         "invalid_npi_checksum_provider_plan_rows": 4,
+        "invalid_npi_structure": 0,
+        "invalid_npi_structure_individual_records": 0,
+        "invalid_npi_structure_facility_records": 0,
+        "invalid_npi_structure_address_rows": 0,
+        "invalid_npi_structure_provider_plan_rows": 0,
     }
     serialized = repr(rejected)
     assert SOURCE_FILE_ID not in serialized
@@ -292,4 +324,35 @@ def test_zero_rejection_count_rejects_nonzero_dimension() -> None:
                 invalid_npi_address_rows=1,
                 invalid_npi_provider_plan_rows=1,
             )
+        )
+
+
+def test_structural_subset_is_publicly_distinct_and_exactly_balanced() -> None:
+    counters = _counter_map(
+        invalid_npi_structure_count=1,
+        invalid_npi_structure_individual_records=0,
+        invalid_npi_structure_facility_records=1,
+        invalid_npi_structure_address_rows=2,
+        invalid_npi_structure_provider_plan_rows=3,
+    )
+
+    rejected = provider_quarantine_rejected_counts(counters)
+
+    assert rejected["invalid_npi_checksum"] == 1
+    assert rejected["invalid_npi_structure"] == 1
+    assert rejected["invalid_npi_structure_facility_records"] == 1
+    assert rejected["invalid_npi_structure_address_rows"] == 2
+    assert rejected["invalid_npi_structure_provider_plan_rows"] == 3
+    assert provider_quarantine_rejected_totals(rejected, 2) == {
+        "individual_records": 1,
+        "facility_records": 1,
+        "address_rows": 3,
+        "provider_plan_rows": 4,
+    }
+
+
+def test_structural_native_counter_group_must_be_complete() -> None:
+    with pytest.raises(UhcProviderQuarantineError, match="incomplete"):
+        provider_quarantine_rejected_counts(
+            _counter_map(invalid_npi_structure_count=1)
         )
