@@ -165,8 +165,10 @@ mod tests {
     #[test]
     fn immutable_dense_map_rejects_duplicates() {
         let mut map = DenseIdentityMap::with_capacity(1).unwrap();
+        assert!(map.is_empty());
         map.insert(identity(7), DenseIdentityValue::default())
             .unwrap();
+        assert!(!map.is_empty());
         assert!(map
             .insert(identity(7), DenseIdentityValue::default())
             .unwrap_err()

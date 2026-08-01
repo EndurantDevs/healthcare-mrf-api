@@ -22,12 +22,16 @@ async def test_postgres_crash_reclaim_verify_seal_and_reuse(monkeypatch) -> None
         artifact_sha256=semantic_proof._digest("artifact"),
         raw_contract_version=2,
         raw_range_count=4,
+        manifest_sha256=semantic_proof._digest("manifest"),
+        range_set_sha256=semantic_proof._digest("ranges"),
+        raw_record_count=4,
+        raw_producer_build_id="postgres-proof-producer-v1",
         collection_kind="provider_membership",
         encoder_sha256=semantic_proof._digest("encoder"),
     )
     try:
         await semantic_proof._install_schema(engine, migration)
-        await _exercise_semantic_build(database_url, identity)
+        await _exercise_semantic_build(database_url, identity, monkeypatch)
         await _assert_semantic_downgrade(engine, migration)
     finally:
         async with engine.begin() as connection:
@@ -37,7 +41,7 @@ async def test_postgres_crash_reclaim_verify_seal_and_reuse(monkeypatch) -> None
         await engine.dispose()
 
 
-async def _exercise_semantic_build(database_url, identity) -> None:
+async def _exercise_semantic_build(database_url, identity, monkeypatch) -> None:
     connection = await semantic_proof.asyncpg.connect(
         host=str(database_url.host),
         port=int(database_url.port or 5432),
@@ -60,6 +64,7 @@ async def _exercise_semantic_build(database_url, identity) -> None:
             recovered_claim,
             binary_copy_payload,
             native_report,
+            monkeypatch,
         )
     finally:
         await connection.close()

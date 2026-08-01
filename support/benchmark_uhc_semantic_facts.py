@@ -15,7 +15,7 @@ import re
 import statistics
 import time
 import uuid
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Mapping
 
 import asyncpg
 
@@ -29,6 +29,10 @@ from process.uhc_semantic_build_store import (
 )
 from process.uhc_semantic_evidence import summarize_uhc_npi_evidence
 from process.uhc_semantic_stage_verifier import verify_uhc_semantic_stage
+from support.uhc_semantic_benchmark_quarantine import (
+    benchmark_proof_identity as _proof_identity,
+    benchmark_quarantine_source,
+)
 
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -39,12 +43,14 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--catalog-set-sha256", required=True)
     parser.add_argument("--artifact-sha256", required=True)
     parser.add_argument("--artifact-byte-count", type=int, required=True)
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--range-set-sha256", required=True)
     parser.add_argument("--record-count", type=int, required=True)
     parser.add_argument("--range-count", type=int, required=True)
+    parser.add_argument("--producer-build-id", required=True)
     parser.add_argument("--source-file-id", required=True)
     parser.add_argument("--source-binding-id", required=True)
     parser.add_argument(
@@ -84,11 +90,15 @@ def _native_command(
     encoder_sha256: str,
 ) -> tuple[list[str], UhcSemanticBuildIdentity]:
     identity = UhcSemanticBuildIdentity(
-        catalog_set_sha256=hashlib.sha256(b"bounded-benchmark").hexdigest(),
+        catalog_set_sha256=arguments.catalog_set_sha256,
         source_file_id=arguments.source_file_id,
         artifact_sha256=arguments.artifact_sha256,
         raw_contract_version=2,
         raw_range_count=arguments.range_count,
+        manifest_sha256=arguments.manifest_sha256,
+        range_set_sha256=arguments.range_set_sha256,
+        raw_record_count=arguments.record_count,
+        raw_producer_build_id=arguments.producer_build_id,
         collection_kind=arguments.collection_kind,
         encoder_sha256=encoder_sha256,
     )
@@ -143,37 +153,6 @@ async def _terminate(process: asyncio.subprocess.Process | None) -> None:
         await process.wait()
 
 
-def _proof_identity(report: dict[str, Any]) -> str:
-    stable_proof_by_field = {
-        key: report[key]
-        for key in (
-            "contract_id",
-            "contract_version",
-            "copy_format_id",
-            "counters",
-            "encoder_sha256",
-            "evidence_count",
-            "evidence_identity_set_sha256",
-            "evidence_layout_set_sha256",
-            "evidence_ranges",
-            "fact_blocks",
-            "fact_count",
-            "fact_set_sha256",
-            "lineage",
-            "max_record_bytes",
-            "record_identity_set_sha256",
-            "source_id",
-        )
-    }
-    return hashlib.sha256(
-        json.dumps(
-            stable_proof_by_field,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
-
-
 async def _trial(
     arguments: argparse.Namespace,
     trial: int,
@@ -181,6 +160,7 @@ async def _trial(
     identity: UhcSemanticBuildIdentity,
 ) -> dict[str, Any]:
     """Run and verify one isolated semantic landing benchmark trial."""
+
     connection = await asyncpg.connect(arguments.dsn)
     relation = f"provider_directory_uhc_bench_{uuid.uuid4().hex[:18]}"
     stage_ref = _stage_ref(arguments.schema, relation)
@@ -204,20 +184,12 @@ async def _trial(
             identity,
         )
         landing_finished = time.perf_counter()
-        async with connection.transaction():
-            for statement in _stage_index_sql(claim):
-                await connection.execute(statement)
-            await connection.execute(f"ANALYZE {stage_ref}")
-        verifier_report = await verify_uhc_semantic_stage(
+        verifier_report, evidence = await _verify_trial_stage(
             connection,
             claim,
             identity,
             native_report_by_field,
-        )
-        evidence = await summarize_uhc_npi_evidence(
-            connection,
-            f"{arguments.schema}.{relation}",
-            expected_evidence_count=native_report_by_field["evidence_count"],
+            arguments,
         )
         full_finished = time.perf_counter()
         return _trial_result(
@@ -234,6 +206,34 @@ async def _trial(
         await _terminate(process)
         await connection.execute(f"DROP TABLE IF EXISTS {stage_ref}")
         await connection.close()
+
+
+async def _verify_trial_stage(
+    connection: asyncpg.Connection,
+    claim: UhcSemanticBuildClaim,
+    identity: UhcSemanticBuildIdentity,
+    native_report_by_field: Mapping[str, Any],
+    arguments: argparse.Namespace,
+) -> tuple[dict[str, Any], Any]:
+    async with connection.transaction():
+        for statement in _stage_index_sql(claim):
+            await connection.execute(statement)
+        await connection.execute(
+            f"ANALYZE {_stage_ref(arguments.schema, claim.stage_relation)}"
+        )
+    verifier_report = await verify_uhc_semantic_stage(
+        connection,
+        claim,
+        identity,
+        native_report_by_field,
+        quarantine_source=benchmark_quarantine_source(arguments),
+    )
+    evidence = await summarize_uhc_npi_evidence(
+        connection,
+        f"{arguments.schema}.{claim.stage_relation}",
+        expected_evidence_count=native_report_by_field["evidence_count"],
+    )
+    return verifier_report, evidence
 
 
 async def _copy_native_trial(
@@ -333,6 +333,10 @@ def _validate_benchmark_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("artifact and record counts must be positive")
     if not 4 <= arguments.range_count <= 256:
         raise ValueError("range count must be in 4..=256")
+    if arguments.source_binding_id != (
+        f"{arguments.catalog_set_sha256}/{arguments.source_file_id}"
+    ):
+        raise ValueError("source binding ID does not match catalog and source")
     _quoted(arguments.schema)
 
 
@@ -440,6 +444,7 @@ async def _run_benchmark(arguments: argparse.Namespace) -> dict[str, Any]:
     _validate_benchmark_arguments(arguments)
     encoder_sha256 = _file_sha256(arguments.native)
     command, identity = _native_command(arguments, encoder_sha256)
+    identity.validate()
     trial_reports = []
     aggregate_wave_reports = []
     for start in range(0, arguments.trials, arguments.parallelism):

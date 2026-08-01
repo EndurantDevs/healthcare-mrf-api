@@ -4,7 +4,7 @@
 
 This module deliberately has no HTTP client dependency.  Its only inputs are
 the immutable catalog/admission rows, their retained ``file://`` artifacts,
-and SEALED semantic stages produced by the native v2 encoder.
+and SEALED semantic stages produced by the native v3 encoder.
 """
 
 from __future__ import annotations
@@ -59,6 +59,20 @@ from process.uhc_provider_file_semantic_identity import (
     plan_key_for_scope,
 )
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_COUNTER_BY_RAW_FIELD,
+    UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+    UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM,
+    UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+    UhcProviderQuarantineError,
+    provider_quarantine_catalog_limit,
+    provider_quarantine_limit,
+    provider_quarantine_rejected_counts,
+    validate_provider_quarantine_fact,
+)
+from process.uhc_provider_quarantine_raw_verifier import (
+    UhcProviderQuarantineRawSource,
+)
 from process.uhc_semantic_build_store import (
     UHC_SEMANTIC_CONTRACT_ID,
     UHC_SEMANTIC_CONTRACT_VERSION,
@@ -75,6 +89,9 @@ from process.uhc_semantic_build_store import (
 from process.uhc_semantic_evidence import (
     UhcNpiEvidenceSummary,
     summarize_uhc_npi_evidence_stages,
+)
+from process.uhc_semantic_verifier_identity import (
+    semantic_verifier_identity_sha256,
 )
 from process.uhc_semantic_stage_verifier import (
     verify_sealed_uhc_semantic_build,
@@ -145,6 +162,7 @@ class UhcAdmittedFile:
     record_count: int
     range_set_sha256: str
     manifest_sha256: str
+    raw_producer_build_id: str
     raw_path: Path
     manifest_path: Path
 
@@ -169,8 +187,15 @@ class UhcAdmittedFile:
             artifact_sha256=self.artifact_sha256,
             raw_contract_version=self.raw_contract_version,
             raw_range_count=self.raw_range_count,
+            manifest_sha256=self.manifest_sha256,
+            range_set_sha256=self.range_set_sha256,
+            raw_record_count=self.record_count,
+            raw_producer_build_id=self.raw_producer_build_id,
             collection_kind=self.collection_kind,
             encoder_sha256=encoder_sha256,
+            semantic_verifier_sha256=(
+                semantic_verifier_identity_sha256()
+            ),
         )
 
 
@@ -250,6 +275,23 @@ def _positive_int(value: Any, field: str, *, allow_zero: bool = False) -> int:
     return value
 
 
+def _required_printable_text(
+    value: Any,
+    field: str,
+    *,
+    max_length: int,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > max_length
+        or not value.isascii()
+        or not value.isprintable()
+    ):
+        raise UhcRetainedDatasetError(f"retained UHC {field} is invalid")
+    return value
+
+
 def _mapping(value: Any, field: str) -> dict[str, Any]:
     if isinstance(value, str):
         try:
@@ -311,6 +353,7 @@ def _catalog_set_query() -> str:
                layout.record_count,
                layout.range_set_sha256,
                layout.manifest_sha256,
+               layout.producer_build_id AS raw_producer_build_id,
                layout.manifest_storage_uri,
                layout.status AS layout_status,
                raw_ref.storage_uri AS raw_reference_uri,
@@ -455,6 +498,11 @@ def _admitted_uhc_file(
         record_count=_positive_int(binding["record_count"], "record_count"),
         range_set_sha256=_require_sha256(binding["range_set_sha256"], "range_set_sha256"),
         manifest_sha256=_require_sha256(binding["manifest_sha256"], "manifest_sha256"),
+        raw_producer_build_id=_required_printable_text(
+            binding["raw_producer_build_id"],
+            "raw_producer_build_id",
+            max_length=256,
+        ),
         raw_path=raw_path,
         manifest_path=manifest_path,
     )
@@ -669,6 +717,19 @@ async def _seal_native_semantic_report(
         identity,
         report,
         copy_observation=copy_observation,
+        quarantine_source=UhcProviderQuarantineRawSource(
+            raw_path=admitted.raw_path,
+            manifest_path=admitted.manifest_path,
+            artifact_sha256=admitted.artifact_sha256,
+            artifact_byte_count=admitted.artifact_byte_count,
+            raw_contract_version=admitted.raw_contract_version,
+            manifest_sha256=admitted.manifest_sha256,
+            range_set_sha256=admitted.range_set_sha256,
+            record_count=admitted.record_count,
+            range_count=admitted.raw_range_count,
+            raw_producer_build_id=admitted.raw_producer_build_id,
+            source_file_id=admitted.source_file_id,
+        ),
     )
     await seal_uhc_semantic_build(
         connection,
@@ -1710,7 +1771,7 @@ class _CanonicalLandingBuffers:
     key_rows: list[tuple[Any, ...]]
 
 
-def _append_canonical_fact(
+def _append_provider_membership_fact(
     buffers: _CanonicalLandingBuffers,
     admitted: UhcAdmittedFile,
     ordinal: int,
@@ -1719,44 +1780,90 @@ def _append_canonical_fact(
     input_lineage: tuple[dict[str, Any], ...],
 ) -> None:
     logical_scope = admitted.logical_scope
-    if logical_scope.pairing_status == PAIRING_UNPAIRED_RETAINED_ONLY:
+    generated_rows, generated_keys = _provider_resource_rows(
+        semantic_fact,
+        source_file_id=admitted.source_file_id,
+        ordinal=ordinal,
+        logical_scope=logical_scope,
+        source_lineage={
+            "catalog_set_sha256": admitted.catalog_set_sha256,
+            "source_file_id": admitted.source_file_id,
+            "file_name": Path(admitted.file_name).name,
+            "artifact_sha256": admitted.artifact_sha256,
+            "record_ordinal": ordinal,
+            "logical_scope_id": logical_scope.logical_scope_id,
+        },
+    )
+    proof_builder.observe_rows(generated_rows, input_lineage=input_lineage)
+    buffers.resource_rows.extend(generated_rows)
+    buffers.key_rows.extend(generated_keys)
+
+
+def _append_plan_reference_fact(
+    buffers: _CanonicalLandingBuffers,
+    admitted: UhcAdmittedFile,
+    ordinal: int,
+    semantic_fact: Mapping[str, Any],
+) -> None:
+    plan_rows = _plan_detail_rows(
+        semantic_fact,
+        source_file_id=admitted.source_file_id,
+        ordinal=ordinal,
+        logical_scope=admitted.logical_scope,
+    )
+    buffers.plan_rows.extend(plan_rows)
+    buffers.key_rows.extend(
+        ("detail", plan_key, resource_id)
+        for plan_key, resource_id, *_rest in plan_rows
+    )
+
+
+def _append_canonical_fact(
+    buffers: _CanonicalLandingBuffers,
+    admitted: UhcAdmittedFile,
+    range_ordinal: int,
+    ordinal: int,
+    semantic_fact: Mapping[str, Any],
+    proof_builder: UhcCanonicalProofBuilder,
+    input_lineage: tuple[dict[str, Any], ...],
+) -> None:
+    """Append one admitted fact while omitting exact quarantined records."""
+    try:
+        quarantine = validate_provider_quarantine_fact(
+            semantic_fact,
+            expected_source_file_id=admitted.source_file_id,
+            expected_range_ordinal=range_ordinal,
+            expected_occurrence_ordinal=ordinal,
+        )
+    except UhcProviderQuarantineError as error:
+        raise UhcRetainedDatasetError(str(error)) from error
+    if quarantine is not None:
+        if admitted.collection_kind != "provider_membership":
+            raise UhcRetainedDatasetError(
+                "SEALED UHC plan fact contains provider quarantine"
+            )
+        return
+    if admitted.logical_scope.pairing_status == PAIRING_UNPAIRED_RETAINED_ONLY:
         if admitted.collection_kind != "provider_membership":
             raise UhcRetainedDatasetError(
                 "retained-only UHC scope has an invalid collection kind"
             )
         return
     if admitted.collection_kind == "provider_membership":
-        generated_rows, generated_keys = _provider_resource_rows(
+        _append_provider_membership_fact(
+            buffers,
+            admitted,
+            ordinal,
             semantic_fact,
-            source_file_id=admitted.source_file_id,
-            ordinal=ordinal,
-            logical_scope=logical_scope,
-            source_lineage={
-                "catalog_set_sha256": admitted.catalog_set_sha256,
-                "source_file_id": admitted.source_file_id,
-                "file_name": Path(admitted.file_name).name,
-                "artifact_sha256": admitted.artifact_sha256,
-                "record_ordinal": ordinal,
-                "logical_scope_id": logical_scope.logical_scope_id,
-            },
+            proof_builder,
+            input_lineage,
         )
-        proof_builder.observe_rows(
-            generated_rows,
-            input_lineage=input_lineage,
-        )
-        buffers.resource_rows.extend(generated_rows)
-        buffers.key_rows.extend(generated_keys)
         return
-    plan_rows = _plan_detail_rows(
+    _append_plan_reference_fact(
+        buffers,
+        admitted,
+        ordinal,
         semantic_fact,
-        source_file_id=admitted.source_file_id,
-        ordinal=ordinal,
-        logical_scope=logical_scope,
-    )
-    buffers.plan_rows.extend(plan_rows)
-    buffers.key_rows.extend(
-        ("detail", plan_key, resource_id)
-        for plan_key, resource_id, *_rest in plan_rows
     )
 
 
@@ -1808,6 +1915,7 @@ async def _land_canonical_facts(
             _append_canonical_fact(
                 buffers,
                 admitted,
+                range_ordinal,
                 ordinal,
                 semantic_fact,
                 proof_builder,
@@ -2182,38 +2290,183 @@ def _semantic_set_identity(
     )
 
 
+def _assert_provider_quarantine_file_ceiling(
+    counters: Mapping[str, Any],
+) -> None:
+    provider_count = _positive_int(
+        counters.get("raw_provider_records"),
+        "raw_provider_records",
+    )
+    invalid_npi_count = _positive_int(
+        counters.get("invalid_npi_count"),
+        "invalid_npi_count",
+        allow_zero=True,
+    )
+    if invalid_npi_count > provider_quarantine_limit(provider_count):
+        raise UhcRetainedDatasetError(
+            "retained UHC provider quarantine exceeds its file ceiling"
+        )
+
+
+def _add_provider_rejected_counts(
+    counters: Mapping[str, Any],
+    rejected_count_by_field: dict[str, int],
+) -> None:
+    try:
+        file_rejected_count_by_field = provider_quarantine_rejected_counts(
+            counters
+        )
+    except UhcProviderQuarantineError as error:
+        raise UhcRetainedDatasetError(str(error)) from error
+    for field_name in rejected_count_by_field:
+        rejected_count_by_field[field_name] += (
+            file_rejected_count_by_field.get(field_name, 0)
+        )
+
+
+def _add_retained_only_drop_counts(
+    sealed_file: UhcSealedSemanticFile,
+    counters: Mapping[str, Any],
+    retained_only_drop_count_by_field: dict[str, int],
+) -> None:
+    if (
+        sealed_file.admitted.logical_scope.pairing_status
+        != PAIRING_UNPAIRED_RETAINED_ONLY
+    ):
+        return
+    for drop_key, counter_field in (
+        SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS.items()
+    ):
+        quarantine_counter_field = UHC_PROVIDER_QUARANTINE_COUNTER_BY_RAW_FIELD[
+            counter_field
+        ]
+        retained_only_drop_count_by_field[drop_key] += _positive_int(
+            counters.get(counter_field),
+            counter_field,
+            allow_zero=True,
+        ) - _positive_int(
+            counters.get(quarantine_counter_field),
+            quarantine_counter_field,
+            allow_zero=True,
+        )
+
+
+def _provider_quarantine_proof_shard(
+    sealed_file: UhcSealedSemanticFile,
+    counters: Mapping[str, Any],
+) -> list[Any]:
+    return [
+        sealed_file.admitted.source_file_id,
+        _positive_int(
+            counters.get("invalid_npi_count"),
+            "invalid_npi_count",
+            allow_zero=True,
+        ),
+        _require_sha256(
+            counters.get("quarantine_identity_set_sha256"),
+            "quarantine identity set hash",
+        ),
+    ]
+
+
 def _accumulate_sealed_summary_counts(
     sealed_files: tuple[UhcSealedSemanticFile, ...],
     count_by_field: dict[str, int],
     retained_only_drop_count_by_field: dict[str, int],
-) -> tuple[int, list[str]]:
+    rejected_count_by_field: dict[str, int],
+) -> tuple[int, list[str], str]:
     """Accumulate sealed counters and return evidence census and stages."""
     expected_evidence_count = 0
     evidence_stage_refs = []
+    quarantine_proof_shards = []
     for sealed_file in sealed_files:
         counters = _mapping(sealed_file.build_row["counters_json"], "counters")
         for field in _SUMMARY_ADDITIVE_COUNTERS:
             count_by_field[field] += _positive_int(
                 counters.get(field), field, allow_zero=True
             )
-        if sealed_file.admitted.collection_kind == "provider_membership":
-            expected_evidence_count += int(sealed_file.build_row["evidence_count"])
-            evidence_stage_refs.append(sealed_file.stage_ref)
-            if (
-                sealed_file.admitted.logical_scope.pairing_status
-                == PAIRING_UNPAIRED_RETAINED_ONLY
-            ):
-                for drop_key, counter_field in (
-                    SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS.items()
-                ):
-                    retained_only_drop_count_by_field[
-                        drop_key
-                    ] += _positive_int(
-                        counters.get(counter_field),
-                        counter_field,
-                        allow_zero=True,
-                    )
-    return expected_evidence_count, evidence_stage_refs
+        if sealed_file.admitted.collection_kind != "provider_membership":
+            continue
+        _assert_provider_quarantine_file_ceiling(counters)
+        expected_evidence_count += int(sealed_file.build_row["evidence_count"])
+        evidence_stage_refs.append(sealed_file.stage_ref)
+        _add_provider_rejected_counts(counters, rejected_count_by_field)
+        quarantine_proof_shards.append(
+            _provider_quarantine_proof_shard(sealed_file, counters)
+        )
+        _add_retained_only_drop_counts(
+            sealed_file,
+            counters,
+            retained_only_drop_count_by_field,
+        )
+    return (
+        expected_evidence_count,
+        evidence_stage_refs,
+        _json_digest(
+            [
+                UHC_PROVIDER_QUARANTINE_CONTRACT_ID,
+                sorted(quarantine_proof_shards),
+            ]
+        ),
+    )
+
+
+def _empty_summary_count_maps() -> tuple[
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+]:
+    return (
+        dict.fromkeys(SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS, 0),
+        dict.fromkeys(SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS, 0),
+        dict.fromkeys(UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS, 0),
+    )
+
+
+def _summary_count_categories(
+    evidence: UhcNpiEvidenceSummary,
+    rejected_count_by_field: Mapping[str, int],
+    retained_only_drop_count_by_field: Mapping[str, int],
+) -> dict[str, dict[str, int]]:
+    rejected_counts = (
+        dict(rejected_count_by_field)
+        if rejected_count_by_field[
+            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM
+        ]
+        else {}
+    )
+    intentional_drop_counts = (
+        dict(retained_only_drop_count_by_field)
+        if retained_only_drop_count_by_field[
+            SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY
+        ]
+        else {}
+    )
+    return {
+        "conflict_counts": evidence.conflict_counts,
+        "rejected_counts": rejected_counts,
+        "intentional_drop_counts": intentional_drop_counts,
+        "unknown_field_counts": {},
+    }
+
+
+def _assert_summary_provider_balance(
+    count_by_field: Mapping[str, int],
+    expected_evidence_count: int,
+    provider_file_count: int,
+) -> None:
+    if count_by_field["raw_provider_records"] != (
+        expected_evidence_count + count_by_field["invalid_npi_count"]
+    ):
+        raise UhcRetainedDatasetError(
+            "retained UHC provider counters disagree with set evidence"
+        )
+    if count_by_field["invalid_npi_count"] > provider_quarantine_catalog_limit(
+        provider_file_count
+    ):
+        raise UhcRetainedDatasetError(
+            "retained UHC provider quarantine exceeds its publication ceiling"
+        )
 
 
 async def _combined_summary_counts(
@@ -2225,19 +2478,21 @@ async def _combined_summary_counts(
     dict[str, int],
     dict[str, dict[str, int]],
     UhcNpiEvidenceSummary,
+    str,
 ]:
     """Combine sealed per-file counters for the complete catalog set."""
     _resource, _plan, key_relation, _evidence, _sealed = names
-    counts = dict.fromkeys(SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS, 0)
-    retained_only_drop_counts = dict.fromkeys(
-        SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS,
-        0,
-    )
-    expected_evidence_count, evidence_stage_refs = (
+    (
+        count_by_field,
+        retained_only_drop_count_by_field,
+        rejected_count_by_field,
+    ) = _empty_summary_count_maps()
+    expected_evidence_count, evidence_stage_refs, quarantine_proof_sha256 = (
         _accumulate_sealed_summary_counts(
             sealed_files,
-            counts,
-            retained_only_drop_counts,
+            count_by_field,
+            retained_only_drop_count_by_field,
+            rejected_count_by_field,
         )
     )
     evidence = await summarize_uhc_npi_evidence_stages(
@@ -2245,7 +2500,7 @@ async def _combined_summary_counts(
         evidence_stage_refs,
         expected_evidence_count=expected_evidence_count,
     )
-    counts.update(
+    count_by_field.update(
         distinct_npis=evidence.distinct_npis,
         duplicate_npi_groups=evidence.duplicate_npi_groups,
         conflicting_npi_groups=evidence.conflicting_npi_groups,
@@ -2253,24 +2508,20 @@ async def _combined_summary_counts(
         plan_file_count=admitted_set.plan_file_count,
         **await _plan_key_counts(connection, key_relation),
     )
-    if counts["raw_provider_records"] != expected_evidence_count:
-        raise UhcRetainedDatasetError(
-            "retained UHC provider counters disagree with set evidence"
-        )
+    _assert_summary_provider_balance(
+        count_by_field,
+        expected_evidence_count,
+        admitted_set.provider_file_count
+    )
     return (
-        counts,
-        {
-            "conflict_counts": evidence.conflict_counts,
-            "intentional_drop_counts": (
-                dict(retained_only_drop_counts)
-                if retained_only_drop_counts[
-                    SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY
-                ]
-                else {}
-            ),
-            "unknown_field_counts": {},
-        },
+        count_by_field,
+        _summary_count_categories(
+            evidence,
+            rejected_count_by_field,
+            retained_only_drop_count_by_field,
+        ),
         evidence,
+        quarantine_proof_sha256,
     )
 
 
@@ -2337,7 +2588,8 @@ def _validate_summary_contract(summary_input_by_field: dict[str, Any]) -> None:
         "semantic_contract_id", "semantic_contract_version",
         "canonical_contract_id", "semantic_build_ids", "semantic_set_sha256",
         "input_set_sha256", "layout_set_sha256", "encoder_digest",
-        "count_by_field", "count_by_category", "input_sha256",
+        "quarantine_proof_sha256", "count_by_field", "count_by_category",
+        "input_sha256",
     }
     if set(summary_input_by_field) != expected_fields:
         raise UhcRetainedDatasetError("retained UHC summary input shape is invalid")
@@ -2357,6 +2609,7 @@ def _validate_summary_contract(summary_input_by_field: dict[str, Any]) -> None:
     for field_name in (
         "catalog_set_sha256", "semantic_set_sha256", "input_set_sha256",
         "layout_set_sha256", "encoder_digest", "input_sha256",
+        "quarantine_proof_sha256",
     ):
         _require_sha256(summary_input_by_field[field_name], field_name)
 
@@ -2374,8 +2627,12 @@ def _validate_summary_build_ids(summary_input_by_field: dict[str, Any]) -> None:
         )
 
 
-def _validate_summary_counts(summary_input_by_field: dict[str, Any]) -> None:
-    count_by_field = _mapping(summary_input_by_field["count_by_field"], "count_by_field")
+def _validated_summary_count_maps(
+    summary_input_by_field: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Mapping[str, Any]]]:
+    count_by_field = _mapping(
+        summary_input_by_field["count_by_field"], "count_by_field"
+    )
     if set(count_by_field) != set(SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS):
         raise UhcRetainedDatasetError(
             "retained UHC summary count fields are incomplete"
@@ -2387,7 +2644,10 @@ def _validate_summary_counts(summary_input_by_field: dict[str, Any]) -> None:
         "count_by_category",
     )
     expected_categories = {
-        "conflict_counts", "intentional_drop_counts", "unknown_field_counts"
+        "conflict_counts",
+        "rejected_counts",
+        "intentional_drop_counts",
+        "unknown_field_counts",
     }
     if set(count_by_category) != expected_categories or any(
         not isinstance(category_map, Mapping)
@@ -2396,14 +2656,58 @@ def _validate_summary_counts(summary_input_by_field: dict[str, Any]) -> None:
         raise UhcRetainedDatasetError(
             "retained UHC summary count categories are invalid"
         )
-    intentional_drop_counts = count_by_category["intentional_drop_counts"]
-    intentional_drop_counts_valid = (
-        not intentional_drop_counts
+    return count_by_field, count_by_category
+
+
+def _is_summary_rejected_count_map_valid(
+    count_by_field: Mapping[str, Any],
+    rejected_count_by_field: Mapping[str, Any],
+) -> bool:
+    invalid_npi_count = count_by_field["invalid_npi_count"]
+    if rejected_count_by_field and set(rejected_count_by_field) == set(
+        UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS
+    ):
+        for field_name, count in rejected_count_by_field.items():
+            _positive_int(count, field_name, allow_zero=True)
+    return (not rejected_count_by_field and invalid_npi_count == 0) or (
+        set(rejected_count_by_field)
+        == set(UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS)
+        and rejected_count_by_field.get(
+            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM
+        )
+        == invalid_npi_count
+        and rejected_count_by_field.get(
+            "invalid_npi_checksum_individual_records"
+        )
+        + rejected_count_by_field.get(
+            "invalid_npi_checksum_facility_records"
+        )
+        == invalid_npi_count
+        and invalid_npi_count
+        <= rejected_count_by_field.get("invalid_npi_checksum_address_rows")
+        <= count_by_field["raw_address_rows"]
+        and invalid_npi_count
+        <= rejected_count_by_field.get(
+            "invalid_npi_checksum_provider_plan_rows"
+        )
+        <= count_by_field["raw_provider_plan_rows"]
+        and invalid_npi_count
+        <= provider_quarantine_catalog_limit(
+            count_by_field["provider_file_count"]
+        )
+    )
+
+
+def _is_summary_drop_count_map_valid(
+    intentional_drop_count_by_field: Mapping[str, Any],
+) -> bool:
+    return (
+        not intentional_drop_count_by_field
         or (
-            set(intentional_drop_counts)
+            set(intentional_drop_count_by_field)
             == set(SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS)
             and _positive_int(
-                intentional_drop_counts.get(
+                intentional_drop_count_by_field.get(
                     SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY
                 ),
                 SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY,
@@ -2411,7 +2715,7 @@ def _validate_summary_counts(summary_input_by_field: dict[str, Any]) -> None:
             > 0
             and all(
                 _positive_int(
-                    intentional_drop_counts.get(drop_key),
+                    intentional_drop_count_by_field.get(drop_key),
                     drop_key,
                     allow_zero=True,
                 )
@@ -2420,8 +2724,24 @@ def _validate_summary_counts(summary_input_by_field: dict[str, Any]) -> None:
             )
         )
     )
+
+
+def _validate_summary_counts(summary_input_by_field: dict[str, Any]) -> None:
+    """Reject unbalanced or unaccounted UHC summary counters."""
+    count_by_field, count_by_category = _validated_summary_count_maps(
+        summary_input_by_field
+    )
+    rejected_count_by_field = count_by_category["rejected_counts"]
+    intentional_drop_count_by_field = count_by_category[
+        "intentional_drop_counts"
+    ]
     if (
-        not intentional_drop_counts_valid
+        not _is_summary_rejected_count_map_valid(
+            count_by_field, rejected_count_by_field
+        )
+        or not _is_summary_drop_count_map_valid(
+            intentional_drop_count_by_field
+        )
         or count_by_category["unknown_field_counts"]
     ):
         raise UhcRetainedDatasetError(
@@ -2462,6 +2782,7 @@ def _canonical_summary_input(
     sealed_files: tuple[UhcSealedSemanticFile, ...],
     count_by_field: dict[str, int],
     count_by_category: dict[str, dict[str, int]],
+    quarantine_proof_sha256: str,
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     input_digest, layout_digest, semantic_set_digest, build_ids = (
         _semantic_set_identity(admitted_set, sealed_files)
@@ -2479,6 +2800,7 @@ def _canonical_summary_input(
         "input_set_sha256": input_digest,
         "layout_set_sha256": layout_digest,
         "encoder_digest": sealed_files[0].identity.encoder_sha256,
+        "quarantine_proof_sha256": quarantine_proof_sha256,
         "count_by_field": count_by_field,
         "count_by_category": count_by_category,
     }
@@ -2563,6 +2885,59 @@ def _canonical_phase_metrics(
     }
 
 
+def _canonical_content_proof(
+    admitted_set: UhcAdmittedCatalogSet,
+    sealed_files: tuple[UhcSealedSemanticFile, ...],
+    landing: _CanonicalLanding,
+    summary_input_by_field: Mapping[str, Any],
+    build_ids: tuple[str, ...],
+    evidence: UhcNpiEvidenceSummary,
+) -> dict[str, Any]:
+    identity = UhcCanonicalMaterializationIdentity(
+        catalog_set_sha256=admitted_set.catalog_set_sha256,
+        semantic_set_sha256=summary_input_by_field["semantic_set_sha256"],
+        semantic_build_ids=build_ids,
+        source_id=UHC_RETAINED_SOURCE_ID,
+        semantic_contract_id=UHC_SEMANTIC_CONTRACT_ID,
+        semantic_contract_version=UHC_SEMANTIC_CONTRACT_VERSION,
+        canonical_contract_id=UHC_RETAINED_CANONICAL_CONTRACT_ID,
+    )
+    npi_proof = UhcCanonicalNpiProof(
+        evidence_count=evidence.evidence_count,
+        distinct_npis=evidence.distinct_npis,
+        proof_sha256=evidence.proof_sha256,
+        shards=_npi_evidence_proof_shards(sealed_files),
+    )
+    return canonical_materialization_proof(landing.content, identity, npi_proof)
+
+
+def _canonical_stage_result(
+    names: tuple[str, str, str, str, str],
+    landing: _CanonicalLanding,
+    content_proof: Mapping[str, Any],
+    summary_input_by_field: Mapping[str, Any],
+    build_ids: tuple[str, ...],
+    evidence: UhcNpiEvidenceSummary,
+    summary_seconds: float,
+    total_seconds: float,
+) -> UhcCanonicalStage:
+    return UhcCanonicalStage(
+        schema=_schema_name(),
+        resource_relation=names[0],
+        auxiliary_relations=names[1:],
+        resource_counts=landing.resource_counts,
+        content_proof=dict(content_proof),
+        summary_input=dict(summary_input_by_field),
+        semantic_build_ids=build_ids,
+        phase_metrics=_canonical_phase_metrics(
+            landing,
+            evidence,
+            summary_seconds,
+            total_seconds,
+        ),
+    )
+
+
 async def _finalize_uhc_canonical_stage(
     connection: asyncpg.Connection,
     admitted_set: UhcAdmittedCatalogSet,
@@ -2574,7 +2949,12 @@ async def _finalize_uhc_canonical_stage(
     """Build source summary and bind the content proof to semantic lineage."""
 
     summary_started = time.perf_counter()
-    count_by_field, count_by_category, evidence = await _combined_summary_counts(
+    (
+        count_by_field,
+        count_by_category,
+        evidence,
+        quarantine_proof_sha256,
+    ) = await _combined_summary_counts(
         connection,
         admitted_set,
         sealed_files,
@@ -2586,41 +2966,25 @@ async def _finalize_uhc_canonical_stage(
         sealed_files,
         count_by_field,
         count_by_category,
+        quarantine_proof_sha256,
     )
-    content_proof = canonical_materialization_proof(
-        landing.content,
-        UhcCanonicalMaterializationIdentity(
-            catalog_set_sha256=admitted_set.catalog_set_sha256,
-            semantic_set_sha256=summary_input_by_field[
-                "semantic_set_sha256"
-            ],
-            semantic_build_ids=build_ids,
-            source_id=UHC_RETAINED_SOURCE_ID,
-            semantic_contract_id=UHC_SEMANTIC_CONTRACT_ID,
-            semantic_contract_version=UHC_SEMANTIC_CONTRACT_VERSION,
-            canonical_contract_id=UHC_RETAINED_CANONICAL_CONTRACT_ID,
-        ),
-        UhcCanonicalNpiProof(
-            evidence_count=evidence.evidence_count,
-            distinct_npis=evidence.distinct_npis,
-            proof_sha256=evidence.proof_sha256,
-            shards=_npi_evidence_proof_shards(sealed_files),
-        ),
+    content_proof = _canonical_content_proof(
+        admitted_set,
+        sealed_files,
+        landing,
+        summary_input_by_field,
+        build_ids,
+        evidence,
     )
-    return UhcCanonicalStage(
-        schema=_schema_name(),
-        resource_relation=names[0],
-        auxiliary_relations=names[1:],
-        resource_counts=landing.resource_counts,
-        content_proof=content_proof,
-        summary_input=summary_input_by_field,
-        semantic_build_ids=build_ids,
-        phase_metrics=_canonical_phase_metrics(
-            landing,
-            evidence,
-            summary_seconds,
-            time.perf_counter() - started,
-        ),
+    return _canonical_stage_result(
+        names,
+        landing,
+        content_proof,
+        summary_input_by_field,
+        build_ids,
+        evidence,
+        summary_seconds,
+        time.perf_counter() - started,
     )
 
 

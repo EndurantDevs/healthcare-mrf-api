@@ -18,18 +18,22 @@ from support.benchmark_uhc_semantic_facts import (
 
 
 def _arguments() -> Namespace:
+    catalog_set_sha256 = hashlib.sha256(b"catalog").hexdigest()
+    source_file_id = hashlib.sha256(b"source").hexdigest()
     return Namespace(
         native=Path("/tmp/uhc_semantic_facts"),
         input=Path("/tmp/raw.json"),
         manifest=Path("/tmp/manifest.json"),
+        catalog_set_sha256=catalog_set_sha256,
         artifact_sha256=hashlib.sha256(b"artifact").hexdigest(),
         artifact_byte_count=123,
         manifest_sha256=hashlib.sha256(b"manifest").hexdigest(),
         range_set_sha256=hashlib.sha256(b"ranges").hexdigest(),
         record_count=20,
         range_count=4,
-        source_file_id=hashlib.sha256(b"source").hexdigest(),
-        source_binding_id="benchmark",
+        producer_build_id="benchmark-producer-v1",
+        source_file_id=source_file_id,
+        source_binding_id=f"{catalog_set_sha256}/{source_file_id}",
         collection_kind="provider_membership",
         native_workers=4,
     )
@@ -79,6 +83,8 @@ def test_proof_identity_ignores_timings_but_binds_semantics() -> None:
         "fact_set_sha256": "d" * 64,
         "lineage": {"source_file_id": "e" * 64},
         "max_record_bytes": 1024,
+        "quarantine_count": 0,
+        "quarantine_identity_set_sha256": hashlib.sha256(b"").hexdigest(),
         "record_identity_set_sha256": "f" * 64,
         "source_id": "source",
         "elapsed_seconds": 1.0,
@@ -91,12 +97,26 @@ def test_proof_identity_ignores_timings_but_binds_semantics() -> None:
         **report_by_field,
         "fact_set_sha256": "0" * 64,
     }
+    quarantine_count_change_by_field = {
+        **report_by_field,
+        "quarantine_count": 1,
+    }
+    quarantine_identity_change_by_field = {
+        **report_by_field,
+        "quarantine_identity_set_sha256": "1" * 64,
+    }
 
     assert _proof_identity(report_by_field) == _proof_identity(
         timing_change_by_field
     )
     assert _proof_identity(report_by_field) != _proof_identity(
         fact_change_by_field
+    )
+    assert _proof_identity(report_by_field) != _proof_identity(
+        quarantine_count_change_by_field
+    )
+    assert _proof_identity(report_by_field) != _proof_identity(
+        quarantine_identity_change_by_field
     )
 
 

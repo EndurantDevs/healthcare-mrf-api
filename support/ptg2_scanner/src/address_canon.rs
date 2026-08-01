@@ -1205,7 +1205,35 @@ mod tests {
     }
 
     #[test]
+    fn candidate_units_are_deduplicated_without_reinterpreting_suffixes() {
+        assert!(spaced_unit_suffix_allowed("ste"));
+        assert!(!spaced_unit_suffix_allowed("apt"));
+        assert_eq!(unit_from_parts("ste", Some("2"), Some("b")), "ste2b");
+        assert_eq!(unit_from_parts("apt", Some("2"), Some("b")), "");
+
+        let street = " 123 main st ste 7 ".to_owned();
+        assert_eq!(
+            tail_unit(&street).map(|tail| tail.0),
+            Some("ste7".to_owned())
+        );
+        assert_eq!(strip_duplicate_tail_unit(street, "ste7"), " 123 main st");
+        assert_eq!(
+            strip_duplicate_tail_unit("123 main st".to_owned(), ""),
+            "123 main st"
+        );
+        assert_eq!(
+            strip_duplicate_tail_unit("123 main st ste 7".to_owned(), "apt7"),
+            "123 main st ste 7"
+        );
+    }
+
+    #[test]
     fn canonicalizes_ordinal_and_saint_tokens() {
+        assert!(std::panic::catch_unwind(|| assignment_body("", "MISSING")).is_err());
+        assert!(std::panic::catch_unwind(|| assignment_body("MISSING = []", "MISSING")).is_err());
+        assert_eq!(numeric_ordinal_value("1xst"), None);
+        assert_eq!(ordinal_h_typo_value("1xh"), None);
+        assert!(repeated_bare_line2_unit_decision("123 main st ste 7", "7").is_some());
         assert_eq!(
             street_norm(Some("200 14 St"), None),
             street_norm(Some("200 14th St"), None)

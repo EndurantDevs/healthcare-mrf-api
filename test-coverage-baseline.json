@@ -41,6 +41,7 @@
         "api/plan_release_readiness.py",
         "api/plan_release_serving.py",
         "api/provider_demographic_filters.py",
+        "api/provider_directory_profile_capacity_preflight.py",
         "api/provider_directory_profile_selection_attestation.py",
         "api/provider_directory_source_catalog_outcomes.py",
         "api/provider_directory_source_dataset_selection.py",
@@ -186,6 +187,29 @@
         "process/provider_directory_logical_scope.py",
         "process/provider_directory_physical_projection.py",
         "process/provider_directory_profile.py",
+        "process/provider_directory_profile_capacity.py",
+        "process/provider_directory_profile_capacity_attestation.py",
+        "process/provider_directory_profile_capacity_attestation_contract.py",
+        "process/provider_directory_profile_capacity_consumption.py",
+        "process/provider_directory_profile_capacity_control_budget.py",
+        "process/provider_directory_profile_capacity_control_identity.py",
+        "process/provider_directory_profile_capacity_control_operations.py",
+        "process/provider_directory_profile_capacity_control_projection.py",
+        "process/provider_directory_profile_capacity_cutover.py",
+        "process/provider_directory_profile_capacity_cutover_contract.py",
+        "process/provider_directory_profile_capacity_cutover_projection.py",
+        "process/provider_directory_profile_capacity_geometry.py",
+        "process/provider_directory_profile_capacity_geometry_contract.py",
+        "process/provider_directory_profile_capacity_physical.py",
+        "process/provider_directory_profile_capacity_runtime.py",
+        "process/provider_directory_profile_capacity_runtime_config.py",
+        "process/provider_directory_profile_capacity_runtime_geometry.py",
+        "process/provider_directory_profile_capacity_runtime_types.py",
+        "process/provider_directory_profile_capacity_target.py",
+        "process/provider_directory_profile_capacity_trust.py",
+        "process/provider_directory_profile_capacity_trust_config.py",
+        "process/provider_directory_profile_capacity_trust_validation.py",
+        "process/provider_directory_profile_capacity_types.py",
         "process/provider_directory_profile_reference_sql.py",
         "process/provider_directory_profile_selection.py",
         "process/provider_directory_profile_selection_contract.py",
@@ -455,6 +479,9 @@
         "process/uhc_provider_file_identity.py",
         "process/uhc_provider_file_semantic_identity.py",
         "process/uhc_provider_file_source_identity.py",
+        "process/uhc_provider_quarantine_contract.py",
+        "process/uhc_provider_quarantine_raw_verifier.py",
+        "process/uhc_provider_quarantine_record.py",
         "process/uhc_publication_sql.py",
         "process/uhc_retained_dataset.py",
         "process/uhc_retained_locks.py",
@@ -470,6 +497,7 @@
         "process/uhc_semantic_build_store.py",
         "process/uhc_semantic_evidence.py",
         "process/uhc_semantic_stage_verifier.py",
+        "process/uhc_semantic_verifier_identity.py",
         "process/url_security.py"
       ],
       "format": "coverage.py",
@@ -483,12 +511,12 @@
       },
       "metrics": {
         "branches": {
-          "covered": 38615,
-          "total": 42612
+          "covered": 40735,
+          "total": 44708
         },
         "lines": {
-          "covered": 122362,
-          "total": 128551
+          "covered": 129861,
+          "total": 135903
         }
       },
       "one_time_floor_reset": {
@@ -597,16 +625,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 3564,
-          "total": 3972
+          "covered": 3598,
+          "total": 4000
         },
         "lines": {
-          "covered": 56109,
-          "total": 62499
+          "covered": 56804,
+          "total": 63101
         },
         "regions": {
-          "covered": 82656,
-          "total": 92266
+          "covered": 83772,
+          "total": 93184
         }
       },
       "one_time_floor_reset": {

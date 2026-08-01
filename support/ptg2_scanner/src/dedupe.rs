@@ -689,7 +689,10 @@ pub fn emit_dedupe_summary(dedupe: &SharedDedupe, object_counts: &HashMap<String
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_summary_payload, emit_dedupe_summary, SharedDedupe};
+    use super::{
+        dedupe_summary_payload, emit_dedupe_summary, ProviderIdentifierQuarantine, SharedDedupe,
+        MAX_QUARANTINED_PROVIDER_IDENTIFIERS,
+    };
     use crate::manifest::GlobalId128;
     use crate::tax_identity::{TaxIdentityState, TinTokenPolicy};
     use serde_json::{json, Value};
@@ -745,6 +748,11 @@ mod tests {
         assert_eq!(payload["provider_group_member_attempted"], 3);
         assert_eq!(payload["provider_group_member_unique"], 2);
         assert_eq!(payload["provider_group_member_duplicate"], 1);
+        assert!(dedupe
+            .insert_provider_group_with_tax_identity(101, None)
+            .unwrap_err()
+            .to_string()
+            .contains("not configured"));
     }
 
     #[test]
@@ -846,5 +854,60 @@ mod tests {
         assert_eq!(payload["procedure_duplicate"], 1);
         assert_eq!(payload["provider_set_component_duplicate"], Value::Null);
         emit_dedupe_summary(&dedupe, &HashMap::new());
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dedupe.provider_identifier_quarantine.lock().unwrap();
+            panic!("poison quarantine lock for fail-closed coverage");
+        }));
+        assert!(dedupe
+            .record_quarantined_provider_identifiers(&[-1])
+            .is_err());
+        assert!(dedupe.provider_identifier_quarantine().is_err());
+    }
+
+    #[test]
+    fn provider_identifier_quarantine_rejects_valid_and_unbounded_values() {
+        let mut quarantine = ProviderIdentifierQuarantine::default();
+        assert!(quarantine.record(&[0]).is_err());
+        assert!(quarantine.record(&[1_000_000_000]).is_err());
+        for value in 1..=MAX_QUARANTINED_PROVIDER_IDENTIFIERS {
+            quarantine.occurrences_by_value.insert(-(value as i64), 1);
+        }
+        assert!(quarantine.record(&[-2_000]).is_err());
+
+        let mut incoming = ProviderIdentifierQuarantine::default();
+        incoming.record(&[-2_000]).unwrap();
+        assert!(quarantine.merge(&incoming).is_err());
+    }
+
+    #[test]
+    fn provider_identifier_quarantine_count_overflow_fails_closed() {
+        let mut record_overflow = ProviderIdentifierQuarantine::default();
+        record_overflow.occurrences_by_value.insert(-1, u64::MAX);
+        assert!(record_overflow.record(&[-1]).is_err());
+
+        let mut merge_overflow = record_overflow.clone();
+        let mut incoming = ProviderIdentifierQuarantine::default();
+        incoming.occurrences_by_value.insert(-1, 1);
+        assert!(merge_overflow.merge(&incoming).is_err());
+
+        let mut payload_overflow = ProviderIdentifierQuarantine::default();
+        payload_overflow.occurrences_by_value.insert(-2, u64::MAX);
+        payload_overflow.occurrences_by_value.insert(-1, 1);
+        assert!(payload_overflow.payload().is_err());
+    }
+
+    #[test]
+    fn high_cardinality_identity_deduplication_is_exact_when_configured() {
+        let mut dedupe = SharedDedupe::new(1);
+        dedupe.price_set_entry = Some(super::ShardedDedupe128::new(16));
+        dedupe.provider_entry_component = Some(super::ShardedDedupe128::new(16));
+        let price_set = GlobalId128([1; 16]);
+        let price_atom = GlobalId128([2; 16]);
+
+        assert!(dedupe.insert_price_set_entry(price_set, price_atom));
+        assert!(!dedupe.insert_price_set_entry(price_set, price_atom));
+        assert!(dedupe.insert_provider_entry_component(8, 7));
+        assert!(!dedupe.insert_provider_entry_component(8, 7));
     }
 }

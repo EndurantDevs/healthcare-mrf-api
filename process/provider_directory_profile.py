@@ -9,7 +9,9 @@ import json
 import os
 import re
 import time
+from dataclasses import MISSING, dataclass, fields
 from functools import lru_cache
+from inspect import Parameter, Signature
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -526,37 +528,72 @@ def affected_npi_delta_count_sql(
     """
 
 
-def profile_evidence_insert_sql(
-    *,
-    target_ref: str,
-    source_ref: str,
-    practitioner_ref: str,
-    role_ref: str,
-    organization_ref: str,
-    service_ref: str,
-    endpoint_ref: str | None = None,
-    affiliation_ref: str | None = None,
-    affiliation_organization_ref: str | None = None,
-    fact_type: str | None = None,
-    role_bucket_count: int = 1,
-    role_bucket: int = 0,
-    count_only: bool = False,
-) -> str:
-    """Build immutable source evidence from scoped typed FHIR resources."""
-    if fact_type is not None and fact_type not in PROFILE_EVIDENCE_FACT_TYPES:
-        raise ValueError(f"unsupported profile evidence fact type: {fact_type}")
-    if role_bucket_count < 1:
+@dataclass(frozen=True, slots=True)
+class _ProfileEvidenceSqlRequest:
+    target_ref: str
+    source_ref: str
+    practitioner_ref: str
+    role_ref: str
+    organization_ref: str
+    service_ref: str
+    endpoint_ref: str | None = None
+    affiliation_ref: str | None = None
+    affiliation_organization_ref: str | None = None
+    fact_type: str | None = None
+    role_bucket_count: int = 1
+    role_bucket: int = 0
+    count_only: bool = False
+
+
+_PROFILE_SCOPE_FACT_TYPES = {
+    "NAME_FACT_SCOPE_SQL": ("name",),
+    "ADMINISTRATIVE_GENDER_FACT_SCOPE_SQL": ("administrative_gender",),
+    "AGE_FACT_SCOPE_SQL": ("age",),
+    "YEARS_OF_PRACTICE_FACT_SCOPE_SQL": ("years_of_practice",),
+    "QUALIFICATION_DETAIL_FACT_SCOPE_SQL": ("qualification_detail",),
+    "LANGUAGE_FACT_SCOPE_SQL": ("language",),
+    "CONTACT_FACT_SCOPE_SQL": ("contact",),
+    "SPECIALTY_FACT_SCOPE_SQL": ("specialty",),
+    "ROLE_FACT_SCOPE_SQL": ("role",),
+    "ROLE_IDENTIFIER_FACT_SCOPE_SQL": ("role_identifier",),
+    "ROLE_CONTEXT_FACT_SCOPE_SQL": ("role_context",),
+    "NEW_PATIENT_ACCEPTANCE_FACT_SCOPE_SQL": ("new_patient_acceptance",),
+    "TELEHEALTH_FACT_SCOPE_SQL": ("telehealth",),
+    "ACCEPTING_MEDICAID_FACT_SCOPE_SQL": ("accepting_medicaid",),
+    "ORGANIZATION_FACT_SCOPE_SQL": ("organization",),
+    "AFFILIATION_FACT_SCOPE_SQL": ("affiliation",),
+    "PLAN_MEMBERSHIP_FACT_SCOPE_SQL": ("plan_membership",),
+    "SERVICE_FACT_SCOPE_SQL": ("service",),
+    "ENDPOINT_FACT_SCOPE_SQL": ("endpoint",),
+}
+_PROFILE_QUALIFICATION_FACT_TYPES = frozenset(
+    {"taxonomy_qualification", "credential", "qualification"}
+)
+
+
+def _validate_profile_evidence_request(
+    request: _ProfileEvidenceSqlRequest,
+) -> None:
+    if (
+        request.fact_type is not None
+        and request.fact_type not in PROFILE_EVIDENCE_FACT_TYPES
+    ):
+        raise ValueError(
+            f"unsupported profile evidence fact type: {request.fact_type}"
+        )
+    if request.role_bucket_count < 1:
         raise ValueError("profile role bucket count must be positive")
-    if role_bucket < 0 or role_bucket >= role_bucket_count:
-        raise ValueError("profile role bucket is outside the configured range")
+    if not 0 <= request.role_bucket < request.role_bucket_count:
+        raise ValueError(
+            "profile role bucket is outside the configured range"
+        )
+
+
+def _profile_evidence_write_bindings(
+    request: _ProfileEvidenceSqlRequest,
+) -> dict[str, str]:
     evidence_columns = ", ".join(
-        quote_identifier(column)
-        for column in profile_evidence_columns()
-    )
-    write_prefix_sql = (
-        ""
-        if count_only
-        else f"INSERT INTO {target_ref} ({evidence_columns})"
+        quote_identifier(column) for column in profile_evidence_columns()
     )
     result_sql = (
         """
@@ -567,154 +604,171 @@ def profile_evidence_insert_sql(
                )::bigint AS projected_logical_bytes
           FROM normalized_facts
         """
-        if count_only
-        else (
-            "SELECT "
-            + evidence_columns
-            + "\n          FROM normalized_facts"
-        )
+        if request.count_only
+        else f"SELECT {evidence_columns}\n          FROM normalized_facts"
     )
-    endpoint_ref = endpoint_ref or service_ref.replace(
+    return {
+        "WRITE_PREFIX_SQL": (
+            ""
+            if request.count_only
+            else f"INSERT INTO {request.target_ref} ({evidence_columns})"
+        ),
+        "RESULT_SQL": result_sql,
+        "CONFLICT_SQL": (
+            ""
+            if request.count_only
+            else "ON CONFLICT (evidence_key) DO NOTHING;"
+        ),
+    }
+
+
+def _profile_evidence_reference_bindings(
+    request: _ProfileEvidenceSqlRequest,
+) -> dict[str, str]:
+    endpoint_ref = request.endpoint_ref or request.service_ref.replace(
         "provider_directory_healthcare_service",
         "provider_directory_endpoint",
     )
-    affiliation_ref = affiliation_ref or sibling_table_ref(
-        organization_ref,
+    affiliation_ref = request.affiliation_ref or sibling_table_ref(
+        request.organization_ref,
         "provider_directory_organization_affiliation",
     )
     affiliation_organization_ref = (
-        affiliation_organization_ref
+        request.affiliation_organization_ref
         or sibling_table_ref(
-            organization_ref,
+            request.organization_ref,
             "provider_directory_dataset_affiliation_organization",
         )
     )
-    def branch_scope_sql(*branch_fact_types: str) -> str:
-        """Return a literal planner gate for one fact-producing branch."""
-        return (
-            "TRUE"
-            if fact_type is None or fact_type in branch_fact_types
-            else "FALSE"
-        )
+    return {
+        "SOURCE_REF": request.source_ref,
+        "PRACTITIONER_REF": request.practitioner_ref,
+        "ROLE_REF": request.role_ref,
+        "ORGANIZATION_REF": request.organization_ref,
+        "AFFILIATION_REF": affiliation_ref,
+        "AFFILIATION_ORGANIZATION_REF": affiliation_organization_ref,
+        "SERVICE_REF": request.service_ref,
+        "ENDPOINT_REF": endpoint_ref,
+        "ROLE_PRACTITIONER_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
+            "role.practitioner_ref", "Practitioner"
+        ),
+        "ROLE_SERVICE_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
+            "service_reference.value", "HealthcareService"
+        ),
+        "ROLE_ENDPOINT_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
+            "endpoint_reference.value", "Endpoint"
+        ),
+        "ROLE_ORGANIZATION_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
+            "role.organization_ref", "Organization"
+        ),
+    }
 
-    qualification_scope_sql = branch_scope_sql(
-        "taxonomy_qualification",
-        "credential",
-        "qualification",
+
+def _profile_branch_scope_sql(
+    request: _ProfileEvidenceSqlRequest,
+    branch_fact_types: tuple[str, ...] | frozenset[str],
+) -> str:
+    return (
+        "TRUE"
+        if request.fact_type is None
+        or request.fact_type in branch_fact_types
+        else "FALSE"
     )
-    if fact_type in {
-        "taxonomy_qualification",
-        "credential",
-        "qualification",
-    }:
+
+
+def _profile_evidence_scope_bindings(
+    request: _ProfileEvidenceSqlRequest,
+) -> dict[str, str]:
+    bindings_by_name = {
+        token: _profile_branch_scope_sql(request, fact_types)
+        for token, fact_types in _PROFILE_SCOPE_FACT_TYPES.items()
+    }
+    qualification_scope_sql = _profile_branch_scope_sql(
+        request,
+        _PROFILE_QUALIFICATION_FACT_TYPES,
+    )
+    if request.fact_type in _PROFILE_QUALIFICATION_FACT_TYPES:
         qualification_scope_sql = (
-            f"qualification.qualification_type = '{fact_type}'"
+            "qualification.qualification_type = "
+            f"'{request.fact_type}'"
         )
+    bindings_by_name["QUALIFICATION_FACT_SCOPE_SQL"] = (
+        qualification_scope_sql
+    )
+    bindings_by_name["FACT_TYPE_SCOPE_SQL"] = (
+        "TRUE"
+        if request.fact_type is None
+        else f"fact_type = '{request.fact_type}'"
+    )
+    return bindings_by_name
+
+
+def _profile_bucket_scope_sql(
+    resource_alias: str,
+    role_bucket_count: int,
+) -> str:
+    if role_bucket_count == 1:
+        return "TRUE"
+    return (
+        "MOD("
+        f"hashtextextended({resource_alias}.resource_id, 0) "
+        "& 9223372036854775807, "
+        "CAST(:profile_role_bucket_count AS bigint)"
+        ") = CAST(:profile_role_bucket AS bigint)"
+    )
+
+
+def _profile_evidence_template_bindings(
+    request: _ProfileEvidenceSqlRequest,
+) -> dict[str, str]:
+    return {
+        **_profile_evidence_write_bindings(request),
+        **_profile_evidence_reference_bindings(request),
+        **_profile_evidence_scope_bindings(request),
+        "ROLE_BUCKET_SQL": _profile_bucket_scope_sql(
+            "role", request.role_bucket_count
+        ),
+        "AFFILIATION_BUCKET_SQL": _profile_bucket_scope_sql(
+            "affiliation", request.role_bucket_count
+        ),
+        "CURRENT_EVIDENCE_SQL": current_profile_evidence_sql(),
+        "VALID_NPI_SQL": valid_npi_sql("npi"),
+    }
+
+
+def profile_evidence_insert_sql(**values_by_name: object) -> str:
+    """Build immutable source evidence from scoped typed FHIR resources."""
+    request = _ProfileEvidenceSqlRequest(**values_by_name)
+    _validate_profile_evidence_request(request)
     return _render_sql_template(
         "provider_directory_profile_evidence.sql",
-        {
-            "WRITE_PREFIX_SQL": write_prefix_sql,
-            "RESULT_SQL": result_sql,
-            "CONFLICT_SQL": (
-                ""
-                if count_only
-                else "ON CONFLICT (evidence_key) DO NOTHING;"
-            ),
-            "SOURCE_REF": source_ref,
-            "PRACTITIONER_REF": practitioner_ref,
-            "ROLE_REF": role_ref,
-            "ORGANIZATION_REF": organization_ref,
-            "AFFILIATION_REF": affiliation_ref,
-            "AFFILIATION_ORGANIZATION_REF": affiliation_organization_ref,
-            "SERVICE_REF": service_ref,
-            "ENDPOINT_REF": endpoint_ref,
-            "ROLE_PRACTITIONER_RESOURCE_ID_SQL": (
-                fhir_reference_resource_id_sql(
-                    "role.practitioner_ref",
-                    "Practitioner",
-                )
-            ),
-            "ROLE_SERVICE_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
-                "service_reference.value",
-                "HealthcareService",
-            ),
-            "ROLE_ENDPOINT_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
-                "endpoint_reference.value",
-                "Endpoint",
-            ),
-            "ROLE_ORGANIZATION_RESOURCE_ID_SQL": (
-                fhir_reference_resource_id_sql(
-                    "role.organization_ref",
-                    "Organization",
-                )
-            ),
-            "NAME_FACT_SCOPE_SQL": branch_scope_sql("name"),
-            "ADMINISTRATIVE_GENDER_FACT_SCOPE_SQL": branch_scope_sql(
-                "administrative_gender"
-            ),
-            "AGE_FACT_SCOPE_SQL": branch_scope_sql("age"),
-            "YEARS_OF_PRACTICE_FACT_SCOPE_SQL": branch_scope_sql(
-                "years_of_practice"
-            ),
-            "QUALIFICATION_FACT_SCOPE_SQL": qualification_scope_sql,
-            "QUALIFICATION_DETAIL_FACT_SCOPE_SQL": branch_scope_sql(
-                "qualification_detail"
-            ),
-            "LANGUAGE_FACT_SCOPE_SQL": branch_scope_sql("language"),
-            "CONTACT_FACT_SCOPE_SQL": branch_scope_sql("contact"),
-            "SPECIALTY_FACT_SCOPE_SQL": branch_scope_sql("specialty"),
-            "ROLE_FACT_SCOPE_SQL": branch_scope_sql("role"),
-            "ROLE_IDENTIFIER_FACT_SCOPE_SQL": branch_scope_sql(
-                "role_identifier"
-            ),
-            "ROLE_CONTEXT_FACT_SCOPE_SQL": branch_scope_sql(
-                "role_context"
-            ),
-            "NEW_PATIENT_ACCEPTANCE_FACT_SCOPE_SQL": branch_scope_sql(
-                "new_patient_acceptance"
-            ),
-            "TELEHEALTH_FACT_SCOPE_SQL": branch_scope_sql("telehealth"),
-            "ACCEPTING_MEDICAID_FACT_SCOPE_SQL": branch_scope_sql(
-                "accepting_medicaid"
-            ),
-            "ORGANIZATION_FACT_SCOPE_SQL": branch_scope_sql("organization"),
-            "AFFILIATION_FACT_SCOPE_SQL": branch_scope_sql("affiliation"),
-            "PLAN_MEMBERSHIP_FACT_SCOPE_SQL": branch_scope_sql(
-                "plan_membership"
-            ),
-            "SERVICE_FACT_SCOPE_SQL": branch_scope_sql("service"),
-            "ENDPOINT_FACT_SCOPE_SQL": branch_scope_sql("endpoint"),
-            "FACT_TYPE_SCOPE_SQL": (
-                "TRUE"
-                if fact_type is None
-                else f"fact_type = '{fact_type}'"
-            ),
-            "ROLE_BUCKET_SQL": (
-                "TRUE"
-                if role_bucket_count == 1
-                else (
-                    "MOD("
-                    "hashtextextended(role.resource_id, 0) "
-                    "& 9223372036854775807, "
-                    "CAST(:profile_role_bucket_count AS bigint)"
-                    ") = CAST(:profile_role_bucket AS bigint)"
-                )
-            ),
-            "AFFILIATION_BUCKET_SQL": (
-                "TRUE"
-                if role_bucket_count == 1
-                else (
-                    "MOD("
-                    "hashtextextended(affiliation.resource_id, 0) "
-                    "& 9223372036854775807, "
-                    "CAST(:profile_role_bucket_count AS bigint)"
-                    ") = CAST(:profile_role_bucket AS bigint)"
-                )
-            ),
-            "CURRENT_EVIDENCE_SQL": current_profile_evidence_sql(),
-            "VALID_NPI_SQL": valid_npi_sql("npi"),
-        },
+        _profile_evidence_template_bindings(request),
     )
+
+
+def _profile_evidence_public_signature() -> Signature:
+    parameters = []
+    for request_field in fields(_ProfileEvidenceSqlRequest):
+        default = (
+            Parameter.empty
+            if request_field.default is MISSING
+            else request_field.default
+        )
+        parameters.append(
+            Parameter(
+                request_field.name,
+                kind=Parameter.KEYWORD_ONLY,
+                default=default,
+                annotation=request_field.type,
+            )
+        )
+    return Signature(
+        parameters,
+        return_annotation=profile_evidence_insert_sql.__annotations__["return"],
+    )
+
+
+profile_evidence_insert_sql.__signature__ = _profile_evidence_public_signature()
 
 
 def profile_evidence_count_sql(**kwargs: object) -> str:

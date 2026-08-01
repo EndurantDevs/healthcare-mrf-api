@@ -112,6 +112,9 @@ from process.provider_directory_source_summary import (
 from process.provider_directory_source_summary_sql import (
     source_summary_metrics_sql,
 )
+from process.uhc_provider_quarantine_contract import (
+    UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+)
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
     PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
@@ -34621,6 +34624,227 @@ def _cms_sma_cell(row: list[str], index: int | None) -> str | None:
     return _clean_text(row[index])
 
 
+@dataclass(frozen=True)
+class _CmsSmaColumnIndex:
+    state: int
+    source_date: int | None
+    production: int
+    status: int
+    capability: int | None
+    public: int
+    refresh: int | None
+    version: int | None
+
+
+@dataclass(frozen=True)
+class _CmsSmaRowContext:
+    state: str
+    status: str | None
+    public_value: str | None
+    validation_status: str
+    source_date: str | None
+    refresh: str | None
+    fhir_version: str | None
+
+
+def _cms_sma_columns(csv_rows: list[list[str]]) -> _CmsSmaColumnIndex | None:
+    section_headers, field_headers = csv_rows[:2]
+    provider_start = next(
+        (
+            index
+            for index, cell_value in enumerate(section_headers)
+            if _cms_sma_header_key(cell_value)
+            == "provider directory endpoint information"
+        ),
+        0,
+    )
+    indices = _CmsSmaColumnIndex(
+        state=_cms_sma_column_index(field_headers, {"state"}) or 0,
+        source_date=_cms_sma_column_index(
+            field_headers,
+            {"information as of date date completing the survey"},
+        ),
+        production=_cms_sma_column_index(
+            field_headers,
+            {"provider directory production base url"},
+            start=provider_start,
+        ) or 0,
+        status=_cms_sma_column_index(
+            field_headers, {"status drop down list"}, start=provider_start
+        ) or 0,
+        capability=_cms_sma_column_index(
+            field_headers, {"fhir capability statement link"}, start=provider_start
+        ),
+        public=_cms_sma_column_index(
+            field_headers,
+            {"is the api public y n drop down list"},
+            start=provider_start,
+        ) or 0,
+        refresh=_cms_sma_column_index(
+            field_headers,
+            {"data refresh frequency e g real time hourly daily weekly monthly"},
+            start=provider_start,
+        ),
+        version=_cms_sma_column_index(
+            field_headers, {"fhir version drop down list"}, start=provider_start
+        ),
+    )
+    required_indices = (
+        _cms_sma_column_index(field_headers, {"state"}),
+        _cms_sma_column_index(
+            field_headers,
+            {"provider directory production base url"},
+            start=provider_start,
+        ),
+        _cms_sma_column_index(
+            field_headers, {"status drop down list"}, start=provider_start
+        ),
+        _cms_sma_column_index(
+            field_headers,
+            {"is the api public y n drop down list"},
+            start=provider_start,
+        ),
+    )
+    return indices if all(index is not None for index in required_indices) else None
+
+
+def _cms_sma_row_context(
+    csv_row: list[str], columns: _CmsSmaColumnIndex
+) -> _CmsSmaRowContext | None:
+    state = _cms_sma_cell(csv_row, columns.state)
+    status = _cms_sma_cell(csv_row, columns.status)
+    public_value = _cms_sma_cell(csv_row, columns.public)
+    status_key = (status or "").strip().lower()
+    if not state or status_key not in CMS_SMA_TRACKED_PROVIDER_DIRECTORY_STATUSES:
+        return None
+    if not (public_value or "").strip().lower().startswith("y"):
+        return None
+    validation_status = (
+        CMS_SMA_CATALOG_VALIDATION_STATUS
+        if status_key == "active"
+        else CMS_SMA_CATALOG_IN_DEVELOPMENT_STATUS
+    )
+    return _CmsSmaRowContext(
+        state=state,
+        status=status,
+        public_value=public_value,
+        validation_status=validation_status,
+        source_date=_cms_sma_cell(csv_row, columns.source_date),
+        refresh=_cms_sma_cell(csv_row, columns.refresh),
+        fhir_version=_cms_sma_cell(csv_row, columns.version),
+    )
+
+
+def _cms_sma_group_for(
+    groups_by_base: dict[str, dict[str, Any]],
+    api_base: str,
+    capability_url_by_base: dict[str, str],
+) -> dict[str, Any]:
+    group = groups_by_base.setdefault(
+        api_base,
+        {
+            "api_base": api_base,
+            "endpoints": {},
+            "equivalent_api_bases": [],
+            "metadata_url": None,
+        },
+    )
+    for capability_base, capability_url in capability_url_by_base.items():
+        if _is_cms_sma_base_pair_related(api_base, capability_base):
+            group["metadata_url"] = group["metadata_url"] or capability_url
+            _append_unique(group["equivalent_api_bases"], capability_base)
+    return group
+
+
+def _cms_sma_endpoint_groups(
+    csv_row: list[str], columns: _CmsSmaColumnIndex
+) -> dict[str, dict[str, Any]]:
+    production_urls = _extract_urls_from_text(
+        _cms_sma_cell(csv_row, columns.production)
+    )
+    capability_urls = _extract_urls_from_text(
+        _cms_sma_cell(csv_row, columns.capability)
+    )
+    capability_bases: list[str] = []
+    capability_url_by_base: dict[str, str] = {}
+    for capability_url in capability_urls:
+        capability_base = _provider_directory_base_from_metadata_url(capability_url)
+        if capability_base:
+            _append_unique(capability_bases, capability_base)
+            capability_url_by_base.setdefault(capability_base, capability_url)
+    groups_by_base: dict[str, dict[str, Any]] = {}
+    for production_url in production_urls:
+        production_base = _provider_directory_base_from_catalog_url(production_url)
+        if not production_base:
+            continue
+        api_base = _cms_sma_selected_api_base(production_base, capability_bases)
+        group = _cms_sma_group_for(groups_by_base, api_base, capability_url_by_base)
+        _append_unique(group["equivalent_api_bases"], production_base)
+        _append_unique(group["equivalent_api_bases"], production_url)
+        resource_type = _resource_type_from_provider_directory_url(production_url)
+        endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type or "")
+        if endpoint_field and endpoint_field not in group["endpoints"]:
+            group["endpoints"][endpoint_field] = production_url
+    if groups_by_base:
+        return groups_by_base
+    for capability_base in capability_bases:
+        group = _cms_sma_group_for(
+            groups_by_base, capability_base, capability_url_by_base
+        )
+        group["metadata_url"] = (
+            group["metadata_url"] or capability_url_by_base.get(capability_base)
+        )
+    return groups_by_base
+
+
+def _cms_sma_catalog_record(
+    context: _CmsSmaRowContext,
+    group: dict[str, Any],
+    source_url: str,
+) -> dict[str, Any]:
+    api_base = group["api_base"]
+    state_key = re.sub(r"[^a-z0-9]+", "-", context.state.lower()).strip("-")
+    digest = hashlib.sha1(
+        f"{context.state}|{api_base}".encode("utf-8")
+    ).hexdigest()[:8]
+    metadata = {
+        "provider_directory_source_catalog": CMS_SMA_ENDPOINT_DIRECTORY_SOURCE,
+        "provider_directory_confirmed_catalog_url": source_url,
+        "provider_directory_catalog_status": context.status,
+        "provider_directory_catalog_public": context.public_value,
+        "provider_directory_equivalent_api_bases": group["equivalent_api_bases"],
+    }
+    if group["metadata_url"]:
+        metadata["provider_directory_confirmed_metadata_url"] = group["metadata_url"]
+    seed_row_by_field = {
+        "id": f"cms-sma-{state_key}-{digest}",
+        "org_name": f"State of {context.state}",
+        "plan_name": f"{context.state} Medicaid Provider Directory",
+        "api_base": api_base,
+        "auth_type": "none",
+        "last_validated_status": context.validation_status,
+        "requires_registration": False,
+        "fhir_version": context.fhir_version,
+        "source": CMS_SMA_ENDPOINT_DIRECTORY_SOURCE,
+        "source_detail": (
+            "CMS SMA Endpoint Directory public Provider Directory row "
+            f"state={context.state}"
+        ),
+        "source_url": source_url,
+        "source_date": context.source_date,
+        "note": (
+            "Catalog-discovered public Provider Directory endpoint from the CMS State "
+            "Medicaid Agency Endpoint Directory; live probe validation controls "
+            "resource import."
+        ),
+        "metadata_json": metadata,
+        **group["endpoints"],
+    }
+    if context.refresh:
+        seed_row_by_field["data_quality_checked"] = context.refresh
+    return seed_row_by_field
+
+
 def _cms_sma_seed_rows_from_csv(
     csv_text: str,
     *,
@@ -34629,137 +34853,15 @@ def _cms_sma_seed_rows_from_csv(
 ) -> list[dict[str, Any]]:
     """Run the cms sma endpoint directory seed rows from csv step within provider-directory ingestion."""
     csv_rows = list(csv.reader(io.StringIO(csv_text)))
-    if len(csv_rows) < 2:
+    if len(csv_rows) < 2 or not (columns := _cms_sma_columns(csv_rows)):
         return []
-    section_headers = csv_rows[0]
-    field_headers = csv_rows[1]
-    provider_start = next(
-        (
-            index
-            for index, cell_value in enumerate(section_headers)
-            if _cms_sma_header_key(cell_value) == "provider directory endpoint information"
-        ),
-        0,
-    )
-    state_col = _cms_sma_column_index(field_headers, {"state"})
-    source_date_col = _cms_sma_column_index(field_headers, {"information as of date date completing the survey"})
-    prod_col = _cms_sma_column_index(field_headers, {"provider directory production base url"}, start=provider_start)
-    status_col = _cms_sma_column_index(field_headers, {"status drop down list"}, start=provider_start)
-    cap_col = _cms_sma_column_index(field_headers, {"fhir capability statement link"}, start=provider_start)
-    public_col = _cms_sma_column_index(field_headers, {"is the api public y n drop down list"}, start=provider_start)
-    refresh_col = _cms_sma_column_index(
-        field_headers,
-        {"data refresh frequency e g real time hourly daily weekly monthly"},
-        start=provider_start,
-    )
-    version_col = _cms_sma_column_index(field_headers, {"fhir version drop down list"}, start=provider_start)
-    if state_col is None or prod_col is None or status_col is None or public_col is None:
-        return []
-
     seed_rows: list[dict[str, Any]] = []
-    for csv_row_by_field in csv_rows[2:]:
-        state = _cms_sma_cell(csv_row_by_field, state_col)
-        if not state:
+    for csv_row in csv_rows[2:]:
+        context = _cms_sma_row_context(csv_row, columns)
+        if not context:
             continue
-        status = _cms_sma_cell(csv_row_by_field, status_col)
-        public_value = _cms_sma_cell(csv_row_by_field, public_col)
-        status_key = (status or "").strip().lower()
-        if status_key not in CMS_SMA_TRACKED_PROVIDER_DIRECTORY_STATUSES:
-            continue
-        if not (public_value or "").strip().lower().startswith("y"):
-            continue
-        validation_status = (
-            CMS_SMA_CATALOG_VALIDATION_STATUS
-            if status_key == "active"
-            else CMS_SMA_CATALOG_IN_DEVELOPMENT_STATUS
-        )
-
-        production_urls = _extract_urls_from_text(_cms_sma_cell(csv_row_by_field, prod_col))
-        capability_urls = _extract_urls_from_text(_cms_sma_cell(csv_row_by_field, cap_col))
-        capability_bases: list[str] = []
-        capability_url_by_base: dict[str, str] = {}
-        for capability_url in capability_urls:
-            capability_base = _provider_directory_base_from_metadata_url(capability_url)
-            if not capability_base:
-                continue
-            _append_unique(capability_bases, capability_base)
-            capability_url_by_base.setdefault(capability_base, capability_url)
-
-        rows_by_group: dict[str, dict[str, Any]] = {}
-
-        def group_for(api_base: str) -> dict[str, Any]:
-            """Return the seed group bucket for one CMS endpoint row."""
-            group = rows_by_group.setdefault(
-                api_base,
-                {
-                    "api_base": api_base,
-                    "endpoints": {},
-                    "equivalent_api_bases": [],
-                    "metadata_url": None,
-                },
-            )
-            for capability_base, capability_url in capability_url_by_base.items():
-                if _is_cms_sma_base_pair_related(api_base, capability_base):
-                    group["metadata_url"] = group["metadata_url"] or capability_url
-                    _append_unique(group["equivalent_api_bases"], capability_base)
-            return group
-
-        for production_url in production_urls:
-            production_base = _provider_directory_base_from_catalog_url(production_url)
-            if not production_base:
-                continue
-            api_base = _cms_sma_selected_api_base(production_base, capability_bases)
-            group = group_for(api_base)
-            _append_unique(group["equivalent_api_bases"], production_base)
-            _append_unique(group["equivalent_api_bases"], production_url)
-            resource_type = _resource_type_from_provider_directory_url(production_url)
-            endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type or "")
-            if endpoint_field and endpoint_field not in group["endpoints"]:
-                group["endpoints"][endpoint_field] = production_url
-
-        if not rows_by_group:
-            for capability_base in capability_bases:
-                group = group_for(capability_base)
-                group["metadata_url"] = group["metadata_url"] or capability_url_by_base.get(capability_base)
-
-        source_date = _cms_sma_cell(csv_row_by_field, source_date_col)
-        refresh = _cms_sma_cell(csv_row_by_field, refresh_col)
-        fhir_version = _cms_sma_cell(csv_row_by_field, version_col)
-        state_key = re.sub(r"[^a-z0-9]+", "-", state.lower()).strip("-")
-        for group in rows_by_group.values():
-            api_base = group["api_base"]
-            digest = hashlib.sha1(f"{state}|{api_base}".encode("utf-8")).hexdigest()[:8]
-            metadata = {
-                "provider_directory_source_catalog": CMS_SMA_ENDPOINT_DIRECTORY_SOURCE,
-                "provider_directory_confirmed_catalog_url": source_url,
-                "provider_directory_catalog_status": status,
-                "provider_directory_catalog_public": public_value,
-                "provider_directory_equivalent_api_bases": group["equivalent_api_bases"],
-            }
-            if group["metadata_url"]:
-                metadata["provider_directory_confirmed_metadata_url"] = group["metadata_url"]
-            seed_row_by_field = {
-                "id": f"cms-sma-{state_key}-{digest}",
-                "org_name": f"State of {state}",
-                "plan_name": f"{state} Medicaid Provider Directory",
-                "api_base": api_base,
-                "auth_type": "none",
-                "last_validated_status": validation_status,
-                "requires_registration": False,
-                "fhir_version": fhir_version,
-                "source": CMS_SMA_ENDPOINT_DIRECTORY_SOURCE,
-                "source_detail": f"CMS SMA Endpoint Directory public Provider Directory row state={state}",
-                "source_url": source_url,
-                "source_date": source_date,
-                "note": (
-                    "Catalog-discovered public Provider Directory endpoint from the CMS State Medicaid "
-                    "Agency Endpoint Directory; live probe validation controls resource import."
-                ),
-                "metadata_json": metadata,
-                **group["endpoints"],
-            }
-            if refresh:
-                seed_row_by_field["data_quality_checked"] = refresh
+        for group in _cms_sma_endpoint_groups(csv_row, columns).values():
+            seed_row_by_field = _cms_sma_catalog_record(context, group, source_url)
             if _is_seed_row_query_match(seed_row_by_field, source_query):
                 seed_rows.append(seed_row_by_field)
     return seed_rows
@@ -35091,106 +35193,107 @@ def _health_partners_plans_seed_rows(*, source_query: str | None = None) -> list
     )
 
 
+@dataclass(frozen=True)
+class _ReviewedCandidateSeed:
+    row_id: str
+    org_name: str
+    plan_name: str
+    api_base: str
+    source_url: str
+    resources: tuple[str, ...]
+    expected_nonempty_resources: tuple[str, ...]
+    seed_source: str = REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE
+    requires_registration: bool = False
+    acquisition_enabled: bool = True
+    acquisition_blocked_reason: str | None = None
+    candidate_status: str = PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+
+
+def _reviewed_candidate_metadata(candidate: _ReviewedCandidateSeed) -> dict[str, Any]:
+    metadata = {
+        "provider_directory_override": "reviewed_candidate_acquisition",
+        "provider_directory_confirmed_base": candidate.api_base,
+        "provider_directory_confirmed_metadata_url": f"{candidate.api_base}/metadata",
+        "provider_directory_confirmed_catalog_url": candidate.source_url,
+        "provider_directory_supported_resources": list(candidate.resources),
+        "provider_directory_resource_page_count_caps": {
+            resource_type: 100 for resource_type in candidate.resources
+        },
+        "provider_directory_expected_nonempty_resources": list(
+            candidate.expected_nonempty_resources
+        ),
+    }
+    if candidate.acquisition_enabled:
+        campaign_id = REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID.get(
+            candidate.row_id
+        )
+        if not campaign_id:
+            raise RuntimeError("provider_directory_reviewed_candidate_campaign_missing")
+        metadata.update(
+            {
+                "provider_directory_fully_enumerable_resources": list(candidate.resources),
+                "provider_directory_coverage_mode": "full",
+                "provider_directory_acquisition_enabled": True,
+                "provider_directory_candidate_status": candidate.candidate_status,
+                PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY: campaign_id,
+            }
+        )
+        return metadata
+    metadata.update(
+        {
+            "provider_directory_fully_enumerable_resources": [],
+            "provider_directory_coverage_mode": "probe_only",
+            "provider_directory_acquisition_enabled": False,
+            "provider_directory_blocked_reason": PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON,
+            "provider_directory_acquisition_blocked_reason": (
+                candidate.acquisition_blocked_reason
+                or (
+                    "Exact broad census requests return OperationOutcome, so the "
+                    "strict ranged-only completeness contract is not implemented."
+                )
+            ),
+        }
+    )
+    return metadata
+
+
+def _reviewed_candidate_row(candidate: _ReviewedCandidateSeed) -> dict[str, Any]:
+    acquisition_summary = (
+        "pending two matching exhaustive acquisitions"
+        if candidate.acquisition_enabled
+        else "with acquisition blocked by an incomplete census contract"
+    )
+    note_prefix = (
+        "Acquisition controls are configured for candidate verification only; "
+        if candidate.acquisition_enabled
+        else "Acquisition remains disabled and fail-closed; "
+    )
+    return {
+        "id": candidate.row_id,
+        "org_name": candidate.org_name,
+        "plan_name": candidate.plan_name,
+        "api_base": candidate.api_base,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "requires_registration": candidate.requires_registration,
+        "source": candidate.seed_source,
+        "source_detail": (
+            f"HealthPorta-reviewed public Provider Directory candidate {acquisition_summary}"
+        ),
+        "source_url": candidate.source_url,
+        "note": (
+            note_prefix
+            + "the source is not runnable in the public manifest or published to Profile."
+        ),
+        "metadata_json": _reviewed_candidate_metadata(candidate),
+    }
+
+
 def _reviewed_provider_directory_candidate_seed_rows(
     *,
     source_query: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return reviewed seeds that remain unpublished Provider Directory candidates."""
-
-    def candidate_row(
-        *,
-        row_id: str,
-        org_name: str,
-        plan_name: str,
-        api_base: str,
-        source_url: str,
-        resources: tuple[str, ...],
-        expected_nonempty_resources: tuple[str, ...],
-        seed_source: str = REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE,
-        requires_registration: bool = False,
-        acquisition_enabled: bool = True,
-        acquisition_blocked_reason: str | None = None,
-        candidate_status: str = PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
-    ) -> dict[str, Any]:
-        """Build one fail-closed reviewed candidate seed record."""
-        metadata = {
-            "provider_directory_override": "reviewed_candidate_acquisition",
-            "provider_directory_confirmed_base": api_base,
-            "provider_directory_confirmed_metadata_url": f"{api_base}/metadata",
-            "provider_directory_confirmed_catalog_url": source_url,
-            "provider_directory_supported_resources": list(resources),
-            "provider_directory_resource_page_count_caps": {
-                resource_type: 100 for resource_type in resources
-            },
-            "provider_directory_expected_nonempty_resources": list(
-                expected_nonempty_resources
-            ),
-        }
-        if acquisition_enabled:
-            verification_campaign_id = (
-                REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID.get(row_id)
-            )
-            if not verification_campaign_id:
-                raise RuntimeError(
-                    "provider_directory_reviewed_candidate_campaign_missing"
-                )
-            metadata.update(
-                {
-                    "provider_directory_fully_enumerable_resources": list(resources),
-                    "provider_directory_coverage_mode": "full",
-                    "provider_directory_acquisition_enabled": True,
-                    "provider_directory_candidate_status": candidate_status,
-                    PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY: (
-                        verification_campaign_id
-                    ),
-                }
-            )
-        else:
-            metadata.update(
-                {
-                    "provider_directory_fully_enumerable_resources": [],
-                    "provider_directory_coverage_mode": "probe_only",
-                    "provider_directory_acquisition_enabled": False,
-                    "provider_directory_blocked_reason": (
-                        PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
-                    ),
-                    "provider_directory_acquisition_blocked_reason": (
-                        acquisition_blocked_reason
-                        or (
-                            "Exact broad census requests return OperationOutcome, so the "
-                            "strict ranged-only completeness contract is not implemented."
-                        )
-                    ),
-                }
-            )
-        return {
-            "id": row_id,
-            "org_name": org_name,
-            "plan_name": plan_name,
-            "api_base": api_base,
-            "auth_type": "none",
-            "last_validated_status": "valid",
-            "requires_registration": requires_registration,
-            "source": seed_source,
-            "source_detail": (
-                "HealthPorta-reviewed public Provider Directory candidate "
-                + (
-                    "pending two matching exhaustive acquisitions"
-                    if acquisition_enabled
-                    else "with acquisition blocked by an incomplete census contract"
-                )
-            ),
-            "source_url": source_url,
-            "note": (
-                (
-                    "Acquisition controls are configured for candidate verification only; "
-                    if acquisition_enabled
-                    else "Acquisition remains disabled and fail-closed; "
-                )
-                + "the source is not runnable in the public manifest or published to Profile."
-            ),
-            "metadata_json": metadata,
-        }
 
     state_resources = tuple(DEFAULT_RESOURCES)
     county_expected_resources = (
@@ -35201,7 +35304,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
         "HealthcareService",
     )
     reviewed_rows = [
-        candidate_row(
+        _reviewed_candidate_row(_ReviewedCandidateSeed(
             row_id="cms-sma-iowa-reviewed-candidate",
             org_name="State of Iowa",
             plan_name="Iowa Medicaid Provider Directory",
@@ -35213,8 +35316,8 @@ def _reviewed_provider_directory_candidate_seed_rows(
                 sorted(IOWA_MEDICAID_EXPECTED_NONEMPTY_RESOURCES)
             ),
             candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-        ),
-        candidate_row(
+        )),
+        _reviewed_candidate_row(_ReviewedCandidateSeed(
             row_id="cms-sma-pennsylvania-reviewed-candidate",
             org_name="State of Pennsylvania",
             plan_name="Pennsylvania Medicaid Provider Directory",
@@ -35226,8 +35329,8 @@ def _reviewed_provider_directory_candidate_seed_rows(
                 sorted(STATE_EXPECTED_NONEMPTY_RESOURCES)
             ),
             candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-        ),
-        candidate_row(
+        )),
+        _reviewed_candidate_row(_ReviewedCandidateSeed(
             row_id="san-bernardino-county-dbh-reviewed-candidate",
             org_name="San Bernardino County Department of Behavioral Health",
             plan_name="San Bernardino County Behavioral Health Provider Directory",
@@ -35236,8 +35339,8 @@ def _reviewed_provider_directory_candidate_seed_rows(
             resources=state_resources,
             expected_nonempty_resources=county_expected_resources,
             candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-        ),
-        candidate_row(
+        )),
+        _reviewed_candidate_row(_ReviewedCandidateSeed(
             row_id="san-mateo-county-bhrs-reviewed-candidate",
             org_name=(
                 "San Mateo County Behavioral Health and Recovery Services"
@@ -35248,8 +35351,8 @@ def _reviewed_provider_directory_candidate_seed_rows(
             resources=state_resources,
             expected_nonempty_resources=county_expected_resources,
             candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-        ),
-        candidate_row(
+        )),
+        _reviewed_candidate_row(_ReviewedCandidateSeed(
             row_id="el-dorado-county-behavioral-health-reviewed-candidate",
             org_name="El Dorado County Behavioral Health",
             plan_name="El Dorado County Behavioral Health Provider Directory",
@@ -35265,8 +35368,8 @@ def _reviewed_provider_directory_candidate_seed_rows(
                 "without that access. Exhaustive acquisition is disabled until approved "
                 "credentials are configured."
             ),
-        ),
-        candidate_row(
+        )),
+        _reviewed_candidate_row(_ReviewedCandidateSeed(
             row_id="devoted-health-reviewed-candidate",
             org_name="Devoted Health",
             plan_name="Devoted Health Provider Directory",
@@ -35275,8 +35378,8 @@ def _reviewed_provider_directory_candidate_seed_rows(
             resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
             expected_nonempty_resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
             candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-        ),
-        candidate_row(
+        )),
+        _reviewed_candidate_row(_ReviewedCandidateSeed(
             row_id="simpra-advantage-reviewed-candidate",
             org_name="Simpra Advantage",
             plan_name="Simpra Advantage Provider Directory",
@@ -35285,8 +35388,8 @@ def _reviewed_provider_directory_candidate_seed_rows(
             resources=AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES,
             expected_nonempty_resources=AMERIHEALTH_CARITAS_SUPPORTED_RESOURCES,
             candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-        ),
-        candidate_row(
+        )),
+        _reviewed_candidate_row(_ReviewedCandidateSeed(
             row_id="capital-blue-cross-reviewed-candidate",
             org_name="Capital Blue Cross",
             plan_name="Capital Blue Cross Provider Directory",
@@ -35298,7 +35401,7 @@ def _reviewed_provider_directory_candidate_seed_rows(
             resources=tuple(DEFAULT_RESOURCES),
             expected_nonempty_resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
             acquisition_enabled=False,
-        ),
+        )),
     ]
     return [
         candidate_record
@@ -40682,55 +40785,71 @@ def _bulk_response_error_for_request(
     )
 
 
-async def _stream_bulk_export_output_rows(
-    session: aiohttp.ClientSession,
-    source_record: dict[str, Any],
-    url: str,
-    *,
-    model: type,
-    resource_type: str,
-    per_resource_limit: int,
-    timeout: int,
-    run_id: str | None,
-    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None,
-    row_batch_size: int,
-    retain_rows: bool,
+@dataclass(frozen=True)
+class _BulkOutputStreamContext:
+    session: aiohttp.ClientSession
+    source_record: dict[str, Any]
+    url: str
+    model: type
+    resource_type: str
+    per_resource_limit: int
+    timeout: int
+    run_id: str | None
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None
+    row_batch_size: int
+    retain_rows: bool
     resume_options: BulkOutputResumeOptions = BulkOutputResumeOptions(
         row_progress_handler=None,
         resume_offset=0,
         expected_etag=None,
         expected_content_length=None,
-    ),
-    requires_access_token: bool | None = None,
-) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
-    """Stream bulk export output rows without retaining the full export in memory."""
-    retained_rows: list[dict[str, Any]] = []
-    pending_rows: list[dict[str, Any]] = []
-    stream_counts_by_name = {"rows_fetched": 0, "rows_written": 0}
-    row_limit_by_name = {"reached": False}
-    byte_counts_by_name = {
-        "processed": max(0, resume_options.resume_offset),
-        "committed": max(0, resume_options.resume_offset),
-    }
+    )
+    requires_access_token: bool | None = None
 
-    async def flush_pending_rows(committed_boundary: int) -> None:
-        """Persist buffered bulk-export rows and clear the pending batch."""
-        if row_batch_handler and pending_rows:
-            pending_rows_list = list(pending_rows)
-            pending_rows.clear()
-            stream_counts_by_name["rows_written"] += await row_batch_handler(model, pending_rows_list)
-        if (
-            resume_options.row_progress_handler
-            and committed_boundary > byte_counts_by_name["committed"]
-        ):
-            await resume_options.row_progress_handler(
-                stream_counts_by_name["rows_written"],
-                committed_boundary,
-            )
-            byte_counts_by_name["committed"] = committed_boundary
 
-    def handle_line(raw_line: bytes) -> str | None:
-        """Parse and stage one NDJSON bulk-export line."""
+@dataclass
+class _BulkOutputStreamState:
+    context: _BulkOutputStreamContext
+    retained_rows: list[dict[str, Any]] = field(default_factory=list)
+    pending_rows: list[dict[str, Any]] = field(default_factory=list)
+    rows_fetched: int = 0
+    rows_written: int = 0
+    row_limit_reached: bool = False
+    processed_bytes: int = field(init=False)
+    committed_bytes: int = field(init=False)
+    buffer: bytes = b""
+
+    def __post_init__(self) -> None:
+        resume_offset = max(0, self.context.resume_options.resume_offset)
+        self.processed_bytes = resume_offset
+        self.committed_bytes = resume_offset
+
+    def result(
+        self, error: str | None
+    ) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
+        """Return the retained rows and counters in the legacy stream tuple shape."""
+        return (
+            self.retained_rows,
+            self.rows_fetched,
+            self.rows_written,
+            self.row_limit_reached,
+            error,
+        )
+
+    async def flush_pending_rows(self, committed_boundary: int) -> None:
+        """Persist the pending batch and record its durable byte boundary."""
+        handler = self.context.row_batch_handler
+        if handler and self.pending_rows:
+            pending_rows = list(self.pending_rows)
+            self.pending_rows.clear()
+            self.rows_written += await handler(self.context.model, pending_rows)
+        progress_handler = self.context.resume_options.row_progress_handler
+        if progress_handler and committed_boundary > self.committed_bytes:
+            await progress_handler(self.rows_written, committed_boundary)
+            self.committed_bytes = committed_boundary
+
+    def handle_line(self, raw_line: bytes) -> str | None:
+        """Parse and stage one NDJSON resource without changing error semantics."""
         line = raw_line.strip()
         if not line:
             return None
@@ -40738,169 +40857,179 @@ async def _stream_bulk_export_output_rows(
             resource = json.loads(line.decode("utf-8-sig", errors="replace"))
         except json.JSONDecodeError:
             return "invalid_ndjson"
+        progress_handler = self.context.resume_options.row_progress_handler
         if not isinstance(resource, dict):
-            return (
-                "invalid_ndjson"
-                if resume_options.row_progress_handler is not None
-                else None
-            )
-        if resource.get("resourceType") != resource_type:
+            return "invalid_ndjson" if progress_handler is not None else None
+        if resource.get("resourceType") != self.context.resource_type:
             return (
                 "bulk_export_output_resource_type_mismatch"
-                if resume_options.row_progress_handler is not None
+                if progress_handler is not None
                 else None
             )
-        parsed = parse_fhir_resource(
-            source_record["source_id"],
-            resource,
-            resource_url=_bulk_capability_log_identity(url),
-            acquisition=FHIRAcquisitionContext(
-                fetch_url=_bulk_capability_log_identity(url),
-                fetch_mode="bulk_ndjson",
-            ),
-            run_id=run_id,
-            normalize_location_contacts=not (resource_type == "Location" and row_batch_handler),
+        parsed = self._parse_resource(resource)
+        if not parsed or parsed[0] is not self.context.model:
+            return None
+        parsed_row = parsed[1]
+        self.rows_fetched += 1
+        if self.context.retain_rows:
+            self.retained_rows.append(parsed_row)
+        if self.context.row_batch_handler:
+            self.pending_rows.append(parsed_row)
+        self.row_limit_reached = not _can_limit_accept_more(
+            self.rows_fetched, self.context.per_resource_limit
         )
-        if not parsed:
-            return None
-        parsed_model, parsed_row = parsed
-        if parsed_model is not model:
-            return None
-        stream_counts_by_name["rows_fetched"] += 1
-        if retain_rows:
-            retained_rows.append(parsed_row)
-        if row_batch_handler:
-            pending_rows.append(parsed_row)
-        if not _can_limit_accept_more(stream_counts_by_name["rows_fetched"], per_resource_limit):
-            row_limit_by_name["reached"] = True
         return None
 
+    def _parse_resource(
+        self, resource: dict[str, Any]
+    ) -> tuple[type, dict[str, Any]] | None:
+        context = self.context
+        log_identity = _bulk_capability_log_identity(context.url)
+        return parse_fhir_resource(
+            context.source_record["source_id"],
+            resource,
+            resource_url=log_identity,
+            acquisition=FHIRAcquisitionContext(
+                fetch_url=log_identity,
+                fetch_mode="bulk_ndjson",
+            ),
+            run_id=context.run_id,
+            normalize_location_contacts=not (
+                context.resource_type == "Location" and context.row_batch_handler
+            ),
+        )
+
+
+async def _consume_bulk_stream_chunk(
+    state: _BulkOutputStreamState, chunk: bytes
+) -> tuple[bool, str | None]:
+    state.buffer += chunk
+    while b"\n" in state.buffer:
+        line, state.buffer = state.buffer.split(b"\n", 1)
+        state.processed_bytes += len(line) + 1
+        error = state.handle_line(line)
+        if error:
+            return True, error
+        context = state.context
+        if context.row_batch_handler and len(state.pending_rows) >= max(
+            1, context.row_batch_size
+        ):
+            await state.flush_pending_rows(state.processed_bytes)
+        if state.row_limit_reached:
+            await state.flush_pending_rows(state.processed_bytes)
+            return True, None
+    return False, None
+
+
+async def _read_bulk_output_response(
+    response: Any,
+    state: _BulkOutputStreamState,
+) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
+    response_error = _bulk_response_error_for_request(
+        response, state.context.resume_options
+    )
+    if response_error:
+        return state.result(response_error)
+    async for chunk in response.content.iter_chunked(READ_CHUNK_BYTES):
+        cancel_probe = state.context.resume_options.cancel_probe
+        if cancel_probe is not None:
+            await cancel_probe()
+        complete, error = await _consume_bulk_stream_chunk(state, chunk)
+        if complete:
+            return state.result(error)
+    if state.buffer:
+        state.processed_bytes += len(state.buffer)
+        error = state.handle_line(state.buffer)
+        if error:
+            return state.result(error)
+    expected_length = state.context.resume_options.expected_content_length
+    if expected_length is not None and state.processed_bytes != expected_length:
+        return state.result("bulk_export_output_length_mismatch")
+    await state.flush_pending_rows(state.processed_bytes)
+    return state.result(None)
+
+
+async def _stream_bulk_output_response(
+    context: _BulkOutputStreamContext,
+    state: _BulkOutputStreamState,
+) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
+    cancel_probe = context.resume_options.cancel_probe
+    if cancel_probe is not None:
+        await cancel_probe()
+    output_request = _bulk_output_stream_request(
+        context.source_record,
+        context.url,
+        requires_access_token=context.requires_access_token,
+        resume_options=context.resume_options,
+    )
+    _bulk_export_log(
+        "stream_start",
+        source_id=context.source_record.get("source_id"),
+        resource=context.resource_type,
+        output_url=_bulk_capability_log_identity(context.url),
+        row_batch_size=context.row_batch_size,
+    )
+    client_timeout = aiohttp.ClientTimeout(
+        total=None,
+        sock_connect=context.timeout,
+        sock_read=context.timeout,
+    )
+    async with context.session.get(
+        output_request.fetch_url,
+        headers=output_request.headers_by_name,
+        timeout=client_timeout,
+        allow_redirects=False,
+        ssl=_ssl_context(),
+    ) as response:
+        return await _read_bulk_output_response(response, state)
+
+
+def _bulk_stream_error(exc: Exception) -> str | None:
+    if isinstance(exc, ValueError):
+        return str(exc)
+    if isinstance(exc, RuntimeError):
+        error = str(exc)
+        if error in BULK_EXPORT_FENCING_ERRORS:
+            return None
+        if error == BULK_EXPORT_STATUS_DEADLINE_EXCEEDED:
+            return error
+        return _bulk_transport_error(exc)
+    if isinstance(exc, OSError):
+        if str(exc) == "bulk_export_non_public_dns_address":
+            return "bulk_export_non_public_dns_address"
+        return _bulk_transport_error(exc)
+    if "bulk_export_non_public_dns_address" in str(exc):
+        return "bulk_export_non_public_dns_address"
+    return _bulk_transport_error(exc)
+
+
+async def _stream_bulk_export_output_rows(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    url: str,
+    **stream_fields: Any,
+) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
+    """Stream bulk export output rows without retaining the full export in memory."""
+    context = _BulkOutputStreamContext(
+        session=session,
+        source_record=source_record,
+        url=url,
+        **stream_fields,
+    )
+    state = _BulkOutputStreamState(context)
     try:
-        if resume_options.cancel_probe is not None:
-            await resume_options.cancel_probe()
-        output_request = _bulk_output_stream_request(
-            source_record,
-            url,
-            requires_access_token=requires_access_token,
-            resume_options=resume_options,
-        )
-        _bulk_export_log(
-            "stream_start",
-            source_id=source_record.get("source_id"),
-            resource=resource_type,
-            output_url=_bulk_capability_log_identity(url),
-            row_batch_size=row_batch_size,
-        )
-        async with session.get(
-            output_request.fetch_url,
-            headers=output_request.headers_by_name,
-            timeout=aiohttp.ClientTimeout(total=None, sock_connect=timeout, sock_read=timeout),
-            allow_redirects=False,
-            ssl=_ssl_context(),
-        ) as response:
-            response_error = _bulk_response_error_for_request(
-                response,
-                resume_options,
-            )
-            if response_error:
-                return _bulk_stream_result(
-                    retained_rows,
-                    stream_counts_by_name,
-                    row_limit_by_name,
-                    response_error,
-                )
-            buffer = b""
-            async for chunk in response.content.iter_chunked(READ_CHUNK_BYTES):
-                if resume_options.cancel_probe is not None:
-                    await resume_options.cancel_probe()
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    byte_counts_by_name["processed"] += len(line) + 1
-                    error = handle_line(line)
-                    if error:
-                        return _bulk_stream_result(retained_rows, stream_counts_by_name, row_limit_by_name, error)
-                    if row_batch_handler and len(pending_rows) >= max(1, row_batch_size):
-                        await flush_pending_rows(byte_counts_by_name["processed"])
-                    if row_limit_by_name["reached"]:
-                        await flush_pending_rows(byte_counts_by_name["processed"])
-                        return _bulk_stream_result(retained_rows, stream_counts_by_name, row_limit_by_name, None)
-            if buffer:
-                byte_counts_by_name["processed"] += len(buffer)
-                error = handle_line(buffer)
-                if error:
-                    return _bulk_stream_result(retained_rows, stream_counts_by_name, row_limit_by_name, error)
-            if (
-                resume_options.expected_content_length is not None
-                and byte_counts_by_name["processed"]
-                != resume_options.expected_content_length
-            ):
-                return _bulk_stream_result(
-                    retained_rows,
-                    stream_counts_by_name,
-                    row_limit_by_name,
-                    "bulk_export_output_length_mismatch",
-                )
-            await flush_pending_rows(byte_counts_by_name["processed"])
-            return _bulk_stream_result(retained_rows, stream_counts_by_name, row_limit_by_name, None)
+        return await _stream_bulk_output_response(context, state)
     except (
         asyncio.CancelledError,
         ImportCancelledError,
         ResourceImportControlPlaneFailure,
     ):
         raise
-    except ValueError as exc:
-        return _bulk_stream_result(
-            retained_rows,
-            stream_counts_by_name,
-            row_limit_by_name,
-            str(exc),
-        )
-    except RuntimeError as exc:
-        error = str(exc)
-        if error in BULK_EXPORT_FENCING_ERRORS:
-            raise
-        if error == BULK_EXPORT_STATUS_DEADLINE_EXCEEDED:
-            return _bulk_stream_result(
-                retained_rows,
-                stream_counts_by_name,
-                row_limit_by_name,
-                error,
-            )
-        return _bulk_stream_result(
-            retained_rows,
-            stream_counts_by_name,
-            row_limit_by_name,
-            _bulk_transport_error(exc),
-        )
-    except OSError as exc:
-        if str(exc) == "bulk_export_non_public_dns_address":
-            return _bulk_stream_result(
-                retained_rows,
-                stream_counts_by_name,
-                row_limit_by_name,
-                "bulk_export_non_public_dns_address",
-            )
-        return _bulk_stream_result(
-            retained_rows,
-            stream_counts_by_name,
-            row_limit_by_name,
-            _bulk_transport_error(exc),
-        )
     except Exception as exc:
-        if "bulk_export_non_public_dns_address" in str(exc):
-            return _bulk_stream_result(
-                retained_rows,
-                stream_counts_by_name,
-                row_limit_by_name,
-                "bulk_export_non_public_dns_address",
-            )
-        return _bulk_stream_result(
-            retained_rows,
-            stream_counts_by_name,
-            row_limit_by_name,
-            _bulk_transport_error(exc),
-        )
+        error = _bulk_stream_error(exc)
+        if error is None:
+            raise
+        return state.result(error)
 
 
 def _bulk_stream_result(
@@ -54081,59 +54210,106 @@ def _build_endpoint_dataset_source_summary(
     )
 
 
+def _expected_uhc_resource_count(
+    count_by_field: Mapping[str, int],
+    intentional_drop_count_by_field: Mapping[str, int],
+    rejected_count_by_field: Mapping[str, int],
+    count_field: str,
+    drop_field: str,
+    rejection_field: str,
+) -> int:
+    return (
+        count_by_field[count_field]
+        - int(intentional_drop_count_by_field.get(drop_field, 0))
+        - int(rejected_count_by_field.get(rejection_field, 0))
+    )
+
+
+def _assert_uhc_relationship_summary_counts(
+    resource_count_by_type: Mapping[str, int],
+    count_by_field: Mapping[str, int],
+    intentional_drop_count_by_field: Mapping[str, int],
+    rejected_count_by_field: Mapping[str, int],
+) -> None:
+    membership_count = (
+        count_by_field["raw_provider_plan_rows"]
+        - int(
+            rejected_count_by_field.get(
+                "invalid_npi_checksum_provider_plan_rows", 0
+            )
+        )
+        - int(
+            intentional_drop_count_by_field.get(
+                "ifp_unpaired_retained_only_provider_plan_rows", 0
+            )
+        )
+    )
+    role_and_affiliation_count = resource_count_by_type.get(
+        "PractitionerRole", 0
+    ) + resource_count_by_type.get("OrganizationAffiliation", 0)
+    plan_count = count_by_field["membership_plan_key_count"] + count_by_field[
+        "orphan_plan_detail_count"
+    ]
+    if (
+        role_and_affiliation_count != membership_count
+        or resource_count_by_type.get("InsurancePlan", 0) != plan_count
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_canonical_relationship_counts_inconsistent"
+        )
+
+
 def _assert_uhc_canonical_summary_counts(
     content_proof: EndpointDatasetContentProof,
     count_by_field: dict[str, int],
     intentional_drop_counts: Mapping[str, int],
+    rejected_counts: Mapping[str, int],
 ) -> None:
     """Bind retained semantic counters to the six emitted resource families."""
 
-    resource_counts = content_proof.resource_counts
+    resource_count_by_type = content_proof.resource_counts
     exact_field_by_resource_type = {
         "Practitioner": (
             "raw_individual_records",
             "ifp_unpaired_retained_only_individual_records",
+            "invalid_npi_checksum_individual_records",
         ),
         "Organization": (
             "raw_facility_records",
             "ifp_unpaired_retained_only_facility_records",
+            "invalid_npi_checksum_facility_records",
         ),
         "Location": (
             "raw_address_rows",
             "ifp_unpaired_retained_only_address_rows",
+            "invalid_npi_checksum_address_rows",
         ),
     }
     if any(
-        resource_counts.get(resource_type, 0)
-        != count_by_field[field_name]
-        - int(intentional_drop_counts.get(drop_key, 0))
+        resource_count_by_type.get(resource_type, 0)
+        != _expected_uhc_resource_count(
+            count_by_field,
+            intentional_drop_counts,
+            rejected_counts,
+            field_name,
+            drop_key,
+            rejected_key,
+        )
         for resource_type, (
             field_name,
             drop_key,
+            rejected_key,
         ) in exact_field_by_resource_type.items()
     ):
         raise RuntimeError(
             "provider_directory_uhc_canonical_resource_counts_inconsistent"
         )
-    if (
-        resource_counts.get("PractitionerRole", 0)
-        + resource_counts.get("OrganizationAffiliation", 0)
-        != count_by_field["raw_provider_plan_rows"]
-        - int(
-            intentional_drop_counts.get(
-                "ifp_unpaired_retained_only_provider_plan_rows",
-                0,
-            )
-        )
-        or resource_counts.get("InsurancePlan", 0)
-        != (
-            count_by_field["membership_plan_key_count"]
-            + count_by_field["orphan_plan_detail_count"]
-        )
-    ):
-        raise RuntimeError(
-            "provider_directory_uhc_canonical_relationship_counts_inconsistent"
-        )
+    _assert_uhc_relationship_summary_counts(
+        resource_count_by_type,
+        count_by_field,
+        intentional_drop_counts,
+        rejected_counts,
+    )
 
 
 async def _uhc_candidate_summary_input(
@@ -54187,41 +54363,40 @@ async def _uhc_candidate_summary_input(
     return summary_input
 
 
-async def _uhc_endpoint_dataset_source_summary(
-    connection: Any,
-    candidate: EndpointDatasetCandidate,
-    content_proof: EndpointDatasetContentProof,
-) -> dict[str, Any] | None:
-    """Build UHC's v2 semantic summary from its durable candidate input."""
-
-    if candidate.source_ids != (UHC_RETAINED_SOURCE_ID,):
-        return None
-    summary_input = await _uhc_candidate_summary_input(
-        connection,
-        candidate,
-    )
-    if summary_input is None:
-        return None
+def _uhc_summary_category_counts(
+    summary_input: Mapping[str, Any],
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
     count_by_field = dict(summary_input["count_by_field"])
     intentional_drop_count_by_field = dict(
         summary_input["count_by_category"]["intentional_drop_counts"]
     )
+    rejected_count_by_field = dict(
+        summary_input["count_by_category"]["rejected_counts"]
+    )
     if intentional_drop_count_by_field and set(
         intentional_drop_count_by_field
-    ) != set(
-        SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS
+    ) != set(SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS):
+        raise RuntimeError("provider_directory_uhc_summary_drop_scope_invalid")
+    if rejected_count_by_field and set(rejected_count_by_field) != set(
+        UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS
     ):
         raise RuntimeError(
-            "provider_directory_uhc_summary_drop_scope_invalid"
+            "provider_directory_uhc_summary_rejection_scope_invalid"
         )
-    _assert_uhc_canonical_summary_counts(
-        content_proof,
+    return (
         count_by_field,
         intentional_drop_count_by_field,
+        rejected_count_by_field,
     )
-    acquisition_root_run_id = _clean_text(candidate.acquisition_root_run_id)
-    if acquisition_root_run_id is None:
-        raise RuntimeError("provider_directory_uhc_acquisition_root_required")
+
+
+def _build_uhc_endpoint_summary(
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+    summary_input: Mapping[str, Any],
+    count_by_field: Mapping[str, int],
+    acquisition_root_run_id: str,
+) -> dict[str, Any]:
     return build_source_summary(
         binding=ProviderDirectorySourceSummaryBinding(
             dataset_id=candidate.dataset_id,
@@ -54240,7 +54415,48 @@ async def _uhc_endpoint_dataset_source_summary(
             "input_set_sha256": summary_input["input_set_sha256"],
             "layout_set_sha256": summary_input["layout_set_sha256"],
             "encoder_digest": summary_input["encoder_digest"],
+            "quarantine_proof_sha256": summary_input[
+                "quarantine_proof_sha256"
+            ],
         },
+    )
+
+
+async def _uhc_endpoint_dataset_source_summary(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+) -> dict[str, Any] | None:
+    """Build UHC's v2 semantic summary from its durable candidate input."""
+
+    if candidate.source_ids != (UHC_RETAINED_SOURCE_ID,):
+        return None
+    summary_input = await _uhc_candidate_summary_input(
+        connection,
+        candidate,
+    )
+    if summary_input is None:
+        return None
+    (
+        count_by_field,
+        intentional_drop_count_by_field,
+        rejected_count_by_field,
+    ) = _uhc_summary_category_counts(summary_input)
+    _assert_uhc_canonical_summary_counts(
+        content_proof,
+        count_by_field,
+        intentional_drop_count_by_field,
+        rejected_count_by_field,
+    )
+    acquisition_root_run_id = _clean_text(candidate.acquisition_root_run_id)
+    if acquisition_root_run_id is None:
+        raise RuntimeError("provider_directory_uhc_acquisition_root_required")
+    return _build_uhc_endpoint_summary(
+        candidate,
+        content_proof,
+        summary_input,
+        count_by_field,
+        acquisition_root_run_id,
     )
 
 
@@ -57276,7 +57492,7 @@ async def _build_uhc_publication_stage(
         total=4,
         message=(
             f"sealed {len(sealed_files)}/{len(admitted_set.files)} "
-            "admitted UHC files under semantic v2"
+            "admitted UHC files under semantic v3"
         ),
         details={
             "semantic_file_concurrency": (
@@ -58236,120 +58452,81 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     ctx.setdefault("context", {})["finished_at"] = _now().isoformat()
 
 
+@dataclass(frozen=True, kw_only=True)
+class _ProviderDirectoryFhirCommandOptions:
+    test_mode: bool = False
+    seed_db_path: str | None = None
+    seed_db_url: str | None = None
+    retest_results_path: str | None = None
+    retest_results_url: str | None = None
+    run_id: str | None = None
+    provider_directory_pagination_root_run_id: str | None = None
+    source_ids: list[str] | tuple[str, ...] | str | None = None
+    limit: int | None = None
+    source_query: str | None = None
+    refresh_preset: str | None = None
+    include_supplemental_catalogs: bool | None = None
+    cms_sma_endpoint_directory_path: str | None = None
+    cms_sma_endpoint_directory_url: str | None = None
+    seed_only: bool = False
+    probe: bool = True
+    import_resources: bool = False
+    uhc_catalog_set_sha256: str | None = None
+    dataset_rehydrate_only: bool = False
+    rehydrate_dataset_id: str | None = None
+    rehydrate_acquisition_root_run_id: str | None = None
+    rehydrate_resources: list[str] | tuple[str, ...] | str | None = None
+    rehydrate_batch_size: int | None = None
+    canonical_backfill_only: bool = False
+    contact_backfill_only: bool = False
+    publish_artifacts_only: bool = False
+    publish_artifacts_targets: list[str] | tuple[str, ...] | str | None = None
+    publish_corroboration: bool | None = None
+    full_refresh: bool = False
+    stale_cleanup: bool | None = None
+    publish_artifacts: bool | None = None
+    publish_after_acquisition: bool = False
+    open_only: bool = True
+    include_auth_required: bool = False
+    credential_config_file: str | None = None
+    resources: str | None = None
+    resource_limit: int | None = None
+    resource_deadline_seconds: int | None = None
+    linked_resource_limit: int | None = None
+    linked_resource_deadline_seconds: int | None = None
+    page_limit: int | None = None
+    page_count: int | None = None
+    stream_batch_size: int | None = None
+    bulk_export: bool | None = None
+    bulk_export_max_pending_seconds: int | None = None
+    source_concurrency: int | None = None
+    concurrency: int | None = None
+    timeout: int | None = None
+
+
 async def run_provider_directory_fhir_command(
-    *,
-    test_mode: bool = False,
-    seed_db_path: str | None = None,
-    seed_db_url: str | None = None,
-    retest_results_path: str | None = None,
-    retest_results_url: str | None = None,
-    run_id: str | None = None,
-    provider_directory_pagination_root_run_id: str | None = None,
-    source_ids: list[str] | tuple[str, ...] | str | None = None,
-    limit: int | None = None,
-    source_query: str | None = None,
-    refresh_preset: str | None = None,
-    include_supplemental_catalogs: bool | None = None,
-    cms_sma_endpoint_directory_path: str | None = None,
-    cms_sma_endpoint_directory_url: str | None = None,
-    seed_only: bool = False,
-    probe: bool = True,
-    import_resources: bool = False,
-    uhc_catalog_set_sha256: str | None = None,
-    dataset_rehydrate_only: bool = False,
-    rehydrate_dataset_id: str | None = None,
-    rehydrate_acquisition_root_run_id: str | None = None,
-    rehydrate_resources: list[str] | tuple[str, ...] | str | None = None,
-    rehydrate_batch_size: int | None = None,
-    canonical_backfill_only: bool = False,
-    contact_backfill_only: bool = False,
-    publish_artifacts_only: bool = False,
-    publish_artifacts_targets: list[str] | tuple[str, ...] | str | None = None,
-    publish_corroboration: bool | None = None,
-    full_refresh: bool = False,
-    stale_cleanup: bool | None = None,
-    publish_artifacts: bool | None = None,
-    publish_after_acquisition: bool = False,
-    open_only: bool = True,
-    include_auth_required: bool = False,
-    credential_config_file: str | None = None,
-    resources: str | None = None,
-    resource_limit: int | None = None,
-    resource_deadline_seconds: int | None = None,
-    linked_resource_limit: int | None = None,
-    linked_resource_deadline_seconds: int | None = None,
-    page_limit: int | None = None,
-    page_count: int | None = None,
-    stream_batch_size: int | None = None,
-    bulk_export: bool | None = None,
-    bulk_export_max_pending_seconds: int | None = None,
-    source_concurrency: int | None = None,
-    concurrency: int | None = None,
-    timeout: int | None = None,
+    **command_fields: Any,
 ) -> dict[str, Any]:
     """Run the provider-directory import command."""
-    runtime_context_by_key: dict[str, Any] = {"context": {"test_mode": test_mode}}
-    task_by_field = {
-        "test_mode": test_mode,
-        "seed_db_path": seed_db_path,
-        "seed_db_url": seed_db_url,
-        "retest_results_path": retest_results_path,
-        "retest_results_url": retest_results_url,
-        "run_id": run_id,
-        "provider_directory_pagination_root_run_id": (
-            provider_directory_pagination_root_run_id
-        ),
-        "source_ids": source_ids,
-        "limit": limit,
-        "source_query": source_query,
-        "refresh_preset": refresh_preset,
-        "include_supplemental_catalogs": include_supplemental_catalogs,
-        "cms_sma_endpoint_directory_path": cms_sma_endpoint_directory_path,
-        "cms_sma_endpoint_directory_url": cms_sma_endpoint_directory_url,
-        "seed_only": seed_only,
-        "probe": probe,
-        "import_resources": import_resources,
-        "uhc_catalog_set_sha256": uhc_catalog_set_sha256,
-        "dataset_rehydrate_only": dataset_rehydrate_only,
-        "rehydrate_dataset_id": rehydrate_dataset_id,
-        "rehydrate_acquisition_root_run_id": rehydrate_acquisition_root_run_id,
-        "rehydrate_resources": rehydrate_resources,
-        "rehydrate_batch_size": rehydrate_batch_size,
-        "canonical_backfill_only": canonical_backfill_only,
-        "contact_backfill_only": contact_backfill_only,
-        "publish_artifacts_only": publish_artifacts_only,
-        "publish_artifacts_targets": publish_artifacts_targets,
-        "publish_corroboration": publish_corroboration,
-        "full_refresh": full_refresh,
-        "stale_cleanup": stale_cleanup,
-        "publish_artifacts": publish_artifacts,
-        "publish_after_acquisition": publish_after_acquisition,
-        "open_only": open_only,
-        "include_auth_required": include_auth_required,
-        "credential_config_file": credential_config_file,
-        "resources": resources,
-        "resource_limit": resource_limit,
-        "resource_deadline_seconds": resource_deadline_seconds,
-        "linked_resource_limit": linked_resource_limit,
-        "linked_resource_deadline_seconds": linked_resource_deadline_seconds,
-        "page_limit": page_limit,
-        "page_count": page_count,
-        "stream_batch_size": stream_batch_size,
-        "bulk_export": bulk_export,
-        "bulk_export_max_pending_seconds": bulk_export_max_pending_seconds,
-        "source_concurrency": source_concurrency,
-        "concurrency": concurrency,
-        "timeout": timeout,
+    options = _ProviderDirectoryFhirCommandOptions(**command_fields)
+    runtime_context_by_key: dict[str, Any] = {
+        "context": {"test_mode": options.test_mode}
     }
-    task_by_field = _apply_provider_directory_refresh_preset(task_by_field)
-    validate_uhc_official_file_admission(
-        task_by_field,
-        test_mode=test_mode,
-    )
+    task_by_field = _apply_provider_directory_refresh_preset(asdict(options))
+    validate_uhc_official_file_admission(task_by_field, test_mode=options.test_mode)
     await startup(runtime_context_by_key)
     import_result = await process_data(runtime_context_by_key, task_by_field)
     await shutdown(runtime_context_by_key)
     return import_result
+
+
+run_provider_directory_fhir_command.__annotations__ = {
+    **_ProviderDirectoryFhirCommandOptions.__annotations__,
+    "return": "dict[str, Any]",
+}
+run_provider_directory_fhir_command.__signature__ = inspect.signature(
+    _ProviderDirectoryFhirCommandOptions
+).replace(return_annotation="dict[str, Any]")
 
 
 main = run_provider_directory_fhir_command

@@ -25105,6 +25105,103 @@ mod tests {
     }
 
     #[test]
+    fn indexed_range_metrics_and_wrapped_parser_preserve_exact_values() {
+        let index = TemporaryRapidgzipIndex::new().unwrap();
+        assert_eq!(index.byte_len(), 0);
+        std::fs::write(&index.path, b"index").unwrap();
+        assert_eq!(index.byte_len(), 5);
+
+        let range = IndexedInNetworkRange {
+            offset: 11,
+            length: 22,
+            object_count: 3,
+        };
+        assert_eq!(
+            range.payload(7, 2),
+            json!({
+                "range_id": 7,
+                "offset": 11,
+                "length": 22,
+                "object_count": 3,
+                "decoder_threads": 2,
+            })
+        );
+
+        let mut raw_chunk_stats = RawChunkStats::default();
+        raw_chunk_stats.record(2, 64);
+        raw_chunk_stats.record_queue_depth(3);
+        raw_chunk_stats.record_queue_blocked();
+        let output = IndexedRangeProducerOutput {
+            range_id: 7,
+            range,
+            decoder_threads: 2,
+            elapsed_seconds: 0.25,
+            rate_count: 2,
+            blocked_micros: 1_500_000,
+            compressed_bytes: 32,
+            raw_chunk_stats,
+        };
+        assert_eq!(
+            output.payload(),
+            json!({
+                "range_id": 7,
+                "offset": 11,
+                "length": 22,
+                "object_count": 3,
+                "decoder_threads": 2,
+                "elapsed_seconds": 0.25,
+                "rate_count": 2,
+                "blocked_seconds": 1.5,
+                "raw_chunk_count": 1,
+                "raw_chunk_total_bytes": 64,
+                "raw_chunk_max_bytes": 64,
+                "raw_chunk_max_rates": 2,
+                "queue_high_water": 3,
+                "queue_blocked_sends": 1,
+                "compressed_bytes": 32,
+            })
+        );
+
+        let input = br#"[{"name":"one"},{"name":"two"}]"#;
+        let wrapped = WrappedIndexedRangeReader::new(
+            Box::new(Cursor::new(input.to_vec())),
+            input.len() as u64,
+            b"",
+            b"",
+        );
+        let mut reader = BufferedJsonByteReader::new(wrapped);
+        reader.expect_byte(b'[').unwrap();
+        let mut first = true;
+        let mut captured = Vec::new();
+
+        assert!(reader
+            .capture_next_array_object_bytes_append(&mut captured, &mut first)
+            .unwrap());
+        assert_eq!(captured, br#"{"name":"one"}"#);
+
+        captured.clear();
+        assert!(reader
+            .capture_next_array_object_bytes_append(&mut captured, &mut first)
+            .unwrap());
+        assert_eq!(captured, br#"{"name":"two"}"#);
+
+        captured.clear();
+        assert!(!reader
+            .capture_next_array_object_bytes_append(&mut captured, &mut first)
+            .unwrap());
+
+        let invalid_money = b"1e999999999";
+        let wrapped = WrappedIndexedRangeReader::new(
+            Box::new(Cursor::new(invalid_money.to_vec())),
+            invalid_money.len() as u64,
+            b"",
+            b"",
+        );
+        let mut reader = JsonStreamReader::new(wrapped);
+        assert!(strict_money_number_from_reader(&mut reader).is_err());
+    }
+
+    #[test]
     fn serving_binary_compression_requires_minimum_savings() {
         let _lock = scanner_env_lock().lock().unwrap();
         let _minimum_savings = TestEnvVar::set(
@@ -35798,6 +35895,73 @@ mod tests {
     }
 
     #[test]
+    fn direct_spooled_sidecars_and_dictionary_outputs_finalize_exactly() {
+        let temporary = tempfile::tempdir().unwrap();
+        let provider_set = GlobalId128([1; GLOBAL_ID_BYTES]);
+        let price_set = PriceSetLite {
+            global_id: GlobalId128([8; GLOBAL_ID_BYTES]),
+            atoms: Vec::new(),
+            atom_ids: vec![GlobalId128([9; GLOBAL_ID_BYTES])],
+        };
+        let mut collector = ManifestSidecarCollector {
+            spools: Some(ManifestSidecarSpools::all().unwrap()),
+            ..ManifestSidecarCollector::default()
+        };
+        collector
+            .record_provider_set(provider_set, &[2, 1], &[4, 3], &[1_234_567_890])
+            .unwrap();
+        collector.record_provider_component(3, &[2, 1]).unwrap();
+        collector.record_price_set(&price_set).unwrap();
+
+        for (name, dense) in [
+            ("provider_forward", false),
+            ("provider_inverted", false),
+            ("provider_set_component", false),
+            ("provider_component_group", false),
+            ("provider_npi", true),
+            ("price_forward", false),
+        ] {
+            let path = temporary.path().join(format!("{name}.ptg2sc"));
+            assert!(collector
+                .write_spooled_standard_sidecar(name, path.to_str().unwrap(), dense)
+                .unwrap()
+                .is_some());
+        }
+        assert!(collector
+            .write_spooled_standard_sidecar(
+                "unknown",
+                temporary.path().join("unknown").to_str().unwrap(),
+                false,
+            )
+            .unwrap()
+            .is_none());
+
+        let path = |name: &str| temporary.path().join(name).display().to_string();
+        let paths = CopyPathConfig {
+            manifest_price_atom: Some(path("manifest-price-atom.copy")),
+            manifest_price_set_atom: Some(path("manifest-price-set-atom.copy")),
+            manifest_price_set_summary: Some(path("manifest-price-set-summary.copy")),
+            manifest_provider_group_member: Some(path("manifest-provider-member.copy")),
+            manifest_code_count: Some(path("manifest-code-count.copy")),
+            manifest_provider_set_dictionary: Some(path("manifest-provider-set.copy")),
+            procedure: Some(path("procedure.copy")),
+            price_code_set: Some(path("price-code-set.copy")),
+            price_atom: Some(path("price-atom.copy")),
+            price_set_entry: Some(path("price-set-entry.copy")),
+            provider_set: Some(path("provider-set.copy")),
+            provider_set_component: Some(path("provider-set-component.copy")),
+            provider_set_entry: Some(path("provider-set-entry.copy")),
+            provider_entry_component: Some(path("provider-entry-component.copy")),
+            provider_group_member: Some(path("provider-group-member.copy")),
+            ..CopyPathConfig::default()
+        };
+        let sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
+        let stdout = io::stdout();
+        let mut events = BufWriter::new(stdout.lock());
+        sinks.finish(&mut events).unwrap();
+    }
+
+    #[test]
     fn v4_provider_membership_sidecars_preserve_exact_edges_and_reject_bad_rows() {
         let temporary = tempfile::tempdir().unwrap();
         let group_a = GlobalId128([5; GLOBAL_ID_BYTES]).to_hex();
@@ -36834,6 +36998,40 @@ mod tests {
         )
         .unwrap();
         batch_receiver.join().unwrap();
+
+        let mut sink = io::sink();
+        let event = CopyFileEvent {
+            record_kind: "copy_file".to_owned(),
+            path: "test.copy".to_owned(),
+            bytes: 0,
+            row_count: 0,
+            final_file: true,
+            partition: None,
+            partition_count: None,
+            format: None,
+            version: None,
+            sha256: None,
+        };
+        emit_copy_file_event(&mut sink, &event).unwrap();
+        let (sink_event_tx, sink_event_rx) = unbounded();
+        sink_event_tx.send(event).unwrap();
+        drain_copy_file_events(&sink_event_rx, &mut sink).unwrap();
+
+        let (sink_job_tx, sink_job_rx) = bounded(1);
+        send_worker_job(
+            &sink_job_tx,
+            &sink_event_rx,
+            &mut sink,
+            None,
+            &mut blocked_micros,
+            &mut stats,
+            empty_job(),
+        )
+        .unwrap();
+        assert!(matches!(
+            sink_job_rx.recv().unwrap(),
+            WorkerJob::Rates { .. }
+        ));
     }
 }
 

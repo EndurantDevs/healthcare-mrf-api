@@ -1,3 +1,4 @@
+use ptg2_scanner::address_canon::canonicalize_address;
 use ptg2_scanner::contact_canon::{canonicalize_contact_number, canonicalize_contact_pair};
 use ptg2_scanner::copy_format::{
     emit_compact_copy_row, pg_text_array_copy_field, write_copy_fields, CompactCopyRow,
@@ -112,6 +113,33 @@ fn provider_identifier_quarantine_rejects_valid_and_unbounded_values() {
     let mut extra = ProviderIdentifierQuarantine::default();
     extra.record(&[-1025]).unwrap();
     assert!(merge_target.merge(&extra).is_err());
+}
+
+#[test]
+fn candidate_address_units_are_deduplicated_at_the_public_boundary() {
+    let duplicate = canonicalize_address(
+        Some("123 Main St Ste 7"),
+        Some("Ste 7"),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(duplicate.unit_norm, "ste7");
+    assert!(duplicate
+        .line1_norm
+        .as_deref()
+        .is_some_and(|line| !line.contains("ste7")));
+
+    let spaced_suffix = canonicalize_address(
+        Some("123 Main St"),
+        Some("Ste 2 B"),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(spaced_suffix.unit_norm, "ste2b");
 }
 
 #[test]
@@ -322,11 +350,15 @@ fn dense_identity_memory_estimate_rejects_count_and_slot_byte_overflow() {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(error.to_string(), "identity map is too large");
     }
-
     let mut bounded_map = DenseIdentityMap::with_capacity(0).unwrap();
     bounded_map
         .insert([1; 16], DenseIdentityValue::default())
         .unwrap();
+    assert_eq!(
+        bounded_map.get(&[1; 16]),
+        Some(DenseIdentityValue::default())
+    );
+    assert_eq!(bounded_map.get(&[9; 16]), None);
     let error = bounded_map
         .insert([2; 16], DenseIdentityValue::default())
         .expect_err("immutable dense map must enforce its bounded load factor");
