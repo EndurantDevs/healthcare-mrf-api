@@ -24,6 +24,10 @@ from tests.test_provider_directory_profile_capacity_attestation_schema import (
     _OperationsRecorder,
     _load_migration,
 )
+from tests.provider_directory_profile_capacity_v2_migration_support import (
+    capacity_constraint_definition,
+    load_capacity_v2_migration as _load_capacity_v2_migration,
+)
 
 async def _require_disposable_database(database: Database) -> None:
     try:
@@ -334,6 +338,109 @@ async def _assert_profile_delta_downgrade(
             '"provider_directory_profile_delta_receipt"'
         ),
     ) is True
+
+
+def _historical_v1_consumption_values() -> dict[str, object]:
+    values = _consumption_values()
+    values["contract_id"] = (
+        "provider-directory-database-capacity-lease-v1"
+    )
+    return values
+
+
+def _second_v2_consumption_values() -> dict[str, object]:
+    values = _consumption_values()
+    values.update(
+        {
+            "attestation_id": "cd" * 32,
+            "reservation_id": "pd-capacity-reservation-v2",
+            "lease_digest": "dc" * 32,
+            "run_id": "run_" + "d" * 32,
+            "build_id": "pdpb_" + "e" * 32,
+        }
+    )
+    return values
+
+
+async def _install_v1_capacity_ledger(
+    database: Database,
+    schema: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    await database.status(
+        f'CREATE TABLE "{schema}".'
+        'provider_directory_profile_build_checkpoint ('
+        'build_id varchar(64) PRIMARY KEY);'
+    )
+    monkeypatch.setenv("DB_SCHEMA", schema)
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    await _apply_profile_delta_migration(
+        database,
+        _load_migration(),
+        "upgrade",
+    )
+    ledger_table = (
+        ProviderDirectoryProfileCapacityLeaseConsumption.__table__
+        .to_metadata(MetaData(), schema=schema)
+    )
+    await database.insert(ledger_table).values(
+        **_historical_v1_consumption_values()
+    ).status()
+    return ledger_table
+
+
+@pytest.mark.asyncio
+async def test_capacity_v2_migration_preserves_v1_history_and_downgrades(
+    monkeypatch,
+):
+    database = Database()
+    schema = f"pd_capacity_v2_migration_{uuid.uuid4().hex[:12]}"
+    is_schema_created = False
+    try:
+        await database.connect()
+        await _require_disposable_database(database)
+        await database.status(f'CREATE SCHEMA "{schema}";')
+        is_schema_created = True
+        ledger_table = await _install_v1_capacity_ledger(
+            database,
+            schema,
+            monkeypatch,
+        )
+        migration = _load_capacity_v2_migration()
+        await _apply_profile_delta_migration(database, migration, "upgrade")
+        definition = await capacity_constraint_definition(database, schema)
+        assert "capacity-lease-v1" in definition
+        assert "capacity-lease-v2" in definition
+        assert await database.scalar(
+            f'SELECT count(*) FROM "{schema}".'
+            'provider_directory_profile_capacity_lease_consumption '
+            "WHERE contract_id LIKE '%-v1';"
+        ) == 1
+
+        await _apply_profile_delta_migration(database, migration, "downgrade")
+        definition = await capacity_constraint_definition(database, schema)
+        assert "capacity-lease-v1" in definition
+        assert "capacity-lease-v2" not in definition
+        await _apply_profile_delta_migration(database, migration, "upgrade")
+        await database.insert(ledger_table).values(
+            **_second_v2_consumption_values()
+        ).status()
+        with pytest.raises(DBAPIError, match="v2_history_exists"):
+            await _apply_profile_delta_migration(
+                database,
+                migration,
+                "downgrade",
+            )
+        assert "capacity-lease-v2" in await capacity_constraint_definition(
+            database,
+            schema,
+        )
+    finally:
+        if is_schema_created:
+            await database.status(
+                f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'
+            )
+        await database.disconnect()
 
 
 @pytest.mark.asyncio

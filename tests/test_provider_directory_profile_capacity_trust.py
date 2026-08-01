@@ -35,8 +35,8 @@ EXECUTION_V2_FIXTURE = (
     / "fixtures/provider_directory_profile_execution_v2_golden.json"
 )
 EXECUTION_V2_CANONICAL_SHA256 = (
-    "196bb6b9315a5d87bb7591e414849ce28"
-    "deaace788fa2852a2aa5bd6be07bd08"
+    "43ef397505fc23eb0c9aed88f90ef38a"
+    "501c3061f715ad18478ec219bf19e59b"
 )
 
 

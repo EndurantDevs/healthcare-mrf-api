@@ -19,20 +19,28 @@ from process.provider_directory_profile_capacity_trust import (
     CapacityLeaseTrustTablespace,
     CapacityLeaseTrustVolume,
 )
-
+from process.provider_directory_profile_capacity_runtime_witness import (
+    CAPACITY_RUNTIME_WITNESS_DOMAIN,
+    CapacityLeaseDeploymentWitness,
+    CapacityLeaseRuntimeWitness,
+    ProviderDirectoryCapacityLeaseError,
+    _parse_capacity_deployment_witness,
+    _parse_capacity_runtime_witness,
+    capacity_runtime_witness_sha256,
+)
 
 CAPACITY_LEASE_CONTRACT_ID = (
-    "provider-directory-database-capacity-lease-v1"
+    "provider-directory-database-capacity-lease-v2"
 )
 CAPACITY_LEASE_SIGNATURE_ALGORITHM = "Ed25519"
 CAPACITY_LEASE_SIGNATURE_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-lease.v1"
+    "healthporta.provider-directory.database-capacity-lease.v2"
 )
 CAPACITY_ATTESTATION_ID_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-attestation-id.v1"
+    "healthporta.provider-directory.database-capacity-attestation-id.v2"
 )
 CAPACITY_LEASE_DIGEST_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-lease-digest.v1"
+    "healthporta.provider-directory.database-capacity-lease-digest.v2"
 )
 CAPACITY_LEASE_PUBLIC_KEY_DOMAIN = (
     "healthporta.provider-directory.database-capacity-public-key.v1"
@@ -66,6 +74,9 @@ _SIGNED_BODY_FIELDS = frozenset(
         "nonce",
         "observed_at",
         "reservation_id",
+        "runtime_witness",
+        "runtime_witness_sha256",
+        "deployment_witness",
         "signature_algorithm",
         "tablespaces",
         "volumes",
@@ -104,15 +115,6 @@ _MAX_SIGNED_BIGINT = (1 << 63) - 1
 _MAX_UNSIGNED_BIGINT = (1 << 64) - 1
 _MAX_OID = (1 << 32) - 1
 _UTC = datetime.timezone.utc
-
-
-class ProviderDirectoryCapacityLeaseError(ValueError):
-    """Stable fail-closed capacity lease error without input disclosure."""
-
-    def __init__(self, code: str, field: str):
-        self.code = code
-        self.field = field
-        super().__init__(f"{code}: {field}")
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,9 @@ class VerifiedDatabaseCapacityLease:
     nonce: str
     observed_at: datetime.datetime
     reservation_id: str
+    runtime_witness: CapacityLeaseRuntimeWitness
+    runtime_witness_sha256: str
+    deployment_witness: CapacityLeaseDeploymentWitness
     signature_algorithm: str
     tablespaces: tuple[DatabaseCapacityTablespace, ...]
     volumes: tuple[DatabaseCapacityVolume, ...]
@@ -476,9 +481,12 @@ __all__ = (
     "CAPACITY_LEASE_PUBLIC_KEY_DOMAIN",
     "CAPACITY_LEASE_SIGNATURE_ALGORITHM",
     "CAPACITY_LEASE_SIGNATURE_DOMAIN",
+    "CAPACITY_RUNTIME_WITNESS_DOMAIN",
     "CAPACITY_TABLESPACE_IDENTITY_DOMAIN",
     "CAPACITY_VOLUME_IDENTITY_DOMAIN",
     "CapacityLeaseConsumptionBinding",
+    "CapacityLeaseDeploymentWitness",
+    "CapacityLeaseRuntimeWitness",
     "CapacityLeaseTrust",
     "CapacityLeaseTrustKey",
     "CapacityLeaseTrustTablespace",
@@ -488,4 +496,5 @@ __all__ = (
     "ProviderDirectoryCapacityLeaseError",
     "VerifiedDatabaseCapacityLease",
     "canonical_capacity_lease_json",
+    "capacity_runtime_witness_sha256",
 )

@@ -17,6 +17,9 @@ from process.provider_directory_profile_selection import (
     ProviderDirectoryProfileSelectionStale,
     validated_profile_execution,
 )
+from process.provider_directory_profile_runtime_observation import (
+    ProviderDirectoryProfileRuntimeObservationError,
+)
 
 
 async def control_provider_directory_profile_capacity_preflight(request):
@@ -43,6 +46,7 @@ async def control_provider_directory_profile_capacity_preflight(request):
     except (
         ProviderDirectoryArtifactBuildStale,
         ProviderDirectoryProfileSelectionStale,
+        ProviderDirectoryProfileRuntimeObservationError,
     ) as exc:
         raise SanicException(str(exc), status_code=409) from exc
     return response.json(preflight)

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 
 import pytest
@@ -19,9 +20,8 @@ from tests.test_provider_directory_profile_capacity_attestation import (
 )
 
 
-def test_consumption_values_bind_full_build_and_source_identity():
-    verified = _verify()
-    binding = lease.CapacityLeaseConsumptionBinding(
+def _binding():
+    return lease.CapacityLeaseConsumptionBinding(
         run_id="run_" + "6" * 32,
         build_id="pdpb_" + "7" * 32,
         executable_plan_hash="88" * 32,
@@ -31,9 +31,13 @@ def test_consumption_values_bind_full_build_and_source_identity():
         profile_as_of="2026-07-30",
     )
 
+
+def test_consumption_values_bind_full_build_and_source_identity():
+    verified = _verify()
+
     consumption_by_field = lease.capacity_lease_consumption_values(
         verified,
-        binding,
+        _binding(),
         accepted_at=VALIDATION_TIME,
     )
 
@@ -57,6 +61,23 @@ def test_consumption_values_bind_full_build_and_source_identity():
         consumption_by_field["canonical_lease_json"].encode("ascii")
     ).hexdigest()
     assert canonical_digest != consumption_by_field["lease_digest"]
+
+
+def test_consumption_writer_rejects_noncurrent_verified_contract():
+    legacy_verified = dataclasses.replace(
+        _verify(),
+        contract_id="provider-directory-database-capacity-lease-v1",
+    )
+
+    with pytest.raises(
+        lease.ProviderDirectoryCapacityLeaseError,
+        match="unsupported_contract: contract_id",
+    ):
+        lease.capacity_lease_consumption_values(
+            legacy_verified,
+            _binding(),
+            accepted_at=VALIDATION_TIME,
+        )
 
 
 @pytest.mark.parametrize(
