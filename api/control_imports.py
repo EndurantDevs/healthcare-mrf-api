@@ -43,6 +43,14 @@ from process.ptg_parts.frozen_rate_privacy import (
     has_frozen_private_evidence,
     redact_frozen_public_values,
 )
+from process.ptg_parts.ptg_source_attempt_actions import (
+    record_source_attempt_event,
+)
+from process.ptg_parts.ptg_source_attempt_guard import (
+    guard_source_attempt,
+    require_source_attempt_capabilities,
+    source_file_import_id_from_payload,
+)
 
 from db.models import ImportRun, db
 from process.import_status_events import enqueue_status_event, isoformat_utc
@@ -1149,8 +1157,15 @@ async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> 
 
     finish_params = _finish_params_for(importer, current_run, finalize_payload)
     finish_fn = _finish_function(importer)
-    finalize_result = await finish_fn(**finish_params)
     now = utc_now()
+    finalizing_progress_by_field = {
+        "unit": "run",
+        "total": 1,
+        "done": 0,
+        "pct": 0,
+        "message": "finalizing",
+    }
+    finalize_result = await finish_fn(**finish_params)
     run_metrics_by_name = dict(current_run.get("metrics") or {})
     run_metrics_by_name["finalize"] = (
         finalize_result if isinstance(finalize_result, dict) else {"queued": True}
@@ -1162,7 +1177,7 @@ async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> 
             status="finalizing",
             phase_detail="finalize enqueued",
             heartbeat_at=now,
-            progress={"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "finalizing"},
+            progress=finalizing_progress_by_field,
             metrics=run_metrics_by_name,
             import_id=finish_params.get("import_id"),
         )
@@ -1635,8 +1650,19 @@ async def _admit_ptg_source_file_run(
     import_row: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Bind immutable input and insert control lifecycle state atomically."""
-
     async with db.acquire() as connection:
+        source_file_import_id = source_file_import_id_from_payload(
+            import_row,
+            required=True,
+        )
+        await require_source_attempt_capabilities(
+            connection,
+            require_attempt_authority=False,
+        )
+        await guard_source_attempt(
+            connection,
+            source_file_import_id=source_file_import_id,
+        )
         await connection.scalar(
             text(
                 "SELECT pg_advisory_xact_lock("
@@ -1669,6 +1695,16 @@ async def _admit_ptg_source_file_run(
             if active_runs:
                 return active_runs[0]
         await connection.status(insert(ImportRun).values(**import_row))
+        await record_source_attempt_event(
+            connection,
+            source_file_import_id=source_file_import_id,
+            event_kind=(
+                "retry_admitted"
+                if import_row.get("retry_of_run_id")
+                else "start_admitted"
+            ),
+            outer_run=import_row,
+        )
     return None
 
 
@@ -1725,12 +1761,21 @@ async def create_import_run(
         **request_payload_map,
         "params": normalized_params_by_name,
     }
-    is_ptg_source_file_admission = bool(
-        importer == "ptg"
-        and str(
-            request_payload_map.get("source_file_import_id") or ""
-        ).strip()
+    source_file_import_id = (
+        source_file_import_id_from_payload(
+            request_payload_map,
+            required=False,
+        )
+        if importer == "ptg"
+        else None
     )
+    is_ptg_source_file_admission = source_file_import_id is not None
+    if source_file_import_id is not None:
+        request_payload_map = {
+            **request_payload_map,
+            "source_file_import_id": source_file_import_id,
+            "import_id": source_file_import_id,
+        }
 
     idempotency_key = (
         str(request_payload_map.get("idempotency_key") or "").strip() or None

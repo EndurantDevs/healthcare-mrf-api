@@ -65,7 +65,7 @@ def test_snapshot_model_declares_the_attempt_run_index() -> None:
     } in PTG2Snapshot.__my_additional_indexes__
 
 
-def test_ci_runs_attempt_stage_crash_boundary_postgres_tests() -> None:
+def test_ci_runs_attempt_and_legacy_guard_postgres_tests() -> None:
     workflow_text = (
         Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
     ).read_text()
@@ -97,3 +97,10 @@ def test_ci_runs_attempt_stage_crash_boundary_postgres_tests() -> None:
     assert "tests/test_ptg2_v4_attempt_model_autogenerate_postgres.py" in (
         packed_v4_gate
     )
+    for legacy_guard_test in (
+        "tests/test_ptg2_legacy_v3_metadata_reconcile_postgres.py",
+        "tests/test_ptg2_legacy_v3_migration_postgres.py",
+        "tests/test_ptg2_legacy_v3_v4_compat_postgres.py",
+        "tests/test_ptg_source_attempt_action_postgres.py",
+    ):
+        assert legacy_guard_test in packed_v4_gate

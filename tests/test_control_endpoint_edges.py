@@ -29,11 +29,10 @@ async def test_control_health_worker_routes_keep_stable_envelopes(monkeypatch):
 
     monkeypatch.setattr(control, "node_health", fake_node_health)
     monkeypatch.setattr(control, "worker_registry", lambda: [{"name": "finish"}])
-    monkeypatch.setattr(
-        control,
-        "ensure_worker",
-        lambda payload: {"name": payload["name"], "state": "starting"},
-    )
+    async def guarded_ensure(payload):
+        return {"name": payload["name"], "state": "starting"}
+
+    monkeypatch.setattr(control, "guarded_ensure_worker", guarded_ensure)
 
     health = await control.control_node_health(request())
     workers = await control.control_workers(request())

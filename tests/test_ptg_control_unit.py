@@ -14,6 +14,18 @@ async def _allow_active_run(_run_id):
     return None
 
 
+@pytest.fixture(autouse=True)
+def _admit_unit_ptg_run(monkeypatch):
+    async def admit_run(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        ptg_control,
+        "guard_ptg_worker_start",
+        admit_run,
+    )
+
+
 @pytest.mark.asyncio
 async def test_ptg_control_start_maps_payload_to_ptg_main(monkeypatch):
     calls = []

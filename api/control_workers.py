@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -14,6 +15,16 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from process.ptg_parts.ptg_source_attempt_actions import (
+    PTGSourceAttemptIdentityError,
+    PTGWorkerActionSelection,
+    admit_existing_outer_run_action,
+)
+from process.ptg_parts.ptg_source_attempt_guard import (
+    PTGSourceAttemptTerminalError,
+    source_file_import_id_from_payload,
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +139,120 @@ def ensure_worker(payload: dict[str, Any]) -> dict[str, Any]:
         status=status,
         items=items,
     )
+
+
+def _worker_action_selection(
+    importer: str,
+    selected_specs: list[WorkerSpec],
+) -> PTGWorkerActionSelection:
+    return PTGWorkerActionSelection(
+        request_importer=importer or None,
+        allowed_importers=frozenset(
+            selected_importer
+            for worker_spec in selected_specs
+            for selected_importer in worker_spec.importers
+        ),
+        allowed_roles=frozenset(
+            worker_spec.role for worker_spec in selected_specs
+        ),
+    )
+
+
+def _failed_worker_admission(
+    worker_payload: dict[str, Any],
+    message: str,
+) -> dict[str, Any]:
+    return _worker_ensure_response(
+        worker_payload,
+        status="failed",
+        items=[],
+        message=message,
+    )
+
+
+async def _admit_worker_ensure(
+    worker_payload: dict[str, Any],
+    *,
+    run_id: str,
+    importer: str,
+    selected_specs: list[WorkerSpec],
+) -> dict[str, Any] | None:
+    try:
+        requested_source_id = source_file_import_id_from_payload(
+            worker_payload,
+            required=False,
+        )
+        admitted_run = await admit_existing_outer_run_action(
+            run_id=run_id,
+            event_kind="ensure_admitted",
+            expected_source_file_import_id=requested_source_id,
+            worker_selection=_worker_action_selection(
+                importer,
+                selected_specs,
+            ),
+        )
+    except (PTGSourceAttemptIdentityError, ValueError):
+        return _failed_worker_admission(
+            worker_payload,
+            "PTG source-attempt identity is invalid or changed",
+        )
+    except PTGSourceAttemptTerminalError as error:
+        return _failed_worker_admission(worker_payload, str(error))
+    if admitted_run is None:
+        return _failed_worker_admission(
+            worker_payload,
+            "control run was not found",
+        )
+    if (
+        str(admitted_run.get("importer") or "") != "ptg"
+        and requested_source_id is not None
+    ):
+        return _failed_worker_admission(
+            worker_payload,
+            "source-attempt identity requires a PTG import",
+        )
+    return None
+
+
+async def guarded_ensure_worker(
+    worker_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist run/selector admission before any worker launch."""
+
+    importer = str(worker_payload.get("importer") or "").strip()
+    run_id = str(worker_payload.get("run_id") or "").strip()
+    selected_specs = _resolve_specs(worker_payload)
+    selects_ptg = any("ptg" in spec.importers for spec in selected_specs)
+    if (selects_ptg and importer and importer != "ptg") or (
+        importer == "ptg" and selected_specs and not selects_ptg
+    ):
+        return _failed_worker_admission(
+            worker_payload,
+            "PTG worker selector conflicts with importer",
+        )
+    if run_id:
+        admission_failure = await _admit_worker_ensure(
+            worker_payload,
+            run_id=run_id,
+            importer=importer,
+            selected_specs=selected_specs,
+        )
+        if admission_failure is not None:
+            return admission_failure
+    else:
+        try:
+            requested_source_id = source_file_import_id_from_payload(
+                worker_payload,
+                required=False,
+            )
+        except ValueError:
+            requested_source_id = "invalid"
+        if requested_source_id is not None:
+            return _failed_worker_admission(
+                worker_payload,
+                "source-attempt worker launch requires run_id",
+            )
+    return await asyncio.to_thread(ensure_worker, worker_payload)
 
 
 def _worker_ensure_response(

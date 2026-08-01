@@ -42,6 +42,7 @@ _MRF_REQUIRED_TABLES = (
     "ptg2_current_source_snapshot",
     "ptg2_import_job",
     "ptg2_import_run",
+    "ptg2_legacy_v3_metadata_reconcile_audit",
     "ptg2_plan_month",
     "ptg2_serving_rate",
     "ptg2_serving_rate_compact",
@@ -69,6 +70,11 @@ _CONTROL_REQUIRED_TABLES = (
     "source_file_import",
 )
 _BLOCKING_ATTACHMENTS = (
+    (
+        "ptg2_legacy_v3_metadata_reconcile_audit",
+        ("snapshot_id",),
+        ("internal_run_id",),
+    ),
     ("ptg2_v3_candidate_audit_attestation", ("snapshot_id",), ()),
     ("ptg2_plan_month", ("snapshot_id",), ()),
     ("ptg2_allowed_amount_plan", ("snapshot_id",), ()),

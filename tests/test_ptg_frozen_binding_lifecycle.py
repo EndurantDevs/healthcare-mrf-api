@@ -13,13 +13,33 @@ from process import ptg_control, ptg_frozen_control
 from process.ptg_parts.frozen_rate_binding import (
     FrozenRateFileBindingMismatchError,
 )
-from process.ptg_parts.frozen_rate_files import (
-    FrozenRateFileValidationError,
+from process.ptg_parts.ptg_source_attempt_guard import (
+    source_file_import_id_from_payload,
 )
 from tests.ptg_frozen_test_support import protected_control_payload
 
 
 ptg = importlib.import_module("process.ptg")
+
+
+@pytest.fixture(autouse=True)
+def _admit_lifecycle_ptg_run(monkeypatch):
+    async def admit_run(task_payload, *, run_id, **_kwargs):
+        try:
+            source_file_import_id_from_payload(task_payload, required=False)
+        except ValueError:
+            return {
+                "status": "skipped",
+                "run_id": run_id,
+                "reason": "source_attempt_identity_mismatch",
+            }
+        return None
+
+    monkeypatch.setattr(
+        ptg_control,
+        "guard_ptg_worker_start",
+        admit_run,
+    )
 
 
 class _WorkerFailureHarness:
@@ -110,7 +130,7 @@ async def test_worker_binding_recheck_is_terminal_inside_lifecycle(
 async def test_worker_outer_identity_mismatch_is_terminal_inside_lifecycle(
     monkeypatch,
 ):
-    """An outer/nested ID mismatch must persist as a non-retryable failure."""
+    """An outer/nested ID mismatch must stop before worker admission."""
 
     harness = _WorkerFailureHarness()
     monkeypatch.setattr(
@@ -138,35 +158,23 @@ async def test_worker_outer_identity_mismatch_is_terminal_inside_lifecycle(
         protected_control_payload()
     )
 
-    with pytest.raises(
-        FrozenRateFileValidationError,
-        match="outer and nested",
-    ):
-        await ptg_control.ptg_control_start(
-            {},
-            {
-                "run_id": "run-protected",
-                "source_file_import_id": "drifted-source-file-import",
-                "import_id": request_payload_by_name["import_id"],
-                "params": request_payload_by_name["params"],
-            },
-        )
-
-    assert harness.main_calls == []
-    assert [
-        mark_call["status"] for mark_call in harness.mark_calls
-    ] == ["running", "failed"]
-    assert harness.mark_calls[1]["error"] == {
-        "code": "ptg_frozen_rate_file_contract_failed",
-        "message": (
-            "protected outer and nested source_file_import_id and "
-            "import_id must all match"
-        ),
-        "retryable": False,
-    }
-    assert harness.mark_calls[0]["attempt_id"] == (
-        harness.mark_calls[1]["attempt_id"]
+    lifecycle_response = await ptg_control.ptg_control_start(
+        {},
+        {
+            "run_id": "run-protected",
+            "source_file_import_id": "drifted-source-file-import",
+            "import_id": request_payload_by_name["import_id"],
+            "params": request_payload_by_name["params"],
+        },
     )
+
+    assert lifecycle_response == {
+        "status": "skipped",
+        "run_id": "run-protected",
+        "reason": "source_attempt_identity_mismatch",
+    }
+    assert harness.main_calls == []
+    assert harness.mark_calls == []
 
 
 class _RejectedClaimHarness:

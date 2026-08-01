@@ -345,6 +345,9 @@ async def test_ptg_admission_returns_existing_idempotent_run(
     monkeypatch,
 ) -> None:
     class _Connection:
+        async def execute(self, *_args, **_kwargs):
+            return None
+
         async def scalar(self, *_args, **_kwargs):
             return 1
 

@@ -1771,7 +1771,11 @@ async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
     assert source_row["metrics"]["queue"] == "arq:PTG"
     assert source_row["source_file_import_id"] == "source-file-1"
     assert harness.importer_checks == []
-    assert len(harness.statements) == 2
+    assert len(harness.statements) == 4
+    rendered_statements = [str(statement) for statement in harness.statements]
+    assert "guard_ptg_source_attempt" in rendered_statements[0]
+    assert "INSERT INTO mrf.import_run" in rendered_statements[1]
+    assert "ptg_source_attempt_event" in rendered_statements[2]
 
 
 @pytest.mark.asyncio
@@ -1800,6 +1804,7 @@ async def test_create_import_run_serializes_unsourced_ptg(monkeypatch):
             "run_id": "run_duplicate_ptg",
             "importer": "ptg",
             "idempotency_key": "manual-ptg",
+            "params": {"import_id": "20260801"},
         }
     )
 

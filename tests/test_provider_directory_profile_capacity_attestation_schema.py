@@ -84,10 +84,10 @@ def _load_migration():
     return migration
 
 
-def test_capacity_v2_migration_is_the_unique_repository_head():
+def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260801130000_provider_directory_capacity_lease_v2"
+        "20260801140000_ptg2_legacy_v3_metadata_reconcile"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (
