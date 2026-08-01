@@ -1,7 +1,7 @@
 aiocsv
 aiofile
 aiohappyeyeballs>=2.7.1
-aiohttp>=3.14.2
+aiohttp>=3.14.3
 aiohttp-socks>=0.11.0
 aioshutil
 aiosignal>=1.4.0
@@ -25,7 +25,7 @@ Jinja2
 msgpack
 numpy>=2.5.1
 orjson>=3.11.9
-pandas>=3.0.3
+pandas>=3.0.5
 propcache>=0.5.2
 pyaml>=26.7.0
 pylightxl
