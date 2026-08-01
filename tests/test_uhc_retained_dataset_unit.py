@@ -1530,13 +1530,20 @@ def test_summary_accumulator_counts_retained_only_provider_evidence():
     assert retained_only[SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY] == 1
 
 
-def _quarantined_provider_file(source_file_id: str, invalid_count: int):
+def _quarantined_provider_file(
+    source_file_id: str,
+    invalid_count: int,
+    *,
+    provider_count: int | None = None,
+):
+    if provider_count is None:
+        provider_count = invalid_count
     counters = _summary_counters()
     counters.update(
-        raw_provider_records=invalid_count,
-        raw_individual_records=invalid_count,
-        raw_address_rows=invalid_count,
-        raw_provider_plan_rows=invalid_count,
+        raw_provider_records=provider_count,
+        raw_individual_records=provider_count,
+        raw_address_rows=provider_count,
+        raw_provider_plan_rows=provider_count,
         invalid_npi_count=invalid_count,
         invalid_npi_individual_records=invalid_count,
         invalid_npi_address_rows=invalid_count,
@@ -1551,7 +1558,10 @@ def _quarantined_provider_file(source_file_id: str, invalid_count: int):
             collection_kind="provider_membership",
             logical_scope=SimpleNamespace(pairing_status="paired"),
         ),
-        build_row={"counters_json": counters, "evidence_count": 0},
+        build_row={
+            "counters_json": counters,
+            "evidence_count": provider_count - invalid_count,
+        },
         stage_ref=f"mrf.provider_{source_file_id[0]}",
     )
 
@@ -1589,6 +1599,39 @@ def test_summary_accumulator_applies_quarantine_rate_per_provider_file():
     assert count_by_field["invalid_npi_count"] == 2
     assert rejected["invalid_npi_checksum"] == 2
     assert len(quarantine_proof) == 64
+
+
+def test_summary_accumulator_accepts_bounded_multi_quarantine_file():
+    count_by_field = dict.fromkeys(
+        SOURCE_SUMMARY_UHC_OUTCOME_COUNT_FIELDS,
+        0,
+    )
+    retained_only = dict.fromkeys(
+        SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS,
+        0,
+    )
+    rejected = dict.fromkeys(
+        UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS,
+        0,
+    )
+
+    expected, _, _ = retained._accumulate_sealed_summary_counts(
+        (
+            _quarantined_provider_file(
+                "a" * 64,
+                2,
+                provider_count=10_001,
+            ),
+        ),
+        count_by_field,
+        retained_only,
+        rejected,
+    )
+
+    assert expected == 9_999
+    assert count_by_field["raw_provider_records"] == 10_001
+    assert count_by_field["invalid_npi_count"] == 2
+    assert rejected["invalid_npi_checksum"] == 2
 
 
 def test_summary_accumulator_rejects_over_rate_provider_file():

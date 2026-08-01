@@ -2607,6 +2607,37 @@ def test_provider_directory_coverage_audit_markdown_caps_credential_groups_witho
     assert "2 additional credential/onboarding group(s) omitted from markdown" in markdown
 
 
+def test_audit_sql_rendering_preserves_placeholder_shaped_schema_names():
+    credential_schema = "__GATEWAY_HOSTS__"
+    credential_sql = audit._credential_backlog_sql(credential_schema)
+    assert (
+        f'"{credential_schema}"."provider_directory_source"'
+        in credential_sql
+    )
+    assert "source_host = ANY(ARRAY[" in credential_sql
+
+    location_schema = "__ROLE_TABLE__"
+    location_sql = audit._location_without_unified_sql(
+        location_schema,
+        "SELECT 1 AS source_id",
+        {"has_healthcare_service": True},
+    )
+    assert (
+        f'"{location_schema}"."provider_directory_practitioner_role"'
+        in location_sql
+    )
+
+
+def test_audit_sql_rendering_and_retest_constants_fail_closed():
+    with pytest.raises(ValueError, match="SQL template token mismatch"):
+        audit._render_sql_template("SELECT __ONE__", {"__TWO__": "2"})
+
+    assert isinstance(audit.RETEST_RECOVERABLE_SOURCE_STATUSES, frozenset)
+    assert isinstance(audit.RETEST_IMPORTABLE_CLASSIFICATIONS, frozenset)
+    assert isinstance(audit.RETEST_CREDENTIAL_CLASSIFICATIONS, frozenset)
+    assert isinstance(audit.RETEST_CHECKED_CLASSIFICATIONS, frozenset)
+
+
 @pytest.mark.asyncio
 async def test_provider_directory_coverage_audit_source_resource_coverage_summary(monkeypatch):
     """Verify provider directory coverage audit source resource coverage summary."""

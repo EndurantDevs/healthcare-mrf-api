@@ -108,6 +108,25 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+SQL_TEMPLATE_TOKEN_RE = re.compile(r"__[A-Z][A-Z_]*__")
+
+
+def _render_sql_template(template: str, replacements: dict[str, str]) -> str:
+    """Replace the exact template tokens once without rewriting inserted SQL."""
+    template_tokens = set(SQL_TEMPLATE_TOKEN_RE.findall(template))
+    replacement_tokens = set(replacements)
+    if template_tokens != replacement_tokens:
+        raise ValueError(
+            "SQL template token mismatch: "
+            f"template={sorted(template_tokens)!r} "
+            f"replacements={sorted(replacement_tokens)!r}"
+        )
+    return SQL_TEMPLATE_TOKEN_RE.sub(
+        lambda match: replacements[match.group(0)],
+        template,
+    )
+
+
 def _sql_string_literal(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -346,6 +365,276 @@ def _source_row_metadata(row: dict[str, Any]) -> dict[str, Any]:
     return _json_object(row.get("metadata_json"))
 
 
+RETEST_RECOVERABLE_SOURCE_STATUSES = frozenset({
+    "",
+    "auth_required",
+    "catalog_in_development",
+    "catalog_public",
+    "valid",
+    "valid_non_fhir",
+})
+RETEST_IMPORTABLE_CLASSIFICATIONS = frozenset({"valid", "valid_non_fhir"})
+RETEST_CREDENTIAL_CLASSIFICATIONS = frozenset({"auth_required"})
+RETEST_CHECKED_CLASSIFICATIONS = (
+    RETEST_IMPORTABLE_CLASSIFICATIONS | RETEST_CREDENTIAL_CLASSIFICATIONS
+)
+
+
+def _empty_retest_source_indexes() -> dict[str, dict[Any, list[dict[str, Any]]]]:
+    return {
+        "current_by_base": {},
+        "redirected_by_base": {},
+        "current_by_org": {},
+        "blocked_by_org": {},
+    }
+
+
+def _append_retest_redirected_base(
+    redirected_by_base: dict[str, list[dict[str, Any]]],
+    source_record_dict: dict[str, Any],
+    raw_base: Any,
+    confirmed_base: str | None,
+) -> None:
+    redirected_base = _canonical_base(raw_base)
+    if redirected_base and confirmed_base and redirected_base != confirmed_base:
+        redirected_by_base.setdefault(redirected_base, []).append(source_record_dict)
+
+
+def _index_retest_source(
+    indexes: dict[str, dict[Any, list[dict[str, Any]]]],
+    source_record_dict: dict[str, Any],
+) -> None:
+    metadata = _source_row_metadata(source_record_dict)
+    source_base = _canonical_base(
+        source_record_dict.get("canonical_api_base") or source_record_dict.get("api_base")
+    )
+    validation_status = (
+        _clean_text(source_record_dict.get("last_validated_status")) or ""
+    ).lower()
+    org_key = _name_key(source_record_dict.get("org_name"))
+    if org_key and metadata.get("provider_directory_blocked"):
+        indexes["blocked_by_org"].setdefault(org_key, []).append(source_record_dict)
+    if source_base and validation_status in RETEST_RECOVERABLE_SOURCE_STATUSES and org_key:
+        indexes["current_by_org"].setdefault(org_key, []).append(source_record_dict)
+    for raw_base in (
+        source_record_dict.get("canonical_api_base"),
+        source_record_dict.get("api_base"),
+        metadata.get("resolved_api_base"),
+    ):
+        base = _canonical_base(raw_base)
+        if base:
+            indexes["current_by_base"].setdefault(base, []).append(source_record_dict)
+    confirmed_base = _canonical_base(
+        metadata.get("provider_directory_confirmed_base") or source_base
+    )
+    redirect_candidates = [
+        metadata.get("provider_directory_previous_api_base")
+        or metadata.get("resolved_api_base_from"),
+        *_list(metadata.get("provider_directory_equivalent_api_bases")),
+        *_list(metadata.get("provider_directory_replaces_stale_generic_api_bases")),
+    ]
+    for raw_base in redirect_candidates:
+        _append_retest_redirected_base(
+            indexes["redirected_by_base"], source_record_dict, raw_base, confirmed_base
+        )
+
+
+def _retest_source_indexes(
+    source_rows: list[dict[str, Any]],
+) -> dict[str, dict[Any, list[dict[str, Any]]]]:
+    indexes = _empty_retest_source_indexes()
+    for source_record_dict in source_rows:
+        _index_retest_source(indexes, source_record_dict)
+    return indexes
+
+
+def _empty_retest_coverage_state() -> dict[str, Any]:
+    return {
+        "classification_counts": {},
+        "coverage_by_status": {
+            "covered_current_base": 0,
+            "covered_by_redirect": 0,
+            "missing": 0,
+        },
+        "coverage_by_category": {
+            "importable_checked_result_count": 0,
+            "importable_covered_count": 0,
+            "importable_missing_result_count": 0,
+            "credential_gated_checked_result_count": 0,
+            "credential_gated_covered_count": 0,
+            "credential_gated_missing_result_count": 0,
+        },
+        "missing_samples": [],
+        "redirected_samples": [],
+        "unchecked_counts": {},
+        "uncovered_clusters": {},
+        "recovered_unchecked_count": 0,
+        "uncovered_unchecked_count": 0,
+        "checked_count": 0,
+        "unique_bases": set(),
+    }
+
+
+def _is_recovered_unchecked_retest(
+    retest_result: dict[str, Any],
+    classification: str,
+    base: str | None,
+    indexes: dict[str, dict[Any, list[dict[str, Any]]]],
+) -> bool:
+    if base and (
+        base in indexes["current_by_base"] or base in indexes["redirected_by_base"]
+    ):
+        return True
+    org_key = _name_key(retest_result.get("org_name"))
+    if org_key in indexes["current_by_org"]:
+        return True
+    return bool(
+        not base
+        and classification == "no_api"
+        and org_key in indexes["blocked_by_org"]
+    )
+
+
+def _append_unique_retest_sample(samples: list[Any], sample: Any, sample_limit: int) -> None:
+    if sample is not None and len(samples) < sample_limit and sample not in samples:
+        samples.append(sample)
+
+
+def _record_unchecked_retest_result(
+    retest_result: dict[str, Any],
+    classification: str,
+    base: str | None,
+    indexes: dict[str, dict[Any, list[dict[str, Any]]]],
+    state: dict[str, Any],
+    sample_limit: int,
+) -> None:
+    unchecked_counts = state["unchecked_counts"]
+    unchecked_counts[classification] = unchecked_counts.get(classification, 0) + 1
+    if _is_recovered_unchecked_retest(retest_result, classification, base, indexes):
+        state["recovered_unchecked_count"] += 1
+        return
+    state["uncovered_unchecked_count"] += 1
+    host = _host_from_base(base or retest_result.get("api_base"))
+    cluster = state["uncovered_clusters"].setdefault(
+        (host, classification),
+        {
+            "source_host": host,
+            "classification": classification,
+            "result_count": 0,
+            "sample_payers": [],
+            "sample_api_bases": [],
+            "sample_status_codes": [],
+        },
+    )
+    cluster["result_count"] += 1
+    payer_label = " / ".join(
+        part
+        for part in (
+            _clean_text(retest_result.get("org_name")),
+            _clean_text(retest_result.get("plan_name")),
+        )
+        if part
+    )
+    if payer_label and len(cluster["sample_payers"]) < sample_limit:
+        cluster["sample_payers"].append(payer_label)
+    sample_api_base = base or retest_result.get("api_base")
+    if sample_api_base:
+        _append_unique_retest_sample(
+            cluster["sample_api_bases"], sample_api_base, sample_limit
+        )
+    _append_unique_retest_sample(
+        cluster["sample_status_codes"], retest_result.get("status_code"), sample_limit
+    )
+
+
+def _record_checked_retest_result(
+    retest_result: dict[str, Any],
+    classification: str,
+    base: str | None,
+    indexes: dict[str, dict[Any, list[dict[str, Any]]]],
+    state: dict[str, Any],
+    sample_limit: int,
+) -> None:
+    state["checked_count"] += 1
+    classification_counts = state["classification_counts"]
+    classification_counts[classification] = classification_counts.get(classification, 0) + 1
+    category = (
+        "credential_gated"
+        if classification in RETEST_CREDENTIAL_CLASSIFICATIONS
+        else "importable"
+    )
+    state["coverage_by_category"][f"{category}_checked_result_count"] += 1
+    if base and base in indexes["current_by_base"]:
+        state["coverage_by_status"]["covered_current_base"] += 1
+        state["coverage_by_category"][f"{category}_covered_count"] += 1
+        return
+    if base and base in indexes["redirected_by_base"]:
+        state["coverage_by_status"]["covered_by_redirect"] += 1
+        state["coverage_by_category"][f"{category}_covered_count"] += 1
+        if len(state["redirected_samples"]) < sample_limit:
+            redirected_source = indexes["redirected_by_base"][base][0]
+            state["redirected_samples"].append(
+                {
+                    "classification": classification,
+                    "org_name": retest_result.get("org_name"),
+                    "api_base": base,
+                    "covered_by_source_id": redirected_source.get("source_id"),
+                    "covered_by_api_base": _canonical_base(
+                        redirected_source.get("canonical_api_base")
+                        or redirected_source.get("api_base")
+                    ),
+                }
+            )
+        return
+    state["coverage_by_status"]["missing"] += 1
+    state["coverage_by_category"][f"{category}_missing_result_count"] += 1
+    if len(state["missing_samples"]) < sample_limit:
+        state["missing_samples"].append(
+            {
+                "classification": classification,
+                "org_name": retest_result.get("org_name"),
+                "api_base": base or retest_result.get("api_base"),
+                "status_code": retest_result.get("status_code"),
+                "payer_id": retest_result.get("payer_id"),
+            }
+        )
+
+
+def _retest_coverage_report(
+    retest_payload: Any,
+    state: dict[str, Any],
+    sample_limit: int,
+) -> dict[str, Any]:
+    coverage_by_status = state["coverage_by_status"]
+    unchecked_counts = state["unchecked_counts"]
+    return {
+        "available": True,
+        "tested_at": retest_payload.get("tested_at") if isinstance(retest_payload, dict) else None,
+        "checked_classifications": sorted(RETEST_CHECKED_CLASSIFICATIONS),
+        "checked_result_count": state["checked_count"],
+        "checked_unique_api_base_count": len(state["unique_bases"]),
+        "classification_counts": state["classification_counts"],
+        **coverage_by_status,
+        **state["coverage_by_category"],
+        "covered_count": coverage_by_status["covered_current_base"]
+        + coverage_by_status["covered_by_redirect"],
+        "missing_result_count": coverage_by_status["missing"],
+        "missing_samples": state["missing_samples"],
+        "redirected_samples": state["redirected_samples"],
+        "unchecked_classification_counts": unchecked_counts,
+        "unchecked_result_count": sum(unchecked_counts.values()),
+        "recovered_unchecked_result_count": state["recovered_unchecked_count"],
+        "uncovered_unchecked_result_count": state["uncovered_unchecked_count"],
+        "uncovered_unchecked_clusters": sorted(
+            state["uncovered_clusters"].values(),
+            key=lambda cluster_record: (
+                -_int(cluster_record.get("result_count")),
+                cluster_record.get("source_host") or "",
+            ),
+        )[:sample_limit],
+    }
+
+
 def _source_catalog_retest_coverage(
     retest_payload: Any,
     source_rows: list[dict[str, Any]],
@@ -360,217 +649,24 @@ def _source_catalog_retest_coverage(
     )
     if not isinstance(retest_results, list):
         return {"available": False, "reason": "invalid retest results payload", "missing_result_count": 0}
-
-    recoverable_source_statuses = {
-        "",
-        "auth_required",
-        "catalog_in_development",
-        "catalog_public",
-        "valid",
-        "valid_non_fhir",
-    }
-    sources_by_current_base: dict[str, list[dict[str, Any]]] = {}
-    sources_by_redirected_base: dict[str, list[dict[str, Any]]] = {}
-    current_sources_by_org_key: dict[str, list[dict[str, Any]]] = {}
-    blocked_sources_by_org_key: dict[str, list[dict[str, Any]]] = {}
-    for source_record_dict in source_rows:
-        metadata = _source_row_metadata(source_record_dict)
-        source_base = _canonical_base(
-            source_record_dict.get("canonical_api_base") or source_record_dict.get("api_base")
-        )
-        validation_status = (
-            _clean_text(source_record_dict.get("last_validated_status")) or ""
-        ).lower()
-        org_key = _name_key(source_record_dict.get("org_name"))
-        if org_key and metadata.get("provider_directory_blocked"):
-            blocked_sources_by_org_key.setdefault(org_key, []).append(source_record_dict)
-        if source_base and validation_status in recoverable_source_statuses:
-            if org_key:
-                current_sources_by_org_key.setdefault(org_key, []).append(source_record_dict)
-        for raw_base in (
-            source_record_dict.get("canonical_api_base"),
-            source_record_dict.get("api_base"),
-            metadata.get("resolved_api_base"),
-        ):
-            base = _canonical_base(raw_base)
-            if base:
-                sources_by_current_base.setdefault(base, []).append(source_record_dict)
-        previous_base = _canonical_base(
-            metadata.get("provider_directory_previous_api_base") or metadata.get("resolved_api_base_from")
-        )
-        confirmed_base = _canonical_base(metadata.get("provider_directory_confirmed_base") or source_base)
-        if previous_base and confirmed_base and previous_base != confirmed_base:
-            sources_by_redirected_base.setdefault(previous_base, []).append(
-                source_record_dict
-            )
-        for equivalent_base_raw in _list(metadata.get("provider_directory_equivalent_api_bases")):
-            equivalent_base = _canonical_base(equivalent_base_raw)
-            if equivalent_base and confirmed_base and equivalent_base != confirmed_base:
-                sources_by_redirected_base.setdefault(equivalent_base, []).append(
-                    source_record_dict
-                )
-        for replaced_base_raw in _list(metadata.get("provider_directory_replaces_stale_generic_api_bases")):
-            replaced_base = _canonical_base(replaced_base_raw)
-            if replaced_base and confirmed_base and replaced_base != confirmed_base:
-                sources_by_redirected_base.setdefault(replaced_base, []).append(
-                    source_record_dict
-                )
-
-    importable_classifications = {"valid", "valid_non_fhir"}
-    credential_gated_classifications = {"auth_required"}
-    checked_classifications = importable_classifications | credential_gated_classifications
-    result_count_by_classification: dict[str, int] = {}
-    coverage_count_by_status = {
-        "covered_current_base": 0,
-        "covered_by_redirect": 0,
-        "missing": 0,
-    }
-    coverage_count_by_category = {
-        "importable_checked_result_count": 0,
-        "importable_covered_count": 0,
-        "importable_missing_result_count": 0,
-        "credential_gated_checked_result_count": 0,
-        "credential_gated_covered_count": 0,
-        "credential_gated_missing_result_count": 0,
-    }
-    missing_samples: list[dict[str, Any]] = []
-    redirected_samples: list[dict[str, Any]] = []
-    unchecked_count_by_classification: dict[str, int] = {}
-    uncovered_unchecked_clusters_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    recovered_unchecked_result_count = 0
-    uncovered_unchecked_result_count = 0
-    checked_result_count = 0
-    unique_bases: set[str] = set()
-
+    indexes = _retest_source_indexes(source_rows)
+    state = _empty_retest_coverage_state()
     for retest_result in retest_results:
         if not isinstance(retest_result, dict):
             continue
         classification = _clean_text(retest_result.get("classification")) or "unknown"
         base = _canonical_base(retest_result.get("api_base"))
         if base:
-            unique_bases.add(base)
-        if classification not in checked_classifications:
-            unchecked_count_by_classification[classification] = (
-                unchecked_count_by_classification.get(classification, 0) + 1
+            state["unique_bases"].add(base)
+        if classification not in RETEST_CHECKED_CLASSIFICATIONS:
+            _record_unchecked_retest_result(
+                retest_result, classification, base, indexes, state, sample_limit
             )
-            if base and (
-                base in sources_by_current_base
-                or base in sources_by_redirected_base
-            ):
-                recovered_unchecked_result_count += 1
-                continue
-            org_key = _name_key(retest_result.get("org_name"))
-            if org_key in current_sources_by_org_key:
-                recovered_unchecked_result_count += 1
-                continue
-            if (
-                not base
-                and classification == "no_api"
-                and org_key in blocked_sources_by_org_key
-            ):
-                recovered_unchecked_result_count += 1
-                continue
-            uncovered_unchecked_result_count += 1
-            host = _host_from_base(base or retest_result.get("api_base"))
-            key = (host, classification)
-            cluster = uncovered_unchecked_clusters_by_key.setdefault(
-                key,
-                {
-                    "source_host": host,
-                    "classification": classification,
-                    "result_count": 0,
-                    "sample_payers": [],
-                    "sample_api_bases": [],
-                    "sample_status_codes": [],
-                },
+        else:
+            _record_checked_retest_result(
+                retest_result, classification, base, indexes, state, sample_limit
             )
-            cluster["result_count"] += 1
-            payer_label = " / ".join(
-                part
-                for part in (
-                    _clean_text(retest_result.get("org_name")),
-                    _clean_text(retest_result.get("plan_name")),
-                )
-                if part
-            )
-            if payer_label and len(cluster["sample_payers"]) < sample_limit:
-                cluster["sample_payers"].append(payer_label)
-            sample_api_base = base or retest_result.get("api_base")
-            if sample_api_base and len(cluster["sample_api_bases"]) < sample_limit:
-                if sample_api_base not in cluster["sample_api_bases"]:
-                    cluster["sample_api_bases"].append(sample_api_base)
-            status_code = retest_result.get("status_code")
-            if status_code is not None and len(cluster["sample_status_codes"]) < sample_limit:
-                if status_code not in cluster["sample_status_codes"]:
-                    cluster["sample_status_codes"].append(status_code)
-            continue
-        checked_result_count += 1
-        result_count_by_classification[classification] = (
-            result_count_by_classification.get(classification, 0) + 1
-        )
-        category = "credential_gated" if classification in credential_gated_classifications else "importable"
-        coverage_count_by_category[f"{category}_checked_result_count"] += 1
-        if base and base in sources_by_current_base:
-            coverage_count_by_status["covered_current_base"] += 1
-            coverage_count_by_category[f"{category}_covered_count"] += 1
-            continue
-        if base and base in sources_by_redirected_base:
-            coverage_count_by_status["covered_by_redirect"] += 1
-            coverage_count_by_category[f"{category}_covered_count"] += 1
-            if len(redirected_samples) < sample_limit:
-                redirected_source = sources_by_redirected_base[base][0]
-                redirected_samples.append(
-                    {
-                        "classification": classification,
-                        "org_name": retest_result.get("org_name"),
-                        "api_base": base,
-                        "covered_by_source_id": redirected_source.get("source_id"),
-                        "covered_by_api_base": _canonical_base(
-                            redirected_source.get("canonical_api_base") or redirected_source.get("api_base")
-                        ),
-                    }
-                )
-            continue
-        coverage_count_by_status["missing"] += 1
-        coverage_count_by_category[f"{category}_missing_result_count"] += 1
-        if len(missing_samples) < sample_limit:
-            missing_samples.append(
-                {
-                    "classification": classification,
-                    "org_name": retest_result.get("org_name"),
-                    "api_base": base or retest_result.get("api_base"),
-                    "status_code": retest_result.get("status_code"),
-                    "payer_id": retest_result.get("payer_id"),
-                }
-            )
-
-    return {
-        "available": True,
-        "tested_at": retest_payload.get("tested_at") if isinstance(retest_payload, dict) else None,
-        "checked_classifications": sorted(checked_classifications),
-        "checked_result_count": checked_result_count,
-        "checked_unique_api_base_count": len(unique_bases),
-        "classification_counts": result_count_by_classification,
-        **coverage_count_by_status,
-        **coverage_count_by_category,
-        "covered_count": coverage_count_by_status["covered_current_base"]
-        + coverage_count_by_status["covered_by_redirect"],
-        "missing_result_count": coverage_count_by_status["missing"],
-        "missing_samples": missing_samples,
-        "redirected_samples": redirected_samples,
-        "unchecked_classification_counts": unchecked_count_by_classification,
-        "unchecked_result_count": sum(unchecked_count_by_classification.values()),
-        "recovered_unchecked_result_count": recovered_unchecked_result_count,
-        "uncovered_unchecked_result_count": uncovered_unchecked_result_count,
-        "uncovered_unchecked_clusters": sorted(
-            uncovered_unchecked_clusters_by_key.values(),
-            key=lambda cluster_record: (
-                -_int(cluster_record.get("result_count")),
-                cluster_record.get("source_host") or "",
-            ),
-        )[:sample_limit],
-    }
-
+    return _retest_coverage_report(retest_payload, state, sample_limit)
 
 async def _source_catalog_retest_coverage_from_path(
     conn: asyncpg.Connection,
@@ -1085,20 +1181,7 @@ async def _probe_timeout_summary(
     }
 
 
-async def _credential_onboarding_backlog(
-    conn: asyncpg.Connection,
-    schema: str,
-    *,
-    sample_limit: int,
-    credential_config_file: str | None = None,
-) -> dict[str, Any]:
-    """Summarize sources blocked on endpoint discovery or credentials."""
-    if not await _has_relation(conn, schema, "provider_directory_source"):
-        return {"available": False, "blocked_source_count": 0, "groups": []}
-    gateway_hosts = _sql_string_array(FHIR_ONBOARDING_GATEWAY_HOSTS)
-    credential_markers = _sql_string_array(FHIR_CREDENTIAL_AUTH_MARKERS)
-    backlog_rows = await conn.fetch(
-        f"""
+_CREDENTIAL_BACKLOG_SQL_TEMPLATE = """
         WITH src AS (
             SELECT source_id,
                    org_name,
@@ -1120,19 +1203,19 @@ async def _credential_onboarding_backlog(
                        '/',
                        1
                    ) AS source_host
-              FROM {_qt(schema, "provider_directory_source")}
+              FROM __SOURCE_TABLE__
         ),
         blocked AS (
             SELECT *,
                    CASE
                        WHEN effective_probe_status = 'auth_required' THEN 'auth_required'
                        WHEN effective_probe_status = 'valid_non_fhir'
-                            AND source_host = ANY({gateway_hosts})
+                            AND source_host = ANY(__GATEWAY_HOSTS__)
                            THEN 'onboarding_gateway'
                        WHEN effective_probe_status = 'valid_non_fhir'
                             AND EXISTS (
                                 SELECT 1
-                                  FROM unnest({credential_markers}) AS marker(value)
+                                  FROM unnest(__CREDENTIAL_MARKERS__) AS marker(value)
                                  WHERE auth_type_norm LIKE '%' || marker.value || '%'
                             )
                            THEN 'credentialed_non_fhir'
@@ -1143,10 +1226,10 @@ async def _credential_onboarding_backlog(
                 OR (
                     effective_probe_status = 'valid_non_fhir'
                     AND (
-                        source_host = ANY({gateway_hosts})
+                        source_host = ANY(__GATEWAY_HOSTS__)
                         OR EXISTS (
                             SELECT 1
-                              FROM unnest({credential_markers}) AS marker(value)
+                              FROM unnest(__CREDENTIAL_MARKERS__) AS marker(value)
                              WHERE auth_type_norm LIKE '%' || marker.value || '%'
                         )
                     )
@@ -1169,261 +1252,369 @@ async def _credential_onboarding_backlog(
           FROM blocked
          ORDER BY lower(org_name), lower(coalesce(plan_name, '')), source_id
         """
+
+
+def _credential_backlog_sql(schema: str) -> str:
+    return _render_sql_template(
+        _CREDENTIAL_BACKLOG_SQL_TEMPLATE,
+        {
+            "__SOURCE_TABLE__": _qt(schema, "provider_directory_source"),
+            "__GATEWAY_HOSTS__": _sql_string_array(FHIR_ONBOARDING_GATEWAY_HOSTS),
+            "__CREDENTIAL_MARKERS__": _sql_string_array(FHIR_CREDENTIAL_AUTH_MARKERS),
+        },
     )
-    credentials_config, config_source = _load_credentials_config(
-        credential_config_file=credential_config_file
+
+
+def _credential_backlog_group_record(key: tuple[str, str, str, str]) -> dict[str, Any]:
+    return {
+        "source_host": key[0],
+        "probe_status": key[1],
+        "auth_type": key[2],
+        "reason": key[3],
+        "source_count": 0,
+        "credential_configured_source_count": 0,
+        "credential_config_missing_source_count": 0,
+        "credential_secret_ready_source_count": 0,
+        "credential_secret_missing_source_count": 0,
+        "credential_rule_candidate_source_count": 0,
+        "endpoint_discovery_needed_source_count": 0,
+        "regulated_market_source_count": 0,
+        "medicare_advantage_source_count": 0,
+        "medicaid_mco_source_count": 0,
+        "chip_source_count": 0,
+        "qhp_source_count": 0,
+        "sample_payers": [],
+        "sample_missing_credential_payers": [],
+        "sample_missing_secret_payers": [],
+        "sample_missing_secret_env_vars": [],
+        "sample_source_ids": [],
+        "sample_api_bases": [],
+        "sample_sources": [],
+        "sample_missing_credential_sources": [],
+        "sample_missing_secret_sources": [],
+        "sample_endpoint_discovery_sources": [],
+        "_api_bases_seen": set(),
+        "_api_base_targets": {},
+    }
+
+
+def _credential_api_base_target_record(api_base: str) -> dict[str, Any]:
+    return {
+        "api_base": api_base,
+        "source_count": 0,
+        "credential_configured_source_count": 0,
+        "credential_config_missing_source_count": 0,
+        "credential_secret_ready_source_count": 0,
+        "credential_secret_missing_source_count": 0,
+        "credential_rule_candidate_source_count": 0,
+        "endpoint_discovery_needed_source_count": 0,
+        "regulated_market_source_count": 0,
+        "medicare_advantage_source_count": 0,
+        "medicaid_mco_source_count": 0,
+        "chip_source_count": 0,
+        "qhp_source_count": 0,
+        "sample_payers": [],
+        "sample_source_ids": [],
+        "sample_missing_credential_payers": [],
+        "sample_missing_secret_payers": [],
+        "sample_missing_secret_env_vars": [],
+        "sample_sources": [],
+        "sample_missing_credential_sources": [],
+        "sample_missing_secret_sources": [],
+        "sample_endpoint_discovery_sources": [],
+    }
+
+
+def _increment_credential_market_counts(
+    bucket: dict[str, Any], source_record_dict: dict[str, Any]
+) -> None:
+    market_fields = (
+        "is_medicare_advantage",
+        "is_medicaid_mco",
+        "is_chip",
+        "is_qhp",
     )
-    groups_by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    configured_source_count = 0
-    missing_source_count = 0
-    secret_ready_source_count = 0
-    secret_missing_source_count = 0
-    missing_secret_env_vars: set[str] = set()
-    for backlog_row in backlog_rows:
-        source_record_dict = dict(backlog_row)
-        key = (
-            str(source_record_dict.get("source_host") or "(missing host)"),
-            str(source_record_dict.get("probe_status") or ""),
-            str(source_record_dict.get("auth_type") or ""),
-            str(source_record_dict.get("reason") or ""),
+    if any(source_record_dict.get(field) is True for field in market_fields):
+        bucket["regulated_market_source_count"] += 1
+    for field, count_key in (
+        ("is_medicare_advantage", "medicare_advantage_source_count"),
+        ("is_medicaid_mco", "medicaid_mco_source_count"),
+        ("is_chip", "chip_source_count"),
+        ("is_qhp", "qhp_source_count"),
+    ):
+        if source_record_dict.get(field) is True:
+            bucket[count_key] += 1
+
+
+def _record_credential_bucket_source(
+    bucket: dict[str, Any],
+    source_record_dict: dict[str, Any],
+    payer_label: str,
+    *,
+    is_endpoint_discovery_needed: bool,
+    sample_limit: int,
+) -> None:
+    bucket["source_count"] += 1
+    _increment_credential_market_counts(bucket, source_record_dict)
+    split_key = (
+        "endpoint_discovery_needed_source_count"
+        if is_endpoint_discovery_needed
+        else "credential_rule_candidate_source_count"
+    )
+    bucket[split_key] += 1
+    if len(bucket["sample_payers"]) < sample_limit:
+        bucket["sample_payers"].append(payer_label or source_record_dict.get("source_id"))
+    if source_record_dict.get("source_id") and len(bucket["sample_source_ids"]) < sample_limit:
+        bucket["sample_source_ids"].append(source_record_dict.get("source_id"))
+
+
+def _credential_group_and_target(
+    groups_by_key: dict[tuple[str, str, str, str], dict[str, Any]],
+    source_record_dict: dict[str, Any],
+    payer_label: str,
+    api_base: str | None,
+    *,
+    is_endpoint_discovery_needed: bool,
+    sample_limit: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    key = (
+        str(source_record_dict.get("source_host") or "(missing host)"),
+        str(source_record_dict.get("probe_status") or ""),
+        str(source_record_dict.get("auth_type") or ""),
+        str(source_record_dict.get("reason") or ""),
+    )
+    group = groups_by_key.setdefault(key, _credential_backlog_group_record(key))
+    _record_credential_bucket_source(
+        group,
+        source_record_dict,
+        payer_label,
+        is_endpoint_discovery_needed=is_endpoint_discovery_needed,
+        sample_limit=sample_limit,
+    )
+    api_base_target = None
+    if api_base:
+        group["_api_bases_seen"].add(api_base)
+        api_base_target = group["_api_base_targets"].setdefault(
+            api_base, _credential_api_base_target_record(api_base)
         )
-        group = groups_by_key.setdefault(
-            key,
-            {
-                "source_host": key[0],
-                "probe_status": key[1],
-                "auth_type": key[2],
-                "reason": key[3],
-                "source_count": 0,
-                "credential_configured_source_count": 0,
-                "credential_config_missing_source_count": 0,
-                "credential_secret_ready_source_count": 0,
-                "credential_secret_missing_source_count": 0,
-                "credential_rule_candidate_source_count": 0,
-                "endpoint_discovery_needed_source_count": 0,
-                "regulated_market_source_count": 0,
-                "medicare_advantage_source_count": 0,
-                "medicaid_mco_source_count": 0,
-                "chip_source_count": 0,
-                "qhp_source_count": 0,
-                "sample_payers": [],
-                "sample_missing_credential_payers": [],
-                "sample_missing_secret_payers": [],
-                "sample_missing_secret_env_vars": [],
-                "sample_source_ids": [],
-                "sample_api_bases": [],
-                "sample_sources": [],
-                "sample_missing_credential_sources": [],
-                "sample_missing_secret_sources": [],
-                "sample_endpoint_discovery_sources": [],
-                "_api_bases_seen": set(),
-                "_api_base_targets": {},
-            },
-        )
-        payer_label = " / ".join(
-            part
-            for part in (
-                _clean_text(source_record_dict.get("org_name")),
-                _clean_text(source_record_dict.get("plan_name")),
-            )
-            if part
-        )
-        group["source_count"] += 1
-        if any(
-            source_record_dict.get(field) is True
-            for field in ("is_medicare_advantage", "is_medicaid_mco", "is_chip", "is_qhp")
-        ):
-            group["regulated_market_source_count"] += 1
-        if source_record_dict.get("is_medicare_advantage") is True:
-            group["medicare_advantage_source_count"] += 1
-        if source_record_dict.get("is_medicaid_mco") is True:
-            group["medicaid_mco_source_count"] += 1
-        if source_record_dict.get("is_chip") is True:
-            group["chip_source_count"] += 1
-        if source_record_dict.get("is_qhp") is True:
-            group["qhp_source_count"] += 1
-        if len(group["sample_payers"]) < sample_limit:
-            group["sample_payers"].append(
-                payer_label or source_record_dict.get("source_id")
-            )
-        if (
-            len(group["sample_source_ids"]) < sample_limit
-            and source_record_dict.get("source_id")
-        ):
-            group["sample_source_ids"].append(source_record_dict.get("source_id"))
-        api_base = _canonical_base(
-            source_record_dict.get("canonical_api_base") or source_record_dict.get("api_base")
-        )
-        is_endpoint_discovery_needed = _is_credential_backlog_endpoint_discovery_needed(
+        _record_credential_bucket_source(
+            api_base_target,
             source_record_dict,
-            api_base=api_base,
+            payer_label,
+            is_endpoint_discovery_needed=is_endpoint_discovery_needed,
+            sample_limit=sample_limit,
         )
-        if is_endpoint_discovery_needed:
-            group["endpoint_discovery_needed_source_count"] += 1
-        else:
-            group["credential_rule_candidate_source_count"] += 1
-        api_base_target: dict[str, Any] | None = None
-        if api_base:
-            group["_api_bases_seen"].add(api_base)
-            api_base_target = group["_api_base_targets"].setdefault(
-                api_base,
-                {
-                    "api_base": api_base,
-                    "source_count": 0,
-                    "credential_configured_source_count": 0,
-                    "credential_config_missing_source_count": 0,
-                    "credential_secret_ready_source_count": 0,
-                    "credential_secret_missing_source_count": 0,
-                    "credential_rule_candidate_source_count": 0,
-                    "endpoint_discovery_needed_source_count": 0,
-                    "regulated_market_source_count": 0,
-                    "medicare_advantage_source_count": 0,
-                    "medicaid_mco_source_count": 0,
-                    "chip_source_count": 0,
-                    "qhp_source_count": 0,
-                    "sample_payers": [],
-                    "sample_source_ids": [],
-                    "sample_missing_credential_payers": [],
-                    "sample_missing_secret_payers": [],
-                    "sample_missing_secret_env_vars": [],
-                    "sample_sources": [],
-                    "sample_missing_credential_sources": [],
-                    "sample_missing_secret_sources": [],
-                    "sample_endpoint_discovery_sources": [],
-                },
-            )
-            api_base_target["source_count"] += 1
-            if is_endpoint_discovery_needed:
-                api_base_target["endpoint_discovery_needed_source_count"] += 1
-            else:
-                api_base_target["credential_rule_candidate_source_count"] += 1
-            if any(
-                source_record_dict.get(field) is True
-                for field in ("is_medicare_advantage", "is_medicaid_mco", "is_chip", "is_qhp")
-            ):
-                api_base_target["regulated_market_source_count"] += 1
-            if source_record_dict.get("is_medicare_advantage") is True:
-                api_base_target["medicare_advantage_source_count"] += 1
-            if source_record_dict.get("is_medicaid_mco") is True:
-                api_base_target["medicaid_mco_source_count"] += 1
-            if source_record_dict.get("is_chip") is True:
-                api_base_target["chip_source_count"] += 1
-            if source_record_dict.get("is_qhp") is True:
-                api_base_target["qhp_source_count"] += 1
-            if len(api_base_target["sample_payers"]) < sample_limit:
-                api_base_target["sample_payers"].append(
-                    payer_label or source_record_dict.get("source_id")
-                )
-            if (
-                source_record_dict.get("source_id")
-                and len(api_base_target["sample_source_ids"]) < sample_limit
-            ):
-                api_base_target["sample_source_ids"].append(
-                    source_record_dict.get("source_id")
-                )
-        if api_base and len(group["sample_api_bases"]) < sample_limit and api_base not in group["sample_api_bases"]:
+        if len(group["sample_api_bases"]) < sample_limit and api_base not in group["sample_api_bases"]:
             group["sample_api_bases"].append(api_base)
-        source_sample = _credential_source_sample(
-            source_record_dict,
-            payer_label=payer_label,
-            api_base=api_base,
+    return group, api_base_target
+
+
+def _record_credential_source_samples(
+    group: dict[str, Any],
+    api_base_target: dict[str, Any] | None,
+    source_sample: dict[str, Any],
+    *,
+    is_endpoint_discovery_needed: bool,
+    sample_limit: int,
+) -> None:
+    _append_unique_source_sample(group["sample_sources"], source_sample, limit=sample_limit)
+    if api_base_target is not None:
+        _append_unique_source_sample(
+            api_base_target["sample_sources"], source_sample, limit=sample_limit
         )
-        _append_unique_source_sample(group["sample_sources"], source_sample, limit=sample_limit)
+    if not is_endpoint_discovery_needed:
+        return
+    _append_unique_source_sample(
+        group["sample_endpoint_discovery_sources"], source_sample, limit=sample_limit
+    )
+    if api_base_target is not None:
+        _append_unique_source_sample(
+            api_base_target["sample_endpoint_discovery_sources"],
+            source_sample,
+            limit=sample_limit,
+        )
+
+
+def _append_missing_credential_samples(
+    bucket: dict[str, Any] | None,
+    payer_label: str,
+    source_id: Any,
+    source_sample: dict[str, Any],
+    *,
+    sample_limit: int,
+) -> None:
+    if bucket is None:
+        return
+    if len(bucket["sample_missing_credential_payers"]) < sample_limit:
+        bucket["sample_missing_credential_payers"].append(payer_label or source_id)
+    _append_unique_source_sample(
+        bucket["sample_missing_credential_sources"], source_sample, limit=sample_limit
+    )
+
+
+def _record_missing_credential_config(
+    state: dict[str, Any],
+    group: dict[str, Any],
+    api_base_target: dict[str, Any] | None,
+    source_record_dict: dict[str, Any],
+    payer_label: str,
+    source_sample: dict[str, Any],
+    *,
+    sample_limit: int,
+) -> None:
+    state["missing_source_count"] += 1
+    group["credential_config_missing_source_count"] += 1
+    if api_base_target is not None:
+        api_base_target["credential_config_missing_source_count"] += 1
+    for bucket in (group, api_base_target):
+        _append_missing_credential_samples(
+            bucket,
+            payer_label,
+            source_record_dict.get("source_id"),
+            source_sample,
+            sample_limit=sample_limit,
+        )
+
+
+def _append_missing_secret_samples(
+    bucket: dict[str, Any] | None,
+    missing_env_refs: list[str],
+    payer_label: str,
+    source_id: Any,
+    source_sample: dict[str, Any],
+    *,
+    sample_limit: int,
+) -> None:
+    if bucket is None:
+        return
+    for env_name in missing_env_refs:
+        if len(bucket["sample_missing_secret_env_vars"]) < sample_limit and env_name not in bucket["sample_missing_secret_env_vars"]:
+            bucket["sample_missing_secret_env_vars"].append(env_name)
+    if len(bucket["sample_missing_secret_payers"]) < sample_limit:
+        bucket["sample_missing_secret_payers"].append(payer_label or source_id)
+    _append_unique_source_sample(
+        bucket["sample_missing_secret_sources"], source_sample, limit=sample_limit
+    )
+
+
+def _record_configured_credential(
+    state: dict[str, Any],
+    group: dict[str, Any],
+    api_base_target: dict[str, Any] | None,
+    source_record_dict: dict[str, Any],
+    payer_label: str,
+    source_sample: dict[str, Any],
+    credential_spec: dict[str, Any],
+    *,
+    sample_limit: int,
+) -> None:
+    state["configured_source_count"] += 1
+    group["credential_configured_source_count"] += 1
+    if api_base_target is not None:
+        api_base_target["credential_configured_source_count"] += 1
+    secret_status = _credential_secret_status(credential_spec)
+    if secret_status["ready"]:
+        state["secret_ready_source_count"] += 1
+        group["credential_secret_ready_source_count"] += 1
         if api_base_target is not None:
-            _append_unique_source_sample(api_base_target["sample_sources"], source_sample, limit=sample_limit)
-        if is_endpoint_discovery_needed:
-            _append_unique_source_sample(group["sample_endpoint_discovery_sources"], source_sample, limit=sample_limit)
-            if api_base_target is not None:
-                _append_unique_source_sample(
-                    api_base_target["sample_endpoint_discovery_sources"],
-                    source_sample,
-                    limit=sample_limit,
-                )
-
-        credential_spec = _credential_spec_for_source(
-            source_record_dict,
-            credentials_config,
+            api_base_target["credential_secret_ready_source_count"] += 1
+        return
+    state["secret_missing_source_count"] += 1
+    state["missing_secret_env_vars"].update(secret_status["missing_env_refs"])
+    group["credential_secret_missing_source_count"] += 1
+    if api_base_target is not None:
+        api_base_target["credential_secret_missing_source_count"] += 1
+    for bucket in (group, api_base_target):
+        _append_missing_secret_samples(
+            bucket,
+            secret_status["missing_env_refs"],
+            payer_label,
+            source_record_dict.get("source_id"),
+            source_sample,
+            sample_limit=sample_limit,
         )
-        if _has_credential_spec_material(credential_spec):
-            configured_source_count += 1
-            group["credential_configured_source_count"] += 1
-            if api_base_target is not None:
-                api_base_target["credential_configured_source_count"] += 1
-            secret_status = _credential_secret_status(credential_spec)
-            if secret_status["ready"]:
-                secret_ready_source_count += 1
-                group["credential_secret_ready_source_count"] += 1
-                if api_base_target is not None:
-                    api_base_target["credential_secret_ready_source_count"] += 1
-            else:
-                secret_missing_source_count += 1
-                group["credential_secret_missing_source_count"] += 1
-                if api_base_target is not None:
-                    api_base_target["credential_secret_missing_source_count"] += 1
-                missing_secret_env_vars.update(secret_status["missing_env_refs"])
-                for env_name in secret_status["missing_env_refs"]:
-                    if len(group["sample_missing_secret_env_vars"]) < sample_limit and env_name not in group["sample_missing_secret_env_vars"]:
-                        group["sample_missing_secret_env_vars"].append(env_name)
-                    if (
-                        api_base_target is not None
-                        and len(api_base_target["sample_missing_secret_env_vars"]) < sample_limit
-                        and env_name not in api_base_target["sample_missing_secret_env_vars"]
-                    ):
-                        api_base_target["sample_missing_secret_env_vars"].append(env_name)
-                if len(group["sample_missing_secret_payers"]) < sample_limit:
-                    group["sample_missing_secret_payers"].append(
-                        payer_label or source_record_dict.get("source_id")
-                    )
-                if api_base_target is not None and len(api_base_target["sample_missing_secret_payers"]) < sample_limit:
-                    api_base_target["sample_missing_secret_payers"].append(
-                        payer_label or source_record_dict.get("source_id")
-                    )
-                _append_unique_source_sample(group["sample_missing_secret_sources"], source_sample, limit=sample_limit)
-                if api_base_target is not None:
-                    _append_unique_source_sample(
-                        api_base_target["sample_missing_secret_sources"],
-                        source_sample,
-                        limit=sample_limit,
-                    )
-        else:
-            missing_source_count += 1
-            group["credential_config_missing_source_count"] += 1
-            if api_base_target is not None:
-                api_base_target["credential_config_missing_source_count"] += 1
-            if len(group["sample_missing_credential_payers"]) < sample_limit:
-                group["sample_missing_credential_payers"].append(
-                    payer_label or source_record_dict.get("source_id")
-                )
-            if api_base_target is not None and len(api_base_target["sample_missing_credential_payers"]) < sample_limit:
-                api_base_target["sample_missing_credential_payers"].append(
-                    payer_label or source_record_dict.get("source_id")
-                )
-            _append_unique_source_sample(group["sample_missing_credential_sources"], source_sample, limit=sample_limit)
-            if api_base_target is not None:
-                _append_unique_source_sample(
-                    api_base_target["sample_missing_credential_sources"],
-                    source_sample,
-                    limit=sample_limit,
-                )
 
+
+def _record_credential_backlog_source(
+    state: dict[str, Any],
+    source_record_dict: dict[str, Any],
+    credentials_config: dict[str, Any],
+    *,
+    sample_limit: int,
+) -> None:
+    payer_label = " / ".join(
+        part
+        for part in (
+            _clean_text(source_record_dict.get("org_name")),
+            _clean_text(source_record_dict.get("plan_name")),
+        )
+        if part
+    )
+    api_base = _canonical_base(
+        source_record_dict.get("canonical_api_base") or source_record_dict.get("api_base")
+    )
+    is_endpoint_discovery_needed = _is_credential_backlog_endpoint_discovery_needed(
+        source_record_dict, api_base=api_base
+    )
+    group, api_base_target = _credential_group_and_target(
+        state["groups_by_key"],
+        source_record_dict,
+        payer_label,
+        api_base,
+        is_endpoint_discovery_needed=is_endpoint_discovery_needed,
+        sample_limit=sample_limit,
+    )
+    source_sample = _credential_source_sample(source_record_dict, payer_label=payer_label, api_base=api_base)
+    _record_credential_source_samples(
+        group,
+        api_base_target,
+        source_sample,
+        is_endpoint_discovery_needed=is_endpoint_discovery_needed,
+        sample_limit=sample_limit,
+    )
+    credential_spec = _credential_spec_for_source(source_record_dict, credentials_config)
+    if _has_credential_spec_material(credential_spec):
+        _record_configured_credential(
+            state,
+            group,
+            api_base_target,
+            source_record_dict,
+            payer_label,
+            source_sample,
+            credential_spec,
+            sample_limit=sample_limit,
+        )
+    else:
+        _record_missing_credential_config(
+            state,
+            group,
+            api_base_target,
+            source_record_dict,
+            payer_label,
+            source_sample,
+            sample_limit=sample_limit,
+        )
+
+
+def _prepared_credential_groups(
+    groups_by_key: dict[tuple[str, str, str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
     prepared_groups = []
     for group in groups_by_key.values():
         api_base_count = len(group.pop("_api_bases_seen", set()))
         sample_api_base_count = len(group.get("sample_api_bases") or [])
-        api_base_targets = sorted(
+        group["api_base_count"] = api_base_count
+        group["sample_api_base_count"] = sample_api_base_count
+        group["api_base_sample_complete"] = sample_api_base_count >= api_base_count
+        group["api_base_targets"] = sorted(
             group.pop("_api_base_targets", {}).values(),
             key=lambda api_base_target_record: (
                 -_int(api_base_target_record.get("source_count")),
                 str(api_base_target_record.get("api_base")),
             ),
         )
-        group["api_base_count"] = api_base_count
-        group["sample_api_base_count"] = sample_api_base_count
-        group["api_base_sample_complete"] = sample_api_base_count >= api_base_count
-        group["api_base_targets"] = api_base_targets
         prepared_groups.append(group)
-
-    groups = sorted(
+    return sorted(
         prepared_groups,
         key=lambda group: (
             -_int(group.get("source_count")),
@@ -1433,26 +1624,65 @@ async def _credential_onboarding_backlog(
             str(group.get("reason")),
         ),
     )
+
+
+def _credential_backlog_report(
+    backlog_rows: list[Any],
+    credentials_config: dict[str, Any],
+    config_source: str | None,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    groups = _prepared_credential_groups(state["groups_by_key"])
     return {
         "available": True,
         "blocked_source_count": len(backlog_rows),
         "credential_config_available": bool(credentials_config),
         "credential_config_source": config_source,
-        "credential_configured_source_count": configured_source_count,
-        "credential_config_missing_source_count": missing_source_count,
-        "credential_secret_ready_source_count": secret_ready_source_count,
-        "credential_secret_missing_source_count": secret_missing_source_count,
+        "credential_configured_source_count": state["configured_source_count"],
+        "credential_config_missing_source_count": state["missing_source_count"],
+        "credential_secret_ready_source_count": state["secret_ready_source_count"],
+        "credential_secret_missing_source_count": state["secret_missing_source_count"],
         "credential_rule_candidate_source_count": sum(
             _int(group.get("credential_rule_candidate_source_count")) for group in groups
         ),
         "endpoint_discovery_needed_source_count": sum(
             _int(group.get("endpoint_discovery_needed_source_count")) for group in groups
         ),
-        "credential_missing_secret_env_vars": sorted(missing_secret_env_vars),
+        "credential_missing_secret_env_vars": sorted(state["missing_secret_env_vars"]),
         "group_count": len(groups),
         "groups": groups,
     }
 
+
+async def _credential_onboarding_backlog(
+    conn: asyncpg.Connection,
+    schema: str,
+    *,
+    sample_limit: int,
+    credential_config_file: str | None = None,
+) -> dict[str, Any]:
+    """Summarize sources blocked on endpoint discovery or credentials."""
+    if not await _has_relation(conn, schema, "provider_directory_source"):
+        return {"available": False, "blocked_source_count": 0, "groups": []}
+    backlog_rows = await conn.fetch(_credential_backlog_sql(schema))
+    credentials_config, config_source = _load_credentials_config(
+        credential_config_file=credential_config_file
+    )
+    state_dict = {
+        "groups_by_key": {},
+        "configured_source_count": 0,
+        "missing_source_count": 0,
+        "secret_ready_source_count": 0,
+        "secret_missing_source_count": 0,
+        "missing_secret_env_vars": set(),
+    }
+    for backlog_row in backlog_rows:
+        _record_credential_backlog_source(
+            state_dict, dict(backlog_row), credentials_config, sample_limit=sample_limit
+        )
+    return _credential_backlog_report(
+        backlog_rows, credentials_config, config_source, state_dict
+    )
 
 def _suggested_credential_rule(source_host: str | None) -> dict[str, Any] | None:
     if source_host and source_host != "(missing host)":
@@ -2480,95 +2710,16 @@ async def _unified_summary(
     return unified_summary
 
 
-async def _source_resource_coverage_summary(
-    conn: asyncpg.Connection,
-    schema: str,
-    *,
-    sample_limit: int,
-    include_unified: bool,
-) -> dict[str, Any]:
-    """Compare source catalog coverage with materialized resource rows."""
-    if not await _has_relation(conn, schema, "provider_directory_source"):
-        return {"available": False, "samples": []}
-
-    resource_tables = [
-        table
-        for table in PROVIDER_DIRECTORY_RESOURCE_TABLES
-        if await _has_relation(conn, schema, table)
-    ]
-    metadata_summary = await _resource_import_metadata_summary(conn, schema)
-    if metadata_summary:
-        resource_source_union = f"""
-            SELECT DISTINCT src.source_id::varchar AS source_id
-              FROM {_qt(schema, "provider_directory_source")} AS src
-              CROSS JOIN LATERAL jsonb_each(
-                    COALESCE(
-                        src.metadata_json::jsonb #> '{{last_resource_import,resources}}',
-                        '{{}}'::jsonb
-                    )
-              ) AS resource(key, value)
-             WHERE COALESCE(NULLIF(resource.value->>'rows_written', ''), '0')::bigint > 0
-        """
-    else:
-        resource_source_union = (
-            " UNION ".join(
-                f"SELECT DISTINCT source_id::varchar AS source_id FROM {_qt(schema, table)}"
-                for table in resource_tables
-            )
-            if resource_tables
-            else "SELECT NULL::varchar AS source_id WHERE false"
-        )
-
-    has_location = await _has_relation(conn, schema, "provider_directory_location")
-    has_location_address_key = has_location and await _has_column(
-        conn,
-        schema,
-        "provider_directory_location",
-        "address_key",
-    )
-    has_organization = await _has_relation(conn, schema, "provider_directory_organization")
-    has_organization_address_json = has_organization and await _has_column(
-        conn,
-        schema,
-        "provider_directory_organization",
-        "address_json",
-    )
-    has_healthcare_service = await _has_relation(
-        conn,
-        schema,
-        "provider_directory_healthcare_service",
-    )
-    has_unified = (
-        include_unified
-        and await _has_relation(conn, schema, "entity_address_unified")
-        and await _has_column(conn, schema, "entity_address_unified", "address_sources")
-        and await _has_column(conn, schema, "entity_address_unified", "source_record_ids")
-    )
-    has_unified_address_key = has_unified and await _has_column(
-        conn,
-        schema,
-        "entity_address_unified",
-        "address_key",
-    )
-    has_unified_phone = has_unified and await _has_column(
-        conn,
-        schema,
-        "entity_address_unified",
-        "telephone_number",
-    )
-    if metadata_summary:
-        coverage_summary = await _fetch_mapping(
-            conn,
-            f"""
+_METADATA_RESOURCE_COVERAGE_SQL_TEMPLATE = """
             WITH resource_diagnostics AS (
                 SELECT src.source_id,
                        resource.key AS resource_type,
                        COALESCE(NULLIF(resource.value->>'rows_written', ''), '0')::bigint AS rows_written
-                  FROM {_qt(schema, "provider_directory_source")} AS src
+                  FROM __SOURCE_TABLE__ AS src
                   CROSS JOIN LATERAL jsonb_each(
                         COALESCE(
-                            src.metadata_json::jsonb #> '{{last_resource_import,resources}}',
-                            '{{}}'::jsonb
+                            src.metadata_json::jsonb #> '{last_resource_import,resources}',
+                            '{}'::jsonb
                         )
                   ) AS resource(key, value)
             ),
@@ -2578,7 +2729,7 @@ async def _source_resource_coverage_summary(
                        sum(resource_diagnostics.rows_written) FILTER (
                            WHERE resource_diagnostics.resource_type = 'Location'
                        ) AS location_rows
-                  FROM {_qt(schema, "provider_directory_source")} AS src
+                  FROM __SOURCE_TABLE__ AS src
                   LEFT JOIN resource_diagnostics
                     ON resource_diagnostics.source_id = src.source_id
                  GROUP BY src.source_id
@@ -2592,18 +2743,17 @@ async def _source_resource_coverage_summary(
                        AS sources_with_location_rows,
                    sum(COALESCE(location_rows, 0))::bigint AS location_rows
               FROM source_context
-            """,
-        )
-        sample_catalog_only = await conn.fetch(
-            f"""
+            """
+
+_METADATA_CATALOG_ONLY_SQL_TEMPLATE = """
             WITH resource_diagnostics AS (
                 SELECT src.source_id,
                        COALESCE(NULLIF(resource.value->>'rows_written', ''), '0')::bigint AS rows_written
-                  FROM {_qt(schema, "provider_directory_source")} AS src
+                  FROM __SOURCE_TABLE__ AS src
                   CROSS JOIN LATERAL jsonb_each(
                         COALESCE(
-                            src.metadata_json::jsonb #> '{{last_resource_import,resources}}',
-                            '{{}}'::jsonb
+                            src.metadata_json::jsonb #> '{last_resource_import,resources}',
+                            '{}'::jsonb
                         )
                   ) AS resource(key, value)
             ),
@@ -2620,70 +2770,427 @@ async def _source_resource_coverage_summary(
                    src.last_probe_status,
                    src.last_validated_status,
                    src.auth_type
-              FROM {_qt(schema, "provider_directory_source")} AS src
+              FROM __SOURCE_TABLE__ AS src
               LEFT JOIN resource_sources
                 ON resource_sources.source_id = src.source_id
              WHERE resource_sources.source_id IS NULL
              ORDER BY lower(src.org_name), lower(coalesce(src.plan_name, '')), src.source_id
              LIMIT $1
-            """,
-            sample_limit,
-        )
-        coverage_summary["available"] = True
-        coverage_summary["summary_source"] = (
-            "provider_directory_source.metadata_json.last_resource_import"
-        )
-        coverage_summary["projection_counts_exact"] = False
-        source_count = _int(coverage_summary.get("source_count"))
-        coverage_summary["resource_source_pct"] = _pct(
-            _int(coverage_summary.get("sources_with_resource_rows")),
-            source_count,
-        )
-        coverage_summary["location_source_pct"] = _pct(
-            _int(coverage_summary.get("sources_with_location_rows")),
-            source_count,
-        )
-        coverage_summary["unified_available"] = bool(has_unified)
-        coverage_summary["sources_with_keyed_location_rows"] = None
-        coverage_summary["sources_with_location_rows_without_keys"] = None
-        coverage_summary["keyed_location_rows"] = None
-        coverage_summary["sources_with_organization_address_rows"] = None
-        coverage_summary["sources_with_valid_npi_organization_address_rows"] = None
-        coverage_summary[
-            "sources_with_valid_npi_organization_address_rows_without_unified_rows"
-        ] = None
-        coverage_summary["organization_address_rows"] = None
-        coverage_summary["valid_npi_organization_address_rows"] = None
-        coverage_summary["sources_with_unified_rows"] = None
-        coverage_summary["sources_with_keyed_unified_rows"] = None
-        coverage_summary["sources_with_phone_unified_rows"] = None
-        coverage_summary["sources_with_location_rows_without_unified_rows"] = None
-        coverage_summary["unified_rows"] = None
-        coverage_summary["keyed_unified_rows"] = None
-        coverage_summary["phone_unified_rows"] = None
-        coverage_summary["keyed_location_source_pct"] = None
-        coverage_summary["catalog_only_samples"] = [
-            dict(catalog_source) for catalog_source in sample_catalog_only
-        ]
-        coverage_summary["location_without_unified_samples"] = []
-        coverage_summary["organization_address_without_unified_samples"] = []
-        return coverage_summary
+            """
 
-    location_source_rows = (
-        f"""
+_RESOURCE_COVERAGE_SUMMARY_SQL_TEMPLATE = """
+        __CTE_SQL__
+        SELECT count(*)::bigint AS source_count,
+               count(*) FILTER (WHERE has_resource_rows)::bigint AS sources_with_resource_rows,
+               count(*) FILTER (WHERE NOT has_resource_rows)::bigint AS catalog_only_source_count,
+               count(*) FILTER (WHERE location_rows > 0)::bigint AS sources_with_location_rows,
+               count(*) FILTER (WHERE keyed_location_rows > 0)::bigint AS sources_with_keyed_location_rows,
+               count(*) FILTER (WHERE location_rows > 0 AND keyed_location_rows = 0)::bigint
+                   AS sources_with_location_rows_without_keys,
+               sum(location_rows)::bigint AS location_rows,
+               sum(keyed_location_rows)::bigint AS keyed_location_rows,
+               count(*) FILTER (WHERE organization_address_rows > 0)::bigint
+                   AS sources_with_organization_address_rows,
+               count(*) FILTER (WHERE valid_npi_organization_address_rows > 0)::bigint
+                   AS sources_with_valid_npi_organization_address_rows,
+               count(*) FILTER (WHERE valid_npi_organization_address_rows > 0 AND unified_rows = 0)::bigint
+                   AS sources_with_valid_npi_organization_address_rows_without_unified_rows,
+               sum(organization_address_rows)::bigint AS organization_address_rows,
+               sum(valid_npi_organization_address_rows)::bigint AS valid_npi_organization_address_rows,
+               count(*) FILTER (WHERE unified_rows > 0)::bigint AS sources_with_unified_rows,
+               count(*) FILTER (WHERE keyed_unified_rows > 0)::bigint AS sources_with_keyed_unified_rows,
+               count(*) FILTER (WHERE phone_unified_rows > 0)::bigint AS sources_with_phone_unified_rows,
+               count(*) FILTER (WHERE location_rows > 0 AND unified_rows = 0)::bigint
+                   AS sources_with_location_rows_without_unified_rows,
+               sum(unified_rows)::bigint AS unified_rows,
+               sum(keyed_unified_rows)::bigint AS keyed_unified_rows,
+               sum(phone_unified_rows)::bigint AS phone_unified_rows
+          FROM source_context
+        """
+
+_RESOURCE_CATALOG_ONLY_SQL_TEMPLATE = """
+        __CTE_SQL__
+        SELECT source_id,
+               org_name,
+               plan_name,
+               canonical_api_base,
+               last_probe_status,
+               last_validated_status,
+               auth_type
+          FROM source_context
+         WHERE NOT has_resource_rows
+         ORDER BY lower(org_name), lower(coalesce(plan_name, '')), source_id
+         LIMIT $1
+        """
+
+_HEALTHCARE_SERVICE_PROJECTION_COLUMNS = """
+                   COALESCE(role_healthcare_service_links.role_healthcare_service_location_refs, 0)::bigint
+                       AS role_healthcare_service_location_refs,
+                   COALESCE(role_healthcare_service_links.role_healthcare_service_valid_npi_refs, 0)::bigint
+                       AS role_healthcare_service_valid_npi_refs,
+                   COALESCE(role_healthcare_service_links.role_healthcare_service_matching_location_refs, 0)::bigint
+                       AS role_healthcare_service_matching_location_refs,
+                   COALESCE(role_healthcare_service_links.role_healthcare_service_projectable_location_refs, 0)::bigint
+                       AS role_healthcare_service_projectable_location_refs,
+                   COALESCE(affiliation_healthcare_service_links.affiliation_healthcare_service_location_refs, 0)::bigint
+                       AS affiliation_healthcare_service_location_refs,
+                   COALESCE(affiliation_healthcare_service_links.affiliation_healthcare_service_valid_npi_refs, 0)::bigint
+                       AS affiliation_healthcare_service_valid_npi_refs,
+                   COALESCE(affiliation_healthcare_service_links.affiliation_healthcare_service_matching_location_refs, 0)::bigint
+                       AS affiliation_healthcare_service_matching_location_refs,
+                   COALESCE(affiliation_healthcare_service_links.affiliation_healthcare_service_projectable_location_refs, 0)::bigint
+                       AS affiliation_healthcare_service_projectable_location_refs"""
+
+_NO_HEALTHCARE_SERVICE_PROJECTION_COLUMNS = """
+                   0::bigint AS role_healthcare_service_location_refs,
+                   0::bigint AS role_healthcare_service_valid_npi_refs,
+                   0::bigint AS role_healthcare_service_matching_location_refs,
+                   0::bigint AS role_healthcare_service_projectable_location_refs,
+                   0::bigint AS affiliation_healthcare_service_location_refs,
+                   0::bigint AS affiliation_healthcare_service_valid_npi_refs,
+                   0::bigint AS affiliation_healthcare_service_matching_location_refs,
+                   0::bigint AS affiliation_healthcare_service_projectable_location_refs"""
+
+_HEALTHCARE_SERVICE_PROJECTION_JOINS_TEMPLATE = """
+              LEFT JOIN LATERAL (
+                  SELECT count(*)::bigint AS role_healthcare_service_location_refs,
+                         count(*) FILTER (
+                             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
+                         )::bigint AS role_healthcare_service_valid_npi_refs,
+                         count(*) FILTER (
+                             WHERE loc.resource_id IS NOT NULL
+                         )::bigint AS role_healthcare_service_matching_location_refs,
+                         count(*) FILTER (
+                             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
+                               AND practitioner.active IS DISTINCT FROM false
+                               AND role.active IS DISTINCT FROM false
+                               AND healthcare_service.active IS DISTINCT FROM false
+                               AND loc.resource_id IS NOT NULL
+                               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
+                         )::bigint AS role_healthcare_service_projectable_location_refs
+                    FROM __ROLE_TABLE__ AS role
+                    LEFT JOIN __PRACTITIONER_TABLE__ AS practitioner
+                      ON practitioner.source_id = role.source_id
+                     AND practitioner.resource_id = NULLIF(
+                            regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''),
+                            ''
+                         )
+                    JOIN LATERAL jsonb_array_elements_text(
+                         COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
+                    ) AS service_ref(value) ON TRUE
+                    JOIN __SERVICE_TABLE__ AS healthcare_service
+                      ON healthcare_service.source_id = role.source_id
+                     AND healthcare_service.resource_id = NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '')
+                    JOIN LATERAL jsonb_array_elements_text(
+                         COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                    ) AS location_ref(value) ON TRUE
+                    LEFT JOIN __LOCATION_TABLE__ AS loc
+                      ON loc.source_id = role.source_id
+                     AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+                   WHERE role.source_id = sample_sources.source_id
+              ) AS role_healthcare_service_links ON TRUE
+              LEFT JOIN LATERAL (
+                  SELECT count(*)::bigint AS affiliation_healthcare_service_location_refs,
+                         count(*) FILTER (
+                             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
+                         )::bigint AS affiliation_healthcare_service_valid_npi_refs,
+                         count(*) FILTER (
+                             WHERE loc.resource_id IS NOT NULL
+                         )::bigint AS affiliation_healthcare_service_matching_location_refs,
+                         count(*) FILTER (
+                             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
+                               AND organization.active IS DISTINCT FROM false
+                               AND affiliation.active IS DISTINCT FROM false
+                               AND healthcare_service.active IS DISTINCT FROM false
+                               AND loc.resource_id IS NOT NULL
+                               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
+                         )::bigint AS affiliation_healthcare_service_projectable_location_refs
+                    FROM __AFFILIATION_TABLE__ AS affiliation
+                    JOIN LATERAL (
+                        SELECT DISTINCT normalized_ref AS resource_id
+                          FROM (
+                              VALUES
+                                  (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
+                                  (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
+                          ) AS refs(normalized_ref)
+                         WHERE normalized_ref IS NOT NULL
+                    ) AS organization_ref ON TRUE
+                    LEFT JOIN __ORGANIZATION_TABLE__ AS organization
+                      ON organization.source_id = affiliation.source_id
+                     AND organization.resource_id = organization_ref.resource_id
+                    JOIN LATERAL jsonb_array_elements_text(
+                         COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
+                    ) AS service_ref(value) ON TRUE
+                    JOIN __SERVICE_TABLE__ AS healthcare_service
+                      ON healthcare_service.source_id = affiliation.source_id
+                     AND healthcare_service.resource_id = NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '')
+                    JOIN LATERAL jsonb_array_elements_text(
+                         COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                    ) AS location_ref(value) ON TRUE
+                    LEFT JOIN __LOCATION_TABLE__ AS loc
+                      ON loc.source_id = affiliation.source_id
+                     AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+                   WHERE affiliation.source_id = sample_sources.source_id
+              ) AS affiliation_healthcare_service_links ON TRUE"""
+
+_LOCATION_WITHOUT_UNIFIED_SQL_TEMPLATE = """
+            __CTE_SQL__
+            , sample_sources AS (
+                SELECT source_id,
+                       org_name,
+                       plan_name,
+                       canonical_api_base,
+                       last_probe_status,
+                       auth_type,
+                       location_rows,
+                       keyed_location_rows,
+                       organization_address_rows,
+                       valid_npi_organization_address_rows
+                  FROM source_context
+                 WHERE location_rows > 0
+                   AND unified_rows = 0
+                 ORDER BY location_rows DESC, lower(org_name), lower(coalesce(plan_name, '')), source_id
+                 LIMIT $1
+            )
+            SELECT sample_sources.*,
+                   COALESCE(role_links.role_location_refs, 0)::bigint AS role_location_refs,
+                   COALESCE(role_links.role_valid_npi_refs, 0)::bigint AS role_valid_npi_refs,
+                   COALESCE(role_links.role_matching_location_refs, 0)::bigint AS role_matching_location_refs,
+                   COALESCE(role_links.role_projectable_location_refs, 0)::bigint AS role_projectable_location_refs,
+                   COALESCE(affiliation_links.affiliation_location_refs, 0)::bigint AS affiliation_location_refs,
+                   COALESCE(affiliation_links.affiliation_valid_npi_refs, 0)::bigint AS affiliation_valid_npi_refs,
+                   COALESCE(affiliation_links.affiliation_matching_location_refs, 0)::bigint
+                       AS affiliation_matching_location_refs,
+                   COALESCE(affiliation_links.affiliation_projectable_location_refs, 0)::bigint
+                       AS affiliation_projectable_location_refs,
+                   __HEALTHCARE_COLUMNS__
+              FROM sample_sources
+              LEFT JOIN LATERAL (
+                  SELECT count(*)::bigint AS role_location_refs,
+                         count(*) FILTER (
+                             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
+                         )::bigint AS role_valid_npi_refs,
+                         count(*) FILTER (
+                             WHERE loc.resource_id IS NOT NULL
+                         )::bigint AS role_matching_location_refs,
+                         count(*) FILTER (
+                             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
+                               AND practitioner.active IS DISTINCT FROM false
+                               AND role.active IS DISTINCT FROM false
+                               AND loc.resource_id IS NOT NULL
+                               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
+                         )::bigint AS role_projectable_location_refs
+                    FROM __ROLE_TABLE__ AS role
+                    LEFT JOIN __PRACTITIONER_TABLE__ AS practitioner
+                      ON practitioner.source_id = role.source_id
+                     AND practitioner.resource_id = NULLIF(
+                            regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''),
+                            ''
+                         )
+                    JOIN LATERAL jsonb_array_elements_text(
+                         COALESCE(role.location_refs::jsonb, '[]'::jsonb)
+                    ) AS location_ref(value) ON TRUE
+                    LEFT JOIN __LOCATION_TABLE__ AS loc
+                      ON loc.source_id = role.source_id
+                     AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+                   WHERE role.source_id = sample_sources.source_id
+              ) AS role_links ON TRUE
+              LEFT JOIN LATERAL (
+                  SELECT count(*)::bigint AS affiliation_location_refs,
+                         count(*) FILTER (
+                             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
+                         )::bigint AS affiliation_valid_npi_refs,
+                         count(*) FILTER (
+                             WHERE loc.resource_id IS NOT NULL
+                         )::bigint AS affiliation_matching_location_refs,
+                         count(*) FILTER (
+                             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
+                               AND organization.active IS DISTINCT FROM false
+                               AND affiliation.active IS DISTINCT FROM false
+                               AND loc.resource_id IS NOT NULL
+                               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
+                         )::bigint AS affiliation_projectable_location_refs
+                    FROM __AFFILIATION_TABLE__ AS affiliation
+                    JOIN LATERAL (
+                        SELECT DISTINCT normalized_ref AS resource_id
+                          FROM (
+                              VALUES
+                                  (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
+                                  (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
+                          ) AS refs(normalized_ref)
+                         WHERE normalized_ref IS NOT NULL
+                    ) AS organization_ref ON TRUE
+                    LEFT JOIN __ORGANIZATION_TABLE__ AS organization
+                      ON organization.source_id = affiliation.source_id
+                     AND organization.resource_id = organization_ref.resource_id
+                    JOIN LATERAL jsonb_array_elements_text(
+                         COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
+                    ) AS location_ref(value) ON TRUE
+                    LEFT JOIN __LOCATION_TABLE__ AS loc
+                      ON loc.source_id = affiliation.source_id
+                     AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+                   WHERE affiliation.source_id = sample_sources.source_id
+              ) AS affiliation_links ON TRUE
+              __HEALTHCARE_JOINS__
+            """
+
+_ORGANIZATION_ADDRESS_WITHOUT_UNIFIED_SQL_TEMPLATE = """
+            __CTE_SQL__
+            SELECT source_id,
+                   org_name,
+                   plan_name,
+                   canonical_api_base,
+                   last_probe_status,
+                   auth_type,
+                   organization_address_rows,
+                   valid_npi_organization_address_rows
+              FROM source_context
+             WHERE valid_npi_organization_address_rows > 0
+               AND unified_rows = 0
+             ORDER BY valid_npi_organization_address_rows DESC,
+                      lower(org_name),
+                      lower(coalesce(plan_name, '')),
+                      source_id
+             LIMIT $1
+            """
+
+
+def _resource_source_union_sql(
+    schema: str, resource_tables: list[str], *, has_metadata_summary: bool
+) -> str:
+    if has_metadata_summary:
+        return f"""
+            SELECT DISTINCT src.source_id::varchar AS source_id
+              FROM {_qt(schema, "provider_directory_source")} AS src
+              CROSS JOIN LATERAL jsonb_each(
+                    COALESCE(
+                        src.metadata_json::jsonb #> '{{last_resource_import,resources}}',
+                        '{{}}'::jsonb
+                    )
+              ) AS resource(key, value)
+             WHERE COALESCE(NULLIF(resource.value->>'rows_written', ''), '0')::bigint > 0
+        """
+    if not resource_tables:
+        return "SELECT NULL::varchar AS source_id WHERE false"
+    return " UNION ".join(
+        f"SELECT DISTINCT source_id::varchar AS source_id FROM {_qt(schema, table)}"
+        for table in resource_tables
+    )
+
+
+async def _resource_projection_capabilities(
+    conn: asyncpg.Connection, schema: str, *, include_unified: bool
+) -> dict[str, bool]:
+    capabilities_by_name: dict[str, bool] = {}
+    capabilities_by_name["has_location"] = await _has_relation(
+        conn, schema, "provider_directory_location"
+    )
+    capabilities_by_name["has_location_address_key"] = capabilities_by_name["has_location"] and await _has_column(
+        conn, schema, "provider_directory_location", "address_key"
+    )
+    capabilities_by_name["has_organization"] = await _has_relation(
+        conn, schema, "provider_directory_organization"
+    )
+    capabilities_by_name["has_organization_address_json"] = capabilities_by_name["has_organization"] and await _has_column(
+        conn, schema, "provider_directory_organization", "address_json"
+    )
+    capabilities_by_name["has_healthcare_service"] = await _has_relation(
+        conn, schema, "provider_directory_healthcare_service"
+    )
+    capabilities_by_name["has_unified"] = (
+        include_unified
+        and await _has_relation(conn, schema, "entity_address_unified")
+        and await _has_column(conn, schema, "entity_address_unified", "address_sources")
+        and await _has_column(conn, schema, "entity_address_unified", "source_record_ids")
+    )
+    capabilities_by_name["has_unified_address_key"] = capabilities_by_name["has_unified"] and await _has_column(
+        conn, schema, "entity_address_unified", "address_key"
+    )
+    capabilities_by_name["has_unified_phone"] = capabilities_by_name["has_unified"] and await _has_column(
+        conn, schema, "entity_address_unified", "telephone_number"
+    )
+    return capabilities_by_name
+
+
+def _metadata_resource_sql(template: str, schema: str) -> str:
+    return template.replace("__SOURCE_TABLE__", _qt(schema, "provider_directory_source"))
+
+
+async def _metadata_resource_coverage_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    sample_limit: int,
+    *,
+    has_unified: bool,
+) -> dict[str, Any]:
+    coverage_summary = await _fetch_mapping(
+        conn, _metadata_resource_sql(_METADATA_RESOURCE_COVERAGE_SQL_TEMPLATE, schema)
+    )
+    sample_catalog_only = await conn.fetch(
+        _metadata_resource_sql(_METADATA_CATALOG_ONLY_SQL_TEMPLATE, schema), sample_limit
+    )
+    coverage_summary["available"] = True
+    coverage_summary["summary_source"] = "provider_directory_source.metadata_json.last_resource_import"
+    coverage_summary["projection_counts_exact"] = False
+    source_count = _int(coverage_summary.get("source_count"))
+    coverage_summary["resource_source_pct"] = _pct(
+        _int(coverage_summary.get("sources_with_resource_rows")), source_count
+    )
+    coverage_summary["location_source_pct"] = _pct(
+        _int(coverage_summary.get("sources_with_location_rows")), source_count
+    )
+    coverage_summary["unified_available"] = bool(has_unified)
+    unavailable_projection_keys = (
+        "sources_with_keyed_location_rows",
+        "sources_with_location_rows_without_keys",
+        "keyed_location_rows",
+        "sources_with_organization_address_rows",
+        "sources_with_valid_npi_organization_address_rows",
+        "sources_with_valid_npi_organization_address_rows_without_unified_rows",
+        "organization_address_rows",
+        "valid_npi_organization_address_rows",
+        "sources_with_unified_rows",
+        "sources_with_keyed_unified_rows",
+        "sources_with_phone_unified_rows",
+        "sources_with_location_rows_without_unified_rows",
+        "unified_rows",
+        "keyed_unified_rows",
+        "phone_unified_rows",
+        "keyed_location_source_pct",
+    )
+    for projection_key in unavailable_projection_keys:
+        coverage_summary[projection_key] = None
+    coverage_summary["catalog_only_samples"] = [
+        dict(catalog_source) for catalog_source in sample_catalog_only
+    ]
+    coverage_summary["location_without_unified_samples"] = []
+    coverage_summary["organization_address_without_unified_samples"] = []
+    return coverage_summary
+
+
+def _location_source_rows_sql(schema: str, capabilities: dict[str, bool]) -> str:
+    if not capabilities["has_location"]:
+        return "SELECT NULL::varchar AS source_id, 0::bigint AS location_rows, 0::bigint AS keyed_location_rows WHERE false"
+    address_key_condition = (
+        "address_key IS NOT NULL" if capabilities["has_location_address_key"] else "false"
+    )
+    return f"""
         SELECT source_id::varchar AS source_id,
                count(*)::bigint AS location_rows,
                count(*) FILTER (
-                   WHERE {"address_key IS NOT NULL" if has_location_address_key else "false"}
+                   WHERE {address_key_condition}
                )::bigint AS keyed_location_rows
           FROM {_qt(schema, "provider_directory_location")}
          GROUP BY source_id
         """
-        if has_location
-        else "SELECT NULL::varchar AS source_id, 0::bigint AS location_rows, 0::bigint AS keyed_location_rows WHERE false"
-    )
-    organization_address_source_rows = (
-        f"""
+
+
+def _organization_address_source_rows_sql(
+    schema: str, capabilities: dict[str, bool]
+) -> str:
+    if not capabilities["has_organization_address_json"]:
+        return "SELECT NULL::varchar AS source_id, 0::bigint AS organization_address_rows, 0::bigint AS valid_npi_organization_address_rows WHERE false"
+    return f"""
         SELECT organization.source_id::varchar AS source_id,
                sum(jsonb_array_length(COALESCE(organization.address_json::jsonb, '[]'::jsonb)))::bigint
                    AS organization_address_rows,
@@ -2695,18 +3202,27 @@ async def _source_resource_coverage_summary(
          WHERE jsonb_array_length(COALESCE(organization.address_json::jsonb, '[]'::jsonb)) > 0
       GROUP BY organization.source_id
         """
-        if has_organization_address_json
-        else "SELECT NULL::varchar AS source_id, 0::bigint AS organization_address_rows, 0::bigint AS valid_npi_organization_address_rows WHERE false"
+
+
+def _unified_source_rows_sql(schema: str, capabilities: dict[str, bool]) -> str:
+    if not capabilities["has_unified"]:
+        return "SELECT NULL::varchar AS source_id, 0::bigint AS unified_rows, 0::bigint AS keyed_unified_rows, 0::bigint AS phone_unified_rows WHERE false"
+    address_key_condition = (
+        "unified.address_key IS NOT NULL" if capabilities["has_unified_address_key"] else "false"
     )
-    unified_source_rows = (
-        f"""
+    phone_condition = (
+        "unified.telephone_number IS NOT NULL AND BTRIM(unified.telephone_number) <> ''"
+        if capabilities["has_unified_phone"]
+        else "false"
+    )
+    return f"""
         SELECT split_part(pd_rid.rid, ':', 3)::varchar AS source_id,
                count(*)::bigint AS unified_rows,
                count(*) FILTER (
-                   WHERE {"unified.address_key IS NOT NULL" if has_unified_address_key else "false"}
+                   WHERE {address_key_condition}
                )::bigint AS keyed_unified_rows,
                count(*) FILTER (
-                   WHERE {"unified.telephone_number IS NOT NULL AND BTRIM(unified.telephone_number) <> ''" if has_unified_phone else "false"}
+                   WHERE {phone_condition}
                )::bigint AS phone_unified_rows
           FROM {_qt(schema, "entity_address_unified")} AS unified
           CROSS JOIN LATERAL unnest(COALESCE(unified.source_record_ids, ARRAY[]::varchar[])) AS pd_rid(rid)
@@ -2715,10 +3231,19 @@ async def _source_resource_coverage_summary(
            AND NULLIF(split_part(pd_rid.rid, ':', 3), '') IS NOT NULL
          GROUP BY split_part(pd_rid.rid, ':', 3)
         """
-        if has_unified
-        else "SELECT NULL::varchar AS source_id, 0::bigint AS unified_rows, 0::bigint AS keyed_unified_rows, 0::bigint AS phone_unified_rows WHERE false"
+
+
+def _resource_coverage_cte_sql(
+    schema: str,
+    resource_source_union: str,
+    capabilities: dict[str, bool],
+) -> str:
+    location_source_rows = _location_source_rows_sql(schema, capabilities)
+    organization_address_source_rows = _organization_address_source_rows_sql(
+        schema, capabilities
     )
-    cte_sql = f"""
+    unified_source_rows = _unified_source_rows_sql(schema, capabilities)
+    return f"""
         WITH resource_sources AS ({resource_source_union}),
         location_source_rows AS ({location_source_rows}),
         organization_address_source_rows AS ({organization_address_source_rows}),
@@ -2752,345 +3277,166 @@ async def _source_resource_coverage_summary(
                 ON unified_source_rows.source_id = src.source_id
         )
     """
-    coverage_summary = await _fetch_mapping(
-        conn,
-        f"""
-        {cte_sql}
-        SELECT count(*)::bigint AS source_count,
-               count(*) FILTER (WHERE has_resource_rows)::bigint AS sources_with_resource_rows,
-               count(*) FILTER (WHERE NOT has_resource_rows)::bigint AS catalog_only_source_count,
-               count(*) FILTER (WHERE location_rows > 0)::bigint AS sources_with_location_rows,
-               count(*) FILTER (WHERE keyed_location_rows > 0)::bigint AS sources_with_keyed_location_rows,
-               count(*) FILTER (WHERE location_rows > 0 AND keyed_location_rows = 0)::bigint
-                   AS sources_with_location_rows_without_keys,
-               sum(location_rows)::bigint AS location_rows,
-               sum(keyed_location_rows)::bigint AS keyed_location_rows,
-               count(*) FILTER (WHERE organization_address_rows > 0)::bigint
-                   AS sources_with_organization_address_rows,
-               count(*) FILTER (WHERE valid_npi_organization_address_rows > 0)::bigint
-                   AS sources_with_valid_npi_organization_address_rows,
-               count(*) FILTER (WHERE valid_npi_organization_address_rows > 0 AND unified_rows = 0)::bigint
-                   AS sources_with_valid_npi_organization_address_rows_without_unified_rows,
-               sum(organization_address_rows)::bigint AS organization_address_rows,
-               sum(valid_npi_organization_address_rows)::bigint AS valid_npi_organization_address_rows,
-               count(*) FILTER (WHERE unified_rows > 0)::bigint AS sources_with_unified_rows,
-               count(*) FILTER (WHERE keyed_unified_rows > 0)::bigint AS sources_with_keyed_unified_rows,
-               count(*) FILTER (WHERE phone_unified_rows > 0)::bigint AS sources_with_phone_unified_rows,
-               count(*) FILTER (WHERE location_rows > 0 AND unified_rows = 0)::bigint
-                   AS sources_with_location_rows_without_unified_rows,
-               sum(unified_rows)::bigint AS unified_rows,
-               sum(keyed_unified_rows)::bigint AS keyed_unified_rows,
-               sum(phone_unified_rows)::bigint AS phone_unified_rows
-          FROM source_context
-        """,
+
+
+def _sql_with_cte(template: str, cte_sql: str) -> str:
+    return _render_sql_template(template, {"__CTE_SQL__": cte_sql})
+
+
+def _healthcare_service_projection_joins(schema: str) -> str:
+    replacements_by_placeholder = {
+        "__ROLE_TABLE__": _qt(schema, "provider_directory_practitioner_role"),
+        "__PRACTITIONER_TABLE__": _qt(schema, "provider_directory_practitioner"),
+        "__SERVICE_TABLE__": _qt(schema, "provider_directory_healthcare_service"),
+        "__LOCATION_TABLE__": _qt(schema, "provider_directory_location"),
+        "__AFFILIATION_TABLE__": _qt(schema, "provider_directory_organization_affiliation"),
+        "__ORGANIZATION_TABLE__": _qt(schema, "provider_directory_organization"),
+    }
+    return _render_sql_template(
+        _HEALTHCARE_SERVICE_PROJECTION_JOINS_TEMPLATE,
+        replacements_by_placeholder,
     )
-    sample_catalog_only = await conn.fetch(
-        f"""
-        {cte_sql}
-        SELECT source_id,
-               org_name,
-               plan_name,
-               canonical_api_base,
-               last_probe_status,
-               last_validated_status,
-               auth_type
-          FROM source_context
-         WHERE NOT has_resource_rows
-         ORDER BY lower(org_name), lower(coalesce(plan_name, '')), source_id
-         LIMIT $1
-        """,
-        sample_limit,
+
+
+def _location_without_unified_sql(
+    schema: str,
+    cte_sql: str,
+    capabilities: dict[str, bool],
+) -> str:
+    healthcare_columns = (
+        _HEALTHCARE_SERVICE_PROJECTION_COLUMNS
+        if capabilities["has_healthcare_service"]
+        else _NO_HEALTHCARE_SERVICE_PROJECTION_COLUMNS
     )
-    healthcare_service_projection_columns = (
-        """
-                   COALESCE(role_healthcare_service_links.role_healthcare_service_location_refs, 0)::bigint
-                       AS role_healthcare_service_location_refs,
-                   COALESCE(role_healthcare_service_links.role_healthcare_service_valid_npi_refs, 0)::bigint
-                       AS role_healthcare_service_valid_npi_refs,
-                   COALESCE(role_healthcare_service_links.role_healthcare_service_matching_location_refs, 0)::bigint
-                       AS role_healthcare_service_matching_location_refs,
-                   COALESCE(role_healthcare_service_links.role_healthcare_service_projectable_location_refs, 0)::bigint
-                       AS role_healthcare_service_projectable_location_refs,
-                   COALESCE(affiliation_healthcare_service_links.affiliation_healthcare_service_location_refs, 0)::bigint
-                       AS affiliation_healthcare_service_location_refs,
-                   COALESCE(affiliation_healthcare_service_links.affiliation_healthcare_service_valid_npi_refs, 0)::bigint
-                       AS affiliation_healthcare_service_valid_npi_refs,
-                   COALESCE(affiliation_healthcare_service_links.affiliation_healthcare_service_matching_location_refs, 0)::bigint
-                       AS affiliation_healthcare_service_matching_location_refs,
-                   COALESCE(affiliation_healthcare_service_links.affiliation_healthcare_service_projectable_location_refs, 0)::bigint
-                       AS affiliation_healthcare_service_projectable_location_refs"""
-        if has_healthcare_service
-        else """
-                   0::bigint AS role_healthcare_service_location_refs,
-                   0::bigint AS role_healthcare_service_valid_npi_refs,
-                   0::bigint AS role_healthcare_service_matching_location_refs,
-                   0::bigint AS role_healthcare_service_projectable_location_refs,
-                   0::bigint AS affiliation_healthcare_service_location_refs,
-                   0::bigint AS affiliation_healthcare_service_valid_npi_refs,
-                   0::bigint AS affiliation_healthcare_service_matching_location_refs,
-                   0::bigint AS affiliation_healthcare_service_projectable_location_refs"""
-    )
-    healthcare_service_projection_joins = (
-        f"""
-              LEFT JOIN LATERAL (
-                  SELECT count(*)::bigint AS role_healthcare_service_location_refs,
-                         count(*) FILTER (
-                             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
-                         )::bigint AS role_healthcare_service_valid_npi_refs,
-                         count(*) FILTER (
-                             WHERE loc.resource_id IS NOT NULL
-                         )::bigint AS role_healthcare_service_matching_location_refs,
-                         count(*) FILTER (
-                             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
-                               AND practitioner.active IS DISTINCT FROM false
-                               AND role.active IS DISTINCT FROM false
-                               AND healthcare_service.active IS DISTINCT FROM false
-                               AND loc.resource_id IS NOT NULL
-                               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
-                         )::bigint AS role_healthcare_service_projectable_location_refs
-                    FROM {_qt(schema, "provider_directory_practitioner_role")} AS role
-                    LEFT JOIN {_qt(schema, "provider_directory_practitioner")} AS practitioner
-                      ON practitioner.source_id = role.source_id
-                     AND practitioner.resource_id = NULLIF(
-                            regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''),
-                            ''
-                         )
-                    JOIN LATERAL jsonb_array_elements_text(
-                         COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
-                    ) AS service_ref(value) ON TRUE
-                    JOIN {_qt(schema, "provider_directory_healthcare_service")} AS healthcare_service
-                      ON healthcare_service.source_id = role.source_id
-                     AND healthcare_service.resource_id = NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '')
-                    JOIN LATERAL jsonb_array_elements_text(
-                         COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
-                    ) AS location_ref(value) ON TRUE
-                    LEFT JOIN {_qt(schema, "provider_directory_location")} AS loc
-                      ON loc.source_id = role.source_id
-                     AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
-                   WHERE role.source_id = sample_sources.source_id
-              ) AS role_healthcare_service_links ON TRUE
-              LEFT JOIN LATERAL (
-                  SELECT count(*)::bigint AS affiliation_healthcare_service_location_refs,
-                         count(*) FILTER (
-                             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
-                         )::bigint AS affiliation_healthcare_service_valid_npi_refs,
-                         count(*) FILTER (
-                             WHERE loc.resource_id IS NOT NULL
-                         )::bigint AS affiliation_healthcare_service_matching_location_refs,
-                         count(*) FILTER (
-                             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
-                               AND organization.active IS DISTINCT FROM false
-                               AND affiliation.active IS DISTINCT FROM false
-                               AND healthcare_service.active IS DISTINCT FROM false
-                               AND loc.resource_id IS NOT NULL
-                               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
-                         )::bigint AS affiliation_healthcare_service_projectable_location_refs
-                    FROM {_qt(schema, "provider_directory_organization_affiliation")} AS affiliation
-                    JOIN LATERAL (
-                        SELECT DISTINCT normalized_ref AS resource_id
-                          FROM (
-                              VALUES
-                                  (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
-                                  (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
-                          ) AS refs(normalized_ref)
-                         WHERE normalized_ref IS NOT NULL
-                    ) AS organization_ref ON TRUE
-                    LEFT JOIN {_qt(schema, "provider_directory_organization")} AS organization
-                      ON organization.source_id = affiliation.source_id
-                     AND organization.resource_id = organization_ref.resource_id
-                    JOIN LATERAL jsonb_array_elements_text(
-                         COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
-                    ) AS service_ref(value) ON TRUE
-                    JOIN {_qt(schema, "provider_directory_healthcare_service")} AS healthcare_service
-                      ON healthcare_service.source_id = affiliation.source_id
-                     AND healthcare_service.resource_id = NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '')
-                    JOIN LATERAL jsonb_array_elements_text(
-                         COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
-                    ) AS location_ref(value) ON TRUE
-                    LEFT JOIN {_qt(schema, "provider_directory_location")} AS loc
-                      ON loc.source_id = affiliation.source_id
-                     AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
-                   WHERE affiliation.source_id = sample_sources.source_id
-              ) AS affiliation_healthcare_service_links ON TRUE"""
-        if has_healthcare_service
+    healthcare_joins = (
+        _healthcare_service_projection_joins(schema)
+        if capabilities["has_healthcare_service"]
         else ""
     )
-    sample_location_without_unified = (
-        await conn.fetch(
-            f"""
-            {cte_sql}
-            , sample_sources AS (
-                SELECT source_id,
-                       org_name,
-                       plan_name,
-                       canonical_api_base,
-                       last_probe_status,
-                       auth_type,
-                       location_rows,
-                       keyed_location_rows,
-                       organization_address_rows,
-                       valid_npi_organization_address_rows
-                  FROM source_context
-                 WHERE location_rows > 0
-                   AND unified_rows = 0
-                 ORDER BY location_rows DESC, lower(org_name), lower(coalesce(plan_name, '')), source_id
-                 LIMIT $1
-            )
-            SELECT sample_sources.*,
-                   COALESCE(role_links.role_location_refs, 0)::bigint AS role_location_refs,
-                   COALESCE(role_links.role_valid_npi_refs, 0)::bigint AS role_valid_npi_refs,
-                   COALESCE(role_links.role_matching_location_refs, 0)::bigint AS role_matching_location_refs,
-                   COALESCE(role_links.role_projectable_location_refs, 0)::bigint AS role_projectable_location_refs,
-                   COALESCE(affiliation_links.affiliation_location_refs, 0)::bigint AS affiliation_location_refs,
-                   COALESCE(affiliation_links.affiliation_valid_npi_refs, 0)::bigint AS affiliation_valid_npi_refs,
-                   COALESCE(affiliation_links.affiliation_matching_location_refs, 0)::bigint
-                       AS affiliation_matching_location_refs,
-                   COALESCE(affiliation_links.affiliation_projectable_location_refs, 0)::bigint
-                       AS affiliation_projectable_location_refs,
-                   {healthcare_service_projection_columns}
-              FROM sample_sources
-              LEFT JOIN LATERAL (
-                  SELECT count(*)::bigint AS role_location_refs,
-                         count(*) FILTER (
-                             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
-                         )::bigint AS role_valid_npi_refs,
-                         count(*) FILTER (
-                             WHERE loc.resource_id IS NOT NULL
-                         )::bigint AS role_matching_location_refs,
-                         count(*) FILTER (
-                             WHERE practitioner.npi BETWEEN 1000000000 AND 9999999999
-                               AND practitioner.active IS DISTINCT FROM false
-                               AND role.active IS DISTINCT FROM false
-                               AND loc.resource_id IS NOT NULL
-                               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
-                         )::bigint AS role_projectable_location_refs
-                    FROM {_qt(schema, "provider_directory_practitioner_role")} AS role
-                    LEFT JOIN {_qt(schema, "provider_directory_practitioner")} AS practitioner
-                      ON practitioner.source_id = role.source_id
-                     AND practitioner.resource_id = NULLIF(
-                            regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''),
-                            ''
-                         )
-                    JOIN LATERAL jsonb_array_elements_text(
-                         COALESCE(role.location_refs::jsonb, '[]'::jsonb)
-                    ) AS location_ref(value) ON TRUE
-                    LEFT JOIN {_qt(schema, "provider_directory_location")} AS loc
-                      ON loc.source_id = role.source_id
-                     AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
-                   WHERE role.source_id = sample_sources.source_id
-              ) AS role_links ON TRUE
-              LEFT JOIN LATERAL (
-                  SELECT count(*)::bigint AS affiliation_location_refs,
-                         count(*) FILTER (
-                             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
-                         )::bigint AS affiliation_valid_npi_refs,
-                         count(*) FILTER (
-                             WHERE loc.resource_id IS NOT NULL
-                         )::bigint AS affiliation_matching_location_refs,
-                         count(*) FILTER (
-                             WHERE organization.npi BETWEEN 1000000000 AND 9999999999
-                               AND organization.active IS DISTINCT FROM false
-                               AND affiliation.active IS DISTINCT FROM false
-                               AND loc.resource_id IS NOT NULL
-                               AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
-                         )::bigint AS affiliation_projectable_location_refs
-                    FROM {_qt(schema, "provider_directory_organization_affiliation")} AS affiliation
-                    JOIN LATERAL (
-                        SELECT DISTINCT normalized_ref AS resource_id
-                          FROM (
-                              VALUES
-                                  (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
-                                  (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
-                          ) AS refs(normalized_ref)
-                         WHERE normalized_ref IS NOT NULL
-                    ) AS organization_ref ON TRUE
-                    LEFT JOIN {_qt(schema, "provider_directory_organization")} AS organization
-                      ON organization.source_id = affiliation.source_id
-                     AND organization.resource_id = organization_ref.resource_id
-                    JOIN LATERAL jsonb_array_elements_text(
-                         COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
-                    ) AS location_ref(value) ON TRUE
-                    LEFT JOIN {_qt(schema, "provider_directory_location")} AS loc
-                      ON loc.source_id = affiliation.source_id
-                     AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
-                   WHERE affiliation.source_id = sample_sources.source_id
-              ) AS affiliation_links ON TRUE
-              {healthcare_service_projection_joins}
-            """,
+    replacements_by_placeholder = {
+        "__CTE_SQL__": cte_sql,
+        "__HEALTHCARE_COLUMNS__": healthcare_columns,
+        "__HEALTHCARE_JOINS__": healthcare_joins,
+        "__ROLE_TABLE__": _qt(schema, "provider_directory_practitioner_role"),
+        "__PRACTITIONER_TABLE__": _qt(schema, "provider_directory_practitioner"),
+        "__LOCATION_TABLE__": _qt(schema, "provider_directory_location"),
+        "__AFFILIATION_TABLE__": _qt(schema, "provider_directory_organization_affiliation"),
+        "__ORGANIZATION_TABLE__": _qt(schema, "provider_directory_organization"),
+    }
+    return _render_sql_template(
+        _LOCATION_WITHOUT_UNIFIED_SQL_TEMPLATE,
+        replacements_by_placeholder,
+    )
+
+
+async def _resource_coverage_query_results(
+    conn: asyncpg.Connection,
+    schema: str,
+    cte_sql: str,
+    capabilities: dict[str, bool],
+    sample_limit: int,
+) -> tuple[dict[str, Any], list[Any], list[Any], list[Any]]:
+    coverage_summary = await _fetch_mapping(
+        conn, _sql_with_cte(_RESOURCE_COVERAGE_SUMMARY_SQL_TEMPLATE, cte_sql)
+    )
+    sample_catalog_only = await conn.fetch(
+        _sql_with_cte(_RESOURCE_CATALOG_ONLY_SQL_TEMPLATE, cte_sql), sample_limit
+    )
+    location_without_unified_samples = []
+    if capabilities["has_unified"]:
+        location_without_unified_samples = await conn.fetch(
+            _location_without_unified_sql(schema, cte_sql, capabilities), sample_limit
+        )
+    organization_address_without_unified_samples = []
+    if capabilities["has_unified"] and capabilities["has_organization_address_json"]:
+        organization_address_without_unified_samples = await conn.fetch(
+            _sql_with_cte(_ORGANIZATION_ADDRESS_WITHOUT_UNIFIED_SQL_TEMPLATE, cte_sql),
             sample_limit,
         )
-        if has_unified
-        else []
+    return (
+        coverage_summary,
+        sample_catalog_only,
+        location_without_unified_samples,
+        organization_address_without_unified_samples,
     )
-    sample_organization_address_without_unified = (
-        await conn.fetch(
-            f"""
-            {cte_sql}
-            SELECT source_id,
-                   org_name,
-                   plan_name,
-                   canonical_api_base,
-                   last_probe_status,
-                   auth_type,
-                   organization_address_rows,
-                   valid_npi_organization_address_rows
-              FROM source_context
-             WHERE valid_npi_organization_address_rows > 0
-               AND unified_rows = 0
-             ORDER BY valid_npi_organization_address_rows DESC,
-                      lower(org_name),
-                      lower(coalesce(plan_name, '')),
-                      source_id
-             LIMIT $1
-            """,
-            sample_limit,
-        )
-        if has_unified and has_organization_address_json
-        else []
-    )
+
+
+def _finalize_resource_coverage_summary(
+    coverage_summary: dict[str, Any],
+    capabilities: dict[str, bool],
+    sample_catalog_only: list[Any],
+    sample_location_without_unified: list[Any],
+    sample_organization_address_without_unified: list[Any],
+) -> dict[str, Any]:
     source_count = _int(coverage_summary.get("source_count"))
     coverage_summary["available"] = True
-    coverage_summary["unified_available"] = has_unified
+    coverage_summary["unified_available"] = capabilities["has_unified"]
     coverage_summary["resource_source_pct"] = _pct(
-        _int(coverage_summary.get("sources_with_resource_rows")),
-        source_count,
+        _int(coverage_summary.get("sources_with_resource_rows")), source_count
     )
     coverage_summary["location_source_pct"] = _pct(
-        _int(coverage_summary.get("sources_with_location_rows")),
-        source_count,
+        _int(coverage_summary.get("sources_with_location_rows")), source_count
     )
     coverage_summary["keyed_location_source_pct"] = _pct(
         _int(coverage_summary.get("sources_with_keyed_location_rows")),
         _int(coverage_summary.get("sources_with_location_rows")),
     )
-    coverage_summary["unified_source_pct"] = _pct(
-        _int(coverage_summary.get("sources_with_unified_rows")),
-        source_count,
-    )
-    coverage_summary["keyed_unified_source_pct"] = _pct(
-        _int(coverage_summary.get("sources_with_keyed_unified_rows")),
-        _int(coverage_summary.get("sources_with_unified_rows")),
-    )
-    coverage_summary["phone_unified_source_pct"] = _pct(
-        _int(coverage_summary.get("sources_with_phone_unified_rows")),
-        _int(coverage_summary.get("sources_with_unified_rows")),
-    )
-    coverage_summary["catalog_only_samples"] = [
-        dict(catalog_source) for catalog_source in sample_catalog_only
-    ]
+    for metric_name, numerator_key, denominator_key in (
+        ("unified_source_pct", "sources_with_unified_rows", "source_count"),
+        ("keyed_unified_source_pct", "sources_with_keyed_unified_rows", "sources_with_unified_rows"),
+        ("phone_unified_source_pct", "sources_with_phone_unified_rows", "sources_with_unified_rows"),
+    ):
+        coverage_summary[metric_name] = _pct(
+            _int(coverage_summary.get(numerator_key)),
+            source_count if denominator_key == "source_count" else _int(coverage_summary.get(denominator_key)),
+        )
+    coverage_summary["catalog_only_samples"] = [dict(source_row) for source_row in sample_catalog_only]
     coverage_summary["location_without_unified_samples"] = [
-        dict(location_source) for location_source in sample_location_without_unified
+        dict(source_row) for source_row in sample_location_without_unified
     ]
     for location_source in coverage_summary["location_without_unified_samples"]:
         location_source["projection_gap_reason"] = _provider_directory_projection_gap_reason(
             location_source
         )
     coverage_summary["organization_address_without_unified_samples"] = [
-        dict(organization_source)
-        for organization_source in sample_organization_address_without_unified
+        dict(source_row) for source_row in sample_organization_address_without_unified
     ]
     return coverage_summary
 
+
+async def _source_resource_coverage_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    *,
+    sample_limit: int,
+    include_unified: bool,
+) -> dict[str, Any]:
+    """Compare source catalog coverage with materialized resource rows."""
+    if not await _has_relation(conn, schema, "provider_directory_source"):
+        return {"available": False, "samples": []}
+    resource_tables = [
+        table
+        for table in PROVIDER_DIRECTORY_RESOURCE_TABLES
+        if await _has_relation(conn, schema, table)
+    ]
+    metadata_summary = await _resource_import_metadata_summary(conn, schema)
+    resource_source_union = _resource_source_union_sql(
+        schema, resource_tables, has_metadata_summary=bool(metadata_summary)
+    )
+    capabilities = await _resource_projection_capabilities(
+        conn, schema, include_unified=include_unified
+    )
+    if metadata_summary:
+        return await _metadata_resource_coverage_summary(
+            conn, schema, sample_limit, has_unified=capabilities["has_unified"]
+        )
+    cte_sql = _resource_coverage_cte_sql(schema, resource_source_union, capabilities)
+    query_results = await _resource_coverage_query_results(
+        conn, schema, cte_sql, capabilities, sample_limit
+    )
+    return _finalize_resource_coverage_summary(
+        query_results[0], capabilities, query_results[1], query_results[2], query_results[3]
+    )
 
 DEFAULT_SEMANTIC_SOURCE_MANIFEST = (
     Path(__file__).resolve().parents[2]
@@ -5259,9 +5605,7 @@ async def _valid_sources_without_resource_rows(
     }
 
 
-def _derive_gaps(report: dict[str, Any]) -> list[str]:
-    """Translate report metrics into prioritized human-readable gap statements."""
-    gaps: list[str] = []
+def _append_source_catalog_gaps(report: dict[str, Any], gaps: list[str]) -> None:
     source_summary = report.get("source_summary") or {}
     if source_summary.get("available"):
         if _int(source_summary.get("live_auth_required_count")):
@@ -5281,6 +5625,9 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
     non_fhir = capability_count_by_status.get("valid_non_fhir", 0)
     if non_fhir:
         gaps.append(f"{non_fhir} seed URLs responded but did not expose a FHIR CapabilityStatement.")
+
+
+def _append_unified_projection_gaps(report: dict[str, Any], gaps: list[str]) -> None:
     unified = report.get("unified_summary") or {}
     if unified.get("available") and _int(unified.get("provider_directory_null_key_rows")):
         if unified.get("counts_are_lower_bounds"):
@@ -5289,28 +5636,32 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
             gaps.append(
                 f"{unified['provider_directory_null_key_rows']} Provider Directory unified-address rows still lack address_key."
             )
-    if unified.get("available"):
-        provider_directory_rows = _int(unified.get("provider_directory_rows"))
-        source_record_id_rows = _int(unified.get("provider_directory_source_record_id_rows"))
-        if provider_directory_rows and source_record_id_rows < provider_directory_rows:
-            missing_source_record_id_count = provider_directory_rows - source_record_id_rows
-            if unified.get("counts_are_lower_bounds"):
-                gaps.append(
-                    "At least one Provider Directory unified-address row lacks retained FHIR source record IDs."
-                )
-            else:
-                gaps.append(
-                    f"{missing_source_record_id_count} Provider Directory unified-address rows lack retained FHIR source record IDs."
-                )
-        if _int(unified.get("provider_directory_country_001_rows")):
-            if unified.get("counts_are_lower_bounds"):
-                gaps.append(
-                    "At least one Provider Directory unified-address row still exposes country_code `001`."
-                )
-            else:
-                gaps.append(
-                    f"{unified['provider_directory_country_001_rows']} Provider Directory unified-address rows still expose country_code `001`."
-                )
+    if not unified.get("available"):
+        return
+    provider_directory_rows = _int(unified.get("provider_directory_rows"))
+    source_record_id_rows = _int(unified.get("provider_directory_source_record_id_rows"))
+    if provider_directory_rows and source_record_id_rows < provider_directory_rows:
+        missing_source_record_id_count = provider_directory_rows - source_record_id_rows
+        if unified.get("counts_are_lower_bounds"):
+            gaps.append(
+                "At least one Provider Directory unified-address row lacks retained FHIR source record IDs."
+            )
+        else:
+            gaps.append(
+                f"{missing_source_record_id_count} Provider Directory unified-address rows lack retained FHIR source record IDs."
+            )
+    if _int(unified.get("provider_directory_country_001_rows")):
+        if unified.get("counts_are_lower_bounds"):
+            gaps.append(
+                "At least one Provider Directory unified-address row still exposes country_code `001`."
+            )
+        else:
+            gaps.append(
+                f"{unified['provider_directory_country_001_rows']} Provider Directory unified-address rows still expose country_code `001`."
+            )
+
+
+def _append_source_resource_gaps(report: dict[str, Any], gaps: list[str]) -> None:
     source_coverage = report.get("source_resource_coverage_summary") or {}
     if source_coverage.get("available"):
         if _int(source_coverage.get("catalog_only_source_count")):
@@ -5342,9 +5693,7 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
             f"{semantic_readiness['missing_maintained_source_count']} maintained Provider Directory "
             "source(s) are absent from the source catalog."
         )
-    if semantic_readiness.get("available") and _int(
-        semantic_readiness.get("raw_only_source_count")
-    ):
+    if semantic_readiness.get("available") and _int(semantic_readiness.get("raw_only_source_count")):
         scope_label = (
             "maintained"
             if semantic_readiness.get("scope") == "maintained_manifest_source_ids"
@@ -5355,6 +5704,9 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
             f"{semantic_readiness.get('sampled_source_count', 0)} {scope_label} Provider Directory "
             "source probe(s) have raw resources but incomplete downstream semantic evidence."
         )
+
+
+def _append_network_context_gaps(report: dict[str, Any], gaps: list[str]) -> None:
     role_gap = report.get("practitioner_role_reimport_gap_summary") or {}
     if role_gap.get("available") and _int(role_gap.get("practitioner_role_reimport_gap_source_count")):
         gaps.append(
@@ -5366,47 +5718,57 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
             f"{network['unresolved_network_refs']} distinct Provider Directory network refs are unresolved to FHIR Organization names."
         )
     plan_network = report.get("plan_network_context_summary") or {}
-    if plan_network.get("available"):
-        if _int(plan_network.get("insurance_plan_rows")) and not _int(
-            plan_network.get("sources_with_insurance_plan_network_refs")
-        ):
-            gaps.append(
-                "Provider Directory InsurancePlan rows are present, but none expose network refs for PTG network-name matching."
-            )
-        if _int(plan_network.get("distinct_network_refs")) and not _int(
-            plan_network.get("resolved_network_refs")
-        ):
-            gaps.append(
-                "Provider Directory network refs are present, but none resolve to network Organization names for PTG matching."
-            )
-        ptg_corroboration = (report.get("ptg_summary") or {}).get("ptg_corroboration") or {}
-        if (
-            _int(plan_network.get("sources_with_resolved_network_names"))
-            and not ptg_corroboration.get("skipped")
-            and not ptg_corroboration.get("available")
-        ):
-            gaps.append(
-                f"Provider Directory has resolved network names from {plan_network['sources_with_resolved_network_names']} source(s), "
-                "but `provider_directory_address_corroboration` is not published for PTG network matching."
-            )
-        network_catalog = report.get("network_catalog_summary") or {}
-        if (
-            "network_catalog_summary" in report
-            and _int(plan_network.get("sources_with_resolved_network_names"))
-            and not network_catalog.get("skipped")
-            and not network_catalog.get("available")
-        ):
-            gaps.append(
-                "Provider Directory has resolved network names, but `provider_directory_network_catalog` is not published."
-            )
-        if (
-            network_catalog.get("available")
-            and _int(plan_network.get("resolved_network_names"))
-            and not _int(network_catalog.get("network_catalog_rows"))
-        ):
-            gaps.append(
-                "Provider Directory network names resolve from raw resources, but `provider_directory_network_catalog` is empty."
-            )
+    if not plan_network.get("available"):
+        return
+    if _int(plan_network.get("insurance_plan_rows")) and not _int(
+        plan_network.get("sources_with_insurance_plan_network_refs")
+    ):
+        gaps.append(
+            "Provider Directory InsurancePlan rows are present, but none expose network refs for PTG network-name matching."
+        )
+    if _int(plan_network.get("distinct_network_refs")) and not _int(plan_network.get("resolved_network_refs")):
+        gaps.append(
+            "Provider Directory network refs are present, but none resolve to network Organization names for PTG matching."
+        )
+    _append_network_publication_gaps(report, plan_network, gaps)
+
+
+def _append_network_publication_gaps(
+    report: dict[str, Any],
+    plan_network: dict[str, Any],
+    gaps: list[str],
+) -> None:
+    ptg_corroboration = (report.get("ptg_summary") or {}).get("ptg_corroboration") or {}
+    if (
+        _int(plan_network.get("sources_with_resolved_network_names"))
+        and not ptg_corroboration.get("skipped")
+        and not ptg_corroboration.get("available")
+    ):
+        gaps.append(
+            f"Provider Directory has resolved network names from {plan_network['sources_with_resolved_network_names']} source(s), "
+            "but `provider_directory_address_corroboration` is not published for PTG network matching."
+        )
+    network_catalog = report.get("network_catalog_summary") or {}
+    if (
+        "network_catalog_summary" in report
+        and _int(plan_network.get("sources_with_resolved_network_names"))
+        and not network_catalog.get("skipped")
+        and not network_catalog.get("available")
+    ):
+        gaps.append(
+            "Provider Directory has resolved network names, but `provider_directory_network_catalog` is not published."
+        )
+    if (
+        network_catalog.get("available")
+        and _int(plan_network.get("resolved_network_names"))
+        and not _int(network_catalog.get("network_catalog_rows"))
+    ):
+        gaps.append(
+            "Provider Directory network names resolve from raw resources, but `provider_directory_network_catalog` is empty."
+        )
+
+
+def _append_import_backlog_gaps(report: dict[str, Any], gaps: list[str]) -> None:
     valid_zero_rows = report.get("valid_sources_without_resource_rows") or {}
     if valid_zero_rows.get("available") and _int(valid_zero_rows.get("source_count")):
         if _int(valid_zero_rows.get("resource_auth_required_source_count")):
@@ -5441,29 +5803,36 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
         gaps.append(
             f"{timeout_summary['timeout_source_count']} Provider Directory source probe(s) timed out across {timeout_summary.get('host_count')} host(s)."
         )
+
+
+def _append_advertised_resource_gaps(report: dict[str, Any], gaps: list[str]) -> None:
     advertised_gaps = report.get("advertised_resource_gap_summary") or {}
-    if advertised_gaps.get("available") and _int(advertised_gaps.get("advertised_without_rows")):
-        if _int(advertised_gaps.get("advertised_auth_blocked_without_rows")):
-            auth_missing_resource_counts = [
-                f"{resource_gap['resource_type']}={resource_gap['auth_blocked_without_rows_count']}"
-                for resource_gap in advertised_gaps.get("resources", [])
-                if _int(resource_gap.get("auth_blocked_without_rows_count"))
-            ]
-            gaps.append(
-                "Provider Directory advertised-resource imports are auth-blocked after metadata success: "
-                + ", ".join(auth_missing_resource_counts)
-                + "."
-            )
-        missing_resource_counts = [
-            f"{resource_gap['resource_type']}={resource_gap['advertised_without_rows_count']}"
+    if not (advertised_gaps.get("available") and _int(advertised_gaps.get("advertised_without_rows"))):
+        return
+    if _int(advertised_gaps.get("advertised_auth_blocked_without_rows")):
+        auth_missing_resource_counts = [
+            f"{resource_gap['resource_type']}={resource_gap['auth_blocked_without_rows_count']}"
             for resource_gap in advertised_gaps.get("resources", [])
-            if _int(resource_gap.get("advertised_without_rows_count"))
+            if _int(resource_gap.get("auth_blocked_without_rows_count"))
         ]
         gaps.append(
-            "Provider Directory advertised-resource imports have supported sources with zero rows: "
-            + ", ".join(missing_resource_counts)
+            "Provider Directory advertised-resource imports are auth-blocked after metadata success: "
+            + ", ".join(auth_missing_resource_counts)
             + "."
         )
+    missing_resource_counts = [
+        f"{resource_gap['resource_type']}={resource_gap['advertised_without_rows_count']}"
+        for resource_gap in advertised_gaps.get("resources", [])
+        if _int(resource_gap.get("advertised_without_rows_count"))
+    ]
+    gaps.append(
+        "Provider Directory advertised-resource imports have supported sources with zero rows: "
+        + ", ".join(missing_resource_counts)
+        + "."
+    )
+
+
+def _append_ptg_gaps(report: dict[str, Any], gaps: list[str]) -> None:
     ptg = (report.get("ptg_summary") or {}).get("ptg_corroboration") or {}
     if ptg.get("available") and _int(ptg.get("network_context_rows")) and not _int(ptg.get("resolved_network_match_rows")):
         gaps.append("PTG-overlap Provider Directory rows carry network refs, but none currently resolve to network-name matches.")
@@ -5475,19 +5844,30 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
     ):
         gaps.append("Provider Directory network names are present for PTG plan pairs, but none match PTG serving network_names.")
     ptg_plan_filter = report.get("ptg_plan_filter")
-    if ptg_plan_filter:
-        ptg_unified_address = (report.get("ptg_summary") or {}).get("ptg_unified_address") or {}
-        ptg_corroboration = (report.get("ptg_summary") or {}).get("ptg_corroboration") or {}
-        if ptg_unified_address.get("available") and not _int(
-            ptg_unified_address.get("ptg_unified_address_rows")
-        ):
-            gaps.append(
-                f"Requested PTG plan `{ptg_plan_filter}` has no PTG-associated unified address rows."
-            )
-        elif ptg_corroboration.get("available") and not _int(ptg_corroboration.get("corroboration_rows")):
-            gaps.append(
-                f"Requested PTG plan `{ptg_plan_filter}` has no Provider Directory address corroboration rows."
-            )
+    if not ptg_plan_filter:
+        return
+    ptg_unified_address = (report.get("ptg_summary") or {}).get("ptg_unified_address") or {}
+    ptg_corroboration = (report.get("ptg_summary") or {}).get("ptg_corroboration") or {}
+    if ptg_unified_address.get("available") and not _int(ptg_unified_address.get("ptg_unified_address_rows")):
+        gaps.append(
+            f"Requested PTG plan `{ptg_plan_filter}` has no PTG-associated unified address rows."
+        )
+    elif ptg_corroboration.get("available") and not _int(ptg_corroboration.get("corroboration_rows")):
+        gaps.append(
+            f"Requested PTG plan `{ptg_plan_filter}` has no Provider Directory address corroboration rows."
+        )
+
+
+def _derive_gaps(report: dict[str, Any]) -> list[str]:
+    """Translate report metrics into prioritized human-readable gap statements."""
+    gaps: list[str] = []
+    _append_source_catalog_gaps(report, gaps)
+    _append_unified_projection_gaps(report, gaps)
+    _append_source_resource_gaps(report, gaps)
+    _append_network_context_gaps(report, gaps)
+    _append_import_backlog_gaps(report, gaps)
+    _append_advertised_resource_gaps(report, gaps)
+    _append_ptg_gaps(report, gaps)
     return gaps
 
 
@@ -5510,36 +5890,26 @@ def _readiness_check(
     return check_result_dict
 
 
-def _serving_readiness_summary(report: dict[str, Any]) -> dict[str, Any]:
-    """Condense audit sections into serving-readiness gates and blockers."""
+def _source_catalog_readiness_check(report: dict[str, Any]) -> dict[str, Any]:
     source_metrics_by_name = report.get("source_summary") or {}
-    source_coverage = report.get("source_resource_coverage_summary") or {}
-    resource_summary = report.get("resource_summary") or {}
-    unified = report.get("unified_summary") or {}
-    plan_network = report.get("plan_network_context_summary") or {}
-    network_catalog = report.get("network_catalog_summary") or {}
-    ptg = report.get("ptg_summary") or {}
-    ptg_unified_address = ptg.get("ptg_unified_address") or {}
-    ptg_corroboration = ptg.get("ptg_corroboration") or {}
-    ptg_network = ptg.get("ptg_network_name_overlap") or {}
-
-    checks: list[dict[str, Any]] = []
     source_count = _int(source_metrics_by_name.get("source_count"))
-    checks.append(
-        _readiness_check(
-            "source_catalog_seeded",
-            passed=bool(source_metrics_by_name.get("available") and source_count > 0),
-            reason="provider_directory_source is missing or empty",
-            metrics={
-                "source_count": source_count,
-                "live_valid_count": _int(source_metrics_by_name.get("live_valid_count")),
-                "auth_required_count": _int(
-                    source_metrics_by_name.get("live_auth_required_count")
-                ),
-            },
-        )
+    return _readiness_check(
+        "source_catalog_seeded",
+        passed=bool(source_metrics_by_name.get("available") and source_count > 0),
+        reason="provider_directory_source is missing or empty",
+        metrics={
+            "source_count": source_count,
+            "live_valid_count": _int(source_metrics_by_name.get("live_valid_count")),
+            "auth_required_count": _int(
+                source_metrics_by_name.get("live_auth_required_count")
+            ),
+        },
     )
 
+
+def _resource_rows_readiness_check(report: dict[str, Any]) -> dict[str, Any]:
+    source_coverage = report.get("source_resource_coverage_summary") or {}
+    resource_summary = report.get("resource_summary") or {}
     resource_sources = _int(source_coverage.get("sources_with_resource_rows"))
     resource_table_rows = sum(
         _int(summary.get("row_count"))
@@ -5549,145 +5919,170 @@ def _serving_readiness_summary(report: dict[str, Any]) -> dict[str, Any]:
     resource_rows_available = bool(
         source_coverage.get("available") and resource_sources > 0
     ) or bool(resource_table_rows > 0)
-    checks.append(
-        _readiness_check(
-            "resource_rows_imported",
-            passed=resource_rows_available,
-            reason="no Provider Directory source has imported FHIR resource rows",
-            metrics={
-                "sources_with_resource_rows": resource_sources,
-                "source_count": _int(source_coverage.get("source_count")),
-                "resource_source_pct": source_coverage.get("resource_source_pct"),
-                "resource_table_rows": resource_table_rows,
-                "source_resource_coverage_skipped": bool(source_coverage.get("skipped")),
-            },
-        )
+    return _readiness_check(
+        "resource_rows_imported",
+        passed=resource_rows_available,
+        reason="no Provider Directory source has imported FHIR resource rows",
+        metrics={
+            "sources_with_resource_rows": resource_sources,
+            "source_count": _int(source_coverage.get("source_count")),
+            "resource_source_pct": source_coverage.get("resource_source_pct"),
+            "resource_table_rows": resource_table_rows,
+            "source_resource_coverage_skipped": bool(source_coverage.get("skipped")),
+        },
     )
 
+
+def _searchable_address_readiness_check(report: dict[str, Any]) -> dict[str, Any]:
+    unified = report.get("unified_summary") or {}
     provider_directory_rows = _int(unified.get("provider_directory_rows"))
     keyed_rows = _int(unified.get("provider_directory_keyed_rows"))
-    phone_rows = _int(unified.get("provider_directory_phone_rows"))
-    source_record_id_rows = _int(unified.get("provider_directory_source_record_id_rows"))
     should_require_unified_checks = not bool(unified.get("skipped"))
-    checks.append(
-        _readiness_check(
-            "searchable_address_overlay",
-            required=should_require_unified_checks,
-            passed=bool(unified.get("available") and provider_directory_rows > 0 and keyed_rows > 0),
-            reason=(
-                unified.get("reason")
-                if unified.get("skipped")
-                else "no keyed Provider Directory address rows are available for provider/address search"
-            ),
-            metrics={
-                "summary_source": unified.get("summary_source") or "entity_address_unified",
-                "provider_directory_rows": provider_directory_rows,
-                "provider_directory_keyed_rows": keyed_rows,
-                "provider_directory_keyed_pct": unified.get("provider_directory_keyed_pct"),
-            },
-        )
-    )
-    checks.append(
-        _readiness_check(
-            "searchable_phone_overlay",
-            required=should_require_unified_checks,
-            passed=bool(unified.get("available") and provider_directory_rows > 0 and phone_rows > 0),
-            reason=(
-                unified.get("reason")
-                if unified.get("skipped")
-                else "no Provider Directory phone rows are available for provider phone search"
-            ),
-            metrics={
-                "summary_source": unified.get("summary_source") or "entity_address_unified",
-                "provider_directory_rows": provider_directory_rows,
-                "provider_directory_phone_rows": phone_rows,
-                "provider_directory_phone_pct": unified.get("provider_directory_phone_pct"),
-            },
-        )
-    )
-    checks.append(
-        _readiness_check(
-            "source_detail_attribution",
-            required=should_require_unified_checks,
-            passed=bool(provider_directory_rows > 0 and source_record_id_rows >= provider_directory_rows),
-            reason=(
-                unified.get("reason")
-                if unified.get("skipped")
-                else "Provider Directory address rows lack retained FHIR source record ids for provider_directory_sources"
-            ),
-            metrics={
-                "provider_directory_rows": provider_directory_rows,
-                "source_record_id_rows": source_record_id_rows,
-                "source_record_id_pct": unified.get("provider_directory_source_record_id_pct"),
-            },
-        )
+    return _readiness_check(
+        "searchable_address_overlay",
+        required=should_require_unified_checks,
+        passed=bool(unified.get("available") and provider_directory_rows > 0 and keyed_rows > 0),
+        reason=(
+            unified.get("reason")
+            if unified.get("skipped")
+            else "no keyed Provider Directory address rows are available for provider/address search"
+        ),
+        metrics={
+            "summary_source": unified.get("summary_source") or "entity_address_unified",
+            "provider_directory_rows": provider_directory_rows,
+            "provider_directory_keyed_rows": keyed_rows,
+            "provider_directory_keyed_pct": unified.get("provider_directory_keyed_pct"),
+        },
     )
 
+
+def _searchable_phone_readiness_check(report: dict[str, Any]) -> dict[str, Any]:
+    unified = report.get("unified_summary") or {}
+    provider_directory_rows = _int(unified.get("provider_directory_rows"))
+    phone_rows = _int(unified.get("provider_directory_phone_rows"))
+    should_require_unified_checks = not bool(unified.get("skipped"))
+    return _readiness_check(
+        "searchable_phone_overlay",
+        required=should_require_unified_checks,
+        passed=bool(unified.get("available") and provider_directory_rows > 0 and phone_rows > 0),
+        reason=(
+            unified.get("reason")
+            if unified.get("skipped")
+            else "no Provider Directory phone rows are available for provider phone search"
+        ),
+        metrics={
+            "summary_source": unified.get("summary_source") or "entity_address_unified",
+            "provider_directory_rows": provider_directory_rows,
+            "provider_directory_phone_rows": phone_rows,
+            "provider_directory_phone_pct": unified.get("provider_directory_phone_pct"),
+        },
+    )
+
+
+def _source_attribution_readiness_check(report: dict[str, Any]) -> dict[str, Any]:
+    unified = report.get("unified_summary") or {}
+    provider_directory_rows = _int(unified.get("provider_directory_rows"))
+    source_record_id_rows = _int(unified.get("provider_directory_source_record_id_rows"))
+    should_require_unified_checks = not bool(unified.get("skipped"))
+    return _readiness_check(
+        "source_detail_attribution",
+        required=should_require_unified_checks,
+        passed=bool(provider_directory_rows > 0 and source_record_id_rows >= provider_directory_rows),
+        reason=(
+            unified.get("reason")
+            if unified.get("skipped")
+            else "Provider Directory address rows lack retained FHIR source record ids for provider_directory_sources"
+        ),
+        metrics={
+            "provider_directory_rows": provider_directory_rows,
+            "source_record_id_rows": source_record_id_rows,
+            "source_record_id_pct": unified.get("provider_directory_source_record_id_pct"),
+        },
+    )
+
+
+def _network_catalog_readiness_check(report: dict[str, Any]) -> dict[str, Any]:
+    plan_network = report.get("plan_network_context_summary") or {}
+    network_catalog = report.get("network_catalog_summary") or {}
     network_ref_rows = _int(plan_network.get("network_ref_rows"))
     resolved_network_names = _int(plan_network.get("resolved_network_names"))
     network_catalog_rows = _int(network_catalog.get("network_catalog_rows"))
-    network_catalog_required = bool(network_ref_rows or resolved_network_names)
-    checks.append(
-        _readiness_check(
-            "network_catalog_published",
-            required=network_catalog_required,
-            passed=bool(
-                network_catalog.get("available")
-                and network_catalog_rows > 0
-                and _int(network_catalog.get("rows_with_issuer_network_match_key")) > 0
+    return _readiness_check(
+        "network_catalog_published",
+        required=bool(network_ref_rows or resolved_network_names),
+        passed=bool(
+            network_catalog.get("available")
+            and network_catalog_rows > 0
+            and _int(network_catalog.get("rows_with_issuer_network_match_key")) > 0
+        ),
+        reason=(
+            "network refs are present but provider_directory_network_catalog is missing, "
+            "empty, or lacks issuer/network match keys"
+        ),
+        metrics={
+            "network_ref_rows": network_ref_rows,
+            "resolved_network_names": resolved_network_names,
+            "network_catalog_rows": network_catalog_rows,
+            "rows_with_issuer_network_match_key": _int(
+                network_catalog.get("rows_with_issuer_network_match_key")
             ),
-            reason=(
-                "network refs are present but provider_directory_network_catalog is missing, "
-                "empty, or lacks issuer/network match keys"
-            ),
-            metrics={
-                "network_ref_rows": network_ref_rows,
-                "resolved_network_names": resolved_network_names,
-                "network_catalog_rows": network_catalog_rows,
-                "rows_with_issuer_network_match_key": _int(
-                    network_catalog.get("rows_with_issuer_network_match_key")
-                ),
-            },
-        )
+        },
     )
 
+
+def _ptg_corroboration_readiness_check(report: dict[str, Any]) -> dict[str, Any]:
+    unified = report.get("unified_summary") or {}
+    ptg = report.get("ptg_summary") or {}
+    ptg_unified_address = ptg.get("ptg_unified_address") or {}
+    ptg_corroboration = ptg.get("ptg_corroboration") or {}
     ptg_address_rows = _int(ptg_unified_address.get("ptg_unified_address_rows"))
-    ptg_corroboration_required = bool(ptg_address_rows and provider_directory_rows)
-    checks.append(
-        _readiness_check(
-            "ptg_corroboration_table",
-            required=ptg_corroboration_required,
-            passed=bool(
-                ptg_corroboration.get("available")
-                and ptg_corroboration.get("relation_kind") in {"table", "partitioned_table", "materialized_view"}
-                and _int(ptg_corroboration.get("corroboration_rows")) > 0
-            ),
-            reason="PTG addresses and Provider Directory addresses exist but corroboration table is not published with rows",
-            metrics={
-                "ptg_unified_address_rows": ptg_address_rows,
-                "relation_kind": ptg_corroboration.get("relation_kind"),
-                "corroboration_rows": _int(ptg_corroboration.get("corroboration_rows")),
-                "active_match_rows": _int(ptg_corroboration.get("active_match_rows")),
-            },
-        )
+    provider_directory_rows = _int(unified.get("provider_directory_rows"))
+    return _readiness_check(
+        "ptg_corroboration_table",
+        required=bool(ptg_address_rows and provider_directory_rows),
+        passed=bool(
+            ptg_corroboration.get("available")
+            and ptg_corroboration.get("relation_kind") in {"table", "partitioned_table", "materialized_view"}
+            and _int(ptg_corroboration.get("corroboration_rows")) > 0
+        ),
+        reason="PTG addresses and Provider Directory addresses exist but corroboration table is not published with rows",
+        metrics={
+            "ptg_unified_address_rows": ptg_address_rows,
+            "relation_kind": ptg_corroboration.get("relation_kind"),
+            "corroboration_rows": _int(ptg_corroboration.get("corroboration_rows")),
+            "active_match_rows": _int(ptg_corroboration.get("active_match_rows")),
+        },
     )
 
+
+def _ptg_network_readiness_check(report: dict[str, Any]) -> dict[str, Any]:
+    ptg_network = (report.get("ptg_summary") or {}).get("ptg_network_name_overlap") or {}
     provider_directory_plan_network_names = _int(ptg_network.get("provider_directory_plan_network_names"))
-    ptg_network_required = bool(provider_directory_plan_network_names)
-    checks.append(
-        _readiness_check(
-            "ptg_network_name_overlap",
-            required=ptg_network_required,
-            passed=bool(ptg_network.get("available") and _int(ptg_network.get("matched_plan_network_names")) > 0),
-            reason="FHIR network names are present for PTG plan pairs but none match PTG serving network_names",
-            metrics={
-                "provider_directory_plan_network_names": provider_directory_plan_network_names,
-                "matched_plan_network_names": _int(ptg_network.get("matched_plan_network_names")),
-                "matched_plan_pairs": _int(ptg_network.get("matched_plan_pairs")),
-            },
-        )
+    return _readiness_check(
+        "ptg_network_name_overlap",
+        required=bool(provider_directory_plan_network_names),
+        passed=bool(ptg_network.get("available") and _int(ptg_network.get("matched_plan_network_names")) > 0),
+        reason="FHIR network names are present for PTG plan pairs but none match PTG serving network_names",
+        metrics={
+            "provider_directory_plan_network_names": provider_directory_plan_network_names,
+            "matched_plan_network_names": _int(ptg_network.get("matched_plan_network_names")),
+            "matched_plan_pairs": _int(ptg_network.get("matched_plan_pairs")),
+        },
     )
 
+
+def _serving_readiness_summary(report: dict[str, Any]) -> dict[str, Any]:
+    """Condense audit sections into serving-readiness gates and blockers."""
+    checks = [
+        _source_catalog_readiness_check(report),
+        _resource_rows_readiness_check(report),
+        _searchable_address_readiness_check(report),
+        _searchable_phone_readiness_check(report),
+        _source_attribution_readiness_check(report),
+        _network_catalog_readiness_check(report),
+        _ptg_corroboration_readiness_check(report),
+        _ptg_network_readiness_check(report),
+    ]
     required_checks = [check for check in checks if check["required"]]
     failed_required_checks = [check for check in required_checks if check["status"] != "pass"]
     return {
@@ -5698,7 +6093,6 @@ def _serving_readiness_summary(report: dict[str, Any]) -> dict[str, Any]:
         "skipped_check_count": len([check for check in checks if check["status"] == "skip"]),
         "checks": checks,
     }
-
 
 async def build_report(args: argparse.Namespace) -> dict[str, Any]:
     """Collect database, catalog, and serving evidence into one audit report."""
