@@ -9,6 +9,9 @@ from tests.ptg2_serving_address_evidence_postgres_geo import (
     test_knn_template_executes_precedence_and_empty_probe_shape,
     test_optimized_membership_rejects_npi_wide_cms_anchor,
 )
+from tests.ptg2_serving_address_evidence_postgres_coverage import (
+    test_provider_set_geo_candidate_scope_executes_beyond_old_prefix,
+)
 from tests.ptg2_serving_address_evidence_postgres_lineage import (
     test_admitted_mrf_recovers_specific_lineage_without_fabrication,
     test_admitted_source_never_falls_back_to_generic_materialization,
