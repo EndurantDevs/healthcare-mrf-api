@@ -224,7 +224,8 @@ def provider_address_location_filter_sql(
         return f"({identity_sql} AND ({exact_without_point} OR {radius_branch}))"
     if exact_zip_predicate:
         return (
-            f"({exact_zip_predicate} AND {identity_sql} AND {missing_point_sql})"
+            f"({exact_zip_predicate} AND {identity_sql} "
+            f"AND ({missing_point_sql} OR {point_sql}))"
         )
     return f"({identity_sql} AND {radius_branch})" if radius_branch else None
 

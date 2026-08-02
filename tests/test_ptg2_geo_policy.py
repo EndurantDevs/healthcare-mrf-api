@@ -167,7 +167,7 @@ async def test_geo_capability_probe_rejects_unsafe_schema(
     assert session.execute_args is None
 
 
-def test_exact_zip_without_radius_only_allows_rows_without_points():
+def test_exact_zip_without_radius_allows_missing_or_coherent_points():
     filter_sql = provider_address_location_filter_sql(
         "addr",
         schema_name="tenant_data",
@@ -177,7 +177,7 @@ def test_exact_zip_without_radius_only_allows_rows_without_points():
 
     assert "addr.lat IS NULL AND addr.long IS NULL" in filter_sql
     assert "COALESCE(addr.country_code, '')" in filter_sql
-    assert "ST_Covers" not in filter_sql
+    assert "ST_Covers" in filter_sql
 
 
 def test_location_filter_without_zip_or_radius_returns_none():

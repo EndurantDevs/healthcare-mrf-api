@@ -4162,10 +4162,11 @@ paths:
         Address-bearing spatial matches also fail closed on postal coherence.
         A coordinate-bearing address must agree with its canonical ZIP, state,
         and country, its point must fall inside its own ZCTA, and the point must
-        be inside the requested radius. Exact-ZIP fallback is limited to
-        coherent addresses that have no coordinates. Allowed-amount fallback
-        applies these filters internally but does not return provider address
-        or distance fields.
+        be inside any requested positive radius. Exact-ZIP searches admit both
+        coherent coordinate-bearing addresses and coherent addresses without
+        coordinates in the requested ZIP. Allowed-amount fallback applies these
+        filters internally but does not return provider address or distance
+        fields.
       parameters:
         - name: year
           in: query
@@ -4186,15 +4187,14 @@ paths:
           in: query
           schema: { type: string }
           description: |
-            Exact ZIP anchor. A coherent address without coordinates may match
-            this ZIP directly; a coordinate-bearing address must instead pass
-            its own-ZCTA and requested-radius checks.
+            Exact ZIP anchor. A coherent address in this ZIP may match directly;
+            a coordinate-bearing address must also pass its own-ZCTA check.
         - name: zip_radius_miles
           in: query
           schema: { type: number, minimum: 0, default: 10 }
           description: |
             Radius around the ZIP anchor. Coordinate-bearing addresses must be
-            inside both their canonical ZCTA and this requested radius.
+            inside both their canonical ZCTA and any requested positive radius.
         - name: specialty
           in: query
           schema: { type: string }
@@ -4421,10 +4421,11 @@ paths:
 
         Address-bearing spatial matches require coherent canonical ZIP, state,
         and country identity. Coordinate-bearing addresses must fall inside
-        their own ZCTA and the requested radius; exact-ZIP fallback is limited
-        to coherent addresses without coordinates. Allowed-amount fallback
-        applies location filters internally but does not return provider
-        address, contact, or distance fields.
+        their own ZCTA and any requested positive radius. Exact-ZIP searches
+        admit both coherent coordinate-bearing addresses and coherent addresses
+        without coordinates in the requested ZIP. Allowed-amount fallback
+        applies location filters internally but does not return provider address,
+        contact, or distance fields.
       parameters:
         - name: year
           in: query
@@ -4451,9 +4452,8 @@ paths:
           schema:
             type: string
           description: |
-            Exact ZIP anchor. A coherent address without coordinates may match
-            this ZIP directly; a coordinate-bearing address must instead pass
-            its own-ZCTA and requested-radius checks.
+            Exact ZIP anchor. A coherent address in this ZIP may match directly;
+            a coordinate-bearing address must also pass its own-ZCTA check.
         - name: zip_radius_miles
           in: query
           schema:
@@ -4462,9 +4462,9 @@ paths:
             default: 10
           description: |
             Optional ZIP-based radius in miles. Coordinate-bearing addresses
-            must be inside their canonical ZCTA and this radius. Defaults to
-            10 when `zip5` is provided; set `0` for exact-ZIP fallback, which
-            only admits coherent addresses without coordinates.
+            must be inside their canonical ZCTA and any requested positive
+            radius. Defaults to 10 when `zip5` is provided; set `0` for
+            exact-ZIP matching.
         - name: specialty
           in: query
           schema:

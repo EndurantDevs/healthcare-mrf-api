@@ -52,6 +52,38 @@ def _spatial_coherence_query(schema: str) -> serving._MembershipLocationQuery:
     )
 
 
+def _exact_zip_coherence_query(schema: str) -> serving._MembershipLocationQuery:
+    request_arg_map = {"zip5": "00001"}
+    query_parameter_map = {
+        "limit": 10,
+        "offset": 0,
+        "shared_snapshot_key": 41,
+    }
+    filter_sql, distance_sql = serving._membership_filter_sql(
+        request_arg_map,
+        candidate_npis=None,
+        uses_unified_addresses=True,
+        address_zip5_sql=serving._ptg2_address_zip5_sql("addr", unified=True),
+        parameter_map=query_parameter_map,
+        literal_service_address_types=True,
+    )
+    return serving._MembershipLocationQuery(
+        address_table=f"{schema}.entity_address_unified",
+        npi_scope_table=f"{schema}.ptg2_v3_npi_scope",
+        filter_sql=(
+            "npi_scope.snapshot_key = :shared_snapshot_key "
+            f"AND ({filter_sql})"
+        ),
+        parameter_map=query_parameter_map,
+        distance_sql=distance_sql,
+        knn_order_sql=None,
+        address_assurance_sql=serving._membership_address_assurance_sql(
+            request_arg_map,
+            True,
+        ),
+    )
+
+
 async def _insert_spatial_candidate_memberships(
     database: Database,
     schema: str,
@@ -210,3 +242,42 @@ async def test_radius_membership_rejects_incoherent_and_out_of_radius_points():
         ] == [
             1990000213
         ]
+
+
+@pytest.mark.asyncio
+async def test_exact_zip_accepts_coherent_points_and_rejects_incoherent_points():
+    async with _temporary_schema() as (database, schema):
+        await _insert_spatial_reference_rows(database, schema)
+        await _insert_spatial_candidate_rows(database, schema)
+        location_query = _exact_zip_coherence_query(schema)
+        location_sql = _schema_sql(
+            serving._membership_location_sql(location_query, limit=10, offset=0),
+            schema,
+        )
+
+        location_rows = await database.all(
+            location_sql,
+            **location_query.parameter_map,
+        )
+
+        assert sorted(
+            location_record._mapping["npi"]
+            for location_record in location_rows
+        ) == [1990000205, 1990000239]
+
+        await database.status(
+            f"""
+            UPDATE {schema}.entity_address_unified
+               SET lat = 43.0
+             WHERE location_key = 'coherent-exact-point-outside-radius'
+            """
+        )
+        incoherent_location_rows = await database.all(
+            location_sql,
+            **location_query.parameter_map,
+        )
+
+        assert [
+            location_record._mapping["npi"]
+            for location_record in incoherent_location_rows
+        ] == [1990000205]

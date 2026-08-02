@@ -19,6 +19,7 @@ from tests.ptg2_serving_address_evidence_postgres_capability import (
     test_geo_capability_probe_requires_usable_zcta_zip_index,
 )
 from tests.ptg2_serving_address_evidence_postgres_spatial import (
+    test_exact_zip_accepts_coherent_points_and_rejects_incoherent_points,
     test_radius_membership_rejects_incoherent_and_out_of_radius_points,
 )
 from tests.ptg2_serving_address_evidence_postgres_lineage import (
