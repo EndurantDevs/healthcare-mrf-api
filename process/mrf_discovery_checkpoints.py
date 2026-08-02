@@ -917,6 +917,11 @@ async def _process_source_with_lease_heartbeat(
             await heartbeat_task
         return await processing_task
     finally:
-        if not heartbeat_task.done():
-            heartbeat_task.cancel()
-        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        for source_task in (processing_task, heartbeat_task):
+            if not source_task.done():
+                source_task.cancel()
+        await asyncio.gather(
+            processing_task,
+            heartbeat_task,
+            return_exceptions=True,
+        )

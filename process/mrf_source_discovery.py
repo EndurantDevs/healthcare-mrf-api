@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 from urllib.parse import (
     parse_qs,
     parse_qsl,
@@ -106,6 +106,14 @@ DISCOVERY_CATALOG_EXPORT_VERSION = 1
 USER_AGENT = "HealthPorta mrf-source-discovery/1.0"
 DISCOVERY_PROCESS_WORKERS_ENV = "HLTHPRT_MRF_DISCOVERY_PROCESS_WORKERS"
 MAX_DISCOVERY_PROCESS_WORKERS = 8
+DISCOVERY_TARGET_CONCURRENCY_ENV = "HLTHPRT_MRF_DISCOVERY_TARGET_CONCURRENCY"
+MAX_DISCOVERY_TARGET_CONCURRENCY = 16
+DISCOVERY_HTTP_CONNECTION_LIMIT_ENV = (
+    "HLTHPRT_MRF_DISCOVERY_HTTP_CONNECTION_LIMIT"
+)
+DISCOVERY_HTTP_PER_HOST_LIMIT_ENV = (
+    "HLTHPRT_MRF_DISCOVERY_HTTP_PER_HOST_LIMIT"
+)
 BROWSER_FALLBACK_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -271,9 +279,14 @@ def _default_ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
-def _tcp_connector(limit: int) -> aiohttp.TCPConnector:
+def _tcp_connector(
+    limit: int,
+    *,
+    limit_per_host: int = 0,
+) -> aiohttp.TCPConnector:
     return aiohttp.TCPConnector(
         limit=limit,
+        limit_per_host=limit_per_host,
         family=socket.AF_INET,
         ttl_dns_cache=300,
         ssl=_default_ssl_context(),
@@ -286,13 +299,17 @@ async def _discovery_http_session(
     existing_session: aiohttp.ClientSession | None,
     timeout: aiohttp.ClientTimeout,
     connector_limit: int,
+    connector_limit_per_host: int = 0,
 ):
     """Yield a borrowed session or own one shared by the current operation."""
 
     if existing_session is not None:
         yield existing_session
         return
-    connector = _tcp_connector(limit=connector_limit)
+    connector = _tcp_connector(
+        limit=connector_limit,
+        limit_per_host=connector_limit_per_host,
+    )
     async with aiohttp.ClientSession(
         headers={"User-Agent": USER_AGENT},
         timeout=timeout,
@@ -15470,6 +15487,14 @@ async def _probe_mrf_file_heads(
         return await writer_task
 
 
+@dataclass(frozen=True)
+class _CrawlExecutionContext:
+    """Share one HTTP session and global target permit across sources."""
+
+    session: aiohttp.ClientSession | None = None
+    target_semaphore: asyncio.Semaphore | None = None
+
+
 async def _crawl_toc_metadata(
     source_rows: list[dict[str, Any]],
     *,
@@ -15479,7 +15504,7 @@ async def _crawl_toc_metadata(
     max_toc_bytes: int,
     concurrency: int = DEFAULT_CONCURRENCY,
     crawl_target_limit: int | None = None,
-    session: aiohttp.ClientSession | None = None,
+    execution_context: _CrawlExecutionContext | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
     """Crawl TOC targets, derive rows, and persist crawl observations."""
     if test_mode:
@@ -15492,6 +15517,7 @@ async def _crawl_toc_metadata(
         total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
     )
     crawl_source_rows = _dedupe_source_rows_for_crawl(source_rows)
+    active_context = execution_context or _CrawlExecutionContext()
     try:
         target_crawl_timeout = float(
             os.getenv("HLTHPRT_MRF_TOC_TARGET_TIMEOUT_SECONDS", "180")
@@ -15644,7 +15670,7 @@ async def _crawl_toc_metadata(
             )
 
     async with _discovery_http_session(
-        existing_session=session,
+        existing_session=active_context.session,
         timeout=timeout,
         connector_limit=worker_count * 2,
     ) as active_session:
@@ -15689,13 +15715,15 @@ async def _crawl_toc_metadata(
                 total=expanded_target_count,
                 message=message,
             )
-        crawl_semaphore = asyncio.Semaphore(worker_count)
 
         async def crawl_bounded(
             crawl_target: CrawlTarget,
         ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
             """Crawl one target under the shared concurrency and timeout limits."""
-            async with crawl_semaphore:
+
+            async def crawl_with_timeout():
+                """Apply the per-target deadline inside the global work permit."""
+
                 try:
                     if target_crawl_timeout > 0:
                         return await asyncio.wait_for(
@@ -15720,15 +15748,21 @@ async def _crawl_toc_metadata(
                         crawl_target.url,
                     )
 
-        completed_target_count = 0
+            if active_context.target_semaphore is None:
+                return await crawl_with_timeout()
+            async with active_context.target_semaphore:
+                return await crawl_with_timeout()
+
+        crawl_progress_by_name = {"completed_target_count": 0}
         pending_plan_rows: list[dict[str, Any]] = []
         pending_file_rows: list[dict[str, Any]] = []
         pending_observation_rows: list[dict[str, Any]] = []
-        crawl_tasks = [asyncio.create_task(crawl_bounded(toc_target)) for toc_target in toc_targets]
-        for task in asyncio.as_completed(crawl_tasks):
-            target_result = await task
+
+        async def record_crawl_result(target_result) -> None:
+            """Accumulate and checkpoint one completed target result."""
+
             plan_rows, file_rows, crawl_observations, result_url = target_result
-            completed_target_count += 1
+            crawl_progress_by_name["completed_target_count"] += 1
             discovery_count_map["plans"] += len(plan_rows)
             discovery_count_map["files"] += len(file_rows)
             for metadata_row in crawl_observations:
@@ -15748,19 +15782,21 @@ async def _crawl_toc_metadata(
                         status="running",
                         phase="writing TOC metadata rows",
                         unit="targets",
-                        done=completed_target_count,
+                        done=crawl_progress_by_name["completed_target_count"],
                         total=total,
-                        message=f"writing rows for TOC target {completed_target_count}/{total}",
+                        message=(
+                            "writing rows for TOC target "
+                            f"{crawl_progress_by_name['completed_target_count']}/{total}"
+                        ),
                         label=str(result_url),
                     )
-                write_coro = _push_crawl_row_batches(
+                await _push_crawl_row_batches(
                     pending_plan_rows,
                     pending_file_rows,
                     pending_observation_rows,
                     batch_size=write_batch_size,
                     row_write_timeout=row_write_timeout,
                 )
-                await write_coro
             if progress_run_id:
                 enqueue_live_progress(
                     run_id=progress_run_id,
@@ -15768,11 +15804,22 @@ async def _crawl_toc_metadata(
                     status="running",
                     phase="crawling TOC metadata",
                     unit="targets",
-                    done=completed_target_count,
+                    done=crawl_progress_by_name["completed_target_count"],
                     total=total,
-                    message=f"crawled {completed_target_count}/{total} TOC targets",
+                    message=(
+                        "crawled "
+                        f"{crawl_progress_by_name['completed_target_count']}/{total} "
+                        "TOC targets"
+                    ),
                     label=str(result_url),
                 )
+
+        await _consume_bounded_crawl_targets(
+            toc_targets,
+            concurrency=worker_count,
+            crawl_target=crawl_bounded,
+            on_result=record_crawl_result,
+        )
         if progress_run_id:
             enqueue_live_progress(
                 run_id=progress_run_id,
@@ -15780,9 +15827,13 @@ async def _crawl_toc_metadata(
                 status="running",
                 phase="writing final TOC metadata rows",
                 unit="targets",
-                done=completed_target_count,
+                done=crawl_progress_by_name["completed_target_count"],
                 total=total,
-                message=f"writing final rows for {completed_target_count}/{total} TOC targets",
+                message=(
+                    "writing final rows for "
+                    f"{crawl_progress_by_name['completed_target_count']}/{total} "
+                    "TOC targets"
+                ),
             )
         final_write_coro = _push_crawl_row_batches(
             pending_plan_rows,
@@ -15797,6 +15848,63 @@ async def _crawl_toc_metadata(
         discovery_count_map["files"],
         [{"observation_id": metadata_value} for metadata_value in observation_ids],
     )
+
+
+async def _consume_completed_crawl_tasks(
+    crawl_task_list: list[asyncio.Task],
+    on_result: Callable[[tuple], Awaitable[None]],
+) -> None:
+    """Consume results and fully stop every child on any parent failure."""
+
+    try:
+        for crawl_task in asyncio.as_completed(crawl_task_list):
+            await on_result(await crawl_task)
+    finally:
+        for crawl_task in crawl_task_list:
+            if not crawl_task.done():
+                crawl_task.cancel()
+        await asyncio.gather(*crawl_task_list, return_exceptions=True)
+
+
+async def _consume_bounded_crawl_targets(
+    crawl_targets: list[CrawlTarget],
+    *,
+    concurrency: int,
+    crawl_target: Callable[[CrawlTarget], Awaitable[tuple]],
+    on_result: Callable[[tuple], Awaitable[None]],
+) -> None:
+    """Keep only a bounded rolling window of target tasks in memory."""
+
+    target_iterator = iter(crawl_targets)
+    pending_tasks: set[asyncio.Task] = set()
+
+    def start_next_target() -> None:
+        """Start one target when the input iterator still has work."""
+
+        try:
+            next_target = next(target_iterator)
+        except StopIteration:
+            return
+        pending_tasks.add(asyncio.create_task(crawl_target(next_target)))
+
+    for _ in range(min(max(int(concurrency), 1), len(crawl_targets))):
+        start_next_target()
+    try:
+        while pending_tasks:
+            completed_tasks, _ = await asyncio.wait(
+                pending_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for completed_task in completed_tasks:
+                pending_tasks.remove(completed_task)
+                await on_result(await completed_task)
+                start_next_target()
+    finally:
+        for pending_task in pending_tasks:
+            if not pending_task.done():
+                pending_task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
 def _is_signed(url: str | None) -> bool:
@@ -16060,6 +16168,9 @@ class DiscoverySourceProcessingOptions:
     observation_run_id: str
     max_toc_bytes: int
     crawl_target_limit: int | None
+    target_concurrency: int = 1
+    http_connection_limit: int = 0
+    http_per_host_limit: int = 0
 
 
 @dataclass(frozen=True)
@@ -16089,11 +16200,82 @@ def _discovery_process_worker_count(concurrency: int) -> int:
     )
 
 
+def _bounded_discovery_env_int(
+    env_name: str,
+    *,
+    default: int,
+    maximum: int,
+) -> int:
+    """Return one positive, deployment-bounded discovery integer."""
+
+    try:
+        configured_value = int(os.getenv(env_name, str(default)))
+    except ValueError:
+        configured_value = default
+    return min(max(configured_value, 1), maximum)
+
+
+def _discovery_target_concurrency() -> int:
+    """Return bounded async TOC-target workers available to each source."""
+
+    return _bounded_discovery_env_int(
+        DISCOVERY_TARGET_CONCURRENCY_ENV,
+        default=4,
+        maximum=MAX_DISCOVERY_TARGET_CONCURRENCY,
+    )
+
+
+def _discovery_http_connection_limit(
+    source_concurrency: int,
+    target_concurrency: int,
+) -> int:
+    """Bound shared sockets while allowing source and target overlap."""
+
+    configured_limit = _bounded_discovery_env_int(
+        DISCOVERY_HTTP_CONNECTION_LIMIT_ENV,
+        default=64,
+        maximum=512,
+    )
+    desired_limit = max(
+        int(source_concurrency) * 2,
+        int(target_concurrency) * 2,
+        2,
+    )
+    return min(configured_limit, desired_limit)
+
+
+def _discovery_http_per_host_limit() -> int:
+    """Keep async fleet expansion from flooding one payer origin."""
+
+    return _bounded_discovery_env_int(
+        DISCOVERY_HTTP_PER_HOST_LIMIT_ENV,
+        default=4,
+        maximum=32,
+    )
+
+
+def _discovery_process_http_limits(
+    connection_limit: int,
+    per_host_limit: int,
+    process_workers: int,
+) -> tuple[int, int]:
+    """Allocate explicit connector budgets to each isolated child process."""
+
+    worker_count = max(1, int(process_workers))
+    if worker_count == 1:
+        return max(1, int(connection_limit)), max(1, int(per_host_limit))
+    return (
+        max(2, int(connection_limit) // worker_count),
+        max(1, int(per_host_limit) // worker_count),
+    )
+
+
 async def _process_discovery_source_record(
     source_record: dict[str, Any],
     processing_options: DiscoverySourceProcessingOptions,
     *,
     session: aiohttp.ClientSession | None = None,
+    target_semaphore: asyncio.Semaphore | None = None,
 ) -> SourceProcessResult:
     """Check and crawl one source, returning only its durable output counts."""
 
@@ -16105,7 +16287,11 @@ async def _process_discovery_source_record(
     async with _discovery_http_session(
         existing_session=session,
         timeout=timeout,
-        connector_limit=2,
+        connector_limit=max(1, int(processing_options.http_connection_limit or 2)),
+        connector_limit_per_host=max(
+            0,
+            int(processing_options.http_per_host_limit or 0),
+        ),
     ) as active_session:
         source_observations: list[dict[str, Any]] = []
         if processing_options.check_urls:
@@ -16128,9 +16314,12 @@ async def _process_discovery_source_record(
                 test_mode=processing_options.test_mode,
                 run_id=processing_options.observation_run_id,
                 max_toc_bytes=processing_options.max_toc_bytes,
-                concurrency=1,
+                concurrency=processing_options.target_concurrency,
                 crawl_target_limit=processing_options.crawl_target_limit,
-                session=active_session,
+                execution_context=_CrawlExecutionContext(
+                    session=active_session,
+                    target_semaphore=target_semaphore,
+                ),
             )
         return SourceProcessResult(
             urls_checked=len(source_observations),
@@ -16285,10 +16474,22 @@ async def _execute_discovery_source_batch(
         connect=15,
         sock_read=HTTP_READ_TIMEOUT,
     )
+    shared_connection_limit = (
+        batch_context.processing_options.http_connection_limit
+        or _discovery_http_connection_limit(
+            batch_context.concurrency,
+            batch_context.processing_options.target_concurrency,
+        )
+    )
+    shared_target_semaphore = asyncio.Semaphore(shared_connection_limit)
     async with _discovery_http_session(
         existing_session=None,
         timeout=shared_timeout,
-        connector_limit=batch_context.concurrency * 2,
+        connector_limit=shared_connection_limit,
+        connector_limit_per_host=(
+            batch_context.processing_options.http_per_host_limit
+            or _discovery_http_per_host_limit()
+        ),
     ) as shared_session:
 
         async def process_in_event_loop(
@@ -16300,6 +16501,7 @@ async def _execute_discovery_source_batch(
                 source_record,
                 batch_context.processing_options,
                 session=shared_session,
+                target_semaphore=shared_target_semaphore,
             )
 
         return await execute_checkpointed_source_batch(
@@ -16346,6 +16548,20 @@ async def run_mrf_source_discovery_command(
         if test_mode or dry_run
         else _discovery_process_worker_count(concurrency)
     )
+    target_concurrency = 1 if test_mode else _discovery_target_concurrency()
+    global_http_connection_limit = _discovery_http_connection_limit(
+        concurrency,
+        target_concurrency,
+    )
+    global_http_per_host_limit = _discovery_http_per_host_limit()
+    (
+        source_http_connection_limit,
+        source_http_per_host_limit,
+    ) = _discovery_process_http_limits(
+        global_http_connection_limit,
+        global_http_per_host_limit,
+        process_workers,
+    )
     discovery_result = DiscoveryResult(
         providers=providers,
         process_workers=process_workers,
@@ -16384,6 +16600,14 @@ async def run_mrf_source_discovery_command(
         mrf_discovery_root_run_id=mrf_discovery_root_run_id,
     )
     run_params["process_workers"] = process_workers
+    run_params["target_concurrency"] = target_concurrency
+    run_params["http_connection_limit"] = source_http_connection_limit
+    run_params["http_per_host_limit"] = source_http_per_host_limit
+    run_params["http_limit_scope"] = (
+        "shared_session" if process_workers == 1 else "per_process"
+    )
+    run_params["http_global_connection_budget"] = global_http_connection_limit
+    run_params["http_global_per_host_budget"] = global_http_per_host_limit
     run_context_dict = {
         "crawl_run_id": crawl_run_id,
         "control_run_id": control_run_id,
@@ -16619,6 +16843,9 @@ async def run_mrf_source_discovery_command(
                         observation_run_id=observation_run_id,
                         max_toc_bytes=max_toc_bytes,
                         crawl_target_limit=crawl_target_limit,
+                        target_concurrency=target_concurrency,
+                        http_connection_limit=source_http_connection_limit,
+                        http_per_host_limit=source_http_per_host_limit,
                     ),
                 ),
                 checkpoint_store,
