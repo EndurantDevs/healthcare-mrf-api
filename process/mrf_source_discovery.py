@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 from urllib.parse import (
     parse_qs,
     parse_qsl,
@@ -106,6 +106,14 @@ DISCOVERY_CATALOG_EXPORT_VERSION = 1
 USER_AGENT = "HealthPorta mrf-source-discovery/1.0"
 DISCOVERY_PROCESS_WORKERS_ENV = "HLTHPRT_MRF_DISCOVERY_PROCESS_WORKERS"
 MAX_DISCOVERY_PROCESS_WORKERS = 8
+DISCOVERY_TARGET_CONCURRENCY_ENV = "HLTHPRT_MRF_DISCOVERY_TARGET_CONCURRENCY"
+MAX_DISCOVERY_TARGET_CONCURRENCY = 16
+DISCOVERY_HTTP_CONNECTION_LIMIT_ENV = (
+    "HLTHPRT_MRF_DISCOVERY_HTTP_CONNECTION_LIMIT"
+)
+DISCOVERY_HTTP_PER_HOST_LIMIT_ENV = (
+    "HLTHPRT_MRF_DISCOVERY_HTTP_PER_HOST_LIMIT"
+)
 BROWSER_FALLBACK_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -271,9 +279,14 @@ def _default_ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
-def _tcp_connector(limit: int) -> aiohttp.TCPConnector:
+def _tcp_connector(
+    limit: int,
+    *,
+    limit_per_host: int = 0,
+) -> aiohttp.TCPConnector:
     return aiohttp.TCPConnector(
         limit=limit,
+        limit_per_host=limit_per_host,
         family=socket.AF_INET,
         ttl_dns_cache=300,
         ssl=_default_ssl_context(),
@@ -286,13 +299,17 @@ async def _discovery_http_session(
     existing_session: aiohttp.ClientSession | None,
     timeout: aiohttp.ClientTimeout,
     connector_limit: int,
+    connector_limit_per_host: int = 0,
 ):
     """Yield a borrowed session or own one shared by the current operation."""
 
     if existing_session is not None:
         yield existing_session
         return
-    connector = _tcp_connector(limit=connector_limit)
+    connector = _tcp_connector(
+        limit=connector_limit,
+        limit_per_host=connector_limit_per_host,
+    )
     async with aiohttp.ClientSession(
         headers={"User-Agent": USER_AGENT},
         timeout=timeout,
@@ -2800,37 +2817,16 @@ async def _ensure_catalog_tables() -> None:
         await db.create_table(model.__table__, checkfirst=True)
 
 
-def _candidate_to_rows(
+def _candidate_payer_row(
     candidate: SourceCandidate,
     now: dt.datetime,
-    *,
-    discovery_run_id: str | None = None,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Convert one source candidate into payer and source database rows."""
-    payer_id = _id("mrfpayer", _clean_text(candidate.payer_name).lower())
-    source_url = candidate.index_url or candidate.human_url
-    aliases = sorted(
-        {
-            _clean_text(alias_text)
-            for alias_text in (candidate.payer_name, *candidate.aliases)
-            if _clean_text(alias_text)
-        },
-        key=str.lower,
-    )
-    candidate_metadata = _candidate_metadata(candidate, aliases)
-    target_payer_query = _candidate_target_payer_query(candidate)
-    source_identity_dict: dict[str, Any] = {
-        "payer": payer_id,
-        "url": _canonical_or_none(source_url),
-        "provider": candidate.provider,
-    }
-    if target_payer_query:
-        source_identity_dict["target_payer_query"] = target_payer_query
-    source_id = _id(
-        "mrfsource",
-        source_identity_dict,
-    )
-    payer_row_dict = {
+    payer_id: str,
+    aliases: list[str],
+    candidate_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the payer row shared by every candidate source variant."""
+
+    return {
         "payer_id": payer_id,
         "canonical_name": _clean_text(candidate.payer_name),
         "aliases": aliases,
@@ -2847,8 +2843,16 @@ def _candidate_to_rows(
         "created_at": now,
         "updated_at": now,
     }
-    if not source_url:
-        return payer_row_dict, None
+
+
+def _candidate_source_key(
+    candidate: SourceCandidate,
+    source_url: str,
+    target_payer_query: str,
+    source_id: str,
+) -> str:
+    """Build the stable human-readable key for one candidate source."""
+
     source_key_base = _slug(
         "-".join(
             identity_part
@@ -2861,15 +2865,31 @@ def _candidate_to_rows(
             if identity_part
         )
     )
-    source_key = f"{source_key_base[:80]}-{source_id[-8:]}"
+    return f"{source_key_base[:80]}-{source_id[-8:]}"
+
+
+def _candidate_source_row(
+    candidate: SourceCandidate,
+    now: dt.datetime,
+    payer_id: str,
+    source_id: str,
+    source_url: str,
+    target_payer_query: str,
+    candidate_metadata: dict[str, Any],
+    discovery_run_id: str | None,
+) -> dict[str, Any]:
+    """Build the persisted source row for one URL-bearing candidate."""
+
     source_metadata_dict = dict(candidate_metadata)
     normalized_discovery_run_id = _clean_text(discovery_run_id)
     if normalized_discovery_run_id:
         source_metadata_dict["discovery_run_id"] = normalized_discovery_run_id
-    source_row_dict = {
+    return {
         "source_id": source_id,
         "payer_id": payer_id,
-        "source_key": source_key,
+        "source_key": _candidate_source_key(
+            candidate, source_url, target_payer_query, source_id
+        ),
         "display_name": _clean_text(candidate.payer_name),
         "source_type": candidate.source_type,
         "hosting_platform": candidate.hosting_platform
@@ -2895,7 +2915,51 @@ def _candidate_to_rows(
         "created_at": now,
         "updated_at": now,
     }
-    return payer_row_dict, source_row_dict
+
+
+def _candidate_to_rows(
+    candidate: SourceCandidate,
+    now: dt.datetime,
+    *,
+    discovery_run_id: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Convert one source candidate into payer and source database rows."""
+
+    payer_id = _id("mrfpayer", _clean_text(candidate.payer_name).lower())
+    source_url = candidate.index_url or candidate.human_url
+    aliases = sorted(
+        {
+            _clean_text(alias_text)
+            for alias_text in (candidate.payer_name, *candidate.aliases)
+            if _clean_text(alias_text)
+        },
+        key=str.lower,
+    )
+    candidate_metadata = _candidate_metadata(candidate, aliases)
+    target_payer_query = _candidate_target_payer_query(candidate)
+    source_identity_dict: dict[str, Any] = {
+        "payer": payer_id,
+        "url": _canonical_or_none(source_url),
+        "provider": candidate.provider,
+    }
+    if target_payer_query:
+        source_identity_dict["target_payer_query"] = target_payer_query
+    source_id = _id("mrfsource", source_identity_dict)
+    payer_row_dict = _candidate_payer_row(
+        candidate, now, payer_id, aliases, candidate_metadata
+    )
+    if not source_url:
+        return payer_row_dict, None
+    return payer_row_dict, _candidate_source_row(
+        candidate,
+        now,
+        payer_id,
+        source_id,
+        source_url,
+        target_payer_query,
+        candidate_metadata,
+        discovery_run_id,
+    )
 
 
 def _candidate_metadata(
@@ -2929,6 +2993,58 @@ def _candidate_metadata(
     return metadata
 
 
+def _merge_payer_candidate_row(
+    existing_payer_row: dict[str, Any],
+    payer_row: dict[str, Any],
+    candidate: SourceCandidate,
+) -> None:
+    """Merge one additional source candidate into its payer row."""
+
+    existing_payer_row["aliases"] = sorted(
+        set(
+            (existing_payer_row.get("aliases") or [])
+            + (payer_row.get("aliases") or [])
+        )
+    )
+    existing_payer_row["source_coverage"] = sorted(
+        set(
+            (existing_payer_row.get("source_coverage") or [])
+            + (payer_row.get("source_coverage") or [])
+        )
+    )
+    existing_metadata_by_field = dict(existing_payer_row.get("metadata_json") or {})
+    existing_metadata_by_field["benefit_lines"] = sorted(
+        set(
+            (existing_metadata_by_field.get("benefit_lines") or [])
+            + list(candidate.benefit_lines)
+        )
+    )
+    payer_metadata_by_field = payer_row.get("metadata_json") or {}
+    for key in (
+        "aliases",
+        "source_coverage",
+        "vendor_names",
+        "network_names",
+        "plan_names",
+    ):
+        existing_metadata_by_field[key] = sorted(
+            set(
+                (existing_metadata_by_field.get(key) or [])
+                + (payer_metadata_by_field.get(key) or [])
+            )
+        )
+    existing_metadata_by_field["source_tier"] = _normalize_source_tier(
+        existing_metadata_by_field.get("source_tier")
+        or payer_metadata_by_field.get("source_tier")
+    )
+    existing_payer_row["metadata_json"] = {
+        **existing_metadata_by_field,
+        "providers": sorted(
+            set(existing_metadata_by_field.get("providers", []) + [candidate.provider])
+        ),
+    }
+
+
 async def _store_candidates(
     candidates: list[SourceCandidate],
     *,
@@ -2946,48 +3062,7 @@ async def _store_candidates(
         )
         existing = payer_rows_by_id.get(payer_row["payer_id"])
         if existing:
-            existing["aliases"] = sorted(
-                set((existing.get("aliases") or []) + (payer_row.get("aliases") or []))
-            )
-            existing["source_coverage"] = sorted(
-                set(
-                    (existing.get("source_coverage") or [])
-                    + (payer_row.get("source_coverage") or [])
-                )
-            )
-            existing_metadata_by_field = dict(existing.get("metadata_json") or {})
-            existing_metadata_by_field["benefit_lines"] = sorted(
-                set(
-                    (existing_metadata_by_field.get("benefit_lines") or [])
-                    + list(candidate.benefit_lines)
-                )
-            )
-            for key in (
-                "aliases",
-                "source_coverage",
-                "vendor_names",
-                "network_names",
-                "plan_names",
-            ):
-                existing_metadata_by_field[key] = sorted(
-                    set(
-                        (existing_metadata_by_field.get(key) or [])
-                        + ((payer_row.get("metadata_json") or {}).get(key) or [])
-                    )
-                )
-            existing_metadata_by_field["source_tier"] = _normalize_source_tier(
-                existing_metadata_by_field.get("source_tier")
-                or (payer_row.get("metadata_json") or {}).get("source_tier")
-            )
-            existing["metadata_json"] = {
-                **existing_metadata_by_field,
-                "providers": sorted(
-                    set(
-                        (existing.get("metadata_json") or {}).get("providers", [])
-                        + [candidate.provider]
-                    )
-                ),
-            }
+            _merge_payer_candidate_row(existing, payer_row, candidate)
         else:
             payer_rows_by_id[payer_row["payer_id"]] = payer_row
         if source_row:
@@ -3030,6 +3105,51 @@ async def _retag_sources_for_discovery_run(
         await session.execute(retag_statement, retag_parameters)
 
 
+async def _source_url_observation(
+    source_row: dict[str, Any],
+    url: Any,
+    *,
+    test_mode: bool,
+    run_id: str | None,
+    semaphore: asyncio.Semaphore,
+    session: aiohttp.ClientSession,
+) -> dict[str, Any]:
+    """Check one source URL and return its normalized observation row."""
+
+    async with semaphore:
+        if test_mode:
+            head_by_field = {
+                "status": "skipped_test_mode",
+                "checked_at": _utc_now(),
+            }
+        else:
+            head_by_field = await _head_url(str(url), session=session)
+    return {
+        "observation_id": _id(
+            "mrfurlobs",
+            {
+                "source_id": source_row["source_id"],
+                "url": url,
+                "checked_at": head_by_field["checked_at"].isoformat(),
+            },
+        ),
+        "source_id": source_row["source_id"],
+        "url": str(url),
+        "canonical_url": _canonical_or_none(str(url)),
+        "url_type": "index_or_landing",
+        "status": str(head_by_field.get("status") or "unknown"),
+        "http_status": head_by_field.get("http_status"),
+        "etag": head_by_field.get("etag"),
+        "last_modified": head_by_field.get("last_modified"),
+        "content_length": head_by_field.get("content_length"),
+        "content_type": head_by_field.get("content_type"),
+        "final_url": head_by_field.get("final_url"),
+        "checked_at": head_by_field["checked_at"],
+        "error": head_by_field.get("error"),
+        "metadata_json": {"run_id": run_id},
+    }
+
+
 async def _store_observations(
     source_rows: list[dict[str, Any]],
     *,
@@ -3050,50 +3170,22 @@ async def _store_observations(
     semaphore = asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY)))
     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
 
-    async def check_one(
-        source_row: dict[str, Any], url: Any, session: aiohttp.ClientSession
-    ) -> dict[str, Any]:
-        """Check one source URL and return its normalized observation row."""
-        async with semaphore:
-            if test_mode:
-                head_by_field = {
-                    "status": "skipped_test_mode",
-                    "checked_at": _utc_now(),
-                }
-            else:
-                head_by_field = await _head_url(str(url), session=session)
-            return {
-                "observation_id": _id(
-                    "mrfurlobs",
-                    {
-                        "source_id": source_row["source_id"],
-                        "url": url,
-                        "checked_at": head_by_field["checked_at"].isoformat(),
-                    },
-                ),
-                "source_id": source_row["source_id"],
-                "url": str(url),
-                "canonical_url": _canonical_or_none(str(url)),
-                "url_type": "index_or_landing",
-                "status": str(head_by_field.get("status") or "unknown"),
-                "http_status": head_by_field.get("http_status"),
-                "etag": head_by_field.get("etag"),
-                "last_modified": head_by_field.get("last_modified"),
-                "content_length": head_by_field.get("content_length"),
-                "content_type": head_by_field.get("content_type"),
-                "final_url": head_by_field.get("final_url"),
-                "checked_at": head_by_field["checked_at"],
-                "error": head_by_field.get("error"),
-                "metadata_json": {"run_id": run_id},
-            }
-
     async with _discovery_http_session(
         existing_session=session,
         timeout=timeout,
         connector_limit=max(1, int(concurrency or DEFAULT_CONCURRENCY)) * 2,
     ) as active_session:
         tasks = [
-            asyncio.create_task(check_one(source_row, url, active_session))
+            asyncio.create_task(
+                _source_url_observation(
+                    source_row,
+                    url,
+                    test_mode=test_mode,
+                    run_id=run_id,
+                    semaphore=semaphore,
+                    session=active_session,
+                )
+            )
             for source_row, url in source_url_pairs
         ]
         for done, task in enumerate(asyncio.as_completed(tasks), start=1):
@@ -15357,6 +15449,102 @@ async def _update_mrf_file_probe_metadata(updates: list[dict[str, Any]]) -> None
             )
 
 
+@dataclass(frozen=True)
+class _FileProbeExecutionContext:
+    """Share queues, limits, and reporting identity across probe tasks."""
+
+    target_queue: asyncio.Queue[dict[str, Any] | None]
+    result_queue: asyncio.Queue[tuple[dict[str, Any], dict[str, Any]] | None]
+    worker_count: int
+    run_id: str | None
+    progress_run_id: str | None
+    total: int
+
+
+async def _file_probe_worker(
+    execution_context: _FileProbeExecutionContext,
+    session: aiohttp.ClientSession,
+) -> None:
+    """Consume file-probe targets and enqueue response heads."""
+
+    while True:
+        probe_target = await execution_context.target_queue.get()
+        try:
+            if probe_target is None:
+                await execution_context.result_queue.put(None)
+                return
+            head = await _head_url(str(probe_target["url"]), session=session)
+            await execution_context.result_queue.put((probe_target, head))
+        finally:
+            execution_context.target_queue.task_done()
+
+
+async def _flush_file_probe_rows(
+    observation_rows: list[dict[str, Any]],
+    update_rows: list[dict[str, Any]],
+    *,
+    force: bool = False,
+) -> None:
+    """Persist full probe batches, or all remaining rows when forced."""
+
+    if observation_rows and (force or len(observation_rows) >= WRITE_BATCH_SIZE):
+        await push_objects(
+            observation_rows,
+            MRFUrlObservation,
+            rewrite=True,
+            use_copy=False,
+        )
+        observation_rows.clear()
+    if update_rows and (force or len(update_rows) >= WRITE_BATCH_SIZE):
+        await _update_mrf_file_probe_metadata(update_rows)
+        update_rows.clear()
+
+
+async def _file_probe_writer(
+    execution_context: _FileProbeExecutionContext,
+) -> tuple[list[dict[str, Any]], int]:
+    """Persist file-probe observations and report completion counts."""
+
+    done = 0
+    ok_count = 0
+    finished_workers = 0
+    all_observations: list[dict[str, Any]] = []
+    observation_rows: list[dict[str, Any]] = []
+    update_rows: list[dict[str, Any]] = []
+    while finished_workers < execution_context.worker_count:
+        queue_result = await execution_context.result_queue.get()
+        if queue_result is None:
+            finished_workers += 1
+            continue
+        probe_target, head = queue_result
+        done += 1
+        if str(head.get("status") or "") == "ok":
+            ok_count += 1
+        observation = _file_probe_observation(
+            probe_target, head, execution_context.run_id
+        )
+        all_observations.append(observation)
+        observation_rows.append(observation)
+        update_values = _file_probe_update_values(probe_target, head)
+        if update_values:
+            update_rows.append(update_values)
+        await _flush_file_probe_rows(observation_rows, update_rows)
+        if execution_context.progress_run_id:
+            enqueue_live_progress(
+                run_id=execution_context.progress_run_id,
+                importer="mrf-source-discovery",
+                status="running",
+                phase="probing MRF file headers",
+                unit="files",
+                done=done,
+                total=execution_context.total,
+                message=f"probed {done}/{execution_context.total} file headers",
+                label=str(probe_target.get("url") or ""),
+            )
+    await _flush_file_probe_rows(observation_rows, update_rows, force=True)
+    return all_observations, ok_count
+
+
 async def _probe_mrf_file_heads(
     *,
     file_types: tuple[str, ...],
@@ -15384,78 +15572,14 @@ async def _probe_mrf_file_heads(
         target_queue.put_nowait(probe_target)
     for _ in range(worker_count):
         target_queue.put_nowait(None)
-
-    async def worker(session: aiohttp.ClientSession) -> None:
-        """Consume file-probe targets and enqueue response heads."""
-        while True:
-            probe_target = await target_queue.get()
-            try:
-                if probe_target is None:
-                    await result_queue.put(None)
-                    return
-                head = await _head_url(
-                    str(probe_target["url"]), session=session
-                )
-                await result_queue.put((probe_target, head))
-            finally:
-                target_queue.task_done()
-
-    async def writer() -> tuple[list[dict[str, Any]], int]:
-        """Persist file-probe observations and report completion counts."""
-        done = 0
-        ok_count = 0
-        finished_workers = 0
-        all_observations: list[dict[str, Any]] = []
-        observation_rows: list[dict[str, Any]] = []
-        update_rows: list[dict[str, Any]] = []
-        total = len(probe_targets)
-        while finished_workers < worker_count:
-            queue_result = await result_queue.get()
-            if queue_result is None:
-                finished_workers += 1
-                continue
-            probe_target, head = queue_result
-            done += 1
-            if str(head.get("status") or "") == "ok":
-                ok_count += 1
-            observation = _file_probe_observation(probe_target, head, run_id)
-            all_observations.append(observation)
-            observation_rows.append(observation)
-            update_values = _file_probe_update_values(probe_target, head)
-            if update_values:
-                update_rows.append(update_values)
-            if len(observation_rows) >= WRITE_BATCH_SIZE:
-                await push_objects(
-                    observation_rows,
-                    MRFUrlObservation,
-                    rewrite=True,
-                    use_copy=False,
-                )
-                observation_rows.clear()
-            if len(update_rows) >= WRITE_BATCH_SIZE:
-                await _update_mrf_file_probe_metadata(update_rows)
-                update_rows.clear()
-            if progress_run_id:
-                enqueue_live_progress(
-                    run_id=progress_run_id,
-                    importer="mrf-source-discovery",
-                    status="running",
-                    phase="probing MRF file headers",
-                    unit="files",
-                    done=done,
-                    total=total,
-                    message=f"probed {done}/{total} file headers",
-                    label=str(probe_target.get("url") or ""),
-                )
-        if observation_rows:
-            await push_objects(
-                observation_rows,
-                MRFUrlObservation,
-                rewrite=True,
-                use_copy=False,
-            )
-        await _update_mrf_file_probe_metadata(update_rows)
-        return all_observations, ok_count
+    execution_context = _FileProbeExecutionContext(
+        target_queue=target_queue,
+        result_queue=result_queue,
+        worker_count=worker_count,
+        run_id=run_id,
+        progress_run_id=progress_run_id,
+        total=len(probe_targets),
+    )
 
     async with aiohttp.ClientSession(
         headers={"User-Agent": USER_AGENT},
@@ -15463,11 +15587,22 @@ async def _probe_mrf_file_heads(
         connector=connector,
         trust_env=False,
     ) as session:
-        workers = [asyncio.create_task(worker(session)) for _ in range(worker_count)]
-        writer_task = asyncio.create_task(writer())
+        workers = [
+            asyncio.create_task(_file_probe_worker(execution_context, session))
+            for _ in range(worker_count)
+        ]
+        writer_task = asyncio.create_task(_file_probe_writer(execution_context))
         await target_queue.join()
         await asyncio.gather(*workers)
         return await writer_task
+
+
+@dataclass(frozen=True)
+class _CrawlExecutionContext:
+    """Share one HTTP session and global target permit across sources."""
+
+    session: aiohttp.ClientSession | None = None
+    target_semaphore: asyncio.Semaphore | None = None
 
 
 async def _crawl_toc_metadata(
@@ -15479,7 +15614,7 @@ async def _crawl_toc_metadata(
     max_toc_bytes: int,
     concurrency: int = DEFAULT_CONCURRENCY,
     crawl_target_limit: int | None = None,
-    session: aiohttp.ClientSession | None = None,
+    execution_context: _CrawlExecutionContext | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
     """Crawl TOC targets, derive rows, and persist crawl observations."""
     if test_mode:
@@ -15492,6 +15627,7 @@ async def _crawl_toc_metadata(
         total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
     )
     crawl_source_rows = _dedupe_source_rows_for_crawl(source_rows)
+    active_context = execution_context or _CrawlExecutionContext()
     try:
         target_crawl_timeout = float(
             os.getenv("HLTHPRT_MRF_TOC_TARGET_TIMEOUT_SECONDS", "180")
@@ -15644,7 +15780,7 @@ async def _crawl_toc_metadata(
             )
 
     async with _discovery_http_session(
-        existing_session=session,
+        existing_session=active_context.session,
         timeout=timeout,
         connector_limit=worker_count * 2,
     ) as active_session:
@@ -15689,13 +15825,15 @@ async def _crawl_toc_metadata(
                 total=expanded_target_count,
                 message=message,
             )
-        crawl_semaphore = asyncio.Semaphore(worker_count)
 
         async def crawl_bounded(
             crawl_target: CrawlTarget,
         ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
             """Crawl one target under the shared concurrency and timeout limits."""
-            async with crawl_semaphore:
+
+            async def crawl_with_timeout():
+                """Apply the per-target deadline inside the global work permit."""
+
                 try:
                     if target_crawl_timeout > 0:
                         return await asyncio.wait_for(
@@ -15720,15 +15858,21 @@ async def _crawl_toc_metadata(
                         crawl_target.url,
                     )
 
-        completed_target_count = 0
+            if active_context.target_semaphore is None:
+                return await crawl_with_timeout()
+            async with active_context.target_semaphore:
+                return await crawl_with_timeout()
+
+        crawl_progress_by_name = {"completed_target_count": 0}
         pending_plan_rows: list[dict[str, Any]] = []
         pending_file_rows: list[dict[str, Any]] = []
         pending_observation_rows: list[dict[str, Any]] = []
-        crawl_tasks = [asyncio.create_task(crawl_bounded(toc_target)) for toc_target in toc_targets]
-        for task in asyncio.as_completed(crawl_tasks):
-            target_result = await task
+
+        async def record_crawl_result(target_result) -> None:
+            """Accumulate and checkpoint one completed target result."""
+
             plan_rows, file_rows, crawl_observations, result_url = target_result
-            completed_target_count += 1
+            crawl_progress_by_name["completed_target_count"] += 1
             discovery_count_map["plans"] += len(plan_rows)
             discovery_count_map["files"] += len(file_rows)
             for metadata_row in crawl_observations:
@@ -15748,19 +15892,21 @@ async def _crawl_toc_metadata(
                         status="running",
                         phase="writing TOC metadata rows",
                         unit="targets",
-                        done=completed_target_count,
+                        done=crawl_progress_by_name["completed_target_count"],
                         total=total,
-                        message=f"writing rows for TOC target {completed_target_count}/{total}",
+                        message=(
+                            "writing rows for TOC target "
+                            f"{crawl_progress_by_name['completed_target_count']}/{total}"
+                        ),
                         label=str(result_url),
                     )
-                write_coro = _push_crawl_row_batches(
+                await _push_crawl_row_batches(
                     pending_plan_rows,
                     pending_file_rows,
                     pending_observation_rows,
                     batch_size=write_batch_size,
                     row_write_timeout=row_write_timeout,
                 )
-                await write_coro
             if progress_run_id:
                 enqueue_live_progress(
                     run_id=progress_run_id,
@@ -15768,11 +15914,22 @@ async def _crawl_toc_metadata(
                     status="running",
                     phase="crawling TOC metadata",
                     unit="targets",
-                    done=completed_target_count,
+                    done=crawl_progress_by_name["completed_target_count"],
                     total=total,
-                    message=f"crawled {completed_target_count}/{total} TOC targets",
+                    message=(
+                        "crawled "
+                        f"{crawl_progress_by_name['completed_target_count']}/{total} "
+                        "TOC targets"
+                    ),
                     label=str(result_url),
                 )
+
+        await _consume_bounded_crawl_targets(
+            toc_targets,
+            concurrency=worker_count,
+            crawl_target=crawl_bounded,
+            on_result=record_crawl_result,
+        )
         if progress_run_id:
             enqueue_live_progress(
                 run_id=progress_run_id,
@@ -15780,9 +15937,13 @@ async def _crawl_toc_metadata(
                 status="running",
                 phase="writing final TOC metadata rows",
                 unit="targets",
-                done=completed_target_count,
+                done=crawl_progress_by_name["completed_target_count"],
                 total=total,
-                message=f"writing final rows for {completed_target_count}/{total} TOC targets",
+                message=(
+                    "writing final rows for "
+                    f"{crawl_progress_by_name['completed_target_count']}/{total} "
+                    "TOC targets"
+                ),
             )
         final_write_coro = _push_crawl_row_batches(
             pending_plan_rows,
@@ -15797,6 +15958,63 @@ async def _crawl_toc_metadata(
         discovery_count_map["files"],
         [{"observation_id": metadata_value} for metadata_value in observation_ids],
     )
+
+
+async def _consume_completed_crawl_tasks(
+    crawl_task_list: list[asyncio.Task],
+    on_result: Callable[[tuple], Awaitable[None]],
+) -> None:
+    """Consume results and fully stop every child on any parent failure."""
+
+    try:
+        for crawl_task in asyncio.as_completed(crawl_task_list):
+            await on_result(await crawl_task)
+    finally:
+        for crawl_task in crawl_task_list:
+            if not crawl_task.done():
+                crawl_task.cancel()
+        await asyncio.gather(*crawl_task_list, return_exceptions=True)
+
+
+async def _consume_bounded_crawl_targets(
+    crawl_targets: list[CrawlTarget],
+    *,
+    concurrency: int,
+    crawl_target: Callable[[CrawlTarget], Awaitable[tuple]],
+    on_result: Callable[[tuple], Awaitable[None]],
+) -> None:
+    """Keep only a bounded rolling window of target tasks in memory."""
+
+    target_iterator = iter(crawl_targets)
+    pending_tasks: set[asyncio.Task] = set()
+
+    def start_next_target() -> None:
+        """Start one target when the input iterator still has work."""
+
+        try:
+            next_target = next(target_iterator)
+        except StopIteration:
+            return
+        pending_tasks.add(asyncio.create_task(crawl_target(next_target)))
+
+    for _ in range(min(max(int(concurrency), 1), len(crawl_targets))):
+        start_next_target()
+    try:
+        while pending_tasks:
+            completed_tasks, _ = await asyncio.wait(
+                pending_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for completed_task in completed_tasks:
+                pending_tasks.remove(completed_task)
+                await on_result(await completed_task)
+                start_next_target()
+    finally:
+        for pending_task in pending_tasks:
+            if not pending_task.done():
+                pending_task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
 def _is_signed(url: str | None) -> bool:
@@ -16060,6 +16278,9 @@ class DiscoverySourceProcessingOptions:
     observation_run_id: str
     max_toc_bytes: int
     crawl_target_limit: int | None
+    target_concurrency: int = 1
+    http_connection_limit: int = 0
+    http_per_host_limit: int = 0
 
 
 @dataclass(frozen=True)
@@ -16089,11 +16310,82 @@ def _discovery_process_worker_count(concurrency: int) -> int:
     )
 
 
+def _bounded_discovery_env_int(
+    env_name: str,
+    *,
+    default: int,
+    maximum: int,
+) -> int:
+    """Return one positive, deployment-bounded discovery integer."""
+
+    try:
+        configured_value = int(os.getenv(env_name, str(default)))
+    except ValueError:
+        configured_value = default
+    return min(max(configured_value, 1), maximum)
+
+
+def _discovery_target_concurrency() -> int:
+    """Return bounded async TOC-target workers available to each source."""
+
+    return _bounded_discovery_env_int(
+        DISCOVERY_TARGET_CONCURRENCY_ENV,
+        default=4,
+        maximum=MAX_DISCOVERY_TARGET_CONCURRENCY,
+    )
+
+
+def _discovery_http_connection_limit(
+    source_concurrency: int,
+    target_concurrency: int,
+) -> int:
+    """Bound shared sockets while allowing source and target overlap."""
+
+    configured_limit = _bounded_discovery_env_int(
+        DISCOVERY_HTTP_CONNECTION_LIMIT_ENV,
+        default=64,
+        maximum=512,
+    )
+    desired_limit = max(
+        int(source_concurrency) * 2,
+        int(target_concurrency) * 2,
+        2,
+    )
+    return min(configured_limit, desired_limit)
+
+
+def _discovery_http_per_host_limit() -> int:
+    """Keep async fleet expansion from flooding one payer origin."""
+
+    return _bounded_discovery_env_int(
+        DISCOVERY_HTTP_PER_HOST_LIMIT_ENV,
+        default=4,
+        maximum=32,
+    )
+
+
+def _discovery_process_http_limits(
+    connection_limit: int,
+    per_host_limit: int,
+    process_workers: int,
+) -> tuple[int, int]:
+    """Allocate explicit connector budgets to each isolated child process."""
+
+    worker_count = max(1, int(process_workers))
+    if worker_count == 1:
+        return max(1, int(connection_limit)), max(1, int(per_host_limit))
+    return (
+        max(2, int(connection_limit) // worker_count),
+        max(1, int(per_host_limit) // worker_count),
+    )
+
+
 async def _process_discovery_source_record(
     source_record: dict[str, Any],
     processing_options: DiscoverySourceProcessingOptions,
     *,
     session: aiohttp.ClientSession | None = None,
+    target_semaphore: asyncio.Semaphore | None = None,
 ) -> SourceProcessResult:
     """Check and crawl one source, returning only its durable output counts."""
 
@@ -16105,7 +16397,11 @@ async def _process_discovery_source_record(
     async with _discovery_http_session(
         existing_session=session,
         timeout=timeout,
-        connector_limit=2,
+        connector_limit=max(1, int(processing_options.http_connection_limit or 2)),
+        connector_limit_per_host=max(
+            0,
+            int(processing_options.http_per_host_limit or 0),
+        ),
     ) as active_session:
         source_observations: list[dict[str, Any]] = []
         if processing_options.check_urls:
@@ -16128,9 +16424,12 @@ async def _process_discovery_source_record(
                 test_mode=processing_options.test_mode,
                 run_id=processing_options.observation_run_id,
                 max_toc_bytes=processing_options.max_toc_bytes,
-                concurrency=1,
+                concurrency=processing_options.target_concurrency,
                 crawl_target_limit=processing_options.crawl_target_limit,
-                session=active_session,
+                execution_context=_CrawlExecutionContext(
+                    session=active_session,
+                    target_semaphore=target_semaphore,
+                ),
             )
         return SourceProcessResult(
             urls_checked=len(source_observations),
@@ -16255,40 +16554,71 @@ async def _execute_discovery_source_batch(
         "on_source_checkpoint": checkpoint_reporter,
     }
     if batch_context.process_workers > 1:
-        source_process_pool = DiscoverySourceProcessPool(
-            batch_context.process_workers
+        return await _execute_process_discovery_source_batch(
+            batch_context, executor_arguments_by_name
+        )
+    return await _execute_shared_discovery_source_batch(
+        batch_context, executor_arguments_by_name
+    )
+
+
+async def _execute_process_discovery_source_batch(
+    batch_context: DiscoverySourceBatchContext,
+    executor_arguments_by_name: dict[str, Any],
+) -> SourceBatchSummary:
+    """Execute one source batch across isolated reusable CPU workers."""
+
+    source_process_pool = DiscoverySourceProcessPool(batch_context.process_workers)
+
+    async def process_in_worker(
+        source_record: dict[str, Any],
+    ) -> SourceProcessResult:
+        """Submit one frozen source to the child-process pool."""
+
+        return await source_process_pool.process_source(
+            source_record,
+            batch_context.processing_options,
         )
 
-        async def process_in_worker(
-            source_record: dict[str, Any],
-        ) -> SourceProcessResult:
-            """Submit one frozen source to the child-process pool."""
+    try:
+        batch_summary = await execute_checkpointed_source_batch(
+            **executor_arguments_by_name,
+            process_source=process_in_worker,
+        )
+    except BaseException:
+        await source_process_pool.terminate()
+        raise
+    await source_process_pool.close()
+    return batch_summary
 
-            return await source_process_pool.process_source(
-                source_record,
-                batch_context.processing_options,
-            )
 
-        try:
-            batch_summary = await execute_checkpointed_source_batch(
-                **executor_arguments_by_name,
-                process_source=process_in_worker,
-            )
-        except BaseException:
-            await source_process_pool.terminate()
-            raise
-        await source_process_pool.close()
-        return batch_summary
+async def _execute_shared_discovery_source_batch(
+    batch_context: DiscoverySourceBatchContext,
+    executor_arguments_by_name: dict[str, Any],
+) -> SourceBatchSummary:
+    """Execute one source batch with shared async network resources."""
 
     shared_timeout = aiohttp.ClientTimeout(
         total=HTTP_TOTAL_TIMEOUT,
         connect=15,
         sock_read=HTTP_READ_TIMEOUT,
     )
+    shared_connection_limit = (
+        batch_context.processing_options.http_connection_limit
+        or _discovery_http_connection_limit(
+            batch_context.concurrency,
+            batch_context.processing_options.target_concurrency,
+        )
+    )
+    shared_target_semaphore = asyncio.Semaphore(shared_connection_limit)
     async with _discovery_http_session(
         existing_session=None,
         timeout=shared_timeout,
-        connector_limit=batch_context.concurrency * 2,
+        connector_limit=shared_connection_limit,
+        connector_limit_per_host=(
+            batch_context.processing_options.http_per_host_limit
+            or _discovery_http_per_host_limit()
+        ),
     ) as shared_session:
 
         async def process_in_event_loop(
@@ -16300,6 +16630,7 @@ async def _execute_discovery_source_batch(
                 source_record,
                 batch_context.processing_options,
                 session=shared_session,
+                target_semaphore=shared_target_semaphore,
             )
 
         return await execute_checkpointed_source_batch(
@@ -16346,6 +16677,20 @@ async def run_mrf_source_discovery_command(
         if test_mode or dry_run
         else _discovery_process_worker_count(concurrency)
     )
+    target_concurrency = 1 if test_mode else _discovery_target_concurrency()
+    global_http_connection_limit = _discovery_http_connection_limit(
+        concurrency,
+        target_concurrency,
+    )
+    global_http_per_host_limit = _discovery_http_per_host_limit()
+    (
+        source_http_connection_limit,
+        source_http_per_host_limit,
+    ) = _discovery_process_http_limits(
+        global_http_connection_limit,
+        global_http_per_host_limit,
+        process_workers,
+    )
     discovery_result = DiscoveryResult(
         providers=providers,
         process_workers=process_workers,
@@ -16384,6 +16729,14 @@ async def run_mrf_source_discovery_command(
         mrf_discovery_root_run_id=mrf_discovery_root_run_id,
     )
     run_params["process_workers"] = process_workers
+    run_params["target_concurrency"] = target_concurrency
+    run_params["http_connection_limit"] = source_http_connection_limit
+    run_params["http_per_host_limit"] = source_http_per_host_limit
+    run_params["http_limit_scope"] = (
+        "shared_session" if process_workers == 1 else "per_process"
+    )
+    run_params["http_global_connection_budget"] = global_http_connection_limit
+    run_params["http_global_per_host_budget"] = global_http_per_host_limit
     run_context_dict = {
         "crawl_run_id": crawl_run_id,
         "control_run_id": control_run_id,
@@ -16619,6 +16972,9 @@ async def run_mrf_source_discovery_command(
                         observation_run_id=observation_run_id,
                         max_toc_bytes=max_toc_bytes,
                         crawl_target_limit=crawl_target_limit,
+                        target_concurrency=target_concurrency,
+                        http_connection_limit=source_http_connection_limit,
+                        http_per_host_limit=source_http_per_host_limit,
                     ),
                 ),
                 checkpoint_store,

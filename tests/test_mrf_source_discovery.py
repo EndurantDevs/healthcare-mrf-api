@@ -12868,6 +12868,62 @@ async def test_crawl_toc_metadata_disables_row_write_timeout_by_default(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_crawl_toc_metadata_cancels_children_before_parent_returns(monkeypatch):
+    source_rows = [
+        {
+            "source_id": "source_1",
+            "payer_id": "payer_1",
+            "index_url": "https://example.com/source",
+        }
+    ]
+    crawl_target = discovery.CrawlTarget(
+        source=source_rows[0],
+        url="https://example.com/slow-index.json",
+    )
+    child_started = asyncio.Event()
+    child_stopped = asyncio.Event()
+
+    async def fake_resolve_crawl_targets(*_args, **_kwargs):
+        return [crawl_target], []
+
+    async def blocking_fetch_json(*_args, **_kwargs):
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            child_stopped.set()
+
+    monkeypatch.setenv("HLTHPRT_MRF_TOC_TARGET_TIMEOUT_SECONDS", "0")
+    monkeypatch.setattr(discovery, "_resolve_crawl_targets", fake_resolve_crawl_targets)
+    monkeypatch.setattr(discovery, "_fetch_json", blocking_fetch_json)
+    monkeypatch.setattr(
+        discovery,
+        "_push_crawl_row_batches",
+        _accept_crawl_row_batches,
+    )
+
+    crawl_task = asyncio.create_task(
+        discovery._crawl_toc_metadata(
+            source_rows,
+            test_mode=False,
+            run_id="run_1",
+            max_toc_bytes=1024,
+            concurrency=1,
+            execution_context=discovery._CrawlExecutionContext(
+                session=object()
+            ),
+        )
+    )
+    await asyncio.wait_for(child_started.wait(), timeout=1)
+    crawl_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawl_task
+
+    assert child_stopped.is_set()
+
+
+@pytest.mark.asyncio
 async def test_crawl_table_of_contents_metadata_times_out_slow_target(monkeypatch):
     pushed_batches = []
     source_rows = [

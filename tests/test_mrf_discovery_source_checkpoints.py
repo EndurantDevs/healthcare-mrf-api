@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections import Counter
@@ -16,6 +17,7 @@ from process.mrf_discovery_checkpoints import (
     SourceBatchSummary,
     SourceProcessResult,
     _is_retry_descendant,
+    _process_source_with_lease_heartbeat,
     execute_checkpointed_source_batch,
     source_set_sha256,
 )
@@ -204,6 +206,37 @@ def test_source_set_digest_matches_catalog_sync_contract():
     assert source_set_sha256(
         [" source_beta ", "source_alpha", "source_alpha"]
     ) == hashlib.sha256(canonical_payload).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_source_wrapper_stops_processing_before_returning():
+    processing_started = asyncio.Event()
+    processing_stopped = asyncio.Event()
+
+    async def process_source(_source_record):
+        processing_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            processing_stopped.set()
+
+    wrapper_task = asyncio.create_task(
+        _process_source_with_lease_heartbeat(
+            root_run_id="run_root",
+            owner_run_id="run_owner",
+            source_id="source_alpha",
+            source_record={"source_id": "source_alpha"},
+            process_source=process_source,
+            checkpoint_store=AsyncMock(),
+        )
+    )
+    await processing_started.wait()
+
+    wrapper_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await wrapper_task
+
+    assert processing_stopped.is_set()
 
 
 @pytest.mark.asyncio
