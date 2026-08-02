@@ -82,6 +82,19 @@ class SourceBatchProgress:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+@dataclass(frozen=True)
+class SourceBatchExecutionContext:
+    """Hold immutable dependencies shared by checkpoint source workers."""
+
+    root_run_id: str
+    owner_run_id: str
+    total_source_count: int
+    process_source: Callable[[dict[str, Any]], Awaitable[SourceProcessResult]]
+    checkpoint_store: DiscoveryCheckpointStoreProtocol
+    source_progress: SourceBatchProgress
+    on_source_checkpoint: Callable[[int, int, str, str], None] | None = None
+
+
 class DiscoverySourceBatchIncomplete(RuntimeError):
     """Report a frozen source batch that has not completed exactly once."""
 
@@ -284,6 +297,64 @@ async def _insert_source_checkpoints(
         await session.execute(checkpoint_statement)
 
 
+def _new_batch_values(
+    root_run_id: str,
+    owner_run_id: str,
+    frozen_sources: list[tuple[str, dict[str, Any], str]],
+    now: dt.datetime,
+) -> dict[str, Any]:
+    """Build the persisted identity and counters for one frozen batch."""
+
+    source_ids = [source_id for source_id, _, _ in frozen_sources]
+    return {
+        "root_run_id": root_run_id,
+        "latest_run_id": owner_run_id,
+        "retry_of_run_id": None,
+        "strategy_version": CHECKPOINT_STRATEGY_VERSION,
+        "status": "running",
+        "source_set_count": len(source_ids),
+        "source_set_sha256": source_set_sha256(source_ids),
+        "source_payload_set_sha256": _source_payload_set_sha256(frozen_sources),
+        "completed_source_count": 0,
+        "failed_source_count": 0,
+        "urls_checked": 0,
+        "plans_discovered": 0,
+        "files_discovered": 0,
+        "bytes_streamed": 0,
+        "lease_expires_at": _checkpoint_lease_deadline(now),
+        "started_at": now,
+        "updated_at": now,
+    }
+
+
+def _new_source_checkpoint_values(
+    root_run_id: str,
+    owner_run_id: str,
+    frozen_sources: list[tuple[str, dict[str, Any], str]],
+    now: dt.datetime,
+) -> list[dict[str, Any]]:
+    """Build initial pending checkpoint rows for a frozen source set."""
+
+    return [
+        {
+            "root_run_id": root_run_id,
+            "source_id": source_id,
+            "owner_run_id": owner_run_id,
+            "status": "pending",
+            "source_payload": source_payload,
+            "source_payload_sha256": payload_digest,
+            "lease_expires_at": None,
+            "attempt_count": 0,
+            "urls_checked": 0,
+            "plans_discovered": 0,
+            "files_discovered": 0,
+            "bytes_streamed": 0,
+            "updated_at": now,
+        }
+        for source_id, source_payload, payload_digest in frozen_sources
+    ]
+
+
 async def _is_retry_descendant(
     session: Any,
     *,
@@ -310,6 +381,150 @@ async def _is_retry_descendant(
     return False
 
 
+async def _validated_retry_checkpoint_owner(
+    session: Any,
+    root_run_id: str,
+    retry_of_run_id: str,
+) -> str | None:
+    """Return the current owner after validating retry lineage and checkpoints."""
+
+    existing_batch = await session.get(MRFDiscoveryBatch, root_run_id)
+    if existing_batch is None:
+        return None
+    checkpoint_owner_run_id = str(existing_batch.latest_run_id or "").strip()
+    if not await _is_retry_descendant(
+        session,
+        candidate_run_id=retry_of_run_id,
+        ancestor_run_id=checkpoint_owner_run_id,
+    ):
+        raise DiscoverySourceBatchMismatch(
+            "MRF discovery retry does not descend from the batch owner"
+        )
+    stale_owner_exists = await session.scalar(
+        select(
+            exists().where(
+                MRFDiscoverySourceCheckpoint.root_run_id == root_run_id,
+                MRFDiscoverySourceCheckpoint.status != "succeeded",
+                MRFDiscoverySourceCheckpoint.owner_run_id != checkpoint_owner_run_id,
+            )
+        )
+    )
+    if stale_owner_exists:
+        raise DiscoverySourceBatchMismatch(
+            "MRF discovery source checkpoint ownership does not match retry lineage"
+        )
+    return checkpoint_owner_run_id
+
+
+async def _adopt_retry_checkpoint_ownership(
+    session: Any,
+    *,
+    root_run_id: str,
+    checkpoint_owner_run_id: str,
+    owner_run_id: str,
+    retry_of_run_id: str,
+    now: dt.datetime,
+) -> None:
+    """Transfer one unfinished batch and its checkpoints to the retry owner."""
+
+    adoption_statement = (
+        update(MRFDiscoveryBatch)
+        .where(MRFDiscoveryBatch.root_run_id == root_run_id)
+        .where(MRFDiscoveryBatch.latest_run_id == checkpoint_owner_run_id)
+        .values(
+            latest_run_id=owner_run_id,
+            retry_of_run_id=retry_of_run_id,
+            status="running",
+            lease_expires_at=_checkpoint_lease_deadline(now),
+            updated_at=now,
+            completed_at=None,
+        )
+    )
+    adoption_result = await session.execute(adoption_statement)
+    if int(adoption_result.rowcount or 0) != 1:
+        raise DiscoverySourceBatchMismatch(
+            "MRF discovery batch retry ownership was lost"
+        )
+    checkpoint_adoption_statement = (
+        update(MRFDiscoverySourceCheckpoint)
+        .where(MRFDiscoverySourceCheckpoint.root_run_id == root_run_id)
+        .where(MRFDiscoverySourceCheckpoint.status != "succeeded")
+        .where(
+            MRFDiscoverySourceCheckpoint.owner_run_id == checkpoint_owner_run_id
+        )
+        .values(
+            owner_run_id=owner_run_id,
+            status="pending",
+            lease_expires_at=None,
+            error=None,
+            updated_at=now,
+            completed_at=None,
+        )
+    )
+    await session.execute(checkpoint_adoption_statement)
+
+
+def _batch_summary_from_checkpoints(
+    root_run_id: str,
+    batch: MRFDiscoveryBatch,
+    checkpoint_records: list[Any],
+) -> SourceBatchSummary:
+    """Aggregate one repeatable-read checkpoint snapshot."""
+
+    completed_records = [
+        checkpoint
+        for checkpoint in checkpoint_records
+        if checkpoint.status == "succeeded"
+    ]
+    return SourceBatchSummary(
+        root_run_id=root_run_id,
+        source_set_count=batch.source_set_count,
+        source_set_sha256=batch.source_set_sha256,
+        completed_source_count=len(completed_records),
+        completed_source_set_sha256=source_set_sha256(
+            [checkpoint.source_id for checkpoint in completed_records]
+        ),
+        failed_source_count=sum(
+            checkpoint.status == "failed" for checkpoint in checkpoint_records
+        ),
+        urls_checked=sum(checkpoint.urls_checked for checkpoint in completed_records),
+        plans_discovered=sum(
+            checkpoint.plans_discovered for checkpoint in completed_records
+        ),
+        files_discovered=sum(
+            checkpoint.files_discovered for checkpoint in completed_records
+        ),
+        bytes_streamed=sum(
+            checkpoint.bytes_streamed for checkpoint in completed_records
+        ),
+    )
+
+
+def _apply_batch_summary(
+    batch: MRFDiscoveryBatch,
+    summary: SourceBatchSummary,
+    now: dt.datetime,
+) -> None:
+    """Persist aggregate checkpoint proof fields on the owning batch row."""
+
+    batch.status = (
+        "succeeded"
+        if summary.is_complete
+        else "failed"
+        if summary.failed_source_count
+        else "running"
+    )
+    batch.completed_source_count = summary.completed_source_count
+    batch.failed_source_count = summary.failed_source_count
+    batch.urls_checked = summary.urls_checked
+    batch.plans_discovered = summary.plans_discovered
+    batch.files_discovered = summary.files_discovered
+    batch.bytes_streamed = summary.bytes_streamed
+    batch.updated_at = now
+    batch.completed_at = now if summary.is_complete else None
+    batch.lease_expires_at = None if summary.is_complete else now
+
+
 class DatabaseDiscoveryCheckpointStore:
     """Persist frozen source batches and retry-safe source checkpoints."""
 
@@ -326,43 +541,12 @@ class DatabaseDiscoveryCheckpointStore:
         source_digest = source_set_sha256(source_ids)
         payload_set_digest = _source_payload_set_sha256(frozen_sources)
         now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
-        batch_values_by_column = {
-            "root_run_id": root_run_id,
-            "latest_run_id": owner_run_id,
-            "retry_of_run_id": None,
-            "strategy_version": CHECKPOINT_STRATEGY_VERSION,
-            "status": "running",
-            "source_set_count": len(source_ids),
-            "source_set_sha256": source_digest,
-            "source_payload_set_sha256": payload_set_digest,
-            "completed_source_count": 0,
-            "failed_source_count": 0,
-            "urls_checked": 0,
-            "plans_discovered": 0,
-            "files_discovered": 0,
-            "bytes_streamed": 0,
-            "lease_expires_at": _checkpoint_lease_deadline(now),
-            "started_at": now,
-            "updated_at": now,
-        }
-        checkpoint_values = [
-            {
-                "root_run_id": root_run_id,
-                "source_id": source_id,
-                "owner_run_id": owner_run_id,
-                "status": "pending",
-                "source_payload": source_payload,
-                "source_payload_sha256": payload_digest,
-                "lease_expires_at": None,
-                "attempt_count": 0,
-                "urls_checked": 0,
-                "plans_discovered": 0,
-                "files_discovered": 0,
-                "bytes_streamed": 0,
-                "updated_at": now,
-            }
-            for source_id, source_payload, payload_digest in frozen_sources
-        ]
+        batch_values_by_column = _new_batch_values(
+            root_run_id, owner_run_id, frozen_sources, now
+        )
+        checkpoint_values = _new_source_checkpoint_values(
+            root_run_id, owner_run_id, frozen_sources, now
+        )
         async with db.session() as session:
             reservation_statement = (
                 pg_insert(MRFDiscoveryBatch)
@@ -401,68 +585,19 @@ class DatabaseDiscoveryCheckpointStore:
 
         now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
         async with db.session() as session:
-            existing_batch = await session.get(MRFDiscoveryBatch, root_run_id)
-            if existing_batch is None:
+            checkpoint_owner_run_id = await _validated_retry_checkpoint_owner(
+                session, root_run_id, retry_of_run_id
+            )
+            if checkpoint_owner_run_id is None:
                 return None
-            checkpoint_owner_run_id = str(existing_batch.latest_run_id or "").strip()
-            if not await _is_retry_descendant(
+            await _adopt_retry_checkpoint_ownership(
                 session,
-                candidate_run_id=retry_of_run_id,
-                ancestor_run_id=checkpoint_owner_run_id,
-            ):
-                raise DiscoverySourceBatchMismatch(
-                    "MRF discovery retry does not descend from the batch owner"
-                )
-            stale_owner_exists = await session.scalar(
-                select(
-                    exists().where(
-                        MRFDiscoverySourceCheckpoint.root_run_id == root_run_id,
-                        MRFDiscoverySourceCheckpoint.status != "succeeded",
-                        MRFDiscoverySourceCheckpoint.owner_run_id
-                        != checkpoint_owner_run_id,
-                    )
-                )
+                root_run_id=root_run_id,
+                checkpoint_owner_run_id=checkpoint_owner_run_id,
+                owner_run_id=owner_run_id,
+                retry_of_run_id=retry_of_run_id,
+                now=now,
             )
-            if stale_owner_exists:
-                raise DiscoverySourceBatchMismatch(
-                    "MRF discovery source checkpoint ownership does not match retry lineage"
-                )
-            adoption_statement = (
-                update(MRFDiscoveryBatch)
-                .where(MRFDiscoveryBatch.root_run_id == root_run_id)
-                .where(MRFDiscoveryBatch.latest_run_id == checkpoint_owner_run_id)
-                .values(
-                    latest_run_id=owner_run_id,
-                    retry_of_run_id=retry_of_run_id,
-                    status="running",
-                    lease_expires_at=_checkpoint_lease_deadline(now),
-                    updated_at=now,
-                    completed_at=None,
-                )
-            )
-            adoption_result = await session.execute(adoption_statement)
-            if int(adoption_result.rowcount or 0) != 1:
-                raise DiscoverySourceBatchMismatch(
-                    "MRF discovery batch retry ownership was lost"
-                )
-            checkpoint_adoption_statement = (
-                update(MRFDiscoverySourceCheckpoint)
-                .where(MRFDiscoverySourceCheckpoint.root_run_id == root_run_id)
-                .where(MRFDiscoverySourceCheckpoint.status != "succeeded")
-                .where(
-                    MRFDiscoverySourceCheckpoint.owner_run_id
-                    == checkpoint_owner_run_id
-                )
-                .values(
-                    owner_run_id=owner_run_id,
-                    status="pending",
-                    lease_expires_at=None,
-                    error=None,
-                    updated_at=now,
-                    completed_at=None,
-                )
-            )
-            await session.execute(checkpoint_adoption_statement)
         return await self._load_validated_source_records(root_run_id)
 
     async def pending_sources(self, root_run_id: str) -> list[dict[str, Any]]:
@@ -647,51 +782,14 @@ class DatabaseDiscoveryCheckpointStore:
                 )
             checkpoint_result = await session.execute(checkpoint_query)
             checkpoint_records = checkpoint_result.scalars().all()
-            completed_records = [
-                checkpoint
-                for checkpoint in checkpoint_records
-                if checkpoint.status == "succeeded"
-            ]
-            failed_count = sum(
-                checkpoint.status == "failed" for checkpoint in checkpoint_records
+            summary = _batch_summary_from_checkpoints(
+                root_run_id, existing_batch, checkpoint_records
             )
-            summary = SourceBatchSummary(
-                root_run_id=root_run_id,
-                source_set_count=existing_batch.source_set_count,
-                source_set_sha256=existing_batch.source_set_sha256,
-                completed_source_count=len(completed_records),
-                completed_source_set_sha256=source_set_sha256(
-                    [checkpoint.source_id for checkpoint in completed_records]
-                ),
-                failed_source_count=failed_count,
-                urls_checked=sum(checkpoint.urls_checked for checkpoint in completed_records),
-                plans_discovered=sum(
-                    checkpoint.plans_discovered for checkpoint in completed_records
-                ),
-                files_discovered=sum(
-                    checkpoint.files_discovered for checkpoint in completed_records
-                ),
-                bytes_streamed=sum(
-                    checkpoint.bytes_streamed for checkpoint in completed_records
-                ),
+            _apply_batch_summary(
+                existing_batch,
+                summary,
+                dt.datetime.now(dt.UTC).replace(tzinfo=None),
             )
-            now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
-            existing_batch.status = (
-                "succeeded"
-                if summary.is_complete
-                else "failed"
-                if summary.failed_source_count
-                else "running"
-            )
-            existing_batch.completed_source_count = summary.completed_source_count
-            existing_batch.failed_source_count = summary.failed_source_count
-            existing_batch.urls_checked = summary.urls_checked
-            existing_batch.plans_discovered = summary.plans_discovered
-            existing_batch.files_discovered = summary.files_discovered
-            existing_batch.bytes_streamed = summary.bytes_streamed
-            existing_batch.updated_at = now
-            existing_batch.completed_at = now if summary.is_complete else None
-            existing_batch.lease_expires_at = None if summary.is_complete else now
         return summary
 
     @staticmethod
@@ -782,6 +880,86 @@ class DatabaseDiscoveryCheckpointStore:
             )
 
 
+async def _process_claimed_checkpoint_source(
+    execution_context: SourceBatchExecutionContext,
+    source_record: dict[str, Any],
+    source_id: str,
+) -> str:
+    """Process and durably finish one claimed source checkpoint."""
+
+    try:
+        source_result = await _process_source_with_lease_heartbeat(
+            root_run_id=execution_context.root_run_id,
+            owner_run_id=execution_context.owner_run_id,
+            source_id=source_id,
+            source_record=source_record,
+            process_source=execution_context.process_source,
+            checkpoint_store=execution_context.checkpoint_store,
+        )
+        is_completed = await execution_context.checkpoint_store.is_source_completed(
+            execution_context.root_run_id,
+            source_id,
+            execution_context.owner_run_id,
+            source_result,
+        )
+        if not is_completed:
+            raise RuntimeError(
+                f"lost MRF discovery source checkpoint claim: {source_id}"
+            )
+        return "succeeded"
+    except asyncio.CancelledError as error:
+        await execution_context.checkpoint_store.is_source_failed(
+            execution_context.root_run_id,
+            source_id,
+            execution_context.owner_run_id,
+            error,
+        )
+        raise
+    except Exception as error:  # keep independent sources progressing
+        await execution_context.checkpoint_store.is_source_failed(
+            execution_context.root_run_id,
+            source_id,
+            execution_context.owner_run_id,
+            error,
+        )
+        return "failed"
+
+
+async def _drain_checkpoint_source_queue(
+    execution_context: SourceBatchExecutionContext,
+    source_queue: asyncio.Queue[dict[str, Any] | None],
+) -> None:
+    """Drain unfinished sources while preserving independent failures."""
+
+    while True:
+        source_record = await source_queue.get()
+        try:
+            if source_record is None:
+                return
+            source_id = str(source_record.get("source_id") or "").strip()
+            is_claimed = await execution_context.checkpoint_store.is_source_claimed(
+                execution_context.root_run_id,
+                source_id,
+                execution_context.owner_run_id,
+            )
+            if not is_claimed:
+                continue
+            checkpoint_status = await _process_claimed_checkpoint_source(
+                execution_context, source_record, source_id
+            )
+            async with execution_context.source_progress.lock:
+                execution_context.source_progress.completed_source_count += 1
+                if execution_context.on_source_checkpoint is not None:
+                    execution_context.on_source_checkpoint(
+                        execution_context.source_progress.completed_source_count,
+                        execution_context.total_source_count,
+                        source_id,
+                        checkpoint_status,
+                    )
+        finally:
+            source_queue.task_done()
+
+
 async def execute_checkpointed_source_batch(
     *,
     root_run_id: str,
@@ -806,65 +984,20 @@ async def execute_checkpointed_source_batch(
         source_queue.put_nowait(source_record)
     for _worker_index in range(worker_count):
         source_queue.put_nowait(None)
-
-    async def process_pending_sources() -> None:
-        """Drain unfinished sources while preserving independent failures."""
-
-        while True:
-            source_record = await source_queue.get()
-            try:
-                if source_record is None:
-                    return
-                source_id = str(source_record.get("source_id") or "").strip()
-                is_claimed = await checkpoint_store.is_source_claimed(
-                    root_run_id, source_id, owner_run_id
-                )
-                if not is_claimed:
-                    continue
-                try:
-                    source_result = await _process_source_with_lease_heartbeat(
-                        root_run_id=root_run_id,
-                        owner_run_id=owner_run_id,
-                        source_id=source_id,
-                        source_record=source_record,
-                        process_source=process_source,
-                        checkpoint_store=checkpoint_store,
-                    )
-                    is_completed = await checkpoint_store.is_source_completed(
-                        root_run_id,
-                        source_id,
-                        owner_run_id,
-                        source_result,
-                    )
-                    if not is_completed:
-                        raise RuntimeError(
-                            f"lost MRF discovery source checkpoint claim: {source_id}"
-                        )
-                    checkpoint_status = "succeeded"
-                except asyncio.CancelledError as error:
-                    await checkpoint_store.is_source_failed(
-                        root_run_id, source_id, owner_run_id, error
-                    )
-                    raise
-                except Exception as error:  # keep independent sources progressing
-                    await checkpoint_store.is_source_failed(
-                        root_run_id, source_id, owner_run_id, error
-                    )
-                    checkpoint_status = "failed"
-                async with source_progress.lock:
-                    source_progress.completed_source_count += 1
-                    if on_source_checkpoint is not None:
-                        on_source_checkpoint(
-                            source_progress.completed_source_count,
-                            total_source_count,
-                            source_id,
-                            checkpoint_status,
-                        )
-            finally:
-                source_queue.task_done()
-
+    execution_context = SourceBatchExecutionContext(
+        root_run_id=root_run_id,
+        owner_run_id=owner_run_id,
+        total_source_count=total_source_count,
+        process_source=process_source,
+        checkpoint_store=checkpoint_store,
+        source_progress=source_progress,
+        on_source_checkpoint=on_source_checkpoint,
+    )
     source_workers = [
-        asyncio.create_task(process_pending_sources()) for _worker_index in range(worker_count)
+        asyncio.create_task(
+            _drain_checkpoint_source_queue(execution_context, source_queue)
+        )
+        for _worker_index in range(worker_count)
     ]
     try:
         await asyncio.gather(*source_workers)
