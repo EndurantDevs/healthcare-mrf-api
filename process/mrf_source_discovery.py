@@ -14962,6 +14962,29 @@ def _dedupe_source_rows_for_crawl(
     return list(by_url.values()) + no_url_rows
 
 
+def _crawl_representative_source_ids(
+    source_rows: list[dict[str, Any]],
+) -> frozenset[str]:
+    """Select deterministic crawl owners without dropping checkpointed sources."""
+
+    crawl_eligible_source_rows = sorted(
+        (
+            source_row
+            for source_row in source_rows
+            if (source_row.get("index_url") or source_row.get("human_url"))
+            and _is_source_row_importable(source_row)
+        ),
+        key=lambda source_row: str(source_row.get("source_id") or ""),
+    )
+    return frozenset(
+        str(source_row.get("source_id") or "").strip()
+        for source_row in _dedupe_source_rows_for_crawl(
+            crawl_eligible_source_rows
+        )
+        if str(source_row.get("source_id") or "").strip()
+    )
+
+
 def _estimate_crawl_row_write_bytes(row_dict: dict[str, Any]) -> int:
     """Estimate encoded bind bytes without retaining another row payload."""
     estimated_bytes = 0
@@ -16553,18 +16576,26 @@ async def _execute_discovery_source_batch(
         "checkpoint_store": checkpoint_store,
         "on_source_checkpoint": checkpoint_reporter,
     }
+    crawl_representative_source_ids = _crawl_representative_source_ids(
+        batch_context.source_records
+    )
     if batch_context.process_workers > 1:
         return await _execute_process_discovery_source_batch(
-            batch_context, executor_arguments_by_name
+            batch_context,
+            executor_arguments_by_name,
+            crawl_representative_source_ids,
         )
     return await _execute_shared_discovery_source_batch(
-        batch_context, executor_arguments_by_name
+        batch_context,
+        executor_arguments_by_name,
+        crawl_representative_source_ids,
     )
 
 
 async def _execute_process_discovery_source_batch(
     batch_context: DiscoverySourceBatchContext,
     executor_arguments_by_name: dict[str, Any],
+    crawl_representative_source_ids: frozenset[str],
 ) -> SourceBatchSummary:
     """Execute one source batch across isolated reusable CPU workers."""
 
@@ -16575,9 +16606,16 @@ async def _execute_process_discovery_source_batch(
     ) -> SourceProcessResult:
         """Submit one frozen source to the child-process pool."""
 
+        source_id = str(source_record.get("source_id") or "").strip()
         return await source_process_pool.process_source(
             source_record,
-            batch_context.processing_options,
+            replace(
+                batch_context.processing_options,
+                crawl=(
+                    batch_context.processing_options.crawl
+                    and source_id in crawl_representative_source_ids
+                ),
+            ),
         )
 
     try:
@@ -16595,6 +16633,7 @@ async def _execute_process_discovery_source_batch(
 async def _execute_shared_discovery_source_batch(
     batch_context: DiscoverySourceBatchContext,
     executor_arguments_by_name: dict[str, Any],
+    crawl_representative_source_ids: frozenset[str],
 ) -> SourceBatchSummary:
     """Execute one source batch with shared async network resources."""
 
@@ -16626,9 +16665,16 @@ async def _execute_shared_discovery_source_batch(
         ) -> SourceProcessResult:
             """Process one frozen source in the current event loop."""
 
+            source_id = str(source_record.get("source_id") or "").strip()
             return await _process_discovery_source_record(
                 source_record,
-                batch_context.processing_options,
+                replace(
+                    batch_context.processing_options,
+                    crawl=(
+                        batch_context.processing_options.crawl
+                        and source_id in crawl_representative_source_ids
+                    ),
+                ),
                 session=shared_session,
                 target_semaphore=shared_target_semaphore,
             )

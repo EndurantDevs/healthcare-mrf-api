@@ -2358,6 +2358,50 @@ def test_crawl_source_dedupe_preserves_base_and_normalized_query_siblings():
     }
 
 
+def test_crawl_representatives_dedupe_base_and_preserve_query_variants():
+    base_source_dict = {
+        "index_url": "https://example.test/machine-readable-files/",
+        "hosting_platform": "uhc_public_blobs",
+        "status": "active",
+        "metadata_json": {},
+    }
+    source_rows = [
+        {
+            **base_source_dict,
+            "source_id": "source_duplicate_low",
+            "source_type": "community_index",
+            "confidence": 50,
+        },
+        {
+            **base_source_dict,
+            "source_id": "source_duplicate_curated",
+            "source_type": "curated_registry",
+            "seed_provider": "master-list",
+            "confidence": 100,
+        },
+        {
+            **base_source_dict,
+            "source_id": "source_query_alpha",
+            "metadata_json": {"raw": {"target_payer_query": "Alpha"}},
+        },
+        {
+            **base_source_dict,
+            "source_id": "source_query_beta",
+            "metadata_json": {"raw": {"target_payer_query": "Beta"}},
+        },
+    ]
+
+    representative_source_id_set = discovery._crawl_representative_source_ids(
+        list(reversed(source_rows))
+    )
+
+    assert representative_source_id_set == {
+        "source_duplicate_curated",
+        "source_query_alpha",
+        "source_query_beta",
+    }
+
+
 def test_parse_master_list_prefers_active_duplicate_over_unsupported_fragment():
     markdown = """
 ## C. Regional, provider-sponsored, Medicaid-MCO, DTC & TPA payers
