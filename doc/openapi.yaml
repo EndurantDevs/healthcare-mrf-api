@@ -6117,6 +6117,52 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PtgNegotiatedPrice'
+        billing_associations:
+          type: array
+          description: |
+            Exact provider-group billing evidence for an exact-NPI,
+            provider-expanded request. These opaque associations are not a
+            facility, service address, legal-ownership record, or raw/masked
+            tax identifier. Association ordinals are local to this rate option
+            and are not stable identifiers.
+          items:
+            $ref: '#/components/schemas/PtgBillingAssociation'
+        billing_association_count:
+          type: integer
+          minimum: 0
+        billing_association_status:
+          type: string
+          enum: [resolved, partially_resolved, unresolved, unavailable]
+    PtgBillingAssociation:
+      type: object
+      required: [association_ordinal, tax_identity_status]
+      description: |
+        Billing evidence for one exact provider group in the selected snapshot.
+        The option-local ordinal carries no provider-group identity and cannot
+        be used to correlate groups across options. These fields do not identify
+        a facility or expose the underlying tax identifier.
+      properties:
+        association_ordinal:
+          type: integer
+          minimum: 1
+          description: One-based position within this rate option only.
+        tax_identity_status:
+          type: string
+          enum: [matched_ein, missing, malformed, unsupported_type, unavailable]
+        tin_type:
+          type: string
+          enum: [ein]
+        billing_entity_ref:
+          type: string
+          pattern: '^be1_[A-Za-z0-9_-]{64}$'
+          description: |
+            Opaque pseudonym containing a policy-stable identity component and
+            a snapshot-tagged integrity component. It is not a raw or masked
+            tax identifier, can be correlated when snapshots share a token
+            policy, and must not be treated as facility identity.
+        unavailable_reason:
+          type: string
+          enum: [legacy_snapshot_without_tax_identity_sidecar]
     PricingProcedureProviderRecord:
       type: object
       properties:
@@ -6177,6 +6223,27 @@ components:
         rate_pack_count:
           type: integer
           minimum: 0
+        billing_association_count:
+          type: integer
+          minimum: 0
+          description: Distinct provider-set/provider-group edges across rate options.
+        resolved_billing_entity_count:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: |
+            Distinct visible billing references, or null when the tax-identity
+            sidecar is unavailable.
+        billing_entity_count:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: |
+            Exact distinct billing-entity count only when every association is
+            resolved; otherwise null.
+        billing_entity_count_status:
+          type: string
+          enum: [exact, lower_bound, unavailable]
         provider_set_hashes:
           type: array
           items:

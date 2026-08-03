@@ -56,6 +56,10 @@ from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
     retain_unique_integer_keys,
 )
+from api.ptg2_billing_associations import (
+    attach_billing_associations,
+    load_provider_group_billing_associations,
+)
 from api.ptg2_online_work import PTG2OnlineWorkBudgetExceeded
 from api.ptg2_price_hydration_cache import (
     PRICE_HYDRATION_CACHE,
@@ -9033,6 +9037,11 @@ def _merge_provider_rate_group(
 
 def _merge_ptg2_provider_rate_items(
     provider_rate_items: list[dict[str, Any]],
+    *,
+    billing_associations_by_set: Mapping[
+        str, Iterable[Mapping[str, Any]]
+    ]
+    | None = None,
 ) -> list[dict[str, Any]]:
     """Collapse duplicate provider/location rows while preserving every rate option."""
     merged_provider_rates: list[dict[str, Any]] = []
@@ -9069,7 +9078,30 @@ def _merge_ptg2_provider_rate_items(
         grouped_provider_rate.update(
             _price_response_fields(grouped_provider_rate.get("prices"))
         )
-    return merged_provider_rates
+    return (
+        attach_billing_associations(
+            merged_provider_rates,
+            billing_associations_by_set,
+        )
+        if billing_associations_by_set
+        else merged_provider_rates
+    )
+
+
+def _merge_provider_rates_for_request(
+    provider_rate_items: list[dict[str, Any]],
+    billing_associations_by_set: Mapping[
+        str, Iterable[Mapping[str, Any]]
+    ],
+) -> list[dict[str, Any]]:
+    """Preserve the legacy merge call shape when no billing evidence exists."""
+
+    if not billing_associations_by_set:
+        return _merge_ptg2_provider_rate_items(provider_rate_items)
+    return _merge_ptg2_provider_rate_items(
+        provider_rate_items,
+        billing_associations_by_set=billing_associations_by_set,
+    )
 
 
 def _manifest_base_provider_predicates(
@@ -12917,6 +12949,334 @@ async def _exact_npi_provider_rows_by_set(
         provider_set_ids_by_npi={npi: provider_set_ids},
         args=args,
         snapshot_id=snapshot_id,
+    )
+
+
+_PTG2_EXACT_BILLING_MAX_PROVIDER_GROUPS = 2048
+_PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES = 8192
+
+
+def _validated_exact_group_keys_by_set(
+    groups_by_set: Mapping[int, tuple[int, ...]],
+    *,
+    provider_set_keys: tuple[int, ...],
+    exact_group_keys: tuple[int, ...],
+) -> dict[int, tuple[int, ...]]:
+    """Keep a complete set scope containing only requested exact groups."""
+
+    allowed_group_keys = frozenset(exact_group_keys)
+    has_invalid_scope = set(groups_by_set) != set(provider_set_keys) or any(
+        not set(group_keys).issubset(allowed_group_keys)
+        for group_keys in groups_by_set.values()
+    )
+    if has_invalid_scope:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 exact billing-association projection is incomplete"
+        )
+    association_edge_count = sum(
+        len(group_keys) for group_keys in groups_by_set.values()
+    )
+    if association_edge_count > _PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES:
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing association scope exceeds its edge limit"
+        )
+    return dict(groups_by_set)
+
+
+async def _v4_exact_source_groups(
+    session,
+    *,
+    snapshot_key: int,
+    relation: str,
+    owner_keys: tuple[int, ...],
+    exact_group_keys: tuple[int, ...],
+    maximum_projection_members: int,
+) -> dict[int, tuple[int, ...]]:
+    """Read one exact group intersection within its remaining logical budget."""
+
+    if not owner_keys:
+        return {}
+    return await lookup_v4_relation_intersections(
+        session,
+        snapshot_key=snapshot_key,
+        relation=relation,
+        owner_keys=owner_keys,
+        allowed_member_keys=exact_group_keys,
+        schema_name=PTG2_SCHEMA,
+        max_members=maximum_projection_members,
+    )
+
+
+async def _v4_pattern_exact_groups(
+    session,
+    *,
+    snapshot_key: int,
+    provider_set_keys: tuple[int, ...],
+    exact_group_keys: tuple[int, ...],
+    hot_limits: _V4HotPrefixLimits,
+) -> dict[int, tuple[int, ...]]:
+    """Intersect pattern and component sources without unbounded fanout."""
+
+    group_sources = await _load_v4_pattern_set_group_sources(
+        session,
+        snapshot_key=snapshot_key,
+        provider_set_keys=provider_set_keys,
+        maximum_pattern_degree=hot_limits.maximum_patterns_per_set,
+        maximum_component_degree=(
+            hot_limits.maximum_components_per_fallback_set
+        ),
+    )
+    pattern_keys, component_keys = _v4_group_source_owner_keys(group_sources)
+    groups_by_pattern = await _v4_exact_source_groups(
+        session,
+        snapshot_key=snapshot_key,
+        relation="pattern_groups",
+        owner_keys=pattern_keys,
+        exact_group_keys=exact_group_keys,
+        maximum_projection_members=_PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES,
+    )
+    remaining_projection_members = (
+        _PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES
+        - sum(len(group_keys) for group_keys in groups_by_pattern.values())
+    )
+    groups_by_component = await _v4_exact_source_groups(
+        session,
+        snapshot_key=snapshot_key,
+        relation="component_groups",
+        owner_keys=component_keys,
+        exact_group_keys=exact_group_keys,
+        maximum_projection_members=remaining_projection_members,
+    )
+    if (
+        set(groups_by_pattern) != set(pattern_keys)
+        or set(groups_by_component) != set(component_keys)
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 exact billing-association projection is incomplete"
+        )
+    return {
+        provider_set_key: _merge_v4_source_groups(
+            provider_set_key,
+            group_sources,
+            groups_by_pattern,
+            groups_by_component,
+        )
+        for provider_set_key in provider_set_keys
+    }
+
+
+async def _v4_exact_groups_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    provider_set_keys: Iterable[int],
+    exact_group_keys: Iterable[int],
+) -> dict[int, tuple[int, ...]]:
+    """Intersect retained V4 sets with only the exact NPI's groups."""
+
+    normalized_set_keys = tuple(sorted({int(key) for key in provider_set_keys}))
+    normalized_group_keys = tuple(sorted({int(key) for key in exact_group_keys}))
+    snapshot_key = _required_shared_snapshot_key(serving_tables)
+    hot_limits = _v4_hot_prefix_limits(serving_tables)
+    with _v4_source_scope(hot_limits, len(normalized_set_keys)):
+        graph_root = await load_v4_graph_root(
+            session,
+            snapshot_key,
+            schema_name=PTG2_SCHEMA,
+        )
+        if graph_root.representation == "direct_v1":
+            groups_by_set = await _v4_exact_source_groups(
+                session,
+                snapshot_key=snapshot_key,
+                relation="set_groups_direct",
+                owner_keys=normalized_set_keys,
+                exact_group_keys=normalized_group_keys,
+                maximum_projection_members=(
+                    _PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES
+                ),
+            )
+        else:
+            groups_by_set = await _v4_pattern_exact_groups(
+                session,
+                snapshot_key=snapshot_key,
+                provider_set_keys=normalized_set_keys,
+                exact_group_keys=normalized_group_keys,
+                hot_limits=hot_limits,
+            )
+    return _validated_exact_group_keys_by_set(
+        groups_by_set,
+        provider_set_keys=normalized_set_keys,
+        exact_group_keys=normalized_group_keys,
+    )
+
+
+async def _exact_provider_set_keys_by_id(
+    session,
+    serving_tables: PTG2ServingTables,
+    serving_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Resolve every retained rate option to one V4 provider-set key."""
+
+    provider_set_ids: list[str] = []
+    for serving_row in serving_rows:
+        provider_set_id = _ptg2_manifest_id(
+            serving_row.get("provider_set_global_id_128")
+        )
+        if provider_set_id is None:
+            raise PTG2ManifestArtifactError(
+                "PTG2 exact billing association references an unknown provider set"
+            )
+        if provider_set_id not in provider_set_ids:
+            provider_set_ids.append(provider_set_id)
+    if (
+        not provider_set_ids
+        or len(provider_set_ids) > _PTG2_EXACT_BILLING_MAX_PROVIDER_GROUPS
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing association scope exceeds its provider-set limit"
+        )
+    provider_set_keys_by_id = await _provider_set_keys_for_ids(
+        session,
+        serving_tables,
+        tuple(provider_set_ids),
+    )
+    if set(provider_set_keys_by_id) != set(provider_set_ids):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing association references an unknown provider set"
+        )
+    return provider_set_keys_by_id
+
+
+async def _exact_group_keys_by_id(
+    session,
+    serving_tables: PTG2ServingTables,
+    npi: int,
+) -> dict[str, int]:
+    """Resolve the exact NPI's bounded provider-group witness dictionary."""
+
+    exact_group_ids = await _shared_graph_members_for_id(
+        session,
+        serving_tables,
+        "provider_npi_group",
+        _ptg2_npi_member_id(npi),
+        max_members=_PTG2_EXACT_BILLING_MAX_PROVIDER_GROUPS,
+    )
+    if not exact_group_ids:
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing association has no provider-group witness"
+        )
+    group_keys_by_id = await _shared_provider_group_keys_for_ids(
+        session,
+        serving_tables,
+        exact_group_ids,
+    )
+    if set(group_keys_by_id) != set(exact_group_ids):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing association references an unknown provider group"
+        )
+    return group_keys_by_id
+
+
+def _exact_group_ids_by_set(
+    provider_set_keys_by_id: Mapping[str, int],
+    group_keys_by_id: Mapping[str, int],
+    group_keys_by_set: Mapping[int, tuple[int, ...]],
+) -> dict[str, tuple[str, ...]]:
+    """Translate exact V4 group intersections back to stable public IDs."""
+
+    group_id_by_key = {
+        provider_group_key: provider_group_id
+        for provider_group_id, provider_group_key in group_keys_by_id.items()
+    }
+    if len(group_id_by_key) != len(group_keys_by_id):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing association provider-group keys are inconsistent"
+        )
+    group_ids_by_set = {
+        provider_set_id: tuple(
+            group_id_by_key[group_key]
+            for group_key in group_keys_by_set.get(provider_set_key, ())
+        )
+        for provider_set_id, provider_set_key in provider_set_keys_by_id.items()
+    }
+    if any(not group_ids for group_ids in group_ids_by_set.values()):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing association omitted a provider-set witness"
+        )
+    return group_ids_by_set
+
+
+async def _exact_npi_billing_associations_by_set(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    npi: int,
+    serving_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Resolve one bounded exact-NPI group and billing map for all options."""
+
+    provider_set_keys_by_id = await _exact_provider_set_keys_by_id(
+        session,
+        serving_tables,
+        serving_rows,
+    )
+    group_keys_by_id = await _exact_group_keys_by_id(
+        session,
+        serving_tables,
+        npi,
+    )
+    group_keys_by_set = await _v4_exact_groups_by_set(
+        session,
+        serving_tables,
+        provider_set_keys=provider_set_keys_by_id.values(),
+        exact_group_keys=group_keys_by_id.values(),
+    )
+    group_ids_by_set = _exact_group_ids_by_set(
+        provider_set_keys_by_id,
+        group_keys_by_id,
+        group_keys_by_set,
+    )
+    association_by_group = await load_provider_group_billing_associations(
+        session,
+        schema_name=PTG2_SCHEMA,
+        snapshot_key=_required_shared_snapshot_key(serving_tables),
+        provider_group_refs={
+            group_id
+            for group_ids in group_ids_by_set.values()
+            for group_id in group_ids
+        },
+    )
+    return {
+        provider_set_id: tuple(
+            association_by_group[group_id] for group_id in group_ids
+        )
+        for provider_set_id, group_ids in group_ids_by_set.items()
+    }
+
+
+async def _billing_associations_for_exact_npi_request(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    include_providers: bool,
+    direct_npi_filter_requested: bool,
+    explicit_npi_scope: _ExplicitNpiGraphScope | None,
+    serving_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Load billing evidence only for a provider-expanded exact V4 NPI."""
+
+    if (
+        not include_providers
+        or not direct_npi_filter_requested
+        or explicit_npi_scope is None
+        or not serving_tables.uses_v4_graph
+    ):
+        return {}
+    return await _exact_npi_billing_associations_by_set(
+        session,
+        serving_tables,
+        npi=explicit_npi_scope.npi,
+        serving_rows=serving_rows,
     )
 
 
@@ -16797,6 +17157,16 @@ async def _search_manifest_serving_table(
             if provider_rows_by_set is None:
                 return None
             providers_by_set = provider_rows_by_set
+    billing_associations_by_set = (
+        await _billing_associations_for_exact_npi_request(
+            session,
+            serving_tables,
+            include_providers=include_providers,
+            direct_npi_filter_requested=direct_npi_filter_requested,
+            explicit_npi_scope=explicit_npi_scope,
+            serving_rows=serving_rows,
+        )
+    )
     procedure_details = await _procedure_details_for_rows(
         session,
         serving_rows,
@@ -16979,7 +17349,10 @@ async def _search_manifest_serving_table(
     if not response_items:
         return None
     if include_providers:
-        response_items = _merge_ptg2_provider_rate_items(response_items)
+        response_items = _merge_provider_rates_for_request(
+            response_items,
+            billing_associations_by_set,
+        )
     if exact_provider_selection is not None:
         selected_items: list[dict[str, Any]] = []
         materialized_keys: set[_ProviderExpansionKey] = set()
