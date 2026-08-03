@@ -61,3 +61,34 @@ After an in-scope source change, regenerate the affected report and run
 `python scripts/coverage_ratchet.py --report rust --write-baseline`. The pinned
 Ubuntu CI measurement is canonical; if local counts differ, use the CI counts
 rather than committing platform-specific totals.
+
+## CI forecast and provenance
+
+Before either ratchet is enforced, CI runs the same ratchet against a
+report-derived temporary baseline and uploads a small forecast diagnostic. This
+does not change the ratchet policy or its one-time floor-reset marker: it only
+shows the exact uncovered-debt cap, margin, changed-line count, and Python
+missing branch arcs that CI is about to enforce.
+
+The forecast is fail closed. Every coverage producer checks out the same
+`github.sha` with full history and binds its artifact to the immutable target
+base SHA, checked-out head SHA, Coverage.py version, baseline digest, filename,
+and file digest. The aggregation job accepts exactly these Python inputs:
+
+- four main-suite shards: `.coverage.main.0` through `.coverage.main.3`;
+- one capacity shard: `.coverage.capacity`;
+- three PostgreSQL shards: `.coverage.postgres.core`,
+  `.coverage.postgres.provider-directory`, and
+  `.coverage.postgres.provider-profile`.
+
+Each file has a matching hidden provenance sidecar. Rust remains separate: its
+`llvm-cov` JSON report and provenance sidecar are the only accepted inputs to
+the Rust forecast. A missing, stale, renamed, extra, mixed-base, or
+mixed-head artifact is an error rather than a best-effort forecast.
+
+Pull requests use the pull request base SHA; pushes use the event's previous
+SHA. A manual workflow run requires an explicit full `base_sha` input. CI never
+falls back to `origin/main` or `HEAD^`. The forecast stages both the measured
+report metrics and source-file set into the candidate copy before it invokes
+the production ratchet, so a stale committed baseline cannot create a false
+coverage failure or hide a real one.
