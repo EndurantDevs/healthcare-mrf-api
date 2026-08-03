@@ -5997,6 +5997,14 @@ components:
           type: string
         service_description:
           type: string
+        address_kind:
+          type: string
+          enum: [physical, postal_box, unknown]
+          description: Postal boxes are retained only as provider mailing evidence.
+        address:
+          $ref: '#/components/schemas/PtgProviderAddress'
+        address_verification:
+          $ref: '#/components/schemas/PtgAddressVerification'
         reported_code:
           type: string
         reported_code_system:
@@ -6163,6 +6171,50 @@ components:
         unavailable_reason:
           type: string
           enum: [legacy_snapshot_without_tax_identity_sidecar]
+    PtgProviderAddress:
+      type: object
+      description: |
+        Provider identity address evidence. A postal_box value is mailing
+        evidence only and must not be interpreted as the priced service,
+        facility, or rate-bound location. Coordinates, distance/map data, and
+        physical-location identifiers and confidence labels are omitted for it.
+      properties:
+        address_kind:
+          type: string
+          enum: [physical, postal_box, unknown]
+        first_line:
+          type: string
+        second_line:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        postal_code:
+          type: string
+      additionalProperties: true
+    PtgAddressVerification:
+      type: object
+      description: |
+        Evidence and network-binding semantics for the displayed provider
+        address. Rate network evidence and address evidence are independent.
+      properties:
+        address_kind:
+          type: string
+          enum: [physical, postal_box, unknown]
+        address_evidence_level:
+          type: string
+          description: Includes postal_box_provider_address for mailing-only evidence.
+        address_network_binding:
+          type: string
+          description: Includes not_applicable_postal_box when no service location is represented.
+        displayed_address_present:
+          type: boolean
+        network_bound_address:
+          type: boolean
+        requires_location_confirmation:
+          type: boolean
+      additionalProperties: true
     PricingProcedureProviderRecord:
       type: object
       properties:
@@ -6178,6 +6230,14 @@ components:
           type: string
         zip5:
           type: string
+        address_kind:
+          type: string
+          enum: [physical, postal_box, unknown]
+          description: Postal boxes are retained only as provider mailing evidence.
+        address:
+          $ref: '#/components/schemas/PtgProviderAddress'
+        address_verification:
+          $ref: '#/components/schemas/PtgAddressVerification'
         distance_miles:
           type: number
           nullable: true

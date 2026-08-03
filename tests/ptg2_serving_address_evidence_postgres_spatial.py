@@ -84,6 +84,41 @@ def _exact_zip_coherence_query(schema: str) -> serving._MembershipLocationQuery:
     )
 
 
+def _state_city_coherence_query(schema: str) -> serving._MembershipLocationQuery:
+    request_arg_map = {"state": "TS", "city": "TEST CITY"}
+    query_parameter_map = {
+        "limit": 10,
+        "offset": 0,
+        "shared_snapshot_key": 41,
+    }
+    filter_sql, distance_sql = serving._membership_filter_sql(
+        request_arg_map,
+        candidate_npis=None,
+        uses_unified_addresses=True,
+        address_zip5_sql=serving._ptg2_address_zip5_sql(
+            "addr",
+            unified=True,
+        ),
+        parameter_map=query_parameter_map,
+        literal_service_address_types=True,
+    )
+    return serving._MembershipLocationQuery(
+        address_table=f"{schema}.entity_address_unified",
+        npi_scope_table=f"{schema}.ptg2_v3_npi_scope",
+        filter_sql=(
+            "npi_scope.snapshot_key = :shared_snapshot_key "
+            f"AND ({filter_sql})"
+        ),
+        parameter_map=query_parameter_map,
+        distance_sql=distance_sql,
+        knn_order_sql=None,
+        address_assurance_sql=serving._membership_address_assurance_sql(
+            request_arg_map,
+            True,
+        ),
+    )
+
+
 async def _insert_spatial_candidate_memberships(
     database: Database,
     schema: str,
@@ -95,21 +130,22 @@ async def _insert_spatial_candidate_memberships(
             (41, 1990000205),
             (41, 1990000213),
             (41, 1990000221),
-            (41, 1990000239)
+            (41, 1990000239),
+            (41, 1990000247)
         """
     )
 
 
-async def _insert_spatial_unified_addresses(
-    database: Database,
-    schema: str,
-) -> None:
+async def _insert_spatial_unified_addresses(database: Database, schema: str) -> None:
+    """Insert coherent, incoherent, and two-line postal candidates."""
+
     await database.status(
         f"""
         INSERT INTO {schema}.entity_address_unified (
             location_key, npi, address_key, premise_key,
             address_source_mask, address_sources, source_count, source_mask,
-            type, checksum, first_line, city_name, state_name, state_code,
+            type, checksum, first_line, second_line,
+            city_name, state_name, state_code,
             postal_code, zip5, country_code, address_precision, lat, long
         ) VALUES
             (
@@ -117,7 +153,8 @@ async def _insert_spatial_unified_addresses(
                 '00000000-0000-0000-0000-000000000201',
                 '10000000-0000-0000-0000-000000000201',
                 1, ARRAY['nppes']::varchar[], 1, 1,
-                'practice', 201, '201 SYNTHETIC WAY', 'TEST CITY', 'TS', 'TS',
+                'practice', 201, '201 SYNTHETIC WAY', NULL,
+                'TEST CITY', 'TS', 'TS',
                 '00001', '00001', 'US', 'street', NULL, NULL
             ),
             (
@@ -125,7 +162,8 @@ async def _insert_spatial_unified_addresses(
                 '00000000-0000-0000-0000-000000000202',
                 '10000000-0000-0000-0000-000000000202',
                 2, ARRAY['mrf']::varchar[], 1, 2,
-                'practice', 202, '202 SYNTHETIC WAY', 'NEARBY CITY', 'TS', 'TS',
+                'practice', 202, '202 SYNTHETIC WAY', NULL,
+                'NEARBY CITY', 'TS', 'TS',
                 '00002', '00002', 'US', 'street', 42.0, -83.18
             ),
             (
@@ -133,7 +171,8 @@ async def _insert_spatial_unified_addresses(
                 '00000000-0000-0000-0000-000000000203',
                 '10000000-0000-0000-0000-000000000203',
                 1, ARRAY['nppes']::varchar[], 1, 1,
-                'practice', 203, '203 SYNTHETIC WAY', 'OTHER CITY', 'OS', 'OS',
+                'practice', 203, '203 SYNTHETIC WAY', NULL,
+                'OTHER CITY', 'OS', 'OS',
                 '00003', '00003', 'US', 'street', 42.0, -83.05
             ),
             (
@@ -141,8 +180,18 @@ async def _insert_spatial_unified_addresses(
                 '00000000-0000-0000-0000-000000000204',
                 '10000000-0000-0000-0000-000000000204',
                 1, ARRAY['nppes']::varchar[], 1, 1,
-                'practice', 204, '204 SYNTHETIC WAY', 'TEST CITY', 'TS', 'TS',
+                'practice', 204, '204 SYNTHETIC WAY', NULL,
+                'TEST CITY', 'TS', 'TS',
                 '00001', '00001', 'US', 'street', 42.65, -83.0
+            ),
+            (
+                'postal-exact-point', 1990000247,
+                '00000000-0000-0000-0000-000000000205',
+                '10000000-0000-0000-0000-000000000205',
+                1, ARRAY['nppes']::varchar[], 1, 1,
+                'practice', 205, 'SYNTHETIC CLINIC', 'P.O. Box 205',
+                'TEST CITY', 'TS', 'TS',
+                '00001', '00001', 'US', 'street', 42.0, -83.0
             )
         """
     )
@@ -171,6 +220,11 @@ async def _insert_spatial_source_addresses(
                 1990000239,
                 '00000000-0000-0000-0000-000000000204',
                 'practice', 204, '2026-07-31'
+            ),
+            (
+                1990000247,
+                '00000000-0000-0000-0000-000000000205',
+                'practice', 205, '2026-07-31'
             )
         """
     )
@@ -281,3 +335,29 @@ async def test_exact_zip_accepts_coherent_points_and_rejects_incoherent_points()
             location_record._mapping["npi"]
             for location_record in incoherent_location_rows
         ] == [1990000205]
+
+
+@pytest.mark.asyncio
+async def test_state_city_membership_rejects_evidenced_postal_boxes():
+    async with _temporary_schema() as (database, schema):
+        await _insert_spatial_reference_rows(database, schema)
+        await _insert_spatial_candidate_rows(database, schema)
+        location_query = _state_city_coherence_query(schema)
+        location_sql = _schema_sql(
+            serving._membership_location_sql(
+                location_query,
+                limit=10,
+                offset=0,
+            ),
+            schema,
+        )
+
+        location_rows = await database.all(
+            location_sql,
+            **location_query.parameter_map,
+        )
+
+        assert sorted(
+            location_record._mapping["npi"]
+            for location_record in location_rows
+        ) == [1990000205, 1990000239]

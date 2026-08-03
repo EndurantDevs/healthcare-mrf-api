@@ -12,6 +12,14 @@ from pathlib import Path
 import re
 from typing import Any
 
+from api.ptg2_address_policy import (
+    PTG_ADDRESS_KIND_POSTAL_BOX,
+    PTG_NO_DISPLAY_ADDRESS_FIELDS,
+    PTG_NO_DISPLAY_VERIFICATION_FIELDS,
+    PTG_POSTAL_BOX_GEO_FIELDS,
+    PTG_POSTAL_BOX_LOCATION_LABEL_FIELDS,
+    classify_ptg_address_kind,
+)
 from process.ptg_parts.provider_location_evidence import audit_tic_provider_location_evidence
 
 
@@ -19,6 +27,7 @@ ALLOWED_ADDRESS_BINDINGS = {
     "payer_confirmed_location",
     "payer_directory_corroborated_location",
     "inferred_from_provider_identity",
+    "not_applicable_postal_box",
 }
 ALLOWED_ADDRESS_EVIDENCE_LEVELS = {
     "payer_confirmed_location",
@@ -30,6 +39,7 @@ ALLOWED_ADDRESS_EVIDENCE_LEVELS = {
     "nppes_provider_address",
     "unified_provider_address",
     "city_zip_fallback",
+    "postal_box_provider_address",
     "unknown",
 }
 ALLOWED_RATE_BINDINGS = {"tic_provider_group_npi_tin"}
@@ -52,65 +62,8 @@ DIRECT_PAYER_LOCATION_RECORD_KEYS = {
     "raw_provider_location_key",
     "json_pointer",
 }
-NO_DISPLAY_ADDRESS_FIELDS = {
-    "address",
-    "formatted_address",
-    "address_key",
-    "city",
-    "state",
-    "zip5",
-    "zip_code",
-    "postal_code",
-    "lat",
-    "long",
-    "latitude",
-    "longitude",
-    "distance",
-    "distance_miles",
-    "zip_match_type",
-    "coordinates",
-    "google_maps_url",
-    "google_map_url",
-    "maps_url",
-    "phone",
-    "telephone",
-    "telephone_number",
-    "phone_number",
-    "fax",
-    "fax_number",
-    "location_hash",
-    "location_source",
-    "location_confidence_code",
-    "address_sources",
-    "address_precision",
-    "source_count",
-    "multi_source_confirmed",
-    "source_mask",
-    "address_source_mask",
-}
-NO_DISPLAY_VERIFICATION_FIELDS = {
-    "location_source",
-    "location_confidence_code",
-    "address_precision",
-    "address_sources",
-    "source_count",
-    "multi_source_confirmed",
-    "source_mask",
-    "address_source_mask",
-    "provider_directory_source_id",
-    "provider_directory_location_resource_id",
-    "provider_directory_location_name",
-    "provider_directory_plan_context_matched",
-    "provider_directory_network_name_matched",
-    "provider_directory_network_context_present",
-    "provider_directory_network_refs",
-    "provider_directory_network_names",
-    "provider_directory_network_matches",
-    "provider_directory_insurance_plan_refs",
-    "provider_directory_insurance_plan_matches",
-    "provider_directory_match_type",
-    "address_verification_evidence",
-}
+NO_DISPLAY_ADDRESS_FIELDS = PTG_NO_DISPLAY_ADDRESS_FIELDS
+NO_DISPLAY_VERIFICATION_FIELDS = PTG_NO_DISPLAY_VERIFICATION_FIELDS
 
 
 def _items_from_payload(payload: Any) -> list[dict[str, Any]]:
@@ -176,6 +129,8 @@ def _has_usable_address_source(source: dict[str, Any]) -> bool:
         "address_line_1",
         "street",
         "street_address",
+        "second_line",
+        "address_line_2",
     ):
         return True
     return _has_nonempty_field(
@@ -363,6 +318,146 @@ def _has_provider_directory_network_context_evidence(verification: dict[str, Any
     )
 
 
+def _has_postal_box_contract(
+    price_item_by_field: dict[str, Any],
+    verification: dict[str, Any],
+) -> bool:
+    """Return whether text or response markers identify mailing evidence."""
+
+    address_value = price_item_by_field.get("address")
+    address_by_field = address_value if isinstance(address_value, dict) else {}
+    markers = {
+        str(price_item_by_field.get("address_kind") or "").strip(),
+        str(address_by_field.get("address_kind") or "").strip(),
+        str(verification.get("address_kind") or "").strip(),
+        str(verification.get("address_network_binding") or "").strip(),
+        str(verification.get("address_evidence_level") or "").strip(),
+        classify_ptg_address_kind(price_item_by_field),
+        classify_ptg_address_kind(address_by_field),
+    }
+    postal_markers = {
+        PTG_ADDRESS_KIND_POSTAL_BOX,
+        "not_applicable_postal_box",
+        "postal_box_provider_address",
+    }
+    return bool(markers.intersection(postal_markers))
+
+
+def _postal_box_expected_value_issues(
+    verification: dict[str, Any],
+    *,
+    index: int,
+) -> list[dict[str, Any]]:
+    """Validate the public mailing-only binding tuple."""
+
+    issues: list[dict[str, Any]] = []
+    expected_value_by_field = {
+        "address_network_binding": "not_applicable_postal_box",
+        "address_evidence_level": "postal_box_provider_address",
+        "requires_location_confirmation": True,
+        "network_bound_address": False,
+        "displayed_address_present": True,
+    }
+    for field_name, expected_value in expected_value_by_field.items():
+        if verification.get(field_name) != expected_value:
+            issues.append(
+                _issue(
+                    f"postal-box address requires {field_name}="
+                    f"{expected_value!r}",
+                    index=index,
+                )
+            )
+    return issues
+
+
+def _postal_box_kind_issues(
+    price_item_by_field: dict[str, Any],
+    verification: dict[str, Any],
+    *,
+    index: int,
+) -> list[dict[str, Any]]:
+    """Require every emitted address-kind label to agree."""
+
+    address_value = price_item_by_field.get("address")
+    address_by_field = address_value if isinstance(address_value, dict) else {}
+    kind_value_by_field = {
+        "item.address_kind": price_item_by_field.get("address_kind"),
+        "address.address_kind": address_by_field.get("address_kind"),
+        "address_verification.address_kind": verification.get("address_kind"),
+    }
+    issues: list[dict[str, Any]] = []
+    for field_name, field_value in kind_value_by_field.items():
+        if field_value != PTG_ADDRESS_KIND_POSTAL_BOX:
+            issues.append(
+                _issue(
+                    f"postal-box address requires {field_name}='postal_box'",
+                    index=index,
+                )
+            )
+    return issues
+
+
+def _postal_box_prohibited_field_issues(
+    price_item_by_field: dict[str, Any],
+    verification: dict[str, Any],
+    *,
+    index: int,
+) -> list[dict[str, Any]]:
+    """Reject physical-location identifiers and labels on mailing evidence."""
+
+    address_value = price_item_by_field.get("address")
+    address_by_field = address_value if isinstance(address_value, dict) else {}
+    prohibited_fields = (
+        PTG_POSTAL_BOX_GEO_FIELDS | PTG_POSTAL_BOX_LOCATION_LABEL_FIELDS
+    )
+    issues: list[dict[str, Any]] = []
+    for source_name, address_evidence_by_field in (
+        ("item", price_item_by_field),
+        ("address", address_by_field),
+        ("address_verification", verification),
+    ):
+        leaked_fields = sorted(
+            field_name
+            for field_name in prohibited_fields
+            if address_evidence_by_field.get(field_name)
+            not in (None, "", [], {})
+        )
+        if leaked_fields:
+            issues.append(
+                _issue(
+                    f"postal-box {source_name} includes physical-location fields: "
+                    + ", ".join(leaked_fields),
+                    index=index,
+                )
+            )
+    return issues
+
+
+def _postal_box_contract_issues(
+    price_item_by_field: dict[str, Any],
+    verification: dict[str, Any],
+    *,
+    index: int,
+) -> list[dict[str, Any]]:
+    """Require mailing-only semantics whenever a postal marker is emitted."""
+
+    if not _has_postal_box_contract(price_item_by_field, verification):
+        return []
+    return [
+        *_postal_box_expected_value_issues(verification, index=index),
+        *_postal_box_kind_issues(
+            price_item_by_field,
+            verification,
+            index=index,
+        ),
+        *_postal_box_prohibited_field_issues(
+            price_item_by_field,
+            verification,
+            index=index,
+        ),
+    ]
+
+
 def validate_ptg_price_address_item(
     price_item_by_field: dict[str, Any],
     *,
@@ -547,6 +642,13 @@ def validate_ptg_price_address_item(
             issues.append(_issue("provider_directory_address must stay inferred_from_provider_identity", index=index))
         if requires_confirmation is not True:
             issues.append(_issue("provider_directory_address must require location confirmation", index=index))
+    issues.extend(
+        _postal_box_contract_issues(
+            price_item_by_field,
+            verification,
+            index=index,
+        )
+    )
     return issues
 
 

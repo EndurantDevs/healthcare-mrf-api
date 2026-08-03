@@ -76,6 +76,8 @@ from api.ptg2_response import _normalize_filter_string_list
 from api.ptg2_address_policy import (
     PTG_NO_DISPLAY_ADDRESS_FIELDS,
     PTG2_UNIFIED_ADDRESS_COLUMNS,
+    address_display_rank_sql,
+    postal_box_address_sql,
 )
 from api.ptg2_serving_utils import ein_plan_id_variants
 from api.plan_release_serving import (
@@ -5418,6 +5420,7 @@ def _allowed_amount_location_join_sql(
     address_table: str,
     uses_unified_addresses: bool,
     address_predicates: list[str],
+    address_rank_sql: str | None,
     distance_sql: str,
 ) -> str:
     """Render the indexed best-address lateral lookup."""
@@ -5425,6 +5428,9 @@ def _allowed_amount_location_join_sql(
     zip5_sql = _ptg2_address_zip5_sql(
         "addr",
         unified=uses_unified_addresses,
+    )
+    address_rank_order_sql = (
+        f"{address_rank_sql},\n               " if address_rank_sql else ""
     )
     return f"""
     LEFT JOIN LATERAL (
@@ -5454,7 +5460,7 @@ def _allowed_amount_location_join_sql(
           FROM {address_table} addr
          WHERE {' AND '.join(address_predicates)}
          ORDER BY
-               {distance_sql} ASC NULLS LAST,
+               {address_rank_order_sql}{distance_sql} ASC NULLS LAST,
                CASE addr.type
                    WHEN 'practice' THEN 0
                    WHEN 'site' THEN 1
@@ -5499,11 +5505,22 @@ def _allowed_amount_location_sql(
         uses_unified_addresses=uses_unified_addresses,
         parameter_map=parameter_map,
     )
+    if (
+        uses_unified_addresses
+        and _has_allowed_amount_address_filter(args)
+        and not spatial_predicates
+    ):
+        address_predicates.append(f"NOT {postal_box_address_sql('addr')}")
     address_predicates.extend(spatial_predicates)
     join_sql = _allowed_amount_location_join_sql(
         address_table=address_table,
         uses_unified_addresses=uses_unified_addresses,
         address_predicates=address_predicates,
+        address_rank_sql=(
+            None
+            if _has_allowed_amount_address_filter(args)
+            else address_display_rank_sql("addr")
+        ),
         distance_sql=distance_sql,
     )
     required_sql = (
