@@ -2280,6 +2280,26 @@ def test_provider_rate_items_merge_duplicate_location_and_code_prices():
     assert len(merged) == 1
     assert {price["negotiated_rate"] for price in merged[0]["prices"]} == {100, 200}
     assert merged[0]["provider_set_hashes"] == ["provider-set-1", "provider-set-2"]
+    assert merged[0]["rate_options"] == [
+        {
+            "provider_set_ref": "provider-set-1",
+            "price_set_ref": "price-set-1",
+            "rate_pack_ref": "rate-pack-1",
+            "prices": [
+                {"negotiated_type": "negotiated", "negotiated_rate": 100}
+            ],
+        },
+        {
+            "provider_set_ref": "provider-set-2",
+            "price_set_ref": "price-set-2",
+            "rate_pack_ref": "rate-pack-2",
+            "prices": [
+                {"negotiated_type": "negotiated", "negotiated_rate": 200}
+            ],
+        },
+    ]
+    assert merged[0]["rate_option_count"] == 2
+    assert merged[0]["provider_set_count"] == 2
     assert merged[0]["price_set_count"] == 2
     assert merged[0]["rate_pack_count"] == 2
 
@@ -2686,6 +2706,16 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
     assert response["items"][0]["prices"] == [
         {"negotiated_rate": 20, "service_code": ["22"]}
     ]
+    assert response["items"][0]["rate_options"] == [
+        {
+            "provider_set_ref": harness.matching_provider_set_id,
+            "price_set_ref": harness.matching_price_set_id,
+            "rate_pack_ref": "06" * 16,
+            "prices": [{"negotiated_rate": 20, "service_code": ["22"]}],
+        }
+    ]
+    assert response["items"][0]["rate_option_count"] == 1
+    assert response["items"][0]["provider_set_count"] == 1
     assert response["pagination"]["has_more"] is False
     assert response["pagination"]["total_is_exact"] is True
     assert response["query"]["lat"] == 0.0
