@@ -60,7 +60,8 @@ def test_coverage_forecast_keeps_rust_separate_and_uploads_diagnostics() -> None
     assert "coverage-artifacts/rust/coverage-provenance-rust.json" in workflow
     assert "forecast-rust" in workflow
     assert "timeout --foreground 295s python scripts/coverage_forecast.py forecast-rust" in workflow
-    assert "--cargo-llvm-cov-version \"$(cargo-llvm-cov --version" in workflow
+    assert "--cargo-llvm-cov-version \"$(cargo llvm-cov --version" in workflow
+    assert "$(cargo-llvm-cov --version" not in workflow
     assert "--rust-version \"$(rustc --version" in workflow
     assert "mrf-python-coverage-forecast" in workflow
     assert "mrf-rust-coverage-forecast" in workflow

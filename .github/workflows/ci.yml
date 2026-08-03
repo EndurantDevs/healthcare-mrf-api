@@ -323,7 +323,7 @@ jobs:
           --report-name rust
           --report coverage-artifacts/rust/test-coverage-rust.json
           --output coverage-artifacts/rust/coverage-provenance-rust.json
-          --cargo-llvm-cov-version "$(cargo-llvm-cov --version | awk '{print $2}')"
+          --cargo-llvm-cov-version "$(cargo llvm-cov --version | awk '{print $2}')"
           --rust-version "$(rustc --version | awk '{print $2}')"
       - name: Upload Rust coverage data
         if: always()
