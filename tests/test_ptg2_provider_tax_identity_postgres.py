@@ -12,6 +12,9 @@ import sqlalchemy as sa
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from tests.ptg2_billing_associations_postgres_support import (
+    assert_billing_loader_contract,
+)
 from tests.ptg2_provider_tax_identity_postgres_support import (
     assert_layout_cascade,
     assert_new_v4_requires_sidecar,
@@ -122,6 +125,7 @@ async def _assert_sidecar_cardinality(
                 )
             )
         ).one()
+        await assert_billing_loader_contract(connection, schema_name)
     assert sidecar_count == 4
     assert matched_count == 1
     assert unavailable_reverse_count == 0

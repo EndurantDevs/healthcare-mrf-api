@@ -18,6 +18,8 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from process.tin_npi_connector_security import token_policy_descriptor_sha256
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = (
@@ -77,7 +79,7 @@ def manifest_insert(
             {snapshot_key},
             'ptg2_provider_group_tax_identity_v1',
             :token_policy_id,
-            decode(repeat('11', 32), 'hex'),
+            decode(:token_policy_descriptor_sha256, 'hex'),
             :normalization_contract,
             :hmac_contract,
             'snapshot_shard_id_sorted_lsb0_bitmap_v1',
@@ -97,6 +99,9 @@ def manifest_parameters(**overrides: Any) -> dict[str, Any]:
         "source_map": '[{"ordinal":0,"shard_id":"shard-a"}]',
         "source_shard_count": 1,
         "token_policy_id": "ptg-tin-hmac-sha256-v1:2026-07",
+        "token_policy_descriptor_sha256": token_policy_descriptor_sha256(
+            "ptg-tin-hmac-sha256-v1:2026-07"
+        ),
         "normalization_contract": "ein_ascii_digits_or_2_7_hyphen_v1",
         "hmac_contract": "hmac_sha256_ptg_tin_v1",
     }
