@@ -25,7 +25,7 @@ UHC_PROVIDER_QUARANTINE_REASONS = (
     UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE,
 )
 UHC_PROVIDER_QUARANTINE_MAX_COUNT = 32
-UHC_PROVIDER_QUARANTINE_RATE_DENOMINATOR = 1_000_000
+UHC_PROVIDER_QUARANTINE_RATE_DENOMINATOR = 10_000
 UHC_PROVIDER_QUARANTINE_REJECTED_COUNT_FIELDS = {
     "invalid_npi_checksum": "invalid_npi_count",
     "invalid_npi_checksum_individual_records": (
@@ -133,7 +133,7 @@ def _ordinal(value: Any, field_name: str) -> int:
 
 
 def provider_quarantine_limit(provider_count: int) -> int:
-    """Return the one-per-million, absolute-32 publication ceiling."""
+    """Allow one quarantine per started 10,000 records, capped at 32."""
 
     if (
         isinstance(provider_count, bool)

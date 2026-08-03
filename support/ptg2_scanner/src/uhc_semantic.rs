@@ -31,7 +31,7 @@ const UHC_PROVIDER_QUARANTINE_CONTRACT_ID: &str = "healthporta.uhc.provider-quar
 const UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_CHECKSUM: &str = "invalid_npi_checksum";
 const UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE: &str = "invalid_npi_structure";
 const UHC_PROVIDER_QUARANTINE_MAX_COUNT: u64 = 32;
-const UHC_PROVIDER_QUARANTINE_RATE_DENOMINATOR: u64 = 1_000_000;
+const UHC_PROVIDER_QUARANTINE_RATE_DENOMINATOR: u64 = 10_000;
 
 const COPY_ROW_FACT_BLOCK: i16 = 1;
 const COPY_ROW_NPI_EVIDENCE: i16 = 2;
@@ -2473,6 +2473,17 @@ mod tests {
 
     #[test]
     fn encoder_enforces_quarantine_rate_and_other_fields_still_fail_closed() {
+        let bounded = MixedProviderSource {
+            // SyntheticSource divides records evenly across four ranges; 10,004
+            // exercises the same second started 10,000-record bucket.
+            inner: SyntheticSource::new(10_004, UhcCollectionKind::ProviderMembership),
+            invalid_ordinals: vec![1, 2],
+            invalid_record: CHECKSUM_INVALID_PROVIDER_RECORD,
+        };
+        let bounded_report =
+            encode_admitted_ranges_to_copy(&bounded, io::sink(), &test_budget()).unwrap();
+        assert_eq!(bounded_report.quarantine_count, 2);
+
         let excessive = MixedProviderSource {
             inner: SyntheticSource::new(4, UhcCollectionKind::ProviderMembership),
             invalid_ordinals: vec![1, 2],
@@ -2484,6 +2495,20 @@ mod tests {
                 .to_string()
                 .contains("exceeds the file rate ceiling")
         );
+
+        let excessive_second_bucket = MixedProviderSource {
+            inner: SyntheticSource::new(20_000, UhcCollectionKind::ProviderMembership),
+            invalid_ordinals: vec![1, 2, 3],
+            invalid_record: CHECKSUM_INVALID_PROVIDER_RECORD,
+        };
+        assert!(encode_admitted_ranges_to_copy(
+            &excessive_second_bucket,
+            io::sink(),
+            &test_budget(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exceeds the file rate ceiling"));
 
         let mut malformed = SyntheticSource::new(4, UhcCollectionKind::ProviderMembership);
         malformed.record = String::from_utf8(CHECKSUM_INVALID_PROVIDER_RECORD.to_vec())
@@ -2750,9 +2775,14 @@ mod tests {
         assert_eq!(npi_validity("1003821380"), NpiValidity::Valid);
         assert_eq!(provider_quarantine_limit(0), 0);
         assert_eq!(provider_quarantine_limit(1), 1);
-        assert_eq!(provider_quarantine_limit(1_000_000), 1);
-        assert_eq!(provider_quarantine_limit(1_000_001), 2);
-        assert_eq!(provider_quarantine_limit(32_000_000), 32);
+        assert_eq!(provider_quarantine_limit(9_999), 1);
+        assert_eq!(provider_quarantine_limit(10_000), 1);
+        assert_eq!(provider_quarantine_limit(10_001), 2);
+        assert_eq!(provider_quarantine_limit(290_000), 29);
+        assert_eq!(provider_quarantine_limit(310_000), 31);
+        assert_eq!(provider_quarantine_limit(310_001), 32);
+        assert_eq!(provider_quarantine_limit(320_000), 32);
+        assert_eq!(provider_quarantine_limit(320_001), 32);
         assert_eq!(provider_quarantine_limit(u64::MAX), 32);
 
         assert_eq!(accepting_code(None).unwrap(), None);

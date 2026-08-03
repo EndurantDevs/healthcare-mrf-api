@@ -226,13 +226,18 @@ def test_tombstone_rejects_expected_lineage_drift(
     (
         (0, 0),
         (1, 1),
-        (1_000_000, 1),
-        (1_000_001, 2),
-        (31_000_001, 32),
+        (9_999, 1),
+        (10_000, 1),
+        (10_001, 2),
+        (290_000, 29),
+        (310_000, 31),
+        (310_001, 32),
+        (320_000, 32),
+        (320_001, 32),
         (100_000_000, UHC_PROVIDER_QUARANTINE_MAX_COUNT),
     ),
 )
-def test_rate_ceiling_is_ceil_one_per_million_with_absolute_cap(
+def test_rate_ceiling_is_ceil_one_per_ten_thousand_with_absolute_cap(
     provider_count,
     expected_limit,
 ) -> None:

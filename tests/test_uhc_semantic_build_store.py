@@ -311,6 +311,37 @@ def test_nonzero_quarantine_report_is_exactly_balanced_and_publicly_aggregated()
     }
 
 
+def test_native_report_accepts_started_bucket_quarantine_boundary() -> None:
+    identity = _identity(raw_range_count=1, raw_record_count=10_001)
+    native = _native_report(identity)
+    native.update(
+        fact_count=10_001,
+        evidence_count=9_999,
+        quarantine_count=2,
+        quarantine_identity_set_sha256=_digest("two quarantines"),
+        copy_row_count=10_000,
+    )
+    native["fact_blocks"][0].update(record_count=10_001, fact_count=10_001)
+    native["evidence_ranges"][0].update(evidence_count=9_999, run_count=1)
+    native["counters"].update(
+        raw_provider_records=10_001,
+        raw_individual_records=10_001,
+        raw_address_rows=10_001,
+        raw_provider_plan_rows=10_001,
+        invalid_npi_count=2,
+        invalid_npi_individual_records=2,
+        invalid_npi_address_rows=2,
+        invalid_npi_provider_plan_rows=2,
+    )
+
+    fact_count, evidence_count, counters, _blocks, _ranges = (
+        store._validate_native_report(identity, native)
+    )
+
+    assert (fact_count, evidence_count) == (10_001, 9_999)
+    assert counters["invalid_npi_count"] == 2
+
+
 def test_structural_quarantine_is_a_bounded_subset_of_native_totals() -> None:
     identity = _identity()
     native = _native_report_with_quarantine(identity)
