@@ -13122,7 +13122,7 @@ async def _exact_provider_set_keys_by_id(
         provider_set_id = _ptg2_manifest_id(
             serving_row.get("provider_set_global_id_128")
         )
-        if provider_set_id is None:
+        if not provider_set_id:
             raise PTG2ManifestArtifactError(
                 "PTG2 exact billing association references an unknown provider set"
             )

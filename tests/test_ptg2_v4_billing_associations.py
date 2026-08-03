@@ -107,6 +107,40 @@ async def test_exact_billing_groups_intersect_pattern_and_component_sets(
 
 
 @pytest.mark.asyncio
+async def test_exact_billing_groups_reject_incomplete_pattern_source_scope(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        serving,
+        "load_v4_graph_root",
+        AsyncMock(return_value=V4GraphRoot(17, "pattern_v1", b"p" * 32)),
+    )
+    monkeypatch.setattr(
+        serving,
+        "_load_v4_pattern_set_group_sources",
+        AsyncMock(
+            return_value=serving._V4SetGroupSources(
+                pattern_keys_by_set={3: (10,)}, component_keys_by_set={4: (20,)}
+            )
+        ),
+    )
+
+    async def incomplete_intersection(*_args, **kwargs):
+        return {10: (7,)} if kwargs["relation"] == "pattern_groups" else {}
+
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        AsyncMock(side_effect=incomplete_intersection),
+    )
+
+    with pytest.raises(serving.PTG2ManifestArtifactError, match="incomplete"):
+        await serving._v4_exact_groups_by_set(
+            object(), _tables(), provider_set_keys=(3, 4), exact_group_keys=(7, 8)
+        )
+
+
+@pytest.mark.asyncio
 async def test_shared_pattern_fanout_cannot_exceed_association_edge_cap(
     monkeypatch,
 ) -> None:
@@ -249,6 +283,36 @@ async def test_exact_npi_billing_provider_set_scope_is_bounded() -> None:
                 {"provider_set_global_id_128": f"{ordinal:032x}"}
                 for ordinal in range(1, 2050)
             ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_exact_billing_provider_sets_require_ids_and_deduplicate(
+    monkeypatch,
+) -> None:
+    with pytest.raises(serving.PTG2ManifestArtifactError, match="unknown provider set"):
+        await serving._exact_provider_set_keys_by_id(object(), _tables(), [{}])
+
+    provider_set = "11" * 16
+    set_dictionary = AsyncMock(return_value={provider_set: 3})
+    monkeypatch.setattr(serving, "_provider_set_keys_for_ids", set_dictionary)
+    assert await serving._exact_provider_set_keys_by_id(
+        object(),
+        _tables(),
+        [
+            {"provider_set_global_id_128": provider_set},
+            {"provider_set_global_id_128": provider_set},
+        ],
+    ) == {provider_set: 3}
+    assert set_dictionary.await_args.args[2] == (provider_set,)
+
+
+def test_exact_billing_group_dictionary_rejects_duplicate_keys() -> None:
+    with pytest.raises(serving.PTG2ManifestArtifactError, match="inconsistent"):
+        serving._exact_group_ids_by_set(
+            {"11" * 16: 3},
+            {"aa" * 16: 7, "bb" * 16: 7},
+            {3: (7,)},
         )
 
 
