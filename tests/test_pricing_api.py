@@ -50,6 +50,16 @@ resolve_procedure_taxonomy = pricing_module.resolve_procedure_taxonomy
 pricing_statistics = pricing_module.pricing_statistics
 
 
+def test_allowed_amount_response_filters_preserve_numeric_zero():
+    filters_by_name = pricing_module._allowed_amount_response_filters(
+        {"lat": 0.0, "long": 0.0, "radius_miles": 0.0}
+    )
+
+    assert filters_by_name["lat"] == 0.0
+    assert filters_by_name["long"] == 0.0
+    assert filters_by_name["radius_miles"] == 0.0
+
+
 def test_ptg_result_status_cannot_contradict_returned_items():
     payload = {
         "items": [{"npi": 1000000003}],
@@ -3698,9 +3708,153 @@ def test_allowed_amount_sql_filters_before_exact_count_and_pagination():
     assert "allowed_amount_specialty_nt" in sql_text
     assert "healthcare_provider_primary_taxonomy_switch" in sql_text
     assert "mrf.entity_address_unified" in sql_text
+    assert "FROM mrf.geo_zip_lookup AS address_zip" in sql_text
+    assert "FROM tiger.zcta5 AS address_zcta" in sql_text
+    assert "addr.lat IS NULL AND addr.long IS NULL" in sql_text
+    assert "geo_nppes_anchor.premise_key = addr.premise_key" in sql_text
     assert "provider_page.npi ASC" in sql_text
     assert "__LOCATION_" not in sql_text
     assert "__TAXONOMY_" not in sql_text
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_spatial_lookup_fails_without_geo_capability(
+    monkeypatch,
+):
+    address_table_lookup = AsyncMock(
+        return_value="mrf.entity_address_unified"
+    )
+    capability_check = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        pricing_module,
+        "_ptg2_address_serving_table",
+        address_table_lookup,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "is_provider_address_geo_capability_available",
+        capability_check,
+    )
+
+    with pytest.raises(
+        pricing_module.PTG2ManifestArtifactError,
+        match="requires canonical ZIP geometry",
+    ):
+        await pricing_module._allowed_amount_address_table(
+            object(),
+            {"zip5": "00000"},
+        )
+
+    assert address_table_lookup.await_args.args[1] == (
+        pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS
+    )
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_spatial_lookup_returns_unified_table_when_geo_capable(
+    monkeypatch,
+):
+    session = object()
+    address_table = "mrf.entity_address_unified"
+    address_table_lookup = AsyncMock(return_value=address_table)
+    capability_check = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        pricing_module,
+        "_ptg2_address_serving_table",
+        address_table_lookup,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "is_provider_address_geo_capability_available",
+        capability_check,
+    )
+
+    assert await pricing_module._allowed_amount_address_table(
+        session,
+        {"lat": 0.0, "long": 0.0},
+    ) == address_table
+    address_table_lookup.assert_awaited_once_with(
+        session,
+        pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS,
+        require_legacy_available=True,
+    )
+    capability_check.assert_awaited_once_with(
+        session,
+        schema_name=pricing_module.PTG2_SCHEMA,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unfiltered_allowed_amounts_skip_address_lookup(monkeypatch):
+    address_table_lookup = AsyncMock()
+    monkeypatch.setattr(
+        pricing_module,
+        "_ptg2_address_serving_table",
+        address_table_lookup,
+    )
+
+    assert await pricing_module._allowed_amount_address_table(object(), {}) is None
+    address_table_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_allowed_amount_text_filter_requires_complete_unified_schema(
+    monkeypatch,
+):
+    address_table_lookup = AsyncMock(return_value="mrf.npi_address")
+    capability_check = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        pricing_module,
+        "_ptg2_address_serving_table",
+        address_table_lookup,
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "is_provider_address_geo_capability_available",
+        capability_check,
+    )
+
+    with pytest.raises(
+        pricing_module.PTG2ManifestArtifactError,
+        match="location filtering requires unified source-backed addresses",
+    ):
+        await pricing_module._allowed_amount_address_table(
+            object(),
+            {"state": "TS"},
+        )
+
+    assert address_table_lookup.await_args.args[1] == (
+        pricing_module.PTG2_UNIFIED_ADDRESS_COLUMNS
+    )
+    capability_check.assert_not_awaited()
+
+
+def test_allowed_amount_legacy_spatial_filter_combines_zip_and_geo():
+    parameter_map = {}
+
+    _distance_sql, spatial_predicates = (
+        pricing_module._allowed_amount_spatial_filter_sql(
+            {
+                "zip5": "00000",
+                "lat": 0.0,
+                "long": 0.0,
+                "radius_miles": 0.0,
+            },
+            uses_unified_addresses=False,
+            parameter_map=parameter_map,
+        )
+    )
+
+    assert len(spatial_predicates) == 1
+    assert ":allowed_zip5" in spatial_predicates[0]
+    assert " OR " in spatial_predicates[0]
+    assert ":allowed_geo_radius_miles" in spatial_predicates[0]
+    assert parameter_map == {
+        "allowed_geo_lat": 0.0,
+        "allowed_geo_long": 0.0,
+        "allowed_geo_radius_miles": 0.0,
+        "allowed_zip5": "00000",
+    }
 
 
 def test_allowed_amount_sql_uses_stable_current_source_parameters():
@@ -3894,6 +4048,7 @@ def _assert_allowed_amount_multi_source_response(response_by_field):
         "allowed_source_a",
         "allowed_source_b",
     ]
+    _assert_allowed_amount_location_payload_suppressed(provider_by_field)
 
 
 def _assert_allowed_amount_sql_executions(session):
@@ -3912,12 +4067,9 @@ def _assert_allowed_amount_location_payload_suppressed(provider_by_field):
 
     suppressed_field_names = {
         "address",
-        "address_network_binding",
         "city",
         "distance_bucket",
         "distance_miles",
-        "network_bound_address",
-        "requires_location_confirmation",
         "state",
         "zip5",
     }
@@ -3935,6 +4087,11 @@ def _assert_allowed_amount_location_payload_suppressed(provider_by_field):
     assert provider_by_field["confidence"] == {
         "network": "allowed_amounts_in_network"
     }
+    assert provider_by_field["network_bound_address"] is False
+    assert provider_by_field["requires_location_confirmation"] is True
+    assert provider_by_field["address_network_binding"] == (
+        "not_applicable_allowed_amounts"
+    )
 
 
 @pytest.mark.asyncio
@@ -3986,8 +4143,13 @@ async def test_allowed_amount_search_combines_sources_and_keeps_exact_large_tota
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "include_unverified_addresses",
+    [None, "true", "false"],
+)
 async def test_allowed_amount_search_filters_with_location_but_omits_unverified_address(
     monkeypatch,
+    include_unverified_addresses,
 ):
     """Location filters remain active while inferred location output is omitted."""
 
@@ -4008,17 +4170,21 @@ async def test_allowed_amount_search_filters_with_location_but_omits_unverified_
         ]
     )
 
+    request_args_by_name = {
+        "plan_id": "TESTPLAN001",
+        "plan_market_type": "group",
+        "code": "99214",
+        "code_system": "CPT",
+        "city": "Chicago",
+        "state": "IL",
+    }
+    if include_unverified_addresses is not None:
+        request_args_by_name["include_unverified_addresses"] = (
+            include_unverified_addresses
+        )
     response_by_field = await pricing_module._search_ptg_allowed_amount_evidence(
         session,
-        {
-            "plan_id": "TESTPLAN001",
-            "plan_market_type": "group",
-            "code": "99214",
-            "code_system": "CPT",
-            "city": "Chicago",
-            "state": "IL",
-            "include_unverified_addresses": "false",
-        },
+        request_args_by_name,
         types.SimpleNamespace(limit=25, offset=0, page=1),
     )
 

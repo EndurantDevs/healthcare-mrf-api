@@ -397,12 +397,17 @@ def test_openapi_documents_allowed_unverified_location_suppression():
             for parameter_by_field in parameters
             if parameter_by_field["name"] == "include_unverified_addresses"
         )
-        description = unverified_address_parameter["description"]
-        assert "allowed-amount fallback results" in description
-        assert "suppresses distance" in description
-        assert "location-verification metadata" in description
-        assert "location filters" in description
-        assert "apply internally" in description
+        description = " ".join(
+            unverified_address_parameter["description"].split()
+        )
+        required_phrases = (
+            "Allowed-amount fallback never returns", "provider address", "distance",
+            "location filters", "apply internally",
+            "no-address-binding metadata remains",
+        )
+        assert all(
+            required_phrase in description for required_phrase in required_phrases
+        )
 
 
 def test_npi_profile_contract_is_typed_and_address_refresh_is_boolean():

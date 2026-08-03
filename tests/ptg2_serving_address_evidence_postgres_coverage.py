@@ -43,7 +43,39 @@ def _invalid_fixture_npis(count: int) -> tuple[int, ...]:
     return tuple(invalid_npis)
 
 
+async def _insert_spatial_reference_rows(database, schema: str) -> None:
+    """Create one coherent synthetic ZIP/state/polygon reference record."""
+
+    await database.status(
+        f"""
+        INSERT INTO {schema}.geo_zip_lookup (zip_code, state, state_name)
+        VALUES ('48201', 'MI', 'MICHIGAN')
+        """
+    )
+    await database.status(
+        f"""
+        INSERT INTO {schema}.zip_state (zip, stusps)
+        VALUES ('48201', 'MI')
+        """
+    )
+    await database.status(
+        f"""
+        INSERT INTO {schema}.zcta5 (zcta5ce, the_geom)
+        VALUES (
+            '48201',
+            ST_GeomFromText(
+                'POLYGON((-83.20 42.20,-82.90 42.20,-82.90 42.50,-83.20 42.50,-83.20 42.20))',
+                4269
+            )
+        )
+        """
+    )
+
+
 async def _insert_candidate_addresses(database, schema: str, npis: tuple[int, ...]):
+    """Insert the bounded synthetic candidate and evidence population."""
+
+    await _insert_spatial_reference_rows(database, schema)
     await database.status(
         f"""
         INSERT INTO {schema}.ptg2_v3_npi_scope (snapshot_key, npi)
@@ -62,8 +94,8 @@ async def _insert_candidate_addresses(database, schema: str, npis: tuple[int, ..
         INSERT INTO {schema}.entity_address_unified (
             location_key, npi, address_key, premise_key,
             address_source_mask, address_sources, source_count, source_mask,
-            type, checksum, first_line, city_name, state_name, postal_code,
-            zip5, address_precision, lat, long
+            type, checksum, first_line, city_name, state_name, state_code,
+            postal_code, zip5, country_code, address_precision, lat, long
         )
         SELECT
             'geo-rate-' || candidates.ordinality,
@@ -79,8 +111,8 @@ async def _insert_candidate_addresses(database, schema: str, npis: tuple[int, ..
             CASE WHEN candidates.ordinality IN (1, 2501, 5001) THEN 1 ELSE 0 END,
             CASE WHEN candidates.ordinality IN (1, 2501, 5001) THEN 1 ELSE 0 END,
             'practice', candidates.ordinality,
-            'TEST ADDRESS', 'TEST CITY', 'MI', '48201', '48201', 'street',
-            42.3314, -83.0458
+            'TEST ADDRESS', 'TEST CITY', 'MI', 'MI', '48201', '48201', 'US',
+            'street', 42.3314, -83.0458
           FROM candidates
         """,
         npis=list(npis),
@@ -116,6 +148,40 @@ async def _index_candidate_addresses(database, schema: str) -> None:
         await database.status(f"ANALYZE {schema}.{table_name}")
 
 
+def _patch_spatial_policy_dependencies(monkeypatch, schema: str) -> None:
+    """Route canonical capability and geometry reads to the test schema."""
+
+    geo_capability = serving.is_provider_address_geo_capability_available
+
+    async def schema_geo_capability(session, *, schema_name, **_kwargs):
+        return await geo_capability(
+            session,
+            schema_name=schema_name,
+            reference_schema=schema,
+        )
+
+    monkeypatch.setattr(
+        serving,
+        "is_provider_address_geo_capability_available",
+        schema_geo_capability,
+    )
+    location_filter_sql = serving.provider_address_location_filter_sql
+
+    def schema_location_filter_sql(*args, **kwargs):
+        spatial_filter = location_filter_sql(*args, **kwargs)
+        return (
+            _schema_sql(spatial_filter, schema)
+            if spatial_filter is not None
+            else None
+        )
+
+    monkeypatch.setattr(
+        serving,
+        "provider_address_location_filter_sql",
+        schema_location_filter_sql,
+    )
+
+
 def _patch_candidate_geo_dependencies(monkeypatch, schema: str):
     """Route the production geo read to isolated test tables."""
 
@@ -132,6 +198,7 @@ def _patch_candidate_geo_dependencies(monkeypatch, schema: str):
         "_ptg2_npi_scope_table",
         lambda *_args, **_kwargs: f"{schema}.ptg2_v3_npi_scope",
     )
+    _patch_spatial_policy_dependencies(monkeypatch, schema)
     provider_enrichment = AsyncMock()
     monkeypatch.setattr(
         serving,

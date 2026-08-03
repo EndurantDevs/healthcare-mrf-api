@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import os
+import re
 import uuid
 
 import pytest
 
 from api import ptg2_serving as serving
 from db.connection import Database
+
+
+ZCTA5_ZIP_INDEX_NAME = "zcta5_zcta5ce_idx"
 
 
 def _require_disposable_postgres() -> None:
@@ -50,6 +54,7 @@ async def _create_unified_address_table(database: Database, schema: str) -> None
             location_confidence_id smallint NOT NULL DEFAULT 0,
             address_precision varchar NOT NULL DEFAULT 'street',
             zip5 varchar,
+            state_code varchar,
             state_name varchar,
             city_name varchar,
             postal_code varchar,
@@ -171,6 +176,33 @@ async def _create_npi_scope_table(database: Database, schema: str) -> None:
     )
 
 
+async def _create_geo_reference_tables(database: Database, schema: str) -> None:
+    table_sql_by_name = {
+        "geo_zip_lookup": """
+            zip_code varchar PRIMARY KEY,
+            state varchar,
+            state_name varchar
+        """,
+        "zip_state": """
+            zip varchar PRIMARY KEY,
+            stusps varchar
+        """,
+        "zcta5": """
+            gid bigserial PRIMARY KEY,
+            zcta5ce varchar NOT NULL,
+            the_geom geometry(Polygon, 4269) NOT NULL
+        """,
+    }
+    for table_name, column_sql in table_sql_by_name.items():
+        await database.status(
+            f"CREATE TABLE {schema}.{table_name} ({column_sql})"
+        )
+    await database.status(
+        f"CREATE INDEX {ZCTA5_ZIP_INDEX_NAME} "
+        f"ON {schema}.zcta5 (zcta5ce)"
+    )
+
+
 async def _create_tables(database: Database, schema: str) -> None:
     await database.status("CREATE EXTENSION IF NOT EXISTS postgis")
     await _create_unified_address_table(database, schema)
@@ -180,6 +212,7 @@ async def _create_tables(database: Database, schema: str) -> None:
     await _create_npi_address_table(database, schema)
     await _create_cms_address_table(database, schema)
     await _create_npi_scope_table(database, schema)
+    await _create_geo_reference_tables(database, schema)
 
 
 def _schema_sql(sql: str, schema: str) -> str:
@@ -187,14 +220,34 @@ def _schema_sql(sql: str, schema: str) -> str:
         "doctor_clinician_address",
         "entity_address_evidence",
         "entity_address_unified",
+        "npi",
+        "npi_taxonomy",
+        "nucc_taxonomy",
         "mrf_address",
         "npi_address",
+        "ptg2_allowed_amount_item",
+        "ptg2_allowed_amount_payment",
+        "ptg2_allowed_amount_plan",
+        "ptg2_allowed_amount_provider_payment",
+        "ptg2_current_source_snapshot",
+        "ptg2_snapshot",
         "ptg2_v3_npi_scope",
+        "geo_zip_lookup",
     ):
-        sql = sql.replace(
-            f"{serving.PTG2_SCHEMA}.{table_name}",
-            f"{schema}.{table_name}",
+        source_relation = re.escape(
+            f"{serving.PTG2_SCHEMA}.{table_name}"
         )
+        sql = re.sub(
+            rf"(?P<prefix>\b(?:FROM|JOIN|UPDATE|INTO)\s+)"
+            rf"{source_relation}(?![A-Za-z0-9_])",
+            rf"\g<prefix>{schema}.{table_name}",
+            sql,
+        )
+    for source_relation, target_relation in (
+        ("tiger.zip_state", f"{schema}.zip_state"),
+        ("tiger.zcta5", f"{schema}.zcta5"),
+    ):
+        sql = sql.replace(source_relation, target_relation)
     return sql
 
 

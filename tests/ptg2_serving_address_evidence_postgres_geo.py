@@ -84,10 +84,11 @@ def _knn_query(schema: str) -> serving._MembershipLocationQuery:
 
 
 async def _insert_knn_location(database: Database, schema: str) -> None:
+    await _insert_spatial_reference_rows(database, schema)
     await database.status(
         f"""
         INSERT INTO {schema}.ptg2_v3_npi_scope (snapshot_key, npi)
-        VALUES (41, 1990000015)
+        VALUES (41, 1990000015), (41, 1990000221)
         """
     )
     await database.status(
@@ -95,16 +96,25 @@ async def _insert_knn_location(database: Database, schema: str) -> None:
         INSERT INTO {schema}.entity_address_unified (
             location_key, npi, address_key, premise_key,
             address_source_mask, address_sources, source_count, source_mask,
-            type, checksum, first_line, city_name, state_name, postal_code,
-            zip5, address_precision, lat, long
-        ) VALUES (
-            'knn-precedence', 1990000015,
-            '00000000-0000-0000-0000-000000000033',
-            '10000000-0000-0000-0000-000000000033',
-            7, ARRAY['nppes', 'mrf', 'cms_doctors']::varchar[], 3, 7,
-            'practice', 33, '33 TEST STREET', 'TEST CITY', 'MI', '48201',
-            '48201', 'street', 42.3314, -83.0458
-        )
+            type, checksum, first_line, city_name, state_name, state_code,
+            postal_code, zip5, country_code, address_precision, lat, long
+        ) VALUES
+            (
+                'knn-precedence', 1990000015,
+                '00000000-0000-0000-0000-000000000033',
+                '10000000-0000-0000-0000-000000000033',
+                7, ARRAY['nppes', 'mrf', 'cms_doctors']::varchar[], 3, 7,
+                'practice', 33, '33 TEST STREET', 'TEST CITY', 'TS', 'TS',
+                '00001', '00001', 'US', 'street', 42.0, -83.0
+            ),
+            (
+                'knn-incoherent-nearest', 1990000221,
+                '00000000-0000-0000-0000-000000000034',
+                '10000000-0000-0000-0000-000000000034',
+                1, ARRAY['nppes']::varchar[], 1, 1,
+                'practice', 34, '34 TEST STREET', 'OTHER CITY', 'OS', 'OS',
+                '00003', '00003', 'US', 'street', 42.3314, -83.0458
+            )
         """
     )
 
@@ -114,11 +124,17 @@ async def _insert_knn_source_addresses(database: Database, schema: str) -> None:
         f"""
         INSERT INTO {schema}.npi_address (
             npi, address_key, type, checksum, date_added
-        ) VALUES (
-            1990000015,
-            '00000000-0000-0000-0000-000000000033',
-            'practice', 33, '2026-07-29'
-        )
+        ) VALUES
+            (
+                1990000015,
+                '00000000-0000-0000-0000-000000000033',
+                'practice', 33, '2026-07-29'
+            ),
+            (
+                1990000221,
+                '00000000-0000-0000-0000-000000000034',
+                'practice', 34, '2026-07-29'
+            )
         """
     )
     await database.status(
@@ -336,3 +352,51 @@ async def test_optimized_membership_rejects_npi_wide_cms_anchor():
         assert json.loads(selected_location["address_payload"])["location_key"] == (
             "cms-anchored"
         )
+
+
+async def _insert_spatial_reference_rows(database: Database, schema: str) -> None:
+    await database.status(
+        f"""
+        INSERT INTO {schema}.geo_zip_lookup (zip_code, state, state_name)
+        VALUES
+            ('00001', 'TS', 'Test State'),
+            ('00002', 'TS', 'Test State'),
+            ('00003', 'OS', 'Other State')
+        """
+    )
+    await database.status(
+        f"""
+        INSERT INTO {schema}.zip_state (zip, stusps)
+        VALUES
+            ('00001', 'TS'),
+            ('00002', 'TS'),
+            ('00003', 'OS')
+        """
+    )
+    await database.status(
+        f"""
+        INSERT INTO {schema}.zcta5 (zcta5ce, the_geom)
+        VALUES
+            (
+                '00001',
+                ST_GeomFromText(
+                    'POLYGON((-83.10 41.90,-82.90 41.90,-82.90 42.70,-83.10 42.70,-83.10 41.90))',
+                    4269
+                )
+            ),
+            (
+                '00002',
+                ST_GeomFromText(
+                    'POLYGON((-83.25 41.90,-83.11 41.90,-83.11 42.10,-83.25 42.10,-83.25 41.90))',
+                    4269
+                )
+            ),
+            (
+                '00003',
+                ST_GeomFromText(
+                    'POLYGON((-118.40 33.90,-118.20 33.90,-118.20 34.10,-118.40 34.10,-118.40 33.90))',
+                    4269
+                )
+            )
+        """
+    )

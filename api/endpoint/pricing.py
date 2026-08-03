@@ -58,6 +58,7 @@ from api.ptg2_serving import (
     _provider_taxonomy_summary_lateral_sql,
     _ptg2_address_serving_table,
     _ptg2_address_zip5_sql,
+    _ptg2_geo_assured_address_sql,
     _ptg2_geo_distance_miles_sql,
     _ptg2_geo_dwithin_sql,
     _ptg2_npi_scope_table,
@@ -66,10 +67,13 @@ from api.ptg2_serving import (
     search_current_ptg2_index,
     search_ptg2_provider_procedures,
 )
+from api.ptg2_geo_policy import (
+    is_provider_address_geo_capability_available,
+    provider_address_location_filter_sql,
+)
 from api.ptg2_snapshot import current_source_snapshot_id_for_plan, current_network_snapshots_for_plan
 from api.ptg2_response import _normalize_filter_string_list
 from api.ptg2_address_policy import (
-    PTG2_LEGACY_ADDRESS_COLUMNS,
     PTG_NO_DISPLAY_ADDRESS_FIELDS,
     PTG2_UNIFIED_ADDRESS_COLUMNS,
 )
@@ -782,6 +786,12 @@ def _parse_float(raw: Any, param: str, minimum: float | None = None) -> float | 
     if minimum is not None and value < minimum:
         raise InvalidUsage(f"Parameter '{param}' must be >= {minimum}")
     return value
+
+
+def _request_value_or_none(value: Any) -> Any:
+    """Preserve explicit numeric zero while normalizing request null sentinels."""
+
+    return None if value in (None, "", "null") else value
 
 
 def _normalize_zip5(raw: Any) -> str | None:
@@ -5113,10 +5123,7 @@ ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED = "mixed_historical_allowed_amounts"
 _ALLOWED_AMOUNT_UNVERIFIED_LOCATION_FIELD_NAMES = frozenset(
     {
         *PTG_NO_DISPLAY_ADDRESS_FIELDS,
-        "address_network_binding",
         "distance_bucket",
-        "network_bound_address",
-        "requires_location_confirmation",
     }
 )
 _ALLOWED_AMOUNT_CURRENT_SNAPSHOT_SQL = f"""
@@ -5249,20 +5256,32 @@ async def _allowed_amount_address_table(
     session,
     args: Mapping[str, Any],
 ) -> str | None:
+    if not _has_allowed_amount_address_filter(args):
+        return None
     has_geo_filter = any(
         args.get(parameter_name) not in (None, "", "null")
         for parameter_name in ("lat", "long")
     )
-    required_columns = (
-        PTG2_UNIFIED_ADDRESS_COLUMNS
-        if has_geo_filter
-        else PTG2_LEGACY_ADDRESS_COLUMNS
-    )
-    return await _ptg2_address_serving_table(
+    has_zip_filter = bool(_normalize_zip5(args.get("zip5") or args.get("zip")))
+    has_spatial_filter = has_geo_filter or has_zip_filter
+    address_table = await _ptg2_address_serving_table(
         session,
-        required_columns,
+        PTG2_UNIFIED_ADDRESS_COLUMNS,
         require_legacy_available=True,
     )
+    if not _is_unified_address_table(address_table):
+        raise PTG2ManifestArtifactError(
+            "Allowed-amount location filtering requires unified source-backed addresses"
+        )
+    if has_spatial_filter:
+        if not await is_provider_address_geo_capability_available(
+            session,
+            schema_name=PTG2_SCHEMA,
+        ):
+            raise PTG2ManifestArtifactError(
+                "Allowed-amount spatial filtering requires canonical ZIP geometry"
+            )
+    return address_table
 
 
 def _has_allowed_amount_address_filter(args: Mapping[str, Any]) -> bool:
@@ -5352,6 +5371,48 @@ def _allowed_amount_geo_sql(
     ]
 
 
+def _allowed_amount_spatial_filter_sql(
+    request_arg_map: Mapping[str, Any],
+    *,
+    uses_unified_addresses: bool,
+    parameter_map: dict[str, Any],
+) -> tuple[str, list[str]]:
+    """Build spatial predicates shared by allowed-amount page and count SQL."""
+
+    distance_sql, geo_predicates = _allowed_amount_geo_sql(
+        request_arg_map,
+        uses_unified_addresses=uses_unified_addresses,
+        parameter_map=parameter_map,
+    )
+    zip5 = _normalize_zip5(
+        request_arg_map.get("zip5") or request_arg_map.get("zip")
+    )
+    zip_predicate = None
+    if zip5:
+        parameter_map["allowed_zip5"] = zip5
+        zip_sql = _ptg2_address_zip5_sql(
+            "addr",
+            unified=uses_unified_addresses,
+        )
+        zip_predicate = f"{zip_sql} = :allowed_zip5"
+    if uses_unified_addresses and (zip_predicate or geo_predicates):
+        coherence_sql = provider_address_location_filter_sql(
+            "addr",
+            schema_name=PTG2_SCHEMA,
+            exact_zip_predicate=zip_predicate,
+            radius_predicates=geo_predicates,
+        )
+        return distance_sql, [coherence_sql] if coherence_sql else []
+    if zip_predicate:
+        legacy_spatial_sql = (
+            f"({zip_predicate} OR ({' AND '.join(geo_predicates)}))"
+            if geo_predicates
+            else zip_predicate
+        )
+        return distance_sql, [legacy_spatial_sql]
+    return distance_sql, geo_predicates
+
+
 def _allowed_amount_location_join_sql(
     *,
     address_table: str,
@@ -5426,31 +5487,19 @@ def _allowed_amount_location_sql(
         "addr.npi = provider_rollup.npi",
         "addr.type = ANY(CAST(:allowed_address_types AS varchar[]))",
     ]
+    if uses_unified_addresses and _has_allowed_amount_address_filter(args):
+        address_predicates.append(_ptg2_geo_assured_address_sql("addr"))
     _append_allowed_amount_text_location_filters(
         args,
         parameter_map,
         address_predicates,
     )
-    distance_sql, geo_predicates = _allowed_amount_geo_sql(
+    distance_sql, spatial_predicates = _allowed_amount_spatial_filter_sql(
         args,
         uses_unified_addresses=uses_unified_addresses,
         parameter_map=parameter_map,
     )
-    zip5 = _normalize_zip5(args.get("zip5") or args.get("zip"))
-    if zip5:
-        parameter_map["allowed_zip5"] = zip5
-        zip_sql = _ptg2_address_zip5_sql(
-            "addr",
-            unified=uses_unified_addresses,
-        )
-        zip_predicate = f"{zip_sql} = :allowed_zip5"
-        address_predicates.append(
-            f"({zip_predicate} OR ({' AND '.join(geo_predicates)}))"
-            if geo_predicates
-            else zip_predicate
-        )
-    elif geo_predicates:
-        address_predicates.extend(geo_predicates)
+    address_predicates.extend(spatial_predicates)
     join_sql = _allowed_amount_location_join_sql(
         address_table=address_table,
         uses_unified_addresses=uses_unified_addresses,
@@ -6025,7 +6074,6 @@ def _allowed_amount_network_context_from_summary(
 
 
 def _allowed_amount_provider_items_from_rows(
-    args: Mapping[str, Any],
     provider_rows: list[dict[str, Any]],
     detail_rows: list[dict[str, Any]],
     *,
@@ -6043,11 +6091,6 @@ def _allowed_amount_provider_items_from_rows(
             provider_by_field=provider_by_field,
             code=code,
             code_system=code_system,
-            include_unverified_addresses=_parse_bool(
-                args.get("include_unverified_addresses"),
-                "include_unverified_addresses",
-                default=True,
-            ),
         )
         for provider_by_field in provider_rows
     ]
@@ -6231,7 +6274,6 @@ async def _allowed_amount_response_from_page(
         provider_rows,
     )
     provider_items = _allowed_amount_provider_items_from_rows(
-        args,
         provider_rows,
         detail_rows,
         code=code,
@@ -6471,9 +6513,9 @@ def _allowed_amount_response_filters(
         "zip_radius_miles": (
             args.get("zip_radius_miles") if args.get("zip5") else None
         ),
-        "lat": args.get("lat") or None,
-        "long": args.get("long") or None,
-        "radius_miles": args.get("radius_miles") or None,
+        "lat": _request_value_or_none(args.get("lat")),
+        "long": _request_value_or_none(args.get("long")),
+        "radius_miles": _request_value_or_none(args.get("radius_miles")),
         "npi": args.get("npi") or None,
         "service_code": (
             args.get("service_code")
@@ -6745,7 +6787,6 @@ def _allowed_amount_provider_item(
     provider_by_field: dict[str, Any],
     code: str,
     code_system: str,
-    include_unverified_addresses: bool = True,
 ) -> dict[str, Any]:
     network_statuses = _normalize_string_sequence(
         provider_by_field.get("network_statuses")
@@ -6789,10 +6830,7 @@ def _allowed_amount_provider_item(
             network_status=network_status,
         )
     )
-    if not include_unverified_addresses:
-        _strip_allowed_amount_unverified_location_fields(
-            provider_item_by_field
-        )
+    _strip_allowed_amount_unverified_location_fields(provider_item_by_field)
     return provider_item_by_field
 
 
@@ -7075,10 +7113,9 @@ async def group_plan_providers(request):
     city = (request.args.get("city") or "").strip().lower()
     state = (request.args.get("state") or "").strip().upper()
     zip5 = _normalize_zip5(request.args.get("zip5"))
-    # zip5 means "this ZIP plus a radius" everywhere else on the pricing
-    # surface (search-by-procedure defaults to 10 miles); a strict-equality
-    # ZIP match here silently returned zero providers one block outside the
-    # requested ZIP. zip_radius_miles=0 restores exact matching.
+    # This route expands a ZIP into nearby ZIP codes before address filtering.
+    # zip_radius_miles=0 restores exact matching. It does not use the
+    # point-coherence contract of search-by-procedure.
     zip_radius_miles = _parse_zip_radius_miles(
         request.args.get("zip_radius_miles"),
         param="zip_radius_miles",

@@ -13,6 +13,15 @@ from tests.ptg2_serving_coverage_paydown_support import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _assume_geo_reference_capability(monkeypatch):
+    monkeypatch.setattr(
+        serving,
+        "is_provider_address_geo_capability_available",
+        AsyncMock(return_value=True),
+    )
+
+
 def _overlay_provider_rows():
     address_key = "00000000-0000-0000-0000-000000000011"
     original_row_map = {
@@ -163,7 +172,7 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
         "_ptg2_address_serving_table",
         AsyncMock(return_value=address_table),
     )
-    args = {"lat": "41.9", "long": "-87.6"} if unified else {"state": "IL"}
+    args = {"lat": "41.9", "long": "-87.6"} if unified else {}
 
     query = await serving._membership_location_query(
         object(),
@@ -194,7 +203,6 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
         assert "addr.checksum,\n                     addr.location_key" in rendered_sql
     else:
         assert query.knn_order_sql is None
-        assert query.parameter_map["state_value"] == "IL"
         rendered_sql = serving._membership_location_sql(query, limit=1, offset=0)
         assert (
             "COALESCE(addr.address_key::text, ''), "
@@ -263,7 +271,7 @@ async def test_membership_location_query_uses_v4_local_npi_dictionary(monkeypatc
     monkeypatch.setattr(
         serving,
         "_ptg2_address_serving_table",
-        AsyncMock(return_value="mrf.npi_address"),
+        AsyncMock(return_value="mrf.entity_address_unified"),
     )
     tables = strict_v3_tables(
         storage_generation="shared_blocks_v4",
