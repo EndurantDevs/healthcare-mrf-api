@@ -172,6 +172,7 @@ fi
 if [ -n "$ranges" ]; then
   count=${ranges%@*}
   skip=${ranges#*@}
+  sleep 4
   gzip -dc "$input" | dd bs=1 skip="$skip" count="$count" 2>/dev/null
 else
   gzip -dc "$input"
@@ -219,7 +220,11 @@ fi
     );
     let stderr = String::from_utf8_lossy(&completed.stderr);
     assert!(
-        stderr.contains("progress_basis=indexed_objects"),
+        stderr.lines().any(|line| {
+            line.contains("progress_basis=indexed_objects")
+                && line.contains("indexed_objects_completed=0")
+                && line.contains("done=false")
+        }),
         "{stderr}"
     );
     assert!(!completed.stdout.is_empty());
