@@ -152,9 +152,12 @@ purpose:
   lists normalized file and `plan_info` records for one source. The maximum
   page size is 500.
 
-Both responses return `items` and `next_cursor`. Consumers should continue
-until `next_cursor` is null, checkpoint only after a page is durably ingested,
-and treat replayed pages as idempotent.
+Both responses return `items` and `next_cursor`. File-page responses may also
+include a cached `paging_manifest` with an exact total for the current source
+version and page limit. The manifest is optional and may be absent or stale;
+consumers must continue to page until `next_cursor` is null, checkpoint only
+after a page is durably ingested, and never block ingestion on that cache.
+Replayed pages remain idempotent.
 
 ### Reader performance notes
 

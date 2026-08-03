@@ -7294,6 +7294,50 @@ def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():
 
 
 @pytest.mark.asyncio
+async def test_mymedicalshopper_talon_employers_builds_direct_employer_context(
+    monkeypatch,
+):
+    direct_slug = "sample-employer-network-varipro-77100"
+    ddp_call = AsyncMock(return_value="Sample Employer")
+    monkeypatch.setattr(discovery, "_mymedicalshopper_ddp_call", ddp_call)
+
+    employers = await discovery._mymedicalshopper_talon_employers(
+        object(),
+        source_record={"source_id": "source_varipro"},
+        entity_slug=None,
+        employer_slug=direct_slug,
+        resolver={},
+        timeout_seconds=5,
+    )
+
+    assert employers == [
+        {
+            "slug": direct_slug,
+            "name": "Sample Employer",
+            "tpaSlug": "varipro",
+            "tpaName": "Varipro",
+            "groupId": "77100",
+        }
+    ]
+    assert ddp_call.await_args.kwargs["params"] == [direct_slug]
+
+
+@pytest.mark.asyncio
+async def test_mymedicalshopper_talon_targets_skips_empty_employer_slugs():
+    targets = await discovery._mymedicalshopper_talon_targets(
+        object(),
+        [{"slug": ""}],
+        source_record={"source_id": "source_varipro"},
+        entity_slug="varipro",
+        resolver={},
+        resolved_from_url="https://www.mymedicalshopper.com/mrf-search/varipro",
+        timeout_seconds=5,
+    )
+
+    assert targets == []
+
+
+@pytest.mark.asyncio
 async def test_mymedicalshopper_resolver_honors_max_targets(monkeypatch):
     generated_employer_slugs = []
 

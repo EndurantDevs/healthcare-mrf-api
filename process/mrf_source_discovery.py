@@ -40,6 +40,12 @@ import aiohttp
 from sqlalchemy import bindparam, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
+from api.mrf_discovery_catalog_manifest import (
+    CATALOG_PAGING_MANIFEST_METADATA_KEY,
+)
+from process.mrf_discovery_catalog_manifest import (
+    refresh_catalog_paging_manifests,
+)
 from db.connection import init_db
 from db.models import (
     MRFCrawlRun,
@@ -1011,14 +1017,15 @@ _MONTH_NAME_TO_NUMBER = {
 }
 
 
-def _is_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool:
-    """Identify references that are clearly unrelated to TiC MRF data."""
-    parsed = urlsplit(str(url or ""))
-    host = parsed.netloc.lower()
-    path = parsed.path.lower().replace("_", "-")
-    file_name = Path(path).name
-    text = f"{path} {parsed.query.lower()} {label or ''}".lower().replace("_", "-")
-    compact_text = re.sub(r"[^a-z0-9]+", "", text)
+def _is_static_non_tic_reference(
+    *,
+    host: str,
+    path: str,
+    file_name: str,
+    text: str,
+    compact_text: str,
+) -> bool:
+    """Return whether path metadata proves a reference is not TiC MRF data."""
     if (
         file_name.endswith(
             (
@@ -1063,49 +1070,94 @@ def _is_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool
         )
     ):
         return True
-    if re.match(r"^\d{4}-\d{2}-\d{2}[-_].*[-_]index\.json$", file_name) and re.search(
-        r"/(?:mrf|mrfs)/", path
-    ):
-        return False
+    return False
+
+
+def _is_explicit_tic_index_reference(file_name: str, path: str) -> bool:
+    """Return whether a dated MRF index filename is explicitly TiC-shaped."""
+    return bool(
+        re.match(r"^\d{4}-\d{2}-\d{2}[-_].*[-_]index\.json$", file_name)
+        and re.search(r"/(?:mrf|mrfs)/", path)
+    )
+
+
+def _is_tic_table_of_contents_reference(
+    url: str | None,
+    label: str | None,
+    *,
+    file_name: str,
+    text: str,
+) -> bool:
+    """Return whether a known table-of-contents reference is TiC data."""
     tic_index_file = bool(
         re.match(r"^\d{4}-\d{2}-\d{2}[-_].*[-_]index\.json(?:\.gz)?$", file_name)
         and any(token in text for token in ("mrf", "price-transparency", "transparency"))
     )
-    if (
-        _mrf_file_type_from_text(url, label) == "table-of-contents" or tic_index_file
-    ) and any(
-        token in text
-        for token in (
-            "mrf",
-            "machine-readable",
-            "price-transparency",
-            "transparency",
-            "table-of-content",
-            "table of content",
+    return bool(
+        (_mrf_file_type_from_text(url, label) == "table-of-contents" or tic_index_file)
+        and any(
+            token in text
+            for token in (
+                "mrf",
+                "machine-readable",
+                "price-transparency",
+                "transparency",
+                "table-of-content",
+                "table of content",
+            )
         )
-    ):
-        return False
-    if re.search(
-        r"(^|[-/_.])(?:providers?|plans?|drugs?|rx-plan)(?:[-/_.]|\d|$)",
-        file_name,
-        flags=re.I,
-    ) and not any(
-        token in text
-        for token in (
-            "allowed",
-            "in-network",
-            "out-of-network",
-            "negotiated",
-            "rate",
-            "rates",
-            "price-transparency",
-            "transparency",
-            "table-of-contents",
-            "toc",
+    )
+
+
+def _is_non_tic_plan_reference(file_name: str, text: str) -> bool:
+    """Return whether a plan, provider, or drug file lacks TiC markers."""
+    return bool(
+        re.search(
+            r"(^|[-/_.])(?:providers?|plans?|drugs?|rx-plan)(?:[-/_.]|\d|$)",
+            file_name,
+            flags=re.I,
         )
+        and not any(
+            token in text
+            for token in (
+                "allowed",
+                "in-network",
+                "out-of-network",
+                "negotiated",
+                "rate",
+                "rates",
+                "price-transparency",
+                "transparency",
+                "table-of-contents",
+                "toc",
+            )
+        )
+    )
+
+
+def _is_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool:
+    """Identify references that are clearly unrelated to TiC MRF data."""
+    parsed = urlsplit(str(url or ""))
+    host = parsed.netloc.lower()
+    path = parsed.path.lower().replace("_", "-")
+    file_name = Path(path).name
+    text = f"{path} {parsed.query.lower()} {label or ''}".lower().replace("_", "-")
+    compact_text = re.sub(r"[^a-z0-9]+", "", text)
+    if _is_static_non_tic_reference(
+        host=host,
+        path=path,
+        file_name=file_name,
+        text=text,
+        compact_text=compact_text,
     ):
         return True
-    return False
+    if _is_explicit_tic_index_reference(file_name, path):
+        return False
+    if _is_tic_table_of_contents_reference(
+        url, label, file_name=file_name, text=text
+    ):
+        return False
+    return _is_non_tic_plan_reference(file_name, text)
 
 
 def _mrf_body_file_type_from_text(
@@ -2180,79 +2232,67 @@ def _parse_provider_list(provider: str | None, *, test_mode: bool) -> list[str]:
     )
 
 
-async def _fetch_text(
+class _BrowserFallbackRequired(Exception):
+    """Retry a public JSON URL with browser-compatible request headers."""
+
+
+async def _read_text_response(
+    response: aiohttp.ClientResponse,
+    *,
+    max_bytes: int,
+    expect_json: bool,
+    allow_browser_fallback: bool,
+) -> tuple[bytes, str]:
+    """Read and validate one bounded response body and its content type."""
+    await _assert_fetch_url_allowed(str(response.url))
+    content_type = str(response.headers.get("Content-Type") or "").lower()
+    if expect_json and allow_browser_fallback and response.status in _BROWSER_FALLBACK_HTTP_STATUSES:
+        raise _BrowserFallbackRequired()
+    if expect_json and any(
+        marker in content_type
+        for marker in ("text/html", "application/xhtml", "application/pdf", "xml")
+    ):
+        if allow_browser_fallback:
+            raise _BrowserFallbackRequired()
+        raise ValueError(f"response content-type is not JSON: {content_type or 'unknown'}")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+        if expect_json and not chunks:
+            prefix = chunk.lstrip()[:64].lower()
+            if prefix.startswith((b"<!doctype", b"<html", b"<?xml")):
+                if allow_browser_fallback:
+                    raise _BrowserFallbackRequired()
+                raise ValueError("response body is not JSON")
+        chunks.append(chunk)
+    return b"".join(chunks), response.charset or "utf-8"
+
+
+async def _fetch_text_with_session(
     url: str,
     *,
-    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
-    session: aiohttp.ClientSession | None = None,
-    expect_json: bool = False,
+    max_bytes: int,
+    session: aiohttp.ClientSession,
+    expect_json: bool,
 ) -> str:
-    """Fetch text from a URL with bounded size and fallback handling."""
-    await _assert_fetch_url_allowed(url)
-    if session is None:
-        timeout = aiohttp.ClientTimeout(
-            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
-        )
-        connector = _tcp_connector(limit=0)
-        async with aiohttp.ClientSession(
-            headers={"User-Agent": USER_AGENT},
-            timeout=timeout,
-            connector=connector,
-            trust_env=False,
-        ) as owned_session:
-            return await _fetch_text(
-                url, max_bytes=max_bytes, session=owned_session, expect_json=expect_json
-            )
-    class BrowserFallbackRequired(Exception):
-        """Retry this public JSON URL with browser-compatible request headers."""
-
-    async def read_response(
-        resp: aiohttp.ClientResponse,
-        *,
-        allow_browser_fallback: bool,
-    ) -> tuple[bytes, str]:
-        """Read and validate a response body as bytes and content type."""
-        await _assert_fetch_url_allowed(str(resp.url))
-        content_type = str(resp.headers.get("Content-Type") or "").lower()
-        if (
-            expect_json
-            and allow_browser_fallback
-            and resp.status in _BROWSER_FALLBACK_HTTP_STATUSES
-        ):
-            raise BrowserFallbackRequired()
-        if expect_json and any(
-            marker in content_type
-            for marker in ("text/html", "application/xhtml", "application/pdf", "xml")
-        ):
-            if allow_browser_fallback:
-                raise BrowserFallbackRequired()
-            raise ValueError(
-                f"response content-type is not JSON: {content_type or 'unknown'}"
-            )
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in resp.content.iter_chunked(64 * 1024):
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
-            if expect_json and not chunks:
-                prefix = chunk.lstrip()[:64].lower()
-                if prefix.startswith((b"<!doctype", b"<html", b"<?xml")):
-                    if allow_browser_fallback:
-                        raise BrowserFallbackRequired()
-                    raise ValueError("response body is not JSON")
-            chunks.append(chunk)
-        return b"".join(chunks), resp.charset or "utf-8"
-
+    """Fetch bounded text with a supplied session and browser-header retry."""
     try:
         async with session.get(
             url, allow_redirects=True, **_request_ssl_kwargs(url)
-        ) as resp:
-            body, charset = await read_response(resp, allow_browser_fallback=True)
+        ) as response:
+            body, charset = await _read_text_response(
+                response,
+                max_bytes=max_bytes,
+                expect_json=expect_json,
+                allow_browser_fallback=True,
+            )
     except (
         aiohttp.ClientOSError,
         aiohttp.ServerDisconnectedError,
-        BrowserFallbackRequired,
+        _BrowserFallbackRequired,
     ):
         retry_headers_by_name = {
             "User-Agent": BROWSER_FALLBACK_USER_AGENT,
@@ -2271,9 +2311,45 @@ async def _fetch_text(
         ) as retry_session:
             async with retry_session.get(
                 url, allow_redirects=True, **_request_ssl_kwargs(url)
-            ) as resp:
-                body, charset = await read_response(resp, allow_browser_fallback=False)
+            ) as response:
+                body, charset = await _read_text_response(
+                    response,
+                    max_bytes=max_bytes,
+                    expect_json=expect_json,
+                    allow_browser_fallback=False,
+                )
     return _decode_response_body(body, charset=charset)
+
+
+async def _fetch_text(
+    url: str,
+    *,
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+    session: aiohttp.ClientSession | None = None,
+    expect_json: bool = False,
+) -> str:
+    """Fetch text from a URL with bounded size and fallback handling."""
+    await _assert_fetch_url_allowed(url)
+    if session is not None:
+        return await _fetch_text_with_session(
+            url,
+            max_bytes=max_bytes,
+            session=session,
+            expect_json=expect_json,
+        )
+    timeout = aiohttp.ClientTimeout(
+        total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+    )
+    connector = _tcp_connector(limit=0)
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT},
+        timeout=timeout,
+        connector=connector,
+        trust_env=False,
+    ) as owned_session:
+        return await _fetch_text(
+            url, max_bytes=max_bytes, session=owned_session, expect_json=expect_json
+        )
 
 
 async def _fetch_bytes(
@@ -3083,6 +3159,7 @@ async def _retag_sources_for_discovery_run(
     retag_parameters: list[dict[str, Any]] = []
     for source_row in source_rows:
         source_metadata_by_key = dict(source_row.get("metadata_json") or {})
+        source_metadata_by_key.pop(CATALOG_PAGING_MANIFEST_METADATA_KEY, None)
         source_metadata_by_key["discovery_run_id"] = discovery_run_id
         retag_parameters.append(
             {
@@ -3317,6 +3394,110 @@ def _healthsparq_last_updated_on(file_item: dict[str, Any]) -> Any:
     )
 
 
+def _healthsparq_plan_row(
+    source_row_dict: dict[str, Any],
+    file_item: dict[str, Any],
+    plan: dict[str, Any],
+    normalized_plan: dict[str, Any],
+    *,
+    now: dt.datetime,
+) -> tuple[str, dict[str, Any]]:
+    """Build one normalized plan row from a HealthSparq reporting plan."""
+    plan_id = str(_healthsparq_plan_value(plan, "planId", "plan_id") or "").strip()
+    plan_name = normalized_plan.get("plan_name") or _healthsparq_plan_value(
+        plan, "planName", "plan_name", "name"
+    )
+    market_type = _healthsparq_plan_value(
+        plan, "planMarketType", "plan_market_type", "marketType"
+    )
+    plan_row_id = _id(
+        "mrfplan",
+        {
+            "source": source_row_dict["source_id"],
+            "plan_id": plan_id,
+            "plan_name": plan_name,
+            "market_type": market_type,
+        },
+    )
+    return plan_row_id, {
+        "mrf_plan_id": plan_row_id,
+        "payer_id": source_row_dict.get("payer_id"),
+        "source_id": source_row_dict["source_id"],
+        "plan_id": plan_id or None,
+        "plan_id_type": _healthsparq_plan_value(plan, "planIdType", "plan_id_type"),
+        "plan_name": plan_name,
+        "market_type": market_type,
+        "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
+        "reporting_entity_type": _healthsparq_reporting_entity_type(file_item),
+        "metadata_json": {
+            "raw_plan": plan,
+            "resolver": "healthsparq_public_mrf",
+            "plan_sponsor_name": normalized_plan.get("plan_sponsor_name"),
+            "company_name": normalized_plan.get("company_name"),
+        },
+        "first_seen_at": now,
+        "last_seen_at": now,
+    }
+
+
+def _healthsparq_file_row(
+    source_row_dict: dict[str, Any], file_item: dict[str, Any], file_url: str,
+    *, metadata_url: str, plan_info: list[dict[str, Any]], now: dt.datetime,
+) -> tuple[str, dict[str, Any]]:
+    """Build one normalized MRF file row from a HealthSparq metadata file."""
+    file_type = _healthsparq_file_type(_healthsparq_file_schema(file_item))
+    canonical_url = _canonical_or_none(file_url) or file_url
+    file_row_id = _id(
+        "mrffile",
+        {
+            "source": source_row_dict["source_id"],
+            "type": file_type,
+            "url": canonical_url,
+        },
+    )
+    file_name = _healthsparq_file_name(file_item)
+    return file_row_id, {
+        "mrf_file_id": file_row_id,
+        "payer_id": source_row_dict.get("payer_id"),
+        "source_id": source_row_dict["source_id"],
+        "file_type": file_type,
+        "url": file_url,
+        "canonical_url": canonical_url,
+        "from_index_url": metadata_url,
+        "description": file_name,
+        "network_name": file_name,
+        "plan_ids": [plan.get("plan_id") for plan in plan_info if plan.get("plan_id")],
+        "plan_names": [plan.get("plan_name") for plan in plan_info if plan.get("plan_name")],
+        "market_types": sorted(
+            {
+                plan.get("plan_market_type")
+                for plan in plan_info
+                if plan.get("plan_market_type")
+            }
+        ),
+        "is_signed_url": _is_signed(file_url),
+        "size_bytes": None,
+        "schema_version": None,
+        "metadata_json": {
+            "resolver": "healthsparq_public_mrf",
+            "container_format": _container_format(file_url),
+            **_file_benefit_metadata(
+                source_row_dict,
+                file_url,
+                file_name,
+                _healthsparq_reporting_entity_name(file_item),
+            ),
+            "file_path": _healthsparq_file_path(file_item),
+            "file_schema": _healthsparq_file_schema(file_item),
+            "last_updated_on": _healthsparq_last_updated_on(file_item),
+            "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
+            "plan_info": plan_info,
+        },
+        "first_seen_at": now,
+        "last_seen_at": now,
+    }
+
+
 def _healthsparq_rows_from_metadata(
     source_row_dict: dict[str, Any],
     metadata_url: str,
@@ -3334,110 +3515,113 @@ def _healthsparq_rows_from_metadata(
         file_url = _healthsparq_file_url(metadata_url, _healthsparq_file_path(file_item))
         if not file_url:
             continue
-        reporting_plans = _healthsparq_reporting_plans(file_item)
-        normalized_plan_info = _healthsparq_plan_info(
-            file_item, target_query=target_query
+        plan_info = _healthsparq_plan_info(file_item, target_query=target_query)
+        for plan, normalized_plan in zip(_healthsparq_reporting_plans(file_item), plan_info):
+            plan_row_id, plan_row = _healthsparq_plan_row(
+                source_row_dict,
+                file_item,
+                plan,
+                normalized_plan,
+                now=now,
+            )
+            plan_rows_by_id[plan_row_id] = plan_row
+        file_row_id, file_row = _healthsparq_file_row(
+            source_row_dict,
+            file_item,
+            file_url,
+            metadata_url=metadata_url,
+            plan_info=plan_info,
+            now=now,
         )
-        for plan, normalized_plan in zip(reporting_plans, normalized_plan_info):
-            plan_id = str(
-                _healthsparq_plan_value(plan, "planId", "plan_id") or ""
-            ).strip()
-            plan_name = normalized_plan.get("plan_name") or _healthsparq_plan_value(
-                plan, "planName", "plan_name", "name"
-            )
-            market_type = _healthsparq_plan_value(
-                plan, "planMarketType", "plan_market_type", "marketType"
-            )
-            plan_row_id = _id(
-                "mrfplan",
-                {
-                    "source": source_row_dict["source_id"],
-                    "plan_id": plan_id,
-                    "plan_name": plan_name,
-                    "market_type": market_type,
-                },
-            )
-            plan_rows_by_id[plan_row_id] = {
-                "mrf_plan_id": plan_row_id,
-                "payer_id": source_row_dict.get("payer_id"),
-                "source_id": source_row_dict["source_id"],
-                "plan_id": plan_id or None,
-                "plan_id_type": _healthsparq_plan_value(
-                    plan, "planIdType", "plan_id_type"
-                ),
-                "plan_name": plan_name,
-                "market_type": market_type,
-                "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
-                "reporting_entity_type": _healthsparq_reporting_entity_type(file_item),
-                "metadata_json": {
-                    "raw_plan": plan,
-                    "resolver": "healthsparq_public_mrf",
-                    "plan_sponsor_name": normalized_plan.get("plan_sponsor_name"),
-                    "company_name": normalized_plan.get("company_name"),
-                },
-                "first_seen_at": now,
-                "last_seen_at": now,
-            }
-        file_type = _healthsparq_file_type(_healthsparq_file_schema(file_item))
-        canonical_url = _canonical_or_none(file_url) or file_url
-        file_row_id = _id(
-            "mrffile",
-            {
-                "source": source_row_dict["source_id"],
-                "type": file_type,
-                "url": canonical_url,
-            },
-        )
-        file_rows_by_id[file_row_id] = {
-            "mrf_file_id": file_row_id,
-            "payer_id": source_row_dict.get("payer_id"),
-            "source_id": source_row_dict["source_id"],
-            "file_type": file_type,
-            "url": file_url,
-            "canonical_url": canonical_url,
-            "from_index_url": metadata_url,
-            "description": _healthsparq_file_name(file_item),
-            "network_name": _healthsparq_file_name(file_item),
-            "plan_ids": [
-                plan.get("plan_id")
-                for plan in normalized_plan_info
-                if plan.get("plan_id")
-            ],
-            "plan_names": [
-                plan.get("plan_name")
-                for plan in normalized_plan_info
-                if plan.get("plan_name")
-            ],
-            "market_types": sorted(
-                {
-                    plan.get("plan_market_type")
-                    for plan in normalized_plan_info
-                    if plan.get("plan_market_type")
-                }
-            ),
-            "is_signed_url": _is_signed(file_url),
-            "size_bytes": None,
-            "schema_version": None,
-            "metadata_json": {
-                "resolver": "healthsparq_public_mrf",
-                "container_format": _container_format(file_url),
-                **_file_benefit_metadata(
-                    source_row_dict,
-                    file_url,
-                    _healthsparq_file_name(file_item),
-                    _healthsparq_reporting_entity_name(file_item),
-                ),
-                "file_path": _healthsparq_file_path(file_item),
-                "file_schema": _healthsparq_file_schema(file_item),
-                "last_updated_on": _healthsparq_last_updated_on(file_item),
-                "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
-                # Keep a normalized per-file plan list with snake_case keys.
-                "plan_info": normalized_plan_info,
-            },
-            "first_seen_at": now,
-            "last_seen_at": now,
-        }
+        file_rows_by_id[file_row_id] = file_row
     return list(plan_rows_by_id.values()), list(file_rows_by_id.values())
+
+
+def _toc_plan_row(
+    source_row_dict: dict[str, Any], entry: Any, plan: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Build one normalized plan row from a parsed table-of-contents entry."""
+    plan_id = str(plan.get("plan_id") or "").strip()
+    plan_name = plan.get("plan_name")
+    market_type = plan.get("plan_market_type")
+    plan_row_id = _id(
+        "mrfplan",
+        {
+            "source": source_row_dict["source_id"],
+            "plan_id": plan_id,
+            "plan_name": plan_name,
+            "market_type": market_type,
+        },
+    )
+    return plan_row_id, {
+        "mrf_plan_id": plan_row_id,
+        "payer_id": source_row_dict.get("payer_id"),
+        "source_id": source_row_dict["source_id"],
+        "plan_id": plan_id or None,
+        "plan_id_type": plan.get("plan_id_type"),
+        "plan_name": plan_name,
+        "market_type": market_type,
+        "reporting_entity_name": entry.reporting_entity_name,
+        "reporting_entity_type": entry.reporting_entity_type,
+        "metadata_json": {"raw_plan": plan},
+        "first_seen_at": _utc_now(),
+        "last_seen_at": _utc_now(),
+    }
+
+
+def _toc_file_row(
+    source_row_dict: dict[str, Any],
+    entry: Any,
+    plan_info: list[dict[str, Any]],
+    *,
+    schema_version: str | None,
+) -> dict[str, Any]:
+    """Build one normalized file row from a parsed table-of-contents entry."""
+    file_row_id = _id(
+        "mrffile",
+        {
+            "source": source_row_dict["source_id"],
+            "type": entry.source_type,
+            "url": entry.canonical_url,
+        },
+    )
+    return {
+        "mrf_file_id": file_row_id,
+        "payer_id": source_row_dict.get("payer_id"),
+        "source_id": source_row_dict["source_id"],
+        "file_type": entry.source_type,
+        "url": entry.original_url,
+        "canonical_url": entry.canonical_url,
+        "from_index_url": entry.from_index_url,
+        "description": entry.description,
+        "network_name": entry.description,
+        "plan_ids": [plan.get("plan_id") for plan in plan_info if plan.get("plan_id")],
+        "plan_names": [plan.get("plan_name") for plan in plan_info if plan.get("plan_name")],
+        "market_types": sorted(
+            {
+                plan.get("plan_market_type")
+                for plan in plan_info
+                if plan.get("plan_market_type")
+            }
+        ),
+        "is_signed_url": _is_signed(entry.original_url),
+        "size_bytes": None,
+        "schema_version": schema_version,
+        "metadata_json": {
+            "container_format": _container_format(entry.original_url),
+            **_file_benefit_metadata(
+                source_row_dict,
+                entry.original_url,
+                entry.description,
+                entry.reporting_entity_name,
+            ),
+            "domain": entry.domain,
+            "reporting_entity_name": entry.reporting_entity_name,
+            "plan_info": plan_info,
+        },
+        "first_seen_at": _utc_now(),
+        "last_seen_at": _utc_now(),
+    }
 
 
 def _toc_rows_from_content(
@@ -3456,9 +3640,7 @@ def _toc_rows_from_content(
     target_queries = _source_payer_query_candidates(source_row_dict)
     plan_predicate = None
     if filter_to_target_query and target_queries:
-        plan_predicate = lambda plan: _is_plan_info_query_match(
-            plan, target_queries
-        )
+        plan_predicate = lambda plan: _is_plan_info_query_match(plan, target_queries)
     if plan_predicate is None:
         entries = parse_toc_catalog_entries(toc, str(url))
     else:
@@ -3478,89 +3660,20 @@ def _toc_rows_from_content(
         if filter_to_target_query and target_queries and not plan_info:
             continue
         for plan in plan_info:
-            plan_id = str(plan.get("plan_id") or "").strip()
-            plan_name = plan.get("plan_name")
-            market_type = plan.get("plan_market_type")
-            plan_row_id = _id(
-                "mrfplan",
-                {
-                    "source": source_row_dict["source_id"],
-                    "plan_id": plan_id,
-                    "plan_name": plan_name,
-                    "market_type": market_type,
-                },
+            plan_row_id, plan_row = _toc_plan_row(source_row_dict, entry, plan)
+            plan_rows_by_id[plan_row_id] = plan_row
+        if (
+            entry.source_type != "table-of-contents"
+            and str(entry.original_url or "").startswith(("http://", "https://"))
+        ):
+            file_rows.append(
+                _toc_file_row(
+                    source_row_dict,
+                    entry,
+                    plan_info,
+                    schema_version=schema_version,
+                )
             )
-            plan_rows_by_id[plan_row_id] = {
-                "mrf_plan_id": plan_row_id,
-                "payer_id": source_row_dict.get("payer_id"),
-                "source_id": source_row_dict["source_id"],
-                "plan_id": plan_id or None,
-                "plan_id_type": plan.get("plan_id_type"),
-                "plan_name": plan_name,
-                "market_type": market_type,
-                "reporting_entity_name": entry.reporting_entity_name,
-                "reporting_entity_type": entry.reporting_entity_type,
-                "metadata_json": {"raw_plan": plan},
-                "first_seen_at": _utc_now(),
-                "last_seen_at": _utc_now(),
-            }
-        if entry.source_type == "table-of-contents":
-            continue
-        if not str(entry.original_url or "").startswith(("http://", "https://")):
-            continue
-        file_row_id = _id(
-            "mrffile",
-            {
-                "source": source_row_dict["source_id"],
-                "type": entry.source_type,
-                "url": entry.canonical_url,
-            },
-        )
-        file_rows.append(
-            {
-                "mrf_file_id": file_row_id,
-                "payer_id": source_row_dict.get("payer_id"),
-                "source_id": source_row_dict["source_id"],
-                "file_type": entry.source_type,
-                "url": entry.original_url,
-                "canonical_url": entry.canonical_url,
-                "from_index_url": entry.from_index_url,
-                "description": entry.description,
-                "network_name": entry.description,
-                "plan_ids": [
-                    plan.get("plan_id") for plan in plan_info if plan.get("plan_id")
-                ],
-                "plan_names": [
-                    plan.get("plan_name") for plan in plan_info if plan.get("plan_name")
-                ],
-                "market_types": sorted(
-                    {
-                        plan.get("plan_market_type")
-                        for plan in plan_info
-                        if plan.get("plan_market_type")
-                    }
-                ),
-                "is_signed_url": _is_signed(entry.original_url),
-                "size_bytes": None,
-                "schema_version": schema_version,
-                "metadata_json": {
-                    "container_format": _container_format(entry.original_url),
-                    **_file_benefit_metadata(
-                        source_row_dict,
-                        entry.original_url,
-                        entry.description,
-                        entry.reporting_entity_name,
-                    ),
-                    "domain": entry.domain,
-                    "reporting_entity_name": entry.reporting_entity_name,
-                    # Preserve the exact per-file plan list, including plan_id_type,
-                    # so catalog consumers can use the stored rows directly.
-                    "plan_info": plan_info,
-                },
-                "first_seen_at": _utc_now(),
-                "last_seen_at": _utc_now(),
-            }
-        )
     return list(plan_rows_by_id.values()), file_rows
 
 
@@ -4359,6 +4472,23 @@ class _MmsEmployerQuery:
     query_filter: str | None = None
 
 
+@dataclass(frozen=True)
+class _MmsEmployerDiscoveryContext:
+    """Shared settings for one bounded MyMedicalShopper employer crawl."""
+
+    entity_slug: str
+    resolver: dict[str, Any]
+    tpa_name: str | None
+    target_query: str | None
+    base_selector: dict[str, Any]
+    search_selector: dict[str, Any] | None
+    selectors: list[dict[str, Any]]
+    fields: dict[str, int]
+    page_size: int
+    max_employers: int
+    timeout_seconds: float
+
+
 async def _mymedicalshopper_entity_employer_page(
     ws: aiohttp.ClientWebSocketResponse,
     employer_query: _MmsEmployerQuery,
@@ -4450,15 +4580,11 @@ async def _mymedicalshopper_entity_employers_for_query(
     return employers_by_slug
 
 
-async def _mymedicalshopper_entity_employers(
-    ws: aiohttp.ClientWebSocketResponse,
-    *,
-    source_record: dict[str, Any] | None = None,
-    entity_slug: str,
-    resolver: dict[str, Any],
-    timeout_seconds: float,
-) -> list[dict[str, Any]]:
-    """Retrieve employer records from a MyMedicalShopper websocket."""
+async def _mymedicalshopper_employer_discovery_context(
+    ws: aiohttp.ClientWebSocketResponse, *, source_record: dict[str, Any] | None = None,
+    entity_slug: str, resolver: dict[str, Any], timeout_seconds: float,
+) -> _MmsEmployerDiscoveryContext:
+    """Load bounded selector and paging settings for an entity employer crawl."""
     config_messages = await _mymedicalshopper_ddp_subscribe_collect(
         ws,
         name="entityMRFsConfig",
@@ -4473,9 +4599,7 @@ async def _mymedicalshopper_entity_employers(
         if isinstance(config.get("machineReadableFiles"), dict)
         else {}
     )
-    all_employers_searchable = bool(
-        machine_readable_files.get("allEmployersSearchable")
-    )
+    all_employers_searchable = bool(machine_readable_files.get("allEmployersSearchable"))
     target_query = _source_target_payer_query(source_record or {})
     base_selector = _mymedicalshopper_employer_selector(
         entity_slug, all_employers_searchable=all_employers_searchable
@@ -4494,58 +4618,108 @@ async def _mymedicalshopper_entity_employers(
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
         max_employers = min(max_employers, max_targets)
-    fields_by_name = {
-        "name": 1,
-        "slug": 1,
-        "tpaSlug": 1,
-        "status": 1,
-        "machineReadableFiles": 1,
-        "groupId": 1,
-        "ein": 1,
-    }
+    return _MmsEmployerDiscoveryContext(
+        entity_slug=entity_slug,
+        resolver=resolver,
+        tpa_name=tpa_name,
+        target_query=target_query,
+        base_selector=base_selector,
+        search_selector=search_selector,
+        selectors=selectors,
+        fields={
+            "name": 1,
+            "slug": 1,
+            "tpaSlug": 1,
+            "status": 1,
+            "machineReadableFiles": 1,
+            "groupId": 1,
+            "ein": 1,
+        },
+        page_size=page_size,
+        max_employers=max_employers,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _mymedicalshopper_employer_query(
+    context: _MmsEmployerDiscoveryContext,
+    *,
+    selector: dict[str, Any],
+    selector_label: str,
+    max_employers: int | None = None,
+) -> _MmsEmployerQuery:
+    """Build one selector-specific query from shared employer crawl settings."""
+    max_query_employers = max_employers or context.max_employers
+    return _MmsEmployerQuery(
+        entity_slug=context.entity_slug,
+        selector=selector,
+        selector_label=selector_label,
+        fields=context.fields,
+        page_size=min(context.page_size, max_query_employers),
+        max_employers=max_query_employers,
+        tpa_name=context.tpa_name,
+        timeout_seconds=context.timeout_seconds,
+        query_filter=context.target_query,
+    )
+
+
+async def _mymedicalshopper_entity_employers_for_context(
+    ws: aiohttp.ClientWebSocketResponse,
+    context: _MmsEmployerDiscoveryContext,
+) -> dict[str, dict[str, Any]]:
+    """Retrieve all bounded employer pages, including the targeted fallback query."""
     employers_by_slug: dict[str, dict[str, Any]] = {}
-    for selector_index, selector in enumerate(selectors):
+    for selector_index, selector in enumerate(context.selectors):
         employers_by_slug.update(
             await _mymedicalshopper_entity_employers_for_query(
                 ws,
-                _MmsEmployerQuery(
-                    entity_slug=entity_slug,
-                    selector=selector,
-                    selector_label=str(selector_index),
-                    fields=fields_by_name,
-                    page_size=page_size,
-                    max_employers=max_employers,
-                    tpa_name=tpa_name,
-                    timeout_seconds=timeout_seconds,
-                    query_filter=target_query,
+                _mymedicalshopper_employer_query(
+                    context, selector=selector, selector_label=str(selector_index)
                 ),
             )
         )
     if (
         not employers_by_slug
-        and target_query
-        and search_selector is not None
-        and not resolver.get("query_search_include_full_table")
+        and context.target_query
+        and context.search_selector is not None
+        and not context.resolver.get("query_search_include_full_table")
     ):
         fallback_max_employers = _mymedicalshopper_query_fallback_max_employers(
-            resolver, max_employers
+            context.resolver, context.max_employers
         )
         employers_by_slug.update(
             await _mymedicalshopper_entity_employers_for_query(
                 ws,
-                _MmsEmployerQuery(
-                    entity_slug=entity_slug,
-                    selector=base_selector,
+                _mymedicalshopper_employer_query(
+                    context,
+                    selector=context.base_selector,
                     selector_label="query-fallback",
-                    fields=fields_by_name,
-                    page_size=min(page_size, fallback_max_employers),
                     max_employers=fallback_max_employers,
-                    tpa_name=tpa_name,
-                    timeout_seconds=timeout_seconds,
-                    query_filter=target_query,
                 ),
             )
         )
+    return employers_by_slug
+
+
+async def _mymedicalshopper_entity_employers(
+    ws: aiohttp.ClientWebSocketResponse,
+    *,
+    source_record: dict[str, Any] | None = None,
+    entity_slug: str,
+    resolver: dict[str, Any],
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    """Retrieve employer records from a MyMedicalShopper websocket."""
+    context = await _mymedicalshopper_employer_discovery_context(
+        ws,
+        source_record=source_record,
+        entity_slug=entity_slug,
+        resolver=resolver,
+        timeout_seconds=timeout_seconds,
+    )
+    employers_by_slug = await _mymedicalshopper_entity_employers_for_context(
+        ws, context
+    )
     return list(employers_by_slug.values())
 
 
@@ -4611,16 +4785,10 @@ def _mymedicalshopper_entry_history(entry: dict[str, Any]) -> list[dict[str, Any
     return []
 
 
-def _mymedicalshopper_targets_from_generated(
-    source_row_dict: dict[str, Any],
-    *,
-    entity_slug: str | None,
-    employer: dict[str, Any],
-    generated: Any,
-    resolver_type: str,
-    resolved_from_url: str,
-) -> list[CrawlTarget]:
-    """Convert generated MyMedicalShopper records into crawl targets."""
+def _mymedicalshopper_employer_target_context(
+    employer: dict[str, Any], *, entity_slug: str | None
+) -> dict[str, Any]:
+    """Return stable employer metadata shared by generated MRF targets."""
     employer_slug = str(employer.get("slug") or "").strip()
     employer_name = _clean_text(employer.get("name") or employer_slug)
     employer_id = (
@@ -4636,61 +4804,178 @@ def _mymedicalshopper_targets_from_generated(
         employer.get("tpaName") or employer.get("tpa_name")
     ) or _slug_label(tpa_slug)
     ein = str(employer.get("ein") or employer.get("EIN") or "").strip() or None
+    return {
+        "entity_slug": entity_slug or tpa_slug,
+        "tpa_slug": tpa_slug,
+        "tpa_name": tpa_name,
+        "client_id": employer_id,
+        "client_name": employer_name or None,
+        "employer_id": employer_id or employer_slug or None,
+        "employer_slug": employer_slug or None,
+        "employer_name": employer_name or None,
+        "group_id": group_id,
+        "ein": ein,
+    }
+
+
+def _mymedicalshopper_generated_target(
+    source_row_dict: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    context: dict[str, Any],
+    resolver_type: str,
+    resolved_from_url: str,
+) -> tuple[str, CrawlTarget] | None:
+    """Convert one generated MyMedicalShopper record to its latest crawl target."""
+    plan_id = _mymedicalshopper_entry_plan_value(
+        entry, ("planId", "plan_id", "id", "_id")
+    )
+    plan_name = _clean_text(
+        _mymedicalshopper_entry_plan_value(entry, ("planName", "plan_name", "name"))
+        or ""
+    )
+    history = _mymedicalshopper_entry_history(entry)
+    latest = sorted(
+        (
+            generation_record
+            for generation_record in history
+            if generation_record.get("mrfGenerated") is True
+            and str(generation_record.get("link") or "")
+            .strip()
+            .startswith(("http://", "https://"))
+        ),
+        key=lambda generation_record: str(generation_record.get("month") or ""),
+        reverse=True,
+    )
+    if not latest:
+        return None
+    generation_record = latest[0]
+    url = str(generation_record.get("link") or "").strip()
+    canonical = _canonical_or_none(url) or url
+    month = str(generation_record.get("month") or "").strip() or None
+    label_parts = [part for part in (context["employer_name"], plan_name, month) if part]
+    return canonical, CrawlTarget(
+        source=source_row_dict,
+        url=url,
+        label=" - ".join(label_parts),
+        resolved_from_url=resolved_from_url,
+        metadata={
+            "resolver": resolver_type,
+            "target_file_type": "table-of-contents",
+            **context,
+            "group_number": context["group_id"],
+            "plan_id": str(plan_id) if plan_id not in (None, "") else None,
+            "plan_name": plan_name or None,
+            "month": month,
+            "history_month_count": len(history),
+        },
+    )
+
+
+def _mymedicalshopper_targets_from_generated(
+    source_row_dict: dict[str, Any],
+    *,
+    entity_slug: str | None,
+    employer: dict[str, Any],
+    generated: Any,
+    resolver_type: str,
+    resolved_from_url: str,
+) -> list[CrawlTarget]:
+    """Convert generated MyMedicalShopper records into crawl targets."""
+    context = _mymedicalshopper_employer_target_context(
+        employer, entity_slug=entity_slug
+    )
     targets_by_url: dict[str, CrawlTarget] = {}
     for entry in _mymedicalshopper_generated_entries(generated):
-        plan_id = _mymedicalshopper_entry_plan_value(
-            entry, ("planId", "plan_id", "id", "_id")
-        )
-        plan_name = _clean_text(
-            _mymedicalshopper_entry_plan_value(entry, ("planName", "plan_name", "name"))
-            or ""
-        )
-        history = _mymedicalshopper_entry_history(entry)
-        latest = sorted(
-            (
-                generation_record
-                for generation_record in history
-                if generation_record.get("mrfGenerated") is True
-                and str(generation_record.get("link") or "")
-                .strip()
-                .startswith(("http://", "https://"))
-            ),
-            key=lambda generation_record: str(generation_record.get("month") or ""),
-            reverse=True,
-        )
-        if not latest:
-            continue
-        generation_record = latest[0]
-        url = str(generation_record.get("link") or "").strip()
-        canonical = _canonical_or_none(url) or url
-        month = str(generation_record.get("month") or "").strip() or None
-        label_parts = [part for part in (employer_name, plan_name, month) if part]
-        targets_by_url[canonical] = CrawlTarget(
-            source=source_row_dict,
-            url=url,
-            label=" - ".join(label_parts),
+        target_by_url = _mymedicalshopper_generated_target(
+            source_row_dict,
+            entry,
+            context=context,
+            resolver_type=resolver_type,
             resolved_from_url=resolved_from_url,
-            metadata={
-                "resolver": resolver_type,
-                "target_file_type": "table-of-contents",
-                "entity_slug": entity_slug or tpa_slug,
-                "tpa_slug": tpa_slug,
-                "tpa_name": tpa_name,
-                "client_id": employer_id,
-                "client_name": employer_name or None,
-                "employer_id": employer_id or employer_slug or None,
-                "employer_slug": employer_slug or None,
-                "employer_name": employer_name or None,
-                "group_id": group_id,
-                "group_number": group_id,
-                "ein": ein,
-                "plan_id": str(plan_id) if plan_id not in (None, "") else None,
-                "plan_name": plan_name or None,
-                "month": month,
-                "history_month_count": len(history),
-            },
         )
+        if target_by_url is None:
+            continue
+        canonical, target = target_by_url
+        targets_by_url[canonical] = target
     return list(targets_by_url.values())
+
+
+async def _mymedicalshopper_talon_employers(
+    ws: aiohttp.ClientWebSocketResponse,
+    *,
+    source_record: dict[str, Any],
+    entity_slug: str | None,
+    employer_slug: str | None,
+    resolver: dict[str, Any],
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    """Load entity employers or construct the direct-employer representation."""
+    if entity_slug:
+        return await _mymedicalshopper_entity_employers(
+            ws,
+            source_record=source_record,
+            entity_slug=entity_slug,
+            resolver=resolver,
+            timeout_seconds=timeout_seconds,
+        )
+    employer_name = await _mymedicalshopper_ddp_call(
+        ws,
+        method="getEmployerName",
+        params=[employer_slug],
+        request_id=f"mms-employer-name-{employer_slug}",
+        timeout_seconds=timeout_seconds,
+    )
+    direct_tpa_slug = _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug)
+    return [
+        {
+            "slug": employer_slug,
+            "name": employer_name,
+            "tpaSlug": direct_tpa_slug,
+            "tpaName": _slug_label(direct_tpa_slug),
+            "groupId": _mymedicalshopper_group_id_from_employer_slug(employer_slug),
+        }
+    ]
+
+
+async def _mymedicalshopper_talon_targets(
+    ws: aiohttp.ClientWebSocketResponse,
+    employers: list[dict[str, Any]],
+    *,
+    source_record: dict[str, Any],
+    entity_slug: str | None,
+    resolver: dict[str, Any],
+    resolved_from_url: str,
+    timeout_seconds: float,
+) -> list[CrawlTarget]:
+    """Fetch generated links for the bounded set of MyMedicalShopper employers."""
+    max_plans = _as_int(resolver.get("max_plans_per_employer"))
+    max_targets = _as_int(resolver.get("max_targets"))
+    resolver_type = str(resolver.get("type") or "mymedicalshopper_talon_mrf")
+    crawl_targets: list[CrawlTarget] = []
+    for employer in employers:
+        slug = str(employer.get("slug") or "").strip()
+        if not slug:
+            continue
+        generated = await _mymedicalshopper_generated_for_employer(
+            ws,
+            employer_slug=slug,
+            timeout_seconds=timeout_seconds,
+            max_plans=max_plans,
+        )
+        crawl_targets.extend(
+            _mymedicalshopper_targets_from_generated(
+                source_record,
+                entity_slug=entity_slug or str(employer.get("tpaSlug") or "").strip() or None,
+                employer=employer,
+                generated=generated,
+                resolver_type=resolver_type,
+                resolved_from_url=resolved_from_url,
+            )
+        )
+        if max_targets and max_targets > 0 and len(crawl_targets) >= max_targets:
+            return crawl_targets[:max_targets]
+    return crawl_targets
 
 
 async def _resolve_mymedicalshopper_talon_mrf(
@@ -4705,79 +4990,30 @@ async def _resolve_mymedicalshopper_talon_mrf(
     if not entity_slug and not employer_slug:
         raise ValueError(f"unsupported MyMedicalShopper MRF URL: {url}")
     timeout_seconds = float(_as_int(resolver.get("ddp_timeout_seconds")) or 30)
-    max_plans = _as_int(resolver.get("max_plans_per_employer"))
-    max_targets = _as_int(resolver.get("max_targets"))
-    ws = await _mymedicalshopper_ddp_connect(
-        session, url, timeout_seconds=timeout_seconds
-    )
+    ws = await _mymedicalshopper_ddp_connect(session, url, timeout_seconds=timeout_seconds)
     try:
-        if entity_slug:
-            employers = await _mymedicalshopper_entity_employers(
-                ws,
-                source_record=source_record,
-                entity_slug=entity_slug,
-                resolver=resolver,
-                timeout_seconds=timeout_seconds,
-            )
-        else:
-            employer_name = await _mymedicalshopper_ddp_call(
-                ws,
-                method="getEmployerName",
-                params=[employer_slug],
-                request_id=f"mms-employer-name-{employer_slug}",
-                timeout_seconds=timeout_seconds,
-            )
-            direct_tpa_slug = _mymedicalshopper_tpa_slug_from_employer_slug(
-                employer_slug
-            )
-            employers = [
-                {
-                    "slug": employer_slug,
-                    "name": employer_name,
-                    "tpaSlug": direct_tpa_slug,
-                    "tpaName": _slug_label(direct_tpa_slug),
-                    "groupId": _mymedicalshopper_group_id_from_employer_slug(
-                        employer_slug
-                    ),
-                }
-            ]
-        crawl_targets: list[CrawlTarget] = []
-        for employer in employers:
-            slug = str(employer.get("slug") or "").strip()
-            if not slug:
-                continue
-            generated = await _mymedicalshopper_generated_for_employer(
-                ws,
-                employer_slug=slug,
-                timeout_seconds=timeout_seconds,
-                max_plans=max_plans,
-            )
-            crawl_targets.extend(
-                _mymedicalshopper_targets_from_generated(
-                    source_record,
-                    entity_slug=entity_slug
-                    or str(employer.get("tpaSlug") or "").strip()
-                    or None,
-                    employer=employer,
-                    generated=generated,
-                    resolver_type=str(
-                        resolver.get("type") or "mymedicalshopper_talon_mrf"
-                    ),
-                    resolved_from_url=url,
-                )
-            )
-            if (
-                max_targets
-                and max_targets > 0
-                and len(crawl_targets) >= max_targets
-            ):
-                crawl_targets = crawl_targets[:max_targets]
-                break
-        if not crawl_targets:
-            raise ValueError(f"no generated MyMedicalShopper MRF links found for {url}")
-        return crawl_targets
+        employers = await _mymedicalshopper_talon_employers(
+            ws,
+            source_record=source_record,
+            entity_slug=entity_slug,
+            employer_slug=employer_slug,
+            resolver=resolver,
+            timeout_seconds=timeout_seconds,
+        )
+        crawl_targets = await _mymedicalshopper_talon_targets(
+            ws,
+            employers,
+            source_record=source_record,
+            entity_slug=entity_slug,
+            resolver=resolver,
+            resolved_from_url=url,
+            timeout_seconds=timeout_seconds,
+        )
     finally:
         await ws.close()
+    if not crawl_targets:
+        raise ValueError(f"no generated MyMedicalShopper MRF links found for {url}")
+    return crawl_targets
 
 
 _VIVA_HEALTH_COMMERCIAL_MRF_FILES: tuple[dict[str, str], ...] = (
@@ -12027,19 +12263,14 @@ def _bcbs_global_solutions_first_plan_name(payload: Any) -> str | None:
     return None
 
 
-async def _resolve_bcbs_global_solutions_mrf(
-    source_row_dict: dict[str, Any],
+async def _bcbs_global_solutions_toc_links(
     url: str,
-    resolver: dict[str, Any],
+    *,
+    max_pages: int,
+    max_bytes: int,
     session: aiohttp.ClientSession,
-) -> list[CrawlTarget]:
-    """Resolve BCBS Global Solutions pages into crawl targets."""
-    resolver_type = str(resolver.get("type") or "bcbs_global_solutions_mrf")
-    max_pages = _as_int(resolver.get("max_pages")) or 5
-    max_targets = _as_int(resolver.get("max_targets")) or 20
-    toc_max_bytes = (
-        _parse_size_bytes(resolver.get("toc_max_bytes")) or MAX_TOC_BYTES_DEFAULT
-    )
+) -> dict[str, dict[str, str]]:
+    """Crawl bounded BCBS Global landing pages and collect distinct TOC links."""
     page_urls = [url]
     seen_pages: set[str] = set()
     toc_links_by_url: dict[str, dict[str, str]] = {}
@@ -12051,7 +12282,7 @@ async def _resolve_bcbs_global_solutions_mrf(
         seen_pages.add(page_key)
         html_text = await _fetch_text(
             page_url,
-            max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+            max_bytes=max_bytes,
             session=session,
         )
         for link in _bcbs_global_solutions_toc_links_from_html(
@@ -12067,48 +12298,82 @@ async def _resolve_bcbs_global_solutions_mrf(
             landing_key = _canonical_or_none(landing_url) or landing_url
             if landing_key not in seen_pages and landing_url not in page_urls:
                 page_urls.append(landing_url)
+    return toc_links_by_url
+
+
+async def _bcbs_global_solutions_toc_target(
+    source_row_dict: dict[str, Any],
+    link: dict[str, str],
+    *,
+    resolved_from_url: str,
+    resolver_type: str,
+    toc_max_bytes: int,
+    session: aiohttp.ClientSession,
+) -> CrawlTarget | None:
+    """Fetch one BCBS Global TOC and return a target only when it has network files."""
+    toc_url = str(link.get("url") or "").strip()
+    if not toc_url:
+        return None
+    try:
+        toc_payload = await _fetch_json_value(
+            toc_url,
+            max_bytes=toc_max_bytes,
+            session=session,
+        )
+    except Exception:
+        return None
+    if not _is_bcbs_toc_in_network(toc_payload):
+        return None
+    plan_type = _clean_text(link.get("plan_type"))
+    plan_name = _bcbs_global_solutions_first_plan_name(toc_payload)
+    label = _clean_text(link.get("label")) or plan_name or plan_type
+    return CrawlTarget(
+        source=source_row_dict,
+        url=toc_url,
+        label=label or str(source_row_dict.get("display_name") or "BCBS Global TOC"),
+        resolved_from_url=resolved_from_url,
+        metadata={
+            "resolver": resolver_type,
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "target_max_bytes": toc_max_bytes,
+            "plan_type": plan_type,
+            "reporting_entity_name": _clean_text(toc_payload.get("reporting_entity_name")),
+            "reporting_entity_type": _clean_text(toc_payload.get("reporting_entity_type")),
+            "reporting_plan_name": plan_name,
+        },
+    )
+
+
+async def _resolve_bcbs_global_solutions_mrf(
+    source_row_dict: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve BCBS Global Solutions pages into crawl targets."""
+    resolver_type = str(resolver.get("type") or "bcbs_global_solutions_mrf")
+    max_targets = _as_int(resolver.get("max_targets")) or 20
+    toc_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes")) or MAX_TOC_BYTES_DEFAULT
+    toc_links_by_url = await _bcbs_global_solutions_toc_links(
+        url,
+        max_pages=_as_int(resolver.get("max_pages")) or 5,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
 
     crawl_targets: list[CrawlTarget] = []
     for link in toc_links_by_url.values():
-        toc_url = str(link.get("url") or "").strip()
-        if not toc_url:
-            continue
-        try:
-            toc_payload = await _fetch_json_value(
-                toc_url,
-                max_bytes=toc_max_bytes,
-                session=session,
-            )
-        except Exception:
-            continue
-        if not _is_bcbs_toc_in_network(toc_payload):
-            continue
-        plan_type = _clean_text(link.get("plan_type"))
-        plan_name = _bcbs_global_solutions_first_plan_name(toc_payload)
-        label = _clean_text(link.get("label")) or plan_name or plan_type
-        crawl_targets.append(
-            CrawlTarget(
-                source=source_row_dict,
-                url=toc_url,
-                label=label
-                or str(source_row_dict.get("display_name") or "BCBS Global TOC"),
-                resolved_from_url=url,
-                metadata={
-                    "resolver": resolver_type,
-                    "target_kind": "toc_json",
-                    "target_file_type": "table-of-contents",
-                    "target_max_bytes": toc_max_bytes,
-                    "plan_type": plan_type,
-                    "reporting_entity_name": _clean_text(
-                        toc_payload.get("reporting_entity_name")
-                    ),
-                    "reporting_entity_type": _clean_text(
-                        toc_payload.get("reporting_entity_type")
-                    ),
-                    "reporting_plan_name": plan_name,
-                },
-            )
+        crawl_target = await _bcbs_global_solutions_toc_target(
+            source_row_dict,
+            link,
+            resolved_from_url=url,
+            resolver_type=resolver_type,
+            toc_max_bytes=toc_max_bytes,
+            session=session,
         )
+        if crawl_target is not None:
+            crawl_targets.append(crawl_target)
         if max_targets and len(crawl_targets) >= max_targets:
             break
     if not crawl_targets:
@@ -13652,36 +13917,48 @@ async def _resolve_healthsparq_direct_metadata(
     return [_healthsparq_target(source, url, url, params)]
 
 
-async def _resolve_healthsparq_public_mrf(
+async def _healthsparq_metadata_targets_or_fallback(
     source_row_dict: dict[str, Any],
-    url: str,
+    metadata_url: str,
+    *,
+    fallback_url: str,
+    params: dict[str, Any],
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
+    verify_metadata_url: bool,
 ) -> list[CrawlTarget]:
-    """Resolve HealthSparq public metadata into crawl targets."""
-    params = _healthsparq_public_params(url)
-    metadata_url = _healthsparq_direct_metadata_url(resolver, params)
-    if metadata_url:
-        try:
+    """Read HealthSparq metadata and retain a fallback target when it is unavailable."""
+    try:
+        if verify_metadata_url:
             await _assert_fetch_url_allowed(metadata_url)
-            api_payload_by_field = await _fetch_json(
-                metadata_url,
-                max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
-                session=session,
-            )
-        except Exception:
-            return [_healthsparq_target(source_row_dict, metadata_url, url, params)]
-        crawl_targets = _healthsparq_targets_from_metadata(
-            source_row_dict,
+        metadata_payload = await _fetch_json(
             metadata_url,
-            api_payload_by_field,
-            resolved_from_url=url,
-            params=params,
+            max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+            session=session,
         )
-        if crawl_targets:
-            max_targets = _as_int(resolver.get("max_targets"))
-            return crawl_targets[:max_targets] if max_targets else crawl_targets
-        return [_healthsparq_target(source_row_dict, metadata_url, url, params)]
+    except Exception:
+        return [_healthsparq_target(source_row_dict, metadata_url, fallback_url, params)]
+    crawl_targets = _healthsparq_targets_from_metadata(
+        source_row_dict,
+        metadata_url,
+        metadata_payload,
+        resolved_from_url=fallback_url,
+        params=params,
+    )
+    if crawl_targets:
+        max_targets = _as_int(resolver.get("max_targets"))
+        return crawl_targets[:max_targets] if max_targets else crawl_targets
+    return [_healthsparq_target(source_row_dict, metadata_url, fallback_url, params)]
+
+
+async def _healthsparq_service_metadata_url(
+    url: str,
+    *,
+    resolver: dict[str, Any],
+    params: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> tuple[str, str]:
+    """Authenticate to the public service and resolve its metadata URL."""
     login_url = _healthsparq_service_url(url, resolver, "login_path")
     login_query_by_key = {"_": str(int(_utc_now().timestamp() * 1000)), **params}
     await _fetch_json(
@@ -13712,27 +13989,43 @@ async def _resolve_healthsparq_public_mrf(
     metadata_url = str(api_payload_by_field.get("url") or "").strip()
     if not metadata_url:
         raise ValueError("HealthSparq public MRF API did not return a metadata URL")
-    try:
-        metadata_payload = await _fetch_json(
+    return metadata_url, mrf_all_url
+
+
+async def _resolve_healthsparq_public_mrf(
+    source_row_dict: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    """Resolve HealthSparq public metadata into crawl targets."""
+    params = _healthsparq_public_params(url)
+    metadata_url = _healthsparq_direct_metadata_url(resolver, params)
+    if metadata_url:
+        return await _healthsparq_metadata_targets_or_fallback(
+            source_row_dict,
             metadata_url,
-            max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+            fallback_url=url,
+            params=params,
+            resolver=resolver,
             session=session,
+            verify_metadata_url=True,
         )
-    except Exception:
-        return [
-            _healthsparq_target(source_row_dict, metadata_url, mrf_all_url, params)
-        ]
-    crawl_targets = _healthsparq_targets_from_metadata(
+    metadata_url, mrf_all_url = await _healthsparq_service_metadata_url(
+        url,
+        resolver=resolver,
+        params=params,
+        session=session,
+    )
+    return await _healthsparq_metadata_targets_or_fallback(
         source_row_dict,
         metadata_url,
-        metadata_payload,
-        resolved_from_url=mrf_all_url,
+        fallback_url=mrf_all_url,
         params=params,
+        resolver=resolver,
+        session=session,
+        verify_metadata_url=False,
     )
-    if crawl_targets:
-        max_targets = _as_int(resolver.get("max_targets"))
-        return crawl_targets[:max_targets] if max_targets else crawl_targets
-    return [_healthsparq_target(source_row_dict, metadata_url, mrf_all_url, params)]
 
 
 async def _fetch_json_with_headers(
@@ -17034,6 +17327,11 @@ async def run_mrf_source_discovery_command(
         discovery_result.urls_checked = source_batch_summary.urls_checked
         discovery_result.plans = source_batch_summary.plans_discovered
         discovery_result.files = source_batch_summary.files_discovered
+        if crawl and not test_mode:
+            await refresh_catalog_paging_manifests(
+                source_rows,
+                source_discovery_run_id=control_run_id,
+            )
     if probe_files:
         try:
             probe_observations, ok_count = await _probe_mrf_file_heads(
