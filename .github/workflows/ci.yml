@@ -6,6 +6,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Exact 40-character target base SHA for coverage forecasting
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,6 +22,7 @@ concurrency:
 env:
   PYTHON_VERSION: "3.14"
   CARGO_TERM_COLOR: always
+  COVERAGE_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
   CAPACITY_TEST_PATHS: |-
     tests/test_ptg2_capacity_evidence.py
     tests/test_ptg2_v3_bounded_readers.py
@@ -90,6 +96,8 @@ jobs:
           fi
       - name: Guard request-time external calls
         run: python scripts/ci/request_time_external_call_guard.py
+      - name: Coverage forecast contracts
+        run: timeout --foreground 295s python -m pytest -q tests/test_coverage_forecast.py tests/test_ci_coverage_forecast.py
 
   python-tests:
     name: python test suite (${{ matrix.shard-index }}/4)
@@ -103,6 +111,9 @@ jobs:
       COVERAGE_FILE: .coverage.main.${{ matrix.shard-index }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -136,11 +147,21 @@ jobs:
             --cov=api --cov=db --cov=process --cov=service --cov=main \
             --cov-branch --cov-report= \
             @"$shard_file"
+      - name: Bind main-suite coverage to source and base
+        run: >
+          timeout --foreground 295s python scripts/coverage_forecast.py write-shard-provenance
+          --base "$COVERAGE_BASE_SHA"
+          --kind main
+          --shard "${{ matrix.shard-index }}"
+          --coverage ".coverage.main.${{ matrix.shard-index }}"
+          --output ".coverage-provenance.main.${{ matrix.shard-index }}.json"
       - name: Upload main-suite coverage data
         uses: actions/upload-artifact@v7
         with:
           name: mrf-python-coverage-main-${{ matrix.shard-index }}
-          path: .coverage.main.${{ matrix.shard-index }}
+          path: |
+            .coverage.main.${{ matrix.shard-index }}
+            .coverage-provenance.main.${{ matrix.shard-index }}.json
           include-hidden-files: true
           retention-days: 1
 
@@ -152,6 +173,9 @@ jobs:
       COVERAGE_FILE: .coverage.capacity
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -168,11 +192,21 @@ jobs:
             --cov=api --cov=db --cov=process --cov=service --cov=main \
             --cov-branch --cov-report= \
             "${capacity_tests[@]}"
+      - name: Bind capacity coverage to source and base
+        run: >
+          timeout --foreground 295s python scripts/coverage_forecast.py write-shard-provenance
+          --base "$COVERAGE_BASE_SHA"
+          --kind capacity
+          --shard capacity
+          --coverage .coverage.capacity
+          --output .coverage-provenance.capacity.json
       - name: Upload capacity coverage data
         uses: actions/upload-artifact@v7
         with:
           name: mrf-python-coverage-capacity
-          path: .coverage.capacity
+          path: |
+            .coverage.capacity
+            .coverage-provenance.capacity.json
           include-hidden-files: true
           retention-days: 1
 
@@ -188,6 +222,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -210,30 +245,23 @@ jobs:
           pattern: mrf-python-coverage-postgres-*
           path: coverage-data/postgres
           merge-multiple: true
-      - name: Combine coverage data
+      - name: Forecast Python coverage ratchet
         run: |
-          python -m coverage combine \
-            coverage-data/main \
-            coverage-data/capacity \
-            coverage-data/postgres
-          python -m coverage json --rcfile=test-coverage.ini -o test-coverage-python.json
-      - name: Test coverage ratchet
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          python scripts/coverage_ratchet.py --self-test
-          reference_args=()
-          if [ -z "$BASE_SHA" ]; then
-            BASE_SHA="$(git rev-parse origin/main 2>/dev/null || git rev-parse HEAD^ 2>/dev/null || true)"
-          fi
-          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:test-coverage-baseline.json" 2>/dev/null; then
-            git show "$BASE_SHA:test-coverage-baseline.json" > "$RUNNER_TEMP/test-coverage-base.json"
-            reference_args+=(
-              --reference-baseline "$RUNNER_TEMP/test-coverage-base.json"
-              --changed-since "$BASE_SHA"
-            )
-          fi
-          python scripts/coverage_ratchet.py --report python "${reference_args[@]}"
+          timeout --foreground 295s python scripts/coverage_ratchet.py --self-test
+          timeout --foreground 295s python scripts/coverage_forecast.py forecast-python \
+            --base "$COVERAGE_BASE_SHA" \
+            --main-artifacts coverage-data/main \
+            --capacity-artifacts coverage-data/capacity \
+            --postgres-artifacts coverage-data/postgres \
+            --output test-coverage-forecast-python.json
+      - name: Upload Python coverage forecast
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mrf-python-coverage-forecast
+          path: test-coverage-forecast-python.json
+          if-no-files-found: ignore
+          retention-days: 1
 
   api-contract:
     name: openapi contract
@@ -260,6 +288,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -282,35 +311,43 @@ jobs:
         run: cargo clippy --manifest-path support/ptg2_scanner/Cargo.toml --all-targets -- -D warnings
       - name: Scanner tests
         run: |
+          mkdir -p coverage-artifacts/rust
           cargo install cargo-llvm-cov --version 0.8.7 --locked
           timeout --foreground 295s cargo llvm-cov --manifest-path support/ptg2_scanner/Cargo.toml \
             --all-targets --features python --json --summary-only \
-            --output-path test-coverage-rust.json
+            --output-path coverage-artifacts/rust/test-coverage-rust.json
+      - name: Bind Rust coverage to source and base
+        run: >
+          timeout --foreground 295s python scripts/coverage_forecast.py write-report-provenance
+          --base "$COVERAGE_BASE_SHA"
+          --report-name rust
+          --report coverage-artifacts/rust/test-coverage-rust.json
+          --output coverage-artifacts/rust/coverage-provenance-rust.json
+          --cargo-llvm-cov-version "$(cargo llvm-cov --version | awk '{print $2}')"
+          --rust-version "$(rustc --version | awk '{print $2}')"
       - name: Upload Rust coverage data
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: mrf-rust-coverage
-          path: test-coverage-rust.json
+          path: coverage-artifacts/rust
           if-no-files-found: ignore
           retention-days: 1
-      - name: Rust coverage ratchet
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+      - name: Forecast Rust coverage ratchet
         run: |
-          python scripts/coverage_ratchet.py --self-test
-          reference_args=()
-          if [ -z "$BASE_SHA" ]; then
-            BASE_SHA="$(git rev-parse origin/main 2>/dev/null || git rev-parse HEAD^ 2>/dev/null || true)"
-          fi
-          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA:test-coverage-baseline.json" 2>/dev/null; then
-            git show "$BASE_SHA:test-coverage-baseline.json" > "$RUNNER_TEMP/test-coverage-base.json"
-            reference_args+=(
-              --reference-baseline "$RUNNER_TEMP/test-coverage-base.json"
-              --changed-since "$BASE_SHA"
-            )
-          fi
-          python scripts/coverage_ratchet.py --report rust "${reference_args[@]}"
+          timeout --foreground 295s python scripts/coverage_ratchet.py --self-test
+          timeout --foreground 295s python scripts/coverage_forecast.py forecast-rust \
+            --base "$COVERAGE_BASE_SHA" \
+            --artifacts coverage-artifacts/rust \
+            --output test-coverage-forecast-rust.json
+      - name: Upload Rust coverage forecast
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mrf-rust-coverage-forecast
+          path: test-coverage-forecast-rust.json
+          if-no-files-found: ignore
+          retention-days: 1
       - name: Cargo audit
         run: |
           cargo install cargo-audit --locked
@@ -487,6 +524,9 @@ jobs:
       HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -794,10 +834,20 @@ jobs:
           tests/test_provider_directory_profile_selection_db.py
           tests/test_provider_directory_profile_trust_db.py
           tests/test_npi_provider_directory_profile_postgres.py
+      - name: Bind PostgreSQL coverage to source and base
+        run: >
+          timeout --foreground 295s python scripts/coverage_forecast.py write-shard-provenance
+          --base "$COVERAGE_BASE_SHA"
+          --kind postgres
+          --shard "${{ matrix.shard }}"
+          --coverage ".coverage.postgres.${{ matrix.shard }}"
+          --output ".coverage-provenance.postgres.${{ matrix.shard }}.json"
       - name: Upload PostgreSQL coverage data
         uses: actions/upload-artifact@v7
         with:
           name: mrf-python-coverage-postgres-${{ matrix.shard }}
-          path: .coverage.postgres.${{ matrix.shard }}
+          path: |
+            .coverage.postgres.${{ matrix.shard }}
+            .coverage-provenance.postgres.${{ matrix.shard }}.json
           include-hidden-files: true
           retention-days: 1

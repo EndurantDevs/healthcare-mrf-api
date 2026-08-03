@@ -104,5 +104,8 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     assert "timeout --foreground 295s python -m pytest" in workflow
     assert "timeout --foreground 295s cargo llvm-cov" in workflow
     for workflow_line in workflow.splitlines():
-        if "python -m pytest" in workflow_line or "cargo llvm-cov" in workflow_line:
+        if (
+            "python -m pytest" in workflow_line
+            or "cargo llvm-cov --manifest-path" in workflow_line
+        ):
             assert "timeout --foreground 295s" in workflow_line
