@@ -25003,6 +25003,20 @@ mod tests {
             .capture_value_bytes_into(&mut captured)
             .expect("capture nested indexed range");
         assert_eq!(captured, nested);
+
+        let string_body = br#"indexed \"range"#;
+        let wrapped_string = WrappedIndexedRangeReader::new(
+            Box::new(Cursor::new(string_body.to_vec())),
+            string_body.len() as u64,
+            b"\"",
+            b"\"",
+        );
+        let mut byte_reader = BufferedJsonByteReader::new(wrapped_string);
+        captured.clear();
+        byte_reader
+            .capture_value_bytes_into(&mut captured)
+            .expect("capture string across indexed range stages");
+        assert_eq!(captured, br#""indexed \"range""#);
     }
 
     #[test]
@@ -27969,6 +27983,12 @@ mod tests {
         let mut right = HashMap::new();
         right.insert(key.clone(), entry.clone());
         let merged = merge_provider_maps_pairwise(vec![(0, left), (1, right)]).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get(&key), Some(&entry));
+
+        let mut right = HashMap::new();
+        right.insert(key.clone(), entry.clone());
+        let merged = merge_provider_maps_pairwise(vec![(0, HashMap::new()), (1, right)]).unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged.get(&key), Some(&entry));
 
