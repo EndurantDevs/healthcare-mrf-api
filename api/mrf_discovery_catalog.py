@@ -24,6 +24,7 @@ from api.mrf_discovery_catalog_paging import (
 from api.mrf_discovery_catalog_filters import (
     source_file_identity_scope_condition,
 )
+from api.mrf_discovery_catalog_manifest_response import catalog_file_page_response, public_source_metadata
 from db.models import MRFFile, MRFPayer, MRFSource, db
 
 DEFAULT_SOURCE_PAGE_SIZE = 100
@@ -231,10 +232,13 @@ async def list_discovery_source_files_page(
         cursor_plan_offset=cursor_plan_offset,
         plan_reference_limit=MAX_FILE_PAGE_PLAN_REFERENCES,
     )
-    return {
-        "items": page_items,
-        "next_cursor": next_cursor,
-    }
+    return await catalog_file_page_response(
+        file_query_rows,
+        page_items=page_items,
+        next_cursor=next_cursor,
+        source_id=normalized_source_id,
+        page_limit=limit,
+    )
 
 
 def _bounded_rows(
@@ -276,7 +280,7 @@ def _bounded_file_items(
 
 def _source_item(source_row: Any) -> dict[str, Any]:
     source_data = _row_mapping(source_row)
-    source_metadata = _metadata_dict(source_data.get("metadata_json"))
+    source_metadata = public_source_metadata(source_data.get("metadata_json"))
     aliases = _text_list(source_metadata.get("aliases"))
     aliases.extend(_text_list(source_data.get("payer_aliases")))
     source_metadata["aliases"] = list(dict.fromkeys(aliases))

@@ -276,6 +276,110 @@ async def test_json_post_rejects_non_json_and_oversized_responses(
 
 
 @pytest.mark.parametrize(
+    ("response", "max_bytes", "allow_browser_fallback", "error_type", "message"),
+    [
+        (
+            _Response(b"{}", content_type="text/html"),
+            64,
+            False,
+            ValueError,
+            "content-type is not JSON",
+        ),
+        (
+            _Response(b"{}", content_type="text/html"),
+            64,
+            True,
+            discovery._BrowserFallbackRequired,
+            None,
+        ),
+        (
+            _Response(b"123", b"456"),
+            5,
+            False,
+            ValueError,
+            "exceeds 5 byte",
+        ),
+        (
+            _Response(b"  <!doctype html>"),
+            64,
+            False,
+            ValueError,
+            "response body is not JSON",
+        ),
+        (
+            _Response(b"  <!doctype html>"),
+            64,
+            True,
+            discovery._BrowserFallbackRequired,
+            None,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_read_text_response_preserves_json_validation_and_fallback_contract(
+    monkeypatch,
+    response,
+    max_bytes,
+    allow_browser_fallback,
+    error_type,
+    message,
+):
+    """The extracted response reader retains the fetcher's error semantics."""
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", AsyncMock())
+
+    with pytest.raises(error_type, match=message):
+        await discovery._read_text_response(
+            response,
+            max_bytes=max_bytes,
+            expect_json=True,
+            allow_browser_fallback=allow_browser_fallback,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_text_uses_supplied_session_for_bounded_json(monkeypatch):
+    allowed = AsyncMock()
+    session = _Session(_Response(b'{"ok": true}'))
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allowed)
+
+    text = await discovery._fetch_text(
+        "https://adapter.example.invalid/toc.json",
+        max_bytes=64,
+        session=session,
+        expect_json=True,
+    )
+
+    assert text == '{"ok": true}'
+    assert [call.args[0] for call in allowed.await_args_list] == [
+        "https://adapter.example.invalid/toc.json",
+        "https://adapter.example.invalid/final",
+    ]
+    assert session.get_calls[0][0] == "https://adapter.example.invalid/toc.json"
+
+
+@pytest.mark.asyncio
+async def test_fetch_text_owns_session_when_one_is_not_supplied(monkeypatch):
+    allowed = AsyncMock()
+    session = _Session(_Response(b"directory html", content_type="text/html"))
+    monkeypatch.setattr(discovery, "_assert_fetch_url_allowed", allowed)
+    monkeypatch.setattr(discovery, "_tcp_connector", lambda **_kwargs: object())
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", lambda **_kwargs: session)
+
+    text = await discovery._fetch_text(
+        "https://adapter.example.invalid/directory",
+        max_bytes=64,
+    )
+
+    assert text == "directory html"
+    assert [call.args[0] for call in allowed.await_args_list] == [
+        "https://adapter.example.invalid/directory",
+        "https://adapter.example.invalid/directory",
+        "https://adapter.example.invalid/final",
+    ]
+    assert session.get_calls[0][0] == "https://adapter.example.invalid/directory"
+
+
+@pytest.mark.parametrize(
     ("helper_name", "value", "expected_message"),
     [
         ("_fetch_json", {"ok": True}, None),

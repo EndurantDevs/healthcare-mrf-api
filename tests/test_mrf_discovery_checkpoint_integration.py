@@ -53,6 +53,12 @@ def _install_retry_discovery_fakes(monkeypatch) -> tuple[list[dict[str, Any]], d
         captured_by_key["execution"] = kwargs
         return _completed_summary()
 
+    async def capture_manifest(records, *, source_discovery_run_id):
+        captured_by_key["manifest_finalizer"] = (
+            records,
+            source_discovery_run_id,
+        )
+
     @asynccontextmanager
     async def fake_http_session(**_kwargs):
         yield object()
@@ -63,6 +69,11 @@ def _install_retry_discovery_fakes(monkeypatch) -> tuple[list[dict[str, Any]], d
     monkeypatch.setattr(discovery, "_load_candidates", fail_if_candidates_load)
     monkeypatch.setattr(discovery, "_retag_sources_for_discovery_run", capture_retag)
     monkeypatch.setattr(discovery, "execute_checkpointed_source_batch", capture_execution)
+    monkeypatch.setattr(
+        discovery,
+        "refresh_catalog_paging_manifests",
+        capture_manifest,
+    )
     monkeypatch.setattr(discovery, "_discovery_http_session", fake_http_session)
     monkeypatch.setattr(discovery, "enqueue_live_progress", lambda **_kwargs: None)
     return source_records, captured_by_key
@@ -86,6 +97,7 @@ async def test_retry_uses_frozen_source_set_and_publishes_exact_proof(monkeypatc
     assert captured_by_key["execution"]["source_records"] == source_records
     assert captured_by_key["execution"]["root_run_id"] == "run_root"
     assert captured_by_key["execution"]["owner_run_id"] == "run_retry"
+    assert captured_by_key["manifest_finalizer"] == (source_records, "run_retry")
     assert discovery_summary["discovery_proof_version"] == 2
     assert discovery_summary["source_set_count"] == 1
     assert discovery_summary["completed_source_count"] == 1

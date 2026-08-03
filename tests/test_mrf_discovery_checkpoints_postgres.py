@@ -10,6 +10,9 @@ import asyncpg
 import pytest
 from sqlalchemy.engine import make_url
 
+from api.mrf_discovery_catalog_manifest import (
+    CATALOG_PAGING_MANIFEST_METADATA_KEY,
+)
 from db.models import MRFPayer, MRFSource, db
 from process.mrf_source_discovery import _retag_sources_for_discovery_run
 from process.mrf_discovery_checkpoints import (
@@ -261,7 +264,12 @@ async def test_postgres_retag_updates_only_resume_metadata():
                     "source_key": "source-retag-test",
                     "display_name": "Retag Test",
                     "status": "active",
-                    "metadata_json": {"discovery_run_id": "run_parent"},
+                    "metadata_json": {
+                        "discovery_run_id": "run_parent",
+                        CATALOG_PAGING_MANIFEST_METADATA_KEY: {
+                            "source_version": "run_parent",
+                        },
+                    },
                     "created_at": "2026-07-15T12:00:00",
                     "updated_at": "2026-07-15T12:00:00",
                 }
@@ -277,6 +285,10 @@ async def test_postgres_retag_updates_only_resume_metadata():
                 )
             ).mappings().one()
         assert source_row["metadata_json"]["discovery_run_id"] == "run_retry"
+        assert (
+            CATALOG_PAGING_MANIFEST_METADATA_KEY
+            not in source_row["metadata_json"]
+        )
         assert isinstance(source_row["created_at"], dt.datetime)
         assert isinstance(source_row["updated_at"], dt.datetime)
     finally:
