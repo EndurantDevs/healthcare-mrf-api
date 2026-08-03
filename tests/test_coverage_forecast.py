@@ -101,21 +101,15 @@ def _write_python_report(root: Path, covered_count: int) -> Path:
 
 
 def _write_coverage_data(root: Path, coverage_path: Path) -> None:
-    """Measure the compact source once using the same coverage.py data format."""
+    """Write compact coverage.py data without replacing pytest-cov's tracer."""
 
     coverage_module = importlib.import_module("coverage")
     source_path = root / "api" / "sample.py"
     source_path.parent.mkdir(exist_ok=True)
     source_path.write_text("value = 1\n", encoding="utf-8")
-    measurement = coverage_module.Coverage(
-        data_file=str(coverage_path),
-        branch=True,
-        source=[str(source_path.parent)],
-    )
-    measurement.start()
-    exec(compile(source_path.read_text(encoding="utf-8"), str(source_path), "exec"), {})
-    measurement.stop()
-    measurement.save()
+    coverage_data = coverage_module.CoverageData(basename=str(coverage_path))
+    coverage_data.add_lines({str(source_path): {1}})
+    coverage_data.write()
 
 
 def _write_shard_artifacts(
@@ -398,6 +392,46 @@ def test_python_forecast_combines_only_the_eight_bound_coverage_files(tmp_path: 
             ".coverage.postgres.provider-profile",
         ],
     }
+
+
+def test_synthetic_coverage_data_preserves_an_outer_tracer(tmp_path: Path) -> None:
+    """Fixture coverage data must not stop the process-wide pytest-cov tracer."""
+
+    child_program = """
+import importlib.util
+from pathlib import Path
+import sys
+
+import coverage
+
+module_path = Path(sys.argv[1])
+root = Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("forecast_test_helper", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec is not None and spec.loader is not None
+spec.loader.exec_module(module)
+
+probe_path = root / "api" / "outer_probe.py"
+probe_path.parent.mkdir(parents=True, exist_ok=True)
+probe_path.write_text("outer_probe = 1\\n", encoding="utf-8")
+outer_path = root / ".coverage.outer"
+outer = coverage.Coverage(data_file=str(outer_path), branch=True, source=[str(root / "api")])
+outer.start()
+module._write_coverage_data(root, root / ".coverage.synthetic")
+exec(compile(probe_path.read_text(encoding="utf-8"), str(probe_path), "exec"), {})
+outer.stop()
+outer.save()
+
+recorded = coverage.CoverageData(basename=str(outer_path))
+recorded.read()
+if str(probe_path) not in recorded.measured_files():
+    raise SystemExit("outer coverage tracer did not record its post-fixture probe")
+"""
+
+    subprocess.run(
+        [sys.executable, "-c", child_program, str(Path(__file__).resolve()), str(tmp_path)],
+        check=True,
+    )
 
 
 def test_diagnostics_rejects_a_report_path_other_than_the_staged_ratchet_input(
