@@ -8904,6 +8904,34 @@ def _ensure_provider_rate_price_fields(item: dict[str, Any]) -> None:
     item.update(_price_response_fields(prices))
 
 
+def _provider_rate_option(provider_rate: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep one price payload tied to the serving identities that produced it."""
+
+    return {
+        "provider_set_ref": provider_rate.get("provider_set_hash"),
+        "price_set_ref": provider_rate.get("price_set_hash"),
+        "rate_pack_ref": provider_rate.get("rate_pack_hash"),
+        "prices": list(provider_rate.get("prices") or []),
+    }
+
+
+def _refresh_provider_rate_counts(provider_rate: dict[str, Any]) -> None:
+    """Derive aggregate counts from retained identities and atomic options."""
+
+    provider_rate["rate_option_count"] = len(
+        provider_rate.get("rate_options") or []
+    )
+    provider_rate["provider_set_count"] = len(
+        provider_rate.get("provider_set_hashes") or []
+    )
+    provider_rate["price_set_count"] = len(
+        provider_rate.get("price_set_hashes") or []
+    )
+    provider_rate["rate_pack_count"] = len(
+        provider_rate.get("rate_pack_hashes") or []
+    )
+
+
 def _initialize_provider_rate_group(
     provider_rate: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, set[str]]]:
@@ -8914,6 +8942,9 @@ def _initialize_provider_rate_group(
     owned_prices = list(merged_rate_by_field.get("prices") or [])
     merged_rate_by_field["prices"] = owned_prices
     merged_rate_by_field["tic_prices"] = owned_prices
+    merged_rate_by_field["rate_options"] = [
+        _provider_rate_option(merged_rate_by_field)
+    ]
     list_fields = (
         "price_set_hashes",
         "rate_pack_hashes",
@@ -8942,6 +8973,7 @@ def _initialize_provider_rate_group(
             provider_rate.get(hash_field),
             seen_payload_keys_by_field[hash_list_field],
         )
+    _refresh_provider_rate_counts(merged_rate_by_field)
     return merged_rate_by_field, seen_payload_keys_by_field
 
 
@@ -8961,6 +8993,11 @@ def _merge_provider_rate_group(
     )
     merged_rate["prices"].extend(normalized_prices)
     merged_rate["tic_prices"] = merged_rate["prices"]
+    option_source_by_field = dict(provider_rate)
+    option_source_by_field["prices"] = normalized_prices
+    merged_rate["rate_options"].append(
+        _provider_rate_option(option_source_by_field)
+    )
     existing_price_key = merged_rate.get("_ptg_price_key")
     incoming_price_key = provider_rate.get("_ptg_price_key")
     if incoming_price_key is not None and (
@@ -8991,12 +9028,7 @@ def _merge_provider_rate_group(
             provider_rate.get(list_field),
             seen_payload_keys=seen_payload_keys_by_field[list_field],
         )
-    merged_rate["price_set_count"] = len(
-        merged_rate.get("price_set_hashes") or []
-    )
-    merged_rate["rate_pack_count"] = len(
-        merged_rate.get("rate_pack_hashes") or []
-    )
+    _refresh_provider_rate_counts(merged_rate)
 
 
 def _merge_ptg2_provider_rate_items(

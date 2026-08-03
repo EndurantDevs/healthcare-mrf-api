@@ -65,6 +65,27 @@ def test_provider_rate_merge_deduplicates_in_linear_first_seen_order(monkeypatch
     assert merged[0]["provider_set_hashes"] == [
         f"provider-{index}" for index in range(20)
     ]
+    assert merged[0]["rate_option_count"] == 200
+    assert merged[0]["provider_set_count"] == 20
+    assert merged[0]["price_set_count"] == 40
+    assert merged[0]["rate_pack_count"] == 30
+    assert [
+        (
+            option["provider_set_ref"],
+            option["price_set_ref"],
+            option["rate_pack_ref"],
+            option["prices"][0]["negotiated_rate"],
+        )
+        for option in merged[0]["rate_options"]
+    ] == [
+        (
+            f"provider-{index % 20}",
+            f"price-{index % 40}",
+            f"rate-{index % 30}",
+            index,
+        )
+        for index in range(200)
+    ]
     assert merged[0]["_ptg_price_key"] == 1
     assert [price["negotiated_rate"] for price in merged[0]["prices"]] == list(
         range(200)

@@ -6070,6 +6070,53 @@ components:
           type: string
         reported_code_system:
           type: string
+    PtgNegotiatedPrice:
+      type: object
+      properties:
+        negotiated_type:
+          type: string
+          nullable: true
+        negotiated_rate:
+          type: number
+        expiration_date:
+          type: string
+          nullable: true
+        service_code:
+          type: array
+          items:
+            type: string
+        billing_class:
+          type: string
+          nullable: true
+        setting:
+          type: string
+          nullable: true
+        billing_code_modifier:
+          type: array
+          items:
+            type: string
+        additional_information:
+          type: string
+          nullable: true
+      additionalProperties: true
+    PtgRateOption:
+      type: object
+      required: [provider_set_ref, price_set_ref, rate_pack_ref, prices]
+      description: |
+        One atomic negotiated-price option. The opaque references retain the
+        exact provider-set, price-set, and rate-pack relationship that produced
+        these prices; they are not facility or legal-ownership identifiers.
+      properties:
+        provider_set_ref:
+          type: string
+        price_set_ref:
+          type: string
+        rate_pack_ref:
+          type: string
+        prices:
+          type: array
+          items:
+            $ref: '#/components/schemas/PtgNegotiatedPrice'
     PricingProcedureProviderRecord:
       type: object
       properties:
@@ -6110,6 +6157,43 @@ components:
           description: |
             Provider cost index for the matched service. Numeric legacy values may appear;
             when peer benchmark data is available this is emitted as '$'..'$$$$$'.
+        rate_options:
+          type: array
+          description: |
+            Atomic PTG/TiC price options. Use these objects when explaining why
+            one provider has multiple prices; the legacy top-level prices and
+            hash arrays are flattened compatibility fields.
+          items:
+            $ref: '#/components/schemas/PtgRateOption'
+        rate_option_count:
+          type: integer
+          minimum: 0
+        provider_set_count:
+          type: integer
+          minimum: 0
+        price_set_count:
+          type: integer
+          minimum: 0
+        rate_pack_count:
+          type: integer
+          minimum: 0
+        provider_set_hashes:
+          type: array
+          items:
+            type: string
+        price_set_hashes:
+          type: array
+          items:
+            type: string
+        rate_pack_hashes:
+          type: array
+          items:
+            type: string
+        prices:
+          type: array
+          description: Legacy flattened PTG/TiC price occurrences.
+          items:
+            $ref: '#/components/schemas/PtgNegotiatedPrice'
         estimated_cost_level:
           type: string
           enum: ['$', '$$', '$$$', '$$$$', '$$$$$']
