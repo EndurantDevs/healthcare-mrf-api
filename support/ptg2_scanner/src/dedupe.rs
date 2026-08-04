@@ -4,7 +4,10 @@ use crate::hashing::{
     provider_set_component_key, provider_set_entry_key, shard_for_u128, shard_for_u64,
 };
 use crate::manifest::GlobalId128;
-use crate::tax_identity::{TaxIdentityObservation, TinTokenPolicy};
+use crate::tax_identity::{
+    TaxIdentityObservation, TaxIdentityObservationV2, TaxIdentityState, TaxIdentityStateV2,
+    TinTokenPolicy,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -67,7 +70,102 @@ struct ShardedProviderGroupTaxIdentity {
     shards: Vec<Mutex<HashMap<u64, TaxIdentityObservation>>>,
 }
 
+struct ShardedProviderGroupTaxIdentityPairs {
+    policy: TinTokenPolicy,
+    shards: Vec<Mutex<HashMap<u64, PairedTaxIdentityObservation>>>,
+}
+
+enum ProviderGroupTaxIdentityDedupe {
+    V1(ShardedProviderGroupTaxIdentity),
+    Paired(ShardedProviderGroupTaxIdentityPairs),
+}
+
 const PROVIDER_GROUP_TAX_IDENTITY_SHARDS: usize = 256;
+const INVALID_PAIRED_TAX_IDENTITY: &str =
+    "provider group has invalid paired tax identity observation";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PairedTaxIdentityObservation {
+    v1: TaxIdentityObservation,
+    v2: TaxIdentityObservationV2,
+}
+
+impl PairedTaxIdentityObservation {
+    fn observe(policy: &TinTokenPolicy, tin: Option<&Value>) -> io::Result<Self> {
+        let v1 = policy.observe(tin);
+        let v2 = if v1.state == TaxIdentityState::MatchedEin {
+            TaxIdentityObservationV2 {
+                state: TaxIdentityStateV2::MatchedEin,
+                tin_hmac_sha256: v1.tin_hmac_sha256,
+            }
+        } else {
+            policy.observe_v2(tin)
+        };
+        let observation = Self { v1, v2 };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    fn merge(self, other: Self) -> io::Result<Self> {
+        self.validate()?;
+        other.validate()?;
+        let next_v1 = self.v1.merge(other.v1)?;
+        let next_v2 = self.v2.merge(other.v2)?;
+        let merged = Self {
+            v1: next_v1,
+            v2: next_v2,
+        };
+        merged.validate()?;
+        Ok(merged)
+    }
+
+    fn validate(self) -> io::Result<()> {
+        let v1_shape_is_valid = match (self.v1.state, self.v1.tin_hmac_sha256) {
+            (TaxIdentityState::MatchedEin, Some(hmac)) => hmac != [0; 32],
+            (
+                TaxIdentityState::Missing
+                | TaxIdentityState::Malformed
+                | TaxIdentityState::UnsupportedType,
+                None,
+            ) => true,
+            _ => false,
+        };
+        let v2_shape_is_valid = match (self.v2.state, self.v2.tin_hmac_sha256) {
+            (TaxIdentityStateV2::MatchedEin | TaxIdentityStateV2::MatchedNpi, Some(hmac)) => {
+                hmac != [0; 32]
+            }
+            (
+                TaxIdentityStateV2::Missing
+                | TaxIdentityStateV2::Malformed
+                | TaxIdentityStateV2::UnsupportedType,
+                None,
+            ) => true,
+            _ => false,
+        };
+        let versions_are_compatible = match (self.v1.state, self.v2.state) {
+            (TaxIdentityState::MatchedEin, TaxIdentityStateV2::MatchedEin) => {
+                self.v1.tin_hmac_sha256 == self.v2.tin_hmac_sha256
+            }
+            (
+                TaxIdentityState::UnsupportedType,
+                TaxIdentityStateV2::MatchedNpi
+                | TaxIdentityStateV2::Malformed
+                | TaxIdentityStateV2::UnsupportedType,
+            )
+            | (TaxIdentityState::Missing, TaxIdentityStateV2::Missing)
+            | (TaxIdentityState::Malformed, TaxIdentityStateV2::Malformed) => true,
+            _ => false,
+        };
+        if v1_shape_is_valid && v2_shape_is_valid && versions_are_compatible {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                INVALID_PAIRED_TAX_IDENTITY,
+            ))
+        }
+    }
+}
 
 impl ShardedProviderGroupTaxIdentity {
     fn new(policy: TinTokenPolicy) -> Self {
@@ -120,6 +218,107 @@ impl ShardedProviderGroupTaxIdentity {
             }
         }
         Ok(())
+    }
+}
+
+impl ShardedProviderGroupTaxIdentityPairs {
+    fn new(policy: TinTokenPolicy) -> Self {
+        Self {
+            policy,
+            shards: (0..PROVIDER_GROUP_TAX_IDENTITY_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn record(&self, group_hash: i64, tin: Option<&Value>) -> io::Result<()> {
+        let key = group_hash as u64;
+        let group_id = provider_group_global_id_from_hash(group_hash);
+        let shard_index = usize::from(group_id.0[0]);
+        let observation = PairedTaxIdentityObservation::observe(&self.policy, tin)?;
+        let mut shard = self.shards[shard_index]
+            .lock()
+            .map_err(|_| io::Error::other("provider tax identity lock poisoned"))?;
+        match shard.get_mut(&key) {
+            Some(current) => {
+                let merged = current.merge(observation)?;
+                *current = merged;
+            }
+            None => {
+                shard.insert(key, observation);
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_sorted_pairs(
+        &self,
+        mut visitor: impl FnMut(i64, TaxIdentityObservation, TaxIdentityObservationV2) -> io::Result<()>,
+    ) -> io::Result<()> {
+        // Shards follow the first global-ID byte, so ascending shard visits plus
+        // each shard's local sort produce one global lexicographic ordering.
+        for shard in &self.shards {
+            let mut rows = shard
+                .lock()
+                .map_err(|_| io::Error::other("provider tax identity lock poisoned"))?
+                .iter()
+                .map(|(group_hash, observation)| {
+                    let signed_hash = *group_hash as i64;
+                    (
+                        provider_group_global_id_from_hash(signed_hash),
+                        signed_hash,
+                        *observation,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable_by_key(|(group_id, _group_hash, _observation)| *group_id);
+            for (_group_id, group_hash, observation) in rows {
+                observation.validate()?;
+                visitor(group_hash, observation.v1, observation.v2)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ProviderGroupTaxIdentityDedupe {
+    fn record(&self, group_hash: i64, tin: Option<&Value>) -> io::Result<()> {
+        match self {
+            Self::V1(identity) => identity.record(group_hash, tin),
+            Self::Paired(identity) => identity.record(group_hash, tin),
+        }
+    }
+
+    fn policy_id(&self) -> &str {
+        match self {
+            Self::V1(identity) => identity.policy.policy_id(),
+            Self::Paired(identity) => identity.policy.policy_id(),
+        }
+    }
+
+    fn visit_sorted(
+        &self,
+        visitor: impl FnMut(i64, TaxIdentityObservation) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match self {
+            Self::V1(identity) => identity.visit_sorted(visitor),
+            Self::Paired(identity) => {
+                let mut visitor = visitor;
+                identity.visit_sorted_pairs(|group_hash, v1, _v2| visitor(group_hash, v1))
+            }
+        }
+    }
+
+    fn visit_sorted_pairs(
+        &self,
+        visitor: impl FnMut(i64, TaxIdentityObservation, TaxIdentityObservationV2) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match self {
+            Self::V1(_) => Err(io::Error::other(
+                "paired provider tax identity output is not configured",
+            )),
+            Self::Paired(identity) => identity.visit_sorted_pairs(visitor),
+        }
     }
 }
 
@@ -269,7 +468,7 @@ pub struct SharedDedupe {
     provider_set_entry: ShardedDedupe128,
     provider_entry_component: Option<ShardedDedupe128>,
     provider_group: ShardedDedupe64,
-    provider_group_tax_identity: Option<ShardedProviderGroupTaxIdentity>,
+    provider_group_tax_identity: Option<ProviderGroupTaxIdentityDedupe>,
     provider_group_member: ShardedDedupe128,
     dedupe_high_cardinality_entries: bool,
     serving_rate_counter: DedupeCounter,
@@ -307,14 +506,31 @@ impl SharedDedupe {
         Self::new_with_optional_tax_identity(
             worker_count,
             serving_rate_dedupe_enabled,
-            Some(policy),
+            Some(ProviderGroupTaxIdentityDedupe::V1(
+                ShardedProviderGroupTaxIdentity::new(policy),
+            )),
+        )
+    }
+
+    /// Enables the opt-in atomic v1/v2 collector without activating a writer.
+    pub fn new_with_v4_paired_tax_identity(
+        worker_count: usize,
+        serving_rate_dedupe_enabled: bool,
+        policy: TinTokenPolicy,
+    ) -> Self {
+        Self::new_with_optional_tax_identity(
+            worker_count,
+            serving_rate_dedupe_enabled,
+            Some(ProviderGroupTaxIdentityDedupe::Paired(
+                ShardedProviderGroupTaxIdentityPairs::new(policy),
+            )),
         )
     }
 
     fn new_with_optional_tax_identity(
         worker_count: usize,
         serving_rate_dedupe_enabled: bool,
-        policy: Option<TinTokenPolicy>,
+        provider_group_tax_identity: Option<ProviderGroupTaxIdentityDedupe>,
     ) -> Self {
         let shard_count = (worker_count.max(1) * 4).max(16);
         let dedupe_high_cardinality_entries =
@@ -333,7 +549,7 @@ impl SharedDedupe {
             provider_entry_component: dedupe_high_cardinality_entries
                 .then(|| ShardedDedupe128::new(shard_count)),
             provider_group: ShardedDedupe64::new(shard_count),
-            provider_group_tax_identity: policy.map(ShardedProviderGroupTaxIdentity::new),
+            provider_group_tax_identity,
             provider_group_member: ShardedDedupe128::new(shard_count),
             dedupe_high_cardinality_entries,
             serving_rate_counter: DedupeCounter::new(),
@@ -489,9 +705,11 @@ impl SharedDedupe {
     pub fn provider_group_tax_identity_policy_id(&self) -> Option<&str> {
         self.provider_group_tax_identity
             .as_ref()
-            .map(|identity| identity.policy.policy_id())
+            .map(ProviderGroupTaxIdentityDedupe::policy_id)
     }
 
+    /// Visits globally sorted v1 observations after ingestion has quiesced.
+    /// This is not a snapshot-isolated view during concurrent inserts.
     pub fn visit_provider_group_tax_identities(
         &self,
         visitor: impl FnMut(i64, TaxIdentityObservation) -> io::Result<()>,
@@ -500,6 +718,21 @@ impl SharedDedupe {
             .as_ref()
             .ok_or_else(|| io::Error::other("provider tax identity output is not configured"))?
             .visit_sorted(visitor)
+    }
+
+    /// Visits globally sorted atomic v1/v2 pairs after ingestion has quiesced.
+    /// This is not a snapshot-isolated view during concurrent inserts.
+    /// Existing group-hash collision proof remains a bundle-validation concern.
+    pub fn visit_provider_group_tax_identity_pairs(
+        &self,
+        visitor: impl FnMut(i64, TaxIdentityObservation, TaxIdentityObservationV2) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.provider_group_tax_identity
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::other("paired provider tax identity output is not configured")
+            })?
+            .visit_sorted_pairs(visitor)
     }
 
     pub fn unique_provider_group_count(&self) -> u64 {
@@ -690,13 +923,56 @@ pub fn emit_dedupe_summary(dedupe: &SharedDedupe, object_counts: &HashMap<String
 #[cfg(test)]
 mod tests {
     use super::{
-        dedupe_summary_payload, emit_dedupe_summary, ProviderIdentifierQuarantine, SharedDedupe,
-        MAX_QUARANTINED_PROVIDER_IDENTIFIERS,
+        dedupe_summary_payload, emit_dedupe_summary, provider_group_global_id_from_hash,
+        PairedTaxIdentityObservation, ProviderGroupTaxIdentityDedupe, ProviderIdentifierQuarantine,
+        SharedDedupe, MAX_QUARANTINED_PROVIDER_IDENTIFIERS,
     };
     use crate::manifest::GlobalId128;
-    use crate::tax_identity::{TaxIdentityState, TinTokenPolicy};
+    use crate::tax_identity::{
+        TaxIdentityObservation, TaxIdentityObservationV2, TaxIdentityState, TaxIdentityStateV2,
+        TinTokenPolicy,
+    };
     use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::io;
+    use std::sync::Arc;
+
+    fn tax_identity_policy() -> TinTokenPolicy {
+        TinTokenPolicy::from_secret("ptg-tin-hmac-sha256-v1:paired-dedupe".to_string(), [7; 32])
+            .unwrap()
+    }
+
+    fn paired_rows(
+        dedupe: &SharedDedupe,
+    ) -> Vec<(i64, TaxIdentityObservation, TaxIdentityObservationV2)> {
+        let mut rows = Vec::new();
+        dedupe
+            .visit_provider_group_tax_identity_pairs(|group_hash, v1, v2| {
+                rows.push((group_hash, v1, v2));
+                Ok(())
+            })
+            .unwrap();
+        rows
+    }
+
+    fn accept_paired_row(
+        _group_hash: i64,
+        _v1: TaxIdentityObservation,
+        _v2: TaxIdentityObservationV2,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn merged_pair(raw_tins: &[Option<Value>]) -> PairedTaxIdentityObservation {
+        let dedupe = SharedDedupe::new_with_v4_paired_tax_identity(1, false, tax_identity_policy());
+        for tin in raw_tins {
+            dedupe
+                .insert_provider_group_with_tax_identity(42, tin.as_ref())
+                .unwrap();
+        }
+        let (_, v1, v2) = paired_rows(&dedupe).into_iter().next().unwrap();
+        PairedTaxIdentityObservation { v1, v2 }
+    }
 
     #[test]
     fn shared_dedupe_counts_serving_rate_duplicates() {
@@ -750,6 +1026,11 @@ mod tests {
         assert_eq!(payload["provider_group_member_duplicate"], 1);
         assert!(dedupe
             .insert_provider_group_with_tax_identity(101, None)
+            .unwrap_err()
+            .to_string()
+            .contains("not configured"));
+        assert!(dedupe
+            .visit_provider_group_tax_identity_pairs(accept_paired_row)
             .unwrap_err()
             .to_string()
             .contains("not configured"));
@@ -822,6 +1103,288 @@ mod tests {
         dedupe.record_cached_provider_group_attempts(4);
         dedupe.record_empty_npi_tin_only_normalizations(2);
         assert_eq!(dedupe.empty_npi_tin_only_normalization_count(), 2);
+        assert!(dedupe
+            .visit_provider_group_tax_identity_pairs(accept_paired_row)
+            .unwrap_err()
+            .to_string()
+            .contains("not configured"));
+    }
+
+    #[test]
+    fn paired_tax_identity_dedupe_maps_raw_states_without_using_business_name() {
+        let dedupe = SharedDedupe::new_with_v4_paired_tax_identity(2, false, tax_identity_policy());
+        assert_eq!(
+            dedupe.provider_group_tax_identity_policy_id(),
+            Some("ptg-tin-hmac-sha256-v1:paired-dedupe")
+        );
+        let raw_tins = [
+            (
+                10,
+                Some(json!({
+                    "type": "ein",
+                    "value": "12-3456789",
+                    "business_name": "Synthetic Practice One"
+                })),
+            ),
+            (11, Some(json!({"type": "npi", "value": "1000000491"}))),
+            (12, Some(json!({"type": "npi", "value": "1000000492"}))),
+            (13, None),
+            (14, Some(json!({"type": "ein", "value": "12 3456789"}))),
+            (15, Some(json!({"type": "other", "value": "opaque"}))),
+        ];
+        for (group_hash, tin) in &raw_tins {
+            assert!(dedupe
+                .insert_provider_group_with_tax_identity(*group_hash, tin.as_ref())
+                .unwrap());
+        }
+        dedupe
+            .visit_provider_group_tax_identity_pairs(accept_paired_row)
+            .unwrap();
+        let same_ein_different_name = json!({
+            "type": "ein",
+            "value": "12-3456789",
+            "business_name": "Synthetic Practice Two"
+        });
+        assert!(!dedupe
+            .insert_provider_group_with_tax_identity(10, Some(&same_ein_different_name))
+            .unwrap());
+
+        let rows = paired_rows(&dedupe)
+            .into_iter()
+            .map(|(group_hash, v1, v2)| (group_hash, (v1, v2)))
+            .collect::<HashMap<_, _>>();
+        let (ein_v1, ein_v2) = rows[&10];
+        assert_eq!(ein_v1.state, TaxIdentityState::MatchedEin);
+        assert_eq!(ein_v2.state, TaxIdentityStateV2::MatchedEin);
+        assert_eq!(ein_v1.tin_hmac_sha256, ein_v2.tin_hmac_sha256);
+        assert!(ein_v1.tin_hmac_sha256.is_some());
+        assert_ne!(ein_v1.tin_hmac_sha256, Some([0; 32]));
+
+        let (valid_npi_v1, valid_npi_v2) = rows[&11];
+        assert_eq!(valid_npi_v1.state, TaxIdentityState::UnsupportedType);
+        assert_eq!(valid_npi_v1.tin_hmac_sha256, None);
+        assert_eq!(valid_npi_v2.state, TaxIdentityStateV2::MatchedNpi);
+        assert!(valid_npi_v2.tin_hmac_sha256.is_some());
+        assert_ne!(valid_npi_v2.tin_hmac_sha256, Some([0; 32]));
+
+        assert_eq!(rows[&12].0.state, TaxIdentityState::UnsupportedType);
+        assert_eq!(rows[&12].1.state, TaxIdentityStateV2::Malformed);
+        assert_eq!(rows[&12].0.tin_hmac_sha256, None);
+        assert_eq!(rows[&12].1.tin_hmac_sha256, None);
+        assert_eq!(rows[&13].0.state, TaxIdentityState::Missing);
+        assert_eq!(rows[&13].1.state, TaxIdentityStateV2::Missing);
+        assert_eq!(rows[&14].0.state, TaxIdentityState::Malformed);
+        assert_eq!(rows[&14].1.state, TaxIdentityStateV2::Malformed);
+        assert_eq!(rows[&15].0.state, TaxIdentityState::UnsupportedType);
+        assert_eq!(rows[&15].1.state, TaxIdentityStateV2::UnsupportedType);
+    }
+
+    #[test]
+    fn paired_tax_identity_merges_are_order_independent_and_fail_closed() {
+        let missing_to_npi = [
+            None,
+            Some(json!({"type": "ein", "value": "malformed"})),
+            Some(json!({"type": "npi", "value": "100-000-0491"})),
+            Some(json!({"type": "npi", "value": "1000000491"})),
+        ];
+        let mut npi_to_missing = missing_to_npi.clone();
+        npi_to_missing.reverse();
+        let expected_npi = merged_pair(&missing_to_npi);
+        let reversed_npi = merged_pair(&npi_to_missing);
+        assert_eq!(expected_npi.v1, reversed_npi.v1);
+        assert_eq!(expected_npi.v2, reversed_npi.v2);
+        assert_eq!(expected_npi.v1.state, TaxIdentityState::UnsupportedType);
+        assert_eq!(expected_npi.v2.state, TaxIdentityStateV2::MatchedNpi);
+
+        let unsupported_then_invalid = [
+            Some(json!({"type": "other", "value": "opaque"})),
+            Some(json!({"type": "npi", "value": "1000000492"})),
+        ];
+        let mut invalid_then_unsupported = unsupported_then_invalid.clone();
+        invalid_then_unsupported.reverse();
+        let expected_unsupported = merged_pair(&unsupported_then_invalid);
+        let reversed_unsupported = merged_pair(&invalid_then_unsupported);
+        assert_eq!(expected_unsupported.v1, reversed_unsupported.v1);
+        assert_eq!(expected_unsupported.v2, reversed_unsupported.v2);
+        assert_eq!(
+            (expected_unsupported.v1.state, expected_unsupported.v2.state),
+            (
+                TaxIdentityState::UnsupportedType,
+                TaxIdentityStateV2::UnsupportedType
+            )
+        );
+
+        let dedupe = SharedDedupe::new_with_v4_paired_tax_identity(1, false, tax_identity_policy());
+        let first_npi = json!({"type": "npi", "value": "1000000491"});
+        dedupe
+            .insert_provider_group_with_tax_identity(7, Some(&first_npi))
+            .unwrap();
+        let before = paired_rows(&dedupe);
+        for conflicting in [
+            json!({"type": "npi", "value": "2999999990"}),
+            json!({"type": "ein", "value": "98-7654321"}),
+        ] {
+            let error = dedupe
+                .insert_provider_group_with_tax_identity(7, Some(&conflicting))
+                .unwrap_err();
+            let error_message = error.to_string();
+            assert!(!error_message.contains("1000000491"));
+            assert!(!error_message.contains(conflicting["value"].as_str().unwrap()));
+            assert_eq!(paired_rows(&dedupe), before);
+        }
+        let conflict_metrics = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(dedupe.unique_provider_group_count(), 1);
+        assert_eq!(conflict_metrics["provider_group_attempted"], 3);
+        assert_eq!(conflict_metrics["provider_group_unique"], 1);
+        assert_eq!(conflict_metrics["provider_group_duplicate"], 2);
+
+        let first_ein = json!({"type": "ein", "value": "12-3456789"});
+        let different_ein = json!({"type": "ein", "value": "98-7654321"});
+        dedupe
+            .insert_provider_group_with_tax_identity(8, Some(&first_ein))
+            .unwrap();
+        let before_ein_conflict = paired_rows(&dedupe);
+        let error = dedupe
+            .insert_provider_group_with_tax_identity(8, Some(&different_ein))
+            .unwrap_err();
+        assert!(!error.to_string().contains("12-3456789"));
+        assert!(!error.to_string().contains("98-7654321"));
+        assert_eq!(paired_rows(&dedupe), before_ein_conflict);
+        assert_eq!(dedupe.unique_provider_group_count(), 2);
+    }
+
+    #[test]
+    fn paired_and_legacy_visitors_are_globally_sorted_and_reusable() {
+        let dedupe = SharedDedupe::new_with_v4_paired_tax_identity(4, false, tax_identity_policy());
+        let ein = json!({"type": "ein", "value": "12-3456789"});
+        let group_hashes = (-256..=256).step_by(7).collect::<Vec<_>>();
+        for group_hash in group_hashes.iter().rev() {
+            dedupe
+                .insert_provider_group_with_tax_identity(*group_hash, Some(&ein))
+                .unwrap();
+        }
+
+        let callback_error = dedupe
+            .visit_provider_group_tax_identity_pairs(|_, _, _| {
+                Err(io::Error::other("synthetic visitor stop"))
+            })
+            .unwrap_err();
+        assert_eq!(callback_error.to_string(), "synthetic visitor stop");
+
+        let paired = paired_rows(&dedupe);
+        let mut expected_hashes = group_hashes;
+        expected_hashes.sort_unstable_by_key(|hash| provider_group_global_id_from_hash(*hash));
+        assert_eq!(
+            paired.iter().map(|(hash, _, _)| *hash).collect::<Vec<_>>(),
+            expected_hashes
+        );
+
+        let mut legacy = Vec::new();
+        dedupe
+            .visit_provider_group_tax_identities(|group_hash, observation| {
+                legacy.push((group_hash, observation));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            legacy,
+            paired
+                .iter()
+                .map(|(group_hash, v1, _v2)| (*group_hash, *v1))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn concurrent_paired_tax_identity_merges_are_deterministic() {
+        let dedupe = Arc::new(SharedDedupe::new_with_v4_paired_tax_identity(
+            8,
+            false,
+            tax_identity_policy(),
+        ));
+        let raw_tins = [
+            None,
+            Some(json!({"type": "ein", "value": "malformed"})),
+            Some(json!({"type": "npi", "value": "100-000-0491"})),
+            Some(json!({"type": "npi", "value": "1000000491"})),
+        ];
+        let workers = raw_tins
+            .into_iter()
+            .cycle()
+            .take(32)
+            .map(|tin| {
+                let dedupe = Arc::clone(&dedupe);
+                std::thread::spawn(move || {
+                    dedupe
+                        .insert_provider_group_with_tax_identity(99, tin.as_ref())
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let rows = paired_rows(&dedupe);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.state, TaxIdentityState::UnsupportedType);
+        assert_eq!(rows[0].2.state, TaxIdentityStateV2::MatchedNpi);
+    }
+
+    #[test]
+    fn paired_tax_identity_validation_rejects_invalid_shapes_and_cross_type_pairs() {
+        let invalid_zero_token = PairedTaxIdentityObservation {
+            v1: TaxIdentityObservation {
+                state: TaxIdentityState::MatchedEin,
+                tin_hmac_sha256: Some([0; 32]),
+            },
+            v2: TaxIdentityObservationV2 {
+                state: TaxIdentityStateV2::MatchedEin,
+                tin_hmac_sha256: Some([0; 32]),
+            },
+        };
+        assert!(invalid_zero_token.validate().is_err());
+
+        let cross_type = PairedTaxIdentityObservation {
+            v1: TaxIdentityObservation {
+                state: TaxIdentityState::MatchedEin,
+                tin_hmac_sha256: Some([1; 32]),
+            },
+            v2: TaxIdentityObservationV2 {
+                state: TaxIdentityStateV2::MatchedNpi,
+                tin_hmac_sha256: Some([1; 32]),
+            },
+        };
+        assert!(cross_type.validate().is_err());
+        assert!(cross_type.merge(cross_type).is_err());
+    }
+
+    #[test]
+    fn paired_tax_identity_poisoned_shard_fails_closed_without_raw_echo() {
+        let dedupe = SharedDedupe::new_with_v4_paired_tax_identity(1, false, tax_identity_policy());
+        let group_hash = 314;
+        let shard_index = usize::from(provider_group_global_id_from_hash(group_hash).0[0]);
+        let identity = match dedupe.provider_group_tax_identity.as_ref().unwrap() {
+            ProviderGroupTaxIdentityDedupe::Paired(identity) => identity,
+            ProviderGroupTaxIdentityDedupe::V1(_) => panic!("expected paired identity mode"),
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = identity.shards[shard_index].lock().unwrap();
+            panic!("poison paired tax identity shard for fail-closed coverage");
+        }));
+
+        let raw_tin = json!({"type": "ein", "value": "12-3456789"});
+        let record_error = dedupe
+            .insert_provider_group_with_tax_identity(group_hash, Some(&raw_tin))
+            .unwrap_err();
+        assert!(record_error.to_string().contains("lock poisoned"));
+        assert!(!record_error.to_string().contains("12-3456789"));
+
+        let visit_error = dedupe
+            .visit_provider_group_tax_identity_pairs(accept_paired_row)
+            .unwrap_err();
+        assert!(visit_error.to_string().contains("lock poisoned"));
+        assert!(!visit_error.to_string().contains("12-3456789"));
     }
 
     #[test]
