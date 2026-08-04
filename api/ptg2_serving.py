@@ -13419,7 +13419,6 @@ async def _billing_associations_for_exact_npi_request(
     serving_tables: PTG2ServingTables,
     *,
     include_providers: bool,
-    direct_npi_filter_requested: bool,
     explicit_npi_scope: _ExplicitNpiGraphScope | None,
     serving_rows: Iterable[Mapping[str, Any]],
 ) -> dict[str, tuple[dict[str, Any], ...]]:
@@ -13427,7 +13426,6 @@ async def _billing_associations_for_exact_npi_request(
 
     if (
         not include_providers
-        or not direct_npi_filter_requested
         or explicit_npi_scope is None
         or not serving_tables.uses_v4_graph
     ):
@@ -17322,7 +17320,6 @@ async def _search_manifest_serving_table(
             session,
             serving_tables,
             include_providers=include_providers,
-            direct_npi_filter_requested=direct_npi_filter_requested,
             explicit_npi_scope=explicit_npi_scope,
             serving_rows=serving_rows,
         )

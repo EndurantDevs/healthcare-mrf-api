@@ -271,6 +271,32 @@ def _assert_public_billing_item(item: dict[str, Any]) -> None:
     assert item["billing_entity_count_status"] == "exact"
 
 
+def _billing_option_fingerprint(item: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        sorted(
+            (
+                option["provider_set_ref"],
+                option["price_set_ref"],
+                option["rate_pack_ref"],
+                option["billing_association_status"],
+                option["billing_association_count"],
+                tuple(
+                    sorted(
+                        (
+                            association["association_ordinal"],
+                            association["billing_entity_ref"],
+                            association["tin_type"],
+                            association["tax_identity_status"],
+                        )
+                        for association in option["billing_associations"]
+                    )
+                ),
+            )
+            for option in item["rate_options"]
+        )
+    )
+
+
 def _assert_no_private_payload_values(response: dict[str, Any]) -> None:
     forbidden_keys = {
         "tin_id_128",
@@ -322,3 +348,115 @@ async def test_v4_exact_npi_search_attaches_intersected_billing_associations(
     assert intersection.await_args.kwargs["relation"] == "set_groups_direct"
     assert intersection.await_args.kwargs["owner_keys"] == (3, 4)
     assert intersection.await_args.kwargs["allowed_member_keys"] == (7, 8, 9)
+
+
+@pytest.mark.asyncio
+async def test_v4_exact_npi_geo_search_preserves_billing_associations(
+    monkeypatch,
+) -> None:
+    _install_search_stubs(monkeypatch)
+    intersection = _install_billing_stubs(monkeypatch)
+    location = AsyncMock(return_value=({SET_ONE, SET_TWO}, _provider_rows()))
+    monkeypatch.setattr(
+        serving,
+        "_ptg2_manifest_location_provider_matches",
+        location,
+    )
+    provider_wide_session = _RoutingSession()
+    geo_session = _RoutingSession()
+    common_args_by_name = {
+        "plan_id": "plan-a",
+        "plan_market_type": "group",
+        "code_system": "CPT",
+        "code": "99213",
+        "npi": str(NPI),
+        "include_providers": True,
+    }
+
+    provider_wide_response = await serving._search_manifest_serving_table(
+        provider_wide_session,
+        "logical-plan-a",
+        common_args_by_name,
+        SimpleNamespace(limit=25, offset=0),
+        _tables(),
+        "exact_source",
+    )
+    geo_response = await serving._search_manifest_serving_table(
+        geo_session,
+        "logical-plan-a",
+        {**common_args_by_name, "state": "ZZ"},
+        SimpleNamespace(limit=25, offset=0),
+        _tables(),
+        "exact_source",
+    )
+
+    assert provider_wide_response is not None
+    assert geo_response is not None
+    provider_wide_item = provider_wide_response["items"][0]
+    geo_item = geo_response["items"][0]
+    _assert_public_billing_item(geo_item)
+    _assert_no_private_payload_values(geo_response)
+    assert _billing_option_fingerprint(geo_item) == _billing_option_fingerprint(
+        provider_wide_item
+    )
+    assert geo_item["npi"] == NPI
+    assert geo_response["query"]["state"] == "ZZ"
+    assert provider_wide_session.sidecar_requests == [
+        tuple(sorted((GROUP_ONE, GROUP_TWO)))
+    ]
+    assert geo_session.sidecar_requests == [tuple(sorted((GROUP_ONE, GROUP_TWO)))]
+    assert intersection.await_count == 2
+    location.assert_awaited_once()
+    assert location.await_args.kwargs["explicit_npi_scope"] == (
+        serving._ExplicitNpiGraphScope(NPI, (3, 4))
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_exact_npi_geo_no_match_skips_billing_sidecar(
+    monkeypatch,
+) -> None:
+    _install_search_stubs(monkeypatch)
+    location = AsyncMock(return_value=(set(), {}))
+    intersection = AsyncMock()
+    billing_resolver = AsyncMock()
+    monkeypatch.setattr(
+        serving,
+        "_ptg2_manifest_location_provider_matches",
+        location,
+    )
+    monkeypatch.setattr(serving, "lookup_v4_relation_intersections", intersection)
+    monkeypatch.setattr(
+        serving,
+        "_exact_npi_billing_associations_by_set",
+        billing_resolver,
+    )
+    session = _RoutingSession()
+
+    response = await serving._search_manifest_serving_table(
+        session,
+        "logical-plan-a",
+        {
+            "plan_id": "plan-a",
+            "plan_market_type": "group",
+            "code_system": "CPT",
+            "code": "99213",
+            "npi": str(NPI),
+            "state": "ZZ",
+            "include_providers": True,
+        },
+        SimpleNamespace(limit=25, offset=0),
+        _tables(),
+        "exact_source",
+    )
+
+    assert response is not None
+    assert response["items"] == []
+    assert response["pagination"]["total"] == 0
+    assert response["query"]["state"] == "ZZ"
+    assert location.await_args.kwargs["explicit_npi_scope"] == (
+        serving._ExplicitNpiGraphScope(NPI, (3, 4))
+    )
+    assert session.sidecar_requests == []
+    intersection.assert_not_awaited()
+    billing_resolver.assert_not_awaited()

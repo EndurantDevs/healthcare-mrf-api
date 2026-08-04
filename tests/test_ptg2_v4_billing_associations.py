@@ -318,16 +318,15 @@ def test_exact_billing_group_dictionary_rejects_duplicate_keys() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("include_providers", "direct_filter", "has_scope", "uses_v4"),
+    ("include_providers", "has_scope", "uses_v4"),
     [
-        (False, True, True, True),
-        (True, False, True, True),
-        (True, True, False, True),
-        (True, True, True, False),
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
     ],
 )
-async def test_billing_associations_are_exact_npi_v4_only(
-    monkeypatch, include_providers, direct_filter, has_scope, uses_v4
+async def test_billing_associations_are_provider_expanded_exact_npi_v4_only(
+    monkeypatch, include_providers, has_scope, uses_v4
 ) -> None:
     resolver = AsyncMock(return_value={"set": ({"status": "resolved"},)})
     monkeypatch.setattr(serving, "_exact_npi_billing_associations_by_set", resolver)
@@ -344,14 +343,15 @@ async def test_billing_associations_are_exact_npi_v4_only(
     scope = serving._ExplicitNpiGraphScope(1234567890, (3,)) if has_scope else None
     assert await serving._billing_associations_for_exact_npi_request(
         object(), tables, include_providers=include_providers,
-        direct_npi_filter_requested=direct_filter, explicit_npi_scope=scope,
-        serving_rows=({"provider_set_global_id_128": "11" * 16},),
+        explicit_npi_scope=scope, serving_rows=(
+            {"provider_set_global_id_128": "11" * 16},
+        ),
     ) == {}
     resolver.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_billing_associations_delegate_for_exact_provider_request(
+async def test_billing_associations_delegate_for_provider_expanded_exact_npi_request(
     monkeypatch,
 ) -> None:
     expected_by_set = {"set": ({"status": "resolved"},)}
@@ -361,8 +361,7 @@ async def test_billing_associations_delegate_for_exact_provider_request(
     serving_rows = ({"provider_set_global_id_128": "11" * 16},)
     assert await serving._billing_associations_for_exact_npi_request(
         object(), _tables(), include_providers=True,
-        direct_npi_filter_requested=True, explicit_npi_scope=scope,
-        serving_rows=serving_rows,
+        explicit_npi_scope=scope, serving_rows=serving_rows,
     ) == expected_by_set
     assert resolver.await_args.kwargs == {
         "npi": 1234567890,
