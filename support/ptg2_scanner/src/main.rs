@@ -1594,6 +1594,7 @@ fn insert_provider_definition(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_preloaded_provider_definition(
     provider_map: &HashMap<ProviderRefKey, ProviderEntry>,
     key: &ProviderRefKey,
@@ -3633,6 +3634,7 @@ impl CompactCopySink {
         Ok(Some(event))
     }
 
+    #[cfg(test)]
     fn finish<W: Write>(mut self, stdout: &mut W) -> io::Result<()> {
         let mut writer = self.writer.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "compact copy writer is closed")
@@ -3800,15 +3802,6 @@ impl V3ServingRunSink {
 
     fn maybe_rotate_silent(&mut self) -> io::Result<Vec<CopyFileEvent>> {
         Ok(Vec::new())
-    }
-
-    fn finish<W: Write>(self, stdout: &mut W) -> io::Result<ServingRunMetrics> {
-        let (events, metrics) = serving_run_partition_events(self.writer)?;
-        for event in events {
-            emit_copy_file_event(stdout, &event)?;
-        }
-        stdout.flush()?;
-        Ok(metrics)
     }
 
     fn finish_silent(self) -> io::Result<(Vec<CopyFileEvent>, ServingRunMetrics)> {
@@ -4110,6 +4103,7 @@ impl DictionaryCopySinks {
         Ok(events)
     }
 
+    #[cfg(test)]
     fn finish<W: Write>(mut self, writer: &mut W) -> io::Result<()> {
         if let Some(sink) = self.manifest_price_atom.take() {
             sink.finish(writer)?;
@@ -4392,6 +4386,7 @@ impl DictionaryCopySinks {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_price_code_sets_for_atom(
         &mut self,
         atom: &PriceAtomLite,
@@ -4430,6 +4425,7 @@ impl DictionaryCopySinks {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_price_atoms(
         &mut self,
         atoms: &[PriceAtomLite],
@@ -4462,6 +4458,7 @@ impl DictionaryCopySinks {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_price_set_entries(
         &mut self,
         price_set_id: GlobalId128,
@@ -4616,6 +4613,7 @@ impl DictionaryCopySinks {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_provider_set_entries(
         &mut self,
         provider_set_hash: &str,
@@ -4648,6 +4646,7 @@ impl DictionaryCopySinks {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_provider_set_components(
         &mut self,
         provider_set_hash: &str,
@@ -4744,6 +4743,7 @@ impl DictionaryCopySinks {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_provider_entry_components(
         &mut self,
         provider_entry_hash: i64,
@@ -4810,6 +4810,7 @@ impl DictionaryCopySinks {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_provider_group_members(
         &mut self,
         provider_ref: &Value,
@@ -4958,6 +4959,7 @@ impl DictionaryCopySinks {
     }
 }
 
+#[cfg(test)]
 type ParsedCompactRate = (PriceSetLite, i64, Vec<i64>, Vec<i64>, i64, Vec<String>);
 type ProviderEntryComponents = BTreeMap<i64, Vec<i64>>;
 
@@ -5005,6 +5007,7 @@ impl
     }
 }
 
+#[cfg(test)]
 struct LocalCompactOutputs<'a, W: Write> {
     writer: &'a mut W,
     compact_copy_writer: &'a mut Option<CompactCopySink>,
@@ -5015,6 +5018,7 @@ struct LocalCompactOutputs<'a, W: Write> {
     suppress_legacy_row_output: bool,
 }
 
+#[cfg(test)]
 struct LocalCompactDedupe<'a> {
     price_code_sets: &'a mut HashSet<String>,
     price_atoms: &'a mut HashSet<GlobalId128>,
@@ -5029,6 +5033,7 @@ struct LocalCompactDedupe<'a> {
     provider_identifier_quarantine: &'a mut ProviderIdentifierQuarantine,
 }
 
+#[cfg(test)]
 struct CompactRateBatch<'a> {
     provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
     manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
@@ -5105,6 +5110,7 @@ fn strict_optional_source_metadata_text(
     }
 }
 
+#[cfg(test)]
 fn process_compact_rate_lites<W: Write>(
     outputs: &mut LocalCompactOutputs<'_, W>,
     dedupe: &mut LocalCompactDedupe<'_>,
@@ -9322,21 +9328,6 @@ fn strict_string_or_array_from_reader<R: Read>(
     }
 }
 
-struct InNetworkStreamState<'a, W: Write> {
-    writer: &'a mut W,
-    compact_copy_writer: &'a mut Option<CompactCopySink>,
-    manifest_serving_copy_writer: &'a mut Option<V3ServingRunSink>,
-    dictionary_copy_sinks: &'a mut DictionaryCopySinks,
-    manifest_sidecars: Option<&'a mut ManifestSidecarCollector>,
-    record_price_forward_sidecar: bool,
-    suppress_legacy_row_output: bool,
-    provider_map: &'a HashMap<ProviderRefKey, ProviderEntry>,
-    dedupe: LocalCompactDedupe<'a>,
-    manifest_global_id_cache: &'a mut ManifestGlobalIdCache,
-    context: CompactContext,
-    chunk_size: usize,
-}
-
 fn procedure_has_queryable_code(procedure: &Map<String, Value>) -> bool {
     ["billing_code_type", "billing_code"]
         .iter()
@@ -9389,96 +9380,6 @@ fn reject_late_procedure_field(name: &str, rates_dispatched: bool) -> io::Result
         io::ErrorKind::InvalidData,
         format!("procedure field {name} appeared after negotiated rates were dispatched"),
     ))
-}
-
-fn process_in_network_struson<R: Read, W: Write>(
-    json_reader: &mut JsonStreamReader<R>,
-    state: &mut InNetworkStreamState<'_, W>,
-) -> io::Result<u64> {
-    let mut procedure = Map::new();
-    let mut rate_chunk: Vec<RateLite> = Vec::with_capacity(state.chunk_size);
-    let mut rate_count = 0u64;
-    let mut rates_dispatched = false;
-    json_reader.begin_object().map_err(to_io_error)?;
-    while json_reader.has_next().map_err(to_io_error)? {
-        let name = json_reader.next_name_owned().map_err(to_io_error)?;
-        match name.as_str() {
-            "billing_code_type"
-            | "billing_code_type_version"
-            | "billing_code"
-            | "negotiation_arrangement"
-            | "name"
-            | "description" => {
-                reject_late_procedure_field(&name, rates_dispatched)?;
-                let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                procedure.insert(name, value);
-            }
-            "negotiated_rates" => {
-                json_reader.begin_array().map_err(to_io_error)?;
-                while json_reader.has_next().map_err(to_io_error)? {
-                    rate_count += 1;
-                    if let Some(rate) = read_rate_lite_struson(json_reader, false)? {
-                        rate_chunk.push(rate);
-                        if rate_chunk.len() >= state.chunk_size {
-                            validate_procedure_for_rate_dispatch(&procedure)?;
-                            let procedure_value = Value::Object(procedure.clone());
-                            let mut outputs = LocalCompactOutputs {
-                                writer: state.writer,
-                                compact_copy_writer: state.compact_copy_writer,
-                                manifest_serving_copy_writer: state.manifest_serving_copy_writer,
-                                dictionary_copy_sinks: state.dictionary_copy_sinks,
-                                manifest_sidecars: state.manifest_sidecars.as_deref_mut(),
-                                record_price_forward_sidecar: state.record_price_forward_sidecar,
-                                suppress_legacy_row_output: state.suppress_legacy_row_output,
-                            };
-                            let mut batch = CompactRateBatch {
-                                provider_map: state.provider_map,
-                                manifest_global_id_cache: state.manifest_global_id_cache,
-                                rates: &rate_chunk,
-                                procedure_value: &procedure_value,
-                                context: &state.context,
-                            };
-                            process_compact_rate_lites(
-                                &mut outputs,
-                                &mut state.dedupe,
-                                &mut batch,
-                            )?;
-                            rates_dispatched = true;
-                            rate_chunk.clear();
-                        }
-                    }
-                }
-                json_reader.end_array().map_err(to_io_error)?;
-            }
-            _ => {
-                json_reader.skip_value().map_err(to_io_error)?;
-            }
-        }
-    }
-    json_reader.end_object().map_err(to_io_error)?;
-    validate_procedure_for_rate_dispatch(&procedure)?;
-    if !rate_chunk.is_empty() {
-        validate_procedure_for_rate_dispatch(&procedure)?;
-        let procedure_value = Value::Object(procedure);
-        let mut outputs = LocalCompactOutputs {
-            writer: state.writer,
-            compact_copy_writer: state.compact_copy_writer,
-            manifest_serving_copy_writer: state.manifest_serving_copy_writer,
-            dictionary_copy_sinks: state.dictionary_copy_sinks,
-            manifest_sidecars: state.manifest_sidecars.as_deref_mut(),
-            record_price_forward_sidecar: state.record_price_forward_sidecar,
-            suppress_legacy_row_output: state.suppress_legacy_row_output,
-        };
-        let mut batch = CompactRateBatch {
-            provider_map: state.provider_map,
-            manifest_global_id_cache: state.manifest_global_id_cache,
-            rates: &rate_chunk,
-            procedure_value: &procedure_value,
-            context: &state.context,
-        };
-        process_compact_rate_lites(&mut outputs, &mut state.dedupe, &mut batch)?;
-    }
-    Ok(rate_count)
 }
 
 #[derive(Clone, Copy)]
@@ -11924,732 +11825,10 @@ fn scan_compact_byte_top_level_parallel(
     Ok(())
 }
 
-fn scan_compact_struson_parallel(
-    path: &Path,
-    context: CompactContext,
-    worker_count: usize,
-    queue_size: usize,
-    copy_paths: CopyPathConfig,
-    compact_copy_rotate_bytes: u64,
-    scan_selection: CompactParallelScanSelection,
-) -> io::Result<()> {
-    let factor_mode = configured_v4_factor_mode(&copy_paths)?;
-    let CompactParallelScanSelection {
-        preflight_metrics,
-        top_level_byte_scan_requested,
-        top_level_byte_scan_fallback_reason,
-    } = scan_selection;
-    let total_bytes = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    let compressed_bytes_read = Arc::new(AtomicU64::new(0));
-    let reader = open_json_reader(path, Arc::clone(&compressed_bytes_read))?;
-    let mut json_reader = JsonStreamReader::new(reader);
-    let progress_bytes_interval = progress_interval(
-        "HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES",
-        DEFAULT_PROGRESS_BYTES,
-    );
-    let mut next_progress_bytes = progress_bytes_interval;
-    let progress_objects_interval = progress_interval(
-        "HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS",
-        DEFAULT_PROGRESS_OBJECTS,
-    );
-    let mut next_progress_objects = progress_objects_interval;
-    let mut object_counts: HashMap<String, u64> = HashMap::new();
-    let started_at = Instant::now();
-    let mut provider_map: HashMap<ProviderRefKey, ProviderEntry> = HashMap::new();
-    let negotiated_rate_chunk_size = split_interval(
-        "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
-        DEFAULT_SPLIT_NEGOTIATED_RATES,
-    );
-    let raw_chunk_byte_limit =
-        env_usize("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES", DEFAULT_RAW_CHUNK_BYTES);
-    let provider_refs_in_workers = env_bool("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", true);
-    let provider_ref_worker_count =
-        env_usize("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", worker_count).max(1);
-    let provider_ref_queue_size = env_usize(
-        "HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE",
-        provider_ref_worker_count.max(queue_size).max(1),
-    )
-    .max(provider_ref_worker_count)
-    .max(1);
-    let provider_ref_chunk_items = env_usize(
-        "HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS",
-        DEFAULT_PROVIDER_REF_CHUNK_ITEMS,
-    )
-    .max(1);
-    let provider_ref_raw_chunk_byte_limit = env_usize(
-        "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES",
-        raw_chunk_byte_limit,
-    )
-    .max(1);
-    let parse_in_workers = env_bool(
-        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS",
-        DEFAULT_PARSE_IN_WORKERS,
-    );
-    let bounded_queue_size = queue_size.max(worker_count).max(1);
-    let dedupe = Arc::new(configured_shared_dedupe(
-        worker_count,
-        !copy_paths.manifest_only,
-        factor_mode,
-    )?);
-    let provider_graph_v4_factor_cache = Arc::new(
-        V4ProviderSetFactorSharedCache::configured_for_mode(factor_mode)?,
-    );
-    let semantic_progress = provider_graph_v4_factor_cache.semantic_progress_if_enabled();
-    let mut semantic_progress_reporter = start_semantic_progress_reporter(
-        path,
-        total_bytes,
-        &compressed_bytes_read,
-        semantic_progress.as_ref(),
-        started_at,
-    )?;
-    let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
-        Some(Arc::new(Mutex::new(ManifestSidecarCollector::for_import(
-            &copy_paths,
-        )?)))
-    } else {
-        None
-    };
-    let event_queue_size = env_usize(
-        "HLTHPRT_PTG2_RUST_EVENT_QUEUE",
-        (bounded_queue_size * 4).max(worker_count),
-    );
-    let (tx, rx) = bounded::<WorkerJob>(bounded_queue_size);
-    let (event_tx, event_rx) = bounded::<CopyFileEvent>(event_queue_size);
-    let stdout = io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
-    let mut producer_blocked_micros = 0u128;
-    let mut provider_ref_producer_blocked_micros = 0u128;
-    let mut raw_chunk_stats = RawChunkStats::default();
-    let mut provider_ref_raw_chunk_stats = RawChunkStats::default();
-    let raw_recycle_tx = raw_chunk_stats.enable_recycling(
-        bounded_queue_size
-            .saturating_add(worker_count)
-            .saturating_add(1),
-    );
-    let provider_ref_recycle_tx = provider_ref_raw_chunk_stats.enable_recycling(
-        provider_ref_queue_size
-            .saturating_add(provider_ref_worker_count)
-            .saturating_add(1),
-    );
-    let mut provider_refs_seconds = 0.0f64;
-    let mut provider_capture_seconds = 0.0f64;
-    let mut provider_worker_join_seconds = 0.0f64;
-    let mut provider_map_merge_seconds = 0.0f64;
-    let provider_capture_compressed_bytes: u64;
-    let mut in_network_enqueue_seconds = 0.0f64;
-    let mut in_network_compressed_bytes = 0u64;
-    let mut worker_join_seconds = 0.0f64;
-    let mut sidecar_finalize_lock_wait_seconds = 0.0f64;
-    let mut sidecar_merge_write_seconds = 0.0f64;
-    let mut provider_worker_metrics = Vec::new();
-    let mut compact_worker_metrics = Vec::new();
-
-    emit_json_record(
-        &mut writer,
-        "scanner_config",
-        &json!({
-            "worker_count": worker_count,
-            "work_queue": bounded_queue_size,
-            "event_queue": event_queue_size,
-            "split_negotiated_rates": negotiated_rate_chunk_size,
-            "raw_chunk_bytes": raw_chunk_byte_limit,
-            "read_buffer_bytes": READ_BUF_SIZE,
-            "parse_in_workers": parse_in_workers,
-            "local_dedupe_entries_per_kind_per_worker": env_usize_allow_zero("HLTHPRT_PTG2_RUST_LOCAL_DEDUPE_ENTRIES", 131_072),
-            "provider_refs_in_workers": provider_refs_in_workers,
-            "provider_ref_workers": provider_ref_worker_count,
-            "provider_ref_queue": provider_ref_queue_size,
-            "provider_ref_chunk_items": provider_ref_chunk_items,
-            "provider_ref_raw_chunk_bytes": provider_ref_raw_chunk_byte_limit,
-            "top_level_byte_scan_requested": top_level_byte_scan_requested,
-            "top_level_byte_scan_selected": false,
-            "top_level_byte_scan_fallback_reason": top_level_byte_scan_fallback_reason,
-            "execution_mode": "parallel_struson",
-            "provider_reference_order": "before_in_network",
-            "order_detection_seconds": preflight_metrics.order_detection_seconds,
-            "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
-            "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
-            "raw_buffer_recycling": true,
-            "provider_map_merge": "ordered_pairwise_parallel",
-            "scanner_metric_contract_version": 2,
-            "snapshot_arch": REQUIRED_SNAPSHOT_ARCH,
-            "storage_generation": REQUIRED_STORAGE_GENERATION,
-            "serving_row_semantics": "source_multiset_v1",
-            "group_negotiated_rate_chunks": false,
-            "factor_mode": factor_mode,
-            "provider_graph_v4_factor_mode": factor_mode,
-            "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.max_estimated_bytes,
-            "provider_graph_v4_inline_transform_cache_max_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().max_estimated_bytes,
-            "provider_npi_sidecar": copy_paths.manifest_provider_npi_sidecar.is_some(),
-            "price_forward_sidecar": copy_paths.manifest_price_forward_sidecar.is_some(),
-            "serving_run_format": SERVING_RUN_FORMAT,
-            "serving_run_version": SERVING_RUN_FORMAT_VERSION,
-            "serving_run_partition_count": env_usize("HLTHPRT_PTG2_V3_SERVING_RUN_PARTITIONS", DEFAULT_V3_SERVING_RUN_PARTITIONS),
-            "serving_run_partition_buffer_bytes": env_usize("HLTHPRT_PTG2_V3_SERVING_RUN_PARTITION_BUFFER_BYTES", DEFAULT_V3_SERVING_RUN_PARTITION_BUFFER_BYTES),
-            "panic_strategy": "unwind",
-        }),
-    )?;
-    writer.flush()?;
-
-    json_reader.begin_object().map_err(to_io_error)?;
-    while json_reader.has_next().map_err(to_io_error)? {
-        let name = json_reader.next_name_owned().map_err(to_io_error)?;
-        match name.as_str() {
-            "provider_references" => {
-                let provider_refs_started_at = Instant::now();
-                let provider_refs_compressed_started_at =
-                    compressed_bytes_read.load(Ordering::Relaxed);
-                let provider_ref_paths = copy_paths.for_provider_refs();
-                if provider_refs_in_workers && provider_ref_worker_count > 1 {
-                    let (provider_tx, provider_handles) = spawn_provider_ref_workers(
-                        provider_ref_worker_count,
-                        provider_ref_queue_size,
-                        ProviderRefWorkerConfig {
-                            dedupe: Arc::clone(&dedupe),
-                            source_witness: Arc::clone(&context.source_witness),
-                            manifest_sidecars: manifest_sidecars.as_ref().map(Arc::clone),
-                            copy_paths: provider_ref_paths.clone(),
-                            rotate_bytes: compact_copy_rotate_bytes,
-                            queue_bytes: Arc::clone(&provider_ref_raw_chunk_stats.queue_bytes),
-                            recycle_tx: Some(provider_ref_recycle_tx.clone()),
-                            allow_empty_npi_tin_only: factor_mode,
-                        },
-                    );
-
-                    let mut raw_refs = provider_ref_raw_chunk_stats.allocate_chunk(
-                        provider_ref_chunk_items,
-                        provider_ref_raw_chunk_byte_limit.min(READ_BUF_SIZE),
-                    );
-                    json_reader.begin_array().map_err(to_io_error)?;
-                    let mut capture_batch_started_at = Some(Instant::now());
-                    while json_reader.has_next().map_err(to_io_error)? {
-                        let raw_start = raw_refs.byte_len();
-                        transfer_next_value_to_bytes_append(&mut json_reader, &mut raw_refs.bytes)?;
-                        raw_refs.push_current_value_span_at(
-                            raw_start,
-                            SourceWitnessCoordinate::new(
-                                *object_counts.get("provider_references").unwrap_or(&0),
-                                0,
-                            ),
-                        );
-                        *object_counts
-                            .entry("provider_references".to_string())
-                            .or_insert(0) += 1;
-                        if raw_refs.len() >= provider_ref_chunk_items
-                            || raw_refs.byte_len() >= provider_ref_raw_chunk_byte_limit
-                        {
-                            provider_ref_raw_chunk_stats
-                                .record_capture_batch(capture_batch_started_at.take());
-                            let batch = provider_ref_raw_chunk_stats.take_filled_chunk(
-                                &mut raw_refs,
-                                provider_ref_chunk_items,
-                                provider_ref_raw_chunk_byte_limit,
-                            );
-                            provider_ref_raw_chunk_stats.record(batch.len(), batch.byte_len());
-                            send_provider_ref_batch(
-                                &provider_tx,
-                                &event_rx,
-                                &mut writer,
-                                &mut provider_ref_producer_blocked_micros,
-                                &mut provider_ref_raw_chunk_stats,
-                                batch,
-                            )?;
-                            drain_copy_file_events(&event_rx, &mut writer)?;
-                            capture_batch_started_at = Some(Instant::now());
-                        }
-                    }
-                    json_reader.end_array().map_err(to_io_error)?;
-                    if !raw_refs.is_empty() {
-                        provider_ref_raw_chunk_stats
-                            .record_capture_batch(capture_batch_started_at.take());
-                        provider_ref_raw_chunk_stats.record(raw_refs.len(), raw_refs.byte_len());
-                        send_provider_ref_batch(
-                            &provider_tx,
-                            &event_rx,
-                            &mut writer,
-                            &mut provider_ref_producer_blocked_micros,
-                            &mut provider_ref_raw_chunk_stats,
-                            raw_refs,
-                        )?;
-                        drain_copy_file_events(&event_rx, &mut writer)?;
-                    }
-                    drop(provider_tx);
-                    provider_capture_seconds += provider_refs_started_at.elapsed().as_secs_f64();
-                    let joined_provider_refs =
-                        join_provider_ref_workers(&mut writer, provider_handles)?;
-                    provider_worker_join_seconds += joined_provider_refs.worker_join_seconds;
-                    provider_map_merge_seconds += joined_provider_refs.map_merge_seconds;
-                    provider_map = joined_provider_refs.provider_map;
-                    provider_worker_metrics = joined_provider_refs.worker_metrics;
-                    drain_copy_file_events(&event_rx, &mut writer)?;
-                    for event in joined_provider_refs.events {
-                        emit_copy_file_event(&mut writer, &event)?;
-                    }
-                } else {
-                    let serial_provider_started_at = Instant::now();
-                    let mut serial_provider_metrics = ProviderRefWorkerMetrics::default();
-                    let mut provider_ref_copy_sinks = DictionaryCopySinks::from_paths(
-                        &provider_ref_paths,
-                        compact_copy_rotate_bytes,
-                    )?;
-                    let mut provider_refs_since_rotate = 0usize;
-                    json_reader.begin_array().map_err(to_io_error)?;
-                    while json_reader.has_next().map_err(to_io_error)? {
-                        let parse_started_at = Instant::now();
-                        let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                        serial_provider_metrics.parse_micros = serial_provider_metrics
-                            .parse_micros
-                            .saturating_add(parse_started_at.elapsed().as_micros());
-                        let transform_started_at = Instant::now();
-                        let provider_entry = provider_ref_definition_audited(&value, factor_mode)?;
-                        serial_provider_metrics.transform_micros = serial_provider_metrics
-                            .transform_micros
-                            .saturating_add(transform_started_at.elapsed().as_micros());
-                        let (key, entry, empty_npi_tin_only_normalization_count) = provider_entry;
-                        if let Some(sidecars) = manifest_sidecars.as_ref() {
-                            lock_manifest_sidecars(sidecars).record_provider_component(
-                                entry.entry_hash,
-                                &entry.provider_group_hashes,
-                            )?;
-                        }
-                        insert_provider_definition(&mut provider_map, key, entry)?;
-                        dedupe.record_empty_npi_tin_only_normalizations(
-                            empty_npi_tin_only_normalization_count,
-                        );
-                        let write_started_at = Instant::now();
-                        provider_ref_copy_sinks.write_provider_group_members_shared(
-                            &value,
-                            &dedupe,
-                            factor_mode,
-                        )?;
-                        serial_provider_metrics.write_micros = serial_provider_metrics
-                            .write_micros
-                            .saturating_add(write_started_at.elapsed().as_micros());
-                        provider_refs_since_rotate += 1;
-                        if provider_refs_since_rotate >= 1024 {
-                            for event in provider_ref_copy_sinks.maybe_rotate_silent()? {
-                                emit_copy_file_event(&mut writer, &event)?;
-                            }
-                            provider_refs_since_rotate = 0;
-                        }
-                        serial_provider_metrics.provider_refs =
-                            serial_provider_metrics.provider_refs.saturating_add(1);
-                        *object_counts
-                            .entry("provider_references".to_string())
-                            .or_insert(0) += 1;
-                    }
-                    json_reader.end_array().map_err(to_io_error)?;
-                    for event in provider_ref_copy_sinks.finish_silent()? {
-                        emit_copy_file_event(&mut writer, &event)?;
-                    }
-                    serial_provider_metrics.jobs = 1;
-                    serial_provider_metrics.elapsed_micros =
-                        serial_provider_started_at.elapsed().as_micros();
-                    provider_worker_metrics.push(serial_provider_metrics);
-                    provider_capture_seconds += provider_refs_started_at.elapsed().as_secs_f64();
-                }
-                writer.flush()?;
-                provider_capture_compressed_bytes = compressed_bytes_read
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(provider_refs_compressed_started_at);
-                provider_refs_seconds += provider_capture_seconds
-                    + provider_worker_join_seconds
-                    + provider_map_merge_seconds;
-
-                let provider_map = Arc::new(provider_map);
-                let mut handles = Vec::with_capacity(worker_count);
-                for worker_id in 0..worker_count {
-                    let worker_rx = rx.clone();
-                    let worker_event_tx = event_tx.clone();
-                    let worker_provider_map = Arc::clone(&provider_map);
-                    let worker_dedupe = Arc::clone(&dedupe);
-                    let worker_manifest_sidecars = manifest_sidecars.as_ref().map(Arc::clone);
-                    let worker_copy_paths = copy_paths.clone();
-                    let worker_context = context.clone();
-                    let worker_provider_graph_v4_factor_cache =
-                        Arc::clone(&provider_graph_v4_factor_cache);
-                    let worker_queue_bytes = Arc::clone(&raw_chunk_stats.queue_bytes);
-                    let worker_recycle_tx = raw_recycle_tx.clone();
-                    handles.push((
-                        worker_id,
-                        thread::spawn(move || {
-                            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                                compact_worker_loop(
-                                    worker_id,
-                                    worker_rx,
-                                    CompactWorkerConfig {
-                                        event_tx: worker_event_tx,
-                                        provider_map: worker_provider_map,
-                                        dedupe: worker_dedupe,
-                                        manifest_sidecars: worker_manifest_sidecars,
-                                        queue_bytes: worker_queue_bytes,
-                                        recycle_tx: Some(worker_recycle_tx),
-                                        copy_paths: worker_copy_paths,
-                                        rotate_bytes: compact_copy_rotate_bytes,
-                                        context: worker_context,
-                                        provider_graph_v4_factor_cache:
-                                            worker_provider_graph_v4_factor_cache,
-                                        provider_graph_v4_factor_mode: factor_mode,
-                                    },
-                                )
-                            }));
-                            match result {
-                                Ok(Ok(events)) => Ok(events),
-                                Ok(Err(err)) => {
-                                    log_worker_failure(worker_id, "error", &err.to_string());
-                                    Err(err)
-                                }
-                                Err(payload) => {
-                                    let message = panic_payload_message(payload.as_ref());
-                                    log_worker_failure(worker_id, "panic", &message);
-                                    Err(io::Error::other(format!(
-                                        "compact worker {worker_id} panicked: {message}"
-                                    )))
-                                }
-                            }
-                        }),
-                    ));
-                }
-                drop(rx);
-
-                while json_reader.has_next().map_err(to_io_error)? {
-                    let name = json_reader.next_name_owned().map_err(to_io_error)?;
-                    match name.as_str() {
-                        "in_network" => {
-                            let in_network_started_at = Instant::now();
-                            let in_network_compressed_started_at =
-                                compressed_bytes_read.load(Ordering::Relaxed);
-                            json_reader.begin_array().map_err(to_io_error)?;
-                            while json_reader.has_next().map_err(to_io_error)? {
-                                let mut enqueue_io = InNetworkEnqueueIo {
-                                    tx: &tx,
-                                    event_rx: &event_rx,
-                                    writer: &mut writer,
-                                    cancelled: None,
-                                    producer_blocked_micros: &mut producer_blocked_micros,
-                                    raw_chunk_stats: &mut raw_chunk_stats,
-                                };
-                                let rate_count = enqueue_in_network_struson(
-                                    &mut json_reader,
-                                    &mut enqueue_io,
-                                    InNetworkEnqueueOptions {
-                                        chunk_size: negotiated_rate_chunk_size,
-                                        raw_chunk_byte_limit,
-                                        parse_in_workers,
-                                        object_ordinal: *object_counts
-                                            .get("in_network")
-                                            .unwrap_or(&0),
-                                    },
-                                )?;
-                                drain_copy_file_events(&event_rx, &mut writer)?;
-                                *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
-                                if let Some(semantic_progress) = semantic_progress.as_ref() {
-                                    semantic_progress.record_in_network_object_completed();
-                                }
-                                *object_counts
-                                    .entry("negotiated_rates".to_string())
-                                    .or_insert(0) += rate_count;
-                                let bytes = compressed_bytes_read.load(Ordering::Relaxed);
-                                let objects: u64 = object_counts.values().sum();
-                                if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
-                                    emit_progress(
-                                        path,
-                                        total_bytes,
-                                        &compressed_bytes_read,
-                                        &object_counts,
-                                        started_at,
-                                        false,
-                                    );
-                                    while bytes >= next_progress_bytes {
-                                        next_progress_bytes += progress_bytes_interval;
-                                    }
-                                } else if progress_objects_interval > 0
-                                    && objects >= next_progress_objects
-                                {
-                                    emit_progress(
-                                        path,
-                                        total_bytes,
-                                        &compressed_bytes_read,
-                                        &object_counts,
-                                        started_at,
-                                        false,
-                                    );
-                                    while objects >= next_progress_objects {
-                                        next_progress_objects += progress_objects_interval;
-                                    }
-                                }
-                            }
-                            json_reader.end_array().map_err(to_io_error)?;
-                            in_network_enqueue_seconds +=
-                                in_network_started_at.elapsed().as_secs_f64();
-                            in_network_compressed_bytes = in_network_compressed_bytes
-                                .saturating_add(
-                                    compressed_bytes_read
-                                        .load(Ordering::Relaxed)
-                                        .saturating_sub(in_network_compressed_started_at),
-                                );
-                        }
-                        _ => {
-                            json_reader.skip_value().map_err(to_io_error)?;
-                        }
-                    }
-                }
-
-                drop(tx);
-                drop(event_tx);
-                let worker_join_started_at = Instant::now();
-                drain_copy_file_events_until_workers_finish(&event_rx, &handles, &mut writer)?;
-                let mut worker_error: Option<io::Error> = None;
-                let mut copy_file_events = Vec::new();
-                for (worker_id, handle) in handles {
-                    match handle.join() {
-                        Ok(Ok(mut output)) => {
-                            copy_file_events.append(&mut output.events);
-                            compact_worker_metrics.push(output.metrics);
-                        }
-                        Ok(Err(err)) => {
-                            let message = err.to_string();
-                            emit_worker_failure(&mut writer, worker_id, "error", &message)?;
-                            if worker_error.is_none() {
-                                worker_error = Some(err);
-                            }
-                        }
-                        Err(payload) => {
-                            let message = panic_payload_message(payload.as_ref());
-                            emit_worker_failure(&mut writer, worker_id, "panic", &message)?;
-                            if worker_error.is_none() {
-                                worker_error = Some(io::Error::other(format!(
-                                    "compact worker {worker_id} panicked: {message}"
-                                )));
-                            }
-                        }
-                    }
-                }
-                worker_join_seconds += worker_join_started_at.elapsed().as_secs_f64();
-                if let Some(err) = worker_error {
-                    return Err(err);
-                }
-                compact_worker_metrics.sort_unstable_by_key(|metrics| metrics.worker_id);
-                if copy_paths.manifest_only {
-                    dedupe.record_unmeasured_serving_rates(
-                        compact_worker_metrics
-                            .iter()
-                            .map(|metrics| metrics.serving_run_rows)
-                            .sum(),
-                    );
-                }
-                emit_dedupe_summary(&dedupe, &object_counts);
-                emit_provider_group_tax_identity_sidecar(&mut writer, &copy_paths, &dedupe)?;
-                drain_copy_file_events(&event_rx, &mut writer)?;
-                for event in copy_file_events {
-                    emit_copy_file_event(&mut writer, &event)?;
-                }
-                if let Some(sidecars) = manifest_sidecars.as_ref() {
-                    let sidecar_finalize_started_at = Instant::now();
-                    let sidecar_lock_started_at = Instant::now();
-                    let mut sidecars = sidecars.lock().unwrap();
-                    sidecar_finalize_lock_wait_seconds +=
-                        sidecar_lock_started_at.elapsed().as_secs_f64();
-                    emit_configured_manifest_sidecars(
-                        &mut writer,
-                        &copy_paths,
-                        Some(&mut sidecars),
-                        semantic_progress.as_ref().map(Arc::clone),
-                    )?;
-                    sidecar_merge_write_seconds +=
-                        sidecar_finalize_started_at.elapsed().as_secs_f64();
-                }
-                emit_json_record(
-                    &mut writer,
-                    "dedupe_summary",
-                    &dedupe_summary_payload(&dedupe, &object_counts),
-                )?;
-                let elapsed_seconds = started_at.elapsed().as_secs_f64();
-                let scan_compressed_bytes = compressed_bytes_read.load(Ordering::Relaxed);
-                let producer_blocked_seconds = seconds_from_micros(producer_blocked_micros);
-                let producer_nonblocked_seconds =
-                    (in_network_enqueue_seconds - producer_blocked_seconds).max(0.0);
-                let producer_backpressure_pct = if in_network_enqueue_seconds > 0.0 {
-                    producer_blocked_seconds * 100.0 / in_network_enqueue_seconds
-                } else {
-                    0.0
-                };
-                let provider_parse_seconds: f64 = provider_worker_metrics
-                    .iter()
-                    .map(|metrics| seconds_from_micros(metrics.parse_micros))
-                    .sum();
-                let provider_transform_seconds: f64 = provider_worker_metrics
-                    .iter()
-                    .map(|metrics| seconds_from_micros(metrics.transform_micros))
-                    .sum();
-                let provider_write_seconds: f64 = provider_worker_metrics
-                    .iter()
-                    .map(|metrics| seconds_from_micros(metrics.write_micros))
-                    .sum();
-                let worker_sidecar_lock_wait_seconds: f64 = compact_worker_metrics
-                    .iter()
-                    .map(|metrics| seconds_from_micros(metrics.sidecar_lock_wait_micros))
-                    .sum();
-                emit_json_record(
-                    &mut writer,
-                    "scanner_summary",
-                    &scanner_summary_with_v4_empty_npi_audit(
-                        json!({
-                            "provider_identifier_quarantine": provider_identifier_quarantine_payload(
-                                &provider_map,
-                                dedupe.provider_identifier_quarantine()?,
-                            )?,
-                            "worker_count": worker_count,
-                            "work_queue": bounded_queue_size,
-                            "event_queue": event_queue_size,
-                            "split_negotiated_rates": negotiated_rate_chunk_size,
-                            "raw_chunk_bytes": raw_chunk_byte_limit,
-                            "raw_chunk_count": raw_chunk_stats.chunk_count,
-                            "raw_chunk_total_bytes": raw_chunk_stats.total_bytes,
-                            "raw_chunk_max_bytes": raw_chunk_stats.max_bytes,
-                            "raw_chunk_max_rates": raw_chunk_stats.max_rates,
-                            "raw_buffer_allocations": raw_chunk_stats.buffer_allocations,
-                            "raw_buffer_reuses": raw_chunk_stats.buffer_reuses,
-                            "work_queue_high_water": raw_chunk_stats.queue_high_water,
-                            "work_queue_blocked_sends": raw_chunk_stats.queue_blocked_sends,
-                            "peak_queued_bytes": raw_chunk_stats.queue_bytes.peak_bytes(),
-                            "queued_bytes_at_finish": raw_chunk_stats.queue_bytes.current_bytes(),
-                            "producer_byte_framing_seconds": seconds_from_micros(raw_chunk_stats.framing_micros),
-                            "producer_byte_capture_seconds": seconds_from_micros(raw_chunk_stats.capture_micros),
-                            "producer_byte_capture_bytes": raw_chunk_stats.total_bytes,
-                            "producer_byte_capture_timing_granularity": "raw_chunk",
-                            "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
-                            "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
-                            "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
-                            "provider_ref_raw_chunk_max_items": provider_ref_raw_chunk_stats.max_rates,
-                            "provider_ref_buffer_allocations": provider_ref_raw_chunk_stats.buffer_allocations,
-                            "provider_ref_buffer_reuses": provider_ref_raw_chunk_stats.buffer_reuses,
-                            "provider_ref_queue_high_water": provider_ref_raw_chunk_stats.queue_high_water,
-                            "provider_ref_queue_blocked_sends": provider_ref_raw_chunk_stats.queue_blocked_sends,
-                            "provider_ref_peak_queued_bytes": provider_ref_raw_chunk_stats.queue_bytes.peak_bytes(),
-                            "provider_ref_queued_bytes_at_finish": provider_ref_raw_chunk_stats.queue_bytes.current_bytes(),
-                            "provider_capture_bytes": provider_ref_raw_chunk_stats.total_bytes,
-                            "provider_capture_seconds": provider_capture_seconds,
-                            "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
-                            "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
-                            "provider_parse_seconds": provider_parse_seconds,
-                            "provider_transform_seconds": provider_transform_seconds,
-                            "provider_write_seconds": provider_write_seconds,
-                            "provider_worker_join_seconds": provider_worker_join_seconds,
-                            "provider_map_merge_seconds": provider_map_merge_seconds,
-                            "provider_workers": provider_worker_metrics.iter().map(ProviderRefWorkerMetrics::payload).collect::<Vec<_>>(),
-                            "parse_in_workers": parse_in_workers,
-                            "producer_blocked_micros": producer_blocked_micros,
-                            "producer_blocked_seconds": producer_blocked_seconds,
-                            "producer_nonblocked_seconds": producer_nonblocked_seconds,
-                            "producer_backpressure_pct": producer_backpressure_pct,
-                            "producer_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, in_network_enqueue_seconds),
-                            "producer_nonblocked_raw_mib_s": compressed_mib_per_second(raw_chunk_stats.total_bytes, producer_nonblocked_seconds),
-                            "producer_nonblocked_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, producer_nonblocked_seconds),
-                            "provider_ref_producer_blocked_micros": provider_ref_producer_blocked_micros,
-                            "provider_refs_seconds": provider_refs_seconds,
-                            "in_network_enqueue_seconds": in_network_enqueue_seconds,
-                            "in_network_compressed_bytes": in_network_compressed_bytes,
-                            "in_network_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, in_network_enqueue_seconds),
-                            "worker_join_seconds": worker_join_seconds,
-                            "worker_sidecar_lock_wait_seconds": worker_sidecar_lock_wait_seconds,
-                            "sidecar_finalize_lock_wait_seconds": sidecar_finalize_lock_wait_seconds,
-                            "sidecar_merge_write_seconds": sidecar_merge_write_seconds,
-                            "typed_rate_parses": compact_worker_metrics.iter().map(|metrics| metrics.typed_rate_parses).sum::<u64>(),
-                            "streaming_rate_parse_fallbacks": compact_worker_metrics.iter().map(|metrics| metrics.streaming_rate_parse_fallbacks).sum::<u64>(),
-                            "local_price_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_hits).sum::<u64>(),
-                            "local_price_atom_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_hits).sum::<u64>(),
-                            "local_provider_set_dedupe_hits": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_hits).sum::<u64>(),
-                            "local_price_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_set_dedupe_resets).sum::<u64>(),
-                            "local_price_atom_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_price_atom_dedupe_resets).sum::<u64>(),
-                            "local_provider_set_dedupe_resets": compact_worker_metrics.iter().map(|metrics| metrics.local_provider_set_dedupe_resets).sum::<u64>(),
-                            "serving_run_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_files).sum::<u64>(),
-                            "serving_run_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_rows).sum::<u64>(),
-                            "serving_run_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_run_bytes).sum::<u64>(),
-                            "serving_code_dictionary_files": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_files).sum::<u64>(),
-                            "serving_code_dictionary_rows": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_rows).sum::<u64>(),
-                            "serving_code_dictionary_bytes": compact_worker_metrics.iter().map(|metrics| metrics.serving_code_dictionary_bytes).sum::<u64>(),
-                            "factor_mode": factor_mode,
-                            "provider_graph_v4_factor_mode": factor_mode,
-                            "provider_graph_v4_reference_only_rates": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_reference_only_rates).sum::<u64>(),
-                            "provider_graph_v4_inline_only_rates": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_inline_only_rates).sum::<u64>(),
-                            "provider_graph_v4_mixed_rates": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_mixed_rates).sum::<u64>(),
-                            "provider_graph_v4_factor_cache_hits": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_factor_cache_hits).sum::<u64>(),
-                            "provider_graph_v4_factor_cache_misses": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_factor_cache_misses).sum::<u64>(),
-                            "provider_graph_v4_factor_cache_resets": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_factor_cache_resets).sum::<u64>(),
-                            "provider_graph_v4_npi_union_attempts": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_npi_union_attempts).sum::<u64>(),
-                            "provider_graph_v4_flat_group_union_attempts": compact_worker_metrics.iter().map(|metrics| metrics.provider_graph_v4_flat_group_union_attempts).sum::<u64>(),
-                            "provider_graph_v4_factor_cache_entries": provider_graph_v4_factor_cache.snapshot().0,
-                            "provider_graph_v4_factor_cache_estimated_bytes": provider_graph_v4_factor_cache.snapshot().1,
-                            "provider_graph_v4_factor_cache_max_bytes": provider_graph_v4_factor_cache.snapshot().2,
-                            "provider_graph_v4_inline_transform_cache_hits": provider_graph_v4_factor_cache.inline_transforms.snapshot().hits,
-                            "provider_graph_v4_inline_transform_cache_misses": provider_graph_v4_factor_cache.inline_transforms.snapshot().misses,
-                            "provider_graph_v4_inline_transform_cache_transforms": provider_graph_v4_factor_cache.inline_transforms.snapshot().transforms,
-                            "provider_graph_v4_inline_transform_cache_evictions": provider_graph_v4_factor_cache.inline_transforms.snapshot().evictions,
-                            "provider_graph_v4_inline_transform_cache_evicted_entries": provider_graph_v4_factor_cache.inline_transforms.snapshot().evicted_entries,
-                            "provider_graph_v4_inline_transform_cache_bypasses": provider_graph_v4_factor_cache.inline_transforms.snapshot().bypasses,
-                            "provider_graph_v4_inline_transform_cache_entries": provider_graph_v4_factor_cache.inline_transforms.snapshot().entries,
-                            "provider_graph_v4_inline_transform_cache_estimated_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().estimated_bytes,
-                            "provider_graph_v4_inline_transform_cache_peak_estimated_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().peak_estimated_bytes,
-                            "provider_graph_v4_inline_transform_cache_max_bytes": provider_graph_v4_factor_cache.inline_transforms.snapshot().max_estimated_bytes,
-                            "workers": compact_worker_metrics.iter().map(CompactWorkerMetrics::payload).collect::<Vec<_>>(),
-                            "top_level_byte_scan_requested": top_level_byte_scan_requested,
-                            "top_level_byte_scan_selected": false,
-                            "top_level_byte_scan_fallback_reason": top_level_byte_scan_fallback_reason,
-                            "provider_reference_order": "before_in_network",
-                            "order_detection_seconds": preflight_metrics.order_detection_seconds,
-                            "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
-                            "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
-                            "scan_compressed_bytes": scan_compressed_bytes,
-                            "scan_compressed_mib_s": compressed_mib_per_second(scan_compressed_bytes, elapsed_seconds),
-                            "elapsed_seconds": elapsed_seconds,
-                        }),
-                        factor_mode,
-                        dedupe.empty_npi_tin_only_normalization_count(),
-                    ),
-                )?;
-                writer.flush()?;
-                json_reader.end_object().map_err(to_io_error)?;
-                json_reader
-                    .consume_trailing_whitespace()
-                    .map_err(to_io_error)?;
-                drop(semantic_progress_reporter.take());
-                emit_progress(
-                    path,
-                    total_bytes,
-                    &compressed_bytes_read,
-                    &object_counts,
-                    started_at,
-                    true,
-                );
-                return Ok(());
-            }
-            _ => {
-                json_reader.skip_value().map_err(to_io_error)?;
-            }
-        }
-    }
-    json_reader.end_object().map_err(to_io_error)?;
-    json_reader
-        .consume_trailing_whitespace()
-        .map_err(to_io_error)?;
-    drop(tx);
-    drop(semantic_progress_reporter.take());
-    emit_progress(
-        path,
-        total_bytes,
-        &compressed_bytes_read,
-        &object_counts,
-        started_at,
-        true,
-    );
-    Ok(())
-}
-
 enum CompactProviderReferenceOrder {
     None,
     BeforeInNetwork,
-    AfterInNetwork(HashMap<ProviderRefKey, ProviderEntry>),
+    AfterInNetwork,
     AfterInNetworkIndexed(CompactIndexedReorder),
     AfterInNetworkPlain(CompactPlainReorder),
 }
@@ -12659,7 +11838,7 @@ impl CompactProviderReferenceOrder {
         match self {
             Self::None => "missing",
             Self::BeforeInNetwork => "before_in_network",
-            Self::AfterInNetwork(_)
+            Self::AfterInNetwork
             | Self::AfterInNetworkIndexed(_)
             | Self::AfterInNetworkPlain(_) => "after_in_network",
         }
@@ -12670,13 +11849,6 @@ impl CompactProviderReferenceOrder {
 struct CompactPreflightMetrics {
     order_detection_seconds: f64,
     order_detection_compressed_bytes: u64,
-}
-
-#[derive(Clone, Copy)]
-struct CompactParallelScanSelection {
-    preflight_metrics: CompactPreflightMetrics,
-    top_level_byte_scan_requested: bool,
-    top_level_byte_scan_fallback_reason: &'static str,
 }
 
 impl CompactPreflightMetrics {
@@ -13182,17 +12354,8 @@ fn compact_provider_reference_order(
                 ));
             }
             "provider_references" => {
-                let mut provider_map = HashMap::new();
-                json_reader.begin_array().map_err(to_io_error)?;
-                while json_reader.has_next().map_err(to_io_error)? {
-                    let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                    let (key, entry, _normalization_count) =
-                        provider_ref_definition_audited(&value, false)?;
-                    insert_provider_definition(&mut provider_map, key, entry)?;
-                }
-                json_reader.end_array().map_err(to_io_error)?;
                 return Ok(finish_provider_reference_preflight(
-                    CompactProviderReferenceOrder::AfterInNetwork(provider_map),
+                    CompactProviderReferenceOrder::AfterInNetwork,
                     started_at,
                     &compressed_bytes_read,
                 ));
@@ -13358,7 +12521,7 @@ fn scan_compact_struson_inner(
     copy_paths: CopyPathConfig,
     source_witness: Arc<SourceWitnessCollector>,
 ) -> io::Result<()> {
-    let factor_mode = configured_v4_factor_mode(&copy_paths)?;
+    configured_v4_factor_mode(&copy_paths)?;
     let snapshot_id = env::var("HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID").unwrap_or_default();
     let plan_id = env::var("HLTHPRT_PTG2_COMPACT_PLAN_ID").unwrap_or_default();
     let plan_month_id = env::var("HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID").unwrap_or_default();
@@ -13366,7 +12529,6 @@ fn scan_compact_struson_inner(
         env::var("HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH").unwrap_or_default();
     let confidence_code = env::var("HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE")
         .unwrap_or_else(|_| "tic_rate_npi_tin".to_string());
-    let total_bytes = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     let compact_copy_rotate_bytes = progress_interval(
         "HLTHPRT_PTG2_COMPACT_SERVING_COPY_ROTATE_BYTES",
         DEFAULT_COMPACT_COPY_ROTATE_BYTES,
@@ -13384,6 +12546,12 @@ fn scan_compact_struson_inner(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "strict V3 source attestation requires worker-side raw rate parsing",
+        ));
+    }
+    if !copy_paths.has_file_paths() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "strict V3 source attestation requires configured file outputs",
         ));
     }
     let top_level_byte_scan_requested = env_bool(
@@ -13412,15 +12580,12 @@ fn scan_compact_struson_inner(
         ),
     };
     let gzip_input = is_gzip(path)?;
-    let use_indexed_reorder = copy_paths.has_file_paths()
-        && top_level_byte_scan_requested
+    let use_indexed_reorder = top_level_byte_scan_requested
         && provider_refs_in_workers_requested
         && rapidgzip_config.enabled
         && gzip_input;
-    let use_plain_reorder = copy_paths.has_file_paths()
-        && top_level_byte_scan_requested
-        && provider_refs_in_workers_requested
-        && !gzip_input;
+    let use_plain_reorder =
+        top_level_byte_scan_requested && provider_refs_in_workers_requested && !gzip_input;
     let indexed_range_producers_requested = if use_indexed_reorder {
         indexed_range_producers_requested()?
     } else {
@@ -13455,435 +12620,39 @@ fn scan_compact_struson_inner(
             ),
         ));
     }
-    if copy_paths.has_file_paths() && parallel_top_level_order_supported {
-        if top_level_byte_scan_requested && provider_refs_in_workers_requested {
-            let (indexed_reorder, plain_reorder) = match provider_reference_preflight.order {
-                CompactProviderReferenceOrder::None
-                | CompactProviderReferenceOrder::BeforeInNetwork => (None, None),
-                CompactProviderReferenceOrder::AfterInNetworkIndexed(indexed_reorder) => {
-                    (Some(indexed_reorder), None)
-                }
-                CompactProviderReferenceOrder::AfterInNetworkPlain(plain_reorder) => {
-                    (None, Some(plain_reorder))
-                }
-                _ => unreachable!("parallel top-level order was checked above"),
-            };
-            return scan_compact_byte_top_level_parallel(
-                path,
-                CompactContext {
-                    snapshot_id,
-                    plan_id,
-                    plan_month_id,
-                    source_trace_set_hash,
-                    confidence_code,
-                    source_witness: Arc::clone(&source_witness),
-                },
-                rust_worker_count,
-                rust_queue_size,
-                copy_paths,
-                compact_copy_rotate_bytes,
-                CompactByteScanOptions {
-                    preflight_metrics: provider_reference_preflight.metrics,
-                    rapidgzip_config,
-                    indexed_reorder,
-                    plain_reorder,
-                },
-            );
-        }
-        let byte_scan_fallback_reason = if top_level_byte_scan_requested {
-            "provider_ref_workers_disabled"
-        } else {
-            "disabled"
-        };
-        return scan_compact_struson_parallel(
-            path,
-            CompactContext {
-                snapshot_id,
-                plan_id,
-                plan_month_id,
-                source_trace_set_hash,
-                confidence_code,
-                source_witness: Arc::clone(&source_witness),
-            },
-            rust_worker_count,
-            rust_queue_size,
-            copy_paths,
-            compact_copy_rotate_bytes,
-            CompactParallelScanSelection {
-                preflight_metrics: provider_reference_preflight.metrics,
-                top_level_byte_scan_requested,
-                top_level_byte_scan_fallback_reason: byte_scan_fallback_reason,
-            },
-        );
-    }
-    if factor_mode {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "V4 provider factor mode requires the parallel compact scanner",
-        ));
-    }
-    let top_level_byte_scan_fallback_reason = if !copy_paths.has_file_paths() {
-        "no_file_outputs"
-    } else {
-        match &provider_reference_preflight.order {
-            CompactProviderReferenceOrder::None => "provider_references_missing",
-            CompactProviderReferenceOrder::AfterInNetwork(_) => {
-                "provider_references_after_in_network"
-            }
-            CompactProviderReferenceOrder::AfterInNetworkIndexed(_) => {
-                "indexed_reorder_unavailable"
-            }
-            CompactProviderReferenceOrder::AfterInNetworkPlain(_) => {
-                "plain_range_reorder_unavailable"
-            }
-            CompactProviderReferenceOrder::BeforeInNetwork => "parallel_path_unavailable",
-        }
-    };
-    let preflight_metrics = provider_reference_preflight.metrics;
-    let provider_reference_order = provider_reference_preflight.order;
-    let compressed_bytes_read = Arc::new(AtomicU64::new(0));
-    let reader = open_json_reader(path, Arc::clone(&compressed_bytes_read))?;
-    let mut json_reader = JsonStreamReader::new(reader);
-    let stdout = io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
-    let mut compact_copy_writer: Option<CompactCopySink> = match copy_paths.compact.as_ref() {
-        Some(copy_path) => Some(CompactCopySink::new_file(
-            copy_path.clone(),
-            compact_copy_rotate_bytes,
-        )?),
-        None => None,
-    };
-    let serving_run_directory =
-        copy_paths
-            .v3_serving_run_directory
-            .as_deref()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "strict V3 scan is missing its serving-run directory",
-                )
-            })?;
-    let coverage_scope_id = copy_paths.v3_coverage_scope_id.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "strict V3 scan is missing its coverage-scope identity",
-        )
-    })?;
-    let mut manifest_serving_copy_writer = Some(V3ServingRunSink::new(
-        serving_run_directory,
-        "serial",
-        coverage_scope_id,
-    )?);
-    let mut dictionary_copy_sinks =
-        DictionaryCopySinks::from_paths(&copy_paths, compact_copy_rotate_bytes)?;
-    let mut manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
-        Some(ManifestSidecarCollector::for_import(&copy_paths)?)
-    } else {
-        None
-    };
-    let progress_bytes_interval = progress_interval(
-        "HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES",
-        DEFAULT_PROGRESS_BYTES,
-    );
-    let mut next_progress_bytes = progress_bytes_interval;
-    let progress_objects_interval = progress_interval(
-        "HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS",
-        DEFAULT_PROGRESS_OBJECTS,
-    );
-    let mut next_progress_objects = progress_objects_interval;
-    let mut object_counts: HashMap<String, u64> = HashMap::new();
-    let started_at = Instant::now();
-    let mut provider_capture_seconds = 0.0f64;
-    let mut provider_capture_compressed_bytes = 0u64;
-    let mut provider_parse_micros = 0u128;
-    let mut provider_transform_micros = 0u128;
-    let mut provider_write_micros = 0u128;
-    let mut in_network_seconds = 0.0f64;
-    let mut in_network_compressed_bytes = 0u64;
-    let mut sidecar_merge_write_seconds = 0.0f64;
-    let provider_references_preloaded = matches!(
-        &provider_reference_order,
-        CompactProviderReferenceOrder::AfterInNetwork(_)
-    );
-    let mut provider_map = match provider_reference_order {
-        CompactProviderReferenceOrder::AfterInNetwork(provider_map) => provider_map,
+    let (indexed_reorder, plain_reorder) = match provider_reference_preflight.order {
         CompactProviderReferenceOrder::None | CompactProviderReferenceOrder::BeforeInNetwork => {
-            HashMap::new()
+            (None, None)
         }
-        CompactProviderReferenceOrder::AfterInNetworkIndexed(_) => {
-            return Err(io::Error::other(
-                "indexed provider-reference reorder did not enter the parallel scanner",
-            ));
+        CompactProviderReferenceOrder::AfterInNetworkIndexed(indexed_reorder) => {
+            (Some(indexed_reorder), None)
         }
-        CompactProviderReferenceOrder::AfterInNetworkPlain(_) => {
-            return Err(io::Error::other(
-                "plain provider-reference reorder did not enter the parallel scanner",
-            ));
+        CompactProviderReferenceOrder::AfterInNetworkPlain(plain_reorder) => {
+            (None, Some(plain_reorder))
         }
+        _ => unreachable!("parallel top-level order was checked above"),
     };
-    let mut emitted_price_code_sets: HashSet<String> = HashSet::new();
-    let mut emitted_price_atoms: HashSet<GlobalId128> = HashSet::new();
-    let mut emitted_price_sets: HashSet<GlobalId128> = HashSet::new();
-    let mut emitted_price_set_entries: HashSet<(GlobalId128, GlobalId128)> = HashSet::new();
-    let mut emitted_provider_sets: HashSet<String> = HashSet::new();
-    let mut emitted_provider_set_components: HashSet<(String, i64)> = HashSet::new();
-    let mut emitted_provider_set_entries: HashSet<(String, i64)> = HashSet::new();
-    let mut emitted_provider_entry_components: HashSet<(i64, i64)> = HashSet::new();
-    let mut emitted_procedures: HashSet<String> = HashSet::new();
-    let mut emitted_provider_group_members: HashSet<(i64, i64)> = HashSet::new();
-    let mut provider_identifier_quarantine = ProviderIdentifierQuarantine::default();
-    let mut manifest_global_id_cache = ManifestGlobalIdCache::default();
-    let negotiated_rate_chunk_size = split_interval(
-        "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
-        DEFAULT_SPLIT_NEGOTIATED_RATES,
-    );
-
-    emit_json_record(
-        &mut writer,
-        "scanner_config",
-        &json!({
-            "worker_count": 1,
-            "requested_worker_count": rust_worker_count,
-            "split_negotiated_rates": negotiated_rate_chunk_size,
-            "parse_in_workers": false,
-            "local_dedupe_entries_per_kind_per_worker": 0,
-            "top_level_byte_scan_requested": top_level_byte_scan_requested,
-            "top_level_byte_scan_selected": false,
-            "top_level_byte_scan_fallback_reason": top_level_byte_scan_fallback_reason,
-            "execution_mode": "serial_struson",
-            "provider_reference_order": provider_reference_order_label,
-            "order_detection_seconds": preflight_metrics.order_detection_seconds,
-            "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
-            "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
-            "raw_buffer_recycling": false,
-            "scanner_metric_contract_version": 2,
-            "snapshot_arch": REQUIRED_SNAPSHOT_ARCH,
-            "storage_generation": REQUIRED_STORAGE_GENERATION,
-            "serving_row_semantics": "source_multiset_v1",
-            "group_negotiated_rate_chunks": false,
-            "factor_mode": factor_mode,
-            "provider_graph_v4_factor_mode": factor_mode,
-            "provider_npi_sidecar": copy_paths.manifest_provider_npi_sidecar.is_some(),
-            "price_forward_sidecar": copy_paths.manifest_price_forward_sidecar.is_some(),
-            "serving_run_format": SERVING_RUN_FORMAT,
-            "serving_run_version": SERVING_RUN_FORMAT_VERSION,
-            "serving_run_partition_count": env_usize("HLTHPRT_PTG2_V3_SERVING_RUN_PARTITIONS", DEFAULT_V3_SERVING_RUN_PARTITIONS),
-            "serving_run_partition_buffer_bytes": env_usize("HLTHPRT_PTG2_V3_SERVING_RUN_PARTITION_BUFFER_BYTES", DEFAULT_V3_SERVING_RUN_PARTITION_BUFFER_BYTES),
-            "panic_strategy": "unwind",
-        }),
-    )?;
-    writer.flush()?;
-
-    json_reader.begin_object().map_err(to_io_error)?;
-    while json_reader.has_next().map_err(to_io_error)? {
-        let name = json_reader.next_name_owned().map_err(to_io_error)?;
-        match name.as_str() {
-            "provider_references" => {
-                let provider_capture_started_at = Instant::now();
-                let provider_compressed_started_at = compressed_bytes_read.load(Ordering::Relaxed);
-                json_reader.begin_array().map_err(to_io_error)?;
-                while json_reader.has_next().map_err(to_io_error)? {
-                    let parse_started_at = Instant::now();
-                    let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                    provider_parse_micros = provider_parse_micros
-                        .saturating_add(parse_started_at.elapsed().as_micros());
-                    let transform_started_at = Instant::now();
-                    let (key, entry, _normalization_count) =
-                        provider_ref_definition_audited(&value, false)?;
-                    provider_transform_micros = provider_transform_micros
-                        .saturating_add(transform_started_at.elapsed().as_micros());
-                    if let Some(sidecars) = manifest_sidecars.as_mut() {
-                        sidecars.record_provider_component(
-                            entry.entry_hash,
-                            &entry.provider_group_hashes,
-                        )?;
-                    }
-                    let insert_started_at = Instant::now();
-                    if provider_references_preloaded {
-                        validate_preloaded_provider_definition(&provider_map, &key, &entry)?;
-                    } else {
-                        insert_provider_definition(&mut provider_map, key, entry)?;
-                    }
-                    provider_transform_micros = provider_transform_micros
-                        .saturating_add(insert_started_at.elapsed().as_micros());
-                    let write_started_at = Instant::now();
-                    dictionary_copy_sinks.write_provider_group_members(
-                        &value,
-                        &mut emitted_provider_group_members,
-                    )?;
-                    provider_write_micros = provider_write_micros
-                        .saturating_add(write_started_at.elapsed().as_micros());
-                    *object_counts
-                        .entry("provider_references".to_string())
-                        .or_insert(0) += 1;
-                }
-                json_reader.end_array().map_err(to_io_error)?;
-                provider_capture_seconds += provider_capture_started_at.elapsed().as_secs_f64();
-                provider_capture_compressed_bytes = provider_capture_compressed_bytes
-                    .saturating_add(
-                        compressed_bytes_read
-                            .load(Ordering::Relaxed)
-                            .saturating_sub(provider_compressed_started_at),
-                    );
-            }
-            "in_network" => {
-                let in_network_started_at = Instant::now();
-                let in_network_compressed_started_at =
-                    compressed_bytes_read.load(Ordering::Relaxed);
-                json_reader.begin_array().map_err(to_io_error)?;
-                while json_reader.has_next().map_err(to_io_error)? {
-                    let mut stream_state = InNetworkStreamState {
-                        writer: &mut writer,
-                        compact_copy_writer: &mut compact_copy_writer,
-                        manifest_serving_copy_writer: &mut manifest_serving_copy_writer,
-                        dictionary_copy_sinks: &mut dictionary_copy_sinks,
-                        manifest_sidecars: manifest_sidecars.as_mut(),
-                        record_price_forward_sidecar: copy_paths
-                            .manifest_price_forward_sidecar
-                            .is_some(),
-                        suppress_legacy_row_output: copy_paths.manifest_only,
-                        provider_map: &provider_map,
-                        dedupe: LocalCompactDedupe {
-                            price_code_sets: &mut emitted_price_code_sets,
-                            price_atoms: &mut emitted_price_atoms,
-                            price_sets: &mut emitted_price_sets,
-                            price_set_entries: &mut emitted_price_set_entries,
-                            provider_sets: &mut emitted_provider_sets,
-                            provider_set_components: &mut emitted_provider_set_components,
-                            provider_set_entries: &mut emitted_provider_set_entries,
-                            provider_entry_components: &mut emitted_provider_entry_components,
-                            procedures: &mut emitted_procedures,
-                            provider_group_members: &mut emitted_provider_group_members,
-                            provider_identifier_quarantine: &mut provider_identifier_quarantine,
-                        },
-                        manifest_global_id_cache: &mut manifest_global_id_cache,
-                        context: CompactContext {
-                            snapshot_id: snapshot_id.clone(),
-                            plan_id: plan_id.clone(),
-                            plan_month_id: plan_month_id.clone(),
-                            source_trace_set_hash: source_trace_set_hash.clone(),
-                            confidence_code: confidence_code.clone(),
-                            source_witness: Arc::clone(&source_witness),
-                        },
-                        chunk_size: negotiated_rate_chunk_size,
-                    };
-                    let rate_count =
-                        process_in_network_struson(&mut json_reader, &mut stream_state)?;
-                    *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
-                    *object_counts
-                        .entry("negotiated_rates".to_string())
-                        .or_insert(0) += rate_count;
-                    let bytes = compressed_bytes_read.load(Ordering::Relaxed);
-                    let objects: u64 = object_counts.values().sum();
-                    if progress_bytes_interval > 0 && bytes >= next_progress_bytes {
-                        emit_progress(
-                            path,
-                            total_bytes,
-                            &compressed_bytes_read,
-                            &object_counts,
-                            started_at,
-                            false,
-                        );
-                        while bytes >= next_progress_bytes {
-                            next_progress_bytes += progress_bytes_interval;
-                        }
-                    } else if progress_objects_interval > 0 && objects >= next_progress_objects {
-                        emit_progress(
-                            path,
-                            total_bytes,
-                            &compressed_bytes_read,
-                            &object_counts,
-                            started_at,
-                            false,
-                        );
-                        while objects >= next_progress_objects {
-                            next_progress_objects += progress_objects_interval;
-                        }
-                    }
-                }
-                json_reader.end_array().map_err(to_io_error)?;
-                in_network_seconds += in_network_started_at.elapsed().as_secs_f64();
-                in_network_compressed_bytes = in_network_compressed_bytes.saturating_add(
-                    compressed_bytes_read
-                        .load(Ordering::Relaxed)
-                        .saturating_sub(in_network_compressed_started_at),
-                );
-            }
-            _ => {
-                json_reader.skip_value().map_err(to_io_error)?;
-            }
-        }
-    }
-    json_reader.end_object().map_err(to_io_error)?;
-    json_reader
-        .consume_trailing_whitespace()
-        .map_err(to_io_error)?;
-    if let Some(copy_writer) = compact_copy_writer.take() {
-        copy_writer.finish(&mut writer)?;
-    }
-    let serving_run_metrics = if let Some(copy_writer) = manifest_serving_copy_writer.take() {
-        copy_writer.finish(&mut writer)?
-    } else {
-        ServingRunMetrics::default()
-    };
-    dictionary_copy_sinks.finish(&mut writer)?;
-    let sidecar_started_at = Instant::now();
-    emit_configured_manifest_sidecars(&mut writer, &copy_paths, manifest_sidecars.as_mut(), None)?;
-    sidecar_merge_write_seconds += sidecar_started_at.elapsed().as_secs_f64();
-    let elapsed_seconds = started_at.elapsed().as_secs_f64();
-    let scan_compressed_bytes = compressed_bytes_read.load(Ordering::Relaxed);
-    emit_json_record(
-        &mut writer,
-        "scanner_summary",
-        &json!({
-            "provider_identifier_quarantine": provider_identifier_quarantine_payload(
-                &provider_map,
-                provider_identifier_quarantine,
-            )?,
-            "worker_count": 1,
-            "requested_worker_count": rust_worker_count,
-            "execution_mode": "serial_struson",
-            "factor_mode": factor_mode,
-            "provider_graph_v4_factor_mode": factor_mode,
-            "provider_reference_order": provider_reference_order_label,
-            "top_level_byte_scan_selected": false,
-            "top_level_byte_scan_fallback_reason": top_level_byte_scan_fallback_reason,
-            "order_detection_seconds": preflight_metrics.order_detection_seconds,
-            "order_detection_compressed_bytes": preflight_metrics.order_detection_compressed_bytes,
-            "order_detection_compressed_mib_s": preflight_metrics.compressed_mib_s(),
-            "provider_capture_seconds": provider_capture_seconds,
-            "provider_capture_compressed_bytes": provider_capture_compressed_bytes,
-            "provider_capture_compressed_mib_s": compressed_mib_per_second(provider_capture_compressed_bytes, provider_capture_seconds),
-            "provider_parse_seconds": seconds_from_micros(provider_parse_micros),
-            "provider_transform_seconds": seconds_from_micros(provider_transform_micros),
-            "provider_write_seconds": seconds_from_micros(provider_write_micros),
-            "provider_map_merge_seconds": 0.0,
-            "in_network_enqueue_seconds": in_network_seconds,
-            "in_network_compressed_bytes": in_network_compressed_bytes,
-            "in_network_compressed_mib_s": compressed_mib_per_second(in_network_compressed_bytes, in_network_seconds),
-            "sidecar_merge_write_seconds": sidecar_merge_write_seconds,
-            "serving_run_files": serving_run_metrics.file_count,
-            "serving_run_rows": serving_run_metrics.row_count,
-            "serving_run_bytes": serving_run_metrics.bytes,
-            "serving_code_dictionary_files": serving_run_metrics.code_dictionary_file_count,
-            "serving_code_dictionary_rows": serving_run_metrics.code_dictionary_row_count,
-            "serving_code_dictionary_bytes": serving_run_metrics.code_dictionary_bytes,
-            "workers": Vec::<Value>::new(),
-            "scan_compressed_bytes": scan_compressed_bytes,
-            "scan_compressed_mib_s": compressed_mib_per_second(scan_compressed_bytes, elapsed_seconds),
-            "elapsed_seconds": elapsed_seconds,
-        }),
-    )?;
-    writer.flush()?;
-    emit_progress(
+    scan_compact_byte_top_level_parallel(
         path,
-        total_bytes,
-        &compressed_bytes_read,
-        &object_counts,
-        started_at,
-        true,
-    );
-    Ok(())
+        CompactContext {
+            snapshot_id,
+            plan_id,
+            plan_month_id,
+            source_trace_set_hash,
+            confidence_code,
+            source_witness: Arc::clone(&source_witness),
+        },
+        rust_worker_count,
+        rust_queue_size,
+        copy_paths,
+        compact_copy_rotate_bytes,
+        CompactByteScanOptions {
+            preflight_metrics: provider_reference_preflight.metrics,
+            rapidgzip_config,
+            indexed_reorder,
+            plain_reorder,
+        },
+    )
 }
 
 fn scan_compact(path: &Path) -> io::Result<()> {
@@ -24861,33 +23630,96 @@ mod tests {
             indexed_error.to_string(),
             "indexed scans require rapidgzip and gzip input"
         );
+    }
 
-        let context = CompactContext {
-            snapshot_id: "snapshot".to_owned(),
-            plan_id: "plan".to_owned(),
-            plan_month_id: "month".to_owned(),
-            source_trace_set_hash: "trace".to_owned(),
-            confidence_code: "exact".to_owned(),
-            source_witness: Arc::new(SourceWitnessCollector::new(&"00".repeat(32)).unwrap()),
-        };
-        let parallel_error = scan_compact_struson_parallel(
-            &missing,
-            context,
-            1,
-            1,
+    #[test]
+    fn strict_compact_scan_rejects_disabled_parallel_routes() {
+        let _guard = scanner_env_lock().lock().unwrap();
+        let _factor_mode = TestEnvVar::remove(PROVIDER_GRAPH_V4_ENV);
+        let temporary = tempfile::tempdir().unwrap();
+        let input_path = temporary.path().join("input.json");
+        std::fs::write(
+            &input_path,
+            br#"{"provider_references":[],"in_network":[]}"#,
+        )
+        .unwrap();
+
+        for (name, parse_in_workers, top_level_scan, provider_ref_workers, expected) in [
+            (
+                "inline-rate-parsing",
+                "false",
+                "true",
+                "true",
+                "strict V3 source attestation requires worker-side raw rate parsing",
+            ),
+            (
+                "top-level-scan-disabled",
+                "true",
+                "false",
+                "true",
+                "strict V3 source attestation requires the parallel top-level byte scanner; provider_reference_order=before_in_network",
+            ),
+            (
+                "provider-ref-workers-disabled",
+                "true",
+                "true",
+                "false",
+                "strict V3 source attestation requires the parallel top-level byte scanner; provider_reference_order=before_in_network",
+            ),
+        ] {
+            let serving_run_directory = temporary.path().join(name);
+            let _strict_env = strict_scan_env(&serving_run_directory);
+            let _route_env = [
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", parse_in_workers),
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN", top_level_scan),
+                TestEnvVar::set(
+                    "HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS",
+                    provider_ref_workers,
+                ),
+            ];
+
+            let error = scan_compact_struson(&input_path).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{name}");
+            assert_eq!(error.to_string(), expected, "{name}");
+        }
+
+        let reversed_input_path = temporary.path().join("reversed-input.json.gz");
+        let mut reversed_encoder = flate2::write::GzEncoder::new(
+            File::create(&reversed_input_path).unwrap(),
+            Compression::default(),
+        );
+        reversed_encoder
+            .write_all(br#"{"in_network":[],"provider_references":[]}"#)
+            .unwrap();
+        reversed_encoder.finish().unwrap();
+        let reversed_serving_run_directory = temporary.path().join("reversed-order-disabled");
+        let _reversed_strict_env = strict_scan_env(&reversed_serving_run_directory);
+        let _reversed_route_env = [
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", "true"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN", "true"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", "true"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_RAPIDGZIP_ENABLED", "false"),
+        ];
+        let error = scan_compact_struson(&reversed_input_path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "strict V3 source attestation requires the parallel top-level byte scanner; provider_reference_order=after_in_network"
+        );
+
+        let _parse_in_workers = TestEnvVar::set("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", "true");
+        let error = scan_compact_struson_inner(
+            &input_path,
             CopyPathConfig::default(),
-            1,
-            CompactParallelScanSelection {
-                preflight_metrics: CompactPreflightMetrics {
-                    order_detection_seconds: 0.0,
-                    order_detection_compressed_bytes: 0,
-                },
-                top_level_byte_scan_requested: false,
-                top_level_byte_scan_fallback_reason: "test",
-            },
+            Arc::new(SourceWitnessCollector::new(&"00".repeat(32)).unwrap()),
         )
         .unwrap_err();
-        assert_eq!(parallel_error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "strict V3 source attestation requires configured file outputs"
+        );
     }
 
     #[test]
@@ -25284,40 +24116,6 @@ mod tests {
             "{{\"in_network\":{in_network},\"provider_references\":{provider_references}}}"
         );
         std::fs::write(path, payload).unwrap();
-    }
-
-    fn write_forward_provider_reference_fixture(path: &Path) {
-        std::fs::write(
-            path,
-            r#"{
-                "provider_references":[{
-                    "provider_group_id":7,
-                    "provider_groups":[{
-                        "tin":{"type":"ein","value":"123456789"},
-                        "npi":[1234567890]
-                    }],
-                    "network_name":["Provider Network"]
-                }],
-                "in_network":[{
-                    "billing_code_type":"CPT",
-                    "billing_code":"99213",
-                    "negotiation_arrangement":"ffs",
-                    "name":"Office visit",
-                    "negotiated_rates":[{
-                        "provider_references":[7],
-                        "network_name":"Rate Network",
-                        "negotiated_prices":[{
-                            "negotiated_type":"negotiated",
-                            "negotiated_rate":123.45,
-                            "expiration_date":"2026-12-31",
-                            "service_code":["11"],
-                            "billing_class":"professional"
-                        }]
-                    }]
-                }]
-            }"#,
-        )
-        .unwrap();
     }
 
     fn read_worker_copy_text(base_path: &Path) -> io::Result<String> {
@@ -28716,79 +27514,14 @@ mod tests {
     }
 
     #[test]
-    fn parallel_struson_scanner_fails_closed_after_worker_and_inline_parsing() {
+    fn scanner_utility_boundaries_are_explicit() {
         let _env_lock = scanner_env_lock().lock().unwrap();
-        let temporary = tempfile::tempdir().unwrap();
-        let input_path = temporary.path().join("input.json");
-        write_forward_provider_reference_fixture(&input_path);
-        let _factor_mode = TestEnvVar::remove(PROVIDER_GRAPH_V4_ENV);
-
-        for (name, parse_in_workers) in [("worker-parsed", "true"), ("inline-parsed", "false")] {
-            let serving_run_directory = temporary.path().join(name);
-            std::fs::create_dir(&serving_run_directory).unwrap();
-            let _strict_env = strict_scan_env(&serving_run_directory);
-            let _scan_env = [
-                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", "true"),
-                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", "1"),
-                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE", "2"),
-                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS", "1"),
-                TestEnvVar::set("HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES", "256"),
-                TestEnvVar::set("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", parse_in_workers),
-                TestEnvVar::set("HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES", "1"),
-                TestEnvVar::set("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES", "256"),
-                TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "1"),
-                TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "1"),
-            ];
-            let copy_paths = CopyPathConfig::from_env().unwrap();
-            let context = test_compact_context();
-            context.source_witness.configure_provider_spools(1).unwrap();
-            context.source_witness.configure_rate_spools(2).unwrap();
-            let result = scan_compact_struson_parallel(
-                &input_path,
-                context,
-                2,
-                2,
-                copy_paths,
-                1_024,
-                CompactParallelScanSelection {
-                    preflight_metrics: CompactPreflightMetrics {
-                        order_detection_seconds: 0.001,
-                        order_detection_compressed_bytes: 1,
-                    },
-                    top_level_byte_scan_requested: false,
-                    top_level_byte_scan_fallback_reason: "coverage",
-                },
-            );
-            if parse_in_workers == "true" {
-                let error = result.unwrap_err();
-                let message = error.to_string();
-                assert!(
-                    message.contains("provider")
-                        && (message.contains("source spools are not sealed")
-                            || message.contains("source occurrence is missing linked")),
-                    "{name} returned an unexpected failure: {error}",
-                );
-            } else {
-                result.unwrap();
-                assert!(
-                    std::fs::read_dir(&serving_run_directory)
-                        .unwrap()
-                        .filter_map(Result::ok)
-                        .any(|entry| entry.metadata().unwrap().len() > 0),
-                    "{name} did not emit serving output",
-                );
-            }
-        }
-
+        let input_path = Path::new("/tmp/scanner-utility-boundaries.json");
         let _progress_env = [
             TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES", "1"),
             TestEnvVar::set("HLTHPRT_PTG2_SCANNER_PROGRESS_OBJECTS", "1"),
+            TestEnvVar::set("HLTHPRT_PTG2_RUST_INDEXED_RANGE_PRODUCERS", "invalid"),
         ];
-        scan(
-            &input_path,
-            &["provider_references".to_owned(), "in_network".to_owned()],
-        )
-        .unwrap();
 
         let integer_bytes = [0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut integer_cursor = Cursor::new(&integer_bytes);
@@ -28809,12 +27542,16 @@ mod tests {
             to_io_error(io::Error::other("coverage")).kind(),
             io::ErrorKind::InvalidData,
         );
+        assert_eq!(
+            indexed_range_producers_requested().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+        );
         let mut array_reader = BufferedJsonByteReader::new(&b"]"[..]);
         assert!(!next_array_value(&mut array_reader, &mut true).unwrap());
         let mut wrapped_reader =
             WrappedIndexedRangeReader::new(Box::new(Cursor::new(b"[]".to_vec())), 2, b"", b"");
         drain_reader_to_eof(&mut wrapped_reader).unwrap();
-        emit_plain_reorder_progress(&input_path, 2, 1, 1, Instant::now(), false);
+        emit_plain_reorder_progress(input_path, 2, 1, 1, Instant::now(), false);
     }
 
     #[test]
