@@ -204,7 +204,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260731190000_tiger_zcta5_zip_index"
+        "20260804100000_ptg2_raw_tin_vault_foundation"
     ]
 
 
