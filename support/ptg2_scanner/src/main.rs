@@ -63,7 +63,14 @@ use ptg2_scanner::shared_graph::{
 };
 #[cfg(test)]
 use ptg2_scanner::tax_identity::TinTokenPolicy;
-use ptg2_scanner::tax_identity::{load_tin_token_policy_from_env, TaxIdentityState};
+use ptg2_scanner::tax_identity::{
+    load_tin_token_policy_from_env, TaxIdentityObservation, TaxIdentityObservationV2,
+    TaxIdentityState, TaxIdentityStateV2,
+};
+use ptg2_scanner::tax_identity_sidecar_v2::{
+    TaxIdentitySidecarV2Header, TaxIdentitySidecarV2Record, TAX_IDENTITY_SIDECAR_V2_FORMAT,
+    TAX_IDENTITY_SIDECAR_V2_FORMAT_VERSION, TAX_IDENTITY_SIDECAR_V2_RECORD_BYTES,
+};
 use ptg2_scanner::uhc_retained::run_uhc_retain_cli;
 use ptg2_scanner::v3_dense::{DenseIdentityMap, DenseIdentityValue};
 use ptg2_scanner::v3_runs::{
@@ -98,7 +105,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, MutexGuard,
@@ -125,6 +132,8 @@ const V3_RAW_SOURCE_SHA256_ENV: &str = "HLTHPRT_PTG2_RAW_SOURCE_SHA256";
 const GROUP_NEGOTIATED_RATE_CHUNKS_ENV: &str = "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS";
 const RATE_SCHEDULE_OBSERVE_ENV: &str = "HLTHPRT_PTG2_RATE_SCHEDULE_OBSERVE";
 const PROVIDER_GRAPH_V4_ENV: &str = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV: &str =
+    "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH";
 
 thread_local! {
     static SIDECAR_LOCK_WAIT_MICROS: Cell<u128> = const { Cell::new(0) };
@@ -719,6 +728,7 @@ struct CopyPathConfig {
     manifest_provider_set_component_sidecar: Option<String>,
     manifest_provider_component_group_sidecar: Option<String>,
     manifest_provider_group_tax_identity_sidecar: Option<String>,
+    manifest_provider_group_tax_identity_v2_sidecar: Option<String>,
     manifest_provider_npi_sidecar: Option<String>,
     manifest_price_forward_sidecar: Option<String>,
     manifest_price_atom: Option<String>,
@@ -739,11 +749,167 @@ struct CopyPathConfig {
     manifest_only: bool,
 }
 
+// This admission check is intentionally lexical. Symlink and hard-link alias
+// fencing belongs to later run-scoped bundle admission on opened relations.
+fn normalized_absolute_lexical_path(path: &str) -> io::Result<PathBuf> {
+    let absolute = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|tail| matches!(tail, Component::Normal(_)))
+                {
+                    normalized.pop();
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn configured_output_paths(paths: &CopyPathConfig) -> io::Result<Vec<(&'static str, PathBuf)>> {
+    let configured = [
+        ("compact", paths.compact.as_deref()),
+        ("manifest_serving", paths.manifest_serving.as_deref()),
+        (
+            "manifest_lean_serving",
+            paths.manifest_lean_serving.as_deref(),
+        ),
+        (
+            "manifest_provider_forward_sidecar",
+            paths.manifest_provider_forward_sidecar.as_deref(),
+        ),
+        (
+            "manifest_provider_inverted_sidecar",
+            paths.manifest_provider_inverted_sidecar.as_deref(),
+        ),
+        (
+            "manifest_provider_set_component_sidecar",
+            paths.manifest_provider_set_component_sidecar.as_deref(),
+        ),
+        (
+            "manifest_provider_component_group_sidecar",
+            paths.manifest_provider_component_group_sidecar.as_deref(),
+        ),
+        (
+            "manifest_provider_group_tax_identity_sidecar",
+            paths
+                .manifest_provider_group_tax_identity_sidecar
+                .as_deref(),
+        ),
+        (
+            "manifest_provider_group_tax_identity_v2_sidecar",
+            paths
+                .manifest_provider_group_tax_identity_v2_sidecar
+                .as_deref(),
+        ),
+        (
+            "manifest_provider_npi_sidecar",
+            paths.manifest_provider_npi_sidecar.as_deref(),
+        ),
+        (
+            "manifest_price_forward_sidecar",
+            paths.manifest_price_forward_sidecar.as_deref(),
+        ),
+        ("manifest_price_atom", paths.manifest_price_atom.as_deref()),
+        (
+            "manifest_price_set_atom",
+            paths.manifest_price_set_atom.as_deref(),
+        ),
+        (
+            "manifest_price_set_summary",
+            paths.manifest_price_set_summary.as_deref(),
+        ),
+        (
+            "manifest_provider_group_member",
+            paths.manifest_provider_group_member.as_deref(),
+        ),
+        ("manifest_code_count", paths.manifest_code_count.as_deref()),
+        (
+            "manifest_provider_set_dictionary",
+            paths.manifest_provider_set_dictionary.as_deref(),
+        ),
+        ("procedure", paths.procedure.as_deref()),
+        ("price_code_set", paths.price_code_set.as_deref()),
+        ("price_atom", paths.price_atom.as_deref()),
+        ("price_set_entry", paths.price_set_entry.as_deref()),
+        ("provider_set", paths.provider_set.as_deref()),
+        (
+            "provider_set_component",
+            paths.provider_set_component.as_deref(),
+        ),
+        ("provider_set_entry", paths.provider_set_entry.as_deref()),
+        (
+            "provider_entry_component",
+            paths.provider_entry_component.as_deref(),
+        ),
+        (
+            "provider_group_member",
+            paths.provider_group_member.as_deref(),
+        ),
+    ];
+    configured
+        .into_iter()
+        .filter_map(|(name, path)| path.map(|path| (name, path)))
+        .map(|(name, path)| Ok((name, normalized_absolute_lexical_path(path)?)))
+        .collect()
+}
+
+fn validate_configured_output_paths_for_tax_identity_v2(paths: &CopyPathConfig) -> io::Result<()> {
+    let mut outputs = configured_output_paths(paths)?;
+    for (name, path) in [
+        (
+            "manifest_provider_group_tax_identity_sidecar.building",
+            paths
+                .manifest_provider_group_tax_identity_sidecar
+                .as_deref(),
+        ),
+        (
+            "manifest_provider_group_tax_identity_v2_sidecar.building",
+            paths
+                .manifest_provider_group_tax_identity_v2_sidecar
+                .as_deref(),
+        ),
+    ] {
+        if let Some(path) = path {
+            outputs.push((
+                name,
+                normalized_absolute_lexical_path(&format!("{path}.building"))?,
+            ));
+        }
+    }
+    for (index, (left_name, left_path)) in outputs.iter().enumerate() {
+        for (right_name, right_path) in &outputs[index + 1..] {
+            if left_path == right_path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("configured output paths for {left_name} and {right_name} must differ"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn configured_v4_factor_mode(paths: &CopyPathConfig) -> io::Result<bool> {
     let enabled = env_bool(PROVIDER_GRAPH_V4_ENV, false);
     let has_set_component_path = paths.manifest_provider_set_component_sidecar.is_some();
     let has_component_group_path = paths.manifest_provider_component_group_sidecar.is_some();
     let has_tax_identity_path = paths.manifest_provider_group_tax_identity_sidecar.is_some();
+    let has_tax_identity_v2_path = paths
+        .manifest_provider_group_tax_identity_v2_sidecar
+        .is_some();
     if has_set_component_path != has_component_group_path {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -770,6 +936,21 @@ fn configured_v4_factor_mode(paths: &CopyPathConfig) -> io::Result<bool> {
             "provider-group tax identity output requires V4 provider factor mode",
         ));
     }
+    if has_tax_identity_v2_path && !enabled {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider-group tax identity v2 output requires V4 provider factor mode",
+        ));
+    }
+    if has_tax_identity_v2_path && !has_tax_identity_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider-group tax identity v2 output requires the v1 sidecar path",
+        ));
+    }
+    if has_tax_identity_v2_path {
+        validate_configured_output_paths_for_tax_identity_v2(paths)?;
+    }
     Ok(enabled)
 }
 
@@ -777,13 +958,29 @@ fn configured_shared_dedupe(
     worker_count: usize,
     serving_rate_dedupe_enabled: bool,
     factor_mode: bool,
+    paired_tax_identity: bool,
 ) -> io::Result<SharedDedupe> {
-    if factor_mode {
-        return Ok(SharedDedupe::new_with_v4_tax_identity(
-            worker_count,
-            serving_rate_dedupe_enabled,
-            load_tin_token_policy_from_env()?,
+    if paired_tax_identity && !factor_mode {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "paired provider tax identity collection requires V4 provider factor mode",
         ));
+    }
+    if factor_mode {
+        let policy = load_tin_token_policy_from_env()?;
+        return Ok(if paired_tax_identity {
+            SharedDedupe::new_with_v4_paired_tax_identity(
+                worker_count,
+                serving_rate_dedupe_enabled,
+                policy,
+            )
+        } else {
+            SharedDedupe::new_with_v4_tax_identity(
+                worker_count,
+                serving_rate_dedupe_enabled,
+                policy,
+            )
+        });
     }
     Ok(SharedDedupe::new_with_serving_rate_dedupe(
         worker_count,
@@ -846,6 +1043,9 @@ impl CopyPathConfig {
             manifest_provider_group_tax_identity_sidecar: env_path(
                 "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
             ),
+            manifest_provider_group_tax_identity_v2_sidecar: env_path(
+                PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV,
+            ),
             manifest_price_atom: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH"),
             manifest_price_set_atom: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH"),
             manifest_price_set_summary: env_path(
@@ -893,6 +1093,9 @@ impl CopyPathConfig {
             || self.manifest_provider_set_component_sidecar.is_some()
             || self.manifest_provider_component_group_sidecar.is_some()
             || self.manifest_provider_group_tax_identity_sidecar.is_some()
+            || self
+                .manifest_provider_group_tax_identity_v2_sidecar
+                .is_some()
             || self.manifest_provider_npi_sidecar.is_some()
             || self.manifest_price_forward_sidecar.is_some()
     }
@@ -921,6 +1124,9 @@ impl CopyPathConfig {
                 .clone(),
             manifest_provider_group_tax_identity_sidecar: self
                 .manifest_provider_group_tax_identity_sidecar
+                .clone(),
+            manifest_provider_group_tax_identity_v2_sidecar: self
+                .manifest_provider_group_tax_identity_v2_sidecar
                 .clone(),
             manifest_provider_npi_sidecar: self.manifest_provider_npi_sidecar.clone(),
             manifest_price_forward_sidecar: self.manifest_price_forward_sidecar.clone(),
@@ -1006,6 +1212,9 @@ impl CopyPathConfig {
                 .clone(),
             manifest_provider_group_tax_identity_sidecar: self
                 .manifest_provider_group_tax_identity_sidecar
+                .clone(),
+            manifest_provider_group_tax_identity_v2_sidecar: self
+                .manifest_provider_group_tax_identity_v2_sidecar
                 .clone(),
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
@@ -1965,6 +2174,244 @@ fn emit_provider_group_tax_identity_sidecar<W: Write>(
         "manifest_provider_group_tax_identity_sidecar_file",
         &result?,
     )?;
+    writer.flush()
+}
+
+const PROVIDER_GROUP_TAX_IDENTITY_V2_NORMALIZATION_CONTRACT: &str =
+    "ein_ascii_digits_or_2_7_hyphen_and_npi_10_ascii_digits_cms_80840_luhn_v2";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_TOKEN_MESSAGE_CONTRACT: &str =
+    "healthporta_ptg_tin_v1_nul_u16be_type_length_type_u16be_value_length_value";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_HMAC_CONTRACT: &str = "hmac_sha256_ptg_tin_v1";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_TIN_ID_128_CONTRACT: &str = "first_16_bytes(tin_hmac_sha256)";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_FULL_HMAC_AUTHORITY_CONTRACT: &str =
+    "tin_hmac_sha256_full_32_bytes_authoritative";
+
+fn checked_tax_identity_v2_increment(count: &mut u64) -> io::Result<()> {
+    *count = count.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider tax identity v2 count overflow",
+        )
+    })?;
+    Ok(())
+}
+
+fn checked_tax_identity_v2_total(counts: [u64; 5]) -> io::Result<u64> {
+    counts.into_iter().try_fold(0u64, |total, count| {
+        total.checked_add(count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity v2 state total overflow",
+            )
+        })
+    })
+}
+
+fn validate_tax_identity_v1_v2_transition(
+    v1: TaxIdentityObservation,
+    v2: TaxIdentityObservationV2,
+) -> io::Result<()> {
+    let valid = match (v1.state, v2.state) {
+        (TaxIdentityState::MatchedEin, TaxIdentityStateV2::MatchedEin) => {
+            v1.tin_hmac_sha256.is_some() && v1.tin_hmac_sha256 == v2.tin_hmac_sha256
+        }
+        (TaxIdentityState::Missing, TaxIdentityStateV2::Missing)
+        | (TaxIdentityState::Malformed, TaxIdentityStateV2::Malformed) => {
+            v1.tin_hmac_sha256.is_none() && v2.tin_hmac_sha256.is_none()
+        }
+        (TaxIdentityState::UnsupportedType, TaxIdentityStateV2::MatchedNpi) => {
+            v1.tin_hmac_sha256.is_none() && v2.tin_hmac_sha256.is_some()
+        }
+        (
+            TaxIdentityState::UnsupportedType,
+            TaxIdentityStateV2::Malformed | TaxIdentityStateV2::UnsupportedType,
+        ) => v1.tin_hmac_sha256.is_none() && v2.tin_hmac_sha256.is_none(),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider tax identity v1/v2 transition is invalid",
+        ))
+    }
+}
+
+fn validate_tax_identity_v2_group_order(
+    previous_group_id: &mut Option<[u8; 16]>,
+    group_id: [u8; 16],
+) -> io::Result<()> {
+    if previous_group_id.is_some_and(|previous| previous >= group_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider tax identity v2 group ids must be strictly increasing",
+        ));
+    }
+    *previous_group_id = Some(group_id);
+    Ok(())
+}
+
+// The scratch `.building` rename below is atomic for this one sidecar file.
+// It is not publication of an atomic multi-artifact or database bundle.
+fn emit_provider_group_tax_identity_v2_sidecar<W: Write>(
+    writer: &mut W,
+    paths: &CopyPathConfig,
+    dedupe: &SharedDedupe,
+) -> io::Result<()> {
+    let Some(output_path) = paths
+        .manifest_provider_group_tax_identity_v2_sidecar
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    let policy_id = dedupe
+        .provider_group_tax_identity_policy_id()
+        .ok_or_else(|| io::Error::other("provider tax identity policy is not configured"))?;
+    let header = TaxIdentitySidecarV2Header::new(policy_id.to_owned())?;
+    let temporary_path = format!("{output_path}.building");
+    let result = (|| -> io::Result<Value> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary_path)?;
+        let mut artifact = BufWriter::new(file);
+        artifact.write_all(&header.encode())?;
+        let mut row_count = 0u64;
+        let mut matched_ein_count = 0u64;
+        let mut matched_npi_count = 0u64;
+        let mut missing_count = 0u64;
+        let mut malformed_count = 0u64;
+        let mut unsupported_type_count = 0u64;
+        let mut previous_group_id = None;
+        dedupe.visit_provider_group_tax_identity_pairs(|group_hash, v1, observation| {
+            validate_tax_identity_v1_v2_transition(v1, observation)?;
+            let hmac = match (observation.state, observation.tin_hmac_sha256) {
+                (TaxIdentityStateV2::MatchedEin | TaxIdentityStateV2::MatchedNpi, Some(hmac)) => {
+                    hmac
+                }
+                (TaxIdentityStateV2::MatchedEin | TaxIdentityStateV2::MatchedNpi, None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "matched provider tax identity v2 is missing its token",
+                    ));
+                }
+                (_, None) => [0u8; 32],
+                (_, Some(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unavailable provider tax identity v2 carries a token",
+                    ));
+                }
+            };
+            let mut locator = [0u8; 16];
+            locator.copy_from_slice(&hmac[..16]);
+            let group_id = provider_group_global_id_from_hash(group_hash);
+            validate_tax_identity_v2_group_order(&mut previous_group_id, group_id.0)?;
+            let record =
+                TaxIdentitySidecarV2Record::new(group_id.0, observation.state, locator, hmac)?;
+            artifact.write_all(&record.encode())?;
+            checked_tax_identity_v2_increment(&mut row_count)?;
+            let state_count = match observation.state {
+                TaxIdentityStateV2::MatchedEin => &mut matched_ein_count,
+                TaxIdentityStateV2::MatchedNpi => &mut matched_npi_count,
+                TaxIdentityStateV2::Missing => &mut missing_count,
+                TaxIdentityStateV2::Malformed => &mut malformed_count,
+                TaxIdentityStateV2::UnsupportedType => &mut unsupported_type_count,
+            };
+            checked_tax_identity_v2_increment(state_count)
+        })?;
+        let expected_count = dedupe.unique_provider_group_count();
+        if row_count != expected_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "provider tax identity v2 row count {row_count} does not match provider group count {expected_count}",
+                ),
+            ));
+        }
+        let state_total = checked_tax_identity_v2_total([
+            matched_ein_count,
+            matched_npi_count,
+            missing_count,
+            malformed_count,
+            unsupported_type_count,
+        ])?;
+        if state_total != row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity v2 state counts do not match its row count",
+            ));
+        }
+        artifact.flush()?;
+        drop(artifact);
+        let artifact_sha256 = sha256_hex(&sha256_file(Path::new(&temporary_path))?);
+        let artifact_bytes = std::fs::metadata(&temporary_path)?.len();
+        std::fs::rename(&temporary_path, output_path)?;
+        Ok(json!({
+            "path": output_path,
+            "bytes": artifact_bytes,
+            "row_count": row_count,
+            "provider_group_count": expected_count,
+            "matched_ein_count": matched_ein_count,
+            "matched_npi_count": matched_npi_count,
+            "missing_count": missing_count,
+            "malformed_count": malformed_count,
+            "unsupported_type_count": unsupported_type_count,
+            "format": TAX_IDENTITY_SIDECAR_V2_FORMAT,
+            "version": TAX_IDENTITY_SIDECAR_V2_FORMAT_VERSION,
+            "record_bytes": TAX_IDENTITY_SIDECAR_V2_RECORD_BYTES,
+            "token_policy_id": policy_id,
+            "normalization_contract": PROVIDER_GROUP_TAX_IDENTITY_V2_NORMALIZATION_CONTRACT,
+            "token_message_contract": PROVIDER_GROUP_TAX_IDENTITY_V2_TOKEN_MESSAGE_CONTRACT,
+            "hmac_contract": PROVIDER_GROUP_TAX_IDENTITY_V2_HMAC_CONTRACT,
+            "tin_id_128_contract": PROVIDER_GROUP_TAX_IDENTITY_V2_TIN_ID_128_CONTRACT,
+            "full_hmac_authority_contract":
+                PROVIDER_GROUP_TAX_IDENTITY_V2_FULL_HMAC_AUTHORITY_CONTRACT,
+            "sha256": artifact_sha256,
+            "final": true,
+        }))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    emit_json_record(
+        writer,
+        "manifest_provider_group_tax_identity_v2_sidecar_file",
+        &result?,
+    )?;
+    writer.flush()
+}
+
+fn emit_provider_group_tax_identity_sidecars<W: Write>(
+    writer: &mut W,
+    paths: &CopyPathConfig,
+    dedupe: &SharedDedupe,
+) -> io::Result<()> {
+    let has_v1 = paths.manifest_provider_group_tax_identity_sidecar.is_some();
+    let has_v2 = paths
+        .manifest_provider_group_tax_identity_v2_sidecar
+        .is_some();
+    if has_v2 && !has_v1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider-group tax identity v2 output requires the v1 sidecar path",
+        ));
+    }
+    if !has_v2 {
+        return emit_provider_group_tax_identity_sidecar(writer, paths, dedupe);
+    }
+
+    // Buffer success frames so none is attempted before both per-file scratch
+    // renames succeed. The two final renames are not bundle-atomic: a later
+    // failure can leave a complete orphan final as a scratch asset for bundle
+    // admission/recovery. Finals are never deleted here. A later frame-write
+    // failure fails the scan but can still leave a partially written frame.
+    let mut buffered_events = Vec::new();
+    emit_provider_group_tax_identity_sidecar(&mut buffered_events, paths, dedupe)?;
+    emit_provider_group_tax_identity_v2_sidecar(&mut buffered_events, paths, dedupe)?;
+    writer.write_all(&buffered_events)?;
     writer.flush()
 }
 
@@ -10776,6 +11223,9 @@ fn scan_compact_byte_top_level_parallel(
         worker_count,
         !copy_paths.manifest_only,
         factor_mode,
+        copy_paths
+            .manifest_provider_group_tax_identity_v2_sidecar
+            .is_some(),
     )?);
     let provider_graph_v4_factor_cache = Arc::new(
         V4ProviderSetFactorSharedCache::configured_for_mode(factor_mode)?,
@@ -11577,7 +12027,7 @@ fn scan_compact_byte_top_level_parallel(
                         }
                     }
                     emit_dedupe_summary(&dedupe, &object_counts);
-                    emit_provider_group_tax_identity_sidecar(&mut writer, &copy_paths, &dedupe)?;
+                    emit_provider_group_tax_identity_sidecars(&mut writer, &copy_paths, &dedupe)?;
                     if let Some(sidecars) = manifest_sidecars.as_ref() {
                         let sidecar_finalize_started_at = Instant::now();
                         let sidecar_lock_started_at = Instant::now();
@@ -11990,6 +12440,9 @@ fn scan_compact_struson_parallel(
         worker_count,
         !copy_paths.manifest_only,
         factor_mode,
+        copy_paths
+            .manifest_provider_group_tax_identity_v2_sidecar
+            .is_some(),
     )?);
     let provider_graph_v4_factor_cache = Arc::new(
         V4ProviderSetFactorSharedCache::configured_for_mode(factor_mode)?,
@@ -12439,7 +12892,7 @@ fn scan_compact_struson_parallel(
                     );
                 }
                 emit_dedupe_summary(&dedupe, &object_counts);
-                emit_provider_group_tax_identity_sidecar(&mut writer, &copy_paths, &dedupe)?;
+                emit_provider_group_tax_identity_sidecars(&mut writer, &copy_paths, &dedupe)?;
                 drain_copy_file_events(&event_rx, &mut writer)?;
                 for event in copy_file_events {
                     emit_copy_file_event(&mut writer, &event)?;
@@ -25880,6 +26333,8 @@ mod tests {
             TestEnvVar::remove("HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH");
         let _component_path_absent =
             TestEnvVar::remove("HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH");
+        let _tax_identity_v2_path_absent =
+            TestEnvVar::remove(PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV);
 
         let missing_paths_error = CopyPathConfig::from_env().err().unwrap();
         assert!(missing_paths_error
@@ -25906,8 +26361,17 @@ mod tests {
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
             tax_identity_path.to_str().unwrap(),
         );
+        let tax_identity_v2_path = directory.join("provider-group-tax-identity-v2.ptg2tax");
+        let _tax_identity_v2_path = TestEnvVar::set(
+            PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV,
+            tax_identity_v2_path.to_str().unwrap(),
+        );
         let config = CopyPathConfig::from_env().unwrap();
         assert!(configured_v4_factor_mode(&config).unwrap());
+        assert_eq!(
+            config.manifest_provider_group_tax_identity_v2_sidecar,
+            Some(tax_identity_v2_path.display().to_string())
+        );
     }
 
     #[test]
@@ -25924,7 +26388,9 @@ mod tests {
         );
         let _missing_secret = TestEnvVar::remove("HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE");
 
-        let missing = configured_shared_dedupe(2, false, true).err().unwrap();
+        let missing = configured_shared_dedupe(2, false, true, false)
+            .err()
+            .unwrap();
         assert_eq!(missing.kind(), io::ErrorKind::InvalidInput);
         assert!(!output_path.exists());
 
@@ -25933,7 +26399,9 @@ mod tests {
             "HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE",
             secret_path.to_str().unwrap(),
         );
-        let malformed = configured_shared_dedupe(2, false, true).err().unwrap();
+        let malformed = configured_shared_dedupe(2, false, true, false)
+            .err()
+            .unwrap();
         assert_eq!(malformed.kind(), io::ErrorKind::InvalidInput);
         assert!(!malformed
             .to_string()
@@ -25941,7 +26409,9 @@ mod tests {
         assert!(!output_path.exists());
 
         std::fs::write(&secret_path, [9u8; 33]).unwrap();
-        let oversized = configured_shared_dedupe(2, false, true).err().unwrap();
+        let oversized = configured_shared_dedupe(2, false, true, false)
+            .err()
+            .unwrap();
         assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
         assert!(!oversized
             .to_string()
@@ -25949,7 +26419,30 @@ mod tests {
         assert!(!output_path.exists());
 
         std::fs::write(&secret_path, [9u8; 32]).unwrap();
-        configured_shared_dedupe(2, false, true).unwrap();
+        let v1 = configured_shared_dedupe(2, false, true, false).unwrap();
+        let mut paired_visits = 0;
+        let mut accept_pair = |_, _, _| {
+            paired_visits += 1;
+            Ok(())
+        };
+        assert!(v1
+            .visit_provider_group_tax_identity_pairs(&mut accept_pair)
+            .is_err());
+        let paired = configured_shared_dedupe(2, false, true, true).unwrap();
+        paired
+            .insert_provider_group_with_tax_identity(1, None)
+            .unwrap();
+        assert!(paired
+            .visit_provider_group_tax_identity_pairs(&mut accept_pair)
+            .is_ok());
+        assert_eq!(paired_visits, 1);
+        assert_eq!(
+            configured_shared_dedupe(2, false, false, true)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert!(!output_path.exists());
 
         let _ = std::fs::remove_dir_all(directory);
@@ -25974,6 +26467,9 @@ mod tests {
             ),
             manifest_provider_group_tax_identity_sidecar: Some(
                 "provider-group-tax-identity.sidecar".to_string(),
+            ),
+            manifest_provider_group_tax_identity_v2_sidecar: Some(
+                "provider-group-tax-identity-v2.sidecar".to_string(),
             ),
             manifest_provider_npi_sidecar: Some("provider-npi.copy".to_string()),
             manifest_price_forward_sidecar: Some("price-forward.copy".to_string()),
@@ -26075,6 +26571,10 @@ mod tests {
             paths.manifest_provider_group_tax_identity_sidecar
         );
         assert_eq!(
+            worker_paths.manifest_provider_group_tax_identity_v2_sidecar,
+            paths.manifest_provider_group_tax_identity_v2_sidecar
+        );
+        assert_eq!(
             worker_paths.manifest_provider_npi_sidecar,
             paths.manifest_provider_npi_sidecar
         );
@@ -26130,6 +26630,7 @@ mod tests {
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
             manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_v2_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -26186,7 +26687,16 @@ mod tests {
             manifest_provider_inverted_sidecar: None,
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
-            manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_sidecar: Some(
+                base.join("provider-group-tax-identity.sidecar")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            manifest_provider_group_tax_identity_v2_sidecar: Some(
+                base.join("provider-group-tax-identity-v2.sidecar")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: Some(base.join("unused-price.copy").to_string_lossy().to_string()),
@@ -26214,6 +26724,14 @@ mod tests {
         };
 
         let provider_ref_paths = paths.for_provider_refs();
+        assert_eq!(
+            provider_ref_paths.manifest_provider_group_tax_identity_sidecar,
+            paths.manifest_provider_group_tax_identity_sidecar
+        );
+        assert_eq!(
+            provider_ref_paths.manifest_provider_group_tax_identity_v2_sidecar,
+            paths.manifest_provider_group_tax_identity_v2_sidecar
+        );
         let mut sinks = DictionaryCopySinks::from_paths(&provider_ref_paths, 0).unwrap();
         let dedupe = SharedDedupe::new(1);
         let provider_ref = json!({
@@ -26371,6 +26889,321 @@ mod tests {
         assert!(!first_event.contains("opaque"));
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn synthetic_v2_tax_identity_dedupe(
+        worker_count: usize,
+        paired: bool,
+        reverse: bool,
+    ) -> SharedDedupe {
+        let policy =
+            TinTokenPolicy::from_secret("ptg-tin-hmac-sha256-v1:test-v2".to_string(), [8u8; 32])
+                .unwrap();
+        let dedupe = if paired {
+            SharedDedupe::new_with_v4_paired_tax_identity(worker_count, false, policy)
+        } else {
+            SharedDedupe::new_with_v4_tax_identity(worker_count, false, policy)
+        };
+        let mut rows = vec![
+            (
+                10,
+                Some(json!({
+                    "type": "ein",
+                    "value": "12-3456789",
+                    "business_name": "Private Synthetic Practice One"
+                })),
+            ),
+            (
+                10,
+                Some(json!({
+                    "type": " EIN ",
+                    "value": "123456789",
+                    "business_name": "Private Synthetic Practice Two"
+                })),
+            ),
+            (11, Some(json!({"type": "npi", "value": "1000000491"}))),
+            (12, Some(json!({"type": "npi", "value": "1000000492"}))),
+            (13, None),
+            (
+                14,
+                Some(json!({
+                    "type": "other",
+                    "value": "private-unsupported-marker"
+                })),
+            ),
+        ];
+        if reverse {
+            rows.reverse();
+        }
+        for (group_hash, tin) in rows {
+            dedupe
+                .insert_provider_group_with_tax_identity(group_hash, tin.as_ref())
+                .unwrap();
+        }
+        dedupe
+    }
+
+    fn emit_synthetic_v2_tax_identity_artifacts(
+        directory: &Path,
+        label: &str,
+        worker_count: usize,
+        reverse: bool,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let dedupe = synthetic_v2_tax_identity_dedupe(worker_count, true, reverse);
+        let v1_path = directory.join(format!("{label}-v1.ptg2tax"));
+        let v2_path = directory.join(format!("{label}-v2.ptg2tax"));
+        let paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_sidecar: Some(v1_path.display().to_string()),
+            manifest_provider_group_tax_identity_v2_sidecar: Some(v2_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let mut events = Vec::new();
+        emit_provider_group_tax_identity_sidecars(&mut events, &paths, &dedupe).unwrap();
+        (
+            std::fs::read(v1_path).unwrap(),
+            std::fs::read(v2_path).unwrap(),
+            events,
+        )
+    }
+
+    #[test]
+    fn v2_tax_identity_sidecar_is_opt_in_deterministic_private_and_v1_compatible() {
+        let directory = tempfile::tempdir().unwrap();
+        let v1_path = directory.path().join("v1-only.ptg2tax");
+        let v1_paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_sidecar: Some(v1_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let v1_dedupe = synthetic_v2_tax_identity_dedupe(2, false, false);
+        let mut direct_v1_event = Vec::new();
+        emit_provider_group_tax_identity_sidecar(&mut direct_v1_event, &v1_paths, &v1_dedupe)
+            .unwrap();
+        let direct_v1_bytes = std::fs::read(&v1_path).unwrap();
+        let paired_v1_dedupe = synthetic_v2_tax_identity_dedupe(8, true, true);
+        let mut paired_v1_event = Vec::new();
+        emit_provider_group_tax_identity_sidecar(
+            &mut paired_v1_event,
+            &v1_paths,
+            &paired_v1_dedupe,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&v1_path).unwrap(), direct_v1_bytes);
+        assert_eq!(paired_v1_event, direct_v1_event);
+        let mut delegated_v1_event = Vec::new();
+        emit_provider_group_tax_identity_sidecars(&mut delegated_v1_event, &v1_paths, &v1_dedupe)
+            .unwrap();
+        assert_eq!(delegated_v1_event, direct_v1_event);
+        assert_eq!(std::fs::read(&v1_path).unwrap(), direct_v1_bytes);
+        let delegated_v1_text = String::from_utf8(delegated_v1_event.clone()).unwrap();
+        assert_eq!(
+            delegated_v1_text
+                .matches("manifest_provider_group_tax_identity_sidecar_file")
+                .count(),
+            1
+        );
+        assert!(!delegated_v1_text.contains("tax_identity_v2_sidecar_file"));
+        let mut absent_v2_event = Vec::new();
+        emit_provider_group_tax_identity_v2_sidecar(
+            &mut absent_v2_event,
+            &CopyPathConfig::default(),
+            &v1_dedupe,
+        )
+        .unwrap();
+        assert!(absent_v2_event.is_empty());
+
+        let (paired_v1, first_v2, first_events) =
+            emit_synthetic_v2_tax_identity_artifacts(directory.path(), "first", 1, false);
+        let (reversed_v1, reversed_v2, _reversed_events) =
+            emit_synthetic_v2_tax_identity_artifacts(directory.path(), "reversed", 8, true);
+        assert_eq!(paired_v1, direct_v1_bytes);
+        assert_eq!(reversed_v1, direct_v1_bytes);
+        assert_eq!(reversed_v2, first_v2);
+        let frozen_v2_sha256 = "c7a3b0b0bbae41ed968bda60a91a2d03717f0f225e1130b3565bfab9a619a204";
+        assert_eq!(first_v2.len(), 368);
+        assert_eq!(sha256_hex(&Sha256::digest(&first_v2)), frozen_v2_sha256);
+        assert!(!directory.path().join("first-v1.ptg2tax.building").exists());
+        assert!(!directory.path().join("first-v2.ptg2tax.building").exists());
+
+        let mut validator =
+            ptg2_scanner::tax_identity_sidecar_v2::TaxIdentitySidecarV2StreamValidator::new(
+                Cursor::new(&first_v2),
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            validator.header().policy_id(),
+            "ptg-tin-hmac-sha256-v1:test-v2"
+        );
+        let mut state_codes = Vec::new();
+        while let Some(record) = validator.next_record().unwrap() {
+            state_codes.push(record.state() as u8);
+        }
+        state_codes.sort_unstable();
+        assert_eq!(state_codes, vec![1, 2, 3, 4, 5]);
+        assert_eq!(validator.records_validated(), 5);
+
+        let events = String::from_utf8(first_events).unwrap();
+        let v1_event_offset = events
+            .find("manifest_provider_group_tax_identity_sidecar_file")
+            .unwrap();
+        let v2_event_offset = events
+            .find("manifest_provider_group_tax_identity_v2_sidecar_file")
+            .unwrap();
+        assert!(v1_event_offset < v2_event_offset);
+        let v2_frame = &events[v2_event_offset..];
+        let v2_header_end = v2_frame.find('\n').unwrap();
+        let v2_payload_bytes = v2_frame[..v2_header_end]
+            .rsplit_once('\t')
+            .unwrap()
+            .1
+            .parse::<usize>()
+            .unwrap();
+        let v2_payload_start = v2_header_end + 1;
+        let v2_metadata: Value =
+            serde_json::from_str(&v2_frame[v2_payload_start..v2_payload_start + v2_payload_bytes])
+                .unwrap();
+        let expected_v2_metadata = json!({
+            "path": directory.path().join("first-v2.ptg2tax").display().to_string(),
+            "bytes": 368,
+            "row_count": 5,
+            "provider_group_count": 5,
+            "matched_ein_count": 1,
+            "matched_npi_count": 1,
+            "missing_count": 1,
+            "malformed_count": 1,
+            "unsupported_type_count": 1,
+            "format": "ptg2_provider_group_tax_identity_v2",
+            "version": 2,
+            "record_bytes": 65,
+            "token_policy_id": "ptg-tin-hmac-sha256-v1:test-v2",
+            "normalization_contract":
+                "ein_ascii_digits_or_2_7_hyphen_and_npi_10_ascii_digits_cms_80840_luhn_v2",
+            "token_message_contract":
+                "healthporta_ptg_tin_v1_nul_u16be_type_length_type_u16be_value_length_value",
+            "hmac_contract": "hmac_sha256_ptg_tin_v1",
+            "tin_id_128_contract": "first_16_bytes(tin_hmac_sha256)",
+            "full_hmac_authority_contract":
+                "tin_hmac_sha256_full_32_bytes_authoritative",
+            "sha256": frozen_v2_sha256,
+            "final": true,
+        });
+        assert_eq!(v2_metadata, expected_v2_metadata);
+        let expected_v2_payload = serde_json::to_vec(&expected_v2_metadata).unwrap();
+        let mut expected_v2_frame = format!(
+            "manifest_provider_group_tax_identity_v2_sidecar_file\t{}\n",
+            expected_v2_payload.len()
+        )
+        .into_bytes();
+        expected_v2_frame.extend_from_slice(&expected_v2_payload);
+        expected_v2_frame.push(b'\n');
+        assert_eq!(v2_frame.as_bytes(), expected_v2_frame);
+        for private in [
+            "12-3456789",
+            "123456789",
+            "1000000491",
+            "1000000492",
+            "private-unsupported-marker",
+            "Private Synthetic Practice One",
+            "Private Synthetic Practice Two",
+        ] {
+            assert!(!events.contains(private));
+            assert!(!paired_v1
+                .windows(private.len())
+                .any(|window| window == private.as_bytes()));
+            assert!(!first_v2
+                .windows(private.len())
+                .any(|window| window == private.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn v2_tax_identity_failure_emits_no_buffered_success_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let v1_path = directory.path().join("orphan-v1.ptg2tax");
+        let v2_path = directory.path().join("v2-final-directory");
+        std::fs::create_dir(&v2_path).unwrap();
+        let paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_sidecar: Some(v1_path.display().to_string()),
+            manifest_provider_group_tax_identity_v2_sidecar: Some(v2_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let dedupe = synthetic_v2_tax_identity_dedupe(1, true, false);
+        let mut events = Vec::new();
+
+        let error =
+            emit_provider_group_tax_identity_sidecars(&mut events, &paths, &dedupe).unwrap_err();
+
+        assert!(events.is_empty());
+        assert!(v1_path.is_file());
+        assert!(v2_path.is_dir());
+        assert!(!PathBuf::from(format!("{}.building", v2_path.display())).exists());
+        for private in ["12-3456789", "1000000491", "Private Synthetic Practice One"] {
+            assert!(!error.to_string().contains(private));
+        }
+
+        let v2_only_path = directory.path().join("v2-only.ptg2tax");
+        let v2_only_paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_v2_sidecar: Some(
+                v2_only_path.display().to_string(),
+            ),
+            ..CopyPathConfig::default()
+        };
+        let mut v2_only_events = Vec::new();
+        let v2_only_error =
+            emit_provider_group_tax_identity_sidecars(&mut v2_only_events, &v2_only_paths, &dedupe)
+                .unwrap_err();
+        assert_eq!(v2_only_error.kind(), io::ErrorKind::InvalidInput);
+        assert!(v2_only_events.is_empty());
+        assert!(!v2_only_path.exists());
+        assert!(!PathBuf::from(format!("{}.building", v2_only_path.display())).exists());
+    }
+
+    #[test]
+    fn v2_tax_identity_writer_helpers_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let v2_path = directory.path().join("unconfigured-v2.ptg2tax");
+        let paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_v2_sidecar: Some(v2_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let mut events = Vec::new();
+        let unconfigured = SharedDedupe::new(1);
+        let error = emit_provider_group_tax_identity_v2_sidecar(&mut events, &paths, &unconfigured)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(events.is_empty());
+        assert!(!v2_path.exists());
+        assert!(!PathBuf::from(format!("{}.building", v2_path.display())).exists());
+
+        let mut maximum = u64::MAX;
+        assert_eq!(
+            checked_tax_identity_v2_increment(&mut maximum)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            checked_tax_identity_v2_total([u64::MAX, 1, 0, 0, 0])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut previous = None;
+        validate_tax_identity_v2_group_order(&mut previous, [2; 16]).unwrap();
+        assert!(validate_tax_identity_v2_group_order(&mut previous, [2; 16]).is_err());
+        previous = Some([2; 16]);
+        assert!(validate_tax_identity_v2_group_order(&mut previous, [1; 16]).is_err());
+
+        let invalid_v1 = TaxIdentityObservation {
+            state: TaxIdentityState::MatchedEin,
+            tin_hmac_sha256: Some([1; 32]),
+        };
+        let invalid_v2 = TaxIdentityObservationV2 {
+            state: TaxIdentityStateV2::MatchedNpi,
+            tin_hmac_sha256: Some([1; 32]),
+        };
+        assert!(validate_tax_identity_v1_v2_transition(invalid_v1, invalid_v2).is_err());
     }
 
     #[test]
@@ -28232,6 +29065,7 @@ mod tests {
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
             manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_v2_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -28932,6 +29766,7 @@ mod tests {
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
             manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_v2_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -29062,6 +29897,7 @@ mod tests {
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
             manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_v2_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -36877,6 +37713,9 @@ mod tests {
             |config| config.manifest_provider_set_component_sidecar = Some("path".to_owned()),
             |config| config.manifest_provider_component_group_sidecar = Some("path".to_owned()),
             |config| config.manifest_provider_group_tax_identity_sidecar = Some("path".to_owned()),
+            |config| {
+                config.manifest_provider_group_tax_identity_v2_sidecar = Some("path".to_owned())
+            },
             |config| config.manifest_provider_npi_sidecar = Some("path".to_owned()),
             |config| config.manifest_price_forward_sidecar = Some("path".to_owned()),
             |config| config.manifest_price_atom = Some("path".to_owned()),
@@ -36923,6 +37762,61 @@ mod tests {
             ..CopyPathConfig::default()
         };
         assert!(configured_v4_factor_mode(&missing_tax).is_err());
+    }
+
+    #[test]
+    fn v2_tax_identity_paths_require_v4_v1_and_distinct_final_and_temporary_paths() {
+        let _lock = scanner_env_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path_text = |name: &str| directory.path().join(name).display().to_string();
+        let paths = |v1: Option<String>, v2: Option<String>| CopyPathConfig {
+            manifest_provider_set_component_sidecar: Some(path_text("set")),
+            manifest_provider_component_group_sidecar: Some(path_text("component")),
+            manifest_provider_group_tax_identity_sidecar: v1,
+            manifest_provider_group_tax_identity_v2_sidecar: v2,
+            ..CopyPathConfig::default()
+        };
+
+        let _disabled = TestEnvVar::set(PROVIDER_GRAPH_V4_ENV, "false");
+        assert!(
+            configured_v4_factor_mode(&paths(Some(path_text("v1")), Some(path_text("v2")),))
+                .is_err()
+        );
+
+        let _enabled = TestEnvVar::set(PROVIDER_GRAPH_V4_ENV, "true");
+        assert!(configured_v4_factor_mode(&paths(None, Some(path_text("v2")))).is_err());
+        assert!(
+            configured_v4_factor_mode(&paths(Some(path_text("v1")), Some(path_text("v2")),))
+                .unwrap()
+        );
+
+        for (v1, v2) in [
+            (path_text("same"), path_text("same")),
+            (path_text("cross.building"), path_text("cross")),
+            (path_text("reverse"), path_text("reverse.building")),
+            (
+                path_text("unused/../lexical-alias"),
+                path_text("lexical-alias"),
+            ),
+            (
+                "/tmp/ptg2-root-aware-alias".to_string(),
+                "/../tmp/ptg2-root-aware-alias".to_string(),
+            ),
+        ] {
+            let error = configured_v4_factor_mode(&paths(Some(v1), Some(v2)))
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("must differ"));
+        }
+
+        let final_alias = paths(Some(path_text("v1")), Some(path_text("set")));
+        assert!(configured_v4_factor_mode(&final_alias).is_err());
+        let mut temporary_alias =
+            paths(Some(path_text("v1")), Some(path_text("v2-temporary-alias")));
+        temporary_alias.manifest_provider_component_group_sidecar =
+            Some(path_text("v2-temporary-alias.building"));
+        assert!(configured_v4_factor_mode(&temporary_alias).is_err());
     }
 
     #[test]
