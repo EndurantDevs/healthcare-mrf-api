@@ -13,6 +13,10 @@ from tests.tin_npi_connector_pg_cleanup import prove_abandonment_and_gc
 from tests.tin_npi_connector_pg_directory_guards import (
     prove_directory_guard_contract,
 )
+from tests.tin_npi_connector_pg_generation_store import (
+    prove_store_atomic_rollback,
+    prove_store_load_seal_reuse,
+)
 from tests.tin_npi_connector_pg_immutability import (
     prove_generation_immutability,
 )
@@ -118,6 +122,16 @@ async def test_two_policy_record_parity_is_required_at_generation_seal(monkeypat
 @pytest.mark.asyncio
 async def test_dataset_resource_guard_serializes_validation_race_orders(monkeypatch):
     await prove_dataset_validation_races(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_store_loads_seals_and_reuses_without_publishing(monkeypatch):
+    await prove_store_load_seal_reuse(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_store_rolls_back_after_copy_failure(monkeypatch):
+    await prove_store_atomic_rollback(monkeypatch)
 
 
 @pytest.mark.asyncio
