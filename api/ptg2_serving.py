@@ -13,6 +13,7 @@ from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
@@ -21,11 +22,17 @@ from sqlalchemy import text
 from db.connection import db as sa_db
 
 from api.ptg2_address_policy import (
+    PTG_ADDRESS_KIND_POSTAL_BOX,
     PTG2_LEGACY_ADDRESS_COLUMNS as _PTG2_LEGACY_ADDRESS_COLUMNS,
     PTG2_UNIFIED_ADDRESS_COLUMNS as _PTG2_UNIFIED_ADDRESS_COLUMNS,
     PTG_CONTACT_DETAIL_FIELDS,
     PTG_NO_DISPLAY_ADDRESS_FIELDS,
     PTG_NO_DISPLAY_VERIFICATION_FIELDS,
+    PTG_POSTAL_BOX_GEO_FIELDS,
+    PTG_POSTAL_BOX_LOCATION_LABEL_FIELDS,
+    address_display_rank_sql,
+    classify_ptg_address_kind,
+    postal_box_address_sql,
 )
 from api.code_systems import (
     EQUIVALENT_PROCEDURE_CODE_SYSTEMS,
@@ -683,7 +690,15 @@ def _has_payload_value(source: dict[str, Any], *keys: str) -> bool:
 
 
 def _has_displayable_address_fields(source: dict[str, Any]) -> bool:
-    if _has_payload_value(source, "first_line", "address_line_1", "street", "street_address"):
+    if _has_payload_value(
+        source,
+        "first_line",
+        "address_line_1",
+        "street",
+        "street_address",
+        "second_line",
+        "address_line_2",
+    ):
         return True
     has_city = _has_payload_value(source, "city", "city_name")
     has_region = _has_payload_value(source, "state", "state_name", "postal_code", "zip5")
@@ -993,6 +1008,7 @@ class _AddressEvidenceContext:
     location_confidence_code: Any
     address_sources: list[str]
     address_precision: Any
+    address_kind: str
     source_count: int | None
     source_mask: int
     address_source_mask: int
@@ -1171,6 +1187,7 @@ def _address_evidence_context(
         address_precision=provider_item_by_field.get("address_precision")
         or address_payload.get("address_precision")
         or ("street" if address_payload.get("first_line") else None),
+        address_kind=classify_ptg_address_kind(address_payload),
         source_count=source_count,
         source_mask=source_mask,
         address_source_mask=address_source_mask,
@@ -1226,6 +1243,33 @@ def _payer_address_evidence_decision(
     return None
 
 
+def _postal_box_address_evidence_decision(
+    context: _AddressEvidenceContext,
+) -> _AddressEvidenceDecision | None:
+    """Keep postal boxes as mailing evidence, never priced locations."""
+
+    if context.address_kind != PTG_ADDRESS_KIND_POSTAL_BOX:
+        return None
+    return _AddressEvidenceDecision(
+        "postal_box_provider_address",
+        "not_applicable_postal_box",
+        True,
+        "The displayed postal box is provider mailing evidence; it does not identify the priced service or facility location.",
+    )
+
+
+def _address_evidence_decision(
+    context: _AddressEvidenceContext,
+) -> _AddressEvidenceDecision:
+    """Apply fail-closed address evidence precedence."""
+
+    return (
+        _postal_box_address_evidence_decision(context)
+        or _payer_address_evidence_decision(context)
+        or _inferred_address_evidence_decision(context)
+    )
+
+
 def _inferred_address_evidence_decision(
     context: _AddressEvidenceContext,
 ) -> _AddressEvidenceDecision:
@@ -1277,11 +1321,15 @@ def _address_verification_optional_values(
     """Shape optional provenance fields without emitting empty values."""
 
     network_matches = context.provider_directory_network_name_matches
+    is_postal_box = context.address_kind == PTG_ADDRESS_KIND_POSTAL_BOX
     return {
         "displayed_address_present": has_displayed_address,
-        "location_source": context.location_source,
-        "location_confidence_code": context.location_confidence_code,
-        "address_precision": context.address_precision,
+        "address_kind": context.address_kind,
+        "location_source": None if is_postal_box else context.location_source,
+        "location_confidence_code": (
+            None if is_postal_box else context.location_confidence_code
+        ),
+        "address_precision": None if is_postal_box else context.address_precision,
         "source_count": context.source_count,
         "multi_source_confirmed": context.is_multi_source_confirmed,
         "source_mask": context.source_mask or None,
@@ -1312,7 +1360,9 @@ def _address_verification_optional_values(
         "address_provenance": _coerce_json_payload(
             address_payload.get("address_provenance"), []
         ),
-        "geo_evidence_level": address_payload.get("geo_evidence_level"),
+        "geo_evidence_level": (
+            None if is_postal_box else address_payload.get("geo_evidence_level")
+        ),
     }
 
 
@@ -1343,6 +1393,36 @@ def _no_display_address_verification(
     }
 
 
+def _strip_postal_box_geo_fields(payload: dict[str, Any]) -> None:
+    """Remove fields that could turn mailing evidence into a map location."""
+
+    for field_name in PTG_POSTAL_BOX_GEO_FIELDS:
+        payload.pop(field_name, None)
+
+
+def _apply_address_kind_policy(
+    provider_item_by_field: dict[str, Any],
+    address_kind: str,
+) -> None:
+    """Annotate displayable addresses and fail closed for postal boxes."""
+
+    provider_item_by_field["address_kind"] = address_kind
+    if address_kind != PTG_ADDRESS_KIND_POSTAL_BOX:
+        displayed_address = provider_item_by_field.get("address")
+        if isinstance(displayed_address, dict):
+            displayed_address["address_kind"] = address_kind
+        return
+    _strip_postal_box_geo_fields(provider_item_by_field)
+    for field_name in PTG_POSTAL_BOX_LOCATION_LABEL_FIELDS:
+        provider_item_by_field.pop(field_name, None)
+    displayed_address = provider_item_by_field.get("address")
+    if isinstance(displayed_address, dict):
+        displayed_address["address_kind"] = address_kind
+        _strip_postal_box_geo_fields(displayed_address)
+        for field_name in PTG_POSTAL_BOX_LOCATION_LABEL_FIELDS:
+            displayed_address.pop(field_name, None)
+
+
 def _address_verification_payload(
     provider_item_by_field: dict[str, Any],
     location_data_by_field: dict[str, Any],
@@ -1357,12 +1437,13 @@ def _address_verification_payload(
     if has_displayed_address is False:
         return _no_display_address_verification(provider_item_by_field)
 
+    address_kind = classify_ptg_address_kind(address_payload)
+    _apply_address_kind_policy(provider_item_by_field, address_kind)
+
     context = _address_evidence_context(
         provider_item_by_field, location_data_by_field, address_payload
     )
-    decision = _payer_address_evidence_decision(
-        context
-    ) or _inferred_address_evidence_decision(context)
+    decision = _address_evidence_decision(context)
     response_address_sources = list(context.address_sources)
     if decision.network_binding != "payer_confirmed_location":
         response_address_sources = [
@@ -1444,11 +1525,13 @@ def _apply_address_display_policy(item: dict[str, Any], args: Mapping[str, Any] 
         verification["displayed_address_present"] = False
         verification["network_bound_address"] = False
         verification["address_network_binding"] = "inferred_from_provider_identity"
+        verification["address_evidence_level"] = "unknown"
         verification["requires_location_confirmation"] = True
         verification["reason"] = (
             "PTG proves the provider identity is in network, but the displayed address is not tied "
             "to the priced plan or network; address and phone fields are suppressed by request."
         )
+        _set_truthful_location_confidence(item, "unknown")
     _strip_no_display_address_fields(item)
 
 
@@ -8181,35 +8264,39 @@ _PROVIDER_ENRICHMENT_SQL = """
     {fallback_cte}
     SELECT
         source_npis.npi,
-        {location_hash_sql} AS location_hash,
-        {eff_state_name} AS state,
-        {eff_city_name} AS city,
-        LEFT(COALESCE({eff_postal_code}, ''), 5) AS zip5,
-        '{location_source}' AS location_source,
-        '{location_source}' AS location_confidence_code,
+        selected_addr.location_hash,
+        selected_addr.state_name AS state,
+        selected_addr.city_name AS city,
+        LEFT(COALESCE(selected_addr.postal_code, ''), 5) AS zip5,
+        selected_addr.location_source,
+        selected_addr.location_source AS location_confidence_code,
         jsonb_build_object(
-            'npi', source_npis.npi, 'type', addr.type,
-            'checksum', addr.checksum, 'first_line', {eff_first_line},
-            'second_line', {eff_second_line}, 'city_name', {eff_city_name},
-            'state_name', {eff_state_name}, 'city', {eff_city_name},
-            'state', {eff_state_name}, 'postal_code', {eff_postal_code},
-            'country_code', {eff_country_code},
-            'telephone_number', {eff_telephone_number},
-            'fax_number', {eff_fax_number},
-            'phone_number', {eff_phone_number},
-            'phone_extension', {eff_phone_extension},
-            'fax_number_digits', {eff_fax_number_digits},
-            'fax_extension', {eff_fax_extension},
-            'address_key', addr.address_key::text,
-            'address_site_key', addr.premise_key::text,
-            'lat', {eff_lat}, 'long', {eff_long}
+            'npi', source_npis.npi, 'type', selected_addr.type,
+            'checksum', selected_addr.checksum,
+            'first_line', selected_addr.first_line,
+            'second_line', selected_addr.second_line,
+            'city_name', selected_addr.city_name,
+            'state_name', selected_addr.state_name,
+            'city', selected_addr.city_name,
+            'state', selected_addr.state_name,
+            'postal_code', selected_addr.postal_code,
+            'country_code', selected_addr.country_code,
+            'telephone_number', selected_addr.telephone_number,
+            'fax_number', selected_addr.fax_number,
+            'phone_number', selected_addr.phone_number,
+            'phone_extension', selected_addr.phone_extension,
+            'fax_number_digits', selected_addr.fax_number_digits,
+            'fax_extension', selected_addr.fax_extension,
+            'address_key', selected_addr.address_key,
+            'address_site_key', selected_addr.address_site_key,
+            'lat', selected_addr.lat, 'long', selected_addr.long
         )::text AS address_payload,
-        {eff_telephone_number} AS telephone_number,
-        {eff_fax_number} AS fax_number,
-        {eff_phone_number} AS phone_number,
-        {eff_phone_extension} AS phone_extension,
-        {eff_fax_number_digits} AS fax_number_digits,
-        {eff_fax_extension} AS fax_extension,
+        selected_addr.telephone_number,
+        selected_addr.fax_number,
+        selected_addr.phone_number,
+        selected_addr.phone_extension,
+        selected_addr.fax_number_digits,
+        selected_addr.fax_extension,
         COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
         COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
         COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
@@ -8219,74 +8306,152 @@ _PROVIDER_ENRICHMENT_SQL = """
     FROM source_npis
     LEFT JOIN {npi_data_table} n ON n.npi = source_npis.npi
     LEFT JOIN LATERAL (
-        SELECT addr.*
+        SELECT addr.*, {postal_box_rank_sql} AS display_rank
           FROM {npi_address_table} addr
          WHERE addr.npi = source_npis.npi
-         ORDER BY (addr.type = 'primary') DESC, addr.type, addr.checksum
+         ORDER BY {postal_box_rank_sql},
+                  (addr.type = 'primary') DESC, addr.type, addr.checksum
          LIMIT 1
     ) addr ON TRUE
     {fallback_join}
+    {selected_address_join}
     {taxonomy_lateral_sql}
     ORDER BY provider_name, source_npis.npi
 """
 
 
+_PROVIDER_ENRICHMENT_ADDRESS_COLUMNS = (
+    "type", "checksum", "first_line", "second_line", "city_name",
+    "state_name", "postal_code", "country_code", "telephone_number",
+    "fax_number", "phone_number", "phone_extension",
+    "fax_number_digits", "fax_extension", "lat", "long",
+)
+_PROVIDER_ENRICHMENT_FALLBACK_JOIN_SQL = """
+    LEFT JOIN fallback_addresses na
+      ON na.npi = source_npis.npi
+     AND (
+         addr.npi IS NULL
+         OR addr.display_rank = 2
+         OR (addr.display_rank = 1 AND na.display_rank = 0)
+     )"""
+
+
+def _direct_provider_selected_address_join_sql(
+    npi_address_table: str,
+) -> str:
+    """Select every legacy address-owned field from one row."""
+
+    selected_column_sql = ",\n               ".join(
+        f"addr.{column}" for column in _PROVIDER_ENRICHMENT_ADDRESS_COLUMNS
+    )
+    return f"""
+    LEFT JOIN LATERAL (
+        SELECT {selected_column_sql},
+               addr.address_key::text AS address_key,
+               NULL::text AS address_site_key,
+               {_ptg2_address_location_hash_sql('addr', npi_address_table)}
+                   AS location_hash,
+               'npi_address'::varchar AS location_source
+    ) selected_addr ON TRUE"""
+
+
+def _fallback_address_column_sql(
+    column: str,
+    fallback_columns: set[str],
+    sql_type: str = "varchar",
+) -> str:
+    """Select an available legacy column or a typed null."""
+
+    if column in fallback_columns:
+        return f"na.{column}"
+    return f"NULL::{sql_type} AS {column}"
+
+
+def _provider_enrichment_fallback_cte_sql(
+    fallback_columns: set[str],
+) -> str:
+    """Build the source-NPI-bounded best legacy address CTE."""
+
+    fallback_column_sql = partial(
+        _fallback_address_column_sql,
+        fallback_columns=fallback_columns,
+    )
+    return f"""
+    , fallback_addresses AS MATERIALIZED (
+        SELECT DISTINCT ON (na.npi)
+               na.npi, na.type, na.checksum, na.address_key,
+               na.first_line, na.second_line, na.city_name,
+               na.state_name, na.postal_code, na.country_code,
+               {fallback_column_sql('telephone_number')},
+               {fallback_column_sql('fax_number')},
+               {fallback_column_sql('phone_number')},
+               {fallback_column_sql('phone_extension')},
+               {fallback_column_sql('fax_number_digits')},
+               {fallback_column_sql('fax_extension')},
+               na.lat, na.long,
+               {address_display_rank_sql('na')} AS display_rank
+          FROM {PTG2_SCHEMA}.npi_address na
+          JOIN source_npis source_filter ON source_filter.npi = na.npi
+         WHERE {address_display_rank_sql('na')} < 2
+         ORDER BY na.npi,
+                  {address_display_rank_sql('na')},
+                  CASE na.type WHEN 'primary' THEN 0
+                       WHEN 'practice' THEN 1
+                       WHEN 'secondary' THEN 2 ELSE 3 END,
+                  na.checksum
+    )"""
+
+
+def _unified_provider_selected_address_join_sql() -> str:
+    """Switch all address-owned fields together using one fallback marker."""
+
+    selected_column_sql = ",\n               ".join(
+        "CASE WHEN na.npi IS NOT NULL "
+        f"THEN na.{column} ELSE addr.{column} END AS {column}"
+        for column in _PROVIDER_ENRICHMENT_ADDRESS_COLUMNS
+    )
+    return f"""
+    LEFT JOIN LATERAL (
+        SELECT {selected_column_sql},
+               CASE WHEN na.npi IS NOT NULL
+                    THEN na.address_key::text
+                    ELSE addr.address_key::text END AS address_key,
+               CASE WHEN na.npi IS NOT NULL
+                    THEN NULL::text
+                    ELSE addr.premise_key::text END AS address_site_key,
+               CASE WHEN na.npi IS NOT NULL
+                    THEN CONCAT(
+                        'npi_address:', na.npi, ':',
+                        na.type, ':', na.checksum
+                    )
+                    ELSE CONCAT(
+                        'entity_address_unified:', addr.location_key
+                    ) END AS location_hash,
+               CASE WHEN na.npi IS NOT NULL
+                    THEN 'npi_address'::varchar
+                    ELSE 'entity_address_unified'::varchar
+                END AS location_source
+    ) selected_addr ON TRUE"""
+
+
 async def _provider_enrichment_address_sql(
     session,
     npi_address_table: str,
-) -> tuple[str, str, Callable[[str], str]]:
-    """Build address fallback fragments and effective-column expressions."""
+) -> tuple[str, str, str]:
+    """Build one atomic address selection and its bounded legacy fallback."""
 
     if not _is_unified_address_table(npi_address_table):
-        return "", "", lambda column: f"addr.{column}"
+        return "", "", _direct_provider_selected_address_join_sql(
+            npi_address_table
+        )
     fallback_columns = set(
         await _ptg2_table_columns(session, f"{PTG2_SCHEMA}.npi_address")
     )
-
-    def fallback_column(column: str, sql_type: str = "varchar") -> str:
-        """Select an available legacy column or a typed null."""
-
-        if column in fallback_columns:
-            return f"na.{column}"
-        return f"NULL::{sql_type} AS {column}"
-
-    fallback_cte = f"""
-        , fallback_addresses AS MATERIALIZED (
-            SELECT DISTINCT ON (na.npi)
-                   na.npi, na.first_line, na.second_line, na.city_name,
-                   na.state_name, na.postal_code, na.country_code,
-                   {fallback_column('telephone_number')},
-                   {fallback_column('fax_number')},
-                   {fallback_column('phone_number')},
-                   {fallback_column('phone_extension')},
-                   {fallback_column('fax_number_digits')},
-                   {fallback_column('fax_extension')},
-                   na.lat, na.long
-              FROM {PTG2_SCHEMA}.npi_address na
-              JOIN source_npis source_filter ON source_filter.npi = na.npi
-             WHERE NULLIF(BTRIM(na.first_line), '') IS NOT NULL
-             ORDER BY na.npi,
-                      CASE na.type WHEN 'primary' THEN 0
-                           WHEN 'practice' THEN 1
-                           WHEN 'secondary' THEN 2 ELSE 3 END,
-                      na.checksum
-        )"""
-    fallback_join = """
-        LEFT JOIN fallback_addresses na
-          ON na.npi = source_npis.npi
-         AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
-
-    def effective_column(column: str) -> str:
-        """Prefer legacy street data only when unified street data is absent."""
-
-        cast_suffix = "::numeric" if column in {"lat", "long"} else ""
-        return (
-            "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
-            f"AND na.first_line IS NOT NULL THEN na.{column}{cast_suffix} "
-            f"ELSE addr.{column}{cast_suffix} END"
-        )
-
-    return fallback_cte, fallback_join, effective_column
+    return (
+        _provider_enrichment_fallback_cte_sql(fallback_columns),
+        _PROVIDER_ENRICHMENT_FALLBACK_JOIN_SQL,
+        _unified_provider_selected_address_join_sql(),
+    )
 
 
 async def _provider_enrichment_statement(
@@ -8296,33 +8461,21 @@ async def _provider_enrichment_statement(
 ):
     """Build the bounded provider enrichment statement."""
 
-    fallback_cte, fallback_join, effective_column = (
+    fallback_cte, fallback_join, selected_address_join = (
         await _provider_enrichment_address_sql(session, npi_address_table)
     )
-    columns = (
-        "state_name", "city_name", "postal_code", "first_line",
-        "second_line", "country_code", "telephone_number", "fax_number",
-        "phone_number", "phone_extension", "fax_number_digits",
-        "fax_extension", "lat", "long",
-    )
-    effective_fields_by_name = {
-        f"eff_{column}": effective_column(column) for column in columns
-    }
     return text(
         _PROVIDER_ENRICHMENT_SQL.format(
             fallback_cte=fallback_cte,
             fallback_join=fallback_join,
-            location_hash_sql=_ptg2_address_location_hash_sql(
-                "addr", npi_address_table
-            ),
-            location_source=_ptg2_address_location_source(npi_address_table),
+            selected_address_join=selected_address_join,
             provider_name_sql=_ptg2_provider_name_sql("n"),
             npi_data_table=npi_data_table,
             npi_address_table=npi_address_table,
+            postal_box_rank_sql=address_display_rank_sql("addr"),
             taxonomy_lateral_sql=_provider_taxonomy_summary_lateral_sql(
                 "source_npis.npi"
             ),
-            **effective_fields_by_name,
         )
     )
 
@@ -9285,7 +9438,8 @@ WITH matched AS MATERIALIZED (
         )::text AS address_payload,
         ROW_NUMBER() OVER (
             PARTITION BY addr.npi
-            ORDER BY {distance_sql} ASC NULLS LAST,
+            ORDER BY {postal_box_rank_sql},
+                     {distance_sql} ASC NULLS LAST,
                      CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
                      addr.checksum,
                      {location_tiebreak_sql}
@@ -9770,6 +9924,11 @@ def _membership_filter_sql(
     spatial_filter_sql, distance_sql = spatial_sql_parts
     if spatial_filter_sql:
         filter_clauses.append(spatial_filter_sql)
+    elif uses_unified_addresses and _has_location_filter(
+        args,
+        include_npi=False,
+    ):
+        filter_clauses.append(f"NOT {postal_box_address_sql('addr')}")
     if args.get("npi") not in (None, "", "null"):
         try:
             parameter_map["provider_npi"] = int(args["npi"])
@@ -10583,6 +10742,7 @@ def _membership_sql_values(
         "ptg2_schema": PTG2_SCHEMA,
         "filter_sql": query_context.filter_sql,
         "address_assurance_sql": query_context.address_assurance_sql,
+        "postal_box_rank_sql": address_display_rank_sql("addr"),
         "geo_evidence_level_sql": geo_evidence_level_sql,
         "location_tiebreak_sql": (
             "addr.location_key"

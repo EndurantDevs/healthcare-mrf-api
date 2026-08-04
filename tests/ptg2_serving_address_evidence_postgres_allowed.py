@@ -159,6 +159,7 @@ async def _insert_allowed_payments(database: Database, schema: str) -> None:
         ("payment-b", 1990000213, "177.375", "199.50"),
         ("payment-c", 1990000221, "211.625", "244.75"),
         ("payment-d", 1990000239, "255.875", "288.00"),
+        ("payment-e", 1990000247, "299.125", "322.25"),
     )
     for payment_hash, provider_npi, allowed_amount, billed_charge in payment_rows:
         await database.status(
@@ -196,39 +197,47 @@ async def _insert_allowed_providers(database: Database, schema: str) -> None:
             (1990000205, 'Synthetic Provider A'),
             (1990000213, 'Synthetic Provider B'),
             (1990000221, 'Synthetic Provider C'),
-            (1990000239, 'Synthetic Provider D')"""
+            (1990000239, 'Synthetic Provider D'),
+            (1990000247, 'Synthetic Provider E')"""
     )
     await database.status(
         f"""INSERT INTO {schema}.entity_address_unified (
             location_key, npi, address_key, premise_key,
             address_source_mask, address_sources, source_count, source_mask,
-            type, checksum, first_line, city_name, state_name, state_code,
+            type, checksum, first_line, second_line,
+            city_name, state_name, state_code,
             postal_code, zip5, country_code, address_precision, lat, long
         ) VALUES
             ('allowed-exact-no-point', 1990000205,
              '00000000-0000-0000-0000-000000000301',
              '10000000-0000-0000-0000-000000000301',
              1, ARRAY['nppes']::varchar[], 1, 1, 'practice', 301,
-             '301 SYNTHETIC WAY', 'TEST CITY', 'TS', 'TS',
+             '301 SYNTHETIC WAY', NULL, 'TEST CITY', 'TS', 'TS',
              '00001', '00001', 'US', 'street', NULL, NULL),
             ('allowed-nearby-point', 1990000213,
              '00000000-0000-0000-0000-000000000302',
              '10000000-0000-0000-0000-000000000302',
              1, ARRAY['nppes']::varchar[], 1, 1, 'practice', 302,
-             '302 SYNTHETIC WAY', 'NEARBY CITY', 'TS', 'TS',
+             '302 SYNTHETIC WAY', NULL, 'NEARBY CITY', 'TS', 'TS',
              '00002', '00002', 'US', 'street', 42.0, -83.18),
             ('allowed-incoherent-point', 1990000221,
              '00000000-0000-0000-0000-000000000303',
              '10000000-0000-0000-0000-000000000303',
              1, ARRAY['nppes']::varchar[], 1, 1, 'practice', 303,
-             '303 SYNTHETIC WAY', 'OTHER CITY', 'OS', 'OS',
+             '303 SYNTHETIC WAY', NULL, 'OTHER CITY', 'OS', 'OS',
              '00003', '00003', 'US', 'street', 42.0, -83.05),
             ('allowed-outside-radius', 1990000239,
              '00000000-0000-0000-0000-000000000304',
              '10000000-0000-0000-0000-000000000304',
              1, ARRAY['nppes']::varchar[], 1, 1, 'practice', 304,
-             '304 SYNTHETIC WAY', 'TEST CITY', 'TS', 'TS',
-             '00001', '00001', 'US', 'street', 42.65, -83.0)"""
+             '304 SYNTHETIC WAY', NULL, 'TEST CITY', 'TS', 'TS',
+             '00001', '00001', 'US', 'street', 42.65, -83.0),
+            ('allowed-postal-box', 1990000247,
+             '00000000-0000-0000-0000-000000000305',
+             '10000000-0000-0000-0000-000000000305',
+             1, ARRAY['nppes']::varchar[], 1, 1, 'practice', 305,
+             'SYNTHETIC CLINIC', 'P.O. Box 305', 'TEST CITY', 'TS', 'TS',
+             '00001', '00001', 'US', 'street', 42.0, -83.0)"""
     )
     await database.status(
         f"""INSERT INTO {schema}.npi_address (
@@ -248,6 +257,41 @@ def _allowed_page_query(schema: str) -> tuple[str, dict[str, object]]:
         "lat": 42.0,
         "long": -83.0,
         "radius_miles": 30,
+    }
+    query_parameters = pricing._allowed_amount_query_params(
+        request_args_by_name,
+        SimpleNamespace(limit=10, offset=0),
+        plan_id="TESTPLAN001",
+        code="00000",
+        code_system="CPT",
+        npi=None,
+        current_snapshots=[
+            {
+                "snapshot_id": "synthetic-snapshot",
+                "source_key": "synthetic-allowed",
+                "plan_id": "TESTPLAN001",
+                "plan_market_type": "group",
+            }
+        ],
+    )
+    page_query = pricing._allowed_amount_page_sql(
+        request_args_by_name,
+        address_table=f"{pricing.PTG2_SCHEMA}.entity_address_unified",
+        parameter_map=query_parameters,
+    )
+    return _schema_sql(str(page_query), schema), query_parameters
+
+
+def _allowed_state_city_page_query(
+    schema: str,
+) -> tuple[str, dict[str, object]]:
+    request_args_by_name = {
+        "plan_id": "TESTPLAN001",
+        "plan_market_type": "group",
+        "code": "00000",
+        "code_system": "CPT",
+        "state": "TS",
+        "city": "TEST CITY",
     }
     query_parameters = pricing._allowed_amount_query_params(
         request_args_by_name,
@@ -387,3 +431,25 @@ async def test_allowed_page_preserves_rates_and_rejects_incoherent_locations():
         assert "entity_address_unified" in relation_names
         assert "zcta5" in relation_names
         assert ZCTA5_ZIP_INDEX_NAME in _plan_index_names(query_plan)
+
+
+@pytest.mark.asyncio
+async def test_allowed_state_city_page_rejects_postal_boxes():
+    async with _temporary_schema() as (database, schema):
+        await _create_allowed_tables(database, schema)
+        await _insert_spatial_reference_rows(database, schema)
+        await _insert_allowed_snapshot(database, schema)
+        await _insert_allowed_payments(database, schema)
+        await _insert_allowed_providers(database, schema)
+        page_query, query_parameters = _allowed_state_city_page_query(schema)
+
+        page_rows = await database.all(page_query, **query_parameters)
+
+        assert sorted(
+            int(page_record._mapping["npi"])
+            for page_record in page_rows
+            if page_record._mapping["npi"] is not None
+        ) == [1990000205, 1990000239]
+        assert {
+            page_record._mapping["total"] for page_record in page_rows
+        } == {2}

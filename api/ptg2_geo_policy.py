@@ -8,6 +8,8 @@ from typing import Any, Mapping
 
 from sqlalchemy import text
 
+from api.ptg2_address_policy import postal_box_address_sql
+
 
 _PROVIDER_ADDRESS_GEO_CAPABILITY_SQL = """
     SELECT
@@ -161,6 +163,7 @@ def provider_address_identity_coherence_sql(
     normalized_country = f"UPPER(BTRIM(COALESCE({alias}.country_code, '')))"
     return f"""(
         {alias}.address_key IS NOT NULL
+        AND NOT {postal_box_address_sql(alias)}
         AND NULLIF(BTRIM(COALESCE({alias}.zip5, '')), '') IS NOT NULL
         AND NULLIF(BTRIM(COALESCE({alias}.state_code, '')), '') IS NOT NULL
         AND {_display_zip5_sql(alias)} = BTRIM({alias}.zip5)

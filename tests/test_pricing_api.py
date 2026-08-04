@@ -15,6 +15,7 @@ from sanic.request import RequestParameters
 
 from api import ptg2_capacity_evidence as capacity_evidence
 from api import plan_release_serving
+from api.ptg2_address_policy import postal_box_address_sql
 from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_ACCESS_ARG,
     PTG2_CANDIDATE_AUDIT_HEADER,
@@ -3713,8 +3714,26 @@ def test_allowed_amount_sql_filters_before_exact_count_and_pagination():
     assert "addr.lat IS NULL AND addr.long IS NULL" in sql_text
     assert "geo_nppes_anchor.premise_key = addr.premise_key" in sql_text
     assert "provider_page.npi ASC" in sql_text
+    assert sql_text.count(postal_box_address_sql("addr")) == 1
     assert "__LOCATION_" not in sql_text
     assert "__TAXONOMY_" not in sql_text
+
+
+def test_allowed_amount_state_city_filter_excludes_postal_boxes_once():
+    parameter_map = {}
+    location_join_sql, _select_sql, required_sql = (
+        pricing_module._allowed_amount_location_sql(
+            {"state": "MI", "city": "Detroit"},
+            address_table="mrf.entity_address_unified",
+            parameter_map=parameter_map,
+        )
+    )
+
+    assert location_join_sql.count(postal_box_address_sql("addr")) == 1
+    assert "ORDER BY\n               0," not in location_join_sql
+    assert parameter_map["allowed_state"] == "MI"
+    assert parameter_map["allowed_city"] == "DETROIT"
+    assert required_sql == "AND allowed_location.npi IS NOT NULL"
 
 
 @pytest.mark.asyncio

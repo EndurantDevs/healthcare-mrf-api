@@ -12,8 +12,12 @@ from tests.ptg2_serving_address_evidence_postgres_geo import (
 from tests.ptg2_serving_address_evidence_postgres_coverage import (
     test_provider_set_geo_candidate_scope_executes_beyond_old_prefix,
 )
+from tests.ptg2_serving_address_evidence_postgres_enrichment import (
+    test_provider_enrichment_selects_one_truthful_address_row,
+)
 from tests.ptg2_serving_address_evidence_postgres_allowed import (
     test_allowed_page_preserves_rates_and_rejects_incoherent_locations,
+    test_allowed_state_city_page_rejects_postal_boxes,
 )
 from tests.ptg2_serving_address_evidence_postgres_capability import (
     test_geo_capability_probe_requires_usable_zcta_zip_index,
@@ -21,6 +25,7 @@ from tests.ptg2_serving_address_evidence_postgres_capability import (
 from tests.ptg2_serving_address_evidence_postgres_spatial import (
     test_exact_zip_accepts_coherent_points_and_rejects_incoherent_points,
     test_radius_membership_rejects_incoherent_and_out_of_radius_points,
+    test_state_city_membership_rejects_evidenced_postal_boxes,
 )
 from tests.ptg2_serving_address_evidence_postgres_lineage import (
     test_admitted_mrf_recovers_specific_lineage_without_fabrication,

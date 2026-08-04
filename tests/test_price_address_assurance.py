@@ -4,7 +4,10 @@ import json
 import importlib.util
 import sys
 import types
+from copy import deepcopy
 from pathlib import Path
+
+import pytest
 
 import process.ptg_parts.address_assurance as address_assurance
 from process.ptg_parts.address_assurance import (
@@ -14,6 +17,118 @@ from process.ptg_parts.address_assurance import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _postal_box_assurance_item():
+    return {
+        "address_kind": "postal_box",
+        "address": {
+            "address_kind": "postal_box",
+            "first_line": "P.O. Box 123",
+            "city": "Example City",
+            "state": "MI",
+            "postal_code": "48000",
+        },
+        "address_verification": {
+            "rate_network_binding": "tic_provider_group_npi_tin",
+            "address_network_binding": "not_applicable_postal_box",
+            "address_evidence_level": "postal_box_provider_address",
+            "requires_location_confirmation": True,
+            "displayed_address_present": True,
+            "network_bound_address": False,
+            "address_kind": "postal_box",
+        },
+    }
+
+
+def test_price_address_assurance_accepts_mail_only_postal_box():
+    summary = summarize_ptg_price_address_payload(
+        {"data": {"items": [_postal_box_assurance_item()]}}
+    )
+
+    assert summary["ok"] is True
+    assert summary["issues"] == []
+
+
+@pytest.mark.parametrize(
+    ("source_name", "field_name", "field_value", "expected_message"),
+    (
+        ("verification", "address_network_binding", "inferred_from_provider_identity",
+         "requires address_network_binding='not_applicable_postal_box'"),
+        ("verification", "address_evidence_level", "nppes_provider_address",
+         "requires address_evidence_level='postal_box_provider_address'"),
+        ("verification", "requires_location_confirmation", False,
+         "requires requires_location_confirmation=True"),
+        ("verification", "network_bound_address", True,
+         "requires network_bound_address=False"),
+        ("item", "address_kind", "physical",
+         "requires item.address_kind='postal_box'"),
+        ("address", "address_kind", "physical",
+         "requires address.address_kind='postal_box'"),
+        ("verification", "address_kind", "physical",
+         "requires address_verification.address_kind='postal_box'"),
+        ("item", "distance_miles", 1.0,
+         "physical-location fields: distance_miles"),
+        ("address", "lat", 42.0, "physical-location fields: lat"),
+        ("address", "address_site_key", "synthetic-site",
+         "physical-location fields: address_site_key"),
+        ("verification", "location_confidence_id", 3,
+         "physical-location fields: location_confidence_id"),
+    ),
+)
+def test_price_address_assurance_enforces_postal_box_invariants(
+    source_name,
+    field_name,
+    field_value,
+    expected_message,
+):
+    """Reject one independently corrupted mailing-only field per case."""
+
+    price_item_by_field = deepcopy(_postal_box_assurance_item())
+    mutation_target_by_field = (
+        price_item_by_field
+        if source_name == "item"
+        else price_item_by_field[
+            "address_verification"
+            if source_name == "verification"
+            else source_name
+        ]
+    )
+    mutation_target_by_field[field_name] = field_value
+    summary = summarize_ptg_price_address_payload(
+        {"data": {"items": [price_item_by_field]}}
+    )
+
+    assert summary["ok"] is False
+    assert any(
+        expected_message in issue["message"]
+        for issue in summary["issues"]
+    ), (source_name, field_name, summary["issues"])
+
+
+def test_price_address_assurance_detects_postal_text_mislabeled_physical():
+    item = _postal_box_assurance_item()
+    item["address_kind"] = "physical"
+    item["address"]["address_kind"] = "physical"
+    verification = item["address_verification"]
+    verification.update(
+        {
+            "address_kind": "physical",
+            "address_network_binding": "inferred_from_provider_identity",
+            "address_evidence_level": "nppes_provider_address",
+        }
+    )
+
+    summary = summarize_ptg_price_address_payload(
+        {"data": {"items": [item]}}
+    )
+
+    assert summary["ok"] is False
+    assert any(
+        "requires address_network_binding='not_applicable_postal_box'"
+        in issue["message"]
+        for issue in summary["issues"]
+    )
 
 
 def _write_json(path, assurance_by_field):

@@ -88,7 +88,10 @@ async def _insert_knn_location(database: Database, schema: str) -> None:
     await database.status(
         f"""
         INSERT INTO {schema}.ptg2_v3_npi_scope (snapshot_key, npi)
-        VALUES (41, 1990000015), (41, 1990000221)
+        VALUES
+            (41, 1990000015),
+            (41, 1990000221),
+            (41, 1990000247)
         """
     )
     await database.status(
@@ -96,7 +99,8 @@ async def _insert_knn_location(database: Database, schema: str) -> None:
         INSERT INTO {schema}.entity_address_unified (
             location_key, npi, address_key, premise_key,
             address_source_mask, address_sources, source_count, source_mask,
-            type, checksum, first_line, city_name, state_name, state_code,
+            type, checksum, first_line, second_line,
+            city_name, state_name, state_code,
             postal_code, zip5, country_code, address_precision, lat, long
         ) VALUES
             (
@@ -104,7 +108,8 @@ async def _insert_knn_location(database: Database, schema: str) -> None:
                 '00000000-0000-0000-0000-000000000033',
                 '10000000-0000-0000-0000-000000000033',
                 7, ARRAY['nppes', 'mrf', 'cms_doctors']::varchar[], 3, 7,
-                'practice', 33, '33 TEST STREET', 'TEST CITY', 'TS', 'TS',
+                'practice', 33, '33 TEST STREET', NULL,
+                'TEST CITY', 'TS', 'TS',
                 '00001', '00001', 'US', 'street', 42.0, -83.0
             ),
             (
@@ -112,8 +117,18 @@ async def _insert_knn_location(database: Database, schema: str) -> None:
                 '00000000-0000-0000-0000-000000000034',
                 '10000000-0000-0000-0000-000000000034',
                 1, ARRAY['nppes']::varchar[], 1, 1,
-                'practice', 34, '34 TEST STREET', 'OTHER CITY', 'OS', 'OS',
+                'practice', 34, '34 TEST STREET', NULL,
+                'OTHER CITY', 'OS', 'OS',
                 '00003', '00003', 'US', 'street', 42.3314, -83.0458
+            ),
+            (
+                'knn-postal-box', 1990000247,
+                '00000000-0000-0000-0000-000000000035',
+                '10000000-0000-0000-0000-000000000035',
+                1, ARRAY['nppes']::varchar[], 1, 1,
+                'practice', 35, 'SYNTHETIC CLINIC', 'P.O. Box 35',
+                'TEST CITY', 'TS', 'TS',
+                '00001', '00001', 'US', 'street', 42.0, -83.0
             )
         """
     )
@@ -134,6 +149,11 @@ async def _insert_knn_source_addresses(database: Database, schema: str) -> None:
                 1990000221,
                 '00000000-0000-0000-0000-000000000034',
                 'practice', 34, '2026-07-29'
+            ),
+            (
+                1990000247,
+                '00000000-0000-0000-0000-000000000035',
+                'practice', 35, '2026-07-29'
             )
         """
     )
