@@ -1,4 +1,3 @@
-use crate::npi_identifier::{npi_validity, NpiValidity};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -6,6 +5,13 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::sync::atomic::{compiler_fence, Ordering};
+
+mod v2;
+
+pub use v2::{
+    classify_provider_group_tin_v2, ClassifiedTaxIdentityV2, NormalizedTaxIdentity,
+    TaxIdentityObservationV2, TaxIdentityStateV2,
+};
 
 const TOKEN_DOMAIN: &[u8] = b"healthporta.ptg.tin.v1";
 const POLICY_ID_PREFIX: &str = "ptg-tin-hmac-sha256-v1:";
@@ -25,41 +31,21 @@ pub enum TaxIdentityState {
     UnsupportedType = 4,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ClassifiedTaxIdentity {
     pub state: TaxIdentityState,
     pub normalized_ein: Option<[u8; 9]>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum TaxIdentityStateV2 {
-    MatchedEin = 1,
-    Missing = 2,
-    Malformed = 3,
-    UnsupportedType = 4,
-    MatchedNpi = 5,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum NormalizedTaxIdentity {
-    Ein([u8; 9]),
-    Npi([u8; 10]),
-}
-
-impl fmt::Debug for NormalizedTaxIdentity {
+impl fmt::Debug for ClassifiedTaxIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ein(_) => formatter.write_str("Ein(<redacted>)"),
-            Self::Npi(_) => formatter.write_str("Npi(<redacted>)"),
-        }
+        let normalized_ein = self.normalized_ein.map(|_| "<redacted>");
+        formatter
+            .debug_struct("ClassifiedTaxIdentity")
+            .field("state", &self.state)
+            .field("normalized_ein", &normalized_ein)
+            .finish()
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClassifiedTaxIdentityV2 {
-    pub state: TaxIdentityStateV2,
-    pub normalized_identity: Option<NormalizedTaxIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,12 +57,6 @@ pub struct TaxIdentityToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaxIdentityObservation {
     pub state: TaxIdentityState,
-    pub tin_hmac_sha256: Option<[u8; 32]>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TaxIdentityObservationV2 {
-    pub state: TaxIdentityStateV2,
     pub tin_hmac_sha256: Option<[u8; 32]>,
 }
 
@@ -120,10 +100,6 @@ impl TinTokenPolicy {
         self.token_for_normalized_identity(b"ein", normalized_ein)
     }
 
-    pub fn token_for_npi(&self, normalized_npi: &[u8; 10]) -> TaxIdentityToken {
-        self.token_for_normalized_identity(b"npi", normalized_npi)
-    }
-
     fn token_for_normalized_identity(
         &self,
         identity_type: &[u8],
@@ -151,26 +127,6 @@ impl TinTokenPolicy {
             tin_hmac_sha256,
         }
     }
-
-    pub fn observe_v2(&self, tin: Option<&Value>) -> TaxIdentityObservationV2 {
-        let classified = classify_provider_group_tin_v2(tin);
-        let tin_hmac_sha256 =
-            classified
-                .normalized_identity
-                .as_ref()
-                .map(|identity| match identity {
-                    NormalizedTaxIdentity::Ein(normalized_ein) => {
-                        self.token_for_ein(normalized_ein).tin_hmac_sha256
-                    }
-                    NormalizedTaxIdentity::Npi(normalized_npi) => {
-                        self.token_for_npi(normalized_npi).tin_hmac_sha256
-                    }
-                });
-        TaxIdentityObservationV2 {
-            state: classified.state,
-            tin_hmac_sha256,
-        }
-    }
 }
 
 impl TaxIdentityObservation {
@@ -184,24 +140,6 @@ impl TaxIdentityObservation {
             }
         }
         if state_priority(other.state) > state_priority(self.state) {
-            Ok(other)
-        } else {
-            Ok(self)
-        }
-    }
-}
-
-impl TaxIdentityObservationV2 {
-    pub fn merge(self, other: Self) -> io::Result<Self> {
-        if let (Some(left), Some(right)) = (self.tin_hmac_sha256, other.tin_hmac_sha256) {
-            if left != right {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "provider group has conflicting supported tax identities",
-                ));
-            }
-        }
-        if state_priority_v2(other.state) > state_priority_v2(self.state) {
             Ok(other)
         } else {
             Ok(self)
@@ -316,47 +254,6 @@ pub fn classify_provider_group_tin(tin: Option<&Value>) -> ClassifiedTaxIdentity
     }
 }
 
-/// Classify a source tax identity without altering the v1 EIN-only path.
-pub fn classify_provider_group_tin_v2(tin: Option<&Value>) -> ClassifiedTaxIdentityV2 {
-    let Some(tin) = tin else {
-        return classified_v2(TaxIdentityStateV2::Missing, None);
-    };
-    if tin.is_null() {
-        return classified_v2(TaxIdentityStateV2::Missing, None);
-    }
-    let Some(tin) = tin.as_object() else {
-        return classified_v2(TaxIdentityStateV2::Malformed, None);
-    };
-    let tin_type = optional_trimmed_ascii_string(tin.get("type"));
-    let tin_value = optional_trimmed_ascii_string(tin.get("value"));
-    if matches!(tin_type, OptionalText::Missing) && matches!(tin_value, OptionalText::Missing) {
-        return classified_v2(TaxIdentityStateV2::Missing, None);
-    }
-    let (OptionalText::Present(tin_type), OptionalText::Present(tin_value)) = (tin_type, tin_value)
-    else {
-        return classified_v2(TaxIdentityStateV2::Malformed, None);
-    };
-    if tin_type.eq_ignore_ascii_case("ein") {
-        return match strict_normalized_ein(tin_value) {
-            Some(normalized_ein) => classified_v2(
-                TaxIdentityStateV2::MatchedEin,
-                Some(NormalizedTaxIdentity::Ein(normalized_ein)),
-            ),
-            None => classified_v2(TaxIdentityStateV2::Malformed, None),
-        };
-    }
-    if tin_type.eq_ignore_ascii_case("npi") {
-        return match strict_normalized_npi(tin_value) {
-            Some(normalized_npi) => classified_v2(
-                TaxIdentityStateV2::MatchedNpi,
-                Some(NormalizedTaxIdentity::Npi(normalized_npi)),
-            ),
-            None => classified_v2(TaxIdentityStateV2::Malformed, None),
-        };
-    }
-    classified_v2(TaxIdentityStateV2::UnsupportedType, None)
-}
-
 pub fn canonical_tin_token_message(tin_type: &[u8], normalized_tin: &[u8]) -> Vec<u8> {
     let type_length =
         u16::try_from(tin_type.len()).expect("canonical TIN type length must fit u16");
@@ -418,33 +315,10 @@ fn strict_normalized_ein(value: &str) -> Option<[u8; 9]> {
     }
 }
 
-fn strict_normalized_npi(value: &str) -> Option<[u8; 10]> {
-    match npi_validity(value) {
-        NpiValidity::Valid => {
-            let mut normalized = [0u8; 10];
-            normalized.copy_from_slice(value.as_bytes());
-            Some(normalized)
-        }
-        NpiValidity::ChecksumInvalid | NpiValidity::StructuralInvalid | NpiValidity::Invalid => {
-            None
-        }
-    }
-}
-
 fn classified(state: TaxIdentityState, normalized_ein: Option<[u8; 9]>) -> ClassifiedTaxIdentity {
     ClassifiedTaxIdentity {
         state,
         normalized_ein,
-    }
-}
-
-fn classified_v2(
-    state: TaxIdentityStateV2,
-    normalized_identity: Option<NormalizedTaxIdentity>,
-) -> ClassifiedTaxIdentityV2 {
-    ClassifiedTaxIdentityV2 {
-        state,
-        normalized_identity,
     }
 }
 
@@ -454,15 +328,6 @@ fn state_priority(state: TaxIdentityState) -> u8 {
         TaxIdentityState::UnsupportedType => 3,
         TaxIdentityState::Malformed => 2,
         TaxIdentityState::Missing => 1,
-    }
-}
-
-fn state_priority_v2(state: TaxIdentityStateV2) -> u8 {
-    match state {
-        TaxIdentityStateV2::MatchedEin | TaxIdentityStateV2::MatchedNpi => 4,
-        TaxIdentityStateV2::UnsupportedType => 3,
-        TaxIdentityStateV2::Malformed => 2,
-        TaxIdentityStateV2::Missing => 1,
     }
 }
 
