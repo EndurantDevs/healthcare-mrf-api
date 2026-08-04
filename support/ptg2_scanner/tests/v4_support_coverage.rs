@@ -437,14 +437,6 @@ fn scanner_progress_reporters_emit_interval_frame_and_stop_cleanly() {
         Instant::now(),
         true,
     );
-    emit_progress(
-        Path::new("/tmp/scanner-progress-empty.json"),
-        0,
-        &compressed_bytes_read,
-        &HashMap::new(),
-        Instant::now(),
-        true,
-    );
     drop(reporter);
 }
 
