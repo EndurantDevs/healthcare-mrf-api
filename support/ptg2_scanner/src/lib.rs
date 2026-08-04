@@ -9,6 +9,7 @@ pub mod hashing;
 pub mod input;
 pub mod manifest;
 pub mod normalize;
+mod npi_identifier;
 pub mod output;
 pub mod progress;
 pub mod provider_directory_projection;
