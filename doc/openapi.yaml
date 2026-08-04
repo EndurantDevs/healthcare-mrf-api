@@ -6109,12 +6109,23 @@ components:
       additionalProperties: true
     PtgRateOption:
       type: object
-      required: [provider_set_ref, price_set_ref, rate_pack_ref, prices]
+      required:
+        [rate_option_ref, provider_set_ref, price_set_ref, rate_pack_ref, prices]
       description: |
         One atomic negotiated-price option. The opaque references retain the
         exact provider-set, price-set, and rate-pack relationship that produced
         these prices; they are not facility or legal-ownership identifiers.
       properties:
+        rate_option_ref:
+          type: string
+          pattern: '^ro1_[A-Za-z0-9_-]{43}$'
+          description: |
+            Deterministic opaque semantic-lineage reference derived from the
+            complete serving-lineage tuple. Identical sealed lineage can share
+            this reference across source occurrences. It is not a facility,
+            billing entity, tax identifier, unique occurrence ID, or
+            authorization token; any privileged follow-up must also bind the
+            entitled plan, exact immutable snapshot, and billing entity.
         provider_set_ref:
           type: string
         price_set_ref:

@@ -15,12 +15,16 @@ _BASE_PROVIDER = {
 }
 
 
+def _lineage_ref(value: int) -> str:
+    return f"{value:032x}"
+
+
 def _provider_rate(provider_set_ref: str, ordinal: int):
     return {
         **_BASE_PROVIDER,
         "provider_set_hash": provider_set_ref,
-        "price_set_hash": f"price-set-{ordinal}",
-        "rate_pack_hash": f"rate-pack-{ordinal}",
+        "price_set_hash": _lineage_ref(100 + ordinal),
+        "rate_pack_hash": _lineage_ref(200 + ordinal),
         "prices": [{"negotiated_rate": ordinal * 100}],
     }
 
@@ -35,12 +39,14 @@ def _billing_association(hex_character: str):
 
 
 def test_provider_rate_merge_attaches_billing_edges_after_grouping():
+    first_set_ref = _lineage_ref(1)
+    second_set_ref = _lineage_ref(2)
     associations_by_set = {
-        "provider-set-1": [_billing_association("1")],
-        "provider-set-2": [_billing_association("2")],
+        first_set_ref: [_billing_association("1")],
+        second_set_ref: [_billing_association("2")],
     }
     merged = ptg2_serving._merge_provider_rates_for_request(
-        [_provider_rate("provider-set-1", 1), _provider_rate("provider-set-2", 2)],
+        [_provider_rate(first_set_ref, 1), _provider_rate(second_set_ref, 2)],
         associations_by_set,
     )
 
@@ -55,7 +61,7 @@ def test_provider_rate_merge_attaches_billing_edges_after_grouping():
     assert merged[0]["billing_entity_count"] == 2
     assert merged[0]["billing_entity_count_status"] == "exact"
     legacy_shape = ptg2_serving._merge_provider_rates_for_request(
-        [_provider_rate("provider-set-1", 1)],
+        [_provider_rate(first_set_ref, 1)],
         {},
     )[0]
     assert "billing_entity_count" not in legacy_shape

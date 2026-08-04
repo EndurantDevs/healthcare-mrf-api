@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving as serving
+from api.ptg2_rate_option_refs import encode_rate_option_ref
 from process.tin_npi_connector_security import token_policy_descriptor_sha256
 from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 
@@ -242,17 +243,23 @@ def _payload_values(value: Any):
         yield value
 
 
-def _assert_public_billing_item(item: dict[str, Any]) -> None:
+def _assert_public_billing_item(provider_item: dict[str, Any]) -> None:
     expected_by_set = {
         SET_ONE: (PRICE_ONE, PACK_ONE),
         SET_TWO: (PRICE_TWO, PACK_TWO),
     }
     options_by_set = {
-        option["provider_set_ref"]: option for option in item["rate_options"]
+        option["provider_set_ref"]: option
+        for option in provider_item["rate_options"]
     }
     assert set(options_by_set) == set(expected_by_set)
     for set_ref, (price_ref, pack_ref) in expected_by_set.items():
         option = options_by_set[set_ref]
+        assert option["rate_option_ref"] == encode_rate_option_ref(
+            provider_set_ref=set_ref,
+            price_set_ref=price_ref,
+            rate_pack_ref=pack_ref,
+        )
         assert (option["price_set_ref"], option["rate_pack_ref"]) == (
             price_ref,
             pack_ref,
@@ -264,17 +271,18 @@ def _assert_public_billing_item(item: dict[str, Any]) -> None:
         assert "provider_group_ref" not in association
         assert association["tin_type"] == "ein"
         assert association["billing_entity_ref"].startswith("be1_")
-    assert item["rate_option_count"] == 2
-    assert item["billing_association_count"] == 2
-    assert item["resolved_billing_entity_count"] == 2
-    assert item["billing_entity_count"] == 2
-    assert item["billing_entity_count_status"] == "exact"
+    assert provider_item["rate_option_count"] == 2
+    assert provider_item["billing_association_count"] == 2
+    assert provider_item["resolved_billing_entity_count"] == 2
+    assert provider_item["billing_entity_count"] == 2
+    assert provider_item["billing_entity_count_status"] == "exact"
 
 
 def _billing_option_fingerprint(item: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
     return tuple(
         sorted(
             (
+                option["rate_option_ref"],
                 option["provider_set_ref"],
                 option["price_set_ref"],
                 option["rate_pack_ref"],

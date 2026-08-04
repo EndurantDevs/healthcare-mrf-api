@@ -14,8 +14,14 @@ from api.code_systems import (
     catalog_code_system_lookup_values,
     equivalent_external_procedure_pairs,
 )
+from api.ptg2_rate_option_refs import encode_rate_option_ref
 from process.ptg_parts.address_assurance import summarize_ptg_price_address_payload
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from tests.ptg2_rate_option_ref_support import synthetic_rate_option
+
+
+def _lineage_ref(value: int) -> str:
+    return f"{value:032x}"
 
 
 @pytest.fixture(autouse=True)
@@ -2250,6 +2256,8 @@ def test_manifest_provider_procedure_item_shapes_address_and_prices():
 
 
 def test_provider_rate_items_merge_duplicate_location_and_code_prices():
+    """Retain atomic options while merging one provider/location result."""
+
     base_by_field = {
         "npi": 1234567890,
         "provider_name": "Example Clinician",
@@ -2261,16 +2269,16 @@ def test_provider_rate_items_merge_duplicate_location_and_code_prices():
     rate_items = [
         {
             **base_by_field,
-            "provider_set_hash": "provider-set-1",
-            "price_set_hash": "price-set-1",
-            "rate_pack_hash": "rate-pack-1",
+            "provider_set_hash": _lineage_ref(1),
+            "price_set_hash": _lineage_ref(101),
+            "rate_pack_hash": _lineage_ref(201),
             "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
         },
         {
             **base_by_field,
-            "provider_set_hash": "provider-set-2",
-            "price_set_hash": "price-set-2",
-            "rate_pack_hash": "rate-pack-2",
+            "provider_set_hash": _lineage_ref(2),
+            "price_set_hash": _lineage_ref(102),
+            "rate_pack_hash": _lineage_ref(202),
             "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 200}],
         },
     ]
@@ -2279,25 +2287,14 @@ def test_provider_rate_items_merge_duplicate_location_and_code_prices():
 
     assert len(merged) == 1
     assert {price["negotiated_rate"] for price in merged[0]["prices"]} == {100, 200}
-    assert merged[0]["provider_set_hashes"] == ["provider-set-1", "provider-set-2"]
-    assert merged[0]["rate_options"] == [
-        {
-            "provider_set_ref": "provider-set-1",
-            "price_set_ref": "price-set-1",
-            "rate_pack_ref": "rate-pack-1",
-            "prices": [
-                {"negotiated_type": "negotiated", "negotiated_rate": 100}
-            ],
-        },
-        {
-            "provider_set_ref": "provider-set-2",
-            "price_set_ref": "price-set-2",
-            "rate_pack_ref": "rate-pack-2",
-            "prices": [
-                {"negotiated_type": "negotiated", "negotiated_rate": 200}
-            ],
-        },
+    assert merged[0]["provider_set_hashes"] == [
+        _lineage_ref(1),
+        _lineage_ref(2),
     ]
+    expected_options = [synthetic_rate_option(1, 1), synthetic_rate_option(2, 2)]
+    for expected_option_by_field in expected_options:
+        expected_option_by_field["prices"][0]["negotiated_type"] = "negotiated"
+    assert merged[0]["rate_options"] == expected_options
     assert merged[0]["rate_option_count"] == 2
     assert merged[0]["provider_set_count"] == 2
     assert merged[0]["price_set_count"] == 2
@@ -2322,14 +2319,18 @@ def test_price_merge_preserves_occurrences():
     rate_items = [
         {
             **base_by_field,
-            "price_set_hash": "price-set-1",
-            "price_set_hashes": ["price-set-1"],
+            "provider_set_hash": _lineage_ref(1),
+            "price_set_hash": _lineage_ref(101),
+            "price_set_hashes": [_lineage_ref(101)],
+            "rate_pack_hash": _lineage_ref(201),
             "source_trace": [{"source_key": 0}],
             **ptg2_serving._price_response_fields(first_prices),
         },
         {
             **base_by_field,
-            "price_set_hash": "price-set-2",
+            "provider_set_hash": _lineage_ref(1),
+            "price_set_hash": _lineage_ref(102),
+            "rate_pack_hash": _lineage_ref(202),
             **ptg2_serving._price_response_fields(second_prices),
         },
     ]
@@ -2360,9 +2361,9 @@ def test_provider_rate_items_do_not_merge_different_arrangements():
         "reported_code": "70551",
         "reported_code_system": "CPT",
         "address": {"first_line": "100 Example Street"},
-        "provider_set_hash": "provider-set-1",
-        "price_set_hash": "price-set-1",
-        "rate_pack_hash": "rate-pack-1",
+        "provider_set_hash": _lineage_ref(1),
+        "price_set_hash": _lineage_ref(101),
+        "rate_pack_hash": _lineage_ref(201),
     }
     rate_items = [
         {
@@ -2415,16 +2416,16 @@ def test_provider_rate_items_do_not_merge_distinct_source_code_variants(
         "network_names": ["First Network"],
         "source_artifact_key": 0,
         "address": {"first_line": "100 Example Street"},
-        "provider_set_hash": "provider-set-1",
-        "price_set_hash": "price-set-1",
-        "rate_pack_hash": "rate-pack-1",
+        "provider_set_hash": _lineage_ref(1),
+        "price_set_hash": _lineage_ref(101),
+        "rate_pack_hash": _lineage_ref(201),
         "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
     }
     changed_variant_by_field = {
         **base_by_field,
         changed_field: changed_value,
-        "price_set_hash": "price-set-2",
-        "rate_pack_hash": "rate-pack-2",
+        "price_set_hash": _lineage_ref(102),
+        "rate_pack_hash": _lineage_ref(202),
     }
 
     merged = ptg2_serving._merge_ptg2_provider_rate_items(
@@ -2708,6 +2709,11 @@ async def test_geo_price_filter_selects_locations_from_matching_provider_sets(mo
     ]
     assert response["items"][0]["rate_options"] == [
         {
+            "rate_option_ref": encode_rate_option_ref(
+                provider_set_ref=harness.matching_provider_set_id,
+                price_set_ref=harness.matching_price_set_id,
+                rate_pack_ref="06" * 16,
+            ),
             "provider_set_ref": harness.matching_provider_set_id,
             "price_set_ref": harness.matching_price_set_id,
             "rate_pack_ref": "06" * 16,
