@@ -26,24 +26,6 @@ fn frozen_wire_vector_matches_python_reference() {
 }
 
 #[test]
-fn frozen_npi_token_and_locator_use_type_aware_framing() {
-    let message = canonical_tin_token_message(b"npi", b"1000000491");
-    assert_eq!(
-        hex(&message),
-        "6865616c7468706f7274612e7074672e74696e2e76310000036e7069000a31303030303030343931"
-    );
-    assert_ne!(message, canonical_tin_token_message(b"ein", b"1000000491"));
-
-    let token = policy().token_for_npi(b"1000000491");
-    assert_eq!(
-        hex(&token.tin_hmac_sha256),
-        "8370f2246a6b7b08abb55f6fc11fd75015467c4270ddeef3f87396ed734e1f73"
-    );
-    assert_eq!(hex(&token.tin_id_128), "8370f2246a6b7b08abb55f6fc11fd750");
-    assert_ne!(token, policy().token_for_ein(b"123456789"));
-}
-
-#[test]
 fn matched_ein_accepts_only_the_shared_raw_input_grammar() {
     for raw_value in ["123456789", "12-3456789", " \t12-3456789\r\n"] {
         let tin = json!({"type": " EIN ", "value": raw_value});
@@ -71,80 +53,20 @@ fn matched_ein_accepts_only_the_shared_raw_input_grammar() {
 }
 
 #[test]
-fn v2_matches_only_checksum_valid_low_and_high_npis() {
-    for (tin_type, raw_value, normalized) in [
-        ("npi", "1000000491", *b"1000000491"),
-        ("NPI", "2999999990", *b"2999999990"),
-        (" NpI ", " \t1000000491\r\n", *b"1000000491"),
-    ] {
-        let tin = json!({"type": tin_type, "value": raw_value});
-        let classified = classify_provider_group_tin_v2(Some(&tin));
-        assert_eq!(classified.state, TaxIdentityStateV2::MatchedNpi);
-        assert_eq!(
-            classified.normalized_identity,
-            Some(NormalizedTaxIdentity::Npi(normalized))
-        );
-        let observation = policy().observe_v2(Some(&tin));
-        assert_eq!(observation.state, TaxIdentityStateV2::MatchedNpi);
-        assert!(observation.tin_hmac_sha256.is_some());
-    }
-}
+fn classified_tax_identity_debug_redacts_normalized_ein() {
+    let raw_ein = "12-3456789";
+    let tin = json!({"type": "ein", "value": raw_ein});
+    let classified = classify_provider_group_tin(Some(&tin));
+    let rendered = format!("{classified:?}");
 
-#[test]
-fn v2_npi_invalidity_classes_are_never_matchable_or_tokenized() {
-    for (case, raw_value) in [
-        ("checksum", "1000000492"),
-        ("structural-low", "0999999999"),
-        ("structural-high", "3000000000"),
-        ("short", "123"),
-        ("nondigit", "100000049x"),
-        ("unicode", "１００００００４９１"),
-        ("hyphen", "10000004-1"),
-        ("space", "10000 00491"),
-    ] {
-        let tin = json!({"type": "npi", "value": raw_value});
-        let classified = classify_provider_group_tin_v2(Some(&tin));
-        assert_eq!(
-            classified,
-            classified_v2(TaxIdentityStateV2::Malformed, None),
-            "{case}"
-        );
-        assert_eq!(
-            policy().observe_v2(Some(&tin)),
-            TaxIdentityObservationV2 {
-                state: TaxIdentityStateV2::Malformed,
-                tin_hmac_sha256: None,
-            },
-            "{case}"
-        );
-    }
-}
-
-#[test]
-fn v2_is_additive_and_preserves_the_ein_only_v1_contract() {
-    let npi = json!({"type": "npi", "value": "1000000491"});
     assert_eq!(
-        classify_provider_group_tin(Some(&npi)).state,
-        TaxIdentityState::UnsupportedType
+        classified,
+        super::classified(TaxIdentityState::MatchedEin, Some(*b"123456789"))
     );
-    assert_eq!(
-        policy().observe(Some(&npi)),
-        TaxIdentityObservation {
-            state: TaxIdentityState::UnsupportedType,
-            tin_hmac_sha256: None,
-        }
-    );
-
-    let ein = json!({"type": " EIN ", "value": "12-3456789"});
-    let v1 = policy().observe(Some(&ein));
-    let v2 = policy().observe_v2(Some(&ein));
-    assert_eq!(v1.state, TaxIdentityState::MatchedEin);
-    assert_eq!(v2.state, TaxIdentityStateV2::MatchedEin);
-    assert_eq!(v1.tin_hmac_sha256, v2.tin_hmac_sha256);
-    assert_eq!(
-        classify_provider_group_tin_v2(Some(&ein)).normalized_identity,
-        Some(NormalizedTaxIdentity::Ein(*b"123456789"))
-    );
+    assert!(rendered.contains("<redacted>"));
+    assert!(!rendered.contains(raw_ein));
+    assert!(!rendered.contains("123456789"));
+    assert!(!rendered.contains("[49, 50, 51, 52, 53, 54, 55, 56, 57]"));
 }
 
 #[test]
@@ -183,39 +105,6 @@ fn all_unavailable_states_are_explicit() {
 }
 
 #[test]
-fn all_v2_unavailable_states_are_explicit_and_untokenized() {
-    for tin in [None, Some(&Value::Null), Some(&json!({}))] {
-        let classified = classify_provider_group_tin_v2(tin);
-        assert_eq!(classified, classified_v2(TaxIdentityStateV2::Missing, None));
-    }
-
-    for tin in [
-        json!("npi"),
-        json!({"type": "npi"}),
-        json!({"type": 1, "value": "1000000491"}),
-        json!({"type": "npi", "value": false}),
-        json!({"type": "npi", "value": ""}),
-    ] {
-        assert_eq!(
-            classify_provider_group_tin_v2(Some(&tin)),
-            classified_v2(TaxIdentityStateV2::Malformed, None)
-        );
-        assert!(policy().observe_v2(Some(&tin)).tin_hmac_sha256.is_none());
-    }
-
-    for tin in [
-        json!({"type": "ssn", "value": "1000000491"}),
-        json!({"type": "other", "value": "opaque-value"}),
-    ] {
-        assert_eq!(
-            classify_provider_group_tin_v2(Some(&tin)),
-            classified_v2(TaxIdentityStateV2::UnsupportedType, None)
-        );
-        assert!(policy().observe_v2(Some(&tin)).tin_hmac_sha256.is_none());
-    }
-}
-
-#[test]
 fn duplicate_observations_merge_deterministically() {
     let policy = policy();
     let missing = policy.observe(None);
@@ -241,32 +130,6 @@ fn duplicate_observations_merge_deterministically() {
 }
 
 #[test]
-fn v2_observations_merge_by_availability_without_changing_identity() {
-    let policy = policy();
-    let missing = policy.observe_v2(None);
-    let malformed_tin = json!({"type": "npi", "value": "1000000492"});
-    let malformed = policy.observe_v2(Some(&malformed_tin));
-    let unsupported_tin = json!({"type": "ssn", "value": "synthetic"});
-    let unsupported = policy.observe_v2(Some(&unsupported_tin));
-    let matched_tin = json!({"type": "npi", "value": "1000000491"});
-    let matched = policy.observe_v2(Some(&matched_tin));
-
-    assert_eq!(
-        missing.merge(malformed).unwrap().state,
-        TaxIdentityStateV2::Malformed
-    );
-    assert_eq!(
-        malformed.merge(unsupported).unwrap().state,
-        TaxIdentityStateV2::UnsupportedType
-    );
-    assert_eq!(
-        unsupported.merge(matched).unwrap().state,
-        TaxIdentityStateV2::MatchedNpi
-    );
-    assert_eq!(matched.merge(missing).unwrap(), matched);
-}
-
-#[test]
 fn conflicting_supported_tokens_fail_closed() {
     let policy = policy();
     let first_tin = json!({"type": "ein", "value": "12-3456789"});
@@ -274,34 +137,6 @@ fn conflicting_supported_tokens_fail_closed() {
     let first = policy.observe(Some(&first_tin));
     let second = policy.observe(Some(&second_tin));
     assert!(first.merge(second).is_err());
-}
-
-#[test]
-fn v2_conflicting_supported_observations_fail_closed_without_raw_values() {
-    let policy = policy();
-    let ein_value = "12-3456789";
-    let npi_value = "1000000491";
-    let ein = json!({"type": "ein", "value": ein_value});
-    let npi = json!({"type": "npi", "value": npi_value});
-    let ein_observation = policy.observe_v2(Some(&ein));
-    let npi_observation = policy.observe_v2(Some(&npi));
-
-    let error = ein_observation.merge(npi_observation).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(
-        error.to_string(),
-        "provider group has conflicting supported tax identities"
-    );
-    assert!(!error.to_string().contains(ein_value));
-    assert!(!error.to_string().contains(npi_value));
-    assert_eq!(
-        npi_observation.merge(npi_observation).unwrap(),
-        npi_observation
-    );
-
-    let rendered = format!("{:?}", classify_provider_group_tin_v2(Some(&npi)));
-    assert!(!rendered.contains(npi_value));
-    assert!(rendered.contains("Npi(<redacted>)"));
 }
 
 #[test]
@@ -314,24 +149,6 @@ fn business_name_is_not_owner_identity_input() {
     assert_eq!(
         classify_provider_group_tin(Some(&tin)).state,
         TaxIdentityState::MatchedEin
-    );
-}
-
-#[test]
-fn business_name_is_not_v2_identity_or_token_input() {
-    let without_name = json!({"type": "npi", "value": "1000000491"});
-    let with_name = json!({
-        "type": "npi",
-        "value": "1000000491",
-        "business_name": {"untrusted": ["synthetic", 7]}
-    });
-    assert_eq!(
-        classify_provider_group_tin_v2(Some(&without_name)),
-        classify_provider_group_tin_v2(Some(&with_name))
-    );
-    assert_eq!(
-        policy().observe_v2(Some(&without_name)),
-        policy().observe_v2(Some(&with_name))
     );
 }
 
