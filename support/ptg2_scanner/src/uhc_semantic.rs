@@ -6,6 +6,7 @@
 //! object at a time.  Semantic decoding therefore cannot accidentally reopen a
 //! mutable path or allocate the complete retained artifact.
 
+use crate::npi_identifier::{npi_validity, NpiValidity};
 use crate::uhc_retained::{
     open_verified_uhc_replay, UHCVerifiedReplayRequest, UHCVerifiedRetainedSource,
 };
@@ -374,44 +375,6 @@ fn clean(value: Option<&str>, upper: bool) -> Option<String> {
         Some(trimmed.to_uppercase())
     } else {
         Some(trimmed.to_owned())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NpiValidity {
-    Valid,
-    ChecksumInvalid,
-    StructuralInvalid,
-    Invalid,
-}
-
-fn npi_validity(value: &str) -> NpiValidity {
-    if value.len() != 10 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return NpiValidity::Invalid;
-    }
-    let Ok(parsed) = value.parse::<u64>() else {
-        return NpiValidity::Invalid;
-    };
-    if parsed == 0 {
-        return NpiValidity::Invalid;
-    }
-    if !(1_000_000_000..=2_999_999_999).contains(&parsed) {
-        return NpiValidity::StructuralInvalid;
-    }
-    let digits: Vec<u64> = value.bytes().map(|byte| u64::from(byte - b'0')).collect();
-    let mut digit_sum = 24 + digits[9];
-    for (index, digit) in digits[..9].iter().enumerate() {
-        if index % 2 == 0 {
-            let doubled = digit * 2;
-            digit_sum += if doubled > 9 { doubled - 9 } else { doubled };
-        } else {
-            digit_sum += digit;
-        }
-    }
-    if digit_sum.is_multiple_of(10) {
-        NpiValidity::Valid
-    } else {
-        NpiValidity::ChecksumInvalid
     }
 }
 
@@ -2766,13 +2729,6 @@ mod tests {
             clean(Some(" mixed Case "), true).as_deref(),
             Some("MIXED CASE")
         );
-        assert_eq!(npi_validity("123"), NpiValidity::Invalid);
-        assert_eq!(npi_validity("100382138x"), NpiValidity::Invalid);
-        assert_eq!(npi_validity("0000000000"), NpiValidity::Invalid);
-        assert_eq!(npi_validity("3000000000"), NpiValidity::StructuralInvalid);
-        assert_eq!(npi_validity("0999999999"), NpiValidity::StructuralInvalid);
-        assert_eq!(npi_validity("1003821381"), NpiValidity::ChecksumInvalid);
-        assert_eq!(npi_validity("1003821380"), NpiValidity::Valid);
         assert_eq!(provider_quarantine_limit(0), 0);
         assert_eq!(provider_quarantine_limit(1), 1);
         assert_eq!(provider_quarantine_limit(9_999), 1);
