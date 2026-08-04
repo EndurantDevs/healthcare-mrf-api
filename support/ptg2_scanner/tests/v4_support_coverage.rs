@@ -183,6 +183,82 @@ fn candidate_address_units_and_unkeyable_inputs_are_exact() {
     );
     assert_eq!(punctuated_floor.unit_norm, "fl2");
     assert_eq!(punctuated_floor.line1_norm.as_deref(), Some("123mainst"));
+
+    let duplicate_floor = canonicalize_address(
+        Some("123 Main St 2 Floor"),
+        Some("2 Floor"),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(duplicate_floor.unit_norm, "fl2");
+    assert_eq!(duplicate_floor.line1_norm.as_deref(), Some("123mainst"));
+
+    let line_one_floor = canonicalize_address(
+        Some("123 Main St 2 Floor"),
+        None,
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(line_one_floor.unit_norm, "fl2");
+    assert_eq!(line_one_floor.line1_norm.as_deref(), Some("123mainst"));
+
+    let trailing_period_floor = canonicalize_address(
+        Some("123 Main St"),
+        Some("2 Floor."),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(trailing_period_floor.unit_norm, "fl2");
+    assert_eq!(
+        trailing_period_floor.line1_norm.as_deref(),
+        Some("123mainst")
+    );
+
+    let zero_floor = canonicalize_address(
+        Some("123 Main St"),
+        Some("000 Floor"),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert!(zero_floor.unit_norm.is_empty());
+
+    let zero_ordinal = canonicalize_address(
+        Some("000th Ave"),
+        None,
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(zero_ordinal.line1_norm.as_deref(), Some("000thave"));
+
+    let zero_typo_ordinal = canonicalize_address(
+        Some("000h St"),
+        None,
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(zero_typo_ordinal.line1_norm.as_deref(), Some("000hst"));
+
+    let punctuation_only_line2 = canonicalize_address(
+        Some("123 Main St ---"),
+        Some("---"),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert!(punctuation_only_line2.unit_norm.is_empty());
 }
 
 #[test]
@@ -358,6 +434,14 @@ fn scanner_progress_reporters_emit_interval_frame_and_stop_cleanly() {
         10,
         &compressed_bytes_read,
         &HashMap::from([("in_network".to_owned(), 1)]),
+        Instant::now(),
+        true,
+    );
+    emit_progress(
+        Path::new("/tmp/scanner-progress-empty.json"),
+        0,
+        &compressed_bytes_read,
+        &HashMap::new(),
         Instant::now(),
         true,
     );
