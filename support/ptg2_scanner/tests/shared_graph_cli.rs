@@ -1,6 +1,10 @@
 use ptg2_scanner::manifest::{
     normalized_sidecar_entries, write_dense_member_sidecar, write_global_sidecar, GlobalId128,
 };
+use ptg2_scanner::shared_graph::{
+    convert_shared_provider_graph, MembershipArtifactDescriptor, MembershipMetadata,
+    SharedGraphShardDescriptor,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -81,6 +85,49 @@ fn artifact(
             "shard_id": null,
         },
     })
+}
+
+fn artifact_descriptor(value: &Value) -> MembershipArtifactDescriptor {
+    let metadata = &value["metadata"];
+    MembershipArtifactDescriptor {
+        path: Path::new(value["path"].as_str().expect("membership sidecar path")).to_path_buf(),
+        metadata: MembershipMetadata {
+            record_format: metadata["record_format"]
+                .as_str()
+                .expect("membership record format")
+                .to_owned(),
+            sha256: metadata["sha256"]
+                .as_str()
+                .expect("membership digest")
+                .to_owned(),
+            byte_count: metadata["byte_count"]
+                .as_u64()
+                .expect("membership byte count"),
+            owner_count: metadata["owner_count"]
+                .as_u64()
+                .expect("membership owner count"),
+            member_count: metadata["member_count"]
+                .as_u64()
+                .expect("membership member count"),
+            member_global_count: metadata["member_global_count"].as_u64(),
+            name: metadata["name"].as_str().map(str::to_owned),
+            source_shard_id: metadata["source_shard_id"].as_str().map(str::to_owned),
+            shard_id: metadata["shard_id"].as_str().map(str::to_owned),
+        },
+    }
+}
+
+fn shard_descriptor(value: &Value) -> SharedGraphShardDescriptor {
+    SharedGraphShardDescriptor {
+        shard_id: value["shard_id"]
+            .as_str()
+            .expect("shared graph shard id")
+            .to_owned(),
+        group_npi: artifact_descriptor(&value["group_npi"]),
+        npi_group: artifact_descriptor(&value["npi_group"]),
+        group_provider_set: artifact_descriptor(&value["group_provider_set"]),
+        provider_set_group: artifact_descriptor(&value["provider_set_group"]),
+    }
 }
 
 fn shared_graph_manifest(root: &Path) -> Value {
@@ -273,5 +320,85 @@ fn shared_graph_converter_cli_rejects_invalid_descriptor_boundaries() {
                 json!(count + 1);
         },
         "dense membership dictionary count mismatch",
+    );
+}
+
+#[test]
+fn shared_graph_library_admission_and_no_clobber_are_exact() {
+    let temporary = tempfile::tempdir().expect("temporary graph admission root");
+    let root = temporary.path();
+
+    let empty_map = root.join("empty-provider-map.copy");
+    fs::write(&empty_map, b"").expect("write empty provider map");
+    let empty_shards_error =
+        convert_shared_provider_graph(&[], &empty_map, root.join("empty-output"))
+            .expect_err("empty shard set must fail");
+    assert_eq!(
+        empty_shards_error.to_string(),
+        "shared graph conversion requires at least one complete shard"
+    );
+
+    let valid_manifest = shared_graph_manifest(root);
+    let valid_shards = [shard_descriptor(&valid_manifest["shards"][0])];
+
+    let duplicate_map = root.join("duplicate-provider-map.copy");
+    let duplicate_id = hex(global(0x10));
+    fs::write(
+        &duplicate_map,
+        format!("{duplicate_id}\t0\n{duplicate_id}\t1\n"),
+    )
+    .expect("write duplicate provider map");
+    let duplicate_error =
+        convert_shared_provider_graph(&valid_shards, &duplicate_map, root.join("duplicate-output"))
+            .expect_err("duplicate provider identity must fail");
+    assert_eq!(
+        duplicate_error.to_string(),
+        "provider-set dictionary global IDs must be sorted and unique"
+    );
+
+    let invalid_start_map = root.join("invalid-start-provider-map.copy");
+    fs::write(&invalid_start_map, format!("{}\t2\n", hex(global(0x20))))
+        .expect("write invalid-start provider map");
+    let invalid_start_error = convert_shared_provider_graph(
+        &valid_shards,
+        &invalid_start_map,
+        root.join("invalid-start-output"),
+    )
+    .expect_err("provider keys must begin at zero or one");
+    assert_eq!(
+        invalid_start_error.to_string(),
+        "provider-set dictionary keys must start at zero or one"
+    );
+
+    let non_dense_map = root.join("non-dense-provider-map.copy");
+    fs::write(
+        &non_dense_map,
+        format!("{}\t0\n{}\t2\n", hex(global(0x30)), hex(global(0x40))),
+    )
+    .expect("write non-dense provider map");
+    let non_dense_error =
+        convert_shared_provider_graph(&valid_shards, &non_dense_map, root.join("non-dense-output"))
+            .expect_err("non-dense provider keys must fail");
+    assert_eq!(
+        non_dense_error.to_string(),
+        "provider-set dictionary keys must be dense and follow sorted global IDs"
+    );
+
+    let existing_output = root.join("existing-output");
+    fs::create_dir(&existing_output).expect("create existing output directory");
+    let sentinel = existing_output.join("graph-blocks.copy");
+    fs::write(&sentinel, b"sentinel").expect("write existing output sentinel");
+    let existing_error =
+        convert_shared_provider_graph(&[], root.join("unused-provider-map.copy"), &existing_output)
+            .expect_err("existing output must fail before conversion");
+    assert!(
+        existing_error
+            .to_string()
+            .starts_with("shared graph output already exists: "),
+        "unexpected existing-output error: {existing_error}"
+    );
+    assert_eq!(
+        fs::read(&sentinel).expect("read output sentinel"),
+        b"sentinel"
     );
 }
