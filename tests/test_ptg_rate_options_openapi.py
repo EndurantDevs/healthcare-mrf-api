@@ -20,6 +20,7 @@ def test_openapi_exposes_atomic_ptg_rate_options():
     option_schema = schemas["PtgRateOption"]
 
     assert set(option_schema["required"]) == {
+        "rate_option_ref",
         "provider_set_ref",
         "price_set_ref",
         "rate_pack_ref",
@@ -27,6 +28,18 @@ def test_openapi_exposes_atomic_ptg_rate_options():
     }
     assert option_schema["properties"]["prices"]["items"] == {
         "$ref": "#/components/schemas/PtgNegotiatedPrice"
+    }
+    assert option_schema["properties"]["rate_option_ref"] == {
+        "type": "string",
+        "pattern": "^ro1_[A-Za-z0-9_-]{43}$",
+        "description": (
+            "Deterministic opaque semantic-lineage reference derived from the\n"
+            "complete serving-lineage tuple. Identical sealed lineage can share\n"
+            "this reference across source occurrences. It is not a facility,\n"
+            "billing entity, tax identifier, unique occurrence ID, or\n"
+            "authorization token; any privileged follow-up must also bind the\n"
+            "entitled plan, exact immutable snapshot, and billing entity.\n"
+        ),
     }
     provider_properties = schemas["PricingProcedureProviderRecord"][
         "properties"

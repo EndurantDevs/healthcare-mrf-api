@@ -7,6 +7,19 @@ from unittest.mock import Mock
 from api import ptg2_serving as serving
 
 
+def _provider_ref(index: int) -> str:
+    return f"{index % 20 + 1:032x}"
+
+
+def _price_ref(index: int) -> str:
+    return f"{index % 40 + 101:032x}"
+
+
+def _rate_ref(index: int) -> str:
+    rate_index = (index % 30 + index // 120) % 30
+    return f"{rate_index + 201:032x}"
+
+
 def _rate_item(index: int) -> dict[str, object]:
     identity_index = index if index == 50 else index % 50
     return {
@@ -16,10 +29,10 @@ def _rate_item(index: int) -> dict[str, object]:
         "reported_code": "00001",
         "negotiation_arrangement": "FFS",
         "source_artifact_key": 7,
-        "price_set_hash": f"price-{index % 40}",
-        "price_set_hashes": [f"price-{index % 40}"],
-        "rate_pack_hash": f"rate-{index % 30}",
-        "provider_set_hash": f"provider-{index % 20}",
+        "price_set_hash": _price_ref(index),
+        "price_set_hashes": [_price_ref(index)],
+        "rate_pack_hash": _rate_ref(index),
+        "provider_set_hash": _provider_ref(index),
         "source_trace": [
             {
                 "source_file_version_id": f"source-{index % 50}",
@@ -57,13 +70,13 @@ def test_provider_rate_merge_deduplicates_in_linear_first_seen_order(monkeypatch
         }
     ]
     assert merged[0]["price_set_hashes"] == [
-        f"price-{index}" for index in range(40)
+        f"{index + 101:032x}" for index in range(40)
     ]
     assert merged[0]["rate_pack_hashes"] == [
-        f"rate-{index}" for index in range(30)
+        f"{index + 201:032x}" for index in range(30)
     ]
     assert merged[0]["provider_set_hashes"] == [
-        f"provider-{index}" for index in range(20)
+        f"{index + 1:032x}" for index in range(20)
     ]
     assert merged[0]["rate_option_count"] == 200
     assert merged[0]["provider_set_count"] == 20
@@ -79,9 +92,9 @@ def test_provider_rate_merge_deduplicates_in_linear_first_seen_order(monkeypatch
         for option in merged[0]["rate_options"]
     ] == [
         (
-            f"provider-{index % 20}",
-            f"price-{index % 40}",
-            f"rate-{index % 30}",
+            _provider_ref(index),
+            _price_ref(index),
+            _rate_ref(index),
             index,
         )
         for index in range(200)

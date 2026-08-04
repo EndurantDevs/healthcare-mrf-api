@@ -10,6 +10,10 @@ import pytest
 
 from api import ptg2_billing_associations as billing
 from process.tin_npi_connector_security import token_policy_descriptor_sha256
+from tests.ptg2_rate_option_ref_support import (
+    synthetic_lineage_ref as _lineage_ref,
+    synthetic_rate_option,
+)
 
 
 _CONTRACT_FIELDS = {
@@ -371,27 +375,24 @@ def _entity_ref(character: str) -> str:
     return f"be1_{character * 64}"
 
 
-def _provider_item(*provider_set_refs: str) -> dict[str, Any]:
+def _provider_item(*provider_set_ordinals: int) -> dict[str, Any]:
     return {
         "npi": 1234567890,
         "rate_options": [
-            {
-                "provider_set_ref": provider_set_ref,
-                "price_set_ref": f"price-{index}",
-                "rate_pack_ref": f"rate-{index}",
-                "prices": [{"negotiated_rate": index * 100}],
-            }
-            for index, provider_set_ref in enumerate(provider_set_refs, 1)
+            synthetic_rate_option(provider_set_ordinal, option_ordinal)
+            for option_ordinal, provider_set_ordinal in enumerate(
+                provider_set_ordinals, 1
+            )
         ],
     }
 
 
 def test_attachment_keeps_option_edges_and_counts_distinct_entities() -> None:
     shaped = billing.attach_billing_associations(
-        [_provider_item("set-1", "set-2")],
+        [_provider_item(1, 2)],
         {
-            "set-1": [_association(_group_ref(1), entity_ref=_entity_ref("a"))],
-            "set-2": [_association(_group_ref(2), entity_ref=_entity_ref("a"))],
+            _lineage_ref(1): [_association(_group_ref(1), entity_ref=_entity_ref("a"))],
+            _lineage_ref(2): [_association(_group_ref(2), entity_ref=_entity_ref("a"))],
         },
     )[0]
 
@@ -443,8 +444,8 @@ def test_attachment_reports_partial_unresolved_and_unavailable_counts(
     resolved_count: int | None,
 ) -> None:
     shaped = billing.attach_billing_associations(
-        [_provider_item("set-1")],
-        {"set-1": associations},
+        [_provider_item(1)],
+        {_lineage_ref(1): associations},
     )[0]
 
     assert shaped["rate_options"][0]["billing_association_status"] == option_status
@@ -463,21 +464,21 @@ def test_attachment_reports_partial_unresolved_and_unavailable_counts(
         ({}, {}),
         ({"rate_options": ["bad"]}, {}),
         ({"rate_options": [{"provider_set_ref": ""}]}, {}),
-        (_provider_item("set-1"), {}),
-        (_provider_item("set-1"), {"set-1": []}),
+        (_provider_item(1), {}),
+        (_provider_item(1), {_lineage_ref(1): []}),
         (
-            _provider_item("set-1"),
+            _provider_item(1),
             {
-                "set-1": [
+                _lineage_ref(1): [
                     _association(_group_ref(1), status="missing"),
                     _association(_group_ref(1), status="missing"),
                 ]
             },
         ),
         (
-            _provider_item("set-1"),
+            _provider_item(1),
             {
-                "set-1": [
+                _lineage_ref(1): [
                     {
                         **_association(_group_ref(1), status="missing"),
                         "tin_hmac_sha256": b"secret",

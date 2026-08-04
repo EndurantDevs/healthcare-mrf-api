@@ -67,6 +67,10 @@ from api.ptg2_billing_associations import (
     attach_billing_associations,
     load_provider_group_billing_associations,
 )
+from api.ptg2_rate_option_refs import (
+    encode_rate_option_ref,
+    validate_rate_option_ref_consistency,
+)
 from api.ptg2_online_work import PTG2OnlineWorkBudgetExceeded
 from api.ptg2_price_hydration_cache import (
     PRICE_HYDRATION_CACHE,
@@ -9064,10 +9068,18 @@ def _ensure_provider_rate_price_fields(item: dict[str, Any]) -> None:
 def _provider_rate_option(provider_rate: Mapping[str, Any]) -> dict[str, Any]:
     """Keep one price payload tied to the serving identities that produced it."""
 
+    provider_set_ref = provider_rate.get("provider_set_hash")
+    price_set_ref = provider_rate.get("price_set_hash")
+    rate_pack_ref = provider_rate.get("rate_pack_hash")
     return {
-        "provider_set_ref": provider_rate.get("provider_set_hash"),
-        "price_set_ref": provider_rate.get("price_set_hash"),
-        "rate_pack_ref": provider_rate.get("rate_pack_hash"),
+        "rate_option_ref": encode_rate_option_ref(
+            provider_set_ref=provider_set_ref,
+            price_set_ref=price_set_ref,
+            rate_pack_ref=rate_pack_ref,
+        ),
+        "provider_set_ref": provider_set_ref,
+        "price_set_ref": price_set_ref,
+        "rate_pack_ref": rate_pack_ref,
         "prices": list(provider_rate.get("prices") or []),
     }
 
@@ -9231,6 +9243,10 @@ def _merge_ptg2_provider_rate_items(
         grouped_provider_rate.update(
             _price_response_fields(grouped_provider_rate.get("prices"))
         )
+    for provider_rate in merged_provider_rates:
+        rate_options = provider_rate.get("rate_options")
+        if rate_options is not None:
+            validate_rate_option_ref_consistency(rate_options)
     return (
         attach_billing_associations(
             merged_provider_rates,

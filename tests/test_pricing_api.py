@@ -20,6 +20,7 @@ from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_ACCESS_ARG,
     PTG2_CANDIDATE_AUDIT_HEADER,
 )
+from api.ptg2_rate_option_refs import encode_rate_option_ref
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "api" / "endpoint" / "pricing.py"
 MODULE_SPEC = spec_from_file_location("pricing_endpoint_unit", MODULE_PATH)
@@ -2768,10 +2769,18 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
 
 
 def _public_billing_option_by_field():
+    provider_set_ref = "11" * 16
+    price_set_ref = "22" * 16
+    rate_pack_ref = "33" * 16
     return {
-        "provider_set_ref": "11" * 16,
-        "price_set_ref": "22" * 16,
-        "rate_pack_ref": "33" * 16,
+        "rate_option_ref": encode_rate_option_ref(
+            provider_set_ref=provider_set_ref,
+            price_set_ref=price_set_ref,
+            rate_pack_ref=rate_pack_ref,
+        ),
+        "provider_set_ref": provider_set_ref,
+        "price_set_ref": price_set_ref,
+        "rate_pack_ref": rate_pack_ref,
         "prices": [{"negotiated_rate": 125.0, "setting": "outpatient"}],
         "billing_association_status": "resolved",
         "billing_association_count": 1,

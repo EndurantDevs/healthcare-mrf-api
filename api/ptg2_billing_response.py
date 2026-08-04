@@ -11,6 +11,10 @@ from api.ptg2_billing_entity_refs import (
     BILLING_ENTITY_REF_PREFIX,
     PTG2BillingAssociationDataError,
 )
+from api.ptg2_rate_option_refs import (
+    PTG2RateOptionRefError,
+    validate_rate_option_ref_consistency,
+)
 
 
 _PROVIDER_GROUP_REF_BYTES = 16
@@ -171,6 +175,15 @@ class _BillingAttachmentSummary:
                 self.resolved_refs.add(billing_entity_ref)
 
 
+def _validate_rate_options_for_billing(raw_options: list[Any]) -> None:
+    try:
+        validate_rate_option_ref_consistency(raw_options)
+    except PTG2RateOptionRefError as exc:
+        raise PTG2BillingAssociationDataError(
+            "exact billing association response contains an invalid rate option reference"
+        ) from exc
+
+
 def _shape_rate_options_with_billing(
     raw_options: list[Any],
     associations_by_provider_set: Mapping[str, Iterable[Mapping[str, Any]]],
@@ -178,12 +191,9 @@ def _shape_rate_options_with_billing(
 ) -> list[dict[str, Any]]:
     """Bind each atomic rate option to its exact, sanitized group edges."""
 
+    _validate_rate_options_for_billing(raw_options)
     shaped_options: list[dict[str, Any]] = []
     for raw_option in raw_options:
-        if not isinstance(raw_option, Mapping):
-            raise PTG2BillingAssociationDataError(
-                "exact billing association response contains an invalid rate option"
-            )
         option_by_field = dict(raw_option)
         provider_set_ref = option_by_field.get("provider_set_ref")
         if type(provider_set_ref) is not str or not provider_set_ref:
