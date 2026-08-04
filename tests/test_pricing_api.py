@@ -2767,6 +2767,85 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert seen_argument_map["radius_miles"] == 10.0
 
 
+def _public_billing_option_by_field():
+    return {
+        "provider_set_ref": "11" * 16,
+        "price_set_ref": "22" * 16,
+        "rate_pack_ref": "33" * 16,
+        "prices": [{"negotiated_rate": 125.0, "setting": "outpatient"}],
+        "billing_association_status": "resolved",
+        "billing_association_count": 1,
+        "billing_associations": [
+            {
+                "association_ordinal": 1,
+                "billing_entity_ref": "be1_" + "a" * 64,
+                "tax_identity_status": "matched_ein",
+                "tin_type": "ein",
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_exact_npi_geo_pricing_preserves_public_billing_associations(
+    monkeypatch,
+):
+    seen_argument_map = {}
+    public_option_by_field = _public_billing_option_by_field()
+
+    async def fake_search(_session, args, pagination):
+        seen_argument_map.update(args)
+        return {
+            "items": [
+                {
+                    "npi": 1234567890,
+                    "provider_name": "Synthetic clinician",
+                    "rate_options": [public_option_by_field],
+                    "rate_option_count": 1,
+                    "billing_association_count": 1,
+                    "billing_entity_count": 1,
+                    "resolved_billing_entity_count": 1,
+                    "billing_entity_count_status": "exact",
+                }
+            ],
+            "pagination": {
+                "total": 1,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2", "state": args["state"]},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [],
+        args={
+            "plan_id": "TESTPLAN001",
+            "market_type": "group",
+            "code": "29888",
+            "code_system": "CPT",
+            "npi": "1234567890",
+            "state": "ZZ",
+            "include_providers": "true",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+    response_body = json.loads(response.body)
+    response_item = response_body["items"][0]
+
+    assert seen_argument_map["npi"] == 1234567890
+    assert seen_argument_map["state"] == "ZZ"
+    assert seen_argument_map["include_providers"] == "true"
+    assert response_item["rate_options"] == [public_option_by_field]
+    assert response_item["rate_option_count"] == 1
+    assert response_item["billing_association_count"] == 1
+    assert response_item["billing_entity_count"] == 1
+    assert response_item["resolved_billing_entity_count"] == 1
+    assert response_item["billing_entity_count_status"] == "exact"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "budget_dimension",
