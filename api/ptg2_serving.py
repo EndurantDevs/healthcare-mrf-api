@@ -16919,7 +16919,7 @@ async def _search_manifest_serving_table(
     serving_row_limit = _ptg2_manifest_serving_row_limit(
         args,
         rate_candidate_limit,
-        expand_providers=include_providers and not direct_npi_filter_requested,
+        expand_providers=include_providers,
     )
 
     def no_match_response() -> dict[str, Any]:

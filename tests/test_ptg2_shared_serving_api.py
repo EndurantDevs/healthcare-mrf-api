@@ -1071,6 +1071,36 @@ def _stub_exact_npi_price_rows(monkeypatch, provider_set_id, price_set_id):
     return merge_code_rows
 
 
+def _stub_collapsing_exact_npi_price_rows(monkeypatch, provider_set_id):
+    price_set_ids = ("05" * 16, "06" * 16)
+    merge_rows = _stub_exact_npi_price_rows(
+        monkeypatch,
+        provider_set_id,
+        price_set_ids[0],
+    )
+    first_rate_row = merge_rows.return_value[0]
+    merge_rows.return_value = [
+        first_rate_row,
+        {
+            **first_rate_row,
+            "serving_content_hash_128": "07" * 16,
+            "price_set_global_id_128": price_set_ids[1],
+            "price_key": 10,
+        },
+    ]
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_prices_for_price_sets",
+        AsyncMock(
+            return_value={
+                price_set_ids[0]: [{"negotiated_rate": "125.00"}],
+                price_set_ids[1]: [{"negotiated_rate": "150.00"}],
+            }
+        ),
+    )
+    return merge_rows, price_set_ids
+
+
 @pytest.mark.asyncio
 async def test_explicit_npi_search_intersects_provider_sets_before_reading_rows(
     monkeypatch,
@@ -1114,7 +1144,7 @@ async def test_explicit_npi_search_intersects_provider_sets_before_reading_rows(
     assert response is None
     merge_rows.assert_awaited_once()
     assert merge_rows.await_args.kwargs["provider_set_keys"] == [3]
-    assert merge_rows.await_args.kwargs["limit"] == 101
+    assert merge_rows.await_args.kwargs["limit"] is None
     assert merge_rows.await_args.kwargs["offset"] == 0
 
 
@@ -1169,6 +1199,65 @@ async def test_exact_npi_rate_lookup_skips_generic_provider_traversal(
     location_matches.assert_not_awaited()
     broad_rows.assert_not_awaited()
     provider_enrichment.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exact_npi_provider_page_reads_every_rate_before_merging(
+    monkeypatch,
+):
+    """Do not mistake a full rate-row window for a complete provider page."""
+
+    provider_set_id = "03" * 16
+    merge_rows, price_set_ids = _stub_collapsing_exact_npi_price_rows(
+        monkeypatch,
+        provider_set_id,
+    )
+    location_matches, broad_rows, provider_enrichment = _stub_exact_npi_graph(
+        monkeypatch,
+        provider_set_id,
+    )
+
+    response = await ptg2_serving._search_manifest_serving_table(
+        _single_code_metadata_session(),
+        "logical-plan-a",
+        {
+            "plan_id": "plan-a",
+            "plan_market_type": "group",
+            "code_system": "CPT",
+            "code": "99213",
+            "npi": "1234567890",
+            "include_providers": True,
+        },
+        SimpleNamespace(limit=1, offset=0),
+        _strict_tables(snapshot_id="logical-plan-a", snapshot_key=41),
+        "exact_source",
+    )
+
+    assert response is not None
+    assert [provider_record["npi"] for provider_record in response["items"]] == [
+        1234567890
+    ]
+    assert {
+        price["negotiated_rate"] for price in response["items"][0]["prices"]
+    } == {125, 150}
+    assert response["items"][0]["rate_option_count"] == 2
+    assert {
+        option["price_set_ref"] for option in response["items"][0]["rate_options"]
+    } == set(price_set_ids)
+    assert response["pagination"] == {
+        "total": 1,
+        "total_is_exact": True,
+        "total_lower_bound": 1,
+        "limit": 1,
+        "offset": 0,
+        "page": 1,
+        "has_more": False,
+    }
+    assert merge_rows.await_args.kwargs["provider_set_keys"] == [3]
+    assert merge_rows.await_args.kwargs["limit"] is None
+    location_matches.assert_not_awaited()
+    broad_rows.assert_not_awaited()
+    provider_enrichment.assert_awaited_once()
 
 
 @pytest.mark.asyncio
