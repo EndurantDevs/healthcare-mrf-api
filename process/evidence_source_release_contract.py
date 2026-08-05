@@ -477,15 +477,18 @@ def validate_public_evidence_source_release(
     if type(descriptor) is not PublicEvidenceSourceReleaseDescriptor:
         raise _fail()
     try:
-        fixed_state = (
-            descriptor.contract,
-            descriptor.foundation_scope,
-            descriptor.serving_authority,
-        )
-        if fixed_state != (
-            PUBLIC_EVIDENCE_SOURCE_RELEASE_CONTRACT,
-            PUBLIC_EVIDENCE_FOUNDATION_SCOPE,
-            "none",
+        if (
+            type(descriptor.contract) is not str
+            or descriptor.contract != PUBLIC_EVIDENCE_SOURCE_RELEASE_CONTRACT
+            or type(descriptor.foundation_scope) is not str
+            or descriptor.foundation_scope != PUBLIC_EVIDENCE_FOUNDATION_SCOPE
+            or type(descriptor.serving_authority) is not str
+            or descriptor.serving_authority != "none"
+            or any(
+                getattr(descriptor, field_name)
+                is not (field_name in _REQUIRED_TRUE_FIELDS)
+                for field_name in _REQUIRED_TRUE_FIELDS + _REQUIRED_FALSE_FIELDS
+            )
         ):
             raise _fail()
         _normalized_release(_descriptor_input(descriptor))
