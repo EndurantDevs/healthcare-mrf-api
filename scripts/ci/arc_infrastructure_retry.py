@@ -31,8 +31,9 @@ _STRONG_INFRASTRUCTURE_PATTERNS = {
         re.IGNORECASE,
     ),
     "postgres-readiness-timeout": re.compile(
-        r"PostgreSQL service was not ready within \d+ seconds",
-        re.IGNORECASE,
+        r"^(?:(?:\ufeff)?\d{4}-\d{2}-\d{2}T[0-9:.]+Z )?"
+        r"(?:##\[error\])?PostgreSQL service was not ready within \d+ seconds\s*$",
+        re.IGNORECASE | re.MULTILINE,
     ),
     "job-container-lost": re.compile(
         r"(?:container not found \([\"']?job|"

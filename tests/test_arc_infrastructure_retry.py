@@ -66,6 +66,14 @@ def test_classifier_accepts_only_positive_arc_infrastructure_signatures() -> Non
     assert infrastructure_reasons(
         "PostgreSQL service was not ready within 30 seconds"
     ) == ("postgres-readiness-timeout",)
+    assert infrastructure_reasons(
+        "2026-08-05T21:20:58Z PostgreSQL service was not ready within 30 seconds"
+    ) == ("postgres-readiness-timeout",)
+    rendered_command = (
+        '2026-08-05T21:20:58Z echo "PostgreSQL service was not ready '
+        'within 30 seconds"\ncommand terminated with exit code 137'
+    )
+    assert infrastructure_reasons(rendered_command) == ()
     decision = _decision([_job(10), _job(11)], {10: oom, 11: refused})
     assert decision.should_retry is True
     assert decision.failed_jobs == 2
