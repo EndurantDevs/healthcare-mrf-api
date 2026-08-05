@@ -82,6 +82,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         headers: Mapping[str, str],
         new_url: str,
     ) -> None:
+        """Expose a redirect response so its untrusted destination can be checked."""
         del request, file_pointer, code, message, headers, new_url
         return None
 
@@ -100,7 +101,7 @@ def infrastructure_reasons(log: str) -> tuple[str, ...]:
     return tuple(sorted(set(reasons)))
 
 
-def run_allows_retry(run: Mapping[str, Any], *, attempt: int) -> bool:
+def is_run_retryable(run: Mapping[str, Any], *, attempt: int) -> bool:
     """Reject stale or duplicate events after a retry has already started."""
     return (
         run.get("status") == "completed"
@@ -133,9 +134,9 @@ def decide_retry(
     runner_name_prefix: str,
 ) -> RetryDecision:
     """Retry only when every failed job is positively identified as ARC infra."""
-    failed = [job for job in jobs if job.get("conclusion") == "failure"]
+    failed_jobs = [job for job in jobs if job.get("conclusion") == "failure"]
     infrastructure_jobs = 0
-    for job in failed:
+    for job in failed_jobs:
         job_id = job.get("id")
         if (
             not isinstance(job_id, int)
@@ -146,11 +147,11 @@ def decide_retry(
             )
             or not infrastructure_reasons(logs.get(job_id, ""))
         ):
-            return RetryDecision(False, len(failed), infrastructure_jobs)
+            return RetryDecision(False, len(failed_jobs), infrastructure_jobs)
         infrastructure_jobs += 1
     return RetryDecision(
-        bool(failed) and infrastructure_jobs == len(failed),
-        len(failed),
+        bool(failed_jobs) and infrastructure_jobs == len(failed_jobs),
+        len(failed_jobs),
         infrastructure_jobs,
     )
 
@@ -186,6 +187,7 @@ class GitHubEvidenceClient:
         return value
 
     def attempt_jobs(self, run_id: int, attempt: int) -> list[dict[str, Any]]:
+        """Return every job from one immutable workflow-run attempt."""
         jobs: list[dict[str, Any]] = []
         page = 1
         while True:
@@ -204,9 +206,11 @@ class GitHubEvidenceClient:
             page += 1
 
     def workflow_run(self, run_id: int) -> dict[str, Any]:
+        """Return the current workflow-run state used by duplicate-run guards."""
         return self._json(f"/actions/runs/{run_id}")
 
     def job_log(self, job_id: int) -> str:
+        """Download one bounded job log without forwarding authorization."""
         opener = urllib.request.build_opener(_NoRedirect())
         location: str | None = None
         try:
@@ -260,15 +264,17 @@ def _write_outputs(decision: RetryDecision) -> None:
         output.write(f"infrastructure_jobs={decision.infrastructure_jobs}\n")
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
     parser.add_argument("--run-id", required=True, type=_positive_integer)
     parser.add_argument("--attempt", required=True, type=_positive_integer)
     parser.add_argument("--runner-label", required=True)
     parser.add_argument("--runner-name-prefix", required=True)
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
 
+
+def _evaluate_retry(args: argparse.Namespace) -> int:
     if args.attempt != 1:
         _write_outputs(RetryDecision(False, 0, 0))
         return 0
@@ -277,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         args.repository,
         os.environ.get("GITHUB_TOKEN", ""),
     )
-    if not run_allows_retry(client.workflow_run(args.run_id), attempt=args.attempt):
+    if not is_run_retryable(client.workflow_run(args.run_id), attempt=args.attempt):
         _write_outputs(RetryDecision(False, 0, 0))
         return 0
     jobs = client.attempt_jobs(args.run_id, args.attempt)
@@ -294,10 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         _write_outputs(RetryDecision(False, len(failed_jobs), 0))
         return 0
     failed_ids = [job["id"] for job in failed_jobs]
-    logs = {job_id: client.job_log(job_id) for job_id in failed_ids}
+    log_by_job_id = {job_id: client.job_log(job_id) for job_id in failed_ids}
     decision = decide_retry(
         jobs,
-        logs,
+        log_by_job_id,
         runner_label=args.runner_label,
         runner_name_prefix=args.runner_name_prefix,
     )
@@ -308,6 +314,11 @@ def main(argv: list[str] | None = None) -> int:
         f"retry={str(decision.should_retry).lower()}"
     )
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Evaluate one workflow attempt and request a bounded retry when safe."""
+    return _evaluate_retry(_parse_arguments(argv))
 
 
 if __name__ == "__main__":

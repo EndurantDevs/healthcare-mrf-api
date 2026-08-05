@@ -13,7 +13,7 @@ from scripts.ci import arc_infrastructure_retry as retry
 from scripts.ci.arc_infrastructure_retry import (
     decide_retry,
     infrastructure_reasons,
-    run_allows_retry,
+    is_run_retryable,
 )
 
 
@@ -104,22 +104,26 @@ def test_classifier_fails_closed_for_mixed_or_non_arc_failures() -> None:
 
 
 def test_classifier_rejects_stale_duplicate_or_incomplete_run_events() -> None:
-    completed_failure = {
+    completed_failure_run_dict = {
         "status": "completed",
         "conclusion": "failure",
         "run_attempt": 1,
     }
 
-    assert run_allows_retry(completed_failure, attempt=1) is True
-    assert run_allows_retry({**completed_failure, "run_attempt": 2}, attempt=1) is False
+    assert is_run_retryable(completed_failure_run_dict, attempt=1) is True
+    assert is_run_retryable(
+        {**completed_failure_run_dict, "run_attempt": 2}, attempt=1
+    ) is False
     assert (
-        run_allows_retry(
-            {**completed_failure, "status": "in_progress"}, attempt=1
+        is_run_retryable(
+            {**completed_failure_run_dict, "status": "in_progress"}, attempt=1
         )
         is False
     )
     assert (
-        run_allows_retry({**completed_failure, "conclusion": "success"}, attempt=1)
+        is_run_retryable(
+            {**completed_failure_run_dict, "conclusion": "success"}, attempt=1
+        )
         is False
     )
 
