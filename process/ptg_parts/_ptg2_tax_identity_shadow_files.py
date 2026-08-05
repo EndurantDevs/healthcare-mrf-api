@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Protocol
 
-
 _HASH_CHUNK_BYTES = 1024 * 1024
 _HEADER_BYTES = 13
 _V1_MAGIC = b"PTG2TAX1"
@@ -142,7 +141,10 @@ def _recheck_root(root: _ScratchRoot) -> None:
     except (OSError, TaxIdentityShadowAdmissionError):
         raise _fail(_ARTIFACT_CHANGED) from None
     expected = _node_identity(root.metadata)
-    if _node_identity(named_metadata) != expected or _node_identity(opened_metadata) != expected:
+    if (
+        _node_identity(named_metadata) != expected
+        or _node_identity(opened_metadata) != expected
+    ):
         raise _fail(_ARTIFACT_CHANGED)
 
 
@@ -173,7 +175,9 @@ def _preflight_artifact(
 
 
 @contextmanager
-def _open_artifact(root: _ScratchRoot, preflight: _ArtifactPreflight) -> Iterator[_HeldArtifact]:
+def _open_artifact(
+    root: _ScratchRoot, preflight: _ArtifactPreflight
+) -> Iterator[_HeldArtifact]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | _nofollow_flag()
     flags |= _nonblock_flag()
     try:
@@ -257,7 +261,10 @@ def _recheck_artifact(root: _ScratchRoot, held: _HeldArtifact) -> None:
     except OSError:
         raise _fail(_ARTIFACT_CHANGED) from None
     expected = _file_identity(held.metadata)
-    if _file_identity(opened_metadata) != expected or _file_identity(named_metadata) != expected:
+    if (
+        _file_identity(opened_metadata) != expected
+        or _file_identity(named_metadata) != expected
+    ):
         raise _fail(_ARTIFACT_CHANGED)
 
 

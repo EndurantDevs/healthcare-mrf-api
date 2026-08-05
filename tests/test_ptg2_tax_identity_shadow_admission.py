@@ -31,9 +31,13 @@ def _admit(
     )
 
 
-def test_admits_immutable_relocation_stable_publication_disabled_shadow(tmp_path: Path) -> None:
+def test_admits_immutable_relocation_stable_publication_disabled_shadow(
+    tmp_path: Path,
+) -> None:
     first_root, first_v1, first_v2 = make_sidecar_pair(tmp_path, directory_name="first")
-    second_root, second_v1, second_v2 = make_sidecar_pair(tmp_path, directory_name="second")
+    second_root, second_v1, second_v2 = make_sidecar_pair(
+        tmp_path, directory_name="second"
+    )
 
     bundle = _admit(first_root, first_v1, first_v2)
     relocated = _admit(second_root, second_v1, second_v2)
@@ -48,9 +52,10 @@ def test_admits_immutable_relocation_stable_publication_disabled_shadow(tmp_path
     assert bundle.binding_sha256 == (
         "b5a0afd98516a8f27cbef23cf0eec6165ae5bdbb4a9160c23bdf9b4e9f0eb7b3"
     )
-    assert "publication_enabled" not in inspect.signature(
-        admission.TaxIdentityShadowBundleDescriptor
-    ).parameters
+    assert (
+        "publication_enabled"
+        not in inspect.signature(admission.TaxIdentityShadowBundleDescriptor).parameters
+    )
     with pytest.raises(FrozenInstanceError):
         setattr(bundle, "publication_enabled", True)
     with pytest.raises(TypeError):
@@ -70,11 +75,14 @@ def test_binding_digest_changes_with_authenticated_content(tmp_path: Path) -> No
         payload_seed=91,
     )
 
-    assert _admit(first_root, first_v1, first_v2).binding_sha256 != _admit(
-        second_root,
-        second_v1,
-        second_v2,
-    ).binding_sha256
+    assert (
+        _admit(first_root, first_v1, first_v2).binding_sha256
+        != _admit(
+            second_root,
+            second_v1,
+            second_v2,
+        ).binding_sha256
+    )
 
 
 def test_arbitrary_rows_are_admitted_only_as_rust_owned_shadow_evidence(
