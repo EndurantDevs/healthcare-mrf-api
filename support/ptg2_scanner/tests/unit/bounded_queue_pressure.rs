@@ -2,20 +2,14 @@ use super::*;
 
 const QUEUE_FULL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-struct QueueFullHandshakeWriter {
-    full_seen_tx: Sender<()>,
-}
-
-impl Write for QueueFullHandshakeWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.full_seen_tx
-            .send(())
-            .expect("queue-full handshake receiver closed");
-        Ok(())
+fn wait_until_event_is_drained(event_rx: &Receiver<CopyFileEvent>, failure_message: &str) {
+    let started_at = Instant::now();
+    while !event_rx.is_empty() {
+        assert!(
+            started_at.elapsed() < QUEUE_FULL_HANDSHAKE_TIMEOUT,
+            "{failure_message}"
+        );
+        thread::yield_now();
     }
 }
 
@@ -45,14 +39,12 @@ pub(super) fn assert_worker_job_queue_pressure(
             rates: Vec::new(),
         })
         .unwrap();
-    let (full_seen_tx, full_seen_rx) = bounded(1);
     let (event_tx, event_rx) = unbounded();
     event_tx.send(empty_copy_file_event()).unwrap();
-    let mut writer = QueueFullHandshakeWriter { full_seen_tx };
+    let event_observer_rx = event_rx.clone();
+    let mut writer = Vec::new();
     let receiver = thread::spawn(move || {
-        full_seen_rx
-            .recv_timeout(QUEUE_FULL_HANDSHAKE_TIMEOUT)
-            .expect("worker-job queue never reported Full");
+        wait_until_event_is_drained(&event_observer_rx, "worker-job queue never reported Full");
         let _ = job_rx
             .recv_timeout(QUEUE_FULL_HANDSHAKE_TIMEOUT)
             .expect("prefilled worker job was not released");
@@ -84,14 +76,15 @@ pub(super) fn assert_provider_reference_queue_pressure(
 ) {
     let (batch_tx, batch_rx) = bounded(1);
     batch_tx.send(RawRateChunk::with_capacity(0, 0)).unwrap();
-    let (full_seen_tx, full_seen_rx) = bounded(1);
     let (event_tx, event_rx) = unbounded();
     event_tx.send(empty_copy_file_event()).unwrap();
-    let mut writer = QueueFullHandshakeWriter { full_seen_tx };
+    let event_observer_rx = event_rx.clone();
+    let mut writer = Vec::new();
     let receiver = thread::spawn(move || {
-        full_seen_rx
-            .recv_timeout(QUEUE_FULL_HANDSHAKE_TIMEOUT)
-            .expect("provider-reference queue never reported Full");
+        wait_until_event_is_drained(
+            &event_observer_rx,
+            "provider-reference queue never reported Full",
+        );
         let _ = batch_rx
             .recv_timeout(QUEUE_FULL_HANDSHAKE_TIMEOUT)
             .expect("prefilled provider-reference batch was not released");
