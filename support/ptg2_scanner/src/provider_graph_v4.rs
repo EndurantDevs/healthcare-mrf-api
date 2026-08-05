@@ -9,6 +9,11 @@
 //! composed into one reusable scratch vector and immediately counted,
 //! hashed, or emitted.
 
+use crate::tax_identity_sidecar_bundle::{
+    finalize_tax_identity_sidecar_bundle, validate_tax_identity_sidecar_shard_with_progress,
+    ProviderGroupUniverse, TaxIdentitySidecarBundleCheckpoint, TaxIdentitySidecarV1Admission,
+    TaxIdentitySidecarV2ArtifactDescriptor,
+};
 use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -383,6 +388,8 @@ pub struct V4ProviderGraphShardDescriptor {
     pub provider_npi_group: V4MembershipArtifactDescriptor,
     pub provider_npi_scope: V4NpiScopeArtifactDescriptor,
     pub provider_group_tax_identity: V4TaxIdentityArtifactDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_group_tax_identity_v2: Option<TaxIdentitySidecarV2ArtifactDescriptor>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -1065,6 +1072,8 @@ pub struct ProviderGraphV4ConversionSummary {
     pub heavy_bitmaps: Vec<V4HeavyBitmapSummary>,
     pub output_artifacts: Vec<V4OutputArtifactSummary>,
     pub tax_identity: V4TaxIdentitySummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tax_identity_sidecar_bundle: Option<TaxIdentitySidecarBundleCheckpoint>,
     pub observe: V4ObserveCounters,
     pub resource_admission: V4ResourceAdmissionSummary,
     pub input_byte_count: u64,
@@ -1331,6 +1340,21 @@ impl ValidatedArtifact {
             }
         }
         Ok(())
+    }
+}
+
+impl ProviderGroupUniverse for ValidatedArtifact {
+    fn provider_group_count(&self) -> u64 {
+        self.owner_count
+    }
+
+    fn provider_group_at(&self, index: u64) -> io::Result<[u8; 16]> {
+        self.owner(index).map(|owner| owner.owner).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V4 provider-group universe is invalid",
+            )
+        })
     }
 }
 
@@ -1724,6 +1748,7 @@ struct RawFactors {
     tax_identities: V4TaxIdentityFactors,
     input_byte_count: u64,
     input_digest: Sha256,
+    tax_identity_sidecar_bundle: Option<TaxIdentitySidecarBundleCheckpoint>,
 }
 
 #[derive(Clone, Debug)]
@@ -1753,6 +1778,7 @@ impl RawFactors {
             tax_identities: V4TaxIdentityFactors::default(),
             input_byte_count: 0,
             input_digest,
+            tax_identity_sidecar_bundle: None,
         }
     }
 
@@ -1931,6 +1957,7 @@ fn load_raw_factors(
     }
     let mut ordered_descriptors = descriptors.iter().collect::<Vec<_>>();
     ordered_descriptors.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    let paired_tax_identity_mode = tax_identity_v2_paired_mode(descriptors)?;
     let total_edges = ordered_descriptors
         .iter()
         .try_fold(0u64, |total, descriptor| {
@@ -1952,12 +1979,25 @@ fn load_raw_factors(
                 .and_then(|value| {
                     value.checked_add(descriptor.provider_group_tax_identity.metadata.row_count)
                 })
+                .and_then(|value| {
+                    value.checked_add(
+                        descriptor
+                            .provider_group_tax_identity_v2
+                            .as_ref()
+                            .map_or(0, |artifact| artifact.metadata.row_count),
+                    )
+                })
                 .ok_or(invalid("V4 factor progress total overflows"))
         })?;
     let mut completed_edges = 0u64;
     progress.periodic("load_factors", 0, total_edges, "factor_items");
     let mut seen = HashSet::new();
     let mut raw = RawFactors::new();
+    let mut tax_identity_pair_checkpoints = if paired_tax_identity_mode {
+        Vec::with_capacity(ordered_descriptors.len())
+    } else {
+        Vec::new()
+    };
     let source_bitmap_bytes = ordered_descriptors
         .len()
         .checked_add(7)
@@ -2028,6 +2068,51 @@ fn load_raw_factors(
         let component_group = ValidatedArtifact::open(&descriptor.provider_component_group)?;
         let group_npi = ValidatedArtifact::open(&descriptor.provider_group_npi)?;
         let npi_group = ValidatedArtifact::open(&descriptor.provider_npi_group)?;
+        if let Some(v2) = descriptor.provider_group_tax_identity_v2.as_ref() {
+            let metadata = &descriptor.provider_group_tax_identity.metadata;
+            let pair_progress_start = completed_edges;
+            tax_identity_pair_checkpoints.push(validate_tax_identity_sidecar_shard_with_progress(
+                shard_id,
+                TaxIdentitySidecarV1Admission {
+                    path: &descriptor.provider_group_tax_identity.path,
+                    record_format: &metadata.record_format,
+                    sha256: &metadata.sha256,
+                    byte_count: metadata.byte_count,
+                    row_count: metadata.row_count,
+                    provider_group_count: metadata.provider_group_count,
+                    matched_ein_count: metadata.matched_ein_count,
+                    missing_count: metadata.missing_count,
+                    malformed_count: metadata.malformed_count,
+                    unsupported_type_count: metadata.unsupported_type_count,
+                    version: metadata.version,
+                    record_bytes: metadata.record_bytes,
+                    token_policy_id: &metadata.token_policy_id,
+                    normalization_contract: &metadata.normalization_contract,
+                    hmac_contract: &metadata.hmac_contract,
+                    final_file: metadata.final_file,
+                    name: metadata.name.as_deref(),
+                    source_shard_id: metadata.source_shard_id.as_deref(),
+                    shard_id: metadata.shard_id.as_deref(),
+                },
+                v2,
+                &group_npi,
+                |validated_rows| {
+                    completed_edges =
+                        pair_progress_start
+                            .checked_add(validated_rows)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "V4 factor progress count overflows",
+                                )
+                            })?;
+                    progress.periodic("load_factors", completed_edges, total_edges, "factor_items");
+                    Ok(())
+                },
+            )?);
+        }
+        // Reopen and independently re-authenticate v1 before it can remain the
+        // sole projection/COPY authority.
         let tax_identity =
             ValidatedTaxIdentityArtifact::open(&descriptor.provider_group_tax_identity)?;
         if raw.tax_identities.token_policy_id.is_empty() {
@@ -2102,6 +2187,15 @@ fn load_raw_factors(
             "V4 provider tax identity token policy is unavailable",
         ));
     }
+    if paired_tax_identity_mode {
+        let checkpoint = finalize_tax_identity_sidecar_bundle(tax_identity_pair_checkpoints)?;
+        raw.record_input(
+            "provider_group_tax_identity_v2_validation_bundle",
+            parse_sha256(checkpoint.bundle_sha256())?,
+            checkpoint.v2_byte_count(),
+        );
+        raw.tax_identity_sidecar_bundle = Some(checkpoint);
+    }
     Ok(raw)
 }
 
@@ -2113,6 +2207,7 @@ fn resource_admission_preflight(
     if descriptors.is_empty() {
         return Err(invalid("V4 provider graph requires at least one shard"));
     }
+    tax_identity_v2_paired_mode(descriptors)?;
     let mut input_factor_bytes = 0u64;
     let mut factor_edge_count = 0u64;
     let mut factor_owner_count = 0u64;
@@ -2163,6 +2258,14 @@ fn resource_admission_preflight(
                     .provider_group_count,
             )
             .ok_or(invalid("resource_admission: factor owner count overflows"))?;
+        if let Some(v2) = shard.provider_group_tax_identity_v2.as_ref() {
+            input_factor_bytes = input_factor_bytes
+                .checked_add(v2.metadata.byte_count)
+                .ok_or(invalid("resource_admission: input byte count overflows"))?;
+            factor_edge_count = factor_edge_count
+                .checked_add(v2.metadata.row_count)
+                .ok_or(invalid("resource_admission: factor edge count overflows"))?;
+        }
         tax_identity_group_occurrence_upper_bound = tax_identity_group_occurrence_upper_bound
             .checked_add(
                 shard
@@ -2292,6 +2395,22 @@ fn resource_admission_preflight(
         },
         tax_identity_projection_reconciled: false,
     })
+}
+
+fn tax_identity_v2_paired_mode(
+    descriptors: &[V4ProviderGraphShardDescriptor],
+) -> ProviderGraphV4Result<bool> {
+    let v2_descriptor_count = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.provider_group_tax_identity_v2.is_some())
+        .count();
+    match v2_descriptor_count {
+        0 => Ok(false),
+        count if count == descriptors.len() => Ok(true),
+        _ => Err(invalid(
+            "V4 provider tax identity v2 descriptors must be supplied for every shard",
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -8553,6 +8672,7 @@ fn compile_provider_graph_v4_inner(
         heavy_bitmaps,
         output_artifacts,
         tax_identity: tax_identity.summary()?,
+        tax_identity_sidecar_bundle: raw.tax_identity_sidecar_bundle.clone(),
         observe,
         resource_admission: resource_admission.into_summary(),
         input_byte_count: raw.input_byte_count,
@@ -8717,6 +8837,17 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tax_identity::TaxIdentityStateV2;
+    use crate::tax_identity_sidecar_bundle::{
+        TaxIdentitySidecarV2Metadata, TAX_IDENTITY_SIDECAR_FULL_HMAC_AUTHORITY_CONTRACT,
+        TAX_IDENTITY_SIDECAR_HMAC_CONTRACT, TAX_IDENTITY_SIDECAR_LOCATOR_CONTRACT,
+        TAX_IDENTITY_SIDECAR_TOKEN_MESSAGE_CONTRACT,
+        TAX_IDENTITY_SIDECAR_V2_NORMALIZATION_CONTRACT,
+    };
+    use crate::tax_identity_sidecar_v2::{
+        TaxIdentitySidecarV2Header, TaxIdentitySidecarV2Record, TAX_IDENTITY_SIDECAR_V2_FORMAT,
+        TAX_IDENTITY_SIDECAR_V2_FORMAT_VERSION, TAX_IDENTITY_SIDECAR_V2_RECORD_BYTES,
+    };
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::io::Read;
@@ -8757,6 +8888,16 @@ mod tests {
         dense: bool,
     ) -> V4MembershipArtifactDescriptor {
         let pairs = normalized_pairs(pairs);
+        write_normalized_membership(path, shard_id, name, pairs, dense)
+    }
+
+    fn write_normalized_membership(
+        path: &Path,
+        shard_id: &str,
+        name: &str,
+        pairs: BTreeMap<GlobalId, Vec<GlobalId>>,
+        dense: bool,
+    ) -> V4MembershipArtifactDescriptor {
         let member_count = pairs.values().map(Vec::len).sum::<usize>();
         let mut bytes = Vec::new();
         let dictionary = if dense {
@@ -8896,6 +9037,74 @@ mod tests {
         )
     }
 
+    fn write_v2_from_v1(
+        path: &Path,
+        shard_id: &str,
+        v1: &V4TaxIdentityArtifactDescriptor,
+    ) -> TaxIdentitySidecarV2ArtifactDescriptor {
+        let v1_artifact = ValidatedTaxIdentityArtifact::open(v1).unwrap();
+        let header = TaxIdentitySidecarV2Header::new(v1_artifact.token_policy_id.clone()).unwrap();
+        let mut bytes = header.encode();
+        let mut counts = [0u64; 5];
+        for index in 0..v1_artifact.row_count {
+            let record = v1_artifact.record(index).unwrap();
+            let (state, hmac) = match record.state {
+                V4TaxIdentityState::MatchedEin => {
+                    (TaxIdentityStateV2::MatchedEin, record.tin_hmac_sha256)
+                }
+                V4TaxIdentityState::Missing => (TaxIdentityStateV2::Missing, [0; 32]),
+                V4TaxIdentityState::Malformed => (TaxIdentityStateV2::Malformed, [0; 32]),
+                V4TaxIdentityState::UnsupportedType => {
+                    (TaxIdentityStateV2::UnsupportedType, [0; 32])
+                }
+            };
+            let sidecar_record = TaxIdentitySidecarV2Record::new(
+                record.provider_group_global_id,
+                state,
+                hmac[..16].try_into().unwrap(),
+                hmac,
+            )
+            .unwrap();
+            bytes.extend_from_slice(&sidecar_record.encode());
+            let count = match state {
+                TaxIdentityStateV2::MatchedEin => &mut counts[0],
+                TaxIdentityStateV2::MatchedNpi => &mut counts[1],
+                TaxIdentityStateV2::Missing => &mut counts[2],
+                TaxIdentityStateV2::Malformed => &mut counts[3],
+                TaxIdentityStateV2::UnsupportedType => &mut counts[4],
+            };
+            *count += 1;
+        }
+        fs::write(path, &bytes).unwrap();
+        TaxIdentitySidecarV2ArtifactDescriptor {
+            path: path.to_path_buf(),
+            metadata: TaxIdentitySidecarV2Metadata {
+                record_format: TAX_IDENTITY_SIDECAR_V2_FORMAT.to_owned(),
+                sha256: hex(&Sha256::digest(&bytes)),
+                byte_count: bytes.len() as u64,
+                row_count: v1_artifact.row_count,
+                provider_group_count: v1_artifact.row_count,
+                matched_ein_count: counts[0],
+                matched_npi_count: counts[1],
+                missing_count: counts[2],
+                malformed_count: counts[3],
+                unsupported_type_count: counts[4],
+                version: TAX_IDENTITY_SIDECAR_V2_FORMAT_VERSION,
+                record_bytes: TAX_IDENTITY_SIDECAR_V2_RECORD_BYTES as u16,
+                token_policy_id: v1_artifact.token_policy_id.clone(),
+                normalization_contract: TAX_IDENTITY_SIDECAR_V2_NORMALIZATION_CONTRACT.to_owned(),
+                token_message_contract: TAX_IDENTITY_SIDECAR_TOKEN_MESSAGE_CONTRACT.to_owned(),
+                hmac_contract: TAX_IDENTITY_SIDECAR_HMAC_CONTRACT.to_owned(),
+                tin_id_128_contract: TAX_IDENTITY_SIDECAR_LOCATOR_CONTRACT.to_owned(),
+                full_hmac_authority_contract: TAX_IDENTITY_SIDECAR_FULL_HMAC_AUTHORITY_CONTRACT
+                    .to_owned(),
+                final_file: true,
+                name: "provider_group_tax_identity_v2".to_owned(),
+                source_shard_id: shard_id.to_owned(),
+            },
+        }
+    }
+
     fn write_provider_map(path: &Path, sets: &[GlobalId], key_base: u32) {
         let mut sorted = sets.to_vec();
         sorted.sort_unstable();
@@ -9026,6 +9235,7 @@ mod tests {
                 provider_npi_group: npi_group,
                 provider_npi_scope,
                 provider_group_tax_identity,
+                provider_group_tax_identity_v2: None,
             },
             provider_map,
             output,
@@ -9970,6 +10180,7 @@ mod tests {
                 provider_npi_group: npi_group,
                 provider_npi_scope,
                 provider_group_tax_identity,
+                provider_group_tax_identity_v2: None,
             },
             provider_map,
             output,
@@ -10033,6 +10244,7 @@ mod tests {
                 provider_npi_group: npi_group,
                 provider_npi_scope,
                 provider_group_tax_identity,
+                provider_group_tax_identity_v2: None,
             },
             provider_map,
             output,
@@ -10063,6 +10275,48 @@ mod tests {
             .iter()
             .map(|value| value["object_kind"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    fn output_projection_fingerprint(summary: &ProviderGraphV4ConversionSummary) -> String {
+        let mut artifacts = summary
+            .output_artifacts
+            .iter()
+            .map(|artifact| {
+                (
+                    artifact.name.as_str(),
+                    artifact.byte_count,
+                    artifact.row_count,
+                    artifact.sha256.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_unstable();
+        hex(&Sha256::digest(serde_json::to_vec(&artifacts).unwrap()))
+    }
+
+    fn normalized_json_fingerprint<T: Serialize>(value: &T, root: &Path) -> String {
+        fn redact_paths(value: &mut Value, root: &str) {
+            match value {
+                Value::Array(values) => {
+                    for value in values {
+                        redact_paths(value, root);
+                    }
+                }
+                Value::Object(values) => {
+                    for value in values.values_mut() {
+                        redact_paths(value, root);
+                    }
+                }
+                Value::String(value) if value.starts_with(root) => {
+                    *value = value.replacen(root, "$ROOT", 1);
+                }
+                _ => {}
+            }
+        }
+
+        let mut value = serde_json::to_value(value).unwrap();
+        redact_paths(&mut value, root.to_string_lossy().as_ref());
+        hex(&Sha256::digest(serde_json::to_vec_pretty(&value).unwrap()))
     }
 
     fn copy_payloads_for_kind(path: &Path, expected_kind: &str) -> Vec<Vec<u8>> {
@@ -10189,6 +10443,7 @@ mod tests {
                 "tuple-cache",
                 groups.iter().copied(),
             ),
+            provider_group_tax_identity_v2: None,
         };
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &sets, 0);
@@ -10766,6 +11021,7 @@ mod tests {
                 "overlap",
                 groups,
             ),
+            provider_group_tax_identity_v2: None,
         };
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &[provider_set], 0);
@@ -11130,6 +11386,239 @@ mod tests {
         assert_eq!(first.input_sha256, second.input_sha256);
         assert_eq!(first.heavy_bitmaps, second.heavy_bitmaps);
         assert!(!first.heavy_bitmaps.is_empty());
+    }
+
+    #[test]
+    fn legacy_v1_bundle_keeps_frozen_serialization_input_and_output_fingerprints() {
+        let fixture = shared_pattern_fixture(2, 1);
+        let descriptor_json = serde_json::to_value(&fixture.shard).unwrap();
+        assert!(descriptor_json
+            .get("provider_group_tax_identity_v2")
+            .is_none());
+        let reparsed: V4ProviderGraphShardDescriptor =
+            serde_json::from_value(descriptor_json).unwrap();
+        assert!(reparsed.provider_group_tax_identity_v2.is_none());
+
+        let summary = compile_provider_graph_v4_with_progress(
+            std::slice::from_ref(&fixture.shard),
+            &fixture.provider_map,
+            &fixture.output,
+            ProviderGraphV4Options::default(),
+            None,
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(summary.tax_identity_sidecar_bundle.is_none());
+        assert!(serde_json::to_value(&summary)
+            .unwrap()
+            .get("tax_identity_sidecar_bundle")
+            .is_none());
+        assert_eq!(
+            summary.input_sha256,
+            "1502412063f7f19b94bb5296417908ab59c3f88b9c511cd0637a58ce9d9fa2eb"
+        );
+        assert_eq!(
+            output_projection_fingerprint(&summary),
+            "8948b84c4647eb5aeb09a0ce60f32ceea76149d59469f628c559801a65cb7a43"
+        );
+        assert_eq!(
+            normalized_json_fingerprint(
+                &summary,
+                &fs::canonicalize(fixture._temporary.path()).unwrap(),
+            ),
+            "1cb9553b4ea9bedcb008a88a2229046cb8fe5be1700142e8a81686719ebac6b3"
+        );
+    }
+
+    #[test]
+    fn paired_v2_bundle_is_validation_only_and_preserves_v1_projection_bytes() {
+        let legacy = shared_pattern_fixture_with_shard_id(4, 2, "paired-source");
+        let mut paired = shared_pattern_fixture_with_shard_id(4, 2, "paired-source");
+        let v2 = write_v2_from_v1(
+            &paired
+                ._temporary
+                .path()
+                .join("group-tax-identity-v2.sidecar"),
+            &paired.shard.shard_id,
+            &paired.shard.provider_group_tax_identity,
+        );
+        let v2_bytes = v2.metadata.byte_count;
+        let v2_rows = v2.metadata.row_count;
+        paired.shard.provider_group_tax_identity_v2 = Some(v2);
+
+        let legacy_summary = compile_provider_graph_v4_with_progress(
+            std::slice::from_ref(&legacy.shard),
+            &legacy.provider_map,
+            &legacy.output,
+            ProviderGraphV4Options::default(),
+            None,
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let paired_summary = compile_provider_graph_v4_with_progress(
+            std::slice::from_ref(&paired.shard),
+            &paired.provider_map,
+            &paired.output,
+            ProviderGraphV4Options::default(),
+            None,
+            None,
+            &mut |event| events.push(event.clone()),
+        )
+        .unwrap();
+
+        let checkpoint = paired_summary.tax_identity_sidecar_bundle.as_ref().unwrap();
+        assert!(!checkpoint.publication_admissible());
+        assert_eq!(checkpoint.projection_authority(), "v1_only");
+        assert_eq!(
+            checkpoint.cross_row_full_hmac_type_collision_check(),
+            "required_external_pass"
+        );
+        assert_eq!(checkpoint.row_count(), v2_rows);
+        assert_eq!(paired_summary.tax_identity, legacy_summary.tax_identity);
+        assert_eq!(
+            output_projection_fingerprint(&paired_summary),
+            output_projection_fingerprint(&legacy_summary)
+        );
+        assert_eq!(
+            fs::read(&paired_summary.provider_group_tax_identity_copy_path).unwrap(),
+            fs::read(&legacy_summary.provider_group_tax_identity_copy_path).unwrap()
+        );
+        assert_ne!(paired_summary.input_sha256, legacy_summary.input_sha256);
+        assert_eq!(
+            paired_summary.input_byte_count,
+            legacy_summary.input_byte_count + v2_bytes
+        );
+        assert_eq!(
+            paired_summary.resource_admission.input_factor_bytes,
+            legacy_summary.resource_admission.input_factor_bytes + v2_bytes
+        );
+        assert_eq!(
+            paired_summary.resource_admission.factor_edge_count,
+            legacy_summary.resource_admission.factor_edge_count + v2_rows
+        );
+        let load_events = events
+            .iter()
+            .filter(|event| event.phase == "load_factors")
+            .collect::<Vec<_>>();
+        assert!(load_events
+            .iter()
+            .any(|event| event.done == v2_rows && event.done < event.total));
+        let last = load_events.last().unwrap();
+        assert_eq!(last.done, last.total);
+    }
+
+    #[test]
+    fn paired_v2_mode_rejects_mixed_shards_before_resource_admission() {
+        let mut first = shared_pattern_fixture_with_shard_id(2, 1, "paired-a");
+        let second = shared_pattern_fixture_with_shard_id(2, 1, "paired-b");
+        first.shard.provider_group_tax_identity_v2 = Some(write_v2_from_v1(
+            &first
+                ._temporary
+                .path()
+                .join("group-tax-identity-v2.sidecar"),
+            &first.shard.shard_id,
+            &first.shard.provider_group_tax_identity,
+        ));
+        let error = resource_admission_preflight(
+            &[first.shard.clone(), second.shard.clone()],
+            &first.provider_map,
+            &ProviderGraphV4Options::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("supplied for every shard"));
+    }
+
+    #[test]
+    fn paired_v2_universe_includes_zero_member_group_owners() {
+        let temporary = tempfile::tempdir().unwrap();
+        let shard_id = "zero-member-owner";
+        let provider_set = global(1, 1);
+        let component = global(2, 1);
+        let groups = [global(3, 1), global(3, 2)];
+        let provider_npi = npi(1_234_567_890);
+        let provider_set_component = write_membership(
+            &temporary.path().join("set-component.sidecar"),
+            shard_id,
+            "provider_set_component",
+            [(provider_set, component)],
+            true,
+        );
+        let provider_component_group = write_membership(
+            &temporary.path().join("component-group.sidecar"),
+            shard_id,
+            "provider_component_group",
+            groups.into_iter().map(|group| (component, group)),
+            true,
+        );
+        let mut authoritative_group_npis = BTreeMap::new();
+        authoritative_group_npis.insert(groups[0], vec![provider_npi]);
+        authoritative_group_npis.insert(groups[1], Vec::new());
+        let provider_group_npi = write_normalized_membership(
+            &temporary.path().join("group-npi.sidecar"),
+            shard_id,
+            "provider_group_npi",
+            authoritative_group_npis,
+            true,
+        );
+        let provider_npi_group = write_membership(
+            &temporary.path().join("npi-group.sidecar"),
+            shard_id,
+            "provider_npi_group",
+            [(provider_npi, groups[0])],
+            true,
+        );
+        let provider_npi_scope = write_npi_scope(
+            &temporary.path().join("npi-scope.copy"),
+            shard_id,
+            &provider_npi_group,
+        );
+        let provider_group_tax_identity = write_missing_tax_identity(
+            &temporary.path().join("group-tax-identity.sidecar"),
+            shard_id,
+            groups,
+        );
+        let provider_group_tax_identity_v2 = write_v2_from_v1(
+            &temporary.path().join("group-tax-identity-v2.sidecar"),
+            shard_id,
+            &provider_group_tax_identity,
+        );
+        let shard = V4ProviderGraphShardDescriptor {
+            shard_id: shard_id.to_owned(),
+            provider_set_component,
+            provider_component_group,
+            provider_group_npi,
+            provider_npi_group,
+            provider_npi_scope,
+            provider_group_tax_identity,
+            provider_group_tax_identity_v2: Some(provider_group_tax_identity_v2),
+        };
+        let provider_map = temporary.path().join("provider-map.copy");
+        write_provider_map(&provider_map, &[provider_set], 0);
+        let summary = compile_provider_graph_v4_with_progress(
+            std::slice::from_ref(&shard),
+            provider_map,
+            temporary.path().join("output"),
+            ProviderGraphV4Options::default(),
+            None,
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(shard.provider_group_npi.metadata.owner_count, 2);
+        assert_eq!(shard.provider_group_npi.metadata.member_count, 1);
+        assert_eq!(summary.tax_identity.provider_group_count, 2);
+        assert_eq!(
+            summary
+                .tax_identity_sidecar_bundle
+                .as_ref()
+                .unwrap()
+                .row_count(),
+            2
+        );
     }
 
     #[test]
@@ -12034,6 +12523,7 @@ mod tests {
                 "multi-shard",
                 groups,
             ),
+            provider_group_tax_identity_v2: None,
         };
         let provider_map = temporary.path().join("provider-map.copy");
         write_provider_map(&provider_map, &sets, 0);
