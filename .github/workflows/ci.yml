@@ -458,7 +458,7 @@ jobs:
     timeout-minutes: 15
     services:
       redis:
-        image: redis:7
+        image: redis:7@sha256:e9b2e45ecd47fbb69b877cf8d045d5cccaaaed52524b6e098b4abe8212994f73
         ports:
           - 6379:6379
         options: >-
@@ -511,7 +511,7 @@ jobs:
           - provider-profile
     services:
       postgres:
-        image: postgis/postgis:18-3.6
+        image: postgis/postgis:18-3.6@sha256:0aacdfb9dda40942d424785c3ccabeffe31da9cc9e26b0dfd93b222b31462871
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
