@@ -24741,6 +24741,11 @@ fn merge_manifest_copy_files(
 }
 
 #[cfg(test)]
+fn queue_pressure_incremented(before: u64, after: u64) -> bool {
+    after == before + 1
+}
+
+#[cfg(test)]
 #[path = "../tests/unit/bounded_queue_pressure.rs"]
 mod bounded_queue_pressure;
 

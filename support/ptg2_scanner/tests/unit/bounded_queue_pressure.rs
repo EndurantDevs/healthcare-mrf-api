@@ -67,7 +67,10 @@ pub(super) fn assert_worker_job_queue_pressure(
     )
     .unwrap();
     receiver.join().unwrap();
-    assert_eq!(stats.queue_blocked_sends, blocked_sends_before + 1);
+    assert!(queue_pressure_incremented(
+        blocked_sends_before,
+        stats.queue_blocked_sends
+    ));
 }
 
 pub(super) fn assert_provider_reference_queue_pressure(
@@ -103,5 +106,8 @@ pub(super) fn assert_provider_reference_queue_pressure(
     )
     .unwrap();
     receiver.join().unwrap();
-    assert_eq!(stats.queue_blocked_sends, blocked_sends_before + 1);
+    assert!(queue_pressure_incremented(
+        blocked_sends_before,
+        stats.queue_blocked_sends
+    ));
 }
