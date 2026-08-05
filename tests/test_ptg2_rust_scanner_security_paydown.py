@@ -21,6 +21,7 @@ from tests.ptg2_rust_scanner_security_tax_cases import (
 )
 from tests.ptg2_rust_scanner_security_frames_cases import (
     test_compact_scanner_all_optional_paths_and_factor_frames,
+    test_compact_scanner_scrubs_ambient_v2_path_without_explicit_opt_in,
     test_compact_scanner_setup_failure_reaps_process_and_scratch,
     test_async_compact_bridge_forwards_records_and_reader_failure,
     test_return_code_labels_cover_unknown_signal,

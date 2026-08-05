@@ -19,6 +19,9 @@ from tests.ptg2_rust_scanner_security_support import (
     _config,
     _compact_kwargs,
     _factor_frame_process,
+    _assert_ambient_v2_path_scrubbed,
+    _assert_v2_bridge_contract,
+    _assert_v2_rejected_before_spawn,
     _valid_shared_graph_summary,
 )
 
@@ -38,6 +41,10 @@ def test_compact_scanner_all_optional_paths_and_factor_frames(
     monkeypatch.setattr(rust_scanner, "_ptg2_rust_scanner_binary", lambda: binary)
     monkeypatch.setattr(rust_scanner.subprocess, "Popen", popen)
     monkeypatch.setenv(rust_scanner._PROVIDER_GRAPH_V4_ENV, "true")
+    monkeypatch.setenv(
+        rust_scanner._PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV,
+        str(tmp_path / "ambient-v2-output-must-not-win"),
+    )
     kwargs = _compact_kwargs(tmp_path)
     kwargs.update({name: tmp_path / name for name in _COMPACT_OPTIONAL_PATH_NAMES})
     kwargs["manifest_only"] = True
@@ -49,33 +56,20 @@ def test_compact_scanner_all_optional_paths_and_factor_frames(
             **kwargs,
         )
     )
-    assert [kind for kind, _payload in observed_records] == [
-        "scanner_config",
-        "v3_serving_run_partition_file",
-        "v3_serving_code_dictionary_file",
-        "scanner_summary",
-    ]
-    assert (
-        observed_records[-1][1]["serving_run_partition_files"][0]["path"]
-        == "partition.bin"
+    _assert_v2_bridge_contract(
+        observed_records,
+        observed_environment_by_name,
+        kwargs,
     )
-    assert (
-        observed_records[-1][1]["serving_run_code_dictionary_files"][0]["path"]
-        == "dictionary.bin"
-    )
-    assert (
-        observed_environment_by_name[rust_scanner._PROVIDER_GRAPH_V4_FACTORS_ENV]
-        == "true"
-    )
-    assert observed_environment_by_name["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
-    assert (
-        "HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH"
-        in observed_environment_by_name
-    )
-    assert (
-        "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH"
-        in observed_environment_by_name
-    )
+    _assert_v2_rejected_before_spawn(tmp_path, monkeypatch)
+
+
+def test_compact_scanner_scrubs_ambient_v2_path_without_explicit_opt_in(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Prove container configuration cannot activate the additive writer."""
+    _assert_ambient_v2_path_scrubbed(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("attach_failure", [False, True])
@@ -128,7 +122,10 @@ async def test_async_compact_bridge_forwards_records_and_reader_failure(
     tmp_path,
     monkeypatch,
 ) -> None:
-    def records(*_args, **_kwargs):
+    forwarded_options: list[dict[str, object]] = []
+
+    def records(*_args, **kwargs):
+        forwarded_options.append(dict(kwargs))
         yield "one", {"value": 1}
         yield "two", {"value": 2}
 
@@ -138,9 +135,15 @@ async def test_async_compact_bridge_forwards_records_and_reader_failure(
         async for scanner_record in rust_scanner._aiter_compact_serving_records_rust(
             tmp_path / "input",
             **_compact_kwargs(tmp_path),
+            manifest_provider_group_tax_identity_v2_sidecar_path=(
+                tmp_path / "tax-identity-v2.ptg2tax"
+            ),
         )
     ]
     assert observed_records == [("one", {"value": 1}), ("two", {"value": 2})]
+    assert forwarded_options[0][
+        "manifest_provider_group_tax_identity_v2_sidecar_path"
+    ] == (tmp_path / "tax-identity-v2.ptg2tax")
 
     def failed(*_args, **_kwargs):
         yield "one", {}

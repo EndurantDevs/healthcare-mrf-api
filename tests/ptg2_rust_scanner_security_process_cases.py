@@ -357,7 +357,42 @@ def test_factor_mode_summary_validation(payload) -> None:
             rust_scanner._validate_v3_scanner_summary(payload, expect_factor_mode=True)
 
 
+def _assert_v2_factor_admission_rejected(
+    expected_error: str,
+    *,
+    provider_group_tax_identity_path: str | None,
+    provider_set_component_path: str | None = "one",
+    provider_component_group_path: str | None = "two",
+) -> None:
+    """Assert one invalid v2 factor request is rejected at admission."""
+    with pytest.raises(RuntimeError, match=expected_error):
+        rust_scanner._use_v4_provider_factors(
+            {},
+            provider_set_component_path=provider_set_component_path,
+            provider_component_group_path=provider_component_group_path,
+            provider_group_tax_identity_path=provider_group_tax_identity_path,
+            provider_group_tax_identity_v2_path="v2",
+        )
+
+
+def _assert_factor_outputs_enabled(v2_path: str | None) -> None:
+    """Prove paired V4 factors admit v1-only and additive-v2 output modes."""
+    enabled_environment_by_name: dict[str, str] = {}
+    assert rust_scanner._use_v4_provider_factors(
+        enabled_environment_by_name,
+        provider_set_component_path="one",
+        provider_component_group_path="two",
+        provider_group_tax_identity_path="three",
+        provider_group_tax_identity_v2_path=v2_path,
+    )
+    assert enabled_environment_by_name == {
+        rust_scanner._PROVIDER_GRAPH_V4_ENV: "true",
+        rust_scanner._PROVIDER_GRAPH_V4_FACTORS_ENV: "true",
+    }
+
+
 def test_factor_mode_environment_requires_paired_outputs(monkeypatch) -> None:
+    """Enforce factor-pair and additive tax-identity output admission rules."""
     environment_by_name = {rust_scanner._PROVIDER_GRAPH_V4_FACTORS_ENV: "stale"}
     monkeypatch.setattr(rust_scanner, "_env_bool", lambda *_args: False)
     with pytest.raises(RuntimeError, match="require both"):
@@ -366,14 +401,26 @@ def test_factor_mode_environment_requires_paired_outputs(monkeypatch) -> None:
             provider_set_component_path="one",
             provider_component_group_path=None,
             provider_group_tax_identity_path="three",
+            provider_group_tax_identity_v2_path=None,
         )
     assert not rust_scanner._use_v4_provider_factors(
         environment_by_name,
         provider_set_component_path=None,
         provider_component_group_path=None,
         provider_group_tax_identity_path=None,
+        provider_group_tax_identity_v2_path=None,
     )
     assert rust_scanner._PROVIDER_GRAPH_V4_FACTORS_ENV not in environment_by_name
+    _assert_v2_factor_admission_rejected(
+        "v2 output requires the v1",
+        provider_group_tax_identity_path=None,
+        provider_set_component_path=None,
+        provider_component_group_path=None,
+    )
+    _assert_v2_factor_admission_rejected(
+        "requires V4 provider factor mode",
+        provider_group_tax_identity_path="three",
+    )
 
     monkeypatch.setattr(rust_scanner, "_env_bool", lambda *_args: True)
     with pytest.raises(RuntimeError, match="requires both"):
@@ -382,19 +429,14 @@ def test_factor_mode_environment_requires_paired_outputs(monkeypatch) -> None:
             provider_set_component_path=None,
             provider_component_group_path=None,
             provider_group_tax_identity_path=None,
+            provider_group_tax_identity_v2_path=None,
         )
-    enabled_environment_by_name: dict[str, str] = {}
-    assert rust_scanner._use_v4_provider_factors(
-        enabled_environment_by_name,
-        provider_set_component_path="one",
-        provider_component_group_path="two",
-        provider_group_tax_identity_path="three",
+    _assert_v2_factor_admission_rejected(
+        "v2 output requires the v1",
+        provider_group_tax_identity_path=None,
     )
-    assert enabled_environment_by_name[rust_scanner._PROVIDER_GRAPH_V4_ENV] == "true"
-    assert (
-        enabled_environment_by_name[rust_scanner._PROVIDER_GRAPH_V4_FACTORS_ENV]
-        == "true"
-    )
+    _assert_factor_outputs_enabled("v2")
+    _assert_factor_outputs_enabled(None)
 
 
 def test_top_level_scanner_malformed_frames_and_typed_failure(
