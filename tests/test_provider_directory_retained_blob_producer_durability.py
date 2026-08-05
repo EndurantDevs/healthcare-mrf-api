@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import select
 import stat
 import subprocess
 import sys
@@ -23,6 +24,9 @@ from process.provider_directory_retained_blob_store import (
 
 
 pytest_plugins = ("tests.provider_directory_retained_reader_fixtures",)
+
+_CHILD_STARTUP_TIMEOUT_SECONDS = 30
+_FIFO_INSTALL_TIMEOUT_SECONDS = 3
 
 
 def _producer_input(artifact_root: Path, label: str) -> tuple[Path, bytes, str]:
@@ -346,6 +350,9 @@ def test_fifo_source_fails_without_blocking(
 import sys
 from process.provider_directory_retained_artifact_contract import RetainedArtifactError
 from process.provider_directory_retained_blob_producer import install_retained_artifact_blob
+print('ready', flush=True)
+if sys.stdin.readline() != 'run\\n':
+    raise SystemExit(5)
 try:
     install_retained_artifact_blob(
         sys.argv[1], artifact_sha256=sys.argv[2], artifact_byte_count=4
@@ -354,13 +361,38 @@ except RetainedArtifactError as error:
     raise SystemExit(0 if 'source_path_unsafe' in str(error) else 3)
 raise SystemExit(4)
 """
-    completed_process = subprocess.run(
+    child_process = subprocess.Popen(
         [sys.executable, "-c", test_script, str(fifo_path), artifact_sha256],
         cwd=Path(__file__).resolve().parents[1],
         env=os.environ.copy(),
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=3,
-        check=False,
     )
-    assert completed_process.returncode == 0, completed_process.stderr
+    assert child_process.stdout is not None
+    try:
+        ready_streams, _, _ = select.select(
+            (child_process.stdout,), (), (), _CHILD_STARTUP_TIMEOUT_SECONDS
+        )
+        ready_line = child_process.stdout.readline() if ready_streams else ""
+        if ready_line != "ready\n":
+            if child_process.poll() is None:
+                child_process.kill()
+            _, stderr = child_process.communicate()
+            pytest.fail(
+                f"FIFO test child did not become ready: {ready_line!r}; {stderr}"
+            )
+        try:
+            _, stderr = child_process.communicate(
+                "run\n", timeout=_FIFO_INSTALL_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            child_process.kill()
+            _, stderr = child_process.communicate()
+            pytest.fail(f"FIFO source install blocked: {stderr}")
+    finally:
+        if child_process.poll() is None:
+            child_process.kill()
+            child_process.communicate()
+    assert child_process.returncode == 0, stderr
