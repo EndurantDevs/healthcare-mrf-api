@@ -14,6 +14,12 @@ ARC_RUNNER_EXPRESSION = (
     "github.ref == 'refs/heads/main' && "
     "vars.HEALTHCARE_MRF_CI_RUNNER || 'ubuntu-latest' }}"
 )
+COVERAGE_BASE_EXPRESSION = (
+    "${{ github.event_name == 'pull_request' && "
+    "github.event.pull_request.base.sha || "
+    "github.event_name == 'workflow_dispatch' && inputs.base_sha || "
+    "github.event.before }}"
+)
 ARC_IMAGE = (
     "ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci@sha256:"
     "12320cf489cc218f00d04e9df21d12f60bacd883e5120bd8dabb7ba0378c972c"
@@ -33,6 +39,16 @@ HOSTED_JOBS = {
     "worker-queue-smoke",
     "address-canonical-db-tests",
 }
+COMMIT_POLICY_SCRIPT = """if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+  python3 scripts/check_commit_messages.py --event "$GITHUB_EVENT_PATH"
+else
+  if [[ ! "$COVERAGE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "COVERAGE_BASE_SHA must be an exact commit SHA" >&2
+    exit 2
+  fi
+  python3 scripts/check_commit_messages.py --range "$COVERAGE_BASE_SHA..HEAD"
+fi
+"""
 
 
 def _values_for_key(value: object, key: str) -> list[object]:
@@ -99,3 +115,18 @@ def test_arc_jobs_use_the_pinned_image_toolchain() -> None:
             isinstance(action, str) and action.startswith("actions/setup-python@")
             for action in actions
         )
+
+
+def test_commit_policy_uses_git_for_protected_main_without_event_file() -> None:
+    document, _ = _documents()
+
+    assert document["env"]["COVERAGE_BASE_SHA"] == COVERAGE_BASE_EXPRESSION
+    for name in ("public-hygiene", "python-quality"):
+        steps = document["jobs"][name]["steps"]
+        checkout = next(step for step in steps if "uses" in step)
+        assert checkout["with"] == {
+            "persist-credentials": False,
+            "fetch-depth": 0,
+        }
+        policy = next(step for step in steps if step.get("name") == "Commit message policy")
+        assert policy["run"] == COMMIT_POLICY_SCRIPT
