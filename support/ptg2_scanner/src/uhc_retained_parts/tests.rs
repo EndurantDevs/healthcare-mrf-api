@@ -781,6 +781,7 @@ mod tests {
     }
 
     include!("publication_tests.rs");
+    include!("../../tests/unit/retained_raw_publication.rs");
     include!("publication_margin_tests.rs");
 
     #[test]
