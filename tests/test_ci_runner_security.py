@@ -41,6 +41,7 @@ def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
     workflow = _workflow("publish-arc-ci-image.yml")
 
     assert "runs-on: ubuntu-latest" in workflow
+    assert "if: github.ref == 'refs/heads/main'" in workflow
     assert "contents: read\n  packages: write" in workflow
     assert "pull_request" not in workflow
     assert "pull_request_target" not in workflow
@@ -59,4 +60,4 @@ def test_arc_image_contains_no_repository_or_credentials() -> None:
     assert "ARG TOKEN" not in dockerfile
     assert "ARG SECRET" not in dockerfile
     assert "USER 1001:1001" in dockerfile
-    assert dockerfile.count("@sha256:") == 2
+    assert dockerfile.count("@sha256:") == 3
