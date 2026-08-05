@@ -24741,6 +24741,15 @@ fn merge_manifest_copy_files(
 }
 
 #[cfg(test)]
+fn queue_pressure_incremented(before: u64, after: u64) -> bool {
+    after == before + 1
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/bounded_queue_pressure.rs"]
+mod bounded_queue_pressure;
+
+#[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
@@ -37006,25 +37015,10 @@ mod tests {
             io::ErrorKind::BrokenPipe
         );
 
-        let (pressured_job_tx, pressured_job_rx) = bounded(1);
-        pressured_job_tx.send(empty_job()).unwrap();
-        let job_receiver = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            let _ = pressured_job_rx.recv().unwrap();
-            let _ = pressured_job_rx.recv().unwrap();
-        });
-        send_worker_job(
-            &pressured_job_tx,
-            &event_rx,
-            &mut writer,
-            None,
+        super::bounded_queue_pressure::assert_worker_job_queue_pressure(
             &mut blocked_micros,
             &mut stats,
-            empty_job(),
-        )
-        .unwrap();
-        job_receiver.join().unwrap();
-        assert!(stats.queue_blocked_sends > 0);
+        );
 
         let (batch_tx, batch_rx) = bounded(1);
         send_provider_ref_batch(
@@ -37054,37 +37048,13 @@ mod tests {
             io::ErrorKind::BrokenPipe
         );
 
-        let (pressured_batch_tx, pressured_batch_rx) = bounded(1);
-        pressured_batch_tx.send(empty_batch()).unwrap();
-        let batch_receiver = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            let _ = pressured_batch_rx.recv().unwrap();
-            let _ = pressured_batch_rx.recv().unwrap();
-        });
-        send_provider_ref_batch(
-            &pressured_batch_tx,
-            &event_rx,
-            &mut writer,
+        super::bounded_queue_pressure::assert_provider_reference_queue_pressure(
             &mut blocked_micros,
             &mut stats,
-            empty_batch(),
-        )
-        .unwrap();
-        batch_receiver.join().unwrap();
+        );
 
         let mut sink = io::sink();
-        let event = CopyFileEvent {
-            record_kind: "copy_file".to_owned(),
-            path: "test.copy".to_owned(),
-            bytes: 0,
-            row_count: 0,
-            final_file: true,
-            partition: None,
-            partition_count: None,
-            format: None,
-            version: None,
-            sha256: None,
-        };
+        let event = super::bounded_queue_pressure::empty_copy_file_event();
         emit_copy_file_event(&mut sink, &event).unwrap();
         let (sink_event_tx, sink_event_rx) = unbounded();
         sink_event_tx.send(event).unwrap();
