@@ -17,7 +17,6 @@ from process.ptg_parts._ptg2_tax_identity_shadow_files import (
 from process.tin_npi_connector_security import canonical_token_policy_id
 from process.tin_npi_connector_support import TinNpiConnectorError
 
-
 TAX_IDENTITY_SHADOW_BUNDLE_CONTRACT = "ptg2_tax_identity_shadow_bundle_v1"
 TAX_IDENTITY_SHADOW_PROJECTION_AUTHORITY = "v1_only"
 TAX_IDENTITY_SHADOW_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024 * 1024
@@ -189,7 +188,9 @@ def _validated_ceiling(value: object, hard_maximum: int) -> int:
     return value
 
 
-def _descriptor_counts(raw: Mapping[str, Any], version: int) -> TaxIdentityShadowStateCounts:
+def _descriptor_counts(
+    raw: Mapping[str, Any], version: int
+) -> TaxIdentityShadowStateCounts:
     return TaxIdentityShadowStateCounts(
         matched_ein=_strict_count(raw.get("matched_ein_count")),
         matched_npi=(
@@ -232,7 +233,9 @@ def _validate_descriptor_contract(
     normalization = (
         _V1_NORMALIZATION_CONTRACT if version == 1 else _V2_NORMALIZATION_CONTRACT
     )
-    expected_bytes = _HEADER_BYTES + len(core.policy_id) + core.row_count * _RECORD_BYTES
+    expected_bytes = (
+        _HEADER_BYTES + len(core.policy_id) + core.row_count * _RECORD_BYTES
+    )
     if core.row_count > max_row_count or core.byte_count > max_artifact_bytes:
         raise _fail(_CEILING_EXCEEDED)
     is_invalid = (
@@ -330,7 +333,9 @@ def _is_pair_consistent(
     )
 
 
-def _binding_artifact_fields(artifact: TaxIdentityShadowArtifactDescriptor) -> dict[str, Any]:
+def _binding_artifact_fields(
+    artifact: TaxIdentityShadowArtifactDescriptor,
+) -> dict[str, Any]:
     counts = artifact.state_counts
     return {
         "version": artifact.sidecar_version,

@@ -64,7 +64,9 @@ def test_rejects_header_drift_even_with_refreshed_digest(
         _admit(scratch_root, v1, v2)
 
 
-def test_rejects_same_size_payload_change_against_descriptor_digest(tmp_path: Path) -> None:
+def test_rejects_same_size_payload_change_against_descriptor_digest(
+    tmp_path: Path,
+) -> None:
     scratch_root, v1, v2 = make_sidecar_pair(tmp_path)
     path = Path(v2["path"])
     data = bytearray(path.read_bytes())
@@ -131,7 +133,9 @@ def test_rejects_non_private_or_symlinked_scratch_root(tmp_path: Path) -> None:
 @pytest.mark.parametrize("root_shape", ["relative", "missing"])
 def test_rejects_unresolved_scratch_roots(tmp_path: Path, root_shape: str) -> None:
     _scratch_root, v1, v2 = make_sidecar_pair(tmp_path)
-    invalid_root = Path("relative-shadow") if root_shape == "relative" else tmp_path / "missing"
+    invalid_root = (
+        Path("relative-shadow") if root_shape == "relative" else tmp_path / "missing"
+    )
 
     with pytest.raises(
         admission.TaxIdentityShadowAdmissionError,

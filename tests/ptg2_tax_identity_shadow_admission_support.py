@@ -4,7 +4,6 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-
 POLICY_ID = "ptg-tin-hmac-sha256-v1:synthetic-shadow"
 ROW_COUNT = 6
 V1_COUNTS = {
@@ -72,9 +71,7 @@ def descriptor_for(
     }
     if version == 1:
         descriptor_dict.update(V1_COUNTS if counts is None else counts)
-        descriptor_dict["normalization_contract"] = (
-            "ein_ascii_digits_or_2_7_hyphen_v1"
-        )
+        descriptor_dict["normalization_contract"] = "ein_ascii_digits_or_2_7_hyphen_v1"
     else:
         descriptor_dict.update(V2_COUNTS if counts is None else counts)
         descriptor_dict.update(
@@ -109,8 +106,12 @@ def make_sidecar_pair(
     scratch_root.mkdir(mode=0o700)
     v1_path = scratch_root / "tax-v1.bin"
     v2_path = scratch_root / "tax-v2.bin"
-    v1_path.write_bytes(sidecar_bytes(1, policy_id=policy_id, payload_seed=payload_seed))
-    v2_path.write_bytes(sidecar_bytes(2, policy_id=policy_id, payload_seed=payload_seed))
+    v1_path.write_bytes(
+        sidecar_bytes(1, policy_id=policy_id, payload_seed=payload_seed)
+    )
+    v2_path.write_bytes(
+        sidecar_bytes(2, policy_id=policy_id, payload_seed=payload_seed)
+    )
     return (
         scratch_root,
         descriptor_for(v1_path, 1, policy_id=policy_id),
