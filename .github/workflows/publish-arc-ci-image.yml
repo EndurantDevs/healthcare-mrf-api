@@ -4,11 +4,13 @@ on:
   pull_request:
     paths:
       - ci/arc/Dockerfile
+      - ci/arc/network_fence.py
       - .github/workflows/publish-arc-ci-image.yml
   push:
     branches: [main]
     paths:
       - ci/arc/Dockerfile
+      - ci/arc/network_fence.py
       - .github/workflows/publish-arc-ci-image.yml
   workflow_dispatch:
 
@@ -45,6 +47,9 @@ jobs:
           docker run --rm healthcare-mrf-arc-ci-candidate python --version
           docker run --rm healthcare-mrf-arc-ci-candidate cargo --version
           docker run --rm healthcare-mrf-arc-ci-candidate psql --version
+          test "$(docker run --rm healthcare-mrf-arc-ci-candidate stat -c '%u:%g %a' /usr/local/bin/arc-network-fence)" = "0:0 555"
+          docker run --rm healthcare-mrf-arc-ci-candidate \
+            arc-network-fence --timeout 0.1 --target 127.0.0.1:9
       - name: Scan the candidate without exposing the Docker socket
         run: |
           docker save --output "$RUNNER_TEMP/arc-ci-image.tar" healthcare-mrf-arc-ci-candidate

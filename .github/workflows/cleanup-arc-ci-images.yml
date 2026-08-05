@@ -1,0 +1,95 @@
+name: Retain ARC CI images
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: retain-arc-ci-images
+  cancel-in-progress: false
+
+jobs:
+  retain:
+    name: retain active and rollback ARC images
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROTECTED_DIGESTS: ${{ vars.HEALTHCARE_MRF_ARC_PROTECTED_DIGESTS }}
+    steps:
+      - name: Delete only old unprotected image versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${PROTECTED_DIGESTS}" ]]; then
+            echo "ARC image retention skipped: protected digests are not configured"
+            exit 0
+          fi
+
+          versions_file="${RUNNER_TEMP}/arc-ci-versions.json"
+          delete_file="${RUNNER_TEMP}/arc-ci-delete-ids.txt"
+          gh api --paginate --slurp \
+            "/orgs/EndurantDevs/packages/container/healthcare-mrf-api-arc-ci/versions?per_page=100" \
+            >"${versions_file}"
+
+          python3 - "${versions_file}" "${delete_file}" <<'PY'
+          from __future__ import annotations
+
+          from datetime import datetime, timedelta, timezone
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+
+          digest_pattern = re.compile(r"sha256:[0-9a-f]{64}")
+          protected = os.environ["PROTECTED_DIGESTS"].split(",")
+          if not protected or any(
+              digest_pattern.fullmatch(item) is None for item in protected
+          ):
+              raise SystemExit("protected digest configuration is invalid")
+
+          pages = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(pages, list) or any(
+              not isinstance(page, list) for page in pages
+          ):
+              raise SystemExit("package version response is malformed")
+          versions = [version for page in pages for version in page]
+          if any(not isinstance(version, dict) for version in versions):
+              raise SystemExit("package version response is malformed")
+
+          versions.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+          cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+          delete_ids: list[str] = []
+          for version in versions[5:]:
+              version_id = version.get("id")
+              name = version.get("name")
+              created_at = version.get("created_at")
+              if not isinstance(version_id, int) or not isinstance(name, str):
+                  raise SystemExit("package version response is malformed")
+              if not isinstance(created_at, str):
+                  raise SystemExit("package version response is malformed")
+              created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+              if name not in protected and created < cutoff:
+                  delete_ids.append(str(version_id))
+              if len(delete_ids) == 20:
+                  break
+
+          Path(sys.argv[2]).write_text("\n".join(delete_ids), encoding="utf-8")
+          PY
+
+          while IFS= read -r version_id; do
+            [[ -z "${version_id}" ]] && continue
+            [[ "${version_id}" =~ ^[0-9]+$ ]]
+            gh api --method DELETE \
+              "/orgs/EndurantDevs/packages/container/healthcare-mrf-api-arc-ci/versions/${version_id}"
+          done <"${delete_file}"
