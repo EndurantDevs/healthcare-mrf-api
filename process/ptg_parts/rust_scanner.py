@@ -88,6 +88,9 @@ _SCANNER_PROGRESS_WORK_FIELDS = {
 _SCANNER_METRIC_RECORD_KINDS = {"scanner_config", "scanner_summary"}
 _PROVIDER_GRAPH_V4_ENV = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4"
 _PROVIDER_GRAPH_V4_FACTORS_ENV = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4_FACTORS"
+_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV = (
+    "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH"
+)
 _V4_EMPTY_NPI_NORMALIZATION_CONTRACT = (
     "ptg2_v4_empty_npi_tin_only_normalization_v1"
 )
@@ -1196,15 +1199,21 @@ def _use_v4_provider_factors(
     provider_set_component_path: str | Path | None,
     provider_component_group_path: str | Path | None,
     provider_group_tax_identity_path: str | Path | None,
+    provider_group_tax_identity_v2_path: str | Path | None = None,
 ) -> bool:
     """Fence factor mode to the complete V4 provider artifact set."""
     has_set_component_path = provider_set_component_path is not None
     has_component_group_path = provider_component_group_path is not None
     has_tax_identity_path = provider_group_tax_identity_path is not None
+    has_tax_identity_v2_path = provider_group_tax_identity_v2_path is not None
     if has_set_component_path != has_component_group_path:
         raise RuntimeError(
             "V4 provider factor outputs require both set-to-component and "
             "component-to-group sidecar paths"
+        )
+    if has_tax_identity_v2_path and not has_tax_identity_path:
+        raise RuntimeError(
+            "provider-group tax identity v2 output requires the v1 sidecar path"
         )
     expect_factor_mode = _env_bool(_PROVIDER_GRAPH_V4_ENV, False)
     if expect_factor_mode and (
@@ -1904,6 +1913,7 @@ def _iter_compact_serving_records_rust(
     manifest_provider_set_component_sidecar_path: str | Path | None = None,
     manifest_provider_component_group_sidecar_path: str | Path | None = None,
     manifest_provider_group_tax_identity_sidecar_path: str | Path | None = None,
+    manifest_provider_group_tax_identity_v2_sidecar_path: str | Path | None = None,
     manifest_provider_npi_sidecar_path: str | Path | None = None,
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
@@ -1939,12 +1949,19 @@ def _iter_compact_serving_records_rust(
         "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": source_trace_set_hash,
         "HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE": confidence_code,
     }
+    scanner_environment_map.pop(
+        _PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV,
+        None,
+    )
     is_factor_mode_expected = _use_v4_provider_factors(
         scanner_environment_map,
         provider_set_component_path=manifest_provider_set_component_sidecar_path,
         provider_component_group_path=manifest_provider_component_group_sidecar_path,
         provider_group_tax_identity_path=(
             manifest_provider_group_tax_identity_sidecar_path
+        ),
+        provider_group_tax_identity_v2_path=(
+            manifest_provider_group_tax_identity_v2_sidecar_path
         ),
     )
     scanner_environment_map.pop("HLTHPRT_PTG2_SOURCE_NETWORK_NAMES_JSON", None)
@@ -2023,6 +2040,10 @@ def _iter_compact_serving_records_rust(
         scanner_environment_map[
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH"
         ] = str(manifest_provider_group_tax_identity_sidecar_path)
+    if manifest_provider_group_tax_identity_v2_sidecar_path is not None:
+        scanner_environment_map[
+            _PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV
+        ] = str(manifest_provider_group_tax_identity_v2_sidecar_path)
     if manifest_provider_npi_sidecar_path is not None:
         scanner_environment_map["HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH"] = str(
             manifest_provider_npi_sidecar_path
@@ -2338,6 +2359,7 @@ async def _aiter_compact_serving_records_rust(
     manifest_provider_set_component_sidecar_path: str | Path | None = None,
     manifest_provider_component_group_sidecar_path: str | Path | None = None,
     manifest_provider_group_tax_identity_sidecar_path: str | Path | None = None,
+    manifest_provider_group_tax_identity_v2_sidecar_path: str | Path | None = None,
     manifest_provider_npi_sidecar_path: str | Path | None = None,
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
@@ -2381,6 +2403,9 @@ async def _aiter_compact_serving_records_rust(
         manifest_provider_component_group_sidecar_path=manifest_provider_component_group_sidecar_path,
         manifest_provider_group_tax_identity_sidecar_path=(
             manifest_provider_group_tax_identity_sidecar_path
+        ),
+        manifest_provider_group_tax_identity_v2_sidecar_path=(
+            manifest_provider_group_tax_identity_v2_sidecar_path
         ),
         manifest_provider_npi_sidecar_path=manifest_provider_npi_sidecar_path,
         manifest_price_forward_sidecar_path=manifest_price_forward_sidecar_path,
