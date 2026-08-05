@@ -76,6 +76,13 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Create an attestation-capable BuildKit builder
+        run: >-
+          docker buildx create
+          --bootstrap
+          --driver docker-container
+          --name arc-ci-publisher
+          --use
       - name: Build and publish the public CI image
         env:
           IMAGE: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci:sha-${{ github.sha }}
@@ -91,3 +98,6 @@ jobs:
             --tag "$IMAGE" \
             .
           docker buildx imagetools inspect "$IMAGE"
+      - name: Remove the BuildKit builder
+        if: always()
+        run: docker buildx rm arc-ci-publisher

@@ -74,6 +74,8 @@ def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
     assert "/var/run/docker.sock" not in workflow
     assert "aquasec/trivy:0.67.2@sha256:" in workflow
     assert "--input /scan/image.tar" in workflow
+    assert "--driver docker-container" in workflow
+    assert "docker buildx rm arc-ci-publisher" in workflow
 
 
 def test_service_images_are_immutable_before_any_arc_route() -> None:
