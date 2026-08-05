@@ -24,7 +24,6 @@ from process.ptg_parts.ptg2_tax_identity_shadow_admission import (
     TaxIdentityShadowStateCounts,
 )
 
-
 TAX_IDENTITY_SHADOW_SOURCE_BINDING_CONTRACT = (
     "ptg2_tax_identity_shadow_source_binding_v1"
 )
@@ -72,9 +71,8 @@ def _strict_run_coordinate(value: object) -> str:
         encoded = value.encode("utf-8")
     except UnicodeEncodeError:
         raise _fail() from None
-    if (
-        len(encoded) > 96
-        or any(unicodedata.category(character) == "Cc" for character in value)
+    if len(encoded) > 96 or any(
+        unicodedata.category(character) == "Cc" for character in value
     ):
         raise _fail()
     return value

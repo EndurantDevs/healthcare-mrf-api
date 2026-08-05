@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import builtins
-import inspect
-import traceback
-from dataclasses import FrozenInstanceError, asdict
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,8 +10,11 @@ import pytest
 from process.ptg_parts import ptg2_tax_identity_shadow_admission as admission
 from process.ptg_parts import ptg2_tax_identity_shadow_source_binding as binding
 from process.ptg_parts.ptg2_shared_reuse import SharedPhysicalArtifactIdentity
-from tests.ptg2_tax_identity_shadow_admission_support import make_sidecar_pair
-
+from tests.ptg2_tax_identity_shadow_admission_support import (
+    assert_bound_descriptor_identity,
+    assert_bound_descriptor_non_publishable,
+    make_sidecar_pair,
+)
 
 RAW_SHA256 = "1" * 64
 LOGICAL_SHA256 = "2" * 64
@@ -26,7 +26,9 @@ SOURCE_FILE_VERSION_ID = "5" * 16
 def _admitted_bundle(
     tmp_path: Path, *, directory_name: str = "shadow", payload_seed: int = 0
 ) -> admission.TaxIdentityShadowBundleDescriptor:
-    scratch_root, v1, v2 = make_sidecar_pair(tmp_path, directory_name=directory_name, payload_seed=payload_seed)
+    scratch_root, v1, v2 = make_sidecar_pair(
+        tmp_path, directory_name=directory_name, payload_seed=payload_seed
+    )
     return admission.admit_tax_identity_shadow_bundle(
         scratch_root=scratch_root,
         v1_scanner_descriptor=v1,
@@ -36,7 +38,9 @@ def _admitted_bundle(
 
 def _source_input(**overrides: Any) -> binding.TaxIdentityShadowSourceBindingInput:
     fields_by_name: dict[str, Any] = {
-        "physical_identity": SharedPhysicalArtifactIdentity("in-network", "logical_json_sha256_v1", LOGICAL_SHA256),
+        "physical_identity": SharedPhysicalArtifactIdentity(
+            "in-network", "logical_json_sha256_v1", LOGICAL_SHA256
+        ),
         "source_identity_hash": SOURCE_IDENTITY_HASH,
         "source_file_version_id": SOURCE_FILE_VERSION_ID,
         "raw_container_sha256": RAW_SHA256,
@@ -51,12 +55,19 @@ def _source_input(**overrides: Any) -> binding.TaxIdentityShadowSourceBindingInp
     return binding.TaxIdentityShadowSourceBindingInput(**fields_by_name)
 
 
-def _bind(shadow_bundle, source_binding_input) -> binding.BoundTaxIdentityShadowBundleDescriptor:
-    return binding.bind_tax_identity_shadow_source(shadow_bundle=shadow_bundle, source=source_binding_input)
+def _bind(
+    shadow_bundle, source_binding_input
+) -> binding.BoundTaxIdentityShadowBundleDescriptor:
+    return binding.bind_tax_identity_shadow_source(
+        shadow_bundle=shadow_bundle, source=source_binding_input
+    )
 
 
 def _binding_error():
-    return pytest.raises(binding.TaxIdentityShadowSourceBindingError, match="^ptg2_tax_identity_shadow_source_binding_invalid$")
+    return pytest.raises(
+        binding.TaxIdentityShadowSourceBindingError,
+        match="^ptg2_tax_identity_shadow_source_binding_invalid$",
+    )
 
 
 def _coordinate_fields(**overrides: Any) -> dict[str, Any]:
@@ -78,42 +89,21 @@ def _coordinate_fields(**overrides: Any) -> dict[str, Any]:
     return coordinates_by_name
 
 
-def test_binds_pathless_relocation_stable_fixed_authority_descriptor(tmp_path: Path) -> None:
+def test_binds_pathless_relocation_stable_fixed_authority_descriptor(
+    tmp_path: Path,
+) -> None:
+    """Prove relocation stability and an immutable non-publishable surface."""
+
     source_binding_input = _source_input()
-    first = _bind(_admitted_bundle(tmp_path, directory_name="first"), source_binding_input)
-    second = _bind(_admitted_bundle(tmp_path, directory_name="second"), source_binding_input)
+    first = _bind(
+        _admitted_bundle(tmp_path, directory_name="first"), source_binding_input
+    )
+    second = _bind(
+        _admitted_bundle(tmp_path, directory_name="second"), source_binding_input
+    )
 
-    assert first.binding_sha256 == second.binding_sha256
-    assert first.binding_sha256 == "eaa6c9d9fc37f8e429e3431524e9c0bc38dd98421d052f7206295a57060fa21f"
-    assert first.contract == "ptg2_tax_identity_shadow_source_binding_v1"
-    assert first.shadow_state == "SHADOW"
-    assert first.projection_authority == "v1_only"
-    assert first.publication_enabled is False
-    assert first.shadow_bundle_binding_sha256 == second.shadow_bundle_binding_sha256
-    assert first.coordinates.source_shard_id == "file:17"
-    assert not hasattr(first, "source")
-    assert not hasattr(first, "v1")
-    assert not hasattr(first, "v2")
-
-    forbidden_keys = {
-        "path", "url", "storage_uri", "tin", "raw_tin", "business_name", "plan_name", "network_name", "build_token"
-    }
-    serialized = asdict(first)
-    assert forbidden_keys.isdisjoint(serialized)
-    assert forbidden_keys.isdisjoint(serialized["coordinates"])
-    assert "publication_enabled" not in inspect.signature(binding.BoundTaxIdentityShadowBundleDescriptor).parameters
-    assert "publication_enabled" not in inspect.signature(binding.bind_tax_identity_shadow_source).parameters
-    documentation = binding.BoundTaxIdentityShadowBundleDescriptor.__doc__ + binding.bind_tax_identity_shadow_source.__doc__
-    assert "source catalog" in documentation and "pinned generation" in documentation
-    with pytest.raises(FrozenInstanceError):
-        first.binding_sha256 = "0" * 64
-    with pytest.raises(TypeError):
-        binding.BoundTaxIdentityShadowBundleDescriptor(
-            shadow_bundle_binding_sha256=first.shadow_bundle_binding_sha256,
-            coordinates=first.coordinates,
-            binding_sha256=first.binding_sha256,
-            **{"publication_enabled": True},
-        )
+    assert_bound_descriptor_identity(first, second)
+    assert_bound_descriptor_non_publishable(first)
 
 
 @pytest.mark.parametrize(
@@ -140,7 +130,7 @@ def test_accepts_current_source_hash_lengths_and_shard_forms(
             source_identity_hash=source_hash,
             source_file_version_id=source_version,
             source_shard_id=source_shard,
-        )
+        ),
     )
 
     assert result.coordinates.source_identity_hash == source_hash
@@ -152,17 +142,21 @@ def test_accepts_deferred_raw_container_identity(tmp_path: Path) -> None:
     result = _bind(
         _admitted_bundle(tmp_path),
         _source_input(
-            physical_identity=SharedPhysicalArtifactIdentity("in-network", "raw_container_sha256_v1", RAW_SHA256),
+            physical_identity=SharedPhysicalArtifactIdentity(
+                "in-network", "raw_container_sha256_v1", RAW_SHA256
+            ),
             logical_json_sha256=None,
             logical_hash_deferred=True,
-        )
+        ),
     )
 
     assert result.coordinates.logical_hash_deferred is True
     assert result.coordinates.logical_json_sha256 is None
 
 
-@pytest.mark.parametrize(("field", "coordinate"), [("import_run_id", "x" * 96), ("snapshot_id", "é" * 48)])
+@pytest.mark.parametrize(
+    ("field", "coordinate"), [("import_run_id", "x" * 96), ("snapshot_id", "é" * 48)]
+)
 def test_accepts_exact_96_byte_run_coordinates(
     tmp_path: Path,
     field: str,
@@ -180,22 +174,34 @@ def test_every_bound_coordinate_changes_the_digest(tmp_path: Path) -> None:
     bundle = _admitted_bundle(tmp_path, directory_name="baseline")
     baseline_source = _source_input()
     baseline = _bind(bundle, baseline_source)
-    changed_bundle = _admitted_bundle(tmp_path, directory_name="changed-bundle", payload_seed=37)
+    changed_bundle = _admitted_bundle(
+        tmp_path, directory_name="changed-bundle", payload_seed=37
+    )
     source_variants = [
-        {"physical_identity": SharedPhysicalArtifactIdentity("allowed-amount", "logical_json_sha256_v1", LOGICAL_SHA256)},
         {
-            "physical_identity": SharedPhysicalArtifactIdentity("in-network", "logical_json_sha256_v1", "6" * 64),
+            "physical_identity": SharedPhysicalArtifactIdentity(
+                "allowed-amount", "logical_json_sha256_v1", LOGICAL_SHA256
+            )
+        },
+        {
+            "physical_identity": SharedPhysicalArtifactIdentity(
+                "in-network", "logical_json_sha256_v1", "6" * 64
+            ),
             "logical_json_sha256": "6" * 64,
         },
         {"source_identity_hash": "7" * 16},
         {"source_file_version_id": "8" * 16},
         {"raw_container_sha256": "9" * 64},
         {
-            "physical_identity": SharedPhysicalArtifactIdentity("in-network", "logical_json_sha256_v1", "a" * 64),
+            "physical_identity": SharedPhysicalArtifactIdentity(
+                "in-network", "logical_json_sha256_v1", "a" * 64
+            ),
             "logical_json_sha256": "a" * 64,
         },
         {
-            "physical_identity": SharedPhysicalArtifactIdentity("in-network", "raw_container_sha256_v1", RAW_SHA256),
+            "physical_identity": SharedPhysicalArtifactIdentity(
+                "in-network", "raw_container_sha256_v1", RAW_SHA256
+            ),
             "logical_json_sha256": None,
             "logical_hash_deferred": True,
         },
@@ -205,27 +211,50 @@ def test_every_bound_coordinate_changes_the_digest(tmp_path: Path) -> None:
         {"snapshot_id": "ptg2:209902:synthetic"},
     ]
 
-    assert _bind(changed_bundle, baseline_source).binding_sha256 != baseline.binding_sha256
+    assert (
+        _bind(changed_bundle, baseline_source).binding_sha256 != baseline.binding_sha256
+    )
     for variant_by_name in source_variants:
-        assert _bind(bundle, _source_input(**variant_by_name)).binding_sha256 != baseline.binding_sha256
+        assert (
+            _bind(bundle, _source_input(**variant_by_name)).binding_sha256
+            != baseline.binding_sha256
+        )
 
 
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     [
-        ("source_type", None), ("source_type", "IN-NETWORK"), ("source_type", "a" * 65),
-        ("physical_identity_kind", []), ("physical_identity_kind", "unknown"),
-        ("physical_identity_sha256", "A" * 64), ("physical_identity_sha256", "a" * 63),
-        ("source_identity_hash", None), ("source_identity_hash", "a" * 15), ("source_identity_hash", "Z" * 16),
-        ("source_file_version_id", "a" * 64), ("source_file_version_id", "A" * 16),
-        ("raw_container_sha256", "not-a-digest"), ("logical_hash_deferred", 1),
-        ("source_shard_id", None), ("source_shard_id", "manifest:ABCDEF0123456789"),
-        ("source_shard_id", "other:17"), ("source_shard_id", f"file:{'8' * 92}"),
-        ("source_shard_id", f"manifest:{'8' * 88}"), ("source_run_contract_sha256", "a" * 32),
-        ("import_run_id", None), ("import_run_id", ""), ("import_run_id", " surrounded "),
-        ("import_run_id", "x" * 97), ("import_run_id", "é" * 49), ("import_run_id", "run\nvalue"),
-        ("import_run_id", "run\u0085value"), ("import_run_id", "run\u009fvalue"),
-        ("import_run_id", "run\ud800value"), ("snapshot_id", "snapshot\x00value"), ("snapshot_id", "x" * 97),
+        ("source_type", None),
+        ("source_type", "IN-NETWORK"),
+        ("source_type", "a" * 65),
+        ("physical_identity_kind", []),
+        ("physical_identity_kind", "unknown"),
+        ("physical_identity_sha256", "A" * 64),
+        ("physical_identity_sha256", "a" * 63),
+        ("source_identity_hash", None),
+        ("source_identity_hash", "a" * 15),
+        ("source_identity_hash", "Z" * 16),
+        ("source_file_version_id", "a" * 64),
+        ("source_file_version_id", "A" * 16),
+        ("raw_container_sha256", "not-a-digest"),
+        ("logical_hash_deferred", 1),
+        ("source_shard_id", None),
+        ("source_shard_id", "manifest:ABCDEF0123456789"),
+        ("source_shard_id", "other:17"),
+        ("source_shard_id", f"file:{'8' * 92}"),
+        ("source_shard_id", f"manifest:{'8' * 88}"),
+        ("source_run_contract_sha256", "a" * 32),
+        ("import_run_id", None),
+        ("import_run_id", ""),
+        ("import_run_id", " surrounded "),
+        ("import_run_id", "x" * 97),
+        ("import_run_id", "é" * 49),
+        ("import_run_id", "run\nvalue"),
+        ("import_run_id", "run\u0085value"),
+        ("import_run_id", "run\u009fvalue"),
+        ("import_run_id", "run\ud800value"),
+        ("snapshot_id", "snapshot\x00value"),
+        ("snapshot_id", "x" * 97),
     ],
 )
 def test_direct_coordinates_reject_invalid_fields(
@@ -250,7 +279,10 @@ def test_direct_coordinates_reject_invalid_fields(
     ],
 )
 def test_direct_coordinates_reject_logical_identity_forgery(
-    identity_kind: str, physical_sha256: str, logical_sha256: str | None, is_deferred: bool
+    identity_kind: str,
+    physical_sha256: str,
+    logical_sha256: str | None,
+    is_deferred: bool,
 ) -> None:
     with _binding_error():
         binding.TaxIdentityShadowSourceCoordinates(
@@ -264,9 +296,13 @@ def test_direct_coordinates_reject_logical_identity_forgery(
 
 
 def test_source_input_requires_untampered_physical_identity(tmp_path: Path) -> None:
-    tampered = SharedPhysicalArtifactIdentity("in-network", "logical_json_sha256_v1", LOGICAL_SHA256)
+    tampered = SharedPhysicalArtifactIdentity(
+        "in-network", "logical_json_sha256_v1", LOGICAL_SHA256
+    )
     object.__setattr__(tampered, "identity_kind", [])
-    missing_slot = SharedPhysicalArtifactIdentity("in-network", "logical_json_sha256_v1", LOGICAL_SHA256)
+    missing_slot = SharedPhysicalArtifactIdentity(
+        "in-network", "logical_json_sha256_v1", LOGICAL_SHA256
+    )
     object.__delattr__(missing_slot, "source_type")
     invalid_identities: list[object] = [SimpleNamespace(), tampered, missing_slot]
 
@@ -293,7 +329,9 @@ def test_source_input_requires_untampered_physical_identity(tmp_path: Path) -> N
         ("binding_sha256", "f" * 64),
     ],
 )
-def test_direct_bound_descriptor_rejects_forgery(tmp_path: Path, field: str, invalid_value: object) -> None:
+def test_direct_bound_descriptor_rejects_forgery(
+    tmp_path: Path, field: str, invalid_value: object
+) -> None:
     admitted = _bind(_admitted_bundle(tmp_path), _source_input())
     descriptor_field_by_name: dict[str, object] = {
         "shadow_bundle_binding_sha256": admitted.shadow_bundle_binding_sha256,
@@ -341,7 +379,9 @@ def test_binder_rejects_tampered_admission_descriptor(
 
 
 @pytest.mark.parametrize("artifact_name", ["v1", "v2"])
-def test_binder_rejects_direct_constructed_artifact_substitutes(tmp_path: Path, artifact_name: str) -> None:
+def test_binder_rejects_direct_constructed_artifact_substitutes(
+    tmp_path: Path, artifact_name: str
+) -> None:
     admitted = _admitted_bundle(tmp_path)
     forged = admission.TaxIdentityShadowBundleDescriptor(
         v1=SimpleNamespace() if artifact_name == "v1" else admitted.v1,
@@ -354,19 +394,33 @@ def test_binder_rejects_direct_constructed_artifact_substitutes(tmp_path: Path, 
 
 @pytest.mark.parametrize(
     ("artifact_name", "field", "invalid_value"),
-    [("v1", "sha256", "A" * 64), ("v2", "sha256", "0" * 64), ("v1", "record_bytes", True),
-     ("v2", "provider_group_count", 0)],
+    [
+        ("v1", "sha256", "A" * 64),
+        ("v2", "sha256", "0" * 64),
+        ("v1", "record_bytes", True),
+        ("v2", "provider_group_count", 0),
+    ],
 )
-def test_binder_rejects_artifact_digest_and_scalar_tampering(tmp_path: Path, artifact_name: str, field: str, invalid_value: object) -> None:
+def test_binder_rejects_artifact_digest_and_scalar_tampering(
+    tmp_path: Path, artifact_name: str, field: str, invalid_value: object
+) -> None:
     admitted = _admitted_bundle(tmp_path)
     object.__setattr__(getattr(admitted, artifact_name), field, invalid_value)
     with _binding_error():
         _bind(admitted, _source_input())
 
 
-@pytest.mark.parametrize(("artifact_name", "field", "invalid_value"), [
-    ("v2", "state_counts", SimpleNamespace()), ("v2", "missing", -1), ("v1", "matched_npi", 1)])
-def test_binder_rejects_nested_state_count_tampering(tmp_path: Path, artifact_name: str, field: str, invalid_value: object) -> None:
+@pytest.mark.parametrize(
+    ("artifact_name", "field", "invalid_value"),
+    [
+        ("v2", "state_counts", SimpleNamespace()),
+        ("v2", "missing", -1),
+        ("v1", "matched_npi", 1),
+    ],
+)
+def test_binder_rejects_nested_state_count_tampering(
+    tmp_path: Path, artifact_name: str, field: str, invalid_value: object
+) -> None:
     admitted = _admitted_bundle(tmp_path)
     artifact = getattr(admitted, artifact_name)
     owner = artifact if field == "state_counts" else artifact.state_counts
@@ -375,126 +429,16 @@ def test_binder_rejects_nested_state_count_tampering(tmp_path: Path, artifact_na
         _bind(admitted, _source_input())
 
 
-def test_bound_descriptor_revalidates_recomputed_digest_coordinates(tmp_path: Path) -> None:
+def test_bound_descriptor_revalidates_recomputed_digest_coordinates(
+    tmp_path: Path,
+) -> None:
     admitted = _bind(_admitted_bundle(tmp_path), _source_input())
     coordinates = admitted.coordinates
     object.__setattr__(coordinates, "logical_hash_deferred", True)
-    recomputed = binding._source_binding_sha256(admitted.shadow_bundle_binding_sha256, coordinates)
-    with _binding_error():
-        binding.BoundTaxIdentityShadowBundleDescriptor(admitted.shadow_bundle_binding_sha256, coordinates, recomputed)
-
-
-@pytest.mark.parametrize(
-    ("field", "invalid_value"), [("shadow_bundle", SimpleNamespace()), ("source", SimpleNamespace())]
-)
-def test_binder_rejects_non_authoritative_input_types(
-    tmp_path: Path, field: str, invalid_value: object
-) -> None:
-    shadow_bundle: object = _admitted_bundle(tmp_path)
-    source_binding_input: object = _source_input()
-    if field == "shadow_bundle":
-        shadow_bundle = invalid_value
-    else:
-        source_binding_input = invalid_value
-    with _binding_error():
-        binding.bind_tax_identity_shadow_source(
-            shadow_bundle=shadow_bundle,
-            source=source_binding_input,
-        )
-
-
-def test_ambient_activation_and_file_access_cannot_change_binding(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    shadow_bundle = _admitted_bundle(tmp_path)
-    source_binding_input = _source_input()
-    baseline = _bind(shadow_bundle, source_binding_input)
-    for env_name in (
-        "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH",
-        "HLTHPRT_PTG2_PROVIDER_GRAPH_V4",
-        "HLTHPRT_PTG2_AUTO_ACTIVATE_CANDIDATES",
-    ):
-        monkeypatch.setenv(env_name, "1")
-
-    def unexpected_file_access(*_args: object, **_kwargs: object) -> object:
-        pytest.fail("source binding attempted file access")
-
-    monkeypatch.setattr(builtins, "open", unexpected_file_access)
-    monkeypatch.setattr(Path, "open", unexpected_file_access)
-    rebound = _bind(shadow_bundle, source_binding_input)
-
-    assert rebound == baseline
-    assert rebound.projection_authority == "v1_only"
-    assert rebound.publication_enabled is False
-    assert "os" not in binding.__dict__
-    assert "config" not in binding.__dict__
-
-
-def test_binding_is_metadata_only_and_later_admission_reauthenticates(
-    tmp_path: Path,
-) -> None:
-    scratch_root, v1, v2 = make_sidecar_pair(tmp_path)
-    bundle = admission.admit_tax_identity_shadow_bundle(
-        scratch_root=scratch_root,
-        v1_scanner_descriptor=v1,
-        v2_scanner_descriptor=v2,
+    recomputed = binding._source_binding_sha256(
+        admitted.shadow_bundle_binding_sha256, coordinates
     )
-    bound = _bind(bundle, _source_input())
-    before_mutation = bound.binding_sha256
-    v2_path = Path(v2["path"])
-    changed = bytearray(v2_path.read_bytes())
-    changed[-1] ^= 1
-    v2_path.write_bytes(changed)
-
-    assert bound.binding_sha256 == before_mutation
-    with pytest.raises(
-        admission.TaxIdentityShadowAdmissionError,
-        match="ptg2_tax_identity_shadow_artifact_invalid",
-    ):
-        admission.admit_tax_identity_shadow_bundle(
-            scratch_root=scratch_root,
-            v1_scanner_descriptor=v1,
-            v2_scanner_descriptor=v2,
+    with _binding_error():
+        binding.BoundTaxIdentityShadowBundleDescriptor(
+            admitted.shadow_bundle_binding_sha256, coordinates, recomputed
         )
-
-
-def test_repr_errors_and_tracebacks_redact_all_coordinates(tmp_path: Path) -> None:
-    shadow_bundle = _admitted_bundle(tmp_path)
-    source_binding_input = _source_input()
-    bound = _bind(shadow_bundle, source_binding_input)
-    secrets = {
-        str(shadow_bundle.v1.path),
-        str(shadow_bundle.v2.path),
-        shadow_bundle.binding_sha256,
-        source_binding_input.physical_identity.source_type,
-        source_binding_input.physical_identity.identity_sha256,
-        source_binding_input.source_identity_hash,
-        source_binding_input.source_file_version_id,
-        source_binding_input.raw_container_sha256,
-        source_binding_input.source_run_contract_sha256,
-        source_binding_input.source_shard_id,
-        source_binding_input.import_run_id,
-        source_binding_input.snapshot_id,
-    }
-    rendered = repr(bound) + repr(bound.coordinates) + repr(source_binding_input)
-    assert all(secret not in rendered for secret in secrets)
-
-    sentinel = "private-coordinate-sentinel"
-    try:
-        _source_input(import_run_id=f"run\u0085{sentinel}")
-    except binding.TaxIdentityShadowSourceBindingError as error:
-        error_text = repr(error) + "".join(traceback.format_exception(error))
-    else:
-        pytest.fail("Unicode control coordinate was admitted")
-    assert sentinel not in error_text
-    assert all(secret not in error_text for secret in secrets)
-
-    object.__setattr__(shadow_bundle.v1, "path", Path(sentinel))
-    try:
-        _bind(shadow_bundle, source_binding_input)
-    except binding.TaxIdentityShadowSourceBindingError as error:
-        canonical_error_text = repr(error) + "".join(traceback.format_exception(error))
-    else:
-        pytest.fail("tampered admission descriptor was bound")
-    assert sentinel not in canonical_error_text

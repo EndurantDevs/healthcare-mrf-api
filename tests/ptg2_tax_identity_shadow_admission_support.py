@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
+from dataclasses import FrozenInstanceError, asdict
 from pathlib import Path
 from typing import Any
+
+import pytest
+
+from process.ptg_parts import ptg2_tax_identity_shadow_source_binding as binding
 
 POLICY_ID = "ptg-tin-hmac-sha256-v1:synthetic-shadow"
 ROW_COUNT = 6
@@ -125,3 +131,70 @@ def refresh_descriptor(descriptor: dict[str, Any]) -> None:
     data = Path(descriptor["path"]).read_bytes()
     descriptor["bytes"] = len(data)
     descriptor["sha256"] = hashlib.sha256(data).hexdigest()
+
+
+def assert_bound_descriptor_identity(
+    first: binding.BoundTaxIdentityShadowBundleDescriptor,
+    second: binding.BoundTaxIdentityShadowBundleDescriptor,
+) -> None:
+    """Assert relocation-stable identity and fixed shadow authority."""
+
+    assert first.binding_sha256 == second.binding_sha256
+    assert (
+        first.binding_sha256
+        == "eaa6c9d9fc37f8e429e3431524e9c0bc38dd98421d052f7206295a57060fa21f"
+    )
+    assert first.contract == "ptg2_tax_identity_shadow_source_binding_v1"
+    assert first.shadow_state == "SHADOW"
+    assert first.projection_authority == "v1_only"
+    assert first.publication_enabled is False
+    assert first.shadow_bundle_binding_sha256 == second.shadow_bundle_binding_sha256
+    assert first.coordinates.source_shard_id == "file:17"
+    assert not hasattr(first, "source")
+    assert not hasattr(first, "v1")
+    assert not hasattr(first, "v2")
+
+
+def assert_bound_descriptor_non_publishable(
+    descriptor: binding.BoundTaxIdentityShadowBundleDescriptor,
+) -> None:
+    """Assert the public descriptor surface cannot expose or enable publication."""
+
+    forbidden_keys = {
+        "path",
+        "url",
+        "storage_uri",
+        "tin",
+        "raw_tin",
+        "business_name",
+        "plan_name",
+        "network_name",
+        "build_token",
+    }
+    serialized = asdict(descriptor)
+    assert forbidden_keys.isdisjoint(serialized)
+    assert forbidden_keys.isdisjoint(serialized["coordinates"])
+    assert (
+        "publication_enabled"
+        not in inspect.signature(
+            binding.BoundTaxIdentityShadowBundleDescriptor
+        ).parameters
+    )
+    assert (
+        "publication_enabled"
+        not in inspect.signature(binding.bind_tax_identity_shadow_source).parameters
+    )
+    documentation = (
+        binding.BoundTaxIdentityShadowBundleDescriptor.__doc__
+        + binding.bind_tax_identity_shadow_source.__doc__
+    )
+    assert "source catalog" in documentation and "pinned generation" in documentation
+    with pytest.raises(FrozenInstanceError):
+        descriptor.binding_sha256 = "0" * 64
+    with pytest.raises(TypeError):
+        binding.BoundTaxIdentityShadowBundleDescriptor(
+            shadow_bundle_binding_sha256=descriptor.shadow_bundle_binding_sha256,
+            coordinates=descriptor.coordinates,
+            binding_sha256=descriptor.binding_sha256,
+            **{"publication_enabled": True},
+        )
