@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -94,3 +95,42 @@ def test_main_rejects_unclear_message(capsys):
 
     assert exit_code
     assert "policy failed" in capsys.readouterr().out
+
+
+def test_reads_every_subject_after_a_git_range_base(tmp_path, monkeypatch):
+    module = load_policy_module()
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "CI Test"], cwd=repository, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "ci@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    for subject in (
+        "docs: establish range base",
+        "fix(ci): validate protected push subjects",
+        "test(ci): cover workflow dispatch subjects",
+    ):
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "--quiet", "-m", subject],
+            cwd=repository,
+            check=True,
+        )
+        if subject == "docs: establish range base":
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+
+    monkeypatch.chdir(repository)
+    assert module.git_subjects([f"{base_sha}..HEAD"]) == [
+        "test(ci): cover workflow dispatch subjects",
+        "fix(ci): validate protected push subjects",
+    ]
