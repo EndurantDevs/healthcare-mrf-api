@@ -24,6 +24,7 @@ RUN apt-get update \
 
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+COPY ci/arc/network_fence.py /usr/local/bin/arc-network-fence
 
 RUN groupadd --gid 1001 runner \
     && useradd \
@@ -33,7 +34,9 @@ RUN groupadd --gid 1001 runner \
         --shell /bin/bash \
         runner \
     && mkdir -p /home/runner/.cargo \
-    && chown -R 1001:1001 /home/runner
+    && chown -R 1001:1001 /home/runner \
+    && chown 0:0 /usr/local/bin/arc-network-fence \
+    && chmod 0555 /usr/local/bin/arc-network-fence
 
 ENV CARGO_HOME=/home/runner/.cargo \
     HOME=/home/runner \

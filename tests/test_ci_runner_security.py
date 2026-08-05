@@ -69,6 +69,7 @@ def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
     assert "github.ref == 'refs/heads/main'" in publish["if"]
     assert "pull_request:" in workflow
     assert "pull_request_target" not in workflow
+    assert workflow.count("- ci/arc/network_fence.py") == 2
     assert "secrets.GITHUB_TOKEN" in workflow
     assert "secrets." not in workflow.replace("secrets.GITHUB_TOKEN", "")
     assert "/var/run/docker.sock" not in workflow
@@ -81,6 +82,25 @@ def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
         "2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec"
     ) in workflow
     assert "docker buildx rm arc-ci-publisher" in workflow
+    assert "arc-network-fence --timeout 0.1 --target 127.0.0.1:9" in workflow
+
+
+def test_ci_image_retention_is_hosted_bounded_and_fail_closed() -> None:
+    workflow = _workflow("cleanup-arc-ci-images.yml")
+    document = yaml.safe_load(workflow)
+    retain = document["jobs"]["retain"]
+
+    assert retain["runs-on"] == "ubuntu-latest"
+    assert retain["permissions"] == {"contents": "read", "packages": "write"}
+    assert retain["timeout-minutes"] == 10
+    assert "pull_request" not in workflow
+    assert "pull_request_target" not in workflow
+    assert "vars.HEALTHCARE_MRF_ARC_PROTECTED_DIGESTS" in workflow
+    assert "protected digests are not configured" in workflow
+    assert "versions[5:]" in workflow
+    assert "timedelta(days=30)" in workflow
+    assert "len(delete_ids) == 20" in workflow
+    assert "gh api --method DELETE" in workflow
 
 
 def test_service_images_are_immutable_before_any_arc_route() -> None:
@@ -102,9 +122,9 @@ def test_ci_job_containers_cannot_copy_runner_paths() -> None:
     for name, job in workflow["jobs"].items():
         container = job.get("container")
         if isinstance(container, dict):
-            assert "volumes" not in container, (
-                f"{name} must not copy runner paths into an ARC job container"
-            )
+            assert (
+                "volumes" not in container
+            ), f"{name} must not copy runner paths into an ARC job container"
 
 
 def test_arc_image_contains_no_repository_or_credentials() -> None:
@@ -113,9 +133,15 @@ def test_arc_image_contains_no_repository_or_credentials() -> None:
     )
 
     assert "COPY --from=rust-toolchain" in dockerfile
+    assert "COPY ci/arc/network_fence.py /usr/local/bin/arc-network-fence" in dockerfile
     assert "COPY ." not in dockerfile
     assert "ADD " not in dockerfile
     assert "ARG TOKEN" not in dockerfile
     assert "ARG SECRET" not in dockerfile
+    assert "chown 0:0 /usr/local/bin/arc-network-fence" in dockerfile
+    assert "chmod 0555 /usr/local/bin/arc-network-fence" in dockerfile
+    assert dockerfile.index("chmod 0555 /usr/local/bin/arc-network-fence") < (
+        dockerfile.index("USER 1001:1001")
+    )
     assert "USER 1001:1001" in dockerfile
     assert dockerfile.count("@sha256:") == 3
