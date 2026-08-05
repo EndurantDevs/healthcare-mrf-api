@@ -1,5 +1,38 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+fn publish_or_verify_raw(
+    root: &RootDirectory,
+    raw_name: &str,
+    temporary: RootTemporaryFile,
+    expected_sha256: &[u8; SHA256_BYTES],
+    expected_byte_count: u64,
+) -> io::Result<(bool, FileIdentity)> {
+    let temporary_identity = FileIdentity::from_file(temporary.file())?;
+    if temporary.publish_noclobber(raw_name)? {
+        root.sync()?;
+        let final_file = some_or_invalid_data(
+            root.open_existing_regular(raw_name)?,
+            "published retained UHC raw artifact is unavailable",
+        )?;
+        let final_identity = FileIdentity::from_file(&final_file)?;
+        if !same_inode(temporary_identity, final_identity)
+            || final_identity.byte_count != expected_byte_count
+        {
+            return Err(invalid_data(
+                "published retained UHC raw artifact inode changed unexpectedly",
+            ));
+        }
+        return Ok((false, final_identity));
+    }
+
+    let final_file = some_or_invalid_data(
+        root.open_existing_regular(raw_name)?,
+        "concurrently published retained UHC raw artifact is unavailable",
+    )?;
+    verify_existing_raw_file(&final_file, expected_sha256, expected_byte_count)?;
+    Ok((true, FileIdentity::from_file(&final_file)?))
+}
+
 pub fn retain_uhc_artifact(request: &UHCRetainRequest) -> io::Result<UHCRetainSummary> {
     let total_started = Instant::now();
     let expected_sha256 = request.validate()?;
@@ -106,30 +139,13 @@ pub fn retain_uhc_artifact(request: &UHCRetainRequest) -> io::Result<UHCRetainSu
     let raw_publish_started = Instant::now();
     let (raw_reused, authoritative_raw_identity) = if let Some(temporary) = raw_temporary.take()
     {
-        let temporary_identity = FileIdentity::from_file(temporary.file())?;
-        if temporary.publish_noclobber(&raw_name)? {
-            root.sync()?;
-            let final_file = some_or_invalid_data(
-                root.open_existing_regular(&raw_name)?,
-                "published retained UHC raw artifact is unavailable",
-            )?;
-            let final_identity = FileIdentity::from_file(&final_file)?;
-            if !same_inode(temporary_identity, final_identity)
-                || final_identity.byte_count != request.expected_byte_count
-            {
-                return Err(invalid_data(
-                    "published retained UHC raw artifact inode changed unexpectedly",
-                ));
-            }
-            (false, final_identity)
-        } else {
-            let final_file = some_or_invalid_data(
-                root.open_existing_regular(&raw_name)?,
-                "concurrently published retained UHC raw artifact is unavailable",
-            )?;
-            verify_existing_raw_file(&final_file, &expected_sha256, request.expected_byte_count)?;
-            (true, FileIdentity::from_file(&final_file)?)
-        }
+        publish_or_verify_raw(
+            &root,
+            &raw_name,
+            temporary,
+            &expected_sha256,
+            request.expected_byte_count,
+        )?
     } else {
         (true, input_identity)
     };
