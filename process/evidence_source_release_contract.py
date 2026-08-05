@@ -11,7 +11,6 @@ import json
 import re
 from typing import Any, Literal, Mapping
 
-
 _CONTRACT_ID = "healthporta.public-evidence-source-release.v1"
 PUBLIC_EVIDENCE_SOURCE_RELEASE_CONTRACT = _CONTRACT_ID
 PUBLIC_EVIDENCE_FOUNDATION_SCOPE = "phase_1_public_source_neutral_foundation"

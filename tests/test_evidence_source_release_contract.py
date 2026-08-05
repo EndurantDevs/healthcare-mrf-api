@@ -6,7 +6,6 @@ import pytest
 
 from process import evidence_source_release_contract as release
 
-
 POLICY_MATRIX = {
     "tic": (
         *"immutable_artifact payer_transparency_in_coverage "
