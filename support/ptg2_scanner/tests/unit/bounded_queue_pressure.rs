@@ -1,3 +1,5 @@
+use super::*;
+
 const QUEUE_FULL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct QueueFullHandshakeWriter {
@@ -17,7 +19,7 @@ impl Write for QueueFullHandshakeWriter {
     }
 }
 
-fn empty_copy_file_event() -> CopyFileEvent {
+pub(super) fn empty_copy_file_event() -> CopyFileEvent {
     CopyFileEvent {
         record_kind: "copy_file".to_owned(),
         path: "test.copy".to_owned(),
@@ -32,7 +34,7 @@ fn empty_copy_file_event() -> CopyFileEvent {
     }
 }
 
-fn assert_worker_job_queue_pressure(
+pub(super) fn assert_worker_job_queue_pressure(
     blocked_micros: &mut u128,
     stats: &mut RawChunkStats,
 ) {
@@ -76,7 +78,7 @@ fn assert_worker_job_queue_pressure(
     assert_eq!(stats.queue_blocked_sends, blocked_sends_before + 1);
 }
 
-fn assert_provider_reference_queue_pressure(
+pub(super) fn assert_provider_reference_queue_pressure(
     blocked_micros: &mut u128,
     stats: &mut RawChunkStats,
 ) {

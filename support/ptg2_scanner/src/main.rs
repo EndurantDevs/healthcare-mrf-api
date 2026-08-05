@@ -24741,14 +24741,16 @@ fn merge_manifest_copy_files(
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/bounded_queue_pressure.rs"]
+mod bounded_queue_pressure;
+
+#[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use ptg2_scanner::manifest::GLOBAL_ID_BYTES;
     use std::collections::BTreeSet;
     use std::sync::OnceLock;
-
-    include!("../tests/unit/bounded_queue_pressure.rs");
 
     struct TestEnvVar {
         name: &'static str,
@@ -37008,7 +37010,10 @@ mod tests {
             io::ErrorKind::BrokenPipe
         );
 
-        assert_worker_job_queue_pressure(&mut blocked_micros, &mut stats);
+        super::bounded_queue_pressure::assert_worker_job_queue_pressure(
+            &mut blocked_micros,
+            &mut stats,
+        );
 
         let (batch_tx, batch_rx) = bounded(1);
         send_provider_ref_batch(
@@ -37038,10 +37043,13 @@ mod tests {
             io::ErrorKind::BrokenPipe
         );
 
-        assert_provider_reference_queue_pressure(&mut blocked_micros, &mut stats);
+        super::bounded_queue_pressure::assert_provider_reference_queue_pressure(
+            &mut blocked_micros,
+            &mut stats,
+        );
 
         let mut sink = io::sink();
-        let event = empty_copy_file_event();
+        let event = super::bounded_queue_pressure::empty_copy_file_event();
         emit_copy_file_event(&mut sink, &event).unwrap();
         let (sink_event_tx, sink_event_rx) = unbounded();
         sink_event_tx.send(event).unwrap();
