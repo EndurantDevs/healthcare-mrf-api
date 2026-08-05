@@ -185,11 +185,14 @@ jobs:
             [ -n "${address}" ] && echo "::add-mask::${address}"
           done < <(getent ahosts "${DEV_DEPLOY_HOST}" 2>/dev/null | awk '{print $1}' | sort -u)
           deploy_args="${DEPLOY_SHA} ${DEPLOY_BRANCH} --ptg-v3-phase=${PTG_V3_PHASE}"
+          # Strict V3 stays synchronous so this job verifies migration and rollout completion.
           if ! ssh -i ~/.ssh/dev-deploy \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
             -o ConnectTimeout=20 \
             -o ConnectionAttempts=3 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             "ubuntu@${DEV_DEPLOY_HOST}" \

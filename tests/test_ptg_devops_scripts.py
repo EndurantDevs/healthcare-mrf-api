@@ -48,6 +48,8 @@ def test_dev_deploy_workflow_requires_successful_ci_for_exact_main_sha():
     assert "- recovery-writer" in workflow
     assert "--detach" not in workflow
     assert "timeout-minutes: 90" in workflow
+    assert workflow.count("-o ServerAliveInterval=30") == 1
+    assert workflow.count("-o ServerAliveCountMax=3") == 1
     assert "run.conclusion === 'success'" in workflow
 
 
