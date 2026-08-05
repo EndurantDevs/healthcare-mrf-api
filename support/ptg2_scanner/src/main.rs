@@ -24748,6 +24748,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::OnceLock;
 
+    include!("../tests/unit/bounded_queue_pressure.rs");
+
     struct TestEnvVar {
         name: &'static str,
         previous: Option<String>,
@@ -36950,42 +36952,11 @@ mod tests {
 
     #[test]
     fn bounded_worker_queue_delivery_covers_success_pressure_and_shutdown() {
-        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-
-        struct QueueFullHandshakeWriter {
-            full_seen_tx: Sender<()>,
-        }
-
-        impl Write for QueueFullHandshakeWriter {
-            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                self.full_seen_tx
-                    .send(())
-                    .expect("queue-full handshake receiver closed");
-                Ok(())
-            }
-        }
-
         let empty_job = || WorkerJob::Rates {
             procedure: Map::new(),
             rates: Vec::new(),
         };
         let empty_batch = || RawRateChunk::with_capacity(0, 0);
-        let empty_event = || CopyFileEvent {
-            record_kind: "copy_file".to_owned(),
-            path: "test.copy".to_owned(),
-            bytes: 0,
-            row_count: 0,
-            final_file: true,
-            partition: None,
-            partition_count: None,
-            format: None,
-            version: None,
-            sha256: None,
-        };
         let (_event_tx, event_rx) = unbounded();
         let mut writer = Vec::new();
         let mut blocked_micros = 0;
@@ -37037,38 +37008,7 @@ mod tests {
             io::ErrorKind::BrokenPipe
         );
 
-        let (pressured_job_tx, pressured_job_rx) = bounded(1);
-        pressured_job_tx.send(empty_job()).unwrap();
-        let (job_full_seen_tx, job_full_seen_rx) = bounded(1);
-        let (job_event_tx, job_event_rx) = unbounded();
-        job_event_tx.send(empty_event()).unwrap();
-        let mut job_pressure_writer = QueueFullHandshakeWriter {
-            full_seen_tx: job_full_seen_tx,
-        };
-        let job_receiver = thread::spawn(move || {
-            job_full_seen_rx
-                .recv_timeout(HANDSHAKE_TIMEOUT)
-                .expect("worker-job queue never reported Full");
-            let _ = pressured_job_rx
-                .recv_timeout(HANDSHAKE_TIMEOUT)
-                .expect("prefilled worker job was not released");
-            let _ = pressured_job_rx
-                .recv_timeout(HANDSHAKE_TIMEOUT)
-                .expect("pressured worker job was not delivered");
-        });
-        let job_blocked_sends_before = stats.queue_blocked_sends;
-        send_worker_job(
-            &pressured_job_tx,
-            &job_event_rx,
-            &mut job_pressure_writer,
-            None,
-            &mut blocked_micros,
-            &mut stats,
-            empty_job(),
-        )
-        .unwrap();
-        job_receiver.join().unwrap();
-        assert_eq!(stats.queue_blocked_sends, job_blocked_sends_before + 1);
+        assert_worker_job_queue_pressure(&mut blocked_micros, &mut stats);
 
         let (batch_tx, batch_rx) = bounded(1);
         send_provider_ref_batch(
@@ -37098,40 +37038,10 @@ mod tests {
             io::ErrorKind::BrokenPipe
         );
 
-        let (pressured_batch_tx, pressured_batch_rx) = bounded(1);
-        pressured_batch_tx.send(empty_batch()).unwrap();
-        let (batch_full_seen_tx, batch_full_seen_rx) = bounded(1);
-        let (batch_event_tx, batch_event_rx) = unbounded();
-        batch_event_tx.send(empty_event()).unwrap();
-        let mut batch_pressure_writer = QueueFullHandshakeWriter {
-            full_seen_tx: batch_full_seen_tx,
-        };
-        let batch_receiver = thread::spawn(move || {
-            batch_full_seen_rx
-                .recv_timeout(HANDSHAKE_TIMEOUT)
-                .expect("provider-reference queue never reported Full");
-            let _ = pressured_batch_rx
-                .recv_timeout(HANDSHAKE_TIMEOUT)
-                .expect("prefilled provider-reference batch was not released");
-            let _ = pressured_batch_rx
-                .recv_timeout(HANDSHAKE_TIMEOUT)
-                .expect("pressured provider-reference batch was not delivered");
-        });
-        let batch_blocked_sends_before = stats.queue_blocked_sends;
-        send_provider_ref_batch(
-            &pressured_batch_tx,
-            &batch_event_rx,
-            &mut batch_pressure_writer,
-            &mut blocked_micros,
-            &mut stats,
-            empty_batch(),
-        )
-        .unwrap();
-        batch_receiver.join().unwrap();
-        assert_eq!(stats.queue_blocked_sends, batch_blocked_sends_before + 1);
+        assert_provider_reference_queue_pressure(&mut blocked_micros, &mut stats);
 
         let mut sink = io::sink();
-        let event = empty_event();
+        let event = empty_copy_file_event();
         emit_copy_file_event(&mut sink, &event).unwrap();
         let (sink_event_tx, sink_event_rx) = unbounded();
         sink_event_tx.send(event).unwrap();
