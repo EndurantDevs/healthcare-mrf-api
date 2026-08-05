@@ -75,6 +75,11 @@ def test_ci_image_publisher_is_hosted_and_has_bounded_permissions() -> None:
     assert "aquasec/trivy:0.67.2@sha256:" in workflow
     assert "--input /scan/image.tar" in workflow
     assert "--driver docker-container" in workflow
+    assert (
+        "--driver-opt "
+        "image=docker.io/moby/buildkit:buildx-stable-1@sha256:"
+        "2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec"
+    ) in workflow
     assert "docker buildx rm arc-ci-publisher" in workflow
 
 
