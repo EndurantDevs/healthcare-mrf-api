@@ -1,0 +1,93 @@
+name: Publish ARC CI image
+
+on:
+  pull_request:
+    paths:
+      - ci/arc/Dockerfile
+      - .github/workflows/publish-arc-ci-image.yml
+  push:
+    branches: [main]
+    paths:
+      - ci/arc/Dockerfile
+      - .github/workflows/publish-arc-ci-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-arc-ci-image
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate ARC CI image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Build the candidate image without publishing
+        run: >-
+          docker buildx build
+          --file ci/arc/Dockerfile
+          --load
+          --platform linux/amd64
+          --tag healthcare-mrf-arc-ci-candidate
+          .
+      - name: Smoke the non-root toolchain
+        run: |
+          test "$(docker run --rm healthcare-mrf-arc-ci-candidate id -u)" = "1001"
+          docker run --rm healthcare-mrf-arc-ci-candidate python --version
+          docker run --rm healthcare-mrf-arc-ci-candidate cargo --version
+          docker run --rm healthcare-mrf-arc-ci-candidate psql --version
+      - name: Scan the candidate without exposing the Docker socket
+        run: |
+          docker save --output "$RUNNER_TEMP/arc-ci-image.tar" healthcare-mrf-arc-ci-candidate
+          docker run --rm \
+            --volume "$RUNNER_TEMP/arc-ci-image.tar:/scan/image.tar:ro" \
+            docker.io/aquasec/trivy:0.67.2@sha256:e2b22eac59c02003d8749f5b8d9bd073b62e30fefaef5b7c8371204e0a4b0c08 \
+            image \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --input /scan/image.tar \
+            --scanners vuln \
+            --severity CRITICAL
+
+  publish:
+    name: publish public ARC CI image
+    needs: validate
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Authenticate to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build and publish the public CI image
+        env:
+          IMAGE: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci:sha-${{ github.sha }}
+        run: |
+          docker buildx build \
+            --file ci/arc/Dockerfile \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.source="https://github.com/$GITHUB_REPOSITORY" \
+            --platform linux/amd64 \
+            --provenance=true \
+            --sbom=true \
+            --push \
+            --tag "$IMAGE" \
+            .
+          docker buildx imagetools inspect "$IMAGE"
