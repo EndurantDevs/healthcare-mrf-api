@@ -21,10 +21,23 @@ use crate::tax_identity_sidecar_v2::{
 use std::collections::HashSet;
 use std::io::{self, BufReader};
 
+mod collision_audit;
 mod contracts;
 mod digests;
 mod files;
 
+pub use collision_audit::{
+    audit_tax_identity_sidecar_bundle, audit_tax_identity_sidecar_bundle_with_progress,
+    TaxIdentityCollisionAuditConfig, TaxIdentityCollisionAuditLimits,
+    TaxIdentityCollisionAuditPhase, TaxIdentityCollisionAuditProgress,
+    TaxIdentityCollisionAuditResult, TaxIdentityCollisionAuditStats,
+    TaxIdentitySidecarAuditedBundleCheckpoint, TAX_IDENTITY_COLLISION_AUDIT_CHECKPOINT_CONTRACT,
+    TAX_IDENTITY_COLLISION_AUDIT_OCCURRENCE_DIGEST_CONTRACT,
+    TAX_IDENTITY_COLLISION_AUDIT_RECORD_BYTES, TAX_IDENTITY_COLLISION_AUDIT_RECORD_CONTRACT,
+    TAX_IDENTITY_COLLISION_CHECK_PASSED, TAX_IDENTITY_FULL_HMAC_TYPE_COLLISION_POLICY,
+    TAX_IDENTITY_LOCATOR_COLLISION_POLICY, TAX_IDENTITY_MULTI_CANDIDATE_LOCATOR_SUPPORT,
+    TAX_IDENTITY_SAME_IDENTITY_REPETITION_POLICY,
+};
 pub use contracts::{
     ProviderGroupUniverse, TaxIdentitySidecarBundleCheckpoint, TaxIdentitySidecarShardCheckpoint,
     TaxIdentitySidecarV1Admission, TaxIdentitySidecarV2ArtifactDescriptor,
