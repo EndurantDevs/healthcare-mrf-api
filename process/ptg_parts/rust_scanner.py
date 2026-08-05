@@ -2041,9 +2041,9 @@ def _iter_compact_serving_records_rust(
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH"
         ] = str(manifest_provider_group_tax_identity_sidecar_path)
     if manifest_provider_group_tax_identity_v2_sidecar_path is not None:
-        scanner_environment_map[
-            _PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV
-        ] = str(manifest_provider_group_tax_identity_v2_sidecar_path)
+        scanner_environment_map[_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV] = str(
+            manifest_provider_group_tax_identity_v2_sidecar_path
+        )
     if manifest_provider_npi_sidecar_path is not None:
         scanner_environment_map["HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH"] = str(
             manifest_provider_npi_sidecar_path

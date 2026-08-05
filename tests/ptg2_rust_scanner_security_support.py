@@ -183,9 +183,7 @@ def _tax_identity_v2_frame_payload() -> dict[str, object]:
         ),
         "hmac_contract": "hmac_sha256_ptg_tin_v1",
         "tin_id_128_contract": "first_16_bytes(tin_hmac_sha256)",
-        "full_hmac_authority_contract": (
-            "tin_hmac_sha256_full_32_bytes_authoritative"
-        ),
+        "full_hmac_authority_contract": "tin_hmac_sha256_full_32_bytes_authoritative",
         "sha256": "b" * 64,
         "final": True,
     }
