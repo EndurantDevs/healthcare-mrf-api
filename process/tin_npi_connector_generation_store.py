@@ -80,7 +80,11 @@ async def load_and_seal_admitted_connector_generation(
     limits: ConnectorPublicationLimits,
     schema: str,
 ) -> SealedConnectorGeneration:
-    """Atomically load and seal one bounded bundle without publishing it."""
+    """Atomically load and seal one bounded bundle without publishing it.
+
+    A database or timeout error can have indeterminate commit acknowledgement.
+    Discard that connection and retry the exact immutable bundle to reconcile it.
+    """
 
     counts = admit_connector_publication_bundle(bundle, limits=limits)
     canonical_schema = _validated_schema(schema)
@@ -136,10 +140,7 @@ def _require_idle_connection(connection: ConnectorGenerationStoreConnection) -> 
         raise TinNpiConnectorGenerationStoreError(
             "connector generation connection state is unavailable"
         )
-    if (
-        type(is_connection_in_transaction) is not bool
-        or is_connection_in_transaction
-    ):
+    if type(is_connection_in_transaction) is not bool or is_connection_in_transaction:
         raise TinNpiConnectorGenerationStoreError(
             "connector generation requires an idle connection"
         )
@@ -284,14 +285,10 @@ def _sealed_result(
         generation_record,
         expected,
     ):
-        raise TinNpiConnectorGenerationStoreError(
-            "connector generation reuse conflict"
-        )
+        raise TinNpiConnectorGenerationStoreError("connector generation reuse conflict")
     generation_key = generation_record["generation_key"]
     if type(generation_key) is not int or generation_key <= 0:
-        raise TinNpiConnectorGenerationStoreError(
-            "connector generation key is invalid"
-        )
+        raise TinNpiConnectorGenerationStoreError("connector generation key is invalid")
     return SealedConnectorGeneration(
         generation_key=generation_key,
         generation_id=bundle.generation.generation_id,

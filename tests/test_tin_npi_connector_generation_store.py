@@ -233,8 +233,7 @@ def test_sealed_result_repr_excludes_generation_digests(tmp_path):
 
     rendered = repr(result)
     assert rendered == (
-        "<sealed-connector-generation key=17 reused=false "
-        "sources=2 evidence=3>"
+        "<sealed-connector-generation key=17 reused=false " "sources=2 evidence=3>"
     )
     assert result.generation_id not in rendered
     assert result.source_vector_id not in rendered
@@ -342,9 +341,7 @@ class _StoreConnection:
             policy = self.bundle.source_vector.identifier_policy
             return {
                 "descriptor_canonical_json": policy.descriptor_canonical_json,
-                "identifier_policy_sha256": bytes.fromhex(
-                    policy.descriptor_sha256
-                ),
+                "identifier_policy_sha256": bytes.fromhex(policy.descriptor_sha256),
             }
         if "tin_npi_connector_token_policy" in sql:
             policy_id = arguments[0]

@@ -213,13 +213,11 @@ async def _assert_complete_generation(scenario, generation_key, bundle):
 
 
 async def _current_pointer(scenario) -> tuple[int, int | None]:
-    record = await scenario.connection.fetchrow(
-        f"""
+    record = await scenario.connection.fetchrow(f"""
         SELECT pointer_version, generation_key
           FROM {scenario.quoted_schema}.tin_npi_connector_current
          WHERE pointer_key = 1
-        """
-    )
+        """)
     assert record is not None
     return int(record["pointer_version"]), record["generation_key"]
 

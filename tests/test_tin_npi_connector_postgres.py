@@ -17,6 +17,11 @@ from tests.tin_npi_connector_pg_generation_store import (
     prove_store_atomic_rollback,
     prove_store_load_seal_reuse,
 )
+from tests.tin_npi_connector_pg_generation_store_resilience import (
+    prove_store_cancel_rollback,
+    prove_store_commit_ack_recovery,
+    prove_store_concurrent_reuse,
+)
 from tests.tin_npi_connector_pg_immutability import (
     prove_generation_immutability,
 )
@@ -132,6 +137,21 @@ async def test_store_loads_seals_and_reuses_without_publishing(monkeypatch):
 @pytest.mark.asyncio
 async def test_store_rolls_back_after_copy_failure(monkeypatch):
     await prove_store_atomic_rollback(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_store_cancellation_rolls_back_and_retries(monkeypatch):
+    await prove_store_cancel_rollback(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_store_commit_acknowledgement_loss_reuses_on_restart(monkeypatch):
+    await prove_store_commit_ack_recovery(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_store_concurrent_load_reuses_one_generation(monkeypatch):
+    await prove_store_concurrent_reuse(monkeypatch)
 
 
 @pytest.mark.asyncio

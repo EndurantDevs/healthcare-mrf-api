@@ -26,9 +26,10 @@ async def test_store_timeout_is_redacted_and_rolls_back(tmp_path):
     connection = _TimeoutConnection(bundle)
     limits = replace(
         _limits_for(bundle),
+        build_lease_seconds=30,
         lock_timeout_ms=1,
-        statement_timeout_ms=1,
-        operation_timeout_seconds=0.002,
+        statement_timeout_ms=2,
+        operation_timeout_seconds=0.01,
     )
 
     with pytest.raises(

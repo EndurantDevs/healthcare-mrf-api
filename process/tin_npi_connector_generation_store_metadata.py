@@ -80,9 +80,7 @@ async def set_transaction_guards(
         "SELECT set_config('statement_timeout', $1, true)",
         f"{limits.statement_timeout_ms}ms",
     )
-    await connection.execute(
-        "SELECT set_config('synchronous_commit', 'on', true)"
-    )
+    await connection.execute("SELECT set_config('synchronous_commit', 'on', true)")
 
 
 async def register_and_verify_policies(
@@ -193,9 +191,7 @@ async def insert_generation(
     if generation_key is None:
         return None
     if type(generation_key) is not int or generation_key <= 0:
-        raise TinNpiConnectorGenerationStoreError(
-            "connector generation key is invalid"
-        )
+        raise TinNpiConnectorGenerationStoreError("connector generation key is invalid")
     return generation_key
 
 
@@ -279,9 +275,7 @@ async def seal_generation(
         generation_key,
     )
     if status != "UPDATE 1":
-        raise TinNpiConnectorGenerationStoreError(
-            "connector generation seal failed"
-        )
+        raise TinNpiConnectorGenerationStoreError("connector generation seal failed")
     sealed = await read_generation(connection, schema, source_vector_id)
     if sealed is None:
         raise TinNpiConnectorGenerationStoreError(
@@ -299,8 +293,7 @@ def is_exact_record_match(
     if record is None:
         return False
     return all(
-        _is_exact_value_match(record[field], value)
-        for field, value in expected.items()
+        _is_exact_value_match(record[field], value) for field, value in expected.items()
     )
 
 
