@@ -1,0 +1,46 @@
+name: Publish ARC CI image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ci/arc/Dockerfile
+      - .github/workflows/publish-arc-ci-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-arc-ci-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish public ARC CI image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Authenticate to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build and publish the public CI image
+        env:
+          IMAGE: ghcr.io/endurantdevs/healthcare-mrf-api-arc-ci:sha-${{ github.sha }}
+        run: |
+          docker buildx build \
+            --file ci/arc/Dockerfile \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.source="https://github.com/$GITHUB_REPOSITORY" \
+            --platform linux/amd64 \
+            --provenance=true \
+            --sbom=true \
+            --push \
+            --tag "$IMAGE" \
+            .
+          docker buildx imagetools inspect "$IMAGE"
