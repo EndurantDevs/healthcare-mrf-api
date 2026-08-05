@@ -1,3 +1,6 @@
+#[path = "support/v3_runs_negative_coverage.rs"]
+mod negative_coverage;
+
 use ptg2_scanner::v3_runs::{
     external_sort_assigned_serving_records, external_sort_dedupe_partition_files,
     external_sort_dense_ids, external_sort_lexicographic_records, external_sort_partition_files,

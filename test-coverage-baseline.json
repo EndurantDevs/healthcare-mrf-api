@@ -584,6 +584,7 @@
         "support/ptg2_scanner/src/main.rs",
         "support/ptg2_scanner/src/manifest.rs",
         "support/ptg2_scanner/src/normalize.rs",
+        "support/ptg2_scanner/src/npi_identifier.rs",
         "support/ptg2_scanner/src/output.rs",
         "support/ptg2_scanner/src/progress.rs",
         "support/ptg2_scanner/src/provider_directory_projection_v2/canonical.rs",
@@ -601,6 +602,8 @@
         "support/ptg2_scanner/src/source_witness.rs",
         "support/ptg2_scanner/src/source_witness_spool.rs",
         "support/ptg2_scanner/src/tax_identity.rs",
+        "support/ptg2_scanner/src/tax_identity/v2.rs",
+        "support/ptg2_scanner/src/tax_identity_sidecar_v2.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/core.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/filesystem.rs",
         "support/ptg2_scanner/src/uhc_retained_parts/json_framing.rs",
@@ -625,16 +628,16 @@
       },
       "metrics": {
         "functions": {
-          "covered": 3608,
-          "total": 4003
+          "covered": 3724,
+          "total": 4118
         },
         "lines": {
-          "covered": 57271,
-          "total": 63486
+          "covered": 58926,
+          "total": 65055
         },
         "regions": {
-          "covered": 84329,
-          "total": 93650
+          "covered": 86492,
+          "total": 95787
         }
       },
       "one_time_floor_reset": {
