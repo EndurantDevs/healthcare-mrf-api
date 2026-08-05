@@ -26424,6 +26424,33 @@ mod tests {
         assert_eq!(state_codes, vec![1, 2, 3, 4, 5]);
         assert_eq!(validator.records_validated(), 5);
 
+        let mut pair_validator =
+            ptg2_scanner::tax_identity_sidecar_pair::TaxIdentitySidecarPairValidator::new(
+                Cursor::new(paired_v1.clone()),
+                Cursor::new(first_v2.clone()),
+                5,
+            )
+            .unwrap();
+        assert_eq!(pair_validator.policy_id(), "ptg-tin-hmac-sha256-v1:test-v2");
+        let mut paired_state_codes = Vec::new();
+        while let Some(record) = pair_validator.next_record().unwrap() {
+            assert_eq!(
+                record.v1().provider_group_global_id(),
+                record.v2().provider_group_global_id()
+            );
+            paired_state_codes.push(record.v2().state() as u8);
+        }
+        paired_state_codes.sort_unstable();
+        assert_eq!(paired_state_codes, vec![1, 2, 3, 4, 5]);
+        assert_eq!(pair_validator.records_validated(), 5);
+        let pair_summary = pair_validator.validated_summary().unwrap();
+        assert_eq!(pair_summary.row_count(), 5);
+        assert_eq!(pair_summary.matched_ein_count(), 1);
+        assert_eq!(pair_summary.matched_npi_count(), 1);
+        assert_eq!(pair_summary.missing_count(), 1);
+        assert_eq!(pair_summary.malformed_count(), 1);
+        assert_eq!(pair_summary.unsupported_type_count(), 1);
+
         let events = String::from_utf8(first_events).unwrap();
         let v1_event_offset = events
             .find("manifest_provider_group_tax_identity_sidecar_file")
