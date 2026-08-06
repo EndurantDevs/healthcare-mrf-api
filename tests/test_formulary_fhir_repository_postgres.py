@@ -129,6 +129,28 @@ async def _assert_persisted_alias(
     assert current_dataset_id == dataset_id
 
 
+async def _assert_serving_index_plans(alias_version_id: str) -> None:
+    async with db.transaction():
+        await db.status("SET LOCAL enable_seqscan = off")
+        membership_plan = await db.scalar(
+            f"EXPLAIN (FORMAT JSON, COSTS OFF) SELECT upstream_medication_id "
+            f"FROM {table_name('fhir_formulary_alias_membership')} "
+            "WHERE alias_version_id = :alias_version_id "
+            "AND rxnorm_id = :rxnorm_id;",
+            alias_version_id=alias_version_id,
+            rxnorm_id="1",
+        )
+        alias_plan = await db.scalar(
+            f"EXPLAIN (FORMAT JSON, COSTS OFF) SELECT alias_id FROM "
+            f"{table_name('fhir_formulary_drug_plan_alias')} "
+            "WHERE source_plan_identifier = :source_plan_identifier;",
+            source_plan_identifier="SYNTHETIC-PLAN",
+        )
+
+    assert "fhir_formulary_membership_rxnorm_idx" in str(membership_plan)
+    assert "fhir_formulary_alias_source_plan_idx" in str(alias_plan)
+
+
 async def _run_batch_proof() -> None:
     cutoff = dt.datetime(2026, 8, 6, 12, tzinfo=dt.UTC)
     formulary_repository = FHIRFormularyRepository()
@@ -161,6 +183,7 @@ async def _run_batch_proof() -> None:
         assert proof_by_field["medication_membership_count"] == ALIAS_SIZE
         assert generation == 1
         await _assert_persisted_alias(dataset_id, alias_version_id)
+        await _assert_serving_index_plans(alias_version_id)
         raise _RollbackProofTransaction
 
 
