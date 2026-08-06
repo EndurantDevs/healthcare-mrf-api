@@ -9,13 +9,14 @@ deliberately value-free.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from process.ptg_parts.ptg2_tax_identity_source_copy import _ProjectionCopyLease
 
 PTG2_TAX_IDENTITY_SOURCE_CONTRACT = "ptg2_provider_group_tax_identity_source_v1"
 PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT = (
@@ -39,6 +40,29 @@ _STATE_COUNT_FIELDS = (
 )
 _BINDING_FIELDS = frozenset(
     {"contract", "source_type", "identity_kind", "identity_sha256", "source_key"}
+)
+_SOURCE_DESCRIPTOR_FIELDS = frozenset(
+    {
+        "name",
+        "path",
+        "record_format",
+        "sha256",
+        "byte_count",
+        "row_count",
+        "provider_group_count",
+        "matched_ein_count",
+        "missing_count",
+        "malformed_count",
+        "unsupported_type_count",
+        "version",
+        "record_bytes",
+        "token_policy_id",
+        "normalization_contract",
+        "hmac_contract",
+        "final",
+        "source_shard_id",
+        "physical_source_binding",
+    }
 )
 _MAX_INTEGER = 2**31 - 1
 _MAX_BIGINT = 2**63 - 1
@@ -67,8 +91,7 @@ def _strict_int(
     maximum: int = _MAX_BIGINT,
 ) -> int:
     if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
+        type(value) is not int
         or not minimum <= value <= maximum
     ):
         raise _fail()
@@ -76,14 +99,14 @@ def _strict_int(
 
 
 def _strict_sha256(value: object) -> str:
-    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
         raise _fail()
     return value
 
 
 def _strict_policy(value: object) -> str:
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or _POLICY_ID.fullmatch(value) is None
         or len(value.encode("ascii")) > 55
     ):
@@ -158,12 +181,9 @@ class _SourceBinding:
 class PreparedTaxIdentitySourceProjection:
     """Authenticated pathless metadata plus one ephemeral PostgreSQL COPY."""
 
-    copy_path: Path = field(repr=False)
+    _copy_owner: _ProjectionCopyLease = field(repr=False, compare=False)
     copy_sha256: str
     copy_byte_count: int
-    copy_device: int
-    copy_inode: int
-    copy_mtime_ns: int
     bindings: tuple[_SourceBinding, ...] = field(repr=False)
     token_policy_id: str
     token_policy_descriptor_sha256: bytes
@@ -189,60 +209,16 @@ class PreparedTaxIdentitySourceProjection:
         return sum(binding.artifact_byte_count for binding in self.bindings)
 
     def cleanup(self) -> None:
-        """Best-effort remove the ephemeral COPY file after terminal use."""
+        """Best-effort close only this attempt's anonymous COPY descriptor."""
 
-        _remove_ephemeral_copy(
-            self.copy_path,
-            expected_device=self.copy_device,
-            expected_inode=self.copy_inode,
+        from process.ptg_parts.ptg2_tax_identity_source_copy import (
+            _cleanup_projection_copy_owner,
         )
+
+        _cleanup_projection_copy_owner(self)
 
     def __repr__(self) -> str:
         return "<prepared-tax-identity-source-projection evidence=<redacted>>"
-
-
-def _remove_ephemeral_copy(
-    copy_path: Path,
-    *,
-    expected_device: int,
-    expected_inode: int,
-) -> None:
-    """Remove only the exact ephemeral file created by this attempt."""
-
-    try:
-        metadata = os.lstat(copy_path)
-        if metadata.st_dev != expected_device or metadata.st_ino != expected_inode:
-            return
-        copy_path.unlink(missing_ok=True)
-    except OSError:
-        return
-
-
-def _has_same_file_identity(
-    first_metadata: os.stat_result,
-    second_metadata: os.stat_result,
-) -> bool:
-    return (
-        stat.S_ISREG(first_metadata.st_mode)
-        and stat.S_ISREG(second_metadata.st_mode)
-        and first_metadata.st_dev == second_metadata.st_dev
-        and first_metadata.st_ino == second_metadata.st_ino
-        and first_metadata.st_size == second_metadata.st_size
-        and first_metadata.st_mtime_ns == second_metadata.st_mtime_ns
-    )
-
-
-def _has_prepared_copy_identity(
-    file_metadata: os.stat_result,
-    prepared: PreparedTaxIdentitySourceProjection,
-) -> bool:
-    return (
-        stat.S_ISREG(file_metadata.st_mode)
-        and file_metadata.st_dev == prepared.copy_device
-        and file_metadata.st_ino == prepared.copy_inode
-        and file_metadata.st_size == prepared.copy_byte_count
-        and file_metadata.st_mtime_ns == prepared.copy_mtime_ns
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,12 +271,12 @@ def _source_ordinal_by_shard(
     digest.update(b"PTG2V4TAXORD\x01")
     digest.update(len(entries).to_bytes(4, "big"))
     for ordinal, entry in enumerate(entries):
-        if not isinstance(entry, Mapping) or set(entry) != {"shard_id", "ordinal"}:
+        if type(entry) is not dict or set(entry) != {"shard_id", "ordinal"}:
             raise _fail()
         shard_id = entry.get("shard_id")
         if (
             _strict_int(entry.get("ordinal"), maximum=_MAX_INTEGER) != ordinal
-            or not isinstance(shard_id, str)
+            or type(shard_id) is not str
             or not shard_id
             or shard_id in source_ordinal_by_shard
         ):
@@ -335,21 +311,27 @@ def _has_valid_descriptor_contract(
     provider_group_count = numbers_by_name["provider_group_count"]
     identity_kind = binding_by_field.get("identity_kind")
     return (
-        raw.get("name") == "provider_group_tax_identity"
+        type(raw.get("name")) is str
+        and raw.get("name") == "provider_group_tax_identity"
+        and type(raw.get("record_format")) is str
         and raw.get("record_format") == _RECORD_FORMAT
         and numbers_by_name["version"] == _VERSION
         and numbers_by_name["record_bytes"] == _RECORD_BYTES
+        and type(raw.get("normalization_contract")) is str
         and raw.get("normalization_contract") == _NORMALIZATION_CONTRACT
+        and type(raw.get("hmac_contract")) is str
         and raw.get("hmac_contract") == _HMAC_CONTRACT
         and raw.get("final") is True
         and numbers_by_name["row_count"] == provider_group_count
         and policy_id == expected_policy_id
+        and type(binding_by_field.get("contract")) is str
         and binding_by_field.get("contract")
         == PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT
+        and type(binding_by_field.get("source_type")) is str
         and binding_by_field.get("source_type") == "in_network"
-        and isinstance(identity_kind, str)
+        and type(identity_kind) is str
         and identity_kind in {"logical_json_sha256_v1", "raw_container_sha256_v1"}
-        and isinstance(source_shard_id, str)
+        and type(source_shard_id) is str
         and source_shard_id in source_ordinal_by_shard
         and provider_group_count
         == sum(numbers_by_name[name] for name in _STATE_COUNT_FIELDS)
@@ -359,16 +341,18 @@ def _has_valid_descriptor_contract(
 
 
 def _descriptor_binding(
-    raw: Mapping[str, Any],
+    raw: object,
     *,
     source_ordinal_by_shard: Mapping[str, int],
     expected_policy_id: str,
 ) -> _SourceBinding:
     """Validate one source descriptor and return its pathless binding contract."""
     try:
+        if type(raw) is not dict or set(raw) != _SOURCE_DESCRIPTOR_FIELDS:
+            raise _fail()
         binding_by_field = raw.get("physical_source_binding")
         if (
-            not isinstance(binding_by_field, Mapping)
+            type(binding_by_field) is not dict
             or set(binding_by_field) != _BINDING_FIELDS
         ):
             raise _fail()
@@ -391,16 +375,16 @@ def _descriptor_binding(
                 source_shard_id=source_shard_id,
                 source_ordinal_by_shard=source_ordinal_by_shard,
             )
-            or not isinstance(path_value, str)
+            or type(path_value) is not str
             or not path_value
         ):
             raise _fail()
-        assert isinstance(source_shard_id, str)
+        assert type(source_shard_id) is str
         return _SourceBinding(
             source_key=source_key,
             source_ordinal=source_ordinal_by_shard[source_shard_id],
-            source_type=str(binding_by_field["source_type"]),
-            identity_kind=str(binding_by_field["identity_kind"]),
+            source_type=binding_by_field["source_type"],
+            identity_kind=binding_by_field["identity_kind"],
             identity_sha256=identity_sha256,
             source_shard_id=source_shard_id,
             artifact_sha256=bytes.fromhex(artifact_sha256),
@@ -437,7 +421,6 @@ def _validated_bindings(
                     expected_policy_id=token_policy_id,
                 )
                 for entry in raw_entries
-                if isinstance(entry, Mapping)
             ),
             key=lambda binding: binding.source_key,
         )
