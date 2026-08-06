@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from db.models import db
-from process.formulary_fhir.parser import resolve_alternative_references
+from process.formulary_fhir.repository_batch import insert_changed_alias_rows
 from process.formulary_fhir.repository_shared import AliasVersionWrite
 from process.formulary_fhir.repository_shared import PriorAliasState
 from process.formulary_fhir.repository_shared import SOURCE_ID
@@ -234,115 +234,6 @@ async def _copy_prior_membership(
     )
 
 
-async def _put_medication(medication: MedicationRecord) -> str:
-    medication_version_id = stable_id(
-        "ffm_",
-        SOURCE_ID,
-        medication.upstream_medication_id,
-        medication.content_hash,
-    )
-    await db.status(
-        f"INSERT INTO {table_name('fhir_formulary_medication')} ("
-        "medication_version_id, source_id, upstream_medication_id, "
-        "upstream_version_id, upstream_last_updated, status, drug_name, "
-        "rxnorm_id, ndc11, codings_json, content_hash, metadata_json) VALUES ("
-        ":medication_version_id, :source_id, :upstream_medication_id, "
-        ":upstream_version_id, :upstream_last_updated, :status, :drug_name, "
-        ":rxnorm_id, :ndc11, CAST(:codings_json AS jsonb), :content_hash, "
-        "CAST(:metadata_json AS jsonb)) ON CONFLICT (source_id, "
-        "upstream_medication_id, content_hash) DO NOTHING;",
-        medication_version_id=medication_version_id,
-        source_id=SOURCE_ID,
-        upstream_medication_id=medication.upstream_medication_id,
-        upstream_version_id=medication.upstream_version_id,
-        upstream_last_updated=upstream_time(medication.upstream_last_updated),
-        status=medication.status,
-        drug_name=medication.drug_name,
-        rxnorm_id=medication.rxnorm_id,
-        ndc11=medication.ndc11,
-        codings_json=json_text(
-            [coding.__dict__ for coding in medication.codings]
-        ),
-        content_hash=medication.content_hash,
-        metadata_json=json_text(
-            {
-                "raw_extensions": medication.raw_extensions,
-                "source_plan_identifiers": medication.source_plan_identifiers,
-            }
-        ),
-    )
-    return medication_version_id
-
-
-async def _insert_alternative_evidence(
-    alias_version_id: str,
-    medication_id: str,
-    medication: MedicationRecord,
-    known_medication_ids: set[str],
-    *,
-    apply_california_rule: bool,
-) -> None:
-    alternative_evidence_rows = resolve_alternative_references(
-        medication.alternative_references,
-        known_medication_ids=known_medication_ids,
-        apply_california_rule=apply_california_rule,
-    )
-    for evidence in alternative_evidence_rows:
-        await db.status(
-            f"INSERT INTO {table_name('fhir_formulary_alternative')} ("
-            "alias_version_id, upstream_medication_id, raw_reference, "
-            "corrected_reference, resolved_medication_id, resolved, "
-            "rule_version, evidence_json) VALUES ("
-            ":alias_version_id, :upstream_medication_id, :raw_reference, "
-            ":corrected_reference, :resolved_medication_id, :resolved, "
-            ":rule_version, CAST(:evidence_json AS jsonb));",
-            alias_version_id=alias_version_id,
-            upstream_medication_id=medication_id,
-            raw_reference=evidence.raw_reference,
-            corrected_reference=evidence.corrected_reference,
-            resolved_medication_id=evidence.resolved_medication_id,
-            resolved=evidence.resolved,
-            rule_version=evidence.rule_version,
-            evidence_json=json_text({"same_source": True}),
-        )
-
-
-async def _insert_changed_membership(
-    alias_version_id: str,
-    prepared: _PreparedAliasVersion,
-    *,
-    apply_california_rule: bool,
-) -> None:
-    known_medication_ids = set(prepared.variants_by_id)
-    for medication_id, medication in sorted(prepared.medications_by_id.items()):
-        medication_version_id = await _put_medication(medication)
-        await db.status(
-            f"INSERT INTO {table_name('fhir_formulary_alias_membership')} ("
-            "alias_version_id, upstream_medication_id, medication_version_id, "
-            "rxnorm_id, drug_tier, prior_authorization, step_therapy, "
-            "quantity_limit, variant_hash) VALUES ("
-            ":alias_version_id, :upstream_medication_id, :medication_version_id, "
-            ":rxnorm_id, :drug_tier, :prior_authorization, :step_therapy, "
-            ":quantity_limit, :variant_hash);",
-            alias_version_id=alias_version_id,
-            upstream_medication_id=medication_id,
-            medication_version_id=medication_version_id,
-            rxnorm_id=medication.rxnorm_id,
-            drug_tier=medication.drug_tier,
-            prior_authorization=medication.prior_authorization,
-            step_therapy=medication.step_therapy,
-            quantity_limit=medication.quantity_limit,
-            variant_hash=prepared.variants_by_id[medication_id],
-        )
-        await _insert_alternative_evidence(
-            alias_version_id,
-            medication_id,
-            medication,
-            known_medication_ids,
-            apply_california_rule=apply_california_rule,
-        )
-
-
 async def _materialize_membership(
     alias_version_id: str,
     write: AliasVersionWrite,
@@ -356,19 +247,29 @@ async def _materialize_membership(
             alias_version_id=alias_version_id,
         )
     )
-    if has_membership:
-        return
-    if write.acquisition_mode == "delta" and write.prior is not None:
-        await _copy_prior_membership(
+    if not has_membership:
+        if write.acquisition_mode == "delta" and write.prior is not None:
+            await _copy_prior_membership(
+                alias_version_id,
+                write.prior,
+                tuple(prepared.medications_by_id),
+            )
+        await insert_changed_alias_rows(
             alias_version_id,
-            write.prior,
-            tuple(prepared.medications_by_id),
+            prepared.medications_by_id,
+            prepared.variants_by_id,
+            apply_california_rule=write.apply_california_rule,
         )
-    await _insert_changed_membership(
-        alias_version_id,
-        prepared,
-        apply_california_rule=write.apply_california_rule,
+    persisted_count = int(
+        await db.scalar(
+            f"SELECT COUNT(*) FROM "
+            f"{table_name('fhir_formulary_alias_membership')} "
+            "WHERE alias_version_id = :alias_version_id;",
+            alias_version_id=alias_version_id,
+        )
     )
+    if persisted_count != len(prepared.variants_by_id):
+        raise RuntimeError("FHIR formulary persisted membership count is incomplete")
 
 
 async def _link_alias_version(

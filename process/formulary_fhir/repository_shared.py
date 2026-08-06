@@ -13,7 +13,6 @@ from typing import Any
 
 from process.formulary_fhir.types import MedicationRecord
 
-
 SOURCE_ID = "fhir-formulary-primary"
 
 
@@ -76,9 +75,7 @@ def upstream_time(timestamp: str | None) -> dt.datetime | None:
     if not timestamp:
         return None
     try:
-        parsed_timestamp = dt.datetime.fromisoformat(
-            timestamp.replace("Z", "+00:00")
-        )
+        parsed_timestamp = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError:
         return None
     if parsed_timestamp.tzinfo:
@@ -93,6 +90,7 @@ class PriorAliasState:
     expected_count: int
     cutoff_at: dt.datetime
     variants_by_medication_id: dict[str, str]
+    membership_hash_value: str | None = None
 
     @property
     def membership_ids(self) -> frozenset[str]:
@@ -155,18 +153,14 @@ def medication_variant_hash(medication: MedicationRecord) -> str:
         "step_therapy": medication.step_therapy,
         "quantity_limit": medication.quantity_limit,
     }
-    return hashlib.sha256(
-        json_text(variant_by_field).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(json_text(variant_by_field).encode("utf-8")).hexdigest()
 
 
 def membership_hash(variants_by_medication_id: dict[str, str]) -> str:
     """Hash a complete medication ID to coverage-variant membership map."""
 
     digest = hashlib.sha256()
-    for medication_id, variant_hash in sorted(
-        variants_by_medication_id.items()
-    ):
+    for medication_id, variant_hash in sorted(variants_by_medication_id.items()):
         digest.update(medication_id.encode("utf-8"))
         digest.update(b"\x00")
         digest.update(variant_hash.encode("ascii"))

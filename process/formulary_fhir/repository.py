@@ -82,8 +82,7 @@ def _validate_resumed_dataset(
         raise RuntimeError("FHIR formulary run id collision")
     has_changed_parameters = bool(
         dataset_by_field.get("cutoff_at") != cutoff_at
-        or bool(dataset_by_field.get("publish_requested"))
-        != bool(publish_requested)
+        or bool(dataset_by_field.get("publish_requested")) != bool(publish_requested)
     )
     if has_changed_parameters:
         raise RuntimeError("FHIR formulary run resume parameters changed")
@@ -106,18 +105,15 @@ async def _current_pointer_by_field() -> dict[str, Any]:
 async def _snapshot_alias_rows(dataset_id: str) -> list[Any]:
     return await db.all(
         f"SELECT a.public_id, a.source_plan_identifier, a.alias_id, "
-        "av.alias_version_id, av.expected_count, av.cutoff_at, "
-        "m.upstream_medication_id, m.variant_hash "
+        "av.alias_version_id, av.expected_count, av.membership_hash, "
+        "av.cutoff_at "
         f"FROM {table_name('fhir_formulary_dataset_alias')} da "
         f"JOIN {table_name('fhir_formulary_drug_plan_alias')} a "
         "ON a.alias_id = da.alias_id "
         f"JOIN {table_name('fhir_formulary_drug_plan_alias_version')} av "
         "ON av.alias_version_id = da.alias_version_id "
-        f"LEFT JOIN {table_name('fhir_formulary_alias_membership')} m "
-        "ON m.alias_version_id = av.alias_version_id "
         "WHERE da.dataset_id = :dataset_id "
-        "ORDER BY a.public_id, a.source_plan_identifier, "
-        "m.upstream_medication_id;",
+        "ORDER BY a.public_id, a.source_plan_identifier;",
         dataset_id=dataset_id,
     )
 
@@ -126,27 +122,45 @@ def _prior_aliases_by_key(
     alias_rows: list[Any],
 ) -> dict[tuple[str, str], PriorAliasState]:
     aliases_by_key: dict[tuple[str, str], PriorAliasState] = {}
-    variants_by_key: dict[tuple[str, str], dict[str, str]] = {}
     for alias_row in alias_rows:
         alias_by_field = row_mapping(alias_row)
         alias_key = (
             alias_by_field["public_id"],
             alias_by_field["source_plan_identifier"],
         )
-        variants_by_key.setdefault(alias_key, {})
-        medication_id = alias_by_field.get("upstream_medication_id")
-        if medication_id is not None:
-            variants_by_key[alias_key][medication_id] = alias_by_field[
-                "variant_hash"
-            ]
         aliases_by_key[alias_key] = PriorAliasState(
             alias_id=alias_by_field["alias_id"],
             alias_version_id=alias_by_field["alias_version_id"],
             expected_count=int(alias_by_field["expected_count"]),
             cutoff_at=alias_by_field["cutoff_at"],
-            variants_by_medication_id=variants_by_key[alias_key],
+            variants_by_medication_id={},
+            membership_hash_value=alias_by_field["membership_hash"],
         )
     return aliases_by_key
+
+
+async def _loaded_prior_alias(prior: PriorAliasState) -> PriorAliasState:
+    membership_rows = await db.all(
+        f"SELECT upstream_medication_id, variant_hash FROM "
+        f"{table_name('fhir_formulary_alias_membership')} "
+        "WHERE alias_version_id = :alias_version_id "
+        "ORDER BY upstream_medication_id;",
+        alias_version_id=prior.alias_version_id,
+    )
+    variants_by_id = {
+        row_mapping(row)["upstream_medication_id"]: row_mapping(row)["variant_hash"]
+        for row in membership_rows
+    }
+    if len(variants_by_id) != prior.expected_count:
+        raise RuntimeError("FHIR formulary prior membership count is incomplete")
+    return PriorAliasState(
+        alias_id=prior.alias_id,
+        alias_version_id=prior.alias_version_id,
+        expected_count=prior.expected_count,
+        cutoff_at=prior.cutoff_at,
+        variants_by_medication_id=variants_by_id,
+        membership_hash_value=prior.membership_hash_value,
+    )
 
 
 async def _coverage_verification_rows(dataset_id: str) -> list[Any]:
@@ -212,8 +226,7 @@ def _accumulate_alias_membership(
     )
     verification.medication_count += int(coverage_by_field["membership_count"])
     verification.alias_hashes.append(
-        f"{coverage_by_field['alias_id']}:"
-        f"{coverage_by_field['membership_hash']}"
+        f"{coverage_by_field['alias_id']}:" f"{coverage_by_field['membership_hash']}"
     )
 
 
@@ -232,8 +245,7 @@ def _accumulate_verification(coverage_rows: list[Any]) -> _VerificationState:
         verification.observed_aliases_by_plan.setdefault(public_id, set())
         _accumulate_alias_membership(verification, coverage_by_field)
     has_complete_coverage = all(
-        verification.observed_aliases_by_plan.get(public_id, set())
-        == expected_aliases
+        verification.observed_aliases_by_plan.get(public_id, set()) == expected_aliases
         for public_id, expected_aliases in (
             verification.expected_aliases_by_plan.items()
         )
@@ -245,9 +257,9 @@ def _accumulate_verification(coverage_rows: list[Any]) -> _VerificationState:
 
 def _verification_proof(verification: _VerificationState) -> dict[str, Any]:
     coverage_hash = hashlib.sha256(
-        "\n".join(
-            sorted(verification.coverage_versions_by_public_id.values())
-        ).encode("utf-8")
+        "\n".join(sorted(verification.coverage_versions_by_public_id.values())).encode(
+            "utf-8"
+        )
     ).hexdigest()
     aggregate_membership_hash = hashlib.sha256(
         "\n".join(sorted(verification.alias_hashes)).encode("utf-8")
@@ -328,7 +340,7 @@ class FHIRFormularyRepository(
         return dataset_id
 
     async def current_snapshot(self) -> CurrentSnapshot:
-        """Load the published alias membership state used for delta planning."""
+        """Load published alias metadata without materializing all memberships."""
 
         pointer_by_field = await _current_pointer_by_field()
         dataset_id = pointer_by_field.get("dataset_id")
@@ -341,15 +353,23 @@ class FHIRFormularyRepository(
             _prior_aliases_by_key(alias_rows),
         )
 
+    async def load_prior_alias_state(
+        self,
+        prior: PriorAliasState,
+    ) -> PriorAliasState:
+        """Load one prior alias membership within the bounded worker wave."""
+
+        if prior.variants_by_medication_id:
+            return prior
+        return await _loaded_prior_alias(prior)
+
     async def verify_dataset(self, dataset_id: str) -> dict[str, Any]:
         """Prove exact List coverage, alias counts, and deterministic hashes."""
 
         coverage_rows = await _coverage_verification_rows(dataset_id)
         if not coverage_rows:
             raise RuntimeError("FHIR formulary dataset has no CoveragePlan Lists")
-        proof_by_field = _verification_proof(
-            _accumulate_verification(coverage_rows)
-        )
+        proof_by_field = _verification_proof(_accumulate_verification(coverage_rows))
         await _mark_verified(dataset_id, proof_by_field)
         return proof_by_field
 

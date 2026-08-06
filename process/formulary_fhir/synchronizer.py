@@ -222,17 +222,31 @@ def _alias_decision(
             exact_count=exact_count,
             prior_count=prior.expected_count if prior else None,
             delta_ids=frozenset(
-                medication.upstream_medication_id
-                for medication in delta_medications
+                medication.upstream_medication_id for medication in delta_medications
             ),
-            prior_membership_ids=(
-                prior.membership_ids if prior else frozenset()
-            ),
+            prior_membership_ids=(prior.membership_ids if prior else frozenset()),
             rolling_reconciliation_due=is_rolling_reconciliation_due(
                 work.source_plan_identifier,
                 business_day_ordinal=context.rolling_ordinal,
             ),
         )
+    )
+
+
+def _needs_prior_membership(
+    context: _AliasSyncContext,
+    work: AliasWork,
+    prior: PriorAliasState | None,
+    exact_count: int,
+    delta_medications: tuple[MedicationRecord, ...],
+) -> bool:
+    if prior is None or exact_count != prior.expected_count:
+        return False
+    if not delta_medications:
+        return False
+    return not is_rolling_reconciliation_due(
+        work.source_plan_identifier,
+        business_day_ordinal=context.rolling_ordinal,
     )
 
 
@@ -289,8 +303,9 @@ async def _reuse_alias(
             work,
             acquisition_mode="reuse",
             exact_count=exact_count,
-            membership_hash_value=membership_hash(
-                prior.variants_by_medication_id
+            membership_hash_value=(
+                prior.membership_hash_value
+                or membership_hash(prior.variants_by_medication_id)
             ),
         )
     )
@@ -331,9 +346,7 @@ def _completed_variants_by_id(
     )
     variants_by_id.update(
         {
-            medication.upstream_medication_id: medication_variant_hash(
-                medication
-            )
+            medication.upstream_medication_id: medication_variant_hash(medication)
             for medication in medications
         }
     )
@@ -399,6 +412,15 @@ async def _sync_alias(
         cutoff=context.cutoff,
     )
     delta_medications = await _delta_medications(context, work, prior)
+    if _needs_prior_membership(
+        context,
+        work,
+        prior,
+        exact_count,
+        delta_medications,
+    ):
+        assert prior is not None
+        prior = await context.repository.load_prior_alias_state(prior)
     decision = _alias_decision(
         context,
         work,

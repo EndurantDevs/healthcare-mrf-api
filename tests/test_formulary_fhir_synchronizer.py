@@ -25,7 +25,6 @@ from process.formulary_fhir.synchronizer import (
     synchronize,
 )
 
-
 FIXTURES = Path(__file__).parent / "fixtures" / "formulary_fhir"
 BASE = "https://fhir.example.invalid/r4"
 CUTOFF = dt.datetime(2026, 8, 6, 12, tzinfo=dt.UTC)
@@ -72,7 +71,9 @@ class _Client:
             self.active_by_alias[alias],
         )
         try:
-            resources = self.deltas.get(alias, []) if updated_since else self.full[alias]
+            resources = (
+                self.deltas.get(alias, []) if updated_since else self.full[alias]
+            )
             for item in resources:
                 yield item
         finally:
@@ -114,12 +115,17 @@ class _Repository:
         self.published = False
         self.pointer = "previous-dataset"
         self.completed = completed or {}
+        self.loaded_prior_aliases = []
 
     async def begin_dataset(self, **_kwargs):
         return "candidate-dataset"
 
     async def current_snapshot(self):
         return self.current
+
+    async def load_prior_alias_state(self, prior):
+        self.loaded_prior_aliases.append(prior.alias_id)
+        return prior
 
     async def put_coverage_plan(self, *, dataset_id, plan):
         assert dataset_id == "candidate-dataset"
@@ -187,9 +193,7 @@ async def test_equal_total_aliases_are_crawled_independently_and_keep_different_
 
     assert result["alias_modes"] == {"reuse": 0, "delta": 0, "full": 2}
     records_by_alias = {
-        item["alias_id"]: {
-            record.upstream_medication_id for record in item["records"]
-        }
+        item["alias_id"]: {record.upstream_medication_id for record in item["records"]}
         for item in repository.alias_versions
     }
     assert records_by_alias["alias-0"] == {"MI-synthetic-drug-a"}
@@ -211,14 +215,16 @@ async def test_empty_delta_reuses_prior_alias_version(monkeypatch):
             alias_version_id="prior-version-a",
             expected_count=1,
             cutoff_at=CUTOFF - dt.timedelta(days=1),
-            variants_by_medication_id={"MI-synthetic-drug-a": "a" * 64},
+            variants_by_medication_id={},
+            membership_hash_value="a" * 64,
         ),
         (public_id, "SYNTH-NCAL-B"): PriorAliasState(
             alias_id="prior-b",
             alias_version_id="prior-version-b",
             expected_count=1,
             cutoff_at=CUTOFF - dt.timedelta(days=1),
-            variants_by_medication_id={"MI-synthetic-drug-b": "b" * 64},
+            variants_by_medication_id={},
+            membership_hash_value="b" * 64,
         ),
     }
     repository = _Repository(
@@ -242,6 +248,7 @@ async def test_empty_delta_reuses_prior_alias_version(monkeypatch):
         "full": 0,
     }
     assert len(repository.reused) == 2
+    assert repository.loaded_prior_aliases == []
 
 
 @pytest.mark.asyncio
@@ -367,9 +374,7 @@ def test_mi_alias_is_explicit_california_correction_evidence():
     )
 
     assert _is_california_plan(AliasWork(plan, "MI-SYNTHETIC-PLAN", "alias"))
-    assert not _is_california_plan(
-        AliasWork(plan, "SYNTHETIC-OTHER-PLAN", "alias")
-    )
+    assert not _is_california_plan(AliasWork(plan, "SYNTHETIC-OTHER-PLAN", "alias"))
 
 
 @pytest.mark.asyncio

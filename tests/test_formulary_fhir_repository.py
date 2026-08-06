@@ -69,3 +69,50 @@ async def test_verification_rejects_missing_current_alias(monkeypatch):
         await FHIRFormularyRepository().verify_dataset("candidate")
 
     status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_current_snapshot_loads_only_one_alias_membership_on_demand(
+    monkeypatch,
+):
+    first = AsyncMock(
+        return_value={
+            "dataset_id": "published-dataset",
+            "cutoff_at": "2026-08-05T12:00:00Z",
+        }
+    )
+    all_rows = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "public_id": "fhir_abcdefghijklmnopqrstuvwxyz",
+                    "source_plan_identifier": "SYNTHETIC-PLAN",
+                    "alias_id": "alias-a",
+                    "alias_version_id": "alias-version-a",
+                    "expected_count": 2,
+                    "membership_hash": "c" * 64,
+                    "cutoff_at": "2026-08-05T12:00:00Z",
+                }
+            ],
+            [
+                {"upstream_medication_id": "MI-a", "variant_hash": "a" * 64},
+                {"upstream_medication_id": "MI-b", "variant_hash": "b" * 64},
+            ],
+        ]
+    )
+    monkeypatch.setattr(repository_module.db, "first", first)
+    monkeypatch.setattr(repository_module.db, "all", all_rows)
+    repository = FHIRFormularyRepository()
+
+    snapshot = await repository.current_snapshot()
+    prior = snapshot.aliases[("fhir_abcdefghijklmnopqrstuvwxyz", "SYNTHETIC-PLAN")]
+    assert prior.variants_by_medication_id == {}
+    assert prior.membership_hash_value == "c" * 64
+    assert "fhir_formulary_alias_membership" not in all_rows.await_args_list[0].args[0]
+
+    loaded = await repository.load_prior_alias_state(prior)
+    assert loaded.variants_by_medication_id == {
+        "MI-a": "a" * 64,
+        "MI-b": "b" * 64,
+    }
+    assert "fhir_formulary_alias_membership" in all_rows.await_args_list[1].args[0]
