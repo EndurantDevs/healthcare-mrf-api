@@ -13,6 +13,11 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
+from db.models import (
+    ProviderDirectoryCanonicalResource,
+    ProviderDirectoryPractitioner,
+    ProviderDirectorySourceResource,
+)
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
     ProviderDirectoryProofStoreError,
@@ -33,6 +38,11 @@ SELECTED_RESOURCES = (
     "Organization",
     "OrganizationAffiliation",
     "Practitioner",
+)
+LEGACY_MIRROR_MODELS = (
+    ProviderDirectoryPractitioner,
+    ProviderDirectoryCanonicalResource,
+    ProviderDirectorySourceResource,
 )
 
 
@@ -132,6 +142,20 @@ async def _create_tables(database: Database, schema: str) -> None:
         status=importer.ENDPOINT_DATASET_ACQUIRING,
         metadata_json=json.dumps({"source_ids": list(SOURCE_IDS)}),
     )
+    for model in LEGACY_MIRROR_MODELS:
+        await database.status(
+            importer._provider_directory_artifact_scope_table_sql(
+                model,
+                schema,
+                model.__tablename__,
+            )
+        )
+        for statement in importer._artifact_scope_pk_sql(
+            model,
+            schema,
+            model.__tablename__,
+        ):
+            await database.status(statement)
     await ensure_dataset_proof_shard_table(database, schema)
 
 
@@ -140,25 +164,25 @@ async def _proof_database(monkeypatch):
     schema = f"provider_directory_proof_{uuid.uuid4().hex[:12]}"
     database = Database()
     is_schema_created = False
-    original_model_schema = (
-        importer.ProviderDirectoryDatasetResource.__table__.schema
+    models_with_schema = (
+        importer.ProviderDirectoryDatasetResource,
+        *LEGACY_MIRROR_MODELS,
     )
+    original_schema_by_model = {
+        model: model.__table__.schema for model in models_with_schema
+    }
     try:
         await database.connect()
         await _require_disposable_postgres(database)
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
-        monkeypatch.setattr(
-            importer.ProviderDirectoryDatasetResource.__table__,
-            "schema",
-            schema,
-        )
+        for model in models_with_schema:
+            monkeypatch.setattr(model.__table__, "schema", schema)
         await _create_tables(database, schema)
         is_schema_created = True
         yield database, schema
     finally:
-        importer.ProviderDirectoryDatasetResource.__table__.schema = (
-            original_model_schema
-        )
+        for model, original_schema in original_schema_by_model.items():
+            model.__table__.schema = original_schema
         if is_schema_created:
             await database.status(
                 f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'
