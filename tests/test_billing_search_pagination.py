@@ -114,13 +114,14 @@ def _selection() -> PlanReleaseServingSelection:
     )
 
 
-def _pin(*, address_relation_oid=1001):
+def _pin(*, address_relation_oid=1001, address_evidence_relation_oid=1002):
     snapshot_digest = pagination.billing_search_snapshot_set_sha256(_selection())
     generation_digest = pagination._framed_sha256(
         pagination._GENERATION_BUNDLE_DOMAIN,
         pagination._canonical_json_bytes(
             {
                 "address_relation_oid": address_relation_oid,
+                "address_evidence_relation_oid": address_evidence_relation_oid,
                 "address_selection_contract": (
                     pagination.BILLING_ADDRESS_SELECTION_CONTRACT
                 ),
@@ -132,6 +133,7 @@ def _pin(*, address_relation_oid=1001):
         snapshot_set_sha256=snapshot_digest,
         generation_bundle_sha256=generation_digest,
         address_relation_oid=address_relation_oid,
+        address_evidence_relation_oid=address_evidence_relation_oid,
     )
 
 
@@ -226,10 +228,36 @@ def test_cursor_reports_expired_generation_after_address_swap(monkeypatch) -> No
         )
 
 
+def test_cursor_reports_expired_generation_after_evidence_swap(monkeypatch) -> None:
+    monkeypatch.setattr(cursor.secrets, "token_bytes", lambda size: b"n" * size)
+    token = pagination.seal_billing_search_page_cursor(
+        (1,),
+        keyring=KEYRING,
+        binding=_cursor_binding(pin=_pin(address_evidence_relation_oid=10)),
+    )
+    next_request = _request(cursor=token)
+    next_binding = _cursor_binding(
+        next_request,
+        pin=_pin(address_evidence_relation_oid=11),
+    )
+
+    with pytest.raises(cursor.BillingSearchCursorGenerationExpired):
+        pagination.open_billing_search_page_cursor(
+            next_request,
+            keyring=KEYRING,
+            binding=next_binding,
+        )
+
+
 @pytest.mark.asyncio
-async def test_generation_capture_locks_address_relation_before_reading_oid() -> None:
+async def test_generation_capture_locks_address_bundle_before_reading_oids() -> None:
     session = AsyncMock()
-    session.scalar.return_value = 1001
+
+    async def relation_oids_after_lock(*_args, **_kwargs):
+        assert session.execute.await_count == 1
+        return 1001, 1002
+
+    session.scalar.side_effect = relation_oids_after_lock
 
     pin = await pagination.capture_billing_search_generation_pin(
         session,
@@ -237,13 +265,18 @@ async def test_generation_capture_locks_address_relation_before_reading_oid() ->
     )
 
     assert pin.address_relation_oid == 1001
+    assert pin.address_evidence_relation_oid == 1002
     assert len(pin.snapshot_set_sha256) == 64
     assert len(pin.generation_bundle_sha256) == 64
     lock_sql = str(session.execute.await_args.args[0])
-    assert lock_sql == 'LOCK TABLE "mrf"."entity_address_unified" IN ACCESS SHARE MODE'
+    assert lock_sql == (
+        'LOCK TABLE "mrf"."entity_address_evidence", '
+        '"mrf"."entity_address_unified" IN ACCESS SHARE MODE'
+    )
     assert "to_regclass" in str(session.scalar.await_args.args[0])
     assert session.scalar.await_args.args[1] == {
-        "relation_name": "mrf.entity_address_unified"
+        "address_relation_name": "mrf.entity_address_unified",
+        "evidence_relation_name": "mrf.entity_address_evidence",
     }
 
 

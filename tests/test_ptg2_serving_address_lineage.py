@@ -439,3 +439,31 @@ async def test_default_lineage_validation_is_one_bounded_set_query(monkeypatch):
         and json.loads(location_row["address_payload"]) == {}
         for location_row in location_rows
     )
+
+
+@pytest.mark.asyncio
+async def test_billing_lineage_requires_materialized_evidence(monkeypatch):
+    monkeypatch.setattr(
+        serving,
+        "_is_relation_available",
+        AsyncMock(return_value=False),
+    )
+    location_rows = [
+        {
+            "npi": 1990000122,
+            "address_payload": json.dumps(
+                {"location_key": "generation-bound-location"}
+            ),
+        }
+    ]
+    session = FakeSession([])
+
+    provenance_status = await serving._hydrate_address_provenance(
+        session,
+        location_rows,
+        use_stored_only=True,
+    )
+
+    assert provenance_status == "unavailable"
+    assert session.calls == []
+    assert location_rows[0]["npi"] == 1990000122

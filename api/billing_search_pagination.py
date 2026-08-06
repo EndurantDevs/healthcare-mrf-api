@@ -42,7 +42,10 @@ _SNAPSHOT_SET_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_SNAPSHOT_SET_V1\x00"
 _GENERATION_BUNDLE_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_GENERATION_BUNDLE_V1\x00"
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
 _SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}", flags=re.ASCII)
-_ADDRESS_TABLE = "entity_address_unified"
+_ADDRESS_TABLES = (
+    "entity_address_evidence",
+    "entity_address_unified",
+)
 
 
 def _invalid_generation() -> PTG2ManifestArtifactError:
@@ -68,11 +71,18 @@ class BillingSearchGenerationPin:
     snapshot_set_sha256: str
     generation_bundle_sha256: str
     address_relation_oid: int
+    address_evidence_relation_oid: int
 
     def __post_init__(self) -> None:
         _strict_sha256(self.snapshot_set_sha256)
         _strict_sha256(self.generation_bundle_sha256)
-        if type(self.address_relation_oid) is not int or self.address_relation_oid <= 0:
+        if any(
+            type(relation_oid) is not int or relation_oid <= 0
+            for relation_oid in (
+                self.address_relation_oid,
+                self.address_evidence_relation_oid,
+            )
+        ):
             raise _invalid_generation()
 
     def __repr__(self) -> str:
@@ -205,25 +215,46 @@ def billing_search_snapshot_set_sha256(
     )
 
 
-def _quoted_address_relation() -> tuple[str, str]:
+def _quoted_address_relations() -> tuple[tuple[str, str], ...]:
     schema_name = str(ptg2_serving.PTG2_SCHEMA or "")
     if _SCHEMA_PATTERN.fullmatch(schema_name) is None:
         raise _invalid_generation()
-    qualified_name = f"{schema_name}.{_ADDRESS_TABLE}"
-    quoted_name = f'"{schema_name}"."{_ADDRESS_TABLE}"'
-    return qualified_name, quoted_name
-
-
-async def _locked_address_relation_oid(session) -> int:
-    qualified_name, quoted_name = _quoted_address_relation()
-    await session.execute(text(f"LOCK TABLE {quoted_name} IN ACCESS SHARE MODE"))
-    relation_oid = await session.scalar(
-        text("SELECT to_regclass(:relation_name)::oid::bigint"),
-        {"relation_name": qualified_name},
+    return tuple(
+        (
+            f"{schema_name}.{table_name}",
+            f'"{schema_name}"."{table_name}"',
+        )
+        for table_name in _ADDRESS_TABLES
     )
-    if type(relation_oid) is not int or relation_oid <= 0:
+
+
+async def _locked_address_relation_oids(session) -> tuple[int, int]:
+    address_relations = _quoted_address_relations()
+    await session.execute(
+        text(
+            "LOCK TABLE "
+            + ", ".join(quoted_name for _qualified_name, quoted_name in address_relations)
+            + " IN ACCESS SHARE MODE"
+        )
+    )
+    relation_oids = await session.scalar(
+        text(
+            "SELECT ARRAY["
+            "to_regclass(:address_relation_name)::oid::bigint, "
+            "to_regclass(:evidence_relation_name)::oid::bigint]"
+        ),
+        {
+            "address_relation_name": address_relations[1][0],
+            "evidence_relation_name": address_relations[0][0],
+        },
+    )
+    if (
+        type(relation_oids) not in {list, tuple}
+        or len(relation_oids) != 2
+        or any(type(relation_oid) is not int or relation_oid <= 0 for relation_oid in relation_oids)
+    ):
         raise _invalid_generation()
-    return relation_oid
+    return relation_oids[0], relation_oids[1]
 
 
 async def capture_billing_search_generation_pin(
@@ -233,12 +264,15 @@ async def capture_billing_search_generation_pin(
     """Lock the address relation and capture the complete serving generation."""
 
     snapshot_set_sha256 = billing_search_snapshot_set_sha256(selection)
-    address_relation_oid = await _locked_address_relation_oid(session)
+    address_relation_oid, address_evidence_relation_oid = (
+        await _locked_address_relation_oids(session)
+    )
     generation_bundle_sha256 = _framed_sha256(
         _GENERATION_BUNDLE_DOMAIN,
         _canonical_json_bytes(
             {
                 "address_relation_oid": address_relation_oid,
+                "address_evidence_relation_oid": address_evidence_relation_oid,
                 "address_selection_contract": BILLING_ADDRESS_SELECTION_CONTRACT,
                 "snapshot_set_sha256": snapshot_set_sha256,
             }
@@ -248,6 +282,7 @@ async def capture_billing_search_generation_pin(
         snapshot_set_sha256=snapshot_set_sha256,
         generation_bundle_sha256=generation_bundle_sha256,
         address_relation_oid=address_relation_oid,
+        address_evidence_relation_oid=address_evidence_relation_oid,
     )
 
 
