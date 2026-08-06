@@ -188,6 +188,29 @@ def test_prepared_cleanup_is_idempotent_and_swallows_unlink_errors(tmp_path):
     assert not prepared.copy_path.exists()
 
 
+def test_prepare_and_cleanup_preserve_files_owned_by_other_attempts(tmp_path):
+    sidecar = _sidecar(
+        tmp_path,
+        source_key=0,
+        shard_id="file:a",
+        identity_digit="8",
+        sidecar_records=(_record(1, 2),),
+    )
+    output_path = tmp_path / "projection.copy"
+    output_path.write_bytes(b"preexisting-owner")
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        _prepare(tmp_path, (sidecar,))
+    assert output_path.read_bytes() == b"preexisting-owner"
+
+    output_path.unlink()
+    prepared = _prepare(tmp_path, (sidecar,))
+    replacement_path = tmp_path / "replacement.copy"
+    replacement_path.write_bytes(b"replacement-owner")
+    os.replace(replacement_path, prepared.copy_path)
+    prepared.cleanup()
+    assert output_path.read_bytes() == b"replacement-owner"
+
+
 def test_prepare_hashes_copy_through_creation_descriptor(tmp_path):
     sidecar = _sidecar(
         tmp_path,

@@ -191,16 +191,28 @@ class PreparedTaxIdentitySourceProjection:
     def cleanup(self) -> None:
         """Best-effort remove the ephemeral COPY file after terminal use."""
 
-        _remove_ephemeral_copy(self.copy_path)
+        _remove_ephemeral_copy(
+            self.copy_path,
+            expected_device=self.copy_device,
+            expected_inode=self.copy_inode,
+        )
 
     def __repr__(self) -> str:
         return "<prepared-tax-identity-source-projection evidence=<redacted>>"
 
 
-def _remove_ephemeral_copy(copy_path: Path) -> None:
-    """Best-effort cleanup without replacing the privacy-safe root error."""
+def _remove_ephemeral_copy(
+    copy_path: Path,
+    *,
+    expected_device: int,
+    expected_inode: int,
+) -> None:
+    """Remove only the exact ephemeral file created by this attempt."""
 
     try:
+        metadata = os.lstat(copy_path)
+        if metadata.st_dev != expected_device or metadata.st_ino != expected_inode:
+            return
         copy_path.unlink(missing_ok=True)
     except OSError:
         return

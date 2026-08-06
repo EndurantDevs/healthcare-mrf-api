@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 import hashlib
 import hmac
 import os
@@ -35,21 +36,16 @@ from process.ptg_parts.ptg2_tax_identity_source_projection import (
 _CONTENT_DOMAIN = b"PTG2TAXSOURCECONTENT\x01"
 _PG_COPY_HEADER = b"PGCOPY\n\xff\r\n\0" + struct.pack(">II", 0, 0)
 _PG_COPY_TRAILER = struct.pack(">h", -1)
-_STATE_BY_CODE = {
-    1: "matched_ein",
-    2: "missing",
-    3: "malformed",
-    4: "unsupported_type",
-}
+_STATE_BY_CODE = dict(
+    enumerate(("matched_ein", "missing", "malformed", "unsupported_type"), 1)
+)
 _STATE_CODE = {state: code for code, state in _STATE_BY_CODE.items()}
-_COPY_COLUMNS = (
-    "source_key",
-    "source_ordinal",
-    "source_record_ordinal",
-    "provider_group_global_id_128",
-    "tax_identity_state",
-    "tin_id_128",
-    "tin_hmac_sha256",
+_COPY_COLUMNS = tuple(
+    (
+        "source_key source_ordinal source_record_ordinal "
+        "provider_group_global_id_128 tax_identity_state "
+        "tin_id_128 tin_hmac_sha256"
+    ).split()
 )
 _COPY_READ_BYTES = 1024 * 1024
 
@@ -356,26 +352,37 @@ def _write_projection_copy(
     open_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
     open_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     output_descriptor = os.open(output_path, open_flags, 0o600)
+    created_metadata = os.fstat(output_descriptor)
     totals_by_state = {name: 0 for name in _STATE_COUNT_FIELDS}
     occurrence_count = 0
     content_digest = _projection_content_digest(inputs)
-    with os.fdopen(output_descriptor, "w+b", closefd=True) as output_file:
-        output_file.write(_PG_COPY_HEADER)
-        for binding in inputs.bindings:
-            counts_by_state = _parse_source_sidecar(
-                binding,
-                output_file=output_file,
-                content_digest=content_digest,
-                policy_id=inputs.policy_id,
+    try:
+        with os.fdopen(output_descriptor, "w+b", closefd=True) as output_file:
+            output_file.write(_PG_COPY_HEADER)
+            for binding in inputs.bindings:
+                counts_by_state = _parse_source_sidecar(
+                    binding,
+                    output_file=output_file,
+                    content_digest=content_digest,
+                    policy_id=inputs.policy_id,
+                )
+                occurrence_count += binding.provider_group_count
+                for count_name, state_count in counts_by_state.items():
+                    totals_by_state[count_name] += state_count
+            output_file.write(_PG_COPY_TRAILER)
+            copy_sha256, copy_metadata = _authenticated_open_copy(
+                output_file,
+                output_path,
             )
-            occurrence_count += binding.provider_group_count
-            for count_name, state_count in counts_by_state.items():
-                totals_by_state[count_name] += state_count
-        output_file.write(_PG_COPY_TRAILER)
-        copy_sha256, copy_metadata = _authenticated_open_copy(
-            output_file,
+    except BaseException:
+        with suppress(OSError):
+            os.close(output_descriptor)
+        _remove_ephemeral_copy(
             output_path,
+            expected_device=created_metadata.st_dev,
+            expected_inode=created_metadata.st_ino,
         )
+        raise
     return _ProjectionCopySummary(
         occurrence_count=occurrence_count,
         counts_by_state=totals_by_state,
@@ -458,10 +465,8 @@ def prepare_tax_identity_source_projection(
             content_digest=copy_summary.content_digest,
         )
     except TaxIdentitySourceProjectionError:
-        _remove_ephemeral_copy(copy_path)
         raise
     except Exception:
-        _remove_ephemeral_copy(copy_path)
         raise _fail() from None
 
 
