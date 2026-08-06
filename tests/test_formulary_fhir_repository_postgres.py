@@ -10,9 +10,10 @@ import pytest
 from sqlalchemy.engine import make_url
 
 from db.models import db
-from process.formulary_fhir import repository_batch
-from process.formulary_fhir.repository_shared import SOURCE_ID, table_name
-from process.formulary_fhir.types import MedicationRecord
+from process.formulary_fhir.repository import AliasVersionWrite
+from process.formulary_fhir.repository import FHIRFormularyRepository
+from process.formulary_fhir.repository_shared import table_name
+from process.formulary_fhir.types import CoveragePlanRecord, MedicationRecord
 
 OPT_IN_DSN_ENV = "HLTHPRT_FORMULARY_FHIR_POSTGRES_DSN"
 DISPOSABLE_DATABASE_PATTERN = re.compile(
@@ -73,52 +74,30 @@ def _medication(index: int) -> MedicationRecord:
     )
 
 
-async def _insert_alias_version() -> None:
-    await db.status(
-        f"INSERT INTO {table_name('fhir_formulary_coverage_plan')} ("
-        "public_id, source_id, upstream_list_id, canonical_identity) VALUES ("
-        ":public_id, :source_id, :upstream_list_id, :canonical_identity);",
-        public_id="fhir_aaaaaaaaaaaaaaaaaaaaaaaaaa",
-        source_id=SOURCE_ID,
+def _coverage_plan() -> CoveragePlanRecord:
+    return CoveragePlanRecord(
         upstream_list_id="synthetic-list",
-        canonical_identity="https://example.test/fhir/List/synthetic-list",
-    )
-    await db.status(
-        f"INSERT INTO {table_name('fhir_formulary_drug_plan_alias')} ("
-        "alias_id, public_id, source_plan_identifier) VALUES ("
-        ":alias_id, :public_id, :source_plan_identifier);",
-        alias_id="synthetic-alias",
         public_id="fhir_aaaaaaaaaaaaaaaaaaaaaaaaaa",
-        source_plan_identifier="SYNTHETIC-PLAN",
+        canonical_identity="https://example.test/fhir/List/synthetic-list",
+        upstream_version_id="1",
+        upstream_last_updated="2026-08-06T12:00:00Z",
+        status="current",
+        title="Synthetic coverage plan",
+        name="Synthetic plan",
+        upstream_date="2026-08-06T12:00:00Z",
+        period_start=None,
+        period_end=None,
+        source_plan_identifiers=("SYNTHETIC-PLAN",),
+        raw_identifiers=(),
+        raw_extensions=(),
+        content_hash="c" * 64,
     )
-    await db.status(
-        f"INSERT INTO {table_name('fhir_formulary_drug_plan_alias_version')} ("
-        "alias_version_id, alias_id, expected_count, membership_count, "
-        "membership_hash, cutoff_at, acquisition_mode, summary_json) VALUES ("
-        ":alias_version_id, :alias_id, :expected_count, :membership_count, "
-        ":membership_hash, :cutoff_at, 'full', '{}'::jsonb);",
-        alias_version_id="synthetic-alias-version",
-        alias_id="synthetic-alias",
-        expected_count=ALIAS_SIZE,
-        membership_count=ALIAS_SIZE,
-        membership_hash="a" * 64,
-        cutoff_at=dt.datetime(2026, 8, 6, 12, tzinfo=dt.UTC),
-    )
 
 
-def _alias_rows():
-    medications = tuple(_medication(index) for index in range(ALIAS_SIZE))
-    medications_by_id = {
-        medication.upstream_medication_id: medication for medication in medications
-    }
-    variants_by_id = {
-        medication.upstream_medication_id: f"{index + ALIAS_SIZE:064x}"
-        for index, medication in enumerate(medications)
-    }
-    return medications_by_id, variants_by_id
-
-
-async def _assert_persisted_alias() -> None:
+async def _assert_persisted_alias(
+    dataset_id: str,
+    alias_version_id: str,
+) -> None:
     medication_count = await db.scalar(
         f"SELECT COUNT(*) FROM {table_name('fhir_formulary_medication')} "
         "WHERE upstream_medication_id LIKE 'MI-synthetic-%';"
@@ -127,7 +106,7 @@ async def _assert_persisted_alias() -> None:
         f"SELECT COUNT(*) FROM "
         f"{table_name('fhir_formulary_alias_membership')} "
         "WHERE alias_version_id = :alias_version_id;",
-        alias_version_id="synthetic-alias-version",
+        alias_version_id=alias_version_id,
     )
     assert medication_count == ALIAS_SIZE
     assert membership_count == ALIAS_SIZE
@@ -136,26 +115,52 @@ async def _assert_persisted_alias() -> None:
         "resolved_medication_id, resolved FROM "
         f"{table_name('fhir_formulary_alternative')} "
         "WHERE alias_version_id = :alias_version_id;",
-        alias_version_id="synthetic-alias-version",
+        alias_version_id=alias_version_id,
     )
     assert alternative is not None
     assert alternative.raw_reference == "MedicationKnowledge/synthetic-1"
     assert alternative.corrected_reference == ("MedicationKnowledge/MI-synthetic-1")
     assert alternative.resolved_medication_id == "MI-synthetic-1"
     assert alternative.resolved is True
+    current_dataset_id = await db.scalar(
+        f"SELECT dataset_id FROM {table_name('fhir_formulary_current')} "
+        "WHERE source_id = 'fhir-formulary-primary';"
+    )
+    assert current_dataset_id == dataset_id
 
 
 async def _run_batch_proof() -> None:
-    medications_by_id, variants_by_id = _alias_rows()
+    cutoff = dt.datetime(2026, 8, 6, 12, tzinfo=dt.UTC)
+    formulary_repository = FHIRFormularyRepository()
     async with db.transaction():
-        await _insert_alias_version()
-        await repository_batch.insert_changed_alias_rows(
-            "synthetic-alias-version",
-            medications_by_id,
-            variants_by_id,
-            apply_california_rule=True,
+        dataset_id = await formulary_repository.begin_dataset(
+            run_id="synthetic-postgres-seed",
+            cutoff_at=cutoff,
+            publish_requested=False,
+            seed_eligible=True,
         )
-        await _assert_persisted_alias()
+        aliases_by_identifier = await formulary_repository.put_coverage_plan(
+            dataset_id=dataset_id,
+            plan=_coverage_plan(),
+        )
+        alias_version_id = await formulary_repository.put_alias_version(
+            AliasVersionWrite(
+                dataset_id=dataset_id,
+                alias_id=aliases_by_identifier["SYNTHETIC-PLAN"],
+                expected_count=ALIAS_SIZE,
+                cutoff_at=cutoff,
+                medications=tuple(_medication(index) for index in range(ALIAS_SIZE)),
+                acquisition_mode="full",
+                apply_california_rule=True,
+            )
+        )
+        proof_by_field = await formulary_repository.verify_dataset(dataset_id)
+        generation = await formulary_repository.publish_verified_seed(dataset_id)
+        assert proof_by_field["list_count"] == 1
+        assert proof_by_field["alias_count"] == 1
+        assert proof_by_field["medication_membership_count"] == ALIAS_SIZE
+        assert generation == 1
+        await _assert_persisted_alias(dataset_id, alias_version_id)
         raise _RollbackProofTransaction
 
 
@@ -163,7 +168,7 @@ async def _run_batch_proof() -> None:
 async def test_postgres_batches_large_alias_and_preserves_alternative_evidence(
     monkeypatch,
 ):
-    """Cross the production SQLAlchemy and asyncpg bind boundary."""
+    """Cross batching, verification, and publication through real asyncpg."""
 
     database_url = _database_url()
     _configure_database(monkeypatch, database_url)

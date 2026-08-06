@@ -23,7 +23,6 @@ from sqlalchemy import (
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
 
-
 __all__ = (
     "FHIRFormularyAlias",
     "FHIRFormularyAliasMembership",
@@ -97,6 +96,7 @@ class FHIRFormularyDataset(Base, JSONOutputMixin):
     cutoff_at = Column(TIMESTAMP(timezone=True), nullable=False)
     status = Column(String(16), nullable=False)
     publish_requested = Column(Boolean, nullable=False, default=False)
+    seed_eligible = Column(Boolean, nullable=False, default=False)
     list_count = Column(Integer, nullable=False, default=0)
     alias_count = Column(Integer, nullable=False, default=0)
     medication_count = Column(BigInteger, nullable=False, default=0)
@@ -361,7 +361,9 @@ class FHIRFormularyCheckpoint(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = _table_args(
         PrimaryKeyConstraint("source_id", "alias_id", "run_id"),
-        CheckConstraint("fence_token > 0", name="fhir_formulary_checkpoint_fence_check"),
+        CheckConstraint(
+            "fence_token > 0", name="fhir_formulary_checkpoint_fence_check"
+        ),
     )
     __my_index_elements__ = ["source_id", "alias_id", "run_id"]
     __my_additional_indexes__ = [

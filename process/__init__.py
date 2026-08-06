@@ -1289,6 +1289,10 @@ def provider_enrichment(test: bool):
         "weekday automation."
     ),
 )
+@click.option(
+    "--seed-dataset-id",
+    help="Verified ffd_ dataset selected for a no-recrawl publication proof.",
+)
 @click.option("--cutoff", help="Fixed ISO-8601 upper-bound timestamp.")
 @click.option(
     "--alias-concurrency",
@@ -1301,6 +1305,7 @@ def formulary_fhir_command(
     manual_seed: bool,
     publish: bool,
     publication_proof: bool,
+    seed_dataset_id: str | None,
     cutoff: str | None,
     alias_concurrency: str,
 ):
@@ -1310,6 +1315,7 @@ def formulary_fhir_command(
         initiate_formulary_fhir(
             manual_seed=manual_seed,
             publication_proof=publication_proof,
+            seed_dataset_id=seed_dataset_id,
             publish=publish,
             cutoff=cutoff,
             alias_concurrency=int(alias_concurrency),

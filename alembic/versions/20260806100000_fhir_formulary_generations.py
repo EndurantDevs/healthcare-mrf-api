@@ -10,7 +10,6 @@ import os
 
 from alembic import op
 
-
 revision = "20260806100000_fhir_formulary_generations"
 down_revision = "20260806100000_ptg2_tax_identity_source"
 branch_labels = None
@@ -60,8 +59,7 @@ def upgrade() -> None:
     alternative = _qt(schema, "fhir_formulary_alternative")
     checkpoint = _qt(schema, "fhir_formulary_checkpoint")
 
-    _execute_plain_statements(
-        f"""
+    _execute_plain_statements(f"""
         CREATE TABLE {source} (
             source_id varchar(64) PRIMARY KEY,
             canonical_base text NOT NULL UNIQUE,
@@ -80,6 +78,7 @@ def upgrade() -> None:
             cutoff_at timestamptz NOT NULL,
             status varchar(16) NOT NULL,
             publish_requested boolean NOT NULL DEFAULT false,
+            seed_eligible boolean NOT NULL DEFAULT false,
             list_count integer NOT NULL DEFAULT 0,
             alias_count integer NOT NULL DEFAULT 0,
             medication_count bigint NOT NULL DEFAULT 0,
@@ -280,11 +279,9 @@ def upgrade() -> None:
         );
         CREATE INDEX fhir_formulary_checkpoint_run_fence_idx
             ON {checkpoint}(run_id, fence_token);
-        """
-    )
+        """)
 
-    op.execute(
-        f"""
+    op.execute(f"""
         CREATE FUNCTION {_qt(schema, 'guard_fhir_formulary_checkpoint_fence')}()
         RETURNS trigger LANGUAGE plpgsql AS $function$
         BEGIN
@@ -305,19 +302,15 @@ def upgrade() -> None:
             RETURN NEW;
         END;
         $function$;
-        """
-    )
-    op.execute(
-        f"""
+        """)
+    op.execute(f"""
         CREATE TRIGGER fhir_formulary_checkpoint_fence_guard
             BEFORE UPDATE ON {checkpoint}
             FOR EACH ROW EXECUTE FUNCTION
                 {_qt(schema, 'guard_fhir_formulary_checkpoint_fence')}();
-        """
-    )
+        """)
 
-    op.execute(
-        f"""
+    op.execute(f"""
         INSERT INTO {source} (
             source_id,
             canonical_base,
@@ -331,8 +324,7 @@ def upgrade() -> None:
             false,
             '{{"automation_enabled": false, "manual_seed_only": true}}'::jsonb
         );
-        """
-    )
+        """)
 
 
 def downgrade() -> None:

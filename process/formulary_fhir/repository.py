@@ -13,6 +13,7 @@ from db.models import db
 from process.formulary_fhir.repository_checkpoint import (
     FHIRFormularyCheckpointMixin,
 )
+from process.formulary_fhir.repository_publish import FHIRFormularyPublicationMixin
 from process.formulary_fhir.repository_shared import AliasVersionWrite
 from process.formulary_fhir.repository_shared import CheckpointWrite
 from process.formulary_fhir.repository_shared import CompletedAliasCheckpoint
@@ -46,25 +47,28 @@ async def _insert_candidate_dataset(
     previous_dataset_id: str | None,
     cutoff_at: dt.datetime,
     publish_requested: bool,
+    seed_eligible: bool,
 ) -> None:
     await db.status(
         f"INSERT INTO {table_name('fhir_formulary_dataset')} ("
         "dataset_id, source_id, run_id, previous_dataset_id, cutoff_at, "
-        "status, publish_requested) VALUES ("
+        "status, publish_requested, seed_eligible) VALUES ("
         ":dataset_id, :source_id, :run_id, :previous_dataset_id, :cutoff_at, "
-        "'building', :publish_requested) ON CONFLICT (run_id) DO NOTHING;",
+        "'building', :publish_requested, :seed_eligible) "
+        "ON CONFLICT (run_id) DO NOTHING;",
         dataset_id=dataset_id,
         source_id=SOURCE_ID,
         run_id=run_id,
         previous_dataset_id=previous_dataset_id,
         cutoff_at=cutoff_at,
         publish_requested=publish_requested,
+        seed_eligible=seed_eligible,
     )
 
 
 async def _resumed_dataset_by_field(run_id: str) -> dict[str, Any]:
     dataset_row = await db.first(
-        f"SELECT dataset_id, cutoff_at, publish_requested, status "
+        f"SELECT dataset_id, cutoff_at, publish_requested, seed_eligible, status "
         f"FROM {table_name('fhir_formulary_dataset')} WHERE run_id = :run_id;",
         run_id=run_id,
     )
@@ -77,12 +81,14 @@ def _validate_resumed_dataset(
     dataset_id: str,
     cutoff_at: dt.datetime,
     publish_requested: bool,
+    seed_eligible: bool,
 ) -> None:
     if dataset_by_field.get("dataset_id") != dataset_id:
         raise RuntimeError("FHIR formulary run id collision")
     has_changed_parameters = bool(
         dataset_by_field.get("cutoff_at") != cutoff_at
         or bool(dataset_by_field.get("publish_requested")) != bool(publish_requested)
+        or bool(dataset_by_field.get("seed_eligible")) != bool(seed_eligible)
     )
     if has_changed_parameters:
         raise RuntimeError("FHIR formulary run resume parameters changed")
@@ -304,6 +310,7 @@ async def _mark_verified(dataset_id: str, proof_by_field: dict[str, Any]) -> Non
 class FHIRFormularyRepository(
     FHIRFormularyWriteMixin,
     FHIRFormularyCheckpointMixin,
+    FHIRFormularyPublicationMixin,
 ):
     """Coordinate copy-on-write persistence and atomic dataset publication."""
 
@@ -313,6 +320,7 @@ class FHIRFormularyRepository(
         run_id: str,
         cutoff_at: dt.datetime,
         publish_requested: bool,
+        seed_eligible: bool = False,
     ) -> str:
         """Create or validate a resumable candidate dataset for one run."""
 
@@ -323,6 +331,7 @@ class FHIRFormularyRepository(
             previous_dataset_id=await _current_dataset_id(),
             cutoff_at=cutoff_at,
             publish_requested=publish_requested,
+            seed_eligible=seed_eligible,
         )
         dataset_by_field = await _resumed_dataset_by_field(run_id)
         _validate_resumed_dataset(
@@ -330,6 +339,7 @@ class FHIRFormularyRepository(
             dataset_id=dataset_id,
             cutoff_at=cutoff_at,
             publish_requested=publish_requested,
+            seed_eligible=seed_eligible,
         )
         await db.status(
             f"UPDATE {table_name('fhir_formulary_dataset')} SET "
@@ -372,49 +382,6 @@ class FHIRFormularyRepository(
         proof_by_field = _verification_proof(_accumulate_verification(coverage_rows))
         await _mark_verified(dataset_id, proof_by_field)
         return proof_by_field
-
-    async def publish_dataset(self, dataset_id: str) -> int:
-        """Atomically switch one source pointer after all verification succeeds."""
-
-        async with db.transaction():
-            dataset_row = await db.first(
-                f"SELECT source_id, status, publish_requested FROM "
-                f"{table_name('fhir_formulary_dataset')} "
-                "WHERE dataset_id = :dataset_id FOR UPDATE;",
-                dataset_id=dataset_id,
-            )
-            dataset_by_field = row_mapping(dataset_row)
-            is_publishable = bool(
-                dataset_by_field.get("status") == "verified"
-                and dataset_by_field.get("publish_requested")
-            )
-            if not is_publishable:
-                raise RuntimeError("FHIR formulary dataset is not publishable")
-            current_row = await db.first(
-                f"SELECT generation FROM {table_name('fhir_formulary_current')} "
-                "WHERE source_id = :source_id FOR UPDATE;",
-                source_id=dataset_by_field["source_id"],
-            )
-            generation = int(row_mapping(current_row).get("generation") or 0) + 1
-            await db.status(
-                f"INSERT INTO {table_name('fhir_formulary_current')} ("
-                "source_id, dataset_id, generation, published_at) VALUES ("
-                ":source_id, :dataset_id, :generation, transaction_timestamp()) "
-                "ON CONFLICT (source_id) DO UPDATE SET "
-                "dataset_id = EXCLUDED.dataset_id, "
-                "generation = EXCLUDED.generation, "
-                "published_at = EXCLUDED.published_at;",
-                source_id=dataset_by_field["source_id"],
-                dataset_id=dataset_id,
-                generation=generation,
-            )
-            await db.status(
-                f"UPDATE {table_name('fhir_formulary_dataset')} SET "
-                "status = 'published', published_at = transaction_timestamp() "
-                "WHERE dataset_id = :dataset_id AND status = 'verified';",
-                dataset_id=dataset_id,
-            )
-        return generation
 
     async def fail_dataset(self, dataset_id: str, exc: BaseException) -> None:
         """Mark an unrecoverable candidate failed without moving the pointer."""

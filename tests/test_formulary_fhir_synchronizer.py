@@ -103,7 +103,14 @@ class _DriftingListCountClient(_Client):
 
 
 class _Repository:
-    def __init__(self, current=None, *, verify_error=None, completed=None):
+    def __init__(
+        self,
+        current=None,
+        *,
+        verify_error=None,
+        completed=None,
+        loaded_variants=None,
+    ):
         self.current = current or CurrentSnapshot(None, None, {})
         self.verify_error = verify_error
         self.coverage = []
@@ -116,8 +123,11 @@ class _Repository:
         self.pointer = "previous-dataset"
         self.completed = completed or {}
         self.loaded_prior_aliases = []
+        self.begin_requests = []
+        self.loaded_variants = loaded_variants or {}
 
-    async def begin_dataset(self, **_kwargs):
+    async def begin_dataset(self, **kwargs):
+        self.begin_requests.append(kwargs)
         return "candidate-dataset"
 
     async def current_snapshot(self):
@@ -125,7 +135,13 @@ class _Repository:
 
     async def load_prior_alias_state(self, prior):
         self.loaded_prior_aliases.append(prior.alias_id)
-        return prior
+        return replace(
+            prior,
+            variants_by_medication_id=self.loaded_variants.get(
+                prior.alias_id,
+                prior.variants_by_medication_id,
+            ),
+        )
 
     async def put_coverage_plan(self, *, dataset_id, plan):
         assert dataset_id == "candidate-dataset"
@@ -188,6 +204,7 @@ async def test_equal_total_aliases_are_crawled_independently_and_keep_different_
         run_id="synthetic-run",
         cutoff=CUTOFF,
         publish=False,
+        seed_eligible=True,
         alias_concurrency=2,
     )
 
@@ -200,6 +217,7 @@ async def test_equal_total_aliases_are_crawled_independently_and_keep_different_
     assert records_by_alias["alias-1"] == {"MI-synthetic-drug-b"}
     assert all(value == 1 for value in client.maximum_active_by_alias.values())
     assert repository.published is False
+    assert repository.begin_requests[0]["seed_eligible"] is True
 
 
 @pytest.mark.asyncio
@@ -249,6 +267,62 @@ async def test_empty_delta_reuses_prior_alias_version(monkeypatch):
     }
     assert len(repository.reused) == 2
     assert repository.loaded_prior_aliases == []
+
+
+@pytest.mark.asyncio
+async def test_nonempty_equal_count_delta_loads_only_the_changed_prior_alias(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "process.formulary_fhir.synchronizer.is_rolling_reconciliation_due",
+        lambda *_args, **_kwargs: False,
+    )
+    public_id = public_formulary_id(BASE, "synthetic-coverage-a")
+    prior_by_key = {
+        (public_id, "SYNTH-NCAL-A"): PriorAliasState(
+            "prior-a",
+            "prior-version-a",
+            1,
+            CUTOFF - dt.timedelta(days=1),
+            {},
+            "a" * 64,
+        ),
+        (public_id, "SYNTH-NCAL-B"): PriorAliasState(
+            "prior-b",
+            "prior-version-b",
+            1,
+            CUTOFF - dt.timedelta(days=1),
+            {},
+            "b" * 64,
+        ),
+    }
+    repository = _Repository(
+        CurrentSnapshot(
+            "previous-dataset",
+            CUTOFF - dt.timedelta(days=1),
+            prior_by_key,
+        ),
+        loaded_variants={
+            "prior-a": {"MI-synthetic-drug-a": "a" * 64},
+        },
+    )
+    client = _Client(
+        deltas={"SYNTH-NCAL-A": [_fixture("medication_a.json")]},
+    )
+
+    sync_result_by_field = await synchronize(
+        client=client,
+        repository=repository,
+        run_id="synthetic-delta-run",
+        cutoff=CUTOFF,
+    )
+
+    assert sync_result_by_field["alias_modes"] == {
+        "reuse": 1,
+        "delta": 1,
+        "full": 0,
+    }
+    assert repository.loaded_prior_aliases == ["prior-a"]
 
 
 @pytest.mark.asyncio

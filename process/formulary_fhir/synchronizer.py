@@ -454,6 +454,7 @@ async def synchronize(
     run_id: str,
     cutoff: dt.datetime,
     publish: bool = False,
+    seed_eligible: bool = False,
     alias_concurrency: int = 4,
 ) -> dict[str, Any]:
     """Build, verify, and optionally publish one fixed-cutoff generation."""
@@ -466,5 +467,6 @@ async def synchronize(
         run_id=run_id,
         cutoff=cutoff,
         publish=publish,
+        seed_eligible=seed_eligible,
         alias_concurrency=alias_concurrency,
     )

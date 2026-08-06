@@ -65,9 +65,7 @@ async def _alias_work_items(
             dataset_id=dataset_id,
             plan=plan,
         )
-        for source_plan_identifier, alias_id in sorted(
-            aliases_by_identifier.items()
-        ):
+        for source_plan_identifier, alias_id in sorted(aliases_by_identifier.items()):
             work_items.append(AliasWork(plan, source_plan_identifier, alias_id))
     return work_items
 
@@ -126,9 +124,7 @@ def _success_payload(
         "list_census_count": list_census_count,
         "aliases": len(alias_results),
         "alias_modes": _mode_counts(alias_results),
-        "resumed_aliases": sum(
-            alias_result.resumed for alias_result in alias_results
-        ),
+        "resumed_aliases": sum(alias_result.resumed for alias_result in alias_results),
         "final_alias_concurrency": controller.current,
         **proof_by_field,
     }
@@ -141,6 +137,7 @@ async def synchronize_generation(
     run_id: str,
     cutoff: dt.datetime,
     publish: bool = False,
+    seed_eligible: bool = False,
     alias_concurrency: int = 4,
 ) -> dict[str, Any]:
     """Build, verify, and optionally publish one fixed-cutoff generation."""
@@ -151,6 +148,7 @@ async def synchronize_generation(
         run_id=run_id,
         cutoff_at=cutoff,
         publish_requested=publish,
+        seed_eligible=seed_eligible,
     )
     try:
         plans, list_census_count = await _coverage_plans(client, cutoff)
@@ -171,9 +169,7 @@ async def synchronize_generation(
             alias_concurrency,
         )
         proof_by_field = await repository.verify_dataset(dataset_id)
-        generation = (
-            await repository.publish_dataset(dataset_id) if publish else None
-        )
+        generation = await repository.publish_dataset(dataset_id) if publish else None
         return _success_payload(
             dataset_id=dataset_id,
             generation=generation,

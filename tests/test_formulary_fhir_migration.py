@@ -9,13 +9,9 @@ import pytest
 
 from db.models import FHIRFormularyCheckpoint, FHIRFormularyCoveragePlan
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = (
-    ROOT
-    / "alembic"
-    / "versions"
-    / "20260806100000_fhir_formulary_generations.py"
+    ROOT / "alembic" / "versions" / "20260806100000_fhir_formulary_generations.py"
 )
 
 
@@ -68,6 +64,7 @@ def test_formulary_migration_is_copy_on_write_and_inactive(monkeypatch):
     assert "fhir_formulary_checkpoint_stale_fence" in sql
     assert "fhir_formulary_checkpoint_owner_immutable" in sql
     assert "enabled, metadata_json" in sql
+    assert "seed_eligible boolean NOT NULL DEFAULT false" in sql
     assert "false" in sql
     assert '"automation_enabled": false' in sql
     assert "legacy" not in sql.lower()
@@ -86,8 +83,7 @@ def test_formulary_migration_is_copy_on_write_and_inactive(monkeypatch):
     )
     assert "CREATE TRIGGER" not in function_statement
     assert any(
-        statement.lstrip().startswith("CREATE TRIGGER")
-        for statement in statements
+        statement.lstrip().startswith("CREATE TRIGGER") for statement in statements
     )
 
 

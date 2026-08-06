@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
 
 from process.formulary_fhir import repository as repository_module
+from process.formulary_fhir import repository_publish as publish_module
 from process.formulary_fhir.repository import FHIRFormularyRepository
+
+
+@asynccontextmanager
+async def _transaction():
+    yield
 
 
 def _coverage_row(
@@ -116,3 +123,84 @@ async def test_current_snapshot_loads_only_one_alias_membership_on_demand(
         "MI-b": "b" * 64,
     }
     assert "fhir_formulary_alias_membership" in all_rows.await_args_list[1].args[0]
+
+
+@pytest.mark.asyncio
+async def test_verified_manual_seed_publishes_only_into_an_empty_pointer(
+    monkeypatch,
+):
+    first = AsyncMock(
+        side_effect=[
+            {
+                "source_id": repository_module.SOURCE_ID,
+                "status": "verified",
+                "publish_requested": False,
+                "seed_eligible": True,
+            },
+            None,
+        ]
+    )
+    status = AsyncMock(side_effect=[1, 1])
+    monkeypatch.setattr(publish_module.db, "transaction", _transaction)
+    monkeypatch.setattr(publish_module.db, "first", first)
+    monkeypatch.setattr(publish_module.db, "status", status)
+
+    generation = await FHIRFormularyRepository().publish_verified_seed(
+        "ffd_" + "a" * 48
+    )
+
+    assert generation == 1
+    assert "FOR UPDATE" in first.await_args_list[0].args[0]
+    assert "fhir_formulary_current" in first.await_args_list[1].args[0]
+    assert "fhir_formulary_current" in status.await_args_list[0].args[0]
+    assert "status = 'published'" in status.await_args_list[1].args[0]
+
+
+@pytest.mark.asyncio
+async def test_seed_publication_rejects_an_existing_pointer_without_mutation(
+    monkeypatch,
+):
+    first = AsyncMock(
+        side_effect=[
+            {
+                "source_id": repository_module.SOURCE_ID,
+                "status": "verified",
+                "publish_requested": False,
+                "seed_eligible": True,
+            },
+            {"dataset_id": "already-published", "generation": 1},
+        ]
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(publish_module.db, "transaction", _transaction)
+    monkeypatch.setattr(publish_module.db, "first", first)
+    monkeypatch.setattr(publish_module.db, "status", status)
+
+    with pytest.raises(RuntimeError, match="requires an empty pointer"):
+        await FHIRFormularyRepository().publish_verified_seed("ffd_" + "a" * 48)
+
+    status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_seed_publication_rejects_an_ordinary_verified_dataset(
+    monkeypatch,
+):
+    first = AsyncMock(
+        return_value={
+            "source_id": repository_module.SOURCE_ID,
+            "status": "verified",
+            "publish_requested": False,
+            "seed_eligible": False,
+        }
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(publish_module.db, "transaction", _transaction)
+    monkeypatch.setattr(publish_module.db, "first", first)
+    monkeypatch.setattr(publish_module.db, "status", status)
+
+    with pytest.raises(RuntimeError, match="not publishable"):
+        await FHIRFormularyRepository().publish_verified_seed("ffd_" + "a" * 48)
+
+    assert first.await_count == 1
+    status.assert_not_awaited()
