@@ -10,9 +10,11 @@ from unittest.mock import patch
 
 import pytest
 
+from process.ptg_parts import ptg2_tax_identity_source_artifact as artifact
 from process.ptg_parts.ptg2_tax_identity_source_artifact import (
     prepare_tax_identity_source_projection,
 )
+from process.ptg_parts.ptg2_tax_identity_source_copy import _is_copy_file_unchanged
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
     TaxIdentitySourceProjectionError,
 )
@@ -227,6 +229,43 @@ def test_prepare_hashes_copy_through_creation_descriptor(tmp_path):
     prepared.cleanup()
 
 
+def test_copy_reauthentication_rejects_replacement_and_mutation(tmp_path):
+    sidecar = _sidecar(
+        tmp_path,
+        source_key=0,
+        shard_id="file:a",
+        identity_digit="8",
+        sidecar_records=(_record(1, 2),),
+    )
+    prepared = _prepare(tmp_path, (sidecar,))
+    original_bytes = prepared.copy_path.read_bytes()
+    with prepared.copy_path.open("rb") as copy_file:
+        assert _is_copy_file_unchanged(copy_file, prepared)
+
+    replacement_path = tmp_path / "replacement.copy"
+    replacement_path.write_bytes(original_bytes)
+    os.utime(
+        replacement_path,
+        ns=(prepared.copy_mtime_ns, prepared.copy_mtime_ns),
+    )
+    os.replace(replacement_path, prepared.copy_path)
+    with prepared.copy_path.open("rb") as copy_file:
+        assert not _is_copy_file_unchanged(copy_file, prepared)
+
+    prepared.copy_path.unlink()
+    repeated = _prepare(tmp_path, (sidecar,))
+    mutated_bytes = bytearray(repeated.copy_path.read_bytes())
+    mutated_bytes[-3] ^= 1
+    repeated.copy_path.write_bytes(mutated_bytes)
+    os.utime(
+        repeated.copy_path,
+        ns=(repeated.copy_mtime_ns, repeated.copy_mtime_ns),
+    )
+    with repeated.copy_path.open("rb") as copy_file:
+        assert not _is_copy_file_unchanged(copy_file, repeated)
+    repeated.cleanup()
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -382,3 +421,25 @@ def test_prepare_rejects_symlink_without_reading_target(tmp_path):
 
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         _prepare(tmp_path, (sidecar,))
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires POSIX")
+def test_prepare_rejects_fifo_before_opening_it(tmp_path):
+    sidecar = _sidecar(
+        tmp_path,
+        source_key=0,
+        shard_id="file:a",
+        identity_digit="6",
+        sidecar_records=(_record(1, 2),),
+    )
+    fifo_path = tmp_path / "source.fifo"
+    os.mkfifo(fifo_path)
+    sidecar["path"] = str(fifo_path)
+
+    with patch.object(
+        artifact.os,
+        "open",
+        side_effect=AssertionError("non-regular source must not be opened"),
+    ):
+        with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+            _prepare(tmp_path, (sidecar,))
