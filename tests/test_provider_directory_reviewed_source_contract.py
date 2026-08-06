@@ -205,6 +205,22 @@ def test_reviewed_source_exhaustive_mode_binds_one_half_open_snapshot_cutoff():
     assert census_query_by_name["_summary"] == "count"
 
 
+@pytest.mark.parametrize(
+    ("cutoff", "expected_error"),
+    [
+        ("not-a-timestamp", "snapshot_cutoff_invalid"),
+        ("2026-08-01T12:00:00", "snapshot_cutoff_timezone_required"),
+        ("2999-01-01T00:00:00Z", "snapshot_cutoff_cannot_be_future"),
+    ],
+)
+def test_reviewed_source_snapshot_cutoff_rejects_ambiguous_values(
+    cutoff,
+    expected_error,
+):
+    with pytest.raises(ValueError, match=expected_error):
+        importer._normalized_exact_census_snapshot_cutoff(cutoff)
+
+
 def test_reviewed_source_snapshot_and_exhaustive_controls_fail_closed():
     source_record = _reviewed_source_seed_row()
     with pytest.raises(ValueError, match="snapshot_cutoff_required"):
