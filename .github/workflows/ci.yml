@@ -91,7 +91,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
       - name: Compile service modules
-        run: python -m compileall api process db scripts main.py
+        run: python -m compileall api process db public_evidence scripts main.py
       - name: Provider Directory runtime contract
         run: python scripts/smoke/provider_directory_runtime_contract.py
       - name: Check Provider Directory support documentation
@@ -111,6 +111,7 @@ jobs:
               ':(glob)api/**/*.py' \
               ':(glob)db/**/*.py' \
               ':(glob)process/**/*.py' \
+              ':(glob)public_evidence/**/*.py' \
               ':(glob)service/**/*.py'; then
               required_reduction_percent=0
             elif [ "$READABILITY_ZERO_GROWTH_APPROVED" = "true" ]; then
@@ -173,7 +174,7 @@ jobs:
             -- "${collection_args[@]}"
           timeout --foreground 295s python -m pytest -q -n 1 --dist loadscope --durations=20 \
             --cov-config=test-coverage.ini \
-            --cov=api --cov=db --cov=process --cov=service --cov=main \
+            --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
             --cov-branch --cov-report= \
             @"$shard_file"
       - name: Bind main-suite coverage to source and base
@@ -220,7 +221,7 @@ jobs:
           mapfile -t capacity_tests <<< "$CAPACITY_TEST_PATHS"
           timeout --foreground 295s python -m pytest -q -n 4 --dist load --durations=20 \
             --cov-config=test-coverage.ini \
-            --cov=api --cov=db --cov=process --cov=service --cov=main \
+            --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main \
             --cov-branch --cov-report= \
             "${capacity_tests[@]}"
       - name: Bind capacity coverage to source and base
@@ -555,7 +556,7 @@ jobs:
       COVERAGE_FILE: .coverage.postgres.${{ matrix.shard }}
       PYTEST_ADDOPTS: >-
         --cov-config=test-coverage.ini
-        --cov=api --cov=db --cov=process --cov=service --cov=main
+        --cov=api --cov=db --cov=process --cov=public_evidence --cov=service --cov=main
         --cov-branch --cov-report= --cov-append
       HLTHPRT_DB_DRIVER: asyncpg
       HLTHPRT_DB_HOST: 127.0.0.1

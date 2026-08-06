@@ -77,3 +77,26 @@ def test_relative_coverage_combines_different_runner_roots(tmp_path: Path) -> No
     report = _combined_report(tmp_path / "aggregate", producer_paths)
 
     assert set(report["files"]) == {"main.py"}
+
+
+def test_public_evidence_coverage_scope_is_ratcheted() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    coverage_config = (repository_root / "test-coverage.ini").read_text(
+        encoding="utf-8"
+    )
+    baseline = json.loads(
+        (repository_root / "test-coverage-baseline.json").read_text(encoding="utf-8")
+    )
+    python_scope = baseline["reports"]["python"]["scope"]
+    workflow = (repository_root / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "    public_evidence\n" in coverage_config
+    assert "    public_evidence/*.py\n" in coverage_config
+    assert "    public_evidence/**/*.py\n" in coverage_config
+    assert "public_evidence" in python_scope["policy"]["source_dirs"]
+    assert "public_evidence/*.py" in python_scope["include"]
+    assert "public_evidence/**/*.py" in python_scope["include"]
+    assert workflow.count("--cov=public_evidence") == 3
+    assert "compileall api process db public_evidence scripts main.py" in workflow
