@@ -262,7 +262,49 @@ def bind_tax_sidecar_source_key(
     return bound_by_field
 
 
+def bind_tax_source_sidecars(
+    sidecar_sources: Iterable[tuple[dict[str, Any], object]],
+    *,
+    binding_index: object,
+) -> tuple[dict[str, Any], ...]:
+    """Bind one preauthenticated tax sidecar for every source identity."""
+
+    if type(binding_index) is not _TaxSourceBindingIndex or isinstance(
+        sidecar_sources, (str, bytes, bytearray, Mapping)
+    ):
+        raise _fail()
+    try:
+        raw_sources = tuple(sidecar_sources)
+        expected_identities = frozenset(binding_index)
+    except Exception:
+        raise _fail() from None
+    if not raw_sources or len(raw_sources) > len(expected_identities):
+        raise _fail()
+    observed_identities: set[SharedPhysicalArtifactIdentity] = set()
+    bound_sidecars: list[dict[str, Any]] = []
+    for source_entry in raw_sources:
+        if type(source_entry) is not tuple or len(source_entry) != 2:
+            raise _fail()
+        sidecar_by_field, physical_identity = source_entry
+        identity = _identity(physical_identity)
+        if identity in observed_identities or identity not in expected_identities:
+            raise _fail()
+        bound_by_field = bind_tax_sidecar_source_key(
+            sidecar_by_field,
+            physical_identity=identity,
+            binding_index=binding_index,
+        )
+        if bound_by_field.get("name") != _TAX_SIDECAR_NAME:
+            raise _fail()
+        observed_identities.add(identity)
+        bound_sidecars.append(bound_by_field)
+    if observed_identities != expected_identities:
+        raise _fail()
+    return tuple(bound_sidecars)
+
+
 bind_tax_identity_sidecar_to_rate_source = bind_tax_sidecar_source_key
+bind_tax_identity_sidecars_to_rate_sources = bind_tax_source_sidecars
 build_tax_identity_rate_source_binding_index = build_tax_source_bindings
 
 
@@ -271,7 +313,9 @@ __all__ = [
     "TaxIdentityRateSourceBinding",
     "TaxIdentityRateSourceBindingError",
     "bind_tax_identity_sidecar_to_rate_source",
+    "bind_tax_identity_sidecars_to_rate_sources",
     "bind_tax_sidecar_source_key",
+    "bind_tax_source_sidecars",
     "build_tax_identity_rate_source_binding_index",
     "build_tax_source_bindings",
 ]

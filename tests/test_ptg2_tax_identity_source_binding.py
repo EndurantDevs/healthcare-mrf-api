@@ -19,7 +19,9 @@ from process.ptg_parts.ptg2_tax_identity_source_binding import (
     TaxIdentityRateSourceBinding,
     TaxIdentityRateSourceBindingError,
     bind_tax_identity_sidecar_to_rate_source,
+    bind_tax_identity_sidecars_to_rate_sources,
     bind_tax_sidecar_source_key,
+    bind_tax_source_sidecars,
     build_tax_identity_rate_source_binding_index,
     build_tax_source_bindings,
 )
@@ -171,6 +173,88 @@ def test_non_tax_sidecar_is_copied_without_requiring_identity_or_index():
 def test_compatibility_exports_resolve_to_validated_implementations():
     assert bind_tax_identity_sidecar_to_rate_source is bind_tax_sidecar_source_key
     assert build_tax_identity_rate_source_binding_index is build_tax_source_bindings
+    assert bind_tax_identity_sidecars_to_rate_sources is bind_tax_source_sidecars
+
+
+def test_tax_sidecar_vector_requires_exact_source_coverage():
+    first = _assignment(0, "1")
+    second = _assignment(1, "2")
+    first_sidecar_by_field = {
+        "name": "provider_group_tax_identity",
+        "path": "first",
+    }
+    second_sidecar_by_field = {
+        "name": "provider_group_tax_identity",
+        "path": "second",
+    }
+
+    bound = bind_tax_source_sidecars(
+        (
+            (second_sidecar_by_field, second.identity),
+            (first_sidecar_by_field, first.identity.as_dict()),
+        ),
+        binding_index=build_tax_source_bindings((first, second)),
+    )
+
+    assert [entry["physical_source_binding"]["source_key"] for entry in bound] == [
+        1,
+        0,
+    ]
+    assert all(
+        "physical_source_binding" not in entry
+        for entry in (first_sidecar_by_field, second_sidecar_by_field)
+    )
+
+
+@pytest.mark.parametrize(
+    "source_entries",
+    [
+        (),
+        "not-a-source-vector",
+        {"not": "a-source-vector"},
+        (({"name": "provider_group_tax_identity"}, _identity("1")),),
+        (
+            ({"name": "provider_group_tax_identity"}, _identity("1")),
+            ({"name": "provider_group_tax_identity"}, _identity("1")),
+        ),
+        (
+            ({"name": "provider_group_tax_identity"}, _identity("1")),
+            ({"name": "provider_group_tax_identity"}, _identity("3")),
+        ),
+        (
+            ({"name": "provider_forward"}, _identity("1")),
+            ({"name": "provider_group_tax_identity"}, _identity("2")),
+        ),
+        (object(), object()),
+    ],
+)
+def test_tax_sidecar_vector_rejects_incomplete_or_ambiguous_coverage(
+    source_entries,
+):
+    index = build_tax_source_bindings((_assignment(0, "1"), _assignment(1, "2")))
+
+    with pytest.raises(TaxIdentityRateSourceBindingError, match=_error()):
+        bind_tax_source_sidecars(source_entries, binding_index=index)
+
+
+def test_tax_sidecar_vector_redacts_iterator_failure():
+    def failing_sources():
+        yield ({"name": "provider_group_tax_identity"}, _identity("1"))
+        raise RuntimeError("private vector detail")
+
+    with pytest.raises(TaxIdentityRateSourceBindingError) as raised:
+        bind_tax_source_sidecars(
+            failing_sources(),
+            binding_index=build_tax_source_bindings((_assignment(0, "1"),)),
+        )
+
+    assert str(raised.value) == _error()
+    assert "private vector detail" not in str(raised.value)
+
+
+def test_tax_sidecar_vector_rejects_untrusted_index():
+    with pytest.raises(TaxIdentityRateSourceBindingError, match=_error()):
+        bind_tax_source_sidecars((), binding_index=MappingProxyType({}))
 
 
 @pytest.mark.parametrize(
