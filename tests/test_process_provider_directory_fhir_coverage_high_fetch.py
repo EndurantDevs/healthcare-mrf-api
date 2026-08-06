@@ -99,6 +99,28 @@ async def test_fetch_resource_rows_tracks_partition_non_bundle_failures(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_fetch_resource_rows_records_transport_time(monkeypatch):
+    """Aggregate returned page-fetch durations for normal FHIR pagination."""
+    _patch_paged_fetch_defaults(monkeypatch, ["https://example.test/root"])
+    monkeypatch.setattr(
+        importer,
+        "_fetch_source_json",
+        AsyncMock(
+            return_value=(
+                200,
+                {"resourceType": "Bundle", "type": "searchset"},
+                None,
+                17,
+            )
+        ),
+    )
+
+    fetch_outcome = await _fetch_practitioner_rows()
+
+    assert fetch_outcome.source_fetch_elapsed_ms == 17
+
+
+@pytest.mark.asyncio
 async def test_fetch_resource_rows_expands_children_and_skips_unusable_entries(monkeypatch):
     root_url = "https://example.test/root"
     child_url = "https://example.test/child"

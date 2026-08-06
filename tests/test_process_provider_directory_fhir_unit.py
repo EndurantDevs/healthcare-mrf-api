@@ -20302,6 +20302,40 @@ async def test_fetch_resource_rows_streams_batches_without_retaining_rows(monkey
     assert resource_fetch_stats_by_type["Practitioner"]["sources_empty"] == 0
 
 
+def test_resource_stats_and_diagnostics_record_ingestion_timings():
+    """Keep per-resource transport and local-write timing totals observable."""
+    fetch_result = importer.ResourceFetchResult(
+        model=ProviderDirectoryPractitioner,
+        rows=[],
+        rows_fetched=4,
+        rows_written=4,
+        pages_fetched=2,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+        source_fetch_elapsed_ms=37,
+        stream_write_elapsed_seconds=1.25,
+        checkpoint_persist_elapsed_seconds=0.75,
+    )
+
+    diagnostic = importer._resource_fetch_diagnostic(fetch_result, rows_written=4)
+    stats_by_resource: dict[str, dict[str, Any]] = {}
+    importer._record_resource_fetch_stats(
+        stats_by_resource,
+        "Practitioner",
+        fetch_result,
+    )
+
+    assert diagnostic["source_fetch_elapsed_ms"] == 37
+    assert diagnostic["stream_write_elapsed_seconds"] == 1.25
+    assert diagnostic["checkpoint_persist_elapsed_seconds"] == 0.75
+    assert stats_by_resource["Practitioner"]["source_fetch_elapsed_ms"] == 37
+    assert stats_by_resource["Practitioner"]["stream_write_elapsed_seconds"] == 1.25
+    assert stats_by_resource["Practitioner"]["checkpoint_persist_elapsed_seconds"] == 0.75
+
+
 def _cigna_checkpoint_source():
     return {
         "source_id": "source_a",
@@ -21775,6 +21809,7 @@ async def _fetch_checkpointed_cigna_practitioners():
 
 def _assert_cooldown_recovery_observability(fetch_result):
     diagnostic = importer._resource_fetch_diagnostic(fetch_result, rows_written=1)
+    assert diagnostic["source_fetch_elapsed_ms"] == 5
     assert diagnostic["pagination_cooldown_retries"] == 1
     assert diagnostic["pagination_cooldown_wait_seconds"] == 4.0
     assert diagnostic["pagination_cooldown_recovered"] is True
@@ -21786,6 +21821,7 @@ def _assert_cooldown_recovery_observability(fetch_result):
         "Practitioner",
         fetch_result,
     )
+    assert stats_by_resource["Practitioner"]["source_fetch_elapsed_ms"] == 5
     assert stats_by_resource["Practitioner"]["pagination_cooldown_retries"] == 1
     assert stats_by_resource["Practitioner"]["pagination_cooldown_wait_seconds"] == 4.0
     assert (
