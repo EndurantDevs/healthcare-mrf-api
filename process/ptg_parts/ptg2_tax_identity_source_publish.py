@@ -20,6 +20,18 @@ from process.ptg_parts.ptg2_tax_identity_source_projection import (
     _fail,
     _strict_int,
 )
+from process.ptg_parts.ptg2_tax_identity_source_preflight import (
+    validate_staged_tax_identity_source_projection,
+)
+from process.ptg_parts.ptg2_tax_identity_source_target_preflight import (
+    lock_tax_identity_source_target_vector,
+    validate_tax_identity_source_target_aggregate,
+    validate_tax_identity_source_target_sources,
+)
+from process.ptg_parts.ptg2_tax_identity_source_stage import (
+    StagedTaxIdentitySourceProjection,
+    _drop_staged_tax_identity_source_projection,
+)
 from process.ptg_parts.ptg2_tax_identity_source_validation import (
     validate_merged_tax_identity_source_reduction,
     validate_stored_tax_identity_source_counts,
@@ -73,6 +85,7 @@ def _publication(
         unsupported_type_count=prepared.unsupported_type_count,
         content_digest=prepared.content_digest,
         artifact_byte_count=prepared.artifact_byte_count,
+        binding_vector_digest=prepared.binding_vector_digest,
     )
 
 
@@ -222,55 +235,128 @@ async def _publish_bindings(
         raise _fail()
 
 
+async def _validated_publication_stage(
+    session: Any,
+    *,
+    schema_name: str,
+    logical_snapshot_id: str,
+    snapshot_key: int,
+    staged: StagedTaxIdentitySourceProjection,
+    prepared: PreparedTaxIdentitySourceProjection,
+) -> tuple[str, int]:
+    stage, provider_group_count = await validate_staged_tax_identity_source_projection(
+        session,
+        staged=staged,
+        prepared=prepared,
+    )
+    await validate_tax_identity_source_target_aggregate(
+        session,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        prepared=prepared,
+        provider_group_count=provider_group_count,
+    )
+    await validate_tax_identity_source_target_sources(
+        session,
+        schema_name=schema_name,
+        logical_snapshot_id=logical_snapshot_id,
+        prepared=prepared,
+    )
+    return stage, provider_group_count
+
+
+async def _publish_and_validate_source_rows(
+    session: Any,
+    *,
+    schema: str,
+    stage: str,
+    snapshot_key: int,
+    prepared: PreparedTaxIdentitySourceProjection,
+    heartbeat_callback: Callable[[], None] | None,
+) -> None:
+    await _publish_manifest(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        prepared=prepared,
+    )
+    await _publish_bindings(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        prepared=prepared,
+        heartbeat_callback=heartbeat_callback,
+    )
+    await _publish_observations(
+        session,
+        schema=schema,
+        stage=stage,
+        snapshot_key=snapshot_key,
+        prepared=prepared,
+        heartbeat_callback=heartbeat_callback,
+    )
+    await validate_stored_tax_identity_source_counts(
+        session,
+        schema=schema,
+        stage=stage,
+        snapshot_key=snapshot_key,
+        prepared=prepared,
+    )
+    await validate_merged_tax_identity_source_reduction(
+        session,
+        schema=schema,
+        stage=stage,
+        snapshot_key=snapshot_key,
+        heartbeat_callback=heartbeat_callback,
+    )
+
+
 async def publish_staged_tax_identity_source_projection(
     session: Any,
     *,
     schema_name: str,
+    logical_snapshot_id: str,
     snapshot_key: int,
-    stage_table: str,
+    staged: StagedTaxIdentitySourceProjection,
     prepared: PreparedTaxIdentitySourceProjection,
     heartbeat_callback: Callable[[], None] | None = None,
 ) -> TaxIdentitySourcePublication:
     """Publish the complete immutable source bundle in the caller transaction."""
 
     schema = _quote_ident(schema_name)
-    stage = f'{_quote_ident("pg_temp")}.{_quote_ident(stage_table)}'
     try:
-        await _publish_manifest(
+        stage, provider_group_count = await _validated_publication_stage(
             session,
-            schema=schema,
+            schema_name=schema_name,
+            logical_snapshot_id=logical_snapshot_id,
             snapshot_key=snapshot_key,
+            staged=staged,
             prepared=prepared,
         )
-        await _publish_bindings(
-            session,
-            schema=schema,
-            snapshot_key=snapshot_key,
-            prepared=prepared,
-            heartbeat_callback=heartbeat_callback,
-        )
-        await _publish_observations(
-            session,
-            schema=schema,
-            stage=stage,
-            snapshot_key=snapshot_key,
-            prepared=prepared,
-            heartbeat_callback=heartbeat_callback,
-        )
-        await validate_stored_tax_identity_source_counts(
-            session,
-            schema=schema,
-            stage=stage,
-            snapshot_key=snapshot_key,
-            prepared=prepared,
-        )
-        await validate_merged_tax_identity_source_reduction(
-            session,
-            schema=schema,
-            stage=stage,
-            snapshot_key=snapshot_key,
-            heartbeat_callback=heartbeat_callback,
-        )
+        async with session.begin_nested():
+            await _publish_and_validate_source_rows(
+                session,
+                schema=schema,
+                stage=stage,
+                snapshot_key=snapshot_key,
+                prepared=prepared,
+                heartbeat_callback=heartbeat_callback,
+            )
+            await lock_tax_identity_source_target_vector(
+                session,
+                schema_name=schema_name,
+                logical_snapshot_id=logical_snapshot_id,
+                prepared=prepared,
+            )
+            await validate_tax_identity_source_target_aggregate(
+                session,
+                schema_name=schema_name,
+                snapshot_key=snapshot_key,
+                prepared=prepared,
+                provider_group_count=provider_group_count,
+                lock_for_update=True,
+            )
+            await _drop_staged_tax_identity_source_projection(session, staged)
         return _publication(prepared)
     except TaxIdentitySourceProjectionError:
         raise

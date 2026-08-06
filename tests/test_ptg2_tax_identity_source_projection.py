@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
-import hashlib
-import os
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from process.ptg_parts import ptg2_tax_identity_source_observations as observations
+from process.ptg_parts import ptg2_tax_identity_source_preflight as source_preflight
 from process.ptg_parts import ptg2_tax_identity_source_stage as source_stage
+from process.ptg_parts import (
+    ptg2_tax_identity_source_target_preflight as target_preflight,
+)
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
     TaxIdentitySourceProjectionError,
 )
@@ -23,8 +26,68 @@ from tests.test_ptg2_tax_identity_source_artifact import (
 )
 
 
+def _stage_handle() -> source_stage.StagedTaxIdentitySourceProjection:
+    seal_token = "a" * 32
+    table_name = f"ptg2_tax_source_stage_{seal_token[:20]}"
+    return source_stage.StagedTaxIdentitySourceProjection(
+        table_name=table_name,
+        seal_table_name=f"{table_name}_seal",
+        stage_oid=11,
+        seal_oid=12,
+        seal_token=seal_token,
+    )
+
+
+@pytest.mark.parametrize(
+    "source_ordinal_map",
+    [
+        [{"shard_id": "shard-a", "ordinal": False}],
+        [{"shard_id": "shard-a", "ordinal": 0.0}],
+        [{"shard_id": "shard-a", "ordinal": 0, "extra": True}],
+        [
+            {"shard_id": "shard-a", "ordinal": 0},
+            {"shard_id": "shard-a", "ordinal": 1},
+        ],
+        [
+            {"shard_id": "shard-b", "ordinal": 0},
+            {"shard_id": "shard-a", "ordinal": 1},
+        ],
+    ],
+    ids=("bool", "float", "extra", "duplicate", "unsorted"),
+)
+def test_fresh_aggregate_source_map_is_schema_strict(source_ordinal_map):
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        target_preflight.normalize_source_ordinal_entries(source_ordinal_map)
+
+
+def test_stage_handle_requires_exact_dataclass_and_integer_oids():
+    class StagedSubclass(source_stage.StagedTaxIdentitySourceProjection):
+        pass
+
+    class IntegerSubclass(int):
+        pass
+
+    handle = _stage_handle()
+    subclass_handle = StagedSubclass(
+        table_name=handle.table_name,
+        seal_table_name=handle.seal_table_name,
+        stage_oid=handle.stage_oid,
+        seal_oid=handle.seal_oid,
+        seal_token=handle.seal_token,
+    )
+
+    assert source_preflight._validated_stage_handle(handle) is handle
+    for invalid_handle in (
+        subclass_handle,
+        replace(handle, stage_oid=IntegerSubclass(handle.stage_oid)),
+        replace(handle, seal_oid=IntegerSubclass(handle.seal_oid)),
+    ):
+        with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+            source_preflight._validated_stage_handle(invalid_handle)
+
+
 @pytest.mark.asyncio
-async def test_stage_rejects_same_content_copy_replacement(tmp_path):
+async def test_stage_streams_authenticated_copy_once(tmp_path):
     sidecar = _sidecar(
         tmp_path,
         source_key=0,
@@ -33,20 +96,52 @@ async def test_stage_rejects_same_content_copy_replacement(tmp_path):
         sidecar_records=(_record(1, 2),),
     )
     prepared = _prepare(tmp_path, (sidecar,))
-    copy_bytes = prepared.copy_path.read_bytes()
-    replacement_path = tmp_path / "replacement.copy"
-    replacement_path.write_bytes(copy_bytes)
-    os.utime(
-        replacement_path,
-        ns=(prepared.copy_mtime_ns, prepared.copy_mtime_ns),
+    consumed_chunks: list[bytes] = []
+
+    async def copy_to_table(_table_name, *, source, **_kwargs):
+        while copy_chunk := source.read(11):
+            consumed_chunks.append(copy_chunk)
+
+    copy_driver = SimpleNamespace(copy_to_table=AsyncMock(side_effect=copy_to_table))
+    raw_connection = SimpleNamespace(driver_connection=copy_driver)
+    connection = SimpleNamespace(
+        get_raw_connection=AsyncMock(return_value=raw_connection)
     )
-    os.replace(replacement_path, prepared.copy_path)
-    replacement_metadata = prepared.copy_path.stat()
-    assert hashlib.sha256(copy_bytes).hexdigest() == prepared.copy_sha256
-    assert replacement_metadata.st_size == prepared.copy_byte_count
-    assert replacement_metadata.st_mtime_ns == prepared.copy_mtime_ns
-    assert replacement_metadata.st_ino != prepared.copy_inode
-    session = SimpleNamespace(connection=AsyncMock())
+    session = SimpleNamespace(connection=AsyncMock(return_value=connection))
+
+    await source_stage._copy_prepared_projection(
+        session,
+        prepared,
+        stage_table="source_stage",
+    )
+
+    assert sum(map(len, consumed_chunks)) == prepared.copy_byte_count
+    assert copy_driver.copy_to_table.await_count == 1
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        await source_stage._copy_prepared_projection(
+            session,
+            prepared,
+            stage_table="source_stage",
+        )
+    assert copy_driver.copy_to_table.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_rejects_copy_consumer_that_stops_before_eof(tmp_path):
+    sidecar = _sidecar(
+        tmp_path,
+        source_key=0,
+        shard_id="file:a",
+        identity_digit="9",
+        sidecar_records=(_record(1, 2),),
+    )
+    prepared = _prepare(tmp_path, (sidecar,))
+    copy_driver = SimpleNamespace(copy_to_table=AsyncMock(return_value=None))
+    raw_connection = SimpleNamespace(driver_connection=copy_driver)
+    connection = SimpleNamespace(
+        get_raw_connection=AsyncMock(return_value=raw_connection)
+    )
+    session = SimpleNamespace(connection=AsyncMock(return_value=connection))
 
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         await source_stage._copy_prepared_projection(
@@ -55,8 +150,7 @@ async def test_stage_rejects_same_content_copy_replacement(tmp_path):
             stage_table="source_stage",
         )
 
-    session.connection.assert_not_awaited()
-    prepared.cleanup()
+    assert copy_driver.copy_to_table.await_count == 1
 
 
 @pytest.mark.asyncio

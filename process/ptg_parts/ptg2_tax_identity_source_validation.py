@@ -4,10 +4,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+import hmac
 from typing import Any
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_tax_identity_source_aggregate_reuse import (
+    validate_reused_tax_identity_aggregate_manifest,
+)
+from process.ptg_parts.ptg2_tax_identity_source_binding_vector import (
+    PTG2_TAX_IDENTITY_SOURCE_BINDING_VECTOR_CONTRACT,
+    tax_identity_source_binding_vector_digest,
+)
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
     PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT,
     PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT,
@@ -22,6 +30,24 @@ from process.ptg_parts.ptg2_tax_identity_source_projection import (
 )
 
 _VALIDATION_BATCH_ROWS = 10_000
+_BINDING_FIELDS = (
+    "source_key",
+    "source_type",
+    "identity_kind",
+    "identity_sha256",
+    "token_policy_id",
+    "token_policy_descriptor_sha256",
+    "record_format",
+    "format_version",
+    "record_bytes",
+    "artifact_sha256",
+    "artifact_byte_count",
+    "provider_group_count",
+    "matched_ein_count",
+    "missing_count",
+    "malformed_count",
+    "unsupported_type_count",
+)
 
 
 async def validate_stored_tax_identity_source_counts(
@@ -204,6 +230,8 @@ def _publication_from_metadata(
             != PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT
             or metadata_by_field.get("binding_contract")
             != PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT
+            or metadata_by_field.get("binding_vector_contract")
+            != PTG2_TAX_IDENTITY_SOURCE_BINDING_VECTOR_CONTRACT
         ):
             raise _fail()
         return TaxIdentitySourcePublication(
@@ -229,6 +257,9 @@ def _publication_from_metadata(
             ),
             artifact_byte_count=_strict_int(
                 metadata_by_field.get("artifact_byte_count")
+            ),
+            binding_vector_digest=bytes.fromhex(
+                _strict_sha256(metadata_by_field.get("binding_vector_digest"))
             ),
         )
     except TaxIdentitySourceProjectionError:
@@ -318,11 +349,13 @@ async def _validate_reused_bindings(
     schema: str,
     snapshot_key: int,
     expected_bindings: Iterable[Mapping[str, Any]],
+    expected_artifact_byte_count: int,
+    expected_binding_vector_digest: bytes,
 ) -> None:
     stored_bindings = (
         await session.execute(
             db.text(f"""
-                SELECT source_key, source_type, identity_kind, identity_sha256
+                SELECT {", ".join(_BINDING_FIELDS)}
                   FROM {schema}.ptg2_provider_tax_identity_source_binding
                  WHERE snapshot_key = :snapshot_key
                  ORDER BY source_key
@@ -330,10 +363,25 @@ async def _validate_reused_bindings(
             {"snapshot_key": _strict_int(snapshot_key)},
         )
     ).all()
-    stored_binding_values = tuple(
-        tuple(stored_binding) for stored_binding in stored_bindings
+    stored_binding_records = tuple(
+        dict(zip(_BINDING_FIELDS, stored_binding)) for stored_binding in stored_bindings
     )
-    if stored_binding_values != _expected_binding_values(expected_bindings):
+    stored_identity_values = tuple(
+        tuple(binding_by_field[field_name] for field_name in _BINDING_FIELDS[:4])
+        for binding_by_field in stored_binding_records
+    )
+    stored_artifact_byte_count = sum(
+        int(binding_by_field["artifact_byte_count"])
+        for binding_by_field in stored_binding_records
+    )
+    if (
+        stored_identity_values != _expected_binding_values(expected_bindings)
+        or stored_artifact_byte_count != expected_artifact_byte_count
+        or not hmac.compare_digest(
+            tax_identity_source_binding_vector_digest(stored_binding_records),
+            expected_binding_vector_digest,
+        )
+    ):
         raise _fail()
 
 
@@ -383,6 +431,7 @@ async def validate_reused_tax_identity_source_projection(
     snapshot_key: int,
     expected_bindings: Iterable[Mapping[str, Any]],
     sealed_metadata: Mapping[str, Any],
+    aggregate_metadata: Mapping[str, Any],
 ) -> TaxIdentitySourcePublication:
     """Validate sealed pathless evidence without rescanning deleted sidecars."""
 
@@ -396,6 +445,12 @@ async def validate_reused_tax_identity_source_projection(
             await _validate_reused_layout_state(
                 session, schema=schema, snapshot_key=snapshot_key
             )
+            await validate_reused_tax_identity_aggregate_manifest(
+                session,
+                schema_name=schema_name,
+                snapshot_key=snapshot_key,
+                sealed_metadata=aggregate_metadata,
+            )
             await _validate_reused_manifest(
                 session,
                 schema=schema,
@@ -407,6 +462,8 @@ async def validate_reused_tax_identity_source_projection(
                 schema=schema,
                 snapshot_key=snapshot_key,
                 expected_bindings=bindings,
+                expected_artifact_byte_count=expected.artifact_byte_count,
+                expected_binding_vector_digest=expected.binding_vector_digest,
             )
             await _validate_reused_observation_counts(
                 session,
