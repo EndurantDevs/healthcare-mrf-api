@@ -94,6 +94,73 @@ async def test_guarded_ptg_ensure_rejects_conflicting_source_aliases(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    ("canceling", "succeeded", "failed", "canceled", "dead_letter"),
+)
+async def test_guarded_fhir_ensure_rejects_non_launchable_control_status(
+    monkeypatch,
+    status,
+):
+    async def admit(**kwargs):
+        assert kwargs["worker_selection"].allowed_importers == frozenset(
+            {"provider-directory-fhir"}
+        )
+        return {
+            "importer": "provider-directory-fhir",
+            "status": status,
+        }
+
+    def should_not_launch(_worker_payload):
+        raise AssertionError("non-launchable FHIR run must not start a worker")
+
+    monkeypatch.setattr(
+        control_workers,
+        "admit_existing_outer_run_action",
+        admit,
+    )
+    monkeypatch.setattr(control_workers, "ensure_worker", should_not_launch)
+
+    response = await control_workers.guarded_ensure_worker(
+        {
+            "run_id": "run_provider_directory_terminal",
+            "importer": "provider-directory-fhir",
+        }
+    )
+
+    assert response["status"] == "failed"
+    assert response["message"] == f"control run is not launchable: {status}"
+
+
+@pytest.mark.asyncio
+async def test_guarded_fhir_ensure_allows_running_control_status(monkeypatch):
+    async def admit(**_kwargs):
+        return {
+            "importer": "provider-directory-fhir",
+            "status": "running",
+        }
+
+    def ensure(_worker_payload):
+        return {"status": "already_running", "items": []}
+
+    monkeypatch.setattr(
+        control_workers,
+        "admit_existing_outer_run_action",
+        admit,
+    )
+    monkeypatch.setattr(control_workers, "ensure_worker", ensure)
+
+    response = await control_workers.guarded_ensure_worker(
+        {
+            "run_id": "run_provider_directory_running",
+            "importer": "provider-directory-fhir",
+        }
+    )
+
+    assert response["status"] == "already_running"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("request_importer", [None, "claims-pricing"])
 async def test_ptg_run_rejects_non_ptg_worker_selector(
     monkeypatch,
