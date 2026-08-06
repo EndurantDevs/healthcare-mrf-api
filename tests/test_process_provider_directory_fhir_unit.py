@@ -20910,6 +20910,11 @@ def test_resource_stats_and_diagnostics_record_ingestion_timings():
         source_fetch_elapsed_ms=37,
         stream_write_elapsed_seconds=1.25,
         checkpoint_persist_elapsed_seconds=0.75,
+        page_prefetch_eligible=True,
+        page_prefetch_started=2,
+        page_prefetch_consumed=1,
+        page_prefetch_discarded=1,
+        page_prefetch_wait_seconds=0.2,
     )
 
     diagnostic = importer._resource_fetch_diagnostic(fetch_result, rows_written=4)
@@ -20923,9 +20928,19 @@ def test_resource_stats_and_diagnostics_record_ingestion_timings():
     assert diagnostic["source_fetch_elapsed_ms"] == 37
     assert diagnostic["stream_write_elapsed_seconds"] == 1.25
     assert diagnostic["checkpoint_persist_elapsed_seconds"] == 0.75
+    assert diagnostic["page_prefetch_eligible"] is True
+    assert diagnostic["page_prefetch_started"] == 2
+    assert diagnostic["page_prefetch_consumed"] == 1
+    assert diagnostic["page_prefetch_discarded"] == 1
+    assert diagnostic["page_prefetch_wait_seconds"] == 0.2
     assert stats_by_resource["Practitioner"]["source_fetch_elapsed_ms"] == 37
     assert stats_by_resource["Practitioner"]["stream_write_elapsed_seconds"] == 1.25
     assert stats_by_resource["Practitioner"]["checkpoint_persist_elapsed_seconds"] == 0.75
+    assert stats_by_resource["Practitioner"]["page_prefetch_eligible_sources"] == 1
+    assert stats_by_resource["Practitioner"]["page_prefetch_started"] == 2
+    assert stats_by_resource["Practitioner"]["page_prefetch_consumed"] == 1
+    assert stats_by_resource["Practitioner"]["page_prefetch_discarded"] == 1
+    assert stats_by_resource["Practitioner"]["page_prefetch_wait_seconds"] == 0.2
 
 
 def _cigna_checkpoint_source():
@@ -21085,6 +21100,237 @@ def _checkpoint_page_callbacks(
         )
 
     return load_checkpoint, fetch_source_json
+
+
+@contextlib.contextmanager
+def _source_http_test_session(session=None):
+    session = session or SimpleNamespace(closed=False)
+    token = importer._SOURCE_HTTP_SESSION.set(session)
+    try:
+        yield session
+    finally:
+        importer._SOURCE_HTTP_SESSION.reset(token)
+
+
+class _RestPageHarness:
+    """Drive a neutral two- or three-page checkpointed REST scan."""
+
+    def __init__(self, monkeypatch, *, pages=2, prefetch=True):
+        assert pages in {2, 3}
+        base = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner"
+        self.urls = [f"{base}?_count=100"] + [
+            f"{base}?_getpages=page-{number}&_count=100"
+            for number in range(2, pages + 1)
+        ]
+        self.responses = {
+            url: (
+                200,
+                _practitioner_search_bundle(
+                    f"prac-{index + 1}",
+                    self.urls[index + 1] if index + 1 < pages else None,
+                ),
+                None,
+                5,
+            )
+            for index, url in enumerate(self.urls)
+        }
+        self.source_session = SimpleNamespace(closed=False)
+        self.requests = []
+        self.request_timeouts = []
+        self.write_attempts = []
+        self.checkpoints = []
+        self.events = []
+        self.fetch_started = [asyncio.Event() for _ in self.urls]
+        self.fetch_cancelled = [asyncio.Event() for _ in self.urls]
+        self.active_fetches = 0
+        self.max_active_fetches = 0
+        self.fetch_hook = self.write_hook = self.checkpoint_hook = None
+        self.deadline_seconds = 0
+        monkeypatch.setenv(
+            importer.SOURCE_HTTP_PAGE_PREFETCH_ENV,
+            "true" if prefetch else "false",
+        )
+        monkeypatch.setattr(
+            importer,
+            "_load_or_initialize_pagination_checkpoint",
+            self._load_checkpoint,
+        )
+        monkeypatch.setattr(importer, "_fetch_source_json", self._fetch_page)
+        monkeypatch.setattr(
+            importer,
+            "_save_pagination_checkpoint",
+            self._save_checkpoint,
+        )
+
+    async def _load_checkpoint(self, _context, resource_type, request_url):
+        assert (resource_type, request_url) == ("Practitioner", self.urls[0])
+        return importer.PaginationResumeState(self.urls[0], 0, 0, ())
+
+    async def _fetch_page(self, source, request_url, *, timeout):
+        assert source == _cigna_checkpoint_source()
+        page_index = self.urls.index(request_url)
+        assert timeout == 3 or (self.deadline_seconds and 0 < timeout <= 3)
+        self.requests.append(request_url)
+        self.request_timeouts.append(timeout)
+        self.fetch_started[page_index].set()
+        self.active_fetches += 1
+        self.max_active_fetches = max(self.max_active_fetches, self.active_fetches)
+        self.events.append(("fetch_start", request_url))
+        try:
+            if self.fetch_hook:
+                await self.fetch_hook(page_index)
+            await asyncio.sleep(0)
+            return self.responses[request_url]
+        except asyncio.CancelledError:
+            self.fetch_cancelled[page_index].set()
+            raise
+        finally:
+            self.events.append(("fetch_end", request_url))
+            self.active_fetches -= 1
+
+    async def _write_rows(self, _model, rows):
+        resource_ids = [row["resource_id"] for row in rows]
+        self.write_attempts.append(resource_ids)
+        self.events.append(("write_start", resource_ids))
+        if self.write_hook:
+            await self.write_hook(resource_ids)
+        self.events.append(("write_end", resource_ids))
+        return len(rows)
+
+    async def _save_checkpoint(self, _context, _resource_type, **checkpoint):
+        self.checkpoints.append(checkpoint)
+        self.events.append(("checkpoint", checkpoint["next_url"]))
+        if self.checkpoint_hook:
+            await self.checkpoint_hook(checkpoint)
+
+    async def run(self, *, deadline_seconds=0):
+        self.deadline_seconds = deadline_seconds
+        with _source_http_test_session(self.source_session):
+            return await importer._fetch_resource_rows(
+                _cigna_checkpoint_source(),
+                "Practitioner",
+                per_resource_limit=0,
+                page_limit=0,
+                page_count=100,
+                timeout=3,
+                run_id="run_1",
+                row_batch_handler=self._write_rows,
+                row_batch_size=1000,
+                retain_rows=False,
+                deadline_seconds=deadline_seconds,
+                pagination_checkpoint=_cigna_checkpoint_context("run_1"),
+            )
+
+    @property
+    def checkpoint_urls(self):
+        return [checkpoint["next_url"] for checkpoint in self.checkpoints]
+
+
+def _assert_no_rest_page_prefetch_task():
+    assert not any(
+        task.get_name() == "provider-directory-rest-page-prefetch"
+        and not task.done()
+        for task in asyncio.all_tasks()
+    )
+
+
+def test_rest_page_prefetch_eligibility_fails_closed(monkeypatch):
+    source_record = _cigna_checkpoint_source()
+    options_by_name = {
+        "checkpoint_context": _cigna_checkpoint_context("run_1"),
+        "start_url_count": 1,
+        "is_partitioned_fetch": False,
+        "row_batch_handler": AsyncMock(return_value=1),
+        "row_batch_size": 1000,
+        "retain_rows": False,
+        "per_resource_limit": 0,
+        "page_limit": 0,
+    }
+    credential_spec = Mock(return_value={})
+    declared_credentialed = Mock(return_value=False)
+    monkeypatch.setattr(importer, "_credential_spec_for_source", credential_spec)
+    monkeypatch.setattr(
+        importer, "_has_source_declared_credentialed_access", declared_credentialed
+    )
+
+    def is_eligible(*, selected_source=source_record, **overrides):
+        return importer._is_rest_page_prefetch_eligible(
+            selected_source,
+            f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100",
+            importer.RestPagePrefetchEligibility(
+                **(options_by_name | overrides)
+            ),
+        )
+
+    monkeypatch.delenv(importer.SOURCE_HTTP_PAGE_PREFETCH_ENV, raising=False)
+    with _source_http_test_session():
+        assert is_eligible() is False
+        monkeypatch.setenv(importer.SOURCE_HTTP_PAGE_PREFETCH_ENV, "true")
+        assert is_eligible() is True
+        for override in (
+            {"checkpoint_context": None},
+            {"start_url_count": 2},
+            {"is_partitioned_fetch": True},
+            {"row_batch_handler": None},
+            {"row_batch_size": 0},
+            {"retain_rows": True},
+            {"per_resource_limit": 1},
+            {"page_limit": 1},
+        ):
+            assert is_eligible(**override) is False, override
+        assert is_eligible(
+            selected_source={
+                "source_id": "other",
+                "api_base": "https://example.test/fhir",
+                "canonical_api_base": "https://example.test/fhir",
+            }
+        ) is False
+        credential_spec.return_value = {"oauth2": {"client_id": "configured"}}
+        assert is_eligible() is False
+        credential_spec.return_value = {}
+        declared_credentialed.return_value = True
+        assert is_eligible() is False
+    assert is_eligible() is False
+
+
+@pytest.mark.asyncio
+async def test_rest_page_prefetch_pins_anonymous_transport(monkeypatch):
+    request_url = (
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?"
+        "_getpages=opaque&_count=100"
+    )
+    source_session = SimpleNamespace(closed=False)
+    credential_spec = Mock(return_value={})
+    anonymous_fetch = AsyncMock(
+        return_value=(200, _practitioner_search_bundle("prac-1"), None, 5)
+    )
+    monkeypatch.setattr(importer, "_credential_spec_for_source", credential_spec)
+    monkeypatch.setattr(
+        importer, "_has_source_declared_credentialed_access", Mock(return_value=False)
+    )
+    monkeypatch.setattr(
+        importer,
+        "_credential_request_options_for_source",
+        Mock(side_effect=AssertionError("credential transport was recomputed")),
+    )
+    monkeypatch.setattr(importer, "_fetch_json_with_source_session", anonymous_fetch)
+    with _source_http_test_session(source_session):
+        selected_session = importer._rest_page_prefetch_session(
+            _cigna_checkpoint_source(), request_url
+        )
+        assert selected_session is source_session
+        credential_spec.return_value = {
+            "oauth2": {"client_id": "configured-after-selection"}
+        }
+        fetch_result = await importer._fetch_source_json_pinned_session(
+            _cigna_checkpoint_source(),
+            request_url,
+            timeout=3,
+            session=selected_session,
+        )
+
+    assert fetch_result[0] == 200
+    anonymous_fetch.assert_awaited_once_with(source_session, request_url, timeout=3)
 
 
 def _expired_resume_callbacks(
@@ -22203,6 +22449,313 @@ async def test_fetch_resource_rows_checkpoints_only_after_page_write(monkeypatch
         ("write", ["prac-2"]),
         ("checkpoint", None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_prefetches_during_checkpoint_write(
+    monkeypatch,
+):
+    """Overlap one trusted next request without overlapping requests or writes."""
+    page_scan = _RestPageHarness(monkeypatch)
+
+    async def wait_for_page_two(resource_ids):
+        assert resource_ids in (["prac-1"], ["prac-2"])
+        if resource_ids == ["prac-1"]:
+            await asyncio.wait_for(page_scan.fetch_started[1].wait(), timeout=1)
+
+    page_scan.write_hook = wait_for_page_two
+    fetch_result = await page_scan.run()
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.rows_fetched == 2
+    assert fetch_result.rows_written == 2
+    assert fetch_result.page_prefetch_eligible is True
+    assert fetch_result.page_prefetch_started == 1
+    assert fetch_result.page_prefetch_consumed == 1
+    assert fetch_result.page_prefetch_discarded == 0
+    assert fetch_result.page_prefetch_wait_seconds >= 0
+    assert page_scan.max_active_fetches == 1
+    assert page_scan.events.index(("write_start", ["prac-1"])) < page_scan.events.index(
+        ("fetch_start", page_scan.urls[1])
+    )
+    assert page_scan.events.index(("fetch_start", page_scan.urls[1])) < page_scan.events.index(
+        ("write_end", ["prac-1"])
+    )
+    assert page_scan.events.index(("write_end", ["prac-1"])) < page_scan.events.index(
+        ("checkpoint", page_scan.urls[1])
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_keeps_page_reads_sequential_by_default(monkeypatch):
+    page_scan = _RestPageHarness(monkeypatch, prefetch=False)
+    fetch_result = await page_scan.run()
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert page_scan.events == [
+        ("fetch_start", page_scan.urls[0]),
+        ("fetch_end", page_scan.urls[0]),
+        ("write_start", ["prac-1"]),
+        ("write_end", ["prac-1"]),
+        ("checkpoint", page_scan.urls[1]),
+        ("fetch_start", page_scan.urls[1]),
+        ("fetch_end", page_scan.urls[1]),
+        ("write_start", ["prac-2"]),
+        ("write_end", ["prac-2"]),
+        ("checkpoint", None),
+    ]
+
+
+@pytest.mark.parametrize("failure_stage", ("write", "checkpoint"))
+@pytest.mark.asyncio
+async def test_rest_page_prefetch_is_cancelled_on_persistence_failure(
+    monkeypatch,
+    failure_stage,
+):
+    page_scan = _RestPageHarness(monkeypatch)
+    hold_page_two = asyncio.Event()
+
+    async def hold_speculative_fetch(page_index):
+        if page_index == 1:
+            await hold_page_two.wait()
+            raise AssertionError("held speculative request unexpectedly released")
+
+    async def fail_write(_resource_ids):
+        await asyncio.wait_for(page_scan.fetch_started[1].wait(), timeout=1)
+        if failure_stage == "write":
+            raise RuntimeError("synthetic page persistence failure")
+
+    async def fail_checkpoint(checkpoint):
+        assert checkpoint["next_url"] == page_scan.urls[1]
+        if failure_stage == "checkpoint":
+            raise RuntimeError("synthetic checkpoint persistence failure")
+
+    page_scan.fetch_hook = hold_speculative_fetch
+    page_scan.write_hook = fail_write
+    page_scan.checkpoint_hook = fail_checkpoint
+    with pytest.raises(RuntimeError, match="synthetic .* persistence failure"):
+        await asyncio.wait_for(page_scan.run(), timeout=2)
+
+    assert page_scan.fetch_started[1].is_set()
+    assert page_scan.fetch_cancelled[1].is_set()
+    _assert_no_rest_page_prefetch_task()
+
+
+@pytest.mark.asyncio
+async def test_rest_page_prefetch_is_cancelled_with_import_task(monkeypatch):
+    page_scan = _RestPageHarness(monkeypatch)
+    write_blocked = asyncio.Event()
+    hold_operation = asyncio.Event()
+
+    async def hold_speculative_fetch(page_index):
+        if page_index == 1:
+            await hold_operation.wait()
+            raise AssertionError("held speculative request unexpectedly released")
+
+    async def block_write(resource_ids):
+        assert resource_ids == ["prac-1"]
+        await asyncio.wait_for(page_scan.fetch_started[1].wait(), timeout=1)
+        write_blocked.set()
+        await hold_operation.wait()
+        raise AssertionError("held page write unexpectedly released")
+
+    page_scan.fetch_hook = hold_speculative_fetch
+    page_scan.write_hook = block_write
+    import_task = asyncio.create_task(page_scan.run())
+    await asyncio.wait_for(write_blocked.wait(), timeout=1)
+    import_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(import_task, timeout=1)
+
+    assert page_scan.fetch_cancelled[1].is_set()
+    _assert_no_rest_page_prefetch_task()
+
+
+@pytest.mark.asyncio
+async def test_rest_page_prefetch_discards_next_page_after_resource_deadline(
+    monkeypatch,
+):
+    page_scan = _RestPageHarness(monkeypatch)
+    hold_page_two = asyncio.Event()
+
+    async def hold_speculative_fetch(page_index):
+        if page_index == 1:
+            await hold_page_two.wait()
+            raise AssertionError("held speculative request unexpectedly released")
+
+    page_scan.fetch_hook = hold_speculative_fetch
+    started_at = asyncio.get_running_loop().time()
+    fetch_result = await asyncio.wait_for(
+        page_scan.run(deadline_seconds=2),
+        timeout=4,
+    )
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.deadline_reached is True
+    assert fetch_result.pages_fetched == 1
+    assert fetch_result.rows_fetched == 1
+    assert fetch_result.rows_written == 1
+    assert fetch_result.page_prefetch_eligible is True
+    assert fetch_result.page_prefetch_started == 1
+    assert fetch_result.page_prefetch_consumed == 0
+    assert fetch_result.page_prefetch_discarded == 1
+    assert elapsed >= 1
+    assert page_scan.requests == page_scan.urls
+    assert page_scan.request_timeouts == [3, 2]
+    assert page_scan.write_attempts == [["prac-1"]]
+    assert page_scan.checkpoint_urls == [page_scan.urls[1]]
+    assert page_scan.fetch_cancelled[1].is_set()
+    _assert_no_rest_page_prefetch_task()
+
+
+@pytest.mark.asyncio
+async def test_rest_page_prefetch_matches_sequential_result_and_checkpoints(
+    monkeypatch,
+):
+    cases = []
+    for prefetch_enabled in (False, True):
+        page_scan = _RestPageHarness(
+            monkeypatch, pages=3, prefetch=prefetch_enabled
+        )
+        fetch_result = await page_scan.run()
+        assert fetch_result is not None
+        result_fields = (
+            "rows",
+            "rows_fetched",
+            "rows_written",
+            "pages_fetched",
+            "complete",
+            "error",
+            "fetch_mode",
+            "source_fetch_elapsed_ms",
+        )
+        cases.append(
+            (
+                {field: getattr(fetch_result, field) for field in result_fields},
+                page_scan.requests,
+                page_scan.write_attempts,
+                page_scan.checkpoints,
+                page_scan.max_active_fetches,
+            )
+        )
+
+    assert cases[1] == cases[0]
+    assert page_scan.requests == page_scan.urls
+    assert page_scan.max_active_fetches == 1
+    assert page_scan.checkpoint_urls == [*page_scan.urls[1:], None]
+
+
+@pytest.mark.parametrize(
+    ("continuation_kind", "expected_error", "expected_checkpoints"),
+    (
+        ("untrusted", "untrusted_pagination_link", []),
+        ("repeated", "pagination loop detected", ["start"]),
+    ),
+)
+@pytest.mark.asyncio
+async def test_rest_page_prefetch_rejects_unsafe_continuations_before_launch(
+    monkeypatch,
+    continuation_kind,
+    expected_error,
+    expected_checkpoints,
+):
+    page_scan = _RestPageHarness(monkeypatch)
+    next_url = (
+        "https://untrusted.example/fhir/Practitioner?_getpages=opaque"
+        if continuation_kind == "untrusted"
+        else page_scan.urls[0]
+    )
+    page_scan.responses[page_scan.urls[0]] = (
+        200,
+        _practitioner_search_bundle("prac-1", next_url),
+        None,
+        5,
+    )
+    fetch_result = await page_scan.run()
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == expected_error
+    assert page_scan.requests == [page_scan.urls[0]]
+    assert page_scan.checkpoint_urls == [
+        page_scan.urls[0] if value == "start" else value
+        for value in expected_checkpoints
+    ]
+    _assert_no_rest_page_prefetch_task()
+
+
+@pytest.mark.asyncio
+async def test_prefetched_page_uses_existing_cooldown_path(monkeypatch):
+    page_scan = _RestPageHarness(monkeypatch)
+    locked_result = (
+        423,
+        {"resourceType": "OperationOutcome", importer.SOURCE_RETRY_AFTER_FIELD: "0"},
+        None,
+        7,
+    )
+
+    async def wait_for_page_two(resource_ids):
+        if resource_ids == ["prac-1"]:
+            await asyncio.wait_for(page_scan.fetch_started[1].wait(), timeout=1)
+
+    async def recover_on_cooldown(page_index):
+        if page_index == 1 and page_scan.requests.count(page_scan.urls[1]) == 2:
+            assert (
+                importer._SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.get()
+                is page_scan.source_session
+            )
+            page_scan.responses[page_scan.urls[1]] = (
+                200,
+                _practitioner_search_bundle("prac-2"),
+                None,
+                11,
+            )
+
+    page_scan.responses[page_scan.urls[1]] = locked_result
+    page_scan.fetch_hook = recover_on_cooldown
+    page_scan.write_hook = wait_for_page_two
+    monkeypatch.setattr(
+        importer,
+        "_rest_pagination_cooldown_delay_seconds",
+        lambda _payload: 0.0,
+    )
+    fetch_result = await page_scan.run()
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.rows_fetched == 2
+    assert fetch_result.pagination_cooldown_retries == 1
+    assert fetch_result.is_pagination_cooldown_recovered is True
+    assert page_scan.requests == [*page_scan.urls, page_scan.urls[1]]
+    assert page_scan.request_timeouts == [3, 3, 3]
+    assert page_scan.checkpoint_urls == [page_scan.urls[1], None]
+
+
+@pytest.mark.asyncio
+async def test_prefetched_semantic_error_leaves_no_task(monkeypatch):
+    page_scan = _RestPageHarness(monkeypatch)
+    page_scan.responses[page_scan.urls[1]] = (
+        200,
+        {"resourceType": "OperationOutcome"},
+        None,
+        5,
+    )
+
+    async def wait_for_page_two(_resource_ids):
+        await asyncio.wait_for(page_scan.fetch_started[1].wait(), timeout=1)
+
+    page_scan.write_hook = wait_for_page_two
+    fetch_result = await page_scan.run()
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == "non_bundle_payload"
+    assert page_scan.requests == page_scan.urls
+    _assert_no_rest_page_prefetch_task()
 
 
 @pytest.mark.asyncio

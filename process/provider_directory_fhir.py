@@ -889,6 +889,9 @@ CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
 CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
 )
+REST_PAGE_PREFETCH_PILOT_API_BASES = frozenset(
+    {CIGNA_PROVIDER_DIRECTORY_BASE}
+)
 CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR = "cigna_expected_nonempty_resource_returned_zero_rows"
 CIGNA_EMPTY_COLLECTION_RETRY_DELAYS_SECONDS = (15.0, 30.0, 60.0, 120.0)
 CARESOURCE_PROVIDER_DIRECTORY_BASE = (
@@ -1170,6 +1173,7 @@ SOURCE_FETCH_DIAGNOSTIC_FIELD = "_healthporta_source_fetch_diagnostic"
 SOURCE_QUOTA_EXHAUSTED_ERROR = "provider_directory_source_quota_exhausted"
 SOURCE_RETRY_NOT_BEFORE_METRIC = "provider_directory_retry_not_before"
 SOURCE_HTTP_KEEPALIVE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_KEEPALIVE"
+SOURCE_HTTP_PAGE_PREFETCH_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH"
 SOURCE_HTTP_KEEPALIVE_SECONDS = 60.0
 SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
 SOURCE_TRANSIENT_HTTP_STATUSES = frozenset({423, 429, 500, 502, 503, 504})
@@ -1181,6 +1185,12 @@ MOLINA_QUOTA_DURATION_PATTERN = re.compile(
 )
 _SOURCE_HTTP_SESSION: contextvars.ContextVar[aiohttp.ClientSession | None] = (
     contextvars.ContextVar("provider_directory_source_http_session", default=None)
+)
+_SOURCE_HTTP_PINNED_ANONYMOUS_SESSION: contextvars.ContextVar[
+    aiohttp.ClientSession | None
+] = contextvars.ContextVar(
+    "provider_directory_pinned_anonymous_source_http_session",
+    default=None,
 )
 STATE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     {"Location", "Organization", "Practitioner", "PractitionerRole"}
@@ -1428,6 +1438,11 @@ class ResourceFetchResult:
     source_fetch_elapsed_ms: int = 0
     stream_write_elapsed_seconds: float = 0.0
     checkpoint_persist_elapsed_seconds: float = 0.0
+    page_prefetch_eligible: bool = False
+    page_prefetch_started: int = 0
+    page_prefetch_consumed: int = 0
+    page_prefetch_discarded: int = 0
+    page_prefetch_wait_seconds: float = 0.0
 
     @property
     def is_bounded(self) -> bool:
@@ -1438,6 +1453,33 @@ class ResourceFetchResult:
             or self.hard_page_limit_reached
             or self.deadline_reached
         )
+
+
+@dataclass(frozen=True)
+class RestPagePrefetchEligibility:
+    checkpoint_context: PaginationCheckpointContext | None
+    start_url_count: int
+    is_partitioned_fetch: bool
+    row_batch_handler: (
+        Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None
+    )
+    row_batch_size: int
+    retain_rows: bool
+    per_resource_limit: int
+    page_limit: int
+
+
+@dataclass
+class RestPagePrefetchState:
+    page_url: str | None = None
+    session: aiohttp.ClientSession | None = None
+    page_task: asyncio.Task[
+        tuple[int | None, dict[str, Any] | None, str | None, int] | None
+    ] | None = None
+    started: int = 0
+    consumed: int = 0
+    discarded: int = 0
+    wait_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -36527,6 +36569,13 @@ async def _fetch_source_json_once(
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     await _pace_source_request(source_record)
+    pinned_session = _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.get()
+    if pinned_session is not None:
+        return await _fetch_json_with_source_session(
+            pinned_session,
+            url,
+            timeout=timeout,
+        )
     options = _credential_request_options_for_source(source_record, url)
     if not options["headers"] and not options["query_params"]:
         return await _fetch_json(url, timeout=timeout)
@@ -36772,6 +36821,25 @@ async def _fetch_source_json(
         retry_count=retry_count,
     )
     return fetch_result
+
+
+async def _fetch_source_json_pinned_session(
+    source_record: dict[str, Any],
+    url: str,
+    *,
+    timeout: int,
+    session: aiohttp.ClientSession,
+) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    """Fetch through one selected cancellable session for every retry."""
+    session_token = _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.set(session)
+    try:
+        return await _fetch_source_json(
+            source_record,
+            url,
+            timeout=timeout,
+        )
+    finally:
+        _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.reset(session_token)
 
 
 def _is_rest_pagination_cooldown_failure(
@@ -46181,6 +46249,59 @@ async def _finish_caresource_opaque_cursor_census(
     )
 
 
+def _rest_page_prefetch_session(
+    source_record: dict[str, Any],
+    request_url: str,
+) -> aiohttp.ClientSession | None:
+    """Select a cancellable session only for a credential-free pilot GET."""
+    source_session = _SOURCE_HTTP_SESSION.get()
+    is_eligible = bool(
+        source_session is not None
+        and not source_session.closed
+        and _is_anonymous_source_url(request_url)
+        and not _has_source_declared_credentialed_access(source_record)
+        and not _credential_spec_for_source(source_record)
+    )
+    return source_session if is_eligible else None
+
+
+def _is_rest_page_prefetch_request_eligible(
+    source_record: dict[str, Any],
+    request_url: str,
+) -> bool:
+    """Return whether one pilot GET has a pinned anonymous transport."""
+    return _rest_page_prefetch_session(source_record, request_url) is not None
+
+
+def _is_rest_page_prefetch_eligible(
+    source_record: dict[str, Any],
+    request_url: str,
+    options: RestPagePrefetchEligibility,
+) -> bool:
+    """Fail closed unless the request matches the narrow REST pilot shape."""
+    source_api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    return bool(
+        os.getenv(SOURCE_HTTP_PAGE_PREFETCH_ENV, "false").lower()
+        in {"1", "true", "yes"}
+        and source_api_base in REST_PAGE_PREFETCH_PILOT_API_BASES
+        and options.checkpoint_context is not None
+        and options.checkpoint_context.canonical_api_base == source_api_base
+        and options.start_url_count == 1
+        and not options.is_partitioned_fetch
+        and options.row_batch_handler is not None
+        and options.row_batch_size > 0
+        and not options.retain_rows
+        and options.per_resource_limit <= 0
+        and options.page_limit <= 0
+        and _is_rest_page_prefetch_request_eligible(
+            source_record,
+            request_url,
+        )
+    )
+
+
 async def _fetch_resource_rows(
     source_record: dict[str, Any],
     resource_type: str,
@@ -46521,6 +46642,89 @@ async def _fetch_resource_rows(
         )
     partition_error_count = 0
     url: str | None = None
+    page_prefetch_state = RestPagePrefetchState()
+    is_page_prefetch_eligible = _is_rest_page_prefetch_eligible(
+        source_record,
+        pending_start_urls[0],
+        RestPagePrefetchEligibility(
+            checkpoint_context=checkpoint_context,
+            start_url_count=len(pending_start_urls),
+            is_partitioned_fetch=is_partitioned_fetch,
+            row_batch_handler=row_batch_handler,
+            row_batch_size=row_batch_size,
+            retain_rows=retain_rows,
+            per_resource_limit=per_resource_limit,
+            page_limit=page_limit,
+        ),
+    )
+
+    async def fetch_prefetched_page(
+        request_url: str,
+        *,
+        request_timeout: int,
+        remaining_seconds: float | None,
+        session: aiohttp.ClientSession,
+    ) -> tuple[int | None, dict[str, Any] | None, str | None, int] | None:
+        """Fetch one page without running past the active resource deadline."""
+        page_fetch = _fetch_source_json_pinned_session(
+            source_record,
+            request_url,
+            timeout=request_timeout,
+            session=session,
+        )
+        if remaining_seconds is None:
+            return await page_fetch
+        try:
+            return await asyncio.wait_for(
+                page_fetch,
+                timeout=remaining_seconds,
+            )
+        except asyncio.TimeoutError:
+            return None
+
+    async def cancel_prefetched_page() -> None:
+        """Cancel and join the single speculative request, if one exists."""
+        page_fetch = page_prefetch_state.page_task
+        page_prefetch_state.page_url = None
+        page_prefetch_state.session = None
+        page_prefetch_state.page_task = None
+        if page_fetch is None:
+            return
+        page_prefetch_state.discarded += 1
+        page_fetch.cancel()
+        await asyncio.gather(page_fetch, return_exceptions=True)
+
+    async def consume_prefetched_page(
+        request_url: str,
+    ) -> tuple[
+        bool,
+        aiohttp.ClientSession | None,
+        tuple[int | None, dict[str, Any] | None, str | None, int] | None,
+    ]:
+        """Consume the exact prefetched result while owning its cleanup."""
+        if page_prefetch_state.page_task is None:
+            return False, None, None
+        if page_prefetch_state.page_url != request_url:
+            await cancel_prefetched_page()
+            return False, None, None
+        page_fetch = page_prefetch_state.page_task
+        page_session = page_prefetch_state.session
+        page_prefetch_state.page_url = None
+        page_prefetch_state.session = None
+        page_prefetch_state.page_task = None
+        wait_started_at = time.monotonic()
+        try:
+            return True, page_session, await page_fetch
+        except BaseException:
+            page_prefetch_state.discarded += 1
+            page_fetch.cancel()
+            await asyncio.gather(page_fetch, return_exceptions=True)
+            raise
+        finally:
+            page_prefetch_state.wait_seconds += max(
+                0.0,
+                time.monotonic() - wait_started_at,
+            )
 
     async def flush_pending_rows() -> None:
         """Persist buffered resource rows and clear the pending batch."""
@@ -46545,11 +46749,16 @@ async def _fetch_resource_rows(
         url = start_url
         while url and _can_limit_accept_more(rows_fetched, per_resource_limit):
             if cancel_ctx is not None:
-                await _raise_if_resource_import_cancelled(
-                    cancel_ctx,
-                    cancel_task,
-                )
+                try:
+                    await _raise_if_resource_import_cancelled(
+                        cancel_ctx,
+                        cancel_task,
+                    )
+                except BaseException:
+                    await cancel_prefetched_page()
+                    raise
             if deadline_at is not None and time.monotonic() >= deadline_at:
+                await cancel_prefetched_page()
                 is_deadline_reached = True
                 has_next_url = True
                 break
@@ -46572,23 +46781,57 @@ async def _fetch_resource_rows(
                 has_next_url = True
                 break
             seen_urls.add(request_identity)
-            page_fetch_result = await _fetch_source_json(
-                source_record,
-                url,
-                timeout=resource_timeout,
-            )
+            (
+                used_prefetched_page,
+                prefetched_page_session,
+                page_fetch_result,
+            ) = await consume_prefetched_page(url)
+            if used_prefetched_page and (
+                page_fetch_result is None
+                or (
+                    deadline_at is not None
+                    and time.monotonic() >= deadline_at
+                )
+            ):
+                page_prefetch_state.discarded += 1
+                is_deadline_reached = True
+                has_next_url = True
+                break
+            if used_prefetched_page:
+                page_prefetch_state.consumed += 1
+            if not used_prefetched_page:
+                page_fetch_result = await _fetch_source_json(
+                    source_record,
+                    url,
+                    timeout=resource_timeout,
+                )
+            assert page_fetch_result is not None
             source_fetch_elapsed_ms += max(0, int(page_fetch_result[3]))
             if checkpoint_context and _is_rest_pagination_cooldown_failure(
                 page_fetch_result[0],
                 page_fetch_result[2],
             ):
-                cooldown_result = await _retry_rest_pagination_after_cooldown(
-                    source_record,
-                    url,
-                    page_fetch_result,
-                    timeout=resource_timeout,
-                    deadline_at=deadline_at,
+                pinned_session_token = (
+                    _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.set(
+                        prefetched_page_session
+                    )
+                    if used_prefetched_page
+                    and prefetched_page_session is not None
+                    else None
                 )
+                try:
+                    cooldown_result = await _retry_rest_pagination_after_cooldown(
+                        source_record,
+                        url,
+                        page_fetch_result,
+                        timeout=resource_timeout,
+                        deadline_at=deadline_at,
+                    )
+                finally:
+                    if pinned_session_token is not None:
+                        _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.reset(
+                            pinned_session_token
+                        )
                 page_fetch_result = cooldown_result.fetch_result
                 pagination_cooldown_retries += cooldown_result.retries
                 pagination_cooldown_wait_seconds += cooldown_result.wait_seconds
@@ -46806,31 +47049,92 @@ async def _fetch_resource_rows(
             defer_caresource_terminal_checkpoint = bool(
                 is_caresource_census_enabled and resolved_next_url is None
             )
-            if checkpoint_context and not defer_caresource_terminal_checkpoint:
-                await flush_pending_rows()
-                recent_url_hashes.append(request_url_hash)
-                recent_url_hashes = recent_url_hashes[
-                    -PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:
-                ]
-                checkpoint_started_at = time.monotonic()
-                try:
-                    await _save_pagination_checkpoint(
-                        checkpoint_context,
-                        resource_type,
-                        next_url=resolved_next_url,
-                        pages_processed=pages,
-                        rows_processed=rows_fetched,
-                        recent_url_hashes=recent_url_hashes,
-                        completeness=_synthetic_position_page_guard_completeness(
-                            synthetic_page_identity,
-                            recent_synthetic_page_fingerprints,
+            resolved_next_identity = (
+                _pagination_url_identity(resolved_next_url)
+                if resolved_next_url
+                else None
+            )
+            resolved_next_url_hash = (
+                _pagination_url_hash(resolved_next_url)
+                if resolved_next_url
+                else None
+            )
+            prefetch_remaining_seconds = (
+                deadline_at - time.monotonic()
+                if deadline_at is not None
+                else None
+            )
+            prefetch_session = (
+                _rest_page_prefetch_session(
+                    source_record,
+                    resolved_next_url,
+                )
+                if is_page_prefetch_eligible and resolved_next_url
+                else None
+            )
+            if (
+                is_page_prefetch_eligible
+                and resolved_next_url
+                and not defer_caresource_terminal_checkpoint
+                and not error_message
+                and resolved_next_identity not in seen_urls
+                and resolved_next_url_hash not in persisted_url_hashes
+                and (
+                    prefetch_remaining_seconds is None
+                    or prefetch_remaining_seconds >= 1.0
+                )
+                and prefetch_session is not None
+            ):
+                page_prefetch_state.started += 1
+                page_prefetch_state.page_url = resolved_next_url
+                page_prefetch_state.session = prefetch_session
+                page_prefetch_state.page_task = asyncio.create_task(
+                    fetch_prefetched_page(
+                        resolved_next_url,
+                        request_timeout=(
+                            resource_timeout
+                            if prefetch_remaining_seconds is None
+                            else min(
+                                resource_timeout,
+                                math.ceil(prefetch_remaining_seconds),
+                            )
                         ),
-                    )
-                finally:
-                    checkpoint_persist_elapsed_seconds += max(
-                        0.0,
-                        time.monotonic() - checkpoint_started_at,
-                    )
+                        remaining_seconds=prefetch_remaining_seconds,
+                        session=prefetch_session,
+                    ),
+                    name="provider-directory-rest-page-prefetch",
+                )
+            try:
+                if checkpoint_context and not defer_caresource_terminal_checkpoint:
+                    await flush_pending_rows()
+                    recent_url_hashes.append(request_url_hash)
+                    recent_url_hashes = recent_url_hashes[
+                        -PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:
+                    ]
+                    checkpoint_started_at = time.monotonic()
+                    try:
+                        await _save_pagination_checkpoint(
+                            checkpoint_context,
+                            resource_type,
+                            next_url=resolved_next_url,
+                            pages_processed=pages,
+                            rows_processed=rows_fetched,
+                            recent_url_hashes=recent_url_hashes,
+                            completeness=(
+                                _synthetic_position_page_guard_completeness(
+                                    synthetic_page_identity,
+                                    recent_synthetic_page_fingerprints,
+                                )
+                            ),
+                        )
+                    finally:
+                        checkpoint_persist_elapsed_seconds += max(
+                            0.0,
+                            time.monotonic() - checkpoint_started_at,
+                        )
+            except BaseException:
+                await cancel_prefetched_page()
+                raise
             url = resolved_next_url
             if not _can_limit_accept_more(rows_fetched, per_resource_limit) and url:
                 has_reached_row_limit = True
@@ -46939,6 +47243,11 @@ async def _fetch_resource_rows(
             "stream_write_elapsed_seconds"
         ],
         checkpoint_persist_elapsed_seconds=checkpoint_persist_elapsed_seconds,
+        page_prefetch_eligible=is_page_prefetch_eligible,
+        page_prefetch_started=page_prefetch_state.started,
+        page_prefetch_consumed=page_prefetch_state.consumed,
+        page_prefetch_discarded=page_prefetch_state.discarded,
+        page_prefetch_wait_seconds=page_prefetch_state.wait_seconds,
     )
 
 
@@ -48511,6 +48820,11 @@ def _empty_resource_stats() -> dict[str, Any]:
         "source_fetch_elapsed_ms": 0,
         "stream_write_elapsed_seconds": 0.0,
         "checkpoint_persist_elapsed_seconds": 0.0,
+        "page_prefetch_eligible_sources": 0,
+        "page_prefetch_started": 0,
+        "page_prefetch_consumed": 0,
+        "page_prefetch_discarded": 0,
+        "page_prefetch_wait_seconds": 0.0,
         "pagination_cooldown_retries": 0,
         "pagination_cooldown_wait_seconds": 0.0,
         "pagination_cooldown_recovered_sources": 0,
@@ -48647,6 +48961,21 @@ def _record_caresource_opaque_cursor_stats(
             resource_stats[f"caresource_opaque_cursor_{proof_field}"] += proof_value
 
 
+def _record_page_prefetch_stats(
+    resource_stats: dict[str, Any],
+    fetch_result: ResourceFetchResult,
+) -> None:
+    """Accumulate nonsecret speculative-page lifecycle metrics."""
+    if fetch_result.page_prefetch_eligible:
+        resource_stats["page_prefetch_eligible_sources"] += 1
+    resource_stats["page_prefetch_started"] += fetch_result.page_prefetch_started
+    resource_stats["page_prefetch_consumed"] += fetch_result.page_prefetch_consumed
+    resource_stats["page_prefetch_discarded"] += fetch_result.page_prefetch_discarded
+    resource_stats["page_prefetch_wait_seconds"] += (
+        fetch_result.page_prefetch_wait_seconds
+    )
+
+
 def _record_resource_fetch_stats(
     resource_stats_by_type: dict[str, dict[str, Any]],
     resource_type: str,
@@ -48669,6 +48998,7 @@ def _record_resource_fetch_stats(
     resource_stats["checkpoint_persist_elapsed_seconds"] += (
         fetch_result.checkpoint_persist_elapsed_seconds
     )
+    _record_page_prefetch_stats(resource_stats, fetch_result)
     _record_pagination_cooldown_stats(resource_stats, fetch_result)
     if fetch_result.complete:
         resource_stats["sources_completed"] += 1
@@ -48728,11 +49058,30 @@ def _record_resource_completion(
     completion.setdefault(resource_type, set()).update(source_ids)
 
 
+def _resource_fetch_timing_diagnostic(
+    fetch_result: ResourceFetchResult,
+) -> dict[str, Any]:
+    """Return transport, persistence, and prefetch timings and counts."""
+    return {
+        "source_fetch_elapsed_ms": fetch_result.source_fetch_elapsed_ms,
+        "stream_write_elapsed_seconds": fetch_result.stream_write_elapsed_seconds,
+        "checkpoint_persist_elapsed_seconds": (
+            fetch_result.checkpoint_persist_elapsed_seconds
+        ),
+        "page_prefetch_eligible": fetch_result.page_prefetch_eligible,
+        "page_prefetch_started": fetch_result.page_prefetch_started,
+        "page_prefetch_consumed": fetch_result.page_prefetch_consumed,
+        "page_prefetch_discarded": fetch_result.page_prefetch_discarded,
+        "page_prefetch_wait_seconds": fetch_result.page_prefetch_wait_seconds,
+    }
+
+
 def _resource_fetch_diagnostic(
     fetch_result: ResourceFetchResult,
     *,
     rows_written: int,
 ) -> dict[str, Any]:
+    """Return one resource fetch's nonsecret operational diagnostics."""
     return {
         "complete": fetch_result.complete,
         "collection_complete": fetch_result.complete,
@@ -48743,11 +49092,7 @@ def _resource_fetch_diagnostic(
         "pages_fetched": fetch_result.pages_fetched,
         "rows_fetched": fetch_result.rows_fetched,
         "rows_written": rows_written,
-        "source_fetch_elapsed_ms": fetch_result.source_fetch_elapsed_ms,
-        "stream_write_elapsed_seconds": fetch_result.stream_write_elapsed_seconds,
-        "checkpoint_persist_elapsed_seconds": (
-            fetch_result.checkpoint_persist_elapsed_seconds
-        ),
+        **_resource_fetch_timing_diagnostic(fetch_result),
         "row_limit_reached": fetch_result.row_limit_reached,
         "page_limit_reached": fetch_result.page_limit_reached,
         "hard_page_limit_reached": fetch_result.hard_page_limit_reached,

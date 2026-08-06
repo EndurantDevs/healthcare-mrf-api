@@ -920,6 +920,22 @@ optionally bounds the linked fallback per source so a slow remote endpoint does
 not hold the whole import chain after the direct resource collections have been
 captured.
 
+The REST page-prefetch pilot is default-off. Enable it only with both
+`HLTHPRT_PROVIDER_DIRECTORY_REST_KEEPALIVE=true` and
+`HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH=true`. It is fail-closed to the
+pilot source allowlist and only a generic, single-start, checkpointed, unbounded
+streaming scan that does not retain rows. Any declared or configured credential,
+partitions, bounded scans, and specialized acquisition paths stay sequential. The
+pilot starts at most one trusted continuation while the current page is written and
+checkpointed; it does not consume that result until the current checkpoint
+succeeds. A configured resource deadline bounds the speculative request to its
+remaining time, and an expired result is discarded before parsing or persistence.
+Resource diagnostics report prefetch eligibility, started/consumed/discarded page
+counts, and residual wait time without exposing cursor URLs or payloads.
+To roll back, unset the prefetch flag or set it to `false` and restart the worker.
+No schema or checkpoint-format change is involved, so the existing durable
+checkpoint resumes on the sequential path.
+
 If resource rows were imported before canonical resource storage was enabled,
 populate the canonical resource and source-edge tables from existing
 source-level rows without refetching payer FHIR endpoints:
