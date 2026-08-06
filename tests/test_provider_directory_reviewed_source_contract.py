@@ -263,8 +263,6 @@ def test_reviewed_source_snapshot_and_exhaustive_controls_fail_closed():
             bulk_export=False,
             publication_requested=False,
         )
-
-
 def test_exact_census_resume_rejects_snapshot_cutoff_drift():
     census_proof_by_field = {
         "strategy_version": importer.EXACT_CENSUS_OPAQUE_CURSOR_STRATEGY_VERSION,
