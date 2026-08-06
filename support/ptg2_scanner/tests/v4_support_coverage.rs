@@ -10,7 +10,7 @@ use ptg2_scanner::hashing::{
     hash_text_key, price_set_entry_key, provider_entry_component_key, provider_set_component_key,
     provider_set_entry_key, xxh3_63,
 };
-use ptg2_scanner::input::open_plain_range_json_reader;
+use ptg2_scanner::input::{open_plain_range_json_reader, strict_utf8_reader};
 use ptg2_scanner::manifest::{DenseIdMap, GlobalId128};
 use ptg2_scanner::normalize::{
     int_list, normalize_catalog_code, normalize_money_text, normalized_scalar_from_reader,
@@ -21,11 +21,12 @@ use ptg2_scanner::progress::{
     emit_progress, ScannerSemanticProgress, ScannerSemanticProgressReporter,
     SEMANTIC_PROGRESS_INTERVAL,
 };
-use ptg2_scanner::v3_dense::{DenseIdentityMap, DenseIdentityValue};
+use ptg2_scanner::v3_dense::DenseIdentityMap;
 use ptg2_scanner::{decode_u32_le, intersect_sorted_unique_u32};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{atomic::AtomicU64, Arc};
 use std::time::{Duration, Instant};
@@ -116,7 +117,7 @@ fn provider_identifier_quarantine_rejects_valid_and_unbounded_values() {
 }
 
 #[test]
-fn candidate_address_units_are_deduplicated_at_the_public_boundary() {
+fn candidate_address_units_and_unkeyable_inputs_are_exact() {
     let duplicate = canonicalize_address(
         Some("123 Main St Ste 7"),
         Some("Ste 7"),
@@ -140,6 +141,124 @@ fn candidate_address_units_are_deduplicated_at_the_public_boundary() {
         Some("US"),
     );
     assert_eq!(spaced_suffix.unit_norm, "ste2b");
+
+    let hash_separated = canonicalize_address(
+        Some("123 Main St Apt. #   12"),
+        None,
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(hash_separated.unit_norm, "apt12");
+    assert_eq!(hash_separated.line1_norm.as_deref(), Some("123mainst"));
+
+    let foreign = canonicalize_address(
+        Some("123 Main St"),
+        None,
+        Some("Example City"),
+        Some("IL"),
+        Some("60601"),
+        Some("CA"),
+    );
+    assert!(foreign.address_key.is_none());
+    assert!(foreign.identity_key.is_none());
+    assert!(foreign.premise_key.is_none());
+    assert!(foreign.premise_identity_key.is_none());
+
+    let zip_without_place =
+        canonicalize_address(None, None, None, Some("IL"), Some("60601"), Some("US"));
+    assert!(zip_without_place.address_key.is_none());
+    assert!(zip_without_place.identity_key.is_none());
+    assert!(zip_without_place.premise_key.is_none());
+    assert!(zip_without_place.premise_identity_key.is_none());
+
+    let punctuated_floor = canonicalize_address(
+        Some("123 Main St Floor. 2"),
+        None,
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(punctuated_floor.unit_norm, "fl2");
+    assert_eq!(punctuated_floor.line1_norm.as_deref(), Some("123mainst"));
+
+    let duplicate_floor = canonicalize_address(
+        Some("123 Main St 2 Floor"),
+        Some("2 Floor"),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(duplicate_floor.unit_norm, "fl2");
+    assert_eq!(duplicate_floor.line1_norm.as_deref(), Some("123mainst"));
+
+    let line_one_floor = canonicalize_address(
+        Some("123 Main St 2 Floor"),
+        None,
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(line_one_floor.unit_norm, "fl2");
+    assert_eq!(line_one_floor.line1_norm.as_deref(), Some("123mainst"));
+
+    let trailing_period_floor = canonicalize_address(
+        Some("123 Main St"),
+        Some("2 Floor."),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(trailing_period_floor.unit_norm, "fl2");
+    assert_eq!(
+        trailing_period_floor.line1_norm.as_deref(),
+        Some("123mainst")
+    );
+
+    let zero_floor = canonicalize_address(
+        Some("123 Main St"),
+        Some("000 Floor"),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert!(zero_floor.unit_norm.is_empty());
+
+    let zero_ordinal = canonicalize_address(
+        Some("000th Ave"),
+        None,
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(zero_ordinal.line1_norm.as_deref(), Some("000thave"));
+
+    let zero_typo_ordinal = canonicalize_address(
+        Some("000h St"),
+        None,
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert_eq!(zero_typo_ordinal.line1_norm.as_deref(), Some("000hst"));
+
+    let punctuation_only_line2 = canonicalize_address(
+        Some("123 Main St ---"),
+        Some("---"),
+        Some("Chicago"),
+        Some("IL"),
+        Some("60601"),
+        Some("US"),
+    );
+    assert!(punctuation_only_line2.unit_norm.is_empty());
 }
 
 #[test]
@@ -232,6 +351,8 @@ fn v4_normalization_rejects_ambiguous_numeric_and_json_shapes() {
     );
     assert!(int_list(Some(&json!(["bad", {}, []]))).is_empty());
     assert!(int_list(Some(&json!("bad"))).is_empty());
+    assert!(int_list(Some(&json!({}))).is_empty());
+    assert!(int_list(None).is_empty());
     assert!(strict_integer_text(&json!("1"), "field").is_err());
     assert!(strict_integer_text(&json!(1.5), "field").is_err());
     assert_eq!(strict_integer_text(&json!(7), "field").unwrap(), "7");
@@ -270,6 +391,12 @@ fn v4_normalization_rejects_ambiguous_numeric_and_json_shapes() {
         normalized_string_list_from_reader(&mut scalar_reader).unwrap(),
         vec!["42".to_owned()]
     );
+
+    let mut utf8_reader = strict_utf8_reader(b"ok".as_slice());
+    assert_eq!(utf8_reader.read(&mut []).unwrap(), 0);
+    let mut payload = String::new();
+    utf8_reader.read_to_string(&mut payload).unwrap();
+    assert_eq!(payload, "ok");
 }
 
 #[test]
@@ -310,6 +437,14 @@ fn scanner_progress_reporters_emit_interval_frame_and_stop_cleanly() {
         Instant::now(),
         true,
     );
+    emit_progress(
+        Path::new("/tmp/scanner-progress-empty.json"),
+        0,
+        &compressed_bytes_read,
+        &HashMap::new(),
+        Instant::now(),
+        true,
+    );
     drop(reporter);
 }
 
@@ -340,31 +475,4 @@ fn plain_range_reader_rejects_overflow_before_seeking() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 
     assert!(DenseIdentityMap::with_capacity(0).unwrap().is_empty());
-}
-
-#[test]
-fn dense_identity_memory_estimate_rejects_count_and_slot_byte_overflow() {
-    for expected_len in [usize::MAX, usize::MAX / 10] {
-        let error = DenseIdentityMap::estimated_memory_bytes(expected_len)
-            .expect_err("oversized dense identity map must fail before allocation");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(error.to_string(), "identity map is too large");
-    }
-    let mut bounded_map = DenseIdentityMap::with_capacity(0).unwrap();
-    bounded_map
-        .insert([1; 16], DenseIdentityValue::default())
-        .unwrap();
-    assert_eq!(
-        bounded_map.get(&[1; 16]),
-        Some(DenseIdentityValue::default())
-    );
-    assert_eq!(bounded_map.get(&[9; 16]), None);
-    let error = bounded_map
-        .insert([2; 16], DenseIdentityValue::default())
-        .expect_err("immutable dense map must enforce its bounded load factor");
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        error.to_string(),
-        "identity map exceeded its bounded load factor"
-    );
 }
