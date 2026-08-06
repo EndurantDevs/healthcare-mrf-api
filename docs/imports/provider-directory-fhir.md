@@ -932,7 +932,20 @@ succeeds. A configured resource deadline bounds the speculative request to its
 remaining time, and an expired result is discarded before parsing or persistence.
 Resource diagnostics report prefetch eligibility, started/consumed/discarded page
 counts, and residual wait time without exposing cursor URLs or payloads.
-To roll back, unset the prefetch flag or set it to `false` and restart the worker.
+
+After the pilot is verified, set
+`HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_DETERMINISTIC=true` to extend the
+same depth-one overlap to the compiled allowlist of stateless numeric
+`_skip`/`_offset` sources. Their continuation coordinates are normalized with
+`_sort=_id`; pages are still consumed, written, and checkpointed in order. This
+flag does not enable parallel page shards and does not admit response-issued
+opaque token families. It is independently default-off so the deterministic
+expansion can be enabled or rolled back without changing the pilot.
+
+To roll back only the deterministic expansion, unset
+`HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_DETERMINISTIC` or set it to
+`false` and restart the worker; the pilot remains enabled. To disable both,
+unset `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH` or set it to `false`.
 No schema or checkpoint-format change is involved, so the existing durable
 checkpoint resumes on the sequential path.
 
