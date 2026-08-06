@@ -48529,6 +48529,74 @@ async def _upsert_canonical_resource_edges(
         )
 
 
+def _resource_rows_with_location_contacts(
+    model: type,
+    resource_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Populate retained Location contact fields before either write mode."""
+
+    if (
+        model is ProviderDirectoryLocation
+        and _has_missing_location_contact_fields(resource_rows)
+    ):
+        return _attach_location_contact_fields(resource_rows)
+    return resource_rows
+
+
+async def _persist_endpoint_dataset_rows(
+    model: type,
+    resource_rows: list[dict[str, Any]],
+    dataset_id: str | None,
+) -> list[dict[str, Any]]:
+    """Persist immutable endpoint rows and their proof shard transactionally."""
+
+    dataset_rows = _endpoint_dataset_resource_rows(
+        model,
+        resource_rows,
+        dataset_id=dataset_id,
+    )
+    if not dataset_rows:
+        return dataset_rows
+    assert dataset_id is not None
+    async with db.transaction():
+        await _upsert_rows(ProviderDirectoryDatasetResource, dataset_rows)
+        await persist_dataset_proof_shard(
+            db,
+            _schema(),
+            dataset_rows,
+            dataset_id=dataset_id,
+        )
+    return dataset_rows
+
+
+async def _upsert_deferred_resource_rows(
+    model: type,
+    resource_rows: list[dict[str, Any]],
+    *,
+    dataset_id: str | None,
+    track_seen: bool,
+) -> int:
+    """Retain a checkpointed FHIR batch without compatibility materialization."""
+
+    if not resource_rows:
+        return 0
+    if not dataset_id:
+        raise ValueError(
+            "provider_directory_deferred_typed_materialization_dataset_required"
+        )
+    if track_seen:
+        raise ValueError(
+            "provider_directory_deferred_typed_materialization_seen_tracking_unsupported"
+        )
+    resource_rows = _resource_rows_with_location_contacts(model, resource_rows)
+    dataset_rows = await _persist_endpoint_dataset_rows(
+        model,
+        resource_rows,
+        dataset_id,
+    )
+    return len(dataset_rows)
+
+
 async def _upsert_resource_rows(
     model: type,
     resource_rows: list[dict[str, Any]],
@@ -48544,28 +48612,8 @@ async def _upsert_resource_rows(
 
     if not resource_rows:
         return 0
-    if model is ProviderDirectoryLocation and _has_missing_location_contact_fields(
-        resource_rows
-    ):
-        resource_rows = _attach_location_contact_fields(resource_rows)
-    dataset_rows = _endpoint_dataset_resource_rows(
-        model,
-        resource_rows,
-        dataset_id=dataset_id,
-    )
-    if dataset_rows:
-        assert dataset_id is not None
-        async with db.transaction():
-            await _upsert_rows(
-                ProviderDirectoryDatasetResource,
-                dataset_rows,
-            )
-            await persist_dataset_proof_shard(
-                db,
-                _schema(),
-                dataset_rows,
-                dataset_id=dataset_id,
-            )
+    resource_rows = _resource_rows_with_location_contacts(model, resource_rows)
+    await _persist_endpoint_dataset_rows(model, resource_rows, dataset_id)
     if canonical_api_base and source_ids:
         await _upsert_canonical_resource_edges(
             model,
@@ -55908,6 +55956,7 @@ async def _import_resources(
     progress_callback: Callable[[int, int, dict[str, int], dict[str, Any] | None], Awaitable[None]] | None = None,
     preserve_seen_stage: bool = False,
     is_pagination_checkpointing_enabled: bool = False,
+    defer_typed_materialization: bool = False,
     retry_of_run_id: str | None = None,
     pagination_root_run_id: str | None = None,
     pagination_resume_required: set[str] | None = None,
@@ -55915,6 +55964,29 @@ async def _import_resources(
     require_complete_resources: bool = False,
 ) -> dict[str, int]:
     """Import resources into the provider-directory snapshot."""
+    if defer_typed_materialization:
+        if not is_pagination_checkpointing_enabled:
+            raise ValueError(
+                "provider_directory_deferred_typed_materialization_checkpoint_required"
+            )
+        if stale_cleanup or linked_resource_limit > 0:
+            raise ValueError(
+                "provider_directory_deferred_typed_materialization_incompatible_mode"
+            )
+        if any(
+            _uses_alohr_graphql_connector(source_record)
+            or _uses_uhc_official_file_connector(source_record)
+            or _should_use_uhc_plan_graph(
+                source_record,
+                resources,
+                per_resource_limit=per_resource_limit,
+                page_limit=page_limit,
+            )
+            for source_record in source_records
+        ):
+            raise ValueError(
+                "provider_directory_deferred_typed_materialization_source_unsupported"
+            )
     count_by_resource: dict[str, int] = {resource: 0 for resource in resources}
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
     _validate_provider_directory_endpoint_scope(
@@ -56103,6 +56175,39 @@ async def _import_resources(
                 and source_count_by_resource.get("Practitioner", 0) > 0
                 and source_count_by_resource.get("Location", 0) > 0
             )
+
+        async def persist_resource_rows(
+            model: type,
+            resource_rows: list[dict[str, Any]],
+        ) -> int:
+            """Write one generic-source batch in the selected materialization mode."""
+
+            compatibility_rows = _rows_for_compatibility_source(
+                resource_rows,
+                partition_source["source_id"],
+            )
+            dataset_id = partition_source.get("_endpoint_dataset_id")
+            if defer_typed_materialization:
+                return await _upsert_deferred_resource_rows(
+                    model,
+                    compatibility_rows,
+                    dataset_id=dataset_id,
+                    track_seen=stale_cleanup,
+                )
+            return await _upsert_resource_rows(
+                model,
+                compatibility_rows,
+                run_id=run_id,
+                track_seen=stale_cleanup,
+                seen_table=seen_stage_table,
+                canonical_api_base=(
+                    partition_source.get("canonical_api_base")
+                    or partition_source.get("api_base")
+                ),
+                source_ids=[partition_source["source_id"]],
+                dataset_id=dataset_id,
+            )
+
         if _uses_alohr_graphql_connector(partition_source):
             async with progress_lock:
                 active_group_by_key[group_key]["current_resource"] = "ALOHR GraphQL"
@@ -56210,19 +56315,7 @@ async def _import_resources(
                     rows_by_resource.setdefault(resource_type, []).extend(
                         _compact_linked_reference_rows(resource_type, rows)
                     )
-                written = await _upsert_resource_rows(
-                    model,
-                    _rows_for_compatibility_source(
-                        rows,
-                        partition_source["source_id"],
-                    ),
-                    run_id=run_id,
-                    track_seen=stale_cleanup,
-                    seen_table=seen_stage_table,
-                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
-                    source_ids=[partition_source["source_id"]],
-                    dataset_id=partition_source.get("_endpoint_dataset_id"),
-                )
+                written = await persist_resource_rows(model, rows)
                 await maybe_report_partial_progress(group_key, resource_type, written)
                 return written
 
@@ -56293,18 +56386,9 @@ async def _import_resources(
             written_total = (
                 fetch_result.rows_written
                 if use_streaming
-                else await _upsert_resource_rows(
+                else await persist_resource_rows(
                     fetch_result.model,
-                    _rows_for_compatibility_source(
-                        fetch_result.rows,
-                        partition_source["source_id"],
-                    ),
-                    run_id=run_id,
-                    track_seen=stale_cleanup,
-                    seen_table=seen_stage_table,
-                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
-                    source_ids=[partition_source["source_id"]],
-                    dataset_id=partition_source.get("_endpoint_dataset_id"),
+                    fetch_result.rows,
                 )
             )
             source_count_by_resource[resource_type] += written_total
@@ -56334,19 +56418,7 @@ async def _import_resources(
 
             async def retry_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
                 """Persist a retry batch for the active source group."""
-                written = await _upsert_resource_rows(
-                    model,
-                    _rows_for_compatibility_source(
-                        rows,
-                        partition_source["source_id"],
-                    ),
-                    run_id=run_id,
-                    track_seen=stale_cleanup,
-                    seen_table=seen_stage_table,
-                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
-                    source_ids=[partition_source["source_id"]],
-                    dataset_id=partition_source.get("_endpoint_dataset_id"),
-                )
+                written = await persist_resource_rows(model, rows)
                 await maybe_report_partial_progress(group_key, "PractitionerRole", written)
                 return written
 
@@ -56392,18 +56464,9 @@ async def _import_resources(
                 retry_written_total = (
                     retry_result.rows_written
                     if use_streaming
-                    else await _upsert_resource_rows(
+                    else await persist_resource_rows(
                         retry_result.model,
-                        _rows_for_compatibility_source(
-                            retry_result.rows,
-                            partition_source["source_id"],
-                        ),
-                        run_id=run_id,
-                        track_seen=stale_cleanup,
-                        seen_table=seen_stage_table,
-                        canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
-                        source_ids=[partition_source["source_id"]],
-                        dataset_id=partition_source.get("_endpoint_dataset_id"),
+                        retry_result.rows,
                     )
                 )
                 source_count_by_resource["PractitionerRole"] = source_count_by_resource.get("PractitionerRole", 0) + retry_written_total
@@ -56455,19 +56518,7 @@ async def _import_resources(
 
             async def scan_role_row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
                 """Write streamed SCAN PractitionerRole rows for the compatibility owner."""
-                written = await _upsert_resource_rows(
-                    model,
-                    _rows_for_compatibility_source(
-                        rows,
-                        partition_source["source_id"],
-                    ),
-                    run_id=run_id,
-                    track_seen=stale_cleanup,
-                    seen_table=seen_stage_table,
-                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
-                    source_ids=[partition_source["source_id"]],
-                    dataset_id=partition_source.get("_endpoint_dataset_id"),
-                )
+                written = await persist_resource_rows(model, rows)
                 await maybe_report_partial_progress(group_key, "PractitionerRole", written)
                 return written
 
@@ -56511,18 +56562,9 @@ async def _import_resources(
             written_total = (
                 fetch_result.rows_written
                 if use_streaming
-                else await _upsert_resource_rows(
+                else await persist_resource_rows(
                     fetch_result.model,
-                    _rows_for_compatibility_source(
-                        fetch_result.rows,
-                        partition_source["source_id"],
-                    ),
-                    run_id=run_id,
-                    track_seen=stale_cleanup,
-                    seen_table=seen_stage_table,
-                    canonical_api_base=partition_source.get("canonical_api_base") or partition_source.get("api_base"),
-                    source_ids=[partition_source["source_id"]],
-                    dataset_id=partition_source.get("_endpoint_dataset_id"),
+                    fetch_result.rows,
                 )
             )
             source_count_by_resource["PractitionerRole"] = source_count_by_resource.get("PractitionerRole", 0) + written_total
@@ -58073,6 +58115,18 @@ async def process_provider_directory_fhir_data(
         stale_cleanup=should_cleanup_stale_rows,
         publish_artifacts=should_publish_artifacts,
     )
+    should_defer_typed_materialization = _is_bool_or_default(
+        task.get("defer_typed_materialization"),
+        False,
+    )
+    if should_defer_typed_materialization and not import_resources:
+        raise ValueError(
+            "provider_directory_deferred_typed_materialization_import_required"
+        )
+    if should_defer_typed_materialization and publish_after_acquisition:
+        raise ValueError(
+            "provider_directory_deferred_typed_materialization_incompatible_mode"
+        )
     seen_stage_table_for_publish = (
         _import_seen_stage_table_name(run_id)
         if should_publish_artifacts
@@ -58248,6 +58302,7 @@ async def process_provider_directory_fhir_data(
             "publish_after_acquisition": publish_after_acquisition,
             "publish_corroboration": should_publish_corroboration,
             "pagination_checkpoints_enabled": is_pagination_checkpointing_enabled,
+            "defer_typed_materialization": should_defer_typed_materialization,
             "retry_of_run_id": retry_of_run_id,
             "provider_directory_pagination_root_run_id": pagination_root_run_id,
             "provider_directory_endpoint_scope": provider_directory_endpoint_scope,
@@ -58401,6 +58456,7 @@ async def process_provider_directory_fhir_data(
                     progress_callback=resource_progress,
                     preserve_seen_stage=bool(seen_stage_table_for_publish),
                     is_pagination_checkpointing_enabled=is_pagination_checkpointing_enabled,
+                    defer_typed_materialization=should_defer_typed_materialization,
                     retry_of_run_id=retry_of_run_id,
                     pagination_root_run_id=pagination_root_run_id,
                     pagination_resume_required=pagination_resume_required_entries,
@@ -58602,6 +58658,7 @@ class _ProviderDirectoryFhirCommandOptions:
     stale_cleanup: bool | None = None
     publish_artifacts: bool | None = None
     publish_after_acquisition: bool = False
+    defer_typed_materialization: bool = False
     open_only: bool = True
     include_auth_required: bool = False
     credential_config_file: str | None = None

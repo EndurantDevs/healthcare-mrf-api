@@ -1362,6 +1362,14 @@ def provider_enrichment(test: bool):
 @click.option("--page-count", type=int, help="FHIR _count page size.")
 @click.option("--stream-batch-size", type=int, help="Rows per streaming upsert batch. Use 0 to retain rows and upsert after each resource scan.")
 @click.option(
+    "--defer-typed-materialization/--no-defer-typed-materialization",
+    default=False,
+    help=(
+        "Retain checkpointed endpoint rows and proof first; defer typed, canonical, "
+        "and source-edge materialization to the exact rehydration/publish path."
+    ),
+)
+@click.option(
     "--bulk-export/--no-bulk-export",
     default=None,
     help="Try FHIR Bulk Data $export for resource reads when the payer supports it; fallback to paginated reads when unsupported.",
@@ -1410,6 +1418,7 @@ def provider_directory_fhir(
     page_limit: int | None,
     page_count: int | None,
     stream_batch_size: int | None,
+    defer_typed_materialization: bool,
     bulk_export: bool | None,
     source_concurrency: int | None,
     concurrency: int | None,
@@ -1458,6 +1467,7 @@ def provider_directory_fhir(
             page_limit=page_limit,
             page_count=page_count,
             stream_batch_size=stream_batch_size,
+            defer_typed_materialization=defer_typed_materialization,
             bulk_export=bulk_export,
             source_concurrency=source_concurrency,
             concurrency=concurrency,

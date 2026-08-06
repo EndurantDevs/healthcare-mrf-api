@@ -76,7 +76,7 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 48
+    assert len(command_signature.parameters) == 49
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"
     assert command.__annotations__ == expected_annotation_map
@@ -5851,8 +5851,32 @@ def test_provider_directory_cli_refresh_preset_leaves_defaults_unset_for_preset(
     assert calls[0]["import_resources"] is None
     assert calls[0]["full_refresh"] is None
     assert calls[0]["publish_after_acquisition"] is False
+    assert calls[0]["defer_typed_materialization"] is False
     assert calls[0]["seed_only"] is True
     assert calls[0]["probe"] is False
+
+
+def test_provider_directory_cli_forwards_deferred_materialization(monkeypatch):
+    calls = []
+
+    def fake_initiate_provider_directory_fhir(**kwargs):
+        calls.append(kwargs)
+        return "provider-directory-fhir-task"
+
+    monkeypatch.setattr(
+        process_cli,
+        "initiate_provider_directory_fhir",
+        fake_initiate_provider_directory_fhir,
+    )
+    monkeypatch.setattr(process_cli, "_run", lambda task: calls.append({"run": task}))
+
+    cli_result = CliRunner().invoke(
+        process_cli.provider_directory_fhir,
+        ["--import-resources", "--defer-typed-materialization"],
+    )
+
+    assert cli_result.exit_code == 0, cli_result.output
+    assert calls[0]["defer_typed_materialization"] is True
 
 
 def test_provider_directory_cli_routes_uhc_through_normal_import(monkeypatch):
@@ -6226,6 +6250,107 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
         dataset_call[1],
         dataset_id="dataset_1",
     )
+
+
+@pytest.mark.asyncio
+async def test_dataset_backed_upsert_can_defer_legacy_materialization(monkeypatch):
+    upsert_calls = []
+    persisted_proof = AsyncMock()
+
+    @contextlib.asynccontextmanager
+    async def fake_transaction():
+        yield None
+
+    async def fake_upsert(model, resource_rows, **kwargs):
+        upsert_calls.append((model, resource_rows, kwargs))
+        return len(resource_rows)
+
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+    monkeypatch.setattr(importer.db, "transaction", fake_transaction)
+    monkeypatch.setattr(importer, "persist_dataset_proof_shard", persisted_proof)
+
+    resource_rows = [
+        {
+            "source_id": "source_a",
+            "resource_id": "role-1",
+            "practitioner_ref": "Practitioner/practitioner-1",
+        }
+    ]
+
+    written = await importer._upsert_deferred_resource_rows(
+        ProviderDirectoryPractitionerRole,
+        resource_rows,
+        track_seen=False,
+        dataset_id="dataset_1",
+    )
+
+    assert written == 1
+    assert [call[0] for call in upsert_calls] == [
+        ProviderDirectoryDatasetResource
+    ]
+    persisted_proof.assert_awaited_once_with(
+        importer.db,
+        "mrf",
+        upsert_calls[0][1],
+        dataset_id="dataset_1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_deferred_materialization_requires_dataset_and_no_seen_tracking():
+    resource_rows = [{"source_id": "source_a", "resource_id": "role-1"}]
+
+    with pytest.raises(
+        ValueError,
+        match="provider_directory_deferred_typed_materialization_dataset_required",
+    ):
+        await importer._upsert_deferred_resource_rows(
+            ProviderDirectoryPractitionerRole,
+            resource_rows,
+            track_seen=False,
+            dataset_id=None,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="provider_directory_deferred_typed_materialization_seen_tracking_unsupported",
+    ):
+        await importer._upsert_deferred_resource_rows(
+            ProviderDirectoryPractitionerRole,
+            resource_rows,
+            track_seen=True,
+            dataset_id="dataset_1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_deferred_materialization_requires_checkpoint_safe_mode():
+    import_params_by_name = {
+        "resources": [],
+        "per_resource_limit": 0,
+        "page_limit": 0,
+        "page_count": 100,
+        "timeout": 15,
+        "run_id": "run_1",
+        "defer_typed_materialization": True,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="provider_directory_deferred_typed_materialization_checkpoint_required",
+    ):
+        await importer._import_resources([], **import_params_by_name)
+
+    with pytest.raises(
+        ValueError,
+        match="provider_directory_deferred_typed_materialization_incompatible_mode",
+    ):
+        await importer._import_resources(
+            [],
+            **import_params_by_name,
+            is_pagination_checkpointing_enabled=True,
+            stale_cleanup=True,
+        )
 
 
 def _alohr_graphql_fixture_page(root_key: str):
