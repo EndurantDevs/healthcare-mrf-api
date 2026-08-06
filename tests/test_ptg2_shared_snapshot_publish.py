@@ -7,6 +7,7 @@ import datetime
 import hashlib
 import json
 import struct
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -1021,6 +1022,7 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
         compilation,
         publication_context=shared_snapshot_publish._V4GraphCoordinates(
             schema_name="mrf",
+            logical_snapshot_id="synthetic-snapshot",
             snapshot_key=17,
             build_token="token",
         ),
@@ -1041,6 +1043,7 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
     assert publication_context.block_stage.startswith(
         "ptg2_v3_block_stage_"
     )
+    assert publication_context.logical_snapshot_id == "synthetic-snapshot"
     assert not hasattr(shared_snapshot_publish, "publish_v4_cas_block_stage")
     assert publish_maps_mock.await_args.kwargs["compressed_acquisition_bytes"] == 4_096
     assert (
@@ -1123,6 +1126,7 @@ async def test_v4_graph_publish_queues_blocks_after_stage_failure(
             compilation,
             publication_context=shared_snapshot_publish._V4GraphCoordinates(
                 schema_name="mrf",
+                logical_snapshot_id="synthetic-snapshot",
                 snapshot_key=17,
                 build_token="token",
             ),
@@ -1143,16 +1147,22 @@ def _failed_tax_stage_compilation(tmp_path):
     taxonomy_path = tmp_path / "inferred-taxonomy.copy"
     references_path = tmp_path / "graph-references.jsonl"
     return SimpleNamespace(
-        observe={
-            "group_count": 4,
-            "component_count": 0,
-            "npi_count": 0,
-            "npi_prefix_override_owner_count": 0,
-            "npi_prefix_override_member_count": 0,
-        },
+        observe=defaultdict(
+            int,
+            {
+                "group_count": 4,
+                "component_count": 0,
+                "npi_count": 0,
+                "npi_prefix_override_owner_count": 0,
+                "npi_prefix_override_member_count": 0,
+            },
+        ),
+        resource_admission=defaultdict(int),
         selected_layout="direct",
         pattern_copy_path=None,
-        summary={"npi_prefix_target": 201},
+        summary=defaultdict(int, {"npi_prefix_target": 201}),
+        relation_summaries=(),
+        heavy_bitmaps=(),
         group_copy_path=tmp_path / "groups.copy",
         component_copy_path=tmp_path / "components.copy",
         npi_copy_path=tmp_path / "npi.copy",
@@ -1202,51 +1212,69 @@ def _tax_stage_contract():
     )
 
 
+class _AtomicSourceTransactionFixture:
+    """Record one source-publication rollback path through real ordering."""
+
+    def __init__(self) -> None:
+        self.session = _AtomicSourceSession()
+        self.publication_events = []
+        self.staged = object()
+        self.prepared = SimpleNamespace(cleanup=self._cleanup)
+
+    def _cleanup(self) -> None:
+        self.publication_events.append(("cleanup", None))
+
+    @asynccontextmanager
+    async def transaction(self):
+        self.publication_events.append(("begin", self.session))
+        try:
+            yield self.session
+        except BaseException:
+            self.publication_events.append(("rollback", self.session))
+            raise
+        else:
+            self.publication_events.append(("commit", self.session))
+
+    async def stage_source(self, actual_session, actual_prepared):
+        assert actual_session is self.session
+        assert actual_prepared is self.prepared
+        self.publication_events.append(("source-stage", actual_session))
+        return self.staged
+
+    async def publish_tax_groups(self, actual_session, **_kwargs):
+        assert actual_session is self.session
+        self.publication_events.append(("merged-tax-groups", actual_session))
+
+    async def lock_physical_layout(self, actual_session, **_kwargs):
+        assert actual_session is self.session
+        self.publication_events.append(("physical-layout-lock", actual_session))
+
+    async def publish_source(self, actual_session, **kwargs):
+        assert actual_session is self.session
+        assert kwargs["prepared"] is self.prepared
+        assert kwargs["staged"] is self.staged
+        assert kwargs["logical_snapshot_id"] == "synthetic-snapshot"
+        self.publication_events.append(("source-local-tax", actual_session))
+        raise RuntimeError("post-source graph failure")
+
+
+class _AtomicSourceResult:
+    def one(self):
+        return ()
+
+
+class _AtomicSourceSession:
+    async def execute(self, *_args, **_kwargs):
+        return _AtomicSourceResult()
+
+    async def scalar(self, *_args, **_kwargs):
+        return 0
+
+
 def _atomic_source_transaction_fixture():
     """Return callbacks that record one source-publication rollback path."""
 
-    session = object()
-    publication_events = []
-    prepared = SimpleNamespace(
-        cleanup=lambda: publication_events.append(("cleanup", None)),
-    )
-
-    @asynccontextmanager
-    async def transaction():
-        publication_events.append(("begin", session))
-        try:
-            yield session
-        except BaseException:
-            publication_events.append(("rollback", session))
-            raise
-        else:
-            publication_events.append(("commit", session))
-
-    async def stage_source(actual_session, actual_prepared):
-        assert actual_session is session
-        assert actual_prepared is prepared
-        publication_events.append(("source-stage", actual_session))
-        return "source-stage"
-
-    async def publish_tax_groups(actual_session, **_kwargs):
-        assert actual_session is session
-        publication_events.append(("merged-tax-groups", actual_session))
-
-    async def publish_source(actual_session, **kwargs):
-        assert actual_session is session
-        assert kwargs["prepared"] is prepared
-        publication_events.append(("source-local-tax", actual_session))
-        raise RuntimeError("post-source graph failure")
-
-    return SimpleNamespace(
-        session=session,
-        publication_events=publication_events,
-        prepared=prepared,
-        transaction=transaction,
-        stage_source=stage_source,
-        publish_tax_groups=publish_tax_groups,
-        publish_source=publish_source,
-    )
+    return _AtomicSourceTransactionFixture()
 
 
 def _install_atomic_source_transaction_mocks(monkeypatch, atomic_fixture) -> None:
@@ -1268,7 +1296,7 @@ def _install_atomic_source_transaction_mocks(monkeypatch, atomic_fixture) -> Non
         ),
         "_copy_binary_file_to_stage": AsyncMock(),
         "stage_tax_identity_source_projection": atomic_fixture.stage_source,
-        "lock_v4_shared_layout_for_map_write": AsyncMock(),
+        "lock_v4_shared_layout_for_map_write": atomic_fixture.lock_physical_layout,
         "_publish_v4_cas_in_session": AsyncMock(return_value=object()),
         "stage_v4_inferred_taxonomy_compiler_copy": AsyncMock(
             return_value=SimpleNamespace(table_name="taxonomy-stage")
@@ -1280,12 +1308,26 @@ def _install_atomic_source_transaction_mocks(monkeypatch, atomic_fixture) -> Non
         "_publish_v4_tax_identity_manifest": AsyncMock(return_value={}),
         "_publish_v4_dictionary_stage_ranges": AsyncMock(),
         "_publish_v4_tax_group_ranges": atomic_fixture.publish_tax_groups,
+        "publish_v4_relation_manifests": AsyncMock(),
+        "publish_v4_heavy_owners": AsyncMock(),
+        "publish_prepared_v4_inferred_taxonomy_candidates": AsyncMock(
+            return_value=SimpleNamespace(
+                rule_count=0,
+                observe_only_rule_count=0,
+            )
+        ),
         "publish_staged_tax_identity_source_projection": (
             atomic_fixture.publish_source
         ),
     }
     for name, replacement in replacements_by_name.items():
         monkeypatch.setattr(shared_snapshot_publish, name, replacement)
+    monkeypatch.setattr(shared_snapshot_publish, "PTG2_V4_GRAPH_RESOURCE_FIELDS", ())
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS",
+        (),
+    )
 
 
 @pytest.mark.asyncio
@@ -1304,6 +1346,7 @@ async def test_v4_source_projection_shares_atomic_graph_transaction(
             publication_context=shared_snapshot_publish._V4AtomicPublishContext(
                 schema_name="mrf",
                 block_stage="ptg2_v3_block_stage_exact",
+                logical_snapshot_id="synthetic-snapshot",
                 snapshot_key=44,
                 build_token="exact-build",
             ),
@@ -1315,6 +1358,7 @@ async def test_v4_source_projection_shares_atomic_graph_transaction(
     assert atomic_fixture.publication_events == [
         ("begin", atomic_fixture.session),
         ("source-stage", atomic_fixture.session),
+        ("physical-layout-lock", atomic_fixture.session),
         ("merged-tax-groups", atomic_fixture.session),
         ("source-local-tax", atomic_fixture.session),
         ("rollback", atomic_fixture.session),
@@ -1466,6 +1510,7 @@ async def test_v4_tax_stages_are_removed_after_transaction_failure(
             publication_context=shared_snapshot_publish._V4AtomicPublishContext(
                 schema_name="mrf",
                 block_stage="ptg2_v3_block_stage_exact",
+                logical_snapshot_id="synthetic-snapshot",
                 snapshot_key=41,
                 build_token="exact-build",
             ),
@@ -1515,6 +1560,7 @@ async def test_v4_partial_stage_creation_is_removed(
             publication_context=shared_snapshot_publish._V4AtomicPublishContext(
                 schema_name="mrf",
                 block_stage="ptg2_v3_block_stage_exact",
+                logical_snapshot_id="synthetic-snapshot",
                 snapshot_key=42,
                 build_token="exact-build",
             ),
@@ -1553,6 +1599,7 @@ async def test_v4_first_stage_creation_failure_preserves_original_error(
             publication_context=shared_snapshot_publish._V4AtomicPublishContext(
                 schema_name="mrf",
                 block_stage="ptg2_v3_block_stage_exact",
+                logical_snapshot_id="synthetic-snapshot",
                 snapshot_key=43,
                 build_token="exact-build",
             ),

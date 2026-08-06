@@ -39,8 +39,10 @@ from process.ptg_parts import (
     frozen_rate_binding_store,
     ptg2_shared_publish,
     ptg2_tax_identity_source_observations,
+    ptg2_tax_identity_source_preflight,
     ptg2_tax_identity_source_publish,
     ptg2_tax_identity_source_stage,
+    ptg2_tax_identity_source_target_preflight,
     ptg2_tax_identity_source_validation,
     ptg2_v4_audit,
     ptg2_v4_taxonomy_candidates,
@@ -1870,6 +1872,7 @@ async def _publish_seal_pattern_v4_layout(state):
         state.compilation,
         publication_context=snapshot_publish._V4GraphCoordinates(
             schema_name=state.schema_name,
+            logical_snapshot_id="synthetic-snapshot",
             snapshot_key=state.reservation.snapshot_key,
             build_token=state.build_token,
         ),
@@ -2199,6 +2202,7 @@ async def _publish_frozen_provider_graph_with_patches(
         compilation,
         publication_context=snapshot_publish._V4GraphCoordinates(
             schema_name=schema_name,
+            logical_snapshot_id="synthetic-snapshot",
             snapshot_key=snapshot_key,
             build_token=build_token,
         ),
@@ -2754,8 +2758,10 @@ def _bind_source_local_database(monkeypatch, database: Database) -> None:
         ptg2_shared_publish,
         snapshot_publish,
         ptg2_tax_identity_source_observations,
+        ptg2_tax_identity_source_preflight,
         ptg2_tax_identity_source_publish,
         ptg2_tax_identity_source_stage,
+        ptg2_tax_identity_source_target_preflight,
         ptg2_tax_identity_source_validation,
     ):
         monkeypatch.setattr(module, "db", database)
@@ -2769,14 +2775,11 @@ def _install_post_source_failure(
     groups,
     publication_events: list[str],
 ) -> None:
-    """Fail after taxonomy proves source-local rows in the same transaction."""
+    """Fail immediately after source rows are proven in the graph transaction."""
 
     real_source_publish = snapshot_publish.publish_staged_tax_identity_source_projection
-    real_taxonomy_publish = (
-        snapshot_publish.publish_prepared_v4_inferred_taxonomy_candidates
-    )
 
-    async def publish_source_after_aggregate(session, **kwargs):
+    async def fail_after_source_publication(session, **kwargs):
         await _assert_aggregate_tax_rows(
             session,
             schema=schema,
@@ -2784,30 +2787,21 @@ def _install_post_source_failure(
             groups=groups,
         )
         publication_events.append("aggregate")
-        publication = await real_source_publish(session, **kwargs)
-        publication_events.append("source")
-        return publication
-
-    async def fail_after_taxonomy(session, **kwargs):
-        await real_taxonomy_publish(session, **kwargs)
+        await real_source_publish(session, **kwargs)
         await _assert_source_local_tax_rows(
             session,
             schema=schema,
             snapshot_key=snapshot_key,
             groups=groups,
         )
+        publication_events.append("source")
         publication_events.append("later")
         raise _PostSourcePublicationFailure("synthetic post-source failure")
 
     monkeypatch.setattr(
         snapshot_publish,
         "publish_staged_tax_identity_source_projection",
-        publish_source_after_aggregate,
-    )
-    monkeypatch.setattr(
-        snapshot_publish,
-        "publish_prepared_v4_inferred_taxonomy_candidates",
-        fail_after_taxonomy,
+        fail_after_source_publication,
     )
 
 
@@ -2835,6 +2829,81 @@ async def _assert_source_local_rollback(
     assert provider_set_count == 1
 
 
+async def _seed_source_local_logical_sources(
+    database: Database,
+    *,
+    fixture,
+    schema_name: str,
+) -> None:
+    """Seed the exact building snapshot and physical-source vector."""
+
+    schema = _quoted(schema_name)
+    await _create_source_local_logical_tables(database, schema=schema)
+    await database.status(
+        f"INSERT INTO {schema}.ptg2_snapshot (snapshot_id, status) "
+        "VALUES (:snapshot_id, 'building')",
+        snapshot_id="synthetic-snapshot",
+    )
+    await database.status(
+        f"INSERT INTO {schema}.ptg2_v3_snapshot_scope (snapshot_id) "
+        "VALUES (:snapshot_id)",
+        snapshot_id="synthetic-snapshot",
+    )
+    source_bindings = tuple(
+        dict(source_artifact["physical_source_binding"])
+        for source_artifact in fixture.tax_sources
+    )
+    async with database.transaction() as session:
+        await session.execute(
+            sa.text(f"""
+                INSERT INTO {schema}.ptg2_v3_snapshot_source
+                    (snapshot_id, source_key, source_type, identity_kind,
+                     identity_sha256)
+                VALUES
+                    (:snapshot_id, :source_key, :source_type, :identity_kind,
+                     :identity_sha256)
+                """),
+            [
+                {"snapshot_id": "synthetic-snapshot", **source_binding}
+                for source_binding in source_bindings
+            ],
+        )
+
+
+async def _create_source_local_logical_tables(
+    database: Database,
+    *,
+    schema: str,
+) -> None:
+    await database.execute_ddl(f"""
+        CREATE TABLE {schema}.ptg2_snapshot (
+            snapshot_id varchar(96) PRIMARY KEY,
+            status varchar(32) NOT NULL
+        )
+        """)
+    await database.execute_ddl(f"""
+        CREATE TABLE {schema}.ptg2_v3_snapshot_scope (
+            snapshot_id varchar(96) PRIMARY KEY,
+            FOREIGN KEY (snapshot_id)
+                REFERENCES {schema}.ptg2_snapshot (snapshot_id)
+                ON DELETE CASCADE
+        )
+        """)
+    await database.execute_ddl(f"""
+        CREATE TABLE {schema}.ptg2_v3_snapshot_source (
+            snapshot_id varchar(96) NOT NULL,
+            source_key integer NOT NULL,
+            source_type varchar(32) NOT NULL,
+            identity_kind varchar(64) NOT NULL,
+            identity_sha256 varchar(64) NOT NULL,
+            PRIMARY KEY (snapshot_id, source_key),
+            FOREIGN KEY (snapshot_id)
+                REFERENCES {schema}.ptg2_v3_snapshot_scope (snapshot_id)
+                ON DELETE CASCADE
+        )
+        """)
+
+
 async def _prepare_source_local_layout(
     database: Database,
     *,
@@ -2853,6 +2922,11 @@ async def _prepare_source_local_layout(
         database,
         schema_name=schema_name,
         monkeypatch=monkeypatch,
+    )
+    await _seed_source_local_logical_sources(
+        database,
+        fixture=fixture,
+        schema_name=schema_name,
     )
     return await _reserve_source_local_tax_layout(
         database,
@@ -2898,6 +2972,7 @@ async def test_v4_source_local_tax_publication_is_atomic_on_postgres(
                 fixture.compilation,
                 publication_context=snapshot_publish._V4GraphCoordinates(
                     schema_name=schema_name,
+                    logical_snapshot_id="synthetic-snapshot",
                     snapshot_key=reservation.snapshot_key,
                     build_token=build_token,
                 ),
@@ -2973,6 +3048,7 @@ async def _publish_direct_v4_fixture(
         compilation,
         publication_context=snapshot_publish._V4GraphCoordinates(
             schema_name=schema_name,
+            logical_snapshot_id="synthetic-snapshot",
             snapshot_key=reservation.snapshot_key,
             build_token=build_token,
         ),

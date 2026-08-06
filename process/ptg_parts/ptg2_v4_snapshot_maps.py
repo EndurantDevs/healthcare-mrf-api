@@ -30,6 +30,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
     delete_shared_layout_dense_rows,
     shared_block_hash,
 )
+from process.ptg_parts.ptg2_tax_identity_source_seal_validation import (
+    validate_building_tax_identity_source_projection,
+    validate_source_projection_absence,
+)
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     lock_writable_snapshot,
 )
@@ -4013,16 +4017,41 @@ class _V4SealRequest:
     progress_callback: Callable[[str, int], None] | None
 
 
+async def _validate_v4_source_seal_state(
+    session: Any,
+    request: _V4SealRequest,
+) -> None:
+    source_metadata = _tax_identity_source_seal_metadata(request.layout_manifest)
+    if source_metadata is None:
+        await validate_source_projection_absence(
+            session,
+            schema_name=request.schema_name,
+            snapshot_key=request.snapshot_key,
+        )
+        return
+    source_projection, aggregate_projection = source_metadata
+    await validate_building_tax_identity_source_projection(
+        session,
+        schema_name=request.schema_name,
+        snapshot_key=request.snapshot_key,
+        sealed_metadata=source_projection,
+        aggregate_metadata=aggregate_projection,
+    )
+
+
 async def _prepare_v4_seal_state(
     session: Any,
     request: _V4SealRequest,
 ) -> _V4SealState:
+    """Validate and summarize one build while holding its owner fence."""
+
     representation = await _lock_v4_build_owner(
         session,
         schema=request.schema,
         snapshot_key=request.snapshot_key,
         build_token=request.build_token,
     )
+    await _validate_v4_source_seal_state(session, request)
     summary, metadata = await _summarize_v4_seal_state(
         session,
         schema_name=request.schema_name,
@@ -4057,6 +4086,31 @@ async def _prepare_v4_seal_state(
             metadata=metadata,
         ),
     )
+
+
+def _tax_identity_source_seal_metadata(
+    layout_manifest: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]] | None:
+    serving_index = layout_manifest.get("serving_index")
+    provider_graph = (
+        serving_index.get("provider_graph")
+        if isinstance(serving_index, Mapping)
+        else None
+    )
+    if not isinstance(provider_graph, Mapping):
+        return None
+    if "provider_tax_identity_source" not in provider_graph:
+        return None
+    source_projection = provider_graph.get("provider_tax_identity_source")
+    aggregate_projection = provider_graph.get("provider_tax_identity")
+    if (
+        not isinstance(source_projection, Mapping)
+        or not source_projection
+        or not isinstance(aggregate_projection, Mapping)
+        or not aggregate_projection
+    ):
+        raise RuntimeError("PTG V4 tax identity source seal metadata is incomplete")
+    return source_projection, aggregate_projection
 
 
 async def _reuse_v4_layout_if_available(

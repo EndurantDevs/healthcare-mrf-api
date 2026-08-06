@@ -5798,11 +5798,19 @@ def _shared_v3_publisher_sources(
         source_root / "ptg_parts" / "ptg2_v4_snapshot_maps.py",
         source_root / "ptg_parts" / "ptg2_v4_taxonomy_candidates.py",
         source_root / "ptg_parts" / "ptg2_tax_identity_source_binding.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_aggregate_reuse.py",
         source_root / "ptg_parts" / "ptg2_tax_identity_source_artifact.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_binding_vector.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_copy.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_files.py",
         source_root / "ptg_parts" / "ptg2_tax_identity_source_observations.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_persisted.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_preflight.py",
         source_root / "ptg_parts" / "ptg2_tax_identity_source_projection.py",
         source_root / "ptg_parts" / "ptg2_tax_identity_source_publish.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_seal_validation.py",
         source_root / "ptg_parts" / "ptg2_tax_identity_source_stage.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_target_preflight.py",
         source_root / "ptg_parts" / "ptg2_tax_identity_source_validation.py",
     )
 
@@ -6057,9 +6065,17 @@ async def _validate_reused_tax_identity_source_metadata(
         if isinstance(provider_graph, Mapping)
         else None
     )
-    if not isinstance(source_metadata, Mapping):
+    aggregate_metadata = (
+        provider_graph.get("provider_tax_identity")
+        if isinstance(provider_graph, Mapping)
+        else None
+    )
+    if not isinstance(source_metadata, Mapping) or not isinstance(
+        aggregate_metadata,
+        Mapping,
+    ):
         raise RuntimeError(
-            "reusable PTG V4 layout lacks source-local tax identity evidence"
+            "reusable PTG V4 layout lacks complete tax identity evidence"
         )
     binding_index = build_tax_source_bindings(source_assignments)
     expected_bindings = tuple(
@@ -6073,6 +6089,7 @@ async def _validate_reused_tax_identity_source_metadata(
         snapshot_key=int(publication.shared_snapshot_key),
         expected_bindings=expected_bindings,
         sealed_metadata=source_metadata,
+        aggregate_metadata=aggregate_metadata,
     )
 
 
