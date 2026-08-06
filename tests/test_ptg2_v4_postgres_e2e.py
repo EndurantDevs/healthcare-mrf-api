@@ -38,6 +38,10 @@ from db.migration_ptg2_frozen_source_file_binding import (
 from process.ptg_parts import (
     frozen_rate_binding_store,
     ptg2_shared_publish,
+    ptg2_tax_identity_source_observations,
+    ptg2_tax_identity_source_publish,
+    ptg2_tax_identity_source_stage,
+    ptg2_tax_identity_source_validation,
     ptg2_v4_audit,
     ptg2_v4_taxonomy_candidates,
     source_download,
@@ -91,11 +95,11 @@ from tests.ptg2_v4_graph_compiler_test_support import (
     _write_membership as _write_compiler_membership,
     _write_npi_scope,
     _write_tax_identity,
+    compiler_fixture as _compiler_fixture,
     compiler_inputs as _compiler_inputs,
 )
 from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 from tests import test_ptg2_scanner_v3_runs as scanner_support
-
 
 ROOT = Path(__file__).resolve().parents[1]
 ptg_candidate_audit = importlib.import_module("process.ptg_candidate_audit")
@@ -107,6 +111,9 @@ TAXONOMY_MIGRATION_PATH = (
 )
 TAX_IDENTITY_MIGRATION_PATH = (
     ROOT / "alembic" / "versions" / "20260727100000_ptg2_provider_tax_identity.py"
+)
+TAX_IDENTITY_SOURCE_MIGRATION_PATH = (
+    ROOT / "alembic" / "versions" / "20260806100000_ptg2_tax_identity_source.py"
 )
 _STANDARD_FORMAT = (
     "magic8:uint32_le_version:uint64_le_entry_count:"
@@ -151,6 +158,17 @@ def _load_v4_tax_identity_migration():
     spec = importlib.util.spec_from_file_location(
         "ptg2_v4_tax_identity_migration",
         TAX_IDENTITY_MIGRATION_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_v4_source_evidence_migration():
+    spec = importlib.util.spec_from_file_location(
+        "ptg2_v4_tax_identity_source_migration",
+        TAX_IDENTITY_SOURCE_MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -930,6 +948,25 @@ async def _apply_v4_test_migrations(
     async with database.transaction() as session:
         connection = await session.connection()
         for statement in tax_recorder.executed:
+            await connection.exec_driver_sql(statement)
+
+
+async def _install_v4_source_evidence_schema(
+    database: Database,
+    *,
+    schema_name: str,
+    monkeypatch,
+) -> None:
+    """Install the source-local evidence schema for one focused V4 proof."""
+
+    recorder = _OpRecorder()
+    migration = _load_v4_source_evidence_migration()
+    monkeypatch.setattr(migration, "op", recorder)
+    monkeypatch.setattr(migration, "_schema", lambda: schema_name)
+    migration.upgrade()
+    async with database.transaction() as session:
+        connection = await session.connection()
+        for statement in recorder.executed:
             await connection.exec_driver_sql(statement)
 
 
@@ -1831,9 +1868,11 @@ async def _publish_seal_pattern_v4_layout(state):
     publication_progress = []
     state.publication = await snapshot_publish._publish_v4_graph(
         state.compilation,
-        schema_name=state.schema_name,
-        snapshot_key=state.reservation.snapshot_key,
-        build_token=state.build_token,
+        publication_context=snapshot_publish._V4GraphCoordinates(
+            schema_name=state.schema_name,
+            snapshot_key=state.reservation.snapshot_key,
+            build_token=state.build_token,
+        ),
         compressed_acquisition_bytes=1024,
         empty_npi_tin_only_normalization_count=0,
         progress_callback=lambda metric, amount: publication_progress.append(
@@ -2158,9 +2197,11 @@ async def _publish_frozen_provider_graph_with_patches(
     )
     publication = await snapshot_publish._publish_v4_graph(
         compilation,
-        schema_name=schema_name,
-        snapshot_key=snapshot_key,
-        build_token=build_token,
+        publication_context=snapshot_publish._V4GraphCoordinates(
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+        ),
         compressed_acquisition_bytes=sum(
             int(descriptor["content_length"]) for descriptor in batch.descriptors
         ),
@@ -2516,6 +2557,369 @@ async def test_frozen_multipart_scans_publish_and_candidate_audit_exactly(
             await database.disconnect()
 
 
+def _bind_synthetic_tax_source(
+    sidecar: dict[str, object],
+    *,
+    source_key: int,
+) -> dict[str, object]:
+    sidecar["physical_source_binding"] = {
+        "contract": "ptg2_tax_identity_rate_source_binding_v1",
+        "source_type": "in_network",
+        "identity_kind": "logical_json_sha256_v1",
+        "identity_sha256": hashlib.sha256(
+            f"synthetic-source-{source_key}".encode("ascii")
+        ).hexdigest(),
+        "source_key": source_key,
+    }
+    return sidecar
+
+
+async def _compile_source_local_tax_fixture(tmp_path: Path):
+    first_artifacts, provider_map = _compiler_fixture(
+        tmp_path / "source-a",
+        shard_id="source-a",
+    )
+    second_artifacts, _unused_provider_map = _compiler_fixture(
+        tmp_path / "source-b",
+        shard_id="source-b",
+    )
+    groups = (_global(3, 1), _global(3, 2))
+    matched_hmac = bytes.fromhex("11" * 32)
+    first_tax = next(
+        artifact
+        for artifact in first_artifacts
+        if artifact["name"] == "provider_group_tax_identity"
+    )
+    second_artifacts = [
+        artifact
+        for artifact in second_artifacts
+        if artifact["name"] != "provider_group_tax_identity"
+    ]
+    second_tax = _write_tax_identity(
+        tmp_path / "source-b" / "group-tax-identity-mixed.sidecar",
+        shard_id="source-b",
+        tax_observations=[
+            (groups[0], 1, matched_hmac),
+            (groups[1], 4, None),
+        ],
+    )
+    bound_tax_sources = (
+        _bind_synthetic_tax_source(first_tax, source_key=0),
+        _bind_synthetic_tax_source(second_tax, source_key=1),
+    )
+    compilation = await _compile_publication_fixture(
+        tmp_path,
+        [*first_artifacts, *second_artifacts, second_tax],
+        provider_map,
+        output_name="compiled-source-local-tax-v4",
+    )
+    assert compilation.observe["group_count"] == 2
+    assert compilation.observe["provider_set_count"] == 1
+    return SimpleNamespace(
+        compilation=compilation,
+        groups=groups,
+        provider_sets_by_key={1: _global(1, 1)},
+        tax_sources=bound_tax_sources,
+    )
+
+
+async def _reserve_source_local_tax_layout(
+    database: Database,
+    *,
+    schema_name: str,
+    provider_sets_by_key: dict[int, bytes],
+):
+    build_token = f"source-local-tax-v4-{uuid.uuid4().hex}"
+    async with database.transaction() as session:
+        reservation = await reserve_v4_shared_layout(
+            session,
+            schema_name=schema_name,
+            semantic_fingerprint=hashlib.sha256(build_token.encode()).digest(),
+            build_token=build_token,
+        )
+        await _insert_provider_set_rows(
+            session,
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            provider_sets_by_key=provider_sets_by_key,
+        )
+    return reservation, build_token
+
+
+async def _assert_aggregate_tax_rows(
+    session,
+    *,
+    schema: str,
+    snapshot_key: int,
+    groups: tuple[bytes, bytes],
+) -> None:
+    aggregate_rows = (
+        await session.execute(
+            sa.text(f"""
+                SELECT provider_group_global_id_128, tax_identity_state,
+                       tin_key, source_bitmap
+                  FROM {schema}.ptg2_provider_group_tax_identity
+                 WHERE snapshot_key = :snapshot_key
+                 ORDER BY provider_group_global_id_128
+                """),
+            {"snapshot_key": snapshot_key},
+        )
+    ).all()
+    assert [
+        (bytes(group_id), state, tin_key, bytes(source_bitmap))
+        for group_id, state, tin_key, source_bitmap in aggregate_rows
+    ] == [
+        (groups[0], "matched_ein", 0, b"\x03"),
+        (groups[1], "unsupported_type", None, b"\x03"),
+    ]
+
+
+async def _assert_source_local_tax_rows(
+    session,
+    *,
+    schema: str,
+    snapshot_key: int,
+    groups: tuple[bytes, bytes],
+) -> None:
+    source_rows = (
+        await session.execute(
+            sa.text(f"""
+                SELECT source_key, provider_group_global_id_128,
+                       tax_identity_state, tin_key
+                  FROM {schema}.ptg2_provider_group_tax_identity_source
+                 WHERE snapshot_key = :snapshot_key
+                 ORDER BY source_key, provider_group_global_id_128
+                """),
+            {"snapshot_key": snapshot_key},
+        )
+    ).all()
+    assert [
+        (source_key, bytes(group_id), state, tin_key)
+        for source_key, group_id, state, tin_key in source_rows
+    ] == [
+        (0, groups[0], "matched_ein", 0),
+        (0, groups[1], "missing", None),
+        (1, groups[0], "matched_ein", 0),
+        (1, groups[1], "unsupported_type", None),
+    ]
+
+
+async def _failed_source_local_tax_counts(
+    database: Database,
+    *,
+    schema: str,
+    snapshot_key: int,
+) -> tuple[int, ...]:
+    async with database.transaction() as session:
+        counts = (
+            await session.execute(
+                sa.text(f"""
+                    SELECT
+                      (SELECT COUNT(*) FROM {schema}.ptg2_v4_snapshot_map_root
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_group
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*) FROM {schema}.
+                           ptg2_provider_tax_identity_manifest
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*) FROM {schema}.ptg2_provider_tax_identity
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*) FROM {schema}.
+                           ptg2_provider_group_tax_identity
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*) FROM {schema}.
+                           ptg2_provider_tax_identity_source_manifest
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*) FROM {schema}.
+                           ptg2_provider_tax_identity_source_binding
+                        WHERE snapshot_key = :snapshot_key),
+                      (SELECT COUNT(*) FROM {schema}.
+                           ptg2_provider_group_tax_identity_source
+                        WHERE snapshot_key = :snapshot_key)
+                    """),
+                {"snapshot_key": snapshot_key},
+            )
+        ).one()
+    return tuple(int(count) for count in counts)
+
+
+class _PostSourcePublicationFailure(RuntimeError):
+    """Synthetic sentinel raised after source-local rows are observable."""
+
+
+def _bind_source_local_database(monkeypatch, database: Database) -> None:
+    """Bind every source-local publisher module to one test database."""
+
+    for module in (
+        ptg2_shared_publish,
+        snapshot_publish,
+        ptg2_tax_identity_source_observations,
+        ptg2_tax_identity_source_publish,
+        ptg2_tax_identity_source_stage,
+        ptg2_tax_identity_source_validation,
+    ):
+        monkeypatch.setattr(module, "db", database)
+
+
+def _install_post_source_failure(
+    monkeypatch,
+    *,
+    schema: str,
+    snapshot_key: int,
+    groups,
+    publication_events: list[str],
+) -> None:
+    """Fail after taxonomy proves source-local rows in the same transaction."""
+
+    real_source_publish = snapshot_publish.publish_staged_tax_identity_source_projection
+    real_taxonomy_publish = (
+        snapshot_publish.publish_prepared_v4_inferred_taxonomy_candidates
+    )
+
+    async def publish_source_after_aggregate(session, **kwargs):
+        await _assert_aggregate_tax_rows(
+            session,
+            schema=schema,
+            snapshot_key=snapshot_key,
+            groups=groups,
+        )
+        publication_events.append("aggregate")
+        publication = await real_source_publish(session, **kwargs)
+        publication_events.append("source")
+        return publication
+
+    async def fail_after_taxonomy(session, **kwargs):
+        await real_taxonomy_publish(session, **kwargs)
+        await _assert_source_local_tax_rows(
+            session,
+            schema=schema,
+            snapshot_key=snapshot_key,
+            groups=groups,
+        )
+        publication_events.append("later")
+        raise _PostSourcePublicationFailure("synthetic post-source failure")
+
+    monkeypatch.setattr(
+        snapshot_publish,
+        "publish_staged_tax_identity_source_projection",
+        publish_source_after_aggregate,
+    )
+    monkeypatch.setattr(
+        snapshot_publish,
+        "publish_prepared_v4_inferred_taxonomy_candidates",
+        fail_after_taxonomy,
+    )
+
+
+async def _assert_source_local_rollback(
+    database: Database,
+    *,
+    schema: str,
+    snapshot_key: int,
+) -> None:
+    """Require complete rollback while preserving the prior provider set."""
+
+    assert (
+        await _failed_source_local_tax_counts(
+            database,
+            schema=schema,
+            snapshot_key=snapshot_key,
+        )
+        == (0,) * 8
+    )
+    provider_set_count = await database.scalar(
+        f"SELECT COUNT(*) FROM {schema}.ptg2_v3_provider_set "
+        "WHERE snapshot_key = :snapshot_key",
+        snapshot_key=snapshot_key,
+    )
+    assert provider_set_count == 1
+
+
+async def _prepare_source_local_layout(
+    database: Database,
+    *,
+    fixture,
+    schema_name: str,
+    monkeypatch,
+):
+    """Install the focused catalog and reserve its source-local layout."""
+
+    await _create_v4_test_schema(
+        database,
+        schema_name=schema_name,
+        monkeypatch=monkeypatch,
+    )
+    await _install_v4_source_evidence_schema(
+        database,
+        schema_name=schema_name,
+        monkeypatch=monkeypatch,
+    )
+    return await _reserve_source_local_tax_layout(
+        database,
+        schema_name=schema_name,
+        provider_sets_by_key=fixture.provider_sets_by_key,
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_source_local_tax_publication_is_atomic_on_postgres(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Prove aggregate-first source publication and later-step rollback."""
+
+    if os.getenv("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST=1 for PostgreSQL E2E")
+
+    fixture = await _compile_source_local_tax_fixture(tmp_path)
+    schema_name = f"ptg2_v4_tax_source_e2e_{uuid.uuid4().hex}"
+    schema = _quoted(schema_name)
+    database = Database()
+    await database.connect()
+    _bind_source_local_database(monkeypatch, database)
+    try:
+        reservation, build_token = await _prepare_source_local_layout(
+            database,
+            fixture=fixture,
+            schema_name=schema_name,
+            monkeypatch=monkeypatch,
+        )
+        publication_events: list[str] = []
+        _install_post_source_failure(
+            monkeypatch,
+            schema=schema,
+            snapshot_key=reservation.snapshot_key,
+            groups=fixture.groups,
+            publication_events=publication_events,
+        )
+
+        with pytest.raises(_PostSourcePublicationFailure):
+            await snapshot_publish._publish_v4_graph(
+                fixture.compilation,
+                publication_context=snapshot_publish._V4GraphCoordinates(
+                    schema_name=schema_name,
+                    snapshot_key=reservation.snapshot_key,
+                    build_token=build_token,
+                ),
+                compressed_acquisition_bytes=1024,
+                empty_npi_tin_only_normalization_count=0,
+                tax_identity_source_artifacts=fixture.tax_sources,
+            )
+
+        assert publication_events == ["aggregate", "source", "later"]
+        await _assert_source_local_rollback(
+            database,
+            schema=schema,
+            snapshot_key=reservation.snapshot_key,
+        )
+    finally:
+        fixture.compilation.cleanup()
+        try:
+            await database.execute_ddl(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        finally:
+            await database.disconnect()
+
+
 async def _compile_direct_v4_fixture(tmp_path):
     binary_path = _compiler_binary()
     assert binary_path.is_file(), f"missing V4 compiler binary: {binary_path}"
@@ -2567,9 +2971,11 @@ async def _publish_direct_v4_fixture(
         )
     publication = await snapshot_publish._publish_v4_graph(
         compilation,
-        schema_name=schema_name,
-        snapshot_key=reservation.snapshot_key,
-        build_token=build_token,
+        publication_context=snapshot_publish._V4GraphCoordinates(
+            schema_name=schema_name,
+            snapshot_key=reservation.snapshot_key,
+            build_token=build_token,
+        ),
         compressed_acquisition_bytes=1024,
         empty_npi_tin_only_normalization_count=0,
     )
