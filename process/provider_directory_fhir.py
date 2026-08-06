@@ -14806,13 +14806,20 @@ async def _expand_reviewed_artifact_promotion_aliases(
 def _should_select_validated_artifacts(
     publish_artifacts_targets: set[str] | None,
 ) -> bool:
-    """Return whether an artifact run may atomically publish validated data."""
+    """Select validated data only for a complete non-Profile serving bundle.
+
+    Profile publication uses its separately attested global selection and
+    capacity contract. Corroboration is an optional consumer of the serving
+    bundle, so neither target may prevent the bundle from making a reviewed
+    dataset current.
+    """
     if publish_artifacts_targets is None:
         return True
-    base_targets = set(PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS) - {
-        "corroboration"
+    required_targets = set(PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS) - {
+        "corroboration",
+        "profile",
     }
-    return base_targets.issubset(publish_artifacts_targets)
+    return required_targets.issubset(publish_artifacts_targets)
 
 
 def _provider_directory_dataset_artifact_targets(

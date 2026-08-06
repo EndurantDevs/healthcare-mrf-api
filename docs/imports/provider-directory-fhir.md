@@ -404,6 +404,13 @@ source configuration automatically:
 4. Sync discovery for every alias, then publish the artifact and promote the
    validated dataset.
 
+Candidate promotion requires the complete non-Profile serving bundle. Profile
+publication remains a separate global operation governed by its selection and
+capacity attestation, while corroboration remains optional. Promoting the
+non-Profile bundle atomically installs its serving relations and changes the
+current dataset/source pointers; it does not claim that the Profile serving
+generation has been applied.
+
 The exact matched dataset remains nonpromotable while its registry status is
 pending, including after the second root succeeds. Do not publish it until the
 VERIFIED registry PR is deployed and discovery has synced every alias. While
