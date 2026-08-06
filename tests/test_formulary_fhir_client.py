@@ -238,6 +238,45 @@ async def test_coverage_plan_count_requires_an_exact_total():
 
 
 @pytest.mark.asyncio
+async def test_count_response_requires_a_bundle_even_when_total_is_present():
+    session = _Session(
+        [_Response({"resourceType": "OperationOutcome", "total": 2})]
+    )
+    cutoff = dt.datetime(2026, 8, 6, tzinfo=dt.UTC)
+    async with FHIRFormularyClient(session=session) as client:
+        with pytest.raises(FHIRTransportError, match="did not return a Bundle"):
+            await client.coverage_plan_count(cutoff=cutoff)
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_unexpected_resource_instead_of_hiding_delta():
+    session = _Session(
+        [
+            _Response(
+                {
+                    "resourceType": "Bundle",
+                    "entry": [
+                        {"resource": {"resourceType": "OperationOutcome"}}
+                    ],
+                }
+            )
+        ]
+    )
+    cutoff = dt.datetime(2026, 8, 6, tzinfo=dt.UTC)
+    collected_resources = []
+    async with FHIRFormularyClient(session=session) as client:
+        with pytest.raises(FHIRTransportError, match="unexpected OperationOutcome"):
+            async for resource in client.medications(
+                "SYNTH-A",
+                cutoff=cutoff,
+                updated_since=cutoff - dt.timedelta(minutes=5),
+            ):
+                collected_resources.append(resource)
+
+    assert collected_resources == []
+
+
+@pytest.mark.asyncio
 async def test_combined_drug_plan_search_is_rejected_before_transport():
     session = _Session([])
     cutoff = dt.datetime(2026, 8, 6, tzinfo=dt.UTC)

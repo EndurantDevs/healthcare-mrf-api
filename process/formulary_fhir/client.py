@@ -77,14 +77,32 @@ def _bundle_next(bundle: Mapping[str, Any]) -> str | None:
 
 def _bundle_resources(bundle: Mapping[str, Any], expected_type: str) -> tuple[dict[str, Any], ...]:
     entries = bundle.get("entry")
-    if not isinstance(entries, list):
+    if entries is None:
         return ()
+    if not isinstance(entries, list):
+        raise FHIRTransportError("FHIR bundle entries must be a list")
     resources: list[dict[str, Any]] = []
     for entry in entries:
         resource = entry.get("resource") if isinstance(entry, Mapping) else None
-        if isinstance(resource, dict) and resource.get("resourceType") == expected_type:
-            resources.append(resource)
+        if not isinstance(resource, dict):
+            raise FHIRTransportError("FHIR bundle entry has no resource object")
+        if resource.get("resourceType") != expected_type:
+            raise FHIRTransportError(
+                f"FHIR bundle contains an unexpected {resource.get('resourceType')} resource"
+            )
+        resources.append(resource)
     return tuple(resources)
+
+
+def _exact_bundle_total(bundle: Mapping[str, Any], resource_name: str) -> int:
+    if bundle.get("resourceType") != "Bundle":
+        raise FHIRTransportError(f"FHIR {resource_name} count did not return a Bundle")
+    total = bundle.get("total")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise FHIRTransportError(
+            f"FHIR {resource_name} count response has no exact non-negative total"
+        )
+    return total
 
 
 class FHIRFormularyClient:
@@ -273,12 +291,7 @@ class FHIRFormularyClient:
             f"{self.base_url}/List",
             params=search_params_by_name,
         )
-        total = bundle.get("total")
-        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-            raise FHIRTransportError(
-                "FHIR List count response has no exact non-negative total"
-            )
-        return total
+        return _exact_bundle_total(bundle, "List")
 
     async def alias_count(self, alias: str, *, cutoff: dt.datetime) -> int:
         """Return the exact MedicationKnowledge census for one alias."""
@@ -293,10 +306,7 @@ class FHIRFormularyClient:
             f"{self.base_url}/MedicationKnowledge",
             params=search_params_by_name,
         )
-        total = bundle.get("total")
-        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-            raise FHIRTransportError("FHIR count response has no exact non-negative total")
-        return total
+        return _exact_bundle_total(bundle, "MedicationKnowledge")
 
     async def medications(
         self,
