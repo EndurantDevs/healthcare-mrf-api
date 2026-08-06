@@ -882,6 +882,9 @@ AETNA_MEDICAID_TARGETED_QUERY_REQUIRED_ERROR = (
 AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR = (
     "aetna_resource_search_returned_operation_outcome"
 )
+RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR = (
+    "provider_directory_resource_search_returned_operation_outcome"
+)
 CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
 CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
@@ -1143,6 +1146,10 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     },
     **{
         (SCAN_PROVIDER_DIRECTORY_BASE, resource_type): 100
+        for resource_type in DEFAULT_RESOURCES
+    },
+    **{
+        (CIGNA_PROVIDER_DIRECTORY_BASE, resource_type): 100
         for resource_type in DEFAULT_RESOURCES
     },
     # UHC/Flex InsurancePlan accepts tiny pages but returns Azure 504s for
@@ -36165,6 +36172,7 @@ def _is_transient_source_fetch_failure(
     if fetch_error:
         return fetch_error not in {
             AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR,
+            RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR,
             SOURCE_QUOTA_EXHAUSTED_ERROR,
         }
     return status_code in SOURCE_TRANSIENT_HTTP_STATUSES
@@ -36203,6 +36211,57 @@ def _aetna_resource_search_payload_error(
     ):
         return AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
     return None
+
+
+def _resource_search_payload_error(
+    source_record: dict[str, Any],
+    request_url: str,
+    status_code: int | None,
+    fhir_payload: dict[str, Any] | None,
+) -> str | None:
+    """Fail closed when a successful collection search only reports an outcome."""
+    aetna_error = _aetna_resource_search_payload_error(
+        source_record,
+        request_url,
+        status_code,
+        fhir_payload,
+    )
+    if aetna_error:
+        return aetna_error
+    resource_type = _fhir_collection_search_resource_type(
+        source_record,
+        request_url,
+    )
+    if status_code != 200 or not resource_type or not isinstance(fhir_payload, dict):
+        return None
+    if fhir_payload.get("resourceType") == "OperationOutcome":
+        return RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+    if not _is_bundle_payload(fhir_payload):
+        return None
+    entry_resources = [entry["resource"] for entry in _bundle_entries(fhir_payload)]
+    outcome_resources = [
+        resource
+        for resource in entry_resources
+        if resource.get("resourceType") == "OperationOutcome"
+    ]
+    if outcome_resources and (
+        not any(resource.get("resourceType") == resource_type for resource in entry_resources)
+        or any(_has_operation_outcome_error(outcome) for outcome in outcome_resources)
+    ):
+        return RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+    return None
+
+
+def _has_operation_outcome_error(outcome: dict[str, Any]) -> bool:
+    """Treat missing, fatal, error, and unknown issue severities as failures."""
+    issues = [issue for issue in outcome.get("issue") or [] if isinstance(issue, dict)]
+    if not issues:
+        return True
+    return any(
+        str(issue.get("severity") or "").strip().lower()
+        not in {"warning", "information"}
+        for issue in issues
+    )
 
 
 def _source_fetch_retry_delay_seconds(attempt_index: int) -> float:
@@ -36485,7 +36544,7 @@ def _source_fetch_result_with_payload_error(
     fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int],
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
-    payload_error = _aetna_resource_search_payload_error(
+    payload_error = _resource_search_payload_error(
         source_record,
         request_url,
         status_code,

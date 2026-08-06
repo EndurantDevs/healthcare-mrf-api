@@ -7393,6 +7393,165 @@ async def test_cigna_empty_search_retry_excludes_empty_or_continuation_queries(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome_payload",
+    [
+        {
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "too-costly"}],
+        },
+        {
+            "resourceType": "Bundle",
+            "type": "searchset",
+            "entry": [
+                {
+                    "resource": {
+                        "resourceType": "OperationOutcome",
+                        "issue": [
+                            {"severity": "error", "code": "too-costly"}
+                        ],
+                    }
+                }
+            ],
+        },
+    ],
+)
+async def test_http_200_outcome_only_search_response_fails_closed(
+    monkeypatch,
+    outcome_payload,
+):
+    fetch_json = AsyncMock(
+        return_value=(
+            200,
+            outcome_payload,
+            None,
+            5,
+        )
+    )
+    monkeypatch.setattr(importer, "_fetch_json", fetch_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        {
+            "source_id": "source-a",
+            "api_base": "https://directory.example.test/fhir",
+        },
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run-1",
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == importer.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+    fetch_json.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_bundle_allows_outcome_alongside_requested_resource(monkeypatch):
+    fetch_json = AsyncMock(
+        return_value=(
+            200,
+            {
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [
+                    {
+                        "search": {"mode": "outcome"},
+                        "resource": {
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": "warning", "code": "informational"}],
+                        }
+                    },
+                    {
+                        "resource": {
+                            "resourceType": "Practitioner",
+                            "id": "practitioner-1",
+                        }
+                    },
+                ],
+            },
+            None,
+            5,
+        )
+    )
+    monkeypatch.setattr(importer, "_fetch_json", fetch_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        {
+            "source_id": "source-a",
+            "api_base": "https://directory.example.test/fhir",
+        },
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run-1",
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.rows_fetched == 1
+    assert fetch_result.rows[0]["resource_id"] == "practitioner-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("severity", ["error", "fatal"])
+async def test_search_bundle_rejects_error_outcome_alongside_resource(
+    monkeypatch,
+    severity,
+):
+    fetch_json = AsyncMock(
+        return_value=(
+            200,
+            {
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "entry": [
+                    {
+                        "search": {"mode": "outcome"},
+                        "resource": {
+                            "resourceType": "OperationOutcome",
+                            "issue": [{"severity": severity, "code": "processing"}],
+                        },
+                    },
+                    {
+                        "resource": {
+                            "resourceType": "Practitioner",
+                            "id": "practitioner-1",
+                        }
+                    },
+                ],
+            },
+            None,
+            5,
+        )
+    )
+    monkeypatch.setattr(importer, "_fetch_json", fetch_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        {
+            "source_id": "source-a",
+            "api_base": "https://directory.example.test/fhir",
+        },
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run-1",
+    )
+
+    assert fetch_result is not None
+    assert fetch_result.complete is False
+    assert fetch_result.error == importer.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+    fetch_json.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_aetna_http_200_operation_outcome_is_resource_error(monkeypatch):
     fetch_json = AsyncMock(
         return_value=(
@@ -7812,7 +7971,7 @@ def test_molina_200_quota_is_deferred():
     ) == "2026-07-12T00:01:00Z"
 
 
-def test_generic_200_quota_text_is_unchanged():
+def test_generic_200_quota_outcome_is_search_error():
     quota_payload_dict = {
         "resourceType": "OperationOutcome",
         "issue": [{"diagnostics": "Out of call volume quota."}],
@@ -7823,7 +7982,12 @@ def test_generic_200_quota_text_is_unchanged():
         "https://payer.example/fhir/Practitioner?page=2",
         (200, quota_payload_dict, None, 7),
     )
-    assert generic_fetch_result == (200, quota_payload_dict, None, 7)
+    assert generic_fetch_result == (
+        200,
+        quota_payload_dict,
+        importer.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR,
+        7,
+    )
 
 
 def test_non_bundle_backoff_is_bounded():
@@ -15972,6 +16136,18 @@ def test_resource_start_url_caps_scan_server_page_size():
     )
 
     assert url == f"{importer.SCAN_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
+
+
+def test_resource_start_url_caps_known_hundred_row_server_page_size():
+    url = importer._resource_start_url(
+        {"api_base": importer.CIGNA_PROVIDER_DIRECTORY_BASE},
+        "HealthcareService",
+        page_count=1000,
+    )
+
+    assert url == (
+        f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/HealthcareService?_count=100"
+    )
 
 
 def test_aetna_commercial_resources_use_one_unfiltered_count_30_stream():
