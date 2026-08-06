@@ -15,6 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from tests.ptg2_billing_associations_postgres_support import (
     assert_billing_loader_contract,
 )
+from tests.ptg2_billing_entity_group_resolution_postgres_support import (
+    assert_billing_ref_resolver_postgres_contract,
+)
 from tests.ptg2_provider_tax_identity_postgres_support import (
     assert_layout_cascade,
     assert_new_v4_requires_sidecar,
@@ -471,6 +474,9 @@ async def test_provider_tax_identity_postgres_lifecycle(monkeypatch) -> None:
         await _assert_manifest_contract_constraints(engine, schema_name)
         await _assert_direct_writes_are_immutable(engine, schema_name)
         await _assert_completion_guards(engine, schema_name)
+        await assert_billing_ref_resolver_postgres_contract(
+            engine, schema_name
+        )
         await _assert_source_provenance_completion_guards(
             engine,
             schema_name,
