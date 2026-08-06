@@ -10148,19 +10148,24 @@ def test_full_artifact_selection_fails_closed_on_multiple_validated_candidates()
         )
 
 
-def test_only_full_base_artifact_publication_can_promote_candidates():
+def test_complete_non_profile_artifact_publication_can_promote_candidates():
     all_targets = set(importer.PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS)
+    non_profile_targets = all_targets - {"corroboration", "profile"}
 
     assert importer._should_select_validated_artifacts(None)
+    assert importer._should_select_validated_artifacts(all_targets)
+    assert importer._should_select_validated_artifacts(non_profile_targets)
     assert importer._should_select_validated_artifacts(
-        all_targets
+        all_targets - {"profile"}
     )
     assert not importer._should_select_validated_artifacts(
         {"corroboration"}
     )
-    assert not importer._should_select_validated_artifacts(
-        all_targets - {"profile"}
-    )
+    assert not importer._should_select_validated_artifacts({"profile"})
+    for required_target in non_profile_targets:
+        assert not importer._should_select_validated_artifacts(
+            non_profile_targets - {required_target}
+        )
 
 
 def test_artifact_dataset_selection_rejects_missing_and_ambiguous_current():
@@ -10947,6 +10952,32 @@ def test_candidate_artifact_bundle_requires_every_deferred_relation():
             publish_corroboration=False,
             publish_artifacts_targets=None,
         )
+
+
+def test_non_profile_candidate_bundle_does_not_require_profile_artifacts():
+    metrics = _complete_candidate_artifact_metrics()
+    metrics.pop("profile")
+    artifact_bundle = _complete_candidate_artifact_bundle()
+    artifact_bundle.stages = [
+        stage
+        for stage in artifact_bundle.stages
+        if stage.target_relation
+        not in {
+            importer.profile_artifact.PROFILE_EVIDENCE_TABLE,
+            importer.profile_artifact.PROFILE_TABLE,
+        }
+    ]
+    non_profile_targets = set(
+        importer.PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS
+    ) - {"corroboration", "profile"}
+
+    importer._assert_candidate_artifact_bundle_complete(
+        _validated_artifact_candidate_fence(),
+        metrics,
+        artifact_bundle,
+        publish_corroboration=False,
+        publish_artifacts_targets=non_profile_targets,
+    )
 
 
 def _install_confirmed_promotion_harness(monkeypatch, fence, events):
