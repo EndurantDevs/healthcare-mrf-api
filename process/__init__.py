@@ -1260,6 +1260,14 @@ def provider_enrichment(test: bool):
 @click.option("--credential-config-file", help="Path to secret-backed Provider Directory credentials JSON file.")
 @click.option("--run-id", help="Existing Provider Directory FHIR run id to scope artifact publishing.")
 @click.option(
+    "--snapshot-cutoff",
+    "provider_directory_snapshot_cutoff",
+    help=(
+        "Timezone-aware _lastUpdated upper bound required for an exact-census "
+        "manual source acquisition. Reuse it for both verification roots."
+    ),
+)
+@click.option(
     "--source-id",
     multiple=True,
     help="Provider Directory source id to scope artifact publishing. Can be passed more than once.",
@@ -1385,6 +1393,7 @@ def provider_directory_fhir(
     retest_results_url: str | None,
     credential_config_file: str | None,
     run_id: str | None,
+    provider_directory_snapshot_cutoff: str | None,
     source_id: tuple[str, ...],
     limit: int | None,
     source_query: str | None,
@@ -1434,6 +1443,9 @@ def provider_directory_fhir(
             retest_results_url=retest_results_url,
             credential_config_file=credential_config_file,
             run_id=run_id,
+            provider_directory_snapshot_cutoff=(
+                provider_directory_snapshot_cutoff
+            ),
             source_ids=list(source_id),
             limit=limit,
             source_query=source_query,
