@@ -87,16 +87,13 @@ def test_command_wrapper_preserves_public_reflection_contract():
     }
 
 
-@pytest.mark.asyncio
-async def test_provider_directory_progress_moves_from_probe_into_row_import(
-    monkeypatch,
-):
-    """A completed probe must not fence lower-percentage import progress."""
+def _install_provider_progress_capture(monkeypatch):
+    """Capture SQL progress after applying the live monotonic merge."""
     from process import live_progress
 
-    run_id = "run-provider-directory-progress"
+    run_id = "run-synthetic-progress"
     now = datetime.datetime(2026, 8, 6, 12, 0, tzinfo=datetime.UTC)
-    snapshots = []
+    progress_snapshots = []
 
     async def capture_control_progress(
         observed_run_id,
@@ -114,42 +111,74 @@ async def test_provider_directory_progress_moves_from_probe_into_row_import(
                 "status": status,
                 "source": "provider-directory-sql-progress",
             },
-            observed_at=(now + datetime.timedelta(seconds=len(snapshots))).isoformat(),
-            now=now + datetime.timedelta(seconds=len(snapshots)),
-            previous=snapshots[-1] if snapshots else None,
+            observed_at=(
+                now + datetime.timedelta(seconds=len(progress_snapshots))
+            ).isoformat(),
+            now=now + datetime.timedelta(seconds=len(progress_snapshots)),
+            previous=progress_snapshots[-1] if progress_snapshots else None,
         )
         assert candidate is not None
-        snapshots.append(candidate)
+        progress_snapshots.append(candidate)
 
     monkeypatch.setattr(importer, "mark_control_run", capture_control_progress)
     live_progress._reset_attempt_sequences(run_id)
+    return live_progress, run_id, now, progress_snapshots
 
+
+async def _mark_test_probe_progress(run_id: str, message: str) -> None:
     await importer._mark_provider_directory_progress(
         run_id,
         phase="provider-directory probing sources",
-        stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_PROBE,
+        details=importer._provider_directory_progress_details(
+            stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_PROBE
+        ),
         done=1,
         total=1,
-        message="probed 1/1 source(s)",
+        message=message,
     )
+
+
+async def _mark_test_import_progress(
+    run_id: str,
+    *,
+    done: int,
+    total: int,
+    rows_written: int,
+) -> None:
     await importer._mark_provider_directory_progress(
         run_id,
         phase="provider-directory importing resources",
-        stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
-        done=0,
-        total=1,
-        message="imported resources for 0/1 source group(s); rows_written=0",
-        counters={"resource_rows_written": 0, "source_groups_completed": 0},
+        details=importer._provider_directory_progress_details(
+            stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
+            counters={
+                "resource_rows_written": rows_written,
+                "source_groups_completed": done,
+            },
+        ),
+        done=done,
+        total=total,
+        message=(
+            f"imported resources for {done}/{total} source group(s); "
+            f"rows_written={rows_written}"
+        ),
     )
-    await importer._mark_provider_directory_progress(
-        run_id,
-        phase="provider-directory importing resources",
-        stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
-        done=0,
-        total=1,
-        message="imported resources for 0/1 source group(s); rows_written=100",
-        counters={"resource_rows_written": 100, "source_groups_completed": 0},
+
+
+async def _emit_probe_to_import_progress(run_id: str) -> None:
+    await _mark_test_probe_progress(run_id, "probed 1/1 source(s)")
+    await _mark_test_import_progress(run_id, done=0, total=1, rows_written=0)
+    await _mark_test_import_progress(run_id, done=0, total=1, rows_written=100)
+
+
+@pytest.mark.asyncio
+async def test_provider_directory_progress_moves_from_probe_into_row_import(
+    monkeypatch,
+):
+    """A completed probe must not fence lower-percentage import progress."""
+    live_progress, run_id, now, progress_snapshots = (
+        _install_provider_progress_capture(monkeypatch)
     )
+    await _emit_probe_to_import_progress(run_id)
 
     heartbeat = live_progress._merged_live_progress_candidate(
         run_id=run_id,
@@ -165,41 +194,44 @@ async def test_provider_directory_progress_moves_from_probe_into_row_import(
         },
         observed_at=(now + datetime.timedelta(seconds=3)).isoformat(),
         now=now + datetime.timedelta(seconds=3),
-        previous=snapshots[-1],
+        previous=progress_snapshots[-1],
     )
 
-    assert [snapshot["phase"] for snapshot in snapshots] == [
+    assert [snapshot["phase"] for snapshot in progress_snapshots] == [
         "provider-directory probing sources",
         "provider-directory importing resources",
         "provider-directory importing resources",
     ]
-    assert [snapshot["stage_ordinal"] for snapshot in snapshots] == [
+    assert [snapshot["stage_ordinal"] for snapshot in progress_snapshots] == [
         importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_PROBE,
         importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
         importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
     ]
-    assert [snapshot["progress_seq"] for snapshot in snapshots] == [1, 2, 3]
-    assert snapshots[-1]["counters"]["resource_rows_written"] == 100
+    assert [snapshot["progress_seq"] for snapshot in progress_snapshots] == [1, 2, 3]
+    assert progress_snapshots[-1]["counters"]["resource_rows_written"] == 100
     assert heartbeat is not None
     assert heartbeat["phase"] == "provider-directory importing resources"
-    assert heartbeat["progress_seq"] == snapshots[-1]["progress_seq"]
-    assert heartbeat["progressed_at"] == snapshots[-1]["progressed_at"]
+    assert heartbeat["progress_seq"] == progress_snapshots[-1]["progress_seq"]
+    assert heartbeat["progressed_at"] == progress_snapshots[-1]["progressed_at"]
 
-    await importer._mark_provider_directory_progress(
+
+@pytest.mark.asyncio
+async def test_nested_provider_progress_retains_outer_import_percentage(monkeypatch):
+    _, run_id, _now, progress_snapshots = _install_provider_progress_capture(
+        monkeypatch
+    )
+    await _emit_probe_to_import_progress(run_id)
+    await _mark_test_import_progress(
         run_id,
-        phase="provider-directory importing resources",
-        stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
         done=3,
         total=12,
-        message="imported resources for 3/12 source group(s); rows_written=100",
-        counters={"resource_rows_written": 100, "source_groups_completed": 3},
+        rows_written=100,
     )
-    progress_pct_token = (
-        importer._PROVIDER_DIRECTORY_IMPORT_PROGRESS_PCT.set(
-            lambda: 25.0
-        )
-    )
-    try:
+    cleanup = AsyncMock()
+    async with importer._provider_directory_import_progress_scope(
+        lambda: 25.0,
+        cleanup,
+    ):
         await importer._uhc_acquisition_progress_callback(
             run_id,
             "a" * 64,
@@ -207,84 +239,80 @@ async def test_provider_directory_progress_moves_from_probe_into_row_import(
         await importer._mark_provider_directory_progress(
             run_id,
             phase="provider-directory official-file build",
-            stage_id="provider-directory-import-official-file-build",
-            stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
+            details=importer._provider_directory_progress_details(
+                stage_id="provider-directory-import-official-file-build",
+                stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
+            ),
             done=0,
             total=4,
             overall_pct=importer._provider_directory_import_progress_pct(),
             message="building official-file resources",
         )
-    finally:
-        importer._PROVIDER_DIRECTORY_IMPORT_PROGRESS_PCT.reset(
-            progress_pct_token
-        )
-    await importer._mark_provider_directory_progress(
+    cleanup.assert_awaited_once_with()
+    await _mark_test_import_progress(
         run_id,
-        phase="provider-directory importing resources",
-        stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
         done=3,
         total=12,
-        message="imported resources for 3/12 source group(s); rows_written=200",
-        counters={"resource_rows_written": 200, "source_groups_completed": 3},
+        rows_written=200,
     )
 
-    assert [snapshot["phase"] for snapshot in snapshots[-4:]] == [
+    assert [snapshot["phase"] for snapshot in progress_snapshots[-4:]] == [
         "provider-directory importing resources",
         "provider-directory official-file acquisition",
         "provider-directory official-file build",
         "provider-directory importing resources",
     ]
     assert {
-        snapshot["stage_ordinal"] for snapshot in snapshots[-4:]
+        snapshot["stage_ordinal"] for snapshot in progress_snapshots[-4:]
     } == {importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT}
-    assert [snapshot["pct"] for snapshot in snapshots[-4:]] == [25.0] * 4
-    assert [snapshot["progress_seq"] for snapshot in snapshots[-4:]] == [
+    assert [snapshot["pct"] for snapshot in progress_snapshots[-4:]] == [25.0] * 4
+    assert [snapshot["progress_seq"] for snapshot in progress_snapshots[-4:]] == [
         4,
         5,
         6,
         7,
     ]
 
-    await importer._mark_provider_directory_progress(
-        run_id,
-        phase="provider-directory probing sources",
-        stage_ordinal=importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_PROBE,
-        done=1,
-        total=1,
-        message="delayed probe callback",
-    )
 
-    assert snapshots[-1]["phase"] == "provider-directory importing resources"
-    assert snapshots[-1]["stage_ordinal"] == (
+@pytest.mark.asyncio
+async def test_delayed_probe_progress_cannot_replace_import_stage(monkeypatch):
+    _, run_id, _now, progress_snapshots = _install_provider_progress_capture(
+        monkeypatch
+    )
+    await _mark_test_import_progress(run_id, done=3, total=12, rows_written=200)
+    await _mark_test_probe_progress(run_id, "delayed probe callback")
+
+    assert progress_snapshots[-1]["phase"] == "provider-directory importing resources"
+    assert progress_snapshots[-1]["stage_ordinal"] == (
         importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT
     )
-    assert snapshots[-1]["progress_seq"] == 7
+    assert progress_snapshots[-1]["progress_seq"] == 1
 
 
 def test_import_progress_counts_hold_high_water_during_group_handoff():
     """A cleared partial batch must not make displayed row counts regress."""
-    completed_counts = {"Location": 0}
-    active_counts = {1: {"Location": 100}}
-    high_water_counts: dict[str, int] = {}
+    completed_count_by_resource = {"Location": 0}
+    active_count_by_group = {1: {"Location": 100}}
+    high_water_count_by_resource: dict[str, int] = {}
 
     assert importer._provider_directory_progress_counts_snapshot(
-        completed_counts,
-        active_counts,
-        high_water_counts,
+        completed_count_by_resource,
+        active_count_by_group,
+        high_water_count_by_resource,
     ) == {"Location": 100}
 
-    active_counts.clear()
+    active_count_by_group.clear()
     assert importer._provider_directory_progress_counts_snapshot(
-        completed_counts,
-        active_counts,
-        high_water_counts,
+        completed_count_by_resource,
+        active_count_by_group,
+        high_water_count_by_resource,
     ) == {"Location": 100}
 
-    completed_counts["Location"] = 100
+    completed_count_by_resource["Location"] = 100
     assert importer._provider_directory_progress_counts_snapshot(
-        completed_counts,
-        active_counts,
-        high_water_counts,
+        completed_count_by_resource,
+        active_count_by_group,
+        high_water_count_by_resource,
     ) == {"Location": 100}
 
 
@@ -460,6 +488,27 @@ def _common_uhc_group_fixture():
     return official_source, group_result
 
 
+def _completed_practitioner_fetch_result(source_id: str):
+    """Return one complete synthetic Practitioner page."""
+    return importer.ResourceFetchResult(
+        model=ProviderDirectoryPractitioner,
+        rows=[
+            {
+                "source_id": source_id,
+                "resource_id": "synthetic-practitioner",
+            }
+        ],
+        rows_fetched=1,
+        rows_written=0,
+        pages_fetched=1,
+        complete=True,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=False,
+    )
+
+
 def test_uhc_source_selection_and_group_guards():
     """Validate the official source as one atomic normal import group."""
     official_source, _group_result = _common_uhc_group_fixture()
@@ -604,9 +653,7 @@ async def test_common_import_group_dispatches_uhc_adapter(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_nested_import_progress_tracks_completed_sibling_groups(
-    monkeypatch,
-):
+async def test_nested_import_progress_tracks_completed_sibling_groups(monkeypatch):
     """Nested operations inherit the live outer import percentage."""
     official_source, official_result = _common_uhc_group_fixture()
     sibling_complete = asyncio.Event()
@@ -628,23 +675,7 @@ async def test_nested_import_progress_tracks_completed_sibling_groups(
 
     async def fetch_sibling(source, resource_type, **_kwargs):
         assert resource_type == "Practitioner"
-        return importer.ResourceFetchResult(
-            model=ProviderDirectoryPractitioner,
-            rows=[
-                {
-                    "source_id": source["source_id"],
-                    "resource_id": "synthetic-practitioner",
-                }
-            ],
-            rows_fetched=1,
-            rows_written=0,
-            pages_fetched=1,
-            complete=True,
-            row_limit_reached=False,
-            page_limit_reached=False,
-            hard_page_limit_reached=False,
-            next_url_remaining=False,
-        )
+        return _completed_practitioner_fetch_result(source["source_id"])
 
     async def progress_callback(done, total, _counts, _details=None):
         assert total == 2
@@ -652,22 +683,14 @@ async def test_nested_import_progress_tracks_completed_sibling_groups(
             sibling_complete.set()
 
     _stub_resource_import_metadata(monkeypatch)
-    monkeypatch.setattr(
-        importer,
-        "_import_uhc_official_file_source_group",
-        import_official,
-    )
-    monkeypatch.setattr(
-        importer,
-        "_mark_provider_directory_progress",
-        capture_nested_progress,
-    )
-    monkeypatch.setattr(importer, "_fetch_resource_rows", fetch_sibling)
-    monkeypatch.setattr(
-        importer,
-        "_upsert_rows",
-        AsyncMock(return_value=1),
-    )
+    callback_by_name = {
+        "_import_uhc_official_file_source_group": import_official,
+        "_mark_provider_directory_progress": capture_nested_progress,
+        "_fetch_resource_rows": fetch_sibling,
+        "_upsert_rows": AsyncMock(return_value=1),
+    }
+    for callback_name, callback in callback_by_name.items():
+        monkeypatch.setattr(importer, callback_name, callback)
 
     counts = await importer._import_resources(
         [
@@ -15050,6 +15073,20 @@ async def test_process_data_reports_completed_resource_when_next_resource_starts
     }
 
 
+def _normalized_progress_call(call: dict[str, Any]) -> dict[str, Any]:
+    total = max(int(call["total"]), 1)
+    done = max(0, min(int(call["done"]), total))
+    progress_by_name, _details_by_name = importer._profile_progress_payload(
+        call["phase"],
+        done,
+        total,
+        call.get("overall_pct"),
+        call["message"],
+        call.get("details"),
+    )
+    return progress_by_name
+
+
 @pytest.mark.asyncio
 async def test_probe_batch_emits_ordered_probe_stage(monkeypatch):
     mark_progress = AsyncMock()
@@ -15063,7 +15100,8 @@ async def test_probe_batch_emits_ordered_probe_stage(monkeypatch):
     )
 
     assert result == (0, 0, set())
-    assert mark_progress.await_args.kwargs["stage_ordinal"] == (
+    progress_by_name = _normalized_progress_call(mark_progress.await_args.kwargs)
+    assert progress_by_name["stage_ordinal"] == (
         importer.PROVIDER_DIRECTORY_PROGRESS_STAGE_PROBE
     )
 
@@ -15095,7 +15133,7 @@ async def test_process_data_emits_import_activity_counters(monkeypatch):
     )
 
     import_progress = [
-        call
+        _normalized_progress_call(call)
         for call in progress_calls
         if call["phase"] == "provider-directory importing resources"
     ]
