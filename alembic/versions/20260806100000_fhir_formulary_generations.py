@@ -35,6 +35,15 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+def _execute_plain_statements(sql: str) -> None:
+    """Execute a semicolon-delimited DDL batch one statement at a time."""
+
+    for statement in sql.split(";"):
+        normalized = statement.strip()
+        if normalized:
+            op.execute(normalized)
+
+
 def upgrade() -> None:
     schema = _schema()
     source = _qt(schema, "fhir_formulary_source")
@@ -51,7 +60,7 @@ def upgrade() -> None:
     alternative = _qt(schema, "fhir_formulary_alternative")
     checkpoint = _qt(schema, "fhir_formulary_checkpoint")
 
-    op.execute(
+    _execute_plain_statements(
         f"""
         CREATE TABLE {source} (
             source_id varchar(64) PRIMARY KEY,
@@ -296,6 +305,10 @@ def upgrade() -> None:
             RETURN NEW;
         END;
         $function$;
+        """
+    )
+    op.execute(
+        f"""
         CREATE TRIGGER fhir_formulary_checkpoint_fence_guard
             BEFORE UPDATE ON {checkpoint}
             FOR EACH ROW EXECUTE FUNCTION

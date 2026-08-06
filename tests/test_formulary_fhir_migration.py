@@ -30,18 +30,18 @@ def _load_migration():
     return migration
 
 
-def _upgrade_sql(monkeypatch) -> tuple[object, str]:
+def _upgrade_sql(monkeypatch) -> tuple[object, str, list[str]]:
     migration = _load_migration()
     statements: list[str] = []
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "formulary_test")
     monkeypatch.delenv("DB_SCHEMA", raising=False)
     monkeypatch.setattr(migration.op, "execute", statements.append)
     migration.upgrade()
-    return migration, " ".join(" ".join(statements).split())
+    return migration, " ".join(" ".join(statements).split()), statements
 
 
 def test_formulary_migration_is_copy_on_write_and_inactive(monkeypatch):
-    migration, sql = _upgrade_sql(monkeypatch)
+    migration, sql, statements = _upgrade_sql(monkeypatch)
 
     assert migration.down_revision == "20260806100000_ptg2_tax_identity_source"
     for table in (
@@ -71,6 +71,24 @@ def test_formulary_migration_is_copy_on_write_and_inactive(monkeypatch):
     assert "false" in sql
     assert '"automation_enabled": false' in sql
     assert "legacy" not in sql.lower()
+
+    table_statements = [
+        statement
+        for statement in statements
+        if statement.lstrip().startswith("CREATE TABLE")
+    ]
+    assert len(table_statements) == 13
+    assert all("CREATE INDEX" not in statement for statement in table_statements)
+    function_statement = next(
+        statement
+        for statement in statements
+        if statement.lstrip().startswith("CREATE FUNCTION")
+    )
+    assert "CREATE TRIGGER" not in function_statement
+    assert any(
+        statement.lstrip().startswith("CREATE TRIGGER")
+        for statement in statements
+    )
 
 
 def test_formulary_models_keep_public_identity_and_alias_checkpoint_distinct():
