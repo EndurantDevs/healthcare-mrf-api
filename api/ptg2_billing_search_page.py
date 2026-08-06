@@ -211,7 +211,12 @@ def _next_hydration_chunk(
     start: int,
     maximum_candidates: int,
 ) -> tuple[tuple[BillingSearchProviderCandidate, ...], int]:
-    if type(MAX_HYDRATION_PARTITIONS) is not int or MAX_HYDRATION_PARTITIONS < 1:
+    if (
+        type(MAX_HYDRATION_PARTITIONS) is not int
+        or MAX_HYDRATION_PARTITIONS < 1
+        or type(maximum_candidates) is not int
+        or maximum_candidates < 1
+    ):
         raise serving_unavailable()
     selected_candidates: list[BillingSearchProviderCandidate] = []
     price_keys_by_scope: dict[tuple[int, str], set[int]] = {}
@@ -486,10 +491,6 @@ async def hydrate_billing_search_page(
 
 
 __all__ = [
-    "MAX_HYDRATION_CANDIDATES",
-    "MAX_HYDRATION_PARTITIONS",
-    "MAX_PAGE_HYDRATION_CALLS",
-    "MAX_PAGE_SCOPED_PRICE_KEYS",
     "group_billing_geo_candidates",
     "hydrate_billing_search_page",
     "validate_billing_search_sort_key",

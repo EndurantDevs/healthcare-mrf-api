@@ -331,4 +331,3 @@ async def test_cursor_must_identify_existing_immutable_candidate(monkeypatch):
             price_filter_args={},
         )
     hydrate.assert_not_awaited()
-
