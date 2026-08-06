@@ -5,6 +5,7 @@
     "api",
     "db",
     "process",
+    "public_evidence",
     "scripts",
     "support",
     "tests"

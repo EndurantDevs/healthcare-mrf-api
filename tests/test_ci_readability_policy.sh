@@ -11,6 +11,7 @@ printf '%s\n' "$trigger_block" | grep -Fq -- 'types: [opened, synchronize, reope
 printf '%s\n' "$policy_block" | grep -Fq -- "':(glob)api/**/*.py'"
 printf '%s\n' "$policy_block" | grep -Fq -- "':(glob)db/**/*.py'"
 printf '%s\n' "$policy_block" | grep -Fq -- "':(glob)process/**/*.py'"
+printf '%s\n' "$policy_block" | grep -Fq -- "':(glob)public_evidence/**/*.py'"
 printf '%s\n' "$policy_block" | grep -Fq -- "':(glob)service/**/*.py'"
 printf '%s\n' "$policy_block" | grep -Fq -- "contains(github.event.pull_request.labels.*.name, 'readability-zero-growth-approved')"
 printf '%s\n' "$policy_block" | grep -Fq -- 'required_reduction_percent=1'

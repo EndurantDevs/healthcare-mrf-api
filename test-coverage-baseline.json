@@ -544,6 +544,8 @@
           "db/**/*.py",
           "process/*.py",
           "process/**/*.py",
+          "public_evidence/*.py",
+          "public_evidence/**/*.py",
           "service/*.py",
           "service/**/*.py"
         ],
@@ -556,6 +558,7 @@
             "api",
             "db",
             "process",
+            "public_evidence",
             "service"
           ],
           "source_pkgs": [
