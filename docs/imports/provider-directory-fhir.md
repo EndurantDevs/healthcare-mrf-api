@@ -949,6 +949,23 @@ unset `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH` or set it to `false`.
 No schema or checkpoint-format change is involved, so the existing durable
 checkpoint resumes on the sequential path.
 
+Resource-cursor concurrency is a separate default-off pilot. Set
+`HLTHPRT_PROVIDER_DIRECTORY_RESOURCE_SCAN_CONCURRENCY=2` (or pass
+`resource_scan_concurrency=2`) to overlap independent resource collections for
+the exact pilot allowlist; accepted values are `1` through `3`. The importer
+falls back to `1` unless the scan is anonymous, keepalive-backed, unbounded,
+streaming, checkpointed, deferred-materialization acquisition with one source
+worker, one start URL per resource, sufficient database pool capacity, and no
+partition, linked-resource, reverse-lookup, Bulk, or stale-cleanup path. The
+foundation collections may overlap, while the dependency-sensitive role
+collection remains a serial tail. Each resource retains its own durable cursor,
+so a retry skips completed collections and resumes only incomplete ones. This
+does not fan out pages within an opaque cursor or scan archive rows in parallel.
+Progress and persisted resource diagnostics report requested and effective
+resource-scan concurrency so a fail-closed fallback to `1` remains visible.
+Rollback is immediate: set the value back to `1` and restart the worker; durable
+checkpoint identities and formats are unchanged.
+
 If resource rows were imported before canonical resource storage was enabled,
 populate the canonical resource and source-edge tables from existing
 source-level rows without refetching payer FHIR endpoints:
