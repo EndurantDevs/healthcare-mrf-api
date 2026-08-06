@@ -338,6 +338,13 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_strict_shared_v3_layout,
     validate_reused_snapshot_sources,
 )
+from process.ptg_parts.ptg2_tax_identity_source_binding import (
+    bind_tax_source_sidecars,
+    build_tax_source_bindings,
+)
+from process.ptg_parts.ptg2_tax_identity_source_validation import (
+    validate_reused_tax_identity_source_projection,
+)
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_SHARED_GENERATION,
     reserve_v4_shared_layout,
@@ -5790,6 +5797,13 @@ def _shared_v3_publisher_sources(
         source_root / "ptg_parts" / "ptg2_v4_graph_compiler.py",
         source_root / "ptg_parts" / "ptg2_v4_snapshot_maps.py",
         source_root / "ptg_parts" / "ptg2_v4_taxonomy_candidates.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_binding.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_artifact.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_observations.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_projection.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_publish.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_stage.py",
+        source_root / "ptg_parts" / "ptg2_tax_identity_source_validation.py",
     )
 
 
@@ -6028,6 +6042,40 @@ async def _reused_shared_v3_evidence(
     )
 
 
+async def _validate_reused_tax_identity_source_metadata(
+    publication: _ReusedSharedV3PublicationInputs,
+    serving_index: Mapping[str, Any],
+    source_assignments: Iterable[Any],
+) -> None:
+    """Require sealed source-local evidence for a reused V4 layout."""
+
+    if publication.expected_generation != PTG2_V4_SHARED_GENERATION:
+        return
+    provider_graph = serving_index.get("provider_graph")
+    source_metadata = (
+        provider_graph.get("provider_tax_identity_source")
+        if isinstance(provider_graph, Mapping)
+        else None
+    )
+    if not isinstance(source_metadata, Mapping):
+        raise RuntimeError(
+            "reusable PTG V4 layout lacks source-local tax identity evidence"
+        )
+    binding_index = build_tax_source_bindings(source_assignments)
+    expected_bindings = tuple(
+        sorted(
+            (binding.as_dict() for binding in binding_index.values()),
+            key=lambda binding: int(binding["source_key"]),
+        )
+    )
+    await validate_reused_tax_identity_source_projection(
+        schema_name=resolve_ptg2_schema(),
+        snapshot_key=int(publication.shared_snapshot_key),
+        expected_bindings=expected_bindings,
+        sealed_metadata=source_metadata,
+    )
+
+
 async def _publish_reused_serving_metadata(
     publication: _ReusedSharedV3PublicationInputs,
     evidence: _ReusedSharedV3Evidence,
@@ -6056,13 +6104,18 @@ async def _publish_reused_serving_metadata(
         evidence.source_provenance_entries,
         expected_source_count=expected_source_count,
     )
-    await _publish_shared_v3_source_dictionary(
+    source_assignments = await _publish_shared_v3_source_dictionary(
         shared_input_identity=publication.shared_input_identity,
         identity_trace_pairs=evidence.source_provenance_entries,
         snapshot_id=publication.snapshot_id,
         expected_source_set=source_set,
     )
     serving_index["source_set"] = source_set
+    await _validate_reused_tax_identity_source_metadata(
+        publication,
+        serving_index,
+        source_assignments,
+    )
     await validate_reused_snapshot_sources(
         schema_name=resolve_ptg2_schema(),
         snapshot_key=int(publication.shared_snapshot_key),
@@ -8379,7 +8432,7 @@ async def _main_with_artifact_lease(
             if provider_graph_v4_enabled
             else None
         )
-        await _publish_shared_v3_source_dictionary(
+        source_assignments = await _publish_shared_v3_source_dictionary(
             shared_input_identity=shared_input_identity,
             identity_trace_pairs=source_identity_traces,
             snapshot_id=snapshot_id,
@@ -8468,6 +8521,14 @@ async def _main_with_artifact_lease(
         manifest_artifacts = _collect_manifest_artifacts(
             successful_files + skipped_files
         )
+        tax_identity_source_artifacts = (
+            _bound_tax_identity_source_artifacts(
+                successful_files + skipped_files,
+                source_assignments,
+            )
+            if provider_graph_v4_enabled
+            else None
+        )
         pending_strict_v3.graph_artifacts_map = manifest_artifacts
         assert source_key_val is not None
         if has_serving_files:
@@ -8537,6 +8598,7 @@ async def _main_with_artifact_lease(
                     graph_artifact_entries=list(
                         manifest_artifacts.get("sidecars") or []
                     ),
+                    tax_identity_source_artifacts=tax_identity_source_artifacts,
                     provider_identifier_quarantine=provider_identifier_quarantine,
                     compressed_acquisition_entries=(
                         tuple(
@@ -9332,3 +9394,46 @@ def _collect_manifest_artifacts(
             )
         )
     return collection.finish()
+
+
+def _bound_tax_identity_source_artifacts(
+    file_results: Iterable[Mapping[str, Any]],
+    source_assignments: Iterable[Any],
+) -> tuple[dict[str, Any], ...]:
+    """Bind one authenticated tax sidecar to each dense physical source."""
+
+    binding_index = build_tax_source_bindings(source_assignments)
+    sidecar_sources: list[tuple[dict[str, Any], object]] = []
+    for file_index, file_summary in enumerate(file_results):
+        summary_payload = (
+            file_summary.get("summary")
+            if isinstance(file_summary, Mapping)
+            else None
+        )
+        manifest_payload = (
+            summary_payload.get("manifest")
+            if isinstance(summary_payload, Mapping)
+            else None
+        )
+        if not isinstance(manifest_payload, dict):
+            continue
+        physical_identity = manifest_payload.get("physical_artifact_identity")
+        tax_sidecars = tuple(
+            sidecar
+            for sidecar in _bound_manifest_sidecars(
+                file_summary,
+                summary_payload,
+                manifest_payload,
+                file_index,
+            )
+            if sidecar.get("name") == "provider_group_tax_identity"
+        )
+        if tax_sidecars and not isinstance(physical_identity, Mapping):
+            raise RuntimeError("PTG V4 tax identity source binding is incomplete")
+        sidecar_sources.extend(
+            (sidecar, physical_identity) for sidecar in tax_sidecars
+        )
+    return bind_tax_source_sidecars(
+        sidecar_sources,
+        binding_index=binding_index,
+    )
