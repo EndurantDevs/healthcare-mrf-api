@@ -24810,6 +24810,11 @@ mod tests {
             let _invalid = TestEnvVar::set("HLTHPRT_PTG2_RUST_INDEXED_RANGE_PRODUCERS", "0");
             assert!(indexed_range_producers_requested().is_err());
         }
+        {
+            let _invalid =
+                TestEnvVar::set("HLTHPRT_PTG2_RUST_INDEXED_RANGE_PRODUCERS", "not-a-number");
+            assert!(indexed_range_producers_requested().is_err());
+        }
 
         assert!(strict_v3_price_copy_stdio_usage().contains("<24|32>"));
         assert_eq!(
@@ -35128,13 +35133,21 @@ mod tests {
             BTreeMap::from([(0, vec![1, 1])])
         );
         assert!(serving_binary_v3_validate_atom_key(0, 16).is_err());
+        assert!(serving_binary_v3_validate_atom_key(-1, 24).is_err());
         assert_eq!(serving_binary_v3_atom_key_bits("24").unwrap(), 24);
         assert_eq!(serving_binary_v3_atom_key_bits("32").unwrap(), 32);
         assert!(serving_binary_v3_atom_key_bits("3").is_err());
+        assert!(serving_binary_i32_count(usize::MAX, "count").is_err());
+        assert!(serving_binary_v3_block_key(i64::MAX, 1, "key").is_err());
 
         let _env_guard = scanner_env_lock().lock().unwrap();
-        let _atom_bits = TestEnvVar::set(PTG2_SERVING_BINARY_V3_ATOM_KEY_BITS_ENV, "32");
-        assert_eq!(serving_binary_v3_configured_atom_key_bits(&[]).unwrap(), 32);
+        {
+            let _atom_bits = TestEnvVar::set(PTG2_SERVING_BINARY_V3_ATOM_KEY_BITS_ENV, "32");
+            assert_eq!(serving_binary_v3_configured_atom_key_bits(&[]).unwrap(), 32);
+        }
+        let _atom_bits = TestEnvVar::remove(PTG2_SERVING_BINARY_V3_ATOM_KEY_BITS_ENV);
+        let _atom_count = TestEnvVar::set(PTG2_SERVING_BINARY_V3_ATOM_COUNT_ENV, "not-a-count");
+        assert!(serving_binary_v3_configured_atom_key_bits(&[]).is_err());
     }
 
     #[test]
@@ -36589,6 +36602,10 @@ mod tests {
         assert_eq!(
             pg_binary_nonnegative_i64(&7i32.to_be_bytes(), "value").unwrap(),
             7
+        );
+        assert!(pg_binary_nonnegative_i64(&u64::MAX.to_be_bytes(), "value").is_err());
+        assert!(
+            pg_binary_nonnegative_i32(&(i64::from(i32::MAX) + 1).to_be_bytes(), "value",).is_err()
         );
         assert_eq!(
             pg_binary_optional_nonnegative_i64(None, "value").unwrap(),
