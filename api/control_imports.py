@@ -78,6 +78,7 @@ _IMPORT_RUN_ENSURE_STATE = _ImportRunEnsureState()
 _IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
     "npi": ["nucc"],
     "florida-mqa-profile": ["npi"],
+    "formulary-fhir": ["ndc"],
     "terminology-synonyms": ["nucc", "code-sets", "clinical-reference", "claims-pricing", "drug-claims"],
 }
 
@@ -226,6 +227,13 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_function": "process_data",
         "run_shutdown": True,
     },
+    "formulary-fhir": {
+        "queue": "arq:FormularyFHIR",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.formulary_fhir.worker",
+        "target_function": "process_data",
+    },
     "florida-mqa-profile": {
         "queue": "arq:FloridaMQAProfile",
         "function": "control_single_job_start",
@@ -281,6 +289,7 @@ _CANCELABLE_IMPORTERS = {
     "cms-doctors",
     "mrf-source-discovery",
     "provider-directory-fhir",
+    "formulary-fhir",
     "address-archive-v2-migrate",
     "clinical-reference",
     "ms-drg",
@@ -391,7 +400,12 @@ def _importer_family(importer: str) -> str:
         "address-archive-v2-migrate",
     }:
         return "provider"
-    if importer in {"partd-formulary-network", "pharmacy-license", "pharmacy-economics"}:
+    if importer in {
+        "partd-formulary-network",
+        "pharmacy-license",
+        "pharmacy-economics",
+        "formulary-fhir",
+    }:
         return "pharmacy"
     if importer in {"geo", "geo-census", "places-zcta", "lodes", "openaddresses"}:
         return "geo"

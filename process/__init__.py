@@ -103,6 +103,10 @@ from process.partd_formulary_network import (
     partd_formulary_network_process_chunk,
     partd_formulary_network_start,
 )
+from process.formulary_fhir.worker import (
+    main as initiate_formulary_fhir,
+    process_data as process_formulary_fhir_data,
+)
 from process.pharmacy_license import (
     finish_main as finish_pharmacy_license,
     main as initiate_pharmacy_license,
@@ -641,6 +645,21 @@ class ProviderDirectoryFHIR:
             PROVIDER_DIRECTORY_MIN_JOB_TIMEOUT_SECONDS,
         ),
         PROVIDER_DIRECTORY_MIN_JOB_TIMEOUT_SECONDS,
+    )
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class FormularyFHIR:
+    functions = [process_formulary_fhir_data, control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:FormularyFHIR"
+    job_timeout = max(
+        _worker_int_env("HLTHPRT_FORMULARY_FHIR_JOB_TIMEOUT", 72 * 60 * 60),
+        16 * 60 * 60,
     )
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
@@ -1251,6 +1270,53 @@ def provider_enrichment(test: bool):
     _run(initiate_provider_enrichment(test_mode=test))
 
 
+@click.command(help="Run the gated Da Vinci FHIR formulary synchronizer")
+@click.option(
+    "--manual-seed",
+    is_flag=True,
+    help="Run the initial 72-hour, non-publishing full seed.",
+)
+@click.option(
+    "--publish",
+    is_flag=True,
+    help="Atomically publish a verified generation when the runtime gate is enabled.",
+)
+@click.option(
+    "--publication-proof",
+    is_flag=True,
+    help=(
+        "Run a manually authorized atomic-publication proof before enabling "
+        "weekday automation."
+    ),
+)
+@click.option("--cutoff", help="Fixed ISO-8601 upper-bound timestamp.")
+@click.option(
+    "--alias-concurrency",
+    type=click.Choice(("1", "2", "4", "8")),
+    default="4",
+    show_default=True,
+    help="Independent DrugPlan cursors; pages within each cursor stay sequential.",
+)
+def formulary_fhir_command(
+    manual_seed: bool,
+    publish: bool,
+    publication_proof: bool,
+    cutoff: str | None,
+    alias_concurrency: str,
+):
+    """Synchronize non-annual FHIR formularies without implicit publication."""
+
+    _run(
+        initiate_formulary_fhir(
+            manual_seed=manual_seed,
+            publication_proof=publication_proof,
+            publish=publish,
+            cutoff=cutoff,
+            alias_concurrency=int(alias_concurrency),
+        )
+    )
+
+
 @click.command(help="Run payer Provider Directory FHIR source/catalog/resource import")
 @click.option("--test", is_flag=True, help="Use a tiny built-in source fixture for a quick smoke run.")
 @click.option("--seed-db-path", help="Path to provider-directory-db SQLite seed file.")
@@ -1851,6 +1917,7 @@ process_group.add_command(claims_procedures, name="claims-procedures")
 process_group.add_command(drug_claims, name="drug-claims")
 process_group.add_command(provider_quality, name="provider-quality")
 process_group.add_command(provider_directory_fhir, name="provider-directory-fhir")
+process_group.add_command(formulary_fhir_command, name="formulary-fhir")
 process_group.add_command(partd_formulary_network, name="partd-formulary-network")
 process_group.add_command(pharmacy_license, name="pharmacy-license")
 process_group.add_command(florida_mqa_profile, name="florida-mqa-profile")

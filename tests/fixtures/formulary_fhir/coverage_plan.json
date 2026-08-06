@@ -1,0 +1,36 @@
+{
+  "resourceType": "List",
+  "id": "synthetic-coverage-a",
+  "meta": {
+    "versionId": "7",
+    "lastUpdated": "2026-08-01T12:00:00Z"
+  },
+  "status": "current",
+  "title": "Synthetic California Coverage",
+  "name": "Synthetic Coverage A",
+  "date": "2026-08-01T10:00:00Z",
+  "identifier": [
+    {
+      "system": "https://example.invalid/coverage",
+      "value": "SYNTH-NCAL-A"
+    },
+    {
+      "system": "https://example.invalid/coverage",
+      "value": "SYNTH-NCAL-B"
+    }
+  ],
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-PlanID-extension",
+      "valueString": "SYNTH-NCAL-A"
+    },
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-PlanID-extension",
+      "valueString": "SYNTH-NCAL-B"
+    },
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-MarketingURL-extension",
+      "valueUri": "https://example.invalid/synthetic-plan"
+    }
+  ]
+}

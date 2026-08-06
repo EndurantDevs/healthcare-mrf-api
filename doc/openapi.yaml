@@ -425,6 +425,21 @@ paths:
           in: query
           schema:
             type: string
+        - name: source_type
+          in: query
+          description: Select legacy annual formularies, non-annual FHIR formularies, or both stores.
+          schema:
+            type: string
+            enum: [legacy, fhir, all]
+        - name: source_id
+          in: query
+          schema:
+            type: string
+        - name: source_plan_identifier
+          in: query
+          description: Exact upstream DrugPlan alias; implies FHIR selection when source_type is omitted.
+          schema:
+            type: string
         - name: page
           in: query
           schema:
@@ -454,6 +469,11 @@ paths:
           schema:
             type: string
           description: Combination of plan identifier and year (e.g. PLAN123:2025)
+        - name: source_plan_identifier
+          in: query
+          description: Exact upstream DrugPlan alias for an fhir_ formulary.
+          schema:
+            type: string
       responses:
         '200':
           description: Formulary detail payload
@@ -475,6 +495,11 @@ paths:
         - name: formulary_id
           in: path
           required: true
+          schema:
+            type: string
+        - name: source_plan_identifier
+          in: query
+          description: Exact upstream DrugPlan alias for an fhir_ formulary.
           schema:
             type: string
         - name: tier
@@ -546,6 +571,11 @@ paths:
           required: true
           schema:
             type: string
+        - name: source_plan_identifier
+          in: query
+          description: Exact upstream DrugPlan alias for an fhir_ formulary.
+          schema:
+            type: string
       responses:
         '200':
           description: Drug detail within the formulary
@@ -567,6 +597,11 @@ paths:
         - name: formulary_id
           in: path
           required: true
+          schema:
+            type: string
+        - name: source_plan_identifier
+          in: query
+          description: Exact upstream DrugPlan alias for an fhir_ formulary.
           schema:
             type: string
       responses:
@@ -639,6 +674,21 @@ paths:
           in: query
           schema:
             type: integer
+        - name: source_type
+          in: query
+          description: Select legacy annual formularies, non-annual FHIR formularies, or both stores.
+          schema:
+            type: string
+            enum: [legacy, fhir, all]
+        - name: source_id
+          in: query
+          schema:
+            type: string
+        - name: source_plan_identifier
+          in: query
+          description: Exact upstream DrugPlan alias; implies FHIR selection when source_type is omitted.
+          schema:
+            type: string
       responses:
         '200':
           description: Matching formularies
@@ -8156,6 +8206,104 @@ components:
           type: integer
       required: [pharmacy_type, count]
       additionalProperties: false
+    FormularyDatasetProvenance:
+      type: object
+      nullable: true
+      properties:
+        dataset_id:
+          type: string
+        cutoff:
+          type: string
+          format: date-time
+          nullable: true
+        published_at:
+          type: string
+          format: date-time
+          nullable: true
+        coverage_hash:
+          type: string
+          nullable: true
+        membership_hash:
+          type: string
+          nullable: true
+      additionalProperties: false
+    FormularyUpstreamResource:
+      type: object
+      nullable: true
+      properties:
+        resource_type:
+          type: string
+        id:
+          type: string
+        version_id:
+          type: string
+          nullable: true
+        status:
+          type: string
+          nullable: true
+        last_updated:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+    FormularyCoverageVariant:
+      type: object
+      properties:
+        source_plan_identifier:
+          type: string
+        upstream_medication_id:
+          type: string
+        upstream_version_id:
+          type: string
+          nullable: true
+        drug_tier:
+          type: string
+          nullable: true
+        drug_tier_slug:
+          type: string
+          nullable: true
+        prior_authorization:
+          type: boolean
+          nullable: true
+        step_therapy:
+          type: boolean
+          nullable: true
+        quantity_limit:
+          type: boolean
+          nullable: true
+        codings:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        alternatives:
+          type: array
+          description: Same-source alternative-reference evidence; unresolved references do not imply coverage.
+          items:
+            $ref: '#/components/schemas/FormularyAlternativeEvidence'
+      required: [source_plan_identifier, upstream_medication_id]
+      additionalProperties: false
+    FormularyAlternativeEvidence:
+      type: object
+      properties:
+        raw_reference:
+          type: string
+        corrected_reference:
+          type: string
+          nullable: true
+        resolved_medication_id:
+          type: string
+          nullable: true
+        resolved:
+          type: boolean
+        rule_version:
+          type: string
+          nullable: true
+        evidence:
+          type: object
+          additionalProperties: true
+      required: [raw_reference, resolved]
+      additionalProperties: false
     FormularyRecord:
       type: object
       properties:
@@ -8165,21 +8313,28 @@ components:
           type: string
         plan_id:
           type: string
+          nullable: true
         year:
           type: integer
+          nullable: true
         marketing_name:
           type: string
+          nullable: true
         state:
           type: string
+          nullable: true
         issuer:
           type: object
           properties:
             issuer_id:
               type: integer
+              nullable: true
             issuer_name:
               type: string
+              nullable: true
             issuer_marketing_name:
               type: string
+              nullable: true
           additionalProperties: false
         drug_count:
           type: integer
@@ -8187,7 +8342,25 @@ components:
           type: string
           format: date-time
           nullable: true
-      required: [formulary_id, formulary_uri, plan_id, year, marketing_name, state, issuer, drug_count]
+        source_type:
+          type: string
+          enum: [legacy, fhir]
+        source_id:
+          type: string
+          nullable: true
+        source_plan_identifiers:
+          type: array
+          items:
+            type: string
+        upstream:
+          $ref: '#/components/schemas/FormularyUpstreamResource'
+        coverage_plan:
+          type: object
+          nullable: true
+          additionalProperties: true
+        dataset:
+          $ref: '#/components/schemas/FormularyDatasetProvenance'
+      required: [formulary_id, formulary_uri, plan_id, year, marketing_name, state, issuer, drug_count, source_type, source_id, upstream, coverage_plan, dataset]
       additionalProperties: false
     FormularyListResponse:
       type: object
@@ -8240,10 +8413,13 @@ components:
           type: string
         drug_name:
           type: string
+          nullable: true
         drug_tier:
           type: string
+          nullable: true
         drug_tier_slug:
           type: string
+          nullable: true
           enum: [tier_1, tier_2, tier_3, tier_4, tier_5, tier_6, generic, preferred_generic, non_preferred_generic, brand, preferred_brand, non_preferred_brand, specialty, preferred_specialty, non_preferred_specialty, other, unknown]
         prior_authorization:
           type: boolean
@@ -8258,6 +8434,10 @@ components:
           type: string
           format: date-time
           nullable: true
+        coverage_variants:
+          type: array
+          items:
+            $ref: '#/components/schemas/FormularyCoverageVariant'
       required: [rxnorm_id, drug_name, drug_tier, drug_tier_slug]
       additionalProperties: false
     FormularyDrugList:
@@ -8281,6 +8461,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/FormularyDrug'
+        source_type:
+          type: string
+          enum: [legacy, fhir]
+        source_id:
+          type: string
+          nullable: true
+        plan_id:
+          type: string
+          nullable: true
+        year:
+          type: integer
+          nullable: true
+        source_plan_identifier:
+          type: string
+          nullable: true
+        upstream:
+          $ref: '#/components/schemas/FormularyUpstreamResource'
+        coverage_plan:
+          type: object
+          nullable: true
+          additionalProperties: true
+        dataset:
+          $ref: '#/components/schemas/FormularyDatasetProvenance'
       required: [formulary_id, formulary_uri, page, page_size, total, items]
       additionalProperties: false
     FormularyDrugDetail:
@@ -8303,6 +8506,26 @@ components:
                     type: integer
                 required: [plan_id, year]
                 additionalProperties: false
+            source_type:
+              type: string
+              enum: [legacy, fhir]
+            source_id:
+              type: string
+              nullable: true
+            plan_id:
+              type: string
+              nullable: true
+            year:
+              type: integer
+              nullable: true
+            upstream:
+              $ref: '#/components/schemas/FormularyUpstreamResource'
+            coverage_plan:
+              type: object
+              nullable: true
+              additionalProperties: true
+            dataset:
+              $ref: '#/components/schemas/FormularyDatasetProvenance'
           required: [available_pharmacy_types, linked_plans]
           additionalProperties: false
     FormularySummary:
@@ -8346,6 +8569,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PharmacyBreakdownEntry'
+        source_type:
+          type: string
+          enum: [legacy, fhir]
+        source_id:
+          type: string
+          nullable: true
+        plan_id:
+          type: string
+          nullable: true
+        year:
+          type: integer
+          nullable: true
+        source_plan_identifier:
+          type: string
+          nullable: true
+        upstream:
+          $ref: '#/components/schemas/FormularyUpstreamResource'
+        coverage_plan:
+          type: object
+          nullable: true
+          additionalProperties: true
+        dataset:
+          $ref: '#/components/schemas/FormularyDatasetProvenance'
       required: [formulary_id, formulary_uri, total_drugs, tiers, authorization_requirements, step_therapy, quantity_limits, pharmacy_types]
       additionalProperties: false
     FormularyCrosswalk:
@@ -8364,19 +8610,25 @@ components:
                 type: string
               plan_id:
                 type: string
+                nullable: true
               year:
                 type: integer
+                nullable: true
               plan_marketing_name:
                 type: string
+                nullable: true
               state:
                 type: string
+                nullable: true
               issuer:
                 type: object
                 properties:
                   issuer_id:
                     type: integer
+                    nullable: true
                   issuer_name:
                     type: string
+                    nullable: true
                 additionalProperties: false
               drug_tier:
                 type: string
@@ -8391,6 +8643,24 @@ components:
               quantity_limit:
                 type: boolean
                 nullable: true
+              source_type:
+                type: string
+                enum: [legacy, fhir]
+              source_id:
+                type: string
+                nullable: true
+              upstream:
+                $ref: '#/components/schemas/FormularyUpstreamResource'
+              coverage_plan:
+                type: object
+                nullable: true
+                additionalProperties: true
+              dataset:
+                $ref: '#/components/schemas/FormularyDatasetProvenance'
+              coverage_variants:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FormularyCoverageVariant'
             required: [formulary_id, formulary_uri, plan_id, year, plan_marketing_name, state, issuer, drug_tier, drug_tier_slug]
             additionalProperties: false
       required: [rxnorm_id, formularies]

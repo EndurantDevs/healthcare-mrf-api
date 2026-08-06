@@ -66,6 +66,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:ProviderQuality", "process.ProviderQuality", ("provider-quality",)),
     WorkerSpec("arq:ProviderEnrichment", "process.ProviderEnrichment", ("provider-enrichment",)),
     WorkerSpec("arq:ProviderDirectoryFHIR", "process.ProviderDirectoryFHIR", ("provider-directory-fhir",)),
+    WorkerSpec("arq:FormularyFHIR", "process.FormularyFHIR", ("formulary-fhir",)),
     WorkerSpec("arq:FloridaMQAProfile", "process.FloridaMQAProfile", ("florida-mqa-profile",)),
     WorkerSpec("arq:PartDFormularyNetwork", "process.PartDFormularyNetwork", ("partd-formulary-network",)),
     WorkerSpec("arq:PharmacyLicense", "process.PharmacyLicense", ("pharmacy-license",)),

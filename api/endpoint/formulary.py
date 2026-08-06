@@ -9,6 +9,7 @@ from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import and_, func, or_, select
 
 from api.endpoint.pagination import parse_pagination
+from api import formulary_fhir_serving
 from api.tier_utils import normalize_drug_tier_slug
 from db.models import (Issuer, Plan, PlanDrugRaw, PlanDrugStats,
                        PlanDrugTierStats, PlanFormulary)
@@ -214,92 +215,120 @@ def _hydrate_formulary_row(row) -> Dict[str, Any]:
         },
         "drug_count": int(mapping.get("drug_count") or 0),
         "last_updated": last_updated,
+        "source_type": "legacy",
+        "source_id": None,
+        "upstream": None,
+        "coverage_plan": None,
+        "dataset": None,
     }
 
 
 @blueprint.get("/ids")
 async def list_formularies(request):
-    """List filtered formularies with plan, issuer, and pagination metadata."""
+    """List legacy, FHIR, or explicitly unioned formulary sources."""
 
-    session = _get_session(request)
+    request.args.get("issuer_id")
+    request.args.get("plan_id")
+    request.args.get("year")
+    request.args.get("state")
+    request.args.get("drug")
+    request.args.get("page")
+    request.args.get("page_size")
+    request.args.get("source_type")
+    request.args.get("source_id")
+    request.args.get("source_plan_identifier")
+    selection = formulary_fhir_serving.source_selection(request.args)
+    if selection == "fhir":
+        return await formulary_fhir_serving.list_fhir_formularies(request)
+    if selection == "all":
+        return await formulary_fhir_serving.list_all_formularies(request)
+    return await _list_legacy_formularies(request)
 
-    args = request.args
-    # Explicit access keeps route/query introspection in sync with OpenAPI.
-    args.get("page")
-    args.get("page_size")
-    pagination = parse_pagination(
-        args,
-        default_limit=DEFAULT_PAGE_SIZE,
-        max_limit=MAX_PAGE_SIZE,
-        default_page=1,
-        allow_offset=True,
-        allow_start=True,
-        allow_page_size=True,
-    )
-    page = pagination.page
-    page_size = pagination.limit
-    offset = pagination.offset
 
+def _legacy_formulary_query_parts(args):
     plan_table = Plan.__table__
     issuer_table = Issuer.__table__
     plan_drug_table = PlanDrugRaw.__table__
     plan_drug_stats_table = PlanDrugStats.__table__
-
     base_from = (
-        plan_table.join(issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id)
-        .outerjoin(plan_drug_table, plan_drug_table.c.plan_id == plan_table.c.plan_id)
-        .outerjoin(plan_drug_stats_table, plan_drug_stats_table.c.plan_id == plan_table.c.plan_id)
+        plan_table.join(
+            issuer_table,
+            plan_table.c.issuer_id == issuer_table.c.issuer_id,
+        )
+        .outerjoin(
+            plan_drug_table,
+            plan_drug_table.c.plan_id == plan_table.c.plan_id,
+        )
+        .outerjoin(
+            plan_drug_stats_table,
+            plan_drug_stats_table.c.plan_id == plan_table.c.plan_id,
+        )
     )
-
-    issuer_arg = args.get("issuer_id")
-    plan_arg = args.get("plan_id")
-    state_arg = args.get("state")
-    year_arg = args.get("year")
-    drug_arg = args.get("drug")
-
     filters_by_name = {
-        "issuer_id": issuer_arg,
-        "plan_id": plan_arg,
-        "state": state_arg,
-        "year": year_arg,
-        "drug": drug_arg,
+        "issuer_id": args.get("issuer_id"),
+        "plan_id": args.get("plan_id"),
+        "state": args.get("state"),
+        "year": args.get("year"),
+        "drug": args.get("drug"),
     }
-
     filters = _plan_filters(plan_table, plan_drug_table, filters_by_name)
     filter_condition = and_(*filters) if filters else None
+    return (
+        plan_table,
+        issuer_table,
+        plan_drug_stats_table,
+        base_from,
+        filter_condition,
+    )
 
-    distinct_stmt = (
+
+async def _legacy_formulary_total(
+    session,
+    plan_table,
+    base_from,
+    filter_condition,
+) -> int:
+    distinct_statement = (
         select(plan_table.c.plan_id, plan_table.c.year)
         .select_from(base_from)
         .distinct()
     )
     if filter_condition is not None:
-        distinct_stmt = distinct_stmt.where(filter_condition)
-
-    count_result = await session.execute(
-        select(func.count()).select_from(distinct_stmt.subquery())
+        distinct_statement = distinct_statement.where(filter_condition)
+    count_query = select(func.count()).select_from(
+        distinct_statement.subquery()
     )
-    total = count_result.scalar() or 0
+    count_result = await session.execute(count_query)
+    return int(count_result.scalar() or 0)
 
-    data_stmt = (
-        select(
-            plan_table.c.plan_id,
-            plan_table.c.year,
-            plan_table.c.marketing_name,
-            plan_table.c.state,
-            plan_table.c.issuer_id,
-            issuer_table.c.issuer_name,
-            issuer_table.c.issuer_marketing_name,
-            func.coalesce(plan_drug_stats_table.c.total_drugs, 0).label("drug_count"),
-            plan_drug_stats_table.c.last_updated_on.label("last_updated"),
-        )
-        .select_from(base_from)
-    )
+
+def _legacy_formulary_page_statement(
+    plan_table,
+    issuer_table,
+    plan_drug_stats_table,
+    base_from,
+    filter_condition,
+    *,
+    offset: int,
+    page_size: int,
+):
+    page_statement = select(
+        plan_table.c.plan_id,
+        plan_table.c.year,
+        plan_table.c.marketing_name,
+        plan_table.c.state,
+        plan_table.c.issuer_id,
+        issuer_table.c.issuer_name,
+        issuer_table.c.issuer_marketing_name,
+        func.coalesce(plan_drug_stats_table.c.total_drugs, 0).label(
+            "drug_count"
+        ),
+        plan_drug_stats_table.c.last_updated_on.label("last_updated"),
+    ).select_from(base_from)
     if filter_condition is not None:
-        data_stmt = data_stmt.where(filter_condition)
-
-    data_stmt = (
-        data_stmt.group_by(
+        page_statement = page_statement.where(filter_condition)
+    return (
+        page_statement.group_by(
             plan_table.c.plan_id,
             plan_table.c.year,
             plan_table.c.marketing_name,
@@ -315,7 +344,43 @@ async def list_formularies(request):
         .limit(page_size)
     )
 
-    formulary_result = await session.execute(data_stmt)
+
+async def _list_legacy_formularies(request):
+    """List filtered formularies with plan, issuer, and pagination metadata."""
+
+    session = _get_session(request)
+    args = request.args
+    args.get("page")
+    args.get("page_size")
+    pagination = parse_pagination(
+        args,
+        default_limit=DEFAULT_PAGE_SIZE,
+        max_limit=MAX_PAGE_SIZE,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+    query_parts = _legacy_formulary_query_parts(args)
+    plan_table, issuer_table, stats_table, base_from, filter_condition = (
+        query_parts
+    )
+    total = await _legacy_formulary_total(
+        session,
+        plan_table,
+        base_from,
+        filter_condition,
+    )
+    page_statement = _legacy_formulary_page_statement(
+        plan_table,
+        issuer_table,
+        stats_table,
+        base_from,
+        filter_condition,
+        offset=pagination.offset,
+        page_size=pagination.limit,
+    )
+    formulary_result = await session.execute(page_statement)
     formulary_items = [
         _hydrate_formulary_row(formulary_row)
         for formulary_row in formulary_result.all()
@@ -324,10 +389,10 @@ async def list_formularies(request):
     return response.json(
         {
             "items": formulary_items,
-            "page": page,
-            "page_size": page_size,
-            "limit": page_size,
-            "offset": offset,
+            "page": pagination.page,
+            "page_size": pagination.limit,
+            "limit": pagination.limit,
+            "offset": pagination.offset,
             "total": total,
         }
     )
@@ -336,6 +401,13 @@ async def list_formularies(request):
 @blueprint.get("/id/<formulary_id>")
 async def get_formulary(request, formulary_id):
     """Return plan, issuer, tier, pharmacy, and drug metadata for one formulary."""
+
+    request.args.get("source_plan_identifier")
+    if formulary_fhir_serving.is_fhir_formulary_id(formulary_id):
+        return await formulary_fhir_serving.get_fhir_formulary(
+            request,
+            formulary_id,
+        )
 
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
@@ -431,6 +503,11 @@ async def get_formulary(request, formulary_id):
         "available_pharmacy_types": pharmacy_types,
         "drug_count": int(stats_map.get("drug_count") or 0),
         "last_updated": last_updated,
+        "source_type": "legacy",
+        "source_id": None,
+        "upstream": None,
+        "coverage_plan": None,
+        "dataset": None,
     }
 
     return response.json(formulary_payload_by_field)
@@ -439,6 +516,22 @@ async def get_formulary(request, formulary_id):
 @blueprint.get("/id/<formulary_id>/drugs")
 async def list_formulary_drugs(request, formulary_id):
     """List filtered and sorted drugs for one formulary with pagination metadata."""
+
+    request.args.get("tier")
+    request.args.get("pharmacy_type")
+    request.args.get("authorization_required")
+    request.args.get("step_therapy")
+    request.args.get("quantity_limit")
+    request.args.get("sort")
+    request.args.get("order")
+    request.args.get("page")
+    request.args.get("page_size")
+    request.args.get("source_plan_identifier")
+    if formulary_fhir_serving.is_fhir_formulary_id(formulary_id):
+        return await formulary_fhir_serving.list_fhir_formulary_drugs(
+            request,
+            formulary_id,
+        )
 
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
@@ -568,6 +661,9 @@ async def list_formulary_drugs(request, formulary_id):
             "total": total,
             "available_pharmacy_types": pharmacy_types,
             "items": drug_items,
+            "source_type": "legacy",
+            "source_id": None,
+            "dataset": None,
         }
     )
 
@@ -575,6 +671,14 @@ async def list_formulary_drugs(request, formulary_id):
 @blueprint.get("/id/<formulary_id>/drugs/<rxnorm_id>")
 async def get_formulary_drug(request, formulary_id, rxnorm_id):
     """Return tier and coverage restrictions for one drug in a formulary."""
+
+    request.args.get("source_plan_identifier")
+    if formulary_fhir_serving.is_fhir_formulary_id(formulary_id):
+        return await formulary_fhir_serving.get_fhir_formulary_drug(
+            request,
+            formulary_id,
+            rxnorm_id,
+        )
 
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
@@ -642,6 +746,11 @@ async def get_formulary_drug(request, formulary_id, rxnorm_id):
                 "year": year,
             }
         ],
+        "source_type": "legacy",
+        "source_id": None,
+        "upstream": None,
+        "coverage_variants": [],
+        "dataset": None,
     }
 
     return response.json(drug_payload_by_field)
@@ -650,6 +759,13 @@ async def get_formulary_drug(request, formulary_id, rxnorm_id):
 @blueprint.get("/id/<formulary_id>/summary")
 async def get_formulary_summary(request, formulary_id):
     """Return aggregate tier and coverage-restriction counts for one formulary."""
+
+    request.args.get("source_plan_identifier")
+    if formulary_fhir_serving.is_fhir_formulary_id(formulary_id):
+        return await formulary_fhir_serving.get_fhir_formulary_summary(
+            request,
+            formulary_id,
+        )
 
     session = _get_session(request)
     plan_id, year = _decode_formulary_id(formulary_id)
@@ -727,37 +843,91 @@ async def get_formulary_summary(request, formulary_id):
             "step_therapy": step_counts_by_requirement,
             "quantity_limits": quantity_counts_by_limit,
             "pharmacy_types": pharmacy_counts,
+            "source_type": "legacy",
+            "source_id": None,
+            "dataset": None,
         }
     )
 
 
 @blueprint.get("/drugs/<rxnorm_id>")
 async def cross_formulary_drug(request, rxnorm_id):
-    """List formularies covering an RxNorm drug, filtered by plan attributes."""
+    """Return drug coverage from the selected formulary store or union."""
 
-    session = _get_session(request)
-    args = request.args
+    request.args.get("source_type")
+    selection = formulary_fhir_serving.source_selection(request.args)
+    if selection == "fhir":
+        return await formulary_fhir_serving.cross_fhir_formulary_drug(
+            request,
+            rxnorm_id,
+        )
+    if selection == "all":
+        legacy_payload = None
+        fhir_payload = None
+        has_fhir_only_filter = bool(
+            request.args.get("source_id")
+            or request.args.get("source_plan_identifier")
+        )
+        has_legacy_only_filter = bool(
+            request.args.get("year")
+            or request.args.get("state")
+            or request.args.get("issuer_id")
+        )
+        if not has_fhir_only_filter:
+            try:
+                legacy_payload = await _legacy_cross_formulary_drug(
+                    request,
+                    rxnorm_id,
+                )
+            except NotFound:
+                legacy_payload = None
+        if not has_legacy_only_filter:
+            try:
+                fhir_payload = (
+                    await formulary_fhir_serving.cross_fhir_formulary_drug(
+                        request,
+                        rxnorm_id,
+                    )
+                )
+            except NotFound:
+                fhir_payload = None
+        return formulary_fhir_serving.merge_cross_formulary_responses(
+            rxnorm_id,
+            legacy_payload,
+            fhir_payload,
+        )
+    return await _legacy_cross_formulary_drug(request, rxnorm_id)
 
-    plan_table = Plan.__table__
-    plan_drug_table = PlanDrugRaw.__table__
-    issuer_table = Issuer.__table__
 
+def _legacy_cross_filters(args, plan_table, plan_drug_table, rxnorm_id):
     filters = [plan_drug_table.c.rxnorm_id == rxnorm_id]
-
     if args.get("year"):
         year = _parse_positive_int(args.get("year"), "year")
         if year is not None:
             filters.append(plan_table.c.year == year)
-
     if args.get("state"):
         filters.append(plan_table.c.state == args.get("state").upper())
-
     if args.get("issuer_id"):
         issuer_id = _parse_positive_int(args.get("issuer_id"), "issuer_id")
         if issuer_id is not None:
             filters.append(plan_table.c.issuer_id == issuer_id)
+    return filters
 
-    stmt = (
+
+def _legacy_cross_statement(
+    plan_table,
+    plan_drug_table,
+    issuer_table,
+    filters,
+):
+    formulary_join = plan_drug_table.join(
+        plan_table,
+        plan_table.c.plan_id == plan_drug_table.c.plan_id,
+    ).join(
+        issuer_table,
+        plan_table.c.issuer_id == issuer_table.c.issuer_id,
+    )
+    return (
         select(
             plan_table.c.plan_id,
             plan_table.c.year,
@@ -770,42 +940,74 @@ async def cross_formulary_drug(request, rxnorm_id):
             plan_drug_table.c.step_therapy,
             plan_drug_table.c.quantity_limit,
         )
-        .select_from(
-            plan_drug_table.join(plan_table, plan_table.c.plan_id == plan_drug_table.c.plan_id).join(
-                issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id
-            )
-        )
+        .select_from(formulary_join)
         .where(and_(*filters))
         .order_by(plan_table.c.plan_id.asc(), plan_table.c.year.asc())
     )
 
-    formulary_result = await session.execute(stmt)
+
+def _hydrate_legacy_cross_row(formulary_row):
+    row_by_field = formulary_row._mapping
+    return {
+        "formulary_id": _encode_formulary_id(
+            row_by_field["plan_id"],
+            row_by_field["year"],
+        ),
+        "formulary_uri": _encode_formulary_path(
+            row_by_field["plan_id"],
+            row_by_field["year"],
+        ),
+        "plan_id": row_by_field["plan_id"],
+        "year": row_by_field["year"],
+        "plan_marketing_name": row_by_field["marketing_name"],
+        "state": row_by_field["state"],
+        "issuer": {
+            "issuer_id": row_by_field["issuer_id"],
+            "issuer_name": row_by_field["issuer_name"],
+        },
+        "drug_tier": row_by_field["drug_tier"],
+        "drug_tier_slug": normalize_drug_tier_slug(
+            row_by_field["drug_tier"]
+        ),
+        "prior_authorization": row_by_field["prior_authorization"],
+        "step_therapy": row_by_field["step_therapy"],
+        "quantity_limit": row_by_field["quantity_limit"],
+        "source_type": "legacy",
+        "source_id": None,
+        "upstream": None,
+        "coverage_variants": [],
+        "dataset": None,
+    }
+
+
+async def _legacy_cross_formulary_drug(request, rxnorm_id):
+    """List formularies covering an RxNorm drug, filtered by plan attributes."""
+
+    session = _get_session(request)
+    plan_table = Plan.__table__
+    plan_drug_table = PlanDrugRaw.__table__
+    issuer_table = Issuer.__table__
+    filters = _legacy_cross_filters(
+        request.args,
+        plan_table,
+        plan_drug_table,
+        rxnorm_id,
+    )
+    formulary_statement = _legacy_cross_statement(
+        plan_table,
+        plan_drug_table,
+        issuer_table,
+        filters,
+    )
+    formulary_result = await session.execute(formulary_statement)
     formulary_rows = formulary_result.all()
     if not formulary_rows:
         raise NotFound("Drug not present in any known formulary")
 
-    formulary_items = []
-    for formulary_row in formulary_rows:
-        mapping = formulary_row._mapping
-        formulary_items.append(
-            {
-                "formulary_id": _encode_formulary_id(mapping["plan_id"], mapping["year"]),
-                "formulary_uri": _encode_formulary_path(mapping["plan_id"], mapping["year"]),
-                "plan_id": mapping["plan_id"],
-                "year": mapping["year"],
-                "plan_marketing_name": mapping["marketing_name"],
-                "state": mapping["state"],
-                "issuer": {
-                    "issuer_id": mapping["issuer_id"],
-                    "issuer_name": mapping["issuer_name"],
-                },
-                "drug_tier": mapping["drug_tier"],
-                "drug_tier_slug": normalize_drug_tier_slug(mapping["drug_tier"]),
-                "prior_authorization": mapping["prior_authorization"],
-                "step_therapy": mapping["step_therapy"],
-                "quantity_limit": mapping["quantity_limit"],
-            }
-        )
+    formulary_items = [
+        _hydrate_legacy_cross_row(formulary_row)
+        for formulary_row in formulary_rows
+    ]
 
     return response.json({"rxnorm_id": rxnorm_id, "formularies": formulary_items})
 

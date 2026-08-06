@@ -194,18 +194,22 @@ async def test_ptg_run_rejects_non_ptg_worker_selector(
 
 
 def test_worker_registry_exposes_shared_and_finish_workers():
-    items = control_workers.worker_registry()
+    worker_specs = control_workers.worker_registry()
     by_importer = {
-        importer: item
-        for item in items
-        for importer in item["importers"]
-        if item["role"] == "start"
+        importer: spec_by_field
+        for spec_by_field in worker_specs
+        for importer in spec_by_field["importers"]
+        if spec_by_field["role"] == "start"
     }
-    by_queue = {item["queue"]: item for item in items}
+    by_queue = {
+        spec_by_field["queue"]: spec_by_field
+        for spec_by_field in worker_specs
+    }
 
     assert by_importer["claims-procedures"]["worker_class"] == "process.ClaimsPricing"
     assert by_importer["entity-address-unified"]["worker_class"] == "process.EntityAddressUnified"
     assert by_importer["provider-directory-fhir"]["worker_class"] == "process.ProviderDirectoryFHIR"
+    assert by_importer["formulary-fhir"]["worker_class"] == "process.FormularyFHIR"
     assert by_importer["florida-mqa-profile"]["worker_class"] == "process.FloridaMQAProfile"
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"
     assert by_importer["terminology-synonyms"]["worker_class"] == "process.TerminologySynonyms"
@@ -214,6 +218,7 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_queue["arq:PTGCandidateAudit"]["role"] == "start"
     assert by_queue["arq:OpenAddresses"]["role"] == "start"
     assert by_queue["arq:ProviderDirectoryFHIR"]["role"] == "start"
+    assert by_queue["arq:FormularyFHIR"]["role"] == "start"
     assert by_queue["arq:FloridaMQAProfile"]["role"] == "start"
     assert by_queue["arq:PTGSmall"]["worker_class"] == "process.PTGSmall"
     assert by_queue["arq:PTGNormal"]["worker_class"] == "process.PTGNormal"
