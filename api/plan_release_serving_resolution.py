@@ -19,7 +19,6 @@ from api.plan_release_serving import (
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
-
 PLAN_RELEASE_RESOLUTION_READY = "ready"
 PLAN_RELEASE_RESOLUTION_NOT_FOUND = "not_found"
 PLAN_RELEASE_RESOLUTION_UNAVAILABLE = "unavailable"
@@ -117,7 +116,7 @@ async def _load_release_rows(
     return list(result)
 
 
-async def _release_exists(session: Any, plan_release_id: str) -> bool:
+async def _has_release_revision(session: Any, plan_release_id: str) -> bool:
     result = await session.execute(
         text(_PLAN_RELEASE_EXISTS_SQL),
         {"plan_release_id": plan_release_id},
@@ -139,18 +138,14 @@ async def _validate_release_bindings(
             if not await plan_release_serving.is_release_binding_serving_ready(
                 session,
                 binding,
-                validated_serving_tables_by_snapshot_id=(
-                    serving_tables_by_snapshot_id
-                ),
+                validated_serving_tables_by_snapshot_id=(serving_tables_by_snapshot_id),
             ):
                 return None
     except PTG2ManifestArtifactError:
         return None
     validated_selection = replace(
         selection,
-        _validated_serving_tables=tuple(
-            serving_tables_by_snapshot_id.items()
-        ),
+        _validated_serving_tables=tuple(serving_tables_by_snapshot_id.items()),
     )
     if validated_selection.network_tables_by_snapshot() is None:
         return None
@@ -170,7 +165,7 @@ async def resolve_plan_release_serving_resolution(
     if not release_rows:
         state = (
             PLAN_RELEASE_RESOLUTION_UNAVAILABLE
-            if await _release_exists(session, normalized_release_id)
+            if await _has_release_revision(session, normalized_release_id)
             else PLAN_RELEASE_RESOLUTION_NOT_FOUND
         )
         return _resolution(state)
