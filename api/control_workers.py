@@ -100,6 +100,9 @@ _ENGINE_LABEL = "mrf"
 _K8S_API_TOKEN = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _K8S_API_CA = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 _K8S_API_NAMESPACE = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+_NON_LAUNCHABLE_CONTROL_RUN_STATUSES = frozenset(
+    {"canceling", "succeeded", "failed", "canceled", "dead_letter"}
+)
 WORKER_ENSURE_RUN_IDENTITY_CONTRACT = (
     "healthporta.worker-ensure-run-identity.v1"
 )
@@ -202,6 +205,12 @@ async def _admit_worker_ensure(
         return _failed_worker_admission(
             worker_payload,
             "control run was not found",
+        )
+    admitted_status = str(admitted_run.get("status") or "").strip().lower()
+    if admitted_status in _NON_LAUNCHABLE_CONTROL_RUN_STATUSES:
+        return _failed_worker_admission(
+            worker_payload,
+            f"control run is not launchable: {admitted_status}",
         )
     if (
         str(admitted_run.get("importer") or "") != "ptg"
