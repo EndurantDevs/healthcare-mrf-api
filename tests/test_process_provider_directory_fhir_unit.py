@@ -76,7 +76,7 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 49
+    assert len(command_signature.parameters) == 50
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"
     assert command.__annotations__ == expected_annotation_map
@@ -2472,6 +2472,39 @@ def test_health_partners_plans_supplemental_source_is_queryable_by_org():
     assert rows[0]["source"] == "health-partners-plans-fhir-root"
 
 
+def _assert_reviewed_candidate_acquisition_controls(
+    source_record,
+    blocked_candidate_bases,
+):
+    metadata_by_field = source_record["metadata_json"]
+    canonical_base = source_record["canonical_api_base"]
+    if canonical_base == importer.KAISER_FHIR_BASE:
+        assert metadata_by_field["provider_directory_coverage_mode"] == "full"
+        assert metadata_by_field["provider_directory_acquisition_enabled"] is False
+        assert metadata_by_field["provider_directory_manual_only"] is True
+        assert metadata_by_field["provider_directory_candidate_status"] == (
+            importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+        )
+        assert importer._resource_acquisition_blocked_reason(source_record) is None
+        return
+    if canonical_base in blocked_candidate_bases:
+        assert metadata_by_field["provider_directory_coverage_mode"] == "probe_only"
+        assert metadata_by_field["provider_directory_acquisition_enabled"] is False
+        assert metadata_by_field["provider_directory_fully_enumerable_resources"] == []
+        assert importer._resource_acquisition_blocked_reason(source_record) == (
+            importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
+        )
+        return
+    assert metadata_by_field["provider_directory_coverage_mode"] == "full"
+    assert metadata_by_field["provider_directory_acquisition_enabled"] is True
+    assert metadata_by_field["provider_directory_fully_enumerable_resources"]
+    assert metadata_by_field["provider_directory_candidate_status"] in {
+        importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+        importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+    }
+    assert importer._resource_acquisition_blocked_reason(source_record) is None
+
+
 def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
     seed_rows = importer._reviewed_provider_directory_candidate_seed_rows()
     source_rows = [
@@ -2482,7 +2515,7 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
         source_row["canonical_api_base"]: source_row for source_row in source_rows
     }
 
-    assert len(source_rows) == 8
+    assert len(source_rows) == 9
     assert {
         source_row["source_id"] for source_row in source_rows
     } == {
@@ -2494,29 +2527,17 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
         "pdfhir_46d7d27acc677651b0d3516e",
         "pdfhir_e3d82f2cd0a10ab4463dbdda",
         "pdfhir_95d5ad93c689d016351dd088",
+        "pdfhir_67f47e3af69543ce63cfbf6d",
     }
     blocked_candidate_bases = {
         importer.CAPITAL_BLUE_CROSS_PROVIDER_DIRECTORY_BASE,
         importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE,
     }
     for source_row in source_rows:
-        metadata = source_row["metadata_json"]
-        if source_row["canonical_api_base"] in blocked_candidate_bases:
-            assert metadata["provider_directory_coverage_mode"] == "probe_only"
-            assert metadata["provider_directory_acquisition_enabled"] is False
-            assert metadata["provider_directory_fully_enumerable_resources"] == []
-            assert importer._resource_acquisition_blocked_reason(source_row) == (
-                importer.PROVIDER_DIRECTORY_PROBE_ONLY_BLOCKED_REASON
-            )
-        else:
-            assert metadata["provider_directory_coverage_mode"] == "full"
-            assert metadata["provider_directory_acquisition_enabled"] is True
-            assert metadata["provider_directory_fully_enumerable_resources"]
-            assert metadata["provider_directory_candidate_status"] in {
-                importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
-                importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-            }
-            assert importer._resource_acquisition_blocked_reason(source_row) is None
+        _assert_reviewed_candidate_acquisition_controls(
+            source_row,
+            blocked_candidate_bases,
+        )
 
     el_dorado_source = source_by_base[
         importer.EL_DORADO_COUNTY_PROVIDER_DIRECTORY_BASE
@@ -13630,10 +13651,10 @@ def _write_supplemental_catalog_fixtures(tmp_path):
 
 
 def _assert_supplemental_catalog_metrics(metrics) -> None:
-    assert metrics["sources_seeded"] == 16
-    assert metrics["supplemental_catalog_sources_considered"] == 15
+    assert metrics["sources_seeded"] == 17
+    assert metrics["supplemental_catalog_sources_considered"] == 16
     catalog_metrics = metrics["supplemental_catalogs"]["catalogs"]
-    assert catalog_metrics["reviewed_provider_directory_candidates"]["rows"] == 8
+    assert catalog_metrics["reviewed_provider_directory_candidates"]["rows"] == 9
     assert catalog_metrics["amerihealth_caritas"]["rows"] == 1
     assert catalog_metrics["contra_costa"]["rows"] == 1
     assert catalog_metrics["cms_sma_endpoint_directory"]["rows"] == 0
