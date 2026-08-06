@@ -1156,6 +1156,8 @@ SOURCE_RETRY_AFTER_FIELD = "_healthporta_retry_after"
 SOURCE_FETCH_DIAGNOSTIC_FIELD = "_healthporta_source_fetch_diagnostic"
 SOURCE_QUOTA_EXHAUSTED_ERROR = "provider_directory_source_quota_exhausted"
 SOURCE_RETRY_NOT_BEFORE_METRIC = "provider_directory_retry_not_before"
+SOURCE_HTTP_KEEPALIVE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_KEEPALIVE"
+SOURCE_HTTP_KEEPALIVE_SECONDS = 60.0
 SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
 SOURCE_TRANSIENT_HTTP_STATUSES = frozenset({423, 429, 500, 502, 503, 504})
 REST_PAGINATION_COOLDOWN_RETRY_CAP = 2
@@ -1163,6 +1165,9 @@ MOLINA_QUOTA_RESET_GRACE_SECONDS = 60
 MOLINA_QUOTA_DURATION_PATTERN = re.compile(
     r"\breplenished\s+in\s+(\d{1,3}):(\d{2}):(\d{2})\b",
     re.IGNORECASE,
+)
+_SOURCE_HTTP_SESSION: contextvars.ContextVar[aiohttp.ClientSession | None] = (
+    contextvars.ContextVar("provider_directory_source_http_session", default=None)
 )
 STATE_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     {"Location", "Organization", "Practitioner", "PractitionerRole"}
@@ -35742,6 +35747,51 @@ def _ssl_context() -> ssl.SSLContext:
     return context
 
 
+def _is_source_http_keepalive_enabled() -> bool:
+    return os.getenv(SOURCE_HTTP_KEEPALIVE_ENV, "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _source_http_client_session() -> aiohttp.ClientSession:
+    """Create an anonymous REST client without adding cookies or compression."""
+    connector = aiohttp.TCPConnector(
+        ssl=_ssl_context(),
+        keepalive_timeout=SOURCE_HTTP_KEEPALIVE_SECONDS,
+        ttl_dns_cache=300,
+    )
+    return aiohttp.ClientSession(
+        connector=connector,
+        auto_decompress=False,
+        cookie_jar=aiohttp.DummyCookieJar(),
+        skip_auto_headers={"Accept-Encoding"},
+    )
+
+
+def _is_anonymous_source_url(url: str) -> bool:
+    try:
+        parsed_url = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return parsed_url.username is None and parsed_url.password is None
+
+
+@contextlib.asynccontextmanager
+async def _source_http_session_scope() -> AsyncIterator[None]:
+    """Reuse anonymous REST connections for one resource-import run."""
+    if not _is_source_http_keepalive_enabled():
+        yield
+        return
+    async with _source_http_client_session() as session:
+        session_token = _SOURCE_HTTP_SESSION.set(session)
+        try:
+            yield
+        finally:
+            _SOURCE_HTTP_SESSION.reset(session_token)
+
+
 def _source_error_payload_text(payload: dict[str, Any] | None) -> str:
     """Return normalized status text without retaining an upstream response body."""
     if not isinstance(payload, dict):
@@ -35848,6 +35898,127 @@ def _read_response_body_with_deadline(
     return b"".join(chunks)
 
 
+async def _read_source_http_response_body(
+    response: aiohttp.ClientResponse,
+    *,
+    timeout: int,
+    max_bytes: int,
+) -> bytes:
+    """Read one bounded response while preserving the post-header deadline."""
+    chunks: list[bytes] = []
+    total = 0
+    async with asyncio.timeout(max(1, timeout)):
+        while total < max_bytes:
+            chunk = await response.content.read(
+                min(READ_CHUNK_BYTES, max_bytes - total)
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    return b"".join(chunks)
+
+
+def _source_http_payload_with_retry_after(
+    payload_by_field: dict[str, Any] | None,
+    headers_by_name: Mapping[str, str],
+) -> dict[str, Any] | None:
+    retry_after = _clean_text(headers_by_name.get("Retry-After"))
+    if not retry_after:
+        return payload_by_field
+    payload_by_field = dict(payload_by_field or {})
+    payload_by_field[SOURCE_RETRY_AFTER_FIELD] = retry_after
+    return payload_by_field
+
+
+async def _read_source_http_payload(
+    response: aiohttp.ClientResponse,
+    *,
+    timeout: int,
+) -> dict[str, Any] | None:
+    """Read JSON while retaining status metadata when an error body stalls."""
+    is_error_response = not 200 <= response.status < 300
+    max_bytes = 1024 * 1024 if is_error_response else MAX_FHIR_JSON_BODY_BYTES
+    try:
+        body = await _read_source_http_response_body(
+            response,
+            timeout=timeout,
+            max_bytes=max_bytes,
+        )
+    except Exception:
+        if not is_error_response:
+            raise
+        return _source_http_payload_with_retry_after(None, response.headers)
+    payload_by_field = _decode_json_body(body)
+    if not is_error_response:
+        return payload_by_field
+    return _source_http_payload_with_retry_after(payload_by_field, response.headers)
+
+
+def _source_http_redirect_result(
+    exc: aiohttp.TooManyRedirects,
+    *,
+    started: float,
+) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    """Return a deterministic redirect result without retaining its URL."""
+    last_response = exc.history[-1] if exc.history else None
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if last_response is None:
+        return None, None, type(exc).__name__, elapsed_ms
+    payload_by_field = _source_http_payload_with_retry_after(
+        None,
+        last_response.headers,
+    )
+    return last_response.status, payload_by_field, None, elapsed_ms
+
+
+async def _fetch_json_with_source_session(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    timeout: int,
+) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    """Fetch anonymous FHIR JSON through a persistent source session."""
+    headers_by_name = {
+        "Accept": "application/fhir+json, application/json;q=0.9, */*;q=0.1",
+        "Accept-Encoding": "identity",
+        "User-Agent": USER_AGENT,
+    }
+    request_timeout = aiohttp.ClientTimeout(
+        total=None,
+        connect=timeout,
+        sock_connect=timeout,
+        sock_read=timeout,
+    )
+    started = time.monotonic()
+    try:
+        async with session.get(
+            url,
+            headers=headers_by_name,
+            timeout=request_timeout,
+            allow_redirects=True,
+        ) as response:
+            payload_by_field = await _read_source_http_payload(
+                response,
+                timeout=timeout,
+            )
+            return (
+                response.status,
+                payload_by_field,
+                None,
+                int((time.monotonic() - started) * 1000),
+            )
+    except aiohttp.TooManyRedirects as exc:
+        return _source_http_redirect_result(exc, started=started)
+    except Exception as exc:
+        return (
+            None,
+            None,
+            type(exc).__name__,
+            int((time.monotonic() - started) * 1000),
+        )
+
+
 def _fetch_json_sync(
     url: str,
     *,
@@ -35919,6 +36090,13 @@ def _post_json_sync(
 
 
 async def _fetch_json(url: str, *, timeout: int) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    source_session = _SOURCE_HTTP_SESSION.get()
+    if source_session is not None and _is_anonymous_source_url(url):
+        return await _fetch_json_with_source_session(
+            source_session,
+            url,
+            timeout=timeout,
+        )
     return await asyncio.to_thread(_fetch_json_sync, url, timeout=timeout)
 
 
@@ -56833,6 +57011,15 @@ async def _import_resources(
             await _drop_import_seen_stage_table(seen_stage_table)
 
 
+async def _import_resources_with_source_http_session(
+    source_records: list[dict[str, Any]],
+    **import_options: Any,
+) -> dict[str, int]:
+    """Run one resource import inside its optional anonymous HTTP session."""
+    async with _source_http_session_scope():
+        return await _import_resources(source_records, **import_options)
+
+
 def _dataset_rehydrate_resource_types(raw: Any) -> tuple[str, ...]:
     if raw in (None, "", (), []):
         return ()
@@ -58343,6 +58530,7 @@ async def process_provider_directory_fhir_data(
             ),
             "bulk_export_mode": _bulk_export_mode_metrics(use_bulk_export, {}),
             "source_concurrency": source_concurrency,
+            "rest_http_keepalive": _is_source_http_keepalive_enabled(),
             "stale_cleanup": should_cleanup_stale_rows,
             "publish_artifacts": should_publish_artifacts,
             "publish_after_acquisition": publish_after_acquisition,
@@ -58473,7 +58661,7 @@ async def process_provider_directory_fhir_data(
             pagination_resume_required_entries: set[str] = set()
             metrics_by_key["resource_rows"] = {}
             if importable:
-                metrics_by_key["resource_rows"] = await _import_resources(
+                metrics_by_key["resource_rows"] = await _import_resources_with_source_http_session(
                     importable,
                     resources=resources,
                     per_resource_limit=resource_limit,
