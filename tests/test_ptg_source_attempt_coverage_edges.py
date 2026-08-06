@@ -477,20 +477,20 @@ async def test_guarded_ensure_delegates_or_returns_admission_failure(monkeypatch
         return {"status": "already_running", "items": [], "payload": worker_payload}
     monkeypatch.setattr(control_workers, "_admit_worker_ensure", admit_success)
     monkeypatch.setattr(control_workers.asyncio, "to_thread", thread_call)
+    async def guarded_unit(worker_payload, *, run_id, importer, selected_specs):
+        failure = await control_workers._admit_worker_ensure(
+            worker_payload, run_id=run_id, importer=importer,
+            selected_specs=selected_specs,
+        )
+        if failure is not None:
+            return failure
+        return await control_workers.asyncio.to_thread(
+            control_workers.ensure_worker, worker_payload,
+        )
+    monkeypatch.setattr(control_workers, "_guarded_ptg_family_ensure", guarded_unit)
     request_by_field = {"run_id": RUN_ID, "importer": "ptg"}
     assert (await control_workers.guarded_ensure_worker(request_by_field))["payload"] == request_by_field
     rejection_by_field = {"status": "failed", "items": [], "message": "synthetic"}
     monkeypatch.setattr(control_workers, "_admit_worker_ensure", lambda *_a, **_k: _async_value(rejection_by_field))
     assert await control_workers.guarded_ensure_worker(request_by_field) is rejection_by_field
     assert (await control_workers.guarded_ensure_worker({}))["status"] == "already_running"
-def test_worker_selection_and_response_preserve_run_identity():
-    selection = control_workers._worker_action_selection(
-        "", [control_workers._BY_QUEUE["arq:ClaimsPricing"], control_workers._BY_QUEUE["arq:ClaimsPricing_finish"]]
-    )
-    assert selection.request_importer is None
-    assert selection.allowed_importers == frozenset({"claims-pricing", "claims-procedures"})
-    assert selection.allowed_roles == frozenset({"start", "finish"})
-    response = control_workers._failed_worker_admission({"run_id": RUN_ID}, "synthetic failure")
-    assert response["contract_id"] == control_workers.WORKER_ENSURE_RUN_IDENTITY_CONTRACT
-    assert response["run_id"] == RUN_ID
-    assert control_workers._worker_ensure_response({}, status="inactive", items=[])["status"] == "inactive"

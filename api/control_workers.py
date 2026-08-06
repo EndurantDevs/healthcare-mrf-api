@@ -16,6 +16,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from db.models import db
+from process.ptg_parts.ptg_wave_admission_fence import (
+    PTG_WAVE_FENCED_IMPORTERS,
+    PTGWaveCapacityConflict,
+    PTGWaveOwnershipConflict,
+    acquire_ptg_admission_lock,
+    require_no_capacity_owning_wave,
+    require_not_wave_owned_run,
+)
 from process.ptg_parts.ptg_source_attempt_actions import (
     PTGSourceAttemptIdentityError,
     PTGWorkerActionSelection,
@@ -232,6 +241,10 @@ async def guarded_ensure_worker(
     run_id = str(worker_payload.get("run_id") or "").strip()
     selected_specs = _resolve_specs(worker_payload)
     selects_ptg = any("ptg" in spec.importers for spec in selected_specs)
+    selects_ptg_family = any(
+        PTG_WAVE_FENCED_IMPORTERS.intersection(spec.importers)
+        for spec in selected_specs
+    )
     if (selects_ptg and importer and importer != "ptg") or (
         importer == "ptg" and selected_specs and not selects_ptg
     ):
@@ -239,7 +252,19 @@ async def guarded_ensure_worker(
             worker_payload,
             "PTG worker selector conflicts with importer",
         )
+    if selects_ptg_family and not run_id:
+        return _failed_worker_admission(
+            worker_payload,
+            "PTG-family worker launch requires run_id",
+        )
     if run_id:
+        if selects_ptg_family:
+            return await _guarded_ptg_family_ensure(
+                worker_payload,
+                run_id=run_id,
+                importer=importer,
+                selected_specs=selected_specs,
+            )
         admission_failure = await _admit_worker_ensure(
             worker_payload,
             run_id=run_id,
@@ -262,6 +287,33 @@ async def guarded_ensure_worker(
                 "source-attempt worker launch requires run_id",
             )
     return await asyncio.to_thread(ensure_worker, worker_payload)
+
+
+async def _guarded_ptg_family_ensure(
+    worker_payload: dict[str, Any],
+    *,
+    run_id: str,
+    importer: str,
+    selected_specs: list[WorkerSpec],
+) -> dict[str, Any]:
+    """Hold the shared capacity lock through PTG admission and worker launch."""
+
+    async with db.acquire() as connection:
+        await acquire_ptg_admission_lock(connection)
+        try:
+            await require_not_wave_owned_run(connection, run_id)
+            await require_no_capacity_owning_wave(connection)
+        except (PTGWaveCapacityConflict, PTGWaveOwnershipConflict) as exc:
+            return _failed_worker_admission(worker_payload, str(exc))
+        admission_failure = await _admit_worker_ensure(
+            worker_payload,
+            run_id=run_id,
+            importer=importer,
+            selected_specs=selected_specs,
+        )
+        if admission_failure is not None:
+            return admission_failure
+        return await asyncio.to_thread(ensure_worker, worker_payload)
 
 
 def _worker_ensure_response(

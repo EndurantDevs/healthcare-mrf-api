@@ -14,7 +14,9 @@ from sqlalchemy import (
     Computed,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
+    LargeBinary,
     PrimaryKeyConstraint,
     String,
     UniqueConstraint,
@@ -28,6 +30,10 @@ __all__ = (
     "ImportHistory",
     "ImportLog",
     "ImportRun",
+    "PTGImportWave",
+    "PTGImportWaveClaim",
+    "PTGImportWaveIntent",
+    "PTGImportWaveOutcome",
     "MRFCrawlRun",
     "MRFDiscoveryBatch",
     "MRFDiscoverySourceCheckpoint",
@@ -159,6 +165,316 @@ class ImportRun(Base, JSONOutputMixin):
     snapshot_id = Column(String(96))
     import_id = Column(String(64))
     retry_of_run_id = Column(String(64))
+
+
+class PTGImportWave(Base, JSONOutputMixin):
+    """Durable, controller-owned admission record for one exact PTG wave.
+
+    This row is intentionally not a publication API.  A later controller owns
+    every transition after ``admitted`` and must persist terminal evidence
+    before capacity can be released.
+    """
+
+    __tablename__ = "ptg_import_wave"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("wave_id"),
+        UniqueConstraint("idempotency_key", name="ptg_import_wave_idempotency_key"),
+        UniqueConstraint("wave_digest", name="ptg_import_wave_digest_key"),
+        CheckConstraint(
+            "request_digest ~ '^[0-9a-f]{64}$' "
+            "AND cohort_attestation_digest ~ '^[0-9a-f]{64}$' "
+            "AND cohort_signature_digest ~ '^[0-9a-f]{64}$' "
+            "AND physical_coordinate_digest ~ '^[0-9a-f]{64}$' "
+            "AND imported_coordinate_digest ~ '^[0-9a-f]{64}$' "
+            "AND reused_coordinate_digest ~ '^[0-9a-f]{64}$' "
+            "AND partition_digest ~ '^[0-9a-f]{64}$' "
+            "AND jobs_digest ~ '^[0-9a-f]{64}$' "
+            "AND manifest_digest ~ '^[0-9a-f]{64}$' "
+            "AND wave_digest ~ '^[0-9a-f]{64}$' "
+            "AND physical_coordinate_count > 0 AND intent_count > 0 "
+            "AND imported_coordinate_count = intent_count "
+            "AND physical_coordinate_count = imported_coordinate_count + reused_coordinate_count "
+            "AND worker_limit = 12 "
+            "AND queue = 'arq:PTGSmall' "
+            "AND release_queue = 'arq:PTGSmall:wave:' || wave_digest "
+            "AND worker_class = 'process.PTGSmall' "
+            "AND resource_class = 'small' "
+            "AND protocol_identity = 'healthporta.ptg-small.exact-wave.v1' "
+            "AND serializer_identity = 'arq-0.28.process-msgpack.v1' "
+            "AND state IN ('admitted', 'materializing', 'slots_waiting', "
+            "'redis_releasing', 'released', 'executing', 'awaiting_linkage', 'terminalizing', 'cleaning', "
+            "'uncertain', 'succeeded', 'failed', 'canceled', 'dead_letter')",
+            name="ptg_import_wave_contract_check",
+        ),
+        CheckConstraint(
+            "(state IN ('succeeded', 'failed', 'canceled', 'dead_letter') "
+            "AND resolved_at IS NOT NULL "
+            "AND terminal_evidence_digest ~ '^[0-9a-f]{64}$' "
+            "AND cleanup_evidence_digest ~ '^[0-9a-f]{64}$' "
+            "AND redis_cleanup_evidence_digest ~ '^[0-9a-f]{64}$' "
+            "AND kubernetes_delete_evidence_digest ~ '^[0-9a-f]{64}$' "
+            "AND linkage_ack_digest ~ '^[0-9a-f]{64}$' "
+            "AND outcomes_digest ~ '^[0-9a-f]{64}$' "
+            "AND json_typeof(terminal_summary) = 'object' "
+            "AND json_typeof(cleanup_summary) = 'object' "
+            "AND json_typeof(linkage_ack) = 'object') "
+            "OR (state = 'cleaning' AND resolved_at IS NULL "
+            "AND terminal_evidence_digest ~ '^[0-9a-f]{64}$' "
+            "AND cleanup_evidence_digest IS NULL AND cleanup_summary IS NULL "
+            "AND linkage_ack_digest ~ '^[0-9a-f]{64}$' "
+            "AND outcomes_digest ~ '^[0-9a-f]{64}$' "
+            "AND json_typeof(terminal_summary) = 'object' "
+            "AND json_typeof(linkage_ack) = 'object') "
+            "OR (state NOT IN ('succeeded', 'failed', 'canceled', 'dead_letter', 'cleaning') "
+            "AND resolved_at IS NULL AND terminal_evidence_digest IS NULL "
+            "AND terminal_summary IS NULL AND cleanup_evidence_digest IS NULL "
+            "AND cleanup_summary IS NULL)",
+            name="ptg_import_wave_terminal_evidence_check",
+        ),
+        CheckConstraint(
+            "(state = 'uncertain' AND uncertainty_resume_state IN "
+            "('materializing', 'slots_waiting', 'redis_releasing', 'released', "
+            "'executing', 'awaiting_linkage', 'terminalizing', 'cleaning')) "
+            "OR (state <> 'uncertain' AND uncertainty_resume_state IS NULL)",
+            name="ptg_import_wave_uncertainty_resume_check",
+        ),
+        CheckConstraint(
+            "(k8s_post_ticket IS NULL OR k8s_post_ticket ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') "
+            "AND (redis_release_ticket IS NULL OR redis_release_ticket ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') "
+            "AND (redis_cleanup_ticket IS NULL OR redis_cleanup_ticket ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') "
+            "AND (kubernetes_delete_ticket IS NULL OR kubernetes_delete_ticket ~ "
+            "'^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') "
+            "AND ((k8s_post_ticket IS NULL) = (k8s_post_started_at IS NULL)) "
+            "AND ((redis_release_ticket IS NULL) = (redis_release_started_at IS NULL)) "
+            "AND ((redis_cleanup_ticket IS NULL) = (redis_cleanup_started_at IS NULL)) "
+            "AND ((kubernetes_delete_ticket IS NULL) = (kubernetes_delete_started_at IS NULL))",
+            name="ptg_import_wave_operation_ticket_check",
+        ),
+        CheckConstraint(
+            "(failure_receipt IS NULL AND failure_receipt_digest IS NULL) "
+            "OR (failure_receipt_digest ~ '^[0-9a-f]{64}$' "
+            "AND json_typeof(failure_receipt) = 'object' "
+            "AND state IN ('awaiting_linkage', 'terminalizing', 'cleaning', "
+            "'succeeded', 'failed', 'canceled', 'dead_letter'))",
+            name="ptg_import_wave_failure_receipt_check",
+        ),
+        CheckConstraint(
+            "((kubernetes_job_receipt IS NULL) = (kubernetes_job_receipt_digest IS NULL)) "
+            "AND ((kubernetes_ready_attestation IS NULL) = (kubernetes_ready_attestation_digest IS NULL)) "
+            "AND ((redis_release_attestation IS NULL) = (redis_release_attestation_digest IS NULL)) "
+            "AND ((linkage_ack IS NULL) = (linkage_ack_digest IS NULL)) "
+            "AND ((terminal_summary IS NULL) = (terminal_evidence_digest IS NULL)) "
+            "AND ((redis_cleanup_evidence IS NULL) = (redis_cleanup_evidence_digest IS NULL)) "
+            "AND ((kubernetes_delete_evidence IS NULL) = (kubernetes_delete_evidence_digest IS NULL)) "
+            "AND ((cleanup_summary IS NULL) = (cleanup_evidence_digest IS NULL))",
+            name="ptg_import_wave_receipt_pairs_check",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    wave_id = Column(String(64), nullable=False)
+    idempotency_key = Column(String(160), nullable=False)
+    request_digest = Column(String(64), nullable=False)
+    cohort_attestation = Column(JSON, nullable=False)
+    cohort_attestation_digest = Column(String(64), nullable=False)
+    cohort_signature_digest = Column(String(64), nullable=False)
+    physical_coordinate_count = Column(Integer, nullable=False)
+    physical_coordinate_digest = Column(String(64), nullable=False)
+    imported_coordinate_count = Column(Integer, nullable=False)
+    imported_coordinate_digest = Column(String(64), nullable=False)
+    reused_coordinate_count = Column(Integer, nullable=False)
+    reused_coordinate_digest = Column(String(64), nullable=False)
+    partition_digest = Column(String(64), nullable=False)
+    intent_count = Column(Integer, nullable=False)
+    jobs_digest = Column(String(64), nullable=False)
+    manifest_digest = Column(String(64), nullable=False)
+    wave_digest = Column(String(64), nullable=False)
+    queue = Column(String(64), nullable=False)
+    release_queue = Column(String(160), nullable=False)
+    worker_class = Column(String(64), nullable=False)
+    resource_class = Column(String(32), nullable=False)
+    worker_limit = Column(Integer, nullable=False)
+    protocol_identity = Column(String(96), nullable=False)
+    serializer_identity = Column(String(96), nullable=False)
+    enqueue_time_ms = Column(BigInteger, nullable=False)
+    state_version = Column(Integer, nullable=False, default=0)
+    state = Column(String(32), nullable=False)
+    uncertainty_resume_state = Column(String(32))
+    created_at = Column(TIMESTAMP, nullable=False)
+    kubernetes_manifest = Column(JSON)
+    kubernetes_manifest_bytes = Column(LargeBinary)
+    kubernetes_manifest_sha256 = Column(String(64))
+    kubernetes_manifest_identity = Column(String(64))
+    pinned_image_reference = Column(String(512))
+    pinned_image_digest = Column(String(64))
+    runtime_image_identity = Column(String(72))
+    kubernetes_config_identity = Column(String(64))
+    k8s_post_ticket = Column(String(128))
+    k8s_post_started_at = Column(TIMESTAMP)
+    kubernetes_job_uid = Column(String(128))
+    kubernetes_job_receipt = Column(JSON)
+    kubernetes_job_receipt_digest = Column(String(64))
+    kubernetes_ready_attestation = Column(JSON)
+    kubernetes_ready_attestation_digest = Column(String(64))
+    redis_release_ticket = Column(String(128))
+    redis_release_started_at = Column(TIMESTAMP)
+    redis_release_attestation = Column(JSON)
+    redis_release_attestation_digest = Column(String(64))
+    outcomes_digest = Column(String(64))
+    failure_receipt = Column(JSON)
+    failure_receipt_digest = Column(String(64))
+    linkage_ack = Column(JSON)
+    linkage_ack_digest = Column(String(64))
+    redis_cleanup_ticket = Column(String(128))
+    redis_cleanup_started_at = Column(TIMESTAMP)
+    redis_cleanup_evidence = Column(JSON)
+    redis_cleanup_evidence_digest = Column(String(64))
+    kubernetes_delete_ticket = Column(String(128))
+    kubernetes_delete_started_at = Column(TIMESTAMP)
+    kubernetes_delete_evidence = Column(JSON)
+    kubernetes_delete_evidence_digest = Column(String(64))
+    resolved_at = Column(TIMESTAMP)
+    terminal_evidence_digest = Column(String(64))
+    terminal_summary = Column(JSON)
+    cleanup_evidence_digest = Column(String(64))
+    cleanup_summary = Column(JSON)
+
+
+class PTGImportWaveIntent(Base, JSONOutputMixin):
+    """One immutable, ordinal ARQ payload retained before any publication."""
+
+    __tablename__ = "ptg_import_wave_intent"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("wave_id", "ordinal"),
+        ForeignKeyConstraint(
+            ("wave_id",), (PTGImportWave.wave_id,),
+            name="ptg_import_wave_intent_wave_fkey", ondelete="CASCADE",
+        ),
+        UniqueConstraint("run_id", name="ptg_import_wave_intent_run_id_key"),
+        UniqueConstraint("job_id", name="ptg_import_wave_intent_job_id_key"),
+        UniqueConstraint(
+            "wave_id", "ordinal", "run_id", "job_id",
+            name="ptg_import_wave_intent_claim_identity_key",
+        ),
+        UniqueConstraint(
+            "wave_id", "source_file_import_id",
+            name="ptg_import_wave_intent_source_per_wave_key",
+        ),
+        CheckConstraint(
+            "ordinal >= 0 AND length(run_id) > 0 "
+            "AND length(source_file_import_id) > 0 "
+            "AND length(content_version) > 0 "
+            "AND length(run_idempotency_key) > 0 "
+            "AND length(job_id) > 0 "
+            "AND serialized_job_digest ~ '^[0-9a-f]{64}$' "
+            "AND json_typeof(params) = 'object' AND json_typeof(job_payload) = 'object'",
+            name="ptg_import_wave_intent_contract_check",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    wave_id = Column(String(64), nullable=False)
+    ordinal = Column(Integer, nullable=False)
+    run_id = Column(String(64), nullable=False)
+    source_file_import_id = Column(String(64), nullable=False)
+    content_version = Column(String(128), nullable=False)
+    run_idempotency_key = Column(String(160), nullable=False)
+    job_id = Column(String(96), nullable=False)
+    params = Column(JSON, nullable=False)
+    job_payload = Column(JSON, nullable=False)
+    serialized_job = Column(LargeBinary, nullable=False)
+    serialized_job_digest = Column(String(64), nullable=False)
+
+
+class PTGImportWaveClaim(Base, JSONOutputMixin):
+    """One immutable pre-execution claim for an admitted ARQ job."""
+
+    __tablename__ = "ptg_import_wave_claim"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("wave_id", "ordinal"),
+        ForeignKeyConstraint(
+            ("wave_id", "ordinal", "run_id", "job_id"),
+            (
+                PTGImportWaveIntent.wave_id, PTGImportWaveIntent.ordinal,
+                PTGImportWaveIntent.run_id, PTGImportWaveIntent.job_id,
+            ),
+            name="ptg_import_wave_claim_intent_fkey", ondelete="CASCADE",
+        ),
+        UniqueConstraint("run_id", name="ptg_import_wave_claim_run_id_key"),
+        UniqueConstraint("job_id", name="ptg_import_wave_claim_job_id_key"),
+        CheckConstraint(
+            "ordinal >= 0 AND slot >= 0 AND slot < 12 "
+            "AND claim_status IN ('started', 'rejected') "
+            "AND ((claim_status = 'started' AND failure_code IS NULL) "
+            "OR (claim_status = 'rejected' "
+            "AND failure_code IS NOT NULL "
+            "AND failure_code ~ '^[a-z][a-z0-9_]{0,63}$')) "
+            "AND claim_attempt_token ~ '^[0-9a-f]{32}$' "
+            "AND manifest_identity ~ '^[0-9a-f]{64}$' "
+            "AND length(pinned_image_reference) > 0 "
+            "AND pinned_image_digest ~ '^[0-9a-f]{64}$' "
+            "AND runtime_image_identity ~ '^sha256:[0-9a-f]{64}$' "
+            "AND config_identity ~ '^[0-9a-f]{64}$' "
+            "AND length(run_id) > 0 AND length(job_id) > 0 AND length(pod_uid) > 0",
+            name="ptg_import_wave_claim_contract_check",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    wave_id = Column(String(64), nullable=False)
+    ordinal = Column(Integer, nullable=False)
+    run_id = Column(String(64), nullable=False)
+    job_id = Column(String(96), nullable=False)
+    slot = Column(Integer, nullable=False)
+    pod_uid = Column(String(128), nullable=False)
+    kubernetes_job_uid = Column(String(128), nullable=False)
+    pinned_image_reference = Column(String(512), nullable=False)
+    pinned_image_digest = Column(String(64), nullable=False)
+    runtime_image_identity = Column(String(72), nullable=False)
+    config_identity = Column(String(64), nullable=False)
+    manifest_identity = Column(String(64), nullable=False)
+    claim_status = Column(String(16), nullable=False, default="started")
+    failure_code = Column(String(64))
+    claim_attempt_token = Column(String(32), nullable=False)
+    claimed_at = Column(TIMESTAMP, nullable=False)
+
+
+class PTGImportWaveOutcome(Base, JSONOutputMixin):
+    """Immutable terminal snapshot used for stable controller pagination."""
+
+    __tablename__ = "ptg_import_wave_outcome"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("wave_id", "ordinal"),
+        ForeignKeyConstraint(
+            ("wave_id", "ordinal", "run_id", "job_id"),
+            (
+                PTGImportWaveIntent.wave_id, PTGImportWaveIntent.ordinal,
+                PTGImportWaveIntent.run_id, PTGImportWaveIntent.job_id,
+            ),
+            name="ptg_import_wave_outcome_intent_fkey", ondelete="CASCADE",
+        ),
+        UniqueConstraint("run_id", name="ptg_import_wave_outcome_run_id_key"),
+        CheckConstraint(
+            "ordinal >= 0 AND status IN ('succeeded', 'failed', 'canceled', 'dead_letter') "
+            "AND length(job_id) > 0 AND outcome_digest ~ '^[0-9a-f]{64}$' "
+            "AND (status <> 'succeeded' OR (snapshot_id IS NOT NULL "
+            "AND length(snapshot_id) > 0 AND import_id = source_file_import_id))",
+            name="ptg_import_wave_outcome_contract_check",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    wave_id = Column(String(64), nullable=False)
+    ordinal = Column(Integer, nullable=False)
+    run_id = Column(String(64), nullable=False)
+    job_id = Column(String(96), nullable=False)
+    source_file_import_id = Column(String(64), nullable=False)
+    content_version = Column(String(128), nullable=False)
+    status = Column(String(32), nullable=False)
+    snapshot_id = Column(String(96))
+    import_id = Column(String(64))
+    outcome_digest = Column(String(64), nullable=False)
+    recorded_at = Column(TIMESTAMP, nullable=False)
 
 
 class MRFPayer(Base, JSONOutputMixin):

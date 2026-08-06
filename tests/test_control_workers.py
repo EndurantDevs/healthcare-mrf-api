@@ -5,6 +5,33 @@ import pytest
 from api import control_workers
 
 
+@pytest.fixture(autouse=True)
+def isolate_ptg_capacity_from_worker_units(monkeypatch):
+    """These units target source admission; capacity locking has its own tests."""
+
+    async def unit_guard(
+        worker_payload,
+        *,
+        run_id,
+        importer,
+        selected_specs,
+    ):
+        failure = await control_workers._admit_worker_ensure(
+            worker_payload,
+            run_id=run_id,
+            importer=importer,
+            selected_specs=selected_specs,
+        )
+        if failure is not None:
+            return failure
+        return await control_workers.asyncio.to_thread(
+            control_workers.ensure_worker,
+            worker_payload,
+        )
+
+    monkeypatch.setattr(control_workers, "_guarded_ptg_family_ensure", unit_guard)
+
+
 @pytest.mark.asyncio
 async def test_guarded_ptg_ensure_requires_exact_source_identity(monkeypatch):
     admitted_calls: list[dict[str, object]] = []

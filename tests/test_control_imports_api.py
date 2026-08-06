@@ -1684,6 +1684,9 @@ class _ParallelPTGConnection:
     async def status(self, statement):
         self.harness.statements.append(statement)
 
+    async def all(self, *_args, **_kwargs):
+        return []
+
 
 class _ParallelPTGRunHarness:
     def __init__(self):
@@ -2693,6 +2696,10 @@ class _CancelDbUpdateRecorder:
         self.update_parameters.append(statement.compile().params)
         return _CancelUpdateResult()
 
+    async def scalar(self, *_args, **_kwargs):
+        # This recorder models a schema from before exact-wave ownership.
+        return None
+
     def merged_run(self, source_run: dict[str, object]) -> dict[str, object]:
         latest_update = self.update_parameters[-1]
         return {
@@ -2817,6 +2824,11 @@ async def test_sync_terminal_worker_failure_persists_oom_evidence(monkeypatch):
     database_recorder = _CancelDbUpdateRecorder()
     monkeypatch.setattr(control_imports, "db", database_recorder)
     monkeypatch.setattr(control_imports, "_active_worker_state", fake_active_worker_state)
+    monkeypatch.setattr(
+        control_imports,
+        "is_ptg_wave_owned_run",
+        AsyncMock(return_value=False),
+    )
 
     synced_run = await control_imports._sync_terminal_worker_failure(source_run)
 

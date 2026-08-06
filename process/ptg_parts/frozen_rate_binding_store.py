@@ -252,15 +252,27 @@ async def recheck_frozen_binding(
 ) -> dict[str, Any] | None:
     """Recheck a previously admitted binding without creating one."""
 
+    async with db.acquire() as connection:
+        return await recheck_frozen_binding_on_connection(
+            connection,
+            params_by_name,
+        )
+
+
+async def recheck_frozen_binding_on_connection(
+    connection: Any,
+    params_by_name: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Compare an existing binding through the caller's transaction only."""
+
     expected_binding_by_name = frozen_rate_binding_from_params(params_by_name)
     source_file_import_id = source_file_import_id_from_params(params_by_name)
     if source_file_import_id is None:
         return expected_binding_by_name
-    async with db.acquire() as connection:
-        binding_row_by_name = await _load_frozen_binding(
-            connection,
-            source_file_import_id,
-        )
+    binding_row_by_name = await _load_frozen_binding(
+        connection,
+        source_file_import_id,
+    )
     _assert_loaded_binding(
         binding_row_by_name,
         expected_binding_by_name,
@@ -316,4 +328,5 @@ __all__ = [
     "insert_or_compare_frozen_binding_transaction",
     "measure_frozen_binding_storage",
     "recheck_frozen_binding",
+    "recheck_frozen_binding_on_connection",
 ]
