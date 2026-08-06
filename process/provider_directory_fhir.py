@@ -1407,6 +1407,9 @@ class ResourceFetchResult:
     is_pagination_cooldown_recovered: bool = False
     is_pagination_cooldown_exhausted: bool = False
     is_pagination_cooldown_deadline_blocked: bool = False
+    source_fetch_elapsed_ms: int = 0
+    stream_write_elapsed_seconds: float = 0.0
+    checkpoint_persist_elapsed_seconds: float = 0.0
 
     @property
     def is_bounded(self) -> bool:
@@ -46166,7 +46169,12 @@ async def _fetch_resource_rows(
     retained_resource_rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
     rows_fetched = resume_state.rows_processed if resume_state else 0
-    fetch_counts_by_name = {"rows_written": 0}
+    fetch_counts_by_name = {
+        "rows_written": 0,
+        "stream_write_elapsed_seconds": 0.0,
+    }
+    source_fetch_elapsed_ms = 0
+    checkpoint_persist_elapsed_seconds = 0.0
     pages = resume_state.pages_processed if resume_state else 0
     seen_urls: set[str] = set()
     recent_url_hashes = list(resume_state.recent_url_hashes if resume_state else ())
@@ -46239,7 +46247,17 @@ async def _fetch_resource_rows(
             return
         pending_rows_list = list(pending_rows)
         pending_rows.clear()
-        fetch_counts_by_name["rows_written"] += await row_batch_handler(model, pending_rows_list)
+        write_started_at = time.monotonic()
+        try:
+            fetch_counts_by_name["rows_written"] += await row_batch_handler(
+                model,
+                pending_rows_list,
+            )
+        finally:
+            fetch_counts_by_name["stream_write_elapsed_seconds"] += max(
+                0.0,
+                time.monotonic() - write_started_at,
+            )
 
     while pending_start_urls:
         start_url = pending_start_urls.pop(0)
@@ -46278,6 +46296,7 @@ async def _fetch_resource_rows(
                 url,
                 timeout=resource_timeout,
             )
+            source_fetch_elapsed_ms += max(0, int(page_fetch_result[3]))
             if checkpoint_context and _is_rest_pagination_cooldown_failure(
                 page_fetch_result[0],
                 page_fetch_result[2],
@@ -46512,18 +46531,25 @@ async def _fetch_resource_rows(
                 recent_url_hashes = recent_url_hashes[
                     -PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:
                 ]
-                await _save_pagination_checkpoint(
-                    checkpoint_context,
-                    resource_type,
-                    next_url=resolved_next_url,
-                    pages_processed=pages,
-                    rows_processed=rows_fetched,
-                    recent_url_hashes=recent_url_hashes,
-                    completeness=_synthetic_position_page_guard_completeness(
-                        synthetic_page_identity,
-                        recent_synthetic_page_fingerprints,
-                    ),
-                )
+                checkpoint_started_at = time.monotonic()
+                try:
+                    await _save_pagination_checkpoint(
+                        checkpoint_context,
+                        resource_type,
+                        next_url=resolved_next_url,
+                        pages_processed=pages,
+                        rows_processed=rows_fetched,
+                        recent_url_hashes=recent_url_hashes,
+                        completeness=_synthetic_position_page_guard_completeness(
+                            synthetic_page_identity,
+                            recent_synthetic_page_fingerprints,
+                        ),
+                    )
+                finally:
+                    checkpoint_persist_elapsed_seconds += max(
+                        0.0,
+                        time.monotonic() - checkpoint_started_at,
+                    )
             url = resolved_next_url
             if not _can_limit_accept_more(rows_fetched, per_resource_limit) and url:
                 has_reached_row_limit = True
@@ -46627,6 +46653,11 @@ async def _fetch_resource_rows(
         is_pagination_cooldown_deadline_blocked=(
             is_pagination_cooldown_deadline_blocked
         ),
+        source_fetch_elapsed_ms=source_fetch_elapsed_ms,
+        stream_write_elapsed_seconds=fetch_counts_by_name[
+            "stream_write_elapsed_seconds"
+        ],
+        checkpoint_persist_elapsed_seconds=checkpoint_persist_elapsed_seconds,
     )
 
 
@@ -48196,6 +48227,9 @@ def _empty_resource_stats() -> dict[str, Any]:
         "collection_complete_sources": 0,
         "pages_fetched": 0,
         "rows_fetched": 0,
+        "source_fetch_elapsed_ms": 0,
+        "stream_write_elapsed_seconds": 0.0,
+        "checkpoint_persist_elapsed_seconds": 0.0,
         "pagination_cooldown_retries": 0,
         "pagination_cooldown_wait_seconds": 0.0,
         "pagination_cooldown_recovered_sources": 0,
@@ -48347,6 +48381,13 @@ def _record_resource_fetch_stats(
     resource_stats["sources_attempted"] += 1
     resource_stats["pages_fetched"] += fetch_result.pages_fetched
     resource_stats["rows_fetched"] += fetch_result.rows_fetched
+    resource_stats["source_fetch_elapsed_ms"] += fetch_result.source_fetch_elapsed_ms
+    resource_stats["stream_write_elapsed_seconds"] += (
+        fetch_result.stream_write_elapsed_seconds
+    )
+    resource_stats["checkpoint_persist_elapsed_seconds"] += (
+        fetch_result.checkpoint_persist_elapsed_seconds
+    )
     _record_pagination_cooldown_stats(resource_stats, fetch_result)
     if fetch_result.complete:
         resource_stats["sources_completed"] += 1
@@ -48421,6 +48462,11 @@ def _resource_fetch_diagnostic(
         "pages_fetched": fetch_result.pages_fetched,
         "rows_fetched": fetch_result.rows_fetched,
         "rows_written": rows_written,
+        "source_fetch_elapsed_ms": fetch_result.source_fetch_elapsed_ms,
+        "stream_write_elapsed_seconds": fetch_result.stream_write_elapsed_seconds,
+        "checkpoint_persist_elapsed_seconds": (
+            fetch_result.checkpoint_persist_elapsed_seconds
+        ),
         "row_limit_reached": fetch_result.row_limit_reached,
         "page_limit_reached": fetch_result.page_limit_reached,
         "hard_page_limit_reached": fetch_result.hard_page_limit_reached,
