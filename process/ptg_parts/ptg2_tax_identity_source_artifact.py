@@ -14,6 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from process.ptg_parts.ptg2_tax_identity_source_copy import (
+    _ProjectionCopyLease,
+    _authenticate_and_seal_projection_copy,
+    _open_anonymous_projection_copy,
+)
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
     PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT,
     PreparedTaxIdentitySourceProjection,
@@ -25,8 +30,6 @@ from process.ptg_parts.ptg2_tax_identity_source_projection import (
     _VERSION,
     _digest_ascii,
     _fail,
-    _has_same_file_identity,
-    _remove_ephemeral_copy,
     _source_ordinal_by_shard,
     _strict_policy,
     _validated_bindings,
@@ -46,7 +49,6 @@ _COPY_COLUMNS = tuple(
         "tin_id_128 tin_hmac_sha256"
     ).split()
 )
-_COPY_READ_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,9 +67,7 @@ class _ProjectionCopySummary:
     content_digest: bytes
     copy_sha256: str
     copy_byte_count: int
-    copy_device: int
-    copy_inode: int
-    copy_mtime_ns: int
+    copy_owner: _ProjectionCopyLease
 
 
 def _copy_field(output_file: BinaryIO, field_bytes: bytes | None) -> None:
@@ -350,98 +350,58 @@ def _projection_content_digest(inputs: _ProjectionInputs) -> Any:
 
 
 def _write_projection_copy(
-    output_path: Path,
+    scratch_parent: Path,
     inputs: _ProjectionInputs,
 ) -> _ProjectionCopySummary:
-    output_descriptor: int | None = None
-    created_metadata: os.stat_result | None = None
+    output_file: BinaryIO | None = None
+    copy_owner: _ProjectionCopyLease | None = None
     totals_by_state = {name: 0 for name in _STATE_COUNT_FIELDS}
     occurrence_count = 0
     content_digest = _projection_content_digest(inputs)
     try:
-        open_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-        open_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        output_descriptor = os.open(output_path, open_flags, 0o600)
-        created_metadata = os.fstat(output_descriptor)
-        output_file = os.fdopen(output_descriptor, "w+b", closefd=True)
-        output_descriptor = None
-        with output_file:
-            output_file.write(_PG_COPY_HEADER)
-            for binding in inputs.bindings:
-                counts_by_state = _parse_source_sidecar(
-                    binding,
-                    output_file=output_file,
-                    content_digest=content_digest,
-                    policy_id=inputs.policy_id,
-                )
-                occurrence_count += binding.provider_group_count
-                for count_name, state_count in counts_by_state.items():
-                    totals_by_state[count_name] += state_count
-            output_file.write(_PG_COPY_TRAILER)
-            copy_sha256, copy_metadata = _authenticated_open_copy(
-                output_file,
-                output_path,
+        output_file = _open_anonymous_projection_copy(scratch_parent)
+        output_file.write(_PG_COPY_HEADER)
+        for binding in inputs.bindings:
+            counts_by_state = _parse_source_sidecar(
+                binding,
+                output_file=output_file,
+                content_digest=content_digest,
+                policy_id=inputs.policy_id,
             )
-    except BaseException:
-        if output_descriptor is not None:
-            with suppress(OSError):
-                os.close(output_descriptor)
-        if created_metadata is not None:
-            _remove_ephemeral_copy(
-                output_path,
-                expected_device=created_metadata.st_dev,
-                expected_inode=created_metadata.st_ino,
-            )
-        raise
-    return _ProjectionCopySummary(
-        occurrence_count=occurrence_count,
-        counts_by_state=totals_by_state,
-        content_digest=content_digest.digest(),
-        copy_sha256=copy_sha256,
-        copy_byte_count=copy_metadata.st_size,
-        copy_device=copy_metadata.st_dev,
-        copy_inode=copy_metadata.st_ino,
-        copy_mtime_ns=copy_metadata.st_mtime_ns,
-    )
-
-
-def _authenticated_open_copy(
-    output_file: BinaryIO,
-    output_path: Path,
-) -> tuple[str, os.stat_result]:
-    """Hash the original creation descriptor and freeze its exact identity."""
-
-    output_file.flush()
-    initial_metadata = os.fstat(output_file.fileno())
-    output_file.seek(0)
-    copy_digest = hashlib.sha256()
-    observed_byte_count = 0
-    while file_chunk := output_file.read(_COPY_READ_BYTES):
-        copy_digest.update(file_chunk)
-        observed_byte_count += len(file_chunk)
-    final_metadata = os.fstat(output_file.fileno())
-    path_metadata = os.lstat(output_path)
-    if (
-        observed_byte_count != initial_metadata.st_size
-        or not _has_same_file_identity(initial_metadata, final_metadata)
-        or not _has_same_file_identity(final_metadata, path_metadata)
-    ):
-        raise _fail()
-    return copy_digest.hexdigest(), final_metadata
+            occurrence_count += binding.provider_group_count
+            for count_name, state_count in counts_by_state.items():
+                totals_by_state[count_name] += state_count
+        output_file.write(_PG_COPY_TRAILER)
+        copy_owner, copy_sha256, copy_byte_count = (
+            _authenticate_and_seal_projection_copy(output_file)
+        )
+        output_file = None
+        summary = _ProjectionCopySummary(
+            occurrence_count=occurrence_count,
+            counts_by_state=totals_by_state,
+            content_digest=content_digest.digest(),
+            copy_sha256=copy_sha256,
+            copy_byte_count=copy_byte_count,
+            copy_owner=copy_owner,
+        )
+        copy_owner = None
+        return summary
+    finally:
+        if copy_owner is not None:
+            copy_owner.cleanup()
+        if output_file is not None:
+            with suppress(BaseException):
+                output_file.close()
 
 
 def _prepared_projection(
-    copy_path: Path,
     inputs: _ProjectionInputs,
     copy_summary: _ProjectionCopySummary,
 ) -> PreparedTaxIdentitySourceProjection:
     return PreparedTaxIdentitySourceProjection(
-        copy_path=copy_path,
+        _copy_owner=copy_summary.copy_owner,
         copy_sha256=copy_summary.copy_sha256,
         copy_byte_count=copy_summary.copy_byte_count,
-        copy_device=copy_summary.copy_device,
-        copy_inode=copy_summary.copy_inode,
-        copy_mtime_ns=copy_summary.copy_mtime_ns,
         bindings=inputs.bindings,
         token_policy_id=inputs.policy_id,
         token_policy_descriptor_sha256=inputs.policy_descriptor,
@@ -459,18 +419,18 @@ def _prepared_projection(
 def prepare_tax_identity_source_projection(
     bound_sidecars: Iterable[Mapping[str, Any]],
     *,
-    output_path: str | Path,
+    scratch_parent: str | Path,
     token_policy_id: str,
     token_policy_descriptor_sha256: bytes,
     source_ordinal_map: Iterable[Mapping[str, Any]],
     source_ordinal_map_digest: bytes,
     aggregate_tax_content_digest: bytes,
 ) -> PreparedTaxIdentitySourceProjection:
-    """Authenticate every source sidecar and emit one bounded-memory COPY."""
+    """Authenticate every sidecar and seal one anonymous bounded-memory COPY."""
 
-    copy_path = Path(output_path)
     copy_summary: _ProjectionCopySummary | None = None
     try:
+        scratch_path = Path(scratch_parent)
         inputs = _validated_projection_inputs(
             bound_sidecars,
             token_policy_id=token_policy_id,
@@ -479,15 +439,13 @@ def prepare_tax_identity_source_projection(
             source_ordinal_map_digest=source_ordinal_map_digest,
             aggregate_tax_content_digest=aggregate_tax_content_digest,
         )
-        copy_summary = _write_projection_copy(copy_path, inputs)
-        return _prepared_projection(copy_path, inputs, copy_summary)
+        copy_summary = _write_projection_copy(scratch_path, inputs)
+        prepared = _prepared_projection(inputs, copy_summary)
+        copy_summary = None
+        return prepared
     except BaseException as error:
         if copy_summary is not None:
-            _remove_ephemeral_copy(
-                copy_path,
-                expected_device=copy_summary.copy_device,
-                expected_inode=copy_summary.copy_inode,
-            )
+            copy_summary.copy_owner.cleanup()
         if isinstance(error, Exception) and not isinstance(
             error,
             TaxIdentitySourceProjectionError,

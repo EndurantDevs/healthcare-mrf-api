@@ -11,10 +11,13 @@ from unittest.mock import patch
 import pytest
 
 from process.ptg_parts import ptg2_tax_identity_source_artifact as artifact
+from process.ptg_parts import ptg2_tax_identity_source_copy as source_copy
 from process.ptg_parts.ptg2_tax_identity_source_artifact import (
     prepare_tax_identity_source_projection,
 )
-from process.ptg_parts.ptg2_tax_identity_source_copy import _is_copy_file_unchanged
+from process.ptg_parts.ptg2_tax_identity_source_copy import (
+    _authenticated_projection_copy_stream,
+)
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
     TaxIdentitySourceProjectionError,
 )
@@ -104,9 +107,9 @@ def _sidecar(
 def _prepare(
     tmp_path: Path,
     sidecars: tuple[dict[str, object], ...],
-    *,
-    output_name: str = "projection.copy",
 ):
+    scratch_parent = tmp_path / "scratch"
+    scratch_parent.mkdir(exist_ok=True)
     shard_ids = tuple(sorted(str(sidecar["source_shard_id"]) for sidecar in sidecars))
     source_ordinal_rows = tuple(
         {"shard_id": shard_id, "ordinal": ordinal}
@@ -114,13 +117,21 @@ def _prepare(
     )
     return prepare_tax_identity_source_projection(
         sidecars,
-        output_path=tmp_path / output_name,
+        scratch_parent=scratch_parent,
         token_policy_id=_POLICY,
         token_policy_descriptor_sha256=b"p" * 32,
         source_ordinal_map=source_ordinal_rows,
         source_ordinal_map_digest=_ordinal_digest(shard_ids),
         aggregate_tax_content_digest=b"a" * 32,
     )
+
+
+def _consume_copy(prepared, *, chunk_size: int = 524_288) -> bytes:
+    chunks: list[bytes] = []
+    with _authenticated_projection_copy_stream(prepared) as copy_stream:
+        while copy_chunk := copy_stream.read(chunk_size):
+            chunks.append(copy_chunk)
+    return b"".join(chunks)
 
 
 def test_prepare_authenticates_records_and_is_deterministic(tmp_path):
@@ -140,11 +151,7 @@ def test_prepare_authenticates_records_and_is_deterministic(tmp_path):
     )
 
     prepared = _prepare(tmp_path, (second, first))
-    repeated = _prepare(
-        tmp_path,
-        (first, second),
-        output_name="projection-repeated.copy",
-    )
+    repeated = _prepare(tmp_path, (first, second))
 
     assert prepared.source_count == 2
     assert prepared.provider_group_occurrence_count == 4
@@ -154,24 +161,22 @@ def test_prepare_authenticates_records_and_is_deterministic(tmp_path):
     assert prepared.unsupported_type_count == 1
     assert prepared.content_digest == repeated.content_digest
     assert prepared.copy_sha256 == repeated.copy_sha256
-    assert prepared.copy_path.read_bytes().startswith(b"PGCOPY\n\xff\r\n\0")
-    assert prepared.copy_path.read_bytes().endswith(b"\xff\xff")
-    assert prepared.copy_path.stat().st_mode & 0o777 == 0o600
-    copy_metadata = prepared.copy_path.stat()
-    assert prepared.copy_device == copy_metadata.st_dev
-    assert prepared.copy_inode == copy_metadata.st_ino
-    assert prepared.copy_byte_count == copy_metadata.st_size
-    assert prepared.copy_mtime_ns == copy_metadata.st_mtime_ns
+    prepared_bytes = _consume_copy(prepared)
+    repeated_bytes = _consume_copy(repeated)
+    assert prepared_bytes == repeated_bytes
+    assert prepared_bytes.startswith(b"PGCOPY\n\xff\r\n\0")
+    assert prepared_bytes.endswith(b"\xff\xff")
+    assert hashlib.sha256(prepared_bytes).hexdigest() == prepared.copy_sha256
+    assert len(prepared_bytes) == prepared.copy_byte_count
+    assert list((tmp_path / "scratch").iterdir()) == []
     assert str(first["path"]) not in repr(prepared)
     assert "1" * 32 not in repr(prepared)
 
     prepared.cleanup()
     repeated.cleanup()
-    assert not prepared.copy_path.exists()
-    assert not repeated.copy_path.exists()
 
 
-def test_prepared_cleanup_is_idempotent_and_swallows_unlink_errors(tmp_path):
+def test_prepared_cleanup_is_idempotent_and_never_unlinks_a_path(tmp_path):
     sidecar = _sidecar(
         tmp_path,
         source_key=0,
@@ -184,10 +189,11 @@ def test_prepared_cleanup_is_idempotent_and_swallows_unlink_errors(tmp_path):
     with patch.object(Path, "unlink", side_effect=PermissionError("denied")):
         prepared.cleanup()
 
-    assert prepared.copy_path.exists()
     prepared.cleanup()
     prepared.cleanup()
-    assert not prepared.copy_path.exists()
+    assert list((tmp_path / "scratch").iterdir()) == []
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        _consume_copy(prepared)
 
 
 def test_prepare_and_cleanup_preserve_files_owned_by_other_attempts(tmp_path):
@@ -198,19 +204,16 @@ def test_prepare_and_cleanup_preserve_files_owned_by_other_attempts(tmp_path):
         identity_digit="8",
         sidecar_records=(_record(1, 2),),
     )
-    output_path = tmp_path / "projection.copy"
-    output_path.write_bytes(b"preexisting-owner")
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        _prepare(tmp_path, (sidecar,))
-    assert output_path.read_bytes() == b"preexisting-owner"
+    unrelated_path = tmp_path / "other-attempt.copy"
+    unrelated_path.write_bytes(b"other-attempt-owner")
+    first = _prepare(tmp_path, (sidecar,))
+    second = _prepare(tmp_path, (sidecar,))
 
-    output_path.unlink()
-    prepared = _prepare(tmp_path, (sidecar,))
-    replacement_path = tmp_path / "replacement.copy"
-    replacement_path.write_bytes(b"replacement-owner")
-    os.replace(replacement_path, prepared.copy_path)
-    prepared.cleanup()
-    assert output_path.read_bytes() == b"replacement-owner"
+    first.cleanup()
+
+    assert unrelated_path.read_bytes() == b"other-attempt-owner"
+    assert _consume_copy(second).startswith(b"PGCOPY\n\xff\r\n\0")
+    assert unrelated_path.read_bytes() == b"other-attempt-owner"
 
 
 def test_prepare_hashes_copy_through_creation_descriptor(tmp_path):
@@ -226,10 +229,10 @@ def test_prepare_hashes_copy_through_creation_descriptor(tmp_path):
         prepared = _prepare(tmp_path, (sidecar,))
 
     assert len(prepared.copy_sha256) == 64
-    prepared.cleanup()
+    assert hashlib.sha256(_consume_copy(prepared)).hexdigest() == prepared.copy_sha256
 
 
-def test_copy_reauthentication_rejects_replacement_and_mutation(tmp_path):
+def test_copy_consumer_must_read_the_complete_authenticated_stream(tmp_path):
     sidecar = _sidecar(
         tmp_path,
         source_key=0,
@@ -238,32 +241,10 @@ def test_copy_reauthentication_rejects_replacement_and_mutation(tmp_path):
         sidecar_records=(_record(1, 2),),
     )
     prepared = _prepare(tmp_path, (sidecar,))
-    original_bytes = prepared.copy_path.read_bytes()
-    with prepared.copy_path.open("rb") as copy_file:
-        assert _is_copy_file_unchanged(copy_file, prepared)
 
-    replacement_path = tmp_path / "replacement.copy"
-    replacement_path.write_bytes(original_bytes)
-    os.utime(
-        replacement_path,
-        ns=(prepared.copy_mtime_ns, prepared.copy_mtime_ns),
-    )
-    os.replace(replacement_path, prepared.copy_path)
-    with prepared.copy_path.open("rb") as copy_file:
-        assert not _is_copy_file_unchanged(copy_file, prepared)
-
-    prepared.copy_path.unlink()
-    repeated = _prepare(tmp_path, (sidecar,))
-    mutated_bytes = bytearray(repeated.copy_path.read_bytes())
-    mutated_bytes[-3] ^= 1
-    repeated.copy_path.write_bytes(mutated_bytes)
-    os.utime(
-        repeated.copy_path,
-        ns=(repeated.copy_mtime_ns, repeated.copy_mtime_ns),
-    )
-    with repeated.copy_path.open("rb") as copy_file:
-        assert not _is_copy_file_unchanged(copy_file, repeated)
-    repeated.cleanup()
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        with _authenticated_projection_copy_stream(prepared) as copy_stream:
+            assert copy_stream.read(1)
 
 
 @pytest.mark.parametrize(
@@ -291,6 +272,31 @@ def test_prepare_rejects_boolean_numeric_contract_fields(tmp_path, mutator):
         _prepare(tmp_path, (sidecar,))
 
 
+@pytest.mark.parametrize("target", ["descriptor", "binding", "integer"])
+def test_prepare_requires_exact_plain_contract_values(tmp_path, target):
+    sidecar = _sidecar(
+        tmp_path,
+        source_key=0,
+        shard_id="file:a",
+        identity_digit="3",
+        sidecar_records=(_record(1, 2),),
+    )
+    if target == "descriptor":
+        sidecar["unexpected_field"] = "private-value-marker"
+    elif target == "binding":
+        sidecar["physical_source_binding"]["unexpected_field"] = (
+            "private-value-marker"
+        )
+    else:
+        sidecar["version"] = type("IntegerSubclass", (int,), {})(1)
+
+    with pytest.raises(TaxIdentitySourceProjectionError) as raised:
+        _prepare(tmp_path, (sidecar,))
+
+    assert str(raised.value) == _ERROR
+    assert "private-value-marker" not in str(raised.value)
+
+
 def test_prepare_preserves_generic_error_when_cleanup_fails(tmp_path):
     sidecar = _sidecar(
         tmp_path,
@@ -299,12 +305,11 @@ def test_prepare_preserves_generic_error_when_cleanup_fails(tmp_path):
         identity_digit="3",
         sidecar_records=(_record(1, 2),),
     )
-    sidecar["version"] = True
     sensitive_path = str(tmp_path / "private-projection.copy")
 
     with patch.object(
-        Path,
-        "unlink",
+        source_copy.tempfile,
+        "TemporaryFile",
         side_effect=PermissionError(sensitive_path),
     ):
         with pytest.raises(TaxIdentitySourceProjectionError) as raised:
@@ -340,7 +345,7 @@ def test_prepare_rejects_integer_digest_arguments(tmp_path, digest_field):
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         prepare_tax_identity_source_projection(
             (sidecar,),
-            output_path=tmp_path / "projection.copy",
+            scratch_parent=tmp_path / "scratch",
             token_policy_id=_POLICY,
             source_ordinal_map=({"shard_id": "file:a", "ordinal": 0},),
             **arguments_by_name,
@@ -379,7 +384,7 @@ def test_prepare_rejects_semantically_invalid_records_without_detail(
     assert str(raised.value) == _ERROR
     assert str(path) not in str(raised.value)
     assert "7" * 16 not in str(raised.value)
-    assert not (tmp_path / "projection.copy").exists()
+    assert list((tmp_path / "scratch").iterdir()) == []
 
 
 def test_prepare_rejects_artifact_replacement_and_incomplete_binding(tmp_path):
@@ -436,10 +441,13 @@ def test_prepare_rejects_fifo_before_opening_it(tmp_path):
     os.mkfifo(fifo_path)
     sidecar["path"] = str(fifo_path)
 
-    with patch.object(
-        artifact.os,
-        "open",
-        side_effect=AssertionError("non-regular source must not be opened"),
-    ):
+    original_open = artifact.os.open
+
+    def guarded_open(path, flags, mode=0o777):
+        if Path(path) == fifo_path:
+            raise AssertionError("non-regular source must not be opened")
+        return original_open(path, flags, mode)
+
+    with patch.object(artifact.os, "open", side_effect=guarded_open):
         with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
             _prepare(tmp_path, (sidecar,))
