@@ -758,6 +758,7 @@ jobs:
           tests/test_ptg2_v4_taxonomy_candidates_lifecycle.py
           tests/test_ptg2_provider_tax_identity_postgres.py
           tests/test_ptg2_tax_identity_source_migration_postgres.py
+          tests/test_ptg2_tax_identity_source_projection_postgres.py
           tests/test_ptg2_tax_identity_publication_postgres.py
           tests/test_ptg2_raw_tin_vault_postgres.py
           tests/test_ptg2_v4_snapshot_maps.py
