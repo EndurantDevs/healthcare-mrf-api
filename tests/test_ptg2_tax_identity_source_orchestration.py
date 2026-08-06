@@ -108,10 +108,18 @@ def test_v4_publisher_fingerprint_includes_projection_contract_only_for_v4():
     assert {path.name for path in v4_sources} >= {
         "ptg2_tax_identity_source_binding.py",
         "ptg2_tax_identity_source_artifact.py",
+        "ptg2_tax_identity_source_aggregate_reuse.py",
+        "ptg2_tax_identity_source_binding_vector.py",
+        "ptg2_tax_identity_source_copy.py",
+        "ptg2_tax_identity_source_files.py",
         "ptg2_tax_identity_source_observations.py",
+        "ptg2_tax_identity_source_persisted.py",
+        "ptg2_tax_identity_source_preflight.py",
         "ptg2_tax_identity_source_projection.py",
         "ptg2_tax_identity_source_publish.py",
+        "ptg2_tax_identity_source_seal_validation.py",
         "ptg2_tax_identity_source_stage.py",
+        "ptg2_tax_identity_source_target_preflight.py",
         "ptg2_tax_identity_source_validation.py",
     }
 
@@ -141,9 +149,14 @@ def _patched_reuse_fixture(monkeypatch):
         "contract": "ptg2_provider_group_tax_identity_source_v1",
         "content_digest": "5" * 64,
     }
+    aggregate_metadata_by_field = {
+        "contract": "ptg2_provider_group_tax_identity_v1",
+        "content_digest": "6" * 64,
+    }
     serving_index_by_field = {
         "source_count": 1,
         "provider_graph": {
+            "provider_tax_identity": aggregate_metadata_by_field,
             "provider_tax_identity_source": metadata_by_field,
         },
     }
@@ -178,6 +191,7 @@ def _patched_reuse_fixture(monkeypatch):
     publication, evidence = _reuse_publication_and_evidence()
     return (
         metadata_by_field,
+        aggregate_metadata_by_field,
         validate_projection,
         validate_sources,
         publication,
@@ -193,6 +207,7 @@ async def test_reuse_validates_sealed_source_projection_without_rescanning(
 
     (
         metadata_by_field,
+        aggregate_metadata_by_field,
         validate_projection,
         validate_sources,
         publication,
@@ -215,5 +230,6 @@ async def test_reuse_validates_sealed_source_projection_without_rescanning(
             },
         ),
         sealed_metadata=metadata_by_field,
+        aggregate_metadata=aggregate_metadata_by_field,
     )
     validate_sources.assert_awaited_once()

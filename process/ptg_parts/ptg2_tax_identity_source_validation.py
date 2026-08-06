@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-import hmac
 from typing import Any
 
 from db.connection import db
@@ -14,7 +13,12 @@ from process.ptg_parts.ptg2_tax_identity_source_aggregate_reuse import (
 )
 from process.ptg_parts.ptg2_tax_identity_source_binding_vector import (
     PTG2_TAX_IDENTITY_SOURCE_BINDING_VECTOR_CONTRACT,
-    tax_identity_source_binding_vector_digest,
+)
+from process.ptg_parts.ptg2_tax_identity_source_persisted import (
+    SOURCE_BINDING_FIELDS,
+    load_source_bindings,
+    validate_source_binding_seal,
+    validate_source_observation_counts,
 )
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
     PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT,
@@ -30,24 +34,6 @@ from process.ptg_parts.ptg2_tax_identity_source_projection import (
 )
 
 _VALIDATION_BATCH_ROWS = 10_000
-_BINDING_FIELDS = (
-    "source_key",
-    "source_type",
-    "identity_kind",
-    "identity_sha256",
-    "token_policy_id",
-    "token_policy_descriptor_sha256",
-    "record_format",
-    "format_version",
-    "record_bytes",
-    "artifact_sha256",
-    "artifact_byte_count",
-    "provider_group_count",
-    "matched_ein_count",
-    "missing_count",
-    "malformed_count",
-    "unsupported_type_count",
-)
 
 
 async def validate_stored_tax_identity_source_counts(
@@ -343,86 +329,64 @@ def _expected_binding_values(
     )
 
 
-async def _validate_reused_bindings(
-    session: Any,
+def _validate_reused_binding_identities(
+    stored_binding_records: tuple[dict[str, object], ...],
     *,
-    schema: str,
-    snapshot_key: int,
     expected_bindings: Iterable[Mapping[str, Any]],
-    expected_artifact_byte_count: int,
-    expected_binding_vector_digest: bytes,
 ) -> None:
-    stored_bindings = (
-        await session.execute(
-            db.text(f"""
-                SELECT {", ".join(_BINDING_FIELDS)}
-                  FROM {schema}.ptg2_provider_tax_identity_source_binding
-                 WHERE snapshot_key = :snapshot_key
-                 ORDER BY source_key
-                """),
-            {"snapshot_key": _strict_int(snapshot_key)},
-        )
-    ).all()
-    stored_binding_records = tuple(
-        dict(zip(_BINDING_FIELDS, stored_binding)) for stored_binding in stored_bindings
-    )
     stored_identity_values = tuple(
-        tuple(binding_by_field[field_name] for field_name in _BINDING_FIELDS[:4])
+        tuple(binding_by_field[field_name] for field_name in SOURCE_BINDING_FIELDS[:4])
         for binding_by_field in stored_binding_records
     )
-    stored_artifact_byte_count = sum(
-        int(binding_by_field["artifact_byte_count"])
-        for binding_by_field in stored_binding_records
-    )
-    if (
-        stored_identity_values != _expected_binding_values(expected_bindings)
-        or stored_artifact_byte_count != expected_artifact_byte_count
-        or not hmac.compare_digest(
-            tax_identity_source_binding_vector_digest(stored_binding_records),
-            expected_binding_vector_digest,
-        )
-    ):
+    if stored_identity_values != _expected_binding_values(expected_bindings):
         raise _fail()
 
 
-async def _validate_reused_observation_counts(
+async def _validate_tax_identity_source_projection_state(
     session: Any,
     *,
-    schema: str,
+    schema_name: str,
     snapshot_key: int,
-    expected: TaxIdentitySourcePublication,
-) -> None:
-    stored_counts = (
-        await session.execute(
-            db.text(f"""
-                SELECT COUNT(*)::bigint,
-                       COUNT(*) FILTER (
-                           WHERE tax_identity_state = 'matched_ein'
-                       )::bigint,
-                       COUNT(*) FILTER (
-                           WHERE tax_identity_state = 'missing'
-                       )::bigint,
-                       COUNT(*) FILTER (
-                           WHERE tax_identity_state = 'malformed'
-                       )::bigint,
-                       COUNT(*) FILTER (
-                           WHERE tax_identity_state = 'unsupported_type'
-                       )::bigint
-                  FROM {schema}.ptg2_provider_group_tax_identity_source
-                 WHERE snapshot_key = :snapshot_key
-                """),
-            {"snapshot_key": _strict_int(snapshot_key)},
+    sealed_metadata: Mapping[str, Any],
+    aggregate_metadata: Mapping[str, Any],
+    require_sealed_layout: bool,
+) -> tuple[TaxIdentitySourcePublication, tuple[dict[str, object], ...]]:
+    expected = _publication_from_metadata(sealed_metadata)
+    schema = _quote_ident(schema_name)
+    if require_sealed_layout:
+        await _validate_reused_layout_state(
+            session,
+            schema=schema,
+            snapshot_key=snapshot_key,
         )
-    ).one()
-    expected_counts = (
-        expected.provider_group_occurrence_count,
-        expected.matched_ein_count,
-        expected.missing_count,
-        expected.malformed_count,
-        expected.unsupported_type_count,
+    await validate_reused_tax_identity_aggregate_manifest(
+        session,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        sealed_metadata=aggregate_metadata,
     )
-    if tuple(int(stored_count) for stored_count in stored_counts) != expected_counts:
-        raise _fail()
+    await _validate_reused_manifest(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        expected=expected,
+    )
+    stored_bindings = await load_source_bindings(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+    )
+    validate_source_binding_seal(
+        stored_bindings,
+        expected=expected,
+    )
+    await validate_source_observation_counts(
+        session,
+        schema=schema,
+        snapshot_key=snapshot_key,
+        expected=expected,
+    )
+    return expected, stored_bindings
 
 
 async def validate_reused_tax_identity_source_projection(
@@ -435,41 +399,24 @@ async def validate_reused_tax_identity_source_projection(
 ) -> TaxIdentitySourcePublication:
     """Validate sealed pathless evidence without rescanning deleted sidecars."""
 
-    expected = _publication_from_metadata(sealed_metadata)
     bindings = tuple(expected_bindings)
-    if len(bindings) != expected.source_count:
-        raise _fail()
-    schema = _quote_ident(schema_name)
     try:
         async with db.transaction() as session:
-            await _validate_reused_layout_state(
-                session, schema=schema, snapshot_key=snapshot_key
+            expected, stored_bindings = (
+                await _validate_tax_identity_source_projection_state(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_key=snapshot_key,
+                    sealed_metadata=sealed_metadata,
+                    aggregate_metadata=aggregate_metadata,
+                    require_sealed_layout=True,
+                )
             )
-            await validate_reused_tax_identity_aggregate_manifest(
-                session,
-                schema_name=schema_name,
-                snapshot_key=snapshot_key,
-                sealed_metadata=aggregate_metadata,
-            )
-            await _validate_reused_manifest(
-                session,
-                schema=schema,
-                snapshot_key=snapshot_key,
-                expected=expected,
-            )
-            await _validate_reused_bindings(
-                session,
-                schema=schema,
-                snapshot_key=snapshot_key,
+            if len(bindings) != expected.source_count:
+                raise _fail()
+            _validate_reused_binding_identities(
+                stored_bindings,
                 expected_bindings=bindings,
-                expected_artifact_byte_count=expected.artifact_byte_count,
-                expected_binding_vector_digest=expected.binding_vector_digest,
-            )
-            await _validate_reused_observation_counts(
-                session,
-                schema=schema,
-                snapshot_key=snapshot_key,
-                expected=expected,
             )
         return expected
     except TaxIdentitySourceProjectionError:

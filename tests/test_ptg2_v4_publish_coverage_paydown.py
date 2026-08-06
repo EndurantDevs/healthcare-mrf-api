@@ -389,6 +389,7 @@ async def test_graph_wait_heartbeats_and_resource_guards(monkeypatch) -> None:
             publication_context=publication._V4AtomicPublishContext(
                 schema_name="mrf",
                 block_stage="ptg2_v3_block_stage_exact",
+                logical_snapshot_id="synthetic-snapshot",
                 snapshot_key=1,
                 build_token="token",
             ),
@@ -401,6 +402,7 @@ async def test_graph_wait_heartbeats_and_resource_guards(monkeypatch) -> None:
             publication_context=publication._V4AtomicPublishContext(
                 schema_name="mrf",
                 block_stage="ptg2_v3_block_stage_exact",
+                logical_snapshot_id="synthetic-snapshot",
                 snapshot_key=1,
                 build_token="token",
             ),

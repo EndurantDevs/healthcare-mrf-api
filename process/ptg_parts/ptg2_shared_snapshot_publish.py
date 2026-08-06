@@ -485,6 +485,7 @@ class _V4AtomicPublishContext:
 
     schema_name: str
     block_stage: str
+    logical_snapshot_id: str
     snapshot_key: int
     build_token: str
 
@@ -494,6 +495,7 @@ class _V4GraphCoordinates:
     """Immutable layout coordinates used before the graph stage exists."""
 
     schema_name: str
+    logical_snapshot_id: str
     snapshot_key: int
     build_token: str
 
@@ -3821,9 +3823,8 @@ async def _publish_v4_dictionaries_and_maps(
     prepared_tax_identity_source = (
         prepare_tax_identity_source_projection(
             source_artifacts,
-            output_path=(
+            scratch_parent=(
                 compilation.provider_group_tax_identity_copy_path.parent
-                / f"provider-tax-source-{token}.copy"
             ),
             token_policy_id=tax_identity_contract.token_policy_id,
             token_policy_descriptor_sha256=(
@@ -4103,20 +4104,6 @@ async def _publish_v4_dictionaries_and_maps(
                 source_bitmap_bytes=tax_identity_contract.source_bitmap_bytes,
                 heartbeat_callback=heartbeat_callback,
             )
-            tax_identity_source_publication = (
-                await publish_staged_tax_identity_source_projection(
-                    session,
-                    schema_name=schema_name,
-                    snapshot_key=int(snapshot_key),
-                    stage_table=str(tax_identity_source_stage),
-                    prepared=prepared_tax_identity_source,
-                    heartbeat_callback=heartbeat_callback,
-                )
-                if prepared_tax_identity_source is not None
-                and tax_identity_source_stage is not None
-                else None
-            )
-
             diagnostic_parameters_by_name = {
                 "snapshot_key": int(snapshot_key),
                 "compressed_acquisition_bytes": int(compressed_acquisition_bytes),
@@ -4429,6 +4416,20 @@ async def _publish_v4_dictionaries_and_maps(
                     + int(taxonomy_publication.observe_only_rule_count),
                 )
                 progress_callback("publish_batches", 1)
+            tax_identity_source_publication = (
+                await publish_staged_tax_identity_source_projection(
+                    session,
+                    schema_name=schema_name,
+                    logical_snapshot_id=publication_context.logical_snapshot_id,
+                    snapshot_key=int(snapshot_key),
+                    staged=tax_identity_source_stage,
+                    prepared=prepared_tax_identity_source,
+                    heartbeat_callback=heartbeat_callback,
+                )
+                if prepared_tax_identity_source is not None
+                and tax_identity_source_stage is not None
+                else None
+            )
             return (
                 cas_publication,
                 map_summary,
@@ -4493,6 +4494,7 @@ async def _publish_v4_graph(
             publication_context=_V4AtomicPublishContext(
                 schema_name=schema_name,
                 block_stage=block_stage,
+                logical_snapshot_id=publication_context.logical_snapshot_id,
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
             ),
@@ -5118,6 +5120,7 @@ async def _publish_prepared_shared_layout(
                         graph_conversion,
                         publication_context=_V4GraphCoordinates(
                             schema_name=schema_name,
+                            logical_snapshot_id=logical_snapshot_id,
                             snapshot_key=int(reserved_snapshot_key),
                             build_token=build_token,
                         ),

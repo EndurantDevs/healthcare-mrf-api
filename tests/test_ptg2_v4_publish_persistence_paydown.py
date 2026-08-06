@@ -321,6 +321,7 @@ async def test_graph_publication_rejects_selected_layout_drift(
             compilation,
             publication_context=publication._V4GraphCoordinates(
                 schema_name="mrf",
+                logical_snapshot_id="synthetic-snapshot",
                 snapshot_key=1,
                 build_token="token",
             ),
