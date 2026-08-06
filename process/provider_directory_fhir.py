@@ -746,6 +746,12 @@ _PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION: contextvars.ContextVar[
     "provider_directory_profile_capacity_admission",
     default=None,
 )
+_PROVIDER_DIRECTORY_IMPORT_PROGRESS_PCT: contextvars.ContextVar[
+    Callable[[], float] | None
+] = contextvars.ContextVar(
+    "provider_directory_import_progress_pct",
+    default=None,
+)
 SECRET_ENV_PREFIX = "env:"
 DEFAULT_FULL_REFRESH_MAX_PAGES = 10000
 DEFAULT_STREAM_BATCH_SIZE = 5000
@@ -25299,6 +25305,7 @@ async def _mark_provider_directory_profile_batch_progress(
     await _mark_provider_directory_progress(
         build.owner_run_id,
         phase=phase_label,
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH,
         done=completed_batches,
         total=total_batches,
         overall_pct=_provider_directory_profile_overall_pct(
@@ -31933,6 +31940,7 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH,
         done=0,
         total=7,
         message="publishing Provider Directory address artifacts",
@@ -31950,6 +31958,7 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH,
         done=1,
         total=7,
         message=location_contacts_message,
@@ -31969,6 +31978,7 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH,
         done=2,
         total=7,
         message=location_coordinates_message,
@@ -32019,6 +32029,7 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH,
         done=3,
         total=7,
         message=location_address_keys_message,
@@ -32059,6 +32070,7 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH,
         done=4,
         total=7,
         message=address_artifact_message,
@@ -32074,6 +32086,7 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH,
         done=5,
         total=7,
         message=profile_message,
@@ -32103,6 +32116,7 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH,
         done=6,
         total=7,
         message=network_catalog_message,
@@ -32134,6 +32148,7 @@ async def _publish_provider_directory_artifacts(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH,
         done=7,
         total=7,
         message=message,
@@ -37215,6 +37230,7 @@ async def _run_source_probe_batch(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory probing sources",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PROBE,
         done=0,
         total=total_sources,
         message=f"probing 0/{total_sources} source(s)",
@@ -37353,6 +37369,7 @@ async def _run_source_probe_batch(
                 await _mark_provider_directory_progress(
                     run_id,
                     phase="provider-directory probing sources",
+                    stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PROBE,
                     done=probe_counts_by_name["probed"],
                     total=total_sources,
                     message=f"probed {probe_counts_by_name['probed']}/{total_sources} source(s); valid={probe_counts_by_name['valid']}",
@@ -49259,6 +49276,28 @@ def _partition_fetch_concurrency() -> int:
     return max(1, _env_int("HLTHPRT_PROVIDER_DIRECTORY_PARTITION_CONCURRENCY", 16))
 
 
+PROVIDER_DIRECTORY_PROGRESS_STAGE_CATALOG = 10
+PROVIDER_DIRECTORY_PROGRESS_STAGE_SOURCES = 20
+PROVIDER_DIRECTORY_PROGRESS_STAGE_PROBE = 30
+PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT = 40
+PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH = 50
+PROVIDER_DIRECTORY_PROGRESS_STAGE_IDS = {
+    PROVIDER_DIRECTORY_PROGRESS_STAGE_CATALOG: "provider-directory-catalog",
+    PROVIDER_DIRECTORY_PROGRESS_STAGE_SOURCES: "provider-directory-sources",
+    PROVIDER_DIRECTORY_PROGRESS_STAGE_PROBE: "provider-directory-probe",
+    PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT: "provider-directory-import",
+    PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH: "provider-directory-publish",
+}
+
+
+def _provider_directory_import_progress_pct() -> float:
+    """Return the current outer import percentage for a nested operation."""
+    progress_pct = _PROVIDER_DIRECTORY_IMPORT_PROGRESS_PCT.get()
+    if progress_pct is None:
+        return 0.0
+    return max(0.0, min(float(progress_pct()), 100.0))
+
+
 def _profile_progress_payload(
     phase: str,
     done: int,
@@ -49266,6 +49305,10 @@ def _profile_progress_payload(
     overall_pct: float | None,
     message: str,
     details: Mapping[str, Any] | None,
+    *,
+    stage_id: str | None = None,
+    stage_ordinal: int | None = None,
+    counters: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build normalized progress and remaining detail mappings."""
     progress_details_by_name = dict(details or {})
@@ -49285,6 +49328,18 @@ def _profile_progress_payload(
         "phase": phase,
         "message": message,
     }
+    if stage_ordinal is not None:
+        progress_by_name["stage_ordinal"] = int(stage_ordinal)
+        resolved_stage_id = (
+            stage_id
+            or PROVIDER_DIRECTORY_PROGRESS_STAGE_IDS.get(int(stage_ordinal))
+        )
+        if resolved_stage_id is not None:
+            progress_by_name["stage_id"] = resolved_stage_id
+    elif stage_id is not None:
+        progress_by_name["stage_id"] = stage_id
+    if counters is not None:
+        progress_by_name["counters"] = dict(counters)
     if progress_details_by_name:
         progress_by_name["detail"] = progress_details_by_name
     return progress_by_name, progress_details_by_name
@@ -49420,6 +49475,9 @@ async def _mark_provider_directory_progress(
     message: str,
     details: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
+    stage_id: str | None = None,
+    stage_ordinal: int | None = None,
+    counters: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist one bounded progress observation for the active run."""
 
@@ -49440,6 +49498,9 @@ async def _mark_provider_directory_progress(
         overall_pct,
         message,
         details,
+        stage_id=stage_id,
+        stage_ordinal=stage_ordinal,
+        counters=counters,
     )
     if capacity_admission is not None:
         await _reserve_profile_progress(
@@ -56157,6 +56218,26 @@ def _is_validated_uhc_official_source_group(
     return True
 
 
+def _provider_directory_progress_counts_snapshot(
+    completed_count_by_resource: Mapping[str, int],
+    active_count_by_group: Mapping[int, Mapping[str, int]],
+    high_water_by_resource: dict[str, int],
+) -> dict[str, int]:
+    """Preserve row-count movement across partial-to-complete handoffs."""
+    current_count_by_resource = dict(completed_count_by_resource)
+    for partial_count_by_resource in active_count_by_group.values():
+        for resource_type, row_count in partial_count_by_resource.items():
+            current_count_by_resource[resource_type] = (
+                current_count_by_resource.get(resource_type, 0) + row_count
+            )
+    for resource_type, row_count in current_count_by_resource.items():
+        high_water_by_resource[resource_type] = max(
+            row_count,
+            high_water_by_resource.get(resource_type, 0),
+        )
+    return dict(high_water_by_resource)
+
+
 async def _import_resources(
     source_records: list[dict[str, Any]],
     *,
@@ -56231,6 +56312,7 @@ async def _import_resources(
     progress_lock = asyncio.Lock()
     active_partial_count_by_group: dict[int, dict[str, int]] = {}
     active_group_by_key: dict[int, dict[str, Any]] = {}
+    progress_high_water_by_resource: dict[str, int] = {}
     progress_timer_by_name = {"next_partial_progress_at": 0.0}
 
     def merge_counts(target: dict[str, int], source_counts: dict[str, int]) -> None:
@@ -56259,11 +56341,12 @@ async def _import_resources(
                 target_by_resource[resource_type] = retry_at
 
     def progress_counts_snapshot() -> dict[str, int]:
-        """Return an immutable snapshot of current import counters."""
-        progress_count_by_resource = dict(count_by_resource)
-        for partial_counts in active_partial_count_by_group.values():
-            merge_counts(progress_count_by_resource, partial_counts)
-        return progress_count_by_resource
+        """Return monotonic activity counts across partial-to-complete handoffs."""
+        return _provider_directory_progress_counts_snapshot(
+            count_by_resource,
+            active_partial_count_by_group,
+            progress_high_water_by_resource,
+        )
 
     def active_group_snapshot() -> list[dict[str, Any]]:
         """Return a stable snapshot of active provider-directory groups."""
@@ -56859,17 +56942,24 @@ async def _import_resources(
     async def run_with_limit(source_records: list[dict[str, Any]]) -> ResourceImportGroupResult:
         """Run one import coroutine under the shared concurrency limit."""
         async with semaphore:
-            candidate: EndpointDatasetCandidate | None = None
-            diagnostics_by_resource: dict[str, dict[str, Any]] = {}
             prepared_source_records = source_records
-            checkpoint_guard_context = _resource_group_pagination_checkpoint_context(
-                source_records,
-                run_id=run_id,
-                retry_of_run_id=retry_of_run_id,
-                pagination_root_run_id=pagination_root_run_id,
-                is_checkpointing_enabled=is_pagination_checkpointing_enabled,
+            progress_pct_token = _PROVIDER_DIRECTORY_IMPORT_PROGRESS_PCT.set(
+                lambda: (completed_groups / max(total_groups, 1)) * 100
             )
             try:
+                candidate: EndpointDatasetCandidate | None = None
+                diagnostics_by_resource: dict[str, dict[str, Any]] = {}
+                checkpoint_guard_context = (
+                    _resource_group_pagination_checkpoint_context(
+                        source_records,
+                        run_id=run_id,
+                        retry_of_run_id=retry_of_run_id,
+                        pagination_root_run_id=pagination_root_run_id,
+                        is_checkpointing_enabled=(
+                            is_pagination_checkpointing_enabled
+                        ),
+                    )
+                )
                 async with _pagination_checkpoint_worker_guard(
                     checkpoint_guard_context
                 ):
@@ -56909,6 +56999,9 @@ async def _import_resources(
                         )
                         raise
             finally:
+                _PROVIDER_DIRECTORY_IMPORT_PROGRESS_PCT.reset(
+                    progress_pct_token
+                )
                 await clear_partial_progress(id(prepared_source_records))
 
     async def run_isolated_group(
@@ -57779,8 +57872,11 @@ def _uhc_acquisition_progress_callback(
         await _mark_provider_directory_progress(
             run_id,
             phase="provider-directory official-file acquisition",
+            stage_id="provider-directory-import-official-file-acquisition",
+            stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
             done=done,
             total=total,
+            overall_pct=_provider_directory_import_progress_pct(),
             message=(
                 f"{disposition} official provider file "
                 f"{done}/{total}: {file_name}"
@@ -57868,8 +57964,11 @@ async def _build_uhc_publication_stage(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory UHC retained semantic build",
+        stage_id="provider-directory-import-official-file-build",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
         done=0,
         total=4,
+        overall_pct=_provider_directory_import_progress_pct(),
         message="validating complete admitted UHC provider-file catalog",
     )
     async with db.acquire_driver() as driver_connection:
@@ -57886,8 +57985,11 @@ async def _build_uhc_publication_stage(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory UHC retained semantic sealed",
+        stage_id="provider-directory-import-official-file-build",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
         done=1,
         total=4,
+        overall_pct=_provider_directory_import_progress_pct(),
         message=(
             f"sealed {len(sealed_files)}/{len(admitted_set.files)} "
             "admitted UHC files under semantic v3"
@@ -57960,8 +58062,11 @@ async def _validate_and_publish_uhc_candidate(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory UHC retained dataset validated",
+        stage_id="provider-directory-import-official-file-build",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
         done=3,
         total=4,
+        overall_pct=_provider_directory_import_progress_pct(),
         message=(
             f"validated {copied_rows} canonical UHC resources; "
             "publishing the source-local immutable dataset"
@@ -57981,8 +58086,11 @@ async def _record_uhc_source_import_complete(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory official-file source complete",
+        stage_id="provider-directory-import-official-file-build",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
         done=4,
         total=4,
+        overall_pct=_provider_directory_import_progress_pct(),
         message=(
             f"published current UHC dataset {candidate.dataset_id} "
             f"with {publication_result['resource_count']} resources; "
@@ -58430,6 +58538,7 @@ async def process_provider_directory_fhir_data(
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory resolving source catalog",
+        stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_CATALOG,
         done=0,
         total=1,
         message="resolving Provider Directory source catalog",
@@ -58552,6 +58661,7 @@ async def process_provider_directory_fhir_data(
         await _mark_provider_directory_progress(
             run_id,
             phase="provider-directory sources seeded",
+            stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_SOURCES,
             done=1,
             total=1,
             message=f"seeded {len(source_rows)} Provider Directory source(s)",
@@ -58644,23 +58754,35 @@ async def process_provider_directory_fhir_data(
                 await _mark_provider_directory_progress(
                     run_id,
                     phase="provider-directory importing resources",
+                    stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
                     done=done,
                     total=total,
                     message=(
                         f"imported resources for {done}/{total} source group(s); "
-                        f"rows={sum(counts.values())}"
+                        f"rows_written={sum(counts.values())}"
                         f"{active_suffix}"
                     ),
                     details={"active_source_groups": active_source_groups},
+                    counters={
+                        "resource_rows_written": sum(counts.values()),
+                        "source_groups_completed": done,
+                        "source_groups_total": total,
+                    },
                     metrics=metrics_by_key,
                 )
 
             await _mark_provider_directory_progress(
                 run_id,
                 phase="provider-directory importing resources",
+                stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_IMPORT,
                 done=0,
                 total=max(len(source_import_groups), 1),
                 message=f"importing resources from {len(source_import_groups)} source group(s)",
+                counters={
+                    "resource_rows_written": 0,
+                    "source_groups_completed": 0,
+                    "source_groups_total": len(source_import_groups),
+                },
                 metrics=metrics_by_key,
             )
             completed_source_ids_by_resource: dict[str, set[str]] = {}
