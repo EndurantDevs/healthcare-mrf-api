@@ -62,6 +62,9 @@ PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES = (
     "ptg2_provider_tax_identity_manifest",
     "ptg2_provider_tax_identity",
     "ptg2_provider_group_tax_identity",
+    "ptg2_provider_tax_identity_source_manifest",
+    "ptg2_provider_tax_identity_source_binding",
+    "ptg2_provider_group_tax_identity_source",
 )
 
 PTG2_V3_MIGRATION_OWNED_TABLE_NAMES = (

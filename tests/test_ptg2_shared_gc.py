@@ -102,6 +102,9 @@ def test_shared_schema_requires_all_migration_owned_lifecycle_tables():
         "ptg2_provider_tax_identity_manifest",
         "ptg2_provider_tax_identity",
         "ptg2_provider_group_tax_identity",
+        "ptg2_provider_tax_identity_source_manifest",
+        "ptg2_provider_tax_identity_source_binding",
+        "ptg2_provider_group_tax_identity_source",
     )
 
 
@@ -580,7 +583,7 @@ async def test_migration_preflight_requires_candidate_attestation_table():
 @pytest.mark.asyncio
 async def test_cleanup_rejects_partial_provider_tax_identity_schema():
     executor = _SharedGCExecutor()
-    legacy_layout, manifest, dictionary, group_sidecar = (
+    legacy_layout, manifest, *remaining_tables = (
         shared_gc.PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES
     )
     executor.present_tables.add(legacy_layout)
@@ -595,7 +598,7 @@ async def test_cleanup_rejects_partial_provider_tax_identity_schema():
             require_shared=True,
         )
 
-    executor.present_tables.update((dictionary, group_sidecar))
+    executor.present_tables.update(remaining_tables)
     plan = await shared_gc.build_shared_layout_release_plan(
         executor=executor,
         require_shared=True,

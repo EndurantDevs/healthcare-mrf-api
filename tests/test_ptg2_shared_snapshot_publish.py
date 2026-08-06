@@ -9,7 +9,7 @@ import json
 import struct
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from tests.live_progress_atomic_redis import AtomicLiveProgressRedis
@@ -972,12 +972,20 @@ def _patch_v4_graph_publication(
             "content_digest": (b"t" * 32).hex(),
         },
     )
+    tax_identity_source_publication = SimpleNamespace(
+        artifact_byte_count=16,
+        as_dict=lambda: {
+            "contract": "ptg2_provider_group_tax_identity_source_v1",
+            "content_digest": "s" * 64,
+        },
+    )
     publish_maps_mock = AsyncMock(
         return_value=(
             cas_publication,
             map_summary,
             taxonomy_publication,
             tax_identity_publication,
+            tax_identity_source_publication,
         )
     )
     replacements_by_name = {
@@ -1011,16 +1019,22 @@ async def test_v4_graph_publish_threads_compressed_acquisition_resources(
 
     publication = await shared_snapshot_publish._publish_v4_graph(
         compilation,
-        schema_name="mrf",
-        snapshot_key=17,
-        build_token="token",
+        publication_context=shared_snapshot_publish._V4GraphCoordinates(
+            schema_name="mrf",
+            snapshot_key=17,
+            build_token="token",
+        ),
         compressed_acquisition_bytes=4_096,
         empty_npi_tin_only_normalization_count=2,
     )
 
-    assert publication.logical_byte_count == 88
-    assert publication.stored_byte_count == 220
+    assert publication.logical_byte_count == 104
+    assert publication.stored_byte_count == 236
     assert publication.provider_tax_identity["tax_identity_count"] == 1
+    assert (
+        publication.provider_tax_identity_source["contract"]
+        == "ptg2_provider_group_tax_identity_source_v1"
+    )
     publication_context = publish_maps_mock.await_args.kwargs[
         "publication_context"
     ]
@@ -1107,9 +1121,11 @@ async def test_v4_graph_publish_queues_blocks_after_stage_failure(
     with pytest.raises(RuntimeError, match="copy failed"):
         await shared_snapshot_publish._publish_v4_graph(
             compilation,
-            schema_name="mrf",
-            snapshot_key=17,
-            build_token="token",
+            publication_context=shared_snapshot_publish._V4GraphCoordinates(
+                schema_name="mrf",
+                snapshot_key=17,
+                build_token="token",
+            ),
             compressed_acquisition_bytes=1,
             empty_npi_tin_only_normalization_count=0,
         )
@@ -1144,6 +1160,7 @@ def _failed_tax_stage_compilation(tmp_path):
         provider_tax_identity_copy_path=tmp_path / "tax.copy",
         provider_group_tax_identity_copy_path=tmp_path / "group-tax.copy",
         inferred_taxonomy_copy_path=taxonomy_path,
+        reference_manifest_path=references_path,
         output_artifacts=(
             SimpleNamespace(
                 name="inferred_taxonomy_candidates",
@@ -1183,6 +1200,126 @@ def _tax_stage_contract():
         unsupported_type_count=1,
         content_digest=b"c" * 32,
     )
+
+
+def _atomic_source_transaction_fixture():
+    """Return callbacks that record one source-publication rollback path."""
+
+    session = object()
+    publication_events = []
+    prepared = SimpleNamespace(
+        cleanup=lambda: publication_events.append(("cleanup", None)),
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        publication_events.append(("begin", session))
+        try:
+            yield session
+        except BaseException:
+            publication_events.append(("rollback", session))
+            raise
+        else:
+            publication_events.append(("commit", session))
+
+    async def stage_source(actual_session, actual_prepared):
+        assert actual_session is session
+        assert actual_prepared is prepared
+        publication_events.append(("source-stage", actual_session))
+        return "source-stage"
+
+    async def publish_tax_groups(actual_session, **_kwargs):
+        assert actual_session is session
+        publication_events.append(("merged-tax-groups", actual_session))
+
+    async def publish_source(actual_session, **kwargs):
+        assert actual_session is session
+        assert kwargs["prepared"] is prepared
+        publication_events.append(("source-local-tax", actual_session))
+        raise RuntimeError("post-source graph failure")
+
+    return SimpleNamespace(
+        session=session,
+        publication_events=publication_events,
+        prepared=prepared,
+        transaction=transaction,
+        stage_source=stage_source,
+        publish_tax_groups=publish_tax_groups,
+        publish_source=publish_source,
+    )
+
+
+def _install_atomic_source_transaction_mocks(monkeypatch, atomic_fixture) -> None:
+    """Replace unrelated graph work while retaining the real call ordering."""
+
+    monkeypatch.setattr(shared_snapshot_publish.db, "status", AsyncMock())
+    monkeypatch.setattr(
+        shared_snapshot_publish.db,
+        "transaction",
+        atomic_fixture.transaction,
+    )
+    replacements_by_name = {
+        "_validated_v4_tax_identity_contract": (
+            lambda _compilation: _tax_stage_contract()
+        ),
+        "_v4_tax_artifact_byte_count": lambda _compilation: 394,
+        "prepare_tax_identity_source_projection": (
+            lambda *_args, **_kwargs: atomic_fixture.prepared
+        ),
+        "_copy_binary_file_to_stage": AsyncMock(),
+        "stage_tax_identity_source_projection": atomic_fixture.stage_source,
+        "lock_v4_shared_layout_for_map_write": AsyncMock(),
+        "_publish_v4_cas_in_session": AsyncMock(return_value=object()),
+        "stage_v4_inferred_taxonomy_compiler_copy": AsyncMock(
+            return_value=SimpleNamespace(table_name="taxonomy-stage")
+        ),
+        "_validate_v4_dictionary_stage": AsyncMock(),
+        "_validate_v4_tax_identity_stages": AsyncMock(),
+        "publish_v4_snapshot_maps": AsyncMock(return_value=object()),
+        "_require_v4_atomic_map_publication": lambda *_args: None,
+        "_publish_v4_tax_identity_manifest": AsyncMock(return_value={}),
+        "_publish_v4_dictionary_stage_ranges": AsyncMock(),
+        "_publish_v4_tax_group_ranges": atomic_fixture.publish_tax_groups,
+        "publish_staged_tax_identity_source_projection": (
+            atomic_fixture.publish_source
+        ),
+    }
+    for name, replacement in replacements_by_name.items():
+        monkeypatch.setattr(shared_snapshot_publish, name, replacement)
+
+
+@pytest.mark.asyncio
+async def test_v4_source_projection_shares_atomic_graph_transaction(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Merged and source-local tax rows must roll back as one graph bundle."""
+
+    atomic_fixture = _atomic_source_transaction_fixture()
+    _install_atomic_source_transaction_mocks(monkeypatch, atomic_fixture)
+
+    with pytest.raises(RuntimeError, match="post-source graph failure"):
+        await shared_snapshot_publish._publish_v4_dictionaries_and_maps(
+            _failed_tax_stage_compilation(tmp_path),
+            publication_context=shared_snapshot_publish._V4AtomicPublishContext(
+                schema_name="mrf",
+                block_stage="ptg2_v3_block_stage_exact",
+                snapshot_key=44,
+                build_token="exact-build",
+            ),
+            compressed_acquisition_bytes=1,
+            empty_npi_tin_only_normalization_count=0,
+            tax_identity_source_artifacts=({},),
+        )
+
+    assert atomic_fixture.publication_events == [
+        ("begin", atomic_fixture.session),
+        ("source-stage", atomic_fixture.session),
+        ("merged-tax-groups", atomic_fixture.session),
+        ("source-local-tax", atomic_fixture.session),
+        ("rollback", atomic_fixture.session),
+        ("cleanup", None),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1424,6 +1561,55 @@ async def test_v4_first_stage_creation_failure_preserves_original_error(
         )
 
     status_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_v4_dictionary_cleanup_preserves_primary_error_and_releases_copy(
+    monkeypatch,
+) -> None:
+    """A failed stage drop must not mask publication failure or skip file cleanup."""
+
+    drop_stages = AsyncMock(side_effect=RuntimeError("stage drop failed"))
+    prepared = SimpleNamespace(cleanup=Mock())
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_drop_v4_dictionary_stages",
+        drop_stages,
+    )
+
+    await shared_snapshot_publish._cleanup_v4_dictionary_attempt(
+        schema='"mrf"',
+        stages=("stage-a",),
+        prepared_tax_identity_source=prepared,
+        preserve_primary_error=True,
+    )
+
+    prepared.cleanup.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_v4_dictionary_cleanup_reports_drop_error_after_success(
+    monkeypatch,
+) -> None:
+    """A stage-drop failure remains visible when no publication error exists."""
+
+    drop_stages = AsyncMock(side_effect=RuntimeError("stage drop failed"))
+    prepared = SimpleNamespace(cleanup=Mock())
+    monkeypatch.setattr(
+        shared_snapshot_publish,
+        "_drop_v4_dictionary_stages",
+        drop_stages,
+    )
+
+    with pytest.raises(RuntimeError, match="stage drop failed"):
+        await shared_snapshot_publish._cleanup_v4_dictionary_attempt(
+            schema='"mrf"',
+            stages=("stage-a",),
+            prepared_tax_identity_source=prepared,
+            preserve_primary_error=False,
+        )
+
+    prepared.cleanup.assert_called_once_with()
 
 
 def _patch_disabled_v4_publication(monkeypatch):

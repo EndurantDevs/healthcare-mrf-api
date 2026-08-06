@@ -71,6 +71,13 @@ async def _publish_layout(**overrides):
         "graph_artifact_entries": (),
         "provider_identifier_quarantine": {},
     }
+    if (
+        overrides.get("provider_graph_v4")
+        and "tax_identity_source_artifacts" not in overrides
+    ):
+        layout_arguments_by_name["tax_identity_source_artifacts"] = (
+            {"authenticated_test_evidence": True},
+        )
     layout_arguments_by_name.update(overrides)
     return await publication.publish_strict_shared_v3_layout(
         **layout_arguments_by_name
