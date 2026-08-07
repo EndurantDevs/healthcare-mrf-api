@@ -48,10 +48,8 @@ async def test_incomplete_source_aware_descriptor_cut_fails_closed() -> None:
 def test_opaque_preparation_rejects_missing_or_noncanonical_reference(
     reference,
 ) -> None:
-    request = SimpleNamespace(billing_entity_ref=reference)
-
     with pytest.raises(resolution.BillingSearchSelectorNotFoundError):
-        resolution._prepared_opaque_bindings(request, _binding_pins())
+        resolution._prepared_opaque_bindings(reference, _binding_pins())
 
 
 def test_ein_preparation_rejects_a_non_ein_request() -> None:
