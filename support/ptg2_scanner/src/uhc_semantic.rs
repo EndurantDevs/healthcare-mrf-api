@@ -305,6 +305,8 @@ struct ProviderName {
 #[serde(deny_unknown_fields)]
 struct ProviderAddress {
     address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address_2: Option<String>,
     city: Option<String>,
     state: Option<String>,
     zip: Option<String>,
@@ -2146,6 +2148,46 @@ mod tests {
             let error = serde_json::from_str::<PlanRecord>(&record).unwrap_err();
             assert!(error.to_string().contains("plan year is not canonical"));
         }
+    }
+
+    #[test]
+    fn second_address_line_is_preserved_before_encoding() {
+        let provider_record = String::from_utf8(PROVIDER_RECORD.to_vec())
+            .unwrap()
+            .replace(
+                "\"address\":\"1 Main St\",",
+                "\"address\":\"1 Main St\",\"address_2\":\"Suite 200\",",
+            )
+            .into_bytes();
+        let provider: ProviderRecord = serde_json::from_slice(&provider_record).unwrap();
+        assert_eq!(
+            provider.addresses[0].address_2.as_deref(),
+            Some("Suite 200")
+        );
+        let provider_value: serde_json::Value =
+            serde_json::from_slice(&canonical_value_bytes(&provider).unwrap()).unwrap();
+        assert_eq!(
+            provider_value["addresses"][0]["address_2"],
+            serde_json::json!("Suite 200")
+        );
+
+        let mut source = SyntheticSource::new(4, UhcCollectionKind::ProviderMembership);
+        source.record = provider_record;
+        let report = encode_admitted_ranges_to_copy(&source, io::sink(), &test_budget()).unwrap();
+        assert_eq!(report.fact_count, 4);
+        assert_eq!(report.counters.raw_address_rows, 4);
+    }
+
+    #[test]
+    fn nonstring_second_address_line_fails_closed() {
+        let provider_record = String::from_utf8(PROVIDER_RECORD.to_vec())
+            .unwrap()
+            .replace(
+                "\"address\":\"1 Main St\",",
+                "\"address\":\"1 Main St\",\"address_2\":200,",
+            );
+        let error = serde_json::from_str::<ProviderRecord>(&provider_record).unwrap_err();
+        assert!(error.to_string().contains("invalid type"));
     }
 
     #[test]

@@ -279,7 +279,12 @@ fn semantic_cli_streams_or_publishes_copy_with_the_same_sealed_report() {
 fn native_quarantine_tombstone_passes_python_sparse_raw_verification() {
     let invalid_provider_fixture = String::from_utf8(PROVIDER_FIXTURE.to_vec())
         .expect("UTF-8 provider fixture")
-        .replacen("\"npi\":\"1003821380\"", "\"npi\":\"1003821381\"", 1);
+        .replacen("\"npi\":\"1003821380\"", "\"npi\":\"1003821381\"", 1)
+        .replacen(
+            "\"address\":\"1 Main St\"",
+            "\"address\":\"1 Main St\",\"address_2\":\"Suite 200\"",
+            1,
+        );
     let fixture = retained_fixture_for(invalid_provider_fixture.as_bytes());
     let completed = run_semantic(&semantic_arguments(&fixture, Path::new("-")));
     assert!(
@@ -298,7 +303,7 @@ fn native_quarantine_tombstone_passes_python_sparse_raw_verification() {
     assert_eq!(quarantine_facts.len(), 1);
     let encoded_quarantine =
         serde_json::to_string(quarantine_facts[0]).expect("encode quarantine fact");
-    for private_value in ["1003821381", "Lovelace"] {
+    for private_value in ["1003821381", "Lovelace", "Suite 200"] {
         assert!(!encoded_quarantine.contains(private_value));
     }
 

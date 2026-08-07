@@ -1101,11 +1101,12 @@ def _plan_resource_id(plan_key: UHCPlanKey) -> str:
 
 def _address_payload(address: Mapping[str, Any]) -> dict[str, Any]:
     first_line = _clean_text(address.get("address"))
+    second_line = _clean_text(address.get("address_2"))
     city = _clean_text(address.get("city"))
     state = _clean_text(address.get("state"), upper=True)
     postal_code = _clean_text(address.get("zip"))
     payload: dict[str, Any] = {
-        "line": [first_line] if first_line else [],
+        "line": [line for line in (first_line, second_line) if line],
         "city": city,
         "state": state,
         "postalCode": postal_code,
