@@ -114,10 +114,10 @@ def _source_pinned_binding_pins(
 
 
 def _prepared_opaque_bindings(
-    request: BillingSearchPostRequest,
+    billing_entity_ref: object,
     pins: tuple[BillingSearchBindingPin, ...],
 ) -> tuple[_PreparedBindingSelector, ...]:
-    reference = request.billing_entity_ref
+    reference = billing_entity_ref
     if type(reference) is not str:
         raise _resource_not_found()
     try:
@@ -219,7 +219,7 @@ def _prepared_bindings(
     environment_map: Mapping[str, str] | None,
 ) -> tuple[_PreparedBindingSelector, ...]:
     if request.selector_kind == "billing_entity_ref":
-        return _prepared_opaque_bindings(request, pins)
+        return _prepared_opaque_bindings(request.billing_entity_ref, pins)
     if request.tax_identity_type == "npi":
         return tuple(_PreparedBindingSelector(pin, None, None) for pin in pins)
     if request.tax_identity_type == "ein":
@@ -393,6 +393,38 @@ def _completed_resolution_or_none(
         return None
 
 
+async def _resolve_prepared_selector(
+    session,
+    *,
+    prepared: _PreparedSelector,
+    schema_name: str = PTG2_SCHEMA,
+) -> BillingSearchSelectorResolution:
+    resolved_bindings: list[BillingSearchSelectorBindingScope] = []
+    for candidate in prepared.bindings:
+        resolved = await _resolved_binding_or_none(
+            session,
+            candidate,
+            schema_name=schema_name,
+        )
+        if resolved is None:
+            raise serving_unavailable()
+        resolved_bindings.append(resolved)
+    resolved_scopes = tuple(resolved_bindings)
+    if (
+        prepared.selector_kind == "billing_entity_ref"
+        and resolved_scopes
+        and all(
+            binding.state == BILLING_SELECTOR_NO_MATCH
+            for binding in resolved_scopes
+        )
+    ):
+        raise _resource_not_found()
+    resolution = _completed_resolution_or_none(prepared, resolved_scopes)
+    if resolution is None:
+        raise serving_unavailable()
+    return resolution
+
+
 async def resolve_billing_search_selector(
     session,
     *,
@@ -419,30 +451,11 @@ async def resolve_billing_search_selector(
         raise _resource_not_found()
     if state != _PREPARATION_READY or prepared is None:
         raise serving_unavailable()
-    resolved_bindings: list[BillingSearchSelectorBindingScope] = []
-    for candidate in prepared.bindings:
-        resolved = await _resolved_binding_or_none(
-            session,
-            candidate,
-            schema_name=schema_name,
-        )
-        if resolved is None:
-            raise serving_unavailable()
-        resolved_bindings.append(resolved)
-    resolved_scopes = tuple(resolved_bindings)
-    if (
-        prepared.selector_kind == "billing_entity_ref"
-        and resolved_scopes
-        and all(
-            binding.state == BILLING_SELECTOR_NO_MATCH
-            for binding in resolved_scopes
-        )
-    ):
-        raise _resource_not_found()
-    resolution = _completed_resolution_or_none(prepared, resolved_scopes)
-    if resolution is None:
-        raise serving_unavailable()
-    return resolution
+    return await _resolve_prepared_selector(
+        session,
+        prepared=prepared,
+        schema_name=schema_name,
+    )
 
 
 __all__ = [
