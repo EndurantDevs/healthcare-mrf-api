@@ -4934,13 +4934,16 @@ async def lookup_shared_graph_members_from_db(
     *,
     schema_name: str = "mrf",
     max_members: int | None = None,
+    max_total_members: int | None = None,
     retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    """Read graph members directly and optionally bound each owner result."""
+    """Read graph members with optional per-owner and aggregate bounds."""
 
     fetch_options_by_name: dict[str, Any] = {}
     if max_members is not None:
         fetch_options_by_name["max_members"] = max_members
+    if max_total_members is not None:
+        fetch_options_by_name["max_total_members"] = max_total_members
     if retention_budget is not None:
         fetch_options_by_name["retention_budget"] = retention_budget
     try:
