@@ -13984,14 +13984,16 @@ def _artifact_dataset_options_cte(
                    AS validated_candidate_count
           FROM {dataset_ref} AS dataset
          WHERE {endpoint_scope}(
-                dataset.is_current = true
-            AND dataset.status = :published_status
-            AND dataset.superseded_at IS NULL
-         ) OR (
-                dataset.is_current = false
-            AND dataset.status = :validated_status
-            AND dataset.superseded_at IS NULL
-            AND {validated_candidate_gate}
+            (
+                    dataset.is_current = true
+                AND dataset.status = :published_status
+                AND dataset.superseded_at IS NULL
+            ) OR (
+                    dataset.is_current = false
+                AND dataset.status = :validated_status
+                AND dataset.superseded_at IS NULL
+                AND {validated_candidate_gate}
+            )
          )
         )
     """

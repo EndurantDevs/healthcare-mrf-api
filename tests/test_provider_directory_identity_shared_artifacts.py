@@ -462,10 +462,20 @@ async def test_artifact_candidate_selection_covers_empty_and_valid_rows():
     }
     selection_sql = executor.all.await_args.args[0]
     endpoint_scope = "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))"
-    assert endpoint_scope in selection_sql
-    assert selection_sql.index(endpoint_scope) < selection_sql.index(
-        "AND status = :validated_status"
+    normalized_sql = " ".join(selection_sql.split())
+    scoped_option_union = (
+        "WHERE dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[])) "
+        "AND ( ( dataset.is_current = true "
+        "AND dataset.status = :published_status "
+        "AND dataset.superseded_at IS NULL ) OR ( "
+        "dataset.is_current = false"
     )
+    assert scoped_option_union in normalized_sql
+    assert selection_sql.count(endpoint_scope) == 1
+    assert (
+        "FROM dataset_options WHERE endpoint_id = "
+        "ANY(CAST(:endpoint_ids AS varchar[]))"
+    ) in normalized_sql
     assert executor.all.await_args.kwargs["endpoint_ids"] == ["endpoint-a"]
 
 
