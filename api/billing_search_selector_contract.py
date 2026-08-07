@@ -39,6 +39,13 @@ BILLING_SELECTOR_KINDS = frozenset({"tax_identity", "billing_entity_ref"})
 _SHA256_HEX_CHARACTERS = frozenset("0123456789abcdef")
 
 
+class BillingSearchSelectorNotFoundError(LookupError):
+    """Generic inaccessible-or-unknown resource failure for HTTP 404."""
+
+
+BillingSearchSelectorResourceNotFoundError = BillingSearchSelectorNotFoundError
+
+
 class BillingSearchServingUnavailableError(PTG2ManifestArtifactError):
     """Value-free failure for an unavailable immutable serving bundle."""
 
@@ -59,9 +66,7 @@ def _canonical_source_publication(
     if type(publication) is not TaxIdentitySourcePublication:
         raise serving_unavailable()
     try:
-        canonical = tax_identity_source_publication_from_metadata(
-            publication.as_dict()
-        )
+        canonical = tax_identity_source_publication_from_metadata(publication.as_dict())
     except TaxIdentitySourceProjectionError:
         raise serving_unavailable() from None
     if canonical != publication:
@@ -170,8 +175,7 @@ class BillingSearchSelectorScope:
         ):
             raise serving_unavailable()
         coordinates = tuple(
-            (binding.binding_ordinal, binding.snapshot_id)
-            for binding in self.bindings
+            (binding.binding_ordinal, binding.snapshot_id) for binding in self.bindings
         )
         if coordinates != tuple(sorted(set(coordinates))):
             raise serving_unavailable()
@@ -198,10 +202,7 @@ class BillingSearchSelectorResolution:
             and (
                 type(digest) is not str
                 or len(digest) != 64
-                or any(
-                    character not in _SHA256_HEX_CHARACTERS
-                    for character in digest
-                )
+                or any(character not in _SHA256_HEX_CHARACTERS for character in digest)
                 or digest == "0" * 64
             )
         ):
@@ -219,6 +220,8 @@ __all__ = [
     "BILLING_SELECTOR_NO_MATCH",
     "BILLING_SELECTOR_PROJECTION_UNAVAILABLE",
     "BillingSearchBindingPin",
+    "BillingSearchSelectorNotFoundError",
+    "BillingSearchSelectorResourceNotFoundError",
     "BillingSearchSelectorBindingScope",
     "BillingSearchSelectorResolution",
     "BillingSearchSelectorScope",

@@ -20,7 +20,7 @@ from api.billing_search_selector_contract import (
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
     TaxIdentitySourceProjectionError,
 )
-from tests.billing_search_selector_support import (
+from tests.billing_search_entity_ref_support import (
     GROUP_REF,
     SNAPSHOT_ID,
     billing_entity_reference,
@@ -45,7 +45,7 @@ def test_source_pinned_contracts_are_immutable_and_redacted() -> None:
     reference = billing_entity_reference()
     pin = BillingSearchBindingPin(release_binding(), serving_tables())
     binding_scope = _matched_binding()
-    scope = BillingSearchSelectorScope("tax_identity", (binding_scope,))
+    scope = BillingSearchSelectorScope("billing_entity_ref", (binding_scope,))
     resolution = BillingSearchSelectorResolution(scope, "1" * 64)
 
     assert pin.source_publication == source_publication()
@@ -117,11 +117,15 @@ def test_binding_pin_rejects_unreproducible_source_publication(
     canonical_result,
 ) -> None:
     if canonical_result == "error":
+
         def canonicalize(_metadata):
             raise TaxIdentitySourceProjectionError("synthetic")
+
     else:
+
         def canonicalize(_metadata):
             return source_publication(content_digest="6" * 64)
+
     monkeypatch.setattr(
         contract,
         "tax_identity_source_publication_from_metadata",
@@ -200,17 +204,20 @@ def test_matched_scope_requires_typed_scope_and_canonical_reference(
     [
         ("unexpected", (_matched_binding(),)),
         (object(), (_matched_binding(),)),
-        ("tax_identity", ()),
-        ("tax_identity", [_matched_binding()]),
-        ("tax_identity", (object(),)),
+        ("billing_entity_ref", ()),
+        ("billing_entity_ref", [_matched_binding()]),
+        ("billing_entity_ref", (object(),)),
         (
-            "tax_identity",
+            "billing_entity_ref",
             (
                 replace(_matched_binding(), binding_ordinal=1),
                 _matched_binding(),
             ),
         ),
-        ("tax_identity", (_matched_binding(), _matched_binding())),
+        (
+            "billing_entity_ref",
+            (_matched_binding(), _matched_binding()),
+        ),
     ],
 )
 def test_selector_scope_requires_nonempty_unique_sorted_binding_cut(
@@ -225,17 +232,32 @@ def test_selector_scope_requires_nonempty_unique_sorted_binding_cut(
     "selector_scope,digest",
     [
         (object(), "1" * 64),
-        (BillingSearchSelectorScope("tax_identity", (_matched_binding(),)), ""),
         (
-            BillingSearchSelectorScope("tax_identity", (_matched_binding(),)),
+            BillingSearchSelectorScope(
+                "billing_entity_ref",
+                (_matched_binding(),),
+            ),
+            "",
+        ),
+        (
+            BillingSearchSelectorScope(
+                "billing_entity_ref",
+                (_matched_binding(),),
+            ),
             "0" * 64,
         ),
         (
-            BillingSearchSelectorScope("tax_identity", (_matched_binding(),)),
+            BillingSearchSelectorScope(
+                "billing_entity_ref",
+                (_matched_binding(),),
+            ),
             "g" * 64,
         ),
         (
-            BillingSearchSelectorScope("tax_identity", (_matched_binding(),)),
+            BillingSearchSelectorScope(
+                "billing_entity_ref",
+                (_matched_binding(),),
+            ),
             b"1" * 64,
         ),
     ],
@@ -248,7 +270,7 @@ def test_resolution_rejects_invalid_scope_or_pseudonymous_digest(
         BillingSearchSelectorResolution(selector_scope, digest)
 
 
-def test_resolution_allows_unavailable_npi_scope_without_a_digest() -> None:
+def test_resolution_allows_unavailable_tax_identity_scope_without_a_digest() -> None:
     scope = BillingSearchSelectorScope(
         "tax_identity",
         (
