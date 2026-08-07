@@ -1,0 +1,49 @@
+{
+  "cohort_attestation": {
+    "idempotency_key": "wave-unit-key",
+    "intents": [
+      {
+        "content_version": "v1",
+        "ordinal": 0,
+        "params": {
+          "import_id": "coordinate-unit-0",
+          "source_file_import_id": "coordinate-unit-0"
+        },
+        "run_id": "run-unit-0",
+        "source_file_import_id": "coordinate-unit-0"
+      },
+      {
+        "content_version": "v1",
+        "ordinal": 1,
+        "params": {
+          "import_id": "coordinate-unit-1",
+          "source_file_import_id": "coordinate-unit-1"
+        },
+        "run_id": "run-unit-1",
+        "source_file_import_id": "coordinate-unit-1"
+      }
+    ],
+    "partition": {
+      "complete": true,
+      "imported_coordinate_count": 2,
+      "imported_coordinate_digest": "656ac3da7b413cacbea33dc7fbc07a516e6bb0ae50a2b06cbf96e7a4e66c5b0b",
+      "partition_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "physical_coordinate_count": 2,
+      "physical_coordinate_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "reused_coordinate_count": 0,
+      "reused_coordinate_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "schema_version": "healthporta.ptg-import-wave-attestation.v1",
+    "signature": "8b407ed3da16e5423df0eb7709a767eb5c2a62712f67714441c7ca0aede68c56",
+    "snapshot": {
+      "catalog_generation": "9999999999999999999999999999999999999999999999999999999999999999",
+      "entitlement_coverage_count": 2,
+      "entitlement_coverage_digest": "8888888888888888888888888888888888888888888888888888888888888888",
+      "inventory_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "membership_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "snapshot_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "subscription_coverage_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    "wave_id": "wave-unit"
+  }
+}

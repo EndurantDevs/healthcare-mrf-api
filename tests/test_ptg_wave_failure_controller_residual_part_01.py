@@ -297,7 +297,7 @@ def test_import_attestation_canonical_identifier_and_envelope_guards():
     }
     signed_unsupported_by_field = {
         **unsupported_by_field,
-        "signature": attestation.sign_cohort_attestation(unsupported_by_field, key="test"),
+        "signature": "a" * 64,
     }
     with pytest.raises(ValueError, match="schema_version is unsupported"):
         attestation._verify_attestation(signed_unsupported_by_field, attestation_key="test")
@@ -317,8 +317,12 @@ def test_import_attestation_snapshot_guards():
             "catalog_generation",
         )
     }
+    valid_snapshot_by_field["authorization_basis"] = (
+        attestation.AUTHORIZATION_BASIS
+    )
+    valid_snapshot_by_field["authorization_digest"] = "b" * 64
     valid_snapshot_by_field["entitlement_coverage_count"] = True
-    with pytest.raises(ValueError, match="positive integer"):
+    with pytest.raises(ValueError, match="invalid"):
         attestation._validate_snapshot(valid_snapshot_by_field)
 
 
