@@ -215,6 +215,46 @@ async def _mark_verified(
         raise RuntimeError("FHIR formulary verification transition failed")
 
 
+async def _recompute_dataset_verification(
+    database: Any,
+    source_id: str,
+    dataset: DatasetRef,
+) -> DatasetVerification:
+    coverage_records = await _coverage_rows(
+        database,
+        source_id,
+        dataset.dataset_id,
+    )
+    if not coverage_records:
+        raise RuntimeError("FHIR formulary dataset has no coverage plans")
+    expected_aliases, coverage_proof_rows = _coverage_proof(
+        source_id,
+        coverage_records,
+    )
+    alias_records = await snapshot_alias_rows(
+        database,
+        source_id,
+        dataset.dataset_id,
+    )
+    observed_aliases, membership_proof_rows, medication_count = (
+        await _alias_proof(
+            database,
+            source_id,
+            dataset,
+            alias_records,
+        )
+    )
+    if observed_aliases != expected_aliases:
+        raise RuntimeError("FHIR formulary plan alias coverage is incomplete")
+    return _verification_result(
+        source_id,
+        dataset.dataset_id,
+        coverage_proof_rows,
+        membership_proof_rows,
+        medication_count,
+    )
+
+
 class FHIRFormularyVerificationMixin:
     """Recompute exact content evidence before freezing a candidate."""
 
@@ -235,38 +275,10 @@ class FHIRFormularyVerificationMixin:
                 dataset,
                 allowed_statuses={"building", "verified"},
             )
-            coverage_records = await _coverage_rows(
+            verification = await _recompute_dataset_verification(
                 self._database,
                 self.source_id,
-                dataset.dataset_id,
-            )
-            if not coverage_records:
-                raise RuntimeError("FHIR formulary dataset has no coverage plans")
-            expected_aliases, coverage_proof_rows = _coverage_proof(
-                self.source_id,
-                coverage_records,
-            )
-            alias_records = await snapshot_alias_rows(
-                self._database,
-                self.source_id,
-                dataset.dataset_id,
-            )
-            observed_aliases, membership_proof_rows, medication_count = (
-                await _alias_proof(
-                    self._database,
-                    self.source_id,
-                    dataset,
-                    alias_records,
-                )
-            )
-            if observed_aliases != expected_aliases:
-                raise RuntimeError("FHIR formulary plan alias coverage is incomplete")
-            verification = _verification_result(
-                self.source_id,
-                dataset.dataset_id,
-                coverage_proof_rows,
-                membership_proof_rows,
-                medication_count,
+                dataset,
             )
             if dataset_by_field.get("status") == "verified":
                 if not _is_stored_verification_exact(
