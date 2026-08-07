@@ -609,16 +609,18 @@ jobs:
           PY
           alembic stamp 20260610143000_address_checksums_bigint
           alembic upgrade head
-      - name: Run Provider Directory migration adoption and repair cycle
+      - name: Run migration adoption and storage integrity gates
         if: matrix.shard == 'core'
         env:
           HLTHPRT_PROVIDER_DIRECTORY_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
           HLTHPRT_MRF_FILE_CURSOR_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
+          HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN: "postgresql://${{ env.HLTHPRT_DB_USER }}:${{ env.HLTHPRT_DB_PASSWORD }}@${{ env.HLTHPRT_DB_HOST }}:${{ env.HLTHPRT_DB_PORT }}/${{ env.HLTHPRT_DB_DATABASE }}"
         run: >
           timeout --foreground 295s python -m pytest -q
           tests/test_provider_directory_migration_adoption_postgres.py
           tests/test_provider_directory_caresource_census_db.py
           tests/test_mrf_file_source_cursor_migration.py
+          tests/test_formulary_fhir_storage_postgres.py
       - name: Run fresh-migrated PTG2 v3 PostgreSQL lifecycle gate
         if: matrix.shard == 'core'
         env:
