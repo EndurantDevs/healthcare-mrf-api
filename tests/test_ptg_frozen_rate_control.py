@@ -11,6 +11,7 @@ import pytest
 
 from api import control
 from api import control_imports
+from process.ptg_parts import frozen_rate_binding_store
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_BINDING_OPTION,
     FrozenRateFileBindingMismatchError,
@@ -209,6 +210,22 @@ async def test_frozen_binding_recheck_on_connection_is_read_only():
         params,
     ) == expected
     assert connection.last_status_params is None
+
+
+@pytest.mark.asyncio
+async def test_frozen_binding_recheck_without_source_id_avoids_database(
+    monkeypatch,
+):
+    def unexpected_acquire():
+        raise AssertionError("ordinary PTG work must not acquire PostgreSQL")
+
+    monkeypatch.setattr(
+        frozen_rate_binding_store.db,
+        "acquire",
+        unexpected_acquire,
+    )
+
+    assert await frozen_rate_binding_store.recheck_frozen_binding({}) is None
 
 
 @pytest.mark.asyncio

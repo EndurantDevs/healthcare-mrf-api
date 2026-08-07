@@ -252,6 +252,10 @@ async def recheck_frozen_binding(
 ) -> dict[str, Any] | None:
     """Recheck a previously admitted binding without creating one."""
 
+    expected_binding_by_name = frozen_rate_binding_from_params(params_by_name)
+    source_file_import_id = source_file_import_id_from_params(params_by_name)
+    if source_file_import_id is None:
+        return expected_binding_by_name
     async with db.acquire() as connection:
         return await recheck_frozen_binding_on_connection(
             connection,
