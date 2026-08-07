@@ -170,10 +170,10 @@ def test_fresh_orchestration_fails_closed_on_missing_sidecar():
 
 
 def test_fresh_orchestration_rejects_unbound_source_sidecars():
-    missing_manifest = {"summary": {}}
+    missing_manifest_by_field = {"summary": {}}
     with pytest.raises(TaxIdentityRateSourceBindingError):
         ptg._bound_tax_identity_source_artifacts(
-            (missing_manifest,),
+            (missing_manifest_by_field,),
             (_assignment(),),
         )
 
