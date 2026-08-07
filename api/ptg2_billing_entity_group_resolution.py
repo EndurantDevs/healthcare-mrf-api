@@ -16,6 +16,7 @@ from api.ptg2_billing_associations import (
 from api.ptg2_billing_entity_refs import (
     DecodedBillingEntityRef,
     PTG2BillingAssociationDataError,
+    PTG2BillingAssociationProjectionUnavailable,
     decode_billing_entity_ref,
     is_billing_ref_valid_for_token,
 )
@@ -176,7 +177,9 @@ def _verified_tin_key(
             raise PTG2BillingAssociationDataError(
                 "legacy billing reference sidecar contains token candidates"
             )
-        return None
+        raise PTG2BillingAssociationProjectionUnavailable(
+            "sealed billing reference projection is unavailable"
+        )
     if len(token_candidates) > _MAX_BILLING_REF_CANDIDATES:
         raise PTG2BillingAssociationDataError(
             "sealed billing reference locator exceeds its collision limit"
@@ -241,27 +244,15 @@ async def resolve_billing_entity_ref_group_scope(
     immutable snapshot; this low-level reader does not establish those facts.
     """
 
-    if type(snapshot_key) is not int or not 1 <= snapshot_key < 2**63:
-        raise PTG2BillingAssociationDataError(
-            "billing association snapshot key is invalid"
+    try:
+        tin_key = await _resolve_billing_entity_ref_tin_key(
+            session,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            billing_entity_ref=billing_entity_ref,
         )
-    decoded_reference = decode_billing_entity_ref(billing_entity_ref)
-    candidate_result = await session.execute(
-        _billing_ref_candidates_query(schema_name),
-        {
-            "snapshot_key": snapshot_key,
-            "tin_id_128": decoded_reference.tin_id_128,
-            "candidate_limit": _MAX_BILLING_REF_CANDIDATES + 1,
-        },
-    )
-    candidate_records = tuple(
-        dict(candidate_record) for candidate_record in candidate_result.mappings()
-    )
-    tin_key = _verified_tin_key(
-        candidate_records,
-        decoded_reference=decoded_reference,
-        snapshot_key=snapshot_key,
-    )
+    except PTG2BillingAssociationProjectionUnavailable:
+        return None
     if tin_key is None:
         return None
     group_result = await session.execute(
@@ -278,4 +269,36 @@ async def resolve_billing_entity_ref_group_scope(
     return ResolvedBillingEntityGroupScope(
         snapshot_key=snapshot_key,
         provider_group_refs=provider_group_refs,
+    )
+
+
+async def _resolve_billing_entity_ref_tin_key(
+    session,
+    *,
+    schema_name: str,
+    snapshot_key: int,
+    billing_entity_ref: object,
+) -> int | None:
+    """Verify one opaque reference and return only its internal token key."""
+
+    if type(snapshot_key) is not int or not 1 <= snapshot_key < 2**63:
+        raise PTG2BillingAssociationDataError(
+            "billing association snapshot key is invalid"
+        )
+    decoded_reference = decode_billing_entity_ref(billing_entity_ref)
+    candidate_result = await session.execute(
+        _billing_ref_candidates_query(schema_name),
+        {
+            "snapshot_key": snapshot_key,
+            "tin_id_128": decoded_reference.tin_id_128,
+            "candidate_limit": _MAX_BILLING_REF_CANDIDATES + 1,
+        },
+    )
+    candidate_records = tuple(
+        dict(candidate_record) for candidate_record in candidate_result.mappings()
+    )
+    return _verified_tin_key(
+        candidate_records,
+        decoded_reference=decoded_reference,
+        snapshot_key=snapshot_key,
     )

@@ -1,5 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from api import ptg2_serving
@@ -147,6 +149,33 @@ async def test_v3_price_hydration_raises_when_membership_key_is_missing(monkeypa
             _version_three_tables(),
             [10, 11],
         )
+
+
+@pytest.mark.asyncio
+async def test_v3_price_hydration_atom_limit_stops_before_atom_decode(monkeypatch):
+    membership_reader = AsyncMock(return_value={10: tuple(range(257))})
+    atom_reader = AsyncMock(return_value={})
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_shared_price_atom_memberships_from_db",
+        membership_reader,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_shared_price_atoms_from_db",
+        atom_reader,
+    )
+
+    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="atom limit"):
+        await ptg2_serving._version_three_prices_by_key(
+            object(),
+            _version_three_tables(),
+            [10],
+            maximum_atom_count=256,
+        )
+
+    membership_reader.assert_awaited_once()
+    atom_reader.assert_not_awaited()
 
 
 @pytest.mark.asyncio

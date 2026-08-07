@@ -81,6 +81,9 @@ def test_address_provenance_query_selects_coherent_active_source_lineage():
     assert "live_cms_doctors AS MATERIALIZED" in sql
     assert "specific_candidates AS MATERIALIZED" in sql
     assert "STARTS_WITH(stored.source_record_key, source.source_record_prefix)" in sql
+    assert "stored.npi IS NULL OR stored.npi = source.npi" in sql
+    assert "stored.address_key = source.address_key" in sql
+    assert "stored.premise_key = source.premise_key" in sql
     assert "STARTS_WITH(sources.source_name, 'facility_anchor:')" in sql
     assert "NULLIF(BTRIM(stored.source_run_id), '')" in sql
     assert "nppes.date_added::text AS source_run_id" in sql
@@ -89,6 +92,15 @@ def test_address_provenance_query_selects_coherent_active_source_lineage():
     assert "FROM specific_evidence" in sql
     assert serving._ptg2_mrf_lineage_complete_sql("candidate") in sql
     assert "COALESCE(NULLIF(stored.source_record_key" not in sql
+
+
+def test_membership_location_queries_retain_the_public_site_key() -> None:
+    for sql in (
+        serving._MEMBERSHIP_LOCATION_SQL,
+        serving._MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL,
+        serving._MEMBERSHIP_LOCATION_KNN_SQL,
+    ):
+        assert "'address_site_key'" in sql
 
 
 def test_address_provenance_uses_sql_admission_label_without_reclassification():
@@ -124,9 +136,7 @@ def test_address_provenance_uses_sql_admission_label_without_reclassification():
     )
 
     address_payload = json.loads(location_rows[0]["address_payload"])
-    assert address_payload["geo_evidence_level"] == (
-        "multi_issuer_marketplace_address"
-    )
+    assert address_payload["geo_evidence_level"] == ("multi_issuer_marketplace_address")
     assert len(address_payload["address_provenance"]) == 1
     assert "_geo_evidence_level" not in location_rows[0]
     assert "_geo_evidence_source_id" not in location_rows[0]
@@ -238,9 +248,7 @@ def _assert_compacted_provider_redaction(
 
 
 def test_unproven_non_geo_address_is_redacted_without_changing_rate_payload():
-    expected_prices = [
-        {"negotiated_rate": "125.00", "billing_class": "professional"}
-    ]
+    expected_prices = [{"negotiated_rate": "125.00", "billing_class": "professional"}]
     expected_rate_summaries = [{"min": "125.00", "max": "125.00"}]
     location_rows = _unproven_location_rows(
         expected_prices,
@@ -354,9 +362,12 @@ async def test_membership_location_rows_preserves_probe_state_after_lineage_drop
         location_rows,
         *,
         include_response_evidence,
+        use_stored_only,
     ):
-        assert include_response_evidence is True
+        assert include_response_evidence
+        assert not use_stored_only
         location_rows.clear()
+        return "available"
 
     monkeypatch.setattr(serving, "_hydrate_address_provenance", drop_unproven_rows)
     session = FakeSession(
@@ -385,9 +396,7 @@ async def test_membership_location_rows_preserves_probe_state_after_lineage_drop
         limit=2,
     )
 
-    assert location_rows == [
-        {"_ptg_probe_empty": True, "_ptg_source_exhausted": False}
-    ]
+    assert location_rows == [{"_ptg_probe_empty": True, "_ptg_source_exhausted": False}]
 
 
 @pytest.mark.asyncio
@@ -424,9 +433,38 @@ async def test_default_lineage_validation_is_one_bounded_set_query(monkeypatch):
     query_parameters = session.calls[0][0][1]
     assert len(query_parameters["location_keys"]) == 64
     assert len(query_parameters["admitted_source_ids"]) == 64
+    assert query_parameters["stored_only"] is False
     assert len(location_rows) == 64
     assert all(
         location_row[serving._PTG_UNPROVEN_ADDRESS_MARKER] is True
         and json.loads(location_row["address_payload"]) == {}
         for location_row in location_rows
     )
+
+
+@pytest.mark.asyncio
+async def test_billing_lineage_requires_materialized_evidence(monkeypatch):
+    monkeypatch.setattr(
+        serving,
+        "_is_relation_available",
+        AsyncMock(return_value=False),
+    )
+    location_rows = [
+        {
+            "npi": 1990000122,
+            "address_payload": json.dumps(
+                {"location_key": "generation-bound-location"}
+            ),
+        }
+    ]
+    session = FakeSession([])
+
+    provenance_status = await serving._hydrate_address_provenance(
+        session,
+        location_rows,
+        use_stored_only=True,
+    )
+
+    assert provenance_status == "unavailable"
+    assert session.calls == []
+    assert location_rows[0]["npi"] == 1990000122
