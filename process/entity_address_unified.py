@@ -440,21 +440,43 @@ async def _assert_current_provider_directory_dataset(
     expected_dataset_id: str,
     expected_root_run_id: str,
 ) -> None:
-    """Fail when the source no longer serves the exact dataset/root tuple."""
+    """Fail when the source no longer identifies one exact current dataset."""
 
     dataset_row = await db.first(
         f"""
         SELECT dataset.dataset_id
           FROM {db_schema}.provider_directory_source AS source
           JOIN {db_schema}.provider_directory_endpoint_dataset AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
+            ON dataset.dataset_id = :expected_dataset_id
          WHERE source.source_id = :source_id
-           AND dataset.dataset_id = :expected_dataset_id
            AND dataset.acquisition_root_run_id = :expected_root_run_id
            AND dataset.status = 'published'
            AND dataset.is_current IS TRUE
            AND dataset.published_at IS NOT NULL
            AND dataset.superseded_at IS NULL
+           AND jsonb_typeof(
+                   dataset.publication_metadata_json::jsonb -> 'source_ids'
+               ) = 'array'
+           AND (
+                   dataset.publication_metadata_json::jsonb -> 'source_ids'
+               ) @> jsonb_build_array(source.source_id)
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {db_schema}.provider_directory_endpoint_dataset AS competing
+                 WHERE competing.dataset_id <> dataset.dataset_id
+                   AND competing.status = 'published'
+                   AND competing.is_current IS TRUE
+                   AND competing.published_at IS NOT NULL
+                   AND competing.superseded_at IS NULL
+                   AND jsonb_typeof(
+                           competing.publication_metadata_json::jsonb
+                               -> 'source_ids'
+                       ) = 'array'
+                   AND (
+                           competing.publication_metadata_json::jsonb
+                               -> 'source_ids'
+                       ) @> jsonb_build_array(source.source_id)
+           )
          LIMIT 1;
         """,
         source_id=source_id,

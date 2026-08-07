@@ -60,10 +60,20 @@ async def test_dataset_fence_matches_current_publication(monkeypatch):
     )
 
     query = current_dataset.await_args.args[0]
+    assert "dataset.endpoint_id = source.endpoint_id" not in query
+    assert "dataset.dataset_id = :expected_dataset_id" in query
     assert "dataset.status = 'published'" in query
     assert "dataset.is_current IS TRUE" in query
     assert "dataset.acquisition_root_run_id = :expected_root_run_id" in query
+    assert "dataset.published_at IS NOT NULL" in query
     assert "dataset.superseded_at IS NULL" in query
+    assert "dataset.publication_metadata_json::jsonb -> 'source_ids'" in query
+    assert "jsonb_build_array(source.source_id)" in query
+    assert "competing.dataset_id <> dataset.dataset_id" in query
+    assert "competing.status = 'published'" in query
+    assert "competing.is_current IS TRUE" in query
+    assert "competing.published_at IS NOT NULL" in query
+    assert "competing.superseded_at IS NULL" in query
     assert current_dataset.await_args.kwargs == {
         "source_id": "source-current",
         "expected_dataset_id": "dataset-current",
