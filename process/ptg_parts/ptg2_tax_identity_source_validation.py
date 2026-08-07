@@ -23,6 +23,7 @@ from process.ptg_parts.ptg2_tax_identity_source_projection import (
     TaxIdentitySourcePublication,
     _fail,
     _strict_int,
+    _strict_sha256,
     tax_identity_source_publication_from_metadata,
 )
 
