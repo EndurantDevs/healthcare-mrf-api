@@ -398,6 +398,54 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /formulary/fhir/{formulary_id}:
+    get:
+      operationId: getFHIRFormularyDetail
+      summary: Retrieve one current published FHIR formulary
+      description: |
+        Returns the allowlisted detail fields for one opaque public formulary
+        identifier. Malformed, unknown, and unavailable identifiers share one
+        closed not-found response. Internal acquisition and publication
+        identities are never emitted. All responses are private and must not be
+        stored.
+      parameters:
+        - name: formulary_id
+          in: path
+          required: true
+          description: Opaque public identifier for one FHIR formulary.
+          schema:
+            type: string
+            minLength: 31
+            maxLength: 31
+            pattern: '^fhir_[a-z2-7]{26}$'
+      responses:
+        '200':
+          description: Current published FHIR formulary detail
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/FHIRFormularyCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FHIRFormularyDetail'
+        '404':
+          description: Malformed, unknown, or unavailable formulary identifier
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/FHIRFormularyCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FHIRFormularyNotFoundResponse'
+        '503':
+          description: FHIR formulary serving is disabled or temporarily unavailable
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/FHIRFormularyCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FHIRFormularyServingUnavailableResponse'
   /formulary/ids:
     get:
       operationId: getFormularyIds
@@ -5468,6 +5516,11 @@ components:
       schema:
         type: string
         enum: ['private, no-store']
+    FHIRFormularyCacheControl:
+      description: Present on every FHIR formulary response to prohibit storage.
+      schema:
+        type: string
+        enum: ['private, no-store']
   schemas:
     Error:
       type: object
@@ -8598,6 +8651,95 @@ components:
           type: integer
       required: [pharmacy_type, count]
       additionalProperties: false
+    FHIRFormularyPeriod:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [start, end]
+      properties:
+        start:
+          type: string
+          format: date-time
+          maxLength: 40
+          nullable: true
+        end:
+          type: string
+          format: date-time
+          maxLength: 40
+          nullable: true
+    FHIRFormularyDetail:
+      type: object
+      additionalProperties: false
+      required:
+        [formulary_id, status, title, name, period, last_updated, as_of, published_at]
+      properties:
+        formulary_id:
+          type: string
+          minLength: 31
+          maxLength: 31
+          pattern: '^fhir_[a-z2-7]{26}$'
+        status:
+          type: string
+          maxLength: 32
+          nullable: true
+        title:
+          type: string
+          maxLength: 2048
+          nullable: true
+        name:
+          type: string
+          maxLength: 2048
+          nullable: true
+        period:
+          $ref: '#/components/schemas/FHIRFormularyPeriod'
+        last_updated:
+          type: string
+          format: date-time
+          maxLength: 40
+        as_of:
+          type: string
+          format: date-time
+          maxLength: 40
+        published_at:
+          type: string
+          format: date-time
+          maxLength: 40
+    FHIRFormularyNotFoundResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/FHIRFormularyNotFoundError'
+    FHIRFormularyNotFoundError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [formulary_fhir_not_found]
+        message:
+          type: string
+          enum: [FHIR formulary not found.]
+    FHIRFormularyServingUnavailableResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/FHIRFormularyServingUnavailableError'
+    FHIRFormularyServingUnavailableError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [formulary_fhir_serving_unavailable]
+        message:
+          type: string
+          enum: [FHIR formulary serving is temporarily unavailable.]
     FormularyRecord:
       type: object
       properties:

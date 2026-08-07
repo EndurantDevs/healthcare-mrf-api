@@ -10,6 +10,27 @@ from api import init_api
 from api.utils import square_poly
 
 
+EXPECTED_PUBLIC_BLUEPRINT_NAMES = {
+    "coverage",
+    "clinical",
+    "codes",
+    "healthcheck",
+    "plan",
+    "formulary",
+    "formulary_fhir",
+    "import",
+    "issuer",
+    "npi",
+    "nucc",
+    "geo",
+    "pricing",
+    "partd_formulary",
+    "pharmacy_license",
+    "reports",
+    "site_intelligence",
+}
+
+
 def test_init_api_registers_group(monkeypatch):
     """Register the grouped public API blueprint once."""
     calls_by_name = {}
@@ -52,24 +73,9 @@ def test_init_api_registers_group(monkeypatch):
         (init_api.__globals__["add_runtime_identity_headers"], "response"),
     ]
     assert hasattr(app.registered, "blueprints")
-    assert {bp.name for bp in app.registered.blueprints} == {
-        "coverage",
-        "clinical",
-        "codes",
-        "healthcheck",
-        "plan",
-        "formulary",
-        "import",
-        "issuer",
-        "npi",
-        "nucc",
-        "geo",
-        "pricing",
-        "partd_formulary",
-        "pharmacy_license",
-        "reports",
-        "site_intelligence",
-    }
+    assert {bp.name for bp in app.registered.blueprints} == (
+        EXPECTED_PUBLIC_BLUEPRINT_NAMES
+    )
 
 
 @pytest.mark.parametrize("distance", [0.1, 1, 5])

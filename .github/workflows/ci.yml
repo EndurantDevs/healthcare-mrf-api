@@ -316,7 +316,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
       - name: Run OpenAPI route/spec checks
-        run: timeout --foreground 295s python -m pytest -q tests/test_openapi_spec.py tests/test_api_init_and_utils.py tests/test_healthcheck.py
+        run: timeout --foreground 295s python -m pytest -q tests/test_openapi_spec.py tests/test_formulary_fhir_openapi.py tests/test_api_init_and_utils.py tests/test_healthcheck.py
 
   rust-scanner:
     name: rust scanner
@@ -626,6 +626,7 @@ jobs:
           tests/test_formulary_fhir_manual_worker_postgres.py
           tests/test_formulary_fhir_synthetic_canary_postgres.py
           tests/test_formulary_fhir_synthetic_seed_publisher_postgres.py
+          tests/test_formulary_fhir_serving_postgres.py
       - name: Run fresh-migrated PTG2 v3 PostgreSQL lifecycle gate
         if: matrix.shard == 'core'
         env:
