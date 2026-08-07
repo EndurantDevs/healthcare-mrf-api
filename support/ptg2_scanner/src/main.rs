@@ -63,7 +63,14 @@ use ptg2_scanner::shared_graph::{
 };
 #[cfg(test)]
 use ptg2_scanner::tax_identity::TinTokenPolicy;
-use ptg2_scanner::tax_identity::{load_tin_token_policy_from_env, TaxIdentityState};
+use ptg2_scanner::tax_identity::{
+    load_tin_token_policy_from_env, TaxIdentityObservation, TaxIdentityObservationV2,
+    TaxIdentityState, TaxIdentityStateV2, TIN_TOKEN_SECRET_FILE_ENV,
+};
+use ptg2_scanner::tax_identity_sidecar_v2::{
+    TaxIdentitySidecarV2Header, TaxIdentitySidecarV2Record, TAX_IDENTITY_SIDECAR_V2_FORMAT,
+    TAX_IDENTITY_SIDECAR_V2_FORMAT_VERSION, TAX_IDENTITY_SIDECAR_V2_RECORD_BYTES,
+};
 use ptg2_scanner::uhc_retained::run_uhc_retain_cli;
 use ptg2_scanner::v3_dense::{DenseIdentityMap, DenseIdentityValue};
 use ptg2_scanner::v3_runs::{
@@ -98,7 +105,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, MutexGuard,
@@ -125,6 +132,8 @@ const V3_RAW_SOURCE_SHA256_ENV: &str = "HLTHPRT_PTG2_RAW_SOURCE_SHA256";
 const GROUP_NEGOTIATED_RATE_CHUNKS_ENV: &str = "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS";
 const RATE_SCHEDULE_OBSERVE_ENV: &str = "HLTHPRT_PTG2_RATE_SCHEDULE_OBSERVE";
 const PROVIDER_GRAPH_V4_ENV: &str = "HLTHPRT_PTG2_PROVIDER_GRAPH_V4";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV: &str =
+    "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH";
 
 thread_local! {
     static SIDECAR_LOCK_WAIT_MICROS: Cell<u128> = const { Cell::new(0) };
@@ -719,6 +728,7 @@ struct CopyPathConfig {
     manifest_provider_set_component_sidecar: Option<String>,
     manifest_provider_component_group_sidecar: Option<String>,
     manifest_provider_group_tax_identity_sidecar: Option<String>,
+    manifest_provider_group_tax_identity_v2_sidecar: Option<String>,
     manifest_provider_npi_sidecar: Option<String>,
     manifest_price_forward_sidecar: Option<String>,
     manifest_price_atom: Option<String>,
@@ -739,11 +749,172 @@ struct CopyPathConfig {
     manifest_only: bool,
 }
 
+// This first admission layer is intentionally lexical. The active scanner adds
+// canonical-parent and existing-relation identity checks once inputs, secrets,
+// concrete worker paths, and run-scoped directories are known.
+fn normalized_absolute_lexical_path(path: &str) -> io::Result<PathBuf> {
+    normalized_absolute_lexical_path_value(Path::new(path))
+}
+
+fn normalized_absolute_lexical_path_value(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|tail| matches!(tail, Component::Normal(_)))
+                {
+                    normalized.pop();
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn configured_output_paths(paths: &CopyPathConfig) -> io::Result<Vec<(&'static str, PathBuf)>> {
+    let configured = [
+        ("compact", paths.compact.as_deref()),
+        ("manifest_serving", paths.manifest_serving.as_deref()),
+        (
+            "manifest_lean_serving",
+            paths.manifest_lean_serving.as_deref(),
+        ),
+        (
+            "manifest_provider_forward_sidecar",
+            paths.manifest_provider_forward_sidecar.as_deref(),
+        ),
+        (
+            "manifest_provider_inverted_sidecar",
+            paths.manifest_provider_inverted_sidecar.as_deref(),
+        ),
+        (
+            "manifest_provider_set_component_sidecar",
+            paths.manifest_provider_set_component_sidecar.as_deref(),
+        ),
+        (
+            "manifest_provider_component_group_sidecar",
+            paths.manifest_provider_component_group_sidecar.as_deref(),
+        ),
+        (
+            "manifest_provider_group_tax_identity_sidecar",
+            paths
+                .manifest_provider_group_tax_identity_sidecar
+                .as_deref(),
+        ),
+        (
+            "manifest_provider_group_tax_identity_v2_sidecar",
+            paths
+                .manifest_provider_group_tax_identity_v2_sidecar
+                .as_deref(),
+        ),
+        (
+            "manifest_provider_npi_sidecar",
+            paths.manifest_provider_npi_sidecar.as_deref(),
+        ),
+        (
+            "manifest_price_forward_sidecar",
+            paths.manifest_price_forward_sidecar.as_deref(),
+        ),
+        ("manifest_price_atom", paths.manifest_price_atom.as_deref()),
+        (
+            "manifest_price_set_atom",
+            paths.manifest_price_set_atom.as_deref(),
+        ),
+        (
+            "manifest_price_set_summary",
+            paths.manifest_price_set_summary.as_deref(),
+        ),
+        (
+            "manifest_provider_group_member",
+            paths.manifest_provider_group_member.as_deref(),
+        ),
+        ("manifest_code_count", paths.manifest_code_count.as_deref()),
+        (
+            "manifest_provider_set_dictionary",
+            paths.manifest_provider_set_dictionary.as_deref(),
+        ),
+        ("procedure", paths.procedure.as_deref()),
+        ("price_code_set", paths.price_code_set.as_deref()),
+        ("price_atom", paths.price_atom.as_deref()),
+        ("price_set_entry", paths.price_set_entry.as_deref()),
+        ("provider_set", paths.provider_set.as_deref()),
+        (
+            "provider_set_component",
+            paths.provider_set_component.as_deref(),
+        ),
+        ("provider_set_entry", paths.provider_set_entry.as_deref()),
+        (
+            "provider_entry_component",
+            paths.provider_entry_component.as_deref(),
+        ),
+        (
+            "provider_group_member",
+            paths.provider_group_member.as_deref(),
+        ),
+    ];
+    configured
+        .into_iter()
+        .filter_map(|(name, path)| path.map(|path| (name, path)))
+        .map(|(name, path)| Ok((name, normalized_absolute_lexical_path(path)?)))
+        .collect()
+}
+
+fn validate_configured_output_paths_for_tax_identity(paths: &CopyPathConfig) -> io::Result<()> {
+    let mut outputs = configured_output_paths(paths)?;
+    for (name, path) in [
+        (
+            "manifest_provider_group_tax_identity_sidecar.building",
+            paths
+                .manifest_provider_group_tax_identity_sidecar
+                .as_deref(),
+        ),
+        (
+            "manifest_provider_group_tax_identity_v2_sidecar.building",
+            paths
+                .manifest_provider_group_tax_identity_v2_sidecar
+                .as_deref(),
+        ),
+    ] {
+        if let Some(path) = path {
+            outputs.push((
+                name,
+                normalized_absolute_lexical_path(&format!("{path}.building"))?,
+            ));
+        }
+    }
+    for (index, (left_name, left_path)) in outputs.iter().enumerate() {
+        for (right_name, right_path) in &outputs[index + 1..] {
+            if left_path == right_path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("configured output paths for {left_name} and {right_name} must differ"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn configured_v4_factor_mode(paths: &CopyPathConfig) -> io::Result<bool> {
     let enabled = env_bool(PROVIDER_GRAPH_V4_ENV, false);
     let has_set_component_path = paths.manifest_provider_set_component_sidecar.is_some();
     let has_component_group_path = paths.manifest_provider_component_group_sidecar.is_some();
     let has_tax_identity_path = paths.manifest_provider_group_tax_identity_sidecar.is_some();
+    let has_tax_identity_v2_path = paths
+        .manifest_provider_group_tax_identity_v2_sidecar
+        .is_some();
     if has_set_component_path != has_component_group_path {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -770,6 +941,28 @@ fn configured_v4_factor_mode(paths: &CopyPathConfig) -> io::Result<bool> {
             "provider-group tax identity output requires V4 provider factor mode",
         ));
     }
+    if has_tax_identity_v2_path && !enabled {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider-group tax identity v2 output requires V4 provider factor mode",
+        ));
+    }
+    if has_tax_identity_v2_path && !has_tax_identity_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider-group tax identity v2 output requires the v1 sidecar path",
+        ));
+    }
+    #[cfg(not(unix))]
+    if has_tax_identity_path || has_tax_identity_v2_path {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "provider-group tax identity sidecars require Unix file-identity and durability guarantees",
+        ));
+    }
+    if has_tax_identity_path || has_tax_identity_v2_path {
+        validate_configured_output_paths_for_tax_identity(paths)?;
+    }
     Ok(enabled)
 }
 
@@ -777,13 +970,29 @@ fn configured_shared_dedupe(
     worker_count: usize,
     serving_rate_dedupe_enabled: bool,
     factor_mode: bool,
+    paired_tax_identity: bool,
 ) -> io::Result<SharedDedupe> {
-    if factor_mode {
-        return Ok(SharedDedupe::new_with_v4_tax_identity(
-            worker_count,
-            serving_rate_dedupe_enabled,
-            load_tin_token_policy_from_env()?,
+    if paired_tax_identity && !factor_mode {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "paired provider tax identity collection requires V4 provider factor mode",
         ));
+    }
+    if factor_mode {
+        let policy = load_tin_token_policy_from_env()?;
+        return Ok(if paired_tax_identity {
+            SharedDedupe::new_with_v4_paired_tax_identity(
+                worker_count,
+                serving_rate_dedupe_enabled,
+                policy,
+            )
+        } else {
+            SharedDedupe::new_with_v4_tax_identity(
+                worker_count,
+                serving_rate_dedupe_enabled,
+                policy,
+            )
+        });
     }
     Ok(SharedDedupe::new_with_serving_rate_dedupe(
         worker_count,
@@ -846,6 +1055,9 @@ impl CopyPathConfig {
             manifest_provider_group_tax_identity_sidecar: env_path(
                 "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
             ),
+            manifest_provider_group_tax_identity_v2_sidecar: env_path(
+                PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV,
+            ),
             manifest_price_atom: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH"),
             manifest_price_set_atom: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH"),
             manifest_price_set_summary: env_path(
@@ -893,6 +1105,9 @@ impl CopyPathConfig {
             || self.manifest_provider_set_component_sidecar.is_some()
             || self.manifest_provider_component_group_sidecar.is_some()
             || self.manifest_provider_group_tax_identity_sidecar.is_some()
+            || self
+                .manifest_provider_group_tax_identity_v2_sidecar
+                .is_some()
             || self.manifest_provider_npi_sidecar.is_some()
             || self.manifest_price_forward_sidecar.is_some()
     }
@@ -921,6 +1136,9 @@ impl CopyPathConfig {
                 .clone(),
             manifest_provider_group_tax_identity_sidecar: self
                 .manifest_provider_group_tax_identity_sidecar
+                .clone(),
+            manifest_provider_group_tax_identity_v2_sidecar: self
+                .manifest_provider_group_tax_identity_v2_sidecar
                 .clone(),
             manifest_provider_npi_sidecar: self.manifest_provider_npi_sidecar.clone(),
             manifest_price_forward_sidecar: self.manifest_price_forward_sidecar.clone(),
@@ -1007,6 +1225,9 @@ impl CopyPathConfig {
             manifest_provider_group_tax_identity_sidecar: self
                 .manifest_provider_group_tax_identity_sidecar
                 .clone(),
+            manifest_provider_group_tax_identity_v2_sidecar: self
+                .manifest_provider_group_tax_identity_v2_sidecar
+                .clone(),
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -1033,6 +1254,323 @@ impl CopyPathConfig {
             manifest_only: self.manifest_only,
         }
     }
+}
+
+fn worker_owned_output_paths(paths: &CopyPathConfig) -> io::Result<Vec<(&'static str, PathBuf)>> {
+    let configured = [
+        ("compact", paths.compact.as_deref()),
+        ("manifest_serving", paths.manifest_serving.as_deref()),
+        (
+            "manifest_lean_serving",
+            paths.manifest_lean_serving.as_deref(),
+        ),
+        ("manifest_price_atom", paths.manifest_price_atom.as_deref()),
+        (
+            "manifest_price_set_atom",
+            paths.manifest_price_set_atom.as_deref(),
+        ),
+        (
+            "manifest_price_set_summary",
+            paths.manifest_price_set_summary.as_deref(),
+        ),
+        (
+            "manifest_provider_group_member",
+            paths.manifest_provider_group_member.as_deref(),
+        ),
+        ("manifest_code_count", paths.manifest_code_count.as_deref()),
+        (
+            "manifest_provider_set_dictionary",
+            paths.manifest_provider_set_dictionary.as_deref(),
+        ),
+        ("procedure", paths.procedure.as_deref()),
+        ("price_code_set", paths.price_code_set.as_deref()),
+        ("price_atom", paths.price_atom.as_deref()),
+        ("price_set_entry", paths.price_set_entry.as_deref()),
+        ("provider_set", paths.provider_set.as_deref()),
+        (
+            "provider_set_component",
+            paths.provider_set_component.as_deref(),
+        ),
+        ("provider_set_entry", paths.provider_set_entry.as_deref()),
+        (
+            "provider_entry_component",
+            paths.provider_entry_component.as_deref(),
+        ),
+        (
+            "provider_group_member",
+            paths.provider_group_member.as_deref(),
+        ),
+    ];
+    configured
+        .into_iter()
+        .filter_map(|(name, path)| path.map(|path| (name, path)))
+        .map(|(name, path)| Ok((name, normalized_absolute_lexical_path(path)?)))
+        .collect()
+}
+
+fn is_rotated_worker_output(candidate: &Path, worker_output: &Path) -> bool {
+    if candidate.parent() != worker_output.parent() {
+        return false;
+    }
+    let (Some(candidate_name), Some(worker_name)) = (
+        candidate.file_name().and_then(|name| name.to_str()),
+        worker_output.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return false;
+    };
+    let Some(rotation) = candidate_name
+        .strip_prefix(worker_name)
+        .and_then(|suffix| suffix.strip_prefix(".part"))
+        .and_then(|suffix| suffix.strip_suffix(".ready"))
+    else {
+        return false;
+    };
+    rotation.len() >= 6 && rotation.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExistingPathIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExistingPathIdentity;
+
+fn existing_path_identity(path: &Path) -> io::Result<Option<ExistingPathIdentity>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    {
+        Ok(existing_metadata_identity(&metadata))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+fn existing_metadata_identity(metadata: &std::fs::Metadata) -> Option<ExistingPathIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(ExistingPathIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn publication_coordinate(path: &Path) -> io::Result<PathBuf> {
+    let lexical = normalized_absolute_lexical_path_value(path)?;
+    let parent = lexical
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = lexical.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configured tax identity path is missing its file name",
+        )
+    })?;
+    Ok(std::fs::canonicalize(parent)?.join(file_name))
+}
+
+fn resolved_existing_path(path: &Path, publication: &Path) -> io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(publication.to_path_buf()),
+        Err(error) => Err(error),
+    }
+}
+
+struct RuntimeCollisionPath {
+    lexical: PathBuf,
+    publication: PathBuf,
+    resolved_existing: PathBuf,
+    existing_identity: Option<ExistingPathIdentity>,
+}
+
+impl RuntimeCollisionPath {
+    fn new(path: &Path) -> io::Result<Self> {
+        let unavailable = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tax identity collision coordinate could not be resolved",
+            )
+        };
+        let publication = publication_coordinate(path).map_err(|_| unavailable())?;
+        Ok(Self {
+            lexical: normalized_absolute_lexical_path_value(path).map_err(|_| unavailable())?,
+            resolved_existing: resolved_existing_path(path, &publication)
+                .map_err(|_| unavailable())?,
+            publication,
+            existing_identity: existing_path_identity(path).map_err(|_| unavailable())?,
+        })
+    }
+
+    fn conflicts_with(&self, other: &Self) -> bool {
+        self.lexical == other.lexical
+            || self.publication == other.publication
+            || self.resolved_existing == other.resolved_existing
+            || self.publication == other.resolved_existing
+            || self.resolved_existing == other.publication
+            || self
+                .existing_identity
+                .zip(other.existing_identity)
+                .is_some_and(|(left, right)| left == right)
+            || is_rotated_worker_output(&self.lexical, &other.lexical)
+            || is_rotated_worker_output(&self.publication, &other.publication)
+    }
+}
+
+fn validate_runtime_tax_identity_output_paths(
+    paths: &CopyPathConfig,
+    input_path: &Path,
+    token_secret_path: &Path,
+    source_witness_scratch_path: Option<&Path>,
+    worker_count: usize,
+    provider_ref_worker_count: usize,
+) -> io::Result<()> {
+    if paths.manifest_provider_group_tax_identity_sidecar.is_none()
+        && paths
+            .manifest_provider_group_tax_identity_v2_sidecar
+            .is_none()
+    {
+        return Ok(());
+    }
+    let mut protected = Vec::with_capacity(4);
+    for (name, path) in [
+        (
+            "manifest_provider_group_tax_identity_sidecar",
+            paths
+                .manifest_provider_group_tax_identity_sidecar
+                .as_deref(),
+        ),
+        (
+            "manifest_provider_group_tax_identity_v2_sidecar",
+            paths
+                .manifest_provider_group_tax_identity_v2_sidecar
+                .as_deref(),
+        ),
+    ] {
+        if let Some(path) = path {
+            protected.push((name, RuntimeCollisionPath::new(Path::new(path))?));
+            protected.push((
+                if name == "manifest_provider_group_tax_identity_sidecar" {
+                    "manifest_provider_group_tax_identity_sidecar.building"
+                } else {
+                    "manifest_provider_group_tax_identity_v2_sidecar.building"
+                },
+                RuntimeCollisionPath::new(Path::new(&format!("{path}.building")))?,
+            ));
+        }
+    }
+    for (index, (left_name, left_path)) in protected.iter().enumerate() {
+        for (right_name, right_path) in &protected[index + 1..] {
+            if left_path.conflicts_with(right_path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "configured tax identity outputs {left_name} and {right_name} conflict"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut derived = vec![
+        (
+            "raw_input".to_string(),
+            RuntimeCollisionPath::new(input_path)?,
+        ),
+        (
+            "token_secret".to_string(),
+            RuntimeCollisionPath::new(token_secret_path)?,
+        ),
+    ];
+    for (name, path) in configured_output_paths(paths)? {
+        if matches!(
+            name,
+            "manifest_provider_group_tax_identity_sidecar"
+                | "manifest_provider_group_tax_identity_v2_sidecar"
+        ) {
+            continue;
+        }
+        derived.push((format!("{name}.final"), RuntimeCollisionPath::new(&path)?));
+    }
+    for worker_id in 0..worker_count.max(1) {
+        for (name, path) in worker_owned_output_paths(&paths.for_worker(worker_id))? {
+            derived.push((
+                format!("{name}.worker{worker_id:04}"),
+                RuntimeCollisionPath::new(&path)?,
+            ));
+        }
+    }
+    let provider_ref_paths = paths.for_provider_refs();
+    for worker_id in 0..provider_ref_worker_count.max(1) {
+        for (name, path) in worker_owned_output_paths(&provider_ref_paths.for_worker(worker_id))? {
+            derived.push((
+                format!("{name}.provider_refs.worker{worker_id:04}"),
+                RuntimeCollisionPath::new(&path)?,
+            ));
+        }
+    }
+
+    for (protected_name, protected_path) in &protected {
+        for (derived_name, derived_path) in &derived {
+            if protected_path.conflicts_with(derived_path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "configured tax identity output {protected_name} conflicts with {derived_name}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut reserved_directories = Vec::with_capacity(2);
+    if let Some(path) = paths.v3_serving_run_directory.as_deref() {
+        reserved_directories.push((
+            "serving_run_directory",
+            normalized_absolute_lexical_path(path)?,
+            std::fs::canonicalize(path)?,
+        ));
+    }
+    if let Some(path) = source_witness_scratch_path {
+        reserved_directories.push((
+            "source_witness_scratch",
+            normalized_absolute_lexical_path_value(path)?,
+            std::fs::canonicalize(path)?,
+        ));
+    }
+    for (protected_name, protected_path) in &protected {
+        for (reserved_name, reserved_lexical_path, reserved_resolved_path) in &reserved_directories
+        {
+            if protected_path.lexical.starts_with(reserved_lexical_path)
+                || protected_path
+                    .publication
+                    .starts_with(reserved_resolved_path)
+                || protected_path
+                    .resolved_existing
+                    .starts_with(reserved_resolved_path)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "configured tax identity output {protected_name} conflicts with {reserved_name}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn env_path(name: &str) -> Option<String> {
@@ -1851,6 +2389,246 @@ const PROVIDER_GROUP_TAX_IDENTITY_MAGIC: &[u8; 8] = b"PTG2TAX1";
 const PROVIDER_GROUP_TAX_IDENTITY_VERSION: u16 = 1;
 const PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES: u16 = 65;
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TaxIdentityOpenedFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TaxIdentityOpenedFileIdentity;
+
+fn tax_identity_opened_file_identity(
+    metadata: &std::fs::Metadata,
+) -> io::Result<TaxIdentityOpenedFileIdentity> {
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider tax identity scratch relation is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity scratch relation has an unexpected link count",
+            ));
+        }
+        Ok(TaxIdentityOpenedFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(TaxIdentityOpenedFileIdentity)
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_tax_identity_directory(path: &Path) -> io::Result<()> {
+    let _ = path;
+    Ok(())
+}
+
+struct TaxIdentitySidecarScratch {
+    directory: tempfile::TempDir,
+    artifact_path: PathBuf,
+    publication_parent: PathBuf,
+    publication_path: PathBuf,
+    opened_identity: TaxIdentityOpenedFileIdentity,
+    #[cfg(unix)]
+    scratch_directory_handle: File,
+    #[cfg(unix)]
+    publication_parent_handle: File,
+    #[cfg(unix)]
+    publication_parent_identity: ExistingPathIdentity,
+}
+
+impl TaxIdentitySidecarScratch {
+    fn create(output_path: &Path) -> io::Result<(Self, File)> {
+        let legacy_temporary_path = PathBuf::from(format!("{}.building", output_path.display()));
+        match std::fs::symlink_metadata(&legacy_temporary_path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "provider tax identity legacy scratch relation already exists",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let parent = output_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let publication_parent = std::fs::canonicalize(parent)?;
+        let publication_name = output_path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "provider tax identity output is missing its file name",
+            )
+        })?;
+        let publication_path = publication_parent.join(publication_name);
+        let mut directory_builder = tempfile::Builder::new();
+        directory_builder.prefix(".ptg2-tax-identity-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            directory_builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let directory = directory_builder.tempdir_in(&publication_parent)?;
+        #[cfg(unix)]
+        let scratch_directory_handle = File::open(directory.path())?;
+        #[cfg(unix)]
+        let publication_parent_handle = File::open(&publication_parent)?;
+        #[cfg(unix)]
+        let publication_parent_identity =
+            existing_metadata_identity(&publication_parent_handle.metadata()?)
+                .expect("Unix metadata always has a device/inode identity");
+        let artifact_path = directory.path().join("artifact.building");
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o600);
+        }
+        let file = options.open(&artifact_path)?;
+        let opened_identity = tax_identity_opened_file_identity(&file.metadata()?)?;
+        Ok((
+            Self {
+                directory,
+                artifact_path,
+                publication_parent,
+                publication_path,
+                opened_identity,
+                #[cfg(unix)]
+                scratch_directory_handle,
+                #[cfg(unix)]
+                publication_parent_handle,
+                #[cfg(unix)]
+                publication_parent_identity,
+            },
+            file,
+        ))
+    }
+
+    fn validate_opened_relation(&self, file: &File) -> io::Result<u64> {
+        let opened_metadata = file.metadata()?;
+        let opened_identity = tax_identity_opened_file_identity(&opened_metadata)?;
+        if opened_identity != self.opened_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity scratch relation identity changed",
+            ));
+        }
+        let path_metadata = std::fs::symlink_metadata(&self.artifact_path)?;
+        if path_metadata.file_type().is_symlink()
+            || tax_identity_opened_file_identity(&path_metadata)? != self.opened_identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity scratch pathname was replaced",
+            ));
+        }
+        Ok(opened_metadata.len())
+    }
+
+    fn publish(self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            if existing_path_identity(&self.publication_parent)?
+                != Some(self.publication_parent_identity)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider tax identity publication parent identity changed",
+                ));
+            }
+            self.scratch_directory_handle.sync_all()?;
+        }
+        std::fs::rename(&self.artifact_path, &self.publication_path)?;
+        let published_metadata = std::fs::symlink_metadata(&self.publication_path)?;
+        if published_metadata.file_type().is_symlink()
+            || tax_identity_opened_file_identity(&published_metadata)? != self.opened_identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity publication pathname was replaced",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            self.scratch_directory_handle.sync_all()?;
+            self.publication_parent_handle.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        sync_tax_identity_directory(&self.publication_parent)?;
+        self.directory.close()?;
+        #[cfg(unix)]
+        self.publication_parent_handle.sync_all()?;
+        Ok(())
+    }
+}
+
+struct TaxIdentityArtifactWriter {
+    inner: BufWriter<File>,
+    byte_count: u64,
+    sha256: Sha256,
+}
+
+impl TaxIdentityArtifactWriter {
+    fn new(file: File) -> Self {
+        Self {
+            inner: BufWriter::new(file),
+            byte_count: 0,
+            sha256: Sha256::new(),
+        }
+    }
+
+    fn finish(mut self, scratch: &TaxIdentitySidecarScratch) -> io::Result<(u64, String)> {
+        self.inner.flush()?;
+        self.inner.get_ref().sync_all()?;
+        let metadata_bytes = scratch.validate_opened_relation(self.inner.get_ref())?;
+        if metadata_bytes != self.byte_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity scratch byte count is inconsistent",
+            ));
+        }
+        let artifact_sha256 = sha256_hex(&self.sha256.finalize());
+        drop(self.inner);
+        Ok((metadata_bytes, artifact_sha256))
+    }
+}
+
+impl Write for TaxIdentityArtifactWriter {
+    fn write(&mut self, payload: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(payload)?;
+        self.byte_count = self.byte_count.checked_add(written as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity scratch byte count overflow",
+            )
+        })?;
+        self.sha256.update(&payload[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn emit_provider_group_tax_identity_sidecar<W: Write>(
     writer: &mut W,
     paths: &CopyPathConfig,
@@ -1872,14 +2650,10 @@ fn emit_provider_group_tax_identity_sidecar<W: Write>(
             "provider tax identity policy id is too long",
         )
     })?;
-    let temporary_path = format!("{output_path}.building");
+    let output_path_value = Path::new(output_path);
+    let (scratch, file) = TaxIdentitySidecarScratch::create(output_path_value)?;
     let result = (|| -> io::Result<Value> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary_path)?;
-        let mut artifact = BufWriter::new(file);
+        let mut artifact = TaxIdentityArtifactWriter::new(file);
         artifact.write_all(PROVIDER_GROUP_TAX_IDENTITY_MAGIC)?;
         artifact.write_all(&PROVIDER_GROUP_TAX_IDENTITY_VERSION.to_le_bytes())?;
         artifact.write_all(&PROVIDER_GROUP_TAX_IDENTITY_RECORD_BYTES.to_le_bytes())?;
@@ -1934,11 +2708,8 @@ fn emit_provider_group_tax_identity_sidecar<W: Write>(
                 ),
             ));
         }
-        artifact.flush()?;
-        drop(artifact);
-        let artifact_sha256 = sha256_hex(&sha256_file(Path::new(&temporary_path))?);
-        let artifact_bytes = std::fs::metadata(&temporary_path)?.len();
-        std::fs::rename(&temporary_path, output_path)?;
+        let (artifact_bytes, artifact_sha256) = artifact.finish(&scratch)?;
+        scratch.publish()?;
         Ok(json!({
             "path": output_path,
             "bytes": artifact_bytes,
@@ -1958,14 +2729,239 @@ fn emit_provider_group_tax_identity_sidecar<W: Write>(
             "final": true,
         }))
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary_path);
-    }
     emit_json_record(
         writer,
         "manifest_provider_group_tax_identity_sidecar_file",
         &result?,
     )?;
+    writer.flush()
+}
+
+const PROVIDER_GROUP_TAX_IDENTITY_V2_NORMALIZATION_CONTRACT: &str =
+    "ein_ascii_digits_or_2_7_hyphen_and_npi_10_ascii_digits_cms_80840_luhn_v2";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_TOKEN_MESSAGE_CONTRACT: &str =
+    "healthporta_ptg_tin_v1_nul_u16be_type_length_type_u16be_value_length_value";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_HMAC_CONTRACT: &str = "hmac_sha256_ptg_tin_v1";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_TIN_ID_128_CONTRACT: &str = "first_16_bytes(tin_hmac_sha256)";
+const PROVIDER_GROUP_TAX_IDENTITY_V2_FULL_HMAC_AUTHORITY_CONTRACT: &str =
+    "tin_hmac_sha256_full_32_bytes_authoritative";
+
+fn checked_tax_identity_v2_increment(count: &mut u64) -> io::Result<()> {
+    *count = count.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider tax identity v2 count overflow",
+        )
+    })?;
+    Ok(())
+}
+
+fn checked_tax_identity_v2_total(counts: [u64; 5]) -> io::Result<u64> {
+    counts.into_iter().try_fold(0u64, |total, count| {
+        total.checked_add(count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity v2 state total overflow",
+            )
+        })
+    })
+}
+
+fn validate_tax_identity_v1_v2_transition(
+    v1: TaxIdentityObservation,
+    v2: TaxIdentityObservationV2,
+) -> io::Result<()> {
+    let valid = match (v1.state, v2.state) {
+        (TaxIdentityState::MatchedEin, TaxIdentityStateV2::MatchedEin) => {
+            v1.tin_hmac_sha256.is_some() && v1.tin_hmac_sha256 == v2.tin_hmac_sha256
+        }
+        (TaxIdentityState::Missing, TaxIdentityStateV2::Missing)
+        | (TaxIdentityState::Malformed, TaxIdentityStateV2::Malformed) => {
+            v1.tin_hmac_sha256.is_none() && v2.tin_hmac_sha256.is_none()
+        }
+        (TaxIdentityState::UnsupportedType, TaxIdentityStateV2::MatchedNpi) => {
+            v1.tin_hmac_sha256.is_none() && v2.tin_hmac_sha256.is_some()
+        }
+        (
+            TaxIdentityState::UnsupportedType,
+            TaxIdentityStateV2::Malformed | TaxIdentityStateV2::UnsupportedType,
+        ) => v1.tin_hmac_sha256.is_none() && v2.tin_hmac_sha256.is_none(),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider tax identity v1/v2 transition is invalid",
+        ))
+    }
+}
+
+fn validate_tax_identity_v2_group_order(
+    previous_group_id: &mut Option<[u8; 16]>,
+    group_id: [u8; 16],
+) -> io::Result<()> {
+    if previous_group_id.is_some_and(|previous| previous >= group_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider tax identity v2 group ids must be strictly increasing",
+        ));
+    }
+    *previous_group_id = Some(group_id);
+    Ok(())
+}
+
+// The private scratch rename below is atomic for this one sidecar file. It is
+// not publication of an atomic multi-artifact or database bundle.
+fn emit_provider_group_tax_identity_v2_sidecar<W: Write>(
+    writer: &mut W,
+    paths: &CopyPathConfig,
+    dedupe: &SharedDedupe,
+) -> io::Result<()> {
+    let Some(output_path) = paths
+        .manifest_provider_group_tax_identity_v2_sidecar
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    let policy_id = dedupe
+        .provider_group_tax_identity_policy_id()
+        .ok_or_else(|| io::Error::other("provider tax identity policy is not configured"))?;
+    let header = TaxIdentitySidecarV2Header::new(policy_id.to_owned())?;
+    let output_path_value = Path::new(output_path);
+    let (scratch, file) = TaxIdentitySidecarScratch::create(output_path_value)?;
+    let result = (|| -> io::Result<Value> {
+        let mut artifact = TaxIdentityArtifactWriter::new(file);
+        artifact.write_all(&header.encode())?;
+        let mut row_count = 0u64;
+        let mut matched_ein_count = 0u64;
+        let mut matched_npi_count = 0u64;
+        let mut missing_count = 0u64;
+        let mut malformed_count = 0u64;
+        let mut unsupported_type_count = 0u64;
+        let mut previous_group_id = None;
+        dedupe.visit_provider_group_tax_identity_pairs(|group_hash, v1, observation| {
+            validate_tax_identity_v1_v2_transition(v1, observation)?;
+            let hmac = match (observation.state, observation.tin_hmac_sha256) {
+                (TaxIdentityStateV2::MatchedEin | TaxIdentityStateV2::MatchedNpi, Some(hmac)) => {
+                    hmac
+                }
+                (TaxIdentityStateV2::MatchedEin | TaxIdentityStateV2::MatchedNpi, None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "matched provider tax identity v2 is missing its token",
+                    ));
+                }
+                (_, None) => [0u8; 32],
+                (_, Some(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unavailable provider tax identity v2 carries a token",
+                    ));
+                }
+            };
+            let mut locator = [0u8; 16];
+            locator.copy_from_slice(&hmac[..16]);
+            let group_id = provider_group_global_id_from_hash(group_hash);
+            validate_tax_identity_v2_group_order(&mut previous_group_id, group_id.0)?;
+            let record =
+                TaxIdentitySidecarV2Record::new(group_id.0, observation.state, locator, hmac)?;
+            artifact.write_all(&record.encode())?;
+            checked_tax_identity_v2_increment(&mut row_count)?;
+            let state_count = match observation.state {
+                TaxIdentityStateV2::MatchedEin => &mut matched_ein_count,
+                TaxIdentityStateV2::MatchedNpi => &mut matched_npi_count,
+                TaxIdentityStateV2::Missing => &mut missing_count,
+                TaxIdentityStateV2::Malformed => &mut malformed_count,
+                TaxIdentityStateV2::UnsupportedType => &mut unsupported_type_count,
+            };
+            checked_tax_identity_v2_increment(state_count)
+        })?;
+        let expected_count = dedupe.unique_provider_group_count();
+        if row_count != expected_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "provider tax identity v2 row count {row_count} does not match provider group count {expected_count}",
+                ),
+            ));
+        }
+        let state_total = checked_tax_identity_v2_total([
+            matched_ein_count,
+            matched_npi_count,
+            missing_count,
+            malformed_count,
+            unsupported_type_count,
+        ])?;
+        if state_total != row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider tax identity v2 state counts do not match its row count",
+            ));
+        }
+        let (artifact_bytes, artifact_sha256) = artifact.finish(&scratch)?;
+        scratch.publish()?;
+        Ok(json!({
+            "path": output_path,
+            "bytes": artifact_bytes,
+            "row_count": row_count,
+            "provider_group_count": expected_count,
+            "matched_ein_count": matched_ein_count,
+            "matched_npi_count": matched_npi_count,
+            "missing_count": missing_count,
+            "malformed_count": malformed_count,
+            "unsupported_type_count": unsupported_type_count,
+            "format": TAX_IDENTITY_SIDECAR_V2_FORMAT,
+            "version": TAX_IDENTITY_SIDECAR_V2_FORMAT_VERSION,
+            "record_bytes": TAX_IDENTITY_SIDECAR_V2_RECORD_BYTES,
+            "token_policy_id": policy_id,
+            "normalization_contract": PROVIDER_GROUP_TAX_IDENTITY_V2_NORMALIZATION_CONTRACT,
+            "token_message_contract": PROVIDER_GROUP_TAX_IDENTITY_V2_TOKEN_MESSAGE_CONTRACT,
+            "hmac_contract": PROVIDER_GROUP_TAX_IDENTITY_V2_HMAC_CONTRACT,
+            "tin_id_128_contract": PROVIDER_GROUP_TAX_IDENTITY_V2_TIN_ID_128_CONTRACT,
+            "full_hmac_authority_contract":
+                PROVIDER_GROUP_TAX_IDENTITY_V2_FULL_HMAC_AUTHORITY_CONTRACT,
+            "sha256": artifact_sha256,
+            "final": true,
+        }))
+    })();
+    emit_json_record(
+        writer,
+        "manifest_provider_group_tax_identity_v2_sidecar_file",
+        &result?,
+    )?;
+    writer.flush()
+}
+
+fn emit_provider_group_tax_identity_sidecars<W: Write>(
+    writer: &mut W,
+    paths: &CopyPathConfig,
+    dedupe: &SharedDedupe,
+) -> io::Result<()> {
+    let has_v1 = paths.manifest_provider_group_tax_identity_sidecar.is_some();
+    let has_v2 = paths
+        .manifest_provider_group_tax_identity_v2_sidecar
+        .is_some();
+    if has_v2 && !has_v1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider-group tax identity v2 output requires the v1 sidecar path",
+        ));
+    }
+    if !has_v2 {
+        return emit_provider_group_tax_identity_sidecar(writer, paths, dedupe);
+    }
+
+    // Buffer success frames so none is attempted before both per-file scratch
+    // renames succeed. The two final renames are not bundle-atomic: a later
+    // failure can leave a complete orphan final as a scratch asset for bundle
+    // admission/recovery. Finals are never deleted here. A later frame-write
+    // failure fails the scan but can still leave a partially written frame.
+    let mut buffered_events = Vec::new();
+    emit_provider_group_tax_identity_sidecar(&mut buffered_events, paths, dedupe)?;
+    emit_provider_group_tax_identity_v2_sidecar(&mut buffered_events, paths, dedupe)?;
+    writer.write_all(&buffered_events)?;
     writer.flush()
 }
 
@@ -10643,6 +11639,30 @@ fn scan_compact_byte_top_level_parallel(
         env_usize("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES", DEFAULT_RAW_CHUNK_BYTES);
     let provider_ref_worker_count =
         env_usize("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", worker_count).max(1);
+    if copy_paths
+        .manifest_provider_group_tax_identity_sidecar
+        .is_some()
+        || copy_paths
+            .manifest_provider_group_tax_identity_v2_sidecar
+            .is_some()
+    {
+        let token_secret_path = env::var(TIN_TOKEN_SECRET_FILE_ENV).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PTG TIN token secret file must be configured",
+            )
+        })?;
+        let source_witness_scratch_path =
+            env::var_os("HLTHPRT_PTG2_SOURCE_WITNESS_SCRATCH_DIR").map(PathBuf::from);
+        validate_runtime_tax_identity_output_paths(
+            &copy_paths,
+            path,
+            Path::new(&token_secret_path),
+            source_witness_scratch_path.as_deref(),
+            worker_count,
+            provider_ref_worker_count,
+        )?;
+    }
     context
         .source_witness
         .configure_provider_spools(provider_ref_worker_count)?;
@@ -10677,6 +11697,9 @@ fn scan_compact_byte_top_level_parallel(
         worker_count,
         !copy_paths.manifest_only,
         factor_mode,
+        copy_paths
+            .manifest_provider_group_tax_identity_v2_sidecar
+            .is_some(),
     )?);
     let provider_graph_v4_factor_cache = Arc::new(
         V4ProviderSetFactorSharedCache::configured_for_mode(factor_mode)?,
@@ -11478,7 +12501,7 @@ fn scan_compact_byte_top_level_parallel(
                         }
                     }
                     emit_dedupe_summary(&dedupe, &object_counts);
-                    emit_provider_group_tax_identity_sidecar(&mut writer, &copy_paths, &dedupe)?;
+                    emit_provider_group_tax_identity_sidecars(&mut writer, &copy_paths, &dedupe)?;
                     if let Some(sidecars) = manifest_sidecars.as_ref() {
                         let sidecar_finalize_started_at = Instant::now();
                         let sidecar_lock_started_at = Instant::now();
@@ -24692,6 +25715,8 @@ mod tests {
             TestEnvVar::remove("HLTHPRT_PTG2_MANIFEST_PROVIDER_SET_COMPONENT_SIDECAR_PATH");
         let _component_path_absent =
             TestEnvVar::remove("HLTHPRT_PTG2_MANIFEST_PROVIDER_COMPONENT_GROUP_SIDECAR_PATH");
+        let _tax_identity_v2_path_absent =
+            TestEnvVar::remove(PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV);
 
         let missing_paths_error = CopyPathConfig::from_env().err().unwrap();
         assert!(missing_paths_error
@@ -24718,8 +25743,17 @@ mod tests {
             "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_TAX_IDENTITY_SIDECAR_PATH",
             tax_identity_path.to_str().unwrap(),
         );
+        let tax_identity_v2_path = directory.join("provider-group-tax-identity-v2.ptg2tax");
+        let _tax_identity_v2_path = TestEnvVar::set(
+            PROVIDER_GROUP_TAX_IDENTITY_V2_SIDECAR_PATH_ENV,
+            tax_identity_v2_path.to_str().unwrap(),
+        );
         let config = CopyPathConfig::from_env().unwrap();
         assert!(configured_v4_factor_mode(&config).unwrap());
+        assert_eq!(
+            config.manifest_provider_group_tax_identity_v2_sidecar,
+            Some(tax_identity_v2_path.display().to_string())
+        );
     }
 
     #[test]
@@ -24736,7 +25770,9 @@ mod tests {
         );
         let _missing_secret = TestEnvVar::remove("HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE");
 
-        let missing = configured_shared_dedupe(2, false, true).err().unwrap();
+        let missing = configured_shared_dedupe(2, false, true, false)
+            .err()
+            .unwrap();
         assert_eq!(missing.kind(), io::ErrorKind::InvalidInput);
         assert!(!output_path.exists());
 
@@ -24745,7 +25781,9 @@ mod tests {
             "HLTHPRT_PTG2_TIN_TOKEN_SECRET_FILE",
             secret_path.to_str().unwrap(),
         );
-        let malformed = configured_shared_dedupe(2, false, true).err().unwrap();
+        let malformed = configured_shared_dedupe(2, false, true, false)
+            .err()
+            .unwrap();
         assert_eq!(malformed.kind(), io::ErrorKind::InvalidInput);
         assert!(!malformed
             .to_string()
@@ -24753,7 +25791,9 @@ mod tests {
         assert!(!output_path.exists());
 
         std::fs::write(&secret_path, [9u8; 33]).unwrap();
-        let oversized = configured_shared_dedupe(2, false, true).err().unwrap();
+        let oversized = configured_shared_dedupe(2, false, true, false)
+            .err()
+            .unwrap();
         assert_eq!(oversized.kind(), io::ErrorKind::InvalidInput);
         assert!(!oversized
             .to_string()
@@ -24761,7 +25801,30 @@ mod tests {
         assert!(!output_path.exists());
 
         std::fs::write(&secret_path, [9u8; 32]).unwrap();
-        configured_shared_dedupe(2, false, true).unwrap();
+        let v1 = configured_shared_dedupe(2, false, true, false).unwrap();
+        let mut paired_visits = 0;
+        let mut accept_pair = |_, _, _| {
+            paired_visits += 1;
+            Ok(())
+        };
+        assert!(v1
+            .visit_provider_group_tax_identity_pairs(&mut accept_pair)
+            .is_err());
+        let paired = configured_shared_dedupe(2, false, true, true).unwrap();
+        paired
+            .insert_provider_group_with_tax_identity(1, None)
+            .unwrap();
+        assert!(paired
+            .visit_provider_group_tax_identity_pairs(&mut accept_pair)
+            .is_ok());
+        assert_eq!(paired_visits, 1);
+        assert_eq!(
+            configured_shared_dedupe(2, false, false, true)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert!(!output_path.exists());
 
         let _ = std::fs::remove_dir_all(directory);
@@ -24786,6 +25849,9 @@ mod tests {
             ),
             manifest_provider_group_tax_identity_sidecar: Some(
                 "provider-group-tax-identity.sidecar".to_string(),
+            ),
+            manifest_provider_group_tax_identity_v2_sidecar: Some(
+                "provider-group-tax-identity-v2.sidecar".to_string(),
             ),
             manifest_provider_npi_sidecar: Some("provider-npi.copy".to_string()),
             manifest_price_forward_sidecar: Some("price-forward.copy".to_string()),
@@ -24887,6 +25953,10 @@ mod tests {
             paths.manifest_provider_group_tax_identity_sidecar
         );
         assert_eq!(
+            worker_paths.manifest_provider_group_tax_identity_v2_sidecar,
+            paths.manifest_provider_group_tax_identity_v2_sidecar
+        );
+        assert_eq!(
             worker_paths.manifest_provider_npi_sidecar,
             paths.manifest_provider_npi_sidecar
         );
@@ -24942,6 +26012,7 @@ mod tests {
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
             manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_v2_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -24998,7 +26069,16 @@ mod tests {
             manifest_provider_inverted_sidecar: None,
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
-            manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_sidecar: Some(
+                base.join("provider-group-tax-identity.sidecar")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            manifest_provider_group_tax_identity_v2_sidecar: Some(
+                base.join("provider-group-tax-identity-v2.sidecar")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: Some(base.join("unused-price.copy").to_string_lossy().to_string()),
@@ -25026,6 +26106,14 @@ mod tests {
         };
 
         let provider_ref_paths = paths.for_provider_refs();
+        assert_eq!(
+            provider_ref_paths.manifest_provider_group_tax_identity_sidecar,
+            paths.manifest_provider_group_tax_identity_sidecar
+        );
+        assert_eq!(
+            provider_ref_paths.manifest_provider_group_tax_identity_v2_sidecar,
+            paths.manifest_provider_group_tax_identity_v2_sidecar
+        );
         let mut sinks = DictionaryCopySinks::from_paths(&provider_ref_paths, 0).unwrap();
         let dedupe = SharedDedupe::new(1);
         let provider_ref = json!({
@@ -25183,6 +26271,504 @@ mod tests {
         assert!(!first_event.contains("opaque"));
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn synthetic_v2_tax_identity_dedupe(
+        worker_count: usize,
+        paired: bool,
+        reverse: bool,
+    ) -> SharedDedupe {
+        let policy =
+            TinTokenPolicy::from_secret("ptg-tin-hmac-sha256-v1:test-v2".to_string(), [8u8; 32])
+                .unwrap();
+        let dedupe = if paired {
+            SharedDedupe::new_with_v4_paired_tax_identity(worker_count, false, policy)
+        } else {
+            SharedDedupe::new_with_v4_tax_identity(worker_count, false, policy)
+        };
+        let mut rows = vec![
+            (
+                10,
+                Some(json!({
+                    "type": "ein",
+                    "value": "12-3456789",
+                    "business_name": "Private Synthetic Practice One"
+                })),
+            ),
+            (
+                10,
+                Some(json!({
+                    "type": " EIN ",
+                    "value": "123456789",
+                    "business_name": "Private Synthetic Practice Two"
+                })),
+            ),
+            (11, Some(json!({"type": "npi", "value": "1000000491"}))),
+            (12, Some(json!({"type": "npi", "value": "1000000492"}))),
+            (13, None),
+            (
+                14,
+                Some(json!({
+                    "type": "other",
+                    "value": "private-unsupported-marker"
+                })),
+            ),
+        ];
+        if reverse {
+            rows.reverse();
+        }
+        for (group_hash, tin) in rows {
+            dedupe
+                .insert_provider_group_with_tax_identity(group_hash, tin.as_ref())
+                .unwrap();
+        }
+        dedupe
+    }
+
+    fn emit_synthetic_v2_tax_identity_artifacts(
+        directory: &Path,
+        label: &str,
+        worker_count: usize,
+        reverse: bool,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let dedupe = synthetic_v2_tax_identity_dedupe(worker_count, true, reverse);
+        let v1_path = directory.join(format!("{label}-v1.ptg2tax"));
+        let v2_path = directory.join(format!("{label}-v2.ptg2tax"));
+        let paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_sidecar: Some(v1_path.display().to_string()),
+            manifest_provider_group_tax_identity_v2_sidecar: Some(v2_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let mut events = Vec::new();
+        emit_provider_group_tax_identity_sidecars(&mut events, &paths, &dedupe).unwrap();
+        (
+            std::fs::read(v1_path).unwrap(),
+            std::fs::read(v2_path).unwrap(),
+            events,
+        )
+    }
+
+    #[test]
+    fn v2_tax_identity_sidecar_is_opt_in_deterministic_private_and_v1_compatible() {
+        let directory = tempfile::tempdir().unwrap();
+        let v1_path = directory.path().join("v1-only.ptg2tax");
+        let v1_paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_sidecar: Some(v1_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let v1_dedupe = synthetic_v2_tax_identity_dedupe(2, false, false);
+        let mut direct_v1_event = Vec::new();
+        emit_provider_group_tax_identity_sidecar(&mut direct_v1_event, &v1_paths, &v1_dedupe)
+            .unwrap();
+        let direct_v1_bytes = std::fs::read(&v1_path).unwrap();
+        let paired_v1_dedupe = synthetic_v2_tax_identity_dedupe(8, true, true);
+        let mut paired_v1_event = Vec::new();
+        emit_provider_group_tax_identity_sidecar(
+            &mut paired_v1_event,
+            &v1_paths,
+            &paired_v1_dedupe,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&v1_path).unwrap(), direct_v1_bytes);
+        assert_eq!(paired_v1_event, direct_v1_event);
+        let mut delegated_v1_event = Vec::new();
+        emit_provider_group_tax_identity_sidecars(&mut delegated_v1_event, &v1_paths, &v1_dedupe)
+            .unwrap();
+        assert_eq!(delegated_v1_event, direct_v1_event);
+        assert_eq!(std::fs::read(&v1_path).unwrap(), direct_v1_bytes);
+        let delegated_v1_text = String::from_utf8(delegated_v1_event.clone()).unwrap();
+        assert_eq!(
+            delegated_v1_text
+                .matches("manifest_provider_group_tax_identity_sidecar_file")
+                .count(),
+            1
+        );
+        assert!(!delegated_v1_text.contains("tax_identity_v2_sidecar_file"));
+        let mut absent_v2_event = Vec::new();
+        emit_provider_group_tax_identity_v2_sidecar(
+            &mut absent_v2_event,
+            &CopyPathConfig::default(),
+            &v1_dedupe,
+        )
+        .unwrap();
+        assert!(absent_v2_event.is_empty());
+
+        let (paired_v1, first_v2, first_events) =
+            emit_synthetic_v2_tax_identity_artifacts(directory.path(), "first", 1, false);
+        let (reversed_v1, reversed_v2, _reversed_events) =
+            emit_synthetic_v2_tax_identity_artifacts(directory.path(), "reversed", 8, true);
+        assert_eq!(paired_v1, direct_v1_bytes);
+        assert_eq!(reversed_v1, direct_v1_bytes);
+        assert_eq!(reversed_v2, first_v2);
+        let frozen_v2_sha256 = "c7a3b0b0bbae41ed968bda60a91a2d03717f0f225e1130b3565bfab9a619a204";
+        assert_eq!(first_v2.len(), 368);
+        assert_eq!(sha256_hex(&Sha256::digest(&first_v2)), frozen_v2_sha256);
+        assert!(!directory.path().join("first-v1.ptg2tax.building").exists());
+        assert!(!directory.path().join("first-v2.ptg2tax.building").exists());
+
+        let mut validator =
+            ptg2_scanner::tax_identity_sidecar_v2::TaxIdentitySidecarV2StreamValidator::new(
+                Cursor::new(&first_v2),
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            validator.header().policy_id(),
+            "ptg-tin-hmac-sha256-v1:test-v2"
+        );
+        let mut state_codes = Vec::new();
+        while let Some(record) = validator.next_record().unwrap() {
+            state_codes.push(record.state() as u8);
+        }
+        state_codes.sort_unstable();
+        assert_eq!(state_codes, vec![1, 2, 3, 4, 5]);
+        assert_eq!(validator.records_validated(), 5);
+
+        let events = String::from_utf8(first_events).unwrap();
+        let v1_event_offset = events
+            .find("manifest_provider_group_tax_identity_sidecar_file")
+            .unwrap();
+        let v2_event_offset = events
+            .find("manifest_provider_group_tax_identity_v2_sidecar_file")
+            .unwrap();
+        assert!(v1_event_offset < v2_event_offset);
+        let v2_frame = &events[v2_event_offset..];
+        let v2_header_end = v2_frame.find('\n').unwrap();
+        let v2_payload_bytes = v2_frame[..v2_header_end]
+            .rsplit_once('\t')
+            .unwrap()
+            .1
+            .parse::<usize>()
+            .unwrap();
+        let v2_payload_start = v2_header_end + 1;
+        let v2_metadata: Value =
+            serde_json::from_str(&v2_frame[v2_payload_start..v2_payload_start + v2_payload_bytes])
+                .unwrap();
+        let expected_v2_metadata = json!({
+            "path": directory.path().join("first-v2.ptg2tax").display().to_string(),
+            "bytes": 368,
+            "row_count": 5,
+            "provider_group_count": 5,
+            "matched_ein_count": 1,
+            "matched_npi_count": 1,
+            "missing_count": 1,
+            "malformed_count": 1,
+            "unsupported_type_count": 1,
+            "format": "ptg2_provider_group_tax_identity_v2",
+            "version": 2,
+            "record_bytes": 65,
+            "token_policy_id": "ptg-tin-hmac-sha256-v1:test-v2",
+            "normalization_contract":
+                "ein_ascii_digits_or_2_7_hyphen_and_npi_10_ascii_digits_cms_80840_luhn_v2",
+            "token_message_contract":
+                "healthporta_ptg_tin_v1_nul_u16be_type_length_type_u16be_value_length_value",
+            "hmac_contract": "hmac_sha256_ptg_tin_v1",
+            "tin_id_128_contract": "first_16_bytes(tin_hmac_sha256)",
+            "full_hmac_authority_contract":
+                "tin_hmac_sha256_full_32_bytes_authoritative",
+            "sha256": frozen_v2_sha256,
+            "final": true,
+        });
+        assert_eq!(v2_metadata, expected_v2_metadata);
+        let expected_v2_payload = serde_json::to_vec(&expected_v2_metadata).unwrap();
+        let mut expected_v2_frame = format!(
+            "manifest_provider_group_tax_identity_v2_sidecar_file\t{}\n",
+            expected_v2_payload.len()
+        )
+        .into_bytes();
+        expected_v2_frame.extend_from_slice(&expected_v2_payload);
+        expected_v2_frame.push(b'\n');
+        assert_eq!(v2_frame.as_bytes(), expected_v2_frame);
+        for private in [
+            "12-3456789",
+            "123456789",
+            "1000000491",
+            "1000000492",
+            "private-unsupported-marker",
+            "Private Synthetic Practice One",
+            "Private Synthetic Practice Two",
+        ] {
+            assert!(!events.contains(private));
+            assert!(!paired_v1
+                .windows(private.len())
+                .any(|window| window == private.as_bytes()));
+            assert!(!first_v2
+                .windows(private.len())
+                .any(|window| window == private.as_bytes()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tax_identity_writers_preserve_symlink_and_hardlink_scratch_sentinels() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let dedupe = synthetic_v2_tax_identity_dedupe(2, true, false);
+        for version in ["v1", "v2"] {
+            for relation_kind in ["symlink", "hardlink"] {
+                let label = format!("{version}-{relation_kind}");
+                let sentinel = directory.path().join(format!("{label}-sentinel"));
+                let output = directory.path().join(format!("{label}.ptg2tax"));
+                let legacy_scratch = PathBuf::from(format!("{}.building", output.display()));
+                let sentinel_bytes = format!("{label}-sentinel-bytes").into_bytes();
+                std::fs::write(&sentinel, &sentinel_bytes).unwrap();
+                if relation_kind == "symlink" {
+                    symlink(&sentinel, &legacy_scratch).unwrap();
+                } else {
+                    std::fs::hard_link(&sentinel, &legacy_scratch).unwrap();
+                }
+                let paths = if version == "v1" {
+                    CopyPathConfig {
+                        manifest_provider_group_tax_identity_sidecar: Some(
+                            output.display().to_string(),
+                        ),
+                        ..CopyPathConfig::default()
+                    }
+                } else {
+                    CopyPathConfig {
+                        manifest_provider_group_tax_identity_v2_sidecar: Some(
+                            output.display().to_string(),
+                        ),
+                        ..CopyPathConfig::default()
+                    }
+                };
+                let mut events = Vec::new();
+                let error = if version == "v1" {
+                    emit_provider_group_tax_identity_sidecar(&mut events, &paths, &dedupe)
+                        .unwrap_err()
+                } else {
+                    emit_provider_group_tax_identity_v2_sidecar(&mut events, &paths, &dedupe)
+                        .unwrap_err()
+                };
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                assert!(events.is_empty());
+                assert!(!output.exists());
+                assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_bytes);
+                assert!(std::fs::symlink_metadata(&legacy_scratch).is_ok());
+                assert!(!error
+                    .to_string()
+                    .contains(directory.path().to_str().unwrap()));
+                for private in ["12-3456789", "1000000491", "Private Synthetic Practice One"] {
+                    assert!(!error.to_string().contains(private));
+                }
+                std::fs::remove_file(&legacy_scratch).unwrap();
+            }
+        }
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ptg2-tax-identity-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tax_identity_private_scratch_rejects_post_open_link_and_path_replacement() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("hardlink.ptg2tax");
+        let (scratch, file) = TaxIdentitySidecarScratch::create(&output).unwrap();
+        assert_eq!(
+            std::fs::metadata(scratch.directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&scratch.artifact_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let hardlink = scratch.directory.path().join("artifact-hardlink");
+        std::fs::hard_link(&scratch.artifact_path, &hardlink).unwrap();
+        let mut writer = TaxIdentityArtifactWriter::new(file);
+        writer.write_all(b"hardlink-scratch").unwrap();
+        let error = writer.finish(&scratch).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::metadata(&scratch.artifact_path).unwrap().nlink(),
+            2
+        );
+        drop(scratch);
+        assert!(!output.exists());
+
+        let output = directory.path().join("pathname.ptg2tax");
+        let sentinel = directory.path().join("pathname-sentinel");
+        std::fs::write(&sentinel, b"pathname-sentinel").unwrap();
+        let (scratch, file) = TaxIdentitySidecarScratch::create(&output).unwrap();
+        std::fs::remove_file(&scratch.artifact_path).unwrap();
+        symlink(&sentinel, &scratch.artifact_path).unwrap();
+        let mut writer = TaxIdentityArtifactWriter::new(file);
+        writer.write_all(b"unlinked-owned-scratch").unwrap();
+        let error = writer.finish(&scratch).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"pathname-sentinel");
+        drop(scratch);
+        assert!(!output.exists());
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ptg2-tax-identity-")));
+    }
+
+    #[test]
+    fn v2_tax_identity_failure_emits_no_buffered_success_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let v1_path = directory.path().join("orphan-v1.ptg2tax");
+        let v2_path = directory.path().join("v2-final-directory");
+        std::fs::create_dir(&v2_path).unwrap();
+        let paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_sidecar: Some(v1_path.display().to_string()),
+            manifest_provider_group_tax_identity_v2_sidecar: Some(v2_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let dedupe = synthetic_v2_tax_identity_dedupe(1, true, false);
+        let mut events = Vec::new();
+
+        let error =
+            emit_provider_group_tax_identity_sidecars(&mut events, &paths, &dedupe).unwrap_err();
+
+        assert!(events.is_empty());
+        assert!(v1_path.is_file());
+        assert!(v2_path.is_dir());
+        assert!(!PathBuf::from(format!("{}.building", v2_path.display())).exists());
+        for private in ["12-3456789", "1000000491", "Private Synthetic Practice One"] {
+            assert!(!error.to_string().contains(private));
+        }
+
+        let v2_only_path = directory.path().join("v2-only.ptg2tax");
+        let v2_only_paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_v2_sidecar: Some(
+                v2_only_path.display().to_string(),
+            ),
+            ..CopyPathConfig::default()
+        };
+        let mut v2_only_events = Vec::new();
+        let v2_only_error =
+            emit_provider_group_tax_identity_sidecars(&mut v2_only_events, &v2_only_paths, &dedupe)
+                .unwrap_err();
+        assert_eq!(v2_only_error.kind(), io::ErrorKind::InvalidInput);
+        assert!(v2_only_events.is_empty());
+        assert!(!v2_only_path.exists());
+        assert!(!PathBuf::from(format!("{}.building", v2_only_path.display())).exists());
+    }
+
+    #[test]
+    fn v2_tax_identity_writer_helpers_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let v2_path = directory.path().join("unconfigured-v2.ptg2tax");
+        let paths = CopyPathConfig {
+            manifest_provider_group_tax_identity_v2_sidecar: Some(v2_path.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let mut events = Vec::new();
+        let unconfigured = SharedDedupe::new(1);
+        let error = emit_provider_group_tax_identity_v2_sidecar(&mut events, &paths, &unconfigured)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(events.is_empty());
+        assert!(!v2_path.exists());
+        assert!(!PathBuf::from(format!("{}.building", v2_path.display())).exists());
+
+        let lexical_parent = directory.path().join("lexical-parent");
+        assert_eq!(
+            normalized_absolute_lexical_path_value(
+                &lexical_parent.join("discarded").join("..").join("artifact")
+            )
+            .unwrap(),
+            lexical_parent.join("artifact")
+        );
+        assert_eq!(
+            publication_coordinate(Path::new("/")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let missing_publication_name = TaxIdentitySidecarScratch::create(Path::new("/"))
+            .err()
+            .unwrap();
+        assert_eq!(missing_publication_name.kind(), io::ErrorKind::InvalidInput);
+
+        let unresolved_collision_path = directory
+            .path()
+            .join("missing-collision-parent")
+            .join("artifact");
+        let unresolved_collision = RuntimeCollisionPath::new(&unresolved_collision_path)
+            .err()
+            .unwrap();
+        assert_eq!(unresolved_collision.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            unresolved_collision.to_string(),
+            "tax identity collision coordinate could not be resolved"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlink_loop = directory.path().join("collision-symlink-loop");
+            symlink(&symlink_loop, &symlink_loop).unwrap();
+            let loop_collision = RuntimeCollisionPath::new(&symlink_loop).err().unwrap();
+            assert_eq!(loop_collision.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                loop_collision.to_string(),
+                "tax identity collision coordinate could not be resolved"
+            );
+            std::fs::remove_file(symlink_loop).unwrap();
+        }
+
+        let overflow_path = directory.path().join("overflow.ptg2tax");
+        let (overflow_scratch, overflow_file) =
+            TaxIdentitySidecarScratch::create(&overflow_path).unwrap();
+        let mut overflow_writer = TaxIdentityArtifactWriter::new(overflow_file);
+        overflow_writer.flush().unwrap();
+        overflow_writer.byte_count = u64::MAX;
+        assert_eq!(
+            overflow_writer.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(overflow_writer);
+        drop(overflow_scratch);
+        assert!(!overflow_path.exists());
+
+        let mut maximum = u64::MAX;
+        assert_eq!(
+            checked_tax_identity_v2_increment(&mut maximum)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            checked_tax_identity_v2_total([u64::MAX, 1, 0, 0, 0])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut previous = None;
+        validate_tax_identity_v2_group_order(&mut previous, [2; 16]).unwrap();
+        assert!(validate_tax_identity_v2_group_order(&mut previous, [2; 16]).is_err());
+        previous = Some([2; 16]);
+        assert!(validate_tax_identity_v2_group_order(&mut previous, [1; 16]).is_err());
+
+        let invalid_v1 = TaxIdentityObservation {
+            state: TaxIdentityState::MatchedEin,
+            tin_hmac_sha256: Some([1; 32]),
+        };
+        let invalid_v2 = TaxIdentityObservationV2 {
+            state: TaxIdentityStateV2::MatchedNpi,
+            tin_hmac_sha256: Some([1; 32]),
+        };
+        assert!(validate_tax_identity_v1_v2_transition(invalid_v1, invalid_v2).is_err());
     }
 
     #[test]
@@ -27044,6 +28630,7 @@ mod tests {
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
             manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_v2_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -27683,6 +29270,7 @@ mod tests {
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
             manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_v2_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -27813,6 +29401,7 @@ mod tests {
             manifest_provider_set_component_sidecar: None,
             manifest_provider_component_group_sidecar: None,
             manifest_provider_group_tax_identity_sidecar: None,
+            manifest_provider_group_tax_identity_v2_sidecar: None,
             manifest_provider_npi_sidecar: None,
             manifest_price_forward_sidecar: None,
             manifest_price_atom: None,
@@ -35640,6 +37229,9 @@ mod tests {
             |config| config.manifest_provider_set_component_sidecar = Some("path".to_owned()),
             |config| config.manifest_provider_component_group_sidecar = Some("path".to_owned()),
             |config| config.manifest_provider_group_tax_identity_sidecar = Some("path".to_owned()),
+            |config| {
+                config.manifest_provider_group_tax_identity_v2_sidecar = Some("path".to_owned())
+            },
             |config| config.manifest_provider_npi_sidecar = Some("path".to_owned()),
             |config| config.manifest_price_forward_sidecar = Some("path".to_owned()),
             |config| config.manifest_price_atom = Some("path".to_owned()),
@@ -35686,6 +37278,253 @@ mod tests {
             ..CopyPathConfig::default()
         };
         assert!(configured_v4_factor_mode(&missing_tax).is_err());
+    }
+
+    #[test]
+    fn v2_tax_identity_paths_require_v4_v1_and_distinct_final_and_temporary_paths() {
+        let _lock = scanner_env_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path_text = |name: &str| directory.path().join(name).display().to_string();
+        let paths = |v1: Option<String>, v2: Option<String>| CopyPathConfig {
+            manifest_provider_set_component_sidecar: Some(path_text("set")),
+            manifest_provider_component_group_sidecar: Some(path_text("component")),
+            manifest_provider_group_tax_identity_sidecar: v1,
+            manifest_provider_group_tax_identity_v2_sidecar: v2,
+            ..CopyPathConfig::default()
+        };
+
+        let _disabled = TestEnvVar::set(PROVIDER_GRAPH_V4_ENV, "false");
+        assert!(
+            configured_v4_factor_mode(&paths(Some(path_text("v1")), Some(path_text("v2")),))
+                .is_err()
+        );
+
+        let _enabled = TestEnvVar::set(PROVIDER_GRAPH_V4_ENV, "true");
+        assert!(configured_v4_factor_mode(&paths(None, Some(path_text("v2")))).is_err());
+        assert!(
+            configured_v4_factor_mode(&paths(Some(path_text("v1")), Some(path_text("v2")),))
+                .unwrap()
+        );
+
+        for (v1, v2) in [
+            (path_text("same"), path_text("same")),
+            (path_text("cross.building"), path_text("cross")),
+            (path_text("reverse"), path_text("reverse.building")),
+            (
+                path_text("unused/../lexical-alias"),
+                path_text("lexical-alias"),
+            ),
+            (
+                "/tmp/ptg2-root-aware-alias".to_string(),
+                "/../tmp/ptg2-root-aware-alias".to_string(),
+            ),
+        ] {
+            let error = configured_v4_factor_mode(&paths(Some(v1), Some(v2)))
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("must differ"));
+        }
+
+        let final_alias = paths(Some(path_text("v1")), Some(path_text("set")));
+        assert!(configured_v4_factor_mode(&final_alias).is_err());
+        let v1_only_final_alias = paths(Some(path_text("set")), None);
+        assert!(configured_v4_factor_mode(&v1_only_final_alias).is_err());
+        let mut temporary_alias =
+            paths(Some(path_text("v1")), Some(path_text("v2-temporary-alias")));
+        temporary_alias.manifest_provider_component_group_sidecar =
+            Some(path_text("v2-temporary-alias.building"));
+        assert!(configured_v4_factor_mode(&temporary_alias).is_err());
+    }
+
+    #[test]
+    fn tax_identity_runtime_paths_reject_inputs_workers_rotations_and_reserved_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.json");
+        let secret_path = directory.path().join("token-secret.bin");
+        let price_base = directory.path().join("price-atom.copy");
+        let provider_group_base = directory.path().join("provider-group-member.copy");
+        let factor_sidecar = directory.path().join("provider-set-component.sidecar");
+        let v1_path = directory.path().join("tax-v1.ptg2tax");
+        let serving_directory = directory.path().join("serving");
+        let witness_scratch = directory.path().join("witness-scratch");
+        std::fs::write(&source_path, b"source-sentinel").unwrap();
+        std::fs::write(&secret_path, b"secret-sentinel").unwrap();
+        std::fs::create_dir(&serving_directory).unwrap();
+        std::fs::create_dir(&witness_scratch).unwrap();
+
+        let base_paths = CopyPathConfig {
+            v3_serving_run_directory: Some(serving_directory.display().to_string()),
+            manifest_provider_group_tax_identity_sidecar: Some(v1_path.display().to_string()),
+            manifest_provider_set_component_sidecar: Some(factor_sidecar.display().to_string()),
+            manifest_price_atom: Some(price_base.display().to_string()),
+            manifest_provider_group_member: Some(provider_group_base.display().to_string()),
+            ..CopyPathConfig::default()
+        };
+        let collision_cases = [
+            (source_path.clone(), "raw_input"),
+            (secret_path.clone(), "token_secret"),
+            (
+                PathBuf::from(format!("{}.worker0000", price_base.display())),
+                "manifest_price_atom.worker0000",
+            ),
+            (
+                PathBuf::from(format!(
+                    "{}.worker0000.part000000.ready",
+                    price_base.display()
+                )),
+                "manifest_price_atom.worker0000",
+            ),
+            (
+                PathBuf::from(format!(
+                    "{}.provider_refs.worker0000",
+                    provider_group_base.display()
+                )),
+                "manifest_provider_group_member.provider_refs.worker0000",
+            ),
+            (
+                factor_sidecar.clone(),
+                "manifest_provider_set_component_sidecar.final",
+            ),
+            (
+                serving_directory.join("tax-v2.ptg2tax"),
+                "serving_run_directory",
+            ),
+            (
+                witness_scratch.join("tax-v2.ptg2tax"),
+                "source_witness_scratch",
+            ),
+        ];
+        for (candidate, expected_conflict) in collision_cases {
+            let mut paths = base_paths.clone();
+            paths.manifest_provider_group_tax_identity_v2_sidecar =
+                Some(candidate.display().to_string());
+            let error = validate_runtime_tax_identity_output_paths(
+                &paths,
+                &source_path,
+                &secret_path,
+                Some(&witness_scratch),
+                2,
+                2,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(expected_conflict));
+            assert!(!error
+                .to_string()
+                .contains(directory.path().to_str().unwrap()));
+            assert_eq!(std::fs::read(&source_path).unwrap(), b"source-sentinel");
+            assert_eq!(std::fs::read(&secret_path).unwrap(), b"secret-sentinel");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let source_hardlink = directory.path().join("source-hardlink");
+            std::fs::hard_link(&source_path, &source_hardlink).unwrap();
+            let mut hardlink_paths = base_paths.clone();
+            hardlink_paths.manifest_provider_group_tax_identity_v2_sidecar =
+                Some(source_hardlink.display().to_string());
+            assert!(validate_runtime_tax_identity_output_paths(
+                &hardlink_paths,
+                &source_path,
+                &secret_path,
+                Some(&witness_scratch),
+                1,
+                1,
+            )
+            .is_err());
+
+            let actual_parent = directory.path().join("canonical-parent");
+            let alias_parent = directory.path().join("canonical-parent-alias");
+            std::fs::create_dir(&actual_parent).unwrap();
+            symlink(&actual_parent, &alias_parent).unwrap();
+            let canonical_source = actual_parent.join("source.json");
+            std::fs::write(&canonical_source, b"canonical-source").unwrap();
+            let mut symlink_parent_paths = base_paths.clone();
+            symlink_parent_paths.manifest_provider_group_tax_identity_v2_sidecar =
+                Some(alias_parent.join("source.json").display().to_string());
+            assert!(validate_runtime_tax_identity_output_paths(
+                &symlink_parent_paths,
+                &canonical_source,
+                &secret_path,
+                Some(&witness_scratch),
+                1,
+                1,
+            )
+            .is_err());
+            assert_eq!(
+                std::fs::read(&canonical_source).unwrap(),
+                b"canonical-source"
+            );
+
+            let manifest_target = actual_parent.join("manifest.sidecar");
+            let mut manifest_alias_paths = base_paths.clone();
+            manifest_alias_paths.manifest_provider_set_component_sidecar =
+                Some(manifest_target.display().to_string());
+            manifest_alias_paths.manifest_provider_group_tax_identity_v2_sidecar =
+                Some(alias_parent.join("manifest.sidecar").display().to_string());
+            assert!(validate_runtime_tax_identity_output_paths(
+                &manifest_alias_paths,
+                &source_path,
+                &secret_path,
+                Some(&witness_scratch),
+                1,
+                1,
+            )
+            .is_err());
+
+            for (reserved_name, reserved_root) in [
+                ("serving_run_directory", &serving_directory),
+                ("source_witness_scratch", &witness_scratch),
+            ] {
+                let outside_target = directory
+                    .path()
+                    .join(format!("{reserved_name}-outside-target"));
+                std::fs::write(&outside_target, b"outside-target").unwrap();
+                let reserved_alias = directory.path().join(format!("{reserved_name}-alias"));
+                symlink(reserved_root, &reserved_alias).unwrap();
+                let reserved_entry = reserved_root.join("outward-tax-link");
+                symlink(&outside_target, &reserved_entry).unwrap();
+                let mut reserved_symlink_paths = base_paths.clone();
+                reserved_symlink_paths.manifest_provider_group_tax_identity_v2_sidecar = Some(
+                    reserved_alias
+                        .join("outward-tax-link")
+                        .display()
+                        .to_string(),
+                );
+                let error = validate_runtime_tax_identity_output_paths(
+                    &reserved_symlink_paths,
+                    &source_path,
+                    &secret_path,
+                    Some(&witness_scratch),
+                    1,
+                    1,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(reserved_name));
+                assert_eq!(std::fs::read(&outside_target).unwrap(), b"outside-target");
+            }
+        }
+
+        let mut valid_paths = base_paths;
+        valid_paths.manifest_provider_group_tax_identity_v2_sidecar = Some(
+            directory
+                .path()
+                .join("tax-v2.ptg2tax")
+                .display()
+                .to_string(),
+        );
+        validate_runtime_tax_identity_output_paths(
+            &valid_paths,
+            &source_path,
+            &secret_path,
+            Some(&witness_scratch),
+            2,
+            2,
+        )
+        .unwrap();
     }
 
     #[test]
