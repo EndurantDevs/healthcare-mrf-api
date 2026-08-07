@@ -14,6 +14,7 @@ from api import ptg2_serving
 from api.ptg2_billing_exact_contract import (
     BillingRateOccurrenceWitness,
     billing_rate_occurrence_sort_key,
+    validated_rate_occurrence_witness,
 )
 from process.provider_directory_profile import is_valid_npi
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -65,6 +66,21 @@ class BillingProviderRateWitness:
     price_key: int
     occurrence_ordinal: int
     npi: int
+
+    @property
+    def rate_occurrence(self) -> BillingRateOccurrenceWitness:
+        """Return the exact-reader coordinate retained by this provider."""
+
+        return BillingRateOccurrenceWitness(
+            snapshot_key=self.snapshot_key,
+            code_key=self.code_key,
+            source_key=self.source_key,
+            source_record_ordinal=self.source_record_ordinal,
+            provider_group_ref=self.provider_group_ref,
+            provider_set_key=self.provider_set_key,
+            price_key=self.price_key,
+            occurrence_ordinal=self.occurrence_ordinal,
+        )
 
     @property
     def stable_rate_key(self) -> tuple[int, int, int, int, int, int, str]:
@@ -239,13 +255,77 @@ def validated_rate_witnesses(
         maximum_count=MAX_PROVIDER_RATE_WITNESSES,
         error_message="PTG2 exact billing provider expansion exceeds its rate limit",
     )
-    if any(type(witness) is not BillingRateOccurrenceWitness for witness in witnesses):
+    try:
+        for witness in witnesses:
+            validated_rate_occurrence_witness(witness)
+    except PTG2ManifestArtifactError as exc:
         raise PTG2ManifestArtifactError(
             "PTG2 exact billing provider expansion contains an invalid rate witness"
-        )
-    if witnesses != tuple(sorted(witnesses, key=billing_rate_occurrence_sort_key)):
+        ) from exc
+    sort_keys = tuple(billing_rate_occurrence_sort_key(witness) for witness in witnesses)
+    if sort_keys != tuple(sorted(sort_keys)) or len(sort_keys) != len(set(sort_keys)):
         raise PTG2ManifestArtifactError(
-            "PTG2 exact billing rate witnesses are not canonically ordered"
+            "PTG2 exact billing rate witnesses are not canonical and unique"
+        )
+    return witnesses
+
+
+def require_valid_provider_rate_witness(
+    witness: BillingProviderRateWitness,
+) -> BillingProviderRateWitness:
+    """Validate one complete provider/rate coordinate."""
+
+    try:
+        if type(witness) is not BillingProviderRateWitness:
+            raise PTG2ManifestArtifactError("invalid provider witness")
+        validated_rate_occurrence_witness(witness.rate_occurrence)
+        validated_provider_npi(witness.npi)
+    except (PTG2ManifestArtifactError, ValueError) as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing provider/rate scope is invalid"
+        ) from exc
+    return witness
+
+
+def require_valid_provider_address(
+    address: BillingProviderAddress,
+) -> BillingProviderAddress:
+    """Validate the stable public fields of one selected address witness."""
+
+    try:
+        if (
+            type(address) is not BillingProviderAddress
+            or address.selection_contract != BILLING_ADDRESS_SELECTION_CONTRACT
+        ):
+            raise ValueError("invalid provider address")
+        validated_provider_npi(address.npi)
+        if address.distance_miles is not None and (
+            finite_coordinate(address.distance_miles, category="distance_miles") < 0
+        ):
+            raise ValueError("invalid provider address distance")
+    except ValueError as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing provider address scope is invalid"
+        ) from exc
+    return address
+
+
+def validated_provider_rate_witnesses(
+    provider_rate_witnesses: Iterable[BillingProviderRateWitness],
+) -> tuple[BillingProviderRateWitness, ...]:
+    """Validate complete reader coordinates before GEO selection."""
+
+    witnesses = bounded_tuple(
+        provider_rate_witnesses,
+        maximum_count=MAX_PROVIDER_RATE_WITNESSES,
+        error_message="PTG2 exact billing provider/rate scope is invalid",
+    )
+    for witness in witnesses:
+        require_valid_provider_rate_witness(witness)
+    sort_keys = tuple((witness.npi, *witness.stable_rate_key) for witness in witnesses)
+    if sort_keys != tuple(sorted(sort_keys)) or len(sort_keys) != len(set(sort_keys)):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing provider/rate scope is inconsistent"
         )
     return witnesses
 
@@ -340,7 +420,10 @@ __all__ = [
     "bounded_tuple",
     "decoded_address_payload",
     "finite_coordinate",
+    "require_valid_provider_address",
+    "require_valid_provider_rate_witness",
     "validated_geo_args",
     "validated_provider_npi",
+    "validated_provider_rate_witnesses",
     "validated_rate_witnesses",
 ]

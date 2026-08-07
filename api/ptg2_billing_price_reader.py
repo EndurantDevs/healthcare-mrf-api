@@ -10,9 +10,12 @@ from typing import Any
 from api import ptg2_serving
 from api.ptg2_billing_geo_contract import (
     MAX_PROVIDER_RATE_WITNESSES,
+    BillingProviderAddress,
     BillingProviderGeoPriceWitness,
     BillingProviderGeoWitness,
     bounded_tuple,
+    require_valid_provider_address,
+    require_valid_provider_rate_witness,
 )
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -54,26 +57,29 @@ def _normalized_geo_witnesses(
     )
     if any(
         type(witness) is not BillingProviderGeoWitness
+        or type(witness.address) is not BillingProviderAddress
         for witness in normalized_witnesses
     ):
         raise PTG2ManifestArtifactError(
             "PTG2 exact billing geo witness scope is invalid"
         )
-    if normalized_witnesses != tuple(
-        sorted(normalized_witnesses, key=lambda witness: witness.stable_sort_key)
-    ):
+    for witness in normalized_witnesses:
+        require_valid_provider_rate_witness(witness.provider_rate)
+        require_valid_provider_address(witness.address)
+    sort_keys = tuple(witness.stable_sort_key for witness in normalized_witnesses)
+    if sort_keys != tuple(sorted(sort_keys)) or len(sort_keys) != len(set(sort_keys)):
         raise PTG2ManifestArtifactError(
-            "PTG2 exact billing geo witnesses are not canonically ordered"
+            "PTG2 exact billing geo witnesses are not canonical and unique"
         )
     snapshot_key = ptg2_serving._required_shared_snapshot_key(serving_tables)
-    if any(
-        witness.provider_rate.snapshot_key != snapshot_key
-        or witness.address.npi != witness.provider_rate.npi
-        for witness in normalized_witnesses
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing geo witness crossed its snapshot or NPI scope"
-        )
+    for witness in normalized_witnesses:
+        if (
+            witness.provider_rate.snapshot_key != snapshot_key
+            or witness.address.npi != witness.provider_rate.npi
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 exact billing geo witness crossed its snapshot or NPI scope"
+            )
     return normalized_witnesses
 
 
@@ -139,7 +145,7 @@ async def hydrate_exact_billing_geo_prices(
     if not price_keys:
         return ()
     prices_by_key = _validated_prices_by_key(
-        await ptg2_serving._version_three_prices_by_key(
+        await ptg2_serving._version_three_bounded_prices_by_key(
             session,
             serving_tables,
             price_keys,

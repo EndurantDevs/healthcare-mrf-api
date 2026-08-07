@@ -18,6 +18,9 @@ from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
     PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT,
     PTG2_TAX_IDENTITY_SOURCE_CONTRACT,
+    TaxIdentitySourceProjectionError,
+    TaxIdentitySourcePublication,
+    tax_identity_source_publication_from_metadata,
 )
 
 _MAX_SOURCE_WITNESSES = 8192
@@ -40,6 +43,7 @@ class ResolvedBillingEntitySourceScope:
     """Bounded source-local witnesses authenticated by one opaque reference."""
 
     snapshot_key: int
+    publication: TaxIdentitySourcePublication
     witnesses: tuple[BillingEntitySourceWitness, ...]
 
     @property
@@ -95,7 +99,15 @@ def _source_witness_query(schema_name: str):
               WHERE snapshot_key = :snapshot_key) AS manifest_count,
             manifest.contract,
             manifest.binding_contract,
+            manifest.token_policy_id,
+            manifest.token_policy_descriptor_sha256,
             manifest.source_count,
+            manifest.provider_group_occurrence_count,
+            manifest.matched_ein_count,
+            manifest.missing_count,
+            manifest.malformed_count,
+            manifest.unsupported_type_count,
+            manifest.content_digest,
             witnesses.source_key,
             witnesses.source_record_ordinal,
             witnesses.source_provider_group_count,
@@ -110,37 +122,89 @@ def _source_witness_query(schema_name: str):
         """)
 
 
-def _source_count(source_state_rows: tuple[Mapping[str, Any], ...]) -> int:
+def _canonical_source_publication(
+    expected: TaxIdentitySourcePublication,
+) -> TaxIdentitySourcePublication:
+    """Require one canonical sealed source publication."""
+
+    if type(expected) is not TaxIdentitySourcePublication:
+        raise PTG2BillingAssociationDataError(
+            "sealed billing source scope is unavailable"
+        )
+    try:
+        canonical_expected = tax_identity_source_publication_from_metadata(
+            expected.as_dict()
+        )
+    except TaxIdentitySourceProjectionError as exc:
+        raise PTG2BillingAssociationDataError(
+            "sealed billing source scope is unavailable"
+        ) from exc
+    if canonical_expected != expected:
+        raise PTG2BillingAssociationDataError(
+            "sealed billing source scope is unavailable"
+        )
+    return expected
+
+
+_SOURCE_STATE_FIELDS = (
+    "manifest_count",
+    "contract",
+    "binding_contract",
+    "token_policy_id",
+    "token_policy_descriptor_sha256",
+    "source_count",
+    "provider_group_occurrence_count",
+    "matched_ein_count",
+    "missing_count",
+    "malformed_count",
+    "unsupported_type_count",
+    "content_digest",
+)
+
+
+def _persisted_source_state(source_state_row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return tuple(source_state_row.get(field) for field in _SOURCE_STATE_FIELDS)
+
+
+def _validated_source_publication(
+    source_state_rows: tuple[Mapping[str, Any], ...],
+    *,
+    expected: TaxIdentitySourcePublication,
+) -> TaxIdentitySourcePublication:
+    """Bind persisted source state to the exact sealed source geometry."""
+
     if not source_state_rows:
         raise PTG2BillingAssociationDataError(
             "sealed billing source scope returned no state"
         )
+    expected = _canonical_source_publication(expected)
     states = {
-        (
-            source_state_row.get("manifest_count"),
-            source_state_row.get("contract"),
-            source_state_row.get("binding_contract"),
-            source_state_row.get("source_count"),
-        )
+        _persisted_source_state(source_state_row)
         for source_state_row in source_state_rows
     }
     if len(states) != 1:
         raise PTG2BillingAssociationDataError(
             "sealed billing source scope is inconsistent"
         )
-    manifest_count, contract, binding_contract, source_count = states.pop()
-    if (
-        type(manifest_count) is not int
-        or manifest_count != 1
-        or contract != PTG2_TAX_IDENTITY_SOURCE_CONTRACT
-        or binding_contract != PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT
-        or type(source_count) is not int
-        or not 1 <= source_count < 2**31
-    ):
+    expected_state = (
+        1,
+        PTG2_TAX_IDENTITY_SOURCE_CONTRACT,
+        PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT,
+        expected.token_policy_id,
+        expected.token_policy_descriptor_sha256,
+        expected.source_count,
+        expected.provider_group_occurrence_count,
+        expected.matched_ein_count,
+        expected.missing_count,
+        expected.malformed_count,
+        expected.unsupported_type_count,
+        expected.content_digest,
+    )
+    if states.pop() != expected_state:
         raise PTG2BillingAssociationDataError(
             "sealed billing source scope is unavailable"
         )
-    return source_count
+    return expected
 
 
 def _source_witness_from_row(
@@ -226,6 +290,7 @@ async def resolve_billing_entity_ref_source_scope(
     schema_name: str,
     snapshot_key: int,
     billing_entity_ref: object,
+    source_publication: TaxIdentitySourcePublication,
 ) -> ResolvedBillingEntitySourceScope | None:
     """Resolve one ref to exact source/group witnesses in a sealed snapshot."""
 
@@ -246,15 +311,19 @@ async def resolve_billing_entity_ref_source_scope(
     source_state_rows = tuple(
         dict(source_state_row) for source_state_row in source_query_result.mappings()
     )
-    source_count = _source_count(source_state_rows)
+    publication = _validated_source_publication(
+        source_state_rows,
+        expected=source_publication,
+    )
     if tin_key is None:
         return None
     witnesses = _normalized_source_witnesses(
         source_state_rows,
-        source_count=source_count,
+        source_count=publication.source_count,
     )
     return ResolvedBillingEntitySourceScope(
         snapshot_key=snapshot_key,
+        publication=publication,
         witnesses=witnesses,
     )
 

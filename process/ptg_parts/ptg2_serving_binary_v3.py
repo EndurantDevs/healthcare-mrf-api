@@ -37,6 +37,10 @@ from process.ptg_parts.ptg2_serving_binary_v3_types import (
 )
 
 
+class _PriceMembershipAtomLimitError(ValueError):
+    """A selected membership exceeds its predecode atom budget."""
+
+
 def encode_price_memberships(
     memberships: Iterable[tuple[int, Sequence[int]]],
     atom_key_bits: int,
@@ -122,12 +126,18 @@ def decode_price_memberships_for_keys(
     *,
     expected_entry_count: int | None = None,
     expected_atom_key_bits: int | None = None,
+    maximum_selected_atom_count: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Decode only requested memberships using v2 checkpoint directories."""
 
     requested_keys = tuple(sorted({int(price_key) for price_key in requested_price_keys}))
     if not requested_keys:
         return {}
+    if maximum_selected_atom_count is not None and (
+        type(maximum_selected_atom_count) is not int
+        or maximum_selected_atom_count < 0
+    ):
+        raise ValueError("maximum selected atom count must be a non-negative integer")
     header = _price_membership_header(encoded_payload)
     if expected_entry_count is not None and header.entry_count != int(
         expected_entry_count
@@ -138,6 +148,13 @@ def decode_price_memberships_for_keys(
     ):
         raise ValueError("membership payload atom-key width disagrees with manifest")
     if header.version == PTG2_V3_FORMAT_VERSION:
+        if maximum_selected_atom_count is not None:
+            return _legacy_price_memberships_for_keys(
+                encoded_payload,
+                header,
+                set(requested_keys),
+                maximum_selected_atom_count=maximum_selected_atom_count,
+            )
         all_memberships = _decode_price_memberships_with_header(
             encoded_payload,
             header,
@@ -148,10 +165,123 @@ def decode_price_memberships_for_keys(
         checkpoint_index = _membership_checkpoint_index(header, price_key)
         requested_by_checkpoint.setdefault(checkpoint_index, set()).add(price_key)
     memberships_by_price_key: dict[int, tuple[int, ...]] = {}
+    remaining_selected_atom_count = maximum_selected_atom_count
     for checkpoint_index, checkpoint_keys in requested_by_checkpoint.items():
-        memberships_by_price_key.update(
-            _price_memberships_for_checkpoint(encoded_payload, header, checkpoint_index, checkpoint_keys)
+        checkpoint_argument_map = (
+            {}
+            if remaining_selected_atom_count is None
+            else {
+                "maximum_selected_atom_count": remaining_selected_atom_count,
+            }
         )
+        checkpoint_memberships = _price_memberships_for_checkpoint(
+            encoded_payload,
+            header,
+            checkpoint_index,
+            checkpoint_keys,
+            **checkpoint_argument_map,
+        )
+        memberships_by_price_key.update(checkpoint_memberships)
+        if remaining_selected_atom_count is not None:
+            remaining_selected_atom_count -= sum(
+                len(atom_keys) for atom_keys in checkpoint_memberships.values()
+            )
+    return memberships_by_price_key
+
+
+def _bounded_selected_atom_count(
+    selected_atom_count: int,
+    atom_count: int,
+    maximum_selected_atom_count: int | None,
+) -> int:
+    next_selected_atom_count = selected_atom_count + atom_count
+    if (
+        maximum_selected_atom_count is not None
+        and next_selected_atom_count > maximum_selected_atom_count
+    ):
+        raise _PriceMembershipAtomLimitError(
+            "selected price memberships exceed their atom limit"
+        )
+    return next_selected_atom_count
+
+
+def _validate_dense_key_order_without_tuple(
+    encoded_payload: bytes | bytearray | memoryview,
+    *,
+    start: int,
+    end: int,
+    key_bytes: int,
+) -> None:
+    """Validate one dense-key sequence without materializing its tuple."""
+
+    payload_view = memoryview(encoded_payload)
+    previous_atom_key: int | None = None
+    for offset in range(start, end, key_bytes):
+        atom_key = int.from_bytes(
+            payload_view[offset : offset + key_bytes],
+            "little",
+        )
+        if previous_atom_key is not None and previous_atom_key > atom_key:
+            raise ValueError("price membership atom keys are not ordered")
+        previous_atom_key = atom_key
+
+
+def _legacy_price_memberships_for_keys(
+    encoded_payload: bytes | bytearray | memoryview,
+    header: _MembershipPayloadHeader,
+    requested_keys: set[int],
+    *,
+    maximum_selected_atom_count: int,
+) -> dict[int, tuple[int, ...]]:
+    """Scan legacy v1 records while decoding only bounded selections."""
+
+    key_bytes = _dense_key_bytes(header.atom_key_bits)
+    cursor = header.records_offset
+    memberships_by_price_key: dict[int, tuple[int, ...]] = {}
+    previous_price_key: int | None = None
+    selected_atom_count = 0
+    for membership_index in range(header.entry_count):
+        price_delta, cursor = read_uvarint(encoded_payload, cursor)
+        if membership_index and price_delta == 0:
+            raise ValueError("price memberships are not strictly ordered")
+        price_key = (
+            price_delta
+            if previous_price_key is None
+            else previous_price_key + price_delta
+        )
+        atom_count, cursor = read_uvarint(encoded_payload, cursor)
+        if atom_count == 0:
+            raise ValueError("price membership cannot be empty")
+        atom_end = cursor + atom_count * key_bytes
+        if atom_end > len(encoded_payload):
+            raise ValueError("PTG2 v3 price-membership atom keys are truncated")
+        if price_key in requested_keys:
+            selected_atom_count = _bounded_selected_atom_count(
+                selected_atom_count,
+                atom_count,
+                maximum_selected_atom_count,
+            )
+            atom_keys = decode_dense_keys(
+                encoded_payload[cursor:atom_end],
+                header.atom_key_bits,
+            )
+            if any(
+                left_key > right_key
+                for left_key, right_key in zip(atom_keys, atom_keys[1:])
+            ):
+                raise ValueError("price membership atom keys are not ordered")
+            memberships_by_price_key[price_key] = atom_keys
+        else:
+            _validate_dense_key_order_without_tuple(
+                encoded_payload,
+                start=cursor,
+                end=atom_end,
+                key_bytes=key_bytes,
+            )
+        cursor = atom_end
+        previous_price_key = price_key
+    if cursor != len(encoded_payload):
+        raise ValueError("PTG2 v3 price-membership payload has trailing bytes")
     return memberships_by_price_key
 
 
@@ -220,6 +350,8 @@ def _price_memberships_for_checkpoint(
     header: _MembershipPayloadHeader,
     checkpoint_index: int,
     requested_keys: set[int],
+    *,
+    maximum_selected_atom_count: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     previous_price_key, record_offset = header.checkpoints[checkpoint_index]
     cursor = header.records_offset + record_offset
@@ -227,6 +359,7 @@ def _price_memberships_for_checkpoint(
     segment_entries = min(header.checkpoint_interval, remaining_entries)
     key_bytes = _dense_key_bytes(header.atom_key_bits)
     memberships_by_price_key: dict[int, tuple[int, ...]] = {}
+    selected_atom_count = 0
     for segment_index in range(segment_entries):
         price_delta, cursor = read_uvarint(encoded_payload, cursor)
         if (checkpoint_index or segment_index) and price_delta == 0:
@@ -239,6 +372,11 @@ def _price_memberships_for_checkpoint(
         if atom_end > len(encoded_payload):
             raise ValueError("PTG2 v3 price-membership atom keys are truncated")
         if price_key in requested_keys:
+            selected_atom_count = _bounded_selected_atom_count(
+                selected_atom_count,
+                atom_count,
+                maximum_selected_atom_count,
+            )
             atom_keys = decode_dense_keys(encoded_payload[cursor:atom_end], header.atom_key_bits)
             if any(left_key > right_key for left_key, right_key in zip(atom_keys, atom_keys[1:])):
                 raise ValueError("price membership atom keys are not ordered")

@@ -7907,6 +7907,8 @@ async def _version_three_price_memberships(
     normalized_price_keys: tuple[int, ...],
     atom_key_bits: int,
     retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    *,
+    maximum_selected_atom_count: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     membership_argument_map: dict[str, Any] = {
         "atom_key_bits": atom_key_bits,
@@ -7915,6 +7917,10 @@ async def _version_three_price_memberships(
     }
     if retention_budget is not None:
         membership_argument_map["retention_budget"] = retention_budget
+    if maximum_selected_atom_count is not None:
+        membership_argument_map["maximum_selected_atom_count"] = (
+            maximum_selected_atom_count
+        )
     memberships_by_price_key = (
         await lookup_shared_price_atom_memberships_from_db(
             session,
@@ -7957,66 +7963,13 @@ async def _version_three_price_atoms(
     return price_atoms_by_key
 
 
-def _version_three_hydration_atom_keys(
-    normalized_price_keys: tuple[int, ...],
-    atom_keys_by_price_key: Mapping[int, tuple[int, ...]],
-    retention_budget: CandidateAuditDecodedRetentionBudget | None,
-    maximum_atom_count: int | None,
-) -> tuple[tuple[int, ...], int]:
-    """Bound aggregate memberships before retaining atom decode keys."""
-
-    if maximum_atom_count is not None and sum(
-        len(atom_keys) for atom_keys in atom_keys_by_price_key.values()
-    ) > maximum_atom_count:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 price hydration exceeds its atom limit"
-        )
-    return _budgeted_hydration_integer_keys(
-        (
-            atom_key
-            for price_key in normalized_price_keys
-            for atom_key in atom_keys_by_price_key.get(price_key, ())
-        ),
-        retention_budget,
-        category="candidate hydration atom",
-    )
-
-
-async def _version_three_decoded_atom_inputs(
-    session,
-    serving_tables: PTG2ServingTables,
-    requested_atom_keys: tuple[int, ...],
-    atom_key_bits: int,
-    retention_budget: CandidateAuditDecodedRetentionBudget | None,
-) -> tuple[dict[int, Any], Mapping[tuple[str, int], str]]:
-    """Load the exact bounded atom and dictionary inputs for row projection."""
-
-    price_atoms_by_key = await _version_three_price_atoms(
-        session,
-        serving_tables,
-        requested_atom_keys,
-        atom_key_bits,
-        retention_budget,
-    )
-    dictionary_values = await _version_three_dictionary_values(
-        session,
-        serving_tables,
-        price_atoms_by_key,
-        retention_budget,
-    )
-    return price_atoms_by_key, dictionary_values
-
-
 async def _version_three_price_hydration_for_keys(
     session,
     serving_tables: PTG2ServingTables,
     normalized_price_keys: tuple[int, ...],
     copy_payloads: bool,
     retention_budget: CandidateAuditDecodedRetentionBudget | None,
-    maximum_atom_count: int | None,
 ) -> _VersionThreePriceHydration:
-    """Hydrate one normalized key set after enforcing its atom-work cap."""
-
     atom_key_bits = _version_three_atom_key_bits(serving_tables)
     atom_keys_by_price_key = await _version_three_price_memberships(
         session,
@@ -8025,21 +7978,30 @@ async def _version_three_price_hydration_for_keys(
         atom_key_bits,
         retention_budget,
     )
-    requested_atom_keys, retained_atom_key_bytes = _version_three_hydration_atom_keys(
-        normalized_price_keys,
-        atom_keys_by_price_key,
-        retention_budget,
-        maximum_atom_count,
+    requested_atom_keys, retained_atom_key_bytes = (
+        _budgeted_hydration_integer_keys(
+            (
+                atom_key
+                for price_key in normalized_price_keys
+                for atom_key in atom_keys_by_price_key.get(price_key, ())
+            ),
+            retention_budget,
+            category="candidate hydration atom",
+        )
     )
     try:
-        price_atoms_by_key, dictionary_values = (
-            await _version_three_decoded_atom_inputs(
-                session,
-                serving_tables,
-                requested_atom_keys,
-                atom_key_bits,
-                retention_budget,
-            )
+        price_atoms_by_key = await _version_three_price_atoms(
+            session,
+            serving_tables,
+            requested_atom_keys,
+            atom_key_bits,
+            retention_budget,
+        )
+        dictionary_values = await _version_three_dictionary_values(
+            session,
+            serving_tables,
+            price_atoms_by_key,
+            retention_budget,
         )
         prices_by_key = _version_three_price_rows(
             normalized_price_keys,
@@ -8057,66 +8019,6 @@ async def _version_three_price_hydration_for_keys(
     finally:
         if retention_budget is not None:
             retention_budget.release(retained_atom_key_bytes)
-
-
-def _validated_cached_price_atom_count(
-    cached_rows: Mapping[int, list[dict[str, Any]]],
-    maximum_atom_count: int | None,
-) -> int:
-    """Return the cached atom count after enforcing the request budget."""
-
-    cached_atom_count = sum(len(prices) for prices in cached_rows.values())
-    if maximum_atom_count is not None and cached_atom_count > maximum_atom_count:
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 price hydration exceeds its atom limit"
-        )
-    return cached_atom_count
-
-
-async def _version_three_cached_prices_by_key(
-    session,
-    serving_tables: PTG2ServingTables,
-    normalized_price_keys: tuple[int, ...],
-    maximum_atom_count: int | None,
-) -> dict[int, list[dict[str, Any]]]:
-    """Hydrate only cache misses while preserving one aggregate atom cap."""
-
-    cache_layout = _version_three_price_cache_layout(serving_tables)
-    cached_rows, missing_keys = PRICE_HYDRATION_CACHE.get_many(
-        cache_layout,
-        normalized_price_keys,
-    )
-    cached_atom_count = _validated_cached_price_atom_count(
-        cached_rows,
-        maximum_atom_count,
-    )
-    if not missing_keys:
-        return cached_rows
-    hydration = await _version_three_price_hydration(
-        session,
-        serving_tables,
-        missing_keys,
-        maximum_atom_count=(
-            None
-            if maximum_atom_count is None
-            else maximum_atom_count - cached_atom_count
-        ),
-    )
-    if any(price_key not in hydration.prices_by_key for price_key in missing_keys):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 price hydration omitted a requested price key"
-        )
-    PRICE_HYDRATION_CACHE.admit_many(cache_layout, hydration.prices_by_key)
-    return {
-        price_key: (
-            cached_rows[price_key]
-            if price_key in cached_rows
-            else hydration.prices_by_key[price_key]
-        )
-        for price_key in normalized_price_keys
-    }
-
-
 async def _version_three_price_hydration(
     session,
     serving_tables: PTG2ServingTables,
@@ -8124,7 +8026,6 @@ async def _version_three_price_hydration(
     *,
     copy_payloads: bool = True,
     retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
-    maximum_atom_count: int | None = None,
 ) -> _VersionThreePriceHydration:
     """Hydrate memberships and prices through one union of shared blocks."""
 
@@ -8147,7 +8048,6 @@ async def _version_three_price_hydration(
             normalized_price_keys,
             copy_payloads,
             retention_budget,
-            maximum_atom_count,
         )
     finally:
         if retention_budget is not None:
@@ -8160,16 +8060,8 @@ async def _version_three_prices_by_key(
     price_keys: Iterable[int],
     *,
     copy_payloads: bool = True,
-    maximum_atom_count: int | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
     """Hydrate v3 price keys from compact memberships and dense atoms only."""
-
-    if maximum_atom_count is not None and (
-        type(maximum_atom_count) is not int or maximum_atom_count < 0
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 v3 price hydration has an invalid atom limit"
-        )
 
     if not copy_payloads:
         hydration = await _version_three_price_hydration(
@@ -8177,7 +8069,6 @@ async def _version_three_prices_by_key(
             serving_tables,
             price_keys,
             copy_payloads=False,
-            maximum_atom_count=maximum_atom_count,
         )
         return hydration.prices_by_key
     _require_strict_shared_v3(serving_tables)
@@ -8188,12 +8079,151 @@ async def _version_three_prices_by_key(
     )
     if not normalized_price_keys:
         return {}
-    return await _version_three_cached_prices_by_key(
+    cache_layout = _version_three_price_cache_layout(serving_tables)
+    cached_rows, missing_keys = PRICE_HYDRATION_CACHE.get_many(
+        cache_layout,
+        normalized_price_keys,
+    )
+    if not missing_keys:
+        return cached_rows
+    hydration = await _version_three_price_hydration(
+        session,
+        serving_tables,
+        missing_keys,
+    )
+    if any(
+        price_key not in hydration.prices_by_key
+        for price_key in missing_keys
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration omitted a requested price key"
+        )
+    PRICE_HYDRATION_CACHE.admit_many(
+        cache_layout,
+        hydration.prices_by_key,
+    )
+    return {
+        price_key: (
+            cached_rows[price_key]
+            if price_key in cached_rows
+            else hydration.prices_by_key[price_key]
+        )
+        for price_key in normalized_price_keys
+    }
+
+
+async def _version_three_bounded_price_hydration_for_keys(
+    session,
+    serving_tables: PTG2ServingTables,
+    normalized_price_keys: tuple[int, ...],
+    *,
+    maximum_atom_count: int,
+) -> _VersionThreePriceHydration:
+    """Hydrate one billing key set after bounding all atom memberships."""
+
+    atom_key_bits = _version_three_atom_key_bits(serving_tables)
+    atom_keys_by_price_key = await _version_three_price_memberships(
         session,
         serving_tables,
         normalized_price_keys,
-        maximum_atom_count,
+        atom_key_bits,
+        None,
+        maximum_selected_atom_count=maximum_atom_count,
     )
+    if sum(len(atom_keys) for atom_keys in atom_keys_by_price_key.values()) > (
+        maximum_atom_count
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration exceeds its atom limit"
+        )
+    requested_atom_keys, _retained_atom_key_bytes = (
+        _budgeted_hydration_integer_keys(
+            (
+                atom_key
+                for price_key in normalized_price_keys
+                for atom_key in atom_keys_by_price_key.get(price_key, ())
+            ),
+            None,
+            category="billing hydration atom",
+        )
+    )
+    price_atoms_by_key = await _version_three_price_atoms(
+        session,
+        serving_tables,
+        requested_atom_keys,
+        atom_key_bits,
+        None,
+    )
+    dictionary_values = await _version_three_dictionary_values(
+        session,
+        serving_tables,
+        price_atoms_by_key,
+        None,
+    )
+    return _VersionThreePriceHydration(
+        atom_keys_by_price_key,
+        _version_three_price_rows(
+            normalized_price_keys,
+            atom_keys_by_price_key,
+            price_atoms_by_key,
+            dictionary_values,
+            _version_three_price_atom_constants(serving_tables),
+        ),
+    )
+
+
+async def _version_three_bounded_prices_by_key(
+    session,
+    serving_tables: PTG2ServingTables,
+    price_keys: Iterable[int],
+    *,
+    maximum_atom_count: int,
+) -> dict[int, list[dict[str, Any]]]:
+    """Hydrate billing prices under one cache-aware aggregate atom cap."""
+
+    if type(maximum_atom_count) is not int or maximum_atom_count < 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration has an invalid atom limit"
+        )
+    _require_strict_shared_v3(serving_tables)
+    normalized_price_keys, _retained_bytes = _budgeted_hydration_integer_keys(
+        price_keys,
+        None,
+        category="billing hydration price",
+    )
+    if not normalized_price_keys:
+        return {}
+    cache_layout = _version_three_price_cache_layout(serving_tables)
+    cached_rows, missing_keys = PRICE_HYDRATION_CACHE.get_many(
+        cache_layout,
+        normalized_price_keys,
+    )
+    cached_atom_count = sum(len(prices) for prices in cached_rows.values())
+    if cached_atom_count > maximum_atom_count:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration exceeds its atom limit"
+        )
+    if not missing_keys:
+        return cached_rows
+    hydration = await _version_three_bounded_price_hydration_for_keys(
+        session,
+        serving_tables,
+        missing_keys,
+        maximum_atom_count=maximum_atom_count - cached_atom_count,
+    )
+    if any(price_key not in hydration.prices_by_key for price_key in missing_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration omitted a requested price key"
+        )
+    PRICE_HYDRATION_CACHE.admit_many(cache_layout, hydration.prices_by_key)
+    return {
+        price_key: (
+            cached_rows[price_key]
+            if price_key in cached_rows
+            else hydration.prices_by_key[price_key]
+        )
+        for price_key in normalized_price_keys
+    }
 
 
 def _version_three_price_cache_layout(
@@ -9613,7 +9643,7 @@ WITH matched AS MATERIALIZED (
             'fax_number_digits', addr.fax_number_digits,
             'fax_extension', addr.fax_extension,
             'address_key', addr.address_key::text,
-            'address_site_key', {address_site_key_sql},
+            {address_site_key_json_pair_sql}
             'location_key', {location_key_sql},
             'address_sources', {address_sources_sql},
             'source_record_ids', {source_record_ids_sql},
@@ -9807,7 +9837,7 @@ SELECT
         'fax_number_digits', addr.fax_number_digits,
         'fax_extension', addr.fax_extension,
         'address_key', addr.address_key::text,
-        'address_site_key', addr.premise_key::text,
+        {address_site_key_json_pair_sql}
         'location_key', {location_key_sql},
         'address_sources', {address_sources_sql},
         'source_record_ids', {source_record_ids_sql},
@@ -9902,7 +9932,7 @@ WITH nearest_addresses AS MATERIALIZED (
             'fax_number_digits', addr.fax_number_digits,
             'fax_extension', addr.fax_extension,
             'address_key', addr.address_key::text,
-            'address_site_key', addr.premise_key::text,
+            {address_site_key_json_pair_sql}
             'location_key', addr.location_key,
             'address_sources', addr.address_sources,
             'source_record_ids', addr.source_record_ids,
@@ -10559,13 +10589,19 @@ WITH requested(location_key, admitted_source_id) AS (
       JOIN stored_evidence AS stored
         ON stored.location_key = source.location_key
        AND stored.source_id = source.source_id
-       AND (stored.npi IS NULL OR stored.npi = source.npi)
        AND (
-           stored.address_key IS NULL
+           NOT CAST(:stored_only AS boolean)
+           OR stored.npi IS NULL
+           OR stored.npi = source.npi
+       )
+       AND (
+           NOT CAST(:stored_only AS boolean)
+           OR stored.address_key IS NULL
            OR stored.address_key = source.address_key
        )
        AND (
-           stored.premise_key IS NULL
+           NOT CAST(:stored_only AS boolean)
+           OR stored.premise_key IS NULL
            OR stored.premise_key = source.premise_key
        )
      WHERE stored.source_id <> 0
@@ -10879,9 +10915,11 @@ async def _hydrate_address_provenance(
 
     location_requests = _selected_location_requests(location_rows)
     provenance_by_location_key: Mapping[str, list[dict[str, Any]]] = {}
-    is_evidence_relation_available = await _is_relation_available(
-        session, f"{PTG2_SCHEMA}.entity_address_evidence"
-    )
+    is_evidence_relation_available = True
+    if use_stored_only or location_requests:
+        is_evidence_relation_available = await _is_relation_available(
+            session, f"{PTG2_SCHEMA}.entity_address_evidence"
+        )
     if use_stored_only and not is_evidence_relation_available:
         return "unavailable"
     if location_requests and is_evidence_relation_available:
@@ -10908,9 +10946,6 @@ def _membership_provenance_sql(address_table: str) -> dict[str, str]:
     uses_unified_addresses = _is_unified_address_table(address_table)
     return {
         "location_key_sql": "addr.location_key" if uses_unified_addresses else "NULL::varchar",
-        "address_site_key_sql": (
-            "addr.premise_key::text" if uses_unified_addresses else "NULL::text"
-        ),
         "address_sources_sql": (
             "addr.address_sources" if uses_unified_addresses else "ARRAY['nppes']::varchar[]"
         ),
@@ -10931,6 +10966,8 @@ def _membership_provenance_sql(address_table: str) -> dict[str, str]:
 
 def _membership_sql_values(
     query_context: _MembershipLocationQuery,
+    *,
+    include_address_site_key: bool = False,
 ) -> tuple[dict[str, str], bool]:
     """Build location-template values and report unified-address use."""
 
@@ -10947,6 +10984,11 @@ def _membership_sql_values(
         "location_hash_sql": location_hash_sql,
         "telephone_sql": _ptg2_nullish_text_sql("addr.telephone_number"),
         "fax_sql": _ptg2_nullish_text_sql("addr.fax_number"),
+        "address_site_key_json_pair_sql": (
+            "'address_site_key', addr.premise_key::text,"
+            if include_address_site_key and uses_unified_addresses
+            else ""
+        ),
         **_membership_provenance_sql(query_context.address_table),
         "distance_sql": query_context.distance_sql,
         "address_table": query_context.address_table,
@@ -10992,11 +11034,13 @@ def _membership_location_sql(
     *,
     limit: int,
     offset: int,
+    include_address_site_key: bool = False,
 ) -> str:
     """Render the bounded location SQL for the chosen address source."""
 
     format_values_by_name, uses_unified_addresses = _membership_sql_values(
-        query_context
+        query_context,
+        include_address_site_key=include_address_site_key,
     )
     if query_context.knn_order_sql is None or offset != 0:
         if (
@@ -11060,6 +11104,8 @@ async def _finalize_location_rows(
         None,
     )
     uses_unified_addresses = _is_unified_address_table(query_context.address_table)
+    if stored_address_provenance_only and not uses_unified_addresses:
+        return None
     include_response_evidence = (
         _is_request_flag_enabled(args.get("include_evidence"))
         or _is_request_flag_enabled(args.get("include_debug"))
@@ -11124,6 +11170,7 @@ async def _membership_location_rows(
         query_context,
         limit=limit,
         offset=offset,
+        include_address_site_key=stored_address_provenance_only,
     )
     location_rows = await _execute_membership_location_sql(
         session,

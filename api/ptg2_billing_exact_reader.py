@@ -295,6 +295,9 @@ async def _load_group_projection(
         source_scope,
         snapshot_key=snapshot_key,
         source_count=source_count,
+        source_publication=(
+            serving_tables.provider_tax_identity_source_publication
+        ),
     )
     provider_group_refs = tuple(
         sorted(

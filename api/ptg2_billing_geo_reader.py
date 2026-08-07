@@ -22,9 +22,9 @@ from api.ptg2_billing_geo_contract import (
     BillingProviderGeoPriceWitness,
     BillingProviderGeoWitness,
     BillingProviderRateWitness,
-    bounded_tuple,
     validated_geo_args as _validated_geo_args,
     validated_provider_npi,
+    validated_provider_rate_witnesses,
     validated_rate_witnesses,
 )
 from api.ptg2_types import PTG2ServingTables
@@ -183,17 +183,7 @@ async def load_exact_billing_geo_witnesses(
     """Select each eligible NPI's own address within one bounded GEO scope."""
 
     normalized_geo_args = _validated_geo_args(geo_args)
-    provider_rates = bounded_tuple(
-        provider_rate_witnesses,
-        maximum_count=_MAX_PROVIDER_RATE_WITNESSES,
-        error_message="PTG2 exact billing provider/rate scope is invalid",
-    )
-    if any(
-        type(witness) is not BillingProviderRateWitness for witness in provider_rates
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing provider/rate scope is invalid"
-        )
+    provider_rates = validated_provider_rate_witnesses(provider_rate_witnesses)
     if not provider_rates:
         return BillingGeoSelection(True, ())
     snapshot_key = ptg2_serving._required_shared_snapshot_key(serving_tables)

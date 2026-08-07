@@ -6,6 +6,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from process.ptg_parts.ptg2_tax_identity_source_projection import (
+    TaxIdentitySourcePublication,
+)
+
 
 @dataclass(frozen=True)
 class PTG2ServingIndex:
@@ -70,6 +74,9 @@ class PTG2ServingTables:
     database_evidence: dict[str, Any] | None = None
     provider_graph_v4_hot_prefix: dict[str, Any] | None = None
     provider_graph_v4_inferred_taxonomy_candidates: dict[str, Any] | None = None
+    provider_tax_identity_source_publication: (
+        TaxIdentitySourcePublication | None
+    ) = None
 
     @property
     def uses_shared_blocks(self) -> bool:

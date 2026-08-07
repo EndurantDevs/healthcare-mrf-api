@@ -11,6 +11,11 @@ from api.ptg2_billing_entity_source_resolution import (
     ResolvedBillingEntitySourceScope,
 )
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_tax_identity_source_projection import (
+    TaxIdentitySourceProjectionError,
+    TaxIdentitySourcePublication,
+    tax_identity_source_publication_from_metadata,
+)
 
 MAX_PROVIDER_GROUPS = 2048
 MAX_SOURCE_WITNESSES = 8192
@@ -59,6 +64,39 @@ def billing_rate_occurrence_sort_key(
         witness.occurrence_ordinal,
         witness.provider_group_ref,
     )
+
+
+def validated_rate_occurrence_witness(
+    witness: BillingRateOccurrenceWitness,
+) -> BillingRateOccurrenceWitness:
+    """Validate every coordinate carried across the exact-reader boundary."""
+
+    if (
+        type(witness) is not BillingRateOccurrenceWitness
+        or type(witness.snapshot_key) is not int
+        or not 1 <= witness.snapshot_key < 2**63
+        or type(witness.source_record_ordinal) is not int
+        or not 0 <= witness.source_record_ordinal < 2**63
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing rate witness has invalid coordinates"
+        )
+    try:
+        normalized_dense_key(witness.code_key, category="code")
+        normalized_dense_key(witness.source_key, category="source")
+        canonical_ref(witness.provider_group_ref, category="provider group")
+        normalized_dense_key(witness.provider_set_key, category="provider set")
+        normalized_dense_key(
+            witness.price_key,
+            category="price",
+            maximum=MAX_PRICE_KEY,
+        )
+        normalized_dense_key(witness.occurrence_ordinal, category="occurrence")
+    except PTG2ManifestArtifactError as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing rate witness has invalid coordinates"
+        ) from exc
+    return witness
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,22 +196,52 @@ def _source_coordinate(
     return witness.source_key, witness.source_record_ordinal, provider_group_ref
 
 
-def source_groups(
+def _require_source_geometry(
     source_scope: ResolvedBillingEntitySourceScope,
     *,
     snapshot_key: int,
     source_count: int,
-) -> dict[int, dict[str, int]]:
-    """Validate and index exact source, record, and provider-group witnesses."""
-
+    source_publication: TaxIdentitySourcePublication | None,
+) -> None:
     if (
-        type(source_scope.snapshot_key) is not int
+        type(source_scope) is not ResolvedBillingEntitySourceScope
+        or type(source_scope.snapshot_key) is not int
         or source_scope.snapshot_key != snapshot_key
         or type(source_scope.witnesses) is not tuple
     ):
         raise PTG2ManifestArtifactError(
             "PTG2 exact billing source scope belongs to another snapshot"
         )
+    if (
+        type(source_publication) is not TaxIdentitySourcePublication
+        or type(source_scope.publication) is not TaxIdentitySourcePublication
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing source geometry is unavailable"
+        )
+    try:
+        canonical_publication = tax_identity_source_publication_from_metadata(
+            source_publication.as_dict()
+        )
+    except TaxIdentitySourceProjectionError as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing source geometry is unavailable"
+        ) from exc
+    if (
+        canonical_publication != source_publication
+        or source_scope.publication != source_publication
+        or source_publication.source_count != source_count
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing source geometry does not match its scope"
+        )
+
+
+def _validated_source_coordinates(
+    source_scope: ResolvedBillingEntitySourceScope,
+    *,
+    source_count: int,
+) -> tuple[tuple[int, int, str], ...]:
     coordinates = tuple(
         _source_coordinate(witness, source_count=source_count)
         for witness in source_scope.witnesses[: MAX_SOURCE_WITNESSES + 1]
@@ -196,6 +264,28 @@ def source_groups(
         raise PTG2ManifestArtifactError(
             "PTG2 exact billing source scope contains inconsistent witnesses"
         )
+    return coordinates
+
+
+def source_groups(
+    source_scope: ResolvedBillingEntitySourceScope,
+    *,
+    snapshot_key: int,
+    source_count: int,
+    source_publication: TaxIdentitySourcePublication | None,
+) -> dict[int, dict[str, int]]:
+    """Validate and index exact source, record, and provider-group witnesses."""
+
+    _require_source_geometry(
+        source_scope,
+        snapshot_key=snapshot_key,
+        source_count=source_count,
+        source_publication=source_publication,
+    )
+    coordinates = _validated_source_coordinates(
+        source_scope,
+        source_count=source_count,
+    )
     groups_by_source: dict[int, dict[str, int]] = {}
     for source_key, source_record_ordinal, provider_group_ref in coordinates:
         source_group_map = groups_by_source.setdefault(source_key, {})
@@ -229,4 +319,5 @@ __all__ = [
     "distinct_dense_keys",
     "normalized_dense_key",
     "source_groups",
+    "validated_rate_occurrence_witness",
 ]

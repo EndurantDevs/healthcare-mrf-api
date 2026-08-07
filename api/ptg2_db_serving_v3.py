@@ -15,6 +15,7 @@ from process.ptg_parts.ptg2_serving_binary_v3_code_intersection import (
 from process.ptg_parts.ptg2_serving_binary_v3 import (
     PTG2_V3_ATOM_KEY_24_BITS,
     PTG2_V3_ATOM_KEY_32_BITS,
+    _PriceMembershipAtomLimitError,
     decode_price_memberships_for_keys,
     decode_provider_code_set,
     read_uvarint,
@@ -193,13 +194,21 @@ def _decode_price_membership_block(
     atom_key_bits: int | None,
     block_span: int,
     requested_price_keys: set[int],
+    maximum_selected_atom_count: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     try:
+        decoder_argument_map = {
+            "expected_entry_count": entry_count,
+            "expected_atom_key_bits": atom_key_bits,
+        }
+        if maximum_selected_atom_count is not None:
+            decoder_argument_map["maximum_selected_atom_count"] = (
+                maximum_selected_atom_count
+            )
         memberships_by_price_key = decode_price_memberships_for_keys(
             block_bytes,
             requested_price_keys,
-            expected_entry_count=entry_count,
-            expected_atom_key_bits=atom_key_bits,
+            **decoder_argument_map,
         )
         if any(
             not _is_key_in_block(
@@ -211,5 +220,9 @@ def _decode_price_membership_block(
         ):
             raise ValueError("price membership is outside its block")
         return memberships_by_price_key
+    except _PriceMembershipAtomLimitError as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration exceeds its atom limit"
+        ) from exc
     except Exception as exc:
         raise PTG2ManifestArtifactError(f"PTG2 v3 price-membership block {block_key} is corrupt") from exc

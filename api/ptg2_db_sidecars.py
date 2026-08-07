@@ -4733,6 +4733,7 @@ async def lookup_price_atom_memberships_from_db(
     block_span: int | None = None,
     schema_name: str = "mrf",
     retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+    maximum_selected_atom_count: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Read requested price-to-atom memberships from fresh shared blocks."""
 
@@ -4746,6 +4747,13 @@ async def lookup_price_atom_memberships_from_db(
         _requested_keys,
     )
 
+    if maximum_selected_atom_count is not None and (
+        type(maximum_selected_atom_count) is not int
+        or maximum_selected_atom_count < 0
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration has an invalid atom limit"
+        )
     requested_keys = _requested_keys(price_keys)
     effective_span = _effective_block_span(
         block_span, PTG2_SERVING_BINARY_V3_PRICE_KEY_BLOCK_SPAN
@@ -4761,6 +4769,7 @@ async def lookup_price_atom_memberships_from_db(
     requested_key_set = set(requested_keys)
     memberships_by_price_key: dict[int, tuple[int, ...]] = {}
     retained_membership_bytes = 0
+    remaining_selected_atom_count = maximum_selected_atom_count
     try:
         for physical_aliases in _logical_blocks_by_physical_identity(
             logical_blocks
@@ -4778,19 +4787,38 @@ async def lookup_price_atom_memberships_from_db(
                 logical_block,
                 schema_name=schema_name,
             )
+            membership_decode_argument_map: dict[str, Any] = {
+                "block_key": representative_key,
+                "entry_count": logical_block.entry_count,
+                "atom_key_bits": expected_bits,
+                "block_span": effective_span,
+                "requested_price_keys": group_requested_keys,
+            }
+            if remaining_selected_atom_count is not None:
+                membership_decode_argument_map["maximum_selected_atom_count"] = (
+                    remaining_selected_atom_count
+                )
             decoded_memberships = _decode_price_membership_block(
                 logical_block.payload,
-                block_key=representative_key,
-                entry_count=logical_block.entry_count,
-                atom_key_bits=expected_bits,
-                block_span=effective_span,
-                requested_price_keys=group_requested_keys,
+                **membership_decode_argument_map,
             )
             if len(physical_aliases) > 1 and logical_block.entry_count:
                 raise PTG2ManifestArtifactError(
                     "PTG2 v3 price-membership block has an incompatible "
                     "physical alias"
                 )
+            decoded_atom_count = sum(
+                len(atom_keys) for atom_keys in decoded_memberships.values()
+            )
+            if (
+                remaining_selected_atom_count is not None
+                and decoded_atom_count > remaining_selected_atom_count
+            ):
+                raise PTG2ManifestArtifactError(
+                    "PTG2 v3 price hydration exceeds its atom limit"
+                )
+            if remaining_selected_atom_count is not None:
+                remaining_selected_atom_count -= decoded_atom_count
             for price_key, atom_keys in decoded_memberships.items():
                 if price_key in memberships_by_price_key:
                     raise PTG2ManifestArtifactError(
