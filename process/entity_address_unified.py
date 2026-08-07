@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import hashlib
+import importlib
 import logging
 import os
 import re
@@ -433,17 +434,10 @@ def _validate_provider_directory_dataset_fence_scope(
         )
 
 
-async def _assert_current_provider_directory_dataset(
-    db_schema: str,
-    *,
-    source_id: str,
-    expected_dataset_id: str,
-    expected_root_run_id: str,
-) -> None:
-    """Fail when the source no longer identifies one exact current dataset."""
+def _provider_directory_current_dataset_fence_query(db_schema: str) -> str:
+    """Build the immutable publication fence query for one source."""
 
-    dataset_row = await db.first(
-        f"""
+    return f"""
         SELECT dataset.dataset_id
           FROM {db_schema}.provider_directory_source AS source
           JOIN {db_schema}.provider_directory_endpoint_dataset AS dataset
@@ -478,19 +472,45 @@ async def _assert_current_provider_directory_dataset(
                        ) @> jsonb_build_array(source.source_id)
            )
          LIMIT 1;
-        """,
+        """
+
+
+async def _assert_current_provider_directory_dataset(
+    db_schema: str,
+    *,
+    source_id: str,
+    expected_dataset_id: str,
+    expected_root_run_id: str,
+) -> None:
+    """Fail when the source no longer identifies one exact current dataset."""
+
+    dataset_row = await db.first(
+        _provider_directory_current_dataset_fence_query(db_schema),
         source_id=source_id,
         expected_dataset_id=expected_dataset_id,
         expected_root_run_id=expected_root_run_id,
     )
     if dataset_row is None or _clean_optional(
         _row_mapping(dataset_row).get("dataset_id")
-    ) != (
-        expected_dataset_id
-    ):
+    ) != expected_dataset_id:
         raise RuntimeError(
             "entity-address-unified Provider Directory dataset fence changed"
         )
+    provider_directory_fhir = importlib.import_module(
+        "process.provider_directory_fhir"
+    )
+    try:
+        await (
+            provider_directory_fhir.ensure_provider_directory_published_source_alias(
+                source_id=source_id,
+                expected_dataset_id=expected_dataset_id,
+                expected_root_run_id=expected_root_run_id,
+            )
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "entity-address-unified Provider Directory dataset fence changed"
+        ) from exc
 
 
 def _provider_directory_source_batch_size(task: dict) -> int:

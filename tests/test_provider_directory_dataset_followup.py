@@ -1,6 +1,8 @@
 """Source-local publication follow-up contract tests."""
 
+import contextlib
 import importlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -50,7 +52,15 @@ def test_dataset_fence_requires_exact_source_run_scope():
 @pytest.mark.asyncio
 async def test_dataset_fence_matches_current_publication(monkeypatch):
     current_dataset = AsyncMock(return_value={"dataset_id": "dataset-current"})
+    ensure_alias = AsyncMock()
     monkeypatch.setattr(entity_address_unified.db, "first", current_dataset)
+    monkeypatch.setattr(
+        entity_address_unified.importlib,
+        "import_module",
+        lambda _name: SimpleNamespace(
+            ensure_provider_directory_published_source_alias=ensure_alias
+        ),
+    )
 
     await entity_address_unified._assert_current_provider_directory_dataset(
         "mrf",
@@ -79,6 +89,11 @@ async def test_dataset_fence_matches_current_publication(monkeypatch):
         "expected_dataset_id": "dataset-current",
         "expected_root_run_id": "run-root",
     }
+    ensure_alias.assert_awaited_once_with(
+        source_id="source-current",
+        expected_dataset_id="dataset-current",
+        expected_root_run_id="run-root",
+    )
 
     current_dataset.return_value = None
     with pytest.raises(RuntimeError, match="dataset fence changed"):
@@ -88,6 +103,111 @@ async def test_dataset_fence_matches_current_publication(monkeypatch):
             expected_dataset_id="dataset-current",
             expected_root_run_id="run-root",
         )
+    assert ensure_alias.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_dataset_fence_repairs_exact_orphaned_alias(monkeypatch):
+    current_dataset = AsyncMock(return_value={"dataset_id": "dataset-current"})
+    ensure_alias = AsyncMock()
+    monkeypatch.setattr(entity_address_unified.db, "first", current_dataset)
+    monkeypatch.setattr(
+        entity_address_unified.importlib,
+        "import_module",
+        lambda _name: SimpleNamespace(
+            ensure_provider_directory_published_source_alias=ensure_alias
+        ),
+    )
+
+    await entity_address_unified._assert_current_provider_directory_dataset(
+        "mrf",
+        source_id="source-current",
+        expected_dataset_id="dataset-current",
+        expected_root_run_id="run-root",
+    )
+
+    ensure_alias.assert_awaited_once_with(
+        source_id="source-current",
+        expected_dataset_id="dataset-current",
+        expected_root_run_id="run-root",
+    )
+    assert current_dataset.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_dataset_fence_rejects_alias_reconciliation_failure(monkeypatch):
+    current_dataset = AsyncMock(return_value={"dataset_id": "dataset-current"})
+    ensure_alias = AsyncMock(
+        side_effect=RuntimeError("published source alias fence changed")
+    )
+    monkeypatch.setattr(entity_address_unified.db, "first", current_dataset)
+    monkeypatch.setattr(
+        entity_address_unified.importlib,
+        "import_module",
+        lambda _name: SimpleNamespace(
+            ensure_provider_directory_published_source_alias=ensure_alias
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="dataset fence changed"):
+        await entity_address_unified._assert_current_provider_directory_dataset(
+            "mrf",
+            source_id="source-current",
+            expected_dataset_id="dataset-current",
+            expected_root_run_id="run-root",
+        )
+
+
+@pytest.mark.asyncio
+async def test_exact_followup_reconciles_only_matching_publication(monkeypatch):
+    resolve_fence = AsyncMock(
+        return_value=importer.ProviderDirectoryArtifactDatasetFence(
+            (_published_artifact_dataset(),)
+        )
+    )
+    lock_fence = AsyncMock()
+    cutover_alias = AsyncMock()
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    monkeypatch.setattr(
+        importer, "_resolve_provider_directory_artifact_datasets", resolve_fence
+    )
+    monkeypatch.setattr(
+        importer, "_lock_and_verify_artifact_dataset_fence", lock_fence
+    )
+    monkeypatch.setattr(
+        importer, "_cutover_provider_directory_artifact_sources", cutover_alias
+    )
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+
+    await importer.ensure_provider_directory_published_source_alias(
+        source_id="source-current",
+        expected_dataset_id="dataset-current",
+        expected_root_run_id="run-root",
+    )
+    resolve_fence.assert_awaited_once_with(
+        ["source-current"], should_select_validated_candidates=False
+    )
+    lock_fence.assert_awaited_once_with(resolve_fence.return_value)
+    cutover_alias.assert_awaited_once_with(resolve_fence.return_value)
+
+    resolve_fence.return_value = importer.ProviderDirectoryArtifactDatasetFence(
+        (_published_artifact_dataset(evidence_run_id="run-changed"),)
+    )
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="published_source_alias_fence_changed",
+    ):
+        await importer.ensure_provider_directory_published_source_alias(
+            source_id="source-current",
+            expected_dataset_id="dataset-current",
+            expected_root_run_id="run-root",
+        )
+    assert lock_fence.await_count == 1
+    assert cutover_alias.await_count == 1
 
 
 def test_dataset_followup_descriptor_binds_exact_publication():
