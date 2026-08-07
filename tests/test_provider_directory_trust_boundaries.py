@@ -2937,6 +2937,223 @@ def test_artifact_cutover_retryability_follows_postgres_lock_identity():
     assert not importer._is_provider_directory_artifact_cutover_retryable(
         RuntimeError("ordinary")
     )
+    query_canceled = RuntimeError("statement timeout")
+    query_canceled.pgcode = "57014"
+    assert not importer._is_provider_directory_artifact_cutover_retryable(
+        query_canceled
+    )
+
+
+def test_artifact_transaction_timeout_budget_is_phase_specific():
+    """Widen only candidate validation, never current or Profile cutovers."""
+    current_fence = importer.ProviderDirectoryArtifactDatasetFence(())
+    candidate_fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (),
+        should_select_validated_candidates=True,
+    )
+
+    ordinary_timeout = (
+        importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+    )
+    assert importer._provider_directory_artifact_transaction_timeout_seconds(
+        None
+    ) == ordinary_timeout
+    assert importer._provider_directory_artifact_transaction_timeout_seconds(
+        current_fence
+    ) == ordinary_timeout
+    assert importer._provider_directory_artifact_transaction_timeout_seconds(
+        candidate_fence
+    ) == (
+        importer.PROVIDER_DIRECTORY_ARTIFACT_CANDIDATE_TRANSACTION_TIMEOUT_SECONDS
+    )
+    assert importer._provider_directory_artifact_transaction_timeout_seconds(
+        candidate_fence,
+        profile_delta=object(),
+    ) == importer.PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_TIMEOUT_SECONDS
+
+
+def test_artifact_cutover_timeout_tightens_without_extending(monkeypatch):
+    """Shorten a candidate wall for the live phase without extending it."""
+    class Timeout:
+        def __init__(self, deadline):
+            self.deadline = deadline
+            self.rescheduled_to = None
+
+        def when(self):
+            return self.deadline
+
+        def reschedule(self, deadline):
+            self.rescheduled_to = deadline
+
+    monkeypatch.setattr(
+        importer.asyncio,
+        "get_running_loop",
+        lambda: SimpleNamespace(time=lambda: 100.0),
+    )
+    candidate_timeout = Timeout(112.0)
+    importer._tighten_provider_directory_artifact_cutover_timeout(
+        candidate_timeout
+    )
+    assert candidate_timeout.rescheduled_to == 102.0
+
+    current_timeout = Timeout(101.0)
+    importer._tighten_provider_directory_artifact_cutover_timeout(
+        current_timeout
+    )
+    assert current_timeout.rescheduled_to is None
+    importer._tighten_provider_directory_artifact_cutover_timeout(None)
+
+
+@pytest.mark.asyncio
+async def test_artifact_cutover_timeout_reschedule_is_enforced(
+    monkeypatch,
+):
+    """Keep the live deadline enforced through transaction completion."""
+    monkeypatch.setattr(
+        importer,
+        "PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    with pytest.raises(TimeoutError):
+        async with importer.asyncio.timeout(1.0) as cutover_timeout:
+            importer._tighten_provider_directory_artifact_cutover_timeout(
+                cutover_timeout
+            )
+            await importer.asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_candidate_fence_budget_precedes_cutover(monkeypatch):
+    """Use the wider metadata budget only before live serving-table work."""
+    events = []
+
+    async def status(sql, **_params):
+        events.append(str(sql))
+
+    async def verify(_fence):
+        events.append("verify-fence")
+
+    candidate_fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (),
+        should_select_validated_candidates=True,
+    )
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_lock_and_verify_artifact_dataset_fence",
+        verify,
+    )
+
+    await importer._lock_artifact_cutover_fence(
+        candidate_fence
+    )
+    assert events == [
+        "SET LOCAL statement_timeout = "
+        f"'{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
+        "verify-fence",
+        "SET LOCAL statement_timeout = "
+        f"'{importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';",
+    ]
+
+    events.clear()
+    await importer._lock_artifact_cutover_fence(
+        candidate_fence,
+        profile_delta=object(),
+    )
+    assert events == ["verify-fence"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_fence_failure_skips_reset(monkeypatch):
+    """Let a failed transaction roll back without masking its SQL error."""
+    events = []
+
+    async def status(sql, **_params):
+        events.append(str(sql))
+
+    async def fail_verification(_fence):
+        events.append("verify-fence")
+        error = RuntimeError("statement timeout")
+        error.pgcode = "57014"
+        raise error
+
+    candidate_fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (),
+        should_select_validated_candidates=True,
+    )
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_lock_and_verify_artifact_dataset_fence",
+        fail_verification,
+    )
+    with pytest.raises(RuntimeError, match="statement timeout"):
+        await importer._lock_artifact_cutover_fence(
+            candidate_fence
+        )
+    assert events == [
+        "SET LOCAL statement_timeout = "
+        f"'{importer.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';",
+        "verify-fence",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_candidate_bundle_restores_budget_before_table_lock(
+    monkeypatch,
+):
+    """Wire the candidate fence budget ahead of the live bundle lock."""
+    events = []
+
+    async def status(sql, **_params):
+        events.append(str(sql))
+
+    async def verify(_fence):
+        events.append("verify-fence")
+
+    async def lock_tables(_schema, _relations):
+        events.append("lock-tables")
+
+    stage = _artifact_stage()
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (_promotion_dataset(),),
+        should_select_validated_candidates=True,
+    )
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_lock_and_verify_artifact_dataset_fence",
+        verify,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_lock_provider_directory_artifact_tables",
+        lock_tables,
+    )
+    for helper_name in (
+        "_assert_provider_directory_artifact_build_fence",
+        "_install_provider_directory_prepared_stage",
+        "_finish_provider_directory_prepared_stage",
+        "_promote_provider_directory_artifact_datasets",
+    ):
+        monkeypatch.setattr(importer, helper_name, AsyncMock())
+    await importer._apply_locked_provider_directory_artifact_bundle(
+        (stage,),
+        stage.schema,
+        (stage.target_relation,),
+        None,
+        fence,
+    )
+
+    fence_budget = next(
+        index for index, event in enumerate(events) if "8s" in event
+    )
+    live_budget = next(
+        index for index, event in enumerate(events) if "1000ms" in event
+    )
+    assert fence_budget < events.index("verify-fence")
+    assert events.index("verify-fence") < live_budget
+    assert live_budget < events.index("lock-tables")
 
 
 @pytest.mark.asyncio
