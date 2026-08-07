@@ -51,7 +51,7 @@ _CONTEXT_FIELDS = frozenset(
         "expires_at",
     }
 )
-_SELECTOR_KINDS = frozenset({"tax_identity", "billing_entity_ref"})
+_SELECTOR_KINDS = frozenset({"billing_entity_ref"})
 _ACCESS_DECISIONS = frozenset({"authorized", "denied", "rate_limited", "unavailable"})
 
 
@@ -352,7 +352,7 @@ class BillingSearchAccessJournalSeed(_RedactedImmutable):
     plan_entitlement_sha256: str
     generation_bundle_sha256: str
     request_shape_sha256: str
-    selector_kind: Literal["tax_identity", "billing_entity_ref"]
+    selector_kind: Literal["billing_entity_ref"]
     decision: Literal["authorized", "denied", "rate_limited", "unavailable"]
     observed_at: str
     duration_us: int

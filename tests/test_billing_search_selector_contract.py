@@ -203,6 +203,7 @@ def test_matched_scope_requires_typed_scope_and_canonical_reference(
     "selector_kind,bindings",
     [
         ("unexpected", (_matched_binding(),)),
+        ("tax_identity", (_matched_binding(),)),
         (object(), (_matched_binding(),)),
         ("billing_entity_ref", ()),
         ("billing_entity_ref", [_matched_binding()]),
@@ -232,6 +233,13 @@ def test_selector_scope_requires_nonempty_unique_sorted_binding_cut(
     "selector_scope,digest",
     [
         (object(), "1" * 64),
+        (
+            BillingSearchSelectorScope(
+                "billing_entity_ref",
+                (_matched_binding(),),
+            ),
+            None,
+        ),
         (
             BillingSearchSelectorScope(
                 "billing_entity_ref",
@@ -268,18 +276,3 @@ def test_resolution_rejects_invalid_scope_or_pseudonymous_digest(
 ) -> None:
     with pytest.raises(BillingSearchServingUnavailableError):
         BillingSearchSelectorResolution(selector_scope, digest)
-
-
-def test_resolution_allows_unavailable_tax_identity_scope_without_a_digest() -> None:
-    scope = BillingSearchSelectorScope(
-        "tax_identity",
-        (
-            BillingSearchSelectorBindingScope(
-                0,
-                SNAPSHOT_ID,
-                BILLING_SELECTOR_PROJECTION_UNAVAILABLE,
-            ),
-        ),
-    )
-
-    assert BillingSearchSelectorResolution(scope, None).selector_scope is scope
