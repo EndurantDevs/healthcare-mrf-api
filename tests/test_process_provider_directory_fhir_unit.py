@@ -19215,6 +19215,7 @@ def _bulk_test_context(
     retry_of_run_id: str | None = None,
     root_run_id: str = "root_1",
     dataset_id: str = "dataset_1",
+    lineage_verified: bool = True,
 ):
     return importer.PaginationCheckpointContext(
         canonical_api_base=importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE,
@@ -19225,6 +19226,7 @@ def _bulk_test_context(
         endpoint_id="endpoint_1",
         dataset_id=dataset_id,
         acquisition_root_run_id=root_run_id,
+        lineage_verified=lineage_verified,
     )
 
 
@@ -19363,6 +19365,21 @@ class _BulkCheckpointMemory:
             importer,
             "_repair_terminal_bulk_export_checkpoint",
             self.repair_terminal_checkpoint,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_recover_failed_bulk_export_capability_checkpoint",
+            self.recover_failed_capability_checkpoint,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_begin_bulk_capability_refresh",
+            self.begin_capability_refresh,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_persist_bulk_capability_refresh",
+            self.persist_capability_refresh,
         )
 
     def _checkpoint_map(
@@ -19681,6 +19698,82 @@ class _BulkCheckpointMemory:
                 if output_checkpoint["checkpoint_id"] == checkpoint_id:
                     output_checkpoint["output_url_ciphertext"] = None
                     output_checkpoint["etag_ciphertext"] = None
+        else:
+            checkpoint["state"] = importer.BULK_EXPORT_CHECKPOINT_RETRYABLE
+
+    async def recover_failed_capability_checkpoint(self, identity, checkpoint):
+        assert identity.lineage_verified is True
+        assert checkpoint["state"] == importer.BULK_EXPORT_CHECKPOINT_FAILED
+        stored = self.checkpoint_by_id[identity.checkpoint_id]
+        stored.update(
+            owner_run_id=identity.owner_run_id,
+            retry_of_run_id=checkpoint["owner_run_id"],
+            state=importer.BULK_EXPORT_CHECKPOINT_RETRYABLE,
+        )
+        return dict(stored)
+
+    async def begin_capability_refresh(
+        self,
+        identity,
+        checkpoint,
+        output_checkpoints,
+    ):
+        assert checkpoint["error"] in importer.BULK_EXPORT_CAPABILITY_REFRESH_ERRORS
+        for output_checkpoint in output_checkpoints:
+            if output_checkpoint["state"] != importer.BULK_EXPORT_OUTPUT_COMPLETE:
+                self.output_by_id[output_checkpoint["output_id"]][
+                    "attempt_count"
+                ] += 1
+        self.event_log.append(("begin_capability_refresh", identity.checkpoint_id))
+
+    async def persist_capability_refresh(
+        self,
+        identity,
+        _checkpoint,
+        manifest,
+        output_pairs,
+        observed_validators,
+    ):
+        checkpoint = self.checkpoint_by_id[identity.checkpoint_id]
+        checkpoint.update(
+            manifest_hash=manifest.identity_hash,
+            manifest_ciphertext=importer._encrypt_bulk_capability(
+                json.dumps(manifest.payload, sort_keys=True)
+            ),
+            manifest_json=importer._bulk_manifest_audit_payload(
+                manifest.payload
+            ),
+            state=importer.BULK_EXPORT_CHECKPOINT_MANIFEST_READY,
+            error=None,
+        )
+        for (manifest_output, output_checkpoint), validator in zip(
+            output_pairs,
+            observed_validators,
+            strict=True,
+        ):
+            stored_output = self.output_by_id.pop(output_checkpoint["output_id"])
+            refreshed_output_id = importer._bulk_manifest_output_id(
+                identity.checkpoint_id,
+                manifest_output,
+            )
+            stored_output.update(
+                output_id=refreshed_output_id,
+                output_url_ciphertext=importer._encrypt_bulk_capability(
+                    manifest_output.url
+                ),
+                output_url_hash=manifest_output.url_hash,
+                etag_ciphertext=importer._encrypt_bulk_capability(
+                    validator.etag
+                ),
+                etag_hash=validator.etag_hash,
+                content_length_bytes=validator.content_length_bytes,
+                output_expires_at=validator.output_expires_at,
+                validator_checked_at=importer._bulk_export_now_utc(),
+                state=importer.BULK_EXPORT_OUTPUT_PENDING,
+                error=None,
+            )
+            self.output_by_id[refreshed_output_id] = stored_output
+        self.event_log.append(("persist_capability_refresh", manifest.identity_hash))
 
     async def repair_terminal_checkpoint(self, identity, terminal_state):
         checkpoint_id = identity.checkpoint_id
@@ -20193,6 +20286,102 @@ def test_bulk_checkpoint_rejects_manifest_change():
         )
 
 
+@pytest.mark.asyncio
+async def test_bulk_capability_refresh_rejects_changed_byte_proof(
+    monkeypatch,
+):
+    manifest = importer._bulk_export_manifest_from_payload(
+        _bulk_status_payload(
+            "https://storage.example/snapshot/part.ndjson?sig=fresh"
+        ),
+        "Practitioner",
+    )
+    original_etag = '"original-etag"'
+    output_checkpoint_by_field = {
+        "output_id": "a" * 64,
+        "output_index": 0,
+        "resource_type": "Practitioner",
+        "state": importer.BULK_EXPORT_OUTPUT_PENDING,
+        "content_length_bytes": 200,
+        "committed_bytes": 100,
+        "etag_hash": hashlib.sha256(
+            original_etag.encode("utf-8")
+        ).hexdigest(),
+        "validator_checked_at": importer._bulk_export_now_utc(),
+    }
+    output_pairs = importer._bulk_capability_refresh_output_pairs(
+        manifest,
+        [output_checkpoint_by_field],
+    )
+    monkeypatch.setattr(
+        importer,
+        "_bulk_http_probe_output",
+        AsyncMock(
+            return_value=(
+                206,
+                {
+                    "content-length": "1",
+                    "content-range": "bytes 0-0/200",
+                    "etag": '"changed-etag"',
+                },
+                None,
+            )
+        ),
+    )
+
+    validators, error = (
+        await importer._probe_bulk_capability_refresh_validators(
+            SimpleNamespace(),
+            _bulk_test_source(),
+            manifest,
+            output_pairs,
+            timeout=3,
+            runtime_probe=AsyncMock(),
+        )
+    )
+
+    assert validators == []
+    assert error == "bulk_export_output_validator_mismatch"
+
+
+def test_bulk_output_identity_changes_are_rejected():
+    original_manifest = importer._bulk_export_manifest_from_payload(
+        _bulk_status_payload(
+            "https://storage.example/snapshot/part.ndjson?sig=expired"
+        ),
+        "Practitioner",
+    )
+    refreshed_manifest = importer._bulk_export_manifest_from_payload(
+        _bulk_status_payload(
+            "https://storage.example/snapshot/part.ndjson?sig=fresh"
+        ),
+        "Practitioner",
+    )
+    checkpoint_id = "b" * 64
+    output_checkpoint_by_field = {
+        "output_id": importer._bulk_manifest_output_id(
+            checkpoint_id,
+            original_manifest.outputs[0],
+        ),
+        "output_index": 0,
+        "resource_type": "Practitioner",
+        "output_url_hash": refreshed_manifest.outputs[0].url_hash,
+        "last_error": None,
+    }
+
+    assert importer._bulk_output_checkpoint_error(
+        checkpoint_id,
+        refreshed_manifest,
+        [output_checkpoint_by_field],
+    ) == "bulk_export_manifest_output_checkpoint_mismatch"
+    output_checkpoint_by_field["last_error"] = "bulk_export_output_http_410"
+    assert importer._bulk_output_checkpoint_error(
+        checkpoint_id,
+        refreshed_manifest,
+        [output_checkpoint_by_field],
+    ) == "bulk_export_manifest_output_checkpoint_mismatch"
+
+
 def test_bulk_checkpoint_validates_status_identity(bulk_checkpoint_key):
     status_url = f"{importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE}/status/1"
     valid_checkpoint_map = {
@@ -20252,50 +20441,177 @@ async def test_bulk_checkpoint_rejects_expired_status(
     assert checkpoint["state"] == importer.BULK_EXPORT_CHECKPOINT_FAILED
 
 
-@pytest.mark.asyncio
-async def test_bulk_checkpoint_rejects_expired_output(
-    monkeypatch,
-    bulk_checkpoint_key,
-):
+@dataclasses.dataclass
+class _BulkCapabilityRefreshFixture:
+    memory: _BulkCheckpointMemory
+    checkpoint_context: importer.PaginationCheckpointContext
+    checkpoint_identity: importer.BulkExportCheckpointIdentity
+    original_manifest: importer.BulkExportManifest
+    refreshed_manifest: importer.BulkExportManifest
+    etag: str
+    source_record: dict[str, Any]
+
+
+def _bulk_capability_refresh_fixture() -> _BulkCapabilityRefreshFixture:
     checkpoint_memory = _BulkCheckpointMemory()
     checkpoint_context = _bulk_test_context()
     checkpoint_identity = _bulk_test_identity(checkpoint_context)
-    manifest = importer._bulk_export_manifest_from_payload(
-        _bulk_status_payload("https://storage.example/snapshot/expired.ndjson?sig=one"),
+    original_manifest = importer._bulk_export_manifest_from_payload(
+        _bulk_status_payload(
+            "https://storage.example/snapshot/part.ndjson?sig=expired"
+        ),
+        "Practitioner",
+    )
+    refreshed_manifest = importer._bulk_export_manifest_from_payload(
+        _bulk_status_payload(
+            "https://storage.example/snapshot/part.ndjson?sig=fresh",
+            transaction_time=datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat(),
+        ),
         "Practitioner",
     )
     checkpoint_memory.seed_manifest(
         checkpoint_identity,
-        manifest,
+        original_manifest,
         [importer.BULK_EXPORT_OUTPUT_PENDING],
+        [2],
     )
-    checkpoint_memory.install(monkeypatch)
-    stream_count_by_name = {"value": 0}
-
-    async def expired_output(*_args, **_request_options):
-        stream_count_by_name["value"] += 1
-        return [], 0, 0, False, "bulk_export_output_http_410"
-
-    monkeypatch.setattr(importer, "_stream_bulk_export_output_rows", expired_output)
-    source_lookup = _bulk_test_source(checkpoint_identity.canonical_api_base)
-    first_result = await importer._fetch_checkpointed_bulk_export_resource_rows(
-        source_lookup,
-        "Practitioner",
+    output_checkpoint_by_field = next(
+        iter(checkpoint_memory.output_by_id.values())
+    )
+    etag = '"snapshot-etag"'
+    output_checkpoint_by_field.update(
+        content_length_bytes=200,
+        etag_ciphertext=importer._encrypt_bulk_capability(etag),
+        etag_hash=hashlib.sha256(etag.encode("utf-8")).hexdigest(),
+        committed_bytes=100,
+        output_expires_at=importer._bulk_export_now_utc()
+        + datetime.timedelta(hours=1),
+        validator_checked_at=importer._bulk_export_now_utc(),
+    )
+    source_record_by_field = {
+        **_bulk_test_source(checkpoint_identity.canonical_api_base),
+        "metadata_json": {
+            "provider_directory_bulk_export_output_hosts": [
+                "storage.example"
+            ],
+            "provider_directory_bulk_export_range_resume": True,
+        },
+    }
+    return _BulkCapabilityRefreshFixture(
+        checkpoint_memory,
         checkpoint_context,
+        checkpoint_identity,
+        original_manifest,
+        refreshed_manifest,
+        etag,
+        source_record_by_field,
+    )
+
+
+class _BulkCapabilityRefreshFakes:
+    def __init__(self, fixture: _BulkCapabilityRefreshFixture):
+        self.fixture = fixture
+        self.stream_count = 0
+
+    async def stream_output(
+        self, _session, _source, output_url, **request_options,
+    ):
+        self.stream_count += 1
+        resume_options = request_options["resume_options"]
+        assert resume_options.resume_offset == 100
+        assert resume_options.expected_etag == self.fixture.etag
+        assert resume_options.expected_content_length == 200
+        if output_url == self.fixture.original_manifest.outputs[0].url:
+            return [], 0, 0, False, "bulk_export_output_http_410"
+        assert output_url == self.fixture.refreshed_manifest.outputs[0].url
+        await resume_options.row_progress_handler(1, 200)
+        return [], 1, 1, False, None
+
+    async def prepared_validators(
+        self,
+        _session,
+        _source,
+        identity,
+        _manifest,
+        _options,
+        _output_checkpoints,
+    ):
+        return await self.fixture.memory.load_outputs(identity.checkpoint_id), None
+
+    async def refresh_manifest(self, *_args, **_kwargs):
+        return self.fixture.refreshed_manifest, None, 1
+
+    async def probe_output(self, *_args, **_kwargs):
+        return (
+            206,
+            {
+                "content-length": "1",
+                "content-range": "bytes 0-0/200",
+                "etag": self.fixture.etag,
+            },
+            None,
+        )
+
+    def install(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            importer, "_stream_bulk_export_output_rows", self.stream_output,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_prepare_checkpointed_output_validators",
+            self.prepared_validators,
+        )
+        monkeypatch.setattr(
+            importer,
+            "_request_bulk_capability_refresh_manifest",
+            self.refresh_manifest,
+        )
+        monkeypatch.setattr(
+            importer, "_bulk_http_probe_output", self.probe_output,
+        )
+
+
+@pytest.mark.asyncio
+async def test_bulk_checkpoint_refreshes_expired_output_with_identical_proof(
+    monkeypatch,
+    bulk_checkpoint_key,
+):
+    """Resume retained bytes only after a fresh URL proves identical bytes."""
+    fixture = _bulk_capability_refresh_fixture()
+    fixture.memory.install(monkeypatch)
+    refresh_fakes = _BulkCapabilityRefreshFakes(fixture)
+    refresh_fakes.install(monkeypatch)
+
+    first_result = await importer._fetch_checkpointed_bulk_export_resource_rows(
+        fixture.source_record,
+        "Practitioner",
+        fixture.checkpoint_context,
         _bulk_fetch_options(),
     )
     retry_result = await importer._fetch_checkpointed_bulk_export_resource_rows(
-        source_lookup,
+        fixture.source_record,
         "Practitioner",
-        checkpoint_context,
+        fixture.checkpoint_context,
         _bulk_fetch_options(),
     )
 
-    assert first_result is not None and first_result.error == "bulk_export_output_http_410"
-    assert retry_result is not None and retry_result.error == "bulk_export_output_http_410"
-    assert stream_count_by_name["value"] == 1
-    checkpoint = checkpoint_memory.checkpoint_by_id[checkpoint_identity.checkpoint_id]
-    assert checkpoint["state"] == importer.BULK_EXPORT_CHECKPOINT_FAILED
+    assert first_result is not None and first_result.complete is True
+    assert first_result.error is None
+    assert first_result.rows_fetched == 3
+    assert first_result.rows_written == 1
+    assert retry_result is not None and retry_result.complete is True
+    assert retry_result.rows_fetched == 3
+    assert refresh_fakes.stream_count == 2
+    checkpoint = fixture.memory.checkpoint_by_id[
+        fixture.checkpoint_identity.checkpoint_id
+    ]
+    assert checkpoint["state"] == importer.BULK_EXPORT_CHECKPOINT_COMPLETE
+    assert (
+        "begin_capability_refresh",
+        fixture.checkpoint_identity.checkpoint_id,
+    ) in fixture.memory.event_log
 
 
 def test_bulk_output_credential_safety(monkeypatch):

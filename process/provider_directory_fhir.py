@@ -1328,6 +1328,16 @@ BULK_EXPORT_OUTPUT_COMPLETE = "complete"
 BULK_EXPORT_OUTPUT_FAILED = "failed"
 BULK_EXPORT_MAX_OUTPUT_CONCURRENCY = 8
 BULK_EXPORT_DEFAULT_OUTPUT_CONCURRENCY = 1
+BULK_EXPORT_DEFAULT_CAPABILITY_REFRESH_ATTEMPTS = 64
+BULK_EXPORT_MAX_CAPABILITY_REFRESH_ATTEMPTS = 256
+BULK_EXPORT_CAPABILITY_REFRESH_ERRORS = frozenset(
+    {
+        "bulk_export_output_http_403",
+        "bulk_export_output_http_404",
+        "bulk_export_output_http_410",
+        "bulk_export_output_url_expired",
+    }
+)
 REQUESTED_SOURCE_IMPORT_EMPTY_ERROR = (
     "provider_directory_requested_sources_not_selected_for_resource_import"
 )
@@ -1716,6 +1726,7 @@ class BulkExportCheckpointIdentity:
     dataset_id: str
     start_url: str
     start_url_hash: str
+    lineage_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -1825,6 +1836,31 @@ class BulkExportStreamState:
     rows_written_this_run: int = 0
     outputs_processed: int = 0
 
+
+@dataclass
+class _BulkCapabilityRefreshProgress:
+    retained_resource_rows: list[dict[str, Any]] = field(default_factory=list)
+    rows_written_this_run: int = 0
+    pages_fetched_this_run: int = 0
+
+    def absorb(self, result: ResourceFetchResult) -> None:
+        """Accumulate one retryable stream attempt."""
+        self.retained_resource_rows.extend(result.rows)
+        self.rows_written_this_run += result.rows_written
+        self.pages_fetched_this_run += result.pages_fetched
+
+    def merged_result(self, result: ResourceFetchResult) -> ResourceFetchResult:
+        """Return a result including prior attempts from this worker run."""
+        if not self.retained_resource_rows and not (
+            self.rows_written_this_run or self.pages_fetched_this_run
+        ):
+            return result
+        return replace(
+            result,
+            rows=self.retained_resource_rows + result.rows,
+            rows_written=self.rows_written_this_run + result.rows_written,
+            pages_fetched=self.pages_fetched_this_run + result.pages_fetched,
+        )
 
 @dataclass(frozen=True)
 class EndpointDatasetCandidate:
@@ -38652,6 +38688,20 @@ def _bulk_checkpoint_lease_seconds() -> int:
     )
 
 
+def _bulk_capability_refresh_attempt_limit() -> int:
+    configured_attempts = _env_int(
+        "HLTHPRT_PROVIDER_DIRECTORY_BULK_CAPABILITY_REFRESH_ATTEMPTS",
+        BULK_EXPORT_DEFAULT_CAPABILITY_REFRESH_ATTEMPTS,
+    )
+    return max(
+        1,
+        min(
+            configured_attempts,
+            BULK_EXPORT_MAX_CAPABILITY_REFRESH_ATTEMPTS,
+        ),
+    )
+
+
 async def _bulk_guard_autocommit_connection(guard_connection: Any) -> Any:
     autocommit_connection = guard_connection.execution_options(
         isolation_level="AUTOCOMMIT"
@@ -39390,6 +39440,7 @@ def _bulk_export_checkpoint_identity(
         dataset_id=checkpoint_context.dataset_id or "",
         start_url=start_url,
         start_url_hash=start_url_hash,
+        lineage_verified=checkpoint_context.lineage_verified,
     )
 
 
@@ -40453,8 +40504,14 @@ async def _accept_bulk_export_checkpoint(
     return checkpoint
 
 
+def _is_bulk_export_capability_refresh_error(error: str | None) -> bool:
+    return bool(error and error in BULK_EXPORT_CAPABILITY_REFRESH_ERRORS)
+
+
 def _is_bulk_export_error_terminal(error: str | None) -> bool:
     if not error:
+        return False
+    if _is_bulk_export_capability_refresh_error(error):
         return False
     terminal_errors = {
         "bulk_export_missing_status_url",
@@ -40487,6 +40544,8 @@ def _is_bulk_export_error_terminal(error: str | None) -> bool:
         "bulk_export_output_content_range_invalid",
         "bulk_export_output_length_mismatch",
         "bulk_export_output_etag_mismatch",
+        "bulk_export_output_capability_refresh_exhausted",
+        "bulk_export_output_capability_refresh_lineage_unverified",
         "invalid_ndjson",
     }
     terminal_prefixes = ("bulk_export_manifest_", "bulk_export_error_")
@@ -40830,6 +40889,32 @@ def _bulk_output_checkpoint_error(
     return None
 
 
+def _bulk_output_checkpoint_for_manifest_output(
+    checkpoint_id: str,
+    manifest_output: BulkExportManifestOutput,
+    output_checkpoints: list[dict[str, Any]],
+) -> dict[str, Any]:
+    index_matches = [
+        output
+        for output in output_checkpoints
+        if output.get("output_index") == manifest_output.output_index
+    ]
+    if len(index_matches) == 1:
+        return index_matches[0]
+    expected_output_id = _bulk_manifest_output_id(
+        checkpoint_id,
+        manifest_output,
+    )
+    id_matches = [
+        output
+        for output in output_checkpoints
+        if _clean_text(output.get("output_id")) == expected_output_id
+    ]
+    if len(id_matches) != 1:
+        raise ValueError("bulk_export_manifest_output_checkpoint_mismatch")
+    return id_matches[0]
+
+
 def _stored_bulk_output_validator(
     output_checkpoint: dict[str, Any],
 ) -> BulkExportOutputValidator | None:
@@ -41086,16 +41171,13 @@ async def _prepare_bulk_output_validators(
     ownership_probe: Callable[[], Awaitable[None]],
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Persist immutable validators before any incomplete output is streamed."""
-    checkpoints_by_id = {
-        _clean_text(output.get("output_id")): output
-        for output in output_checkpoints
-    }
     for manifest_output in manifest.outputs:
-        output_id = _bulk_manifest_output_id(
+        output_checkpoint = _bulk_output_checkpoint_for_manifest_output(
             identity.checkpoint_id,
             manifest_output,
+            output_checkpoints,
         )
-        output_checkpoint = checkpoints_by_id[output_id]
+        output_id = str(output_checkpoint["output_id"])
         if _is_complete_bulk_output_proof(output_checkpoint):
             if output_checkpoint.get("output_url_ciphertext") or output_checkpoint.get(
                 "etag_ciphertext"
@@ -41122,6 +41204,695 @@ async def _prepare_bulk_output_validators(
             )
             return output_checkpoints, validation_error
     return await _load_bulk_output_checkpoints(identity.checkpoint_id), None
+
+
+def _bulk_output_validator_proof(
+    output_checkpoint: Mapping[str, Any],
+) -> tuple[int, str]:
+    """Return URL-free immutable proof retained after a capability expires."""
+
+    try:
+        content_length = int(output_checkpoint.get("content_length_bytes"))
+        committed_bytes = int(output_checkpoint.get("committed_bytes") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "bulk_export_output_validator_checkpoint_corrupt"
+        ) from exc
+    etag_hash = _clean_text(output_checkpoint.get("etag_hash")) or ""
+    if (
+        content_length <= 0
+        or not 0 <= committed_bytes <= content_length
+        or re.fullmatch(r"[0-9a-f]{64}", etag_hash) is None
+        or output_checkpoint.get("validator_checked_at") is None
+    ):
+        raise ValueError("bulk_export_output_validator_checkpoint_corrupt")
+    if (
+        output_checkpoint.get("state") == BULK_EXPORT_OUTPUT_COMPLETE
+        and committed_bytes != content_length
+    ):
+        raise ValueError("bulk_export_output_validator_checkpoint_corrupt")
+    return content_length, etag_hash
+
+
+def _bulk_capability_refresh_output_pairs(
+    manifest: BulkExportManifest,
+    output_checkpoints: list[dict[str, Any]],
+) -> list[tuple[BulkExportManifestOutput, dict[str, Any]]]:
+    checkpoint_by_index = {
+        output.get("output_index"): output
+        for output in output_checkpoints
+    }
+    if (
+        len(checkpoint_by_index) != len(output_checkpoints)
+        or len(manifest.outputs) != len(output_checkpoints)
+    ):
+        raise ValueError("bulk_export_manifest_output_checkpoint_mismatch")
+    pairs: list[tuple[BulkExportManifestOutput, dict[str, Any]]] = []
+    for manifest_output in manifest.outputs:
+        output_checkpoint = checkpoint_by_index.get(
+            manifest_output.output_index
+        )
+        if (
+            output_checkpoint is None
+            or _clean_text(output_checkpoint.get("resource_type"))
+            != manifest_output.resource_type
+        ):
+            raise ValueError(
+                "bulk_export_manifest_output_checkpoint_mismatch"
+            )
+        _bulk_output_validator_proof(output_checkpoint)
+        pairs.append((manifest_output, output_checkpoint))
+    return pairs
+
+
+def _assert_bulk_capability_refresh_manifest_contract(
+    checkpoint: Mapping[str, Any],
+    manifest: BulkExportManifest,
+) -> None:
+    manifest_audit = checkpoint.get("manifest_json")
+    if (
+        not _clean_text(checkpoint.get("manifest_hash"))
+        or not isinstance(manifest_audit, Mapping)
+        or not isinstance(manifest_audit.get("requiresAccessToken"), bool)
+    ):
+        raise ValueError("bulk_export_manifest_checkpoint_corrupt")
+    if (
+        manifest_audit["requiresAccessToken"]
+        is not manifest.requires_access_token
+    ):
+        raise ValueError("bulk_export_manifest_mismatch")
+
+
+async def _begin_bulk_capability_refresh(
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: Mapping[str, Any],
+    output_checkpoints: list[dict[str, Any]],
+) -> None:
+    """Persist one bounded refresh attempt before creating a remote job."""
+
+    refresh_error = _clean_text(checkpoint.get("error"))
+    if not _is_bulk_export_capability_refresh_error(refresh_error):
+        raise ValueError("bulk_export_output_capability_refresh_not_required")
+    incomplete_outputs = [
+        output
+        for output in output_checkpoints
+        if output.get("state") != BULK_EXPORT_OUTPUT_COMPLETE
+    ]
+    attempt_limit = _bulk_capability_refresh_attempt_limit()
+    if not incomplete_outputs or any(
+        int(output.get("attempt_count") or 0) >= attempt_limit
+        for output in incomplete_outputs
+    ):
+        raise ValueError("bulk_export_output_capability_refresh_exhausted")
+    async with db.acquire() as connection:
+        parent_count = await connection.status(
+            f"""
+            UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+               SET lease_expires_at =
+                       now() + make_interval(secs => :lease_seconds),
+                   updated_at = now()
+             WHERE checkpoint_id = :checkpoint_id
+               AND owner_run_id = :owner_run_id
+               AND state = :retryable_state
+               AND error = :refresh_error;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+            owner_run_id=identity.owner_run_id,
+            retryable_state=BULK_EXPORT_CHECKPOINT_RETRYABLE,
+            refresh_error=refresh_error,
+            lease_seconds=_bulk_checkpoint_lease_seconds(),
+        )
+        if _coerce_rowcount(parent_count) != 1:
+            raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+        output_count = await connection.status(
+            f"""
+            UPDATE {_bulk_output_checkpoint_table_ref()}
+               SET attempt_count = attempt_count + 1,
+                   updated_at = now()
+             WHERE checkpoint_id = :checkpoint_id
+               AND state <> :complete_state
+               AND attempt_count < :attempt_limit;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+            complete_state=BULK_EXPORT_OUTPUT_COMPLETE,
+            attempt_limit=attempt_limit,
+        )
+        if _coerce_rowcount(output_count) != len(incomplete_outputs):
+            raise RuntimeError(
+                "bulk_export_output_capability_refresh_exhausted"
+            )
+
+
+async def _start_bulk_capability_refresh_request(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    *,
+    timeout: int,
+) -> tuple[int | None, dict[str, Any] | None, str | None, str | None]:
+    status_code, headers, status_payload, request_error = (
+        await _bulk_http_get_json(
+            session,
+            source_record,
+            identity.start_url,
+            timeout=timeout,
+            prefer_async=True,
+        )
+    )
+    raw_status_location = _clean_text(
+        headers.get("content-location") or headers.get("location")
+    )
+    _bulk_export_log(
+        "capability_refresh_start",
+        source_id=source_record.get("source_id"),
+        resource=identity.resource_type,
+        status=status_code,
+        error=request_error,
+        start_url=_bulk_export_log_url(identity.start_url),
+        status_url=_bulk_capability_log_identity(raw_status_location),
+    )
+    return status_code, status_payload, raw_status_location, request_error
+
+
+async def _poll_bulk_capability_refresh_request(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    raw_status_location: str | None,
+    *,
+    timeout: int,
+    max_pending_seconds: int,
+    runtime_probe: Callable[[], Awaitable[None]],
+) -> tuple[dict[str, Any] | None, str | None, int]:
+    try:
+        status_url = _resolved_bulk_export_status_url(
+            source_record,
+            identity.start_url,
+            raw_status_location,
+        )
+    except ValueError as exc:
+        return None, str(exc), 0
+    return await _bulk_export_poll_manifest(
+        session,
+        source_record,
+        status_url,
+        resource_type=identity.resource_type,
+        timeout=timeout,
+        poll_options=BulkExportPollOptions(
+            lease_handler=partial(
+                _refresh_bulk_export_rows_written,
+                identity,
+            ),
+            accepted_at=_bulk_export_now_utc(),
+            max_pending_seconds=max_pending_seconds,
+            cancel_probe=runtime_probe,
+        ),
+    )
+
+
+def _validated_bulk_capability_refresh_manifest(
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    status_payload: dict[str, Any] | None,
+) -> tuple[BulkExportManifest | None, str | None]:
+    try:
+        manifest = _bulk_export_manifest_from_payload(
+            status_payload,
+            identity.resource_type,
+            expected_request_url=identity.start_url,
+        )
+        _assert_bulk_transaction_time_window(
+            str(manifest.payload["transactionTime"])
+        )
+        for manifest_output in manifest.outputs:
+            _bulk_export_output_request_options(
+                source_record,
+                manifest_output.url,
+                requires_access_token=manifest.requires_access_token,
+            )
+    except (RuntimeError, ValueError) as exc:
+        return None, str(exc)
+    return manifest, None
+
+
+async def _request_bulk_capability_refresh_manifest(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    *,
+    timeout: int,
+    max_pending_seconds: int,
+    runtime_probe: Callable[[], Awaitable[None]],
+) -> tuple[BulkExportManifest | None, str | None, int]:
+    """Request a fresh URL capability without changing dataset identity."""
+
+    await runtime_probe()
+    status_code, status_payload, status_location, request_error = (
+        await _start_bulk_capability_refresh_request(
+            session, source_record, identity, timeout=timeout,
+        )
+    )
+    if request_error is not None:
+        return None, request_error, 0
+    if status_code is None:
+        return None, "bulk_export_acceptance_outcome_unknown", 0
+    if status_code not in {200, 202}:
+        return None, f"bulk_export_status_http_{status_code}", 0
+    polls = 0
+    if status_code == 202:
+        status_payload, poll_error, polls = (
+            await _poll_bulk_capability_refresh_request(
+                session, source_record, identity, status_location,
+                timeout=timeout,
+                max_pending_seconds=max_pending_seconds,
+                runtime_probe=runtime_probe,
+            )
+        )
+        if poll_error is not None:
+            return None, poll_error, polls
+    if not _is_bulk_export_status_payload(status_payload):
+        return None, "bulk_export_status_non_bulk_payload", polls
+    payload_error = _bulk_export_payload_error(status_payload)
+    if payload_error is not None:
+        return None, payload_error, polls
+    manifest, manifest_error = _validated_bulk_capability_refresh_manifest(
+        source_record,
+        identity,
+        status_payload,
+    )
+    return manifest, manifest_error, polls
+
+
+async def _probe_bulk_capability_refresh_validators(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    manifest: BulkExportManifest,
+    output_pairs: list[
+        tuple[BulkExportManifestOutput, dict[str, Any]]
+    ],
+    *,
+    timeout: int,
+    runtime_probe: Callable[[], Awaitable[None]],
+) -> tuple[list[BulkExportOutputValidator], str | None]:
+    observed_validators: list[BulkExportOutputValidator] = []
+    for manifest_output, output_checkpoint in output_pairs:
+        await runtime_probe()
+        status_code, headers_by_name, request_error = (
+            await _bulk_http_probe_output(
+                session,
+                source_record,
+                manifest_output.url,
+                requires_access_token=manifest.requires_access_token,
+                timeout=timeout,
+                expected_etag=None,
+            )
+        )
+        if request_error is not None:
+            return [], request_error
+        if status_code != 206:
+            return [], (
+                "bulk_export_output_range_response_invalid"
+                if status_code == 200
+                else f"bulk_export_output_http_{status_code}"
+            )
+        try:
+            observed_validator = _bulk_output_validator_from_probe(
+                manifest_output.url,
+                headers_by_name,
+            )
+            expected_length, expected_etag_hash = (
+                _bulk_output_validator_proof(output_checkpoint)
+            )
+            if (
+                observed_validator.content_length_bytes != expected_length
+                or observed_validator.etag_hash != expected_etag_hash
+            ):
+                raise ValueError("bulk_export_output_validator_mismatch")
+        except (RuntimeError, ValueError) as exc:
+            return [], str(exc)
+        observed_validators.append(observed_validator)
+    return observed_validators, None
+
+
+def _bulk_capability_refresh_audit_payload(
+    checkpoint: Mapping[str, Any],
+    manifest: BulkExportManifest,
+    output_pairs: list[
+        tuple[BulkExportManifestOutput, dict[str, Any]]
+    ],
+) -> dict[str, Any]:
+    previous_audit = checkpoint.get("manifest_json")
+    refresh_count = (
+        int(previous_audit.get("capability_refresh_count") or 0) + 1
+        if isinstance(previous_audit, Mapping)
+        else 1
+    )
+    previous_chain_hash = (
+        _clean_text(previous_audit.get("capability_refresh_chain_hash"))
+        if isinstance(previous_audit, Mapping)
+        else None
+    )
+    audit_payload = _bulk_manifest_audit_payload(manifest.payload)
+    audit_payload.update(
+        {
+            "capability_refresh_count": refresh_count,
+            "capability_refresh_previous_manifest_hash": (
+                _clean_text(checkpoint.get("manifest_hash"))
+            ),
+            "capability_refresh_chain_hash": _identity_hash(
+                {
+                    "previous_chain_hash": previous_chain_hash,
+                    "previous_manifest_hash": _clean_text(
+                        checkpoint.get("manifest_hash")
+                    ),
+                    "refreshed_manifest_hash": manifest.identity_hash,
+                    "output_proofs": [
+                        {
+                            "output_id": output_checkpoint["output_id"],
+                            "content_length_bytes": (
+                                output_checkpoint["content_length_bytes"]
+                            ),
+                            "etag_hash": output_checkpoint["etag_hash"],
+                        }
+                        for _manifest_output, output_checkpoint in output_pairs
+                    ],
+                }
+            ),
+        }
+    )
+    return audit_payload
+
+
+def _bulk_capability_output_update_sql() -> str:
+    return f"""
+        UPDATE {_bulk_output_checkpoint_table_ref()}
+           SET output_id = :refreshed_output_id,
+               output_url_ciphertext = CASE
+                    WHEN :is_complete THEN NULL
+                    ELSE :output_url_ciphertext
+               END,
+               output_url_hash = :output_url_hash,
+               etag_ciphertext = CASE
+                    WHEN :is_complete THEN NULL
+                    ELSE :etag_ciphertext
+               END,
+               output_expires_at = :output_expires_at,
+               validator_checked_at = now(),
+               state = CASE
+                    WHEN :is_complete THEN state
+                    ELSE :pending_state
+               END,
+               error = NULL,
+               updated_at = now()
+         WHERE checkpoint_id = :checkpoint_id
+           AND output_id = :output_id
+           AND output_index = :output_index
+           AND resource_type = :resource_type
+           AND content_length_bytes = :content_length_bytes
+           AND etag_hash = :etag_hash;
+    """
+
+
+def _bulk_capability_parent_update_sql() -> str:
+    return f"""
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+           SET status_url_ciphertext = NULL,
+               status_url_hash = NULL,
+               manifest_hash = :manifest_hash,
+               manifest_ciphertext = :manifest_ciphertext,
+               manifest_json = CAST(:manifest_audit_json AS jsonb),
+               state = :manifest_ready_state,
+               error = NULL,
+               next_poll_at = NULL,
+               manifest_received_at = now(),
+               lease_expires_at =
+                   now() + make_interval(secs => :lease_seconds),
+               updated_at = now()
+         WHERE checkpoint_id = :checkpoint_id
+           AND owner_run_id = :owner_run_id
+           AND state = :retryable_state
+           AND error = :refresh_error;
+    """
+
+
+def _bulk_validator_expiration(
+    validator: BulkExportOutputValidator,
+) -> datetime.datetime | None:
+    if validator.output_expires_at is None:
+        return None
+    return validator.output_expires_at.astimezone(datetime.UTC).replace(
+        tzinfo=None
+    )
+
+
+async def _persist_refreshed_bulk_output(
+    connection: Any,
+    identity: BulkExportCheckpointIdentity,
+    manifest_output: BulkExportManifestOutput,
+    output_checkpoint: Mapping[str, Any],
+    validator: BulkExportOutputValidator,
+) -> None:
+    is_complete = output_checkpoint.get("state") == BULK_EXPORT_OUTPUT_COMPLETE
+    output_count = await connection.status(
+        _bulk_capability_output_update_sql(),
+        checkpoint_id=identity.checkpoint_id,
+        output_id=output_checkpoint["output_id"],
+        refreshed_output_id=_bulk_manifest_output_id(
+            identity.checkpoint_id,
+            manifest_output,
+        ),
+        output_index=manifest_output.output_index,
+        resource_type=manifest_output.resource_type,
+        output_url_ciphertext=_encrypt_bulk_capability(manifest_output.url),
+        output_url_hash=manifest_output.url_hash,
+        etag_ciphertext=_encrypt_bulk_capability(validator.etag),
+        output_expires_at=_bulk_validator_expiration(validator),
+        is_complete=is_complete,
+        pending_state=BULK_EXPORT_OUTPUT_PENDING,
+        content_length_bytes=validator.content_length_bytes,
+        etag_hash=validator.etag_hash,
+    )
+    if _coerce_rowcount(output_count) != 1:
+        raise RuntimeError("bulk_export_output_validator_mismatch")
+
+
+async def _persist_refreshed_bulk_manifest(
+    connection: Any,
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: Mapping[str, Any],
+    manifest: BulkExportManifest,
+    manifest_audit_json: str,
+) -> None:
+    parent_count = await connection.status(
+        _bulk_capability_parent_update_sql(),
+        checkpoint_id=identity.checkpoint_id,
+        owner_run_id=identity.owner_run_id,
+        retryable_state=BULK_EXPORT_CHECKPOINT_RETRYABLE,
+        refresh_error=_clean_text(checkpoint.get("error")),
+        manifest_hash=manifest.identity_hash,
+        manifest_ciphertext=_encrypt_bulk_capability(
+            json.dumps(manifest.payload, sort_keys=True)
+        ),
+        manifest_audit_json=manifest_audit_json,
+        manifest_ready_state=BULK_EXPORT_CHECKPOINT_MANIFEST_READY,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+    )
+    if _coerce_rowcount(parent_count) != 1:
+        raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+
+
+async def _persist_bulk_capability_refresh(
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: Mapping[str, Any],
+    manifest: BulkExportManifest,
+    output_pairs: list[
+        tuple[BulkExportManifestOutput, dict[str, Any]]
+    ],
+    observed_validators: list[BulkExportOutputValidator],
+) -> None:
+    """Atomically replace capabilities after exact byte-proof validation."""
+
+    manifest_audit_json = json.dumps(
+        _bulk_capability_refresh_audit_payload(
+            checkpoint,
+            manifest,
+            output_pairs,
+        ),
+        sort_keys=True,
+    )
+    async with db.acquire() as connection:
+        for output_pair, validator in zip(
+            output_pairs, observed_validators, strict=True,
+        ):
+            await _persist_refreshed_bulk_output(
+                connection,
+                identity,
+                *output_pair,
+                validator,
+            )
+        await _persist_refreshed_bulk_manifest(
+            connection,
+            identity,
+            checkpoint,
+            manifest,
+            manifest_audit_json,
+        )
+
+
+async def _record_bulk_capability_refresh_error(
+    identity: BulkExportCheckpointIdentity,
+    refresh_error: str,
+    polls: int,
+    *,
+    terminal: bool | None = None,
+) -> tuple[None, str, int]:
+    await _record_bulk_export_checkpoint_error(
+        identity,
+        refresh_error,
+        terminal=(
+            _is_bulk_export_error_terminal(refresh_error)
+            if terminal is None
+            else terminal
+        ),
+    )
+    return None, refresh_error, polls
+
+
+async def _prepare_bulk_capability_refresh(
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if not identity.lineage_verified:
+        raise ValueError(
+            "bulk_export_output_capability_refresh_lineage_unverified"
+        )
+    output_checkpoints = await _load_bulk_output_checkpoints(
+        identity.checkpoint_id
+    )
+    for output_checkpoint in output_checkpoints:
+        _bulk_output_validator_proof(output_checkpoint)
+    await _begin_bulk_capability_refresh(
+        identity,
+        checkpoint,
+        output_checkpoints,
+    )
+    return output_checkpoints
+
+
+async def _request_bulk_capability_refresh_for_options(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    fetch_options: BulkExportFetchOptions,
+    runtime_probe: Callable[[], Awaitable[None]],
+) -> tuple[BulkExportManifest | None, str | None, int]:
+    return await _request_bulk_capability_refresh_manifest(
+        session,
+        source_record,
+        identity,
+        timeout=fetch_options.timeout,
+        max_pending_seconds=fetch_options.bulk_export_max_pending_seconds,
+        runtime_probe=runtime_probe,
+    )
+
+
+async def _validate_and_persist_bulk_capabilities(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: Mapping[str, Any],
+    manifest: BulkExportManifest,
+    output_checkpoints: list[dict[str, Any]],
+    fetch_options: BulkExportFetchOptions,
+    runtime_probe: Callable[[], Awaitable[None]],
+) -> str | None:
+    _assert_bulk_capability_refresh_manifest_contract(checkpoint, manifest)
+    output_pairs = _bulk_capability_refresh_output_pairs(
+        manifest,
+        output_checkpoints,
+    )
+    observed_validators, refresh_error = (
+        await _probe_bulk_capability_refresh_validators(
+            session,
+            source_record,
+            manifest,
+            output_pairs,
+            timeout=fetch_options.timeout,
+            runtime_probe=runtime_probe,
+        )
+    )
+    if refresh_error is not None:
+        return refresh_error
+    await _persist_bulk_capability_refresh(
+        identity,
+        checkpoint,
+        manifest,
+        output_pairs,
+        observed_validators,
+    )
+    return None
+
+
+async def _refresh_checkpointed_bulk_export_capabilities(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: dict[str, Any],
+    fetch_options: BulkExportFetchOptions,
+    runtime_probe: Callable[[], Awaitable[None]],
+) -> tuple[BulkExportManifest | None, str | None, int]:
+    """Refresh expired URLs only when every immutable byte proof matches."""
+    try:
+        output_checkpoints = await _prepare_bulk_capability_refresh(
+            identity,
+            checkpoint,
+        )
+    except (RuntimeError, ValueError) as exc:
+        return await _record_bulk_capability_refresh_error(
+            identity,
+            str(exc),
+            0,
+        )
+    manifest, refresh_error, polls = (
+        await _request_bulk_capability_refresh_for_options(
+            session,
+            source_record,
+            identity,
+            fetch_options,
+            runtime_probe,
+        )
+    )
+    if refresh_error is not None or manifest is None:
+        return await _record_bulk_capability_refresh_error(
+            identity,
+            refresh_error or "bulk_export_manifest_unavailable",
+            polls,
+        )
+    try:
+        refresh_error = await _validate_and_persist_bulk_capabilities(
+            session,
+            source_record,
+            identity,
+            checkpoint,
+            manifest,
+            output_checkpoints,
+            fetch_options,
+            runtime_probe,
+        )
+    except (RuntimeError, ValueError) as exc:
+        return await _record_bulk_capability_refresh_error(
+            identity,
+            str(exc),
+            polls,
+            terminal=True,
+        )
+    if refresh_error is not None:
+        return await _record_bulk_capability_refresh_error(
+            identity,
+            refresh_error,
+            polls,
+        )
+    return manifest, None, polls
 
 
 async def _refresh_bulk_export_rows_written(
@@ -42338,7 +43109,7 @@ async def _stream_one_checkpointed_bulk_output(
     stream_state: BulkExportStreamState,
 ) -> str | None:
     """Resume one incomplete output and persist committed NDJSON boundaries."""
-    output_id = _bulk_manifest_output_id(identity.checkpoint_id, manifest_output)
+    output_id = str(output_checkpoint["output_id"])
     base_rows_written = (
         max(0, int(output_checkpoint.get("rows_written") or 0))
         if options.range_resume_enabled
@@ -42467,14 +43238,13 @@ def _pending_bulk_outputs(
     list[tuple[BulkExportManifestOutput, dict[str, Any]]],
     str | None,
 ]:
-    output_checkpoint_by_id = {
-        _clean_text(output.get("output_id")): output
-        for output in output_checkpoints
-    }
     pending_outputs: list[tuple[BulkExportManifestOutput, dict[str, Any]]] = []
     for manifest_output in manifest.outputs:
-        output_id = _bulk_manifest_output_id(identity.checkpoint_id, manifest_output)
-        output_checkpoint = output_checkpoint_by_id[output_id]
+        output_checkpoint = _bulk_output_checkpoint_for_manifest_output(
+            identity.checkpoint_id,
+            manifest_output,
+            output_checkpoints,
+        )
         if output_checkpoint.get("state") == BULK_EXPORT_OUTPUT_COMPLETE:
             continue
         if output_checkpoint.get("state") == BULK_EXPORT_OUTPUT_FAILED:
@@ -42758,6 +43528,91 @@ async def _load_or_start_checkpointed_bulk_export(
     )
 
 
+async def _recover_failed_bulk_export_capability_checkpoint(
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reopen only an exact failed lineage whose output capability expired."""
+
+    observed_owner_run_id = _clean_text(checkpoint.get("owner_run_id"))
+    observed_error = _clean_text(checkpoint.get("error"))
+    if (
+        not identity.lineage_verified
+        or observed_owner_run_id is None
+        or not _is_bulk_export_capability_refresh_error(observed_error)
+    ):
+        raise RuntimeError(
+            "bulk_export_output_capability_refresh_lineage_unverified"
+        )
+    retry_of_run_id = (
+        observed_owner_run_id
+        if observed_owner_run_id != identity.owner_run_id
+        else _clean_text(checkpoint.get("retry_of_run_id"))
+    )
+    recovered_count = await db.status(
+        f"""
+        UPDATE {_bulk_acquisition_checkpoint_table_ref()}
+           SET owner_run_id = :owner_run_id,
+               retry_of_run_id = :retry_of_run_id,
+               status_url_hash = NULL,
+               state = :retryable_state,
+               lease_expires_at = now() + make_interval(secs => :lease_seconds),
+               updated_at = now()
+         WHERE checkpoint_id = :checkpoint_id
+           AND acquisition_root_run_id = :acquisition_root_run_id
+           AND endpoint_id = :endpoint_id
+           AND dataset_id = :dataset_id
+           AND owner_run_id = :observed_owner_run_id
+           AND state = :failed_state
+           AND error = :observed_error;
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        acquisition_root_run_id=identity.acquisition_root_run_id,
+        endpoint_id=identity.endpoint_id,
+        dataset_id=identity.dataset_id,
+        owner_run_id=identity.owner_run_id,
+        retry_of_run_id=retry_of_run_id,
+        observed_owner_run_id=observed_owner_run_id,
+        observed_error=observed_error,
+        retryable_state=BULK_EXPORT_CHECKPOINT_RETRYABLE,
+        failed_state=BULK_EXPORT_CHECKPOINT_FAILED,
+        lease_seconds=_bulk_checkpoint_lease_seconds(),
+    )
+    if _coerce_rowcount(recovered_count) != 1:
+        raise RuntimeError("bulk_export_checkpoint_ownership_conflict")
+    recovered_checkpoint = await _load_bulk_export_checkpoint(identity)
+    if not recovered_checkpoint:
+        raise RuntimeError("bulk_export_checkpoint_adoption_lost")
+    return recovered_checkpoint
+
+
+async def _claim_failed_bulk_export_checkpoint(
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: dict[str, Any],
+    ownership_probe: Callable[[], Awaitable[None]],
+) -> tuple[dict[str, Any], None, str | None]:
+    checkpoint_error = _clean_text(checkpoint.get("error"))
+    if not _is_bulk_export_capability_refresh_error(checkpoint_error):
+        return checkpoint, None, None
+    if not identity.lineage_verified:
+        return (
+            checkpoint,
+            None,
+            "bulk_export_output_capability_refresh_lineage_unverified",
+        )
+    try:
+        recovered_checkpoint = (
+            await _recover_failed_bulk_export_capability_checkpoint(
+                identity,
+                checkpoint,
+            )
+        )
+        await ownership_probe()
+        return recovered_checkpoint, None, None
+    except RuntimeError as exc:
+        return checkpoint, None, str(exc)
+
+
 async def _claim_existing_bulk_export_checkpoint(
     identity: BulkExportCheckpointIdentity,
     checkpoint: dict[str, Any],
@@ -42765,17 +43620,22 @@ async def _claim_existing_bulk_export_checkpoint(
     ownership_probe: Callable[[], Awaitable[None]],
     cancel_probe: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[dict[str, Any], None, str | None]:
+    """Claim, adopt, or safely reopen one exact checkpoint lineage."""
+
     claim_deadline = time.monotonic() + _bulk_checkpoint_lease_seconds()
     while True:
         if cancel_probe is not None:
             await cancel_probe()
         checkpoint_owner = _clean_text(checkpoint.get("owner_run_id"))
         checkpoint_state = _clean_text(checkpoint.get("state"))
-        if checkpoint_state in {
-            BULK_EXPORT_CHECKPOINT_COMPLETE,
-            BULK_EXPORT_CHECKPOINT_FAILED,
-        }:
+        if checkpoint_state == BULK_EXPORT_CHECKPOINT_COMPLETE:
             return checkpoint, None, None
+        if checkpoint_state == BULK_EXPORT_CHECKPOINT_FAILED:
+            return await _claim_failed_bulk_export_checkpoint(
+                identity,
+                checkpoint,
+                ownership_probe,
+            )
         if checkpoint_owner == identity.owner_run_id:
             await ownership_probe()
             if checkpoint_state == BULK_EXPORT_CHECKPOINT_STARTING:
@@ -42969,6 +43829,91 @@ def _bulk_manifest_failure_result(
     )
 
 
+async def _next_checkpointed_bulk_manifest(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: dict[str, Any],
+    fetch_options: BulkExportFetchOptions,
+    initial_status_payload: dict[str, Any] | None,
+    runtime_probe: Callable[[], Awaitable[None]],
+) -> tuple[BulkExportManifest | None, str | None, int]:
+    await runtime_probe()
+    if _is_bulk_export_capability_refresh_error(
+        _clean_text(checkpoint.get("error"))
+    ):
+        return await _refresh_checkpointed_bulk_export_capabilities(
+            session,
+            source_record,
+            identity,
+            checkpoint,
+            fetch_options,
+            runtime_probe,
+        )
+    return await _checkpointed_bulk_export_manifest(
+        session,
+        source_record,
+        identity,
+        checkpoint,
+        initial_status_payload=initial_status_payload,
+        timeout=fetch_options.timeout,
+        max_pending_seconds=fetch_options.bulk_export_max_pending_seconds,
+        runtime_probe=runtime_probe,
+    )
+
+
+async def _run_checkpointed_bulk_stream_cycles(
+    session: aiohttp.ClientSession,
+    source_record: dict[str, Any],
+    identity: BulkExportCheckpointIdentity,
+    checkpoint: dict[str, Any],
+    initial_status_payload: dict[str, Any] | None,
+    model: type,
+    fetch_options: BulkExportFetchOptions,
+    runtime_probe: Callable[[], Awaitable[None]],
+) -> ResourceFetchResult:
+    progress = _BulkCapabilityRefreshProgress()
+    pending_status_payload = initial_status_payload
+    while True:
+        manifest, manifest_error, polls = (
+            await _next_checkpointed_bulk_manifest(
+                session,
+                source_record,
+                identity,
+                checkpoint,
+                fetch_options,
+                pending_status_payload,
+                runtime_probe,
+            )
+        )
+        pending_status_payload = None
+        if manifest_error or manifest is None:
+            return progress.merged_result(
+                _bulk_manifest_failure_result(
+                    model, checkpoint, polls, manifest_error,
+                )
+            )
+        stream_options, configuration_result = (
+            await _configured_bulk_stream_options(
+                identity, model, fetch_options, polls, runtime_probe,
+                source_record, checkpoint,
+            )
+        )
+        if configuration_result is not None:
+            return progress.merged_result(configuration_result)
+        if stream_options is None:
+            raise RuntimeError("bulk_export_stream_options_unavailable")
+        stream_result = await _stream_checkpointed_bulk_outputs(
+            session, source_record, identity, manifest, stream_options,
+        )
+        if not _is_bulk_export_capability_refresh_error(stream_result.error):
+            return progress.merged_result(stream_result)
+        progress.absorb(stream_result)
+        checkpoint = await _load_bulk_export_checkpoint(identity)
+        if not checkpoint:
+            raise RuntimeError("bulk_export_checkpoint_adoption_lost")
+
+
 async def _fetch_owned_checkpointed_bulk_resource_rows(
     source_record: dict[str, Any], identity: BulkExportCheckpointIdentity,
     model: type, fetch_options: BulkExportFetchOptions,
@@ -42996,32 +43941,15 @@ async def _fetch_owned_checkpointed_bulk_resource_rows(
             return early_result
         if checkpoint is None:
             return None
-        await runtime_probe()
-        manifest, manifest_error, polls = await _checkpointed_bulk_export_manifest(
-            session, source_record, identity, checkpoint,
-            initial_status_payload=initial_status_payload,
-            timeout=fetch_options.timeout,
-            max_pending_seconds=fetch_options.bulk_export_max_pending_seconds,
-            runtime_probe=runtime_probe,
-        )
-        if manifest_error or manifest is None:
-            return _bulk_manifest_failure_result(
-                model, checkpoint, polls, manifest_error
-            )
-        stream_options, configuration_result = await _configured_bulk_stream_options(
-            identity, model, fetch_options, polls, runtime_probe,
-            source_record, checkpoint,
-        )
-        if configuration_result is not None:
-            return configuration_result
-        if stream_options is None:
-            raise RuntimeError("bulk_export_stream_options_unavailable")
-        return await _stream_checkpointed_bulk_outputs(
+        return await _run_checkpointed_bulk_stream_cycles(
             session,
             source_record,
             identity,
-            manifest,
-            stream_options,
+            checkpoint,
+            initial_status_payload,
+            model,
+            fetch_options,
+            runtime_probe,
         )
 
 
@@ -60050,6 +60978,24 @@ async def process_provider_directory_fhir_data(
                 metrics=publish_metric_by_name,
                 execution=profile_execution,
             )
+        if (
+            profile_execution is None
+            and _should_select_validated_artifacts(
+                publish_artifacts_targets
+            )
+            and len(requested_source_ids) == 1
+        ):
+            dataset_followup = (
+                await _source_local_dataset_followup_if_current(
+                    source_ids=requested_source_ids,
+                    expected_acquisition_root_run_id=None,
+                )
+            )
+            if dataset_followup is None:
+                raise RuntimeError(
+                    "provider_directory_dataset_followup_current_dataset_missing"
+                )
+            publish_metric_by_name["dataset_followup"] = dataset_followup
         ctx["context"]["audit"] = publish_metric_by_name
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         print("PROVIDER_DIRECTORY_ARTIFACT_PUBLISH_DONE\t" + json.dumps(publish_metric_by_name, sort_keys=True, default=str))

@@ -228,3 +228,224 @@ async def test_owned_fetch_honors_configuration_result_and_defensive_none(
             _fetch_options(),
             AsyncMock(),
         )
+
+
+def _refreshable_checkpoint(identity):
+    return {
+        **_checkpoint(identity),
+        "state": importer.BULK_EXPORT_CHECKPOINT_RETRYABLE,
+        "error": "bulk_export_output_http_410",
+    }
+
+
+def _refresh_error_result(_identity_value, error, polls, **_options):
+    return None, error, polls
+
+
+@pytest.mark.asyncio
+async def test_refresh_orchestration_records_prepare_error(monkeypatch):
+    identity = dataclasses.replace(_identity(), lineage_verified=True)
+    monkeypatch.setattr(
+        importer,
+        "_prepare_bulk_capability_refresh",
+        AsyncMock(side_effect=ValueError("prepare-error")),
+    )
+    record_error = AsyncMock(side_effect=_refresh_error_result)
+    monkeypatch.setattr(
+        importer,
+        "_record_bulk_capability_refresh_error",
+        record_error,
+    )
+
+    result = await importer._refresh_checkpointed_bulk_export_capabilities(
+        object(), _source(), identity, _refreshable_checkpoint(identity),
+        _fetch_options(), AsyncMock(),
+    )
+
+    assert result == (None, "prepare-error", 0)
+
+
+@pytest.mark.asyncio
+async def test_refresh_orchestration_records_request_error(monkeypatch):
+    identity = dataclasses.replace(_identity(), lineage_verified=True)
+    monkeypatch.setattr(
+        importer,
+        "_prepare_bulk_capability_refresh",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_request_bulk_capability_refresh_for_options",
+        AsyncMock(return_value=(None, "request-error", 2)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_record_bulk_capability_refresh_error",
+        AsyncMock(side_effect=_refresh_error_result),
+    )
+
+    result = await importer._refresh_checkpointed_bulk_export_capabilities(
+        object(), _source(), identity, _refreshable_checkpoint(identity),
+        _fetch_options(), AsyncMock(),
+    )
+
+    assert result == (None, "request-error", 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capability_check_outcome", ["raise", "return"])
+async def test_refresh_orchestration_records_validation_error(
+    monkeypatch,
+    capability_check_outcome,
+):
+    identity = dataclasses.replace(_identity(), lineage_verified=True)
+    manifest = importer._bulk_export_manifest_from_payload(
+        _manifest_payload(), "Practitioner",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_prepare_bulk_capability_refresh",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_request_bulk_capability_refresh_for_options",
+        AsyncMock(return_value=(manifest, None, 2)),
+    )
+    validation_call = AsyncMock(
+        side_effect=(
+            ValueError("validation-error")
+            if capability_check_outcome == "raise"
+            else None
+        ),
+        return_value=(
+            "validation-error"
+            if capability_check_outcome == "return"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_validate_and_persist_bulk_capabilities",
+        validation_call,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_record_bulk_capability_refresh_error",
+        AsyncMock(side_effect=_refresh_error_result),
+    )
+
+    refresh_outcome = await importer._refresh_checkpointed_bulk_export_capabilities(
+        object(), _source(), identity, _refreshable_checkpoint(identity),
+        _fetch_options(), AsyncMock(),
+    )
+
+    assert refresh_outcome == (None, "validation-error", 2)
+
+
+@pytest.mark.asyncio
+async def test_refresh_cycle_rejects_lost_checkpoint(monkeypatch):
+    identity = dataclasses.replace(_identity(), lineage_verified=True)
+    manifest = importer._bulk_export_manifest_from_payload(
+        _manifest_payload(), "Practitioner",
+    )
+    monkeypatch.setattr(
+        importer,
+        "_next_checkpointed_bulk_manifest",
+        AsyncMock(return_value=(manifest, None, 0)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_configured_bulk_stream_options",
+        AsyncMock(return_value=(_stream_options(range_resume_enabled=True), None)),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_stream_checkpointed_bulk_outputs",
+        AsyncMock(
+            return_value=importer._checkpointed_bulk_fetch_result(
+                ProviderDirectoryPractitioner,
+                error="bulk_export_output_http_410",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_load_bulk_export_checkpoint",
+        AsyncMock(return_value={}),
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint_adoption_lost"):
+        await importer._run_checkpointed_bulk_stream_cycles(
+            object(), _source(), identity, _refreshable_checkpoint(identity),
+            None, ProviderDirectoryPractitioner, _fetch_options(), AsyncMock(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_checkpoint_requires_verified_lineage():
+    identity = _identity()
+    failed_checkpoint_by_field = {
+        **_checkpoint(identity),
+        "state": importer.BULK_EXPORT_CHECKPOINT_FAILED,
+        "error": "bulk_export_output_http_404",
+    }
+
+    claimed, status_payload, error = (
+        await importer._claim_failed_bulk_export_checkpoint(
+            identity,
+            failed_checkpoint_by_field,
+            AsyncMock(),
+        )
+    )
+
+    assert claimed == failed_checkpoint_by_field and status_payload is None
+    assert error == "bulk_export_output_capability_refresh_lineage_unverified"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("should_recover", [True, False])
+async def test_failed_refresh_checkpoint_reports_recovery_outcome(
+    monkeypatch,
+    should_recover,
+):
+    identity = dataclasses.replace(_identity(), lineage_verified=True)
+    failed_checkpoint_by_field = {
+        **_checkpoint(identity),
+        "state": importer.BULK_EXPORT_CHECKPOINT_FAILED,
+        "error": "bulk_export_output_http_404",
+    }
+    recovered_checkpoint_by_field = {
+        **failed_checkpoint_by_field,
+        "state": importer.BULK_EXPORT_CHECKPOINT_RETRYABLE,
+    }
+    recover = AsyncMock(
+        side_effect=(
+            None
+            if should_recover
+            else RuntimeError("bulk_export_checkpoint_ownership_conflict")
+        ),
+        return_value=recovered_checkpoint_by_field,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_recover_failed_bulk_export_capability_checkpoint",
+        recover,
+    )
+    ownership_probe = AsyncMock()
+
+    claimed, status_payload, error = (
+        await importer._claim_failed_bulk_export_checkpoint(
+            identity,
+            failed_checkpoint_by_field,
+            ownership_probe,
+        )
+    )
+
+    assert status_payload is None
+    if should_recover:
+        assert claimed == recovered_checkpoint_by_field and error is None
+        ownership_probe.assert_awaited_once()
+    else:
+        assert claimed == failed_checkpoint_by_field
+        assert error == "bulk_export_checkpoint_ownership_conflict"

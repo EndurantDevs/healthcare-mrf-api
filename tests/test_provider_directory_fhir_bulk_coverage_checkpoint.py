@@ -199,6 +199,148 @@ async def test_persist_bulk_manifest_rejects_lost_owner(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_persist_refreshed_capabilities_is_one_transaction(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY",
+        "bulk-coverage-key",
+    )
+    identity = dataclasses.replace(_identity(), lineage_verified=True)
+    manifest = importer._bulk_export_manifest_from_payload(
+        _manifest_payload(),
+        "Practitioner",
+        expected_request_url=identity.start_url,
+    )
+    etag = '"stable"'
+    output_checkpoint_by_field = {
+        "output_id": "a" * 64,
+        "output_index": 0,
+        "resource_type": "Practitioner",
+        "state": importer.BULK_EXPORT_OUTPUT_PENDING,
+        "content_length_bytes": 20,
+        "etag_hash": hashlib.sha256(etag.encode()).hexdigest(),
+    }
+    checkpoint_by_field = {
+        **_checkpoint(identity),
+        "error": "bulk_export_output_http_410",
+        "manifest_hash": "b" * 64,
+        "manifest_json": {"requiresAccessToken": False},
+    }
+    validator = importer.BulkExportOutputValidator(
+        content_length_bytes=20,
+        etag=etag,
+        etag_hash=output_checkpoint_by_field["etag_hash"],
+        output_expires_at=None,
+    )
+    connection = _Connection(1)
+    monkeypatch.setattr(importer.db, "acquire", lambda: _acquire(connection))
+
+    await importer._persist_bulk_capability_refresh(
+        identity,
+        checkpoint_by_field,
+        manifest,
+        [(manifest.outputs[0], output_checkpoint_by_field)],
+        [validator],
+    )
+
+    assert connection.status.await_count == 2
+    output_call, parent_call = connection.status.await_args_list
+    assert output_call.kwargs["output_id"] == "a" * 64
+    assert output_call.kwargs["refreshed_output_id"] == (
+        importer._bulk_manifest_output_id(
+            identity.checkpoint_id,
+            manifest.outputs[0],
+        )
+    )
+    assert output_call.kwargs["content_length_bytes"] == 20
+    assert parent_call.kwargs["refresh_error"] == "bulk_export_output_http_410"
+    assert parent_call.kwargs["manifest_hash"] == manifest.identity_hash
+
+
+@pytest.mark.asyncio
+async def test_recover_failed_capability_requires_exact_identity(monkeypatch):
+    identity = dataclasses.replace(
+        _identity(owner_run_id="retry-run", retry_of_run_id="prior-run"),
+        lineage_verified=True,
+    )
+    failed_checkpoint_by_field = {
+        **_checkpoint(identity),
+        "owner_run_id": "prior-run",
+        "state": importer.BULK_EXPORT_CHECKPOINT_FAILED,
+        "error": "bulk_export_output_http_404",
+    }
+    recovered_checkpoint_by_field = {
+        **failed_checkpoint_by_field,
+        "owner_run_id": identity.owner_run_id,
+        "state": importer.BULK_EXPORT_CHECKPOINT_RETRYABLE,
+    }
+    status = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(
+        importer,
+        "_load_bulk_export_checkpoint",
+        AsyncMock(return_value=recovered_checkpoint_by_field),
+    )
+
+    recovered = await importer._recover_failed_bulk_export_capability_checkpoint(
+        identity,
+        failed_checkpoint_by_field,
+    )
+
+    assert recovered == recovered_checkpoint_by_field
+    recovery_call = status.await_args
+    assert "status_url_hash = NULL" in recovery_call.args[0]
+    assert recovery_call.kwargs["acquisition_root_run_id"] == identity.acquisition_root_run_id
+    assert recovery_call.kwargs["endpoint_id"] == identity.endpoint_id
+    assert recovery_call.kwargs["dataset_id"] == identity.dataset_id
+    assert recovery_call.kwargs["observed_owner_run_id"] == "prior-run"
+
+
+@pytest.mark.asyncio
+async def test_recover_failed_capability_rejects_unverified_identity():
+    identity = _identity()
+    with pytest.raises(RuntimeError, match="lineage_unverified"):
+        await importer._recover_failed_bulk_export_capability_checkpoint(
+            identity,
+            {
+                **_checkpoint(identity),
+                "state": importer.BULK_EXPORT_CHECKPOINT_FAILED,
+                "error": "bulk_export_output_http_404",
+            },
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_count", [0, 1])
+async def test_recover_failed_capability_rejects_lost_state(
+    monkeypatch,
+    status_count,
+):
+    identity = dataclasses.replace(_identity(), lineage_verified=True)
+    monkeypatch.setattr(
+        importer.db,
+        "status",
+        AsyncMock(return_value=status_count),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_load_bulk_export_checkpoint",
+        AsyncMock(return_value={}),
+    )
+    expected_error = (
+        "ownership_conflict" if status_count == 0 else "adoption_lost"
+    )
+    with pytest.raises(RuntimeError, match=expected_error):
+        await importer._recover_failed_bulk_export_capability_checkpoint(
+            identity,
+            {
+                **_checkpoint(identity),
+                "state": importer.BULK_EXPORT_CHECKPOINT_FAILED,
+                "error": "bulk_export_output_http_404",
+            },
+        )
+
+
+@pytest.mark.asyncio
 async def test_claim_existing_checkpoint_covers_lineage_and_adoption_errors(
     monkeypatch,
 ):
