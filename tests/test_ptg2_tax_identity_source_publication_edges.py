@@ -11,6 +11,7 @@ import pytest
 
 from process.ptg_parts import ptg2_tax_identity_source_aggregate_reuse as aggregate
 from process.ptg_parts import ptg2_tax_identity_source_binding_vector as vector
+from process.ptg_parts import ptg2_tax_identity_source_persisted as persisted
 from process.ptg_parts import ptg2_tax_identity_source_target_preflight as target
 from process.ptg_parts import ptg2_tax_identity_source_validation as validation
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
@@ -393,7 +394,7 @@ async def test_reused_layout_manifest_and_counts_are_required():
         execute=AsyncMock(return_value=_QueryResult(one=(0, 0, 0, 0, 0)))
     )
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        await validation._validate_reused_observation_counts(
+        await persisted.validate_source_observation_counts(
             count_session,
             schema='"mrf"',
             snapshot_key=7,
