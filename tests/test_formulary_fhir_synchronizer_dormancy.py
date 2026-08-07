@@ -97,3 +97,67 @@ def test_synthetic_canary_postgres_proof_and_fixtures_are_packaged():
     assert (fixture_directory / "medication_a.json").is_file()
     assert (fixture_directory / "medication_b.json").is_file()
     assert (fixture_directory / "canary_expected_v1.json").is_file()
+
+
+def test_synthetic_seed_publisher_is_fixed_smoke_only_and_dormant():
+    publisher_source = (
+        ROOT
+        / "process"
+        / "formulary_fhir"
+        / "synthetic_seed_publisher.py"
+    ).read_text(encoding="utf-8")
+    script_source = (
+        ROOT
+        / "scripts"
+        / "smoke"
+        / "formulary_fhir_synthetic_seed_publisher.py"
+    ).read_text(encoding="utf-8")
+    assert 'choices=("publish-seed",)' in script_source
+    assert "publish_synthetic_seed" in script_source
+    for forbidden_import in (
+        "FHIRFormularyClient",
+        "SyntheticCanaryClient",
+        "synchronize_verified_dataset",
+        "_run_verified_sync",
+        "aiohttp",
+        "socket",
+        "publish_dataset",
+    ):
+        assert forbidden_import not in publisher_source
+    for forbidden_selector in (
+        "--source-id",
+        "--run-id",
+        "--dataset-id",
+        "--cutoff",
+        "--generation",
+        "--intent",
+    ):
+        assert forbidden_selector not in script_source
+
+
+def test_synthetic_seed_publisher_has_no_runtime_or_deployment_reachability():
+    runtime_paths = [
+        ROOT / "main.py",
+        ROOT / "process" / "__init__.py",
+        ROOT / "api" / "control_imports.py",
+        ROOT / "api" / "control_workers.py",
+    ]
+    runtime_paths.extend((ROOT / "api" / "endpoint").glob("*.py"))
+    for runtime_path in runtime_paths:
+        runtime_source = runtime_path.read_text(encoding="utf-8")
+        assert "publish_synthetic_seed" not in runtime_source
+        assert (
+            "HLTHPRT_FHIR_FORMULARY_SYNTHETIC_SEED_PUBLICATION_ENABLED"
+            not in runtime_source
+        )
+
+    workflow_source = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert (
+        "tests/test_formulary_fhir_synthetic_seed_publisher_postgres.py"
+        in workflow_source
+    )
+    assert "COPY process/ /opt/process/" in dockerfile_source
+    assert "COPY scripts/ /opt/scripts/" in dockerfile_source

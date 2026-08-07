@@ -13,6 +13,9 @@ from typing import Any
 
 CANARY_CONTRACT_VERSION = "formulary-fhir-synthetic-v1"
 CANARY_ENABLED_ENV = "HLTHPRT_FHIR_FORMULARY_SYNTHETIC_CANARY_ENABLED"
+SEED_PUBLICATION_ENABLED_ENV = (
+    "HLTHPRT_FHIR_FORMULARY_SYNTHETIC_SEED_PUBLICATION_ENABLED"
+)
 CANARY_SOURCE_ID = "formulary-fhir-synthetic-v1"
 CANARY_SOURCE_BASE = "https://formulary-fhir-canary.example.invalid/fhir"
 CANARY_SOURCE_DISPLAY_NAME = "Synthetic Formulary Canary V1"
@@ -21,6 +24,7 @@ CANARY_CUTOFF = dt.datetime(2026, 8, 6, tzinfo=dt.UTC)
 CANARY_LOCK_WAIT_SECONDS = 5.0
 CANARY_LOCK_RETRY_SECONDS = 0.1
 CANARY_TIMEOUT_SECONDS = 60
+CANARY_PUBLICATION_TIMEOUT_SECONDS = 30
 CANARY_FINAL_TABLE_COUNTS = {
     "fhir_formulary_source": 1,
     "fhir_formulary_dataset": 1,
@@ -35,6 +39,10 @@ CANARY_FINAL_TABLE_COUNTS = {
     "fhir_formulary_alias_membership": 2,
     "fhir_formulary_alternative": 1,
     "fhir_formulary_checkpoint": 2,
+}
+CANARY_PUBLISHED_TABLE_COUNTS = {
+    **CANARY_FINAL_TABLE_COUNTS,
+    "fhir_formulary_current": 1,
 }
 FIXTURE_ROOT = (
     Path(__file__).resolve().parents[2]
@@ -166,11 +174,14 @@ __all__ = (
     "CANARY_FINAL_TABLE_COUNTS",
     "CANARY_LOCK_RETRY_SECONDS",
     "CANARY_LOCK_WAIT_SECONDS",
+    "CANARY_PUBLICATION_TIMEOUT_SECONDS",
+    "CANARY_PUBLISHED_TABLE_COUNTS",
     "CANARY_RUN_ID",
     "CANARY_SOURCE_BASE",
     "CANARY_SOURCE_DISPLAY_NAME",
     "CANARY_SOURCE_ID",
     "CANARY_TIMEOUT_SECONDS",
+    "SEED_PUBLICATION_ENABLED_ENV",
     "SyntheticCanaryContractError",
     "canary_metadata",
     "canary_runtime_config",

@@ -37,3 +37,27 @@ Publication is a separate reviewed slice with a separate default-off approval
 gate and exact golden evidence. There is no supported unpublish or hard-delete
 path for completed checkpoint lineages, so a later published synthetic seed is
 retained as disabled, isolated evidence rather than deleted ad hoc.
+
+## Generation-one publication
+
+After the exact seed candidate is verified and disabled, its separately
+reviewed publisher can atomically create or exactly replay generation 1:
+
+```console
+HLTHPRT_FHIR_FORMULARY_SYNTHETIC_SEED_PUBLICATION_ENABLED=true \
+  /opt/venv/bin/python -B \
+  /opt/scripts/smoke/formulary_fhir_synthetic_seed_publisher.py publish-seed
+```
+
+This second gate is also process-local and default-off. It must not be added to
+a ConfigMap, Secret, worker, schedule, control route, or API route. The command
+accepts no source, run, dataset, cutoff, generation, or intent selector. It
+locks the fixed source, recomputes the complete stored graph, compares every
+count and hash with the checked-in v1 evidence, and commits the current pointer
+only when all postconditions are exact.
+
+If the command's outcome is ambiguous because the caller times out or loses
+its connection, rerun the same fixed command. Exact replay returns the original
+generation and publication timestamp; compensation, deletion, and unpublish
+are intentionally unsupported. The disabled source, generation-one pointer,
+and tiny synthetic lineage remain as durable release evidence.
