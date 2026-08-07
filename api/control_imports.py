@@ -59,6 +59,12 @@ from process.ptg_parts.ptg_wave_admission_fence import (
     require_no_capacity_owning_wave,
     require_not_wave_owned_run,
 )
+from process.ptg_singleton_direct_control import (
+    DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
+    DIRECT_RATE_FILE_PROTECTED_FIELDS,
+    DIRECT_RATE_FILE_PUBLIC_MARKER,
+    protected_singleton_direct_presence,
+)
 
 from db.models import ImportRun, db
 from process.import_status_events import enqueue_status_event, isoformat_utc
@@ -735,7 +741,10 @@ def normalize_run(import_run: Any) -> dict[str, Any]:
     has_private_frozen_evidence = has_frozen_private_evidence(run_by_field)
     private_frozen_values: frozenset[str] = frozenset()
     if isinstance(run_by_field.get("params"), dict):
-        if str(run_by_field.get("importer") or "") == "ptg":
+        if (
+            str(run_by_field.get("importer") or "") == "ptg"
+            and has_private_frozen_evidence
+        ):
             private_frozen_values = frozen_private_scalar_values(
                 run_by_field["params"]
             )
@@ -780,9 +789,22 @@ def _params_for_import_run_response(
         importer,
         params_by_name,
     )
-    if importer != "ptg" or not protected_frozen_tuple_presence(
-        stored_params_by_name
-    ):
+    if importer != "ptg":
+        return stored_params_by_name
+    if protected_singleton_direct_presence(stored_params_by_name):
+        public_params_by_name = {
+            name: param_value
+            for name, param_value in stored_params_by_name.items()
+            if name not in DIRECT_RATE_FILE_PROTECTED_FIELDS
+            and name not in {"source_file_id", "source_key"}
+        }
+        public_params_by_name[DIRECT_RATE_FILE_PUBLIC_MARKER] = True
+        public_params_by_name[DIRECT_RATE_FILE_INTENT_SHA256_FIELD] = (
+            stored_params_by_name[DIRECT_RATE_FILE_INTENT_SHA256_FIELD]
+        )
+        public_params_by_name["max_files"] = 1
+        return public_params_by_name
+    if not protected_frozen_tuple_presence(stored_params_by_name):
         return stored_params_by_name
     public_params_by_name = {
         name: param_value
@@ -2676,6 +2698,10 @@ def _retry_child_params(
     if current_params_by_name.get("frozen_rate_file_set_protected") is True:
         raise ValueError(
             "protected frozen runs cannot be retried through the public API"
+        )
+    if current_params_by_name.get(DIRECT_RATE_FILE_PUBLIC_MARKER) is True:
+        raise ValueError(
+            "protected direct runs cannot be retried through the public API"
         )
     if current_run_map.get("importer") == "ptg" and (
         _has_ptg_full_rebuild_control(current_params_by_name)

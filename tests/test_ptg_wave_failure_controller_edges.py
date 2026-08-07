@@ -264,9 +264,11 @@ class _Redis:
 
 
 class _Request:
-    def __init__(self, *, json=None, args=None):
+    def __init__(self, *, json=None, args=None, headers=None, body=b""):
         self.json = json
         self.args = {} if args is None else args
+        self.headers = {} if headers is None else headers
+        self.body = body
 
 
 class _Rows:

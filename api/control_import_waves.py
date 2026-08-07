@@ -31,8 +31,8 @@ from api.control_imports import (
     _import_param_views,
     _normalize_triggered_by,
 )
+from api import control_import_wave_direct as direct_wave
 from db.models import ImportRun, PTGImportWave, PTGImportWaveIntent, db
-from process.ptg_parts.frozen_rate_binding import normalize_protected_frozen_rate_params
 from process.ptg_parts.frozen_rate_binding_store import insert_or_compare_frozen_binding
 from process.ptg_parts.ptg_source_attempt_actions import record_source_attempt_event
 from process.ptg_parts.ptg_source_attempt_guard import (
@@ -54,6 +54,8 @@ WORKER_CLASS = "process.PTGSmall"
 RESOURCE_CLASS = "small"
 WORKER_LIMIT = 12
 MAX_INTENTS = 4096
+MAX_INTENT_CANONICAL_BYTES = direct_wave.MAX_INTENT_CANONICAL_BYTES
+MAX_ATTESTATION_CANONICAL_BYTES = direct_wave.MAX_ATTESTATION_CANONICAL_BYTES
 PROTOCOL_IDENTITY = "healthporta.ptg-small.exact-wave.v1"
 SERIALIZER_IDENTITY = "arq-0.28.process-msgpack.v1"
 class ImportWaveConflict(ValueError):
@@ -96,7 +98,7 @@ def _validated_intent_payload(
     run_key: str,
 ) -> tuple[str, dict[str, Any]]:
     source_id = intent["source_file_import_id"]
-    raw_params = normalize_protected_frozen_rate_params(intent["params"])
+    raw_params = direct_wave.normalized_wave_params(intent["params"])
     _assert_ptg_rebuild_request_params("ptg", raw_params)
     control_payload = validated_control_import_payload(
         {
@@ -180,13 +182,14 @@ def _prepare_intent(
     }
 
 
-def _validate_signed_intents(raw_intents: object) -> list[dict[str, Any]]:
+def _validate_signed_intents(raw_intents: object, *, wave_id: str | None = None) -> list[dict[str, Any]]:
     if not isinstance(raw_intents, list) or not 1 <= len(raw_intents) <= MAX_INTENTS:
         raise ValueError(f"cohort_attestation intents must contain between 1 and {MAX_INTENTS} items")
     intents: list[dict[str, Any]] = []
     run_ids: set[str] = set()
     source_ids: set[str] = set()
     for ordinal, raw in enumerate(raw_intents):
+        direct_wave.require_bounded_direct_intent(raw)
         expected_intent_fields = {
             "ordinal", "run_id", "source_file_import_id", "content_version", "params",
         }
@@ -202,10 +205,18 @@ def _validate_signed_intents(raw_intents: object) -> list[dict[str, Any]]:
         source_ids.add(source_id)
         if not isinstance(raw["params"], dict):
             raise ValueError("signed intent params must be an object")
+        content_version = _identifier(raw["content_version"], "content_version", 128)
+        normalized_params = direct_wave.normalized_wave_params(raw["params"])
+        direct_wave.require_matching_direct_coordinate(
+            normalized_params,
+            content_version,
+            source_file_import_id=source_id,
+            wave_id=wave_id or "",
+        )
         intents.append({
             "run_id": run_id, "source_file_import_id": source_id,
-            "content_version": _identifier(raw["content_version"], "content_version", 128),
-            "params": normalize_protected_frozen_rate_params(raw["params"]),
+            "content_version": content_version,
+            "params": normalized_params,
         })
     return intents
 
@@ -217,6 +228,7 @@ def validate_import_wave_payload(
 
     if not isinstance(request_body, dict) or set(request_body) != {"cohort_attestation"}:
         raise ValueError("import wave payload must contain only cohort_attestation")
+    direct_wave.require_bounded_wave_request(request_body)
     attestation = _verify_attestation(
         request_body["cohort_attestation"],
         attestation_key=attestation_key,
@@ -228,7 +240,10 @@ def validate_import_wave_payload(
         schema_version=attestation["schema_version"],
     )
     partition = _validate_partition(attestation["partition"])
-    intents = _validate_signed_intents(attestation["intents"])
+    intents = _validate_signed_intents(
+        attestation["intents"],
+        wave_id=wave_id,
+    )
     if partition["imported_coordinate_count"] != len(intents):
         raise ValueError("partition imported_coordinate_count must equal signed intent count")
     imported_coordinate_digest = _sha256(
