@@ -106,6 +106,10 @@ def test_shared_schema_requires_all_migration_owned_lifecycle_tables():
         "ptg2_provider_tax_identity_source_binding",
         "ptg2_provider_group_tax_identity_source",
     )
+    assert shared_gc.PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES == (
+        shared_gc.PTG2_PROVIDER_TAX_IDENTITY_BASE_TABLE_NAMES
+        + shared_gc.PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES
+    )
 
 
 def test_cleanup_recognizes_current_and_legacy_shared_generations_only():
@@ -583,8 +587,8 @@ async def test_migration_preflight_requires_candidate_attestation_table():
 @pytest.mark.asyncio
 async def test_cleanup_rejects_partial_provider_tax_identity_schema():
     executor = _SharedGCExecutor()
-    legacy_layout, manifest, *remaining_tables = (
-        shared_gc.PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES
+    legacy_layout, manifest, *remaining_base_tables = (
+        shared_gc.PTG2_PROVIDER_TAX_IDENTITY_BASE_TABLE_NAMES
     )
     executor.present_tables.add(legacy_layout)
     executor.present_tables.add(manifest)
@@ -598,13 +602,52 @@ async def test_cleanup_rejects_partial_provider_tax_identity_schema():
             require_shared=True,
         )
 
-    executor.present_tables.update(remaining_tables)
+    executor.present_tables.update(remaining_base_tables)
     plan = await shared_gc.build_shared_layout_release_plan(
         executor=executor,
         require_shared=True,
     )
 
     assert plan.tables_available is True
+
+    executor.present_tables.add(
+        shared_gc.PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES[0]
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="complete additive schema.*missing tables",
+    ):
+        await shared_gc.build_shared_layout_release_plan(
+            executor=executor,
+            require_shared=True,
+        )
+
+    executor.present_tables.update(
+        shared_gc.PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES
+    )
+    plan = await shared_gc.build_shared_layout_release_plan(
+        executor=executor,
+        require_shared=True,
+    )
+
+    assert plan.tables_available is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_rejects_source_tax_identity_schema_without_base():
+    executor = _SharedGCExecutor()
+    executor.present_tables.update(
+        shared_gc.PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="complete additive schema.*missing tables",
+    ):
+        await shared_gc.build_shared_layout_release_plan(
+            executor=executor,
+            require_shared=True,
+        )
 
 
 @pytest.mark.asyncio

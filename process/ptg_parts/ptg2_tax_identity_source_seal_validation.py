@@ -21,6 +21,36 @@ from process.ptg_parts.ptg2_tax_identity_source_validation import (
 )
 
 
+async def _source_projection_relation_state(
+    session: Any,
+    *,
+    schema: str,
+) -> tuple[bool, bool, bool]:
+    manifest_relation = f"{schema}.ptg2_provider_tax_identity_source_manifest"
+    binding_relation = f"{schema}.ptg2_provider_tax_identity_source_binding"
+    observation_relation = f"{schema}.ptg2_provider_group_tax_identity_source"
+    manifest_oid, binding_oid, observation_oid = (
+        await session.execute(
+            db.text("""
+                SELECT
+                  to_regclass(:manifest_relation),
+                  to_regclass(:binding_relation),
+                  to_regclass(:observation_relation)
+                """),
+            {
+                "manifest_relation": manifest_relation,
+                "binding_relation": binding_relation,
+                "observation_relation": observation_relation,
+            },
+        )
+    ).one()
+    return (
+        manifest_oid is not None,
+        binding_oid is not None,
+        observation_oid is not None,
+    )
+
+
 async def validate_source_projection_absence(
     session: Any,
     *,
@@ -30,6 +60,14 @@ async def validate_source_projection_absence(
     """Allow omitted source metadata only when no source evidence exists."""
 
     schema = _quote_ident(schema_name)
+    relation_state = await _source_projection_relation_state(
+        session,
+        schema=schema,
+    )
+    if not any(relation_state):
+        return
+    if not all(relation_state):
+        raise _fail()
     has_source_evidence = await session.scalar(
         db.text(f"""
             SELECT EXISTS (

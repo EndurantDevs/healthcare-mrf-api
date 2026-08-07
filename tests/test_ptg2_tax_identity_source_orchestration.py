@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process.ptg_parts import ptg2_tax_identity_source_seal_validation as validation
 from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
@@ -17,8 +18,84 @@ from process.ptg_parts.ptg2_shared_reuse import (
 from process.ptg_parts.ptg2_tax_identity_source_binding import (
     TaxIdentityRateSourceBindingError,
 )
+from process.ptg_parts.ptg2_tax_identity_source_projection import (
+    TaxIdentitySourceProjectionError,
+)
 
 ptg = importlib.import_module("process.ptg")
+
+
+def _source_absence_session(
+    relation_oids: tuple[object | None, object | None, object | None],
+    *,
+    has_source_evidence: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(one=lambda: relation_oids),
+        ),
+        scalar=AsyncMock(return_value=has_source_evidence),
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_absence_accepts_complete_legacy_schema() -> None:
+    session = _source_absence_session((None, None, None))
+
+    await validation.validate_source_projection_absence(
+        session,
+        schema_name="mrf",
+        snapshot_key=17,
+    )
+
+    session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_source_absence_rejects_partial_source_schema() -> None:
+    session = _source_absence_session((1, None, None))
+
+    with pytest.raises(
+        TaxIdentitySourceProjectionError,
+        match="ptg2_tax_identity_source_projection_invalid",
+    ):
+        await validation.validate_source_projection_absence(
+            session,
+            schema_name="mrf",
+            snapshot_key=17,
+        )
+
+    session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_source_evidence", [False, True])
+async def test_source_absence_checks_complete_source_schema(
+    has_source_evidence: bool,
+) -> None:
+    session = _source_absence_session(
+        (1, 2, 3),
+        has_source_evidence=has_source_evidence,
+    )
+
+    if has_source_evidence:
+        with pytest.raises(
+            TaxIdentitySourceProjectionError,
+            match="ptg2_tax_identity_source_projection_invalid",
+        ):
+            await validation.validate_source_projection_absence(
+                session,
+                schema_name="mrf",
+                snapshot_key=17,
+            )
+    else:
+        await validation.validate_source_projection_absence(
+            session,
+            schema_name="mrf",
+            snapshot_key=17,
+        )
+
+    session.scalar.assert_awaited_once()
 
 
 def _assignment() -> SharedSnapshotSourceAssignment:

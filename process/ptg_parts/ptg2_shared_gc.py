@@ -57,14 +57,20 @@ PTG2_V4_GC_TABLE_NAMES = (
     "ptg2_v4_snapshot_map_root",
     "ptg2_v4_snapshot_map_pack",
 )
-PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES = (
+PTG2_PROVIDER_TAX_IDENTITY_BASE_TABLE_NAMES = (
     "ptg2_provider_tax_identity_legacy_layout",
     "ptg2_provider_tax_identity_manifest",
     "ptg2_provider_tax_identity",
     "ptg2_provider_group_tax_identity",
+)
+PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES = (
     "ptg2_provider_tax_identity_source_manifest",
     "ptg2_provider_tax_identity_source_binding",
     "ptg2_provider_group_tax_identity_source",
+)
+PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES = (
+    PTG2_PROVIDER_TAX_IDENTITY_BASE_TABLE_NAMES
+    + PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES
 )
 
 PTG2_V3_MIGRATION_OWNED_TABLE_NAMES = (
@@ -473,16 +479,30 @@ async def _has_provider_tax_identity_tables(
         for table_record in table_records
         if _row_mapping(table_record).get("table_name")
     }
-    expected_names = set(PTG2_PROVIDER_TAX_IDENTITY_TABLE_NAMES)
-    installed_names = expected_names & present_names
-    if installed_names and installed_names != expected_names:
+    base_names = set(PTG2_PROVIDER_TAX_IDENTITY_BASE_TABLE_NAMES)
+    source_names = set(PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES)
+    installed_base_names = base_names & present_names
+    installed_source_names = source_names & present_names
+    has_incomplete_base = bool(installed_base_names) and (
+        installed_base_names != base_names
+    )
+    has_incomplete_source = bool(installed_source_names) and (
+        installed_source_names != source_names
+    )
+    has_source_without_base = bool(installed_source_names) and (
+        installed_base_names != base_names
+    )
+    if has_incomplete_base or has_incomplete_source or has_source_without_base:
+        expected_names = (
+            base_names | source_names if installed_source_names else base_names
+        )
         missing = ", ".join(sorted(expected_names - present_names))
         raise RuntimeError(
             "PTG provider tax-identity cleanup requires the complete "
             f"additive schema; missing tables: {missing}; "
             "run alembic upgrade head"
         )
-    return installed_names == expected_names
+    return installed_base_names == base_names
 
 
 async def _has_v4_map_tables(executor: Any, schema_name: str) -> bool:
