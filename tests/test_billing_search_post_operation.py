@@ -313,7 +313,7 @@ def _install_matched_cursor_mocks(
     monkeypatch.setattr(
         operation,
         "seal_billing_search_page_cursor",
-        lambda *_args, **_kwargs: SimpleNamespace(token="sealed-next"),
+        lambda *_args, **_kwargs: SimpleNamespace(**{"token": "sealed-next"}),
     )
     opened_tokens: list[object] = []
 
