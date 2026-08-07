@@ -24,6 +24,12 @@ asyncpg = pytest.importorskip("asyncpg")
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260729110000_tin_npi_connector.py"
+GUARD_MIGRATION_PATH = (
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260807100000_provider_directory_endpoint_dataset_guard.py"
+)
 POSTGRES_DSN_ENV = "HLTHPRT_TIN_NPI_CONNECTOR_POSTGRES_DSN"
 TEST_DATABASE_PATTERN = re.compile(r"(?:^|[_-])test(?:[_-]|$)", re.IGNORECASE)
 ORGANIZATION_ROWS = (
@@ -53,6 +59,17 @@ def load_migration():
     return migration
 
 
+def load_guard_migration():
+    module_spec = importlib.util.spec_from_file_location(
+        "provider_directory_endpoint_dataset_guard_postgres_migration",
+        GUARD_MIGRATION_PATH,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
+
+
 async def open_test_connection():
     database_dsn = os.getenv(POSTGRES_DSN_ENV)
     if not database_dsn:
@@ -72,6 +89,28 @@ async def run_migration(migration, action: str, connection) -> list[str]:
     for sql_statement in sql_capture.statements:
         await connection.execute(sql_statement)
     return sql_capture.statements
+
+
+async def _endpoint_dataset_guard_binding(connection, schema: str):
+    return await connection.fetchrow(
+        """
+        SELECT function_row.oid AS function_oid,
+               trigger_row.tgfoid AS trigger_function_oid
+          FROM pg_catalog.pg_proc AS function_row
+          JOIN pg_catalog.pg_namespace AS function_namespace
+            ON function_namespace.oid = function_row.pronamespace
+          JOIN pg_catalog.pg_trigger AS trigger_row
+            ON trigger_row.tgfoid = function_row.oid
+         WHERE function_namespace.nspname = $1
+           AND function_row.proname =
+                   'guard_tin_npi_connector_endpoint_dataset'
+           AND function_row.pronargs = 0
+           AND trigger_row.tgname =
+                   'tin_npi_connector_endpoint_dataset_guard'
+           AND trigger_row.tgisinternal IS FALSE
+        """,
+        schema,
+    )
 
 
 async def create_fence_tables(connection, schema: str) -> None:
@@ -109,10 +148,11 @@ async def _create_directory_catalog_tables(connection, schema: str) -> None:
             status varchar(32) NOT NULL,
             is_current boolean NOT NULL,
             resource_count bigint NOT NULL,
+            created_at timestamp,
             validated_at timestamp,
             published_at timestamp,
             superseded_at timestamp,
-            publication_metadata_json jsonb
+            publication_metadata_json json
         )
         """
     )
@@ -316,7 +356,7 @@ async def _insert_directory_identity(connection, quoted_schema, source_summary):
             'dataset-a', 'endpoint-a', 'run-a', $1, 'published', TRUE, 2,
             timestamp '2026-07-27 00:00:00',
             timestamp '2026-07-27 00:01:00',
-            $2::jsonb
+            $2::json
         )
         """,
         "ab" * 32,
@@ -341,6 +381,7 @@ class TransactionalSchema:
     transaction: object
     schema: str
     migration: object
+    guard_migration: object
 
     @property
     def quoted_schema(self) -> str:
@@ -355,9 +396,16 @@ class TransactionalSchema:
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
         monkeypatch.delenv("DB_SCHEMA", raising=False)
         migration = load_migration()
+        guard_migration = load_guard_migration()
         await connection.execute(f'CREATE SCHEMA "{schema}"')
         await create_fence_tables(connection, schema)
-        return cls(connection, transaction, schema, migration)
+        return cls(
+            connection,
+            transaction,
+            schema,
+            migration,
+            guard_migration,
+        )
 
     async def close(self):
         await self.transaction.rollback()
@@ -365,3 +413,18 @@ class TransactionalSchema:
 
     async def upgrade(self):
         await run_migration(self.migration, "upgrade", self.connection)
+        guard_binding_before = await _endpoint_dataset_guard_binding(
+            self.connection,
+            self.schema,
+        )
+        assert guard_binding_before is not None
+        await run_migration(
+            self.guard_migration,
+            "upgrade",
+            self.connection,
+        )
+        guard_binding_after = await _endpoint_dataset_guard_binding(
+            self.connection,
+            self.schema,
+        )
+        assert guard_binding_after == guard_binding_before

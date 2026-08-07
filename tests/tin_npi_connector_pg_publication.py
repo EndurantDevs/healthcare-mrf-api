@@ -110,10 +110,10 @@ async def _set_dataset_source_ids(scenario, source_ids_json):
         UPDATE {scenario.quoted_schema}.provider_directory_endpoint_dataset
            SET publication_metadata_json =
                jsonb_set(
-                   publication_metadata_json,
+                   publication_metadata_json::jsonb,
                    '{{source_ids}}',
                    $1::jsonb
-               )
+               )::json
          WHERE dataset_id = 'dataset-a'
         """,
         source_ids_json,
@@ -148,10 +148,10 @@ async def _set_summary_hash(scenario, dataset_hash):
         UPDATE {scenario.quoted_schema}.provider_directory_endpoint_dataset
            SET publication_metadata_json =
                jsonb_set(
-                   publication_metadata_json,
+                   publication_metadata_json::jsonb,
                    '{{source_summary_v1,dataset_hash}}',
                    to_jsonb($1::text)
-               )
+               )::json
          WHERE dataset_id = 'dataset-a'
         """,
         dataset_hash,

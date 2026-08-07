@@ -49,6 +49,28 @@ async def test_connector_migration_upgrades_and_downgrades_only_when_empty(
         downgrade_fence = _capture_downgrade_fence(session)
         await _prove_token_registry_downgrade_fence(session, downgrade_fence)
         await _prove_identifier_registry_downgrade_fence(session, downgrade_fence)
+        guard_oid_before = await _endpoint_dataset_guard_oid(session)
+        await run_migration(
+            session.guard_migration,
+            "downgrade",
+            session.connection,
+        )
+        guard_after_downgrade = await session.connection.fetchrow(
+            """
+            SELECT function_row.oid,
+                   pg_catalog.pg_get_functiondef(function_row.oid) AS definition
+              FROM pg_catalog.pg_proc AS function_row
+              JOIN pg_catalog.pg_namespace AS function_namespace
+                ON function_namespace.oid = function_row.pronamespace
+             WHERE function_namespace.nspname = $1
+               AND function_row.proname =
+                       'guard_tin_npi_connector_endpoint_dataset'
+               AND function_row.pronargs = 0
+            """,
+            session.schema,
+        )
+        assert guard_after_downgrade["oid"] == guard_oid_before
+        assert "to_jsonb(new)" in guard_after_downgrade["definition"].lower()
         await run_migration(session.migration, "downgrade", session.connection)
         table_count = await session.connection.fetchval(
             """
@@ -60,6 +82,47 @@ async def test_connector_migration_upgrades_and_downgrades_only_when_empty(
             session.schema,
         )
         assert table_count == 0
+    finally:
+        await session.close()
+
+
+async def _endpoint_dataset_guard_oid(session):
+    return await session.connection.fetchval(
+        """
+        SELECT function_row.oid
+          FROM pg_catalog.pg_proc AS function_row
+          JOIN pg_catalog.pg_namespace AS function_namespace
+            ON function_namespace.oid = function_row.pronamespace
+         WHERE function_namespace.nspname = $1
+           AND function_row.proname =
+                   'guard_tin_npi_connector_endpoint_dataset'
+           AND function_row.pronargs = 0
+        """,
+        session.schema,
+    )
+
+
+@pytest.mark.asyncio
+async def test_endpoint_dataset_guard_migration_rejects_schema_drift(monkeypatch):
+    session = await TransactionalSchema.create(monkeypatch)
+    try:
+        await run_migration(session.migration, "upgrade", session.connection)
+        await session.connection.execute(
+            f"""
+            ALTER TABLE {
+                session.quoted_schema
+            }.provider_directory_endpoint_dataset
+                ADD COLUMN guard_drift_probe text
+            """
+        )
+        sql_capture = SqlCapture()
+        session.guard_migration.op = sql_capture
+        session.guard_migration.upgrade()
+        await expect_postgres_error(
+            session.connection,
+            "provider_directory_endpoint_dataset_guard_schema_changed",
+            sql_capture.statements[0],
+        )
     finally:
         await session.close()
 
