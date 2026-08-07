@@ -1,0 +1,40 @@
+{
+  "resourceType": "MedicationKnowledge",
+  "id": "synthetic-drug-b",
+  "meta": {
+    "versionId": "4",
+    "lastUpdated": "2026-08-02T13:00:00Z"
+  },
+  "status": "active",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-DrugTierID-extension",
+      "valueCodeableConcept": {
+        "coding": [
+          {"code": "tier-2", "display": "Tier 2"}
+        ]
+      }
+    },
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-PlanID-extension",
+      "valueString": "SYNTH-B"
+    }
+  ],
+  "code": {
+    "coding": [
+      {
+        "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+        "code": "100001",
+        "display": "Synthetic Drug B"
+      },
+      {
+        "system": "http://hl7.org/fhir/sid/ndc",
+        "code": "12345678901"
+      },
+      {
+        "system": "http://hl7.org/fhir/sid/ndc",
+        "code": "10987654321"
+      }
+    ]
+  }
+}
