@@ -169,6 +169,23 @@ def test_fresh_orchestration_fails_closed_on_missing_sidecar():
         )
 
 
+def test_fresh_orchestration_rejects_unbound_source_sidecars():
+    missing_manifest = {"summary": {}}
+    with pytest.raises(TaxIdentityRateSourceBindingError):
+        ptg._bound_tax_identity_source_artifacts(
+            (missing_manifest,),
+            (_assignment(),),
+        )
+
+    missing_identity = _file_result(sidecar=True)
+    del missing_identity["summary"]["manifest"]["physical_artifact_identity"]
+    with pytest.raises(RuntimeError, match="source binding is incomplete"):
+        ptg._bound_tax_identity_source_artifacts(
+            (missing_identity,),
+            (_assignment(),),
+        )
+
+
 def test_v4_publisher_fingerprint_includes_projection_contract_only_for_v4():
     process_root = Path(ptg.__file__).resolve().parent
 
@@ -217,6 +234,18 @@ def _reuse_publication_and_evidence():
         source_provenance_entries=(),
     )
     return publication, evidence
+
+
+@pytest.mark.asyncio
+async def test_reused_v4_requires_complete_tax_identity_metadata() -> None:
+    publication, _evidence = _reuse_publication_and_evidence()
+
+    with pytest.raises(RuntimeError, match="complete tax identity evidence"):
+        await ptg._validate_reused_tax_identity_source_metadata(
+            publication,
+            {"provider_graph": {}},
+            (_assignment(),),
+        )
 
 
 def _patched_reuse_fixture(monkeypatch):
