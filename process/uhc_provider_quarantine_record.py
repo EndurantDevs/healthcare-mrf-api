@@ -31,7 +31,9 @@ _PROVIDER_FIELDS = frozenset(
 )
 _PROVIDER_REQUIRED_FIELDS = frozenset({"type", "npi", "addresses", "plans"})
 _NAME_FIELDS = frozenset({"first", "middle", "last"})
-_ADDRESS_FIELDS = frozenset({"address", "city", "state", "zip", "phone"})
+_ADDRESS_FIELDS = frozenset(
+    {"address", "address_2", "city", "state", "zip", "phone"}
+)
 _PLAN_FIELDS = frozenset({"plan_id_type", "plan_id", "years", "network_tier"})
 _SUPPORTED_PROVIDER_TYPES = frozenset({"INDIVIDUAL", "FACILITY"})
 _SUPPORTED_ACCEPTING_CODES = frozenset(

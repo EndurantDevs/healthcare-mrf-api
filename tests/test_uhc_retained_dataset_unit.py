@@ -221,6 +221,20 @@ def test_provider_semantics_emit_profile_ready_six_family_relationships():
     _assert_individual_plan_payload(logical_scope)
 
 
+def test_provider_address_projection_preserves_second_line() -> None:
+    payload = retained._address_payload(
+        {
+            "address": "1 Main St",
+            "address_2": "Suite 200",
+            "city": "Chicago",
+            "state": "IL",
+            "zip": "60601",
+        }
+    )
+
+    assert payload["line"] == ["1 Main St", "Suite 200"]
+
+
 def _valid_summary_input() -> dict[str, object]:
     summary_input_by_field: dict[str, object] = {
         "contract_id": UHC_RETAINED_SUMMARY_INPUT_CONTRACT_ID,

@@ -356,6 +356,15 @@ def test_checksum_invalid_record_matches_native_permissive_plan_text() -> None:
     assert census.provider_plan_rows == 2
 
 
+def test_checksum_invalid_record_accepts_second_address_line() -> None:
+    record_by_field = _provider_record("1003821381")
+    record_by_field["addresses"][0]["address_2"] = "Suite 200"
+
+    census = validate_checksum_invalid_provider_record(record_by_field)
+
+    assert census.address_rows == 1
+
+
 def test_structural_record_requires_a_string_shape_failure_only() -> None:
     for npi in ("3000000000", "10/00/0491"):
         census = validate_structurally_invalid_provider_record(
