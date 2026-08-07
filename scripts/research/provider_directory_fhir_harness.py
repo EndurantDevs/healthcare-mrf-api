@@ -504,6 +504,13 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
             command_parts.extend(["--stream-batch-size", str(args.stream_batch_size)])
         if args.source_concurrency is not None:
             command_parts.extend(["--source-concurrency", str(args.source_concurrency)])
+        if args.resource_scan_concurrency is not None:
+            command_parts.extend(
+                [
+                    "--resource-scan-concurrency",
+                    str(args.resource_scan_concurrency),
+                ]
+            )
         if args.publish_artifacts is True:
             command_parts.append("--publish-artifacts")
         elif args.publish_artifacts is False:
@@ -582,6 +589,7 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         "page_count",
         "stream_batch_size",
         "source_concurrency",
+        "resource_scan_concurrency",
     ):
         param_value = getattr(args, key)
         if param_value is not None:
@@ -923,6 +931,7 @@ def _add_import_behavior_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--page-count", type=int, default=None, help="FHIR _count page size.")
     parser.add_argument("--stream-batch-size", type=int, default=None, help="Rows per streaming upsert batch; 0 disables streaming.")
     parser.add_argument("--source-concurrency", type=int, default=None, help="Concurrent source resource imports.")
+    parser.add_argument("--resource-scan-concurrency", type=int, choices=(1, 2, 3), default=None, help="Concurrent independent resource cursors for eligible imports.")
     parser.add_argument("--concurrency", type=int, default=4, help="Concurrent metadata probes.")
     parser.add_argument("--timeout", type=int, default=15, help="Per-request timeout.")
     parser.add_argument("--command-timeout", type=int, default=900, help="Local CLI command timeout.")

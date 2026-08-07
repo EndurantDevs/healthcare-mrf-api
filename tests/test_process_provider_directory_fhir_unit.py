@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import csv
 import dataclasses
@@ -76,7 +77,8 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 49
+    assert len(command_signature.parameters) == 50
+    assert "resource_scan_concurrency" in command_signature.parameters
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"
     assert command.__annotations__ == expected_annotation_map
@@ -23798,6 +23800,580 @@ async def test_import_resources_honors_source_concurrency(monkeypatch):
     assert stats_by_resource["Location"]["rows_fetched"] == 3
 
 
+def _parallel_resource_source():
+    """Return one anonymous checkpointed source for resource-wave tests."""
+    checkpoint_context = dataclasses.replace(
+        _cigna_checkpoint_context(
+            "run_1",
+            dataset_id="dataset_a",
+            is_lineage_verified=True,
+        ),
+        endpoint_id="endpoint_a",
+    )
+    return {
+        **_cigna_checkpoint_source(),
+        "_endpoint_id": "endpoint_a",
+        "_endpoint_dataset_id": "dataset_a",
+        "_partition_checkpoint_source_ids": ("source_a",),
+        "_pagination_checkpoint_context": checkpoint_context,
+    }
+
+
+def _resource_concurrency_options(**overrides):
+    """Return the exact safe acquisition shape with selected overrides."""
+    options = importer.ResourceScanConcurrencyOptions(
+        resource_types=("Location", "HealthcareService"),
+        requested_concurrency=2,
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        stream_batch_size=100,
+        source_concurrency=1,
+        linked_resource_limit=0,
+        stale_cleanup=False,
+        bulk_export=False,
+        checkpointing_enabled=True,
+        deferred_materialization=True,
+    )
+    return dataclasses.replace(options, **overrides)
+
+
+def test_resource_scan_concurrency_fails_closed(monkeypatch):
+    """Admit only one anonymous checkpointed full-acquisition source."""
+    source_record = _parallel_resource_source()
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "16")
+    monkeypatch.setattr(importer, "_credential_spec_for_source", Mock(return_value={}))
+    monkeypatch.setattr(
+        importer,
+        "_has_source_declared_credentialed_access",
+        Mock(return_value=False),
+    )
+    unsafe_options = (
+        {"resource_types": ("Location", "Location")},
+        {"per_resource_limit": 1},
+        {"page_limit": 1},
+        {"page_count": 0},
+        {"stream_batch_size": 0},
+        {"source_concurrency": 2},
+        {"linked_resource_limit": 1},
+        {"stale_cleanup": True},
+        {"bulk_export": True},
+        {"checkpointing_enabled": False},
+        {"deferred_materialization": False},
+    )
+
+    with _source_http_test_session():
+        assert importer._effective_resource_scan_concurrency(
+            source_record,
+            _resource_concurrency_options(),
+        ) == 2
+        for overrides in unsafe_options:
+            assert importer._effective_resource_scan_concurrency(
+                source_record,
+                _resource_concurrency_options(**overrides),
+            ) == 1
+        assert importer._effective_resource_scan_concurrency(
+            {**source_record, "canonical_api_base": "https://example.test/fhir"},
+            _resource_concurrency_options(),
+        ) == 1
+        monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "2")
+        assert importer._effective_resource_scan_concurrency(
+            source_record,
+            _resource_concurrency_options(),
+        ) == 1
+    assert importer._effective_resource_scan_concurrency(
+        source_record,
+        _resource_concurrency_options(),
+    ) == 1
+
+
+def test_resource_scan_concurrency_requires_every_start_url(monkeypatch):
+    """Fail closed when any member of the proposed wave has no start URL."""
+    source_record = _parallel_resource_source()
+    resource_start_url = importer._resource_start_url
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "16")
+    monkeypatch.setattr(importer, "_credential_spec_for_source", Mock(return_value={}))
+    monkeypatch.setattr(
+        importer,
+        "_has_source_declared_credentialed_access",
+        Mock(return_value=False),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resource_start_url",
+        lambda source, resource_type, **kwargs: (
+            None
+            if resource_type == "HealthcareService"
+            else resource_start_url(source, resource_type, **kwargs)
+        ),
+    )
+
+    with _source_http_test_session():
+        assert importer._effective_resource_scan_concurrency(
+            source_record,
+            _resource_concurrency_options(),
+        ) == 1
+
+
+def test_resource_scan_concurrency_checks_parallel_transport_shape(monkeypatch):
+    """Reject each incomplete transport shape before admitting parallel scans."""
+    source_record = _parallel_resource_source()
+    request_url = "https://example.test/fhir/Location?_count=100"
+    resource_start_url = Mock(return_value=None)
+    partitioned_start_urls = Mock(return_value=[])
+    prefetch_session = Mock(return_value=None)
+    monkeypatch.setattr(importer, "_resource_start_url", resource_start_url)
+    monkeypatch.setattr(
+        importer,
+        "_partitioned_resource_start_urls",
+        partitioned_start_urls,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_rest_page_prefetch_session",
+        prefetch_session,
+    )
+
+    assert not importer._has_parallel_resource_transport(
+        source_record,
+        ("Location", "HealthcareService"),
+        100,
+    )
+
+    resource_start_url.return_value = request_url
+    assert not importer._has_parallel_resource_transport(
+        source_record,
+        ("Location", "HealthcareService"),
+        100,
+    )
+
+    partitioned_start_urls.return_value = [request_url]
+    assert not importer._has_parallel_resource_transport(
+        source_record,
+        ("Location", "HealthcareService"),
+        100,
+    )
+
+    prefetch_session.return_value = object()
+    assert not importer._has_parallel_resource_transport(
+        source_record,
+        ("Location",),
+        100,
+    )
+    assert importer._has_parallel_resource_transport(
+        source_record,
+        ("Location", "HealthcareService"),
+        100,
+    )
+
+
+@pytest.mark.parametrize("raw_value", (0, 4, "invalid", True, 2.0, 2.9, None))
+def test_resource_scan_concurrency_rejects_invalid_values(raw_value):
+    with pytest.raises(
+        ValueError,
+        match="provider_directory_resource_scan_concurrency_invalid",
+    ):
+        importer._validated_resource_scan_concurrency(raw_value)
+
+
+def test_resource_scan_concurrency_requires_candidate_bound_checkpoint(
+    monkeypatch,
+):
+    """Reject incomplete, mismatched, or unverified checkpoint identities."""
+    source_record = _parallel_resource_source()
+    checkpoint_context = source_record["_pagination_checkpoint_context"]
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "16")
+    monkeypatch.setattr(importer, "_credential_spec_for_source", Mock(return_value={}))
+    monkeypatch.setattr(
+        importer,
+        "_has_source_declared_credentialed_access",
+        Mock(return_value=False),
+    )
+    assert not importer._has_bound_resource_scan_checkpoint(source_record, None)
+    for scoped_source_ids in ("source_a", None):
+        safe_source_by_field = dict(source_record)
+        if scoped_source_ids is None:
+            safe_source_by_field.pop("_partition_checkpoint_source_ids")
+        else:
+            safe_source_by_field["_partition_checkpoint_source_ids"] = scoped_source_ids
+        assert importer._has_bound_resource_scan_checkpoint(
+            safe_source_by_field,
+            checkpoint_context,
+        )
+    unsafe_sources = (
+        {**source_record, "_endpoint_dataset_id": "dataset_b"},
+        {**source_record, "_endpoint_id": "endpoint_b"},
+        {
+            **source_record,
+            "_partition_checkpoint_source_ids": ("source_b",),
+        },
+        {
+            **source_record,
+            "_pagination_checkpoint_context": dataclasses.replace(
+                checkpoint_context,
+                lineage_verified=False,
+            ),
+        },
+        {
+            **source_record,
+            "_pagination_checkpoint_context": dataclasses.replace(
+                checkpoint_context,
+                endpoint_id=None,
+            ),
+        },
+    )
+
+    with _source_http_test_session():
+        assert all(
+            importer._effective_resource_scan_concurrency(
+                unsafe_source,
+                _resource_concurrency_options(),
+            )
+            == 1
+            for unsafe_source in unsafe_sources
+        )
+
+
+@pytest.mark.parametrize("raises_runtime_error", (False, True))
+def test_resource_scan_concurrency_rejects_bound_upsert_session(
+    monkeypatch,
+    raises_runtime_error,
+):
+    """Keep scans serial when an upsert session is bound or invalid."""
+    source_record = _parallel_resource_source()
+    bound_session = (
+        Mock(side_effect=RuntimeError)
+        if raises_runtime_error
+        else Mock(return_value=object())
+    )
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "16")
+    monkeypatch.setattr(importer, "_bound_upsert_session", bound_session)
+
+    with _source_http_test_session():
+        assert importer._effective_resource_scan_concurrency(
+            source_record,
+            _resource_concurrency_options(),
+        ) == 1
+
+
+def _patch_parallel_resource_flow(
+    monkeypatch,
+    fetch_resource_rows,
+    persist_resource_rows=None,
+):
+    """Patch candidate ownership while retaining the real resource-wave runner."""
+    source_record = _parallel_resource_source()
+
+    @contextlib.asynccontextmanager
+    async def fake_guard(_context):
+        yield
+
+    async def fake_prepare(_source_records, *_args, **_kwargs):
+        return [dict(source_record)], None
+
+    callbacks_by_name = {
+        "_pagination_checkpoint_worker_guard": fake_guard,
+        "_prepare_resource_import_source_group": fake_prepare,
+        "_fetch_resource_rows": fetch_resource_rows,
+        "_upsert_deferred_resource_rows": (
+            persist_resource_rows
+            or AsyncMock(side_effect=lambda _model, rows, **_kwargs: len(rows))
+        ),
+        "_finalize_source_pagination_checkpoints": AsyncMock(),
+        "_finalize_candidate_and_clear_checkpoints": AsyncMock(),
+        "_update_source_resource_import_metadata": AsyncMock(),
+        "_credential_spec_for_source": Mock(return_value={}),
+        "_has_source_declared_credentialed_access": Mock(return_value=False),
+    }
+    for callback_name, callback in callbacks_by_name.items():
+        monkeypatch.setattr(importer, callback_name, callback)
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "16")
+    return source_record
+
+
+async def _run_parallel_resource_import(
+    source_record,
+    progress_callback=None,
+):
+    """Run the exact checkpointed deferred acquisition shape under test."""
+    with _source_http_test_session():
+        return await importer._import_resources(
+            [source_record],
+            resources=["PractitionerRole", "Location", "HealthcareService"],
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=100,
+            timeout=3,
+            run_id="run_1",
+            stream_batch_size=100,
+            source_concurrency=1,
+            resource_scan_concurrency=2,
+            progress_callback=progress_callback,
+            is_pagination_checkpointing_enabled=True,
+            defer_typed_materialization=True,
+        )
+
+
+class _ResourceOverlapHarness:
+    """Record concurrency, ordering, and progress for one resource wave."""
+
+    def __init__(self):
+        self.active_by_name = {"count": 0, "maximum": 0, "completed": 0}
+        self.foundation_started = asyncio.Event()
+        self.foundation_completed = asyncio.Event()
+        self.lifecycle_events: list[tuple[str, str]] = []
+        self.progress_resources: list[tuple[str, ...]] = []
+        self.progress_concurrency: list[tuple[int, int]] = []
+        self.model_by_resource = {
+            "Location": ProviderDirectoryLocation,
+            "HealthcareService": ProviderDirectoryHealthcareService,
+            "PractitionerRole": ProviderDirectoryPractitionerRole,
+        }
+
+    async def fetch(self, _source, resource_type, **kwargs):
+        self.lifecycle_events.append(("start", resource_type))
+        if resource_type == "PractitionerRole":
+            assert self.foundation_completed.is_set()
+        else:
+            self.active_by_name["count"] += 1
+            self.active_by_name["maximum"] = max(
+                self.active_by_name["maximum"],
+                self.active_by_name["count"],
+            )
+            if self.active_by_name["count"] == 2:
+                self.foundation_started.set()
+            await self.foundation_started.wait()
+        written = await kwargs["row_batch_handler"](
+            self.model_by_resource[resource_type],
+            [{"source_id": "source_a", "resource_id": resource_type.lower()}],
+        )
+        if resource_type != "PractitionerRole":
+            self.active_by_name["count"] -= 1
+            self.active_by_name["completed"] += 1
+            if self.active_by_name["completed"] == 2:
+                self.foundation_completed.set()
+        self.lifecycle_events.append(("finish", resource_type))
+        return _checkpoint_complete_fetch_result(
+            self.model_by_resource[resource_type],
+            written,
+        )
+
+    async def capture_progress(self, _done, _total, _counts, details=None):
+        for group_by_field in (details or {}).get("active_source_groups", []):
+            current_resources = tuple(group_by_field.get("current_resources") or ())
+            if len(current_resources) > 1:
+                self.progress_resources.append(current_resources)
+                self.progress_concurrency.append(
+                    (
+                        group_by_field["resource_scan_concurrency_requested"],
+                        group_by_field["resource_scan_concurrency_effective"],
+                    )
+                )
+
+    def assert_complete(self, counts):
+        assert counts == {
+            "PractitionerRole": 1,
+            "Location": 1,
+            "HealthcareService": 1,
+        }
+        assert self.active_by_name["maximum"] == 2
+        role_start = self.lifecycle_events.index(("start", "PractitionerRole"))
+        assert all(
+            self.lifecycle_events.index(("finish", resource_type)) < role_start
+            for resource_type in ("Location", "HealthcareService")
+        )
+        assert self.progress_resources
+        assert set(self.progress_resources) == {
+            ("Location", "HealthcareService")
+        }
+        assert set(self.progress_concurrency) == {(2, 2)}
+
+
+@pytest.mark.asyncio
+async def test_resource_scan_overlaps_foundation_and_keeps_role_serial(monkeypatch):
+    """Use two independent cursors, then start the dependent role tail."""
+    resource_harness = _ResourceOverlapHarness()
+
+    source_record = _patch_parallel_resource_flow(monkeypatch, resource_harness.fetch)
+    counts = await _run_parallel_resource_import(
+        source_record,
+        progress_callback=resource_harness.capture_progress,
+    )
+    resource_harness.assert_complete(counts)
+
+
+@pytest.mark.asyncio
+async def test_resource_scan_failure_cancels_and_joins_sibling(monkeypatch):
+    """Propagate a source failure only after the other cursor is joined."""
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+
+    async def fake_fetch(_source, resource_type, **_kwargs):
+        if resource_type == "Location":
+            await sibling_started.wait()
+            raise RuntimeError("synthetic_resource_failure")
+        if resource_type == "HealthcareService":
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
+        raise AssertionError("role cursor must not start after foundation failure")
+
+    source_record = _patch_parallel_resource_flow(monkeypatch, fake_fetch)
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic_resource_failure",
+    ):
+        await _run_parallel_resource_import(source_record)
+
+    assert sibling_cancelled.is_set()
+    assert not any(
+        task.get_name() == "provider-directory-resource-scan" and not task.done()
+        for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+async def test_resource_scan_external_cancellation_joins_every_cursor(monkeypatch):
+    """Cancel and join every resource cursor when the source task is stopped."""
+    started_resources: set[str] = set()
+    cancelled_resources: set[str] = set()
+    foundation_started = asyncio.Event()
+
+    async def fake_fetch(_source, resource_type, **_kwargs):
+        started_resources.add(resource_type)
+        if len(started_resources) == 2:
+            foundation_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled_resources.add(resource_type)
+            raise
+
+    source_record = _patch_parallel_resource_flow(monkeypatch, fake_fetch)
+    import_task = asyncio.create_task(
+        _run_parallel_resource_import(source_record)
+    )
+    await foundation_started.wait()
+    import_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await import_task
+
+    assert started_resources == {"Location", "HealthcareService"}
+    assert cancelled_resources == started_resources
+    assert not any(
+        task.get_name() == "provider-directory-resource-scan" and not task.done()
+        for task in asyncio.all_tasks()
+    )
+
+
+class _ResourceRestartHarness:
+    """Model durable per-resource checkpoints across one synthetic failure."""
+
+    def __init__(self):
+        self.next_page_by_resource = {
+            "Location": 0,
+            "HealthcareService": 0,
+            "PractitionerRole": 0,
+        }
+        self.complete_resources: set[str] = set()
+        self.remote_pages_by_resource = collections.Counter()
+        self.persist_attempts: list[tuple[str, str]] = []
+        self.persisted_rows: set[tuple[str, str]] = set()
+        self.location_complete = asyncio.Event()
+        self.should_fail = True
+        self.model_by_resource = {
+            "Location": ProviderDirectoryLocation,
+            "HealthcareService": ProviderDirectoryHealthcareService,
+            "PractitionerRole": ProviderDirectoryPractitionerRole,
+        }
+
+    async def persist(self, model, rows, **_kwargs):
+        resource_type = importer.RESOURCE_TYPES_BY_MODEL[model]
+        for row in rows:
+            row_identity = (resource_type, row["resource_id"])
+            self.persist_attempts.append(row_identity)
+            self.persisted_rows.add(row_identity)
+        return len(rows)
+
+    async def fetch(self, _source, resource_type, **kwargs):
+        model = self.model_by_resource[resource_type]
+        target_pages = 1 if resource_type == "PractitionerRole" else 2
+        if resource_type in self.complete_resources:
+            return dataclasses.replace(
+                _checkpoint_complete_fetch_result(model, 0),
+                rows_fetched=target_pages,
+                pages_fetched=target_pages,
+            )
+        first_page = self.next_page_by_resource[resource_type]
+        written = 0
+        for page_number in range(first_page, target_pages):
+            await self._fail_at_resume_boundary(resource_type, page_number)
+            self.remote_pages_by_resource[resource_type] += 1
+            written += await kwargs["row_batch_handler"](
+                model,
+                [{"resource_id": f"{resource_type.lower()}-{page_number}"}],
+            )
+            self.next_page_by_resource[resource_type] = page_number + 1
+            await asyncio.sleep(0)
+        self.complete_resources.add(resource_type)
+        if resource_type == "Location":
+            self.location_complete.set()
+        return dataclasses.replace(
+            _checkpoint_complete_fetch_result(model, written),
+            rows_fetched=target_pages,
+            pages_fetched=target_pages - first_page,
+        )
+
+    async def _fail_at_resume_boundary(self, resource_type, page_number):
+        if not (
+            self.should_fail
+            and resource_type == "HealthcareService"
+            and page_number == 1
+        ):
+            return
+        await self.location_complete.wait()
+        self.should_fail = False
+        raise RuntimeError("synthetic_restart_boundary")
+
+
+@pytest.mark.asyncio
+async def test_resource_scan_retry_skips_complete_and_resumes_partial(monkeypatch):
+    """Retain a completed cursor and resume only its interrupted sibling."""
+    restart_harness = _ResourceRestartHarness()
+    source_record = _patch_parallel_resource_flow(
+        monkeypatch,
+        restart_harness.fetch,
+        restart_harness.persist,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic_restart_boundary"):
+        await _run_parallel_resource_import(source_record)
+    assert restart_harness.complete_resources == {"Location"}
+    assert restart_harness.next_page_by_resource["HealthcareService"] == 1
+    location_remote_pages = restart_harness.remote_pages_by_resource["Location"]
+
+    counts = await _run_parallel_resource_import(source_record)
+
+    assert counts == {
+        "PractitionerRole": 1,
+        "Location": 0,
+        "HealthcareService": 1,
+    }
+    assert restart_harness.remote_pages_by_resource["Location"] == (
+        location_remote_pages
+    )
+    assert restart_harness.complete_resources == {
+        "Location",
+        "HealthcareService",
+        "PractitionerRole",
+    }
+    assert len(restart_harness.persist_attempts) == 5
+    assert len(restart_harness.persisted_rows) == 5
+
+
 async def _import_location_source_groups(
     source_ids: list[str],
     **import_options: Any,
@@ -24737,6 +25313,7 @@ def _harness_cli_args(**overrides: Any) -> argparse.Namespace:
         page_count=None,
         stream_batch_size=None,
         source_concurrency=None,
+        resource_scan_concurrency=None,
         publish_artifacts=None,
         resources=None,
         include_credentialed=False,
@@ -24782,6 +25359,9 @@ def test_harness_local_cli_passes_retest_supplement_args(monkeypatch, tmp_path):
         credential_config_file="/tmp/provider-directory-credentials.json",
         refresh_preset="monthly-full",
         include_supplemental_catalogs=True,
+        import_resources=True,
+        seed_only=False,
+        resource_scan_concurrency=2,
     )
 
     harness_result = harness._run_cli_case("local-cli", args)
@@ -24795,6 +25375,7 @@ def test_harness_local_cli_passes_retest_supplement_args(monkeypatch, tmp_path):
     assert command[command.index("--credential-config-file") + 1] == "/tmp/provider-directory-credentials.json"
     assert command[command.index("--refresh-preset") + 1] == "monthly-full"
     assert "--include-supplemental-catalogs" in command
+    assert command[command.index("--resource-scan-concurrency") + 1] == "2"
     assert harness_result.metrics["supplemental_retest_sources_considered"] == 1
 
 
@@ -24823,6 +25404,8 @@ def test_harness_parse_args_accepts_retest_supplement_args():
             "--include-supplemental-catalogs",
             "--linked-resource-deadline-seconds",
             "1800",
+            "--resource-scan-concurrency",
+            "2",
         ]
     )
 
@@ -24840,6 +25423,7 @@ def test_harness_parse_args_accepts_retest_supplement_args():
     assert args.refresh_preset == "monthly-full"
     assert args.include_supplemental_catalogs is True
     assert args.linked_resource_deadline_seconds == 1800
+    assert args.resource_scan_concurrency == 2
 
 
 def test_harness_fixture_covers_healthcare_service_location_refs():

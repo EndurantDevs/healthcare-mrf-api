@@ -1375,6 +1375,11 @@ def provider_enrichment(test: bool):
     help="Try FHIR Bulk Data $export for resource reads when the payer supports it; fallback to paginated reads when unsupported.",
 )
 @click.option("--source-concurrency", type=int, help="Concurrent source resource imports.")
+@click.option(
+    "--resource-scan-concurrency",
+    type=click.IntRange(1, 3),
+    help="Concurrent independent resource cursors for eligible imports.",
+)
 @click.option("--concurrency", type=int, help="Concurrent source metadata probes.")
 @click.option("--timeout", type=int, help="Per-request timeout in seconds.")
 def provider_directory_fhir(
@@ -1421,6 +1426,7 @@ def provider_directory_fhir(
     defer_typed_materialization: bool,
     bulk_export: bool | None,
     source_concurrency: int | None,
+    resource_scan_concurrency: int | None,
     concurrency: int | None,
     timeout: int | None,
 ):
@@ -1470,6 +1476,7 @@ def provider_directory_fhir(
             defer_typed_materialization=defer_typed_materialization,
             bulk_export=bulk_export,
             source_concurrency=source_concurrency,
+            resource_scan_concurrency=resource_scan_concurrency,
             concurrency=concurrency,
             timeout=timeout,
         )

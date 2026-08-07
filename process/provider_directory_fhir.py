@@ -1185,6 +1185,10 @@ SOURCE_HTTP_PAGE_PREFETCH_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH"
 SOURCE_HTTP_DETERMINISTIC_PAGE_PREFETCH_ENV = (
     "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_DETERMINISTIC"
 )
+SOURCE_RESOURCE_SCAN_CONCURRENCY_ENV = (
+    "HLTHPRT_PROVIDER_DIRECTORY_RESOURCE_SCAN_CONCURRENCY"
+)
+MAX_RESOURCE_SCAN_CONCURRENCY = 3
 SOURCE_HTTP_KEEPALIVE_SECONDS = 60.0
 SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
 SOURCE_TRANSIENT_HTTP_STATUSES = frozenset({423, 429, 500, 502, 503, 504})
@@ -1478,6 +1482,22 @@ class RestPagePrefetchEligibility:
     retain_rows: bool
     per_resource_limit: int
     page_limit: int
+
+
+@dataclass(frozen=True)
+class ResourceScanConcurrencyOptions:
+    resource_types: tuple[str, ...]
+    requested_concurrency: int
+    per_resource_limit: int
+    page_limit: int
+    page_count: int
+    stream_batch_size: int
+    source_concurrency: int
+    linked_resource_limit: int
+    stale_cleanup: bool
+    bulk_export: bool
+    checkpointing_enabled: bool
+    deferred_materialization: bool
 
 
 @dataclass
@@ -49652,6 +49672,160 @@ def _source_resource_fetch_order(
     return foundational_resources + practitioner_role_resources
 
 
+def _validated_resource_scan_concurrency(raw_value: Any) -> int:
+    """Return a bounded resource-cursor concurrency or reject bad input."""
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, str)):
+        raise ValueError("provider_directory_resource_scan_concurrency_invalid")
+    raw_text = str(raw_value).strip()
+    if not raw_text.isdecimal():
+        raise ValueError("provider_directory_resource_scan_concurrency_invalid")
+    try:
+        concurrency = int(raw_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "provider_directory_resource_scan_concurrency_invalid"
+        ) from exc
+    if not 1 <= concurrency <= MAX_RESOURCE_SCAN_CONCURRENCY:
+        raise ValueError("provider_directory_resource_scan_concurrency_invalid")
+    return concurrency
+
+
+def _resource_scan_foundation_types(
+    source_record: dict[str, Any],
+    resource_types: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return the ordered Cigna wave that may run before the role tail."""
+    return tuple(
+        resource_type
+        for resource_type in _source_resource_fetch_order(
+            source_record,
+            list(resource_types),
+        )
+        if resource_type != "PractitionerRole"
+    )
+
+
+def _has_parallel_resource_transport(
+    source_record: dict[str, Any],
+    resource_types: tuple[str, ...],
+    page_count: int,
+) -> bool:
+    """Require one anonymous, nonpartitioned start URL for every wave member."""
+    fetchable_count = 0
+    for resource_type in resource_types:
+        request_url = _resource_start_url(
+            source_record,
+            resource_type,
+            page_count=page_count,
+        )
+        if request_url is None:
+            return False
+        partition_start_urls = _partitioned_resource_start_urls(
+            source_record,
+            resource_type,
+            page_count=page_count,
+        )
+        if partition_start_urls != [request_url]:
+            return False
+        if _rest_page_prefetch_session(source_record, request_url) is None:
+            return False
+        fetchable_count += 1
+    return fetchable_count >= 2
+
+
+def _has_bound_resource_scan_checkpoint(
+    source_record: dict[str, Any],
+    checkpoint_context: Any,
+) -> bool:
+    """Require one candidate-bound checkpoint identity for the source group."""
+    if not isinstance(checkpoint_context, PaginationCheckpointContext):
+        return False
+    scoped_source_ids = source_record.get("_partition_checkpoint_source_ids")
+    if isinstance(scoped_source_ids, str):
+        scoped_source_ids = (scoped_source_ids,)
+    if not scoped_source_ids:
+        scoped_source_ids = (source_record.get("source_id"),)
+    normalized_source_ids = tuple(
+        sorted(
+            {
+                source_id
+                for raw_source_id in scoped_source_ids
+                if (source_id := _clean_text(raw_source_id))
+            }
+        )
+    )
+    return bool(
+        normalized_source_ids
+        and checkpoint_context.source_ids == normalized_source_ids
+        and checkpoint_context.source_scope_hash
+        and checkpoint_context.owner_run_id
+        and checkpoint_context.acquisition_root_run_id
+        and checkpoint_context.endpoint_id
+        and checkpoint_context.dataset_id
+        and checkpoint_context.lineage_verified
+        and _clean_text(source_record.get("_endpoint_id"))
+        == checkpoint_context.endpoint_id
+        and _clean_text(source_record.get("_endpoint_dataset_id"))
+        == checkpoint_context.dataset_id
+    )
+
+
+def _effective_resource_scan_concurrency(
+    source_record: dict[str, Any],
+    options: ResourceScanConcurrencyOptions,
+) -> int:
+    """Fail closed unless one Cigna group has independent durable cursors."""
+    requested = _validated_resource_scan_concurrency(
+        options.requested_concurrency
+    )
+    source_api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    checkpoint_context = source_record.get("_pagination_checkpoint_context")
+    foundation_types = _resource_scan_foundation_types(
+        source_record,
+        options.resource_types,
+    )
+    is_safe_shape = bool(
+        requested > 1
+        and source_api_base == CIGNA_PROVIDER_DIRECTORY_BASE
+        and _has_bound_resource_scan_checkpoint(
+            source_record,
+            checkpoint_context,
+        )
+        and checkpoint_context.canonical_api_base == source_api_base
+        and len(options.resource_types) == len(set(options.resource_types))
+        and options.per_resource_limit <= 0
+        and options.page_limit <= 0
+        and options.page_count > 0
+        and options.stream_batch_size > 0
+        and options.source_concurrency == 1
+        and options.linked_resource_limit <= 0
+        and not options.stale_cleanup
+        and not options.bulk_export
+        and options.checkpointing_enabled
+        and options.deferred_materialization
+        and not _is_practitioner_role_reverse_lookup_planned(
+            source_record,
+            list(options.resource_types),
+        )
+        and _provider_directory_database_pool_capacity() >= requested + 1
+        and _has_parallel_resource_transport(
+            source_record,
+            foundation_types,
+            options.page_count,
+        )
+    )
+    if not is_safe_shape:
+        return 1
+    try:
+        if _bound_upsert_session() is not None:
+            return 1
+    except RuntimeError:
+        return 1
+    return min(requested, len(foundation_types))
+
+
 def _is_bool_or_default(value: Any, default: bool) -> bool:
     if value is None or value == "":
         return default
@@ -56467,6 +56641,7 @@ async def _prepare_resource_import_source_group(
         checkpoint_context = candidate.checkpoint_context
     for source_record in prepared_source_records:
         if candidate is not None:
+            source_record["_endpoint_id"] = candidate.endpoint_id
             source_record["_endpoint_dataset_id"] = candidate.dataset_id
         if checkpoint_context is not None:
             source_record["_pagination_checkpoint_context"] = checkpoint_context
@@ -56747,6 +56922,365 @@ def _provider_directory_progress_counts_snapshot(
     return dict(high_water_by_resource)
 
 
+@dataclass(frozen=True)
+class ResourceGroupScanOptions:
+    per_resource_limit: int
+    page_limit: int
+    page_count: int
+    timeout: int
+    run_id: str | None
+    stream_batch_size: int
+    cancel_ctx: dict[str, Any] | None
+    cancel_task: dict[str, Any] | None
+    bulk_export: bool
+    bulk_export_max_pending_seconds: int
+    resource_deadline_seconds: int
+    linked_resource_limit: int
+    stale_cleanup: bool
+    seen_stage_table: str | None
+    scan_role_reverse_lookup_planned: bool
+    source_concurrency: int
+    requested_resource_concurrency: int
+    checkpointing_enabled: bool
+    deferred_materialization: bool
+
+
+@dataclass
+class ResourceGroupScanRunner:
+    """Own shared state while independent resource cursors run concurrently."""
+
+    source_record: dict[str, Any]
+    source_ids: list[str]
+    group_key: int
+    options: ResourceGroupScanOptions
+    progress_lock: asyncio.Lock
+    active_group_by_key: dict[int, dict[str, Any]]
+    report_progress: Callable[..., Awaitable[None]]
+    persist_rows: Callable[[type, list[dict[str, Any]]], Awaitable[int]]
+    partial_progress: Callable[[int, str, int], Awaitable[None]]
+    mark_stale_ready: Callable[[str, ResourceFetchResult], Awaitable[None]]
+    count_by_resource: dict[str, int]
+    stats_by_resource: dict[str, dict[str, Any]]
+    resource_completion: dict[str, set[str]] | None
+    rows_by_resource: dict[str, list[dict[str, Any]]]
+    diagnostic_by_resource: dict[str, dict[str, Any]]
+    effective_concurrency: int = field(init=False, default=1)
+
+    @property
+    def is_streaming(self) -> bool:
+        """Return whether page rows are persisted through the batch callback."""
+        return self.options.stream_batch_size > 0
+
+    async def activate(
+        self,
+        resource_types: tuple[str, ...],
+        *,
+        summary: str | None = None,
+    ) -> None:
+        """Publish every resource cursor active for this source group."""
+        started_at = _now().isoformat(timespec="seconds") + "Z"
+        async with self.progress_lock:
+            active_group = self.active_group_by_key[self.group_key]
+            active_group["current_resource"] = summary or resource_types[0]
+            active_group["current_resources"] = list(resource_types)
+            active_group["resource_scan_concurrency_requested"] = (
+                self.options.requested_resource_concurrency
+            )
+            active_group["resource_scan_concurrency_effective"] = (
+                self.effective_concurrency
+            )
+            active_group["resource_started_at"] = started_at
+            active_group["resource_started_monotonic"] = time.monotonic()
+        await self.report_progress(force=True)
+
+    async def persist_batch(
+        self,
+        resource_type: str,
+        model: type,
+        resource_rows: list[dict[str, Any]],
+    ) -> int:
+        """Persist one resource-owned batch and publish partial progress."""
+        if self.options.linked_resource_limit > 0 or (
+            self.options.scan_role_reverse_lookup_planned
+            and resource_type
+            in _practitioner_role_reverse_lookup_resources(self.source_record)
+        ):
+            self.rows_by_resource.setdefault(resource_type, []).extend(
+                _compact_linked_reference_rows(resource_type, resource_rows)
+            )
+        written = await self.persist_rows(model, resource_rows)
+        await self.partial_progress(self.group_key, resource_type, written)
+        return written
+
+    async def fetch(
+        self,
+        resource_type: str,
+        source_record_by_field: dict[str, Any],
+        *,
+        report_start: bool,
+    ) -> ResourceFetchResult | None:
+        """Fetch and persist one isolated resource cursor."""
+        await _raise_if_resource_import_cancelled(
+            self.options.cancel_ctx,
+            self.options.cancel_task,
+        )
+        if resource_type == "PractitionerRole" and (
+            _needs_practitioner_role_reverse_lookup(
+                self.source_record,
+                "PractitionerRole",
+            )
+        ):
+            return None
+        if report_start:
+            await self.activate((resource_type,))
+        if self.options.stale_cleanup and resource_type == "PractitionerRole" and (
+            _is_uhc_role_postal_partition_enabled(self.source_record)
+        ):
+            await _mark_postal_checkpointed_roles_seen(
+                self.source_record,
+                [self.source_record["source_id"]],
+                self.options.run_id,
+                self.options.seen_stage_table,
+            )
+        return await self._fetch_rows(resource_type, source_record_by_field)
+
+    async def _fetch_rows(
+        self,
+        resource_type: str,
+        source_record_by_field: dict[str, Any],
+    ) -> ResourceFetchResult | None:
+        """Invoke the generic FHIR reader with one task-local source record."""
+        return await _fetch_resource_rows(
+            source_record_by_field,
+            resource_type,
+            per_resource_limit=self.options.per_resource_limit,
+            page_limit=self.options.page_limit,
+            page_count=self.options.page_count,
+            timeout=self.options.timeout,
+            run_id=self.options.run_id,
+            row_batch_handler=(
+                partial(self.persist_batch, resource_type)
+                if self.is_streaming
+                else None
+            ),
+            row_batch_size=self.options.stream_batch_size,
+            retain_rows=not self.is_streaming,
+            cancel_ctx=self.options.cancel_ctx,
+            cancel_task=self.options.cancel_task,
+            bulk_export=self.options.bulk_export,
+            bulk_export_max_pending_seconds=(
+                self.options.bulk_export_max_pending_seconds
+            ),
+            deadline_seconds=self.options.resource_deadline_seconds,
+            pagination_checkpoint=source_record_by_field.get(
+                "_pagination_checkpoint_context"
+            ),
+        )
+
+    async def record(
+        self,
+        resource_type: str,
+        source_record_by_field: dict[str, Any],
+        fetch_result: ResourceFetchResult | None,
+    ) -> ResourceFetchResult | None:
+        """Merge one settled fetch in resource-owned result slots."""
+        if fetch_result is None:
+            return None
+        fetch_result = _fail_closed_on_unexpected_empty_resource(
+            source_record_by_field,
+            resource_type,
+            fetch_result,
+        )
+        await _reset_unexpected_empty_pagination_checkpoint(
+            source_record_by_field,
+            resource_type,
+            self.options.page_count,
+            fetch_result,
+        )
+        self._record_stats(resource_type, source_record_by_field, fetch_result)
+        written_total = await self._written_total(fetch_result)
+        self.count_by_resource[resource_type] += written_total
+        resource_diagnostic = _resource_fetch_diagnostic(
+            fetch_result,
+            rows_written=written_total,
+        )
+        resource_diagnostic["resource_scan_concurrency_requested"] = (
+            self.options.requested_resource_concurrency
+        )
+        resource_diagnostic["resource_scan_concurrency_effective"] = (
+            self.effective_concurrency
+        )
+        self.diagnostic_by_resource[resource_type] = resource_diagnostic
+        is_zero_role = bool(
+            resource_type == "PractitionerRole"
+            and fetch_result.complete
+            and not fetch_result.error
+            and not fetch_result.is_bounded
+            and fetch_result.rows_fetched == 0
+            and written_total == 0
+        )
+        if is_zero_role:
+            return fetch_result
+        await self.mark_stale_ready(resource_type, fetch_result)
+        return None
+
+    def _record_stats(
+        self,
+        resource_type: str,
+        source_record_by_field: dict[str, Any],
+        fetch_result: ResourceFetchResult,
+    ) -> None:
+        """Record completion, fetch timing, and retained linked rows."""
+        checkpoint_context = (
+            source_record_by_field.get("_pagination_checkpoint_context")
+            if self.is_streaming
+            and self.options.per_resource_limit <= 0
+            and self.options.page_limit <= 0
+            else None
+        )
+        _record_resource_fetch_stats(
+            self.stats_by_resource,
+            resource_type,
+            fetch_result,
+            bulk_export_selection=_source_bulk_export_selection(
+                source_record_by_field,
+                self.options.bulk_export,
+                per_resource_limit=self.options.per_resource_limit,
+                checkpoint_context=checkpoint_context,
+            ),
+        )
+        _record_resource_completion(
+            self.resource_completion,
+            resource_type,
+            self.source_ids,
+            fetch_result,
+        )
+        if fetch_result.rows or resource_type not in self.rows_by_resource:
+            self.rows_by_resource[resource_type] = fetch_result.rows
+
+    async def _written_total(self, fetch_result: ResourceFetchResult) -> int:
+        """Return callback writes or persist a retained result once."""
+        if self.is_streaming:
+            return fetch_result.rows_written
+        return await self.persist_rows(fetch_result.model, fetch_result.rows)
+
+    async def import_one(
+        self,
+        resource_type: str,
+        *,
+        report_start: bool,
+    ) -> ResourceFetchResult | None:
+        """Fetch one task-local source view and merge its settled outcome."""
+        source_record_by_field = dict(self.source_record)
+        fetch_result = await self.fetch(
+            resource_type,
+            source_record_by_field,
+            report_start=report_start,
+        )
+        return await self.record(
+            resource_type,
+            source_record_by_field,
+            fetch_result,
+        )
+
+    async def _run_bounded(
+        self,
+        resource_type: str,
+        resource_semaphore: asyncio.Semaphore,
+    ) -> ResourceFetchResult | None:
+        """Run one resource only while holding a bounded wave slot."""
+        async with resource_semaphore:
+            return await self.import_one(resource_type, report_start=False)
+
+    async def wave(
+        self,
+        resource_types: tuple[str, ...],
+        concurrency: int,
+    ) -> list[ResourceFetchResult | None]:
+        """Run a fail-fast wave and always cancel and join every sibling."""
+        resource_semaphore = asyncio.Semaphore(concurrency)
+        resource_tasks = [
+            asyncio.create_task(
+                self._run_bounded(resource_type, resource_semaphore),
+                name="provider-directory-resource-scan",
+            )
+            for resource_type in resource_types
+        ]
+        try:
+            return list(await asyncio.gather(*resource_tasks))
+        finally:
+            for resource_task in resource_tasks:
+                if not resource_task.done():
+                    resource_task.cancel()
+            if resource_tasks:
+                await asyncio.gather(*resource_tasks, return_exceptions=True)
+
+    def _effective_concurrency(
+        self,
+        ordered_resource_types: tuple[str, ...],
+    ) -> int:
+        """Return the fail-closed cursor concurrency for this source group."""
+        return _effective_resource_scan_concurrency(
+            self.source_record,
+            ResourceScanConcurrencyOptions(
+                resource_types=ordered_resource_types,
+                requested_concurrency=(
+                    self.options.requested_resource_concurrency
+                ),
+                per_resource_limit=self.options.per_resource_limit,
+                page_limit=self.options.page_limit,
+                page_count=self.options.page_count,
+                stream_batch_size=self.options.stream_batch_size,
+                source_concurrency=self.options.source_concurrency,
+                linked_resource_limit=self.options.linked_resource_limit,
+                stale_cleanup=self.options.stale_cleanup,
+                bulk_export=self.options.bulk_export,
+                checkpointing_enabled=self.options.checkpointing_enabled,
+                deferred_materialization=(
+                    self.options.deferred_materialization
+                ),
+            ),
+        )
+
+    async def scan(
+        self,
+        requested_resource_types: list[str],
+    ) -> ResourceFetchResult | None:
+        """Run a foundation wave and retain the serial role-tail outcome."""
+        ordered_resource_types = tuple(
+            _source_resource_fetch_order(
+                self.source_record,
+                requested_resource_types,
+            )
+        )
+        concurrency = self._effective_concurrency(ordered_resource_types)
+        self.effective_concurrency = concurrency
+        if concurrency > 1:
+            foundation_types = tuple(
+                resource_type
+                for resource_type in ordered_resource_types
+                if resource_type != "PractitionerRole"
+            )
+            await self.activate(
+                foundation_types,
+                summary="parallel FHIR resources",
+            )
+            await self.wave(foundation_types, concurrency)
+            serial_types = tuple(
+                resource_type
+                for resource_type in ordered_resource_types
+                if resource_type == "PractitionerRole"
+            )
+        else:
+            serial_types = ordered_resource_types
+        zero_role_result = None
+        for resource_type in serial_types:
+            candidate = await self.import_one(resource_type, report_start=True)
+            if candidate is not None:
+                zero_role_result = candidate
+        return zero_role_result
+
+
 async def _import_resources(
     source_records: list[dict[str, Any]],
     *,
@@ -56768,6 +57302,7 @@ async def _import_resources(
     stale_cleanup: bool = False,
     stream_batch_size: int = 0,
     source_concurrency: int = 1,
+    resource_scan_concurrency: int = 1,
     bulk_export: bool = False,
     bulk_export_max_pending_seconds: int = (
         DEFAULT_BULK_EXPORT_MAX_PENDING_SECONDS
@@ -56948,6 +57483,7 @@ async def _import_resources(
                 "sample_plan_name": partition_source.get("plan_name"),
                 "api_base": partition_source.get("canonical_api_base") or partition_source.get("api_base"),
                 "current_resource": None,
+                "current_resources": [],
                 "started_at": _now().isoformat(timespec="seconds") + "Z",
                 "started_monotonic": time.monotonic(),
                 "resource_started_at": None,
@@ -57115,121 +57651,48 @@ async def _import_resources(
                 import_summary[1],
             )
             return import_summary
-        for resource_type in _source_resource_fetch_order(partition_source, resources):
-            await _raise_if_resource_import_cancelled(cancel_ctx, cancel_task)
-            if (
-                resource_type == "PractitionerRole"
-                and _needs_practitioner_role_reverse_lookup(partition_source, "PractitionerRole")
-            ):
-                continue
-            async with progress_lock:
-                active_group_by_key[group_key]["current_resource"] = resource_type
-                active_group_by_key[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
-                active_group_by_key[group_key]["resource_started_monotonic"] = time.monotonic()
-            await report_progress(force=True)
-            use_streaming = stream_batch_size > 0
-
-            async def row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
-                """Persist a normalized row batch for the active source group."""
-                if linked_resource_limit > 0 or (
-                    is_scan_role_reverse_lookup_planned
-                    and resource_type in _practitioner_role_reverse_lookup_resources(partition_source)
-                ):
-                    rows_by_resource.setdefault(resource_type, []).extend(
-                        _compact_linked_reference_rows(resource_type, rows)
-                    )
-                written = await persist_resource_rows(model, rows)
-                await maybe_report_partial_progress(group_key, resource_type, written)
-                return written
-
-            if (
-                stale_cleanup
-                and resource_type == "PractitionerRole"
-                and _is_uhc_role_postal_partition_enabled(partition_source)
-            ):
-                await _mark_postal_checkpointed_roles_seen(
-                    partition_source,
-                    [partition_source["source_id"]],
-                    run_id,
-                    seen_stage_table,
-                )
-            fetch_result = await _fetch_resource_rows(
-                partition_source,
-                resource_type,
+        use_streaming = stream_batch_size > 0
+        deferred_zero_role_cleanup = await ResourceGroupScanRunner(
+            source_record=partition_source,
+            source_ids=source_ids,
+            group_key=group_key,
+            options=ResourceGroupScanOptions(
                 per_resource_limit=per_resource_limit,
                 page_limit=page_limit,
                 page_count=page_count,
                 timeout=timeout,
                 run_id=run_id,
-                row_batch_handler=row_batch_handler if use_streaming else None,
-                row_batch_size=stream_batch_size,
-                retain_rows=not use_streaming,
+                stream_batch_size=stream_batch_size,
                 cancel_ctx=cancel_ctx,
                 cancel_task=cancel_task,
                 bulk_export=bulk_export,
                 bulk_export_max_pending_seconds=(
                     bulk_export_max_pending_seconds
                 ),
-                deadline_seconds=resource_deadline_seconds,
-                pagination_checkpoint=partition_source.get("_pagination_checkpoint_context"),
-            )
-            if not fetch_result:
-                continue
-            fetch_result = _fail_closed_on_unexpected_empty_resource(
-                partition_source,
-                resource_type,
-                fetch_result,
-            )
-            await _reset_unexpected_empty_pagination_checkpoint(
-                partition_source,
-                resource_type,
-                page_count,
-                fetch_result,
-            )
-            _record_resource_fetch_stats(
-                resource_stats_by_type,
-                resource_type,
-                fetch_result,
-                bulk_export_selection=_source_bulk_export_selection(
-                    partition_source,
-                    bulk_export,
-                    per_resource_limit=per_resource_limit,
-                    checkpoint_context=(
-                        partition_source.get("_pagination_checkpoint_context")
-                        if use_streaming
-                        and per_resource_limit <= 0
-                        and page_limit <= 0
-                        else None
-                    ),
+                resource_deadline_seconds=resource_deadline_seconds,
+                linked_resource_limit=linked_resource_limit,
+                stale_cleanup=stale_cleanup,
+                seen_stage_table=seen_stage_table,
+                scan_role_reverse_lookup_planned=(
+                    is_scan_role_reverse_lookup_planned
                 ),
-            )
-            _record_resource_completion(resource_completion, resource_type, source_ids, fetch_result)
-            if fetch_result.rows or resource_type not in rows_by_resource:
-                rows_by_resource[resource_type] = fetch_result.rows
-            written_total = (
-                fetch_result.rows_written
-                if use_streaming
-                else await persist_resource_rows(
-                    fetch_result.model,
-                    fetch_result.rows,
-                )
-            )
-            source_count_by_resource[resource_type] += written_total
-            resource_diagnostic_by_type[resource_type] = _resource_fetch_diagnostic(
-                fetch_result,
-                rows_written=written_total,
-            )
-            if (
-                resource_type == "PractitionerRole"
-                and fetch_result.complete
-                and not fetch_result.error
-                and not fetch_result.is_bounded
-                and fetch_result.rows_fetched == 0
-                and written_total == 0
-            ):
-                deferred_zero_role_cleanup = fetch_result
-            else:
-                await mark_resource_stale_cleanup_ready(resource_type, fetch_result)
+                source_concurrency=source_concurrency,
+                requested_resource_concurrency=resource_scan_concurrency,
+                checkpointing_enabled=is_pagination_checkpointing_enabled,
+                deferred_materialization=defer_typed_materialization,
+            ),
+            progress_lock=progress_lock,
+            active_group_by_key=active_group_by_key,
+            report_progress=report_progress,
+            persist_rows=persist_resource_rows,
+            partial_progress=maybe_report_partial_progress,
+            mark_stale_ready=mark_resource_stale_cleanup_ready,
+            count_by_resource=source_count_by_resource,
+            stats_by_resource=resource_stats_by_type,
+            resource_completion=resource_completion,
+            rows_by_resource=rows_by_resource,
+            diagnostic_by_resource=resource_diagnostic_by_type,
+        ).scan(resources)
         if should_retry_zero_practitioner_role(deferred_zero_role_cleanup):
             async with progress_lock:
                 active_group_by_key[group_key]["current_resource"] = "PractitionerRole retry"
@@ -58955,6 +59418,11 @@ async def process_provider_directory_fhir_data(
         task.get("source_concurrency"),
         1 if test_mode else _env_int("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_CONCURRENCY", 1),
     )
+    resource_scan_concurrency = _validated_resource_scan_concurrency(
+        task.get("resource_scan_concurrency")
+        if task.get("resource_scan_concurrency") not in (None, "")
+        else _env_int(SOURCE_RESOURCE_SCAN_CONCURRENCY_ENV, 1)
+    )
     stale_cleanup_raw = task.get("stale_cleanup")
     should_cleanup_stale_rows = _is_bool_or_default(
         stale_cleanup_raw,
@@ -59160,6 +59628,7 @@ async def process_provider_directory_fhir_data(
             ),
             "bulk_export_mode": _bulk_export_mode_metrics(use_bulk_export, {}),
             "source_concurrency": source_concurrency,
+            "resource_scan_concurrency": resource_scan_concurrency,
             "rest_http_keepalive": _is_source_http_keepalive_enabled(),
             "stale_cleanup": should_cleanup_stale_rows,
             "publish_artifacts": should_publish_artifacts,
@@ -59330,6 +59799,7 @@ async def process_provider_directory_fhir_data(
                     stale_cleanup=should_cleanup_stale_rows,
                     stream_batch_size=stream_batch_size,
                     source_concurrency=source_concurrency,
+                    resource_scan_concurrency=resource_scan_concurrency,
                     bulk_export=use_bulk_export,
                     bulk_export_max_pending_seconds=(
                         bulk_export_max_pending_seconds
@@ -59556,6 +60026,7 @@ class _ProviderDirectoryFhirCommandOptions:
     bulk_export: bool | None = None
     bulk_export_max_pending_seconds: int | None = None
     source_concurrency: int | None = None
+    resource_scan_concurrency: int | None = None
     concurrency: int | None = None
     timeout: int | None = None
 
