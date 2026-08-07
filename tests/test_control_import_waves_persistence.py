@@ -323,6 +323,11 @@ def test_wave_payload_requires_closed_envelope_count_and_digest():
     validated = waves.validate_import_wave_payload(_payload(), attestation_key=_KEY)
     assert validated["wave_id"] == "wave-unit"
     assert validated["release_queue"].endswith(validated["wave_digest"])
+    assert (
+        validated["attestation"]["schema_version"]
+        == "healthporta.ptg-import-wave-attestation.v2"
+    )
+    assert waves.PROTOCOL_IDENTITY == "healthporta.ptg-small.exact-wave.v1"
 
 
 @pytest.mark.asyncio
@@ -356,7 +361,10 @@ def test_manifest_digests_and_prepare_wave_intents_are_deterministic(monkeypatch
 
 
 def test_new_wave_record_and_response_bind_capacity_and_terminal_flags():
-    request = _request()
+    request = waves.validate_import_wave_payload(
+        _payload(count=1),
+        attestation_key=_KEY,
+    )
     wave = waves._new_wave_record(
         request,
         [_prepared()],
@@ -367,6 +375,8 @@ def test_new_wave_record_and_response_bind_capacity_and_terminal_flags():
     )
     assert wave.state == "admitted"
     assert wave.worker_limit == 12
+    assert wave.cohort_attestation["schema_version"] == waves.ATTESTATION_VERSION
+    assert wave.protocol_identity == "healthporta.ptg-small.exact-wave.v1"
     response = waves._wave_response(_wave_record())
     assert response["capacity_owning"] is True
     assert response["terminal"] is False

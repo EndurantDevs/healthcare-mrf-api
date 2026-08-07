@@ -10,8 +10,17 @@ import re
 from typing import Any
 
 
-ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v1"
-ATTESTATION_DOMAIN = b"healthporta.ptg-import-wave-attestation.v1\0"
+LEGACY_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v1"
+ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v2"
+_ATTESTATION_DOMAINS = {
+    LEGACY_ATTESTATION_VERSION: (
+        b"healthporta.ptg-import-wave-attestation.v1\0"
+    ),
+    ATTESTATION_VERSION: b"healthporta.ptg-import-wave-attestation.v2\0",
+}
+AUTHORIZATION_BASIS = (
+    "complete_subscriptions_and_client_visible_bindings_v1"
+)
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,190}$")
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -73,9 +82,15 @@ def sign_cohort_attestation(
 ) -> str:
     """Return the HMAC required by the orchestrator-to-engine contract."""
 
+    schema_version = unsigned_attestation.get("schema_version")
+    if not isinstance(schema_version, str):
+        raise ValueError("cohort_attestation schema_version is unsupported")
+    domain = _ATTESTATION_DOMAINS.get(schema_version)
+    if domain is None:
+        raise ValueError("cohort_attestation schema_version is unsupported")
     return hmac.new(
         _attestation_key(key),
-        ATTESTATION_DOMAIN + _canonical(unsigned_attestation),
+        domain + _canonical(unsigned_attestation),
         hashlib.sha256,
     ).hexdigest()
 
@@ -99,7 +114,11 @@ def _verify_attestation(
         for key, field_value in attestation.items()
         if key != "signature"
     }
-    if unsigned_attestation_map["schema_version"] != ATTESTATION_VERSION:
+    schema_version = unsigned_attestation_map["schema_version"]
+    if (
+        not isinstance(schema_version, str)
+        or schema_version not in _ATTESTATION_DOMAINS
+    ):
         raise ValueError("cohort_attestation schema_version is unsupported")
     expected_signature = sign_cohort_attestation(
         unsigned_attestation_map,
@@ -110,22 +129,45 @@ def _verify_attestation(
     return {**unsigned_attestation_map, "signature": signature}
 
 
-def _validate_snapshot(snapshot: object) -> dict[str, Any]:
+def _validate_snapshot(
+    snapshot: object,
+    *,
+    schema_version: str = ATTESTATION_VERSION,
+) -> dict[str, Any]:
+    """Validate one exact versioned signed snapshot envelope."""
+
     digest_fields = {
         "snapshot_digest", "membership_digest", "inventory_digest",
         "subscription_coverage_digest", "entitlement_coverage_digest",
         "catalog_generation",
     }
     expected_snapshot_fields = digest_fields | {"entitlement_coverage_count"}
+    if schema_version == ATTESTATION_VERSION:
+        expected_snapshot_fields |= {
+            "authorization_basis",
+            "authorization_digest",
+        }
+        digest_fields.add("authorization_digest")
+    elif schema_version != LEGACY_ATTESTATION_VERSION:
+        raise ValueError("cohort_attestation schema_version is unsupported")
     if not isinstance(snapshot, dict) or set(snapshot) != expected_snapshot_fields:
         raise ValueError("cohort_attestation snapshot fields are not exact")
     for field in digest_fields:
         _digest(snapshot[field], f"snapshot.{field}")
     count = snapshot["entitlement_coverage_count"]
-    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise ValueError("snapshot.entitlement_coverage_count is invalid")
+    if schema_version == LEGACY_ATTESTATION_VERSION and count < 1:
         raise ValueError(
             "snapshot.entitlement_coverage_count must be a positive integer"
         )
+    if schema_version == ATTESTATION_VERSION:
+        if count < 0:
+            raise ValueError(
+                "snapshot.entitlement_coverage_count must be non-negative"
+            )
+        if snapshot["authorization_basis"] != AUTHORIZATION_BASIS:
+            raise ValueError("snapshot.authorization_basis is unsupported")
     return dict(snapshot)
 
 

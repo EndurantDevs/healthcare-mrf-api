@@ -223,7 +223,10 @@ def validate_import_wave_payload(
     )
     wave_id = _identifier(attestation["wave_id"], "wave_id", 64)
     idempotency_key = _identifier(attestation["idempotency_key"], "idempotency_key", 160)
-    snapshot = _validate_snapshot(attestation["snapshot"])
+    snapshot = _validate_snapshot(
+        attestation["snapshot"],
+        schema_version=attestation["schema_version"],
+    )
     partition = _validate_partition(attestation["partition"])
     intents = _validate_signed_intents(attestation["intents"])
     if partition["imported_coordinate_count"] != len(intents):
