@@ -5533,7 +5533,7 @@ components:
         limit:
           type: integer
           minimum: 1
-          maximum: 200
+          maximum: 100
           default: 25
         cursor:
           type: string
@@ -5884,7 +5884,7 @@ components:
         limit:
           type: integer
           minimum: 1
-          maximum: 200
+          maximum: 100
         has_more:
           type: boolean
         next_cursor:

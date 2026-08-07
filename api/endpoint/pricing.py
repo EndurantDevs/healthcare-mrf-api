@@ -30,6 +30,9 @@ from api.billing_search_post_endpoint_access import (
     BillingSearchPostEndpointAccessError,
     authorize_billing_search_post_endpoint,
 )
+from api.billing_search_post_endpoint_journal import (
+    billing_search_post_failure_journal,
+)
 from api.billing_search_post_operation import (
     BillingSearchCursorGenerationExpiredError,
     BillingSearchPostCursorInvalidError,
@@ -10936,6 +10939,54 @@ def _authorize_billing_search_request(request: Any, trusted_now: str):
     )
 
 
+_BILLING_SEARCH_POST_OPERATION_FAILURES = (
+    BillingSearchResourceNotFoundError,
+    BillingSearchCursorGenerationExpiredError,
+    BillingSearchPostCursorInvalidError,
+    BillingSearchPostServingUnavailableError,
+)
+_BILLING_SEARCH_POST_FAILURE_RESPONSE_BY_TYPE = {
+    BillingSearchResourceNotFoundError: (404, "resource_not_found", "denied"),
+    BillingSearchCursorGenerationExpiredError: (
+        409,
+        "cursor_generation_expired",
+        "unavailable",
+    ),
+    BillingSearchPostCursorInvalidError: (400, "invalid_request", "denied"),
+    BillingSearchPostServingUnavailableError: (
+        503,
+        "billing_search_unavailable",
+        "unavailable",
+    ),
+}
+
+
+def _billing_search_operation_failure_response(
+    operation_failure: Exception,
+    access: object,
+    *,
+    trusted_now: str,
+    started_at: float,
+) -> Any:
+    status, code, decision = _BILLING_SEARCH_POST_FAILURE_RESPONSE_BY_TYPE[
+        type(operation_failure)
+    ]
+    logger.info(
+        "Billing search POST access decision",
+        extra={
+            "billing_search_audit": (
+                billing_search_post_failure_journal(
+                    access,
+                    decision=decision,
+                    trusted_observed_at=trusted_now,
+                    started_at=started_at,
+                )
+            ),
+        },
+    )
+    return _billing_search_error_response(status=status, code=code)
+
+
 @blueprint.post(
     "/providers/search-by-procedure",
     name="pricing.providers.search_by_procedure_post",
@@ -10943,6 +10994,7 @@ def _authorize_billing_search_request(request: Any, trusted_now: str):
 async def search_providers_by_procedure_billing_identity(request):
     """Serve one exact billing-identity-scoped provider pricing page."""
 
+    started_at = time.perf_counter()
     trusted_now = _billing_search_trusted_now()
     try:
         access = _authorize_billing_search_request(request, trusted_now)
@@ -10957,32 +11009,30 @@ async def search_providers_by_procedure_billing_identity(request):
             code="resource_not_found",
         )
     try:
+        session = _get_session(request)
+    except Exception:
+        return _billing_search_operation_failure_response(
+            BillingSearchPostServingUnavailableError(
+                "billing_search_post_session_unavailable"
+            ),
+            access,
+            trusted_now=trusted_now,
+            started_at=started_at,
+        )
+    try:
         execution = await execute_billing_search_post(
-            _get_session(request),
+            session,
             access,
             trusted_now=trusted_now,
             radius_zip_context_resolver=_lookup_zip_context,
             environment_map=os.environ,
         )
-    except BillingSearchResourceNotFoundError:
-        return _billing_search_error_response(
-            status=404,
-            code="resource_not_found",
-        )
-    except BillingSearchCursorGenerationExpiredError:
-        return _billing_search_error_response(
-            status=409,
-            code="cursor_generation_expired",
-        )
-    except BillingSearchPostCursorInvalidError:
-        return _billing_search_error_response(
-            status=400,
-            code="invalid_request",
-        )
-    except BillingSearchPostServingUnavailableError:
-        return _billing_search_error_response(
-            status=503,
-            code="billing_search_unavailable",
+    except _BILLING_SEARCH_POST_OPERATION_FAILURES as operation_failure:
+        return _billing_search_operation_failure_response(
+            operation_failure,
+            access,
+            trusted_now=trusted_now,
+            started_at=started_at,
         )
     logger.info(
         "Billing search POST completed",

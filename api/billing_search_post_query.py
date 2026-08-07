@@ -86,4 +86,35 @@ def build_billing_search_resolved_query(
     )
 
 
-__all__ = ["build_billing_search_resolved_query"]
+def build_billing_search_terminal_query(
+    service_query: BillingSearchPostServiceQuery,
+    *,
+    plan_release_id: str,
+) -> BillingSearchResolvedQuery:
+    """Build a no-traversal query without resolving an unused radius centroid."""
+
+    if type(service_query) is not BillingSearchPostServiceQuery:
+        raise serving_unavailable()
+    return BillingSearchResolvedQuery(
+        plan_release_id=plan_release_id,
+        selector_kind=service_query.selector_kind,
+        tax_identity_type=service_query.tax_identity_type,
+        code_system=service_query.code_system,
+        code=service_query.code,
+        zip5=service_query.zip5,
+        latitude=None,
+        longitude=None,
+        radius_miles=None,
+        provider_npi=service_query.provider_npi,
+        modifiers=service_query.modifiers,
+        place_of_service=service_query.place_of_service,
+        include_evidence=service_query.include_evidence,
+        limit=service_query.limit,
+        after_sort_key=None,
+    )
+
+
+__all__ = [
+    "build_billing_search_resolved_query",
+    "build_billing_search_terminal_query",
+]

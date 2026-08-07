@@ -8,6 +8,7 @@ from copy import deepcopy
 from typing import Any
 
 from api import ptg2_serving
+from api.ptg2_billing_exact_contract import BillingRateOccurrenceWitness
 from api.ptg2_billing_geo_contract import (
     MAX_PROVIDER_RATE_WITNESSES,
     BillingProviderAddress,
@@ -16,12 +17,26 @@ from api.ptg2_billing_geo_contract import (
     bounded_tuple,
     require_valid_provider_address,
     require_valid_provider_rate_witness,
+    validated_rate_witnesses,
 )
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 MAX_PRICE_KEYS = 256
 MAX_PRICE_ATOMS = 256
+MAX_RATE_FILTER_PRICE_KEYS = 4096
+MAX_RATE_FILTER_SCAN_ATOMS = 4096
+
+_PRICE_FILTER_FIELDS = (
+    "pos",
+    "place_of_service",
+    "service_code",
+    "modifier",
+    "modifiers",
+    "billing_code_modifier",
+    "rate",
+    "negotiated_rate",
+)
 
 
 def _validated_prices_by_key(
@@ -44,6 +59,89 @@ def _validated_prices_by_key(
             )
         validated_prices_by_key[price_key] = price_payloads
     return validated_prices_by_key
+
+
+def _normalized_price_filter_args(
+    price_filter_args: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if price_filter_args is None:
+        return {}
+    if not isinstance(price_filter_args, Mapping):
+        raise PTG2ManifestArtifactError("PTG2 exact billing price filter is malformed")
+    return dict(price_filter_args)
+
+
+def _is_price_filter_requested(price_filter_args: Mapping[str, Any]) -> bool:
+    return any(price_filter_args.get(field_name) for field_name in _PRICE_FILTER_FIELDS)
+
+
+def _normalized_rate_witnesses(
+    serving_tables: PTG2ServingTables,
+    rate_witnesses: Iterable[BillingRateOccurrenceWitness],
+) -> tuple[BillingRateOccurrenceWitness, ...]:
+    normalized_witnesses = validated_rate_witnesses(rate_witnesses)
+    snapshot_key = ptg2_serving._required_shared_snapshot_key(serving_tables)
+    if any(witness.snapshot_key != snapshot_key for witness in normalized_witnesses):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing rate filter crossed its snapshot scope"
+        )
+    return normalized_witnesses
+
+
+async def filter_exact_billing_rate_occurrences(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    rate_witnesses: Iterable[BillingRateOccurrenceWitness],
+    price_filter_args: Mapping[str, Any] | None = None,
+) -> tuple[BillingRateOccurrenceWitness, ...]:
+    """Filter exact occurrences by price key before provider expansion."""
+
+    normalized_witnesses = _normalized_rate_witnesses(
+        serving_tables,
+        rate_witnesses,
+    )
+    normalized_filter_args = _normalized_price_filter_args(price_filter_args)
+    if not normalized_witnesses or not _is_price_filter_requested(
+        normalized_filter_args
+    ):
+        return normalized_witnesses
+    if (
+        type(MAX_RATE_FILTER_PRICE_KEYS) is not int
+        or MAX_RATE_FILTER_PRICE_KEYS < 1
+        or type(MAX_RATE_FILTER_SCAN_ATOMS) is not int
+        or MAX_RATE_FILTER_SCAN_ATOMS < 1
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing rate filter has invalid limits"
+        )
+    price_keys = tuple(sorted({witness.price_key for witness in normalized_witnesses}))
+    if len(price_keys) > MAX_RATE_FILTER_PRICE_KEYS:
+        raise PTG2ManifestArtifactError(
+            "PTG2 exact billing rate filter exceeds its key limit"
+        )
+    prices_by_key = _validated_prices_by_key(
+        await ptg2_serving._version_three_bounded_prices_by_key(
+            session,
+            serving_tables,
+            price_keys,
+            maximum_atom_count=MAX_RATE_FILTER_SCAN_ATOMS,
+        ),
+        price_keys=price_keys,
+    )
+    matching_price_keys = {
+        price_key
+        for price_key in price_keys
+        if ptg2_serving._ptg2_manifest_filter_prices(
+            prices_by_key[price_key],
+            normalized_filter_args,
+        )
+    }
+    return tuple(
+        witness
+        for witness in normalized_witnesses
+        if witness.price_key in matching_price_keys
+    )
 
 
 def _normalized_geo_witnesses(
@@ -156,12 +254,13 @@ async def hydrate_exact_billing_geo_prices(
     return _hydrated_price_witnesses(
         normalized_witnesses,
         prices_by_key,
-        dict(price_filter_args or {}),
+        _normalized_price_filter_args(price_filter_args),
         atom_budget=effective_atom_budget,
     )
 
 
 __all__ = [
     "BillingProviderGeoPriceWitness",
+    "filter_exact_billing_rate_occurrences",
     "hydrate_exact_billing_geo_prices",
 ]

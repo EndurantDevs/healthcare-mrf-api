@@ -17,7 +17,7 @@ def _service_query(*, radius_miles: float = 0.0):
     return parse_billing_search_post_request(
         {
             "healthporta_plan_id": "hpplan_" + "0" * 26,
-            "billing_identity": {"billing_entity_ref": "be1_" + "a" * 48},
+            "billing_identity": {"billing_entity_ref": "be1_" + "a" * 64},
             "procedure": {
                 "code_system": "CPT",
                 "code": "00000",

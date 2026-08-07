@@ -277,6 +277,107 @@ async def test_matched_service_preserves_every_exact_reader_stage(
 
 
 @pytest.mark.asyncio
+async def test_price_filter_prunes_cross_group_rate_before_provider_expansion(
+    monkeypatch,
+) -> None:
+    tables = serving_tables()
+    exact_provider_rate = provider_rate()
+    matching_rate = exact_provider_rate.rate_occurrence
+    nonmatching_rate = replace(
+        matching_rate,
+        source_record_ordinal=1,
+        provider_group_ref="bb" * 16,
+        provider_set_key=4,
+        price_key=11,
+        occurrence_ordinal=1,
+    )
+    exact_geo = BillingProviderGeoWitness(exact_provider_rate, address())
+    _code_lookup, rate_lookup, npi_lookup, _geo_lookup = _install_matched_reader_chain(
+        monkeypatch,
+        exact_code=code_witness(),
+        exact_rate=matching_rate,
+        exact_provider_rate=exact_provider_rate,
+        exact_geo=exact_geo,
+    )
+    rate_lookup.return_value = (matching_rate, nonmatching_rate)
+    price_filter = AsyncMock(return_value=(matching_rate,))
+    monkeypatch.setattr(
+        service.ptg2_billing_price_reader,
+        "filter_exact_billing_rate_occurrences",
+        price_filter,
+    )
+
+    service_result = await service.search_exact_billing_provider_page(
+        object(),
+        query=query(modifiers=("AA",), place_of_service=("11",)),
+        selection=selection(tables=tables),
+        selector_scope=selector_scope(
+            source_publication=tables.provider_tax_identity_source_publication
+        ),
+    )
+
+    assert service_result.state == BILLING_SEARCH_RESULT_MATCHED
+    assert price_filter.await_args.kwargs == {
+        "rate_witnesses": (matching_rate, nonmatching_rate),
+        "price_filter_args": {
+            "modifiers": ("AA",),
+            "place_of_service": ("11",),
+        },
+    }
+    assert npi_lookup.await_args.kwargs["rate_witnesses"] == (matching_rate,)
+
+
+@pytest.mark.asyncio
+async def test_empty_price_filter_result_is_not_misclassified_as_geo_miss(
+    monkeypatch,
+) -> None:
+    tables = serving_tables()
+    exact_rate = provider_rate().rate_occurrence
+    monkeypatch.setattr(
+        service.ptg2_billing_code_reader,
+        "load_exact_billing_code_witnesses",
+        AsyncMock(return_value=(code_witness(),)),
+    )
+    monkeypatch.setattr(
+        service.ptg2_billing_exact_reader,
+        "load_exact_billing_rate_occurrence_witnesses",
+        AsyncMock(return_value=(exact_rate,)),
+    )
+    price_filter = AsyncMock(return_value=())
+    npi_lookup = AsyncMock()
+    geo_lookup = AsyncMock()
+    monkeypatch.setattr(
+        service.ptg2_billing_price_reader,
+        "filter_exact_billing_rate_occurrences",
+        price_filter,
+    )
+    monkeypatch.setattr(
+        service.ptg2_billing_geo_reader,
+        "expand_billing_rate_witnesses_to_npis",
+        npi_lookup,
+    )
+    monkeypatch.setattr(
+        service.ptg2_billing_geo_reader,
+        "load_exact_billing_geo_witnesses",
+        geo_lookup,
+    )
+
+    service_result = await service.search_exact_billing_provider_page(
+        object(),
+        query=query(modifiers=("AA",)),
+        selection=selection(tables=tables),
+        selector_scope=selector_scope(
+            source_publication=tables.provider_tax_identity_source_publication
+        ),
+    )
+
+    assert service_result.state == BILLING_SEARCH_RESULT_NO_MATCHING_RATES
+    price_filter.assert_awaited_once()
+    npi_lookup.assert_not_awaited()
+    geo_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_provider_rates_without_provider_address_mean_no_geo_match(
     monkeypatch,
 ) -> None:

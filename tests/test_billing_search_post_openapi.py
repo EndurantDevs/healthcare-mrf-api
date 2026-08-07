@@ -216,6 +216,12 @@ def test_post_response_matches_the_closed_response_shaper() -> None:
     assert properties["procedure"] == {
         "$ref": "#/components/schemas/BillingIdentityPricingProcedureResult"
     }
+    pagination = schemas["BillingIdentityPricingPaginationResult"]["properties"]
+    assert pagination["limit"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": BILLING_SEARCH_POST_MAX_LIMIT,
+    }
 
 
 def test_post_statuses_are_explicit_generic_and_never_cacheable() -> None:

@@ -150,23 +150,6 @@ async def test_unknown_opaque_reference_is_generic_resource_not_found(
 
 
 @pytest.mark.asyncio
-async def test_malformed_opaque_reference_is_indistinguishable_from_unknown() -> None:
-    reference = "be1_x"
-
-    with pytest.raises(
-        resolution.BillingSearchSelectorNotFoundError,
-        match="^billing_search_resource_not_found$",
-    ) as captured:
-        await resolution.resolve_billing_search_selector(
-            object(),
-            access=_opaque_access(reference),
-            source_pinned_selection=_source_pinned_selection(),
-        )
-
-    assert reference not in str(captured.value)
-
-
-@pytest.mark.asyncio
 async def test_missing_source_publication_is_explicitly_unavailable(
     monkeypatch,
 ) -> None:

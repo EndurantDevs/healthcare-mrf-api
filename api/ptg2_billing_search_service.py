@@ -9,10 +9,15 @@ from api import (
     ptg2_billing_code_reader,
     ptg2_billing_exact_reader,
     ptg2_billing_geo_reader,
+    ptg2_billing_price_reader,
     ptg2_billing_search_page,
     ptg2_tables,
 )
 from api.plan_release_serving import PlanReleaseServingSelection
+from api.ptg2_billing_entity_source_resolution import (
+    ResolvedBillingEntitySourceScope,
+)
+from api.ptg2_billing_exact_contract import BillingRateOccurrenceWitness
 from api.ptg2_billing_geo_contract import MAX_PROVIDER_RATE_WITNESSES
 from api.ptg2_billing_search_contract import (
     BILLING_SEARCH_RESULT_MATCHED,
@@ -174,6 +179,32 @@ def _validated_scope_bindings(
     return selector_scope.bindings
 
 
+async def _load_price_filtered_rate_witnesses(
+    session,
+    *,
+    query: BillingSearchResolvedQuery,
+    binding_pin: BillingSearchBindingPin,
+    source_scope: ResolvedBillingEntitySourceScope,
+    code_keys: tuple[int, ...],
+) -> tuple[BillingRateOccurrenceWitness, ...]:
+    """Load exact occurrences and apply price filters before NPI expansion."""
+
+    rate_witnesses = (
+        await ptg2_billing_exact_reader.load_exact_billing_rate_occurrence_witnesses(
+            session,
+            binding_pin.serving_tables,
+            source_scope=source_scope,
+            code_keys=code_keys,
+        )
+    )
+    return await ptg2_billing_price_reader.filter_exact_billing_rate_occurrences(
+        session,
+        binding_pin.serving_tables,
+        rate_witnesses=rate_witnesses,
+        price_filter_args=query.price_filter_args,
+    )
+
+
 async def _binding_candidates(
     session,
     *,
@@ -194,19 +225,20 @@ async def _binding_candidates(
     )
     if not code_witnesses:
         return (), False
-    rate_witnesses = (
-        await ptg2_billing_exact_reader.load_exact_billing_rate_occurrence_witnesses(
-            session,
-            binding_pin.serving_tables,
-            source_scope=source_scope,
-            code_keys=tuple(witness.code_key for witness in code_witnesses),
-        )
+    filtered_rate_witnesses = await _load_price_filtered_rate_witnesses(
+        session,
+        query=query,
+        binding_pin=binding_pin,
+        source_scope=source_scope,
+        code_keys=tuple(witness.code_key for witness in code_witnesses),
     )
+    if not filtered_rate_witnesses:
+        return (), False
     provider_rates = (
         await ptg2_billing_geo_reader.expand_billing_rate_witnesses_to_npis(
             session,
             binding_pin.serving_tables,
-            rate_witnesses=rate_witnesses,
+            rate_witnesses=filtered_rate_witnesses,
             provider_npi=query.provider_npi,
         )
     )
