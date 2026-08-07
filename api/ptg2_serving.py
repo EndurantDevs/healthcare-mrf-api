@@ -4678,19 +4678,28 @@ async def _shared_graph_members_by_id(
     owner_ids: list[str] | tuple[str, ...],
     *,
     max_members: int | None = None,
+    max_projection_members: int | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """Resolve dense shared-graph members for normalized 128-bit owner IDs."""
 
+    max_projection_members = _normalized_projection_member_limit(max_projection_members)
     _require_strict_shared_v3(serving_tables)
     owner_id_list = list(_deduplicate_ptg2_manifest_ids(tuple(owner_ids)))
     if not owner_id_list:
         return {}
+    graph_read_options_by_name: dict[str, int | None] = {
+        "max_members": max_members
+    }
+    if max_projection_members is not None:
+        graph_read_options_by_name["max_projection_members"] = (
+            max_projection_members
+        )
     return await _shared_graph_members_many(
         session,
         serving_tables,
         name,
         owner_id_list,
-        max_members=max_members,
+        **graph_read_options_by_name,
     )
 
 async def _shared_provider_group_ids_for_keys(
@@ -5606,30 +5615,47 @@ async def _v4_npi_groups(
     }
 
 
+def _v4_group_npi_lookup(
+    owner_count: int,
+    max_members: int | None,
+    max_projection_members: int | None,
+) -> tuple[Any, dict[str, int]]:
+    """Choose the bounded V4 group-to-NPI lookup and its options."""
+
+    if max_members is None:
+        lookup_options_by_name = (
+            {}
+            if max_projection_members is None
+            else {"max_members": max_projection_members}
+        )
+        return lookup_v4_relation_members, lookup_options_by_name
+    return lookup_v4_relation_member_prefixes, {
+        "limit_per_owner": max_members,
+        "max_members": (
+            max_members * owner_count
+            if max_projection_members is None
+            else max_projection_members
+        ),
+    }
+
+
 async def _v4_group_npis(
     session,
     serving_tables: PTG2ServingTables,
     snapshot_key: int,
     owner_ids: list[str],
     max_members: int | None,
+    max_projection_members: int | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """Translate provider-group owner IDs to exact NPI member IDs."""
 
     owner_key_by_id = await _shared_provider_group_keys_for_ids(
         session, serving_tables, owner_ids
     )
-    lookup = (
-        lookup_v4_relation_members
-        if max_members is None
-        else lookup_v4_relation_member_prefixes
-    )
-    lookup_options = (
-        {}
-        if max_members is None
-        else {
-            "limit_per_owner": max_members,
-            "max_members": max_members * len(owner_key_by_id),
-        }
+    lookup, lookup_options_by_name = _v4_group_npi_lookup(
+        len(owner_key_by_id),
+        max_members,
+        max_projection_members,
     )
     npi_keys_by_group = await lookup(
         session,
@@ -5637,7 +5663,7 @@ async def _v4_group_npis(
         relation="group_npis_exact",
         owner_keys=owner_key_by_id.values(),
         schema_name=PTG2_SCHEMA,
-        **lookup_options,
+        **lookup_options_by_name,
     )
     npi_keys = {
         int(npi_key)
@@ -5766,6 +5792,7 @@ async def _v4_shared_graph_members_many(
     owner_ids: list[str],
     *,
     max_members: int | None,
+    max_projection_members: int | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """Translate legacy graph artifact names through packed V4 relations."""
 
@@ -5786,6 +5813,7 @@ async def _v4_shared_graph_members_many(
                 snapshot_key,
                 owner_ids,
                 max_members,
+                max_projection_members,
             )
         identity_maps = await _v4_projected_graph_identity_maps(
             session,
@@ -5862,23 +5890,18 @@ async def _legacy_graph_member_ids(
     }
 
 
-async def _shared_graph_members_many(
+async def _legacy_shared_graph_members_many(
     session,
     serving_tables: PTG2ServingTables,
     name: str,
     owner_ids: list[str],
     *,
     max_members: int | None,
+    max_projection_members: int | None = None,
 ) -> dict[str, tuple[str, ...]]:
-    """Resolve shared-graph member IDs for each requested owner ID."""
-    if serving_tables.uses_v4_graph:
-        return await _v4_shared_graph_members_many(
-            session,
-            serving_tables,
-            name,
-            owner_ids,
-            max_members=max_members,
-        )
+    """Resolve legacy shared-graph member IDs with a projection bound."""
+
+    max_projection_members = _normalized_projection_member_limit(max_projection_members)
     direction_by_name = {
         "provider_npi_group": PTG2_V3_GRAPH_NPI_TO_GROUP,
         "provider_group_npi": PTG2_V3_GRAPH_GROUP_TO_NPI,
@@ -5901,6 +5924,7 @@ async def _shared_graph_members_many(
         owner_key_by_id.values(),
         schema_name=PTG2_SCHEMA,
         max_members=max_members,
+        max_total_members=max_projection_members,
     )
     member_keys = {
         member_key
@@ -5922,6 +5946,57 @@ async def _shared_graph_members_many(
         )
         for owner_id in owner_ids
     }
+
+
+def _normalized_projection_member_limit(
+    max_projection_members: int | None,
+) -> int | None:
+    """Require one exact non-negative aggregate graph bound."""
+
+    if max_projection_members is None:
+        return None
+    if type(max_projection_members) is not int or max_projection_members < 0:
+        raise ValueError(
+            "PTG2 max_projection_members must be a non-negative integer"
+        )
+    return max_projection_members
+
+
+async def _shared_graph_members_many(
+    session,
+    serving_tables: PTG2ServingTables,
+    name: str,
+    owner_ids: list[str],
+    *,
+    max_members: int | None,
+    max_projection_members: int | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Resolve shared-graph member IDs for each requested owner ID."""
+
+    max_projection_members = _normalized_projection_member_limit(max_projection_members)
+    if not serving_tables.uses_v4_graph:
+        return await _legacy_shared_graph_members_many(
+            session,
+            serving_tables,
+            name,
+            owner_ids,
+            max_members=max_members,
+            max_projection_members=max_projection_members,
+        )
+    graph_read_options_by_name: dict[str, int | None] = {
+        "max_members": max_members
+    }
+    if max_projection_members is not None:
+        graph_read_options_by_name["max_projection_members"] = (
+            max_projection_members
+        )
+    return await _v4_shared_graph_members_many(
+        session,
+        serving_tables,
+        name,
+        owner_ids,
+        **graph_read_options_by_name,
+    )
 
 
 async def _shared_graph_members_for_id(
@@ -5949,6 +6024,8 @@ async def _manifest_sets_by_group(
     session,
     serving_tables: PTG2ServingTables,
     group_ids: list[str] | tuple[str, ...],
+    *,
+    max_members: int | None = None,
 ) -> dict[str, tuple[str, ...]]:
     normalized_group_ids = _deduplicate_ptg2_manifest_ids(tuple(group_ids))
     if not normalized_group_ids:
@@ -5958,6 +6035,7 @@ async def _manifest_sets_by_group(
         serving_tables,
         "provider_inverted",
         normalized_group_ids,
+        max_members=max_members,
     )
 
 def _ptg2_build_rate_scope(group_ids: tuple[str, ...]) -> _ManifestRateScope:

@@ -1654,6 +1654,7 @@ class _SharedGraphReadRequest:
     member_width: int
     member_count_sql: str
     params_by_name: dict[str, Any]
+    max_total_members: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1665,6 +1666,7 @@ class _GraphOwnerSelection:
 @dataclass
 class _GraphPreflightClaim:
     retained_bytes: int = 0
+    selected_member_count: int = 0
 
     def reserve(
         self,
@@ -1679,6 +1681,23 @@ class _GraphPreflightClaim:
             return
         retention_budget.claim(byte_count, category=category)
         self.retained_bytes += byte_count
+
+    def retain_selected_members(
+        self,
+        selected_member_count: int,
+        max_total_members: int | None,
+    ) -> None:
+        """Reject aggregate members before retaining their chunk coordinates."""
+
+        if (
+            max_total_members is not None
+            and selected_member_count
+            > max_total_members - self.selected_member_count
+        ):
+            raise SharedGraphReadLimitError(
+                "shared PTG graph selection exceeds max_total_members"
+            )
+        self.selected_member_count += selected_member_count
 
 
 async def _fetch_shared_graph_members_preflight(
@@ -1773,6 +1792,7 @@ def _shared_graph_read_request(
     owner_keys: tuple[int, ...],
     owner_key_set: set[int] | None = None,
     max_members: int | None,
+    max_total_members: int | None = None,
 ) -> _SharedGraphReadRequest:
     try:
         object_kind, member_width = _GRAPH_KIND_AND_WIDTH[int(direction)]
@@ -1785,6 +1805,7 @@ def _shared_graph_read_request(
             raise ValueError("shared PTG graph max_members must be non-negative")
         normalized_max_members = int(max_members)
         member_count_sql = "LEAST(owner.member_count, :max_members)"
+    max_total_members = _normalized_graph_total_member_limit(max_total_members)
     params_by_name = {
         "snapshot_key": int(snapshot_key),
         "generation": PTG2_V3_SHARED_GENERATION,
@@ -1806,7 +1827,22 @@ def _shared_graph_read_request(
         member_width=member_width,
         member_count_sql=member_count_sql,
         params_by_name=params_by_name,
+        max_total_members=max_total_members,
     )
+
+
+def _normalized_graph_total_member_limit(
+    max_total_members: int | None,
+) -> int | None:
+    """Require an exact non-negative aggregate graph limit."""
+
+    if max_total_members is None:
+        return None
+    if type(max_total_members) is not int or max_total_members < 0:
+        raise ValueError(
+            "shared PTG graph max_total_members must be a non-negative integer"
+        )
+    return max_total_members
 
 
 async def _shared_graph_owner_records(
@@ -1859,6 +1895,7 @@ def _validated_graph_owner_selection(
             previous_owner_key,
         )
         first_chunk, member_offset, _member_count, selected_member_count = locator
+        active_preflight_claim.retain_selected_members(selected_member_count, request.max_total_members)
         previous_owner_key = owner_key
         locator_by_owner[owner_key] = locator
         selected_byte_count = selected_member_count * request.member_width
@@ -2099,10 +2136,12 @@ async def fetch_shared_graph_members(
     direction: int,
     owner_keys: Iterable[int],
     max_members: int | None = None,
+    max_total_members: int | None = None,
     retention_budget: GraphDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Resolve one dense graph direction after an optional bounded preflight."""
 
+    max_total_members = _normalized_graph_total_member_limit(max_total_members)
     if retention_budget is None:
         requested_owner_key_set = {
             int(owner_key) for owner_key in owner_keys
@@ -2110,11 +2149,7 @@ async def fetch_shared_graph_members(
         requested_owner_keys = tuple(sorted(requested_owner_key_set))
         retained_owner_key_bytes = 0
     else:
-        (
-            requested_owner_keys,
-            requested_owner_key_set,
-            retained_owner_key_bytes,
-        ) = (
+        requested_owner_keys, requested_owner_key_set, retained_owner_key_bytes = (
             _budgeted_graph_owner_keys(owner_keys, retention_budget)
         )
     if not requested_owner_keys:
@@ -2135,6 +2170,7 @@ async def fetch_shared_graph_members(
             owner_keys=requested_owner_keys,
             owner_key_set=requested_owner_key_set,
             max_members=max_members,
+            max_total_members=max_total_members,
         )
         if _ACTIVE_SHARED_BLOCK_READ_ONCE_SCOPE.get() is not None:
             return await _fetch_shared_graph_members_read_once(
@@ -2157,7 +2193,7 @@ async def _fetch_shared_graph_members_direct(
     request: _SharedGraphReadRequest,
     retention_budget: GraphDecodedRetentionBudget | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    if retention_budget is not None:
+    if retention_budget is not None or request.max_total_members is not None:
         return await _fetch_shared_graph_members_preflight(
             session,
             request,
