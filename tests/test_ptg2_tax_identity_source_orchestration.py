@@ -52,8 +52,21 @@ async def test_source_absence_accepts_complete_legacy_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_source_absence_rejects_partial_source_schema() -> None:
-    session = _source_absence_session((1, None, None))
+@pytest.mark.parametrize(
+    "relation_oids",
+    [
+        (1, None, None),
+        (None, 2, None),
+        (None, None, 3),
+        (1, 2, None),
+        (1, None, 3),
+        (None, 2, 3),
+    ],
+)
+async def test_source_absence_rejects_partial_source_schema(
+    relation_oids: tuple[object | None, object | None, object | None],
+) -> None:
+    session = _source_absence_session(relation_oids)
 
     with pytest.raises(
         TaxIdentitySourceProjectionError,
@@ -66,6 +79,77 @@ async def test_source_absence_rejects_partial_source_schema() -> None:
         )
 
     session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_durable_source_reduction_rejects_group_count_drift() -> None:
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(one=lambda: (1, 2)),
+        ),
+    )
+
+    with pytest.raises(
+        TaxIdentitySourceProjectionError,
+        match="ptg2_tax_identity_source_projection_invalid",
+    ):
+        await validation._validate_durable_source_reduction(
+            session,
+            schema='"mrf"',
+            snapshot_key=17,
+        )
+
+
+@pytest.mark.asyncio
+async def test_durable_source_reduction_rejects_content_drift(monkeypatch) -> None:
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(one=lambda: (1, 1)),
+        ),
+    )
+    monkeypatch.setattr(
+        validation,
+        "_next_stored_group_boundary",
+        AsyncMock(return_value=b"g" * 16),
+    )
+    monkeypatch.setattr(
+        validation,
+        "_count_reduction_mismatches",
+        AsyncMock(return_value=1),
+    )
+
+    with pytest.raises(
+        TaxIdentitySourceProjectionError,
+        match="ptg2_tax_identity_source_projection_invalid",
+    ):
+        await validation._validate_durable_source_reduction(
+            session,
+            schema='"mrf"',
+            snapshot_key=17,
+        )
+
+
+@pytest.mark.asyncio
+async def test_building_source_validation_redacts_unexpected_failures(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        validation,
+        "_validate_tax_identity_source_projection_state",
+        AsyncMock(side_effect=RuntimeError("synthetic failure")),
+    )
+
+    with pytest.raises(
+        TaxIdentitySourceProjectionError,
+        match="ptg2_tax_identity_source_projection_invalid",
+    ):
+        await validation.validate_building_tax_identity_source_projection(
+            object(),
+            schema_name="mrf",
+            snapshot_key=17,
+            sealed_metadata={},
+            aggregate_metadata={},
+        )
 
 
 @pytest.mark.asyncio
@@ -169,6 +253,30 @@ def test_fresh_orchestration_fails_closed_on_missing_sidecar():
         )
 
 
+def test_fresh_orchestration_ignores_unmanifested_results():
+    bound = ptg._bound_tax_identity_source_artifacts(
+        ({"summary": {}}, _file_result(sidecar=True)),
+        (_assignment(),),
+    )
+
+    assert len(bound) == 1
+    assert bound[0]["source_shard_id"] == "file:17"
+
+
+def test_fresh_orchestration_rejects_sidecar_without_physical_identity():
+    file_result = _file_result(sidecar=True)
+    del file_result["summary"]["manifest"]["physical_artifact_identity"]
+
+    with pytest.raises(
+        RuntimeError,
+        match="PTG V4 tax identity source binding is incomplete",
+    ):
+        ptg._bound_tax_identity_source_artifacts(
+            (file_result,),
+            (_assignment(),),
+        )
+
+
 def test_v4_publisher_fingerprint_includes_projection_contract_only_for_v4():
     process_root = Path(ptg.__file__).resolve().parent
 
@@ -217,6 +325,21 @@ def _reuse_publication_and_evidence():
         source_provenance_entries=(),
     )
     return publication, evidence
+
+
+@pytest.mark.asyncio
+async def test_v4_reuse_rejects_missing_source_metadata() -> None:
+    publication, _evidence = _reuse_publication_and_evidence()
+
+    with pytest.raises(
+        RuntimeError,
+        match="reusable PTG V4 layout lacks complete tax identity evidence",
+    ):
+        await ptg._validate_reused_tax_identity_source_metadata(
+            publication,
+            {"provider_graph": {}},
+            (_assignment(),),
+        )
 
 
 def _patched_reuse_fixture(monkeypatch):

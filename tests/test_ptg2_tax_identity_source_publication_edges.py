@@ -57,6 +57,14 @@ class _ExplodingAsyncContext:
         return False
 
 
+class _YieldingAsyncContext:
+    async def __aenter__(self):
+        return object()
+
+    async def __aexit__(self, _error_type, _error, _traceback):
+        return False
+
+
 def _valid_binding_values() -> dict[str, object]:
     return {
         "source_key": 0,
@@ -399,6 +407,42 @@ async def test_reused_layout_manifest_and_counts_are_required():
             schema='"mrf"',
             snapshot_key=7,
             expected=expected,
+        )
+
+
+def test_reused_binding_identity_mismatch_is_rejected():
+    stored_binding = _valid_binding_values()
+    expected_binding_by_field = dict(stored_binding)
+    expected_binding_by_field["identity_sha256"] = "2" * 64
+
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        validation._validate_reused_binding_identities(
+            (stored_binding,),
+            expected_bindings=(expected_binding_by_field,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_reused_projection_requires_expected_binding_count(monkeypatch):
+    expected = validation._publication_from_metadata(_sealed_metadata())
+    monkeypatch.setattr(
+        validation.db,
+        "transaction",
+        lambda: _YieldingAsyncContext(),
+    )
+    monkeypatch.setattr(
+        validation,
+        "_validate_tax_identity_source_projection_state",
+        AsyncMock(return_value=(expected, ())),
+    )
+
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        await validation.validate_reused_tax_identity_source_projection(
+            schema_name="mrf",
+            snapshot_key=7,
+            expected_bindings=(),
+            sealed_metadata=_sealed_metadata(),
+            aggregate_metadata=_aggregate_metadata(),
         )
 
 
