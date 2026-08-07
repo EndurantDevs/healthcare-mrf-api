@@ -122,7 +122,7 @@ def test_optional_include_evidence_is_strict_and_shape_bound() -> None:
 
 
 def test_exactly_one_closed_selector_and_closed_objects_are_required() -> None:
-    reference = "be1_" + "A" * 32
+    reference = "be1_" + "A" * 64
     invalid_identities = (
         {},
         {
@@ -202,7 +202,7 @@ def test_billing_and_provider_npis_require_valid_checksums() -> None:
 def test_reference_is_structurally_parsed_but_not_resolved_or_exposed_to_service() -> (
     None
 ):
-    reference = "be1_" + "b" * 48
+    reference = "be1_" + "b" * 64
     request = parse_billing_search_post_request(
         _payload(identity={"billing_entity_ref": reference})
     )
@@ -217,7 +217,13 @@ def test_reference_is_structurally_parsed_but_not_resolved_or_exposed_to_service
             lambda _tin_type, _value: None,
         )
 
-    for invalid_reference in ("be1_", "be1_bad.value", "be2_" + "a" * 8):
+    for invalid_reference in (
+        "be1_",
+        "be1_" + "a" * 63,
+        "be1_" + "a" * 65,
+        "be1_" + "a" * 63 + ".",
+        "be2_" + "a" * 64,
+    ):
         _assert_invalid(_payload(identity={"billing_entity_ref": invalid_reference}))
 
 
@@ -285,10 +291,10 @@ def test_request_shape_omits_selector_values_and_cursor_but_binds_filters() -> N
     assert filtered.request_shape_sha256 != first.request_shape_sha256
 
     ref_one = parse_billing_search_post_request(
-        _payload(identity={"billing_entity_ref": "be1_" + "a" * 16})
+        _payload(identity={"billing_entity_ref": "be1_" + "a" * 64})
     )
     ref_two = parse_billing_search_post_request(
-        _payload(identity={"billing_entity_ref": "be1_" + "b" * 16})
+        _payload(identity={"billing_entity_ref": "be1_" + "b" * 64})
     )
     assert ref_one.request_shape_sha256 == ref_two.request_shape_sha256
     assert ref_one.request_shape_sha256 != first.request_shape_sha256
@@ -306,7 +312,7 @@ def test_shape_and_fingerprint_payloads_never_receive_selector_values(
 
     monkeypatch.setattr(request_values, "_canonical_json_bytes", capture)
     raw_value = _synthetic_ein(3)
-    reference = "be1_" + "z" * 24
+    reference = "be1_" + "z" * 64
     tax_payload = _payload()
     tax_payload["billing_identity"]["tax_identity"]["value"] = raw_value
     tax_request = parse_billing_search_post_request(tax_payload)
@@ -365,6 +371,50 @@ def test_callback_errors_are_value_free_and_query_tamper_is_rejected() -> None:
     )
     with pytest.raises(BillingSearchPostRequestError):
         validate_billing_search_post_request(request)
+
+
+def test_canonical_selector_substitution_breaks_the_internal_keyed_seal() -> None:
+    original_ein = _synthetic_ein(6)
+    replacement_ein = _synthetic_ein(7)
+    request_body_by_field = _payload()
+    request_body_by_field["billing_identity"]["tax_identity"]["value"] = (
+        original_ein
+    )
+    request = parse_billing_search_post_request(request_body_by_field)
+
+    object.__setattr__(
+        request,
+        "_BillingSearchPostRequest__tax_identity_value",
+        replacement_ein,
+    )
+
+    with pytest.raises(BillingSearchPostRequestError) as captured:
+        validate_billing_search_post_request(request)
+    with pytest.raises(BillingSearchPostRequestError):
+        apply_entitled_billing_search_tax_identity(
+            request,
+            lambda identity_type, normalized_identity_value: (
+                identity_type,
+                normalized_identity_value,
+            ),
+        )
+    assert original_ein not in repr(captured.value)
+    assert replacement_ein not in repr(captured.value)
+
+    original_reference = "be1_" + "a" * 64
+    replacement_reference = "be1_" + "b" * 64
+    reference_request = parse_billing_search_post_request(
+        _payload(identity={"billing_entity_ref": original_reference})
+    )
+    object.__setattr__(
+        reference_request,
+        "_BillingSearchPostRequest__billing_entity_ref",
+        replacement_reference,
+    )
+    with pytest.raises(BillingSearchPostRequestError) as reference_error:
+        validate_billing_search_post_request(reference_request)
+    assert original_reference not in repr(reference_error.value)
+    assert replacement_reference not in repr(reference_error.value)
 
 
 def test_request_parser_error_drops_sensitive_input_from_its_frame() -> None:

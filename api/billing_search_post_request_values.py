@@ -37,7 +37,7 @@ _NPI_PATTERN = re.compile(r"[0-9]{10}\Z", flags=re.ASCII)
 _ZIP5_PATTERN = re.compile(r"[0-9]{5}\Z", flags=re.ASCII)
 _MODIFIER_PATTERN = re.compile(r"[A-Z0-9]{1,8}\Z", flags=re.ASCII)
 _PLACE_OF_SERVICE_PATTERN = re.compile(r"[0-9]{2}\Z", flags=re.ASCII)
-_BILLING_REF_PATTERN = re.compile(r"be1_[A-Za-z0-9_-]{1,508}\Z", flags=re.ASCII)
+_BILLING_REF_PATTERN = re.compile(r"be1_[A-Za-z0-9_-]{64}\Z", flags=re.ASCII)
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z", flags=re.ASCII)
 _TOP_LEVEL_FIELDS = frozenset(
     {

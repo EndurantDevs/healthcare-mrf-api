@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
+import json
+import secrets
 from typing import Any, Callable, TypeVar
 
 from api.billing_search_post_request_projection import (
@@ -25,6 +28,8 @@ from api.billing_search_post_request_values import (
 )
 
 _REDACTED_REQUEST = "<redacted-billing-search-post-request>"
+_REQUEST_AUTH_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_POST_REQUEST_AUTH_V1\x00"
+_REQUEST_AUTH_KEY = secrets.token_bytes(32)
 _REQUEST_VALUE_FIELDS = (
     "healthporta_plan_id",
     "selector_kind",
@@ -72,6 +77,7 @@ class BillingSearchPostRequest(_RedactedImmutable):
     """Sensitive selector state retained only for entitlement-gated resolution."""
 
     __slots__ = tuple(f"__{field_name}" for field_name in _REQUEST_VALUE_FIELDS) + (
+        "__request_auth_tag",
         "__request_shape_sha256",
         "__service_query",
     )
@@ -201,6 +207,11 @@ def _new_request(fields_by_name: dict[str, Any]) -> BillingSearchPostRequest:
         "_BillingSearchPostRequest__service_query",
         _new_service_query(fields_by_name, shape_sha256),
     )
+    object.__setattr__(
+        request,
+        "_BillingSearchPostRequest__request_auth_tag",
+        _request_auth_tag(request),
+    )
     return request
 
 
@@ -236,6 +247,24 @@ def _request_payload(request: BillingSearchPostRequest) -> dict[str, Any]:
     return payload_by_field
 
 
+def _request_auth_tag(request: BillingSearchPostRequest) -> bytes:
+    """Authenticate the full in-process value without an enumerable selector hash."""
+
+    encoded_payload = json.dumps(
+        _request_payload(request),
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    digest = hmac.new(_REQUEST_AUTH_KEY, digestmod=hashlib.sha256)
+    digest.update(_REQUEST_AUTH_DOMAIN)
+    digest.update(id(request).to_bytes(16, "big"))
+    digest.update(len(encoded_payload).to_bytes(8, "big"))
+    digest.update(encoded_payload)
+    return digest.digest()
+
+
 def _validated_request_or_none(request: object) -> BillingSearchPostRequest | None:
     try:
         if type(request) is not BillingSearchPostRequest:
@@ -253,6 +282,15 @@ def _validated_request_or_none(request: object) -> BillingSearchPostRequest | No
             expected = normalized_fields[field_name]
             if type(actual) is not type(expected) or actual != expected:
                 return None
+        supplied_auth_tag = object.__getattribute__(
+            request,
+            "_BillingSearchPostRequest__request_auth_tag",
+        )
+        if type(supplied_auth_tag) is not bytes or not hmac.compare_digest(
+            supplied_auth_tag,
+            _request_auth_tag(request),
+        ):
+            return None
         expected_shape = _request_shape_sha256(normalized_fields)
         supplied_shape = request.request_shape_sha256
         if type(supplied_shape) is not str or not hmac.compare_digest(
