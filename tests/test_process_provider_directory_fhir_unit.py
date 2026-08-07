@@ -77,7 +77,7 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 50
+    assert len(command_signature.parameters) == 51
     assert "resource_scan_concurrency" in command_signature.parameters
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"
@@ -323,7 +323,14 @@ def _stub_uhc_normal_import_lifecycle(monkeypatch):
     async def no_op(*_args, **_kwargs):
         return None
 
-    import_resources = AsyncMock(return_value={"Practitioner": 1})
+    async def import_resources_result(*_args, **kwargs):
+        kwargs["resource_fetch_stats"]["Practitioner"] = {
+            "official_provider_file_sources": 1,
+            "collection_complete_sources": 1,
+        }
+        return {"Practitioner": 1}
+
+    import_resources = AsyncMock(side_effect=import_resources_result)
     monkeypatch.setattr(importer, "ensure_database", no_op)
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", no_op)
     monkeypatch.setattr(importer, "raise_if_cancelled", no_op)
@@ -349,6 +356,11 @@ def _stub_uhc_normal_import_lifecycle(monkeypatch):
         importer,
         "_source_local_profile_followup_if_current",
         AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_source_local_dataset_followup_if_current",
+        AsyncMock(return_value={"dataset_id": "dataset-current"}),
     )
     return import_resources
 
@@ -378,6 +390,9 @@ async def test_uhc_official_files_enter_normal_import_lifecycle(
     assert process_result["sources_probed"] == 1
     assert process_result["source_import_sources_selected"] == 1
     assert process_result["resource_rows"] == {"Practitioner": 1}
+    assert process_result["dataset_followup"] == {
+        "dataset_id": "dataset-current"
+    }
     import_resources.assert_awaited_once()
     imported_source = import_resources.await_args.args[0][0]
     assert imported_source["source_id"] == importer.UHC_RETAINED_SOURCE_ID

@@ -19851,10 +19851,37 @@ def _provider_directory_global_profile_followup(
     }
 
 
+def _provider_directory_dataset_followup(
+    *,
+    source_id: str,
+    endpoint_id: str,
+    dataset_id: str,
+    dataset_hash: str,
+    parent_run_id: str,
+) -> dict[str, Any]:
+    """Describe the source-local serving work required after publication."""
+
+    return {
+        "version": 1,
+        "status": "required",
+        "kind": "provider_directory_dataset_publication",
+        "intent": "ensure_address_overlay_then_unified_address",
+        "importer": "provider-directory-fhir",
+        "source_id": source_id,
+        "endpoint_id": endpoint_id,
+        "dataset_id": dataset_id,
+        "dataset_hash": dataset_hash,
+        "parent_run_id": parent_run_id,
+        "idempotency_key": "provider-directory-dataset-followup:" + dataset_id,
+        "triggered_by": "pd_dataset_followup",
+    }
+
+
 async def _current_profile_dataset_map(source_id: str) -> dict[str, Any]:
     database_row = await db.first(
         f"""
         SELECT dataset.dataset_id,
+               dataset.endpoint_id,
                dataset.acquisition_root_run_id,
                dataset.dataset_hash,
                dataset.status,
@@ -19877,6 +19904,80 @@ async def _current_profile_dataset_map(source_id: str) -> dict[str, Any]:
     if database_row is None:
         return {}
     return dict(_pagination_checkpoint_row_mapping(database_row))
+
+
+async def _source_local_dataset_followup_if_current(
+    *,
+    source_ids: list[str],
+    expected_acquisition_root_run_id: str | None,
+) -> dict[str, Any] | None:
+    """Return a follow-up only for one exact current published dataset."""
+
+    if len(source_ids) != 1:
+        return None
+    source_id = source_ids[0]
+    dataset_fence = await _resolve_provider_directory_artifact_datasets(
+        [source_id],
+        should_select_validated_candidates=False,
+    )
+    if len(dataset_fence.datasets) != 1:
+        return None
+    dataset = dataset_fence.datasets[0]
+    acquisition_root_run_id = _clean_text(dataset.evidence_run_id)
+    expected_root_run_id = (
+        expected_acquisition_root_run_id or acquisition_root_run_id
+    )
+    if (
+        expected_root_run_id is None
+        or acquisition_root_run_id != expected_root_run_id
+        or dataset.source_id != source_id
+        or dataset.status != ENDPOINT_DATASET_PUBLISHED
+        or dataset.is_current is not True
+    ):
+        return None
+    endpoint_id = _clean_text(dataset.endpoint_id)
+    dataset_id = _clean_text(dataset.dataset_id)
+    dataset_hash = _clean_text(dataset.dataset_hash)
+    if endpoint_id is None or dataset_id is None or dataset_hash is None:
+        return None
+    return _provider_directory_dataset_followup(
+        source_id=source_id,
+        endpoint_id=endpoint_id,
+        dataset_id=dataset_id,
+        dataset_hash=dataset_hash,
+        parent_run_id=expected_root_run_id,
+    )
+
+
+def _has_dataset_publication_followup_trigger(
+    metrics: Mapping[str, Any],
+    source_ids: list[str],
+    importable_sources: list[dict[str, Any]],
+) -> bool:
+    """Recognize only a completed atomic source-dataset publication path."""
+
+    if len(source_ids) != 1 or len(importable_sources) != 1:
+        return False
+    resource_fetch_stats = metrics.get("resource_fetch_stats")
+    if isinstance(resource_fetch_stats, Mapping) and any(
+        isinstance(resource_stats, Mapping)
+        and type(resource_stats.get("official_provider_file_sources")) is int
+        and resource_stats["official_provider_file_sources"] == 1
+        and type(resource_stats.get("collection_complete_sources")) is int
+        and resource_stats["collection_complete_sources"] == 1
+        for resource_stats in resource_fetch_stats.values()
+    ):
+        return True
+    dataset_ids = metrics.get("artifact_dataset_ids")
+    evidence_run_ids = metrics.get("artifact_dataset_evidence_run_ids")
+    return bool(
+        isinstance(dataset_ids, list)
+        and len(dataset_ids) == 1
+        and _clean_text(dataset_ids[0]) is not None
+        and isinstance(evidence_run_ids, list)
+        and len(evidence_run_ids) == 1
+        and _clean_text(evidence_run_ids[0]) is not None
+    )
 
 
 def _is_expected_profile_followup_dataset(
@@ -59667,6 +59768,11 @@ async def process_provider_directory_fhir_data(
         or task.get("provider_directory_source_ids")
         or task.get("provider_directory_source_id")
     )
+    dataset_followup_only = bool(task.get("dataset_followup_only", False))
+    if dataset_followup_only and bool(task.get("dataset_rehydrate_only")):
+        raise ValueError(
+            "provider_directory_dataset_followup_replay_scope_invalid"
+        )
     if bool(task.get("dataset_rehydrate_only")):
         return await _run_provider_directory_dataset_rehydrate(
             ctx, task, run_id, requested_source_ids
@@ -59789,6 +59895,39 @@ async def process_provider_directory_fhir_data(
         and _is_seen_stage_enabled()
         else None
     )
+    if dataset_followup_only:
+        incompatible_followup_mode_by_name = {
+            "canonical_backfill_only": canonical_backfill_only,
+            "contact_backfill_only": contact_backfill_only,
+            "dataset_rehydrate_only": bool(task.get("dataset_rehydrate_only")),
+            "import_resources": import_resources,
+            "publish_after_acquisition": publish_after_acquisition,
+            "publish_artifacts": should_publish_artifacts,
+            "publish_artifacts_only": publish_artifacts_only,
+            "seed_only": seed_only,
+        }
+        if len(requested_source_ids) != 1 or any(
+            incompatible_followup_mode_by_name.values()
+        ):
+            raise ValueError(
+                "provider_directory_dataset_followup_replay_scope_invalid"
+            )
+        dataset_followup = await _source_local_dataset_followup_if_current(
+            source_ids=requested_source_ids,
+            expected_acquisition_root_run_id=None,
+        )
+        if dataset_followup is None:
+            raise RuntimeError(
+                "provider_directory_dataset_followup_current_dataset_missing"
+            )
+        metrics_by_key = {
+            "dataset_followup_only": True,
+            "source_ids": requested_source_ids,
+            "dataset_followup": dataset_followup,
+        }
+        ctx["context"]["audit"] = metrics_by_key
+        ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+        return metrics_by_key
     if canonical_backfill_only:
         metrics_by_key = await backfill_provider_directory_canonical_resources(
             resources=task.get("resources"),
@@ -60262,6 +60401,21 @@ async def process_provider_directory_fhir_data(
             )
             if profile_followup is not None:
                 metrics_by_key["profile_followup"] = profile_followup
+            if _has_dataset_publication_followup_trigger(
+                metrics_by_key,
+                source_local_ids,
+                importable,
+            ):
+                dataset_followup = (
+                    await _source_local_dataset_followup_if_current(
+                        source_ids=source_local_ids,
+                        expected_acquisition_root_run_id=(
+                            pagination_root_run_id or run_id
+                        ),
+                    )
+                )
+                if dataset_followup is not None:
+                    metrics_by_key["dataset_followup"] = dataset_followup
         ctx["context"]["audit"] = metrics_by_key
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         print(
@@ -60330,6 +60484,7 @@ class _ProviderDirectoryFhirCommandOptions:
     rehydrate_batch_size: int | None = None
     canonical_backfill_only: bool = False
     contact_backfill_only: bool = False
+    dataset_followup_only: bool = False
     publish_artifacts_only: bool = False
     publish_artifacts_targets: list[str] | tuple[str, ...] | str | None = None
     publish_corroboration: bool | None = None

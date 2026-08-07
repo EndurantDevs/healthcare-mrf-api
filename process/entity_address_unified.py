@@ -411,6 +411,66 @@ def _entity_address_provider_directory_run_id(task: dict) -> str | None:
     )
 
 
+def _entity_address_provider_directory_dataset_id(task: dict) -> str | None:
+    return _clean_optional(task.get("provider_directory_dataset_id"))
+
+
+def _validate_provider_directory_dataset_fence_scope(
+    *,
+    dataset_id: str | None,
+    source_ids: list[str],
+    run_id: str | None,
+    partial_scope: str | None,
+) -> None:
+    """Require an exact source and overlay run for an explicit dataset fence."""
+
+    if dataset_id is None:
+        return
+    if len(source_ids) != 1 or run_id is None or partial_scope != "latest-run":
+        raise ValueError(
+            "provider_directory_dataset_id requires one explicit source, "
+            "provider_directory_run_id, and provider_directory_partial_scope=latest-run"
+        )
+
+
+async def _assert_current_provider_directory_dataset(
+    db_schema: str,
+    *,
+    source_id: str,
+    expected_dataset_id: str,
+    expected_root_run_id: str,
+) -> None:
+    """Fail when the source no longer serves the exact dataset/root tuple."""
+
+    dataset_row = await db.first(
+        f"""
+        SELECT dataset.dataset_id
+          FROM {db_schema}.provider_directory_source AS source
+          JOIN {db_schema}.provider_directory_endpoint_dataset AS dataset
+            ON dataset.endpoint_id = source.endpoint_id
+         WHERE source.source_id = :source_id
+           AND dataset.dataset_id = :expected_dataset_id
+           AND dataset.acquisition_root_run_id = :expected_root_run_id
+           AND dataset.status = 'published'
+           AND dataset.is_current IS TRUE
+           AND dataset.published_at IS NOT NULL
+           AND dataset.superseded_at IS NULL
+         LIMIT 1;
+        """,
+        source_id=source_id,
+        expected_dataset_id=expected_dataset_id,
+        expected_root_run_id=expected_root_run_id,
+    )
+    if dataset_row is None or _clean_optional(
+        _row_mapping(dataset_row).get("dataset_id")
+    ) != (
+        expected_dataset_id
+    ):
+        raise RuntimeError(
+            "entity-address-unified Provider Directory dataset fence changed"
+        )
+
+
 def _provider_directory_source_batch_size(task: dict) -> int:
     raw = (
         task.get("provider_directory_source_batch_size")
@@ -10322,6 +10382,11 @@ async def process_entity_address_unified_data(ctx, task=None):
         if is_partial_provider_directory_refresh
         else None
     )
+    provider_directory_dataset_id = (
+        _entity_address_provider_directory_dataset_id(task)
+        if is_partial_provider_directory_refresh
+        else None
+    )
     provider_directory_source_batch_size = (
         _provider_directory_source_batch_size(task)
         if is_partial_provider_directory_refresh
@@ -10331,6 +10396,15 @@ async def process_entity_address_unified_data(ctx, task=None):
     context["refresh_mode"] = refresh_mode
     context["partial_provider_directory_refresh"] = is_partial_provider_directory_refresh
     context["partial_provider_directory_scope"] = provider_directory_partial_scope
+    context["partial_provider_directory_dataset_id"] = (
+        provider_directory_dataset_id
+    )
+    _validate_provider_directory_dataset_fence_scope(
+        dataset_id=provider_directory_dataset_id,
+        source_ids=provider_directory_source_ids,
+        run_id=provider_directory_run_id,
+        partial_scope=provider_directory_partial_scope,
+    )
     should_aggregate_source_record_ids = _should_aggregate_source_record_ids()
     context["aggregate_source_record_ids"] = should_aggregate_source_record_ids
     serving_only_refresh = is_partial_provider_directory_refresh or (
@@ -10487,6 +10561,13 @@ async def process_entity_address_unified_data(ctx, task=None):
             )
     if is_partial_provider_directory_refresh:
         await _preflight_provider_directory_partial_scope_index(db_schema)
+    if provider_directory_dataset_id is not None:
+        await _assert_current_provider_directory_dataset(
+            db_schema,
+            source_id=provider_directory_source_ids[0],
+            expected_dataset_id=provider_directory_dataset_id,
+            expected_root_run_id=provider_directory_run_id,
+        )
     if (
         is_partial_provider_directory_refresh
         and provider_directory_partial_scope == "latest-run"
@@ -12089,6 +12170,30 @@ async def publish_entity_address_unified_generation(ctx):
             "entity-address-unified support patch publish requires "
             "the affected group table to remain available through shutdown."
         )
+    expected_provider_directory_dataset_id = _clean_optional(
+        context.get("partial_provider_directory_dataset_id")
+    )
+    if expected_provider_directory_dataset_id is not None:
+        partial_source_ids = _coerce_str_list(
+            context.get("partial_provider_directory_source_ids")
+        )
+        expected_provider_directory_root_run_id = _clean_optional(
+            context.get("partial_provider_directory_run_id")
+        )
+        _validate_provider_directory_dataset_fence_scope(
+            dataset_id=expected_provider_directory_dataset_id,
+            source_ids=partial_source_ids,
+            run_id=expected_provider_directory_root_run_id,
+            partial_scope=_clean_optional(
+                context.get("partial_provider_directory_scope")
+            ),
+        )
+        await _assert_current_provider_directory_dataset(
+            db_schema,
+            source_id=partial_source_ids[0],
+            expected_dataset_id=expected_provider_directory_dataset_id,
+            expected_root_run_id=expected_provider_directory_root_run_id,
+        )
     await _publish_staged_entity_address_tables(
         db_schema,
         stage_cls,
@@ -12165,6 +12270,9 @@ async def publish_entity_address_unified_generation(ctx):
             ),
             "partial_provider_directory_scope": context.get("partial_provider_directory_scope"),
             "partial_provider_directory_run_id": context.get("partial_provider_directory_run_id"),
+            "partial_provider_directory_dataset_id": context.get(
+                "partial_provider_directory_dataset_id"
+            ),
             "partial_provider_directory_source_count": int(
                 context.get("partial_provider_directory_source_count") or 0
             ),
@@ -12336,6 +12444,7 @@ async def run_entity_address_unified_command(
     serving_only_refresh: bool | None = None,
     provider_directory_run_id: str | None = None,
     provider_directory_source_ids: list[str] | tuple[str, ...] | str | None = None,
+    provider_directory_dataset_id: str | None = None,
     provider_directory_partial_scope: str | None = None,
     provider_directory_source_batch_size: int | None = None,
 ):
@@ -12359,6 +12468,10 @@ async def run_entity_address_unified_command(
     source_ids = _coerce_str_list(provider_directory_source_ids)
     if source_ids:
         task_payload_map["provider_directory_source_ids"] = source_ids
+    if provider_directory_dataset_id:
+        task_payload_map["provider_directory_dataset_id"] = (
+            provider_directory_dataset_id
+        )
     if provider_directory_partial_scope:
         task_payload_map["provider_directory_partial_scope"] = provider_directory_partial_scope
     if provider_directory_source_batch_size is not None:
