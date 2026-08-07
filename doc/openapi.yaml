@@ -6373,6 +6373,8 @@ components:
         dataset:
           type: string
           maxLength: 1024
+          enum:
+            [cms_nppes_registry, marketplace_provider_directory, cms_doctors_and_clinicians, cms_provider_enrollment_ffs, cms_provider_enrollment_facility, facility_reference, payer_transparency_in_coverage, payer_provider_directory_fhir]
         retrieved_at:
           type: string
           maxLength: 64
@@ -6439,6 +6441,7 @@ components:
         service_code:
           type: array
           maxItems: 32
+          uniqueItems: true
           items:
             type: string
             maxLength: 16
@@ -6453,6 +6456,7 @@ components:
         billing_code_modifier:
           type: array
           maxItems: 32
+          uniqueItems: true
           items:
             type: string
             maxLength: 16

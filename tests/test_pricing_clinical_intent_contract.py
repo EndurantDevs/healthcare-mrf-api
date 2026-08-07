@@ -5,7 +5,6 @@ from pathlib import Path
 
 import yaml
 
-
 OPENAPI_PATH = Path("doc/openapi.yaml")
 RAW_SEARCH_PATHS = (
     "/pricing/providers/search-by-procedure",
@@ -35,13 +34,19 @@ def test_procedure_search_documents_resolver_only_clinical_intent():
         assert "provider_filter.taxonomy_codes" in description
         assert "provider_filter.primary_only" in description
         assert "provider_filter.include_subspecialties" in description
-        assert operation["responses"]["400"]["content"][
-            "application/json"
-        ]["schema"] == {"$ref": "#/components/schemas/Error"}
+        response_schema = operation["responses"]["400"]["content"]["application/json"][
+            "schema"
+        ]
+        if path == "/pricing/providers/search-by-procedure":
+            assert response_schema == {
+                "oneOf": [
+                    {"$ref": "#/components/schemas/Error"},
+                    {"$ref": "#/components/schemas/BillingSearchErrorResponse"},
+                ]
+            }
+        else:
+            assert response_schema == {"$ref": "#/components/schemas/Error"}
 
 
 def _parameter_names(spec: dict, path: str) -> set[str]:
-    return {
-        parameter["name"]
-        for parameter in spec["paths"][path]["get"]["parameters"]
-    }
+    return {parameter["name"] for parameter in spec["paths"][path]["get"]["parameters"]}

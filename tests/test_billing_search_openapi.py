@@ -244,6 +244,21 @@ def test_exact_billing_object_schemas_are_closed_and_required_keys_are_frozen():
         ]
         == 64
     )
+    assert set(
+        schemas["BillingSearchAddressEvidenceSource"]["properties"]["dataset"]["enum"]
+    ) == {
+        "cms_nppes_registry",
+        "marketplace_provider_directory",
+        "cms_doctors_and_clinicians",
+        "cms_provider_enrollment_ffs",
+        "cms_provider_enrollment_facility",
+        "facility_reference",
+        "payer_transparency_in_coverage",
+        "payer_provider_directory_fhir",
+    }
+    negotiated_price_properties = schemas["BillingSearchNegotiatedPrice"]["properties"]
+    assert negotiated_price_properties["service_code"]["uniqueItems"] is True
+    assert negotiated_price_properties["billing_code_modifier"]["uniqueItems"] is True
     assert schemas["BillingSearchProvider"]["properties"]["npi"] == {
         "type": "integer",
         "minimum": 1000000000,
