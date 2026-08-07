@@ -25,7 +25,6 @@ from api.billing_search_post_transport import (
 )
 from api.billing_search_transport_keys import BillingSearchTransportKeyring
 
-
 PLAN_ID = "hpplan_" + "0" * 26
 PLAN_RELEASE_ID = "hprelease_" + "0" * 26
 KEY_ID = "synthetic-a"
@@ -90,9 +89,7 @@ def _context(body: bytes, **updates: object) -> dict[str, object]:
         "method": BILLING_SEARCH_POST_METHOD,
         "path": BILLING_SEARCH_POST_PATH,
         "plan_entitlement_sha256": (
-            gateway_transport.billing_search_plan_entitlement_sha256(
-                PLAN_RELEASE_ID
-            )
+            gateway_transport.billing_search_plan_entitlement_sha256(PLAN_RELEASE_ID)
         ),
         "plan_release_id": PLAN_RELEASE_ID,
         "principal_scope_sha256": _sha("principal"),
@@ -117,9 +114,7 @@ def _headers(body: bytes, **context_updates: object) -> dict[str, str]:
     ).digest()
     return {
         gateway_transport.BILLING_SEARCH_TRANSPORT_CONTEXT_HEADER: (
-            base64.urlsafe_b64encode(context_bytes)
-            .rstrip(b"=")
-            .decode("ascii")
+            base64.urlsafe_b64encode(context_bytes).rstrip(b"=").decode("ascii")
         ),
         gateway_transport.BILLING_SEARCH_TRANSPORT_KEY_ID_HEADER: KEY_ID,
         gateway_transport.BILLING_SEARCH_TRANSPORT_SIGNATURE_HEADER: (
@@ -182,15 +177,19 @@ def test_endpoint_access_verifies_transport_shape_and_authority() -> None:
     assert access.request.selector_kind == "tax_identity"
     assert repr(access) == "<redacted-billing-search-post-endpoint-access>"
     assert SYNTHETIC_EIN not in repr(access)
-    assert validate_billing_search_post_endpoint_access(access) is access
+    assert (
+        validate_billing_search_post_endpoint_access(
+            access,
+            trusted_now=NOW,
+        )
+        is access
+    )
 
 
 def test_endpoint_access_rejects_valid_request_object_substitution() -> None:
     body = _body()
     access = _authorize(body, _headers(body))
-    replacement_body = _body(
-        tax_identity_value=REPLACEMENT_SYNTHETIC_EIN
-    )
+    replacement_body = _body(tax_identity_value=REPLACEMENT_SYNTHETIC_EIN)
     replacement = _authorize(
         replacement_body,
         _headers(replacement_body),
@@ -202,7 +201,21 @@ def test_endpoint_access_rejects_valid_request_object_substitution() -> None:
     )
 
     with pytest.raises(BillingSearchPostEndpointAccessError):
-        validate_billing_search_post_endpoint_access(access)
+        validate_billing_search_post_endpoint_access(
+            access,
+            trusted_now=NOW,
+        )
+
+
+def test_endpoint_access_revalidation_uses_the_current_trusted_time() -> None:
+    body = _body()
+    access = _authorize(body, _headers(body))
+
+    with pytest.raises(BillingSearchPostEndpointAccessError):
+        validate_billing_search_post_endpoint_access(
+            access,
+            trusted_now="2026-08-07T10:01:00Z",
+        )
 
 
 def test_endpoint_access_accepts_the_real_sanic_header_mapping() -> None:

@@ -12,14 +12,11 @@ import pytest
 from api import billing_search_post_gateway_transport as transport
 from api.billing_search_transport_keys import BillingSearchTransportKeyring
 
-
 PLAN_RELEASE_ID = "hprelease_" + "0" * 26
 SYNTHETIC_EIN = "99-" + "9" * 7
 BODY = json.dumps(
     {
-        "billing_identity": {
-            "tax_identity": {"type": "ein", "value": SYNTHETIC_EIN}
-        },
+        "billing_identity": {"tax_identity": {"type": "ein", "value": SYNTHETIC_EIN}},
         "geo": {"radius_miles": 0, "zip5": "00000"},
         "healthporta_plan_id": "hpplan_" + "0" * 26,
         "procedure": {
@@ -42,9 +39,7 @@ def _sha(label: str) -> str:
 
 
 def _context(**updates):
-    plan_entitlement = transport.billing_search_plan_entitlement_sha256(
-        PLAN_RELEASE_ID
-    )
+    plan_entitlement = transport.billing_search_plan_entitlement_sha256(PLAN_RELEASE_ID)
     context_by_field = {
         "audience": transport.BILLING_SEARCH_TRANSPORT_AUDIENCE,
         "audit_scope_sha256": _sha("audit"),
@@ -66,8 +61,8 @@ def _context(**updates):
         "tenant_scope_sha256": _sha("tenant"),
     }
     context_by_field.update(updates)
-    context_by_field["metering_receipt_sha256"] = (
-        transport._metering_receipt_sha256(context_by_field)
+    context_by_field["metering_receipt_sha256"] = transport._metering_receipt_sha256(
+        context_by_field
     )
     return context_by_field
 
@@ -106,9 +101,7 @@ def test_transport_authenticates_exact_body_without_retaining_body_digest():
 
     assert verified.plan_release_id == PLAN_RELEASE_ID
     assert verified.request_shape_sha256 == _sha("request-shape")
-    assert verified.authorization_context.capabilities == (
-        "pricing:billing-search",
-    )
+    assert verified.authorization_context.capabilities == ("pricing:billing-search",)
     assert SYNTHETIC_EIN not in repr(verified)
     decoded_context = json.loads(
         base64.urlsafe_b64decode(headers[0] + "=" * (-len(headers[0]) % 4))
@@ -156,9 +149,7 @@ def test_transport_accepts_the_stronger_provenance_capability():
         trusted_now=NOW,
     )
 
-    assert verified.authorization_context.capabilities[-1].endswith(
-        ":provenance"
-    )
+    assert verified.authorization_context.capabilities[-1].endswith(":provenance")
 
 
 def test_transport_exposes_one_stable_signed_id_for_the_external_replay_gate():
@@ -180,6 +171,27 @@ def test_transport_exposes_one_stable_signed_id_for_the_external_replay_gate():
     assert first.metering_request_id == "00000000-0000-4000-8000-000000000000"
     assert second.metering_request_id == first.metering_request_id
     assert second.verified_state_sha256 == first.verified_state_sha256
+
+
+def test_transport_revalidation_binds_the_signed_replay_id():
+    headers = _headers()
+    verified = transport.verify_billing_search_post_transport(
+        *headers,
+        body_bytes=BODY,
+        keyring=_keyring(),
+        trusted_now=NOW,
+    )
+    object.__setattr__(
+        verified,
+        "metering_request_id",
+        "11111111-1111-4111-8111-111111111111",
+    )
+
+    with pytest.raises(transport.BillingSearchPostTransportAuthenticationError):
+        transport.validate_billing_search_post_verified_transport(
+            verified,
+            trusted_now=NOW,
+        )
 
 
 @pytest.mark.parametrize(
@@ -229,4 +241,21 @@ def test_transport_error_never_echoes_sensitive_body():
     assert repr(error.value) == (
         "BillingSearchPostTransportAuthenticationError("
         "'billing_search_post_transport_authentication_invalid')"
+    )
+    traceback = error.value.__traceback__
+    authentication_frames = []
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_name in {
+            "_verified_signature",
+            "verify_billing_search_post_transport",
+        }:
+            authentication_frames.append(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+    assert authentication_frames
+    assert all(
+        "body_bytes" not in local_values for local_values in authentication_frames
+    )
+    assert all(
+        SYNTHETIC_EIN not in repr(local_values)
+        for local_values in authentication_frames
     )

@@ -23,6 +23,7 @@ from api.billing_search_access_contract import (
     BILLING_SEARCH_PROVENANCE_CAPABILITY,
     BillingSearchAuthorizationContext,
     build_billing_search_authorization_context,
+    validate_billing_search_authorization_context,
 )
 from api.billing_search_post_transport import (
     BILLING_SEARCH_POST_MAX_BODY_BYTES,
@@ -33,19 +34,10 @@ from api.billing_search_post_transport import (
 from api.billing_search_transport_keys import BillingSearchTransportKeyring
 from api.plan_release_serving import normalize_plan_release_id
 
-
-BILLING_SEARCH_POST_TRANSPORT_CONTRACT = (
-    "healthporta.billing-search-post-transport.v2"
-)
-BILLING_SEARCH_TRANSPORT_CONTEXT_HEADER = (
-    "X-HealthPorta-Billing-Search-Context"
-)
-BILLING_SEARCH_TRANSPORT_KEY_ID_HEADER = (
-    "X-HealthPorta-Billing-Search-Key-Id"
-)
-BILLING_SEARCH_TRANSPORT_SIGNATURE_HEADER = (
-    "X-HealthPorta-Billing-Search-Signature"
-)
+BILLING_SEARCH_POST_TRANSPORT_CONTRACT = "healthporta.billing-search-post-transport.v2"
+BILLING_SEARCH_TRANSPORT_CONTEXT_HEADER = "X-HealthPorta-Billing-Search-Context"
+BILLING_SEARCH_TRANSPORT_KEY_ID_HEADER = "X-HealthPorta-Billing-Search-Key-Id"
+BILLING_SEARCH_TRANSPORT_SIGNATURE_HEADER = "X-HealthPorta-Billing-Search-Signature"
 BILLING_SEARCH_TRANSPORT_ISSUER = "healthporta-billing-search-gateway"
 BILLING_SEARCH_TRANSPORT_AUDIENCE = "healthcare-mrf-api"
 BILLING_SEARCH_TRANSPORT_MAX_TTL_SECONDS = 60
@@ -254,25 +246,31 @@ def _verified_signature(
     context_bytes: bytes,
     body_bytes: object,
 ) -> str:
-    if (
-        type(keyring) is not BillingSearchTransportKeyring
-        or type(key_id) is not str
-        or _KEY_ID_PATTERN.fullmatch(key_id) is None
-        or type(body_bytes) is not bytes
-        or not 1 <= len(body_bytes) <= BILLING_SEARCH_POST_MAX_BODY_BYTES
-    ):
-        raise _fail()
-    signature = _decoded_base64url(encoded_signature, maximum_characters=64)
-    if len(signature) != hashlib.sha256().digest_size:
-        raise _fail()
-    expected = hmac.new(
-        keyring.key_for(key_id),
-        _signature_message(key_id, context_bytes, body_bytes),
-        hashlib.sha256,
-    ).digest()
-    if not hmac.compare_digest(signature, expected):
-        raise _fail()
-    return key_id
+    try:
+        if (
+            type(keyring) is not BillingSearchTransportKeyring
+            or type(key_id) is not str
+            or _KEY_ID_PATTERN.fullmatch(key_id) is None
+            or type(body_bytes) is not bytes
+            or not 1 <= len(body_bytes) <= BILLING_SEARCH_POST_MAX_BODY_BYTES
+        ):
+            raise _fail()
+        signature = _decoded_base64url(
+            encoded_signature,
+            maximum_characters=64,
+        )
+        if len(signature) != hashlib.sha256().digest_size:
+            raise _fail()
+        expected = hmac.new(
+            keyring.key_for(key_id),
+            _signature_message(key_id, context_bytes, body_bytes),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise _fail()
+        return key_id
+    finally:
+        del body_bytes
 
 
 def _capabilities(value: object) -> tuple[str, ...]:
@@ -317,7 +315,8 @@ def _validated_context(
         or context.get("method") != BILLING_SEARCH_POST_METHOD
         or context.get("path") != BILLING_SEARCH_POST_PATH
         or context.get("media_type") != BILLING_SEARCH_POST_MEDIA_TYPE
-        or not 0 < (expires - issued).total_seconds()
+        or not 0
+        < (expires - issued).total_seconds()
         <= BILLING_SEARCH_TRANSPORT_MAX_TTL_SECONDS
         or now < issued
         or now >= expires
@@ -335,16 +334,10 @@ def _validated_context(
         "principal_scope_sha256": _canonical_sha256(
             context.get("principal_scope_sha256")
         ),
-        "tenant_scope_sha256": _canonical_sha256(
-            context.get("tenant_scope_sha256")
-        ),
+        "tenant_scope_sha256": _canonical_sha256(context.get("tenant_scope_sha256")),
         "plan_entitlement_sha256": plan_entitlement,
-        "audit_scope_sha256": _canonical_sha256(
-            context.get("audit_scope_sha256")
-        ),
-        "quota_scope_sha256": _canonical_sha256(
-            context.get("quota_scope_sha256")
-        ),
+        "audit_scope_sha256": _canonical_sha256(context.get("audit_scope_sha256")),
+        "quota_scope_sha256": _canonical_sha256(context.get("quota_scope_sha256")),
         "capabilities": capabilities,
         "issued_at": issued_at,
         "expires_at": expires_at,
@@ -366,6 +359,75 @@ class VerifiedBillingSearchPostTransport:
 
     def __repr__(self) -> str:
         return _REDACTED
+
+
+def _verified_state_sha256(
+    authorization_context: BillingSearchAuthorizationContext,
+    *,
+    plan_release_id: str,
+    request_shape_sha256: str,
+    metering_request_id: str,
+    trusted_now: str,
+) -> str:
+    state_by_field = {
+        "authorization_context_sha256": authorization_context.context_sha256,
+        "metering_request_id": metering_request_id,
+        "plan_release_id": plan_release_id,
+        "request_shape_sha256": request_shape_sha256,
+        "trusted_now": trusted_now,
+    }
+    return _framed_sha256(
+        _VERIFIED_DOMAIN,
+        _canonical_json_bytes(state_by_field),
+    )
+
+
+def validate_billing_search_post_verified_transport(
+    transport: object,
+    *,
+    trusted_now: object,
+) -> VerifiedBillingSearchPostTransport:
+    """Revalidate every value-safe signed coordinate at the current time."""
+
+    try:
+        if type(transport) is not VerifiedBillingSearchPostTransport:
+            raise _fail()
+        original_trusted_now, _ = _canonical_utc(transport.trusted_now)
+        authorization_context = validate_billing_search_authorization_context(
+            transport.authorization_context,
+            trusted_now=original_trusted_now,
+        )
+        validate_billing_search_authorization_context(
+            authorization_context,
+            trusted_now=trusted_now,
+        )
+        plan_release_id = normalize_plan_release_id(transport.plan_release_id)
+        request_shape_sha256 = _canonical_sha256(transport.request_shape_sha256)
+        metering_request_id = _canonical_uuid4(transport.metering_request_id)
+        if (
+            plan_release_id is None
+            or plan_release_id != transport.plan_release_id
+            or not hmac.compare_digest(
+                authorization_context.plan_entitlement_sha256,
+                billing_search_plan_entitlement_sha256(plan_release_id),
+            )
+            or not hmac.compare_digest(
+                _canonical_sha256(transport.verified_state_sha256),
+                _verified_state_sha256(
+                    authorization_context,
+                    plan_release_id=plan_release_id,
+                    request_shape_sha256=request_shape_sha256,
+                    metering_request_id=metering_request_id,
+                    trusted_now=original_trusted_now,
+                ),
+            )
+        ):
+            raise _fail()
+        return transport
+    except BillingSearchPostTransportAuthenticationError:
+        raise
+    except Exception:
+        raise _fail() from None
 
 
 def verify_billing_search_post_transport(
@@ -396,27 +458,20 @@ def verify_billing_search_post_transport(
             claims_by_field,
             trusted_now=canonical_now,
         )
-        request_shape_sha256 = _canonical_sha256(
-            context.get("request_shape_sha256")
-        )
-        metering_request_id = _canonical_uuid4(
-            context.get("metering_request_id")
-        )
-        state_by_field = {
-            "authorization_context_sha256": authorization_context.context_sha256,
-            "metering_receipt_sha256": context["metering_receipt_sha256"],
-            "plan_release_id": plan_release_id,
-            "request_shape_sha256": request_shape_sha256,
-        }
+        request_shape_sha256 = _canonical_sha256(context.get("request_shape_sha256"))
+        metering_request_id = _canonical_uuid4(context.get("metering_request_id"))
         return VerifiedBillingSearchPostTransport(
             authorization_context=authorization_context,
             plan_release_id=plan_release_id,
             request_shape_sha256=request_shape_sha256,
             metering_request_id=metering_request_id,
             trusted_now=canonical_now,
-            verified_state_sha256=_framed_sha256(
-                _VERIFIED_DOMAIN,
-                _canonical_json_bytes(state_by_field),
+            verified_state_sha256=_verified_state_sha256(
+                authorization_context,
+                plan_release_id=plan_release_id,
+                request_shape_sha256=request_shape_sha256,
+                metering_request_id=metering_request_id,
+                trusted_now=canonical_now,
             ),
         )
     except BillingSearchPostTransportAuthenticationError:
@@ -435,5 +490,6 @@ __all__ = [
     "BillingSearchPostTransportAuthenticationError",
     "VerifiedBillingSearchPostTransport",
     "billing_search_plan_entitlement_sha256",
+    "validate_billing_search_post_verified_transport",
     "verify_billing_search_post_transport",
 ]

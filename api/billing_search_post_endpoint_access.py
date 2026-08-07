@@ -21,6 +21,7 @@ from api.billing_search_post_gateway_transport import (
     BILLING_SEARCH_TRANSPORT_SIGNATURE_HEADER,
     VerifiedBillingSearchPostTransport,
     billing_search_plan_entitlement_sha256,
+    validate_billing_search_post_verified_transport,
     verify_billing_search_post_transport,
 )
 from api.billing_search_post_request import (
@@ -35,7 +36,6 @@ from api.billing_search_transport_keys import (
     BillingSearchTransportKeyring,
     load_billing_search_transport_keyring,
 )
-
 
 _STATE_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_POST_ENDPOINT_ACCESS_V1\x00"
 _STATE_AUTH_KEY = secrets.token_bytes(32)
@@ -134,13 +134,33 @@ def _closed_header_values(headers: Mapping[str, Any]) -> tuple[str, str, str]:
     return header_values[0], header_values[1], header_values[2]
 
 
+def _request_keyring(
+    keyring: BillingSearchTransportKeyring | None,
+    environment_map: Mapping[str, str] | None,
+) -> BillingSearchTransportKeyring:
+    if keyring is None:
+        return load_billing_search_transport_keyring(
+            os.environ if environment_map is None else environment_map
+        )
+    if environment_map is not None:
+        raise _fail()
+    return keyring
+
+
 def _state_hmac(
     request: BillingSearchPostRequest,
     transport: VerifiedBillingSearchPostTransport,
 ) -> bytes:
     encoded = json.dumps(
         {
+            "authorization_context_sha256": (
+                transport.authorization_context.context_sha256
+            ),
+            "metering_request_id": transport.metering_request_id,
+            "plan_release_id": transport.plan_release_id,
             "request_shape_sha256": request.request_shape_sha256,
+            "transport_request_shape_sha256": transport.request_shape_sha256,
+            "transport_trusted_now": transport.trusted_now,
             "transport_state_sha256": transport.verified_state_sha256,
         },
         ensure_ascii=True,
@@ -237,22 +257,28 @@ def _new_access(
 
 def _validated_access_or_none(
     access: object,
+    *,
+    trusted_now: object,
 ) -> BillingSearchPostEndpointAccess | None:
     try:
         if type(access) is not BillingSearchPostEndpointAccess:
             return None
         request = validate_billing_search_post_request(access.request)
-        transport = access.transport
-        if type(transport) is not VerifiedBillingSearchPostTransport:
-            return None
-        entitlement = billing_search_plan_entitlement_sha256(
-            transport.plan_release_id
+        transport = validate_billing_search_post_verified_transport(
+            access.transport,
+            trusted_now=trusted_now,
         )
+        if not hmac.compare_digest(
+            request.request_shape_sha256,
+            transport.request_shape_sha256,
+        ):
+            return None
+        entitlement = billing_search_plan_entitlement_sha256(transport.plan_release_id)
         require_billing_search_access(
             transport.authorization_context,
             requested_plan_entitlement_sha256=entitlement,
             detailed_provenance=request.include_evidence,
-            trusted_now=transport.trusted_now,
+            trusted_now=trusted_now,
         )
         expected_state = _state_hmac(request, transport)
         supplied_state = object.__getattribute__(
@@ -271,10 +297,15 @@ def _validated_access_or_none(
 
 def validate_billing_search_post_endpoint_access(
     access: object,
+    *,
+    trusted_now: object,
 ) -> BillingSearchPostEndpointAccess:
     """Revalidate one factory-created access object without selector exposure."""
 
-    validated = _validated_access_or_none(access)
+    validated = _validated_access_or_none(
+        access,
+        trusted_now=trusted_now,
+    )
     if validated is None:
         raise _fail()
     return validated
@@ -299,15 +330,8 @@ def authorize_billing_search_post_endpoint(
     """
 
     try:
-        context_header, key_id_header, signature_header = _closed_header_values(
-            headers
-        )
-        if keyring is None:
-            keyring = load_billing_search_transport_keyring(
-                os.environ if environment_map is None else environment_map
-            )
-        elif environment_map is not None:
-            raise _fail()
+        context_header, key_id_header, signature_header = _closed_header_values(headers)
+        keyring = _request_keyring(keyring, environment_map)
         transport = verify_billing_search_post_transport(
             context_header,
             key_id_header,
@@ -328,7 +352,7 @@ def authorize_billing_search_post_endpoint(
         ):
             raise _fail()
         access = _new_access(request, transport)
-        validated = _validated_access_or_none(access)
+        validated = _validated_access_or_none(access, trusted_now=trusted_now)
         if validated is None:
             raise _fail()
         return validated
