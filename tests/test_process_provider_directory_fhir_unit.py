@@ -23991,13 +23991,13 @@ def test_resource_scan_concurrency_requires_candidate_bound_checkpoint(
     )
     assert not importer._has_bound_resource_scan_checkpoint(source_record, None)
     for scoped_source_ids in ("source_a", None):
-        safe_source = dict(source_record)
+        safe_source_by_field = dict(source_record)
         if scoped_source_ids is None:
-            safe_source.pop("_partition_checkpoint_source_ids")
+            safe_source_by_field.pop("_partition_checkpoint_source_ids")
         else:
-            safe_source["_partition_checkpoint_source_ids"] = scoped_source_ids
+            safe_source_by_field["_partition_checkpoint_source_ids"] = scoped_source_ids
         assert importer._has_bound_resource_scan_checkpoint(
-            safe_source,
+            safe_source_by_field,
             checkpoint_context,
         )
     unsafe_sources = (
