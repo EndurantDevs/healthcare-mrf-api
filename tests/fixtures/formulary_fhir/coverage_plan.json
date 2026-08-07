@@ -1,0 +1,32 @@
+{
+  "resourceType": "List",
+  "id": "synthetic-coverage-a",
+  "meta": {
+    "versionId": "7",
+    "lastUpdated": "2026-08-01T12:00:00Z"
+  },
+  "status": "current",
+  "title": "Synthetic Coverage",
+  "name": "Synthetic Coverage A",
+  "date": "2026-08-01T10:00:00Z",
+  "identifier": [
+    {
+      "system": "https://example.invalid/coverage",
+      "value": "SYNTH-A"
+    }
+  ],
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-PlanID-extension",
+      "valueString": "SYNTH-A"
+    },
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-PlanID-extension",
+      "valueString": "SYNTH-B"
+    },
+    {
+      "url": "https://example.invalid/StructureDefinition/evidence",
+      "valueString": "retained"
+    }
+  ]
+}
