@@ -62,6 +62,9 @@ class _ScriptedSession:
             raise AssertionError(f"unexpected SQL: {statement}")
         return self.responses.pop(0)
 
+    async def scalar(self, statement, parameters=None):
+        return (await self.execute(statement, parameters)).scalar()
+
 
 def _reference(
     object_kind: str,
