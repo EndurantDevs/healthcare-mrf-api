@@ -370,6 +370,7 @@ async def _verify_replay_and_conflict(
 async def _seal_and_verify_stored_projection(
     engine,
     schema_name: str,
+    source_publication,
 ) -> None:
     schema = quoted(schema_name)
     async with engine.begin() as connection:
@@ -404,10 +405,18 @@ async def _seal_and_verify_stored_projection(
                 "SET state = 'sealed' WHERE snapshot_key = 18"
             )
         )
-        await _assert_source_resolver(connection, schema_name)
+        await _assert_source_resolver(
+            connection,
+            schema_name,
+            source_publication,
+        )
 
 
-async def _assert_source_resolver(connection, schema_name: str) -> None:
+async def _assert_source_resolver(
+    connection,
+    schema_name: str,
+    source_publication,
+) -> None:
     """Resolve both colliding references to their exact physical sources."""
 
     first_hmac = bytes.fromhex("44" * 16 + "55" * 16)
@@ -424,6 +433,7 @@ async def _assert_source_resolver(connection, schema_name: str) -> None:
                     tin_id_128=full_hmac[:16],
                     tin_hmac_sha256=full_hmac,
                 ),
+                source_publication=source_publication,
             )
         )
     first_scope, second_scope = source_scopes
@@ -485,7 +495,11 @@ async def test_projector_publishes_replays_rolls_back_and_validates_reuse(
             prepare_projection,
             schema_name,
         )
-        await _seal_and_verify_stored_projection(engine, schema_name)
+        await _seal_and_verify_stored_projection(
+            engine,
+            schema_name,
+            published,
+        )
         await assert_sealed_reuse_proofs(
             engine,
             schema_name=schema_name,

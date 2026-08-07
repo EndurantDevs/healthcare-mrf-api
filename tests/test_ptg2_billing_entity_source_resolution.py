@@ -12,10 +12,38 @@ from api.ptg2_billing_entity_refs import (
     PTG2BillingAssociationProjectionUnavailable,
 )
 from api import ptg2_billing_entity_source_resolution as resolution
+from process.ptg_parts.ptg2_tax_identity_source_projection import (
+    tax_identity_source_publication_from_metadata,
+)
 from process.tin_npi_connector_security import token_policy_descriptor_sha256
 
 POLICY_ID = "ptg-tin-hmac-sha256-v1:2026-07"
 SNAPSHOT_KEY = 41
+
+
+def _publication(*, source_count: int = 2, **overrides: Any):
+    metadata_by_field: dict[str, Any] = {
+        "contract": "ptg2_provider_group_tax_identity_source_v1",
+        "content_contract": "ptg2_provider_group_tax_identity_source_content_v1",
+        "binding_contract": "ptg2_tax_identity_rate_source_binding_v1",
+        "binding_vector_contract": "ptg2_tax_identity_source_binding_vector_v1",
+        "token_policy_id": POLICY_ID,
+        "token_policy_descriptor_sha256": token_policy_descriptor_sha256(
+            POLICY_ID
+        ),
+        "source_ordinal_map_digest": "1" * 64,
+        "source_count": source_count,
+        "provider_group_occurrence_count": 7,
+        "matched_ein_count": 5,
+        "missing_count": 1,
+        "malformed_count": 1,
+        "unsupported_type_count": 0,
+        "content_digest": "2" * 64,
+        "artifact_byte_count": 455,
+        "binding_vector_digest": "3" * 64,
+    }
+    metadata_by_field.update(overrides)
+    return tax_identity_source_publication_from_metadata(metadata_by_field)
 
 
 class _Result:
@@ -80,12 +108,23 @@ def _source_row(
     source_provider_group_count: Any = 2,
     source_count: Any = 2,
     manifest_count: Any = 1,
+    **source_state_overrides: Any,
 ) -> dict[str, Any]:
-    return {
+    source_state_row = {
         "manifest_count": manifest_count,
         "contract": "ptg2_provider_group_tax_identity_source_v1",
         "binding_contract": "ptg2_tax_identity_rate_source_binding_v1",
+        "token_policy_id": POLICY_ID,
+        "token_policy_descriptor_sha256": bytes.fromhex(
+            token_policy_descriptor_sha256(POLICY_ID)
+        ),
         "source_count": source_count,
+        "provider_group_occurrence_count": 7,
+        "matched_ein_count": 5,
+        "missing_count": 1,
+        "malformed_count": 1,
+        "unsupported_type_count": 0,
+        "content_digest": b"\x22" * 32,
         "source_key": source_key,
         "source_record_ordinal": source_record_ordinal,
         "source_provider_group_count": source_provider_group_count,
@@ -95,6 +134,8 @@ def _source_row(
             else group_character
         ),
     }
+    source_state_row.update(source_state_overrides)
+    return source_state_row
 
 
 def _source_state_row(*, manifest_count: Any = 1) -> dict[str, Any]:
@@ -137,10 +178,12 @@ async def test_resolves_collision_safe_ref_to_source_group_witnesses() -> None:
         schema_name="synthetic",
         snapshot_key=SNAPSHOT_KEY,
         billing_entity_ref=_reference(matching_hmac),
+        source_publication=_publication(),
     )
 
     assert resolved == resolution.ResolvedBillingEntitySourceScope(
         snapshot_key=SNAPSHOT_KEY,
+        publication=_publication(),
         witnesses=(
             resolution.BillingEntitySourceWitness(0, 0, "1" * 32),
             resolution.BillingEntitySourceWitness(1, 0, "1" * 32),
@@ -178,6 +221,7 @@ async def test_unknown_or_wrong_snapshot_ref_returns_no_source_scope() -> None:
             schema_name="synthetic",
             snapshot_key=SNAPSHOT_KEY,
             billing_entity_ref=_reference(full_hmac),
+            source_publication=_publication(),
         )
         is None
     )
@@ -187,6 +231,7 @@ async def test_unknown_or_wrong_snapshot_ref_returns_no_source_scope() -> None:
             schema_name="synthetic",
             snapshot_key=SNAPSHOT_KEY,
             billing_entity_ref=_reference(full_hmac, SNAPSHOT_KEY + 1),
+            source_publication=_publication(),
         )
         is None
     )
@@ -207,7 +252,9 @@ async def test_unknown_identity_still_requires_complete_source_projection() -> N
             schema_name="synthetic",
             snapshot_key=SNAPSHOT_KEY,
             billing_entity_ref=_reference(full_hmac),
+            source_publication=_publication(),
         )
+    assert len(session.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -221,6 +268,7 @@ async def test_legacy_snapshot_reports_projection_unavailable_before_identity() 
             schema_name="synthetic",
             snapshot_key=SNAPSHOT_KEY,
             billing_entity_ref=_reference(full_hmac),
+            source_publication=_publication(),
         )
     assert len(session.calls) == 1
 
@@ -255,6 +303,45 @@ async def test_missing_or_inconsistent_source_manifest_fails_closed(
             schema_name="synthetic",
             snapshot_key=SNAPSHOT_KEY,
             billing_entity_ref=_reference(full_hmac),
+            source_publication=_publication(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_name", "persisted_value"),
+    (
+        ("token_policy_id", "ptg-tin-hmac-sha256-v1:other"),
+        ("token_policy_descriptor_sha256", b"p" * 32),
+        ("source_count", 1),
+        ("provider_group_occurrence_count", 8),
+        ("matched_ein_count", 6),
+        ("missing_count", 2),
+        ("malformed_count", 2),
+        ("unsupported_type_count", 1),
+        ("content_digest", b"d" * 32),
+    ),
+)
+async def test_source_manifest_is_bound_to_exact_policy_counts_and_digest(
+    field_name: str,
+    persisted_value: Any,
+) -> None:
+    full_hmac = b"j" * 32
+    session = _Session(
+        [_candidate_row(tin_key=6, full_hmac=full_hmac)],
+        [_source_row(0, "1", **{field_name: persisted_value})],
+    )
+
+    with pytest.raises(
+        billing.PTG2BillingAssociationDataError,
+        match="source scope is unavailable",
+    ):
+        await resolution.resolve_billing_entity_ref_source_scope(
+            session,
+            schema_name="synthetic",
+            snapshot_key=SNAPSHOT_KEY,
+            billing_entity_ref=_reference(full_hmac),
+            source_publication=_publication(),
         )
 
 
@@ -299,6 +386,7 @@ async def test_invalid_or_inconsistent_source_witnesses_fail_closed(
             schema_name="synthetic",
             snapshot_key=SNAPSHOT_KEY,
             billing_entity_ref=_reference(full_hmac),
+            source_publication=_publication(),
         )
 
 
@@ -328,6 +416,7 @@ async def test_source_witness_fanout_is_bounded() -> None:
             schema_name="synthetic",
             snapshot_key=SNAPSHOT_KEY,
             billing_entity_ref=_reference(full_hmac),
+            source_publication=_publication(source_count=1),
         )
 
 

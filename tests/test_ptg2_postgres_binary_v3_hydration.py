@@ -152,9 +152,14 @@ async def test_v3_price_hydration_raises_when_membership_key_is_missing(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_v3_price_hydration_atom_limit_stops_before_atom_decode(monkeypatch):
+async def test_legacy_v3_price_hydration_accepts_257_atoms(monkeypatch):
     membership_reader = AsyncMock(return_value={10: tuple(range(257))})
-    atom_reader = AsyncMock(return_value={})
+    atom_reader = AsyncMock(
+        return_value={
+            atom_key: PTG2V3PriceAtomRecord(str(atom_key), (None,) * 7)
+            for atom_key in range(257)
+        }
+    )
     monkeypatch.setattr(
         ptg2_serving,
         "lookup_shared_price_atom_memberships_from_db",
@@ -166,16 +171,17 @@ async def test_v3_price_hydration_atom_limit_stops_before_atom_decode(monkeypatc
         atom_reader,
     )
 
-    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="atom limit"):
-        await ptg2_serving._version_three_prices_by_key(
-            object(),
-            _version_three_tables(),
-            [10],
-            maximum_atom_count=256,
-        )
+    prices_by_key = await ptg2_serving._version_three_prices_by_key(
+        object(),
+        _version_three_tables(),
+        [10],
+        copy_payloads=False,
+    )
 
+    assert len(prices_by_key[10]) == 257
     membership_reader.assert_awaited_once()
-    atom_reader.assert_not_awaited()
+    assert "maximum_selected_atom_count" not in membership_reader.await_args.kwargs
+    atom_reader.assert_awaited_once()
 
 
 @pytest.mark.asyncio

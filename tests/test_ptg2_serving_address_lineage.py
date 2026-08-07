@@ -13,14 +13,15 @@ from tests.ptg2_serving_coverage_paydown_support import (
 )
 
 
-def _location_query():
+def _location_query(*, knn_order_sql=None, address_assurance_sql="TRUE"):
     return serving._MembershipLocationQuery(
         address_table="mrf.entity_address_unified",
         npi_scope_table="mrf.ptg2_v3_npi_scope",
         filter_sql="npi_scope.snapshot_key = :shared_snapshot_key",
         parameter_map={"limit": 2},
         distance_sql="NULL::double precision",
-        knn_order_sql=None,
+        knn_order_sql=knn_order_sql,
+        address_assurance_sql=address_assurance_sql,
     )
 
 
@@ -68,6 +69,7 @@ def test_address_provenance_index_omits_incomplete_or_source_zero_entries():
 
 def test_address_provenance_query_selects_coherent_active_source_lineage():
     sql = serving._ADDRESS_PROVENANCE_SQL
+    normalized_sql = " ".join(sql.split())
 
     assert "UNION ALL" in sql
     assert "SELECT unified.*" not in sql
@@ -81,9 +83,6 @@ def test_address_provenance_query_selects_coherent_active_source_lineage():
     assert "live_cms_doctors AS MATERIALIZED" in sql
     assert "specific_candidates AS MATERIALIZED" in sql
     assert "STARTS_WITH(stored.source_record_key, source.source_record_prefix)" in sql
-    assert "stored.npi IS NULL OR stored.npi = source.npi" in sql
-    assert "stored.address_key = source.address_key" in sql
-    assert "stored.premise_key = source.premise_key" in sql
     assert "STARTS_WITH(sources.source_name, 'facility_anchor:')" in sql
     assert "NULLIF(BTRIM(stored.source_run_id), '')" in sql
     assert "nppes.date_added::text AS source_run_id" in sql
@@ -92,15 +91,41 @@ def test_address_provenance_query_selects_coherent_active_source_lineage():
     assert "FROM specific_evidence" in sql
     assert serving._ptg2_mrf_lineage_complete_sql("candidate") in sql
     assert "COALESCE(NULLIF(stored.source_record_key" not in sql
-
-
-def test_membership_location_queries_retain_the_public_site_key() -> None:
-    for sql in (
-        serving._MEMBERSHIP_LOCATION_SQL,
-        serving._MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL,
-        serving._MEMBERSHIP_LOCATION_KNN_SQL,
+    for coordinate_predicate in (
+        "stored.npi IS NULL OR stored.npi = source.npi",
+        "stored.address_key IS NULL OR stored.address_key = source.address_key",
+        "stored.premise_key IS NULL OR stored.premise_key = source.premise_key",
     ):
-        assert "'address_site_key'" in sql
+        assert (
+            "NOT CAST(:stored_only AS boolean) OR " + coordinate_predicate
+            in normalized_sql
+        )
+
+
+@pytest.mark.parametrize(
+    "query_kwargs",
+    (
+        {},
+        {"address_assurance_sql": "addr.is_assured"},
+        {"knn_order_sql": "addr.location <-> :request_location"},
+    ),
+    ids=("standard", "unified-assured", "knn"),
+)
+def test_membership_location_sql_keeps_site_key_billing_only(query_kwargs) -> None:
+    default_sql = serving._membership_location_sql(
+        _location_query(**query_kwargs),
+        limit=2,
+        offset=0,
+    )
+    billing_sql = serving._membership_location_sql(
+        _location_query(**query_kwargs),
+        limit=2,
+        offset=0,
+        include_address_site_key=True,
+    )
+
+    assert "'address_site_key'" not in default_sql
+    assert "'address_site_key', addr.premise_key::text" in billing_sql
 
 
 def test_address_provenance_uses_sql_admission_label_without_reclassification():
@@ -468,3 +493,33 @@ async def test_billing_lineage_requires_materialized_evidence(monkeypatch):
     assert provenance_status == "unavailable"
     assert session.calls == []
     assert location_rows[0]["npi"] == 1990000122
+
+
+@pytest.mark.asyncio
+async def test_billing_lineage_sets_stored_only_coherence_mode(monkeypatch):
+    monkeypatch.setattr(
+        serving,
+        "_is_relation_available",
+        AsyncMock(return_value=True),
+    )
+    location_rows = [
+        {
+            "npi": 1990000122,
+            "_geo_evidence_level": "nppes_registry_address",
+            "_geo_evidence_source_id": 1,
+            "address_payload": json.dumps(
+                {"location_key": "stored-only-location"}
+            ),
+        }
+    ]
+    session = FakeSession([FakeResult([])])
+
+    provenance_status = await serving._hydrate_address_provenance(
+        session,
+        location_rows,
+        use_stored_only=True,
+    )
+
+    assert provenance_status == "available"
+    assert session.calls[0][0][1]["stored_only"] is True
+    assert location_rows == []

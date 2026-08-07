@@ -16,6 +16,9 @@ from api.ptg2_billing_entity_source_resolution import (
 )
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_tax_identity_source_projection import (
+    tax_identity_source_publication_from_metadata,
+)
 
 GROUP_A = "aa" * 16
 GROUP_B = "bb" * 16
@@ -23,7 +26,36 @@ SET_X = "11" * 16
 SET_Y = "22" * 16
 
 
-def _tables(*, v4: bool = True) -> PTG2ServingTables:
+def _publication(**overrides):
+    metadata_by_field = {
+        "contract": "ptg2_provider_group_tax_identity_source_v1",
+        "content_contract": "ptg2_provider_group_tax_identity_source_content_v1",
+        "binding_contract": "ptg2_tax_identity_rate_source_binding_v1",
+        "binding_vector_contract": "ptg2_tax_identity_source_binding_vector_v1",
+        "token_policy_id": "ptg-tin-hmac-sha256-v1:test",
+        "token_policy_descriptor_sha256": "1" * 64,
+        "source_ordinal_map_digest": "2" * 64,
+        "source_count": 2,
+        "provider_group_occurrence_count": 7,
+        "matched_ein_count": 5,
+        "missing_count": 1,
+        "malformed_count": 1,
+        "unsupported_type_count": 0,
+        "content_digest": "3" * 64,
+        "artifact_byte_count": 455,
+        "binding_vector_digest": "4" * 64,
+    }
+    metadata_by_field.update(overrides)
+    return tax_identity_source_publication_from_metadata(metadata_by_field)
+
+
+def _tables(
+    *,
+    v4: bool = True,
+    source_publication=...,
+) -> PTG2ServingTables:
+    if source_publication is ...:
+        source_publication = _publication()
     return PTG2ServingTables(
         arch_version="postgres_binary_v3",
         shared_snapshot_key=17,
@@ -36,12 +68,20 @@ def _tables(*, v4: bool = True) -> PTG2ServingTables:
         price_dictionary_item_count=128,
         price_dictionary_block_bytes=32,
         provider_shard_span=1024,
+        provider_tax_identity_source_publication=source_publication,
     )
 
 
-def _scope(*, snapshot_key: int = 17) -> ResolvedBillingEntitySourceScope:
+def _scope(
+    *,
+    snapshot_key: int = 17,
+    source_publication=...,
+) -> ResolvedBillingEntitySourceScope:
+    if source_publication is ...:
+        source_publication = _publication()
     return ResolvedBillingEntitySourceScope(
         snapshot_key=snapshot_key,
+        publication=source_publication,
         witnesses=(
             BillingEntitySourceWitness(0, 0, GROUP_A),
             BillingEntitySourceWitness(1, 0, GROUP_B),
@@ -196,6 +236,67 @@ async def test_reader_rejects_snapshot_mismatch_before_graph_read(monkeypatch) -
             source_scope=_scope(snapshot_key=18),
             code_keys=(10,),
         )
+    graph_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("serving_publication", "scope_publication", "error"),
+    (
+        (None, _publication(), "geometry is unavailable"),
+        (
+            _publication(),
+            _publication(content_digest="5" * 64),
+            "geometry does not match",
+        ),
+        (
+            _publication(),
+            _publication(
+                matched_ein_count=1,
+                missing_count=5,
+            ),
+            "geometry does not match",
+        ),
+        (
+            _publication(),
+            _publication(source_ordinal_map_digest="6" * 64),
+            "geometry does not match",
+        ),
+        (
+            _publication(),
+            _publication(binding_vector_digest="7" * 64),
+            "geometry does not match",
+        ),
+    ),
+    ids=(
+        "missing",
+        "mismatched-digest",
+        "permuted-counts",
+        "mismatched-source-map-digest",
+        "mismatched-binding-vector-digest",
+    ),
+)
+async def test_reader_rejects_missing_mismatched_or_permuted_source_geometry(
+    monkeypatch,
+    serving_publication,
+    scope_publication,
+    error,
+) -> None:
+    graph_read = AsyncMock()
+    monkeypatch.setattr(
+        reader.ptg2_serving,
+        "_manifest_sets_by_group",
+        graph_read,
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match=error):
+        await reader.load_exact_billing_rate_occurrence_witnesses(
+            object(),
+            _tables(source_publication=serving_publication),
+            source_scope=_scope(source_publication=scope_publication),
+            code_keys=(10,),
+        )
+
     graph_read.assert_not_awaited()
 
 
@@ -404,6 +505,7 @@ async def test_reader_canonicalizes_shared_set_multi_group_duplicates(
 ) -> None:
     source_scope = ResolvedBillingEntitySourceScope(
         snapshot_key=17,
+        publication=_publication(),
         witnesses=(
             BillingEntitySourceWitness(0, 0, GROUP_B),
             BillingEntitySourceWitness(0, 1, GROUP_A),
@@ -469,11 +571,13 @@ def test_source_scope_rejects_invalid_or_excessive_groups(monkeypatch) -> None:
     with pytest.raises(PTG2ManifestArtifactError, match="invalid witness"):
         reader._source_groups(
             ResolvedBillingEntitySourceScope(
-                17,
-                (BillingEntitySourceWitness(0, 0, "not-a-group"),),
+                snapshot_key=17,
+                publication=_publication(),
+                witnesses=(BillingEntitySourceWitness(0, 0, "not-a-group"),),
             ),
             snapshot_key=17,
             source_count=2,
+            source_publication=_publication(),
         )
 
     monkeypatch.setattr(exact_contract, "MAX_PROVIDER_GROUPS", 1)
@@ -482,4 +586,5 @@ def test_source_scope_rejects_invalid_or_excessive_groups(monkeypatch) -> None:
             _scope(),
             snapshot_key=17,
             source_count=2,
+            source_publication=_publication(),
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import orjson
 import pytest
@@ -100,6 +101,90 @@ async def test_price_hydration_cache_batches_only_misses_and_preserves_wire_payl
         option=orjson.OPT_NON_STR_KEYS,
     )
     assert isolated_cache.metrics().entries == 3
+
+
+@pytest.mark.asyncio
+async def test_bounded_price_hydration_rejects_all_cache_overflow_without_decode(
+    monkeypatch,
+    isolated_cache,
+):
+    tables = _serving_tables()
+    layout = ptg2_serving._version_three_price_cache_layout(tables)
+    isolated_cache.admit_many(
+        layout,
+        {
+            1: [
+                {"negotiated_rate": str(atom_ordinal)}
+                for atom_ordinal in range(257)
+            ]
+        },
+    )
+    decode_missing = AsyncMock()
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_version_three_bounded_price_hydration_for_keys",
+        decode_missing,
+    )
+
+    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="atom limit"):
+        await ptg2_serving._version_three_bounded_prices_by_key(
+            object(),
+            tables,
+            [1],
+            maximum_atom_count=256,
+        )
+
+    decode_missing.assert_not_awaited()
+    assert isolated_cache.metrics().entries == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_price_hydration_rejects_mixed_overflow_before_decode_or_admission(
+    monkeypatch,
+    isolated_cache,
+):
+    tables = _serving_tables()
+    layout = ptg2_serving._version_three_price_cache_layout(tables)
+    isolated_cache.admit_many(
+        layout,
+        {
+            1: [
+                {"negotiated_rate": str(atom_ordinal)}
+                for atom_ordinal in range(200)
+            ]
+        },
+    )
+    membership_reader = AsyncMock(return_value={2: tuple(range(57))})
+    atom_reader = AsyncMock(return_value={})
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_shared_price_atom_memberships_from_db",
+        membership_reader,
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "lookup_shared_price_atoms_from_db",
+        atom_reader,
+    )
+
+    with pytest.raises(ptg2_serving.PTG2ManifestArtifactError, match="atom limit"):
+        await ptg2_serving._version_three_bounded_prices_by_key(
+            object(),
+            tables,
+            [1, 2],
+            maximum_atom_count=256,
+        )
+
+    membership_reader.assert_awaited_once()
+    assert (
+        membership_reader.await_args.kwargs["maximum_selected_atom_count"]
+        == 56
+    )
+    atom_reader.assert_not_awaited()
+    cached_rows, missing_keys = isolated_cache.get_many(layout, (1, 2))
+    assert tuple(cached_rows) == (1,)
+    assert missing_keys == (2,)
+    assert isolated_cache.metrics().entries == 1
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -95,6 +96,89 @@ def _geo_witness(
 
 
 @pytest.mark.asyncio
+async def test_price_hydration_rejects_duplicate_geo_witness_keys(
+    monkeypatch,
+) -> None:
+    hydrate = AsyncMock(return_value={10: [{"negotiated_rate": 20}]})
+    monkeypatch.setattr(
+        geo_reader.ptg2_serving,
+        "_version_three_bounded_prices_by_key",
+        hydrate,
+    )
+    witness = _geo_witness()
+
+    with pytest.raises(PTG2ManifestArtifactError, match="canonical and unique"):
+        await geo_reader.hydrate_exact_billing_geo_prices(
+            object(),
+            _tables(),
+            geo_witnesses=(witness, witness),
+        )
+
+    hydrate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_price_hydration_rejects_invalid_nested_provider_witness(
+    monkeypatch,
+) -> None:
+    hydrate = AsyncMock(return_value={10: [{"negotiated_rate": 20}]})
+    monkeypatch.setattr(
+        geo_reader.ptg2_serving,
+        "_version_three_bounded_prices_by_key",
+        hydrate,
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="provider/rate scope"):
+        await geo_reader.hydrate_exact_billing_geo_prices(
+            object(),
+            _tables(),
+            geo_witnesses=(
+                geo_reader.BillingProviderGeoWitness(
+                    provider_rate=object(),
+                    address=_address(NPI_A),
+                ),
+            ),
+        )
+
+    hydrate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_address",
+    (
+        replace(_address(NPI_A), selection_contract="unexpected"),
+        replace(_address(NPI_A), distance_miles=float("nan")),
+    ),
+    ids=("selection-contract", "non-finite-distance"),
+)
+async def test_price_hydration_rejects_forged_address_stable_fields(
+    monkeypatch,
+    invalid_address,
+) -> None:
+    hydrate = AsyncMock(return_value={10: [{"negotiated_rate": 20}]})
+    monkeypatch.setattr(
+        geo_reader.ptg2_serving,
+        "_version_three_bounded_prices_by_key",
+        hydrate,
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="address scope is invalid"):
+        await geo_reader.hydrate_exact_billing_geo_prices(
+            object(),
+            _tables(),
+            geo_witnesses=(
+                geo_reader.BillingProviderGeoWitness(
+                    provider_rate=_provider_rate(),
+                    address=invalid_address,
+                ),
+            ),
+        )
+
+    hydrate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_price_hydration_preserves_source_witness_multiplicity(
     monkeypatch,
 ) -> None:
@@ -108,7 +192,7 @@ async def test_price_hydration_preserves_source_witness_multiplicity(
     )
     monkeypatch.setattr(
         geo_reader.ptg2_serving,
-        "_version_three_prices_by_key",
+        "_version_three_bounded_prices_by_key",
         hydrate,
     )
     hydrated = await geo_reader.hydrate_exact_billing_geo_prices(
@@ -141,7 +225,7 @@ async def test_price_hydration_rejects_missing_keys_and_atom_overflow(
     hydrate = AsyncMock(return_value={})
     monkeypatch.setattr(
         geo_reader.ptg2_serving,
-        "_version_three_prices_by_key",
+        "_version_three_bounded_prices_by_key",
         hydrate,
     )
     with pytest.raises(PTG2ManifestArtifactError, match="incomplete"):
@@ -179,7 +263,7 @@ async def test_price_hydration_accepts_256_atoms_and_rejects_257(
     )
     monkeypatch.setattr(
         geo_reader.ptg2_serving,
-        "_version_three_prices_by_key",
+        "_version_three_bounded_prices_by_key",
         price_reader,
     )
 
@@ -206,7 +290,7 @@ async def test_price_hydration_rejects_cross_snapshot_or_cross_npi_witness(
     hydrate = AsyncMock(return_value={10: [{"negotiated_rate": 20}]})
     monkeypatch.setattr(
         geo_reader.ptg2_serving,
-        "_version_three_prices_by_key",
+        "_version_three_bounded_prices_by_key",
         hydrate,
     )
     cross_snapshot = geo_reader.BillingProviderGeoWitness(
@@ -247,7 +331,7 @@ async def test_price_payloads_are_independent_across_source_witnesses(
     nested_price_by_field = {"negotiated_rate": 20, "service_code": ["11"]}
     monkeypatch.setattr(
         geo_reader.ptg2_serving,
-        "_version_three_prices_by_key",
+        "_version_three_bounded_prices_by_key",
         AsyncMock(return_value={10: [nested_price_by_field]}),
     )
     hydrated = await geo_reader.hydrate_exact_billing_geo_prices(

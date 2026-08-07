@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from unittest.mock import AsyncMock
 
@@ -134,6 +135,106 @@ def _replace_location_payload(
             payload[key] = value
     updated_row_by_field["address_payload"] = json.dumps(payload)
     return updated_row_by_field
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("snapshot_key", True),
+        ("code_key", -1),
+        ("source_key", True),
+        ("source_record_ordinal", -1),
+        ("provider_group_ref", GROUP_A.upper()),
+        ("provider_set_key", True),
+        ("price_key", 2**32),
+        ("occurrence_ordinal", -1),
+    ),
+)
+def test_rate_witnesses_reject_every_invalid_coordinate(
+    field_name,
+    invalid_value,
+) -> None:
+    invalid_witness = replace(_rate(), **{field_name: invalid_value})
+
+    with pytest.raises(PTG2ManifestArtifactError, match="invalid rate witness"):
+        geo_reader.validated_rate_witnesses((invalid_witness,))
+
+
+@pytest.mark.parametrize("witnesses", ("noncanonical", "duplicate"))
+def test_rate_witnesses_require_canonical_unique_coordinates(witnesses) -> None:
+    first = _rate(price_key=10)
+    second = _rate(price_key=11)
+    invalid_witnesses = (
+        (second, first) if witnesses == "noncanonical" else (first, first)
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="canonical and unique"):
+        geo_reader.validated_rate_witnesses(invalid_witnesses)
+
+
+@pytest.mark.parametrize(
+    "invalid_witness",
+    (
+        object(),
+        replace(_provider_rate(), price_key=2**32),
+        replace(_provider_rate(), npi=1234567890),
+    ),
+    ids=("wrong-type", "invalid-rate-coordinate", "invalid-npi"),
+)
+def test_provider_rate_witnesses_reject_invalid_complete_coordinates(
+    invalid_witness,
+) -> None:
+    with pytest.raises(PTG2ManifestArtifactError, match="provider/rate scope"):
+        geo_reader.validated_provider_rate_witnesses((invalid_witness,))
+
+
+@pytest.mark.parametrize("witnesses", ("noncanonical", "duplicate"))
+def test_provider_rate_witnesses_require_canonical_unique_coordinates(
+    witnesses,
+) -> None:
+    first = _provider_rate(npi=NPI_A)
+    second = _provider_rate(npi=NPI_B)
+    invalid_witnesses = (
+        (second, first) if witnesses == "noncanonical" else (first, first)
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError, match="inconsistent"):
+        geo_reader.validated_provider_rate_witnesses(invalid_witnesses)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_rates",
+    (
+        (replace(_provider_rate(), price_key=-1),),
+        (
+            _provider_rate(npi=NPI_B),
+            _provider_rate(npi=NPI_A),
+        ),
+        (_provider_rate(), _provider_rate()),
+    ),
+    ids=("invalid-coordinate", "noncanonical", "duplicate"),
+)
+async def test_geo_rejects_invalid_provider_witnesses_before_address_io(
+    monkeypatch,
+    provider_rates,
+) -> None:
+    location_lookup = AsyncMock()
+    monkeypatch.setattr(
+        geo_reader.ptg2_serving,
+        "_membership_location_rows",
+        location_lookup,
+    )
+
+    with pytest.raises(PTG2ManifestArtifactError):
+        await geo_reader.load_exact_billing_geo_witnesses(
+            object(),
+            _tables(),
+            provider_rate_witnesses=provider_rates,
+            geo_args={"zip5": "25000"},
+        )
+
+    location_lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio

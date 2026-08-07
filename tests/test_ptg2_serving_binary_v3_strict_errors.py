@@ -1,5 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from unittest.mock import Mock
+
 import pytest
 
 from process.ptg_parts import ptg2_serving_binary_v3 as codec
@@ -10,6 +12,21 @@ from process.ptg_parts.ptg2_serving_binary_v3_types import (
 
 def _memberships(rows):
     return codec.encode_price_memberships(rows, 24)
+
+
+def _legacy_memberships(rows):
+    encoded = bytearray((codec.PTG2_V3_FORMAT_VERSION, 3))
+    codec.append_uvarint(encoded, len(rows))
+    previous_price_key = None
+    for price_key, atom_keys in rows:
+        codec.append_uvarint(
+            encoded,
+            price_key if previous_price_key is None else price_key - previous_price_key,
+        )
+        codec.append_uvarint(encoded, len(atom_keys))
+        encoded.extend(codec.encode_dense_keys(atom_keys, 24))
+        previous_price_key = price_key
+    return bytes(encoded)
 
 
 def test_price_membership_full_decoder_rejects_record_corruption():
@@ -51,6 +68,86 @@ def test_price_membership_sparse_decoder_guards_metadata_and_empty_requests():
         )
     with pytest.raises(ValueError, match="payload version"):
         codec.decode_price_memberships(b"")
+
+
+@pytest.mark.parametrize(
+    ("encoded", "requested_key", "expected_atoms"),
+    (
+        (_memberships(((0, (1, 2)),)), 0, (1, 2)),
+        (
+            bytes.fromhex("01030203030000000100000101000601ffff00"),
+            9,
+            (65_535,),
+        ),
+    ),
+    ids=("indexed-v2", "legacy-v1"),
+)
+def test_selected_atom_limit_is_opt_in_and_precedes_dense_decode(
+    monkeypatch,
+    encoded,
+    requested_key,
+    expected_atoms,
+):
+    assert codec.decode_price_memberships_for_keys(
+        encoded,
+        (requested_key,),
+    ) == {requested_key: expected_atoms}
+    dense_decode = Mock(wraps=codec.decode_dense_keys)
+    monkeypatch.setattr(codec, "decode_dense_keys", dense_decode)
+
+    with pytest.raises(ValueError, match="atom limit"):
+        codec.decode_price_memberships_for_keys(
+            encoded,
+            (requested_key,),
+            maximum_selected_atom_count=0,
+        )
+
+    dense_decode.assert_not_called()
+
+
+def test_selected_atom_limit_is_global_across_indexed_checkpoints(monkeypatch):
+    encoded = _memberships(tuple((price_key, (price_key,)) for price_key in range(33)))
+    dense_decode = Mock(wraps=codec.decode_dense_keys)
+    monkeypatch.setattr(codec, "decode_dense_keys", dense_decode)
+
+    with pytest.raises(ValueError, match="atom limit"):
+        codec.decode_price_memberships_for_keys(
+            encoded,
+            (0, 32),
+            maximum_selected_atom_count=1,
+        )
+
+    assert dense_decode.call_count == 1
+
+
+def test_selected_atom_limit_is_global_across_legacy_memberships(monkeypatch):
+    encoded = _legacy_memberships(((0, (1,)), (1, (2,))))
+    dense_decode = Mock(wraps=codec.decode_dense_keys)
+    monkeypatch.setattr(codec, "decode_dense_keys", dense_decode)
+
+    with pytest.raises(ValueError, match="atom limit"):
+        codec.decode_price_memberships_for_keys(
+            encoded,
+            (0, 1),
+            maximum_selected_atom_count=1,
+        )
+
+    assert dense_decode.call_count == 1
+
+
+def test_bounded_legacy_selection_validates_unrequested_atom_order(monkeypatch):
+    encoded = _legacy_memberships(((0, (2, 1)), (1, (3,))))
+    dense_decode = Mock(wraps=codec.decode_dense_keys)
+    monkeypatch.setattr(codec, "decode_dense_keys", dense_decode)
+
+    with pytest.raises(ValueError, match="atom keys are not ordered"):
+        codec.decode_price_memberships_for_keys(
+            encoded,
+            (1,),
+            maximum_selected_atom_count=1,
+        )
+
+    dense_decode.assert_not_called()
 
 
 def test_price_membership_directory_rejects_invalid_checkpoints():
