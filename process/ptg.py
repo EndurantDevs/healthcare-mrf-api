@@ -4344,6 +4344,29 @@ def _direct_in_network_job(
     return job_map
 
 
+def _direct_allowed_amounts_job(
+    url: str,
+    *,
+    plan_info: list[dict[str, Any]],
+    private_intent_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Build one scalar allowed-amounts job with optional private progress."""
+
+    job_map: dict[str, Any] = {"type": "allowed_amounts", "url": url}
+    if private_intent_sha256 is not None:
+        job_map.update(
+            {
+                "_ptg_progress_label": (
+                    "direct-singleton-" + private_intent_sha256[:12]
+                ),
+                "_ptg_progress_private": True,
+            }
+        )
+    if plan_info:
+        job_map["plan_info"] = plan_info
+    return job_map
+
+
 def _source_file_versions_from_results(
     files: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -7771,17 +7794,19 @@ async def _main_with_artifact_lease(
                 )
             )
         if allowed_url:
-            direct_allowed_job_by_field: dict[str, Any] = {
-                "type": "allowed_amounts",
-                "url": allowed_url,
-            }
             direct_allowed_plans = _direct_dispatch_plan_info(
                 plan_ids,
                 plan_market_types,
             )
-            if direct_allowed_plans:
-                direct_allowed_job_by_field["plan_info"] = direct_allowed_plans
-            jobs.append(direct_allowed_job_by_field)
+            jobs.append(
+                _direct_allowed_amounts_job(
+                    allowed_url,
+                    plan_info=direct_allowed_plans,
+                    private_intent_sha256=(
+                        direct_rate_file_intent_sha256
+                    ),
+                )
+            )
         jobs = _filter_jobs_by_url_contains(jobs, file_url_contains)
         if source_network_name_values:
             for job in jobs:
