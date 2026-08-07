@@ -252,10 +252,14 @@ def test_sparse_raw_verifier_binds_exact_checksum_invalid_record(tmp_path):
     }
 
 
-def test_sparse_raw_verifier_binds_structural_reason_and_census(tmp_path):
+@pytest.mark.parametrize("rejected_npi", ["3000000000", "10/00/0491"])
+def test_sparse_raw_verifier_binds_structural_reason_and_census(
+    tmp_path,
+    rejected_npi,
+):
     arguments, _records = _fixture(
         tmp_path,
-        rejected_npi="3000000000",
+        rejected_npi=rejected_npi,
         reason=UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE,
     )
 
@@ -353,18 +357,20 @@ def test_checksum_invalid_record_matches_native_permissive_plan_text() -> None:
 
 
 def test_structural_record_requires_a_string_shape_failure_only() -> None:
-    census = validate_structurally_invalid_provider_record(
-        _provider_record("3000000000")
-    )
+    for npi in ("3000000000", "10/00/0491"):
+        census = validate_structurally_invalid_provider_record(
+            _provider_record(npi)
+        )
 
-    assert census.structural_count == 1
-    assert census.structural_individual_records == 1
+        assert census.structural_count == 1
+        assert census.structural_individual_records == 1
 
     for npi in (
         None,
         3_000_000_000,
         "123",
         "abcdefghij",
+        "10000004-1",
         "0000000000",
         "1003821380",
         "1003821381",

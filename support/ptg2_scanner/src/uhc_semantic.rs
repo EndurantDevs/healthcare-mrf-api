@@ -2225,6 +2225,31 @@ mod tests {
         assert!(!decoded.contains("3000000000"));
         assert!(!decoded.contains("Example Clinic"));
 
+        let slash_delimited = String::from_utf8(STRUCTURAL_INVALID_PROVIDER_RECORD.to_vec())
+            .unwrap()
+            .replace("3000000000", "10/00/0491")
+            .into_bytes();
+        let mut slash_worker = RangeWorker::new(
+            &source.lineage().source_file_id,
+            source.lineage().collection_kind,
+            invalid_range,
+            &test_budget(),
+        )
+        .unwrap();
+        slash_worker.process_provider(1, &slash_delimited).unwrap();
+        let mut slash_result = slash_worker.finish(Instant::now()).unwrap();
+        let mut slash_decoded = String::new();
+        flate2::read::ZlibDecoder::new(&mut slash_result.fact_payload)
+            .read_to_string(&mut slash_decoded)
+            .unwrap();
+        let slash_fact: serde_json::Value = serde_json::from_str(slash_decoded.trim()).unwrap();
+        assert_eq!(
+            slash_fact["_healthporta_quarantine"]["reason"],
+            UHC_PROVIDER_QUARANTINE_REASON_INVALID_NPI_STRUCTURE
+        );
+        assert_eq!(slash_result.counters.invalid_npi_structure_count, 1);
+        assert!(!slash_decoded.contains("10/00/0491"));
+
         let malformed = String::from_utf8(STRUCTURAL_INVALID_PROVIDER_RECORD.to_vec())
             .unwrap()
             .replace("\"accepting\":\"accepting\"", "\"accepting\":\"sometimes\"")

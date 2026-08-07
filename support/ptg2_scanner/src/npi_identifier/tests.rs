@@ -2,8 +2,8 @@ use super::{npi_validity, NpiValidity};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
-const FROZEN_VECTORS: &str = include_str!("../../tests/fixtures/npi_identifier_vectors_v1.json");
-const CONTRACT_ID: &str = "healthporta.npi-identifier-classification.v1";
+const FROZEN_VECTORS: &str = include_str!("../../tests/fixtures/npi_identifier_vectors_v2.json");
+const CONTRACT_ID: &str = "healthporta.npi-identifier-classification.v2";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,7 +25,7 @@ struct VectorCase {
 fn frozen_vectors_cover_every_classification() {
     let contract: VectorContract = serde_json::from_str(FROZEN_VECTORS).unwrap();
     assert_eq!(contract.contract_id, CONTRACT_ID);
-    assert_eq!(contract.version, 1);
+    assert_eq!(contract.version, 2);
     assert!(!contract.cases.is_empty());
 
     let mut case_ids = BTreeSet::new();
@@ -54,6 +54,7 @@ fn representation_is_exact_ascii_without_trimming() {
     assert_eq!(npi_validity(" 1000000491"), NpiValidity::Invalid);
     assert_eq!(npi_validity("1000000491 "), NpiValidity::Invalid);
     assert_eq!(npi_validity("10000004-1"), NpiValidity::Invalid);
+    assert_eq!(npi_validity("10/00/0491"), NpiValidity::StructuralInvalid);
 }
 
 fn classification_name(validity: NpiValidity) -> &'static str {

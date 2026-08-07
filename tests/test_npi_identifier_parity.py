@@ -9,14 +9,14 @@ from pathlib import Path
 
 from process.provider_directory_profile import is_valid_npi
 
-_CONTRACT_ID = "healthporta.npi-identifier-classification.v1"
+_CONTRACT_ID = "healthporta.npi-identifier-classification.v2"
 _VECTOR_PATH = (
     Path(__file__).parents[1]
     / "support"
     / "ptg2_scanner"
     / "tests"
     / "fixtures"
-    / "npi_identifier_vectors_v1.json"
+    / "npi_identifier_vectors_v2.json"
 )
 
 
@@ -25,7 +25,7 @@ def test_python_validity_acceptance_matches_frozen_vectors():
 
     assert set(vector_contract) == {"contract_id", "version", "cases"}
     assert vector_contract["contract_id"] == _CONTRACT_ID
-    assert vector_contract["version"] == 1
+    assert vector_contract["version"] == 2
     classifications = set()
     case_ids = set()
     for vector_case in vector_contract["cases"]:
