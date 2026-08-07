@@ -17,6 +17,7 @@ pub mod provider_graph_v4;
 pub mod rate_schedule_observe;
 pub mod shared_graph;
 pub mod tax_identity;
+pub mod tax_identity_sidecar_bundle;
 pub mod tax_identity_sidecar_pair;
 pub mod tax_identity_sidecar_v1;
 pub mod tax_identity_sidecar_v2;
