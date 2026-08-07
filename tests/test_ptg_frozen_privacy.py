@@ -373,16 +373,8 @@ class _DuplicateCreateDatabase(_CreateDatabase):
         yield _DuplicateCreateConnection(self.existing_run)
 
 
-@pytest.mark.asyncio
-async def test_duplicate_create_route_projects_existing_frozen_run(
-    monkeypatch,
-):
-    """A 409 replay cannot expose the existing run's protected evidence."""
-
-    control_payload = protected_control_payload()
-    control_payload["run_id"] = "run-private-replay"
-    descriptors = control_payload["params"]["frozen_rate_files"]
-    existing_run_by_field = {
+def _existing_frozen_replay(control_payload, descriptors):
+    return {
         "run_id": "run-existing-private",
         "importer": "ptg",
         "status": "running",
@@ -395,6 +387,18 @@ async def test_duplicate_create_route_projects_existing_frozen_run(
             "message": f"reading {descriptors[0]['canonical_url']}",
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_duplicate_create_route_projects_existing_frozen_run(
+    monkeypatch,
+):
+    """A 409 replay cannot expose the existing run's protected evidence."""
+
+    control_payload = protected_control_payload()
+    control_payload["run_id"] = "run-private-replay"
+    descriptors = control_payload["params"]["frozen_rate_files"]
+    existing_run_by_field = _existing_frozen_replay(control_payload, descriptors)
 
     async def compare_binding(_connection, params):
         assert params["frozen_rate_files"] == descriptors
@@ -410,6 +414,16 @@ async def test_duplicate_create_route_projects_existing_frozen_run(
         "insert_or_compare_frozen_binding",
         compare_binding,
     )
+    monkeypatch.setattr(
+        control_imports,
+        "recheck_frozen_binding_on_connection",
+        compare_binding,
+    )
+
+    async def is_ordinary_run(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(control_imports, "is_ptg_wave_owned_run", is_ordinary_run)
 
     response = await control.control_create_import(
         types.SimpleNamespace(

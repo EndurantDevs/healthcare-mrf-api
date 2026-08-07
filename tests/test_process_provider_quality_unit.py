@@ -449,3 +449,11 @@ async def test_process_chunk_passes_test_mode_to_loader(monkeypatch, tmp_path):
 
     assert chunk_result_map["ok"] is True
     assert observed_options_map["test_mode"] is True
+
+
+def test_normalize_helpers_cover_blank_and_digit_fallbacks():
+    assert provider_quality_normalize._to_npi("  ") is None
+    assert provider_quality_normalize._normalize_zcta(" ") is None
+    assert provider_quality_normalize._normalize_zcta("0 1001") == "01001"
+    assert provider_quality_normalize._normalize_zcta("12 3456") == "23456"
+    assert provider_quality_normalize._pick_first({}, "absent") is None

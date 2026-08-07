@@ -37,6 +37,7 @@ from process.ptg_parts.frozen_rate_binding import (
 )
 from process.ptg_parts.frozen_rate_binding_store import (
     insert_or_compare_frozen_binding,
+    recheck_frozen_binding_on_connection,
 )
 from process.ptg_parts.frozen_rate_privacy import (
     frozen_private_scalar_values,
@@ -50,6 +51,13 @@ from process.ptg_parts.ptg_source_attempt_guard import (
     guard_source_attempt,
     require_source_attempt_capabilities,
     source_file_import_id_from_payload,
+)
+from process.ptg_parts.ptg_wave_admission_fence import (
+    PTG_WAVE_FENCED_IMPORTERS,
+    acquire_ptg_admission_lock,
+    is_ptg_wave_owned_run,
+    require_no_capacity_owning_wave,
+    require_not_wave_owned_run,
 )
 
 from db.models import ImportRun, db
@@ -262,6 +270,11 @@ _PTG_CONTROL_QUEUES = frozenset({"arq:PTG", "arq:PTGSmall", "arq:PTGNormal", "ar
 _PTG_FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
 _PTG_FULL_REBUILD_SCOPE_PARAM = "_full_rebuild_scope_digest"
 _PTG_FULL_REBUILD_MARKER_PARAM = "full_rebuild_requested"
+_PTG_EXACT_WAVE_INTERNAL_PARAMS = frozenset({
+    "_wave_id",
+    "_wave_digest",
+    "_wave_job_id",
+})
 _PTG_FULL_REBUILD_SCOPE_DIGEST_DOMAIN = b"PTG2V3FULLREBUILDSCOPE\x01"
 _EPHEMERAL_PARAM_NAMES_BY_IMPORTER = {
     "ptg": frozenset(
@@ -810,6 +823,10 @@ def _import_param_views(
         raise ValueError(
             "PTG full rebuild marker is internal and cannot be supplied"
         )
+    if _PTG_EXACT_WAVE_INTERNAL_PARAMS.intersection(params_by_name):
+        raise ValueError(
+            "PTG exact-wave identity is internal and cannot be supplied"
+        )
     ordinary_params_by_name = {
         name: param_value
         for name, param_value in params_by_name.items()
@@ -851,6 +868,10 @@ def _assert_ptg_rebuild_request_params(
     if _PTG_FULL_REBUILD_MARKER_PARAM in params_by_name:
         raise ValueError(
             "PTG full rebuild marker is internal and cannot be supplied"
+        )
+    if _PTG_EXACT_WAVE_INTERNAL_PARAMS.intersection(params_by_name):
+        raise ValueError(
+            "PTG exact-wave identity is internal and cannot be supplied"
         )
 
 
@@ -1063,6 +1084,11 @@ async def get_import_run(run_id: str) -> dict[str, Any] | None:
 async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
     if run.get("status") not in {"starting", "running", "finalizing"}:
         return run
+    if (
+        str(run.get("importer") or "") == "ptg"
+        and await is_ptg_wave_owned_run(db, str(run.get("run_id") or ""))
+    ):
+        return run
     worker_status = await _active_worker_state(run)
     failed_item = _failed_worker_state_item(worker_status)
     if failed_item is None:
@@ -1149,6 +1175,8 @@ async def finalize_import_run(run_id: str, finalize_payload: dict[str, Any]) -> 
     current_run = await get_import_run(run_id)
     if not current_run:
         return None
+    if str(current_run.get("importer") or "") == "ptg":
+        await require_not_wave_owned_run(db, run_id)
     importer = str(current_run.get("importer") or "").strip()
     if importer not in _FINISH_IMPORTERS:
         raise ValueError(f"importer does not support finalize: {importer}")
@@ -1224,7 +1252,6 @@ async def find_active_runs_by_importer(importer: str) -> list[dict[str, Any]]:
 
 
 _PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY = "import-run-admission:provider-directory-fhir"
-_PTG_SOURCE_FILE_ADMISSION_LOCK_KEY = "import-run-admission:ptg-source-file"
 _PROVIDER_DIRECTORY_ACQUISITION = "acquisition"
 _PROVIDER_DIRECTORY_SCOPED_ARTIFACT = "scoped_artifact"
 _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT = "scoped_relation_artifact"
@@ -1253,6 +1280,31 @@ async def _active_idempotency_run(connection: Any, idempotency_key: str) -> dict
     )
     active_rows = await connection.all(statement)
     return _normalize_connection_run(active_rows[0]) if active_rows else None
+
+
+async def _active_ptg_source_file_replay(
+    connection: Any,
+    source_file_import_id: str,
+) -> dict[str, Any] | None:
+    """Return an active ordinary PTG run for an immutable source replay."""
+
+    statement = (
+        select(ImportRun.__table__)
+        .where(ImportRun.importer == "ptg")
+        .where(ImportRun.source_file_import_id == source_file_import_id)
+        .where(ImportRun.status.in_(ACTIVE_STATUSES))
+        .order_by(ImportRun.created_at.asc())
+        .limit(2)
+    )
+    active_rows = await connection.all(statement)
+    for active_row in active_rows:
+        active_run = _normalize_connection_run(active_row)
+        if not await is_ptg_wave_owned_run(
+            connection,
+            str(active_run.get("run_id") or ""),
+        ):
+            return active_run
+    return None
 
 
 async def _provider_directory_retry_child(connection: Any, retry_of_run_id: str) -> dict[str, Any] | None:
@@ -1646,6 +1698,42 @@ async def _admit_provider_directory_run(import_row: dict[str, Any]) -> dict[str,
     return None
 
 
+async def _locked_ptg_source_replay(
+    connection: Any,
+    import_row: dict[str, Any],
+    *,
+    source_file_import_id: str,
+) -> dict[str, Any] | None:
+    idempotency_key = import_row.get("idempotency_key")
+    if idempotency_key:
+        active_run = await _active_idempotency_run(
+            connection,
+            str(idempotency_key),
+        )
+        if (
+            active_run
+            and not await is_ptg_wave_owned_run(
+                connection,
+                str(active_run.get("run_id") or ""),
+            )
+        ):
+            await recheck_frozen_binding_on_connection(
+                connection,
+                import_row["params"],
+            )
+            return active_run
+    source_replay = await _active_ptg_source_file_replay(
+        connection,
+        source_file_import_id,
+    )
+    if source_replay:
+        await recheck_frozen_binding_on_connection(
+            connection,
+            import_row["params"],
+        )
+    return source_replay
+
+
 async def _admit_ptg_source_file_run(
     import_row: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -1663,25 +1751,23 @@ async def _admit_ptg_source_file_run(
             connection,
             source_file_import_id=source_file_import_id,
         )
-        await connection.scalar(
-            text(
-                "SELECT pg_advisory_xact_lock("
-                "hashtextextended(:lock_key, 0))"
-            ),
-            lock_key=_PTG_SOURCE_FILE_ADMISSION_LOCK_KEY,
+        await acquire_ptg_admission_lock(connection)
+        idempotency_key = import_row.get("idempotency_key")
+        source_replay = await _locked_ptg_source_replay(
+            connection,
+            import_row,
+            source_file_import_id=source_file_import_id,
         )
+        if source_replay:
+            return source_replay
+        # A binding-verified ordinary replay above is read-only. All new work
+        # must clear the exact-wave capacity fence before it can insert a
+        # frozen binding.
+        await require_no_capacity_owning_wave(connection)
         await insert_or_compare_frozen_binding(
             connection,
             import_row["params"],
         )
-        idempotency_key = import_row.get("idempotency_key")
-        if idempotency_key:
-            active_run = await _active_idempotency_run(
-                connection,
-                str(idempotency_key),
-            )
-            if active_run:
-                return active_run
         if not _is_parallel_active_importer_run_allowed(
             "ptg",
             import_row,
@@ -1705,6 +1791,56 @@ async def _admit_ptg_source_file_run(
             ),
             outer_run=import_row,
         )
+    return None
+
+
+async def _admit_wave_fenced_import_run(
+    import_row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Serialize ordinary PTG-family admission against an exact-wave owner."""
+
+    async with db.acquire() as connection:
+        await acquire_ptg_admission_lock(connection)
+        await require_no_capacity_owning_wave(connection)
+        idempotency_key = import_row.get("idempotency_key")
+        if idempotency_key:
+            # Preserve the established public deduplication contract while
+            # holding the shared wave fence; the second in-transaction check
+            # below still closes the ordinary-admission race.
+            existing = await find_active_run_by_idempotency_key(str(idempotency_key))
+            if existing:
+                return existing
+            active_run = await _active_idempotency_run(connection, str(idempotency_key))
+            if active_run:
+                return active_run
+        existing_importer = await find_earliest_active_run_by_importer(
+            str(import_row["importer"])
+        )
+        if existing_importer:
+            return existing_importer
+        active_runs = await _active_importer_runs(
+            connection,
+            str(import_row["importer"]),
+        )
+        if active_runs:
+            return active_runs[0]
+        await connection.status(insert(ImportRun).values(**import_row))
+    return None
+
+
+async def _admit_import_row(
+    importer: str,
+    import_run_values_by_name: dict[str, Any],
+    *,
+    is_ptg_source_file_admission: bool,
+) -> dict[str, Any] | None:
+    if importer == "provider-directory-fhir":
+        return await _admit_provider_directory_run(import_run_values_by_name)
+    if is_ptg_source_file_admission:
+        return await _admit_ptg_source_file_run(import_run_values_by_name)
+    if importer in PTG_WAVE_FENCED_IMPORTERS:
+        return await _admit_wave_fenced_import_run(import_run_values_by_name)
+    await db.execute(insert(ImportRun).values(**import_run_values_by_name))
     return None
 
 
@@ -1841,22 +1977,13 @@ async def create_import_run(
         "retry_of_run_id": retry_of_run_id,
     }
     try:
-        if importer == "provider-directory-fhir":
-            blocking_run = await _admit_provider_directory_run(
-                import_run_values_by_name
-            )
-            if blocking_run:
-                return normalize_run(blocking_run), False
-        elif is_ptg_source_file_admission:
-            blocking_run = await _admit_ptg_source_file_run(
-                import_run_values_by_name
-            )
-            if blocking_run:
-                return normalize_run(blocking_run), False
-        else:
-            await db.execute(
-                insert(ImportRun).values(**import_run_values_by_name)
-            )
+        blocking_run = await _admit_import_row(
+            importer,
+            import_run_values_by_name,
+            is_ptg_source_file_admission=is_ptg_source_file_admission,
+        )
+        if blocking_run:
+            return normalize_run(blocking_run), False
     except IntegrityError:
         if idempotency_key:
             active = await find_active_run_by_idempotency_key(idempotency_key)
@@ -2247,6 +2374,8 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
     current = await get_import_run(run_id)
     if not current:
         return None
+    if str(current.get("importer") or "") == "ptg":
+        await require_not_wave_owned_run(db, run_id)
     if current.get("status") in TERMINAL_STATUSES:
         return current
     if current.get("status") != "queued" and not _supports_active_cancel(str(current.get("importer") or "")):
@@ -2601,6 +2730,8 @@ async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[s
     current = await get_import_run(run_id)
     if not current:
         return None
+    if str(current.get("importer") or "") == "ptg":
+        await require_not_wave_owned_run(db, run_id)
     retry_params = payload.get("retry_params") if isinstance(payload.get("retry_params"), dict) else {}
     child_run_payload_map = {
         "importer": current["importer"],

@@ -6,7 +6,6 @@ import asyncio
 import datetime as dt
 import os
 import uuid
-from contextlib import contextmanager
 from typing import Any
 
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
@@ -25,27 +24,10 @@ from process.ptg import (
     full_rebuild_failure_metrics,
     main as ptg_main,
 )
-from process.ptg_parts.config import (
-    PTG2_FILE_PROCESS_CONCURRENCY_ENV,
-    PTG2_MANIFEST_MERGE_CHUNK_BYTES_ENV,
-    PTG2_MANIFEST_MERGE_SORT_WORKERS_ENV,
-    PTG2_RUST_EVENT_QUEUE_ENV,
-    PTG2_RUST_PARSE_IN_WORKERS_ENV,
-    PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS_ENV,
-    PTG2_RUST_PROVIDER_REF_QUEUE_ENV,
-    PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES_ENV,
-    PTG2_RUST_PROVIDER_REF_WORKERS_ENV,
-    PTG2_RUST_PROVIDER_REFS_IN_WORKERS_ENV,
-    PTG2_RUST_RAPIDGZIP_THREADS_ENV,
-    PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV,
-    PTG2_RUST_TOP_LEVEL_BYTE_SCAN_ENV,
-    PTG2_RUST_RAW_CHUNK_BYTES_ENV,
-    PTG2_RUST_WORK_QUEUE_ENV,
-    PTG2_RUST_WORKERS_ENV,
-)
 from process.ptg_parts.ptg_source_worker_admission import (
     guard_ptg_worker_start,
 )
+from process.ptg_wave_claims import claim_wave_job_start, reconcile_wave_claim_exception
 from process.ptg_frozen_control import (
     frozen_rate_main_kwargs,
     validated_worker_frozen_rate_params,
@@ -56,6 +38,15 @@ from process.ptg_control_runtime import (
     _stale_ptg_job_result,
     _start_threaded_ptg_heartbeat,
     _stop_threaded_ptg_heartbeat,
+)
+from process.ptg_control_environment import (
+    PTG2_RUST_WORKERS_ENV,
+    _optional_int,
+    _ptg_lane_environment,
+    _string_list,
+)
+from process.ptg_wave_worker_claim_adapter import (
+    exact_wave_claim_values as _exact_wave_claim_values,
 )
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
 _FULL_REBUILD_TOKEN_PARAM = "_full_rebuild_token"
@@ -75,12 +66,43 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         timespec="microseconds"
     )
     attempt_id = f"{run_id}:{uuid.uuid4().hex}" if run_id else None
+    claim_attempt_token = uuid.uuid4().hex
+    try:
+        await _claim_exact_wave_worker_start(
+            ctx,
+            params_by_name,
+            run_id=run_id,
+            claim_attempt_token=claim_attempt_token,
+        )
+    except Exception as exc:
+        reconciliation = None
+        if _is_complete_exact_wave_payload(params_by_name):
+            # Reconcile only a fully revalidated exact identity.  A malformed
+            # or mismatched worker context must not be allowed to terminalize
+            # an admitted intent merely by presenting its run id.
+            reconciliation = await _reconcile_exact_wave_claim_exception(
+                ctx,
+                params_by_name,
+                run_id=run_id,
+                claim_attempt_token=claim_attempt_token,
+            )
+        if not (
+            reconciliation is not None
+            and reconciliation.status == "claimed"
+            and reconciliation.same_attempt
+        ):
+            raise
     admission_failure = await guard_ptg_worker_start(
         task_payload,
         run_id=run_id,
         attempt_id=attempt_id,
     )
     if admission_failure is not None:
+        if _is_complete_exact_wave_payload(params_by_name):
+            await _mark_exact_wave_preexecution_failure(
+                run_id,
+                reason=str(admission_failure.get("reason") or "source admission failed"),
+            )
         return admission_failure
     stale_result = await _stale_ptg_job_result(run_id)
     if stale_result is not None:
@@ -325,6 +347,85 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     return {**result_metrics_by_name, "status": "succeeded", "run_id": run_id}
 
 
+async def _claim_exact_wave_worker_start(
+    ctx: Any,
+    params_by_name: dict[str, Any],
+    *,
+    run_id: str,
+    claim_attempt_token: str,
+) -> None:
+    """Bind a released wave job to its attested Pod before source admission."""
+
+    claim_field_map = _exact_wave_claim_values(
+        ctx, params_by_name, run_id=run_id, claim_attempt_token=claim_attempt_token,
+    )
+    if claim_field_map is None:
+        return
+    await claim_wave_job_start(**claim_field_map)
+
+
+async def _reconcile_exact_wave_claim_exception(
+    ctx: Any,
+    params_by_name: dict[str, Any],
+    *,
+    run_id: str,
+    claim_attempt_token: str,
+) -> Any | None:
+    """Persist a valid claim rejection; leave malformed identities untouched."""
+
+    try:
+        claim_field_map = _exact_wave_claim_values(
+            ctx, params_by_name, run_id=run_id, claim_attempt_token=claim_attempt_token,
+        )
+    except Exception:
+        return None
+    if claim_field_map is None:
+        return None
+    try:
+        resolution = await reconcile_wave_claim_exception(**claim_field_map)
+    except Exception:
+        # The original claim exception remains authoritative.  Do not guess
+        # whether a failed reconciliation committed anything or issue a retry.
+        return
+    if resolution.status == "rejected":
+        await _flush_terminal_status_events()
+    return resolution
+
+
+def _is_complete_exact_wave_payload(params_by_name: dict[str, Any]) -> bool:
+    return all(
+        isinstance(params_by_name.get(name), str)
+        and bool(params_by_name[name])
+        and params_by_name[name] == params_by_name[name].strip()
+        for name in ("_wave_id", "_wave_digest", "_wave_job_id")
+    )
+
+
+async def _mark_exact_wave_preexecution_failure(
+    run_id: str,
+    *,
+    reason: str,
+    error: BaseException | None = None,
+) -> None:
+    """Make a one-shot wave start rejection terminal instead of leaking capacity."""
+
+    message = str(reason or "worker start failed").strip() or "worker start failed"
+    if error is not None and str(error).strip():
+        message = f"{message}: {str(error).strip()}"
+    await mark_control_run(
+        run_id,
+        status="failed",
+        phase_detail="PTG exact-wave worker start failed",
+        progress_message="failed",
+        error={
+            "code": "ptg_exact_wave_worker_start_failed",
+            "message": message,
+            "retryable": False,
+        },
+    )
+    await _flush_terminal_status_events()
+
+
 async def _flush_terminal_status_events() -> None:
     timeout = float(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS", "0.25"))
     if timeout <= 0:
@@ -394,85 +495,3 @@ def _build_rebuild_terminal_metrics_by_name(
         **full_rebuild_failure_metrics(error),
         **policy_metrics_by_name,
     }
-
-
-@contextmanager
-def _ptg_lane_environment(params: dict[str, Any]):
-    lane_environment_by_name = {
-        PTG2_RUST_WORKERS_ENV: _optional_env_value(params.get("_scanner_rust_workers")),
-        PTG2_RUST_RAPIDGZIP_THREADS_ENV: _optional_env_value(
-            params.get("_scanner_rapidgzip_threads")
-        ),
-        PTG2_RUST_PARSE_IN_WORKERS_ENV: _bool_env_value(params.get("_scanner_parse_in_workers")),
-        PTG2_RUST_TOP_LEVEL_BYTE_SCAN_ENV: _bool_env_value(params.get("_scanner_top_level_byte_scan")),
-        PTG2_RUST_WORK_QUEUE_ENV: _optional_env_value(params.get("_scanner_work_queue")),
-        PTG2_RUST_EVENT_QUEUE_ENV: _optional_env_value(params.get("_scanner_event_queue")),
-        PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV: _optional_env_value(
-            params.get("_scanner_split_negotiated_rates")
-        ),
-        PTG2_RUST_RAW_CHUNK_BYTES_ENV: _optional_env_value(params.get("_scanner_raw_chunk_bytes")),
-        PTG2_RUST_PROVIDER_REFS_IN_WORKERS_ENV: _bool_env_value(
-            params.get("_scanner_provider_refs_in_workers")
-        ),
-        PTG2_RUST_PROVIDER_REF_WORKERS_ENV: _optional_env_value(params.get("_scanner_provider_ref_workers")),
-        PTG2_RUST_PROVIDER_REF_QUEUE_ENV: _optional_env_value(params.get("_scanner_provider_ref_queue")),
-        PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS_ENV: _optional_env_value(
-            params.get("_scanner_provider_ref_chunk_items")
-        ),
-        PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES_ENV: _optional_env_value(
-            params.get("_scanner_provider_ref_raw_chunk_bytes")
-        ),
-        PTG2_MANIFEST_MERGE_CHUNK_BYTES_ENV: _optional_env_value(
-            params.get("_manifest_merge_chunk_bytes")
-        ),
-        PTG2_MANIFEST_MERGE_SORT_WORKERS_ENV: _optional_env_value(
-            params.get("_manifest_merge_sort_workers")
-        ),
-        PTG2_FILE_PROCESS_CONCURRENCY_ENV: _optional_env_value(params.get("_file_process_concurrency")),
-    }
-    previous_environment_by_name: dict[str, str | None] = {}
-    try:
-        for name, environment_value in lane_environment_by_name.items():
-            if environment_value is None:
-                continue
-            previous_environment_by_name[name] = os.environ.get(name)
-            os.environ[name] = environment_value
-        yield
-    finally:
-        for name, environment_value in previous_environment_by_name.items():
-            if environment_value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = environment_value
-
-
-def _optional_env_value(value: Any) -> str | None:
-    if value is None or value == "":
-        return None
-    return str(value)
-
-
-def _bool_env_value(value: Any) -> str | None:
-    if value is None or value == "":
-        return None
-    return "true" if str(value).strip().lower() in {"1", "true", "yes", "on"} else "false"
-
-
-def _string_list(value: Any) -> list[str] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        return [text] if text else None
-    if isinstance(value, (list, tuple)):
-        normalized_values = [
-            str(item).strip() for item in value if str(item).strip()
-        ]
-        return normalized_values or None
-    return None
-
-
-def _optional_int(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    return int(value)

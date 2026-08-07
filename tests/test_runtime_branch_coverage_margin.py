@@ -364,6 +364,16 @@ async def test_ptg_admission_returns_existing_idempotent_run(
     )
     monkeypatch.setattr(
         control_imports,
+        "recheck_frozen_binding_on_connection",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        control_imports,
+        "is_ptg_wave_owned_run",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        control_imports,
         "_active_idempotency_run",
         AsyncMock(return_value=existing_run_map),
     )

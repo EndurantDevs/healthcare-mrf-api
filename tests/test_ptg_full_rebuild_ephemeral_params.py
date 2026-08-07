@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import hashlib
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 import uuid
 
@@ -14,12 +15,34 @@ _REBUILD_TOKEN = "123e4567-e89b-42d3-a456-426614174000"
 _SECOND_REBUILD_TOKEN = "223e4567-e89b-42d3-a456-426614174000"
 
 
+class _RecordingConnection:
+    """Transaction-capable recorder for PTG admission fencing."""
+
+    def __init__(self, database):
+        self.database = database
+
+    async def scalar(self, *_args, **_kwargs):
+        # The recorder has no wave migration, so its table probe sees no
+        # capacity owner.  The advisory-lock result itself is ignored.
+        return None
+
+    async def all(self, *_args, **_kwargs):
+        return []
+
+    async def status(self, statement, *_args, **_kwargs):
+        self.database.statements.append(statement)
+
+
 class _RecordingDatabase:
     def __init__(self):
         self.statements = []
 
     async def execute(self, statement):
         self.statements.append(statement)
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield _RecordingConnection(self)
 
 
 class _RecordingRedis:
@@ -275,6 +298,15 @@ async def test_ptg_retry_rejects_rebuild_control(
 
     monkeypatch.setattr(control_imports, "get_import_run", get_prior_run)
     monkeypatch.setattr(control_imports, "create_import_run", capture_create)
+
+    async def not_wave_owned(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        control_imports,
+        "require_not_wave_owned_run",
+        not_wave_owned,
+    )
 
     with pytest.raises(
         ValueError,

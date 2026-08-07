@@ -1,0 +1,127 @@
+"""Control routes and lifecycle hooks for exact PTGSmall waves."""
+
+from __future__ import annotations
+
+from sanic import response
+from sanic.exceptions import BadRequest, NotFound, SanicException
+
+from api.control_auth import require_control_auth
+from api.control_import_waves import (
+    ImportWaveConflict,
+    admit_import_wave,
+    get_import_wave,
+)
+from process.ptg_parts.ptg_wave_admission_fence import PTGWaveCapacityConflict
+from process.ptg_wave_controller import (
+    start_ptg_wave_controller,
+    stop_ptg_wave_controller,
+)
+from process.ptg_wave_outcomes import (
+    PTGWaveOutcomeConflict,
+    get_wave_outcomes_page,
+    record_linkage_ack,
+)
+from process.ptg_wave_state import get_wave_receipts
+
+
+async def control_start_ptg_wave_controller(app, _loop):
+    """Start the fail-closed reconciler only when explicitly enabled."""
+
+    await start_ptg_wave_controller(app)
+
+
+async def control_stop_ptg_wave_controller(app, _loop):
+    """Stop the exact-wave reconciler before the control server exits."""
+
+    await stop_ptg_wave_controller(app)
+
+
+async def control_admit_import_wave(request):
+    """Record a signed exact-wave admission without publishing it."""
+
+    require_control_auth(request)
+    try:
+        wave, created = await admit_import_wave(request.json)
+    except (ImportWaveConflict, PTGWaveCapacityConflict) as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(wave, status=201 if created else 200, default=str)
+
+
+async def control_get_import_wave(request, wave_id: str):
+    """Return one durable wave without advancing reconciliation."""
+
+    require_control_auth(request)
+    try:
+        wave = await get_import_wave(wave_id)
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    if wave is None:
+        raise NotFound("import wave not found")
+    return response.json(wave, default=str)
+
+
+async def control_get_import_wave_outcomes(request, wave_id: str):
+    """Return one immutable all-N outcome page for GET-only recovery."""
+
+    require_control_auth(request)
+    raw_after = request.args.get("after_ordinal")
+    raw_limit = request.args.get("limit")
+    try:
+        after_ordinal = int(raw_after) if raw_after is not None else None
+        limit = int(raw_limit) if raw_limit is not None else 200
+        payload = await get_wave_outcomes_page(
+            wave_id,
+            after_ordinal=after_ordinal,
+            limit=limit,
+        )
+    except (TypeError, ValueError, PTGWaveOutcomeConflict) as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(payload, default=str)
+
+
+async def control_record_import_wave_linkage(request, wave_id: str):
+    """Persist one signed all-N source-linkage acknowledgement."""
+
+    require_control_auth(request)
+    payload = request.json if isinstance(request.json, dict) else {}
+    if set(payload) != {"linkage_ack"}:
+        raise BadRequest("request must contain only linkage_ack")
+    try:
+        digest = await record_linkage_ack(wave_id, payload["linkage_ack"])
+    except PTGWaveOutcomeConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    return response.json({"wave_id": wave_id, "linkage_ack_digest": digest})
+
+
+async def control_get_import_wave_proof(request, wave_id: str):
+    """Return durable controller receipts without reconciling the wave."""
+
+    require_control_auth(request)
+    proof = await get_wave_receipts(wave_id)
+    if proof is None:
+        raise NotFound("import wave not found")
+    return response.json(proof, default=str)
+
+
+def register_control_wave_routes(blueprint):
+    """Register exact-wave endpoints and controller lifecycle hooks."""
+
+    blueprint.listener("after_server_start")(control_start_ptg_wave_controller)
+    blueprint.listener("before_server_stop")(control_stop_ptg_wave_controller)
+    blueprint.post("/import-waves")(control_admit_import_wave)
+    blueprint.get("/import-waves/<wave_id>")(control_get_import_wave)
+    blueprint.get("/import-waves/<wave_id>/outcomes")(
+        control_get_import_wave_outcomes
+    )
+    blueprint.post("/import-waves/<wave_id>/linkage-ack")(
+        control_record_import_wave_linkage
+    )
+    blueprint.get("/import-waves/<wave_id>/proof")(
+        control_get_import_wave_proof
+    )
+    return blueprint
+
+
+__all__ = ["register_control_wave_routes"]

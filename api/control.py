@@ -25,6 +25,7 @@ from api.control_frozen_rate_files import (
 )
 from api.control_workers import guarded_ensure_worker, worker_registry
 from api.control_auth import require_control_auth as _require_control_auth
+from api.control_wave_routes import register_control_wave_routes
 from api.control_ptg_source_attempt_errors import (
     register_source_attempt_error_handler,
 )
@@ -59,14 +60,13 @@ from process.ptg_parts.source_snapshot_control import (
     retire_ptg2_source_snapshot,
 )
 
-blueprint = Blueprint("control", url_prefix="/control/v1")
+blueprint = register_control_wave_routes(Blueprint("control", url_prefix="/control/v1"))
 register_source_attempt_error_handler(blueprint)
 register_source_snapshot_rollback_route(blueprint)
 register_v4_control_routes(blueprint)
 register_uhc_provider_file_catalog_routes(blueprint)
 register_profile_selection_route(blueprint)
 register_profile_capacity_preflight_route(blueprint)
-logger = logging.getLogger(__name__)
 
 
 @blueprint.listener("before_server_start")
@@ -102,7 +102,7 @@ async def control_provider_directory_sources(request):
     try:
         catalog = await enrich_provider_directory_source_catalog(catalog)
     except Exception:
-        logger.warning(
+        logging.getLogger(__name__).warning(
             "Provider Directory outcome enrichment failed; returning static catalog",
             exc_info=True,
         )
