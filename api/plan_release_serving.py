@@ -127,9 +127,10 @@ class PlanReleaseServingSelection:
     release_status: str
     binding_set_digest: str
     bindings: tuple[PlanReleaseSnapshotBinding, ...]
-    _validated_serving_tables: tuple[
-        tuple[str, PTG2ServingTables], ...
-    ] = field(default=(), repr=False, compare=False)
+    _validated_serving_tables: tuple[tuple[str, PTG2ServingTables], ...] = field(
+        default=(), repr=False, compare=False
+    )
+    _includes_billing_tax_identity_source: bool = field(default=False, repr=False, compare=False)
 
     def bindings_for_role(
         self,
@@ -183,9 +184,7 @@ class PlanReleaseServingSelection:
             None,
         )
 
-    def network_tables_by_snapshot(
-        self,
-    ) -> dict[str, PTG2ServingTables] | None:
+    def network_tables_by_snapshot(self) -> dict[str, PTG2ServingTables] | None:
         """Return complete readiness descriptors or fail a partial release."""
 
         serving_tables_by_snapshot_id = dict(
@@ -204,6 +203,11 @@ class PlanReleaseServingSelection:
         ):
             return None
         return serving_tables_by_snapshot_id
+
+    @property
+    def includes_billing_tax_identity_source(self) -> bool:
+        """Prove descriptors were loaded with source-publication metadata."""
+        return self._includes_billing_tax_identity_source is True
 
     def response_metadata(self) -> dict[str, Any]:
         """Return canonical coordinates suitable for a pricing response."""
@@ -391,20 +395,22 @@ def _selection_from_rows(
 async def _is_release_binding_set_serving_ready(
     session: Any,
     selection: PlanReleaseServingSelection,
-    validated_serving_tables_by_snapshot_id: dict[
-        str, PTG2ServingTables
-    ],
+    validated_serving_tables_by_snapshot_id: dict[str, PTG2ServingTables],
+    *,
+    include_billing_tax_identity_source: bool = False,
 ) -> bool:
     """Require every frozen binding to pass the normal PTG2 serving guard."""
 
     try:
         for binding in selection.bindings:
+            readiness_options_by_name: dict[str, Any] = {}
+            if include_billing_tax_identity_source:
+                readiness_options_by_name["include_billing_tax_identity_source"] = True
             if not await is_release_binding_serving_ready(
                 session,
                 binding,
-                validated_serving_tables_by_snapshot_id=(
-                    validated_serving_tables_by_snapshot_id
-                ),
+                validated_serving_tables_by_snapshot_id=validated_serving_tables_by_snapshot_id,
+                **readiness_options_by_name,
             ):
                 return False
     except PTG2ManifestArtifactError:
@@ -415,9 +421,13 @@ async def _is_release_binding_set_serving_ready(
 async def resolve_plan_release_serving(
     session: Any,
     plan_release_id: Any,
+    *,
+    include_billing_tax_identity_source: bool = False,
 ) -> PlanReleaseServingSelection | None:
-    """Load one exact, complete, pinned release without any current fallback."""
+    """Load one exact, complete, optionally source-aware pinned release."""
 
+    if type(include_billing_tax_identity_source) is not bool:
+        return None
     normalized_release_id = normalize_plan_release_id(plan_release_id)
     if normalized_release_id is None:
         return None
@@ -441,18 +451,15 @@ async def resolve_plan_release_serving(
         session,
         selection,
         validated_serving_tables_by_snapshot_id,
+        include_billing_tax_identity_source=include_billing_tax_identity_source,
     ):
         return None
     resolved_selection = replace(
         selection,
-        _validated_serving_tables=tuple(
-            validated_serving_tables_by_snapshot_id.items()
-        ),
+        _validated_serving_tables=tuple(validated_serving_tables_by_snapshot_id.items()),
+        _includes_billing_tax_identity_source=include_billing_tax_identity_source,
     )
-    if (
-        resolved_selection.network_tables_by_snapshot()
-        is None
-    ):
+    if resolved_selection.network_tables_by_snapshot() is None:
         return None
     return resolved_selection
 

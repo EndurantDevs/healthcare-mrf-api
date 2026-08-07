@@ -134,9 +134,12 @@ async def is_release_binding_serving_ready(
     validated_serving_tables_by_snapshot_id: MutableMapping[
         str, PTG2ServingTables
     ] | None = None,
+    include_billing_tax_identity_source: bool = False,
 ) -> bool:
     """Validate selectors, strict V3 tables, scope, and role artifacts."""
 
+    if type(include_billing_tax_identity_source) is not bool:
+        return False
     if binding.role == "allowed_amounts":
         return await has_allowed_amount_binding_coverage(session, binding)
     if binding.role != "in_network":
@@ -150,7 +153,14 @@ async def is_release_binding_serving_ready(
     )
     if resolved_snapshot_id != binding.snapshot_id:
         return False
-    serving_tables = await snapshot_serving_tables(session, binding.snapshot_id)
+    if include_billing_tax_identity_source:
+        serving_tables = await snapshot_serving_tables(
+            session,
+            binding.snapshot_id,
+            include_billing_tax_identity_source=True,
+        )
+    else:
+        serving_tables = await snapshot_serving_tables(session, binding.snapshot_id)
     if (
         str(serving_tables.snapshot_id or "").strip() != binding.snapshot_id
         or not serving_tables.uses_shared_blocks
