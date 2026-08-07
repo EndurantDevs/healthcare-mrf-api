@@ -372,4 +372,3 @@ def _expected_redis_release_mapping(
         "ready_slots": ready_slots,
         "ready_slots_digest": sha256_digest(canonical_json(ready_slots)),
     }
-
