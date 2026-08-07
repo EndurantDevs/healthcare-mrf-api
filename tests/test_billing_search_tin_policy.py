@@ -157,3 +157,60 @@ def test_public_module_contains_no_secret_material(tmp_path):
     encoded_secret = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii")
     assert encoded_secret not in repr(policy)
     assert encoded_secret not in repr(billing_search_tin_policy)
+
+
+def test_loader_failure_drops_environment_document_from_traceback_frames() -> None:
+    marker = "synthetic-policy-traceback-marker"
+    raw_document = json.dumps(
+        {
+            "contract": (
+                billing_search_tin_policy.BILLING_SEARCH_TIN_POLICY_FILES_CONTRACT
+            ),
+            "policies": [
+                {
+                    "secret_file": f"/tmp/{marker}",
+                    "token_policy_id": POLICY_ID,
+                }
+            ],
+        }
+    )
+    environment_by_name = {
+        billing_search_tin_policy.BILLING_SEARCH_TIN_POLICY_FILES_ENV: (
+            raw_document
+        )
+    }
+
+    with pytest.raises(
+        billing_search_tin_policy.BillingSearchTinPolicyError
+    ) as captured:
+        billing_search_tin_policy.load_billing_search_tin_policy(
+            POLICY_ID,
+            environment_by_name,
+        )
+
+    traceback = captured.value.__traceback__
+    loader_locals = []
+    while traceback is not None:
+        if traceback.tb_frame.f_globals.get("__name__") == (
+            "api.billing_search_tin_policy"
+        ):
+            loader_locals.append(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+    assert loader_locals
+    assert captured.value.__context__ is None
+    assert all(
+        all(
+            retained is not environment_by_name and retained is not raw_document
+            for retained in local_values.values()
+        )
+        and marker not in repr(local_values)
+        for local_values in loader_locals
+    )
+
+
+def test_loader_rejects_nonmapping_environment_without_retention() -> None:
+    with pytest.raises(billing_search_tin_policy.BillingSearchTinPolicyError):
+        billing_search_tin_policy.load_billing_search_tin_policy(
+            POLICY_ID,
+            object(),
+        )

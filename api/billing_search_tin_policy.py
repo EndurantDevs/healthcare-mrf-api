@@ -129,12 +129,17 @@ def _load_projector(policy_id: str, secret_file: str) -> TinTokenProjector:
         raise _fail() from None
 
 
-def load_billing_search_tin_policy(
+def _loaded_projector_or_none(
     token_policy_id: object,
-    environment_map: Mapping[str, str] | None = None,
-) -> TinTokenProjector:
-    """Load one explicitly configured policy without exposing secret paths."""
+    environment_map: Mapping[str, str] | None,
+) -> TinTokenProjector | None:
+    """Contain configuration failures before a public exception is created."""
 
+    canonical_policy_id = None
+    environment = None
+    raw_document = None
+    policy_files = None
+    secret_file = None
     try:
         canonical_policy_id = canonical_token_policy_id(token_policy_id)
         environment = os.environ if environment_map is None else environment_map
@@ -146,10 +151,31 @@ def load_billing_search_tin_policy(
         if secret_file is None:
             raise _fail()
         return _load_projector(canonical_policy_id, secret_file)
-    except BillingSearchTinPolicyError:
-        raise
-    except (TinNpiConnectorError, TypeError, ValueError):
-        raise _fail() from None
+    except Exception:
+        return None
+    finally:
+        del (
+            canonical_policy_id,
+            environment,
+            environment_map,
+            policy_files,
+            raw_document,
+            secret_file,
+            token_policy_id,
+        )
+
+
+def load_billing_search_tin_policy(
+    token_policy_id: object,
+    environment_map: Mapping[str, str] | None = None,
+) -> TinTokenProjector:
+    """Load one policy without retaining configuration in failure frames."""
+
+    projector = _loaded_projector_or_none(token_policy_id, environment_map)
+    del token_policy_id, environment_map
+    if projector is None:
+        raise _fail()
+    return projector
 
 
 __all__ = [
