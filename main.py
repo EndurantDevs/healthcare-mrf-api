@@ -216,6 +216,53 @@ def sync_structure(skip_columns: bool, skip_indexes: bool):
     render_sync_summary(results)
 
 
+@manage.command("verify-formulary-fhir")
+@click.option("--source-id", required=True, help="Exact registered source id.")
+@click.option("--run-id", required=True, help="Globally unique stable run id.")
+@click.option("--cutoff", required=True, help="Timezone-aware exact census cutoff.")
+@click.option(
+    "--timeout-seconds",
+    required=True,
+    type=click.IntRange(1, 604_800),
+    help="Whole synchronization timeout, from 1 second through 7 days.",
+)
+def verify_formulary_fhir(
+    source_id: str,
+    run_id: str,
+    cutoff: str,
+    timeout_seconds: int,
+) -> None:
+    """Run the default-off, source-locked, verify-only formulary adapter."""
+
+    from process.formulary_fhir.manual_worker import ManualSynchronizationError
+    from process.formulary_fhir.manual_worker import manual_result_json
+    from process.formulary_fhir.manual_worker import (
+        synchronize_verified_dataset_manually,
+    )
+
+    try:
+        synchronization_result = _run_async(
+            synchronize_verified_dataset_manually(
+                source_id=source_id,
+                run_id=run_id,
+                cutoff=cutoff,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+        rendered_result = manual_result_json(synchronization_result)
+    except ManualSynchronizationError as error:
+        raise click.ClickException(str(error)) from None
+    except TimeoutError:
+        raise click.ClickException(
+            "FHIR formulary manual synchronization timed out"
+        ) from None
+    except Exception:
+        raise click.ClickException(
+            "FHIR formulary manual synchronization failed"
+        ) from None
+    click.echo(rendered_result)
+
+
 @manage.command("rebuild-plan-summary")
 @click.option("--test", is_flag=True, help="Use the test database suffix defined via HLTHPRT_TEST_DATABASE_SUFFIX.")
 def rebuild_plan_summary(test: bool):
