@@ -18,6 +18,12 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from process.ptg_parts.ptg2_tax_identity_source_copy import _ProjectionCopyLease
 
+from process.ptg_parts.ptg2_tax_identity_source_binding_vector import (
+    PTG2_TAX_IDENTITY_SOURCE_BINDING_VECTOR_CONTRACT,
+    TaxIdentitySourceBindingVectorError,
+    tax_identity_source_binding_vector_digest,
+)
+
 PTG2_TAX_IDENTITY_SOURCE_CONTRACT = "ptg2_provider_group_tax_identity_source_v1"
 PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT = (
     "ptg2_provider_group_tax_identity_source_content_v1"
@@ -208,6 +214,24 @@ class PreparedTaxIdentitySourceProjection:
 
         return sum(binding.artifact_byte_count for binding in self.bindings)
 
+    @property
+    def binding_vector_digest(self) -> bytes:
+        """Return the digest of every value destined for binding storage."""
+
+        try:
+            return tax_identity_source_binding_vector_digest(
+                binding.persisted_values(
+                    snapshot_key=0,
+                    token_policy_id=self.token_policy_id,
+                    token_policy_descriptor_sha256=(
+                        self.token_policy_descriptor_sha256
+                    ),
+                )
+                for binding in self.bindings
+            )
+        except TaxIdentitySourceBindingVectorError:
+            raise _fail() from None
+
     def cleanup(self) -> None:
         """Best-effort close only this attempt's anonymous COPY descriptor."""
 
@@ -236,6 +260,7 @@ class TaxIdentitySourcePublication:
     unsupported_type_count: int
     content_digest: bytes
     artifact_byte_count: int
+    binding_vector_digest: bytes
 
     def as_dict(self) -> dict[str, object]:
         """Return pathless sealed-manifest metadata for this publication."""
@@ -244,6 +269,9 @@ class TaxIdentitySourcePublication:
             "contract": PTG2_TAX_IDENTITY_SOURCE_CONTRACT,
             "content_contract": PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT,
             "binding_contract": PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT,
+            "binding_vector_contract": (
+                PTG2_TAX_IDENTITY_SOURCE_BINDING_VECTOR_CONTRACT
+            ),
             "token_policy_id": self.token_policy_id,
             "token_policy_descriptor_sha256": (
                 self.token_policy_descriptor_sha256.hex()
@@ -257,6 +285,7 @@ class TaxIdentitySourcePublication:
             "unsupported_type_count": self.unsupported_type_count,
             "content_digest": self.content_digest.hex(),
             "artifact_byte_count": self.artifact_byte_count,
+            "binding_vector_digest": self.binding_vector_digest.hex(),
         }
 
 

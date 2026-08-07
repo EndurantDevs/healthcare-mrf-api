@@ -34,6 +34,7 @@ from process.ptg_parts.ptg2_tax_identity_source_projection import (
     _strict_policy,
     _validated_bindings,
 )
+from process.ptg_parts import ptg2_tax_identity_source_files as source_files
 
 _CONTENT_DOMAIN = b"PTG2TAXSOURCECONTENT\x01"
 _PG_COPY_HEADER = b"PGCOPY\n\xff\r\n\0" + struct.pack(">II", 0, 0)
@@ -134,34 +135,6 @@ def _open_source_sidecar(
         if descriptor is not None:
             with suppress(OSError):
                 os.close(descriptor)
-
-
-def _is_source_unchanged(
-    sidecar_file: BinaryIO,
-    source_path: Path,
-    expected_metadata: os.stat_result,
-) -> bool:
-    try:
-        opened_metadata = os.fstat(sidecar_file.fileno())
-        current_metadata = os.lstat(source_path)
-        return (
-            stat.S_ISREG(opened_metadata.st_mode)
-            and stat.S_ISREG(current_metadata.st_mode)
-            and opened_metadata.st_dev
-            == expected_metadata.st_dev
-            == current_metadata.st_dev
-            and opened_metadata.st_ino
-            == expected_metadata.st_ino
-            == current_metadata.st_ino
-            and opened_metadata.st_size
-            == expected_metadata.st_size
-            == current_metadata.st_size
-            and opened_metadata.st_mtime_ns
-            == expected_metadata.st_mtime_ns
-            == current_metadata.st_mtime_ns
-        )
-    except Exception:
-        return False
 
 
 def _hash_binding(content_digest: Any, binding: _SourceBinding) -> None:
@@ -286,7 +259,11 @@ def _parse_source_sidecar(
         if not (
             has_expected_digest
             and has_expected_counts
-            and _is_source_unchanged(sidecar_file, binding.path, path_metadata)
+            and source_files.is_source_file_unchanged(
+                sidecar_file,
+                binding.path,
+                path_metadata,
+            )
         ):
             raise _fail()
         return counts_by_state
