@@ -35,7 +35,7 @@ BILLING_SELECTOR_STATES = frozenset(
         BILLING_SELECTOR_PROJECTION_UNAVAILABLE,
     }
 )
-BILLING_SELECTOR_KINDS = frozenset({"tax_identity", "billing_entity_ref"})
+BILLING_SELECTOR_KINDS = frozenset({"billing_entity_ref"})
 _SHA256_HEX_CHARACTERS = frozenset("0123456789abcdef")
 
 
@@ -193,18 +193,16 @@ class BillingSearchSelectorResolution:
     """Resolved scope plus a pseudonymous future-cursor binding."""
 
     selector_scope: BillingSearchSelectorScope
-    selector_scope_sha256: str | None
+    selector_scope_sha256: str
 
     def __post_init__(self) -> None:
         digest = self.selector_scope_sha256
-        if type(self.selector_scope) is not BillingSearchSelectorScope or (
-            digest is not None
-            and (
-                type(digest) is not str
-                or len(digest) != 64
-                or any(character not in _SHA256_HEX_CHARACTERS for character in digest)
-                or digest == "0" * 64
-            )
+        if (
+            type(self.selector_scope) is not BillingSearchSelectorScope
+            or type(digest) is not str
+            or len(digest) != 64
+            or any(character not in _SHA256_HEX_CHARACTERS for character in digest)
+            or digest == "0" * 64
         ):
             raise serving_unavailable()
 

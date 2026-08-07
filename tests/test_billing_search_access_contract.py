@@ -57,7 +57,7 @@ def _journal(context=None, **overrides):
     journal_fields_by_name = {
         "generation_bundle_sha256": _sha256("sealed-generation-bundle"),
         "request_shape_sha256": _sha256("safe-request-shape"),
-        "selector_kind": "tax_identity",
+        "selector_kind": "billing_entity_ref",
         "decision": "authorized",
         "trusted_observed_at": NOW,
         "duration_us": 1234,
@@ -337,7 +337,7 @@ def test_journal_record_is_closed_pseudonymous_and_deterministic():
         "plan_entitlement_sha256": context.plan_entitlement_sha256,
         "generation_bundle_sha256": _sha256("sealed-generation-bundle"),
         "request_shape_sha256": _sha256("safe-request-shape"),
-        "selector_kind": "tax_identity",
+        "selector_kind": "billing_entity_ref",
         "decision": "authorized",
         "observed_at": NOW,
         "duration_us": 1234,
@@ -361,14 +361,12 @@ def test_journal_record_is_closed_pseudonymous_and_deterministic():
         assert forbidden not in serialized
 
 
-@pytest.mark.parametrize("selector_kind", ("tax_identity", "billing_entity_ref"))
 @pytest.mark.parametrize(
     "decision",
     ("authorized", "denied", "rate_limited", "unavailable"),
 )
 @pytest.mark.parametrize("detailed_provenance", (False, True))
 def test_journal_accepts_only_fixed_low_cardinality_values(
-    selector_kind,
     decision,
     detailed_provenance,
 ):
@@ -377,7 +375,7 @@ def test_journal_accepts_only_fixed_low_cardinality_values(
     )
     seed = _journal(
         context,
-        selector_kind=selector_kind,
+        selector_kind="billing_entity_ref",
         decision=decision,
         detailed_provenance=detailed_provenance,
     )
@@ -389,6 +387,7 @@ def test_journal_accepts_only_fixed_low_cardinality_values(
     (
         {"request_shape_sha256": SENSITIVE_SENTINEL},
         {"generation_bundle_sha256": SENSITIVE_SENTINEL},
+        {"selector_kind": "tax_identity"},
         {"selector_kind": SENSITIVE_SENTINEL},
         {"decision": SENSITIVE_SENTINEL},
         {"trusted_observed_at": SENSITIVE_SENTINEL},

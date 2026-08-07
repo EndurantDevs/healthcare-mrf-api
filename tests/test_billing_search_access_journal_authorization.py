@@ -104,7 +104,7 @@ def _journal(context, *, decision: str, detailed_provenance: bool, observed_at=N
         context,
         generation_bundle_sha256=_sha256("sealed-generation-bundle"),
         request_shape_sha256=_sha256("safe-request-shape"),
-        selector_kind="tax_identity",
+        selector_kind="billing_entity_ref",
         decision=decision,
         trusted_observed_at=observed_at,
         duration_us=1234,
