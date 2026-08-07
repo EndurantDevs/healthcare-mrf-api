@@ -38,6 +38,7 @@ from api.ptg2_shared_blocks import PTG2SharedBlockError
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from tests.billing_search_page_support import (
     NPI_VALUES,
+    address,
     code_witness,
     geo_witness,
     hydrated_price,
@@ -228,13 +229,38 @@ async def test_source_projection_failure_discards_partial_binding_results(monkey
 
 
 @pytest.mark.asyncio
-async def test_release_traversal_caps_candidates_before_aggregate_sort(monkeypatch):
+async def test_release_traversal_caps_aggregate_geo_witnesses(monkeypatch):
     release_selection = _selection(binding_count=2)
-    monkeypatch.setattr(service, "MAX_PROVIDER_RATE_WITNESSES", 1)
+    candidates = []
+    for binding_index, binding in enumerate(release_selection.in_network_bindings):
+        serving_tables = release_selection.serving_tables_for_snapshot(
+            binding.snapshot_id
+        )
+        selected_address = address(NPI_VALUES[binding_index])
+        witnesses = tuple(
+            geo_witness(
+                npi=NPI_VALUES[binding_index],
+                price_key=10 + witness_index,
+                source_key=witness_index,
+                occurrence_ordinal=witness_index,
+                selected_address=selected_address,
+                snapshot_key=serving_tables.shared_snapshot_key,
+            )
+            for witness_index in range(2)
+        )
+        candidates.append(
+            service.ptg2_billing_search_page.group_billing_geo_candidates(
+                binding=binding,
+                serving_tables=serving_tables,
+                code_witnesses=(code_witness(),),
+                geo_witnesses=witnesses,
+            )[0]
+        )
+    monkeypatch.setattr(service, "MAX_PROVIDER_RATE_WITNESSES", 3)
     candidate_reader = AsyncMock(
         side_effect=(
-            ((object(),), True),
-            ((object(),), True),
+            ((candidates[0],), True),
+            ((candidates[1],), True),
         )
     )
     monkeypatch.setattr(service, "_binding_candidates", candidate_reader)

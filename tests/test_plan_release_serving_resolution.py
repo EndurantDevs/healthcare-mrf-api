@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+from unittest.mock import AsyncMock
 
 from api import plan_release_serving_resolution as resolution
 
@@ -151,6 +152,41 @@ def test_typed_resolution_returns_ready_selection(monkeypatch):
     assert serving_resolution.state == "ready"
     assert serving_resolution.selection is not None
     assert serving_resolution.selection.plan_release_id == PLAN_RELEASE_ID
+
+
+def test_typed_resolution_rejects_release_binding_fanout_before_readiness(
+    monkeypatch,
+):
+    row_limit = resolution.MAX_BILLING_SEARCH_RELEASE_BINDINGS + 1
+    release_rows = [
+        _binding_row(
+            expected_binding_count=row_limit,
+            binding_ordinal=ordinal,
+            snapshot_id=f"ptg2:release-{ordinal}",
+            source_key=f"synthetic-network-{ordinal}",
+        )
+        for ordinal in range(row_limit)
+    ]
+    session = _Session(release_rows)
+    readiness = AsyncMock()
+    monkeypatch.setattr(
+        resolution.plan_release_serving,
+        "is_release_binding_serving_ready",
+        readiness,
+    )
+
+    serving_resolution = asyncio.run(
+        resolution.resolve_plan_release_serving_resolution(
+            session,
+            PLAN_RELEASE_ID,
+        )
+    )
+
+    assert serving_resolution.state == "unavailable"
+    assert serving_resolution.selection is None
+    assert len(session.calls) == 1
+    assert f"LIMIT {row_limit}" in session.calls[0][0]
+    readiness.assert_not_awaited()
 
 
 def test_typed_resolution_pins_billing_source_metadata(monkeypatch):

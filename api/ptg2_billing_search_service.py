@@ -62,6 +62,19 @@ class _BillingSearchTraversal:
     is_identity_projection_available: bool
 
 
+def _candidate_geo_witness_count(
+    candidates: object,
+) -> int:
+    """Count one binding's exact witnesses while enforcing typed candidates."""
+
+    if type(candidates) is not tuple or any(
+        type(candidate) is not BillingSearchProviderCandidate
+        for candidate in candidates
+    ):
+        raise serving_unavailable()
+    return sum(len(candidate.geo_witnesses) for candidate in candidates)
+
+
 def _empty_result(
     state: str,
     selection: PlanReleaseServingSelection | None,
@@ -183,6 +196,7 @@ async def _traverse_release(
         return _BillingSearchTraversal((), False, False, False)
 
     candidates: list[BillingSearchProviderCandidate] = []
+    retained_geo_witness_count = 0
     has_identity = False
     has_provider_rates = False
     for binding_scope in resolved_binding_scopes:
@@ -208,8 +222,13 @@ async def _traverse_release(
             request=request,
         )
         has_provider_rates = has_provider_rates or binding_has_provider_rates
-        if len(candidates) + len(binding_candidates) > MAX_PROVIDER_RATE_WITNESSES:
+        binding_geo_witness_count = _candidate_geo_witness_count(binding_candidates)
+        if (
+            retained_geo_witness_count + binding_geo_witness_count
+            > MAX_PROVIDER_RATE_WITNESSES
+        ):
             raise serving_unavailable()
+        retained_geo_witness_count += binding_geo_witness_count
         candidates.extend(binding_candidates)
     return _BillingSearchTraversal(
         candidates=tuple(sorted(candidates, key=lambda candidate: candidate.sort_key)),

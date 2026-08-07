@@ -29,6 +29,7 @@ PLAN_RELEASE_RESOLUTION_STATES = frozenset(
         PLAN_RELEASE_RESOLUTION_UNAVAILABLE,
     }
 )
+MAX_BILLING_SEARCH_RELEASE_BINDINGS = 8
 
 _PLAN_RELEASE_SERVING_SQL = f"""
 SELECT revision.serving_revision_id,
@@ -65,6 +66,7 @@ SELECT revision.serving_revision_id,
    AND revision.is_current
  ORDER BY CASE binding.role WHEN 'in_network' THEN 0 ELSE 1 END,
           binding.binding_ordinal
+ LIMIT {MAX_BILLING_SEARCH_RELEASE_BINDINGS + 1}
 """
 
 _PLAN_RELEASE_EXISTS_SQL = f"""
@@ -180,6 +182,8 @@ async def resolve_plan_release_serving_resolution(
             else PLAN_RELEASE_RESOLUTION_NOT_FOUND
         )
         return _resolution(state)
+    if len(release_rows) > MAX_BILLING_SEARCH_RELEASE_BINDINGS:
+        return _resolution(PLAN_RELEASE_RESOLUTION_UNAVAILABLE)
     selection = _selection_from_rows(normalized_release_id, release_rows)
     if selection is None:
         return _resolution(PLAN_RELEASE_RESOLUTION_UNAVAILABLE)
