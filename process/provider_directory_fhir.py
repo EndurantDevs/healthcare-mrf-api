@@ -150,11 +150,17 @@ from process.uhc_official_file_acquisition import (
     uhc_provider_file_download_concurrency,
 )
 from process.uhc_provider_file_admission import (
+    is_uhc_official_file_repair_replay,
     should_select_uhc_official_file_source,
     validate_uhc_official_file_admission,
 )
 from process.uhc_provider_file_catalog import (
     refresh_uhc_provider_file_catalog,
+    uhc_provider_file_catalog,
+)
+from process.uhc_provider_file_catalog_types import (
+    UHCFileCatalogError,
+    UHCFileCatalogNotFound,
 )
 from process.uhc_provider_file_source_identity import (
     UHC_PROVIDER_FILE_ADAPTER_CONTRACT,
@@ -58977,29 +58983,84 @@ def _uhc_acquisition_cancel_check(
     return check_cancelled
 
 
+async def _select_uhc_catalog_for_acquisition(
+    requested_catalog_hash: str | None,
+    *,
+    is_repair_replay: bool,
+) -> dict[str, Any]:
+    """Select current catalog state or one exact retained repair pin."""
+
+    if not is_repair_replay:
+        return await refresh_uhc_provider_file_catalog()
+    try:
+        return await uhc_provider_file_catalog(
+            catalog_set_sha256=requested_catalog_hash,
+        )
+    except (UHCFileCatalogError, UHCFileCatalogNotFound) as error:
+        raise RuntimeError(
+            "provider_directory_uhc_catalog_selection_is_not_retained"
+        ) from error
+
+
+async def _recheck_uhc_catalog_after_acquisition(
+    catalog_set_sha256: str,
+    acquisition: UHCOfficialFileAcquisitionResult,
+    *,
+    is_repair_replay: bool,
+) -> None:
+    """Require an unchanged current or retained catalog after acquisition."""
+
+    if is_repair_replay:
+        try:
+            final_catalog = await uhc_provider_file_catalog(
+                catalog_set_sha256=catalog_set_sha256,
+            )
+        except (UHCFileCatalogError, UHCFileCatalogNotFound) as error:
+            raise RuntimeError(
+                "provider_directory_uhc_catalog_changed_during_acquisition"
+            ) from error
+    else:
+        final_catalog = await refresh_uhc_provider_file_catalog()
+    if (
+        final_catalog.get("catalog_set_sha256") != catalog_set_sha256
+        or int(final_catalog.get("catalog_file_count") or 0)
+        != acquisition.file_count
+    ):
+        raise RuntimeError(
+            "provider_directory_uhc_catalog_changed_during_acquisition"
+        )
+
+
 async def _acquire_current_uhc_official_file_set(
     ctx: dict[str, Any],
     task: dict[str, Any],
     *,
     run_id: str,
 ) -> tuple[str, UHCOfficialFileAcquisitionResult]:
-    """Refresh, acquire, and recheck one unchanged official-file catalog."""
+    """Acquire one current catalog or an exact retained repair-generation pin."""
 
     validate_uhc_official_file_admission(task, required=True)
-    initial_catalog = await refresh_uhc_provider_file_catalog()
-    catalog_set_sha256 = _clean_text(
-        initial_catalog.get("catalog_set_sha256")
-    )
     requested_catalog_hash = _clean_text(
         task.get("uhc_catalog_set_sha256")
     )
-    if not catalog_set_sha256 or (
-        requested_catalog_hash is not None
-        and requested_catalog_hash != catalog_set_sha256
+    is_repair_replay = is_uhc_official_file_repair_replay(task)
+    initial_catalog = await _select_uhc_catalog_for_acquisition(
+        requested_catalog_hash,
+        is_repair_replay=is_repair_replay,
+    )
+    catalog_set_sha256 = _clean_text(
+        initial_catalog.get("catalog_set_sha256")
+    )
+    if (
+        not catalog_set_sha256
+        or requested_catalog_hash != catalog_set_sha256
     ):
-        raise RuntimeError(
-            "provider_directory_uhc_catalog_selection_is_not_current"
+        selection_error = (
+            "provider_directory_uhc_catalog_selection_is_not_retained"
+            if is_repair_replay
+            else "provider_directory_uhc_catalog_selection_is_not_current"
         )
+        raise RuntimeError(selection_error)
 
     async with db.acquire_driver() as driver_connection:
         acquisition = await acquire_complete_uhc_catalog_set(
@@ -59018,15 +59079,11 @@ async def _acquire_current_uhc_official_file_set(
         )
 
     await raise_if_cancelled(ctx, task)
-    final_catalog = await refresh_uhc_provider_file_catalog()
-    if (
-        final_catalog.get("catalog_set_sha256") != catalog_set_sha256
-        or int(final_catalog.get("catalog_file_count") or 0)
-        != acquisition.file_count
-    ):
-        raise RuntimeError(
-            "provider_directory_uhc_catalog_changed_during_acquisition"
-        )
+    await _recheck_uhc_catalog_after_acquisition(
+        catalog_set_sha256,
+        acquisition,
+        is_repair_replay=is_repair_replay,
+    )
     return catalog_set_sha256, acquisition
 
 

@@ -21,7 +21,7 @@ import urllib.error
 import urllib.parse
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from click.testing import CliRunner
@@ -1733,6 +1733,101 @@ async def test_uhc_acquisition_rejects_catalog_change_and_accepts_exact_set(
             run_id="run-root",
         )
     ) == (catalog_hash, acquisition)
+
+
+def _uhc_repair_admission_params(catalog_hash: str) -> dict[str, Any]:
+    return _uhc_admission_params(
+        uhc_catalog_set_sha256=catalog_hash,
+        provider_directory_dispatch_contract_version=2,
+        provider_directory_dispatch_generation=1,
+        provider_directory_dispatch_id="pdd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        provider_directory_dispatch_request_id=(
+            "11111111-2222-4333-8444-555555555555"
+        ),
+        provider_directory_dispatch_request_fingerprint="b" * 64,
+        provider_directory_dispatch_catalog_digest="c" * 64,
+        provider_directory_repair_id="86066b89-ecb8-42c2-83d0-b65768a08736",
+    )
+
+
+@pytest.mark.asyncio
+async def test_uhc_repair_acquires_exact_retained_catalog_without_refresh(
+    monkeypatch,
+):
+    """A typed repair replays its retained pin instead of selecting current."""
+    catalog_hash = "a" * 64
+    acquisition = importer.UHCOfficialFileAcquisitionResult(
+        catalog_set_sha256=catalog_hash,
+        file_count=2,
+        downloaded_file_count=0,
+        reused_file_count=2,
+        downloaded_byte_count=0,
+    )
+
+    @contextlib.asynccontextmanager
+    async def acquire_driver():
+        yield object()
+
+    retained_catalog = AsyncMock(
+        return_value={
+            "catalog_set_sha256": catalog_hash,
+            "catalog_file_count": 2,
+        }
+    )
+    refresh = AsyncMock(
+        side_effect=AssertionError("repair replay must not refresh catalogs")
+    )
+    monkeypatch.setattr(importer.db, "acquire_driver", acquire_driver)
+    monkeypatch.setattr(
+        importer,
+        "acquire_complete_uhc_catalog_set",
+        AsyncMock(return_value=acquisition),
+    )
+    monkeypatch.setattr(
+        importer,
+        "load_complete_admitted_uhc_catalog_set",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(importer, "uhc_provider_file_catalog", retained_catalog)
+    monkeypatch.setattr(importer, "refresh_uhc_provider_file_catalog", refresh)
+
+    assert (
+        await importer._acquire_current_uhc_official_file_set(
+            {},
+            _uhc_repair_admission_params(catalog_hash),
+            run_id="run-root",
+        )
+    ) == (catalog_hash, acquisition)
+    assert retained_catalog.await_args_list == [
+        call(catalog_set_sha256=catalog_hash),
+        call(catalog_set_sha256=catalog_hash),
+    ]
+    refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_uhc_nonrepair_stale_pin_still_fails_closed(monkeypatch):
+    """An ordinary acquisition cannot select a retained historical catalog."""
+    retained_catalog = AsyncMock()
+    monkeypatch.setattr(importer, "uhc_provider_file_catalog", retained_catalog)
+    monkeypatch.setattr(
+        importer,
+        "refresh_uhc_provider_file_catalog",
+        AsyncMock(
+            return_value={
+                "catalog_set_sha256": "b" * 64,
+                "catalog_file_count": 2,
+            }
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="selection_is_not_current"):
+        await importer._acquire_current_uhc_official_file_set(
+            {},
+            _uhc_admission_params(uhc_catalog_set_sha256="a" * 64),
+            run_id="run-root",
+        )
+    retained_catalog.assert_not_awaited()
 
 
 @pytest.mark.asyncio
