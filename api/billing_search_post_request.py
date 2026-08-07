@@ -29,6 +29,7 @@ from api.billing_search_post_request_values import (
 
 _REDACTED_REQUEST = "<redacted-billing-search-post-request>"
 _REQUEST_AUTH_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_POST_REQUEST_AUTH_V1\x00"
+_REQUEST_BINDING_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_POST_REQUEST_BINDING_V1\x00"
 _REQUEST_AUTH_KEY = secrets.token_bytes(32)
 _REQUEST_VALUE_FIELDS = (
     "healthporta_plan_id",
@@ -308,6 +309,25 @@ def _validated_request_or_none(request: object) -> BillingSearchPostRequest | No
         return request
     except Exception:
         return None
+
+
+def _billing_search_post_request_auth_binding(request: object) -> bytes:
+    """Return a keyed full-request binding without exposing selector material."""
+
+    validated = _validated_request_or_none(request)
+    del request
+    if validated is None:
+        raise request_failure()
+    request_auth_tag = object.__getattribute__(
+        validated,
+        "_BillingSearchPostRequest__request_auth_tag",
+    )
+    del validated
+    digest = hmac.new(_REQUEST_AUTH_KEY, digestmod=hashlib.sha256)
+    digest.update(_REQUEST_BINDING_DOMAIN)
+    digest.update(len(request_auth_tag).to_bytes(8, "big"))
+    digest.update(request_auth_tag)
+    return digest.digest()
 
 
 def validate_billing_search_post_request(

@@ -11,6 +11,7 @@ import json
 import pytest
 from sanic.compat import Header
 
+from api import billing_search_post_endpoint_access as endpoint_access
 from api import billing_search_post_gateway_transport as gateway_transport
 from api.billing_search_post_endpoint_access import (
     BillingSearchPostEndpointAccessError,
@@ -187,6 +188,30 @@ def test_endpoint_access_verifies_transport_shape_and_authority() -> None:
 
 
 def test_endpoint_access_rejects_valid_request_object_substitution() -> None:
+    body = _body()
+    access = _authorize(body, _headers(body))
+    replacement_body = _body(tax_identity_value=REPLACEMENT_SYNTHETIC_EIN)
+    replacement = _authorize(
+        replacement_body,
+        _headers(replacement_body),
+    )
+    object.__setattr__(
+        access,
+        "_BillingSearchPostEndpointAccess__request",
+        replacement.request,
+    )
+
+    with pytest.raises(BillingSearchPostEndpointAccessError):
+        validate_billing_search_post_endpoint_access(
+            access,
+            trusted_now=NOW,
+        )
+
+
+def test_endpoint_access_rejects_request_substitution_after_id_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(endpoint_access, "id", lambda _value: 1, raising=False)
     body = _body()
     access = _authorize(body, _headers(body))
     replacement_body = _body(tax_identity_value=REPLACEMENT_SYNTHETIC_EIN)

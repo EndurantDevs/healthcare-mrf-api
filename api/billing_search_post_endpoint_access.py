@@ -26,6 +26,7 @@ from api.billing_search_post_gateway_transport import (
 )
 from api.billing_search_post_request import (
     BillingSearchPostRequest,
+    _billing_search_post_request_auth_binding,
     validate_billing_search_post_request,
 )
 from api.billing_search_post_transport import (
@@ -151,6 +152,7 @@ def _state_hmac(
     request: BillingSearchPostRequest,
     transport: VerifiedBillingSearchPostTransport,
 ) -> bytes:
+    request_auth_binding = _billing_search_post_request_auth_binding(request)
     encoded = json.dumps(
         {
             "authorization_context_sha256": (
@@ -172,6 +174,8 @@ def _state_hmac(
             _STATE_DOMAIN,
             id(request).to_bytes(16, "big"),
             id(transport).to_bytes(16, "big"),
+            len(request_auth_binding).to_bytes(8, "big"),
+            request_auth_binding,
             len(encoded).to_bytes(8, "big"),
             encoded,
         )
