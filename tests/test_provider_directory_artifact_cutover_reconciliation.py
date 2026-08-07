@@ -82,12 +82,11 @@ async def test_real_postgres_artifact_bundle_accepts_timeout_after_commit(monkey
 
         async def commit_then_lose_acknowledgement(
             prepared_artifact_stages,
-            *,
-            profile_delta=None,
+            **transaction_options,
         ):
             await promote_transaction(
                 prepared_artifact_stages,
-                profile_delta=profile_delta,
+                **transaction_options,
             )
             raise TimeoutError
 
@@ -134,8 +133,7 @@ async def test_real_postgres_timeout_reconciliation_rejects_oid_only_commit(
 
         async def commit_relations_only_then_timeout(
             prepared_artifact_stages,
-            *,
-            profile_delta=None,
+            **transaction_options,
         ):
             transaction_fence_token = (
                 importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(None)
@@ -143,7 +141,7 @@ async def test_real_postgres_timeout_reconciliation_rejects_oid_only_commit(
             try:
                 await promote_transaction(
                     prepared_artifact_stages,
-                    profile_delta=profile_delta,
+                    **transaction_options,
                 )
             finally:
                 importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(

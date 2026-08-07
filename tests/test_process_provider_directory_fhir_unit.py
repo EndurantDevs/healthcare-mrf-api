@@ -992,6 +992,48 @@ async def test_uhc_source_local_publication_uses_no_artifact_stage(
 
 
 @pytest.mark.asyncio
+async def test_source_local_publication_reconciles_lost_commit(
+    monkeypatch,
+):
+    """Accept a lost acknowledgement only after exact pointer proof."""
+    candidate, fence = _uhc_source_local_candidate_fence()
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+        raise TimeoutError
+
+    monkeypatch.setattr(
+        importer,
+        "_resolve_provider_directory_artifact_datasets",
+        AsyncMock(return_value=fence),
+    )
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=1))
+    monkeypatch.setattr(
+        importer,
+        "_lock_and_verify_artifact_dataset_fence",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_promote_provider_directory_artifact_datasets",
+        AsyncMock(),
+    )
+    committed = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(
+        importer,
+        "_is_provider_directory_dataset_cutover_committed",
+        committed,
+    )
+
+    await importer._publish_validated_uhc_dataset(candidate)
+    with pytest.raises(TimeoutError):
+        await importer._publish_validated_uhc_dataset(candidate)
+    assert committed.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_common_source_upsert_preserves_uhc_transport_endpoint(
     monkeypatch,
 ):

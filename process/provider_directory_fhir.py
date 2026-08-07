@@ -425,8 +425,10 @@ PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS = 3
 PROVIDER_DIRECTORY_ARTIFACT_BUILD_LOCK_ATTEMPTS = 3
 PROVIDER_DIRECTORY_ARTIFACT_BUILD_LOCK_BACKOFF_SECONDS = 0.5
 PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT = "500ms"
+PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT = "8s"
 PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT = "1000ms"
 PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS = 2.0
+PROVIDER_DIRECTORY_ARTIFACT_CANDIDATE_TRANSACTION_TIMEOUT_SECONDS = 12.0
 PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_BACKOFF_SECONDS = 0.2
 DEFAULT_PROVIDER_DIRECTORY_ARTIFACT_SCOPE_MAX_PROJECTED_ROWS = 50_000_000
 PROVIDER_DIRECTORY_PROFILE_ADMISSION_ROW_LOCK_COUNT = 2
@@ -9117,6 +9119,7 @@ async def _promote_provider_directory_artifact_stage_transaction(
     target_relation: str,
     rename_stage_indexes: Callable[[str, str], Awaitable[None]],
     build_fence: ProviderDirectoryArtifactBuildFence | None,
+    cutover_timeout: asyncio.Timeout | None = None,
 ) -> None:
     """Run only the bounded metadata swap inside one database transaction."""
     prepared_stage = ProviderDirectoryPreparedArtifactStage(
@@ -9133,7 +9136,12 @@ async def _promote_provider_directory_artifact_stage_transaction(
         await _verify_active_profile_selection_at_cutover()
         active_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
         if active_fence is not None:
-            await _lock_and_verify_artifact_dataset_fence(active_fence)
+            await _lock_artifact_cutover_fence(
+                active_fence,
+            )
+        _tighten_provider_directory_artifact_cutover_timeout(
+            cutover_timeout
+        )
         await _assert_provider_directory_artifact_build_fence(prepared_stage)
         await _lock_provider_directory_artifact_tables(
             schema,
@@ -12169,6 +12177,39 @@ def _provider_directory_artifact_bundle_context(
     )
 
 
+def _provider_directory_artifact_transaction_timeout_seconds(
+    dataset_fence: ProviderDirectoryArtifactDatasetFence | None,
+    *,
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None = None,
+) -> float:
+    """Return the outer wall for one exact publication transaction."""
+    if profile_delta is not None:
+        return PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_TIMEOUT_SECONDS
+    if (
+        dataset_fence is not None
+        and dataset_fence.should_select_validated_candidates
+    ):
+        return (
+            PROVIDER_DIRECTORY_ARTIFACT_CANDIDATE_TRANSACTION_TIMEOUT_SECONDS
+        )
+    return PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+
+
+def _tighten_provider_directory_artifact_cutover_timeout(
+    cutover_timeout: asyncio.Timeout | None,
+) -> None:
+    """Restore the short live-cutover wall after candidate validation."""
+    if cutover_timeout is None:
+        return
+    current_deadline = cutover_timeout.when()
+    live_deadline = (
+        asyncio.get_running_loop().time()
+        + PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+    )
+    if current_deadline is None or live_deadline < current_deadline:
+        cutover_timeout.reschedule(live_deadline)
+
+
 async def _configure_provider_directory_artifact_promotion(
     lock_timeout: str,
     statement_timeout: str,
@@ -12253,6 +12294,7 @@ async def _apply_locked_provider_directory_artifact_bundle(
     relation_names: tuple[str, ...],
     profile_delta: ProviderDirectoryPreparedProfileDelta | None,
     active_fence: ProviderDirectoryArtifactDatasetFence | None,
+    cutover_timeout: asyncio.Timeout | None = None,
 ) -> None:
     await _verify_active_profile_selection_at_cutover()
     if (
@@ -12265,7 +12307,14 @@ async def _apply_locked_provider_directory_artifact_bundle(
     ):
         return
     if active_fence is not None:
-        await _lock_and_verify_artifact_dataset_fence(active_fence)
+        await _lock_artifact_cutover_fence(
+            active_fence,
+            profile_delta=profile_delta,
+        )
+    if profile_delta is None:
+        _tighten_provider_directory_artifact_cutover_timeout(
+            cutover_timeout
+        )
     for stage in ordered_stages:
         await _assert_provider_directory_artifact_build_fence(stage)
     if profile_delta is not None:
@@ -12297,6 +12346,7 @@ async def _promote_provider_directory_artifact_bundle_transaction(
     stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
     *,
     profile_delta: ProviderDirectoryPreparedProfileDelta | None = None,
+    cutover_timeout: asyncio.Timeout | None = None,
 ) -> None:
     """Publish relation swaps and an optional source delta atomically."""
     ordered_stages = _ordered_provider_directory_artifact_bundle(stages)
@@ -12332,6 +12382,7 @@ async def _promote_provider_directory_artifact_bundle_transaction(
             relation_names,
             profile_delta,
             active_fence,
+            cutover_timeout,
         )
 
 
@@ -12384,17 +12435,21 @@ async def _promote_provider_directory_artifact_bundle(
     )
     dataset_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
     transaction_timeout_seconds = (
-        PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_TIMEOUT_SECONDS
-        if profile_delta is not None
-        else PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+        _provider_directory_artifact_transaction_timeout_seconds(
+            dataset_fence,
+            profile_delta=profile_delta,
+        )
     )
     try:
         async with asyncio.timeout(
             transaction_timeout_seconds
-        ):
+        ) as cutover_timeout:
             await _promote_provider_directory_artifact_bundle_transaction(
                 stages,
                 profile_delta=profile_delta,
+                cutover_timeout=(
+                    None if profile_delta is not None else cutover_timeout
+                ),
             )
     except Exception as promotion_error:
         if await _is_artifact_bundle_promotion_committed(
@@ -12480,14 +12535,17 @@ async def _promote_provider_directory_artifact_stage(
     dataset_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
     try:
         async with asyncio.timeout(
-            PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
-        ):
+            _provider_directory_artifact_transaction_timeout_seconds(
+                dataset_fence,
+            )
+        ) as cutover_timeout:
             await _promote_provider_directory_artifact_stage_transaction(
                 schema,
                 stage_table,
                 target_relation,
                 rename_stage_indexes,
                 build_fence,
+                cutover_timeout,
             )
     except TimeoutError:
         if await _is_provider_directory_artifact_promotion_committed(
@@ -16895,6 +16953,29 @@ async def _lock_and_verify_artifact_dataset_fence(
         locked_dataset_rows,
         eligible_ids_by_endpoint,
     )
+
+
+async def _lock_artifact_cutover_fence(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    *,
+    profile_delta: ProviderDirectoryPreparedProfileDelta | None = None,
+) -> None:
+    """Give candidate metadata validation its own pre-cutover budget."""
+    use_candidate_budget = (
+        profile_delta is None
+        and fence.should_select_validated_candidates
+    )
+    if use_candidate_budget:
+        await db.status(
+            "SET LOCAL statement_timeout = "
+            f"'{PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}';"
+        )
+    await _lock_and_verify_artifact_dataset_fence(fence)
+    if use_candidate_budget:
+        await db.status(
+            "SET LOCAL statement_timeout = "
+            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
+        )
 
 
 async def _lock_artifact_fence_endpoints(
@@ -58811,17 +58892,43 @@ async def _publish_validated_uhc_dataset(
         raise RuntimeError(
             "provider_directory_uhc_source_local_fence_invalid"
         )
-    async with db.transaction():
-        await db.status(
-            "SET LOCAL lock_timeout = "
-            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';"
+    try:
+        async with asyncio.timeout(
+            _provider_directory_artifact_transaction_timeout_seconds(fence)
+        ) as cutover_timeout:
+            async with db.transaction():
+                await db.status(
+                    "SET LOCAL lock_timeout = "
+                    f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';"
+                )
+                await db.status(
+                    "SET LOCAL statement_timeout = "
+                    f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
+                )
+                await _lock_artifact_cutover_fence(fence)
+                _tighten_provider_directory_artifact_cutover_timeout(
+                    cutover_timeout
+                )
+                await _promote_provider_directory_artifact_datasets(fence)
+    except Exception as promotion_error:
+        try:
+            is_cutover_committed = (
+                await _is_provider_directory_dataset_cutover_committed(fence)
+            )
+        except Exception:
+            LOGGER.warning(
+                "Source-local dataset cutover acknowledgement and committed-state "
+                "verification both failed",
+                exc_info=True,
+            )
+            is_cutover_committed = False
+        if not is_cutover_committed:
+            raise
+        LOGGER.warning(
+            "Source-local dataset cutover acknowledgement was lost after commit "
+            "(%s); verified the exact dataset and source pointers",
+            type(promotion_error).__name__,
         )
-        await db.status(
-            "SET LOCAL statement_timeout = "
-            f"'{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';"
-        )
-        await _lock_and_verify_artifact_dataset_fence(fence)
-        await _promote_provider_directory_artifact_datasets(fence)
 
 
 def _uhc_acquisition_progress_callback(
