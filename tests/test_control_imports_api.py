@@ -116,6 +116,7 @@ def test_importer_registry_exposes_provider_directory_params():
     assert any(param["name"] == "publish_after_acquisition" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "canonical_backfill_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "contact_backfill_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "dataset_followup_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "publish_artifacts_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "publish_artifacts_targets" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "publish_corroboration" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
@@ -212,6 +213,11 @@ def test_importer_registry_exposes_entity_address_params():
     assert entity_provider_directory_scope["choices"] == ["latest-run", "all"]
     assert any(
         param["name"] == "provider_directory_source_batch_size" and param["type"] == "integer"
+        for param in importer_by_name["entity-address-unified"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "provider_directory_dataset_id"
+        and param["type"] == "text"
         for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
     entity_refresh_mode = next(

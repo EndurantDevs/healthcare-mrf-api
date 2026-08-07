@@ -76,10 +76,28 @@ async def test_provider_directory_partial_validates_replacement_stage_before_rea
     ctx = _shutdown_context(
         refresh_mode=entity_address_unified.ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
     )
+    ctx["context"].update(
+        {
+            "partial_provider_directory_dataset_id": "dataset-current",
+            "partial_provider_directory_run_id": "run-overlay",
+            "partial_provider_directory_scope": "latest-run",
+            "partial_provider_directory_source_ids": ["source-current"],
+        }
+    )
+    dataset_fence = AsyncMock()
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_assert_current_provider_directory_dataset",
+        dataset_fence,
+    )
     await entity_address_unified.shutdown(ctx)
 
     publish_index = events.index(("publish", "cutover"))
-    validation_events = [(index, value) for index, (kind, value) in enumerate(events) if kind == "validate"]
+    validation_events = [
+        (index, event_detail)
+        for index, (kind, event_detail) in enumerate(events)
+        if kind == "validate"
+    ]
     assert len(validation_events) == 1
     validation_index, validation_table = validation_events[0]
     assert validation_index < publish_index
@@ -88,8 +106,16 @@ async def test_provider_directory_partial_validates_replacement_stage_before_rea
 
     post_cutover_events = events[publish_index + 1 :]
     assert all(kind not in {"sql", "ddl"} for kind, _value in post_cutover_events)
-    assert [value for kind, value in events if kind == "status"] == ["succeeded"]
+    assert [
+        event_detail for kind, event_detail in events if kind == "status"
+    ] == ["succeeded"]
     assert ctx["context"]["post_publish_index_profile"] == "none"
+    dataset_fence.assert_awaited_once_with(
+        "mrf",
+        source_id="source-current",
+        expected_dataset_id="dataset-current",
+        expected_root_run_id="run-overlay",
+    )
 
 
 @pytest.mark.asyncio

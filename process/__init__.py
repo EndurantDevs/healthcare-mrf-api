@@ -1304,6 +1304,11 @@ def provider_enrichment(test: bool):
     help="Populate canonical phone/fax columns from existing Provider Directory Location rows.",
 )
 @click.option(
+    "--dataset-followup-only",
+    is_flag=True,
+    help="Emit the exact current source publication follow-up without acquiring or publishing data.",
+)
+@click.option(
     "--publish-artifacts-only",
     is_flag=True,
     help="Publish Provider Directory contact and address archive artifacts without fetching FHIR resources.",
@@ -1406,6 +1411,7 @@ def provider_directory_fhir(
     rehydrate_batch_size: int | None,
     canonical_backfill_only: bool,
     contact_backfill_only: bool,
+    dataset_followup_only: bool,
     publish_artifacts_only: bool,
     publish_artifacts_targets: str | None,
     publish_corroboration: bool | None,
@@ -1456,6 +1462,7 @@ def provider_directory_fhir(
             rehydrate_batch_size=rehydrate_batch_size,
             canonical_backfill_only=canonical_backfill_only,
             contact_backfill_only=contact_backfill_only,
+            dataset_followup_only=dataset_followup_only,
             publish_artifacts_only=publish_artifacts_only,
             publish_artifacts_targets=publish_artifacts_targets,
             publish_corroboration=publish_corroboration,
@@ -1588,6 +1595,10 @@ def pharmacy_economics(test: bool):
     help="Provider Directory source id to scope provider-directory-partial. Can be passed more than once.",
 )
 @click.option(
+    "--provider-directory-dataset-id",
+    help="Exact current dataset required for one source-scoped provider-directory-partial refresh.",
+)
+@click.option(
     "--provider-directory-partial-scope",
     type=click.Choice(["latest-run", "all"], case_sensitive=False),
     help="Default provider-directory-partial scope; latest-run avoids unscoped full-source refreshes.",
@@ -1605,6 +1616,7 @@ def entity_address_unified(
     serving_only_refresh: bool | None,
     provider_directory_run_id: str | None,
     provider_directory_source_id: tuple[str, ...],
+    provider_directory_dataset_id: str | None,
     provider_directory_partial_scope: str | None,
     provider_directory_source_batch_size: int | None,
 ):
@@ -1620,6 +1632,15 @@ def entity_address_unified(
             provider_directory_source_ids=list(provider_directory_source_id),
             provider_directory_partial_scope=provider_directory_partial_scope,
             provider_directory_source_batch_size=provider_directory_source_batch_size,
+            **(
+                {
+                    "provider_directory_dataset_id": (
+                        provider_directory_dataset_id
+                    )
+                }
+                if provider_directory_dataset_id is not None
+                else {}
+            ),
         )
     )
 

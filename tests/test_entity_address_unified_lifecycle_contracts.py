@@ -272,3 +272,55 @@ async def test_partial_refresh_builds_an_atomic_replacement_stage_without_patchi
         and "entity_address_unified_20260724" not in statement
         for statement in sql_events
     )
+
+
+@pytest.mark.asyncio
+async def test_partial_refresh_checks_exact_dataset_before_materialization(monkeypatch):
+    _configure_materialization_harness(monkeypatch)
+    monkeypatch.setattr(
+        entity_address,
+        "_provider_directory_partial_replacement_source_selects",
+        lambda *_args, **_kwargs: ["SELECT 'synthetic-partial-source'"],
+    )
+    monkeypatch.setattr(
+        entity_address,
+        "_prepare_partial_affected_groups_sql",
+        lambda *_args, **_kwargs: "CREATE TABLE affected_groups AS SELECT 1",
+    )
+    monkeypatch.setattr(
+        entity_address,
+        "_index_partial_affected_groups_sql",
+        lambda *_args, **_kwargs: (
+            "CREATE INDEX affected_groups_idx ON affected_groups ((1))"
+        ),
+    )
+    dataset_assertion = AsyncMock()
+    monkeypatch.setattr(
+        entity_address,
+        "_assert_current_provider_directory_dataset",
+        dataset_assertion,
+    )
+
+    await entity_address.process_data(
+        {
+            "import_date": "20260724",
+            "context": {"control_run_id": "synthetic-control-run"},
+        },
+        {
+            "refresh_mode": (
+                entity_address.ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
+            ),
+            "provider_directory_partial_scope": "latest-run",
+            "provider_directory_source_ids": ["synthetic-source"],
+            "provider_directory_run_id": "synthetic-root-run",
+            "provider_directory_dataset_id": "synthetic-dataset",
+            "publish": False,
+        },
+    )
+
+    dataset_assertion.assert_awaited_once_with(
+        "mrf",
+        source_id="synthetic-source",
+        expected_dataset_id="synthetic-dataset",
+        expected_root_run_id="synthetic-root-run",
+    )
