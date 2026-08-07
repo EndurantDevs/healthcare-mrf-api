@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 
 import pytest
@@ -11,6 +12,8 @@ from tests.test_provider_directory_dataset_artifact_db import (
     _source_metadata,
     importer,
 )
+
+entity_address_unified = importlib.import_module("process.entity_address_unified")
 
 
 async def _orphan_source_alias(database, schema: str) -> None:
@@ -55,6 +58,26 @@ async def _install_current_serving_dataset(database, schema: str) -> None:
         ") VALUES ("
         "'dataset_serving', 'endpoint_repoint', 'run-serving', "
         "'root-serving', :published_status, true, now(), "
+        "CAST(:metadata AS json)"
+        ");",
+        published_status=importer.ENDPOINT_DATASET_PUBLISHED,
+        metadata=json.dumps(publication_metadata_by_field),
+    )
+
+
+async def _install_competing_published_dataset(database, schema: str) -> None:
+    publication_metadata_by_field = {
+        "selected_resources": ["Location"],
+        "expected_resources": ["Location"],
+        "source_ids": ["source_primary"],
+    }
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_endpoint_dataset ("
+        "dataset_id, endpoint_id, import_run_id, acquisition_root_run_id, "
+        "status, is_current, published_at, publication_metadata_json"
+        ") VALUES ("
+        "'dataset_competing', 'endpoint_unpublished', 'run-competing', "
+        "'root-competing', :published_status, true, now(), "
         "CAST(:metadata AS json)"
         ");",
         published_status=importer.ENDPOINT_DATASET_PUBLISHED,
@@ -146,3 +169,31 @@ async def test_real_postgres_keeps_alias_with_current_serving_dataset(monkeypatc
             selected.endpoint_id,
             selected.reconcile_source_alias_on_cutover,
         ) == ("dataset_serving", "endpoint_repoint", False)
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_unified_dataset_fence_uses_publication_source_binding(
+    monkeypatch,
+):
+    """Accept a proven dataset across an orphaned alias and reject ambiguity."""
+
+    async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(entity_address_unified, "db", database)
+        await _orphan_source_alias(database, schema)
+        await _bind_published_dataset_to_source(database, schema)
+
+        await entity_address_unified._assert_current_provider_directory_dataset(
+            schema,
+            source_id="source_primary",
+            expected_dataset_id="dataset_shared",
+            expected_root_run_id="root-shared",
+        )
+
+        await _install_competing_published_dataset(database, schema)
+        with pytest.raises(RuntimeError, match="dataset fence changed"):
+            await entity_address_unified._assert_current_provider_directory_dataset(
+                schema,
+                source_id="source_primary",
+                expected_dataset_id="dataset_shared",
+                expected_root_run_id="root-shared",
+            )
