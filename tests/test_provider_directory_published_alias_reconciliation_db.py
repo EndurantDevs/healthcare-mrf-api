@@ -188,6 +188,7 @@ async def test_real_postgres_unified_dataset_fence_uses_publication_source_bindi
             expected_dataset_id="dataset_shared",
             expected_root_run_id="root-shared",
         )
+        await _assert_reconciled_state(database, schema)
 
         await _install_competing_published_dataset(database, schema)
         with pytest.raises(RuntimeError, match="dataset fence changed"):
@@ -197,3 +198,27 @@ async def test_real_postgres_unified_dataset_fence_uses_publication_source_bindi
                 expected_dataset_id="dataset_shared",
                 expected_root_run_id="root-shared",
             )
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_exact_followup_repairs_proven_published_alias(
+    monkeypatch,
+):
+    """Make the exact follow-up self-heal an orphaned serving alias."""
+
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _orphan_source_alias(database, schema)
+        await _bind_published_dataset_to_source(database, schema)
+
+        await importer.ensure_provider_directory_published_source_alias(
+            source_id="source_primary",
+            expected_dataset_id="dataset_shared",
+            expected_root_run_id="root-shared",
+        )
+        await _assert_reconciled_state(database, schema)
+
+        await importer.ensure_provider_directory_published_source_alias(
+            source_id="source_primary",
+            expected_dataset_id="dataset_shared",
+            expected_root_run_id="root-shared",
+        )

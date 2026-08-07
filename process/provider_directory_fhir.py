@@ -15035,6 +15035,39 @@ async def _resolve_provider_directory_artifact_datasets(
     return await _expand_reviewed_artifact_promotion_aliases(fence)
 
 
+async def ensure_provider_directory_published_source_alias(
+    *,
+    source_id: str,
+    expected_dataset_id: str,
+    expected_root_run_id: str,
+) -> None:
+    """Reconcile one proven published alias under its exact dataset fence."""
+
+    fence = await _resolve_provider_directory_artifact_datasets(
+        [source_id],
+        should_select_validated_candidates=False,
+    )
+    if len(fence.datasets) != 1:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_published_source_alias_fence_changed"
+        )
+    dataset = fence.datasets[0]
+    if (
+        dataset.source_id != source_id
+        or dataset.dataset_id != expected_dataset_id
+        or dataset.evidence_run_id != expected_root_run_id
+        or dataset.status != ENDPOINT_DATASET_PUBLISHED
+        or dataset.is_current is not True
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_published_source_alias_fence_changed"
+        )
+    if dataset.reconcile_source_alias_on_cutover:
+        async with db.transaction():
+            await _lock_and_verify_artifact_dataset_fence(fence)
+            await _cutover_provider_directory_artifact_sources(fence)
+
+
 def _reviewed_promotion_dataset_by_source_id(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> dict[str, ProviderDirectoryArtifactDataset]:
