@@ -184,3 +184,28 @@ async def test_connection_close_failure_is_sanitized(monkeypatch):
     assert caught.value.code == "cleanup"
     assert "private connection" not in str(caught.value)
     assert "driver-close" not in events
+
+
+@pytest.mark.asyncio
+async def test_unlock_operation_failure_is_sanitized(monkeypatch):
+    monkeypatch.setenv(MANUAL_SYNC_ENABLED_ENV, "true")
+    database, events = _database(
+        unlock_result=RuntimeError("private unlock failure")
+    )
+
+    async def synchronize(**_values):
+        return _result()
+
+    monkeypatch.setattr(manual_module, "synchronize_verified_dataset", synchronize)
+    with pytest.raises(ManualSynchronizationError) as caught:
+        await synchronize_verified_dataset_manually(
+            source_id="source-alpha",
+            run_id="synthetic-run",
+            cutoff=CUTOFF,
+            timeout_seconds=10,
+            database=database,
+        )
+
+    assert caught.value.code == "cleanup"
+    assert "private unlock" not in str(caught.value)
+    assert "driver-invalidate" in events

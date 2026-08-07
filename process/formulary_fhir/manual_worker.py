@@ -5,13 +5,12 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import datetime as dt
 import os
-from dataclasses import dataclass, field
 from typing import Any
 
 from db.models import db
+import process.formulary_fhir.manual_lock as manual_lock
 from process.formulary_fhir.repository_shared import json_text
 from process.formulary_fhir.repository_shared import strict_text
 from process.formulary_fhir.repository_shared import utc_timestamp
@@ -23,11 +22,6 @@ MANUAL_SYNC_ENABLED_ENV = "HLTHPRT_FHIR_FORMULARY_MANUAL_SYNC_ENABLED"
 LOCK_WAIT_SECONDS = 5.0
 LOCK_RETRY_SECONDS = 0.1
 MAX_TIMEOUT_SECONDS = 604_800
-LOCK_DOMAIN = "fhir-formulary-manual-sync-v1"
-TRY_LOCK_SQL = (
-    "SELECT pg_try_advisory_lock(hashtextextended($1::text, 0::bigint));"
-)
-UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtextextended($1::text, 0::bigint));"
 TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 ERROR_MESSAGES = {
     "busy": "FHIR formulary manual synchronization source is busy",
@@ -47,15 +41,6 @@ class ManualSynchronizationError(RuntimeError):
             code = "lock_unavailable"
         self.code = code
         super().__init__(ERROR_MESSAGES[code])
-
-
-@dataclass(slots=True, repr=False)
-class _DriverLease:
-    """Retain one source lock on one entered driver connection manager."""
-
-    manager: Any = field(repr=False)
-    driver: Any = field(repr=False)
-    identity: str = field(repr=False)
 
 
 def _is_manual_sync_enabled() -> bool:
@@ -107,116 +92,6 @@ def _normalized_request(
     )
 
 
-def _lock_identity(source_id: str) -> str:
-    return f"{LOCK_DOMAIN}:{source_id}"
-
-
-async def _drain(
-    operation: Any,
-    *,
-    preserve_cancellation: bool,
-) -> Any:
-    """Drain one cleanup task through repeated outer cancellation."""
-
-    cleanup_task = asyncio.create_task(operation)
-    cancellation_error: asyncio.CancelledError | None = None
-    while not cleanup_task.done():
-        try:
-            await asyncio.shield(cleanup_task)
-        except asyncio.CancelledError as error:
-            if cancellation_error is None:
-                cancellation_error = error
-        except BaseException:
-            break
-    try:
-        cleanup_result = cleanup_task.result()
-    except BaseException:
-        if cancellation_error is not None and preserve_cancellation:
-            raise cancellation_error
-        raise
-    if cancellation_error is not None and preserve_cancellation:
-        raise cancellation_error
-    return cleanup_result
-
-
-async def _exit_lease(
-    lease: _DriverLease,
-    error: BaseException | None,
-    *,
-    preserve_cancellation: bool,
-) -> None:
-    error_type = type(error) if error is not None else None
-    error_traceback = error.__traceback__ if error is not None else None
-    await _drain(
-        lease.manager.__aexit__(error_type, error, error_traceback),
-        preserve_cancellation=preserve_cancellation,
-    )
-
-
-async def _discard_entered_manager(
-    manager: Any,
-    error: BaseException,
-) -> None:
-    with contextlib.suppress(BaseException):
-        await _drain(
-            manager.__aexit__(type(error), error, error.__traceback__),
-            preserve_cancellation=False,
-        )
-
-
-async def _acquire_source_lease(
-    database: Any,
-    source_id: str,
-) -> _DriverLease:
-    manager = database.acquire_driver()
-    identity = _lock_identity(source_id)
-    try:
-        async with asyncio.timeout(LOCK_WAIT_SECONDS):
-            driver = await manager.__aenter__()
-            while True:
-                acquired = await driver.fetchval(TRY_LOCK_SQL, identity)
-                if acquired is True:
-                    return _DriverLease(manager, driver, identity)
-                await asyncio.sleep(LOCK_RETRY_SECONDS)
-    except asyncio.CancelledError as error:
-        await _discard_entered_manager(manager, error)
-        raise
-    except TimeoutError as error:
-        await _discard_entered_manager(manager, error)
-        raise ManualSynchronizationError("busy") from None
-    except Exception as error:
-        await _discard_entered_manager(manager, error)
-        raise ManualSynchronizationError("lock_unavailable") from None
-
-
-async def _release_successful_lease(lease: _DriverLease) -> None:
-    try:
-        released = await _drain(
-            lease.driver.fetchval(UNLOCK_SQL, lease.identity),
-            preserve_cancellation=True,
-        )
-        if released is not True:
-            raise ManualSynchronizationError("cleanup")
-    except BaseException as error:
-        with contextlib.suppress(BaseException):
-            await _exit_lease(
-                lease,
-                error,
-                preserve_cancellation=False,
-            )
-        raise
-    try:
-        await _exit_lease(
-            lease,
-            None,
-            preserve_cancellation=True,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        raise ManualSynchronizationError("cleanup") from None
-
-
 async def synchronize_verified_dataset_manually(
     *,
     source_id: str,
@@ -235,26 +110,24 @@ async def synchronize_verified_dataset_manually(
         cutoff_at,
         bounded_timeout_seconds,
     ) = _normalized_request(source_id, run_id, cutoff, timeout_seconds)
-    lease = await _acquire_source_lease(database, normalized_source_id)
     try:
-        async with asyncio.timeout(bounded_timeout_seconds):
-            synchronization_result = await synchronize_verified_dataset(
-                source_id=normalized_source_id,
-                run_id=normalized_run_id,
-                cutoff=cutoff_at,
-                database=database,
-            )
-            if type(synchronization_result) is not SynchronizationResult:
-                raise ManualSynchronizationError("invalid_result")
-    except BaseException as error:
-        with contextlib.suppress(BaseException):
-            await _exit_lease(
-                lease,
-                error,
-                preserve_cancellation=False,
-            )
-        raise
-    await _release_successful_lease(lease)
+        async with manual_lock.manual_source_lease(
+            database,
+            normalized_source_id,
+            wait_seconds=LOCK_WAIT_SECONDS,
+            retry_seconds=LOCK_RETRY_SECONDS,
+        ):
+            async with asyncio.timeout(bounded_timeout_seconds):
+                synchronization_result = await synchronize_verified_dataset(
+                    source_id=normalized_source_id,
+                    run_id=normalized_run_id,
+                    cutoff=cutoff_at,
+                    database=database,
+                )
+                if type(synchronization_result) is not SynchronizationResult:
+                    raise ManualSynchronizationError("invalid_result")
+    except manual_lock.ManualSourceLockError as error:
+        raise ManualSynchronizationError(error.code) from None
     return synchronization_result
 
 
@@ -288,3 +161,7 @@ __all__ = (
     "manual_result_json",
     "synchronize_verified_dataset_manually",
 )
+
+
+# Retain this private alias for the focused cancellation-defense contract.
+_drain = manual_lock._drain

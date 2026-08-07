@@ -1,0 +1,17 @@
+{
+  "contract_version": "formulary-fhir-synthetic-v1",
+  "source_configuration_hash": "ceee67944a59fe13267ff611f868cdc96d03353dc88aa3d59d1e39b1b31db993",
+  "dataset_id": "ffd_642c013c8e40d9b8814dbc6505e4d2fbe4ee28aada4aaa74",
+  "acquisition_contract_hash": "deab044f154b749e1b3e0bb568bbac0c7a116c51917e19e26efa2dd79f766823",
+  "coverage_hash": "e49972a42aeed758096a67369d8ed1f614f3c135054eecb9a0d37eb5651d175e",
+  "membership_hash": "18514dbec753163664a0e3fed4adcfac64dec4a5613e5faeeecae59388b560b9",
+  "list_count": 1,
+  "alias_count": 2,
+  "medication_membership_count": 2,
+  "request_count": 9,
+  "full_aliases": 2,
+  "reused_aliases": 0,
+  "resumed_aliases": 0,
+  "transient_retry_count": 0,
+  "throttle_count": 0
+}

@@ -27,6 +27,7 @@ from process.formulary_fhir.repository import DatasetRef
 from process.formulary_fhir.repository import DatasetVerification
 from process.formulary_fhir.repository import FHIRFormularyRepository
 from process.formulary_fhir.repository import PriorAliasState
+from process.formulary_fhir.repository_shared import PublicationIntent
 from process.formulary_fhir.repository_shared import strict_text
 from process.formulary_fhir.repository_shared import utc_timestamp
 from process.formulary_fhir.source import EnabledSourceBinding
@@ -343,6 +344,7 @@ async def _run_verified_sync(
     database: Any,
     run_id: str,
     cutoff_at: dt.datetime,
+    intent: PublicationIntent,
 ) -> SynchronizationResult:
     coverage_census = await client.coverage_plan_current_census(cutoff=cutoff_at)
     coverage_plan = plan_coverage_census(binding, coverage_census, cutoff_at)
@@ -351,7 +353,7 @@ async def _run_verified_sync(
         run_id=run_id,
         cutoff_at=cutoff_at,
         acquisition_contract_hash=coverage_plan.acquisition_contract_hash,
-        intent="none",
+        intent=intent,
     )
     try:
         if dataset.status == "verified":
@@ -421,6 +423,7 @@ async def synchronize_verified_dataset(
             database=database,
             run_id=normalized_run_id,
             cutoff_at=cutoff_at,
+            intent="none",
         )
 
 

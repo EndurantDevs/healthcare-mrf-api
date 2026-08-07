@@ -1,0 +1,60 @@
+{
+  "resourceType": "MedicationKnowledge",
+  "id": "synthetic-drug-a",
+  "meta": {
+    "versionId": "11",
+    "lastUpdated": "2026-08-02T12:00:00Z"
+  },
+  "status": "active",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-DrugTierID-extension",
+      "valueCodeableConcept": {
+        "coding": [
+          {"code": "tier-1", "display": "Tier 1"}
+        ]
+      }
+    },
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-PriorAuthorization-extension",
+      "valueBoolean": false
+    },
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-StepTherapyLimit-extension",
+      "valueBoolean": true
+    },
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-QuantityLimit-extension",
+      "valueBoolean": false
+    },
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-PlanID-extension",
+      "valueString": "SYNTH-A"
+    },
+    {
+      "url": "http://hl7.org/fhir/us/davinci-drug-formulary/StructureDefinition/usdf-DrugAlternatives-extension",
+      "valueReference": {
+        "reference": "MedicationKnowledge/synthetic-drug-b"
+      }
+    }
+  ],
+  "code": {
+    "coding": [
+      {
+        "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+        "code": "100001",
+        "display": "Synthetic Drug A"
+      },
+      {
+        "system": "http://hl7.org/fhir/sid/ndc",
+        "code": "12345678901",
+        "display": "12345678901"
+      },
+      {
+        "system": "https://example.invalid/original-code",
+        "code": "original-a",
+        "display": "Original coding retained"
+      }
+    ]
+  }
+}
