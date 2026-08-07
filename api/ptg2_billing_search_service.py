@@ -19,6 +19,7 @@ from api.billing_search_cursor import (
     BillingSearchCursorError,
     BillingSearchCursorGenerationExpired,
     BillingSearchCursorKeyring,
+    BillingSearchSealedPageCursor,
 )
 from api.billing_search_endpoint_access import (
     BillingSearchEndpointAccess,
@@ -30,6 +31,7 @@ from api.plan_release_serving_resolution import (
     PLAN_RELEASE_RESOLUTION_READY,
 )
 from api.ptg2_billing_entity_refs import PTG2BillingAssociationDataError
+from api.ptg2_billing_geo_contract import MAX_PROVIDER_RATE_WITNESSES
 from api.ptg2_billing_search_contract import (
     BILLING_SEARCH_RESULT_MATCHED,
     BILLING_SEARCH_RESULT_NO_MATCHING_RATES,
@@ -38,10 +40,13 @@ from api.ptg2_billing_search_contract import (
     BILLING_SEARCH_RESULT_NO_SNAPSHOT,
     BILLING_SEARCH_RESULT_TAX_IDENTITY_UNAVAILABLE,
     BillingSearchProviderCandidate,
+    BillingSearchResourceNotFoundError,
     BillingSearchServiceResult,
     BillingSearchServingUnavailableError,
+    resource_not_found,
     serving_unavailable,
 )
+from api.ptg2_shared_blocks import PTG2SharedBlockError
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
@@ -56,6 +61,8 @@ class _BillingSearchTraversal:
 def _empty_result(
     state: str,
     selection: PlanReleaseServingSelection | None,
+    *,
+    endpoint_access_state_sha256: str,
 ) -> BillingSearchServiceResult:
     return BillingSearchServiceResult(
         state=state,
@@ -63,6 +70,7 @@ def _empty_result(
         next_cursor=None,
         has_more=False,
         selection=selection,
+        endpoint_access_state_sha256=endpoint_access_state_sha256,
     )
 
 
@@ -171,6 +179,8 @@ async def _traverse_release(
             request=request,
         )
         has_provider_rates = has_provider_rates or binding_has_provider_rates
+        if len(candidates) + len(binding_candidates) > MAX_PROVIDER_RATE_WITNESSES:
+            raise serving_unavailable()
         candidates.extend(binding_candidates)
     return _BillingSearchTraversal(
         candidates=tuple(sorted(candidates, key=lambda candidate: candidate.sort_key)),
@@ -236,7 +246,7 @@ def _sealed_next_cursor(
     *,
     cursor_keyring: BillingSearchCursorKeyring,
     cursor_binding,
-) -> str | None:
+) -> BillingSearchSealedPageCursor | None:
     if not provider_page.has_more:
         return None
     try:
@@ -266,7 +276,14 @@ async def _search_ready_release(
     if not traversal.candidates:
         if after_sort_key is not None:
             raise serving_unavailable()
-        return _empty_result(_state_for_empty_traversal(traversal), selection)
+        empty_state = _state_for_empty_traversal(traversal)
+        if empty_state == BILLING_SEARCH_RESULT_NO_MATCHING_TAX_IDENTITY:
+            raise resource_not_found()
+        return _empty_result(
+            empty_state,
+            selection,
+            endpoint_access_state_sha256=access.state_sha256,
+        )
     provider_page = await ptg2_billing_search_page.hydrate_billing_search_page(
         session,
         candidates=traversal.candidates,
@@ -277,7 +294,11 @@ async def _search_ready_release(
     if not provider_page.providers:
         if after_sort_key is not None:
             raise serving_unavailable()
-        return _empty_result(BILLING_SEARCH_RESULT_NO_MATCHING_RATES, selection)
+        return _empty_result(
+            BILLING_SEARCH_RESULT_NO_MATCHING_RATES,
+            selection,
+            endpoint_access_state_sha256=access.state_sha256,
+        )
     next_cursor = _sealed_next_cursor(
         provider_page,
         cursor_keyring=cursor_keyring,
@@ -289,6 +310,7 @@ async def _search_ready_release(
         next_cursor=next_cursor,
         has_more=provider_page.has_more,
         selection=selection,
+        endpoint_access_state_sha256=access.state_sha256,
     )
 
 
@@ -314,7 +336,11 @@ async def search_exact_billing_provider_page(
                 raise BillingSearchCursorGenerationExpired(
                     "billing_search_cursor_generation_expired"
                 )
-            return _empty_result(BILLING_SEARCH_RESULT_NO_SNAPSHOT, None)
+            return _empty_result(
+                BILLING_SEARCH_RESULT_NO_SNAPSHOT,
+                None,
+                endpoint_access_state_sha256=validated_access.state_sha256,
+            )
         selection = resolution.selection
         if selection is None or cursor_binding is None:
             raise serving_unavailable()
@@ -328,7 +354,9 @@ async def search_exact_billing_provider_page(
         )
     except BillingSearchServingUnavailableError:
         raise
-    except PTG2ManifestArtifactError:
+    except BillingSearchResourceNotFoundError:
+        raise
+    except (PTG2ManifestArtifactError, PTG2SharedBlockError):
         raise serving_unavailable() from None
 
 

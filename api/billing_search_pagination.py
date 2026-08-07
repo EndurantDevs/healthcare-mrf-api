@@ -18,7 +18,9 @@ from api.billing_search_access_contract import (
 from api.billing_search_cursor import (
     BILLING_SEARCH_CURSOR_MAX_TTL_SECONDS,
     BillingSearchCursorKeyring,
+    BillingSearchSealedPageCursor,
     BillingSearchCursorState,
+    _new_sealed_page_cursor,
     open_billing_search_cursor,
     seal_billing_search_cursor,
 )
@@ -233,7 +235,9 @@ async def _locked_address_relation_oids(session) -> tuple[int, int]:
     await session.execute(
         text(
             "LOCK TABLE "
-            + ", ".join(quoted_name for _qualified_name, quoted_name in address_relations)
+            + ", ".join(
+                quoted_name for _qualified_name, quoted_name in address_relations
+            )
             + " IN ACCESS SHARE MODE"
         )
     )
@@ -251,7 +255,10 @@ async def _locked_address_relation_oids(session) -> tuple[int, int]:
     if (
         type(relation_oids) not in {list, tuple}
         or len(relation_oids) != 2
-        or any(type(relation_oid) is not int or relation_oid <= 0 for relation_oid in relation_oids)
+        or any(
+            type(relation_oid) is not int or relation_oid <= 0
+            for relation_oid in relation_oids
+        )
     ):
         raise _invalid_generation()
     return relation_oids[0], relation_oids[1]
@@ -343,7 +350,7 @@ def seal_billing_search_page_cursor(
     *,
     keyring: BillingSearchCursorKeyring,
     binding: BillingSearchCursorBinding,
-) -> str:
+) -> BillingSearchSealedPageCursor:
     """Seal one next-page key against stable request, authority, and generation."""
 
     if type(binding) is not BillingSearchCursorBinding:
@@ -358,10 +365,13 @@ def seal_billing_search_page_cursor(
         issued_at=binding.trusted_now,
         expires_at=binding.trusted_now + BILLING_SEARCH_CURSOR_MAX_TTL_SECONDS,
     )
-    return seal_billing_search_cursor(
-        state,
-        keyring=keyring,
-        trusted_now=binding.trusted_now,
+    return _new_sealed_page_cursor(
+        seal_billing_search_cursor(
+            state,
+            keyring=keyring,
+            trusted_now=binding.trusted_now,
+        ),
+        state.sort_key,
     )
 
 

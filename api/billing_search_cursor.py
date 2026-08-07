@@ -17,6 +17,11 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from api.billing_search_sealed_cursor import (
+    BillingSearchSealedPageCursor,
+    _mint_billing_search_sealed_page_cursor,
+)
+
 BILLING_SEARCH_CURSOR_CONTRACT = "healthporta.billing-search-cursor.v1"
 BILLING_SEARCH_CURSOR_PREFIX = "bsc1"
 BILLING_SEARCH_CURSOR_MAX_CHARACTERS = 2048
@@ -273,6 +278,28 @@ def _base64url_decode(value: object) -> bytes:
     return decoded
 
 
+def _new_sealed_page_cursor(
+    token: object,
+    sort_key: object,
+) -> BillingSearchSealedPageCursor:
+    if (
+        type(token) is not str
+        or not 1 <= len(token) <= BILLING_SEARCH_CURSOR_MAX_CHARACTERS
+    ):
+        raise _fail()
+    token_parts = token.split("_", 2)
+    if len(token_parts) != 3 or token_parts[0] != BILLING_SEARCH_CURSOR_PREFIX:
+        raise _fail()
+    _canonical_key_id(token_parts[1])
+    sealed_payload = _base64url_decode(token_parts[2])
+    if len(sealed_payload) <= _NONCE_BYTES + 16:
+        raise _fail()
+    return _mint_billing_search_sealed_page_cursor(
+        token,
+        _canonical_sort_key(sort_key),
+    )
+
+
 def _canonical_json_bytes(json_object: object) -> bytes:
     return json.dumps(
         json_object,
@@ -426,6 +453,7 @@ __all__ = [
     "BillingSearchCursorError",
     "BillingSearchCursorGenerationExpired",
     "BillingSearchCursorKeyring",
+    "BillingSearchSealedPageCursor",
     "BillingSearchCursorState",
     "open_billing_search_cursor",
     "seal_billing_search_cursor",

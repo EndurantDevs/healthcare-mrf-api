@@ -28,4 +28,5 @@ def test_no_snapshot_state_requires_selection_to_be_none():
             next_cursor=None,
             has_more=False,
             selection=object(),
+            endpoint_access_state_sha256="a" * 64,
         )

@@ -10,6 +10,7 @@ import pytest
 from api import ptg2_billing_search_service as service
 from api.billing_search_cursor import (
     BillingSearchCursorError,
+    _new_sealed_page_cursor,
 )
 from api.plan_release_serving_resolution import (
     PLAN_RELEASE_RESOLUTION_NOT_FOUND,
@@ -20,14 +21,15 @@ from api.ptg2_billing_geo_contract import BillingGeoSelection
 from api.ptg2_billing_search_contract import (
     BILLING_SEARCH_RESULT_MATCHED,
     BILLING_SEARCH_RESULT_NO_MATCHING_RATES,
-    BILLING_SEARCH_RESULT_NO_MATCHING_TAX_IDENTITY,
     BILLING_SEARCH_RESULT_NO_MATCH_IN_RADIUS,
     BILLING_SEARCH_RESULT_NO_SNAPSHOT,
     BILLING_SEARCH_RESULT_TAX_IDENTITY_UNAVAILABLE,
     BillingSearchMatchedProvider,
     BillingSearchProviderPage,
+    BillingSearchResourceNotFoundError,
     BillingSearchServingUnavailableError,
 )
+from api.ptg2_shared_blocks import PTG2SharedBlockError
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from tests.billing_search_page_support import (
     NPI_VALUES,
@@ -92,17 +94,39 @@ async def test_unavailable_release_fails_closed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unknown_identity_and_missing_rate_states_are_distinct(monkeypatch):
+async def test_shared_block_failure_is_translated_to_serving_unavailable(monkeypatch):
+    _install_access(monkeypatch)
+    release_selection = _selection()
+    _install_ready_release(monkeypatch, release_selection)
+    monkeypatch.setattr(
+        service,
+        "_search_ready_release",
+        AsyncMock(side_effect=PTG2SharedBlockError("private graph coordinate")),
+    )
+
+    with pytest.raises(BillingSearchServingUnavailableError) as failure:
+        await service.search_exact_billing_provider_page(
+            object(),
+            access=_access(),
+            cursor_keyring=CURSOR_KEYRING,
+        )
+
+    assert "private graph coordinate" not in str(failure.value)
+
+
+@pytest.mark.asyncio
+async def test_unknown_opaque_ref_and_missing_rate_states_are_distinct(monkeypatch):
     _install_access(monkeypatch)
     release_selection = _selection()
     _install_ready_release(monkeypatch, release_selection)
     _install_binding_readers(monkeypatch, source_scope=None)
 
-    unknown_identity = await service.search_exact_billing_provider_page(
-        object(),
-        access=_access(),
-        cursor_keyring=CURSOR_KEYRING,
-    )
+    with pytest.raises(BillingSearchResourceNotFoundError):
+        await service.search_exact_billing_provider_page(
+            object(),
+            access=_access(),
+            cursor_keyring=CURSOR_KEYRING,
+        )
 
     _install_binding_readers(monkeypatch, code_witnesses=())
     missing_rate = await service.search_exact_billing_provider_page(
@@ -110,8 +134,27 @@ async def test_unknown_identity_and_missing_rate_states_are_distinct(monkeypatch
         access=_access(),
         cursor_keyring=CURSOR_KEYRING,
     )
-    assert unknown_identity.state == BILLING_SEARCH_RESULT_NO_MATCHING_TAX_IDENTITY
     assert missing_rate.state == BILLING_SEARCH_RESULT_NO_MATCHING_RATES
+
+
+@pytest.mark.asyncio
+async def test_unknown_opaque_ref_checks_every_entitled_binding(monkeypatch):
+    _install_access(monkeypatch)
+    release_selection = _selection(binding_count=2)
+    _install_ready_release(monkeypatch, release_selection)
+    _install_binding_readers(monkeypatch, source_scope=None)
+
+    with pytest.raises(BillingSearchResourceNotFoundError):
+        await service.search_exact_billing_provider_page(
+            object(),
+            access=_access(),
+            cursor_keyring=CURSOR_KEYRING,
+        )
+
+    source_resolver = (
+        service.ptg2_billing_entity_source_resolution.resolve_billing_entity_ref_source_scope
+    )
+    assert source_resolver.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -146,6 +189,33 @@ async def test_source_projection_failure_discards_partial_binding_results(monkey
     assert search_result.state == BILLING_SEARCH_RESULT_TAX_IDENTITY_UNAVAILABLE
     assert search_result.providers == ()
     assert source_resolver.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_release_traversal_caps_candidates_before_aggregate_sort(monkeypatch):
+    release_selection = _selection(binding_count=2)
+    monkeypatch.setattr(service, "MAX_PROVIDER_RATE_WITNESSES", 1)
+    monkeypatch.setattr(
+        service,
+        "_binding_source_scope",
+        AsyncMock(return_value=object()),
+    )
+    candidate_reader = AsyncMock(
+        side_effect=(
+            ((object(),), True),
+            ((object(),), True),
+        )
+    )
+    monkeypatch.setattr(service, "_binding_candidates", candidate_reader)
+
+    with pytest.raises(BillingSearchServingUnavailableError):
+        await service._traverse_release(
+            object(),
+            selection=release_selection,
+            request=_access().request,
+        )
+
+    assert candidate_reader.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -215,7 +285,11 @@ async def test_matched_page_seals_last_returned_provider_cursor(monkeypatch):
             )
         ),
     )
-    sealer = Mock(return_value="sealed-cursor")
+    sealed_cursor = _new_sealed_page_cursor(
+        "bsc1_k1_" + "A" * 40,
+        candidate.sort_key,
+    )
+    sealer = Mock(return_value=sealed_cursor)
 
     def seal_cursor(*_args, **_kwargs):
         return sealer(*_args, **_kwargs)
@@ -233,7 +307,7 @@ async def test_matched_page_seals_last_returned_provider_cursor(monkeypatch):
     )
 
     assert search_result.state == BILLING_SEARCH_RESULT_MATCHED
-    assert search_result.next_cursor == "sealed-cursor"
+    assert search_result.next_cursor is sealed_cursor
     assert sealer.call_args.args[0] == candidate.sort_key
 
 

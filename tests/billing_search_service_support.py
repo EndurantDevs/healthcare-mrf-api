@@ -46,6 +46,7 @@ def access(**request_overrides):
         request=request(**request_overrides),
         authorization_context=object(),
         trusted_now="2031-01-02T03:04:05Z",
+        state_sha256="a" * 64,
     )
 
 

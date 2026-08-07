@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from api.billing_search_cursor import BillingSearchSealedPageCursor
 from api.plan_release_serving import PlanReleaseServingSelection
 from api.ptg2_billing_code_reader import BillingCodeWitness
 from api.ptg2_billing_geo_contract import (
@@ -32,10 +33,21 @@ BILLING_SEARCH_RESULT_STATES = frozenset(
         BILLING_SEARCH_RESULT_NO_SNAPSHOT,
     }
 )
+_LOWER_HEXADECIMAL = frozenset("0123456789abcdef")
 
 
 class BillingSearchServingUnavailableError(PTG2ManifestArtifactError):
     """One value-free failure for an unavailable immutable serving bundle."""
+
+
+class BillingSearchResourceNotFoundError(RuntimeError):
+    """One value-free failure for an inaccessible opaque billing resource."""
+
+
+def resource_not_found() -> BillingSearchResourceNotFoundError:
+    """Return the generic API-safe opaque-resource failure."""
+
+    return BillingSearchResourceNotFoundError("billing_search_resource_not_found")
 
 
 def serving_unavailable() -> BillingSearchServingUnavailableError:
@@ -221,9 +233,10 @@ class BillingSearchServiceResult:
 
     state: str
     providers: tuple[BillingSearchMatchedProvider, ...]
-    next_cursor: str | None
+    next_cursor: BillingSearchSealedPageCursor | None
     has_more: bool
     selection: PlanReleaseServingSelection | None
+    endpoint_access_state_sha256: str
 
     def __post_init__(self) -> None:
         is_match = self.state == BILLING_SEARCH_RESULT_MATCHED
@@ -237,7 +250,13 @@ class BillingSearchServiceResult:
                 for provider in self.providers
             )
             or type(self.has_more) is not bool
-            or (self.next_cursor is not None and type(self.next_cursor) is not str)
+            or (
+                self.next_cursor is not None
+                and type(self.next_cursor) is not BillingSearchSealedPageCursor
+            )
+            or type(self.endpoint_access_state_sha256) is not str
+            or len(self.endpoint_access_state_sha256) != 64
+            or not set(self.endpoint_access_state_sha256).issubset(_LOWER_HEXADECIMAL)
             or (is_no_snapshot and self.selection is not None)
             or (not is_no_snapshot and not has_selection)
             or (not is_match and (self.providers or self.next_cursor or self.has_more))
@@ -277,8 +296,10 @@ __all__ = [
     "BillingSearchMatchedProvider",
     "BillingSearchProviderPage",
     "BillingSearchProviderCandidate",
+    "BillingSearchResourceNotFoundError",
     "BillingSearchServiceResult",
     "BillingSearchServingUnavailableError",
+    "resource_not_found",
     "serving_unavailable",
     "validate_service_result",
 ]

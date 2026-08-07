@@ -155,12 +155,13 @@ def test_cursor_auth_scope_is_stable_across_transport_timestamps(monkeypatch) ->
         keyring=KEYRING,
         binding=first_binding,
     )
+    assert type(token) is cursor.BillingSearchSealedPageCursor
     next_context = _authorization_context(
         issued_at="2031-01-02T03:04:55Z",
         expires_at="2031-01-02T03:05:55Z",
         trusted_now=NEXT_REQUEST_TIME,
     )
-    next_request = _request(cursor=token)
+    next_request = _request(cursor=token.token)
     next_binding = _cursor_binding(
         next_request,
         next_context,
@@ -198,7 +199,7 @@ def test_cursor_rejects_cross_scope_authority(monkeypatch, context_overrides) ->
     token = pagination.seal_billing_search_page_cursor(
         (1,), keyring=KEYRING, binding=_cursor_binding()
     )
-    next_request = _request(cursor=token)
+    next_request = _request(cursor=token.token)
     next_context = _authorization_context(**context_overrides)
     next_binding = _cursor_binding(next_request, next_context)
 
@@ -217,7 +218,7 @@ def test_cursor_reports_expired_generation_after_address_swap(monkeypatch) -> No
         keyring=KEYRING,
         binding=_cursor_binding(pin=_pin(address_relation_oid=10)),
     )
-    next_request = _request(cursor=token)
+    next_request = _request(cursor=token.token)
     next_binding = _cursor_binding(next_request, pin=_pin(address_relation_oid=11))
 
     with pytest.raises(cursor.BillingSearchCursorGenerationExpired):
@@ -235,7 +236,7 @@ def test_cursor_reports_expired_generation_after_evidence_swap(monkeypatch) -> N
         keyring=KEYRING,
         binding=_cursor_binding(pin=_pin(address_evidence_relation_oid=10)),
     )
-    next_request = _request(cursor=token)
+    next_request = _request(cursor=token.token)
     next_binding = _cursor_binding(
         next_request,
         pin=_pin(address_evidence_relation_oid=11),
