@@ -20584,13 +20584,15 @@ async def _delete_endpoint_dataset_retry_state(
     selected_dataset_ids: list[str],
 ) -> None:
     """Delete non-content retry rows after finalized parents are locked."""
+    retry_resource_types = _last_updated_partition_retry_resource_types()
     await db.status(
         f"""
         DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
          WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[]))
-           AND resource_type LIKE 'LU:%:pass:%';
+           AND resource_type = ANY(CAST(:retry_resource_types AS varchar[]));
         """,
         dataset_ids=selected_dataset_ids,
+        retry_resource_types=retry_resource_types,
     )
     await db.status(
         f"""
@@ -44642,6 +44644,18 @@ def _last_updated_partition_fingerprint_resource_type(
     pass_number: int,
 ) -> str:
     return f"LU:{resource_type}:pass:{pass_number}"
+
+
+def _last_updated_partition_retry_resource_types() -> list[str]:
+    """Return every valid immutable fingerprint marker resource type."""
+    return [
+        _last_updated_partition_fingerprint_resource_type(
+            resource_type,
+            pass_number,
+        )
+        for resource_type in DEFAULT_RESOURCES
+        for pass_number in (1, 2)
+    ]
 
 
 def _last_updated_partition_window_proof_hash(
