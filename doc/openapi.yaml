@@ -4167,6 +4167,30 @@ paths:
         coordinates in the requested ZIP. Allowed-amount fallback applies these
         filters internally but does not return provider address or distance
         fields.
+
+        When `billing_entity_ref` is present, this canonical path switches to
+        the authenticated exact billing-identity branch. That branch requires
+        `billing_entity_ref`, `healthporta_plan_id`, `code_system`, `code`,
+        `limit`, and exactly one GEO form (`zip5` alone or
+        `lat`+`long`+`radius_miles`), and permits only the optional `npi`,
+        `modifiers`, `place_of_service`, `include_evidence`, and `cursor`
+        fields. Lists are sorted unique comma-separated values (at most 8
+        modifiers and 16 place-of-service codes); `npi` is a checksum-valid
+        same-group intersection. Duplicate fields, offset pagination, aliases,
+        raw tax identifiers, client-supplied `plan_release_id`, and all other
+        legacy parameters fail closed. The public gateway resolves the plan to
+        one entitled immutable `plan_release_id` before signing and forwarding
+        the internal request; that resolved release remains visible in the
+        response.
+        Results retain the exact billing identity to group to rate to NPI
+        witness, GEO applies only to that NPI's own address evidence, and
+        allowed-amount/CMS fallback is disabled. Unknown or inaccessible
+        opaque references return the same generic 404. The public response
+        emits no internal snapshot-local group, set, source, record, relation,
+        address, or location coordinates. Phase-1 responses preserve at most
+        256 exact price atoms, 64 KiB of emitted text, and a 256 KiB serialized
+        body; larger source results fail closed without truncation. Billing
+        responses use `Cache-Control: private, no-store`.
       parameters:
         - name: year
           in: query
@@ -4254,6 +4278,25 @@ paths:
             type: string
             pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
           description: Canonical immutable release selector; cannot be combined with raw plan/source/snapshot selectors.
+        - name: billing_entity_ref
+          in: query
+          schema:
+            type: string
+            pattern: '^be1_[A-Za-z0-9_-]{64}$'
+          description: |
+            Opaque exact billing identity. Its presence selects the closed,
+            authenticated billing-search contract described above. It is not a
+            raw or masked tax identifier and is supported only on this canonical
+            path.
+        - name: healthporta_plan_id
+          in: query
+          schema:
+            type: string
+            pattern: '^hpplan_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: |
+            Public plan selector for the exact billing-identity branch. The
+            gateway resolves it to one entitled immutable release; clients must
+            not supply `plan_release_id` in that branch.
         - name: plan_id_type
           in: query
           schema: { type: string, enum: [ein, hios] }
@@ -4344,7 +4387,10 @@ paths:
             for the selected address, including dataset identifier, source
             record/version identifiers, retrieval timestamp, and source URLs
             when available. Allowed-amount fallback does not expose a selected
-            provider address.
+            provider address. For the exact billing-identity branch, evidence
+            exposure is narrower: only the dataset identifier and retrieval
+            timestamp are returned; source record/version identifiers and URLs
+            remain internal.
         - name: include_allowed_amounts
           in: query
           schema: { type: boolean, default: true }
@@ -4391,6 +4437,17 @@ paths:
           in: query
           schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
           description: Maximum provider rows returned on this page.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            maxLength: 2048
+            pattern: '^bsc1_[a-z0-9][a-z0-9-]{0,31}_[A-Za-z0-9_-]+$'
+          description: |
+            Confidential generation-bound keyset cursor for an exact billing
+            search. A syntactically valid sealed cursor that fails authenticated
+            cursor processing returns 400. Malformed cursor syntax fails closed
+            as the same generic 404 used for other inaccessible billing inputs.
         - name: offset
           in: query
           schema: { type: integer, minimum: 0, default: 0 }
@@ -4398,16 +4455,91 @@ paths:
       responses:
         '200':
           description: Paginated provider matches by procedure
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/BillingSearchCacheControl'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PricingProcedureProviderListResponse'
+                oneOf:
+                  - allOf:
+                      - $ref: '#/components/schemas/PricingProcedureProviderListResponse'
+                      - not:
+                          required: [billing_association_scope]
+                  - $ref: '#/components/schemas/BillingSearchResponse'
         '400':
-          description: Invalid raw pricing-search parameters
+          description: |
+            Invalid legacy parameters, or a syntactically valid sealed billing
+            cursor that fails authenticated cursor processing
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/BillingSearchCacheControl'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                oneOf:
+                  - $ref: '#/components/schemas/Error'
+                  - $ref: '#/components/schemas/BillingSearchErrorResponse'
+              examples:
+                billingCursorInvalid:
+                  value:
+                    error:
+                      code: billing_search_cursor_invalid
+                      message: Invalid billing search cursor.
+        '404':
+          description: |
+            Generic inaccessible billing-search resource, malformed billing
+            input (including malformed cursor syntax), or authorization failure
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/BillingSearchCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingSearchErrorResponse'
+              example:
+                error:
+                  code: resource_not_found
+                  message: Resource not found.
+        '409':
+          description: Billing-search cursor generation is no longer available
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/BillingSearchCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingSearchErrorResponse'
+              example:
+                error:
+                  code: billing_search_cursor_generation_expired
+                  message: Billing search cursor generation is no longer available.
+        '503':
+          description: |
+            Billing-search keys, serving generation, projection, or database
+            are unavailable; or a legacy PTG exact query exceeds its sealed
+            online-work budget
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/BillingSearchCacheControl'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/BillingSearchErrorResponse'
+                  - $ref: '#/components/schemas/PricingProcedureProviderBudgetErrorResponse'
+              examples:
+                billingServingUnavailable:
+                  value:
+                    error:
+                      code: billing_search_serving_unavailable
+                      message: Billing search is temporarily unavailable.
+                legacyOnlineWorkBudgetExceeded:
+                  value:
+                    error:
+                      code: ptg2_online_work_budget_exceeded
+                      message: The exact query exceeds this snapshot's sealed online work budget.
+                      dimension: candidate_members
   /pricing/providers/by-procedure:
     get:
       operationId: getPricingProvidersByProcedure
@@ -5327,6 +5459,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/ClinicalCrosswalkListResponse'
 components:
+  headers:
+    BillingSearchCacheControl:
+      description: |
+        Present on exact billing-search responses, which are private and must
+        not be stored. Legacy responses on the shared operation do not
+        guarantee this header.
+      schema:
+        type: string
+        enum: ['private, no-store']
   schemas:
     Error:
       type: object
@@ -6078,6 +6219,307 @@ components:
           type: string
         reported_code_system:
           type: string
+    BillingSearchResponse:
+      type: object
+      additionalProperties: false
+      required:
+        [result_state, pricing_scope, billing_association_scope, geo_match_scope, plan_release_id, billing_entity_ref, procedure, items, pagination]
+      description: |
+        Closed exact billing-identity response. Every emitted rate occurrence
+        is revalidated against the requested opaque identity's exact
+        snapshot-local source/group witness before shaping. The response
+        exposes provider-owned GEO evidence and local occurrence ordinals,
+        never raw tax identifiers or internal snapshot, group, set, source,
+        record, address, location, relation, or generation coordinates.
+      properties:
+        result_state:
+          type: string
+          enum:
+            [matched, no_matching_tax_identity, tax_identity_unavailable_for_snapshot, no_matching_rates, no_match_in_radius, no_snapshot_for_plan]
+        pricing_scope:
+          type: string
+          enum: [plan_scoped_ptg_tax_identity]
+        billing_association_scope:
+          type: string
+          enum: [tax_identity_match_only]
+        geo_match_scope:
+          type: string
+          enum: [provider_address_evidence]
+        plan_release_id:
+          type: string
+          pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+        billing_entity_ref:
+          type: string
+          pattern: '^be1_[A-Za-z0-9_-]{64}$'
+        procedure:
+          $ref: '#/components/schemas/BillingSearchProcedure'
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/BillingSearchProvider'
+        pagination:
+          $ref: '#/components/schemas/BillingSearchPagination'
+    BillingSearchProcedure:
+      type: object
+      additionalProperties: false
+      required: [code_system, code, modifiers, place_of_service]
+      properties:
+        code_system:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_]{0,31}$'
+        code:
+          type: string
+          pattern: '^[A-Z0-9][A-Z0-9._-]{0,63}$'
+        modifiers:
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[A-Z0-9]{1,8}$'
+        place_of_service:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[0-9]{2}$'
+    BillingSearchProvider:
+      type: object
+      additionalProperties: false
+      required: [npi, billing_entity_ref, address, distance_miles, rate_occurrences]
+      properties:
+        npi:
+          type: integer
+          minimum: 1000000000
+          maximum: 2999999999
+          description: Checksum-valid NPI retained through the exact billing-group witness.
+        billing_entity_ref:
+          type: string
+          pattern: '^be1_[A-Za-z0-9_-]{64}$'
+        address:
+          $ref: '#/components/schemas/BillingSearchAddress'
+        distance_miles:
+          type: number
+          minimum: 0
+          nullable: true
+        rate_occurrences:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/BillingSearchRateOccurrence'
+        address_evidence:
+          $ref: '#/components/schemas/BillingSearchAddressEvidence'
+    BillingSearchAddress:
+      type: object
+      additionalProperties: false
+      required: [address_kind, first_line, second_line, city, state, postal_code, country_code]
+      description: |
+        Selected physical address evidence belonging to the returned NPI. It is
+        not asserted to be a TIN-owned facility or a rate-bound service site.
+      properties:
+        address_kind:
+          type: string
+          enum: [physical]
+        first_line:
+          type: string
+          maxLength: 1024
+          nullable: true
+        second_line:
+          type: string
+          maxLength: 1024
+          nullable: true
+        city:
+          type: string
+          maxLength: 1024
+          nullable: true
+        state:
+          type: string
+          maxLength: 1024
+          nullable: true
+        postal_code:
+          type: string
+          maxLength: 1024
+          nullable: true
+        country_code:
+          type: string
+          maxLength: 1024
+          nullable: true
+    BillingSearchAddressEvidence:
+      type: object
+      additionalProperties: false
+      required: [evidence_level, selection_contract, sources]
+      properties:
+        evidence_level:
+          type: string
+          enum:
+            [nppes_registry_address, multi_issuer_marketplace_address, cms_doctors_source_with_nppes_identity_anchor]
+        selection_contract:
+          type: string
+          enum: [ptg2_billing_provider_address_selection_v1]
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/BillingSearchAddressEvidenceSource'
+    BillingSearchAddressEvidenceSource:
+      type: object
+      additionalProperties: false
+      required: [dataset, retrieved_at]
+      properties:
+        dataset:
+          type: string
+          maxLength: 1024
+          enum:
+            [cms_nppes_registry, marketplace_provider_directory, cms_doctors_and_clinicians, cms_provider_enrollment_ffs, cms_provider_enrollment_facility, facility_reference, payer_transparency_in_coverage, payer_provider_directory_fhir]
+        retrieved_at:
+          type: string
+          maxLength: 64
+          format: date-time
+    BillingSearchRateOccurrence:
+      type: object
+      additionalProperties: false
+      required: [occurrence_ordinal, billing_entity_ref, procedure, prices]
+      description: |
+        One exact rate witness proven to belong to the requested billing
+        identity. Internal source, record, group, provider-set, and price keys
+        are deliberately omitted.
+      properties:
+        occurrence_ordinal:
+          type: integer
+          minimum: 1
+          description: One-based position within this provider result only; not a stable source identifier.
+        billing_entity_ref:
+          type: string
+          pattern: '^be1_[A-Za-z0-9_-]{64}$'
+        procedure:
+          $ref: '#/components/schemas/BillingSearchRateProcedure'
+        prices:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/BillingSearchNegotiatedPrice'
+    BillingSearchRateProcedure:
+      type: object
+      additionalProperties: false
+      required: [code_system, code, negotiation_arrangement, billing_code_type_version]
+      properties:
+        code_system:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_]{0,31}$'
+        code:
+          type: string
+          pattern: '^[A-Z0-9][A-Z0-9._-]{0,63}$'
+        negotiation_arrangement:
+          type: string
+          maxLength: 1024
+          nullable: true
+        billing_code_type_version:
+          type: string
+          maxLength: 1024
+          nullable: true
+    BillingSearchNegotiatedPrice:
+      type: object
+      additionalProperties: false
+      required:
+        [negotiated_rate, negotiated_type, expiration_date, service_code, billing_class, setting, billing_code_modifier, additional_information]
+      properties:
+        negotiated_rate:
+          type: number
+        negotiated_type:
+          type: string
+          maxLength: 1024
+          nullable: true
+        expiration_date:
+          type: string
+          maxLength: 1024
+          nullable: true
+        service_code:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            maxLength: 16
+        billing_class:
+          type: string
+          maxLength: 1024
+          nullable: true
+        setting:
+          type: string
+          maxLength: 1024
+          nullable: true
+        billing_code_modifier:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            maxLength: 16
+        additional_information:
+          type: string
+          maxLength: 1024
+          nullable: true
+    BillingSearchPagination:
+      type: object
+      additionalProperties: false
+      required: [limit, has_more, next_cursor]
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+          maxLength: 2048
+          pattern: '^bsc1_[a-z0-9][a-z0-9-]{0,31}_[A-Za-z0-9_-]+$'
+          nullable: true
+    BillingSearchErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/BillingSearchError'
+    BillingSearchError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            [billing_search_cursor_invalid, resource_not_found, billing_search_cursor_generation_expired, billing_search_serving_unavailable]
+        message:
+          type: string
+    PricingProcedureProviderBudgetErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/PricingProcedureProviderBudgetError'
+    PricingProcedureProviderBudgetError:
+      type: object
+      additionalProperties: false
+      required: [code, message, dimension]
+      properties:
+        code:
+          type: string
+          enum: [ptg2_online_work_budget_exceeded]
+        message:
+          type: string
+          enum: [The exact query exceeds this snapshot's sealed online work budget.]
+        dimension:
+          type: string
+          minLength: 1
+          maxLength: 64
     PtgNegotiatedPrice:
       type: object
       properties:
