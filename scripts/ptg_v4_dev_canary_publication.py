@@ -90,6 +90,9 @@ WHOLE_SNAPSHOT_PHYSICAL_RELATIONS = frozenset(
         "ptg2_artifact_manifest",
         "ptg2_artifact_blob_chunk",
         "ptg2_provider_tax_identity_legacy_layout",
+        "ptg2_provider_tax_identity_source_manifest",
+        "ptg2_provider_tax_identity_source_binding",
+        "ptg2_provider_group_tax_identity_source",
         *REQUIRED_PHYSICAL_RELATIONS,
     }
 )
