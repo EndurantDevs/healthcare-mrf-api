@@ -31,9 +31,7 @@ AUDIT_SHA256 = hashlib.sha256(b"synthetic-audit-scope").hexdigest()
 GOLDEN_PAYLOAD_BYTES = (
     b'{"audience":"healthcare-mrf-api","audit_scope_sha256":"'
     + AUDIT_SHA256.encode("ascii")
-    + b'","capabilities":["pricing:billing-search"],"contract":"healthporta.billing-search-transport.v1","expires_at":"2031-01-02T03:04:55Z","issued_at":"2031-01-02T03:03:55Z","issuer":"'
-    + contract.BILLING_SEARCH_TRANSPORT_ISSUER.encode("ascii")
-    + b'","metering_receipt_sha256":"'
+    + b'","capabilities":["pricing:billing-search"],"contract":"healthporta.billing-search-transport.v1","expires_at":"2031-01-02T03:04:55Z","issued_at":"2031-01-02T03:03:55Z","issuer":"healthporta-billing-search-gateway","metering_receipt_sha256":"'
     + METERING_RECEIPT_SHA256.encode("ascii")
     + b'","metering_request_id":"123e4567-e89b-42d3-a456-426614174000","method":"GET","path":"/api/v1/pricing/providers/search-by-procedure","plan_entitlement_sha256":"'
     + PLAN_ENTITLEMENT_SHA256.encode("ascii")
