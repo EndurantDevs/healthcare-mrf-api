@@ -27,6 +27,7 @@ _FROZEN_MARKER_KEYS = _FROZEN_INPUT_MARKER_KEYS | frozenset(
         DIRECT_RATE_FILE_INTENT_FIELD,
         DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
         DIRECT_RATE_FILE_PUBLIC_MARKER,
+        "allowed_url",
         "in_network_url",
     }
 )
@@ -41,6 +42,7 @@ _PRIVATE_SCALAR_KEYS = frozenset(
         "engine_source_file_version_id",
         "frozen_rate_file_set_sha256",
         "frozen_rate_file_proof_sha256",
+        "allowed_url",
         "in_network_url",
         "source_file_id",
         "source_key",
@@ -58,6 +60,7 @@ _PRIVATE_EVIDENCE_KEYS = frozenset(
         "skipped_files",
         "failed_files",
         DIRECT_RATE_FILE_INTENT_FIELD,
+        "allowed_url",
         "in_network_url",
         "source_file_id",
         "source_key",

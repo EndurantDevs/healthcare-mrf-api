@@ -17,74 +17,30 @@ from api.control_import_waves import (
     sign_cohort_attestation,
     validate_import_wave_payload,
 )
-from api.control_imports import _retry_child_params, normalize_run
-from process.ptg import _direct_in_network_job
-from process.ptg_control_failures import ptg_failure_error
+from api.control_imports import normalize_run
 from process.ptg_parts.frozen_rate_files import FROZEN_RATE_FILE_SET_CONTRACT
-from process.ptg_parts.source_download import _download_failure
 from process.ptg_singleton_direct_control import (
-    DIRECT_RATE_FILE_INTENT_CONTRACT,
     DIRECT_RATE_FILE_INTENT_FIELD,
     DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
     DIRECT_RATE_FILE_PUBLIC_MARKER,
-    PTG_SMALL_RESOURCE_CONTRACT,
     SingletonDirectValidationError,
     normalize_protected_singleton_direct_params,
-    singleton_direct_failure_payload,
-    singleton_direct_intent_sha256,
     singleton_direct_main_kwargs,
-    singleton_direct_source_key,
     validated_worker_singleton_direct_params,
 )
+from tests.ptg_singleton_direct_test_support import _direct_params
 
 
 _KEY = "test-singleton-direct-key"
 
 
-def _direct_params(ordinal: int = 0) -> dict:
-    source_file_id = f"file-singleton-{ordinal}"
-    source_import_id = f"import-singleton-{ordinal}"
-    content_version = f"content-singleton-{ordinal}"
-    canonical_url = (
-        f"https://files.example.test/rates-{ordinal}.json.gz"
-    )
-    source_key = singleton_direct_source_key(source_file_id)
-    direct_intent_map = {
-        "contract": DIRECT_RATE_FILE_INTENT_CONTRACT,
-        "source_file_import_id": source_import_id,
-        "source_file_id": source_file_id,
-        "content_version": content_version,
-        "source_type": "in_network",
-        "canonical_url": canonical_url,
-        "source_key": source_key,
-        "content_file_count": 1,
-    }
-    return {
-        "version": 2,
-        "importer": "ptg",
-        "operation_id": "wave-singleton",
-        "source_file_import_id": source_import_id,
-        "import_id": source_import_id,
-        "source_file_id": source_file_id,
-        "content_version": content_version,
-        "import_month": "2026-08",
-        "node_id": "node-singleton",
-        "use_stored_catalog": True,
-        DIRECT_RATE_FILE_INTENT_FIELD: direct_intent_map,
-        DIRECT_RATE_FILE_INTENT_SHA256_FIELD: (
-            singleton_direct_intent_sha256(direct_intent_map)
-        ),
-        "ptg_resource": copy.deepcopy(PTG_SMALL_RESOURCE_CONTRACT),
-        "source_key": source_key,
-        "plan_ids": [f"plan-{ordinal}"],
-        "plan_market_types": ["group"],
-        "in_network_url": canonical_url,
-        "max_files": 1,
-    }
+def _payload(count: int = 1, *, source_type: str = "in_network") -> dict:
+    """Build one signed synthetic exact-wave payload."""
 
-
-def _payload(count: int = 1) -> dict:
-    params = [_direct_params(ordinal) for ordinal in range(count)]
+    params = [
+        _direct_params(ordinal, source_type=source_type)
+        for ordinal in range(count)
+    ]
     intents = [
         {
             "ordinal": ordinal,
@@ -134,10 +90,7 @@ def _payload(count: int = 1) -> dict:
     return {
         "cohort_attestation": {
             **unsigned_attestation_map,
-            "signature": sign_cohort_attestation(
-                unsigned_attestation_map,
-                key=_KEY,
-            ),
+            "signature": sign_cohort_attestation(unsigned_attestation_map, key=_KEY),
         }
     }
 
@@ -155,16 +108,28 @@ def _resign_payload(payload: dict) -> None:
     )
 
 
-def test_singleton_direct_contract_accepts_only_exact_matching_tuple():
-    params = _direct_params()
+@pytest.mark.parametrize(
+    ("source_type", "selector_field", "other_selector"),
+    (
+        ("in_network", "in_network_url", "allowed_url"),
+        ("allowed_amounts", "allowed_url", "in_network_url"),
+    ),
+)
+def test_singleton_direct_contract_accepts_only_exact_matching_tuple(
+    source_type,
+    selector_field,
+    other_selector,
+):
+    params = _direct_params(source_type=source_type)
 
     normalized = normalize_protected_singleton_direct_params(params)
 
     assert normalized == params
     assert normalized["max_files"] == 1
-    assert normalized["in_network_url"] == (
+    assert normalized[selector_field] == (
         normalized[DIRECT_RATE_FILE_INTENT_FIELD]["canonical_url"]
     )
+    assert other_selector not in normalized
     assert validated_worker_singleton_direct_params(
         {
             "source_file_import_id": params["source_file_import_id"],
@@ -221,6 +186,10 @@ def test_ordinary_scalar_direct_import_remains_outside_protected_contract():
         lambda params: params.__setitem__("max_files", 2),
         lambda params: params.pop("in_network_url"),
         lambda params: params.__setitem__(
+            "allowed_url",
+            params["in_network_url"],
+        ),
+        lambda params: params.__setitem__(
             "in_network_url",
             "https://files.example.test/changed.json.gz",
         ),
@@ -268,15 +237,35 @@ def test_singleton_direct_contract_rejects_partial_tampered_or_mixed_input(
         normalize_protected_singleton_direct_params(params)
 
 
-def test_signed_wave_accepts_direct_intent_and_rejects_resigned_tamper():
-    payload = _payload()
+def test_singleton_direct_contract_rejects_role_selector_mismatch():
+    params = _direct_params(source_type="allowed_amounts")
+    params["in_network_url"] = params.pop("allowed_url")
+
+    with pytest.raises(SingletonDirectValidationError, match="conflicts"):
+        normalize_protected_singleton_direct_params(params)
+
+
+@pytest.mark.parametrize(
+    ("source_type", "selector_field"),
+    (
+        ("in_network", "in_network_url"),
+        ("allowed_amounts", "allowed_url"),
+    ),
+)
+def test_signed_wave_accepts_direct_intent_and_rejects_resigned_tamper(
+    source_type,
+    selector_field,
+):
+    payload = _payload(source_type=source_type)
     validated = validate_import_wave_payload(payload, attestation_key=_KEY)
-    assert validated["intents"][0]["params"] == _direct_params()
+    assert validated["intents"][0]["params"] == _direct_params(
+        source_type=source_type
+    )
 
     changed = copy.deepcopy(payload)
-    changed["cohort_attestation"]["intents"][0]["params"][
-        "in_network_url"
-    ] = "https://files.example.test/changed.json.gz"
+    changed["cohort_attestation"]["intents"][0]["params"][selector_field] = (
+        "https://files.example.test/changed.json.gz"
+    )
     _resign_payload(changed)
     with pytest.raises(ValueError, match="conflicts"):
         validate_import_wave_payload(changed, attestation_key=_KEY)
@@ -291,6 +280,22 @@ def test_signed_wave_rejects_outer_direct_content_version_mismatch():
 
     with pytest.raises(ValueError, match="coordinate conflicts"):
         validate_import_wave_payload(changed, attestation_key=_KEY)
+
+
+def test_signed_wave_accepts_mixed_direct_rate_roles():
+    payload = _payload(count=2)
+    payload["cohort_attestation"]["intents"][1]["params"] = _direct_params(
+        1,
+        source_type="allowed_amounts",
+    )
+    _resign_payload(payload)
+
+    validated = validate_import_wave_payload(payload, attestation_key=_KEY)
+
+    assert [
+        intent["params"][DIRECT_RATE_FILE_INTENT_FIELD]["source_type"]
+        for intent in validated["intents"]
+    ] == ["in_network", "allowed_amounts"]
 
 
 @pytest.mark.parametrize(
@@ -335,8 +340,11 @@ def test_direct_marker_cannot_bypass_per_intent_limit_with_v1_version():
         validate_import_wave_payload(changed, attestation_key=_KEY)
 
 
-def test_full_live_shape_fits_one_bounded_twelve_worker_attestation():
-    payload = _payload(3_586)
+@pytest.mark.parametrize("source_type", ("in_network", "allowed_amounts"))
+def test_full_live_shape_fits_one_bounded_twelve_worker_attestation(
+    source_type,
+):
+    payload = _payload(3_586, source_type=source_type)
     canonical_bytes = json.dumps(
         payload,
         sort_keys=True,
@@ -349,93 +357,3 @@ def test_full_live_shape_fits_one_bounded_twelve_worker_attestation():
     assert len(validated["intents"]) == 3_586
     assert len(canonical_bytes) < MAX_ATTESTATION_CANONICAL_BYTES
     assert WORKER_LIMIT == 12
-
-
-def test_direct_worker_progress_and_public_run_projection_are_private():
-    params = _direct_params()
-    direct_intent = params[DIRECT_RATE_FILE_INTENT_FIELD]
-    digest = params[DIRECT_RATE_FILE_INTENT_SHA256_FIELD]
-    job = _direct_in_network_job(
-        params["in_network_url"],
-        plan_info=[{"plan_id": "plan-0"}],
-        source_network_names=[],
-        private_intent_sha256=digest,
-    )
-
-    assert job["_ptg_progress_private"] is True
-    assert job["_ptg_progress_label"] == f"direct-singleton-{digest[:12]}"
-    assert params["in_network_url"] not in job["_ptg_progress_label"]
-
-    normalized = normalize_run(
-        {
-            "run_id": "run-singleton",
-            "importer": "ptg",
-            "status": "failed",
-            "params": params,
-            "progress": {
-                "message": f"failed {direct_intent['canonical_url']}"
-            },
-            "metrics": {
-                "source_file_versions": [direct_intent],
-                DIRECT_RATE_FILE_INTENT_SHA256_FIELD: digest,
-            },
-            "error": {
-                "message": f"failed {direct_intent['source_key']}"
-            },
-        }
-    )
-    assert normalized["params"][DIRECT_RATE_FILE_PUBLIC_MARKER] is True
-    assert normalized["params"][DIRECT_RATE_FILE_INTENT_SHA256_FIELD] == digest
-    assert normalized["params"]["max_files"] == 1
-    rendered = json.dumps(normalized, sort_keys=True)
-    assert direct_intent["canonical_url"] not in rendered
-    assert direct_intent["source_key"] not in rendered
-    assert DIRECT_RATE_FILE_INTENT_FIELD not in normalized["params"]
-
-    with pytest.raises(ValueError, match="cannot be retried"):
-        _retry_child_params(
-            {"importer": "ptg", "params": normalized["params"]},
-            "run-singleton",
-            {},
-        )
-
-
-def test_private_direct_download_failure_does_not_reflect_url():
-    private_url = "https://files.example.test/private-rates.json.gz"
-    job_map = {
-        "type": "in_network",
-        "url": private_url,
-        "_ptg_progress_private": True,
-        "_ptg_progress_label": "direct-singleton-deadbeef0000",
-    }
-
-    failure = _download_failure(
-        job_map,
-        RuntimeError(f"download failed for {private_url}"),
-    )
-
-    assert failure.error is not None
-    assert private_url not in failure.error
-    assert "direct-singleton-deadbeef0000" in failure.error
-
-
-def test_direct_contract_failure_is_classified_without_private_reflection():
-    private_selector = "https://files.example.test/private-selector.json.gz"
-    error = SingletonDirectValidationError(private_selector)
-
-    assert singleton_direct_failure_payload([error]) == {
-        "code": "ptg_singleton_direct_contract_failed",
-        "message": "protected singleton direct input is invalid",
-        "retryable": False,
-    }
-    classified = ptg_failure_error(error)
-    assert classified["code"] == "ptg_singleton_direct_contract_failed"
-    assert private_selector not in repr(classified)
-
-
-def test_direct_intent_digest_matches_cross_service_vector():
-    digest = _direct_params()[DIRECT_RATE_FILE_INTENT_SHA256_FIELD]
-
-    assert digest == (
-        "bdcd799a22207de0d41aa72dd4339b6208d0ee312ff1b404f475bdd3d85e067d"
-    )

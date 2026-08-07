@@ -9,52 +9,25 @@ import re
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
-from process.ptg_parts.frozen_rate_binding import (
-    protected_frozen_tuple_presence,
-)
+from process.ptg_parts.frozen_rate_binding import protected_frozen_tuple_presence
+from process.ptg_singleton_direct_resource import PTG_SMALL_RESOURCE_CONTRACT
 
 
 DIRECT_RATE_FILE_INTENT_CONTRACT = "ptg_singleton_direct_file_intent_v1"
 DIRECT_RATE_FILE_INTENT_FIELD = "direct_rate_file_intent"
 DIRECT_RATE_FILE_INTENT_SHA256_FIELD = "direct_rate_file_intent_sha256"
-DIRECT_RATE_FILE_INTENT_DIGEST_DOMAIN = (
-    "ptg-singleton-direct-file-intent-v1"
-)
+DIRECT_RATE_FILE_INTENT_DIGEST_DOMAIN = "ptg-singleton-direct-file-intent-v1"
 DIRECT_RATE_FILE_PROTECTED_FIELDS = (
     DIRECT_RATE_FILE_INTENT_FIELD,
     DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
+    "allowed_url",
     "in_network_url",
     "max_files",
 )
 _DIRECT_RATE_FILE_MARKER_FIELDS = (
-    DIRECT_RATE_FILE_INTENT_FIELD,
-    DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
+    DIRECT_RATE_FILE_INTENT_FIELD, DIRECT_RATE_FILE_INTENT_SHA256_FIELD
 )
 DIRECT_RATE_FILE_PUBLIC_MARKER = "direct_rate_file_intent_protected"
-
-PTG_SMALL_RESOURCE_CONTRACT = {
-    "version": 1,
-    "resource_class": "small",
-    "queue": "arq:PTGSmall",
-    "worker_class": "process.PTGSmall",
-    "memory_budget_mib": 8192,
-    "estimated_peak_rss_mib": 6144,
-    "estimate_basis": {},
-    "scanner": {
-        "rapidgzip_threads": 4,
-        "rust_workers": 4,
-        "work_queue": 4,
-        "event_queue": 8,
-        "parse_in_workers": True,
-        "top_level_byte_scan": True,
-        "provider_refs_in_workers": True,
-        "provider_ref_workers": 4,
-        "provider_ref_queue": 4,
-        "manifest_merge_chunk_bytes": 256 * 1024 * 1024,
-        "manifest_merge_sort_workers": 4,
-        "file_process_concurrency": 1,
-    },
-}
 
 _DIRECT_INTENT_FIELDS = frozenset(
     {
@@ -68,7 +41,7 @@ _DIRECT_INTENT_FIELDS = frozenset(
         "content_file_count",
     }
 )
-_DIRECT_WAVE_PARAM_FIELDS = frozenset(
+_DIRECT_WAVE_PARAM_BASE_FIELDS = frozenset(
     {
         "version",
         "importer",
@@ -86,13 +59,15 @@ _DIRECT_WAVE_PARAM_FIELDS = frozenset(
         "source_key",
         "plan_ids",
         "plan_market_types",
-        "in_network_url",
         "max_files",
     }
 )
+_SELECTOR_FIELD_BY_SOURCE_TYPE = dict(
+    allowed_amounts="allowed_url", in_network="in_network_url"
+)
+_DIRECT_SELECTOR_FIELDS = frozenset(_SELECTOR_FIELD_BY_SOURCE_TYPE.values())
 _COMPETING_SELECTOR_FIELDS = frozenset(
     {
-        "allowed_url",
         "toc_url",
         "toc_urls",
         "toc_list",
@@ -157,7 +132,8 @@ def normalize_protected_singleton_direct_params(
     normalized_params_by_name[DIRECT_RATE_FILE_INTENT_SHA256_FIELD] = (
         direct_digest
     )
-    normalized_params_by_name["in_network_url"] = direct_intent[
+    selector_field = _direct_selector_field(direct_intent["source_type"])
+    normalized_params_by_name[selector_field] = direct_intent[
         "canonical_url"
     ]
     normalized_params_by_name["max_files"] = 1
@@ -181,12 +157,16 @@ def _require_direct_marker_tuple(
         raise SingletonDirectValidationError(
             "protected singleton direct version must be 2"
         )
-    if any(
-        field_name not in params_by_name
-        for field_name in ("in_network_url", "max_files")
+    if (
+        sum(
+            field_name in params_by_name
+            for field_name in _DIRECT_SELECTOR_FIELDS
+        )
+        != 1
+        or "max_files" not in params_by_name
     ):
         raise SingletonDirectValidationError(
-            "protected singleton direct selectors are required together"
+            "protected singleton direct requires exactly one role selector"
         )
     if protected_frozen_tuple_presence(params_by_name):
         raise SingletonDirectValidationError(
@@ -230,8 +210,11 @@ def _require_direct_outer_matches(
         "source_file_id": direct_intent["source_file_id"],
         "content_version": direct_intent["content_version"],
         "source_key": direct_intent["source_key"],
-        "in_network_url": direct_intent["canonical_url"],
     }
+    selector_field = _direct_selector_field(direct_intent["source_type"])
+    expected_values_by_field[selector_field] = direct_intent[
+        "canonical_url"
+    ]
     if any(
         params_by_name.get(field_name) != expected_value
         for field_name, expected_value in expected_values_by_field.items()
@@ -263,7 +246,16 @@ def require_exact_wave_singleton_direct_params(
 
     if not protected_singleton_direct_presence(params_by_name):
         return
-    if set(params_by_name) != set(_DIRECT_WAVE_PARAM_FIELDS):
+    direct_intent = params_by_name.get(DIRECT_RATE_FILE_INTENT_FIELD)
+    source_type = (
+        direct_intent.get("source_type")
+        if isinstance(direct_intent, Mapping)
+        else None
+    )
+    selector_field = _direct_selector_field(source_type)
+    if set(params_by_name) != set(_DIRECT_WAVE_PARAM_BASE_FIELDS) | {
+        selector_field
+    }:
         raise SingletonDirectValidationError(
             "singleton direct wave parameter fields are not exact"
         )
@@ -382,7 +374,8 @@ def _normalized_direct_intent(raw_intent: Any) -> dict[str, Any]:
         )
     if (
         raw_intent.get("contract") != DIRECT_RATE_FILE_INTENT_CONTRACT
-        or raw_intent.get("source_type") != "in_network"
+        or raw_intent.get("source_type")
+        not in _SELECTOR_FIELD_BY_SOURCE_TYPE
         or raw_intent.get("content_file_count") != 1
         or isinstance(raw_intent.get("content_file_count"), bool)
     ):
@@ -406,7 +399,7 @@ def _normalized_direct_intent(raw_intent: Any) -> dict[str, Any]:
             field_name="content_version",
             max_bytes=128,
         ),
-        "source_type": "in_network",
+        "source_type": raw_intent["source_type"],
         "canonical_url": _canonical_https_url(
             raw_intent.get("canonical_url")
         ),
@@ -424,6 +417,15 @@ def _normalized_direct_intent(raw_intent: Any) -> dict[str, Any]:
             "singleton direct source_key is invalid"
         )
     return normalized_intent_map
+
+
+def _direct_selector_field(source_type: Any) -> str:
+    selector_field = _SELECTOR_FIELD_BY_SOURCE_TYPE.get(source_type)
+    if selector_field is None:
+        raise SingletonDirectValidationError(
+            "singleton direct source_type is invalid"
+        )
+    return selector_field
 
 
 def _required_text(

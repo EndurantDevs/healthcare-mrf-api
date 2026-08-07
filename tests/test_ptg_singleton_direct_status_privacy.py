@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from process.ptg_parts import frozen_rate_privacy
 from process.ptg_singleton_direct_control import (
     DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
@@ -10,7 +12,10 @@ from process.ptg_singleton_direct_control import (
 )
 
 
-def test_direct_status_event_projects_nested_digest_without_frozen_marker():
+@pytest.mark.parametrize("selector_field", ("in_network_url", "allowed_url"))
+def test_direct_status_event_projects_nested_digest_without_frozen_marker(
+    selector_field,
+):
     """Retain only the opaque direct marker when a nested digest is valid."""
 
     private_url = "https://rates.example.test/direct.json.gz"
@@ -19,7 +24,7 @@ def test_direct_status_event_projects_nested_digest_without_frozen_marker():
     direct_digest = "a" * 64
     status_event_by_field = {
         "params": {
-            "in_network_url": private_url,
+            selector_field: private_url,
             "source_key": private_source_key,
             "source_file_id": private_source_file_id,
             DIRECT_RATE_FILE_INTENT_SHA256_FIELD: "invalid-outer-digest",
@@ -54,7 +59,10 @@ def test_direct_status_event_projects_nested_digest_without_frozen_marker():
     assert private_source_file_id not in rendered
 
 
-def test_ordinary_direct_status_event_redacts_without_digest_marker():
+@pytest.mark.parametrize("selector_field", ("in_network_url", "allowed_url"))
+def test_ordinary_direct_status_event_redacts_without_digest_marker(
+    selector_field,
+):
     """Redact an ordinary direct selector without claiming signed evidence."""
 
     private_url = "https://rates.example.test/ordinary.json.gz"
@@ -62,7 +70,7 @@ def test_ordinary_direct_status_event_redacts_without_digest_marker():
     projected_event = frozen_rate_privacy.project_frozen_status_event(
         {
             "params": {
-                "in_network_url": private_url,
+                selector_field: private_url,
                 "source_key": private_source_key,
                 "max_files": 1,
             },

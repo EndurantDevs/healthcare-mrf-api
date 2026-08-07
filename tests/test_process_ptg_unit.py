@@ -6400,6 +6400,50 @@ def test_ptg2_main_publishes_allowed_amount_only_snapshot(monkeypatch):
     publish_allowed_pointer.assert_awaited_once()
 
 
+def test_ptg2_main_dispatches_private_direct_allowed_amount_job(monkeypatch):
+    """Preserve the signed direct role through the main job planner."""
+
+    _install_allowed_only_main_mocks(monkeypatch)
+    allowed_url = "https://files.example.test/direct-allowed.json.gz"
+    intent_digest = "d" * 64
+
+    asyncio.run(
+        process_ptg.main(
+            allowed_url=allowed_url,
+            direct_rate_file_intent_sha256=intent_digest,
+            import_month="2026-07",
+            import_id="direct_allowed_amount_only",
+            source_key="direct_allowed_source",
+            plan_ids=["plan-alpha"],
+            plan_market_types=["group"],
+            max_files=1,
+        )
+    )
+
+    process_allowed_file = process_ptg._process_allowed_amounts_file
+    process_allowed_file.assert_awaited_once()
+    [job, *_rest] = process_allowed_file.await_args.args
+    assert {
+        field_name: job[field_name]
+        for field_name in (
+            "type",
+            "url",
+            "plan_info",
+            "_ptg_progress_label",
+            "_ptg_progress_private",
+        )
+    } == {
+        "type": "allowed_amounts",
+        "url": allowed_url,
+        "plan_info": [
+            {"plan_id": "plan-alpha", "plan_market_type": "group"}
+        ],
+        "_ptg_progress_label": f"direct-singleton-{intent_digest[:12]}",
+        "_ptg_progress_private": True,
+    }
+    assert "source_network_names" not in job
+
+
 def test_ptg2_allowed_current_pointer_replaces_previous_snapshot(monkeypatch):
     (
         pushed_rows,
