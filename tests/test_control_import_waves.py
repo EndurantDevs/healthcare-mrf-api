@@ -40,7 +40,7 @@ def _unsigned(
             f"coordinate-unit-{ordinal}\0v1" for ordinal in range(count)
         ).encode("utf-8")
     ).hexdigest()
-    snapshot = {
+    snapshot_by_field = {
         "snapshot_digest": "a" * 64,
         "membership_digest": "b" * 64,
         "inventory_digest": "c" * 64,
@@ -50,7 +50,7 @@ def _unsigned(
         "catalog_generation": "9" * 64,
     }
     if schema_version == ATTESTATION_VERSION:
-        snapshot.update(
+        snapshot_by_field.update(
             authorization_basis=AUTHORIZATION_BASIS,
             authorization_digest="7" * 64,
         )
@@ -58,7 +58,7 @@ def _unsigned(
         "schema_version": schema_version,
         "wave_id": "wave-unit",
         "idempotency_key": "wave-unit-key",
-        "snapshot": snapshot,
+        "snapshot": snapshot_by_field,
         "partition": {
             "complete": True,
             "physical_coordinate_count": count,
