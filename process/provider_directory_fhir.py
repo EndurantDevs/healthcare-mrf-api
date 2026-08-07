@@ -49891,7 +49891,12 @@ def _effective_resource_scan_concurrency(
         and options.source_concurrency == 1
         and options.linked_resource_limit <= 0
         and not options.stale_cleanup
-        and not options.bulk_export
+        and not _is_source_bulk_export_effective(
+            source_record,
+            options.bulk_export,
+            per_resource_limit=options.per_resource_limit,
+            checkpoint_context=checkpoint_context,
+        )
         and options.checkpointing_enabled
         and options.deferred_materialization
         and not _is_practitioner_role_reverse_lookup_planned(

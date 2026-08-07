@@ -23994,7 +23994,6 @@ def test_resource_scan_concurrency_fails_closed(monkeypatch):
         {"source_concurrency": 2},
         {"linked_resource_limit": 1},
         {"stale_cleanup": True},
-        {"bulk_export": True},
         {"checkpointing_enabled": False},
         {"deferred_materialization": False},
     )
@@ -24022,6 +24021,51 @@ def test_resource_scan_concurrency_fails_closed(monkeypatch):
         source_record,
         _resource_concurrency_options(),
     ) == 1
+
+
+def test_resource_scan_concurrency_uses_effective_bulk_export_selection(
+    monkeypatch,
+):
+    """Keep REST fallback parallel while effective Bulk remains serial."""
+    source_record = _parallel_resource_source()
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "16")
+    monkeypatch.setattr(importer, "_credential_spec_for_source", Mock(return_value={}))
+    monkeypatch.setattr(
+        importer,
+        "_has_source_declared_credentialed_access",
+        Mock(return_value=False),
+    )
+    bulk_eligible_source_by_field = {
+        **source_record,
+        "metadata_json": {
+            importer.PROVIDER_DIRECTORY_BULK_EXPORT_ELIGIBLE_METADATA_KEY: True,
+        },
+    }
+    auto_bulk_source_by_field = {
+        **bulk_eligible_source_by_field,
+        "metadata_json": {
+            **bulk_eligible_source_by_field["metadata_json"],
+            "provider_directory_bulk_export_auto_enabled": True,
+        },
+    }
+
+    with _source_http_test_session():
+        assert importer._effective_resource_scan_concurrency(
+            source_record,
+            _resource_concurrency_options(bulk_export=True),
+        ) == 2
+        assert importer._effective_resource_scan_concurrency(
+            bulk_eligible_source_by_field,
+            _resource_concurrency_options(bulk_export=False),
+        ) == 2
+        assert importer._effective_resource_scan_concurrency(
+            bulk_eligible_source_by_field,
+            _resource_concurrency_options(bulk_export=True),
+        ) == 1
+        assert importer._effective_resource_scan_concurrency(
+            auto_bulk_source_by_field,
+            _resource_concurrency_options(bulk_export=False),
+        ) == 1
 
 
 def test_resource_scan_concurrency_requires_every_start_url(monkeypatch):
@@ -24231,6 +24275,8 @@ def _patch_parallel_resource_flow(
 async def _run_parallel_resource_import(
     source_record,
     progress_callback=None,
+    *,
+    bulk_export=False,
 ):
     """Run the exact checkpointed deferred acquisition shape under test."""
     with _source_http_test_session():
@@ -24245,6 +24291,7 @@ async def _run_parallel_resource_import(
             stream_batch_size=100,
             source_concurrency=1,
             resource_scan_concurrency=2,
+            bulk_export=bulk_export,
             progress_callback=progress_callback,
             is_pagination_checkpointing_enabled=True,
             defer_typed_materialization=True,
@@ -24259,6 +24306,7 @@ class _ResourceOverlapHarness:
         self.foundation_started = asyncio.Event()
         self.foundation_completed = asyncio.Event()
         self.lifecycle_events: list[tuple[str, str]] = []
+        self.bulk_export_requests: list[bool] = []
         self.progress_resources: list[tuple[str, ...]] = []
         self.progress_concurrency: list[tuple[int, int]] = []
         self.model_by_resource = {
@@ -24269,6 +24317,7 @@ class _ResourceOverlapHarness:
 
     async def fetch(self, _source, resource_type, **kwargs):
         self.lifecycle_events.append(("start", resource_type))
+        self.bulk_export_requests.append(kwargs["bulk_export"])
         if resource_type == "PractitionerRole":
             assert self.foundation_completed.is_set()
         else:
@@ -24307,7 +24356,7 @@ class _ResourceOverlapHarness:
                     )
                 )
 
-    def assert_complete(self, counts):
+    def assert_complete(self, counts, *, expected_bulk_export):
         assert counts == {
             "PractitionerRole": 1,
             "Location": 1,
@@ -24324,10 +24373,15 @@ class _ResourceOverlapHarness:
             ("Location", "HealthcareService")
         }
         assert set(self.progress_concurrency) == {(2, 2)}
+        assert set(self.bulk_export_requests) == {expected_bulk_export}
 
 
 @pytest.mark.asyncio
-async def test_resource_scan_overlaps_foundation_and_keeps_role_serial(monkeypatch):
+@pytest.mark.parametrize("bulk_export", (False, True))
+async def test_resource_scan_overlaps_foundation_and_keeps_role_serial(
+    monkeypatch,
+    bulk_export,
+):
     """Use two independent cursors, then start the dependent role tail."""
     resource_harness = _ResourceOverlapHarness()
 
@@ -24335,8 +24389,12 @@ async def test_resource_scan_overlaps_foundation_and_keeps_role_serial(monkeypat
     counts = await _run_parallel_resource_import(
         source_record,
         progress_callback=resource_harness.capture_progress,
+        bulk_export=bulk_export,
     )
-    resource_harness.assert_complete(counts)
+    resource_harness.assert_complete(
+        counts,
+        expected_bulk_export=bulk_export,
+    )
 
 
 @pytest.mark.asyncio
