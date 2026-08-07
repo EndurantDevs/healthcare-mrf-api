@@ -9,6 +9,9 @@ import pytest
 
 from api import ptg2_billing_associations as billing
 from api import ptg2_billing_entity_group_resolution as resolution
+from api.ptg2_billing_entity_refs import (
+    PTG2BillingAssociationProjectionUnavailable,
+)
 from process.tin_npi_connector_security import token_policy_descriptor_sha256
 
 POLICY_ID = "ptg-tin-hmac-sha256-v1:2026-07"
@@ -179,6 +182,27 @@ async def test_unknown_locator_and_legacy_snapshot_return_no_scope() -> None:
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_internal_legacy_resolution_is_typed_and_value_free() -> None:
+    full_hmac = b"q" * 32
+    entity_ref = _reference(full_hmac)
+    session = _Session([_legacy_row()])
+
+    with pytest.raises(
+        PTG2BillingAssociationProjectionUnavailable,
+        match="projection is unavailable",
+    ) as raised:
+        await resolution._resolve_billing_entity_ref_tin_key(
+            session,
+            schema_name="synthetic",
+            snapshot_key=SNAPSHOT_KEY,
+            billing_entity_ref=entity_ref,
+        )
+    assert len(session.calls) == 1
+    assert entity_ref not in str(raised.value)
+    assert full_hmac.hex() not in str(raised.value)
 
 
 @pytest.mark.asyncio

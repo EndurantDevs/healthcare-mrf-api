@@ -28,6 +28,10 @@ class PTG2BillingAssociationDataError(PTG2ManifestArtifactError):
     """The sealed tax-identity sidecar cannot prove the requested mapping."""
 
 
+class PTG2BillingAssociationProjectionUnavailable(PTG2BillingAssociationDataError):
+    """The snapshot has no searchable tax-identity projection."""
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class DecodedBillingEntityRef:
     """Redacted locator and authentication tag from one canonical public ref."""

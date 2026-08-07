@@ -11,9 +11,6 @@ from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_tax_identity_source_aggregate_reuse import (
     validate_reused_tax_identity_aggregate_manifest,
 )
-from process.ptg_parts.ptg2_tax_identity_source_binding_vector import (
-    PTG2_TAX_IDENTITY_SOURCE_BINDING_VECTOR_CONTRACT,
-)
 from process.ptg_parts.ptg2_tax_identity_source_persisted import (
     SOURCE_BINDING_FIELDS,
     load_source_bindings,
@@ -21,16 +18,14 @@ from process.ptg_parts.ptg2_tax_identity_source_persisted import (
     validate_source_observation_counts,
 )
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
-    PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT,
-    PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT,
-    PTG2_TAX_IDENTITY_SOURCE_CONTRACT,
     PreparedTaxIdentitySourceProjection,
     TaxIdentitySourceProjectionError,
     TaxIdentitySourcePublication,
     _fail,
     _strict_int,
-    _strict_policy,
-    _strict_sha256,
+)
+from process.ptg_parts.ptg2_tax_identity_source_publication_parser import (
+    tax_identity_source_publication_from_metadata,
 )
 
 _VALIDATION_BATCH_ROWS = 10_000
@@ -206,54 +201,6 @@ async def validate_merged_tax_identity_source_reduction(
             heartbeat_callback()
 
 
-def _publication_from_metadata(
-    metadata_by_field: Mapping[str, Any],
-) -> TaxIdentitySourcePublication:
-    try:
-        if (
-            metadata_by_field.get("contract") != PTG2_TAX_IDENTITY_SOURCE_CONTRACT
-            or metadata_by_field.get("content_contract")
-            != PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT
-            or metadata_by_field.get("binding_contract")
-            != PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT
-            or metadata_by_field.get("binding_vector_contract")
-            != PTG2_TAX_IDENTITY_SOURCE_BINDING_VECTOR_CONTRACT
-        ):
-            raise _fail()
-        return TaxIdentitySourcePublication(
-            token_policy_id=_strict_policy(metadata_by_field.get("token_policy_id")),
-            token_policy_descriptor_sha256=bytes.fromhex(
-                _strict_sha256(metadata_by_field.get("token_policy_descriptor_sha256"))
-            ),
-            source_ordinal_map_digest=bytes.fromhex(
-                _strict_sha256(metadata_by_field.get("source_ordinal_map_digest"))
-            ),
-            source_count=_strict_int(metadata_by_field.get("source_count"), minimum=1),
-            provider_group_occurrence_count=_strict_int(
-                metadata_by_field.get("provider_group_occurrence_count")
-            ),
-            matched_ein_count=_strict_int(metadata_by_field.get("matched_ein_count")),
-            missing_count=_strict_int(metadata_by_field.get("missing_count")),
-            malformed_count=_strict_int(metadata_by_field.get("malformed_count")),
-            unsupported_type_count=_strict_int(
-                metadata_by_field.get("unsupported_type_count")
-            ),
-            content_digest=bytes.fromhex(
-                _strict_sha256(metadata_by_field.get("content_digest"))
-            ),
-            artifact_byte_count=_strict_int(
-                metadata_by_field.get("artifact_byte_count")
-            ),
-            binding_vector_digest=bytes.fromhex(
-                _strict_sha256(metadata_by_field.get("binding_vector_digest"))
-            ),
-        )
-    except TaxIdentitySourceProjectionError:
-        raise
-    except Exception:
-        raise _fail() from None
-
-
 async def _validate_reused_layout_state(
     session: Any,
     *,
@@ -351,7 +298,7 @@ async def _validate_tax_identity_source_projection_state(
     aggregate_metadata: Mapping[str, Any],
     require_sealed_layout: bool,
 ) -> tuple[TaxIdentitySourcePublication, tuple[dict[str, object], ...]]:
-    expected = _publication_from_metadata(sealed_metadata)
+    expected = tax_identity_source_publication_from_metadata(sealed_metadata)
     schema = _quote_ident(schema_name)
     if require_sealed_layout:
         await _validate_reused_layout_state(
