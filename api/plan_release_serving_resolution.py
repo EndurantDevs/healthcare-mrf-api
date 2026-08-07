@@ -131,14 +131,20 @@ async def _has_release_revision(session: Any, plan_release_id: str) -> bool:
 async def _validate_release_bindings(
     session: Any,
     selection: PlanReleaseServingSelection,
+    *,
+    include_billing_tax_identity_source: bool,
 ) -> PlanReleaseServingSelection | None:
     serving_tables_by_snapshot_id: dict[str, PTG2ServingTables] = {}
     try:
         for binding in selection.bindings:
+            readiness_options_by_name: dict[str, Any] = {}
+            if include_billing_tax_identity_source:
+                readiness_options_by_name["include_billing_tax_identity_source"] = True
             if not await plan_release_serving.is_release_binding_serving_ready(
                 session,
                 binding,
                 validated_serving_tables_by_snapshot_id=(serving_tables_by_snapshot_id),
+                **readiness_options_by_name,
             ):
                 return None
     except PTG2ManifestArtifactError:
@@ -146,6 +152,7 @@ async def _validate_release_bindings(
     validated_selection = replace(
         selection,
         _validated_serving_tables=tuple(serving_tables_by_snapshot_id.items()),
+        _includes_billing_tax_identity_source=include_billing_tax_identity_source,
     )
     if validated_selection.network_tables_by_snapshot() is None:
         return None
@@ -155,9 +162,13 @@ async def _validate_release_bindings(
 async def resolve_plan_release_serving_resolution(
     session: Any,
     plan_release_id: Any,
+    *,
+    include_billing_tax_identity_source: bool = False,
 ) -> PlanReleaseServingResolution:
     """Resolve one release while preserving absent versus unavailable state."""
 
+    if type(include_billing_tax_identity_source) is not bool:
+        return _resolution(PLAN_RELEASE_RESOLUTION_UNAVAILABLE)
     normalized_release_id = normalize_plan_release_id(plan_release_id)
     if normalized_release_id is None:
         return _resolution(PLAN_RELEASE_RESOLUTION_NOT_FOUND)
@@ -172,7 +183,11 @@ async def resolve_plan_release_serving_resolution(
     selection = _selection_from_rows(normalized_release_id, release_rows)
     if selection is None:
         return _resolution(PLAN_RELEASE_RESOLUTION_UNAVAILABLE)
-    validated_selection = await _validate_release_bindings(session, selection)
+    validated_selection = await _validate_release_bindings(
+        session,
+        selection,
+        include_billing_tax_identity_source=include_billing_tax_identity_source,
+    )
     if validated_selection is None:
         return _resolution(PLAN_RELEASE_RESOLUTION_UNAVAILABLE)
     return _resolution(PLAN_RELEASE_RESOLUTION_READY, validated_selection)

@@ -8,6 +8,16 @@ from unittest.mock import AsyncMock
 
 from api import ptg2_billing_search_service as service
 from api.billing_search_cursor import BillingSearchCursorKeyring
+from api.billing_search_pagination import BillingSearchCursorBinding
+from api.billing_search_selector_contract import (
+    BILLING_SELECTOR_MATCHED,
+    BILLING_SELECTOR_NO_MATCH,
+    BILLING_SELECTOR_PROJECTION_UNAVAILABLE,
+    BillingSearchSelectorBindingScope,
+    BillingSearchSelectorNotFoundError,
+    BillingSearchSelectorResolution,
+    BillingSearchSelectorScope,
+)
 from api.plan_release_serving import PlanReleaseServingSelection
 from api.plan_release_serving_resolution import (
     PLAN_RELEASE_RESOLUTION_READY,
@@ -17,19 +27,33 @@ from api.ptg2_billing_geo_contract import BillingGeoSelection
 from tests.billing_search_page_support import (
     binding,
     code_witness,
-    serving_tables,
+)
+from tests.billing_search_entity_ref_support import (
+    billing_entity_reference,
+    resolved_source_scope,
+    serving_tables as source_serving_tables,
+    source_publication,
 )
 
 PLAN_RELEASE_ID = "hprelease_01K123456789ABCDEFGHJKMNPQ"
+TRUSTED_NOW = "2031-01-02T03:04:05Z"
+_DEFAULT_SOURCE_SCOPE = object()
 CURSOR_KEYRING = BillingSearchCursorKeyring(
     active_key_id="cursor-v1",
     keys_by_id={"cursor-v1": b"c" * 32},
+)
+CURSOR_BINDING = BillingSearchCursorBinding(
+    request_fingerprint_sha256="1" * 64,
+    authorization_scope_sha256="2" * 64,
+    generation_bundle_sha256="3" * 64,
+    snapshot_set_sha256="4" * 64,
+    trusted_now=1,
 )
 
 
 def request(*, cursor=None, provider_npi=None, limit=25):
     return SimpleNamespace(
-        billing_entity_ref="be1_" + "A" * 64,
+        billing_entity_ref=billing_entity_reference(),
         code="99213",
         code_system="CPT",
         cursor=cursor,
@@ -45,8 +69,6 @@ def access(**request_overrides):
     return SimpleNamespace(
         request=request(**request_overrides),
         authorization_context=object(),
-        trusted_now="2031-01-02T03:04:05Z",
-        state_sha256="a" * 64,
     )
 
 
@@ -55,16 +77,24 @@ def selection(*, binding_count=1) -> PlanReleaseServingSelection:
         binding(ordinal, snapshot_id=f"ptg2:synthetic-{ordinal}")
         for ordinal in range(binding_count)
     )
-    serving_table_entries = tuple(
-        (
-            release_binding.snapshot_id,
-            serving_tables(
-                snapshot_id=release_binding.snapshot_id,
-                snapshot_key=17 + ordinal,
-            ),
+    serving_table_entries = []
+    for ordinal, release_binding in enumerate(bindings):
+        publication = source_publication(
+            content_digest=f"{6 + ordinal:x}" * 64,
         )
-        for ordinal, release_binding in enumerate(bindings)
-    )
+        serving_table_entries.append(
+            (
+                release_binding.snapshot_id,
+                source_serving_tables(
+                    publication=publication,
+                    snapshot_id=release_binding.snapshot_id,
+                    shared_snapshot_key=17 + ordinal,
+                    plan_id=release_binding.plan_id,
+                    plan_market_type=release_binding.plan_market_type,
+                    source_key=release_binding.source_key,
+                ),
+            )
+        )
     return PlanReleaseServingSelection(
         serving_revision_id="hpserve_01K123456789ABCDEFGHJKMNPQ",
         plan_release_id=PLAN_RELEASE_ID,
@@ -74,15 +104,72 @@ def selection(*, binding_count=1) -> PlanReleaseServingSelection:
         release_status="published",
         binding_set_digest="5" * 64,
         bindings=bindings,
-        _validated_serving_tables=serving_table_entries,
+        _validated_serving_tables=tuple(serving_table_entries),
+        _includes_billing_tax_identity_source=True,
+    )
+
+
+def selector_resolution(
+    release_selection,
+    *,
+    states=None,
+    source_scopes=None,
+) -> BillingSearchSelectorResolution:
+    selected_states = states or (BILLING_SELECTOR_MATCHED,) * len(
+        release_selection.in_network_bindings
+    )
+    selected_source_scopes = source_scopes or ()
+    bindings = []
+    for position, (release_binding, state) in enumerate(
+        zip(
+            release_selection.in_network_bindings,
+            selected_states,
+            strict=True,
+        )
+    ):
+        serving = release_selection.serving_tables_for_snapshot(
+            release_binding.snapshot_id
+        )
+        if state == BILLING_SELECTOR_MATCHED:
+            source_scope = (
+                selected_source_scopes[position]
+                if selected_source_scopes
+                else resolved_source_scope(
+                    publication=serving.provider_tax_identity_source_publication,
+                    snapshot_key=serving.shared_snapshot_key,
+                )
+            )
+            bindings.append(
+                BillingSearchSelectorBindingScope(
+                    binding_ordinal=release_binding.binding_ordinal,
+                    snapshot_id=release_binding.snapshot_id,
+                    state=state,
+                    source_scope=source_scope,
+                    billing_entity_ref=billing_entity_reference(),
+                )
+            )
+        else:
+            bindings.append(
+                BillingSearchSelectorBindingScope(
+                    binding_ordinal=release_binding.binding_ordinal,
+                    snapshot_id=release_binding.snapshot_id,
+                    state=state,
+                )
+            )
+    return BillingSearchSelectorResolution(
+        BillingSearchSelectorScope(
+            selector_kind="billing_entity_ref",
+            bindings=tuple(bindings),
+        ),
+        "6" * 64,
     )
 
 
 def install_access(monkeypatch) -> None:
     monkeypatch.setattr(
         service,
-        "validate_billing_search_endpoint_access",
-        lambda endpoint_access: endpoint_access,
+        "validate_billing_search_endpoint_access_state",
+        lambda endpoint_access, **_kwargs: (endpoint_access, "a" * 64),
     )
 
 
@@ -93,7 +180,7 @@ def install_ready_release(
     after_sort_key=None,
 ) -> None:
     monkeypatch.setattr(
-        service.plan_release_serving,
+        service.plan_release_serving_resolution,
         "resolve_plan_release_serving_resolution",
         AsyncMock(
             return_value=PlanReleaseServingResolution(
@@ -103,6 +190,11 @@ def install_ready_release(
         ),
     )
     monkeypatch.setattr(
+        service.billing_search_entity_ref_resolution,
+        "resolve_billing_search_entity_ref_selector",
+        AsyncMock(return_value=selector_resolution(release_selection)),
+    )
+    monkeypatch.setattr(
         service.billing_search_pagination,
         "capture_billing_search_generation_pin",
         AsyncMock(return_value=object()),
@@ -110,7 +202,7 @@ def install_ready_release(
     monkeypatch.setattr(
         service.billing_search_pagination,
         "build_billing_search_cursor_binding",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: CURSOR_BINDING,
     )
     monkeypatch.setattr(
         service.billing_search_pagination,
@@ -122,7 +214,7 @@ def install_ready_release(
 def install_binding_readers(
     monkeypatch,
     *,
-    source_scope=object(),
+    source_scope=_DEFAULT_SOURCE_SCOPE,
     code_witnesses=None,
     provider_rates=(object(),),
     geo_selection=None,
@@ -131,11 +223,28 @@ def install_binding_readers(
         code_witnesses = (code_witness(),)
     if geo_selection is None:
         geo_selection = BillingGeoSelection(True, ())
-    monkeypatch.setattr(
-        service.ptg2_billing_entity_source_resolution,
-        "resolve_billing_entity_ref_source_scope",
-        AsyncMock(return_value=source_scope),
-    )
+    if source_scope is None:
+        monkeypatch.setattr(
+            service.billing_search_entity_ref_resolution,
+            "resolve_billing_search_entity_ref_selector",
+            AsyncMock(
+                side_effect=BillingSearchSelectorNotFoundError(
+                    "billing_search_resource_not_found"
+                )
+            ),
+        )
+    elif source_scope is not _DEFAULT_SOURCE_SCOPE:
+        selected_release = selection()
+        monkeypatch.setattr(
+            service.billing_search_entity_ref_resolution,
+            "resolve_billing_search_entity_ref_selector",
+            AsyncMock(
+                return_value=selector_resolution(
+                    selected_release,
+                    source_scopes=(source_scope,),
+                )
+            ),
+        )
     monkeypatch.setattr(
         service.ptg2_billing_code_reader,
         "load_exact_billing_code_witnesses",

@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from api.billing_search_cursor import BillingSearchSealedPageCursor
+from api.billing_search_pagination import BillingSearchCursorBinding
+from api.billing_search_selector_contract import (
+    BillingSearchSelectorNotFoundError,
+    BillingSearchSelectorResolution,
+)
 from api.plan_release_serving import PlanReleaseServingSelection
 from api.ptg2_billing_code_reader import BillingCodeWitness
 from api.ptg2_billing_geo_contract import (
@@ -40,8 +45,7 @@ class BillingSearchServingUnavailableError(PTG2ManifestArtifactError):
     """One value-free failure for an unavailable immutable serving bundle."""
 
 
-class BillingSearchResourceNotFoundError(RuntimeError):
-    """One value-free failure for an inaccessible opaque billing resource."""
+BillingSearchResourceNotFoundError = BillingSearchSelectorNotFoundError
 
 
 def resource_not_found() -> BillingSearchResourceNotFoundError:
@@ -237,6 +241,8 @@ class BillingSearchServiceResult:
     has_more: bool
     selection: PlanReleaseServingSelection | None
     endpoint_access_state_sha256: str
+    selector_resolution: BillingSearchSelectorResolution | None = None
+    cursor_binding: BillingSearchCursorBinding | None = None
 
     def __post_init__(self) -> None:
         is_match = self.state == BILLING_SEARCH_RESULT_MATCHED
@@ -254,16 +260,38 @@ class BillingSearchServiceResult:
                 self.next_cursor is not None
                 and type(self.next_cursor) is not BillingSearchSealedPageCursor
             )
+            or (
+                self.cursor_binding is not None
+                and type(self.cursor_binding) is not BillingSearchCursorBinding
+            )
+            or (
+                self.selector_resolution is not None
+                and type(self.selector_resolution)
+                is not BillingSearchSelectorResolution
+            )
             or type(self.endpoint_access_state_sha256) is not str
             or len(self.endpoint_access_state_sha256) != 64
             or not set(self.endpoint_access_state_sha256).issubset(_LOWER_HEXADECIMAL)
             or (is_no_snapshot and self.selection is not None)
             or (not is_no_snapshot and not has_selection)
+            or (is_no_snapshot and self.selector_resolution is not None)
+            or (not is_no_snapshot and self.selector_resolution is None)
             or (not is_match and (self.providers or self.next_cursor or self.has_more))
             or (is_match and not self.providers)
             or self.has_more != (self.next_cursor is not None)
+            or self.has_more != (self.cursor_binding is not None)
         ):
             raise serving_unavailable()
+        if self.cursor_binding is not None:
+            try:
+                self.cursor_binding.__post_init__()
+            except PTG2ManifestArtifactError:
+                raise serving_unavailable() from None
+        if self.selector_resolution is not None:
+            try:
+                self.selector_resolution.__post_init__()
+            except PTG2ManifestArtifactError:
+                raise serving_unavailable() from None
         provider_keys = tuple(
             provider.candidate.sort_key for provider in self.providers
         )

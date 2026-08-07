@@ -238,10 +238,14 @@ def _state_values(state: BillingSearchCursorState) -> dict[str, Any]:
 def _validated_state(state: object) -> dict[str, Any]:
     if type(state) is not BillingSearchCursorState:
         raise _fail()
-    values = _state_values(state)
+    try:
+        values = _state_values(state)
+        contract = state.contract
+    except (AttributeError, TypeError):
+        raise _fail() from None
     if (
-        type(state.contract) is not str
-        or state.contract != BILLING_SEARCH_CURSOR_CONTRACT
+        type(contract) is not str
+        or contract != BILLING_SEARCH_CURSOR_CONTRACT
         or values["expires_at"] <= values["issued_at"]
         or values["expires_at"] - values["issued_at"]
         > BILLING_SEARCH_CURSOR_MAX_TTL_SECONDS
@@ -280,7 +284,7 @@ def _base64url_decode(value: object) -> bytes:
 
 def _new_sealed_page_cursor(
     token: object,
-    sort_key: object,
+    state: object,
 ) -> BillingSearchSealedPageCursor:
     if (
         type(token) is not str
@@ -294,9 +298,10 @@ def _new_sealed_page_cursor(
     sealed_payload = _base64url_decode(token_parts[2])
     if len(sealed_payload) <= _NONCE_BYTES + 16:
         raise _fail()
+    _validated_state(state)
     return _mint_billing_search_sealed_page_cursor(
         token,
-        _canonical_sort_key(sort_key),
+        state,
     )
 
 

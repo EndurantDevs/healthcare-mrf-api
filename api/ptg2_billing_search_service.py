@@ -6,14 +6,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from api import (
+    billing_search_entity_ref_resolution,
     billing_search_pagination,
-    plan_release_serving,
+    plan_release_serving_resolution,
     ptg2_billing_code_reader,
-    ptg2_billing_entity_source_resolution,
     ptg2_billing_exact_reader,
     ptg2_billing_geo_reader,
     ptg2_billing_search_page,
-    ptg2_serving,
 )
 from api.billing_search_cursor import (
     BillingSearchCursorError,
@@ -23,14 +22,19 @@ from api.billing_search_cursor import (
 )
 from api.billing_search_endpoint_access import (
     BillingSearchEndpointAccess,
-    validate_billing_search_endpoint_access,
+    validate_billing_search_endpoint_access_state,
 )
 from api.plan_release_serving import PlanReleaseServingSelection
 from api.plan_release_serving_resolution import (
     PLAN_RELEASE_RESOLUTION_NOT_FOUND,
     PLAN_RELEASE_RESOLUTION_READY,
 )
-from api.ptg2_billing_entity_refs import PTG2BillingAssociationDataError
+from api.billing_search_selector_contract import (
+    BILLING_SELECTOR_MATCHED,
+    BILLING_SELECTOR_NO_MATCH,
+    BILLING_SELECTOR_PROJECTION_UNAVAILABLE,
+    BillingSearchSelectorResolution,
+)
 from api.ptg2_billing_geo_contract import MAX_PROVIDER_RATE_WITNESSES
 from api.ptg2_billing_search_contract import (
     BILLING_SEARCH_RESULT_MATCHED,
@@ -63,6 +67,7 @@ def _empty_result(
     selection: PlanReleaseServingSelection | None,
     *,
     endpoint_access_state_sha256: str,
+    selector_resolution: BillingSearchSelectorResolution | None,
 ) -> BillingSearchServiceResult:
     return BillingSearchServiceResult(
         state=state,
@@ -71,21 +76,7 @@ def _empty_result(
         has_more=False,
         selection=selection,
         endpoint_access_state_sha256=endpoint_access_state_sha256,
-    )
-
-
-async def _binding_source_scope(
-    session,
-    *,
-    serving_tables,
-    billing_entity_ref: str,
-):
-    snapshot_key = ptg2_serving._required_shared_snapshot_key(serving_tables)
-    return await ptg2_billing_entity_source_resolution.resolve_billing_entity_ref_source_scope(
-        session,
-        schema_name=ptg2_serving.PTG2_SCHEMA,
-        snapshot_key=snapshot_key,
-        billing_entity_ref=billing_entity_ref,
+        selector_resolution=selector_resolution,
     )
 
 
@@ -147,35 +138,73 @@ async def _binding_candidates(
     )
 
 
+def _validated_selector_bindings(
+    selection: PlanReleaseServingSelection,
+    selector_resolution: BillingSearchSelectorResolution,
+) -> tuple[dict[tuple[int, str], object], tuple[object, ...]]:
+    """Bind one selector result to the release's exact in-network coordinates."""
+
+    if type(selector_resolution) is not BillingSearchSelectorResolution:
+        raise serving_unavailable()
+    try:
+        selector_resolution.__post_init__()
+    except PTG2ManifestArtifactError:
+        raise serving_unavailable() from None
+    expected_bindings_by_coordinate = {
+        (binding.binding_ordinal, binding.snapshot_id): binding
+        for binding in selection.in_network_bindings
+    }
+    resolved_binding_scopes = selector_resolution.selector_scope.bindings
+    resolved_coordinates = tuple(
+        (binding_scope.binding_ordinal, binding_scope.snapshot_id)
+        for binding_scope in resolved_binding_scopes
+    )
+    if resolved_coordinates != tuple(expected_bindings_by_coordinate):
+        raise serving_unavailable()
+    return expected_bindings_by_coordinate, resolved_binding_scopes
+
+
 async def _traverse_release(
     session,
     *,
     selection: PlanReleaseServingSelection,
+    selector_resolution: BillingSearchSelectorResolution,
     request,
 ) -> _BillingSearchTraversal:
+    """Traverse only selector-matched bindings while retaining exact witnesses."""
+
+    expected_bindings_by_coordinate, resolved_binding_scopes = (
+        _validated_selector_bindings(selection, selector_resolution)
+    )
+    if any(
+        binding_scope.state == BILLING_SELECTOR_PROJECTION_UNAVAILABLE
+        for binding_scope in resolved_binding_scopes
+    ):
+        return _BillingSearchTraversal((), False, False, False)
+
     candidates: list[BillingSearchProviderCandidate] = []
     has_identity = False
     has_provider_rates = False
-    for binding in selection.in_network_bindings:
+    for binding_scope in resolved_binding_scopes:
+        if binding_scope.state == BILLING_SELECTOR_NO_MATCH:
+            continue
+        if (
+            binding_scope.state != BILLING_SELECTOR_MATCHED
+            or binding_scope.source_scope is None
+        ):
+            raise serving_unavailable()
+        binding = expected_bindings_by_coordinate[
+            (binding_scope.binding_ordinal, binding_scope.snapshot_id)
+        ]
         serving_tables = selection.serving_tables_for_snapshot(binding.snapshot_id)
         if serving_tables is None:
             raise serving_unavailable()
-        try:
-            source_scope = await _binding_source_scope(
-                session,
-                serving_tables=serving_tables,
-                billing_entity_ref=request.billing_entity_ref,
-            )
-        except PTG2BillingAssociationDataError:
-            return _BillingSearchTraversal((), False, False, False)
-        if source_scope is None:
-            continue
         has_identity = True
         binding_candidates, binding_has_provider_rates = await _binding_candidates(
             session,
             binding=binding,
             serving_tables=serving_tables,
-            source_scope=source_scope,
+            source_scope=binding_scope.source_scope,
             request=request,
         )
         has_provider_rates = has_provider_rates or binding_has_provider_rates
@@ -195,13 +224,19 @@ async def _ready_release_and_cursor(
     *,
     access: BillingSearchEndpointAccess,
     cursor_keyring: BillingSearchCursorKeyring,
+    trusted_now: object,
 ):
-    resolution = await plan_release_serving.resolve_plan_release_serving_resolution(
-        session,
-        access.request.plan_release_id,
+    resolution = (
+        await (
+            plan_release_serving_resolution.resolve_plan_release_serving_resolution(
+                session,
+                access.request.plan_release_id,
+                include_billing_tax_identity_source=True,
+            )
+        )
     )
     if resolution.state == PLAN_RELEASE_RESOLUTION_NOT_FOUND:
-        return resolution, None, None
+        return resolution, None, None, None
     if (
         resolution.state != PLAN_RELEASE_RESOLUTION_READY
         or resolution.selection is None
@@ -219,14 +254,20 @@ async def _ready_release_and_cursor(
         access.request,
         access.authorization_context,
         generation_pin,
-        trusted_now=access.trusted_now,
+        trusted_now=trusted_now,
     )
     after_sort_key = billing_search_pagination.open_billing_search_page_cursor(
         access.request,
         keyring=cursor_keyring,
         binding=cursor_binding,
     )
-    return resolution, cursor_binding, after_sort_key
+    selector_resolution = await billing_search_entity_ref_resolution.resolve_billing_search_entity_ref_selector(
+        session,
+        billing_entity_ref=access.request.billing_entity_ref,
+        authorized_plan_release_id=access.request.plan_release_id,
+        source_pinned_selection=resolution.selection,
+    )
+    return resolution, selector_resolution, cursor_binding, after_sort_key
 
 
 def _state_for_empty_traversal(
@@ -259,30 +300,55 @@ def _sealed_next_cursor(
         raise serving_unavailable() from None
 
 
+def _empty_traversal_result(
+    traversal: _BillingSearchTraversal,
+    *,
+    after_sort_key,
+    selection: PlanReleaseServingSelection,
+    selector_resolution: BillingSearchSelectorResolution,
+    endpoint_access_state_sha256: str,
+) -> BillingSearchServiceResult:
+    """Map one empty first-page traversal to its explicit result state."""
+
+    if traversal.candidates or after_sort_key is not None:
+        raise serving_unavailable()
+    empty_state = _state_for_empty_traversal(traversal)
+    if empty_state == BILLING_SEARCH_RESULT_NO_MATCHING_TAX_IDENTITY:
+        raise resource_not_found()
+    return _empty_result(
+        empty_state,
+        selection,
+        endpoint_access_state_sha256=endpoint_access_state_sha256,
+        selector_resolution=selector_resolution,
+    )
+
+
 async def _search_ready_release(
     session,
     *,
     access: BillingSearchEndpointAccess,
     cursor_keyring: BillingSearchCursorKeyring,
     selection: PlanReleaseServingSelection,
+    selector_resolution: BillingSearchSelectorResolution,
     cursor_binding,
     after_sort_key,
+    endpoint_access_state_sha256: str,
 ) -> BillingSearchServiceResult:
+    """Traverse and hydrate one already validated immutable release."""
+
     traversal = await _traverse_release(
         session,
         selection=selection,
+        selector_resolution=selector_resolution,
         request=access.request,
     )
     if not traversal.candidates:
-        if after_sort_key is not None:
-            raise serving_unavailable()
-        empty_state = _state_for_empty_traversal(traversal)
-        if empty_state == BILLING_SEARCH_RESULT_NO_MATCHING_TAX_IDENTITY:
-            raise resource_not_found()
-        return _empty_result(
-            empty_state,
-            selection,
-            endpoint_access_state_sha256=access.state_sha256,
+        return _empty_traversal_result(
+            traversal,
+            after_sort_key=after_sort_key,
+            selection=selection,
+            selector_resolution=selector_resolution,
+            endpoint_access_state_sha256=endpoint_access_state_sha256,
         )
     provider_page = await ptg2_billing_search_page.hydrate_billing_search_page(
         session,
@@ -297,7 +363,8 @@ async def _search_ready_release(
         return _empty_result(
             BILLING_SEARCH_RESULT_NO_MATCHING_RATES,
             selection,
-            endpoint_access_state_sha256=access.state_sha256,
+            endpoint_access_state_sha256=endpoint_access_state_sha256,
+            selector_resolution=selector_resolution,
         )
     next_cursor = _sealed_next_cursor(
         provider_page,
@@ -310,7 +377,9 @@ async def _search_ready_release(
         next_cursor=next_cursor,
         has_more=provider_page.has_more,
         selection=selection,
-        endpoint_access_state_sha256=access.state_sha256,
+        endpoint_access_state_sha256=endpoint_access_state_sha256,
+        selector_resolution=selector_resolution,
+        cursor_binding=cursor_binding if next_cursor is not None else None,
     )
 
 
@@ -319,17 +388,29 @@ async def search_exact_billing_provider_page(
     *,
     access: BillingSearchEndpointAccess,
     cursor_keyring: BillingSearchCursorKeyring,
+    trusted_now: object,
 ) -> BillingSearchServiceResult:
     """Serve one exact TIN-group-rate-NPI-address page without fallbacks."""
 
-    validated_access = validate_billing_search_endpoint_access(access)
+    validated_access, endpoint_access_state_sha256 = (
+        validate_billing_search_endpoint_access_state(
+            access,
+            trusted_now=trusted_now,
+        )
+    )
     if type(cursor_keyring) is not BillingSearchCursorKeyring:
         raise serving_unavailable()
     try:
-        resolution, cursor_binding, after_sort_key = await _ready_release_and_cursor(
+        (
+            resolution,
+            selector_resolution,
+            cursor_binding,
+            after_sort_key,
+        ) = await _ready_release_and_cursor(
             session,
             access=validated_access,
             cursor_keyring=cursor_keyring,
+            trusted_now=trusted_now,
         )
         if resolution.state == PLAN_RELEASE_RESOLUTION_NOT_FOUND:
             if validated_access.request.cursor is not None:
@@ -339,18 +420,21 @@ async def search_exact_billing_provider_page(
             return _empty_result(
                 BILLING_SEARCH_RESULT_NO_SNAPSHOT,
                 None,
-                endpoint_access_state_sha256=validated_access.state_sha256,
+                endpoint_access_state_sha256=endpoint_access_state_sha256,
+                selector_resolution=None,
             )
         selection = resolution.selection
-        if selection is None or cursor_binding is None:
+        if selection is None or selector_resolution is None or cursor_binding is None:
             raise serving_unavailable()
         return await _search_ready_release(
             session,
             access=validated_access,
             cursor_keyring=cursor_keyring,
             selection=selection,
+            selector_resolution=selector_resolution,
             cursor_binding=cursor_binding,
             after_sort_key=after_sort_key,
+            endpoint_access_state_sha256=endpoint_access_state_sha256,
         )
     except BillingSearchServingUnavailableError:
         raise

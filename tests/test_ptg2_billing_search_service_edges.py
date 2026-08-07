@@ -16,6 +16,11 @@ from api.plan_release_serving_resolution import (
     PLAN_RELEASE_RESOLUTION_NOT_FOUND,
     PlanReleaseServingResolution,
 )
+from api.billing_search_selector_contract import (
+    BILLING_SELECTOR_MATCHED,
+    BILLING_SELECTOR_NO_MATCH,
+    BillingSearchSelectorNotFoundError,
+)
 from api.ptg2_billing_geo_contract import BillingGeoSelection
 from api.ptg2_billing_search_contract import (
     BILLING_SEARCH_RESULT_MATCHED,
@@ -32,10 +37,12 @@ from tests.billing_search_page_support import (
 )
 from tests.billing_search_service_support import (
     CURSOR_KEYRING,
+    TRUSTED_NOW,
     access,
     install_access,
     install_binding_readers,
     install_ready_release,
+    selector_resolution,
     selection,
 )
 
@@ -73,6 +80,7 @@ async def test_address_projection_unavailable_fails_closed(monkeypatch):
             object(),
             access=access(),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
 
@@ -95,14 +103,59 @@ async def test_generation_expired_cursor_remains_distinct(monkeypatch):
             object(),
             access=access(cursor="bsc1_cursor-v1_synthetic"),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
+
+
+@pytest.mark.parametrize("is_known_reference", [True, False])
+@pytest.mark.parametrize(
+    "cursor_failure_type",
+    [BillingSearchCursorError, BillingSearchCursorGenerationExpired],
+)
+@pytest.mark.asyncio
+async def test_cursor_failure_precedes_selector_resolution(
+    monkeypatch,
+    is_known_reference,
+    cursor_failure_type,
+):
+    install_access(monkeypatch)
+    release_selection = selection()
+    install_ready_release(monkeypatch, release_selection)
+    selector_reader = AsyncMock(
+        return_value=selector_resolution(release_selection),
+    )
+    if not is_known_reference:
+        selector_reader.side_effect = BillingSearchSelectorNotFoundError(
+            "billing_search_resource_not_found"
+        )
+    monkeypatch.setattr(
+        service.billing_search_entity_ref_resolution,
+        "resolve_billing_search_entity_ref_selector",
+        selector_reader,
+    )
+    cursor_failure = cursor_failure_type("billing_search_cursor_invalid")
+    monkeypatch.setattr(
+        service.billing_search_pagination,
+        "open_billing_search_page_cursor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(cursor_failure),
+    )
+
+    with pytest.raises(cursor_failure_type):
+        await service.search_exact_billing_provider_page(
+            object(),
+            access=access(cursor="bsc1_cursor-v1_synthetic"),
+            cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
+        )
+
+    selector_reader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_missing_release_expires_a_supplied_generation_cursor(monkeypatch):
     install_access(monkeypatch)
     monkeypatch.setattr(
-        service.plan_release_serving,
+        service.plan_release_serving_resolution,
         "resolve_plan_release_serving_resolution",
         AsyncMock(
             return_value=PlanReleaseServingResolution(
@@ -117,6 +170,7 @@ async def test_missing_release_expires_a_supplied_generation_cursor(monkeypatch)
             object(),
             access=access(cursor="bsc1_cursor-v1_unavailable-generation"),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
 
@@ -157,6 +211,7 @@ async def test_cursor_sealing_failure_maps_to_generic_unavailable(monkeypatch):
             object(),
             access=access(),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
 
@@ -164,13 +219,14 @@ async def test_cursor_sealing_failure_maps_to_generic_unavailable(monkeypatch):
 async def test_issued_cursor_with_empty_traversal_fails_closed(monkeypatch):
     install_access(monkeypatch)
     install_ready_release(monkeypatch, selection(), after_sort_key=(1,))
-    install_binding_readers(monkeypatch, source_scope=None)
+    install_binding_readers(monkeypatch, code_witnesses=())
 
     with pytest.raises(BillingSearchServingUnavailableError):
         await service.search_exact_billing_provider_page(
             object(),
             access=access(cursor="bsc1_cursor-v1_synthetic"),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
 
@@ -202,6 +258,7 @@ async def test_issued_cursor_with_empty_hydrated_page_fails_closed(monkeypatch):
             object(),
             access=access(cursor="bsc1_cursor-v1_synthetic"),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
 
@@ -211,11 +268,16 @@ async def test_first_binding_miss_does_not_hide_later_binding_match(monkeypatch)
     release_selection = selection(binding_count=2)
     install_ready_release(monkeypatch, release_selection)
     matched_provider = _matched_provider(release_selection, binding_index=1)
-    source_resolver = AsyncMock(side_effect=(None, object()))
+    selector_resolver = AsyncMock(
+        return_value=selector_resolution(
+            release_selection,
+            states=(BILLING_SELECTOR_NO_MATCH, BILLING_SELECTOR_MATCHED),
+        )
+    )
     monkeypatch.setattr(
-        service.ptg2_billing_entity_source_resolution,
-        "resolve_billing_entity_ref_source_scope",
-        source_resolver,
+        service.billing_search_entity_ref_resolution,
+        "resolve_billing_search_entity_ref_selector",
+        selector_resolver,
     )
     monkeypatch.setattr(
         service,
@@ -238,11 +300,12 @@ async def test_first_binding_miss_does_not_hide_later_binding_match(monkeypatch)
         object(),
         access=access(),
         cursor_keyring=CURSOR_KEYRING,
+        trusted_now=TRUSTED_NOW,
     )
 
     assert search_result.state == BILLING_SEARCH_RESULT_MATCHED
     assert search_result.providers == (matched_provider,)
-    assert source_resolver.await_count == 2
+    assert selector_resolver.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -268,6 +331,7 @@ async def test_first_page_price_filter_miss_is_explicit_no_rates(monkeypatch):
         object(),
         access=access(),
         cursor_keyring=CURSOR_KEYRING,
+        trusted_now=TRUSTED_NOW,
     )
 
     assert search_result.state == BILLING_SEARCH_RESULT_NO_MATCHING_RATES
@@ -285,18 +349,18 @@ def _assert_source_and_code_calls(
     serving_tables = release_selection.serving_tables_for_snapshot(
         release_binding.snapshot_id
     )
-    source_reader = (
-        service.ptg2_billing_entity_source_resolution.resolve_billing_entity_ref_source_scope
+    selector_reader = (
+        service.billing_search_entity_ref_resolution.resolve_billing_search_entity_ref_selector
     )
     code_reader = service.ptg2_billing_code_reader.load_exact_billing_code_witnesses
     exact_reader = (
         service.ptg2_billing_exact_reader.load_exact_billing_rate_occurrence_witnesses
     )
-    assert source_reader.await_args.args == (session,)
-    assert source_reader.await_args.kwargs == {
-        "schema_name": service.ptg2_serving.PTG2_SCHEMA,
-        "snapshot_key": 17,
+    assert selector_reader.await_args.args == (session,)
+    assert selector_reader.await_args.kwargs == {
         "billing_entity_ref": endpoint_access.request.billing_entity_ref,
+        "authorized_plan_release_id": endpoint_access.request.plan_release_id,
+        "source_pinned_selection": release_selection,
     }
     assert code_reader.await_args.args == (session, serving_tables, release_binding)
     assert code_reader.await_args.kwargs == {
@@ -336,12 +400,14 @@ async def test_reader_chain_receives_one_exact_binding_scope(monkeypatch):
     install_access(monkeypatch)
     release_selection = selection()
     install_ready_release(monkeypatch, release_selection)
-    source_scope = object()
+    selector_reader = (
+        service.billing_search_entity_ref_resolution.resolve_billing_search_entity_ref_selector
+    )
+    source_scope = selector_reader.return_value.selector_scope.bindings[0].source_scope
     rate_witnesses = (object(),)
     provider_rates = (object(),)
     install_binding_readers(
         monkeypatch,
-        source_scope=source_scope,
         provider_rates=provider_rates,
     )
     service.ptg2_billing_exact_reader.load_exact_billing_rate_occurrence_witnesses.return_value = (
@@ -354,6 +420,7 @@ async def test_reader_chain_receives_one_exact_binding_scope(monkeypatch):
         session,
         access=endpoint_access,
         cursor_keyring=CURSOR_KEYRING,
+        trusted_now=TRUSTED_NOW,
     )
 
     serving_tables = _assert_source_and_code_calls(

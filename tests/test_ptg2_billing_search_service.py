@@ -10,12 +10,17 @@ import pytest
 from api import ptg2_billing_search_service as service
 from api.billing_search_cursor import (
     BillingSearchCursorError,
+    BillingSearchCursorState,
     _new_sealed_page_cursor,
 )
 from api.plan_release_serving_resolution import (
     PLAN_RELEASE_RESOLUTION_NOT_FOUND,
     PLAN_RELEASE_RESOLUTION_UNAVAILABLE,
     PlanReleaseServingResolution,
+)
+from api.billing_search_selector_contract import (
+    BILLING_SELECTOR_MATCHED,
+    BILLING_SELECTOR_PROJECTION_UNAVAILABLE,
 )
 from api.ptg2_billing_geo_contract import BillingGeoSelection
 from api.ptg2_billing_search_contract import (
@@ -38,20 +43,41 @@ from tests.billing_search_page_support import (
     hydrated_price,
 )
 from tests.billing_search_service_support import (
+    CURSOR_BINDING,
     CURSOR_KEYRING,
+    TRUSTED_NOW,
     access as _access,
     install_access as _install_access,
     install_binding_readers as _install_binding_readers,
     install_ready_release as _install_ready_release,
+    selector_resolution as _selector_resolution,
     selection as _selection,
 )
+
+
+def _sealed_cursor_for(candidate):
+    """Return one structurally valid synthetic cursor for service isolation."""
+
+    sealed_state = BillingSearchCursorState(
+        request_fingerprint_sha256="1" * 64,
+        authorization_context_sha256="2" * 64,
+        generation_bundle_sha256="3" * 64,
+        snapshot_set_sha256="4" * 64,
+        sort_key=candidate.sort_key,
+        issued_at=1,
+        expires_at=2,
+    )
+    return _new_sealed_page_cursor(
+        "bsc1_k1_" + "A" * 40,
+        sealed_state,
+    )
 
 
 @pytest.mark.asyncio
 async def test_missing_release_returns_explicit_no_snapshot(monkeypatch):
     _install_access(monkeypatch)
     monkeypatch.setattr(
-        service.plan_release_serving,
+        service.plan_release_serving_resolution,
         "resolve_plan_release_serving_resolution",
         AsyncMock(
             return_value=PlanReleaseServingResolution(
@@ -65,6 +91,7 @@ async def test_missing_release_returns_explicit_no_snapshot(monkeypatch):
         object(),
         access=_access(),
         cursor_keyring=CURSOR_KEYRING,
+        trusted_now=TRUSTED_NOW,
     )
 
     assert search_result.state == BILLING_SEARCH_RESULT_NO_SNAPSHOT
@@ -75,7 +102,7 @@ async def test_missing_release_returns_explicit_no_snapshot(monkeypatch):
 async def test_unavailable_release_fails_closed(monkeypatch):
     _install_access(monkeypatch)
     monkeypatch.setattr(
-        service.plan_release_serving,
+        service.plan_release_serving_resolution,
         "resolve_plan_release_serving_resolution",
         AsyncMock(
             return_value=PlanReleaseServingResolution(
@@ -90,6 +117,7 @@ async def test_unavailable_release_fails_closed(monkeypatch):
             object(),
             access=_access(),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
 
@@ -109,6 +137,7 @@ async def test_shared_block_failure_is_translated_to_serving_unavailable(monkeyp
             object(),
             access=_access(),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
     assert "private graph coordinate" not in str(failure.value)
@@ -126,19 +155,24 @@ async def test_unknown_opaque_ref_and_missing_rate_states_are_distinct(monkeypat
             object(),
             access=_access(),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
+    _install_ready_release(monkeypatch, release_selection)
     _install_binding_readers(monkeypatch, code_witnesses=())
     missing_rate = await service.search_exact_billing_provider_page(
         object(),
         access=_access(),
         cursor_keyring=CURSOR_KEYRING,
+        trusted_now=TRUSTED_NOW,
     )
     assert missing_rate.state == BILLING_SEARCH_RESULT_NO_MATCHING_RATES
 
 
 @pytest.mark.asyncio
-async def test_unknown_opaque_ref_checks_every_entitled_binding(monkeypatch):
+async def test_unknown_opaque_ref_is_resolved_once_for_entitled_binding_set(
+    monkeypatch,
+):
     _install_access(monkeypatch)
     release_selection = _selection(binding_count=2)
     _install_ready_release(monkeypatch, release_selection)
@@ -149,12 +183,13 @@ async def test_unknown_opaque_ref_checks_every_entitled_binding(monkeypatch):
             object(),
             access=_access(),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
-    source_resolver = (
-        service.ptg2_billing_entity_source_resolution.resolve_billing_entity_ref_source_scope
+    selector_resolver = (
+        service.billing_search_entity_ref_resolution.resolve_billing_search_entity_ref_selector
     )
-    assert source_resolver.await_count == 2
+    assert selector_resolver.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -162,44 +197,40 @@ async def test_source_projection_failure_discards_partial_binding_results(monkey
     _install_access(monkeypatch)
     release_selection = _selection(binding_count=2)
     _install_ready_release(monkeypatch, release_selection)
-    source_resolver = AsyncMock(
-        side_effect=(
-            object(),
-            service.PTG2BillingAssociationDataError("synthetic failure"),
+    selector_resolver = AsyncMock(
+        return_value=_selector_resolution(
+            release_selection,
+            states=(
+                BILLING_SELECTOR_MATCHED,
+                BILLING_SELECTOR_PROJECTION_UNAVAILABLE,
+            ),
         )
     )
     monkeypatch.setattr(
-        service.ptg2_billing_entity_source_resolution,
-        "resolve_billing_entity_ref_source_scope",
-        source_resolver,
+        service.billing_search_entity_ref_resolution,
+        "resolve_billing_search_entity_ref_selector",
+        selector_resolver,
     )
-    _install_binding_readers(monkeypatch)
-    monkeypatch.setattr(
-        service.ptg2_billing_entity_source_resolution,
-        "resolve_billing_entity_ref_source_scope",
-        source_resolver,
-    )
+    candidate_reader = AsyncMock()
+    monkeypatch.setattr(service, "_binding_candidates", candidate_reader)
 
     search_result = await service.search_exact_billing_provider_page(
         object(),
         access=_access(),
         cursor_keyring=CURSOR_KEYRING,
+        trusted_now=TRUSTED_NOW,
     )
 
     assert search_result.state == BILLING_SEARCH_RESULT_TAX_IDENTITY_UNAVAILABLE
     assert search_result.providers == ()
-    assert source_resolver.await_count == 2
+    assert selector_resolver.await_count == 1
+    candidate_reader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_release_traversal_caps_candidates_before_aggregate_sort(monkeypatch):
     release_selection = _selection(binding_count=2)
     monkeypatch.setattr(service, "MAX_PROVIDER_RATE_WITNESSES", 1)
-    monkeypatch.setattr(
-        service,
-        "_binding_source_scope",
-        AsyncMock(return_value=object()),
-    )
     candidate_reader = AsyncMock(
         side_effect=(
             ((object(),), True),
@@ -212,6 +243,7 @@ async def test_release_traversal_caps_candidates_before_aggregate_sort(monkeypat
         await service._traverse_release(
             object(),
             selection=release_selection,
+            selector_resolution=_selector_resolution(release_selection),
             request=_access().request,
         )
 
@@ -232,6 +264,7 @@ async def test_provider_rates_without_geo_match_return_radius_state(monkeypatch)
         object(),
         access=_access(),
         cursor_keyring=CURSOR_KEYRING,
+        trusted_now=TRUSTED_NOW,
     )
 
     assert search_result.state == BILLING_SEARCH_RESULT_NO_MATCH_IN_RADIUS
@@ -248,6 +281,7 @@ async def test_optional_npi_is_passed_to_exact_group_expansion(monkeypatch):
         object(),
         access=_access(provider_npi=NPI_VALUES[1]),
         cursor_keyring=CURSOR_KEYRING,
+        trusted_now=TRUSTED_NOW,
     )
 
     expansion = service.ptg2_billing_geo_reader.expand_billing_rate_witnesses_to_npis
@@ -285,10 +319,7 @@ async def test_matched_page_seals_last_returned_provider_cursor(monkeypatch):
             )
         ),
     )
-    sealed_cursor = _new_sealed_page_cursor(
-        "bsc1_k1_" + "A" * 40,
-        candidate.sort_key,
-    )
+    sealed_cursor = _sealed_cursor_for(candidate)
     sealer = Mock(return_value=sealed_cursor)
 
     def seal_cursor(*_args, **_kwargs):
@@ -304,10 +335,12 @@ async def test_matched_page_seals_last_returned_provider_cursor(monkeypatch):
         object(),
         access=_access(limit=1),
         cursor_keyring=CURSOR_KEYRING,
+        trusted_now=TRUSTED_NOW,
     )
 
     assert search_result.state == BILLING_SEARCH_RESULT_MATCHED
     assert search_result.next_cursor is sealed_cursor
+    assert search_result.cursor_binding is CURSOR_BINDING
     assert sealer.call_args.args[0] == candidate.sort_key
 
 
@@ -330,6 +363,7 @@ async def test_graph_failure_maps_to_generic_serving_failure(monkeypatch):
             object(),
             access=_access(),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )
 
 
@@ -350,4 +384,5 @@ async def test_invalid_cursor_error_remains_distinct(monkeypatch):
             object(),
             access=_access(cursor="bsc1_cursor-v1_synthetic"),
             cursor_keyring=CURSOR_KEYRING,
+            trusted_now=TRUSTED_NOW,
         )

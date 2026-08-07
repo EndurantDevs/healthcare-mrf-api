@@ -12,6 +12,9 @@ from api import billing_search_pagination as pagination
 from api.billing_search_access_contract import (
     build_billing_search_authorization_context,
 )
+from api.billing_search_cursor_authentication import (
+    authenticate_billing_search_sealed_page_cursor,
+)
 from api.billing_search_request import parse_billing_search_request
 from api.plan_release_serving import (
     PlanReleaseServingSelection,
@@ -146,22 +149,35 @@ def _cursor_binding(request=None, context=None, pin=None, *, trusted_now=REQUEST
     )
 
 
+def _wire_token(sealed_cursor, binding):
+    _, token = authenticate_billing_search_sealed_page_cursor(
+        sealed_cursor,
+        keyring=KEYRING,
+        trusted_now=binding.trusted_now,
+        request_fingerprint_sha256=binding.request_fingerprint_sha256,
+        authorization_context_sha256=binding.authorization_scope_sha256,
+        generation_bundle_sha256=binding.generation_bundle_sha256,
+        snapshot_set_sha256=binding.snapshot_set_sha256,
+    )
+    return token
+
+
 def test_cursor_auth_scope_is_stable_across_transport_timestamps(monkeypatch) -> None:
     monkeypatch.setattr(cursor.secrets, "token_bytes", lambda size: b"n" * size)
     first_request = _request()
     first_binding = _cursor_binding(first_request)
-    token = pagination.seal_billing_search_page_cursor(
+    sealed_cursor = pagination.seal_billing_search_page_cursor(
         (0, 1.25, 0, SNAPSHOT_ID, 1396271656, "address-key"),
         keyring=KEYRING,
         binding=first_binding,
     )
-    assert type(token) is cursor.BillingSearchSealedPageCursor
+    assert type(sealed_cursor) is cursor.BillingSearchSealedPageCursor
     next_context = _authorization_context(
         issued_at="2031-01-02T03:04:55Z",
         expires_at="2031-01-02T03:05:55Z",
         trusted_now=NEXT_REQUEST_TIME,
     )
-    next_request = _request(cursor=token.token)
+    next_request = _request(cursor=_wire_token(sealed_cursor, first_binding))
     next_binding = _cursor_binding(
         next_request,
         next_context,
@@ -196,10 +212,11 @@ def test_cursor_auth_scope_is_stable_across_transport_timestamps(monkeypatch) ->
 )
 def test_cursor_rejects_cross_scope_authority(monkeypatch, context_overrides) -> None:
     monkeypatch.setattr(cursor.secrets, "token_bytes", lambda size: b"n" * size)
-    token = pagination.seal_billing_search_page_cursor(
-        (1,), keyring=KEYRING, binding=_cursor_binding()
+    first_binding = _cursor_binding()
+    sealed_cursor = pagination.seal_billing_search_page_cursor(
+        (1,), keyring=KEYRING, binding=first_binding
     )
-    next_request = _request(cursor=token.token)
+    next_request = _request(cursor=_wire_token(sealed_cursor, first_binding))
     next_context = _authorization_context(**context_overrides)
     next_binding = _cursor_binding(next_request, next_context)
 
@@ -213,12 +230,13 @@ def test_cursor_rejects_cross_scope_authority(monkeypatch, context_overrides) ->
 
 def test_cursor_reports_expired_generation_after_address_swap(monkeypatch) -> None:
     monkeypatch.setattr(cursor.secrets, "token_bytes", lambda size: b"n" * size)
-    token = pagination.seal_billing_search_page_cursor(
+    first_binding = _cursor_binding(pin=_pin(address_relation_oid=10))
+    sealed_cursor = pagination.seal_billing_search_page_cursor(
         (1,),
         keyring=KEYRING,
-        binding=_cursor_binding(pin=_pin(address_relation_oid=10)),
+        binding=first_binding,
     )
-    next_request = _request(cursor=token.token)
+    next_request = _request(cursor=_wire_token(sealed_cursor, first_binding))
     next_binding = _cursor_binding(next_request, pin=_pin(address_relation_oid=11))
 
     with pytest.raises(cursor.BillingSearchCursorGenerationExpired):
@@ -231,12 +249,13 @@ def test_cursor_reports_expired_generation_after_address_swap(monkeypatch) -> No
 
 def test_cursor_reports_expired_generation_after_evidence_swap(monkeypatch) -> None:
     monkeypatch.setattr(cursor.secrets, "token_bytes", lambda size: b"n" * size)
-    token = pagination.seal_billing_search_page_cursor(
+    first_binding = _cursor_binding(pin=_pin(address_evidence_relation_oid=10))
+    sealed_cursor = pagination.seal_billing_search_page_cursor(
         (1,),
         keyring=KEYRING,
-        binding=_cursor_binding(pin=_pin(address_evidence_relation_oid=10)),
+        binding=first_binding,
     )
-    next_request = _request(cursor=token.token)
+    next_request = _request(cursor=_wire_token(sealed_cursor, first_binding))
     next_binding = _cursor_binding(
         next_request,
         pin=_pin(address_evidence_relation_oid=11),

@@ -37,14 +37,13 @@ MAX_HYDRATION_CANDIDATES = 128
 MAX_HYDRATION_PARTITIONS = 8
 MAX_PAGE_HYDRATION_CALLS = 8
 MAX_PAGE_SCOPED_PRICE_KEYS = MAX_PRICE_KEYS
+_BillingSearchSortKey = tuple[int | float | str, ...]
 
 
-def validate_billing_search_sort_key(
-    candidate_sort_key: object,
-) -> tuple[int | float | str, ...]:
+def validate_billing_search_sort_key(sort_key: object) -> _BillingSearchSortKey:
     """Validate the exact seven-member provider cursor coordinate."""
 
-    if type(candidate_sort_key) not in {tuple, list} or len(candidate_sort_key) != 7:
+    if type(sort_key) not in {tuple, list} or len(sort_key) != 7:
         raise serving_unavailable()
     (
         missing_distance,
@@ -54,7 +53,7 @@ def validate_billing_search_sort_key(
         npi,
         address_key,
         location_key,
-    ) = candidate_sort_key
+    ) = sort_key
     if (
         type(missing_distance) is not int
         or missing_distance not in {0, 1}

@@ -8,9 +8,9 @@ _REDACTED = "<redacted-billing-search-cursor>"
 
 
 class BillingSearchSealedPageCursor:
-    """Opaque proof that the page cursor was minted by the AEAD sealer."""
+    """Opaque cursor and claimed state requiring AEAD verification before use."""
 
-    __slots__ = ("__sort_key", "__token")
+    __slots__ = ("__state", "__token")
 
     def __new__(cls, *_args, **_kwargs):
         raise ValueError(_INVALID)
@@ -22,18 +22,6 @@ class BillingSearchSealedPageCursor:
     def __delattr__(self, attribute_name: str) -> None:
         del attribute_name
         raise TypeError(_INVALID)
-
-    @property
-    def token(self) -> str:
-        """Return the authenticated wire token for explicit response emission."""
-
-        return self.__token
-
-    @property
-    def sort_key(self) -> tuple[int | float | str, ...]:
-        """Return the exact provider position authenticated by the token."""
-
-        return self.__sort_key
 
     def __repr__(self) -> str:
         return _REDACTED
@@ -57,11 +45,11 @@ class BillingSearchSealedPageCursor:
 
 def _mint_billing_search_sealed_page_cursor(
     token: str,
-    sort_key: tuple[int | float | str, ...],
+    state: object,
 ) -> BillingSearchSealedPageCursor:
-    """Mint the proof after the cursor module validates both coordinates."""
+    """Bundle a sealed token with the exact state supplied to the AEAD sealer."""
 
-    if type(token) is not str or type(sort_key) is not tuple:
+    if type(token) is not str:
         raise ValueError(_INVALID)
     sealed_cursor = object.__new__(BillingSearchSealedPageCursor)
     object.__setattr__(
@@ -71,8 +59,8 @@ def _mint_billing_search_sealed_page_cursor(
     )
     object.__setattr__(
         sealed_cursor,
-        "_BillingSearchSealedPageCursor__sort_key",
-        sort_key,
+        "_BillingSearchSealedPageCursor__state",
+        state,
     )
     return sealed_cursor
 

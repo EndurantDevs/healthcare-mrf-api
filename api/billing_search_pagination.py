@@ -28,6 +28,7 @@ from api.billing_search_request import (
     BillingSearchRequest,
     validate_billing_search_request,
 )
+from api.billing_search_selector_contract import BillingSearchBindingPin
 from api.billing_search_transport_contract import (
     _canonical_json_bytes,
     _canonical_sha256,
@@ -102,14 +103,19 @@ class BillingSearchCursorBinding:
     trusted_now: int
 
     def __post_init__(self) -> None:
-        for digest_value in (
-            self.request_fingerprint_sha256,
-            self.authorization_scope_sha256,
-            self.generation_bundle_sha256,
-            self.snapshot_set_sha256,
-        ):
-            _canonical_sha256(digest_value)
-        if type(self.trusted_now) is not int or not 0 <= self.trusted_now < 2**63:
+        try:
+            digest_values = (
+                self.request_fingerprint_sha256,
+                self.authorization_scope_sha256,
+                self.generation_bundle_sha256,
+                self.snapshot_set_sha256,
+            )
+            trusted_now = self.trusted_now
+        except (AttributeError, TypeError):
+            raise _invalid_generation() from None
+        for digest_value in digest_values:
+            _strict_sha256(digest_value)
+        if type(trusted_now) is not int or not 0 <= trusted_now < 2**63:
             raise _invalid_generation()
 
     def __repr__(self) -> str:
@@ -175,6 +181,15 @@ def _binding_generation_payload(
             or type(serving_tables.source_count) is not int
         ):
             raise _invalid_generation()
+        source_publication = None
+        if selection.includes_billing_tax_identity_source:
+            try:
+                source_publication = BillingSearchBindingPin(
+                    binding,
+                    serving_tables,
+                ).source_publication
+            except PTG2ManifestArtifactError:
+                raise _invalid_generation() from None
         binding_payloads.append(
             {
                 "binding_ordinal": binding.binding_ordinal,
@@ -183,6 +198,9 @@ def _binding_generation_payload(
                 ),
                 "plan_id": binding.plan_id,
                 "plan_market_type": binding.plan_market_type,
+                "provider_tax_identity_source_publication": (
+                    None if source_publication is None else source_publication.as_dict()
+                ),
                 "shared_snapshot_key": serving_tables.shared_snapshot_key,
                 "snapshot_id": binding.snapshot_id,
                 "source_count": serving_tables.source_count,
@@ -371,7 +389,7 @@ def seal_billing_search_page_cursor(
             keyring=keyring,
             trusted_now=binding.trusted_now,
         ),
-        state.sort_key,
+        state,
     )
 
 
