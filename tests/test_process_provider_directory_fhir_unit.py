@@ -23915,6 +23915,58 @@ def test_resource_scan_concurrency_requires_every_start_url(monkeypatch):
         ) == 1
 
 
+def test_resource_scan_concurrency_checks_parallel_transport_shape(monkeypatch):
+    """Reject each incomplete transport shape before admitting parallel scans."""
+    source_record = _parallel_resource_source()
+    request_url = "https://example.test/fhir/Location?_count=100"
+    resource_start_url = Mock(return_value=None)
+    partitioned_start_urls = Mock(return_value=[])
+    prefetch_session = Mock(return_value=None)
+    monkeypatch.setattr(importer, "_resource_start_url", resource_start_url)
+    monkeypatch.setattr(
+        importer,
+        "_partitioned_resource_start_urls",
+        partitioned_start_urls,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_rest_page_prefetch_session",
+        prefetch_session,
+    )
+
+    assert not importer._has_parallel_resource_transport(
+        source_record,
+        ("Location", "HealthcareService"),
+        100,
+    )
+
+    resource_start_url.return_value = request_url
+    assert not importer._has_parallel_resource_transport(
+        source_record,
+        ("Location", "HealthcareService"),
+        100,
+    )
+
+    partitioned_start_urls.return_value = [request_url]
+    assert not importer._has_parallel_resource_transport(
+        source_record,
+        ("Location", "HealthcareService"),
+        100,
+    )
+
+    prefetch_session.return_value = object()
+    assert not importer._has_parallel_resource_transport(
+        source_record,
+        ("Location",),
+        100,
+    )
+    assert importer._has_parallel_resource_transport(
+        source_record,
+        ("Location", "HealthcareService"),
+        100,
+    )
+
+
 @pytest.mark.parametrize("raw_value", (0, 4, "invalid", True, 2.0, 2.9, None))
 def test_resource_scan_concurrency_rejects_invalid_values(raw_value):
     with pytest.raises(
