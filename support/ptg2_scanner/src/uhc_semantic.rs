@@ -13,7 +13,7 @@ use crate::uhc_retained::{
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use rayon::ThreadPoolBuilder;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -311,11 +311,38 @@ struct ProviderAddress {
     phone: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RetainedPlanYear {
+    Integer(u16),
+    Decimal(String),
+}
+
+fn deserialize_plan_years<'de, D>(deserializer: D) -> Result<Vec<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<RetainedPlanYear>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| {
+            let year = match value {
+                RetainedPlanYear::Integer(year) => Some(year),
+                RetainedPlanYear::Decimal(value) => value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|year| year.to_string() == value),
+            };
+            year.ok_or_else(|| D::Error::custom("UHC plan year is not canonical"))
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderPlan {
     plan_id_type: Option<String>,
     plan_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_plan_years")]
     years: Vec<u16>,
     network_tier: Option<String>,
 }
@@ -355,6 +382,7 @@ struct FormularyEntry {
 struct PlanRecord {
     plan_id_type: Option<String>,
     plan_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_plan_years")]
     years: Vec<u16>,
     marketing_name: Option<String>,
     marketing_url: Option<String>,
@@ -2068,6 +2096,56 @@ mod tests {
         );
         assert_eq!(first_report.counters, second_report.counters);
         assert!(first_report.peak_worker_reserved_bytes <= budget.per_worker_bytes);
+    }
+
+    #[test]
+    fn decimal_string_plan_years_are_canonicalized_before_encoding() {
+        let provider_record = String::from_utf8(PROVIDER_RECORD.to_vec())
+            .unwrap()
+            .replace("\"years\":[2026]", "\"years\":[\"2026\"]")
+            .into_bytes();
+        let provider: ProviderRecord = serde_json::from_slice(&provider_record).unwrap();
+        assert_eq!(provider.plans[0].years, vec![2026]);
+        let provider_value: serde_json::Value =
+            serde_json::from_slice(&canonical_value_bytes(&provider).unwrap()).unwrap();
+        assert_eq!(
+            provider_value["plans"][0]["years"],
+            serde_json::json!([2026])
+        );
+
+        let plan_record = String::from_utf8(PLAN_RECORD.to_vec())
+            .unwrap()
+            .replace("\"years\":[2026]", "\"years\":[\"2026\"]")
+            .into_bytes();
+        let plan: PlanRecord = serde_json::from_slice(&plan_record).unwrap();
+        assert_eq!(plan.years, vec![2026]);
+        let plan_value: serde_json::Value =
+            serde_json::from_slice(&canonical_value_bytes(&plan).unwrap()).unwrap();
+        assert_eq!(plan_value["years"], serde_json::json!([2026]));
+
+        for (collection_kind, record) in [
+            (UhcCollectionKind::ProviderMembership, provider_record),
+            (UhcCollectionKind::PlanReference, plan_record),
+        ] {
+            let mut source = SyntheticSource::new(4, collection_kind);
+            source.record = record;
+            let report =
+                encode_admitted_ranges_to_copy(&source, io::sink(), &test_budget()).unwrap();
+            assert_eq!(report.fact_count, 4);
+            assert_eq!(report.counters.plan_year_rows, 4);
+        }
+    }
+
+    #[test]
+    fn noncanonical_string_plan_years_fail_closed() {
+        for invalid_year in ["02026", "2026.0", " 2026", "+2026", "year"] {
+            let record = String::from_utf8(PLAN_RECORD.to_vec()).unwrap().replace(
+                "\"years\":[2026]",
+                &format!("\"years\":[\"{invalid_year}\"]"),
+            );
+            let error = serde_json::from_str::<PlanRecord>(&record).unwrap_err();
+            assert!(error.to_string().contains("plan year is not canonical"));
+        }
     }
 
     #[test]
