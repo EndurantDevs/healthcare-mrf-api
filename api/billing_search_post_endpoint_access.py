@@ -192,6 +192,7 @@ class BillingSearchPostEndpointAccess:
     __slots__ = ("__request", "__state_hmac", "__transport")
 
     def __init__(self, *_args, **_kwargs) -> None:
+        del self, _args, _kwargs
         raise _fail()
 
     @property
@@ -224,7 +225,11 @@ class BillingSearchPostEndpointAccess:
     __str__ = __repr__
 
     def __setattr__(self, name: str, value: object) -> None:
-        del name, value
+        del self, name, value
+        raise TypeError(_INVALID)
+
+    def __delattr__(self, name: str) -> None:
+        del self, name
         raise TypeError(_INVALID)
 
     def __copy__(self):
@@ -235,7 +240,7 @@ class BillingSearchPostEndpointAccess:
         return self
 
     def __reduce_ex__(self, protocol: int) -> object:
-        del protocol
+        del self, protocol
         raise _fail()
 
 

@@ -363,12 +363,31 @@ def test_endpoint_access_object_protocol_is_immutable_and_redacted() -> None:
     assert access.authorization_context.capabilities == ("pricing:billing-search",)
     assert copy.copy(access) is access
     assert copy.deepcopy(access) is access
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError) as set_error:
         access.synthetic = "blocked"
-    with pytest.raises(endpoint_access.BillingSearchPostEndpointAccessError):
+    with pytest.raises(TypeError) as delete_error:
+        del access.synthetic
+    with pytest.raises(
+        endpoint_access.BillingSearchPostEndpointAccessError
+    ) as pickle_error:
         pickle.dumps(access)
     with pytest.raises(endpoint_access.BillingSearchPostEndpointAccessError):
         endpoint_access.BillingSearchPostEndpointAccess()
+    protocol_errors = (set_error.value, delete_error.value, pickle_error.value)
+    protocol_frames = []
+    for protocol_error in protocol_errors:
+        traceback = protocol_error.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_globals.get("__name__") == (
+                "api.billing_search_post_endpoint_access"
+            ):
+                protocol_frames.append(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+    assert protocol_frames
+    assert all("self" not in local_values for local_values in protocol_frames)
+    assert all(
+        "12-3333333" not in repr(local_values) for local_values in protocol_frames
+    )
 
 
 def test_endpoint_access_revalidation_rejects_type_and_shape_mismatch() -> None:

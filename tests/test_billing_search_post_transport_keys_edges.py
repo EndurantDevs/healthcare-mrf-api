@@ -79,24 +79,42 @@ def test_keyring_object_protocol_and_unknown_key_are_closed() -> None:
     keyring = _keyring()
     assert copy.copy(keyring) is keyring
     assert copy.deepcopy(keyring) is keyring
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError) as set_error:
         keyring.synthetic = b"blocked"
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError) as delete_error:
         del keyring.synthetic
-    with pytest.raises(transport_keys.BillingSearchTransportKeyringError) as captured:
-        keyring.key_for("synthetic-missing")
-    traceback = captured.value.__traceback__
     key_lookup_frames = []
-    while traceback is not None:
-        if traceback.tb_frame.f_code.co_name == "key_for":
-            key_lookup_frames.append(traceback.tb_frame.f_locals)
-        traceback = traceback.tb_next
+    for rejected_key_id in ("synthetic-missing", "INVALID"):
+        with pytest.raises(
+            transport_keys.BillingSearchTransportKeyringError
+        ) as captured:
+            keyring.key_for(rejected_key_id)
+        traceback = captured.value.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_name == "key_for":
+                key_lookup_frames.append(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
     assert key_lookup_frames
+    assert all("self" not in local_values for local_values in key_lookup_frames)
     assert all(
         repr(KEY) not in repr(local_values) for local_values in key_lookup_frames
     )
-    with pytest.raises(transport_keys.BillingSearchTransportKeyringError):
+    with pytest.raises(
+        transport_keys.BillingSearchTransportKeyringError
+    ) as pickle_error:
         pickle.dumps(keyring)
+    protocol_errors = (set_error.value, delete_error.value, pickle_error.value)
+    protocol_frames = []
+    for protocol_error in protocol_errors:
+        traceback = protocol_error.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_globals.get("__name__") == (
+                "api.billing_search_transport_keys"
+            ):
+                protocol_frames.append(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+    assert protocol_frames
+    assert all("self" not in local_values for local_values in protocol_frames)
 
 
 def _load_keyring_document(document: object) -> None:

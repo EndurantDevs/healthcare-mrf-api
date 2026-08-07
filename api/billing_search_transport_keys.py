@@ -35,10 +35,17 @@ def _fail() -> BillingSearchTransportKeyringError:
     return BillingSearchTransportKeyringError(_INVALID)
 
 
-def _canonical_key_id(value: object) -> str:
+def _canonical_key_id_or_none(value: object) -> str | None:
     if type(value) is not str or _KEY_ID_PATTERN.fullmatch(value) is None:
-        raise _fail()
+        return None
     return value
+
+
+def _canonical_key_id(value: object) -> str:
+    normalized_key_id = _canonical_key_id_or_none(value)
+    if normalized_key_id is None:
+        raise _fail()
+    return normalized_key_id
 
 
 def _canonical_key(value: object) -> bytes:
@@ -155,11 +162,11 @@ class BillingSearchTransportKeyring:
             del normalized_keyring, normalized_keys
 
     def __setattr__(self, attribute_name: str, attribute_value: object) -> None:
-        del attribute_name, attribute_value
+        del self, attribute_name, attribute_value
         raise TypeError(_INVALID)
 
     def __delattr__(self, attribute_name: str) -> None:
-        del attribute_name
+        del self, attribute_name
         raise TypeError(_INVALID)
 
     @property
@@ -171,13 +178,15 @@ class BillingSearchTransportKeyring:
     def key_for(self, key_id: object) -> bytes:
         """Return one retained key without disclosing key availability."""
 
-        normalized_key_id = _canonical_key_id(key_id)
-        for key_index in range(len(self.__keys)):
-            if hmac.compare_digest(
-                self.__keys[key_index][0],
-                normalized_key_id,
-            ):
-                return self.__keys[key_index][1]
+        normalized_key_id = _canonical_key_id_or_none(key_id)
+        if normalized_key_id is not None:
+            for key_index in range(len(self.__keys)):
+                if hmac.compare_digest(
+                    self.__keys[key_index][0],
+                    normalized_key_id,
+                ):
+                    return self.__keys[key_index][1]
+        del self, key_id
         raise _fail()
 
     def __repr__(self) -> str:
@@ -196,7 +205,7 @@ class BillingSearchTransportKeyring:
         return self
 
     def __reduce_ex__(self, protocol: int) -> object:
-        del protocol
+        del self, protocol
         raise _fail()
 
 
