@@ -53,6 +53,23 @@ fn matched_ein_accepts_only_the_shared_raw_input_grammar() {
 }
 
 #[test]
+fn classified_tax_identity_debug_redacts_normalized_ein() {
+    let raw_ein = "12-3456789";
+    let tin = json!({"type": "ein", "value": raw_ein});
+    let classified = classify_provider_group_tin(Some(&tin));
+    let rendered = format!("{classified:?}");
+
+    assert_eq!(
+        classified,
+        super::classified(TaxIdentityState::MatchedEin, Some(*b"123456789"))
+    );
+    assert!(rendered.contains("<redacted>"));
+    assert!(!rendered.contains(raw_ein));
+    assert!(!rendered.contains("123456789"));
+    assert!(!rendered.contains("[49, 50, 51, 52, 53, 54, 55, 56, 57]"));
+}
+
+#[test]
 fn all_unavailable_states_are_explicit() {
     assert_eq!(
         classify_provider_group_tin(None).state,

@@ -6,6 +6,13 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::sync::atomic::{compiler_fence, Ordering};
 
+mod v2;
+
+pub use v2::{
+    classify_provider_group_tin_v2, ClassifiedTaxIdentityV2, NormalizedTaxIdentity,
+    TaxIdentityObservationV2, TaxIdentityStateV2,
+};
+
 const TOKEN_DOMAIN: &[u8] = b"healthporta.ptg.tin.v1";
 const POLICY_ID_PREFIX: &str = "ptg-tin-hmac-sha256-v1:";
 const MAX_POLICY_ID_BYTES: usize = 55;
@@ -24,10 +31,21 @@ pub enum TaxIdentityState {
     UnsupportedType = 4,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ClassifiedTaxIdentity {
     pub state: TaxIdentityState,
     pub normalized_ein: Option<[u8; 9]>,
+}
+
+impl fmt::Debug for ClassifiedTaxIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let normalized_ein = self.normalized_ein.map(|_| "<redacted>");
+        formatter
+            .debug_struct("ClassifiedTaxIdentity")
+            .field("state", &self.state)
+            .field("normalized_ein", &normalized_ein)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,7 +97,15 @@ impl TinTokenPolicy {
     }
 
     pub fn token_for_ein(&self, normalized_ein: &[u8; 9]) -> TaxIdentityToken {
-        let mut message = canonical_tin_token_message(b"ein", normalized_ein);
+        self.token_for_normalized_identity(b"ein", normalized_ein)
+    }
+
+    fn token_for_normalized_identity(
+        &self,
+        identity_type: &[u8],
+        normalized_identity: &[u8],
+    ) -> TaxIdentityToken {
+        let mut message = canonical_tin_token_message(identity_type, normalized_identity);
         let tin_hmac_sha256 = hmac_sha256(&self.secret, &message);
         clear_secret_bytes(&mut message);
         let mut tin_id_128 = [0u8; 16];
