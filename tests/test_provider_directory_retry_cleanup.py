@@ -20,6 +20,9 @@ from tests.test_provider_directory_two_phase_publication import (
 )
 
 
+LARGE_ORDINARY_RESOURCE_ROW_COUNT = 100_000
+
+
 async def _mixed_candidate_current_fence(database):
     """Select one validated candidate and one unchanged current peer."""
     await _insert_validated_shared_dataset(database, importer._schema())
@@ -70,6 +73,65 @@ async def _remaining_retry_dataset_ids(database, schema: str) -> list[str]:
         ") retry_state ORDER BY dataset_id;"
     )
     return [str(row[0]) for row in rows]
+
+
+def _plan_nodes(raw_plan):
+    if isinstance(raw_plan, dict):
+        yield raw_plan
+        for value in raw_plan.values():
+            yield from _plan_nodes(value)
+    elif isinstance(raw_plan, list):
+        for value in raw_plan:
+            yield from _plan_nodes(value)
+
+
+def test_retry_cleanup_resource_types_are_exact_supported_markers(monkeypatch):
+    expected_resource_types = [
+        f"LU:{resource_type}:pass:{pass_number}"
+        for resource_type in importer.DEFAULT_RESOURCES
+        for pass_number in (1, 2)
+    ]
+    assert (
+        importer._last_updated_partition_retry_resource_types()
+        == expected_resource_types
+    )
+
+    monkeypatch.setattr(
+        importer,
+        "DEFAULT_RESOURCES",
+        (*importer.DEFAULT_RESOURCES, "SyntheticResource"),
+    )
+    assert importer._last_updated_partition_retry_resource_types()[-2:] == [
+        "LU:SyntheticResource:pass:1",
+        "LU:SyntheticResource:pass:2",
+    ]
+
+
+async def _seed_large_ordinary_candidate_resources(database, schema: str) -> None:
+    await database.status(
+        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
+        "dataset_id, resource_type, resource_id, payload_hash, payload_json"
+        ") SELECT 'dataset_candidate', 'Location', "
+        "'ordinary-' || value::text, repeat('a', 64), CAST('{}' AS json) "
+        "FROM generate_series(1, :row_count) AS value;",
+        row_count=LARGE_ORDINARY_RESOURCE_ROW_COUNT,
+    )
+    await database.status(
+        f"ANALYZE {schema}.provider_directory_dataset_resource;"
+    )
+
+
+async def _retry_cleanup_delete_plan(database, schema: str):
+    return await database.scalar(
+        "EXPLAIN (FORMAT JSON) "
+        f"DELETE FROM {schema}.provider_directory_dataset_resource "
+        "WHERE dataset_id = ANY(CAST(:dataset_ids AS varchar[])) "
+        "AND resource_type = ANY(CAST(:retry_resource_types AS varchar[]));",
+        dataset_ids=["dataset_candidate"],
+        retry_resource_types=(
+            importer._last_updated_partition_retry_resource_types()
+        ),
+    )
 
 
 @contextlib.asynccontextmanager
@@ -133,3 +195,37 @@ async def test_cleanup_lock_contention_is_bounded_and_recoverable(monkeypatch):
             ["dataset_candidate"]
         ) == ["dataset_candidate"]
         assert await _retry_cleanup_counts(database, schema) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_uses_compound_key_under_one_second_budget(monkeypatch):
+    """Ordinary content volume cannot force retry cleanup into a dataset scan."""
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _prepare_retry_cleanup_state(database, schema)
+        await _seed_large_ordinary_candidate_resources(database, schema)
+
+        raw_plan = await _retry_cleanup_delete_plan(database, schema)
+        plan_nodes = list(_plan_nodes(raw_plan))
+        index_conditions = [
+            str(node["Index Cond"])
+            for node in plan_nodes
+            if "Index Cond" in node
+        ]
+
+        assert all(node.get("Node Type") != "Seq Scan" for node in plan_nodes)
+        assert any(
+            "dataset_id" in condition and "resource_type" in condition
+            for condition in index_conditions
+        )
+        assert importer.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT == (
+            "1000ms"
+        )
+        assert await importer._clear_promoted_endpoint_dataset_retry_state(
+            ["dataset_candidate"]
+        ) == ["dataset_candidate"]
+        assert await _retry_cleanup_counts(database, schema) == (0, 0)
+        assert await database.scalar(
+            f"SELECT count(*) FROM {schema}.provider_directory_dataset_resource "
+            "WHERE dataset_id = 'dataset_candidate' "
+            "AND resource_type = 'Location' AND resource_id LIKE 'ordinary-%';"
+        ) == LARGE_ORDINARY_RESOURCE_ROW_COUNT

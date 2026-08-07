@@ -443,21 +443,21 @@ async def test_finalized_retry_cleanup_remains_narrow_immutable_exception(
     monkeypatch,
 ):
     status = AsyncMock(return_value=1)
-    guard = AsyncMock(
-        side_effect=AssertionError("retry-state exception used mutable guard")
-    )
+    guard = AsyncMock(side_effect=AssertionError("retry-state exception used mutable guard"))
     monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(
-        importer,
-        "_lock_mutable_endpoint_dataset_resource_parents",
-        guard,
-    )
+    monkeypatch.setattr(importer, "_lock_mutable_endpoint_dataset_resource_parents", guard)
 
     await importer._delete_endpoint_dataset_retry_state(["dataset_final"])
 
     retry_resource_sql = status.await_args_list[0].args[0]
-    assert "resource_type LIKE 'LU:%:pass:%'" in retry_resource_sql
+    retry_resource_predicate = "resource_type = ANY(CAST(:retry_resource_types AS varchar[]))"
+    assert retry_resource_predicate in retry_resource_sql
+    assert "resource_type LIKE" not in retry_resource_sql
     assert status.await_args_list[0].kwargs["dataset_ids"] == ["dataset_final"]
+    assert (
+        status.await_args_list[0].kwargs["retry_resource_types"]
+        == importer._last_updated_partition_retry_resource_types()
+    )
     guard.assert_not_awaited()
 
 
