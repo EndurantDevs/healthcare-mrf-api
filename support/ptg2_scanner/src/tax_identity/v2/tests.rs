@@ -106,6 +106,7 @@ fn v2_npi_invalidity_classes_are_never_matchable_or_tokenized() {
         ("short", "123"),
         ("nondigit", "100000049x"),
         ("unicode", "１００００００４９１"),
+        ("slash", "10/00/0491"),
         ("hyphen", "10000004-1"),
         ("space", "10000 00491"),
     ] {
