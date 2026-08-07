@@ -17,6 +17,11 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from api.billing_search_sealed_cursor import (
+    BillingSearchSealedPageCursor,
+    _mint_billing_search_sealed_page_cursor,
+)
+
 BILLING_SEARCH_CURSOR_CONTRACT = "healthporta.billing-search-cursor.v1"
 BILLING_SEARCH_CURSOR_PREFIX = "bsc1"
 BILLING_SEARCH_CURSOR_MAX_CHARACTERS = 2048
@@ -233,10 +238,14 @@ def _state_values(state: BillingSearchCursorState) -> dict[str, Any]:
 def _validated_state(state: object) -> dict[str, Any]:
     if type(state) is not BillingSearchCursorState:
         raise _fail()
-    values = _state_values(state)
+    try:
+        values = _state_values(state)
+        contract = state.contract
+    except (AttributeError, TypeError):
+        raise _fail() from None
     if (
-        type(state.contract) is not str
-        or state.contract != BILLING_SEARCH_CURSOR_CONTRACT
+        type(contract) is not str
+        or contract != BILLING_SEARCH_CURSOR_CONTRACT
         or values["expires_at"] <= values["issued_at"]
         or values["expires_at"] - values["issued_at"]
         > BILLING_SEARCH_CURSOR_MAX_TTL_SECONDS
@@ -271,6 +280,29 @@ def _base64url_decode(value: object) -> bytes:
     if not hmac.compare_digest(_base64url_encode(decoded), value):
         raise _fail()
     return decoded
+
+
+def _new_sealed_page_cursor(
+    token: object,
+    state: object,
+) -> BillingSearchSealedPageCursor:
+    if (
+        type(token) is not str
+        or not 1 <= len(token) <= BILLING_SEARCH_CURSOR_MAX_CHARACTERS
+    ):
+        raise _fail()
+    token_parts = token.split("_", 2)
+    if len(token_parts) != 3 or token_parts[0] != BILLING_SEARCH_CURSOR_PREFIX:
+        raise _fail()
+    _canonical_key_id(token_parts[1])
+    sealed_payload = _base64url_decode(token_parts[2])
+    if len(sealed_payload) <= _NONCE_BYTES + 16:
+        raise _fail()
+    _validated_state(state)
+    return _mint_billing_search_sealed_page_cursor(
+        token,
+        state,
+    )
 
 
 def _canonical_json_bytes(json_object: object) -> bytes:
@@ -426,6 +458,7 @@ __all__ = [
     "BillingSearchCursorError",
     "BillingSearchCursorGenerationExpired",
     "BillingSearchCursorKeyring",
+    "BillingSearchSealedPageCursor",
     "BillingSearchCursorState",
     "open_billing_search_cursor",
     "seal_billing_search_cursor",

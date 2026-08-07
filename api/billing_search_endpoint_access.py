@@ -39,6 +39,7 @@ from api.billing_search_verified_transport import (
 )
 
 _STATE_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_ENDPOINT_ACCESS_V1\x00"
+_STATE_DIGEST_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_ENDPOINT_ACCESS_DIGEST_V1\x00"
 _STATE_AUTH_KEY = secrets.token_bytes(32)
 _HEADER_PREFIX = "x-healthporta-billing-search-"
 _HEADER_NAMES = (
@@ -337,6 +338,33 @@ def validate_billing_search_endpoint_access(
     return validated
 
 
+def validate_billing_search_endpoint_access_state(
+    access: object,
+    *,
+    trusted_now: object,
+) -> tuple[BillingSearchEndpointAccess, str]:
+    """Revalidate access and return its process-local pseudonymous state digest."""
+
+    validated = validate_billing_search_endpoint_access(
+        access,
+        trusted_now=trusted_now,
+    )
+    try:
+        state_hmac = object.__getattribute__(
+            validated,
+            "_BillingSearchEndpointAccess__state_hmac",
+        )
+    except (AttributeError, TypeError):
+        raise _fail() from None
+    if type(state_hmac) is not bytes or len(state_hmac) != hashlib.sha256().digest_size:
+        raise _fail()
+    digest = hashlib.sha256()
+    digest.update(_STATE_DIGEST_DOMAIN)
+    digest.update(len(state_hmac).to_bytes(8, "big"))
+    digest.update(state_hmac)
+    return validated, digest.hexdigest()
+
+
 def _authorized_endpoint_or_none(
     parameters: Mapping[str, Any],
     headers: Mapping[str, Any],
@@ -436,4 +464,5 @@ __all__ = [
     "BillingSearchEndpointAccessError",
     "authorize_billing_search_endpoint",
     "validate_billing_search_endpoint_access",
+    "validate_billing_search_endpoint_access_state",
 ]
