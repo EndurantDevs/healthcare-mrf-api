@@ -50,16 +50,16 @@ async def register_ptg_small_wave_slot(
         slot=slot,
         pod_uid=pod_uid,
     )
-    for attempt in range(_SLOT_REGISTRATION_MAX_ATTEMPTS):
+    attempt = 0
+    while True:
         try:
             return await _register_slot_once(redis, reference, registration)
         except WatchError as exc:
-            if attempt + 1 == _SLOT_REGISTRATION_MAX_ATTEMPTS:
+            if (attempt := attempt + 1) == _SLOT_REGISTRATION_MAX_ATTEMPTS:
                 raise PTGSmallWaveConflictError(
                     "Redis kept changing while registering a wave slot"
                 ) from exc
             await asyncio.sleep(0)
-    raise AssertionError("slot registration retry loop unexpectedly ended")
 
 
 async def _register_slot_once(

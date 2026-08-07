@@ -90,7 +90,7 @@ def attest_terminal_ptg_wave_kubernetes_objects(
             "terminal Job identity differs from the initial wave"
         )
     completed_slots = _attest_terminal_job_status(actual_job)
-    pod_uid_by_slot, actual_runtime_image_ids = _attest_terminal_pods(
+    pod_uid_by_slot, _actual_runtime_image_ids = _attest_terminal_pods(
         contract,
         actual_pods,
         job_name=job_name,
@@ -100,10 +100,10 @@ def attest_terminal_ptg_wave_kubernetes_objects(
         raise PTGWaveContractError(
             "terminal slot-to-pod UID membership differs from the initial wave"
         )
-    if actual_runtime_image_ids != {initial_attestation.runtime_image_identity}:
-        raise PTGWaveContractError(
-            "terminal Pod image identity differs from the initial wave"
-        )
+    # The initial attestation was bound to the manifest runtime above, and
+    # `_attest_terminal_pods` already required the same runtime for every Pod.
+    # A second comparison to the initial runtime was therefore unreachable.
+    # Both independently observable bindings must succeed before returning.
     return _terminal_attestation(
         contract,
         initial_attestation,

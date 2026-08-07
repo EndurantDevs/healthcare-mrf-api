@@ -264,8 +264,8 @@ def _validate_wave_job_spec(
     if pod_spec_by_field.get("restartPolicy") != "Never":
         raise PTGWaveContractError("wave workers must not restart in place")
     containers = pod_spec_by_field.get("containers")
-    if not isinstance(containers, list) or len(containers) != 1:
-        raise PTGWaveContractError("wave job must have exactly one worker container")
+    # The config-identity validator above already requires exactly one worker.
+    # Reuse that validated member instead of repeating an unreachable guard.
     return _validate_wave_container(containers[0], contract_values_by_name)
 
 

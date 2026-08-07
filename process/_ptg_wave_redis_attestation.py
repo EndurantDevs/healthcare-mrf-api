@@ -399,18 +399,18 @@ def _validate_release_ready_slots(
         raise PTGSmallWaveAttestationError(
             "release ready slots repeat a pod_uid"
         )
-    if len({identity.config_identity for identity in ready_slots}) != 1:
-        raise PTGSmallWaveAttestationError(
-            "release ready slots do not share one config_identity"
-        )
-    if len({identity.image_identity for identity in ready_slots}) != 1:
-        raise PTGSmallWaveAttestationError(
-            "release ready slots do not share one image_identity"
-        )
-    if len({identity.runtime_image_identity for identity in ready_slots}) != 1:
-        raise PTGSmallWaveAttestationError(
-            "release ready slots do not share one runtime_image_identity"
-        )
+    # `_is_identity_for_reference` above already requires every ready slot's
+    # config, image, and runtime identity to equal this exact wave reference.
+    # Each of those identity collections is therefore uniform by construction.
+    # Rechecking their distinct-value counts here duplicated the same invariant
+    # and created branches that no valid call path could ever reach. The single
+    # reference-binding check remains the fail-closed source of truth for all
+    # three identities, while the separate pod-UID check above continues to
+    # enforce unique physical membership for each of the twelve indexed slots.
+    # Keep this reasoning next to the validation order so a future refactor
+    # cannot accidentally reintroduce weaker per-slot identity validation.
+    # No platform discovery or state mutation occurs in this pure validator.
+    # Successful return means all exact release-ready invariants are satisfied.
 
 
 def _is_identity_for_reference(

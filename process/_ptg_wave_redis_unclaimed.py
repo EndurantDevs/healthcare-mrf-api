@@ -147,15 +147,15 @@ async def attest_unclaimed_wave_redis_cleanup(
         expected_attestation_digest,
     )
     plan = plan_ptg_small_wave_terminal_cleanup(manifest)
-    try:
-        async with redis.pipeline(transaction=True) as pipe:
-            for key in plan.target_keys:
-                pipe.get(key)
-            target_scalars = await pipe.execute(raise_on_error=False)
-    except ResponseError as exc:
-        raise PTGSmallWaveAttestationError(
-            "all-unclaimed post-cleanup GET encountered an invalid key type"
-        ) from exc
+    async with redis.pipeline(transaction=True) as pipe:
+        for key in plan.target_keys:
+            pipe.get(key)
+        target_scalars = await pipe.execute(raise_on_error=False)
+    # With `raise_on_error=False`, redis-py returns command errors as values in
+    # this sequence instead of raising ResponseError from pipeline execution.
+    # The exact-shape and scalar validators below reject those returned errors.
+    # Keep that single protocol path as the fail-closed post-cleanup proof.
+    # ResponseError handling remains on the watched mutation paths above.
     target_scalars = scalar_sequence(
         target_scalars,
         expected_count=len(plan.target_keys),

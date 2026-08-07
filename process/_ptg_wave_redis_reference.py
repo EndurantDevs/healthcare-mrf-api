@@ -65,7 +65,11 @@ def create_ptg_small_wave_slot_identity(
 ) -> PTGSmallWaveSlotIdentity:
     """Create one exact worker registration bound to a validated reference."""
 
-    if slot not in PTG_SMALL_WAVE_SLOTS:
+    if (
+        not isinstance(slot, int)
+        or isinstance(slot, bool)
+        or slot not in PTG_SMALL_WAVE_SLOTS
+    ):
         raise PTGSmallWaveValidationError(
             "slot must be an integer from 0 through 11"
         )

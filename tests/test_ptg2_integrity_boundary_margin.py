@@ -279,3 +279,15 @@ def test_deflate64_read_shapes_preserve_buffer_and_tail_order():
     bounded._inflate_next = inflate_bounded
     bounded._finish = lambda: b"y"
     assert bounded.read(2) == b"xy"
+
+
+def test_canonical_json_internal_scalar_dispatches():
+    assert canonical._canonicalize_for_json(Decimal("7.00")) == "7"
+    with pytest.raises(TypeError, match="Float money"):
+        canonical._canonicalize_for_json(
+            1.5,
+            key="negotiated_rate",
+        )
+    assert canonical._canonicalize_for_json(
+        datetime.date(2026, 8, 7),
+    ) == "2026-08-07"

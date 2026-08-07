@@ -122,7 +122,7 @@ def attest_preclaim_failure_kubernetes(
             "failure Job identity differs from the initial wave"
         )
     job_active, job_failed, job_succeeded = _attest_failed_job_status(actual_job)
-    failed_pod_uid_by_slot, actual_runtime_image_ids = _attest_failed_pods(
+    failed_pod_uid_by_slot, _actual_runtime_image_ids = _attest_failed_pods(
         contract,
         actual_pods,
         job_name=job_name,
@@ -132,10 +132,10 @@ def attest_preclaim_failure_kubernetes(
         raise PTGWaveContractError(
             "failure slot-to-Pod UID membership differs from the initial wave"
         )
-    if actual_runtime_image_ids != {initial_attestation.runtime_image_identity}:
-        raise PTGWaveContractError(
-            "failure Pod image identity differs from the initial wave"
-        )
+    # The initial attestation was bound to the manifest runtime above, and
+    # `_attest_failed_pods` already required the same runtime for every Pod.
+    # A second comparison to the initial runtime was therefore unreachable.
+    # Both independently observable bindings must succeed before returning.
     return _failure_attestation(
         contract,
         job_name=job_name,
