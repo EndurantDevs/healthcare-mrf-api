@@ -51,6 +51,7 @@ def test_cross_language_query_and_plan_golden_vectors() -> None:
         f" {PLAN_RELEASE_ID}",
         f"{PLAN_RELEASE_ID} ",
         f"\t{PLAN_RELEASE_ID}\n",
+        None,
     ],
 )
 def test_plan_entitlement_rejects_noncanonical_release_ids(plan_release_id) -> None:
@@ -105,6 +106,7 @@ def test_request_binding_is_closed_and_redacted() -> None:
         (("key",),),
         (["key", "value"],),
         tuple((f"key-{index}", "value") for index in range(33)),
+        tuple((f"key-{index}", "x" * 2048) for index in range(5)),
     ],
 )
 def test_query_pairs_reject_noncanonical_or_ambiguous_shapes(query_pairs) -> None:

@@ -24,14 +24,16 @@ from tests.test_billing_search_transport_contract import (
 
 KEY_ID = "k2031-a"
 KEY_BYTES = bytes(range(32))
-GOLDEN_SIGNATURE = "_rW3AAeUUp29iE1pR1mS5jv79TyLFxmtra6ZDO5a5oQ"
+GOLDEN_SIGNATURE = "kvgD1xm6pDnE5egIYoJBxgHhC33C55simNWc2GJGbyw"
 PRINCIPAL_SHA256 = hashlib.sha256(b"synthetic-principal-scope").hexdigest()
 TENANT_SHA256 = hashlib.sha256(b"synthetic-tenant-scope").hexdigest()
 AUDIT_SHA256 = hashlib.sha256(b"synthetic-audit-scope").hexdigest()
 GOLDEN_PAYLOAD_BYTES = (
     b'{"audience":"healthcare-mrf-api","audit_scope_sha256":"'
     + AUDIT_SHA256.encode("ascii")
-    + b'","capabilities":["pricing:billing-search"],"contract":"healthporta.billing-search-transport.v1","expires_at":"2031-01-02T03:04:55Z","issued_at":"2031-01-02T03:03:55Z","issuer":"healthporta-api-layer","metering_receipt_sha256":"'
+    + b'","capabilities":["pricing:billing-search"],"contract":"healthporta.billing-search-transport.v1","expires_at":"2031-01-02T03:04:55Z","issued_at":"2031-01-02T03:03:55Z","issuer":"'
+    + contract.BILLING_SEARCH_TRANSPORT_ISSUER.encode("ascii")
+    + b'","metering_receipt_sha256":"'
     + METERING_RECEIPT_SHA256.encode("ascii")
     + b'","metering_request_id":"123e4567-e89b-42d3-a456-426614174000","method":"GET","path":"/api/v1/pricing/providers/search-by-procedure","plan_entitlement_sha256":"'
     + PLAN_ENTITLEMENT_SHA256.encode("ascii")
@@ -109,7 +111,7 @@ def _verify(headers=None, *, binding=None, keyring=None):
 
 
 def test_cross_language_signature_and_payload_golden_vector() -> None:
-    assert len(GOLDEN_PAYLOAD_BYTES) == 1045
+    assert len(GOLDEN_PAYLOAD_BYTES) == 1058
     assert contract._canonical_json_bytes(_payload()) == GOLDEN_PAYLOAD_BYTES
     context_header, key_id, signature_header = _headers_for_bytes(GOLDEN_PAYLOAD_BYTES)
 
@@ -275,6 +277,29 @@ def test_transport_rejects_tampered_or_unknown_signatures() -> None:
     ):
         with pytest.raises(contract.BillingSearchTransportError):
             _verify(headers)
+
+
+def test_transport_rejects_wrong_runtime_dependency_types() -> None:
+    with pytest.raises(contract.BillingSearchTransportError):
+        _verify(keyring=object())
+
+    with pytest.raises(contract.BillingSearchTransportError):
+        _verify(binding=object())
+
+
+def test_transport_rejects_noncanonical_key_id_type() -> None:
+    context_header, _key_id, signature_header = _headers()
+
+    with pytest.raises(contract.BillingSearchTransportError):
+        _verify((context_header, object(), signature_header))
+
+
+def test_verified_transport_revalidation_rejects_wrong_runtime_type() -> None:
+    with pytest.raises(contract.BillingSearchTransportError):
+        transport.validate_verified_billing_search_transport(
+            object(),
+            trusted_now="2031-01-02T03:04:05Z",
+        )
 
 
 def test_transport_reads_retained_rotation_key() -> None:
