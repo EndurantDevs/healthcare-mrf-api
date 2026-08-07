@@ -623,6 +623,7 @@ jobs:
           tests/test_formulary_fhir_storage_postgres.py
           tests/test_formulary_fhir_repository_postgres.py
           tests/test_formulary_fhir_synchronizer_postgres.py
+          tests/test_formulary_fhir_manual_worker_postgres.py
       - name: Run fresh-migrated PTG2 v3 PostgreSQL lifecycle gate
         if: matrix.shard == 'core'
         env:
