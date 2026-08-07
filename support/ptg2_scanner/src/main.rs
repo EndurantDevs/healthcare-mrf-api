@@ -26682,6 +26682,64 @@ mod tests {
         assert!(!v2_path.exists());
         assert!(!PathBuf::from(format!("{}.building", v2_path.display())).exists());
 
+        let lexical_parent = directory.path().join("lexical-parent");
+        assert_eq!(
+            normalized_absolute_lexical_path_value(
+                &lexical_parent.join("discarded").join("..").join("artifact")
+            )
+            .unwrap(),
+            lexical_parent.join("artifact")
+        );
+        assert_eq!(
+            publication_coordinate(Path::new("/")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let missing_publication_name = TaxIdentitySidecarScratch::create(Path::new("/"))
+            .err()
+            .unwrap();
+        assert_eq!(missing_publication_name.kind(), io::ErrorKind::InvalidInput);
+
+        let unresolved_collision_path = directory
+            .path()
+            .join("missing-collision-parent")
+            .join("artifact");
+        let unresolved_collision = RuntimeCollisionPath::new(&unresolved_collision_path)
+            .err()
+            .unwrap();
+        assert_eq!(unresolved_collision.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            unresolved_collision.to_string(),
+            "tax identity collision coordinate could not be resolved"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlink_loop = directory.path().join("collision-symlink-loop");
+            symlink(&symlink_loop, &symlink_loop).unwrap();
+            let loop_collision = RuntimeCollisionPath::new(&symlink_loop).err().unwrap();
+            assert_eq!(loop_collision.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                loop_collision.to_string(),
+                "tax identity collision coordinate could not be resolved"
+            );
+            std::fs::remove_file(symlink_loop).unwrap();
+        }
+
+        let overflow_path = directory.path().join("overflow.ptg2tax");
+        let (overflow_scratch, overflow_file) =
+            TaxIdentitySidecarScratch::create(&overflow_path).unwrap();
+        let mut overflow_writer = TaxIdentityArtifactWriter::new(overflow_file);
+        overflow_writer.flush().unwrap();
+        overflow_writer.byte_count = u64::MAX;
+        assert_eq!(
+            overflow_writer.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(overflow_writer);
+        drop(overflow_scratch);
+        assert!(!overflow_path.exists());
+
         let mut maximum = u64::MAX;
         assert_eq!(
             checked_tax_identity_v2_increment(&mut maximum)
