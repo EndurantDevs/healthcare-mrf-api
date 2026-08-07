@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -21,6 +22,12 @@ from api.plan_release_serving import (
     PlanReleaseSnapshotBinding,
 )
 from api.ptg2_types import PTG2ServingTables
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from tests.billing_search_entity_ref_support import (
+    serving_tables as source_serving_tables,
+    source_pinned_selection,
+    source_publication,
+)
 from tests.test_billing_search_transport_contract import (
     BILLING_ENTITY_REF,
     PLAN_ENTITLEMENT_SHA256,
@@ -313,3 +320,123 @@ def test_snapshot_digest_changes_with_any_release_binding_coordinate() -> None:
     )
 
     assert pagination.billing_search_snapshot_set_sha256(changed_selection) != baseline
+
+
+def test_generation_contract_rejects_bad_digests_oids_and_timestamps() -> None:
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.BillingSearchGenerationPin(
+            snapshot_set_sha256="0" * 64,
+            generation_bundle_sha256="1" * 64,
+            address_relation_oid=1,
+            address_evidence_relation_oid=2,
+        )
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.BillingSearchGenerationPin(
+            snapshot_set_sha256="1" * 64,
+            generation_bundle_sha256="2" * 64,
+            address_relation_oid=0,
+            address_evidence_relation_oid=2,
+        )
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.BillingSearchCursorBinding(
+            request_fingerprint_sha256="1" * 64,
+            authorization_scope_sha256="2" * 64,
+            generation_bundle_sha256="3" * 64,
+            snapshot_set_sha256="4" * 64,
+            trusted_now=-1,
+        )
+
+    missing_binding = object.__new__(pagination.BillingSearchCursorBinding)
+    with pytest.raises(PTG2ManifestArtifactError):
+        missing_binding.__post_init__()
+
+    assert repr(_pin()) == "<billing-search-generation-pin>"
+    assert repr(_cursor_binding()) == "<billing-search-cursor-binding>"
+
+
+def test_generation_metadata_is_optional_but_strictly_bounded() -> None:
+    assert pagination._optional_generation_text(None) is None
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination._optional_generation_text("\n")
+
+
+def test_snapshot_digest_requires_complete_v4_release_bindings() -> None:
+    missing_tables = replace(_selection(), _validated_serving_tables=())
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.billing_search_snapshot_set_sha256(missing_tables)
+
+    non_v4_tables = replace(_tables(), storage_generation="shared_blocks_v3")
+    non_v4_selection = replace(
+        _selection(),
+        _validated_serving_tables=((SNAPSHOT_ID, non_v4_tables),),
+    )
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.billing_search_snapshot_set_sha256(non_v4_selection)
+
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.billing_search_snapshot_set_sha256(object())
+
+
+def test_snapshot_digest_pins_source_publication_and_rejects_corruption() -> None:
+    source_aware_selection = source_pinned_selection()
+    source_aware_digest = pagination.billing_search_snapshot_set_sha256(
+        source_aware_selection
+    )
+    assert len(source_aware_digest) == 64
+
+    mismatched_publication = source_publication(source_count=1)
+    corrupt_tables = source_serving_tables(publication=mismatched_publication)
+    corrupt_selection = source_pinned_selection(tables=corrupt_tables)
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.billing_search_snapshot_set_sha256(corrupt_selection)
+
+
+def test_address_relation_names_reject_untrusted_schema(monkeypatch) -> None:
+    monkeypatch.setattr(pagination.ptg2_serving, "PTG2_SCHEMA", "bad-schema")
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination._quoted_address_relations()
+
+
+@pytest.mark.asyncio
+async def test_generation_capture_rejects_missing_relation_oids() -> None:
+    session = AsyncMock()
+    session.scalar.return_value = (1001, None)
+
+    with pytest.raises(PTG2ManifestArtifactError):
+        await pagination.capture_billing_search_generation_pin(
+            session,
+            _selection(),
+        )
+
+
+def test_page_cursor_helpers_reject_untyped_generation_inputs() -> None:
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.build_billing_search_cursor_binding(
+            _request(),
+            _authorization_context(),
+            object(),
+            trusted_now=REQUEST_TIME,
+        )
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.open_billing_search_page_cursor(
+            _request(),
+            keyring=KEYRING,
+            binding=object(),
+        )
+    with pytest.raises(PTG2ManifestArtifactError):
+        pagination.seal_billing_search_page_cursor(
+            (1,),
+            keyring=KEYRING,
+            binding=object(),
+        )
+
+
+def test_page_cursor_open_returns_none_without_client_cursor() -> None:
+    assert (
+        pagination.open_billing_search_page_cursor(
+            _request(),
+            keyring=KEYRING,
+            binding=_cursor_binding(),
+        )
+        is None
+    )

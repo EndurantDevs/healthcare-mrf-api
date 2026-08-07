@@ -318,3 +318,74 @@ def test_cursor_sealing_requires_current_state(monkeypatch) -> None:
         cursor.BillingSearchCursorError, match="^billing_search_cursor_invalid$"
     ):
         _seal(monkeypatch, _state(expires_at=1_800_000_100))
+
+
+def test_sealed_cursor_is_opaque_immutable_and_not_serializable() -> None:
+    sealed_cursor = cursor._mint_billing_search_sealed_page_cursor(
+        "opaque-token",
+        object(),
+    )
+
+    with pytest.raises(ValueError, match="^billing_search_cursor_invalid$"):
+        cursor.BillingSearchSealedPageCursor()
+    with pytest.raises(TypeError, match="^billing_search_cursor_invalid$"):
+        sealed_cursor.claimed_state = object()
+    with pytest.raises(TypeError, match="^billing_search_cursor_invalid$"):
+        del sealed_cursor.claimed_state
+    with pytest.raises(ValueError, match="^billing_search_cursor_invalid$"):
+        pickle.dumps(sealed_cursor)
+
+    assert repr(sealed_cursor) == "<redacted-billing-search-cursor>"
+    assert str(sealed_cursor) == "<redacted-billing-search-cursor>"
+    assert copy.copy(sealed_cursor) is sealed_cursor
+    assert copy.deepcopy(sealed_cursor) is sealed_cursor
+
+    with pytest.raises(ValueError, match="^billing_search_cursor_invalid$"):
+        cursor._mint_billing_search_sealed_page_cursor(object(), object())
+
+
+def test_cursor_internal_envelopes_fail_closed_on_forged_shapes() -> None:
+    with pytest.raises(cursor.BillingSearchCursorError):
+        cursor._validated_state(object())
+
+    missing_state = object.__new__(cursor.BillingSearchCursorState)
+    with pytest.raises(cursor.BillingSearchCursorError):
+        cursor._validated_state(missing_state)
+
+    with pytest.raises(cursor.BillingSearchCursorError):
+        cursor._base64url_decode("AB")
+
+    state = _state()
+    for token in (None, "wrong_k1_AA", "bsc1_k1_AA"):
+        with pytest.raises(cursor.BillingSearchCursorError):
+            cursor._new_sealed_page_cursor(token, state)
+
+    assert cursor._parse_authenticated_json(b"NaN") is cursor._INVALID_JSON
+
+
+def test_cursor_sealing_rejects_bad_nonce_and_oversized_envelope(monkeypatch) -> None:
+    monkeypatch.setattr(cursor.secrets, "token_bytes", lambda _size: b"short")
+    with pytest.raises(cursor.BillingSearchCursorError):
+        cursor.seal_billing_search_cursor(
+            _state(),
+            keyring=_keyring(),
+            trusted_now=1_800_000_100,
+        )
+
+    monkeypatch.setattr(
+        cursor.secrets,
+        "token_bytes",
+        lambda size: b"n" * size,
+    )
+    monkeypatch.setattr(cursor, "BILLING_SEARCH_CURSOR_MAX_CHARACTERS", 1)
+    with pytest.raises(cursor.BillingSearchCursorError):
+        cursor.seal_billing_search_cursor(
+            _state(),
+            keyring=_keyring(),
+            trusted_now=1_800_000_100,
+        )
+
+
+def test_cursor_open_rejects_authenticated_payload_shorter_than_aead_tag() -> None:
+    with pytest.raises(cursor.BillingSearchCursorError):
+        _open("bsc1_k1_AA")
