@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
+from typing import Literal
 
 from process.formulary_fhir.repository_shared import AliasRef
 from process.formulary_fhir.repository_shared import CheckpointWrite
@@ -14,6 +16,20 @@ from process.formulary_fhir.repository_shared import lock_dataset
 from process.formulary_fhir.repository_shared import persisted_membership_proof
 from process.formulary_fhir.repository_shared import row_mapping
 from process.formulary_fhir.repository_shared import table_name
+
+
+@dataclass(frozen=True, slots=True)
+class AliasCompletionFence:
+    """Bind a completion fence to an existing incomplete full acquisition."""
+
+    fence_token: int
+    prior_acquisition_mode: Literal["full"] | None
+
+    def __post_init__(self) -> None:
+        if type(self.fence_token) is not int or self.fence_token <= 0:
+            raise ValueError("FHIR formulary completion fence is invalid")
+        if self.prior_acquisition_mode not in {None, "full"}:
+            raise ValueError("FHIR formulary prior acquisition mode is invalid")
 
 
 async def require_alias(
@@ -255,6 +271,48 @@ async def completed_checkpoint(
     return completed_alias
 
 
+async def next_checkpoint_fence(
+    database: Any,
+    source_id: str,
+    dataset: DatasetRef,
+    alias: AliasRef,
+) -> AliasCompletionFence:
+    """Return one greater than an exact incomplete fence, or one if absent."""
+
+    checkpoint_row = await database.first(
+        f"SELECT source_id, alias_id, source_plan_identifier, run_id, "
+        "dataset_id, fence_token, cutoff_at, acquisition_mode, completed FROM "
+        f"{table_name('fhir_formulary_checkpoint')} "
+        "WHERE source_id = :source_id AND alias_id = :alias_id "
+        "AND run_id = :run_id FOR UPDATE;",
+        source_id=source_id,
+        alias_id=alias.alias_id,
+        run_id=dataset.run_id,
+    )
+    checkpoint_by_field = row_mapping(checkpoint_row)
+    if not checkpoint_by_field:
+        return AliasCompletionFence(1, None)
+    expected_by_field = {
+        "source_id": source_id,
+        "alias_id": alias.alias_id,
+        "source_plan_identifier": alias.source_plan_identifier,
+        "run_id": dataset.run_id,
+        "dataset_id": dataset.dataset_id,
+        "cutoff_at": dataset.cutoff_at,
+        "acquisition_mode": "full",
+        "completed": False,
+    }
+    if any(
+        checkpoint_by_field.get(field_name) != expected_value
+        for field_name, expected_value in expected_by_field.items()
+    ):
+        raise RuntimeError("FHIR formulary incomplete checkpoint is inconsistent")
+    fence_token = checkpoint_by_field.get("fence_token")
+    if type(fence_token) is not int or fence_token <= 0:
+        raise RuntimeError("FHIR formulary incomplete checkpoint fence is invalid")
+    return AliasCompletionFence(fence_token + 1, "full")
+
+
 class FHIRFormularyCheckpointMixin:
     """Expose progress writes and exact completed-alias restart checks."""
 
@@ -297,5 +355,28 @@ class FHIRFormularyCheckpointMixin:
             alias,
         )
 
+    async def next_alias_completion_fence(
+        self,
+        *,
+        dataset: DatasetRef,
+        alias: AliasRef,
+    ) -> AliasCompletionFence:
+        """Read the next safe completion fence under a single-owner run."""
 
-__all__ = ("FHIRFormularyCheckpointMixin",)
+        async with self._database.transaction():
+            await lock_dataset(
+                self._database,
+                self.source_id,
+                dataset,
+                allowed_statuses={"building"},
+            )
+            await require_alias(self._database, self.source_id, alias)
+            return await next_checkpoint_fence(
+                self._database,
+                self.source_id,
+                dataset,
+                alias,
+            )
+
+
+__all__ = ("AliasCompletionFence", "FHIRFormularyCheckpointMixin")
