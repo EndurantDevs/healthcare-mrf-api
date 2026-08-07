@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 
+import pytest
+
 from process.ptg_parts.canonical import canonical_json_dumps
+from process.ptg_parts.ptg2_shared_gc import (
+    PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES,
+)
 from scripts import ptg_v4_dev_canary_publication as publication
 from scripts import ptg_v4_dev_canary_storage_budget as storage_policy
 from scripts.ptg_v4_dev_canary_publication import (
@@ -22,6 +27,7 @@ from scripts.ptg_v4_dev_canary_storage_budget import (
     StorageCanaryCase,
     storage_budget,
 )
+from scripts.ptg_v4_dev_canary_storage import relation_size_rows
 from scripts.ptg_v4_dev_canary_storage_sql import _ownership_predicates
 from tests.test_ptg_v4_dev_canary_storage_budget import _database_evidence
 
@@ -119,6 +125,70 @@ def test_tax_identity_sidecars_are_snapshot_owned_graph_storage() -> None:
             '"snapshot_key" IS NOT NULL',
             501,
         )
+
+
+def test_source_local_tax_identity_relations_count_once_in_snapshot_scope() -> None:
+    """Measure every source projection once without changing the graph gate."""
+
+    expected_relations = {
+        "ptg2_provider_tax_identity_source_manifest",
+        "ptg2_provider_tax_identity_source_binding",
+        "ptg2_provider_group_tax_identity_source",
+    }
+    relation_names = sorted(WHOLE_SNAPSHOT_PHYSICAL_RELATIONS)
+
+    assert set(PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES) == expected_relations
+    assert expected_relations <= WHOLE_SNAPSHOT_PHYSICAL_RELATIONS
+    assert expected_relations.isdisjoint(publication.REQUIRED_PHYSICAL_RELATIONS)
+    assert [
+        relation_name
+        for relation_name in relation_names
+        if relation_name in expected_relations
+    ] == sorted(expected_relations)
+    for relation_name in expected_relations:
+        assert _ownership_predicates(
+            relation_name,
+            "ptg2:ignored",
+            501,
+        ) == (
+            '"snapshot_key" = $1::bigint',
+            '"snapshot_key" IS NOT NULL',
+            501,
+        )
+
+
+class _SourceRelationSizeConnection:
+    def __init__(self) -> None:
+        self.size_targets: list[tuple[object, ...]] = []
+        self.existence_targets: list[tuple[object, ...]] = []
+
+    async def fetchval(self, query: str, *parameters: object) -> object:
+        if "pg_total_relation_size" in query:
+            self.size_targets.append(parameters)
+            return 8_192
+        self.existence_targets.append(parameters)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_source_local_storage_uses_exact_schema_and_table_names() -> None:
+    """Keep source projection measurement schema-qualified and duplicate-free."""
+
+    connection = _SourceRelationSizeConnection()
+    relation_names = sorted(PTG2_PROVIDER_TAX_IDENTITY_SOURCE_TABLE_NAMES)
+
+    rows = await relation_size_rows(
+        connection,
+        "billing_canary",
+        relation_names,
+    )
+
+    expected_targets = [
+        ("billing_canary", relation_name) for relation_name in relation_names
+    ]
+    assert connection.size_targets == expected_targets
+    assert connection.existence_targets == expected_targets
+    assert [row["relation"] for row in rows] == relation_names
 
 
 def _physical_storage_approval(
