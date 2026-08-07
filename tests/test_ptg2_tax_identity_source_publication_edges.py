@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -11,6 +12,8 @@ import pytest
 
 from process.ptg_parts import ptg2_tax_identity_source_aggregate_reuse as aggregate
 from process.ptg_parts import ptg2_tax_identity_source_binding_vector as vector
+from process.ptg_parts import ptg2_tax_identity_source_persisted as persisted
+from process.ptg_parts import ptg2_tax_identity_source_seal_validation as seal
 from process.ptg_parts import ptg2_tax_identity_source_target_preflight as target
 from process.ptg_parts import ptg2_tax_identity_source_validation as validation
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
@@ -358,6 +361,62 @@ async def test_reduction_validation_rejects_a_mismatched_batch(monkeypatch):
     next_group_boundary.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_durable_source_reduction_rejects_group_count_drift():
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_QueryResult(one=(2, 1))),
+    )
+
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        await seal._validate_durable_source_reduction(
+            session,
+            schema='"mrf"',
+            snapshot_key=7,
+        )
+
+
+@pytest.mark.asyncio
+async def test_durable_source_reduction_rejects_mismatched_rows(monkeypatch):
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_QueryResult(one=(1, 1))),
+    )
+    monkeypatch.setattr(
+        seal,
+        "_next_stored_group_boundary",
+        AsyncMock(return_value=b"g" * 16),
+    )
+    monkeypatch.setattr(
+        seal,
+        "_count_reduction_mismatches",
+        AsyncMock(return_value=1),
+    )
+
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        await seal._validate_durable_source_reduction(
+            session,
+            schema='"mrf"',
+            snapshot_key=7,
+        )
+
+
+@pytest.mark.asyncio
+async def test_building_source_validation_redacts_unexpected_failures(monkeypatch):
+    monkeypatch.setattr(
+        seal,
+        "_validate_tax_identity_source_projection_state",
+        AsyncMock(side_effect=RuntimeError("synthetic storage failure")),
+    )
+
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        await seal.validate_building_tax_identity_source_projection(
+            object(),
+            schema_name="mrf",
+            snapshot_key=7,
+            sealed_metadata=_sealed_metadata(),
+            aggregate_metadata=_aggregate_metadata(),
+        )
+
+
 def test_sealed_publication_metadata_fails_closed():
     invalid_contract = _sealed_metadata()
     invalid_contract["contract"] = "other"
@@ -393,7 +452,7 @@ async def test_reused_layout_manifest_and_counts_are_required():
         execute=AsyncMock(return_value=_QueryResult(one=(0, 0, 0, 0, 0)))
     )
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        await validation._validate_reused_observation_counts(
+        await persisted.validate_source_observation_counts(
             count_session,
             schema='"mrf"',
             snapshot_key=7,
@@ -403,6 +462,18 @@ async def test_reused_layout_manifest_and_counts_are_required():
 
 @pytest.mark.asyncio
 async def test_reused_projection_rejects_binding_count_and_db_failures(monkeypatch):
+    expected = validation._publication_from_metadata(_sealed_metadata())
+
+    @asynccontextmanager
+    async def transaction():
+        yield object()
+
+    monkeypatch.setattr(validation.db, "transaction", transaction)
+    monkeypatch.setattr(
+        validation,
+        "_validate_tax_identity_source_projection_state",
+        AsyncMock(return_value=(expected, ())),
+    )
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         await validation.validate_reused_tax_identity_source_projection(
             schema_name="mrf",

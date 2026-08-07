@@ -319,9 +319,12 @@ async def test_graph_publication_rejects_selected_layout_drift(
     with pytest.raises(RuntimeError, match="publication selection changed"):
         await publication._publish_v4_graph(
             compilation,
-            schema_name="mrf",
-            snapshot_key=1,
-            build_token="token",
+            publication_context=publication._V4GraphCoordinates(
+                schema_name="mrf",
+                logical_snapshot_id="synthetic-snapshot",
+                snapshot_key=1,
+                build_token="token",
+            ),
             compressed_acquisition_bytes=1,
             empty_npi_tin_only_normalization_count=0,
         )

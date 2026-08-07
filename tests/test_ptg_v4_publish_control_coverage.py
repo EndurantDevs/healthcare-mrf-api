@@ -71,6 +71,13 @@ async def _publish_layout(**overrides):
         "graph_artifact_entries": (),
         "provider_identifier_quarantine": {},
     }
+    if (
+        overrides.get("provider_graph_v4")
+        and "tax_identity_source_artifacts" not in overrides
+    ):
+        layout_arguments_by_name["tax_identity_source_artifacts"] = (
+            {"authenticated_test_evidence": True},
+        )
     layout_arguments_by_name.update(overrides)
     return await publication.publish_strict_shared_v3_layout(
         **layout_arguments_by_name
@@ -133,6 +140,25 @@ async def test_publication_rejects_malformed_resource_evidence(
             expected_raw_source_sha256=expected_hashes,
             compressed_acquisition_entries=entries,
             empty_npi_tin_only_normalization_count=normalization,
+        )
+    publication._prepare_price_with_early_finalizer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publication_requires_source_local_tax_evidence(monkeypatch) -> None:
+    """Reject V4 source evidence omission before preparing price data."""
+
+    _patch_publication_pipeline(monkeypatch, publish_result="unused")
+    raw_hash = "a" * 64
+    with pytest.raises(RuntimeError, match="source-local tax identity evidence"):
+        await _publish_layout(
+            provider_graph_v4=True,
+            expected_raw_source_sha256=(raw_hash,),
+            compressed_acquisition_entries=(
+                {"raw_sha256": raw_hash, "byte_count": 41},
+            ),
+            empty_npi_tin_only_normalization_count=0,
+            tax_identity_source_artifacts=(),
         )
     publication._prepare_price_with_early_finalizer.assert_not_awaited()
 

@@ -225,6 +225,7 @@ async def _assert_new_layout_seal(monkeypatch, expected_summary):
     )
     new_session = _ScriptedSession(
         _Result(rows=(owner_by_field,)),
+        _Result(rows=((None, None, None),)),
         _Result(scalar=17),
         _Result(),
         _Result(),
@@ -302,6 +303,7 @@ async def _assert_reused_layout_seal(
     monkeypatch.setattr(snapshot_maps, "delete_shared_layout_dense_rows", fake_delete)
     reused_session = _ScriptedSession(
         _Result(rows=(owner_by_field,)),
+        _Result(rows=((None, None, None),)),
         _Result(scalar=17),
         _Result(),
         _Result(rows=(reusable_layout_by_field,)),

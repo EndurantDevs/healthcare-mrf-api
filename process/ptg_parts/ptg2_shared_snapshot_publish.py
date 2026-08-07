@@ -12,6 +12,7 @@ import re
 import shutil
 import stat
 import struct
+import sys
 import tempfile
 import time
 import uuid
@@ -118,6 +119,18 @@ from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
     V4InferredTaxonomyPublication,
     publish_prepared_v4_inferred_taxonomy_candidates,
     stage_v4_inferred_taxonomy_compiler_copy,
+)
+from process.ptg_parts.ptg2_tax_identity_source_artifact import (
+    prepare_tax_identity_source_projection,
+)
+from process.ptg_parts.ptg2_tax_identity_source_projection import (
+    TaxIdentitySourcePublication,
+)
+from process.ptg_parts.ptg2_tax_identity_source_publish import (
+    publish_staged_tax_identity_source_projection,
+)
+from process.ptg_parts.ptg2_tax_identity_source_stage import (
+    stage_tax_identity_source_projection,
 )
 
 
@@ -462,6 +475,7 @@ class _V4GraphPublication:
     dictionary_publication: Mapping[str, Any]
     inferred_taxonomy_candidates: Mapping[str, Any]
     provider_tax_identity: Mapping[str, Any]
+    provider_tax_identity_source: Mapping[str, Any]
     audit_witness_path: Path
 
 
@@ -471,6 +485,17 @@ class _V4AtomicPublishContext:
 
     schema_name: str
     block_stage: str
+    logical_snapshot_id: str
+    snapshot_key: int
+    build_token: str
+
+
+@dataclass(frozen=True)
+class _V4GraphCoordinates:
+    """Immutable layout coordinates used before the graph stage exists."""
+
+    schema_name: str
+    logical_snapshot_id: str
     snapshot_key: int
     build_token: str
 
@@ -3664,12 +3689,32 @@ async def _drop_v4_dictionary_stages(
     )
 
 
+async def _cleanup_v4_dictionary_attempt(
+    *,
+    schema: str,
+    stages: Iterable[str],
+    prepared_tax_identity_source: Any,
+    preserve_primary_error: bool,
+) -> None:
+    """Drop publication stages and always release the ephemeral source COPY."""
+
+    try:
+        await _drop_v4_dictionary_stages(schema, stages)
+    except BaseException:
+        if not preserve_primary_error:
+            raise
+    finally:
+        if prepared_tax_identity_source is not None:
+            prepared_tax_identity_source.cleanup()
+
+
 async def _publish_v4_dictionaries_and_maps(
     compilation: V4GraphCompilationResult,
     *,
     publication_context: _V4AtomicPublishContext,
     compressed_acquisition_bytes: int,
     empty_npi_tin_only_normalization_count: int,
+    tax_identity_source_artifacts: Iterable[Mapping[str, Any]] | None = None,
     progress_callback: Callable[[str, int], None] | None = None,
     heartbeat_callback: Callable[[], None] | None = None,
 ) -> tuple[
@@ -3677,6 +3722,7 @@ async def _publish_v4_dictionaries_and_maps(
     V4SnapshotMapSummary,
     V4InferredTaxonomyPublication,
     _V4TaxIdentityPublication,
+    TaxIdentitySourcePublication | None,
 ]:
     """Atomically publish CAS reachability, dictionaries, metadata, and maps."""
 
@@ -3711,6 +3757,7 @@ async def _publish_v4_dictionaries_and_maps(
     )
     tax_identity_contract = _validated_v4_tax_identity_contract(compilation)
     tax_identity_artifact_bytes = _v4_tax_artifact_byte_count(compilation)
+    source_artifacts = tuple(tax_identity_source_artifacts or ())
     taxonomy_artifact = _v4_compiler_artifact(
         compilation,
         "inferred_taxonomy_candidates",
@@ -3773,6 +3820,25 @@ async def _publish_v4_dictionaries_and_maps(
             " CHECK (octet_length(pattern_digest) = 32), "
             " set_count bigint NOT NULL CHECK (set_count >= 0))"
         )
+    prepared_tax_identity_source = (
+        prepare_tax_identity_source_projection(
+            source_artifacts,
+            scratch_parent=(
+                compilation.provider_group_tax_identity_copy_path.parent
+            ),
+            token_policy_id=tax_identity_contract.token_policy_id,
+            token_policy_descriptor_sha256=(
+                tax_identity_contract.token_policy_descriptor_sha256
+            ),
+            source_ordinal_map=tax_identity_contract.source_ordinal_map,
+            source_ordinal_map_digest=(
+                tax_identity_contract.source_ordinal_map_digest
+            ),
+            aggregate_tax_content_digest=tax_identity_contract.content_digest,
+        )
+        if source_artifacts
+        else None
+    )
     created_stages: list[str] = []
     try:
         for stage, statement in zip(
@@ -3785,7 +3851,12 @@ async def _publish_v4_dictionaries_and_maps(
             if progress_callback is not None:
                 progress_callback("publish_batches", 1)
     except BaseException:
-        await _drop_v4_dictionary_stages(schema, created_stages)
+        await _cleanup_v4_dictionary_attempt(
+            schema=schema,
+            stages=created_stages,
+            prepared_tax_identity_source=prepared_tax_identity_source,
+            preserve_primary_error=True,
+        )
         raise
     try:
         await _copy_binary_file_to_stage(
@@ -3912,6 +3983,14 @@ async def _publish_v4_dictionaries_and_maps(
             ),
         )
         async with db.transaction() as session:
+            tax_identity_source_stage = (
+                await stage_tax_identity_source_projection(
+                    session,
+                    prepared_tax_identity_source,
+                )
+                if prepared_tax_identity_source is not None
+                else None
+            )
             snapshot_parameter_map = {"snapshot_key": int(snapshot_key)}
             await lock_v4_shared_layout_for_map_write(
                 session,
@@ -4025,7 +4104,6 @@ async def _publish_v4_dictionaries_and_maps(
                 source_bitmap_bytes=tax_identity_contract.source_bitmap_bytes,
                 heartbeat_callback=heartbeat_callback,
             )
-
             diagnostic_parameters_by_name = {
                 "snapshot_key": int(snapshot_key),
                 "compressed_acquisition_bytes": int(compressed_acquisition_bytes),
@@ -4338,6 +4416,20 @@ async def _publish_v4_dictionaries_and_maps(
                     + int(taxonomy_publication.observe_only_rule_count),
                 )
                 progress_callback("publish_batches", 1)
+            tax_identity_source_publication = (
+                await publish_staged_tax_identity_source_projection(
+                    session,
+                    schema_name=schema_name,
+                    logical_snapshot_id=publication_context.logical_snapshot_id,
+                    snapshot_key=int(snapshot_key),
+                    staged=tax_identity_source_stage,
+                    prepared=prepared_tax_identity_source,
+                    heartbeat_callback=heartbeat_callback,
+                )
+                if prepared_tax_identity_source is not None
+                and tax_identity_source_stage is not None
+                else None
+            )
             return (
                 cas_publication,
                 map_summary,
@@ -4351,24 +4443,32 @@ async def _publish_v4_dictionaries_and_maps(
                     tax_identity_count=tax_identity_contract.tax_identity_count,
                     artifact_byte_count=tax_identity_artifact_bytes,
                 ),
+                tax_identity_source_publication,
             )
     finally:
-        await _drop_v4_dictionary_stages(schema, stages)
+        await _cleanup_v4_dictionary_attempt(
+            schema=schema,
+            stages=stages,
+            prepared_tax_identity_source=prepared_tax_identity_source,
+            preserve_primary_error=sys.exc_info()[0] is not None,
+        )
 
 
 async def _publish_v4_graph(
     compilation: V4GraphCompilationResult,
     *,
-    schema_name: str,
-    snapshot_key: int,
-    build_token: str,
+    publication_context: _V4GraphCoordinates,
     compressed_acquisition_bytes: int,
     empty_npi_tin_only_normalization_count: int,
+    tax_identity_source_artifacts: Iterable[Mapping[str, Any]] | None = None,
     progress_callback: Callable[[str, int], None] | None = None,
     heartbeat_callback: Callable[[], None] | None = None,
 ) -> _V4GraphPublication:
     """Publish graph blocks only to CAS, then make packed maps authoritative."""
 
+    schema_name = publication_context.schema_name
+    snapshot_key = publication_context.snapshot_key
+    build_token = publication_context.build_token
     _require_v4_compilation_layout_selection(compilation)
     block_artifact = _v4_compiler_artifact(compilation, "graph_blocks")
     block_stage = shared_block_stage_name(f"v4-graph-{snapshot_key}")
@@ -4388,11 +4488,13 @@ async def _publish_v4_graph(
             map_summary,
             taxonomy_publication,
             tax_identity_publication,
+            tax_identity_source_publication,
         ) = await _publish_v4_dictionaries_and_maps(
             compilation,
             publication_context=_V4AtomicPublishContext(
                 schema_name=schema_name,
                 block_stage=block_stage,
+                logical_snapshot_id=publication_context.logical_snapshot_id,
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
             ),
@@ -4400,6 +4502,7 @@ async def _publish_v4_graph(
             empty_npi_tin_only_normalization_count=int(
                 empty_npi_tin_only_normalization_count
             ),
+            tax_identity_source_artifacts=tax_identity_source_artifacts,
             **_progress_callback_kwargs(progress_callback),
             heartbeat_callback=heartbeat_callback,
         )
@@ -4437,6 +4540,11 @@ async def _publish_v4_graph(
             "heavy_bitmaps": tuple(compilation.heavy_bitmaps),
             "inferred_taxonomy_candidates": dict(taxonomy_publication.manifest),
             "provider_tax_identity": dict(tax_identity_publication.manifest),
+            "provider_tax_identity_source": (
+                tax_identity_source_publication.as_dict()
+                if tax_identity_source_publication is not None
+                else {}
+            ),
             "observe": dict(compilation.observe),
             "resource_admission": {
                 "compressed_acquisition_bytes": int(compressed_acquisition_bytes),
@@ -4464,6 +4572,11 @@ async def _publish_v4_graph(
             + int(taxonomy_publication.packed_byte_count)
             + int(taxonomy_publication.pattern_member_bytes)
             + int(tax_identity_publication.artifact_byte_count)
+            + int(
+                tax_identity_source_publication.artifact_byte_count
+                if tax_identity_source_publication is not None
+                else 0
+            )
         ),
         stored_byte_count=(
             int(cas_publication.stored_byte_count)
@@ -4471,6 +4584,11 @@ async def _publish_v4_graph(
             + int(taxonomy_publication.packed_byte_count)
             + int(taxonomy_publication.pattern_member_bytes)
             + int(tax_identity_publication.artifact_byte_count)
+            + int(
+                tax_identity_source_publication.artifact_byte_count
+                if tax_identity_source_publication is not None
+                else 0
+            )
         ),
         map_summary=map_summary,
         representation=(
@@ -4481,6 +4599,11 @@ async def _publish_v4_graph(
         dictionary_publication=_V4_DICTIONARY_BATCH_CONTRACT.as_dict(),
         inferred_taxonomy_candidates=dict(taxonomy_publication.manifest),
         provider_tax_identity=dict(tax_identity_publication.manifest),
+        provider_tax_identity_source=(
+            tax_identity_source_publication.as_dict()
+            if tax_identity_source_publication is not None
+            else {}
+        ),
         audit_witness_path=compilation.provider_set_audit_npi_copy_path,
     )
 
@@ -4635,6 +4758,13 @@ def _physical_serving_index(
                     {},
                 )
             ),
+            "provider_tax_identity_source": dict(
+                getattr(
+                    graph_publication,
+                    "provider_tax_identity_source",
+                    {},
+                )
+            ),
         },
         "provider_identifier_quarantine": quarantine,
         "finalizer_block_copy": dict(finalizer_block_copy),
@@ -4706,6 +4836,7 @@ async def _publish_prepared_shared_layout(
     provider_graph_v4: bool = False,
     compressed_acquisition_bytes: int | None = None,
     empty_npi_tin_only_normalization_count: int | None = None,
+    tax_identity_source_artifacts: Iterable[Mapping[str, Any]] | None = None,
     progress_callback: Callable[[str, Mapping[str, int]], None] | None = None,
     progress_interval_seconds: float = 4.0,
 ) -> SharedSnapshotPublication:
@@ -4987,14 +5118,20 @@ async def _publish_prepared_shared_layout(
                 if provider_graph_v4:
                     graph_publication = await _publish_v4_graph(
                         graph_conversion,
-                        schema_name=schema_name,
-                        snapshot_key=int(reserved_snapshot_key),
-                        build_token=build_token,
+                        publication_context=_V4GraphCoordinates(
+                            schema_name=schema_name,
+                            logical_snapshot_id=logical_snapshot_id,
+                            snapshot_key=int(reserved_snapshot_key),
+                            build_token=build_token,
+                        ),
                         compressed_acquisition_bytes=int(
                             compressed_acquisition_bytes or 0
                         ),
                         empty_npi_tin_only_normalization_count=int(
                             empty_npi_tin_only_normalization_count or 0
+                        ),
+                        tax_identity_source_artifacts=(
+                            tax_identity_source_artifacts
                         ),
                         **_progress_callback_kwargs(
                             lane_progress.add if progress_callback is not None else None
@@ -5167,6 +5304,16 @@ async def _publish_prepared_shared_layout(
             # The V4 root digest owns only the factored provider graph.  Bind
             # the unchanged V3 rate/finalizer mappings into the support digest
             # so a graph-identical but rate-different layout cannot be reused.
+            source_projection_by_field = dict(
+                graph_publication.provider_tax_identity_source
+            )
+            if not source_projection_by_field:
+                raise RuntimeError(
+                    "PTG V4 publication omitted source-local tax identity evidence"
+                )
+            core_support_map["provider_tax_identity_source"] = (
+                source_projection_by_field
+            )
             core_support_map["price_finalizer_mapping_digest"] = (
                 mapping_summary.mapping_digest.hex()
             )
@@ -5381,6 +5528,7 @@ async def publish_strict_shared_v3_layout(
     provider_graph_v4: bool = False,
     compressed_acquisition_entries: Iterable[Mapping[str, Any]] | None = None,
     empty_npi_tin_only_normalization_count: int | None = None,
+    tax_identity_source_artifacts: Iterable[Mapping[str, Any]] | None = None,
     progress_callback: Callable[[str, Mapping[str, int]], None] | None = None,
     progress_interval_seconds: float = 4.0,
 ) -> SharedSnapshotPublication:
@@ -5395,6 +5543,9 @@ async def publish_strict_shared_v3_layout(
     expected_source_identities = tuple(expected_source_identities)
     expected_raw_source_digests = tuple(
         str(raw_hash or "").strip().lower() for raw_hash in expected_raw_source_sha256
+    )
+    source_artifacts = tuple(
+        dict(entry) for entry in (tax_identity_source_artifacts or ())
     )
     compressed_acquisition_bytes: int | None = None
     if provider_graph_v4:
@@ -5432,6 +5583,10 @@ async def publish_strict_shared_v3_layout(
         compressed_acquisition_bytes = sum(byte_count_by_hash.values())
         if compressed_acquisition_bytes <= 0:
             raise RuntimeError("PTG V4 compressed acquisition bytes must be positive")
+        if not source_artifacts:
+            raise RuntimeError(
+                "PTG V4 publication requires source-local tax identity evidence"
+            )
     publication_started_at = time.monotonic()
     configured_schema = resolve_ptg2_schema()
     if str(schema_name).strip() != configured_schema:
@@ -5541,6 +5696,7 @@ async def publish_strict_shared_v3_layout(
                 empty_npi_tin_only_normalization_count=(
                     empty_npi_tin_only_normalization_count
                 ),
+                tax_identity_source_artifacts=source_artifacts,
                 progress_callback=progress_callback,
                 progress_interval_seconds=progress_interval_seconds,
             )

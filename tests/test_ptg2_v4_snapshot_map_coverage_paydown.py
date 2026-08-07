@@ -459,4 +459,7 @@ async def test_pattern_seal_requires_pattern_metadata(monkeypatch) -> None:
         progress_callback=None,
     )
     with pytest.raises(RuntimeError, match="no pattern metadata"):
-        await snapshot_maps._prepare_v4_seal_state(object(), request)
+        await snapshot_maps._prepare_v4_seal_state(
+            _ScriptedSession(_Result(rows=((None, None, None),))),
+            request,
+        )
