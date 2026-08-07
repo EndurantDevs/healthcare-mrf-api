@@ -13,6 +13,20 @@ from process.formulary_fhir.parser import (
     parse_medication_knowledge,
     resolve_alternative_references,
 )
+from process.formulary_fhir.repository import (
+    AliasRef,
+    AliasVersionResult,
+    AliasVersionWrite,
+    CheckpointWrite,
+    CompletedAliasCheckpoint,
+    CoveragePlanWriteResult,
+    CurrentSnapshot,
+    DatasetRef,
+    DatasetVerification,
+    FHIRFormularyRepository,
+    PriorAliasState,
+    PublicationResult,
+)
 from process.formulary_fhir.types import (
     AlternativeCorrection,
     CurrentVersionCensus,
@@ -23,10 +37,22 @@ from process.formulary_fhir.types import (
 
 __all__ = (
     "AlternativeCorrection",
+    "AliasRef",
+    "AliasVersionResult",
+    "AliasVersionWrite",
+    "CheckpointWrite",
+    "CompletedAliasCheckpoint",
+    "CoveragePlanWriteResult",
     "CurrentVersionCensus",
+    "CurrentSnapshot",
+    "DatasetRef",
+    "DatasetVerification",
     "FHIRFormularyClient",
+    "FHIRFormularyRepository",
     "FHIRTransportError",
     "FormularySourceConfig",
+    "PriorAliasState",
+    "PublicationResult",
     "canonical_list_identity",
     "enabled_source_config",
     "parse_coverage_plan",

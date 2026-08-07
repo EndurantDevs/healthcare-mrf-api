@@ -299,11 +299,17 @@ def test_generic_alternative_correction_preserves_evidence_without_repr_leak():
     assert "MI-" not in repr(correction)
 
 
-def test_pure_slice_makes_no_checkpoint_or_durable_restart_claim():
+def test_acquisition_slice_makes_no_checkpoint_or_durable_restart_claim():
     production_root = Path(__file__).parents[1] / "process" / "formulary_fhir"
     production_text = "\n".join(
-        module_path.read_text(encoding="utf-8")
-        for module_path in sorted(production_root.glob("*.py"))
+        (production_root / module_name).read_text(encoding="utf-8")
+        for module_name in (
+            "client.py",
+            "continuation.py",
+            "identity.py",
+            "parser.py",
+            "types.py",
+        )
     ).lower()
 
     assert "checkpoint" not in production_text
