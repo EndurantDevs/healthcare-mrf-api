@@ -460,6 +460,13 @@ async def test_artifact_candidate_selection_covers_empty_and_valid_rows():
     assert await fhir._artifact_eligible_validated_ids(fence, executor) == {
         "endpoint-a": ["candidate-a"]
     }
+    selection_sql = executor.all.await_args.args[0]
+    endpoint_scope = "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))"
+    assert endpoint_scope in selection_sql
+    assert selection_sql.index(endpoint_scope) < selection_sql.index(
+        "AND status = :validated_status"
+    )
+    assert executor.all.await_args.kwargs["endpoint_ids"] == ["endpoint-a"]
 
 
 def test_complete_artifact_stage_bundle_matches_expected_relation():
