@@ -1081,6 +1081,45 @@ def read_global_membership_sidecar(manifest_path: str | Path) -> dict[bytes, tup
     return {entry.owner: entry.members for entry in entries}
 
 
+def _decode_standard_sidecar_entries(
+    sidecar_bytes: bytes,
+    *,
+    entry_count: int,
+    index_start: int,
+    member_start: int,
+) -> tuple[tuple[PTG2ManifestSidecarEntry, ...], int]:
+    sidecar_entries: list[PTG2ManifestSidecarEntry] = []
+    total_members = 0
+    previous_owner: bytes | None = None
+    for index in range(entry_count):
+        record_offset = index_start + index * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
+        owner_id, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
+            sidecar_bytes,
+            record_offset,
+        )
+        if previous_owner is not None and owner_id <= previous_owner:
+            raise PTG2ManifestArtifactError(
+                "global membership sidecar owners must be sorted and unique"
+            )
+        previous_owner = owner_id
+        total_members += member_count
+        start = member_start + member_offset * 16
+        end = start + member_count * 16
+        if end > len(sidecar_bytes):
+            raise PTG2ManifestArtifactError(
+                "global membership sidecar member block is truncated"
+            )
+        members = tuple(sidecar_bytes[pos : pos + 16] for pos in range(start, end, 16))
+        if members != tuple(sorted(set(members))):
+            raise PTG2ManifestArtifactError(
+                "global membership sidecar members must be sorted and unique"
+            )
+        sidecar_entries.append(
+            PTG2ManifestSidecarEntry(owner=owner_id, members=members)
+        )
+    return tuple(sidecar_entries), total_members
+
+
 def read_global_sidecar_entries(
     path: str | Path,
     *,
@@ -1119,31 +1158,12 @@ def read_global_sidecar_entries(
     if len(sidecar_bytes) < index_end:
         raise PTG2ManifestArtifactError("global membership sidecar ended inside the owner index")
     member_start = index_end
-    sidecar_entries: list[PTG2ManifestSidecarEntry] = []
-    total_members = 0
-    previous_owner: bytes | None = None
-    for index in range(entry_count):
-        record_offset = index_start + index * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
-        owner_id, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
-            sidecar_bytes,
-            record_offset,
-        )
-        if previous_owner is not None and owner_id <= previous_owner:
-            raise PTG2ManifestArtifactError("global membership sidecar owners must be sorted and unique")
-        previous_owner = owner_id
-        total_members += member_count
-        members: list[bytes] = []
-        start = member_start + member_offset * 16
-        end = start + member_count * 16
-        if end > len(sidecar_bytes):
-            raise PTG2ManifestArtifactError("global membership sidecar member block is truncated")
-        for member_pos in range(start, end, 16):
-            members.append(sidecar_bytes[member_pos : member_pos + 16])
-        if tuple(members) != tuple(sorted(set(members))):
-            raise PTG2ManifestArtifactError("global membership sidecar members must be sorted and unique")
-        sidecar_entries.append(
-            PTG2ManifestSidecarEntry(owner=owner_id, members=tuple(members))
-        )
+    sidecar_entries, total_members = _decode_standard_sidecar_entries(
+        sidecar_bytes,
+        entry_count=entry_count,
+        index_start=index_start,
+        member_start=member_start,
+    )
     if metadata is not None:
         expected_members = metadata.get("member_count")
         if expected_members is not None and total_members != int(expected_members):
@@ -1151,7 +1171,7 @@ def read_global_sidecar_entries(
     expected_size = member_start + total_members * 16
     if len(sidecar_bytes) != expected_size:
         raise PTG2ManifestArtifactError("global membership sidecar has trailing bytes")
-    return tuple(sidecar_entries)
+    return sidecar_entries
 
 
 def lookup_global_sidecar_members(
@@ -1572,6 +1592,53 @@ def lookup_serving_by_provider_set_patterns(
     return tuple(patterns)
 
 
+def _decode_dense_sidecar_entries(
+    dense_sidecar_bytes: bytes | bytearray | mmap.mmap,
+    *,
+    entry_count: int,
+    member_global_count: int,
+    member_globals: list[bytes],
+    index_start: int,
+    members_start: int,
+) -> tuple[tuple[PTG2ManifestSidecarEntry, ...], int]:
+    dense_sidecar_entries: list[PTG2ManifestSidecarEntry] = []
+    total_members = 0
+    previous_owner: bytes | None = None
+    for index in range(entry_count):
+        record_offset = index_start + index * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
+        owner_id, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
+            dense_sidecar_bytes, record_offset
+        )
+        if previous_owner is not None and owner_id <= previous_owner:
+            raise PTG2ManifestArtifactError(
+                "dense global membership sidecar owners must be sorted and unique"
+            )
+        previous_owner = owner_id
+        total_members += member_count
+        start = members_start + member_offset * _DENSE_MEMBER_RECORD.size
+        end = start + member_count * _DENSE_MEMBER_RECORD.size
+        if end > len(dense_sidecar_bytes):
+            raise PTG2ManifestArtifactError(
+                "dense global membership sidecar member block is truncated"
+            )
+        members: list[bytes] = []
+        for pos in range(start, end, _DENSE_MEMBER_RECORD.size):
+            local_id = _DENSE_MEMBER_RECORD.unpack_from(dense_sidecar_bytes, pos)[0]
+            if local_id >= member_global_count:
+                raise PTG2ManifestArtifactError(
+                    "dense global membership sidecar member id is out of range"
+                )
+            members.append(member_globals[local_id])
+        if tuple(members) != tuple(sorted(set(members))):
+            raise PTG2ManifestArtifactError(
+                "dense global membership sidecar members must be sorted and unique"
+            )
+        dense_sidecar_entries.append(
+            PTG2ManifestSidecarEntry(owner=owner_id, members=tuple(members))
+        )
+    return tuple(dense_sidecar_entries), total_members
+
+
 def _read_dense_sidecar_entries(
     dense_sidecar_bytes: bytes | bytearray | mmap.mmap,
     *,
@@ -1607,33 +1674,14 @@ def _read_dense_sidecar_entries(
         bytes(dense_sidecar_bytes[pos : pos + 16])
         for pos in range(globals_start, globals_end, 16)
     ]
-    dense_sidecar_entries: list[PTG2ManifestSidecarEntry] = []
-    total_members = 0
-    previous_owner: bytes | None = None
-    for index in range(entry_count):
-        record_offset = index_start + index * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
-        owner_id, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
-            dense_sidecar_bytes, record_offset
-        )
-        if previous_owner is not None and owner_id <= previous_owner:
-            raise PTG2ManifestArtifactError("dense global membership sidecar owners must be sorted and unique")
-        previous_owner = owner_id
-        total_members += member_count
-        start = members_start + member_offset * _DENSE_MEMBER_RECORD.size
-        end = start + member_count * _DENSE_MEMBER_RECORD.size
-        if end > len(dense_sidecar_bytes):
-            raise PTG2ManifestArtifactError("dense global membership sidecar member block is truncated")
-        members: list[bytes] = []
-        for pos in range(start, end, _DENSE_MEMBER_RECORD.size):
-            local_id = _DENSE_MEMBER_RECORD.unpack_from(dense_sidecar_bytes, pos)[0]
-            if local_id >= member_global_count:
-                raise PTG2ManifestArtifactError("dense global membership sidecar member id is out of range")
-            members.append(member_globals[local_id])
-        if tuple(members) != tuple(sorted(set(members))):
-            raise PTG2ManifestArtifactError("dense global membership sidecar members must be sorted and unique")
-        dense_sidecar_entries.append(
-            PTG2ManifestSidecarEntry(owner=owner_id, members=tuple(members))
-        )
+    dense_sidecar_entries, total_members = _decode_dense_sidecar_entries(
+        dense_sidecar_bytes,
+        entry_count=entry_count,
+        member_global_count=member_global_count,
+        member_globals=member_globals,
+        index_start=index_start,
+        members_start=members_start,
+    )
     if metadata is not None:
         expected_members = metadata.get("member_count")
         if expected_members is not None and total_members != int(expected_members):
@@ -1641,7 +1689,7 @@ def _read_dense_sidecar_entries(
     expected_size = members_start + total_members * _DENSE_MEMBER_RECORD.size
     if len(dense_sidecar_bytes) != expected_size:
         raise PTG2ManifestArtifactError("dense global membership sidecar has trailing bytes")
-    return tuple(dense_sidecar_entries)
+    return dense_sidecar_entries
 
 
 def _lookup_dense_sidecar_members(

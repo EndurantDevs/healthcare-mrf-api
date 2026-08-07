@@ -66,6 +66,572 @@ HOLD_MIGRATION_PATH = (
     / "20260729100000_ptg2_candidate_audit_hold.py"
 )
 
+V3_SHARED_MODELS = (
+    PTG2V3SnapshotLayout,
+    PTG2V3LayoutFingerprint,
+    PTG2V3SnapshotBinding,
+    PTG2V3SnapshotScope,
+    PTG2V3SnapshotSource,
+    PTG2V3Block,
+    PTG2V3SnapshotBlock,
+    PTG2V3GraphOwner,
+    PTG2V3Code,
+    PTG2V3ProviderGroup,
+    PTG2V3ProviderSet,
+    PTG2V3PriceAttr,
+    PTG2V3NPIScope,
+    PTG2V3AuditOccurrence,
+    PTG2V3SourceAuditWitness,
+    PTG2WitnessPart,
+    PTG2V3CandidateAuditAttestation,
+    PTG2V3GCCandidate,
+)
+V3_EXPECTED_COLUMNS_BY_TABLE = {
+    "ptg2_v3_snapshot_layout": (
+        "snapshot_key",
+        "storage_shard_id",
+        "build_token",
+        "generation",
+        "state",
+        "mapping_digest",
+        "support_digest",
+        "layout_manifest",
+        "logical_byte_count",
+        "created_at",
+        "heartbeat_at",
+        "lease_until",
+        "published_at",
+    ),
+    "ptg2_v3_layout_fingerprint": (
+        "semantic_fingerprint",
+        "snapshot_key",
+        "created_at",
+    ),
+    "ptg2_v3_snapshot_binding": (
+        "snapshot_id",
+        "snapshot_key",
+        "created_at",
+    ),
+    "ptg2_v3_snapshot_scope": (
+        "snapshot_id",
+        "plan_id",
+        "plan_market_type",
+        "coverage_scope_id",
+        "created_at",
+    ),
+    "ptg2_v3_snapshot_source": (
+        "snapshot_id",
+        "source_key",
+        "source_type",
+        "identity_kind",
+        "identity_sha256",
+        "raw_container_sha256",
+        "logical_json_sha256",
+        "logical_hash_deferred",
+        "source_trace_set_hash",
+    ),
+    "ptg2_v3_block": (
+        "block_hash",
+        "format_version",
+        "object_kind",
+        "codec",
+        "entry_count",
+        "raw_byte_count",
+        "stored_byte_count",
+        "payload",
+        "created_at",
+    ),
+    "ptg2_v3_snapshot_block": (
+        "snapshot_key",
+        "object_kind",
+        "block_key",
+        "fragment_no",
+        "entry_count",
+        "block_hash",
+    ),
+    "ptg2_v3_graph_owner": (
+        "snapshot_key",
+        "direction",
+        "owner_key",
+        "first_chunk",
+        "member_offset",
+        "member_count",
+    ),
+    "ptg2_v3_code": (
+        "snapshot_key",
+        "code_key",
+        "code_global_id_128",
+        "coverage_scope_id",
+        "reported_code_system",
+        "reported_code",
+        "negotiation_arrangement",
+        "billing_code_type_version",
+        "source_name",
+        "source_description",
+        "rate_count",
+    ),
+    "ptg2_v3_provider_set": (
+        "snapshot_key",
+        "provider_set_key",
+        "provider_set_global_id_128",
+        "provider_count",
+        "network_names",
+    ),
+    "ptg2_v3_provider_group": (
+        "snapshot_key",
+        "provider_group_key",
+        "provider_group_global_id_128",
+    ),
+    "ptg2_v3_price_attr": (
+        "snapshot_key",
+        "attribute_kind",
+        "attribute_key",
+        "value",
+    ),
+    "ptg2_v3_npi_scope": ("snapshot_key", "npi"),
+    "ptg2_v3_audit_occurrence": (
+        "snapshot_key",
+        "occurrence_id",
+        "code_key",
+        "provider_set_key",
+        "price_key",
+        "source_key",
+        "npi",
+        "atom_ordinal",
+        "atom_key",
+    ),
+    "ptg2_v3_source_audit_witness": (
+        "snapshot_key",
+        "contract",
+        "selection_method",
+        "source_set_digest",
+        "sample_digest",
+        "queryable_occurrence_population_count",
+        "provider_population_count",
+        "occurrence_witness_count",
+        "provider_witness_count",
+        "payload_sha256",
+        "payload",
+        "created_at",
+    ),
+    "ptg2_v3_source_audit_witness_part": (
+        "snapshot_key",
+        "part_number",
+        "part_sha256",
+        "payload",
+        "created_at",
+    ),
+    "ptg2_v3_candidate_audit_attestation": (
+        "snapshot_id",
+        "snapshot_key",
+        "source_key",
+        "plan_id",
+        "plan_market_type",
+        "coverage_scope_id",
+        "source_set_digest",
+        "audit_sample_digest",
+        "source_witness_digest",
+        "contract",
+        "tool_name",
+        "tool_version",
+        "report_digest",
+        "report",
+        "activation_intent",
+        "attestation_digest",
+        "attested_at",
+        "expires_at",
+        "activated_at",
+    ),
+    "ptg2_v3_gc_candidate": ("block_hash", "eligible_at", "queued_at"),
+}
+V3_EXPECTED_PRIMARY_KEYS_BY_MODEL = {
+    PTG2V3SnapshotLayout: ("snapshot_key",),
+    PTG2V3LayoutFingerprint: ("semantic_fingerprint",),
+    PTG2V3SnapshotBinding: ("snapshot_id",),
+    PTG2V3SnapshotScope: ("snapshot_id",),
+    PTG2V3SnapshotSource: ("snapshot_id", "source_key"),
+    PTG2V3Block: ("block_hash",),
+    PTG2V3SnapshotBlock: (
+        "snapshot_key",
+        "object_kind",
+        "block_key",
+        "fragment_no",
+    ),
+    PTG2V3GraphOwner: ("snapshot_key", "direction", "owner_key"),
+    PTG2V3Code: ("snapshot_key", "code_key"),
+    PTG2V3ProviderGroup: ("snapshot_key", "provider_group_key"),
+    PTG2V3ProviderSet: ("snapshot_key", "provider_set_key"),
+    PTG2V3PriceAttr: ("snapshot_key", "attribute_kind", "attribute_key"),
+    PTG2V3NPIScope: ("snapshot_key", "npi"),
+    PTG2V3AuditOccurrence: ("snapshot_key", "occurrence_id"),
+    PTG2V3SourceAuditWitness: ("snapshot_key",),
+    PTG2WitnessPart: ("snapshot_key", "part_number"),
+    PTG2V3CandidateAuditAttestation: ("snapshot_id",),
+    PTG2V3GCCandidate: ("block_hash",),
+}
+V3_FOREIGN_KEY_SHAPES_BY_MODEL = {
+    PTG2V3LayoutFingerprint: {
+        "ptg2_v3_layout_fingerprint_snapshot_key_fkey": (
+            ("snapshot_key",),
+            ("ptg2_v3_snapshot_layout.snapshot_key",),
+            "CASCADE",
+        ),
+    },
+    PTG2V3SnapshotBinding: {
+        "ptg2_v3_snapshot_binding_snapshot_id_fkey": (
+            ("snapshot_id",),
+            ("ptg2_snapshot.snapshot_id",),
+            "CASCADE",
+        ),
+        "ptg2_v3_snapshot_binding_snapshot_key_fkey": (
+            ("snapshot_key",),
+            ("ptg2_v3_snapshot_layout.snapshot_key",),
+            "RESTRICT",
+        ),
+    },
+    PTG2V3SnapshotScope: {
+        "ptg2_v3_snapshot_scope_snapshot_id_fkey": (
+            ("snapshot_id",),
+            ("ptg2_snapshot.snapshot_id",),
+            "CASCADE",
+        ),
+    },
+    PTG2V3SnapshotSource: {
+        "ptg2_v3_snapshot_source_snapshot_id_fkey": (
+            ("snapshot_id",),
+            ("ptg2_v3_snapshot_scope.snapshot_id",),
+            "CASCADE",
+        ),
+        "ptg2_v3_snapshot_source_trace_set_hash_fkey": (
+            ("source_trace_set_hash",),
+            ("ptg2_source_trace_set.source_trace_set_hash",),
+            "RESTRICT",
+        ),
+    },
+    PTG2V3SnapshotBlock: {
+        "ptg2_v3_snapshot_block_snapshot_key_fkey": (
+            ("snapshot_key",),
+            ("ptg2_v3_snapshot_layout.snapshot_key",),
+            "CASCADE",
+        ),
+        "ptg2_v3_snapshot_block_block_hash_fkey": (
+            ("block_hash",),
+            ("ptg2_v3_block.block_hash",),
+            None,
+        ),
+    },
+    PTG2V3GCCandidate: {
+        "ptg2_v3_gc_candidate_block_hash_fkey": (
+            ("block_hash",),
+            ("ptg2_v3_block.block_hash",),
+            "CASCADE",
+        ),
+    },
+    PTG2V3CandidateAuditAttestation: {
+        "ptg2_v3_candidate_audit_attestation_snapshot_id_fkey": (
+            ("snapshot_id",),
+            ("ptg2_v3_snapshot_scope.snapshot_id",),
+            "CASCADE",
+        ),
+        "ptg2_v3_candidate_audit_attestation_snapshot_key_fkey": (
+            ("snapshot_key",),
+            ("ptg2_v3_snapshot_layout.snapshot_key",),
+            "RESTRICT",
+        ),
+    },
+    PTG2WitnessPart: {
+        "ptg2_v3_source_audit_witness_part_parent_fkey": (
+            ("snapshot_key",),
+            ("ptg2_v3_source_audit_witness.snapshot_key",),
+            "CASCADE",
+        ),
+    },
+}
+V3_DENSE_MODELS = (
+    PTG2V3GraphOwner,
+    PTG2V3Code,
+    PTG2V3ProviderGroup,
+    PTG2V3ProviderSet,
+    PTG2V3PriceAttr,
+    PTG2V3NPIScope,
+    PTG2V3AuditOccurrence,
+    PTG2V3SourceAuditWitness,
+)
+V3_INDEX_SHAPES_BY_MODEL = {
+    PTG2V3SnapshotLayout: {
+        "ptg2_v3_snapshot_layout_state_idx": (
+            ("state", "lease_until", "heartbeat_at"),
+            (),
+        ),
+        "ptg2_v3_snapshot_layout_sealed_mapping_idx": (
+            ("generation", "mapping_digest", "support_digest"),
+            (),
+        ),
+    },
+    PTG2V3LayoutFingerprint: {
+        "ptg2_v3_layout_fingerprint_snapshot_key_idx": (("snapshot_key",), ()),
+    },
+    PTG2V3SnapshotBinding: {
+        "ptg2_v3_snapshot_binding_snapshot_key_idx": (("snapshot_key",), ()),
+    },
+    PTG2V3SnapshotScope: {
+        "ptg2_v3_snapshot_scope_lookup_idx": (
+            ("snapshot_id", "coverage_scope_id"),
+            (),
+        ),
+    },
+    PTG2V3SnapshotSource: {},
+    PTG2V3SnapshotBlock: {
+        "ptg2_v3_snapshot_block_block_hash_idx": (("block_hash",), ()),
+        "ptg2_v3_snapshot_block_lookup_idx": (
+            ("snapshot_key", "object_kind", "block_key"),
+            (),
+        ),
+    },
+    PTG2V3GraphOwner: {
+        "ptg2_v3_graph_owner_lookup_idx": (
+            ("snapshot_key", "direction", "owner_key"),
+            ("first_chunk", "member_offset", "member_count"),
+        ),
+    },
+    PTG2V3Code: {
+        "ptg2_v3_code_lookup_idx": (
+            (
+                "snapshot_key",
+                "coverage_scope_id",
+                "reported_code_system",
+                "reported_code",
+            ),
+            ("code_key", "negotiation_arrangement", "rate_count"),
+        ),
+    },
+    PTG2V3NPIScope: {},
+    PTG2V3GCCandidate: {
+        "ptg2_v3_gc_candidate_eligible_at_idx": (("eligible_at",), ()),
+    },
+    PTG2V3CandidateAuditAttestation: {
+        "ptg2_v3_candidate_audit_attestation_expiry_idx": (
+            ("expires_at", "activated_at"),
+            (),
+        ),
+        "ptg2_v3_candidate_audit_attestation_snapshot_key_idx": (
+            ("snapshot_key",),
+            (),
+        ),
+    },
+    PTG2V3SourceAuditWitness: {},
+    PTG2WitnessPart: {},
+}
+V3_CHECK_NAMES_BY_MODEL = {
+    PTG2V3SnapshotLayout: {
+        "ptg2_v3_snapshot_layout_state_check",
+        "ptg2_v3_snapshot_layout_mapping_digest_check",
+        "ptg2_v3_snapshot_layout_support_digest_check",
+        "ptg2_v3_snapshot_layout_logical_byte_count_check",
+    },
+    PTG2V3LayoutFingerprint: {
+        "ptg2_v3_layout_fingerprint_digest_check",
+    },
+    PTG2V3SnapshotScope: {
+        "ptg2_v3_snapshot_scope_coverage_scope_id_check",
+    },
+    PTG2V3SnapshotSource: {
+        "ptg2_v3_snapshot_source_source_key_check",
+        "ptg2_v3_snapshot_source_source_type_check",
+        "ptg2_v3_snapshot_source_identity_kind_check",
+        "ptg2_v3_snapshot_source_identity_sha256_check",
+        "ptg2_v3_snapshot_source_raw_sha256_check",
+        "ptg2_v3_snapshot_source_logical_sha256_check",
+        "ptg2_v3_snapshot_source_identity_evidence_check",
+        "ptg2_v3_snapshot_source_trace_set_hash_check",
+    },
+    PTG2V3Block: {
+        "ptg2_v3_block_hash_check",
+        "ptg2_v3_block_format_version_check",
+        "ptg2_v3_block_codec_check",
+        "ptg2_v3_block_entry_count_check",
+        "ptg2_v3_block_raw_byte_count_check",
+        "ptg2_v3_block_stored_byte_count_check",
+        "ptg2_v3_block_payload_size_check",
+    },
+    PTG2V3SnapshotBlock: {
+        "ptg2_v3_snapshot_block_fragment_no_check",
+        "ptg2_v3_snapshot_block_block_key_check",
+        "ptg2_v3_snapshot_block_entry_count_check",
+    },
+    PTG2V3GraphOwner: {
+        "ptg2_v3_graph_owner_direction_check",
+        "ptg2_v3_graph_owner_first_chunk_check",
+        "ptg2_v3_graph_owner_member_offset_check",
+        "ptg2_v3_graph_owner_member_count_check",
+    },
+    PTG2V3Code: {
+        "ptg2_v3_code_global_id_check",
+        "ptg2_v3_code_coverage_scope_id_check",
+        "ptg2_v3_code_rate_count_check",
+        "ptg2_v3_code_code_key_check",
+    },
+    PTG2V3ProviderSet: {
+        "ptg2_v3_provider_set_global_id_check",
+        "ptg2_v3_provider_set_provider_count_check",
+        "ptg2_v3_provider_set_key_check",
+    },
+    PTG2V3ProviderGroup: {
+        "ptg2_v3_provider_group_global_id_check",
+        "ptg2_v3_provider_group_key_check",
+    },
+    PTG2V3NPIScope: {"ptg2_v3_npi_scope_npi_check"},
+    PTG2V3AuditOccurrence: {
+        "ptg2_v3_audit_occurrence_id_check",
+        "ptg2_v3_audit_occurrence_code_key_check",
+        "ptg2_v3_audit_occurrence_provider_set_key_check",
+        "ptg2_v3_audit_occurrence_price_key_check",
+        "ptg2_v3_audit_occurrence_source_key_check",
+        "ptg2_v3_audit_occurrence_npi_check",
+        "ptg2_v3_audit_occurrence_atom_ordinal_check",
+        "ptg2_v3_audit_occurrence_atom_key_check",
+    },
+    PTG2V3SourceAuditWitness: {
+        "ptg2_v3_source_audit_witness_source_set_digest_check",
+        "ptg2_v3_source_audit_witness_sample_digest_check",
+        "ptg2_v3_source_audit_witness_payload_sha256_check",
+        "ptg2_v3_source_audit_witness_occurrence_population_check",
+        "ptg2_v3_source_audit_witness_provider_population_check",
+        "ptg2_v3_source_audit_witness_occurrence_count_check",
+        "ptg2_v3_source_audit_witness_provider_count_check",
+        "ptg2_v3_source_audit_witness_total_count_check",
+        "ptg2_v3_source_audit_witness_payload_check",
+    },
+    PTG2WitnessPart: {
+        "ptg2_v3_source_audit_witness_part_number_check",
+        "ptg2_v3_source_audit_witness_part_sha256_check",
+        "ptg2_v3_source_audit_witness_part_payload_check",
+    },
+    PTG2V3CandidateAuditAttestation: {
+        "ptg2_v3_candidate_audit_attestation_scope_check",
+        "ptg2_v3_candidate_audit_attestation_source_set_check",
+        "ptg2_v3_candidate_audit_attestation_sample_check",
+        "ptg2_v3_candidate_audit_attestation_witness_check",
+        "ptg2_v3_candidate_audit_attestation_report_check",
+        "ptg2_v3_candidate_audit_attestation_intent_check",
+        "ptg2_v3_candidate_audit_attestation_digest_check",
+        "ptg2_v3_candidate_audit_attestation_expiry_check",
+    },
+}
+V3_MIGRATION_PARENT_TABLES = {
+    "ptg2_v3_snapshot_layout",
+    "ptg2_v3_layout_fingerprint",
+    "ptg2_v3_snapshot_binding",
+    "ptg2_v3_snapshot_scope",
+    "ptg2_v3_snapshot_source",
+    "ptg2_v3_block",
+    "ptg2_v3_snapshot_block",
+    "ptg2_v3_graph_owner",
+    "ptg2_v3_code",
+    "ptg2_v3_provider_group",
+    "ptg2_v3_provider_set",
+    "ptg2_v3_price_attr",
+    "ptg2_v3_npi_scope",
+    "ptg2_v3_audit_occurrence",
+    "ptg2_v3_candidate_audit_attestation",
+    "ptg2_v3_gc_candidate",
+}
+V3_MIGRATION_REQUIRED_FRAGMENTS = (
+    "GENERATED BY DEFAULT AS IDENTITY",
+    "CHECK (state IN ('building', 'sealed'))",
+    "CHECK (mapping_digest IS NULL OR octet_length(mapping_digest) = 32)",
+    "CHECK (support_digest IS NULL OR octet_length(support_digest) = 32)",
+    "CHECK (logical_byte_count >= 0)",
+    "CHECK (octet_length(semantic_fingerprint) = 32)",
+    "CHECK (octet_length(coverage_scope_id) = 32)",
+    "CHECK (octet_length(block_hash) = 32)",
+    "CHECK (format_version = 2)",
+    "CHECK (codec IN ('none', 'zlib'))",
+    "CHECK (entry_count >= 0)",
+    "CHECK (raw_byte_count >= 0)",
+    "CHECK (stored_byte_count >= 0)",
+    "CHECK (octet_length(payload) = stored_byte_count)",
+    "CHECK (fragment_no >= 0)",
+    "CHECK (block_key >= 0)",
+    "CHECK (direction BETWEEN 1 AND 4)",
+    "CHECK (first_chunk >= 0)",
+    "CHECK (member_offset >= 0 AND member_offset < 65536)",
+    "CHECK (member_count >= 0)",
+    "CHECK (rate_count >= 0)",
+    "CHECK (code_key >= 0)",
+    "CHECK (octet_length(provider_set_global_id_128) = 16)",
+    "CHECK (octet_length(provider_group_global_id_128) = 16)",
+    "CHECK (provider_group_key >= 0)",
+    "CHECK (provider_count >= 0)",
+    "CHECK (provider_set_key >= 0)",
+    "CHECK (npi > 0)",
+    "CHECK (octet_length(occurrence_id) = 32)",
+    "CHECK (provider_set_key >= 0)",
+    "CHECK (price_key >= 0)",
+    "CHECK (source_key >= 0)",
+    "CHECK (npi BETWEEN 1000000000 AND 9999999999)",
+    "CHECK (atom_ordinal >= 0)",
+    "CHECK (atom_key >= 0)",
+    "CHECK (octet_length(audit_sample_digest) = 32)",
+    "UNIQUE NULLS NOT DISTINCT",
+    'CREATE UNIQUE INDEX "ptg2_v3_snapshot_layout_sealed_mapping_idx"',
+    "(generation, mapping_digest, support_digest) WHERE state = 'sealed' AND mapping_digest IS NOT NULL AND support_digest IS NOT NULL",
+    'REFERENCES "ptg_shared"."ptg2_v3_snapshot_layout" (snapshot_key) ON DELETE CASCADE',
+    'REFERENCES "ptg_shared"."ptg2_v3_snapshot_layout" (snapshot_key) ON DELETE RESTRICT',
+    'REFERENCES "ptg_shared"."ptg2_v3_block" (block_hash)',
+    'REFERENCES "ptg_shared"."ptg2_v3_snapshot_scope" (snapshot_id) ON DELETE CASCADE',
+    'REFERENCES "ptg_shared"."ptg2_source_trace_set" (source_trace_set_hash) ON DELETE RESTRICT',
+    "PARTITION BY HASH (block_hash)",
+    "PARTITION BY HASH (snapshot_key)",
+    "INCLUDE (code_key, negotiation_arrangement, rate_count)",
+    "INCLUDE (first_chunk, member_offset, member_count)",
+    'CREATE INDEX "ptg2_v3_candidate_audit_attestation_snapshot_key_idx"',
+)
+V3_MIGRATION_REQUIRED_CONSTRAINT_NAMES = {
+    "ptg2_v3_layout_fingerprint_snapshot_key_fkey",
+    "ptg2_v3_snapshot_binding_snapshot_key_fkey",
+    "ptg2_v3_snapshot_scope_coverage_scope_id_check",
+    "ptg2_v3_snapshot_source_snapshot_id_fkey",
+    "ptg2_v3_snapshot_source_trace_set_hash_fkey",
+    "ptg2_v3_snapshot_source_source_key_check",
+    "ptg2_v3_snapshot_source_identity_sha256_check",
+    "ptg2_v3_snapshot_source_raw_sha256_check",
+    "ptg2_v3_snapshot_source_logical_sha256_check",
+    "ptg2_v3_snapshot_source_identity_evidence_check",
+    "ptg2_v3_snapshot_block_snapshot_key_fkey",
+    "ptg2_v3_snapshot_block_block_hash_fkey",
+    "ptg2_v3_gc_candidate_block_hash_fkey",
+    "ptg2_v3_snapshot_layout_state_check",
+    "ptg2_v3_snapshot_layout_mapping_digest_check",
+    "ptg2_v3_snapshot_layout_support_digest_check",
+    "ptg2_v3_snapshot_layout_logical_byte_count_check",
+    "ptg2_v3_layout_fingerprint_digest_check",
+    "ptg2_v3_block_hash_check",
+    "ptg2_v3_block_entry_count_check",
+    "ptg2_v3_block_raw_byte_count_check",
+    "ptg2_v3_block_stored_byte_count_check",
+    "ptg2_v3_block_payload_size_check",
+    "ptg2_v3_snapshot_block_fragment_no_check",
+    "ptg2_v3_snapshot_block_entry_count_check",
+    "ptg2_v3_graph_owner_direction_check",
+    "ptg2_v3_graph_owner_first_chunk_check",
+    "ptg2_v3_graph_owner_member_offset_check",
+    "ptg2_v3_graph_owner_member_count_check",
+    "ptg2_v3_code_rate_count_check",
+    "ptg2_v3_code_coverage_scope_id_check",
+    "ptg2_v3_provider_group_global_id_check",
+    "ptg2_v3_provider_set_global_id_check",
+    "ptg2_v3_provider_set_provider_count_check",
+    "ptg2_v3_audit_occurrence_id_check",
+    "ptg2_v3_audit_occurrence_code_key_check",
+    "ptg2_v3_audit_occurrence_provider_set_key_check",
+    "ptg2_v3_audit_occurrence_price_key_check",
+    "ptg2_v3_audit_occurrence_source_key_check",
+    "ptg2_v3_audit_occurrence_npi_check",
+    "ptg2_v3_audit_occurrence_atom_ordinal_check",
+    "ptg2_v3_audit_occurrence_atom_key_check",
+}
+
 
 def _load_migration(path=MIGRATION_PATH):
     spec = importlib.util.spec_from_file_location(
@@ -131,6 +697,318 @@ def _record_upgrade(monkeypatch, schema="mrf"):
     monkeypatch.setattr(migration, "op", recorder)
     migration.upgrade()
     return migration, [_normalized(statement) for statement in recorder.executed]
+
+
+def _assert_parent_columns():
+    expected_schema = (
+        os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
+    )
+    assert {model.__tablename__ for model in V3_SHARED_MODELS} == set(
+        V3_EXPECTED_COLUMNS_BY_TABLE
+    )
+    for model in V3_SHARED_MODELS:
+        table = model.__table__
+        assert table.schema == expected_schema
+        assert tuple(table.columns.keys()) == V3_EXPECTED_COLUMNS_BY_TABLE[table.name]
+
+
+def _assert_layout_types():
+    layout = PTG2V3SnapshotLayout.__table__
+    assert isinstance(layout.c.snapshot_key.type, sa.BigInteger)
+    assert layout.c.snapshot_key.identity is not None
+    assert isinstance(layout.c.mapping_digest.type, sa.LargeBinary)
+    assert isinstance(layout.c.support_digest.type, sa.LargeBinary)
+    assert isinstance(layout.c.layout_manifest.type, JSONB)
+    assert "snapshot_id" not in layout.c
+    assert "semantic_fingerprint" not in layout.c
+    assert layout.c.storage_shard_id.server_default.arg.text == "0"
+    assert layout.c.logical_byte_count.server_default.arg.text == "0"
+
+    fingerprint = PTG2V3LayoutFingerprint.__table__
+    assert isinstance(fingerprint.c.semantic_fingerprint.type, sa.LargeBinary)
+    assert isinstance(fingerprint.c.snapshot_key.type, sa.BigInteger)
+
+
+def _assert_block_provider_types():
+    block = PTG2V3Block.__table__
+    assert isinstance(block.c.block_hash.type, sa.LargeBinary)
+    assert isinstance(block.c.payload.type, sa.LargeBinary)
+    assert isinstance(block.c.entry_count.type, sa.BigInteger)
+    assert isinstance(block.c.raw_byte_count.type, sa.BigInteger)
+    assert isinstance(block.c.stored_byte_count.type, sa.BigInteger)
+    provider_set = PTG2V3ProviderSet.__table__
+    assert isinstance(provider_set.c.provider_set_global_id_128.type, sa.LargeBinary)
+    assert isinstance(provider_set.c.network_names.type, sa.ARRAY)
+    code = PTG2V3Code.__table__
+    assert isinstance(code.c.code_global_id_128.type, sa.LargeBinary)
+    assert isinstance(code.c.coverage_scope_id.type, sa.LargeBinary)
+    snapshot_scope = PTG2V3SnapshotScope.__table__
+    assert isinstance(snapshot_scope.c.coverage_scope_id.type, sa.LargeBinary)
+    assert snapshot_scope.c.plan_market_type.server_default.arg.text == "''"
+    snapshot_source = PTG2V3SnapshotSource.__table__
+    assert isinstance(snapshot_source.c.source_key.type, sa.Integer)
+    assert isinstance(snapshot_source.c.logical_hash_deferred.type, sa.Boolean)
+    provider_group = PTG2V3ProviderGroup.__table__
+    assert isinstance(
+        provider_group.c.provider_group_global_id_128.type,
+        sa.LargeBinary,
+    )
+
+
+def _assert_audit_attestation_types():
+    audit_occurrence = PTG2V3AuditOccurrence.__table__
+    assert isinstance(audit_occurrence.c.occurrence_id.type, sa.LargeBinary)
+    assert audit_occurrence.c.occurrence_id.type.length == 32
+    assert isinstance(audit_occurrence.c.code_key.type, sa.Integer)
+    assert isinstance(audit_occurrence.c.provider_set_key.type, sa.Integer)
+    assert isinstance(audit_occurrence.c.source_key.type, sa.Integer)
+    for column in (
+        audit_occurrence.c.snapshot_key,
+        audit_occurrence.c.price_key,
+        audit_occurrence.c.npi,
+        audit_occurrence.c.atom_ordinal,
+        audit_occurrence.c.atom_key,
+    ):
+        assert isinstance(column.type, sa.BigInteger)
+
+    attestation = PTG2V3CandidateAuditAttestation.__table__
+    source_witness = PTG2V3SourceAuditWitness.__table__
+    source_witness_part = PTG2WitnessPart.__table__
+    for column in (
+        attestation.c.coverage_scope_id,
+        attestation.c.source_set_digest,
+        attestation.c.audit_sample_digest,
+        attestation.c.source_witness_digest,
+        attestation.c.report_digest,
+        source_witness.c.source_set_digest,
+        source_witness.c.sample_digest,
+        source_witness.c.payload_sha256,
+        source_witness.c.payload,
+        source_witness_part.c.part_sha256,
+        source_witness_part.c.payload,
+    ):
+        assert isinstance(column.type, sa.LargeBinary)
+    assert isinstance(attestation.c.report.type, JSONB)
+
+
+def _assert_v3_timezone_column_types():
+    layout = PTG2V3SnapshotLayout.__table__
+    fingerprint = PTG2V3LayoutFingerprint.__table__
+    snapshot_scope = PTG2V3SnapshotScope.__table__
+    block = PTG2V3Block.__table__
+    attestation = PTG2V3CandidateAuditAttestation.__table__
+    source_witness = PTG2V3SourceAuditWitness.__table__
+    source_witness_part = PTG2WitnessPart.__table__
+    timezone_columns = (
+        layout.c.created_at,
+        layout.c.published_at,
+        fingerprint.c.created_at,
+        PTG2V3SnapshotBinding.__table__.c.created_at,
+        snapshot_scope.c.created_at,
+        block.c.created_at,
+        PTG2V3GCCandidate.__table__.c.eligible_at,
+        PTG2V3GCCandidate.__table__.c.queued_at,
+        attestation.c.attested_at,
+        attestation.c.expires_at,
+        attestation.c.activated_at,
+        source_witness.c.created_at,
+        source_witness_part.c.created_at,
+    )
+    assert all(isinstance(column.type, sa.DateTime) for column in timezone_columns)
+    assert all(column.type.timezone is True for column in timezone_columns)
+
+
+def _assert_v3_primary_keys():
+    for model, expected_columns in V3_EXPECTED_PRIMARY_KEYS_BY_MODEL.items():
+        assert _primary_key(model.__table__) == expected_columns
+
+
+def _expected_v3_foreign_key_shapes(schema):
+    return {
+        model: {
+            name: (
+                local_columns,
+                tuple(f"{schema}.{target}" for target in targets),
+                ondelete,
+            )
+            for name, (local_columns, targets, ondelete) in shapes.items()
+        }
+        for model, shapes in V3_FOREIGN_KEY_SHAPES_BY_MODEL.items()
+    }
+
+
+def _assert_v3_foreign_keys():
+    schema = PTG2V3SnapshotLayout.__table__.schema
+    for model, expected_shapes in _expected_v3_foreign_key_shapes(schema).items():
+        assert _foreign_key_shapes(model.__table__) == expected_shapes
+    for model in V3_DENSE_MODELS:
+        assert _foreign_key_shapes(model.__table__) == {}
+
+
+def _assert_v3_unique_constraints():
+    assert not _constraints(PTG2V3SnapshotLayout.__table__, sa.UniqueConstraint)
+    source_unique = _constraints(
+        PTG2V3SnapshotSource.__table__, sa.UniqueConstraint
+    )["ptg2_v3_snapshot_source_identity_key"]
+    assert tuple(column.name for column in source_unique.columns) == (
+        "snapshot_id",
+        "source_type",
+        "identity_kind",
+        "identity_sha256",
+    )
+
+    code_uniques = _constraints(PTG2V3Code.__table__, sa.UniqueConstraint)
+    assert "ptg2_v3_code_identity_key" not in code_uniques
+    assert tuple(
+        column.name
+        for column in code_uniques["ptg2_v3_code_global_id_key"].columns
+    ) == ("snapshot_key", "code_global_id_128")
+
+    price_unique = _constraints(
+        PTG2V3PriceAttr.__table__, sa.UniqueConstraint
+    )["ptg2_v3_price_attr_value_key"]
+    assert tuple(column.name for column in price_unique.columns) == (
+        "snapshot_key",
+        "attribute_kind",
+        "value",
+    )
+    assert price_unique.dialect_options["postgresql"]["nulls_not_distinct"] is True
+
+
+def _assert_v3_partition_intent():
+    expected_partition_by_model = {
+        PTG2V3Block: "HASH (block_hash)",
+        PTG2V3NPIScope: "HASH (snapshot_key)",
+        PTG2V3AuditOccurrence: "HASH (snapshot_key)",
+    }
+    for model, expected_partition in expected_partition_by_model.items():
+        assert model.__table__.dialect_options["postgresql"]["partition_by"] == (
+            expected_partition
+        )
+
+
+def _assert_v3_index_shapes():
+    for model, expected_shapes in V3_INDEX_SHAPES_BY_MODEL.items():
+        assert _index_shapes(model.__table__) == expected_shapes
+
+
+def _assert_v3_sealed_mapping_index():
+    sealed_mapping_index = next(
+        index
+        for index in PTG2V3SnapshotLayout.__table__.indexes
+        if index.name == "ptg2_v3_snapshot_layout_sealed_mapping_idx"
+    )
+    assert sealed_mapping_index.unique is True
+    assert (
+        str(sealed_mapping_index.dialect_options["postgresql"]["where"])
+        == "state = 'sealed' AND mapping_digest IS NOT NULL AND support_digest IS NOT NULL"
+    )
+
+
+def _assert_v3_check_constraint_names():
+    for model, expected_names in V3_CHECK_NAMES_BY_MODEL.items():
+        assert set(_constraints(model.__table__, sa.CheckConstraint)) == expected_names
+
+
+def _assert_v3_migration_metadata(migration):
+    assert migration.revision == "20260712120000_ptg2_v3_shared_schema"
+    assert migration.down_revision == (
+        "20260713237000_provider_directory_plan_scalars"
+    )
+
+
+def _assert_v3_migration_parent_tables(statements, schema):
+    for table_name in V3_MIGRATION_PARENT_TABLES:
+        prefix = f'CREATE TABLE {schema}."{table_name}" ('
+        assert any(statement.startswith(prefix) for statement in statements)
+
+
+def _assert_v3_migration_statement_order(statements, schema):
+    trace_set_statement_index = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith(
+            f'CREATE TABLE IF NOT EXISTS {schema}."ptg2_source_trace_set" ('
+        )
+    )
+    snapshot_source_statement_index = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith(
+            f'CREATE TABLE {schema}."ptg2_v3_snapshot_source" ('
+        )
+    )
+    assert trace_set_statement_index < snapshot_source_statement_index
+    trace_set_statement = statements[trace_set_statement_index]
+    assert "source_trace_set_hash varchar(64) NOT NULL" in trace_set_statement
+    assert "source_trace_hashes varchar[]" in trace_set_statement
+
+
+def _assert_layout_audit_sql(statements, schema):
+    layout_statement = next(
+        statement
+        for statement in statements
+        if statement.startswith(f'CREATE TABLE {schema}."ptg2_v3_snapshot_layout" (')
+    )
+    assert "snapshot_id" not in layout_statement
+    assert "semantic_fingerprint" not in layout_statement
+    sealed_mapping_statement = next(
+        statement
+        for statement in statements
+        if statement.startswith(
+            'CREATE UNIQUE INDEX "ptg2_v3_snapshot_layout_sealed_mapping_idx"'
+        )
+    )
+    assert "NULLS NOT DISTINCT" not in sealed_mapping_statement
+    assert (
+        "WHERE state = 'sealed' AND mapping_digest IS NOT NULL AND support_digest IS NOT NULL"
+        in sealed_mapping_statement
+    )
+    audit_statement = next(
+        statement
+        for statement in statements
+        if statement.startswith(
+            f'CREATE TABLE {schema}."ptg2_v3_audit_occurrence" ('
+        )
+    )
+    assert "PRIMARY KEY (snapshot_key, occurrence_id)" in audit_statement
+    assert "FOREIGN KEY" not in audit_statement
+
+
+def _assert_v3_hash_partitions(statements, schema):
+    for parent in (
+        "ptg2_v3_block",
+        "ptg2_v3_npi_scope",
+        "ptg2_v3_audit_occurrence",
+    ):
+        marker = f'PARTITION OF {schema}."{parent}"'
+        partitions = [statement for statement in statements if marker in statement]
+        assert len(partitions) == 32
+        partition_by_remainder = {}
+        pattern = re.compile(
+            rf'CREATE TABLE {schema}\."{parent}_p(\d{{2}})" '
+            rf'PARTITION OF {schema}\."{parent}" FOR VALUES WITH '
+            r"\( MODULUS 32, REMAINDER (\d+) \);"
+        )
+        for statement in partitions:
+            match = pattern.fullmatch(statement)
+            assert match is not None
+            partition_by_remainder[int(match.group(1))] = int(match.group(2))
+        assert partition_by_remainder == {
+            remainder: remainder for remainder in range(32)
+        }
+
+
+def _assert_v3_required_migration_fragments(statements):
+    joined = "\n".join(statements)
+    for fragment in V3_MIGRATION_REQUIRED_FRAGMENTS:
+        assert fragment in joined
+
+
+def _assert_v3_required_constraint_names(statements):
+    joined = "\n".join(statements)
+    for constraint_name in V3_MIGRATION_REQUIRED_CONSTRAINT_NAMES:
+        assert f'CONSTRAINT "{constraint_name}"' in joined
 
 
 @pytest.mark.parametrize(
@@ -388,653 +1266,28 @@ def test_ptg2_models_support_db_schema_alias_without_cross_schema_fks():
 def test_v3_shared_models_define_exact_parent_columns_and_types():
     """Ensure shared models expose the exact parent columns and SQL types."""
 
-    models = (
-        PTG2V3SnapshotLayout,
-        PTG2V3LayoutFingerprint,
-        PTG2V3SnapshotBinding,
-        PTG2V3SnapshotScope,
-        PTG2V3SnapshotSource,
-        PTG2V3Block,
-        PTG2V3SnapshotBlock,
-        PTG2V3GraphOwner,
-        PTG2V3Code,
-        PTG2V3ProviderGroup,
-        PTG2V3ProviderSet,
-        PTG2V3PriceAttr,
-        PTG2V3NPIScope,
-        PTG2V3AuditOccurrence,
-        PTG2V3SourceAuditWitness,
-        PTG2WitnessPart,
-        PTG2V3CandidateAuditAttestation,
-        PTG2V3GCCandidate,
-    )
-    expected_columns_by_table = {
-        "ptg2_v3_snapshot_layout": (
-            "snapshot_key",
-            "storage_shard_id",
-            "build_token",
-            "generation",
-            "state",
-            "mapping_digest",
-            "support_digest",
-            "layout_manifest",
-                "logical_byte_count",
-                "created_at",
-                "heartbeat_at",
-                "lease_until",
-                "published_at",
-        ),
-        "ptg2_v3_layout_fingerprint": (
-            "semantic_fingerprint",
-            "snapshot_key",
-            "created_at",
-        ),
-        "ptg2_v3_snapshot_binding": (
-            "snapshot_id",
-            "snapshot_key",
-            "created_at",
-        ),
-        "ptg2_v3_snapshot_scope": (
-            "snapshot_id",
-            "plan_id",
-            "plan_market_type",
-            "coverage_scope_id",
-            "created_at",
-        ),
-        "ptg2_v3_snapshot_source": (
-            "snapshot_id",
-            "source_key",
-            "source_type",
-            "identity_kind",
-            "identity_sha256",
-            "raw_container_sha256",
-            "logical_json_sha256",
-            "logical_hash_deferred",
-            "source_trace_set_hash",
-        ),
-        "ptg2_v3_block": (
-            "block_hash",
-            "format_version",
-            "object_kind",
-            "codec",
-            "entry_count",
-            "raw_byte_count",
-            "stored_byte_count",
-            "payload",
-            "created_at",
-        ),
-        "ptg2_v3_snapshot_block": (
-            "snapshot_key",
-            "object_kind",
-            "block_key",
-            "fragment_no",
-            "entry_count",
-            "block_hash",
-        ),
-        "ptg2_v3_graph_owner": (
-            "snapshot_key",
-            "direction",
-            "owner_key",
-            "first_chunk",
-            "member_offset",
-            "member_count",
-        ),
-        "ptg2_v3_code": (
-            "snapshot_key",
-            "code_key",
-            "code_global_id_128",
-            "coverage_scope_id",
-            "reported_code_system",
-            "reported_code",
-            "negotiation_arrangement",
-            "billing_code_type_version",
-            "source_name",
-            "source_description",
-            "rate_count",
-        ),
-        "ptg2_v3_provider_set": (
-            "snapshot_key",
-            "provider_set_key",
-            "provider_set_global_id_128",
-            "provider_count",
-            "network_names",
-        ),
-        "ptg2_v3_provider_group": (
-            "snapshot_key",
-            "provider_group_key",
-            "provider_group_global_id_128",
-        ),
-        "ptg2_v3_price_attr": (
-            "snapshot_key",
-            "attribute_kind",
-            "attribute_key",
-            "value",
-        ),
-        "ptg2_v3_npi_scope": (
-            "snapshot_key",
-            "npi",
-        ),
-        "ptg2_v3_audit_occurrence": (
-            "snapshot_key",
-            "occurrence_id",
-            "code_key",
-            "provider_set_key",
-            "price_key",
-            "source_key",
-            "npi",
-            "atom_ordinal",
-            "atom_key",
-        ),
-        "ptg2_v3_source_audit_witness": (
-            "snapshot_key",
-            "contract",
-            "selection_method",
-            "source_set_digest",
-            "sample_digest",
-            "queryable_occurrence_population_count",
-            "provider_population_count",
-            "occurrence_witness_count",
-            "provider_witness_count",
-            "payload_sha256",
-            "payload",
-            "created_at",
-        ),
-        "ptg2_v3_source_audit_witness_part": (
-            "snapshot_key",
-            "part_number",
-            "part_sha256",
-            "payload",
-            "created_at",
-        ),
-        "ptg2_v3_candidate_audit_attestation": (
-            "snapshot_id",
-            "snapshot_key",
-            "source_key",
-            "plan_id",
-            "plan_market_type",
-            "coverage_scope_id",
-            "source_set_digest",
-            "audit_sample_digest",
-            "source_witness_digest",
-            "contract",
-            "tool_name",
-                "tool_version",
-                "report_digest",
-                "report",
-                "activation_intent",
-                "attestation_digest",
-                "attested_at",
-            "expires_at",
-            "activated_at",
-        ),
-        "ptg2_v3_gc_candidate": (
-            "block_hash",
-            "eligible_at",
-            "queued_at",
-        ),
-    }
-
-    expected_schema = (
-        os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
-    )
-    assert {model.__tablename__ for model in models} == set(
-        expected_columns_by_table
-    )
-    for model in models:
-        table = model.__table__
-        assert table.schema == expected_schema
-        assert tuple(table.columns.keys()) == expected_columns_by_table[table.name]
-
-    layout = PTG2V3SnapshotLayout.__table__
-    assert isinstance(layout.c.snapshot_key.type, sa.BigInteger)
-    assert layout.c.snapshot_key.identity is not None
-    assert isinstance(layout.c.mapping_digest.type, sa.LargeBinary)
-    assert isinstance(layout.c.support_digest.type, sa.LargeBinary)
-    assert isinstance(layout.c.layout_manifest.type, JSONB)
-    assert "snapshot_id" not in layout.c
-    assert "semantic_fingerprint" not in layout.c
-    assert layout.c.storage_shard_id.server_default.arg.text == "0"
-    assert layout.c.logical_byte_count.server_default.arg.text == "0"
-
-    fingerprint = PTG2V3LayoutFingerprint.__table__
-    assert isinstance(fingerprint.c.semantic_fingerprint.type, sa.LargeBinary)
-    assert isinstance(fingerprint.c.snapshot_key.type, sa.BigInteger)
-
-    block = PTG2V3Block.__table__
-    assert isinstance(block.c.block_hash.type, sa.LargeBinary)
-    assert isinstance(block.c.payload.type, sa.LargeBinary)
-    assert isinstance(block.c.entry_count.type, sa.BigInteger)
-    assert isinstance(block.c.raw_byte_count.type, sa.BigInteger)
-    assert isinstance(block.c.stored_byte_count.type, sa.BigInteger)
-    assert isinstance(
-        PTG2V3ProviderSet.__table__.c.provider_set_global_id_128.type, sa.LargeBinary
-    )
-    assert isinstance(PTG2V3ProviderSet.__table__.c.network_names.type, sa.ARRAY)
-    assert isinstance(PTG2V3Code.__table__.c.code_global_id_128.type, sa.LargeBinary)
-    assert isinstance(PTG2V3Code.__table__.c.coverage_scope_id.type, sa.LargeBinary)
-    snapshot_scope = PTG2V3SnapshotScope.__table__
-    assert isinstance(snapshot_scope.c.coverage_scope_id.type, sa.LargeBinary)
-    assert snapshot_scope.c.plan_market_type.server_default.arg.text == "''"
-    snapshot_source = PTG2V3SnapshotSource.__table__
-    assert isinstance(snapshot_source.c.source_key.type, sa.Integer)
-    assert isinstance(snapshot_source.c.logical_hash_deferred.type, sa.Boolean)
-    assert isinstance(
-        PTG2V3ProviderGroup.__table__.c.provider_group_global_id_128.type,
-        sa.LargeBinary,
-    )
-    audit_occurrence = PTG2V3AuditOccurrence.__table__
-    assert isinstance(audit_occurrence.c.occurrence_id.type, sa.LargeBinary)
-    assert audit_occurrence.c.occurrence_id.type.length == 32
-    assert isinstance(audit_occurrence.c.code_key.type, sa.Integer)
-    assert isinstance(audit_occurrence.c.provider_set_key.type, sa.Integer)
-    assert isinstance(audit_occurrence.c.source_key.type, sa.Integer)
-    for column in (
-        audit_occurrence.c.snapshot_key,
-        audit_occurrence.c.price_key,
-        audit_occurrence.c.npi,
-        audit_occurrence.c.atom_ordinal,
-        audit_occurrence.c.atom_key,
-    ):
-        assert isinstance(column.type, sa.BigInteger)
-    attestation = PTG2V3CandidateAuditAttestation.__table__
-    source_witness = PTG2V3SourceAuditWitness.__table__
-    source_witness_part = PTG2WitnessPart.__table__
-    for column in (
-        attestation.c.coverage_scope_id,
-        attestation.c.source_set_digest,
-        attestation.c.audit_sample_digest,
-        attestation.c.source_witness_digest,
-        attestation.c.report_digest,
-        source_witness.c.source_set_digest,
-        source_witness.c.sample_digest,
-        source_witness.c.payload_sha256,
-        source_witness.c.payload,
-        source_witness_part.c.part_sha256,
-        source_witness_part.c.payload,
-    ):
-        assert isinstance(column.type, sa.LargeBinary)
-    assert isinstance(attestation.c.report.type, JSONB)
-
-    timezone_columns = (
-        layout.c.created_at,
-        layout.c.published_at,
-        fingerprint.c.created_at,
-        PTG2V3SnapshotBinding.__table__.c.created_at,
-        snapshot_scope.c.created_at,
-        block.c.created_at,
-        PTG2V3GCCandidate.__table__.c.eligible_at,
-        PTG2V3GCCandidate.__table__.c.queued_at,
-        attestation.c.attested_at,
-        attestation.c.expires_at,
-        attestation.c.activated_at,
-        source_witness.c.created_at,
-        source_witness_part.c.created_at,
-    )
-    assert all(isinstance(column.type, sa.DateTime) for column in timezone_columns)
-    assert all(column.type.timezone is True for column in timezone_columns)
+    _assert_parent_columns()
+    _assert_layout_types()
+    _assert_block_provider_types()
+    _assert_audit_attestation_types()
+    _assert_v3_timezone_column_types()
 
 
 def test_v3_shared_models_define_keys_foreign_keys_and_uniqueness():
     """Ensure shared models define required keys, references, and uniqueness."""
 
-    expected_primary_keys_by_model = {
-        PTG2V3SnapshotLayout: ("snapshot_key",),
-        PTG2V3LayoutFingerprint: ("semantic_fingerprint",),
-        PTG2V3SnapshotBinding: ("snapshot_id",),
-        PTG2V3SnapshotScope: ("snapshot_id",),
-        PTG2V3SnapshotSource: ("snapshot_id", "source_key"),
-        PTG2V3Block: ("block_hash",),
-        PTG2V3SnapshotBlock: (
-            "snapshot_key",
-            "object_kind",
-            "block_key",
-            "fragment_no",
-        ),
-        PTG2V3GraphOwner: ("snapshot_key", "direction", "owner_key"),
-        PTG2V3Code: ("snapshot_key", "code_key"),
-        PTG2V3ProviderGroup: ("snapshot_key", "provider_group_key"),
-        PTG2V3ProviderSet: ("snapshot_key", "provider_set_key"),
-        PTG2V3PriceAttr: (
-            "snapshot_key",
-            "attribute_kind",
-            "attribute_key",
-        ),
-        PTG2V3NPIScope: ("snapshot_key", "npi"),
-        PTG2V3AuditOccurrence: ("snapshot_key", "occurrence_id"),
-        PTG2V3SourceAuditWitness: ("snapshot_key",),
-        PTG2WitnessPart: ("snapshot_key", "part_number"),
-        PTG2V3CandidateAuditAttestation: ("snapshot_id",),
-        PTG2V3GCCandidate: ("block_hash",),
-    }
-    for model, expected_columns in expected_primary_keys_by_model.items():
-        assert _primary_key(model.__table__) == expected_columns
-
-    schema = PTG2V3SnapshotLayout.__table__.schema
-    layout_target = f"{schema}.ptg2_v3_snapshot_layout.snapshot_key"
-    block_target = f"{schema}.ptg2_v3_block.block_hash"
-    scope_target = f"{schema}.ptg2_v3_snapshot_scope.snapshot_id"
-    snapshot_target = f"{schema}.ptg2_snapshot.snapshot_id"
-    trace_set_target = f"{schema}.ptg2_source_trace_set.source_trace_set_hash"
-    witness_target = f"{schema}.ptg2_v3_source_audit_witness.snapshot_key"
-    expected_foreign_keys_by_model = {
-        PTG2V3LayoutFingerprint: {
-            "ptg2_v3_layout_fingerprint_snapshot_key_fkey": (
-                ("snapshot_key",),
-                (layout_target,),
-                "CASCADE",
-            ),
-        },
-        PTG2V3SnapshotBinding: {
-            "ptg2_v3_snapshot_binding_snapshot_id_fkey": (
-                ("snapshot_id",),
-                (snapshot_target,),
-                "CASCADE",
-            ),
-            "ptg2_v3_snapshot_binding_snapshot_key_fkey": (
-                ("snapshot_key",),
-                (layout_target,),
-                "RESTRICT",
-            ),
-        },
-        PTG2V3SnapshotScope: {
-            "ptg2_v3_snapshot_scope_snapshot_id_fkey": (
-                ("snapshot_id",),
-                (snapshot_target,),
-                "CASCADE",
-            ),
-        },
-        PTG2V3SnapshotSource: {
-            "ptg2_v3_snapshot_source_snapshot_id_fkey": (
-                ("snapshot_id",),
-                (scope_target,),
-                "CASCADE",
-            ),
-            "ptg2_v3_snapshot_source_trace_set_hash_fkey": (
-                ("source_trace_set_hash",),
-                (trace_set_target,),
-                "RESTRICT",
-            ),
-        },
-        PTG2V3SnapshotBlock: {
-            "ptg2_v3_snapshot_block_snapshot_key_fkey": (
-                ("snapshot_key",),
-                (layout_target,),
-                "CASCADE",
-            ),
-            "ptg2_v3_snapshot_block_block_hash_fkey": (
-                ("block_hash",),
-                (block_target,),
-                None,
-            ),
-        },
-        PTG2V3GCCandidate: {
-            "ptg2_v3_gc_candidate_block_hash_fkey": (
-                ("block_hash",),
-                (block_target,),
-                "CASCADE",
-            ),
-        },
-        PTG2V3CandidateAuditAttestation: {
-            "ptg2_v3_candidate_audit_attestation_snapshot_id_fkey": (
-                ("snapshot_id",),
-                (scope_target,),
-                "CASCADE",
-            ),
-            "ptg2_v3_candidate_audit_attestation_snapshot_key_fkey": (
-                ("snapshot_key",),
-                (layout_target,),
-                "RESTRICT",
-            ),
-        },
-        PTG2WitnessPart: {
-            "ptg2_v3_source_audit_witness_part_parent_fkey": (
-                ("snapshot_key",),
-                (witness_target,),
-                "CASCADE",
-            ),
-        },
-    }
-    for model, expected_shapes in expected_foreign_keys_by_model.items():
-        assert _foreign_key_shapes(model.__table__) == expected_shapes
-    for dense_model in (
-        PTG2V3GraphOwner,
-        PTG2V3Code,
-        PTG2V3ProviderGroup,
-        PTG2V3ProviderSet,
-        PTG2V3PriceAttr,
-        PTG2V3NPIScope,
-        PTG2V3AuditOccurrence,
-        PTG2V3SourceAuditWitness,
-    ):
-        assert _foreign_key_shapes(dense_model.__table__) == {}
-
-    assert not _constraints(PTG2V3SnapshotLayout.__table__, sa.UniqueConstraint)
-    source_unique = _constraints(
-        PTG2V3SnapshotSource.__table__, sa.UniqueConstraint
-    )["ptg2_v3_snapshot_source_identity_key"]
-    assert tuple(column.name for column in source_unique.columns) == (
-        "snapshot_id",
-        "source_type",
-        "identity_kind",
-        "identity_sha256",
-    )
-
-    code_uniques = _constraints(
-        PTG2V3Code.__table__,
-        sa.UniqueConstraint,
-    )
-    assert "ptg2_v3_code_identity_key" not in code_uniques
-    assert tuple(
-        column.name
-        for column in code_uniques["ptg2_v3_code_global_id_key"].columns
-    ) == ("snapshot_key", "code_global_id_128")
-
-    price_unique = _constraints(
-        PTG2V3PriceAttr.__table__,
-        sa.UniqueConstraint,
-    )["ptg2_v3_price_attr_value_key"]
-    assert tuple(column.name for column in price_unique.columns) == (
-        "snapshot_key",
-        "attribute_kind",
-        "value",
-    )
-    assert price_unique.dialect_options["postgresql"]["nulls_not_distinct"] is True
+    _assert_v3_primary_keys()
+    _assert_v3_foreign_keys()
+    _assert_v3_unique_constraints()
 
 
 def test_v3_shared_models_define_checks_indexes_and_partition_intent():
     """Ensure shared models define required checks, indexes, and partitions."""
 
-    block = PTG2V3Block.__table__
-    npi_scope = PTG2V3NPIScope.__table__
-    audit_occurrence = PTG2V3AuditOccurrence.__table__
-    assert block.dialect_options["postgresql"]["partition_by"] == ("HASH (block_hash)")
-    assert npi_scope.dialect_options["postgresql"]["partition_by"] == (
-        "HASH (snapshot_key)"
-    )
-    assert audit_occurrence.dialect_options["postgresql"]["partition_by"] == (
-        "HASH (snapshot_key)"
-    )
-
-    assert _index_shapes(PTG2V3SnapshotLayout.__table__) == {
-        "ptg2_v3_snapshot_layout_state_idx": (
-            ("state", "lease_until", "heartbeat_at"),
-            (),
-        ),
-        "ptg2_v3_snapshot_layout_sealed_mapping_idx": (
-            ("generation", "mapping_digest", "support_digest"),
-            (),
-        ),
-    }
-    sealed_mapping_index = next(
-        index
-        for index in PTG2V3SnapshotLayout.__table__.indexes
-        if index.name == "ptg2_v3_snapshot_layout_sealed_mapping_idx"
-    )
-    assert sealed_mapping_index.unique is True
-    assert (
-        str(sealed_mapping_index.dialect_options["postgresql"]["where"])
-        == "state = 'sealed' AND mapping_digest IS NOT NULL AND support_digest IS NOT NULL"
-    )
-    assert _index_shapes(PTG2V3LayoutFingerprint.__table__) == {
-        "ptg2_v3_layout_fingerprint_snapshot_key_idx": (
-            ("snapshot_key",),
-            (),
-        ),
-    }
-    assert _index_shapes(PTG2V3SnapshotBinding.__table__) == {
-        "ptg2_v3_snapshot_binding_snapshot_key_idx": (
-            ("snapshot_key",),
-            (),
-        ),
-    }
-    assert _index_shapes(PTG2V3SnapshotScope.__table__) == {
-        "ptg2_v3_snapshot_scope_lookup_idx": (
-            ("snapshot_id", "coverage_scope_id"),
-            (),
-        ),
-    }
-    assert _index_shapes(PTG2V3SnapshotSource.__table__) == {}
-    assert _index_shapes(PTG2V3SnapshotBlock.__table__) == {
-        "ptg2_v3_snapshot_block_block_hash_idx": (("block_hash",), ()),
-        "ptg2_v3_snapshot_block_lookup_idx": (
-            ("snapshot_key", "object_kind", "block_key"),
-            (),
-        ),
-    }
-    assert _index_shapes(PTG2V3GraphOwner.__table__) == {
-        "ptg2_v3_graph_owner_lookup_idx": (
-            ("snapshot_key", "direction", "owner_key"),
-            ("first_chunk", "member_offset", "member_count"),
-        ),
-    }
-    assert _index_shapes(PTG2V3Code.__table__) == {
-        "ptg2_v3_code_lookup_idx": (
-            (
-                "snapshot_key",
-                "coverage_scope_id",
-                "reported_code_system",
-                "reported_code",
-            ),
-            ("code_key", "negotiation_arrangement", "rate_count"),
-        ),
-    }
-    assert _index_shapes(npi_scope) == {}
-    assert _index_shapes(PTG2V3GCCandidate.__table__) == {
-        "ptg2_v3_gc_candidate_eligible_at_idx": (("eligible_at",), ()),
-    }
-    assert _index_shapes(PTG2V3CandidateAuditAttestation.__table__) == {
-        "ptg2_v3_candidate_audit_attestation_expiry_idx": (
-            ("expires_at", "activated_at"),
-            (),
-        ),
-        "ptg2_v3_candidate_audit_attestation_snapshot_key_idx": (
-            ("snapshot_key",),
-            (),
-        ),
-    }
-    assert _index_shapes(PTG2V3SourceAuditWitness.__table__) == {}
-    assert _index_shapes(PTG2WitnessPart.__table__) == {}
-
-    expected_check_names_by_model = {
-        PTG2V3SnapshotLayout: {
-            "ptg2_v3_snapshot_layout_state_check",
-            "ptg2_v3_snapshot_layout_mapping_digest_check",
-            "ptg2_v3_snapshot_layout_support_digest_check",
-            "ptg2_v3_snapshot_layout_logical_byte_count_check",
-        },
-        PTG2V3LayoutFingerprint: {
-            "ptg2_v3_layout_fingerprint_digest_check",
-        },
-        PTG2V3SnapshotScope: {
-            "ptg2_v3_snapshot_scope_coverage_scope_id_check",
-        },
-        PTG2V3SnapshotSource: {
-            "ptg2_v3_snapshot_source_source_key_check",
-            "ptg2_v3_snapshot_source_source_type_check",
-            "ptg2_v3_snapshot_source_identity_kind_check",
-            "ptg2_v3_snapshot_source_identity_sha256_check",
-            "ptg2_v3_snapshot_source_raw_sha256_check",
-            "ptg2_v3_snapshot_source_logical_sha256_check",
-            "ptg2_v3_snapshot_source_identity_evidence_check",
-            "ptg2_v3_snapshot_source_trace_set_hash_check",
-        },
-        PTG2V3Block: {
-            "ptg2_v3_block_hash_check",
-            "ptg2_v3_block_format_version_check",
-            "ptg2_v3_block_codec_check",
-            "ptg2_v3_block_entry_count_check",
-            "ptg2_v3_block_raw_byte_count_check",
-            "ptg2_v3_block_stored_byte_count_check",
-            "ptg2_v3_block_payload_size_check",
-        },
-        PTG2V3SnapshotBlock: {
-            "ptg2_v3_snapshot_block_fragment_no_check",
-            "ptg2_v3_snapshot_block_block_key_check",
-            "ptg2_v3_snapshot_block_entry_count_check",
-        },
-        PTG2V3GraphOwner: {
-            "ptg2_v3_graph_owner_direction_check",
-            "ptg2_v3_graph_owner_first_chunk_check",
-            "ptg2_v3_graph_owner_member_offset_check",
-            "ptg2_v3_graph_owner_member_count_check",
-        },
-        PTG2V3Code: {
-            "ptg2_v3_code_global_id_check",
-            "ptg2_v3_code_coverage_scope_id_check",
-            "ptg2_v3_code_rate_count_check",
-            "ptg2_v3_code_code_key_check",
-        },
-        PTG2V3ProviderSet: {
-            "ptg2_v3_provider_set_global_id_check",
-            "ptg2_v3_provider_set_provider_count_check",
-            "ptg2_v3_provider_set_key_check",
-        },
-        PTG2V3ProviderGroup: {
-            "ptg2_v3_provider_group_global_id_check",
-            "ptg2_v3_provider_group_key_check",
-        },
-        PTG2V3NPIScope: {
-            "ptg2_v3_npi_scope_npi_check",
-        },
-        PTG2V3AuditOccurrence: {
-            "ptg2_v3_audit_occurrence_id_check",
-            "ptg2_v3_audit_occurrence_code_key_check",
-            "ptg2_v3_audit_occurrence_provider_set_key_check",
-            "ptg2_v3_audit_occurrence_price_key_check",
-            "ptg2_v3_audit_occurrence_source_key_check",
-            "ptg2_v3_audit_occurrence_npi_check",
-            "ptg2_v3_audit_occurrence_atom_ordinal_check",
-            "ptg2_v3_audit_occurrence_atom_key_check",
-        },
-        PTG2V3SourceAuditWitness: {
-            "ptg2_v3_source_audit_witness_source_set_digest_check",
-            "ptg2_v3_source_audit_witness_sample_digest_check",
-            "ptg2_v3_source_audit_witness_payload_sha256_check",
-            "ptg2_v3_source_audit_witness_occurrence_population_check",
-            "ptg2_v3_source_audit_witness_provider_population_check",
-            "ptg2_v3_source_audit_witness_occurrence_count_check",
-            "ptg2_v3_source_audit_witness_provider_count_check",
-            "ptg2_v3_source_audit_witness_total_count_check",
-            "ptg2_v3_source_audit_witness_payload_check",
-        },
-        PTG2WitnessPart: {
-            "ptg2_v3_source_audit_witness_part_number_check",
-            "ptg2_v3_source_audit_witness_part_sha256_check",
-            "ptg2_v3_source_audit_witness_part_payload_check",
-        },
-        PTG2V3CandidateAuditAttestation: {
-            "ptg2_v3_candidate_audit_attestation_scope_check",
-            "ptg2_v3_candidate_audit_attestation_source_set_check",
-            "ptg2_v3_candidate_audit_attestation_sample_check",
-            "ptg2_v3_candidate_audit_attestation_witness_check",
-                "ptg2_v3_candidate_audit_attestation_report_check",
-                "ptg2_v3_candidate_audit_attestation_intent_check",
-                "ptg2_v3_candidate_audit_attestation_digest_check",
-                "ptg2_v3_candidate_audit_attestation_expiry_check",
-        },
-    }
-    for model, expected_names in expected_check_names_by_model.items():
-        assert set(_constraints(model.__table__, sa.CheckConstraint)) == expected_names
+    _assert_v3_partition_intent()
+    _assert_v3_index_shapes()
+    _assert_v3_sealed_mapping_index()
+    _assert_v3_check_constraint_names()
 
 
 def test_v3_shared_migration_emits_tables_constraints_and_32_way_partitions(
@@ -1045,208 +1298,13 @@ def test_v3_shared_migration_emits_tables_constraints_and_32_way_partitions(
     migration, statements = _record_upgrade(monkeypatch, schema="ptg_shared")
     schema = '"ptg_shared"'
 
-    assert migration.revision == "20260712120000_ptg2_v3_shared_schema"
-    assert migration.down_revision == (
-        "20260713237000_provider_directory_plan_scalars"
-    )
-
-    expected_parents = {
-        "ptg2_v3_snapshot_layout",
-        "ptg2_v3_layout_fingerprint",
-        "ptg2_v3_snapshot_binding",
-        "ptg2_v3_snapshot_scope",
-        "ptg2_v3_snapshot_source",
-        "ptg2_v3_block",
-        "ptg2_v3_snapshot_block",
-        "ptg2_v3_graph_owner",
-        "ptg2_v3_code",
-        "ptg2_v3_provider_group",
-        "ptg2_v3_provider_set",
-        "ptg2_v3_price_attr",
-        "ptg2_v3_npi_scope",
-        "ptg2_v3_audit_occurrence",
-        "ptg2_v3_candidate_audit_attestation",
-        "ptg2_v3_gc_candidate",
-    }
-    for table_name in expected_parents:
-        prefix = f'CREATE TABLE {schema}."{table_name}" ('
-        assert any(statement.startswith(prefix) for statement in statements)
-
-    trace_set_statement_index = next(
-        index
-        for index, statement in enumerate(statements)
-        if statement.startswith(
-            f'CREATE TABLE IF NOT EXISTS {schema}."ptg2_source_trace_set" ('
-        )
-    )
-    snapshot_source_statement_index = next(
-        index
-        for index, statement in enumerate(statements)
-        if statement.startswith(
-            f'CREATE TABLE {schema}."ptg2_v3_snapshot_source" ('
-        )
-    )
-    assert trace_set_statement_index < snapshot_source_statement_index
-    assert "source_trace_set_hash varchar(64) NOT NULL" in statements[
-        trace_set_statement_index
-    ]
-    assert "source_trace_hashes varchar[]" in statements[trace_set_statement_index]
-
-    layout_statement = next(
-        statement
-        for statement in statements
-        if statement.startswith(f'CREATE TABLE {schema}."ptg2_v3_snapshot_layout" (')
-    )
-    assert "snapshot_id" not in layout_statement
-    assert "semantic_fingerprint" not in layout_statement
-    sealed_mapping_statement = next(
-        statement
-        for statement in statements
-        if statement.startswith(
-            'CREATE UNIQUE INDEX "ptg2_v3_snapshot_layout_sealed_mapping_idx"'
-        )
-    )
-    assert "NULLS NOT DISTINCT" not in sealed_mapping_statement
-    assert (
-        "WHERE state = 'sealed' AND mapping_digest IS NOT NULL AND support_digest IS NOT NULL"
-        in sealed_mapping_statement
-    )
-    audit_statement = next(
-        statement
-        for statement in statements
-        if statement.startswith(
-            f'CREATE TABLE {schema}."ptg2_v3_audit_occurrence" ('
-        )
-    )
-    assert "PRIMARY KEY (snapshot_key, occurrence_id)" in audit_statement
-    assert "FOREIGN KEY" not in audit_statement
-
-    for parent in (
-        "ptg2_v3_block",
-        "ptg2_v3_npi_scope",
-        "ptg2_v3_audit_occurrence",
-    ):
-        marker = f'PARTITION OF {schema}."{parent}"'
-        partitions = [statement for statement in statements if marker in statement]
-        assert len(partitions) == 32
-        observed_partition_by_remainder = {}
-        pattern = re.compile(
-            rf'CREATE TABLE {schema}\."{parent}_p(\d{{2}})" '
-            rf'PARTITION OF {schema}\."{parent}" FOR VALUES WITH '
-            r"\( MODULUS 32, REMAINDER (\d+) \);"
-        )
-        for statement in partitions:
-            match = pattern.fullmatch(statement)
-            assert match is not None
-            observed_partition_by_remainder[int(match.group(1))] = int(
-                match.group(2)
-            )
-        assert observed_partition_by_remainder == {
-            remainder: remainder
-            for remainder in range(32)
-        }
-
-    joined = "\n".join(statements)
-    required_fragments = (
-        "GENERATED BY DEFAULT AS IDENTITY",
-        "CHECK (state IN ('building', 'sealed'))",
-        "CHECK (mapping_digest IS NULL OR octet_length(mapping_digest) = 32)",
-        "CHECK (support_digest IS NULL OR octet_length(support_digest) = 32)",
-        "CHECK (logical_byte_count >= 0)",
-        "CHECK (octet_length(semantic_fingerprint) = 32)",
-        "CHECK (octet_length(coverage_scope_id) = 32)",
-            "CHECK (octet_length(block_hash) = 32)",
-            "CHECK (format_version = 2)",
-            "CHECK (codec IN ('none', 'zlib'))",
-        "CHECK (entry_count >= 0)",
-        "CHECK (raw_byte_count >= 0)",
-        "CHECK (stored_byte_count >= 0)",
-        "CHECK (octet_length(payload) = stored_byte_count)",
-            "CHECK (fragment_no >= 0)",
-            "CHECK (block_key >= 0)",
-        "CHECK (direction BETWEEN 1 AND 4)",
-        "CHECK (first_chunk >= 0)",
-            "CHECK (member_offset >= 0 AND member_offset < 65536)",
-        "CHECK (member_count >= 0)",
-            "CHECK (rate_count >= 0)",
-            "CHECK (code_key >= 0)",
-        "CHECK (octet_length(provider_set_global_id_128) = 16)",
-        "CHECK (octet_length(provider_group_global_id_128) = 16)",
-            "CHECK (provider_group_key >= 0)",
-            "CHECK (provider_count >= 0)",
-            "CHECK (provider_set_key >= 0)",
-            "CHECK (npi > 0)",
-        "CHECK (octet_length(occurrence_id) = 32)",
-        "CHECK (provider_set_key >= 0)",
-        "CHECK (price_key >= 0)",
-        "CHECK (source_key >= 0)",
-        "CHECK (npi BETWEEN 1000000000 AND 9999999999)",
-        "CHECK (atom_ordinal >= 0)",
-        "CHECK (atom_key >= 0)",
-        "CHECK (octet_length(audit_sample_digest) = 32)",
-        "UNIQUE NULLS NOT DISTINCT",
-        'CREATE UNIQUE INDEX "ptg2_v3_snapshot_layout_sealed_mapping_idx"',
-        "(generation, mapping_digest, support_digest) WHERE state = 'sealed' AND mapping_digest IS NOT NULL AND support_digest IS NOT NULL",
-        'REFERENCES "ptg_shared"."ptg2_v3_snapshot_layout" (snapshot_key) ON DELETE CASCADE',
-        'REFERENCES "ptg_shared"."ptg2_v3_snapshot_layout" (snapshot_key) ON DELETE RESTRICT',
-        'REFERENCES "ptg_shared"."ptg2_v3_block" (block_hash)',
-        'REFERENCES "ptg_shared"."ptg2_v3_snapshot_scope" (snapshot_id) ON DELETE CASCADE',
-        'REFERENCES "ptg_shared"."ptg2_source_trace_set" (source_trace_set_hash) ON DELETE RESTRICT',
-        "PARTITION BY HASH (block_hash)",
-        "PARTITION BY HASH (snapshot_key)",
-        "INCLUDE (code_key, negotiation_arrangement, rate_count)",
-        "INCLUDE (first_chunk, member_offset, member_count)",
-        'CREATE INDEX "ptg2_v3_candidate_audit_attestation_snapshot_key_idx"',
-    )
-    for fragment in required_fragments:
-        assert fragment in joined
-
-    required_constraint_names = {
-        "ptg2_v3_layout_fingerprint_snapshot_key_fkey",
-        "ptg2_v3_snapshot_binding_snapshot_key_fkey",
-        "ptg2_v3_snapshot_scope_coverage_scope_id_check",
-        "ptg2_v3_snapshot_source_snapshot_id_fkey",
-        "ptg2_v3_snapshot_source_trace_set_hash_fkey",
-        "ptg2_v3_snapshot_source_source_key_check",
-        "ptg2_v3_snapshot_source_identity_sha256_check",
-        "ptg2_v3_snapshot_source_raw_sha256_check",
-        "ptg2_v3_snapshot_source_logical_sha256_check",
-        "ptg2_v3_snapshot_source_identity_evidence_check",
-        "ptg2_v3_snapshot_block_snapshot_key_fkey",
-        "ptg2_v3_snapshot_block_block_hash_fkey",
-        "ptg2_v3_gc_candidate_block_hash_fkey",
-        "ptg2_v3_snapshot_layout_state_check",
-        "ptg2_v3_snapshot_layout_mapping_digest_check",
-        "ptg2_v3_snapshot_layout_support_digest_check",
-        "ptg2_v3_snapshot_layout_logical_byte_count_check",
-        "ptg2_v3_layout_fingerprint_digest_check",
-        "ptg2_v3_block_hash_check",
-        "ptg2_v3_block_entry_count_check",
-        "ptg2_v3_block_raw_byte_count_check",
-        "ptg2_v3_block_stored_byte_count_check",
-        "ptg2_v3_block_payload_size_check",
-        "ptg2_v3_snapshot_block_fragment_no_check",
-        "ptg2_v3_snapshot_block_entry_count_check",
-        "ptg2_v3_graph_owner_direction_check",
-        "ptg2_v3_graph_owner_first_chunk_check",
-        "ptg2_v3_graph_owner_member_offset_check",
-        "ptg2_v3_graph_owner_member_count_check",
-        "ptg2_v3_code_rate_count_check",
-        "ptg2_v3_code_coverage_scope_id_check",
-        "ptg2_v3_provider_group_global_id_check",
-        "ptg2_v3_provider_set_global_id_check",
-        "ptg2_v3_provider_set_provider_count_check",
-        "ptg2_v3_audit_occurrence_id_check",
-        "ptg2_v3_audit_occurrence_code_key_check",
-        "ptg2_v3_audit_occurrence_provider_set_key_check",
-        "ptg2_v3_audit_occurrence_price_key_check",
-        "ptg2_v3_audit_occurrence_source_key_check",
-        "ptg2_v3_audit_occurrence_npi_check",
-        "ptg2_v3_audit_occurrence_atom_ordinal_check",
-        "ptg2_v3_audit_occurrence_atom_key_check",
-    }
-    for constraint_name in required_constraint_names:
-        assert f'CONSTRAINT "{constraint_name}"' in joined
+    _assert_v3_migration_metadata(migration)
+    _assert_v3_migration_parent_tables(statements, schema)
+    _assert_v3_migration_statement_order(statements, schema)
+    _assert_layout_audit_sql(statements, schema)
+    _assert_v3_hash_partitions(statements, schema)
+    _assert_v3_required_migration_fragments(statements)
+    _assert_v3_required_constraint_names(statements)
 
 
 def test_v3_shared_migration_downgrade_is_dependency_safe(monkeypatch):
