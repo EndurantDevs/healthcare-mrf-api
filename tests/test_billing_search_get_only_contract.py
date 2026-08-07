@@ -13,6 +13,9 @@ PRICING_ENDPOINT_PATH = Path("api/endpoint/pricing.py")
 OPENAPI_PATH = Path("doc/openapi.yaml")
 CANONICAL_ROUTE_FRAGMENT = "/providers/search-by-procedure"
 CANONICAL_OPENAPI_PATH = f"/pricing{CANONICAL_ROUTE_FRAGMENT}"
+BILLING_SEARCH_PARAMETERS = frozenset(
+    {"billing_entity_ref", "cursor", "healthporta_plan_id"}
+)
 REMOVED_RAW_SELECTOR_PARAMETERS = frozenset(
     {
         "billing_identity",
@@ -64,4 +67,20 @@ def test_canonical_billing_search_route_and_openapi_remain_get_only() -> None:
     assert _canonical_route_methods() == {"get"}
     assert documented_methods == {"get"}
     assert "requestBody" not in operation
+    assert BILLING_SEARCH_PARAMETERS.issubset(query_parameter_names)
     assert REMOVED_RAW_SELECTOR_PARAMETERS.isdisjoint(query_parameter_names)
+
+    for alias_path in (
+        "/pricing/providers/by-procedure",
+        "/pricing/providers/by-service",
+        "/pricing/physicians/by-service",
+    ):
+        alias_operation = spec["paths"].get(alias_path, {}).get("get")
+        if alias_operation is None:
+            continue
+        alias_parameter_names = {
+            parameter["name"]
+            for parameter in alias_operation["parameters"]
+            if parameter["in"] == "query"
+        }
+        assert BILLING_SEARCH_PARAMETERS.isdisjoint(alias_parameter_names)

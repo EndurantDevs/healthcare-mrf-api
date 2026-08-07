@@ -23,6 +23,7 @@ from sanic.exceptions import InvalidUsage
 from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, case, cast,
                         func, or_, select, text)
 
+from api.billing_search_http import serve_billing_search_get
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.control_auth import require_control_auth
 from api.endpoint.pagination import parse_pagination
@@ -10901,6 +10902,8 @@ def _reject_resolver_only_procedure_search_params(args) -> None:
 @blueprint.get("/physicians/by-service", name="pricing.physicians.by_service")
 async def list_providers_by_procedure(request):
     """List providers with pricing records matching a procedure or service code."""
+    if "billing_entity_ref" in request.args:
+        return await serve_billing_search_get(request, _get_session(request))
     _reject_resolver_only_procedure_search_params(request.args)
     begin_capacity_evidence(request)
     session = _get_session(request)

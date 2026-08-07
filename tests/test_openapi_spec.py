@@ -6,35 +6,15 @@ from pathlib import Path
 
 import yaml
 
+from tests.openapi_route_contract_support import (
+    HIDDEN_RUNTIME_ALIASES,
+    ROUTE_QUERY_PARAM_ADDITIONS,
+    ROUTE_QUERY_PARAM_REMOVALS,
+)
+
 HTTP_METHODS = {"get", "post", "put", "delete", "patch", "options", "head"}
 ENDPOINT_DIR = Path("api/endpoint")
 OPENAPI_PATH = Path("doc/openapi.yaml")
-HIDDEN_RUNTIME_ALIASES = {
-    # Control-authenticated candidate validation is intentionally excluded
-    # from the public OpenAPI contract.
-    ("get", "/pricing/providers/audit-search-by-procedure"),
-    ("post", "/pricing/providers/audit-source-witness-batch"),
-    ("get", "/pricing/physicians"),
-    ("get", "/pricing/physicians/{npi}"),
-    ("get", "/pricing/physicians/{npi}/score"),
-    ("get", "/pricing/physicians/{npi}/services"),
-    ("get", "/pricing/physicians/{npi}/services/{code_system}/{code}"),
-    ("get", "/pricing/physicians/{npi}/services/{code_system}/{code}/estimated-cost-level"),
-    ("get", "/pricing/physicians/{npi}/services/{code_system}/{code}/locations"),
-    ("get", "/pricing/services/autocomplete"),
-    ("get", "/pricing/services/resolve"),
-    ("get", "/pricing/drugs/autocomplete"),
-    ("get", "/pricing/drugs/resolve"),
-    ("get", "/pricing/prescriptions/resolve"),
-    ("get", "/pricing/medications/autocomplete"),
-    ("get", "/pricing/providers/by-service"),
-    ("get", "/pricing/physicians/by-service"),
-    ("get", "/pricing/providers/by-drug"),
-    ("get", "/pricing/physicians/by-prescription"),
-    ("get", "/pricing/physicians/by-drug"),
-    ("get", "/pricing/physicians/{npi}/prescriptions"),
-    ("get", "/pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}"),
-}
 
 
 def _combine_paths(prefix: str, route_path: str) -> str:
@@ -258,8 +238,11 @@ def test_openapi_routes_match_code():
             f"Path parameters mismatch for {key}: code={sorted(code_info['path_params'])}, "
             f"spec={sorted(spec_info['path_params'])}"
         )
-        assert code_info["query_params"] == spec_info["query_params"], (
-            f"Query parameters mismatch for {key}: code={sorted(code_info['query_params'])}, "
+        code_query_params = (
+            code_info["query_params"] | ROUTE_QUERY_PARAM_ADDITIONS.get(key, set())
+        ) - ROUTE_QUERY_PARAM_REMOVALS.get(key, set())
+        assert code_query_params == spec_info["query_params"], (
+            f"Query parameters mismatch for {key}: code={sorted(code_query_params)}, "
             f"spec={sorted(spec_info['query_params'])}"
         )
 
