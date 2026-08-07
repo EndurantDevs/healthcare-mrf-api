@@ -23989,6 +23989,17 @@ def test_resource_scan_concurrency_requires_candidate_bound_checkpoint(
         "_has_source_declared_credentialed_access",
         Mock(return_value=False),
     )
+    assert not importer._has_bound_resource_scan_checkpoint(source_record, None)
+    for scoped_source_ids in ("source_a", None):
+        safe_source = dict(source_record)
+        if scoped_source_ids is None:
+            safe_source.pop("_partition_checkpoint_source_ids")
+        else:
+            safe_source["_partition_checkpoint_source_ids"] = scoped_source_ids
+        assert importer._has_bound_resource_scan_checkpoint(
+            safe_source,
+            checkpoint_context,
+        )
     unsafe_sources = (
         {**source_record, "_endpoint_dataset_id": "dataset_b"},
         {**source_record, "_endpoint_id": "endpoint_b"},
@@ -24021,6 +24032,28 @@ def test_resource_scan_concurrency_requires_candidate_bound_checkpoint(
             == 1
             for unsafe_source in unsafe_sources
         )
+
+
+@pytest.mark.parametrize("raises_runtime_error", (False, True))
+def test_resource_scan_concurrency_rejects_bound_upsert_session(
+    monkeypatch,
+    raises_runtime_error,
+):
+    """Keep scans serial when an upsert session is bound or invalid."""
+    source_record = _parallel_resource_source()
+    bound_session = (
+        Mock(side_effect=RuntimeError)
+        if raises_runtime_error
+        else Mock(return_value=object())
+    )
+    monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "16")
+    monkeypatch.setattr(importer, "_bound_upsert_session", bound_session)
+
+    with _source_http_test_session():
+        assert importer._effective_resource_scan_concurrency(
+            source_record,
+            _resource_concurrency_options(),
+        ) == 1
 
 
 def _patch_parallel_resource_flow(
