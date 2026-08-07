@@ -86,7 +86,10 @@ pub(super) fn build_checkpoint(
 }
 
 fn update_text(hasher: &mut Sha256, value: &str) -> io::Result<()> {
-    let length = u32::try_from(value.len()).map_err(|_| invalid_data(INVALID_CHECKPOINT))?;
+    let length = match u32::try_from(value.len()) {
+        Ok(length) => length,
+        Err(_) => return Err(invalid_data(INVALID_CHECKPOINT)),
+    };
     hasher.update(length.to_be_bytes());
     hasher.update(value.as_bytes());
     Ok(())

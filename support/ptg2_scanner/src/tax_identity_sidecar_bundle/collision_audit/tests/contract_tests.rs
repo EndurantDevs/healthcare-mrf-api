@@ -21,7 +21,7 @@ fn full_hmac_cross_type_failure_precedes_an_earlier_locator_failure() {
 }
 
 #[test]
-fn source_checkpoint_contract_and_legacy_bytes_are_frozen() {
+fn source_checkpoint_contract_and_released_bytes_are_frozen() {
     let fixture = BundleFixture::new(vec![vec![
         (TaxIdentityStateV2::MatchedEin, Some(token(0x21))),
         (TaxIdentityStateV2::MatchedEin, Some(token(0x21))),
@@ -30,16 +30,16 @@ fn source_checkpoint_contract_and_legacy_bytes_are_frozen() {
 
     assert_eq!(
         fixture.checkpoint.bundle_sha256(),
-        "3369e70f6228bc6c020a872c69b7ea0c1449b850382ae959cf3f2c053cadd1ee"
+        "3ab130b5361d7bd78648045ba69c4fe0f61d3f49a09048e794e382fd665e6335"
     );
     assert_eq!(source_json.len(), 1271);
     assert_eq!(
         encode_hex(&Sha256::digest(&source_json)),
-        "abe3595161885d22ee4ea5662a6bf4ec7b006f4cd5d555377ebed8b6d57db7f5"
+        "89e3c80aafc24dc1916dfad2053b3afc2ef2662d5d1f783afd71d4dfcb532e86"
     );
 
     let source_before = source_json;
-    audit_fixture(&fixture, "legacy-bytes").unwrap();
+    audit_fixture(&fixture, "released-bytes").unwrap();
     assert_eq!(
         serde_json::to_vec(&fixture.checkpoint).unwrap(),
         source_before

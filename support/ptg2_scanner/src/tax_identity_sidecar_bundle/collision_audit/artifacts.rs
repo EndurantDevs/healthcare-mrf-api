@@ -11,12 +11,16 @@ use crate::tax_identity_sidecar_bundle::{
     TAX_IDENTITY_SIDECAR_COLLISION_AUDIT, TAX_IDENTITY_SIDECAR_PROJECTION_AUTHORITY,
 };
 use crate::tax_identity_sidecar_v2::TaxIdentitySidecarV2StreamValidator;
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader};
 
-const HASH_BUFFER_BYTES: usize = 64 * 1024;
+mod files;
+use files::{
+    file_identity, hash_open_file, open_source_artifact, physical_file_identity,
+    reauthenticate_source_path,
+};
+
+pub(super) const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const POLL_ROW_INTERVAL: u64 = 4096;
 pub(super) const INVALID_BASE_CHECKPOINT: &str =
     "PTG tax identity collision audit source checkpoint is invalid";
@@ -24,8 +28,8 @@ pub(super) const ARTIFACT_SET_MISMATCH: &str =
     "PTG tax identity collision audit artifact set does not match checkpoint";
 pub(super) const ARTIFACT_UNAVAILABLE: &str =
     "PTG tax identity collision audit source artifact is unavailable";
-pub(super) const ARTIFACT_AUTHENTICATION_FAILED: &str =
-    "PTG tax identity collision audit source artifact authentication failed";
+pub(super) const ARTIFACT_VERIFICATION_FAILED: &str =
+    "PTG tax identity collision audit source artifact verification failed";
 pub(super) const ARTIFACT_CONTENT_MISMATCH: &str =
     "PTG tax identity collision audit source artifact content does not match checkpoint";
 const COUNT_OVERFLOW: &str = "PTG tax identity collision audit count overflow";
@@ -50,9 +54,9 @@ pub(super) fn validate_and_order_artifacts<'a>(
         return Err(invalid_data(ARTIFACT_SET_MISMATCH));
     }
     let mut ordered = Vec::new();
-    ordered
-        .try_reserve_exact(descriptors.len())
-        .map_err(|_| invalid_data(ARTIFACT_SET_MISMATCH))?;
+    if ordered.try_reserve_exact(descriptors.len()).is_err() {
+        return Err(invalid_data(ARTIFACT_SET_MISMATCH));
+    }
     ordered.extend(
         descriptors
             .iter()
@@ -68,9 +72,9 @@ pub(super) fn validate_and_order_artifacts<'a>(
         pair[0].descriptor.metadata.source_shard_id == pair[1].descriptor.metadata.source_shard_id
     });
     let mut paths = HashSet::new();
-    paths
-        .try_reserve(ordered.len())
-        .map_err(|_| invalid_data(ARTIFACT_SET_MISMATCH))?;
+    if paths.try_reserve(ordered.len()).is_err() {
+        return Err(invalid_data(ARTIFACT_SET_MISMATCH));
+    }
     let duplicate_path = ordered
         .iter()
         .any(|artifact| !paths.insert(artifact.descriptor.path.as_path()));
@@ -100,21 +104,23 @@ pub(super) fn scan_artifacts(
     sorter: &mut CollisionSorter,
     progress: &mut AuditProgressCallback<'_>,
 ) -> io::Result<ArtifactScanSummary> {
-    let authentication_total = checkpoint
+    let verification_total = checkpoint
         .v2_byte_count
-        .checked_mul(2)
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?;
-    let mut authentication_completed = 0u64;
+        .checked_mul(3)
+        .ok_or(invalid_data(COUNT_OVERFLOW))?;
+    let mut verification_completed = 0u64;
     let mut scan_completed = 0u64;
     let mut aggregate_counts = [0u64; 5];
     let mut source_identities = HashSet::new();
-    source_identities
-        .try_reserve(artifacts.len())
-        .map_err(|_| invalid_data(ARTIFACT_SET_MISMATCH))?;
+    if source_identities.try_reserve(artifacts.len()).is_err() {
+        return Err(invalid_data(ARTIFACT_SET_MISMATCH));
+    }
 
     for (shard, artifact) in checkpoint.shards.iter().zip(artifacts) {
-        let expected_digest = decode_sha256(&artifact.descriptor.metadata.sha256)
-            .map_err(|_| invalid_data(ARTIFACT_CONTENT_MISMATCH))?;
+        let expected_digest = match decode_sha256(&artifact.descriptor.metadata.sha256) {
+            Ok(digest) => digest,
+            Err(_) => return Err(invalid_data(ARTIFACT_CONTENT_MISMATCH)),
+        };
         let mut file = open_source_artifact(&artifact.descriptor.path)?;
         let identity = file_identity(&file)?;
         let physical_identity = physical_file_identity(&file)?;
@@ -126,30 +132,37 @@ pub(super) fn scan_artifacts(
         let first_digest = hash_open_file(
             &mut file,
             identity.byte_count,
-            authentication_completed,
-            authentication_total,
+            verification_completed,
+            verification_total,
             progress,
         )?;
-        authentication_completed = checked_add(authentication_completed, identity.byte_count)?;
+        verification_completed = checked_add(verification_completed, identity.byte_count)?;
         if first_digest != expected_digest || file_identity(&file)? != identity {
-            return Err(invalid_data(ARTIFACT_AUTHENTICATION_FAILED));
+            return Err(invalid_data(ARTIFACT_VERIFICATION_FAILED));
         }
 
         let mut shard_counts = [0u64; 5];
         let shard_row_count = artifact.descriptor.metadata.row_count;
         {
-            let mut validator = TaxIdentitySidecarV2StreamValidator::new(
+            let validator = TaxIdentitySidecarV2StreamValidator::new(
                 BufReader::with_capacity(HASH_BUFFER_BYTES, &mut file),
                 shard_row_count,
-            )
-            .map_err(|_| invalid_data(ARTIFACT_CONTENT_MISMATCH))?;
+            );
+            let mut validator = match validator {
+                Ok(validator) => validator,
+                Err(_) => return Err(invalid_data(ARTIFACT_CONTENT_MISMATCH)),
+            };
             if validator.header().policy_id() != checkpoint.token_policy_id {
                 return Err(invalid_data(ARTIFACT_CONTENT_MISMATCH));
             }
-            while let Some(record) = validator
-                .next_record()
-                .map_err(|_| invalid_data(ARTIFACT_CONTENT_MISMATCH))?
-            {
+            loop {
+                let next_record = match validator.next_record() {
+                    Ok(record) => record,
+                    Err(_) => return Err(invalid_data(ARTIFACT_CONTENT_MISMATCH)),
+                };
+                let Some(record) = next_record else {
+                    break;
+                };
                 let state_index = state_index(record.state());
                 shard_counts[state_index] = checked_add(shard_counts[state_index], 1)?;
                 if let Some(collision_record) = CollisionAuditRecord::from_sidecar(&record) {
@@ -176,25 +189,31 @@ pub(super) fn scan_artifacts(
             *aggregate = checked_add(*aggregate, observed)?;
         }
         if file_identity(&file)? != identity {
-            return Err(invalid_data(ARTIFACT_AUTHENTICATION_FAILED));
+            return Err(invalid_data(ARTIFACT_VERIFICATION_FAILED));
         }
         let second_digest = hash_open_file(
             &mut file,
             identity.byte_count,
-            authentication_completed,
-            authentication_total,
+            verification_completed,
+            verification_total,
             progress,
         )?;
-        authentication_completed = checked_add(authentication_completed, identity.byte_count)?;
-        if second_digest != expected_digest
-            || file_identity(&file)? != identity
-            || !path_still_binds_identity(&artifact.descriptor.path, &identity)
-        {
-            return Err(invalid_data(ARTIFACT_AUTHENTICATION_FAILED));
+        verification_completed = checked_add(verification_completed, identity.byte_count)?;
+        if second_digest != expected_digest || file_identity(&file)? != identity {
+            return Err(invalid_data(ARTIFACT_VERIFICATION_FAILED));
         }
+        reauthenticate_source_path(
+            &artifact.descriptor.path,
+            &identity,
+            expected_digest,
+            verification_completed,
+            verification_total,
+            progress,
+        )?;
+        verification_completed = checked_add(verification_completed, identity.byte_count)?;
     }
 
-    if authentication_completed != authentication_total
+    if verification_completed != verification_total
         || scan_completed != checkpoint.row_count
         || aggregate_counts
             != [
@@ -215,17 +234,13 @@ pub(super) fn scan_artifacts(
     })
 }
 
-fn path_still_binds_identity(path: &std::path::Path, expected: &FileIdentity) -> bool {
-    open_source_artifact(path)
-        .and_then(|file| file_identity(&file))
-        .is_ok_and(|observed| &observed == expected)
-}
-
 pub(super) fn validate_base_checkpoint(
     checkpoint: &TaxIdentitySidecarBundleCheckpoint,
 ) -> io::Result<()> {
-    let shard_count =
-        u64::try_from(checkpoint.shards.len()).map_err(|_| invalid_data(COUNT_OVERFLOW))?;
+    let shard_count = match u64::try_from(checkpoint.shards.len()) {
+        Ok(shard_count) => shard_count,
+        Err(_) => return Err(invalid_data(COUNT_OVERFLOW)),
+    };
     if checkpoint.contract != TAX_IDENTITY_SIDECAR_BUNDLE_CHECKPOINT_CONTRACT
         || checkpoint.publication_admissible
         || checkpoint.projection_authority != TAX_IDENTITY_SIDECAR_PROJECTION_AUTHORITY
@@ -238,6 +253,7 @@ pub(super) fn validate_base_checkpoint(
         || checkpoint.bundle_sha256
             != encode_hex(&bundle_digest(
                 &checkpoint.token_policy_id,
+                shard_count,
                 &checkpoint.shards,
             )?)
     {
@@ -287,13 +303,18 @@ fn validate_descriptor_binding(
     shard: &TaxIdentitySidecarShardCheckpoint,
     descriptor: &TaxIdentitySidecarV2ArtifactDescriptor,
 ) -> io::Result<()> {
-    validate_v2_metadata(&shard.shard_id, descriptor)
-        .map_err(|_| invalid_data(ARTIFACT_SET_MISMATCH))?;
+    if validate_v2_metadata(&shard.shard_id, descriptor).is_err() {
+        return Err(invalid_data(ARTIFACT_SET_MISMATCH));
+    }
     let metadata = &descriptor.metadata;
-    let digest =
-        decode_sha256(&metadata.sha256).map_err(|_| invalid_data(ARTIFACT_SET_MISMATCH))?;
-    let resource_identity = derived_v2_resource_identity(&shard.shard_id, metadata, &digest)
-        .map_err(|_| invalid_data(ARTIFACT_SET_MISMATCH))?;
+    let digest = match decode_sha256(&metadata.sha256) {
+        Ok(digest) => digest,
+        Err(_) => return Err(invalid_data(ARTIFACT_SET_MISMATCH)),
+    };
+    let resource_identity = match derived_v2_resource_identity(&shard.shard_id, metadata, &digest) {
+        Ok(identity) => identity,
+        Err(_) => return Err(invalid_data(ARTIFACT_SET_MISMATCH)),
+    };
     if metadata.source_shard_id != shard.shard_id
         || metadata.token_policy_id != bundle.token_policy_id
         || metadata.row_count != shard.row_count
@@ -336,151 +357,5 @@ fn state_index(state: TaxIdentityStateV2) -> usize {
         TaxIdentityStateV2::Missing => 2,
         TaxIdentityStateV2::Malformed => 3,
         TaxIdentityStateV2::UnsupportedType => 4,
-    }
-}
-
-fn hash_open_file(
-    file: &mut File,
-    expected_byte_count: u64,
-    progress_base: u64,
-    progress_total: u64,
-    progress: &mut AuditProgressCallback<'_>,
-) -> io::Result<[u8; 32]> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| invalid_data(ARTIFACT_UNAVAILABLE))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; HASH_BUFFER_BYTES];
-    let mut observed = 0u64;
-    while observed < expected_byte_count {
-        let requested =
-            usize::try_from((expected_byte_count - observed).min(HASH_BUFFER_BYTES as u64))
-                .map_err(|_| invalid_data(ARTIFACT_CONTENT_MISMATCH))?;
-        let read = file
-            .read(&mut buffer[..requested])
-            .map_err(|_| invalid_data(ARTIFACT_UNAVAILABLE))?;
-        if read == 0 {
-            return Err(invalid_data(ARTIFACT_CONTENT_MISMATCH));
-        }
-        hasher.update(&buffer[..read]);
-        observed = checked_add(observed, read as u64)?;
-        progress(
-            TaxIdentityCollisionAuditPhase::Authenticate,
-            checked_add(progress_base, observed)?,
-            progress_total,
-        )?;
-    }
-    let mut trailing = [0u8; 1];
-    if file
-        .read(&mut trailing)
-        .map_err(|_| invalid_data(ARTIFACT_UNAVAILABLE))?
-        != 0
-    {
-        return Err(invalid_data(ARTIFACT_CONTENT_MISMATCH));
-    }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| invalid_data(ARTIFACT_UNAVAILABLE))?;
-    Ok(hasher.finalize().into())
-}
-
-fn open_source_artifact(path: &std::path::Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
-        .map_err(|_| invalid_data(ARTIFACT_UNAVAILABLE))?;
-    if !file
-        .metadata()
-        .map_err(|_| invalid_data(ARTIFACT_UNAVAILABLE))?
-        .is_file()
-    {
-        return Err(invalid_data(ARTIFACT_UNAVAILABLE));
-    }
-    Ok(file)
-}
-
-#[derive(Clone, Eq, Hash, PartialEq)]
-struct FileIdentity {
-    byte_count: u64,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    modified_seconds: i64,
-    #[cfg(unix)]
-    modified_nanoseconds: i64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanoseconds: i64,
-    #[cfg(not(unix))]
-    modified: Option<std::time::SystemTime>,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct PhysicalFileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(not(unix))]
-#[derive(Eq, Hash, PartialEq)]
-struct PhysicalFileIdentity;
-
-#[cfg(unix)]
-fn physical_file_identity(file: &File) -> io::Result<PhysicalFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file
-        .metadata()
-        .map_err(|_| invalid_data(ARTIFACT_UNAVAILABLE))?;
-    if !metadata.is_file() {
-        return Err(invalid_data(ARTIFACT_UNAVAILABLE));
-    }
-    Ok(PhysicalFileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(not(unix))]
-fn physical_file_identity(_file: &File) -> io::Result<PhysicalFileIdentity> {
-    Err(invalid_data(ARTIFACT_AUTHENTICATION_FAILED))
-}
-
-fn file_identity(file: &File) -> io::Result<FileIdentity> {
-    let metadata = file
-        .metadata()
-        .map_err(|_| invalid_data(ARTIFACT_UNAVAILABLE))?;
-    if !metadata.is_file() {
-        return Err(invalid_data(ARTIFACT_UNAVAILABLE));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        Ok(FileIdentity {
-            byte_count: metadata.len(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(FileIdentity {
-            byte_count: metadata.len(),
-            modified: metadata.modified().ok(),
-        })
     }
 }

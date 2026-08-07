@@ -107,10 +107,10 @@ impl ScratchBudget {
     }
 
     pub(super) fn reserve(&mut self, byte_count: u64) -> io::Result<()> {
-        let projected = self
-            .used
-            .checked_add(byte_count)
-            .ok_or_else(|| invalid_data(SCRATCH_ACCOUNTING_INVALID))?;
+        let projected = match self.used.checked_add(byte_count) {
+            Some(projected) => projected,
+            None => return Err(invalid_data(SCRATCH_ACCOUNTING_INVALID)),
+        };
         if projected > self.limit {
             return Err(invalid_data(SCRATCH_LIMIT_EXCEEDED));
         }
@@ -120,10 +120,10 @@ impl ScratchBudget {
     }
 
     pub(super) fn release(&mut self, byte_count: u64) -> io::Result<()> {
-        self.used = self
-            .used
-            .checked_sub(byte_count)
-            .ok_or_else(|| invalid_data(SCRATCH_ACCOUNTING_INVALID))?;
+        self.used = match self.used.checked_sub(byte_count) {
+            Some(remaining) => remaining,
+            None => return Err(invalid_data(SCRATCH_ACCOUNTING_INVALID)),
+        };
         Ok(())
     }
 
@@ -167,7 +167,7 @@ impl PrivateScratch {
         let scratch = Self::create_inner(root)?;
         let required_capacity = required_bytes
             .checked_add(minimum_free_bytes)
-            .ok_or_else(|| invalid_data(SCRATCH_CAPACITY_INSUFFICIENT))?;
+            .ok_or(invalid_data(SCRATCH_CAPACITY_INSUFFICIENT))?;
         if scratch.available_bytes()? < required_capacity {
             return Err(invalid_data(SCRATCH_CAPACITY_INSUFFICIENT));
         }
@@ -287,43 +287,50 @@ fn hash_open_file(
     expected_byte_count: u64,
     poll: &mut ScratchPollCallback<'_>,
 ) -> io::Result<[u8; 32]> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return Err(invalid_data(SCRATCH_UNAVAILABLE));
+    }
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; HASH_BUFFER_BYTES];
     let mut remaining = expected_byte_count;
     while remaining != 0 {
-        let requested = usize::try_from(remaining.min(HASH_BUFFER_BYTES as u64))
-            .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
-        let read = file
-            .read(&mut buffer[..requested])
-            .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
+        let requested = match usize::try_from(remaining.min(HASH_BUFFER_BYTES as u64)) {
+            Ok(requested) => requested,
+            Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+        };
+        let read = match file.read(&mut buffer[..requested]) {
+            Ok(read) => read,
+            Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+        };
         if read == 0 {
             return Err(invalid_data(SCRATCH_UNAVAILABLE));
         }
         hasher.update(&buffer[..read]);
-        remaining = remaining
-            .checked_sub(read as u64)
-            .ok_or_else(|| invalid_data(SCRATCH_UNAVAILABLE))?;
+        remaining = match remaining.checked_sub(read as u64) {
+            Some(remaining) => remaining,
+            None => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+        };
         poll()?;
     }
     let mut trailing = [0u8; 1];
-    if file
-        .read(&mut trailing)
-        .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?
-        != 0
-    {
+    let trailing_count = match file.read(&mut trailing) {
+        Ok(count) => count,
+        Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+    };
+    if trailing_count != 0 {
         return Err(invalid_data(SCRATCH_UNAVAILABLE));
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return Err(invalid_data(SCRATCH_UNAVAILABLE));
+    }
     Ok(hasher.finalize().into())
 }
 
 fn file_identity(file: &File) -> io::Result<ScratchFileIdentity> {
-    let metadata = file
-        .metadata()
-        .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+    };
     if !metadata.is_file() {
         return Err(invalid_data(SCRATCH_UNAVAILABLE));
     }

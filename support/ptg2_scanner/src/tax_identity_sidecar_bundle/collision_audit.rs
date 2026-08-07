@@ -1,8 +1,11 @@
 //! Bounded, validation-only cross-row collision audit for v2 tax identities.
 //!
 //! The audit is deliberately separate from provider-graph compilation. It
-//! produces only a nonpublishable checkpoint bound to an already validated
-//! sidecar bundle; v1 remains the sole projection authority.
+//! verifies supplied artifact bytes against a caller-supplied checkpoint and
+//! evaluates bounded collision properties. It does not authenticate descriptor
+//! provenance, prove that the caller's provider-group universe is complete, or
+//! authorize publication. The result is always nonpublishable and v1 remains
+//! the sole projection authority.
 
 mod artifacts;
 mod contracts;
@@ -70,8 +73,8 @@ pub fn audit_tax_identity_sidecar_bundle(
 
 /// Run the bounded audit and report cancellation-safe, phase-global progress.
 ///
-/// Returning an error from `progress` cancels the audit before publication of
-/// a checkpoint. Scratch artifacts are owned by an RAII cleanup boundary.
+/// Returning an error from `progress` cancels the audit before a checkpoint is
+/// returned. Scratch artifacts are owned by an RAII cleanup boundary.
 pub fn audit_tax_identity_sidecar_bundle_with_progress<
     P: FnMut(TaxIdentityCollisionAuditProgress) -> io::Result<()>,
 >(
@@ -82,9 +85,14 @@ pub fn audit_tax_identity_sidecar_bundle_with_progress<
 ) -> io::Result<TaxIdentityCollisionAuditResult> {
     let mut cancellation_poll_count = 0u64;
     let mut tracked_progress = |phase, completed, total| {
-        cancellation_poll_count = cancellation_poll_count
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("PTG tax identity collision audit count overflow"))?;
+        cancellation_poll_count = match cancellation_poll_count.checked_add(1) {
+            Some(next_count) => next_count,
+            None => {
+                return Err(invalid_data(
+                    "PTG tax identity collision audit count overflow",
+                ));
+            }
+        };
         progress(TaxIdentityCollisionAuditProgress {
             phase,
             completed,
@@ -98,7 +106,9 @@ pub fn audit_tax_identity_sidecar_bundle_with_progress<
     let expected_matched_rows = source_checkpoint
         .matched_ein_count
         .checked_add(source_checkpoint.matched_npi_count)
-        .ok_or_else(|| invalid_data("PTG tax identity collision audit count overflow"))?;
+        .ok_or(invalid_data(
+            "PTG tax identity collision audit count overflow",
+        ))?;
     let sort_plan = CollisionSortPlan::admit(
         source_checkpoint.row_count,
         expected_matched_rows,

@@ -104,7 +104,7 @@ fn preexisting_truncation_and_append_are_rejected_at_declared_bounds() {
 }
 
 #[test]
-fn in_place_content_tamper_during_authentication_is_rejected() {
+fn in_place_content_tamper_during_source_verification_is_rejected() {
     let fixture = matched_fixture();
     let source = fixture.descriptors[0].path.clone();
     let first_hash_end = fixture.descriptors[0].metadata.byte_count;
@@ -117,7 +117,7 @@ fn in_place_content_tamper_during_authentication_is_rejected() {
         &config(scratch.clone(), 1_000_000, 2, 6),
         |event| {
             if !mutated
-                && event.phase == TaxIdentityCollisionAuditPhase::Authenticate
+                && event.phase == TaxIdentityCollisionAuditPhase::VerifySource
                 && event.completed == first_hash_end
             {
                 let mut file = fs::OpenOptions::new().write(true).open(&source)?;
@@ -132,7 +132,7 @@ fn in_place_content_tamper_during_authentication_is_rejected() {
     .unwrap_err();
 
     assert!(mutated);
-    assert_eq!(error.to_string(), artifacts::ARTIFACT_AUTHENTICATION_FAILED);
+    assert_eq!(error.to_string(), artifacts::ARTIFACT_VERIFICATION_FAILED);
     assert!(directory_is_empty(&scratch));
 }
 
@@ -161,16 +161,16 @@ fn held_source_fd_is_reauthenticated_after_record_consumption() {
     .unwrap_err();
 
     assert!(tampered);
-    assert_eq!(error.to_string(), artifacts::ARTIFACT_AUTHENTICATION_FAILED);
+    assert_eq!(error.to_string(), artifacts::ARTIFACT_VERIFICATION_FAILED);
     assert!(directory_is_empty(&scratch));
 }
 
 #[test]
-fn atomic_path_replacement_during_authentication_is_rejected() {
+fn same_bytes_path_replacement_during_held_rehash_is_rejected() {
     let fixture = matched_fixture();
     let source = fixture.descriptors[0].path.clone();
     let original = fs::read(&source).unwrap();
-    let first_hash_end = fixture.descriptors[0].metadata.byte_count;
+    let byte_count = fixture.descriptors[0].metadata.byte_count;
     let scratch = fixture.scratch_root("source-path-replacement");
     let mut replaced = false;
 
@@ -180,8 +180,8 @@ fn atomic_path_replacement_during_authentication_is_rejected() {
         &config(scratch.clone(), 1_000_000, 2, 6),
         |event| {
             if !replaced
-                && event.phase == TaxIdentityCollisionAuditPhase::Authenticate
-                && event.completed == first_hash_end
+                && event.phase == TaxIdentityCollisionAuditPhase::VerifySource
+                && event.completed == byte_count * 2
             {
                 fs::remove_file(&source)?;
                 fs::write(&source, &original)?;
@@ -193,7 +193,95 @@ fn atomic_path_replacement_during_authentication_is_rejected() {
     .unwrap_err();
 
     assert!(replaced);
-    assert_eq!(error.to_string(), artifacts::ARTIFACT_AUTHENTICATION_FAILED);
+    assert_eq!(error.to_string(), artifacts::ARTIFACT_VERIFICATION_FAILED);
+    assert!(directory_is_empty(&scratch));
+}
+
+#[test]
+fn successful_source_verification_hashes_the_reopened_path() {
+    let fixture = matched_fixture();
+    let byte_count = fixture.descriptors[0].metadata.byte_count;
+    let scratch = fixture.scratch_root("source-reopened-hash");
+    let mut maximum_verified = 0;
+
+    audit_tax_identity_sidecar_bundle_with_progress(
+        &fixture.checkpoint,
+        &fixture.descriptors,
+        &config(scratch.clone(), 1_000_000, 2, 6),
+        |event| {
+            if event.phase == TaxIdentityCollisionAuditPhase::VerifySource {
+                maximum_verified = maximum_verified.max(event.completed);
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(maximum_verified, byte_count * 3);
+    assert!(directory_is_empty(&scratch));
+}
+
+#[test]
+fn same_bytes_path_replacement_at_reopened_hash_completion_is_rejected() {
+    let fixture = matched_fixture();
+    let source = fixture.descriptors[0].path.clone();
+    let original = fs::read(&source).unwrap();
+    let byte_count = fixture.descriptors[0].metadata.byte_count;
+    let scratch = fixture.scratch_root("source-final-path-replacement");
+    let mut replaced = false;
+
+    let error = audit_tax_identity_sidecar_bundle_with_progress(
+        &fixture.checkpoint,
+        &fixture.descriptors,
+        &config(scratch.clone(), 1_000_000, 2, 6),
+        |event| {
+            if !replaced
+                && event.phase == TaxIdentityCollisionAuditPhase::VerifySource
+                && event.completed == byte_count * 3
+            {
+                fs::remove_file(&source)?;
+                fs::write(&source, &original)?;
+                replaced = true;
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+
+    assert!(replaced);
+    assert_eq!(error.to_string(), artifacts::ARTIFACT_VERIFICATION_FAILED);
+    assert!(directory_is_empty(&scratch));
+}
+
+#[test]
+fn path_removal_at_reopened_hash_completion_is_redacted() {
+    let fixture = matched_fixture();
+    let source = fixture.descriptors[0].path.clone();
+    let byte_count = fixture.descriptors[0].metadata.byte_count;
+    let scratch = fixture.scratch_root("source-final-path-removal");
+    let mut removed = false;
+
+    let error = audit_tax_identity_sidecar_bundle_with_progress(
+        &fixture.checkpoint,
+        &fixture.descriptors,
+        &config(scratch.clone(), 1_000_000, 2, 6),
+        |event| {
+            if !removed
+                && event.phase == TaxIdentityCollisionAuditPhase::VerifySource
+                && event.completed == byte_count * 3
+            {
+                fs::remove_file(&source)?;
+                removed = true;
+            }
+            Ok(())
+        },
+    )
+    .unwrap_err();
+
+    let message = error.to_string();
+    assert!(removed);
+    assert_eq!(message, artifacts::ARTIFACT_VERIFICATION_FAILED);
+    assert!(!message.contains(source.to_string_lossy().as_ref()));
     assert!(directory_is_empty(&scratch));
 }
 

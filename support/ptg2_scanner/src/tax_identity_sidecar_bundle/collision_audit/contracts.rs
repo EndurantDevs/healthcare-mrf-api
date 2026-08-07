@@ -50,7 +50,7 @@ impl fmt::Debug for TaxIdentityCollisionAuditConfig {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TaxIdentityCollisionAuditPhase {
     Admission,
-    Authenticate,
+    VerifySource,
     Scan,
     Spill,
     Merge,

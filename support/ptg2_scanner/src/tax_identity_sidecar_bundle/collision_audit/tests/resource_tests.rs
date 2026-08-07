@@ -232,7 +232,7 @@ fn every_progress_phase_can_cancel_without_leaking_scratch_or_a_checkpoint() {
     let fixture = BundleFixture::new(vec![rows]);
     let phases = [
         TaxIdentityCollisionAuditPhase::Admission,
-        TaxIdentityCollisionAuditPhase::Authenticate,
+        TaxIdentityCollisionAuditPhase::VerifySource,
         TaxIdentityCollisionAuditPhase::Scan,
         TaxIdentityCollisionAuditPhase::Spill,
         TaxIdentityCollisionAuditPhase::Merge,

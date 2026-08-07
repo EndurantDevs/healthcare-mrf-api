@@ -1,4 +1,5 @@
 use super::*;
+use crate::tax_identity_sidecar_bundle::digests::encode_hex;
 use std::fs::OpenOptions;
 
 impl PrivateScratch {
@@ -7,16 +8,19 @@ impl PrivateScratch {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::fs::OpenOptionsExt;
 
-        let root_directory = OpenOptions::new()
+        let root_directory_result = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(root)
-            .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
-        if !root_directory
-            .metadata()
-            .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?
-            .is_dir()
-        {
+            .open(root);
+        let root_directory = match root_directory_result {
+            Ok(directory) => directory,
+            Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+        };
+        let root_metadata = match root_directory.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+        };
+        if !root_metadata.is_dir() {
             return Err(invalid_data(SCRATCH_UNAVAILABLE));
         }
         for _ in 0..MAX_NAME_ATTEMPTS {
@@ -116,11 +120,11 @@ impl PrivateScratch {
         if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
             return Err(invalid_data(SCRATCH_UNAVAILABLE));
         }
-        if !file
-            .metadata()
-            .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?
-            .is_file()
-        {
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+        };
+        if !metadata.is_file() {
             return Err(invalid_data(SCRATCH_UNAVAILABLE));
         }
         Ok(())
@@ -201,8 +205,11 @@ impl PrivateScratch {
         let statistics = unsafe { statistics.assume_init() };
         let available = u128::from(statistics.f_bavail)
             .checked_mul(u128::from(statistics.f_frsize))
-            .ok_or_else(|| invalid_data(SCRATCH_CAPACITY_INSUFFICIENT))?;
-        u64::try_from(available).map_err(|_| invalid_data(SCRATCH_CAPACITY_INSUFFICIENT))
+            .ok_or(invalid_data(SCRATCH_CAPACITY_INSUFFICIENT))?;
+        match u64::try_from(available) {
+            Ok(available) => Ok(available),
+            Err(_) => Err(invalid_data(SCRATCH_CAPACITY_INSUFFICIENT)),
+        }
     }
 
     #[cfg(not(unix))]
@@ -276,31 +283,30 @@ impl Drop for PrivateScratch {
 
 #[cfg(unix)]
 fn secure_random_directory_name() -> io::Result<String> {
-    use std::fmt::Write as _;
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 
-    let mut random = OpenOptions::new()
+    let random_result = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open("/dev/urandom")
-        .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
-    if !random
-        .metadata()
-        .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?
-        .file_type()
-        .is_char_device()
-    {
+        .open("/dev/urandom");
+    let mut random = match random_result {
+        Ok(file) => file,
+        Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+    };
+    let metadata = match random.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+    };
+    if !metadata.file_type().is_char_device() {
         return Err(invalid_data(SCRATCH_UNAVAILABLE));
     }
     let mut entropy = [0u8; 16];
-    random
-        .read_exact(&mut entropy)
-        .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
+    if random.read_exact(&mut entropy).is_err() {
+        return Err(invalid_data(SCRATCH_UNAVAILABLE));
+    }
     let mut name = String::with_capacity(52);
     name.push_str(".ptg2-tax-collision-");
-    for byte in entropy {
-        write!(&mut name, "{byte:02x}").map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
-    }
+    name.push_str(&encode_hex(&entropy));
     Ok(name)
 }
 
@@ -308,9 +314,10 @@ fn secure_random_directory_name() -> io::Result<String> {
 fn private_directory_metadata(directory: &File) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = directory
-        .metadata()
-        .map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))?;
+    let metadata = match directory.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Err(invalid_data(SCRATCH_UNAVAILABLE)),
+    };
     Ok(metadata.is_dir()
         && metadata.mode() & 0o777 == 0o700
         && metadata.uid() == unsafe { libc::geteuid() })
@@ -318,7 +325,10 @@ fn private_directory_metadata(directory: &File) -> io::Result<bool> {
 
 #[cfg(unix)]
 fn c_string(value: &str) -> io::Result<std::ffi::CString> {
-    std::ffi::CString::new(value).map_err(|_| invalid_data(SCRATCH_UNAVAILABLE))
+    match std::ffi::CString::new(value) {
+        Ok(encoded) => Ok(encoded),
+        Err(_) => Err(invalid_data(SCRATCH_UNAVAILABLE)),
+    }
 }
 
 #[cfg(all(test, unix))]

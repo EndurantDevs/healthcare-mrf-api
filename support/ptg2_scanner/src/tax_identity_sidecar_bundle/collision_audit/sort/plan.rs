@@ -63,7 +63,7 @@ impl CollisionSortPlan {
         let available_chunk_bytes = limits
             .max_memory_bytes
             .checked_sub(runtime_owned_bytes)
-            .ok_or_else(|| invalid_data(MEMORY_LIMIT_EXCEEDED))?;
+            .ok_or(invalid_data(MEMORY_LIMIT_EXCEEDED))?;
         let chunk_records = (available_chunk_bytes / record_bytes)
             .min(matched_rows.max(1))
             .min(MAX_CHUNK_RECORDS);
@@ -73,7 +73,10 @@ impl CollisionSortPlan {
         let chunk_record_capacity = if matched_rows == 0 {
             0
         } else {
-            usize::try_from(chunk_records).map_err(|_| invalid_data(MEMORY_LIMIT_EXCEEDED))?
+            match usize::try_from(chunk_records) {
+                Ok(capacity) => capacity,
+                Err(_) => return Err(invalid_data(MEMORY_LIMIT_EXCEEDED)),
+            }
         };
         Ok(Self {
             expected_records: matched_rows,
@@ -119,7 +122,7 @@ fn validate_counts(
         limits
             .merge_fan_in
             .checked_add(4)
-            .ok_or_else(|| invalid_data(INVALID_LIMITS))?
+            .ok_or(invalid_data(INVALID_LIMITS))?
     };
     if limits.max_open_files < required_open_files {
         return Err(invalid_data(INVALID_LIMITS));
@@ -134,7 +137,7 @@ fn required_scratch_bytes(
     let required = matched_rows
         .checked_mul(TAX_IDENTITY_COLLISION_AUDIT_RECORD_BYTES as u64)
         .and_then(|value| value.checked_mul(2))
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?;
+        .ok_or(invalid_data(COUNT_OVERFLOW))?;
     if required > limits.max_scratch_bytes {
         return Err(invalid_data(SCRATCH_LIMIT_EXCEEDED));
     }
@@ -146,14 +149,17 @@ fn runtime_owned_bytes(
     artifact_count: usize,
     limits: TaxIdentityCollisionAuditLimits,
 ) -> io::Result<u64> {
-    let artifacts = u64::try_from(artifact_count)
-        .map_err(|_| invalid_data(COUNT_OVERFLOW))?
+    let artifact_count = match u64::try_from(artifact_count) {
+        Ok(count) => count,
+        Err(_) => return Err(invalid_data(COUNT_OVERFLOW)),
+    };
+    let artifacts = artifact_count
         .checked_mul(ARTIFACT_TRACKING_UPPER_BOUND_BYTES)
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?;
+        .ok_or(invalid_data(COUNT_OVERFLOW))?;
     if matched_rows == 0 {
         return IO_BUFFER_BYTES
             .checked_add(artifacts)
-            .ok_or_else(|| invalid_data(COUNT_OVERFLOW));
+            .ok_or(invalid_data(COUNT_OVERFLOW));
     }
     let fan_in = limits.merge_fan_in as u64;
     // Input readers + output writer + outer source reader + scratch
@@ -161,23 +167,23 @@ fn runtime_owned_bytes(
     let buffers = fan_in
         .checked_add(3)
         .and_then(|value| value.checked_mul(IO_BUFFER_BYTES))
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?;
+        .ok_or(invalid_data(COUNT_OVERFLOW))?;
     let heap = fan_in
         .checked_mul(HEAP_ENTRY_UPPER_BOUND_BYTES)
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?;
+        .ok_or(invalid_data(COUNT_OVERFLOW))?;
     let active_runs = fan_in
         .checked_sub(1)
         .and_then(|value| value.checked_mul(MAX_RUN_LEVELS))
         .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?;
+        .ok_or(invalid_data(COUNT_OVERFLOW))?;
     let run_metadata = active_runs
         .checked_mul(RUN_METADATA_UPPER_BOUND_BYTES)
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?;
+        .ok_or(invalid_data(COUNT_OVERFLOW))?;
     buffers
         .checked_add(heap)
         .and_then(|value| value.checked_add(run_metadata))
         .and_then(|value| value.checked_add(artifacts))
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))
+        .ok_or(invalid_data(COUNT_OVERFLOW))
 }
 
 fn planned_merge_records(
@@ -188,14 +194,20 @@ fn planned_merge_records(
     if expected_records == 0 {
         return Ok(0);
     }
-    let chunk = u64::try_from(chunk_record_capacity).map_err(|_| invalid_data(COUNT_OVERFLOW))?;
-    let fan_in = u64::try_from(merge_fan_in).map_err(|_| invalid_data(COUNT_OVERFLOW))?;
+    let chunk = match u64::try_from(chunk_record_capacity) {
+        Ok(chunk) => chunk,
+        Err(_) => return Err(invalid_data(COUNT_OVERFLOW)),
+    };
+    let fan_in = match u64::try_from(merge_fan_in) {
+        Ok(fan_in) => fan_in,
+        Err(_) => return Err(invalid_data(COUNT_OVERFLOW)),
+    };
     if chunk == 0 || fan_in < 2 {
         return Err(invalid_data(INVALID_LIMITS));
     }
     let mut run_count = expected_records
         .checked_add(chunk - 1)
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?
+        .ok_or(invalid_data(COUNT_OVERFLOW))?
         / chunk;
     let mut regular_size = chunk;
     let mut last_size = match expected_records % chunk {
@@ -212,24 +224,24 @@ fn planned_merge_records(
             checked_add(
                 (processed_count - 1)
                     .checked_mul(regular_size)
-                    .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?,
+                    .ok_or(invalid_data(COUNT_OVERFLOW))?,
                 last_size,
             )?
         } else {
             processed_count
                 .checked_mul(regular_size)
-                .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?
+                .ok_or(invalid_data(COUNT_OVERFLOW))?
         };
         total = checked_add(total, processed)?;
         append_residual_runs(&mut residual_runs, residual_count, regular_size, last_size)?;
         let next_regular = regular_size
             .checked_mul(fan_in)
-            .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?;
+            .ok_or(invalid_data(COUNT_OVERFLOW))?;
         last_size = if residual_count == 0 {
             checked_add(
                 regular_size
                     .checked_mul(fan_in - 1)
-                    .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?,
+                    .ok_or(invalid_data(COUNT_OVERFLOW))?,
                 last_size,
             )?
         } else {
@@ -258,16 +270,18 @@ fn append_residual_runs(
     if count == 0 {
         return Ok(());
     }
-    let regular_count = usize::try_from(count - 1).map_err(|_| invalid_data(COUNT_OVERFLOW))?;
-    output
-        .try_reserve(regular_count.saturating_add(1))
-        .map_err(|_| invalid_data(MEMORY_LIMIT_EXCEEDED))?;
+    let regular_count = match usize::try_from(count - 1) {
+        Ok(count) => count,
+        Err(_) => return Err(invalid_data(COUNT_OVERFLOW)),
+    };
+    if output.try_reserve(regular_count.saturating_add(1)).is_err() {
+        return Err(invalid_data(MEMORY_LIMIT_EXCEEDED));
+    }
     output.extend(std::iter::repeat_n(regular_size, regular_count));
     output.push(last_size);
     Ok(())
 }
 
 fn checked_add(left: u64, right: u64) -> io::Result<u64> {
-    left.checked_add(right)
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))
+    left.checked_add(right).ok_or(invalid_data(COUNT_OVERFLOW))
 }

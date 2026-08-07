@@ -71,10 +71,12 @@ impl CollisionSorter {
             )?)
         };
         let mut records = Vec::new();
-        if plan.chunk_record_capacity != 0 {
-            records
+        if plan.chunk_record_capacity != 0
+            && records
                 .try_reserve_exact(plan.chunk_record_capacity)
-                .map_err(|_| invalid_data(MEMORY_LIMIT_EXCEEDED))?;
+                .is_err()
+        {
+            return Err(invalid_data(MEMORY_LIMIT_EXCEEDED));
         }
         Ok(Self {
             scratch,
@@ -159,8 +161,10 @@ impl CollisionSorter {
 
     fn spill_chunk(&mut self, progress: &mut AuditProgressCallback<'_>) -> io::Result<()> {
         self.records.sort_unstable();
-        let record_count =
-            u64::try_from(self.records.len()).map_err(|_| invalid_data(COUNT_OVERFLOW))?;
+        let record_count = match u64::try_from(self.records.len()) {
+            Ok(record_count) => record_count,
+            Err(_) => return Err(invalid_data(COUNT_OVERFLOW)),
+        };
         let byte_count = checked_record_bytes(record_count)?;
         self.budget.reserve(byte_count)?;
         let (pending_run, file) = self
@@ -169,9 +173,9 @@ impl CollisionSorter {
         let mut writer = BufWriter::with_capacity(IO_BUFFER_BYTES, file);
         let spill_base = self.spilled_records;
         for (index, record) in self.records.iter().enumerate() {
-            writer
-                .write_all(&record.encode())
-                .map_err(|_| invalid_data(RUN_INVALID))?;
+            if writer.write_all(&record.encode()).is_err() {
+                return Err(invalid_data(RUN_INVALID));
+            }
             poll_records(
                 progress,
                 TaxIdentityCollisionAuditPhase::Spill,
@@ -179,17 +183,20 @@ impl CollisionSorter {
                 self.expected_records,
             )?;
         }
-        writer.flush().map_err(|_| invalid_data(RUN_INVALID))?;
-        if writer
-            .get_ref()
-            .metadata()
-            .map_err(|_| invalid_data(RUN_INVALID))?
-            .len()
-            != byte_count
-        {
+        if writer.flush().is_err() {
             return Err(invalid_data(RUN_INVALID));
         }
-        let mut file = writer.into_inner().map_err(|_| invalid_data(RUN_INVALID))?;
+        let metadata = match writer.get_ref().metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Err(invalid_data(RUN_INVALID)),
+        };
+        if metadata.len() != byte_count {
+            return Err(invalid_data(RUN_INVALID));
+        }
+        let mut file = match writer.into_inner() {
+            Ok(file) => file,
+            Err(_) => return Err(invalid_data(RUN_INVALID)),
+        };
         let spill_completed = checked_add(spill_base, record_count)?;
         let mut poll = || {
             progress(
@@ -227,9 +234,10 @@ impl CollisionSorter {
                 Vec::with_capacity(self.merge_fan_in),
             );
             run = self.merge_runs(group, progress)?;
-            level = level
-                .checked_add(1)
-                .ok_or_else(|| invalid_data(COUNT_OVERFLOW))?;
+            level = match level.checked_add(1) {
+                Some(level) => level,
+                None => return Err(invalid_data(COUNT_OVERFLOW)),
+            };
         }
     }
 
@@ -263,17 +271,20 @@ impl CollisionSorter {
         if checked_record_bytes(merged_records)? != byte_count {
             return Err(invalid_data(RUN_INVALID));
         }
-        writer.flush().map_err(|_| invalid_data(RUN_INVALID))?;
-        if writer
-            .get_ref()
-            .metadata()
-            .map_err(|_| invalid_data(RUN_INVALID))?
-            .len()
-            != byte_count
-        {
+        if writer.flush().is_err() {
             return Err(invalid_data(RUN_INVALID));
         }
-        let mut output_file = writer.into_inner().map_err(|_| invalid_data(RUN_INVALID))?;
+        let metadata = match writer.get_ref().metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Err(invalid_data(RUN_INVALID)),
+        };
+        if metadata.len() != byte_count {
+            return Err(invalid_data(RUN_INVALID));
+        }
+        let mut output_file = match writer.into_inner() {
+            Ok(file) => file,
+            Err(_) => return Err(invalid_data(RUN_INVALID)),
+        };
         let merge_completed = checked_add(merge_base, merged_records)?;
         let mut seal_poll = || {
             progress(
@@ -333,9 +344,10 @@ impl CollisionSorter {
     }
 
     fn scratch_ref(&self) -> io::Result<&PrivateScratch> {
-        self.scratch
-            .as_ref()
-            .ok_or_else(|| invalid_data(RUN_INVALID))
+        match self.scratch.as_ref() {
+            Some(scratch) => Ok(scratch),
+            None => Err(invalid_data(RUN_INVALID)),
+        }
     }
 }
 
@@ -370,9 +382,11 @@ fn merge_sorted_runs(
     let mut output_records = 0u64;
     while let Some(Reverse((record, run_index))) = heap.pop() {
         match &mut sink {
-            MergeSink::Writer(output) => output
-                .write_all(&record.encode())
-                .map_err(|_| invalid_data(RUN_INVALID))?,
+            MergeSink::Writer(output) => {
+                if output.write_all(&record.encode()).is_err() {
+                    return Err(invalid_data(RUN_INVALID));
+                }
+            }
             MergeSink::Accumulator(audit) => audit.observe(record)?,
         }
         output_records = checked_increment(output_records)?;
@@ -429,29 +443,36 @@ fn poll_records(
 }
 
 fn checked_record_bytes(record_count: u64) -> io::Result<u64> {
-    record_count
-        .checked_mul(TAX_IDENTITY_COLLISION_AUDIT_RECORD_BYTES as u64)
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))
+    match record_count.checked_mul(TAX_IDENTITY_COLLISION_AUDIT_RECORD_BYTES as u64) {
+        Some(byte_count) => Ok(byte_count),
+        None => Err(invalid_data(COUNT_OVERFLOW)),
+    }
 }
 
 fn sum_run_bytes(runs: &[ScratchRun]) -> io::Result<u64> {
-    runs.iter().try_fold(0u64, |total, run| {
+    let mut total = 0u64;
+    for run in runs {
         if run.byte_count() % TAX_IDENTITY_COLLISION_AUDIT_RECORD_BYTES as u64 != 0 {
             return Err(invalid_data(RUN_INVALID));
         }
-        total
-            .checked_add(run.byte_count())
-            .ok_or_else(|| invalid_data(COUNT_OVERFLOW))
-    })
+        total = match total.checked_add(run.byte_count()) {
+            Some(total) => total,
+            None => return Err(invalid_data(COUNT_OVERFLOW)),
+        };
+    }
+    Ok(total)
 }
 
 fn checked_increment(value: u64) -> io::Result<u64> {
-    value
-        .checked_add(1)
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))
+    match value.checked_add(1) {
+        Some(value) => Ok(value),
+        None => Err(invalid_data(COUNT_OVERFLOW)),
+    }
 }
 
 fn checked_add(left: u64, right: u64) -> io::Result<u64> {
-    left.checked_add(right)
-        .ok_or_else(|| invalid_data(COUNT_OVERFLOW))
+    match left.checked_add(right) {
+        Some(value) => Ok(value),
+        None => Err(invalid_data(COUNT_OVERFLOW)),
+    }
 }
