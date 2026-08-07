@@ -138,6 +138,14 @@ def test_request_rejects_direct_construction_and_all_field_tampering() -> None:
             request_contract.validate_billing_search_request(parsed)
 
 
+def test_request_rejects_query_pairs_that_normalize_to_no_request() -> None:
+    parsed = _parse()
+    object.__setattr__(parsed, "_BillingSearchRequest__query_pairs", ())
+
+    with pytest.raises(request_contract.BillingSearchRequestError):
+        request_contract.validate_billing_search_request(parsed)
+
+
 @pytest.mark.parametrize(
     ("field_name", "type_confusable_value"),
     [("include_evidence", 0), ("limit", 25.0)],
