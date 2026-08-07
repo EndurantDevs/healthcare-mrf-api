@@ -23,7 +23,9 @@ from api.billing_search_selector_contract import (
     BILLING_SELECTOR_PROJECTION_UNAVAILABLE,
     BillingSearchBindingPin,
     BillingSearchSelectorBindingScope,
+    BillingSearchSelectorNotFoundError,
     BillingSearchSelectorResolution,
+    BillingSearchSelectorResourceNotFoundError,
     BillingSearchSelectorScope,
     serving_unavailable,
 )
@@ -51,13 +53,6 @@ _RESOURCE_NOT_FOUND = "billing_search_resource_not_found"
 _PREPARATION_READY = "ready"
 _PREPARATION_NOT_FOUND = "not_found"
 _PREPARATION_UNAVAILABLE = "unavailable"
-
-
-class BillingSearchSelectorNotFoundError(LookupError):
-    """Generic inaccessible-or-unknown resource failure for HTTP 404."""
-
-
-BillingSearchSelectorResourceNotFoundError = BillingSearchSelectorNotFoundError
 
 
 def _resource_not_found() -> BillingSearchSelectorNotFoundError:
@@ -143,9 +138,7 @@ def _verified_policy_token(
     *,
     environment_map: Mapping[str, str] | None,
 ) -> TinTaxIdentityToken:
-    expected_descriptor = token_policy_descriptor_sha256(
-        publication.token_policy_id
-    )
+    expected_descriptor = token_policy_descriptor_sha256(publication.token_policy_id)
     if not hmac.compare_digest(
         publication.token_policy_descriptor_sha256.hex(),
         expected_descriptor,
@@ -414,8 +407,7 @@ async def _resolve_prepared_selector(
         prepared.selector_kind == "billing_entity_ref"
         and resolved_scopes
         and all(
-            binding.state == BILLING_SELECTOR_NO_MATCH
-            for binding in resolved_scopes
+            binding.state == BILLING_SELECTOR_NO_MATCH for binding in resolved_scopes
         )
     ):
         raise _resource_not_found()
