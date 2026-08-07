@@ -84,6 +84,22 @@ def _scope(
     )
 
 
+def _claimed_forward_lookup(forward_result):
+    async def read_claimed_result(*_args, retention_budget, **_kwargs):
+        retained_bytes = (
+            reader.ptg2_db_sidecars.forward_occurrence_batch_retained_bytes(
+                forward_result
+            )
+        )
+        retention_budget.claim(
+            retained_bytes,
+            category="the synthetic exact-reader forward result",
+        )
+        return forward_result
+
+    return AsyncMock(return_value=forward_result, side_effect=read_claimed_result)
+
+
 def _patch_graph(
     monkeypatch,
     *,
@@ -119,19 +135,19 @@ def _patch_graph(
             function_name,
             AsyncMock(return_value=response_value),
         )
-    forward = AsyncMock(
-        return_value=(
-            occurrences_by_code
-            if occurrences_by_code is not None
-            else {
-                10: (
-                    (3, 100, 0),
-                    (3, 101, 1),
-                    (4, 103, 1),
-                )
-            }
-        )
+    forward_result = (
+        occurrences_by_code
+        if occurrences_by_code is not None
+        else {
+            10: (
+                (3, 100, 0),
+                (3, 101, 1),
+                (4, 103, 1),
+            )
+        }
     )
+
+    forward = _claimed_forward_lookup(forward_result)
     monkeypatch.setattr(
         reader.ptg2_db_sidecars,
         "lookup_forward_occurrences_batch_from_db",

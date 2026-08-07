@@ -7,12 +7,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from api import ptg2_billing_exact_reader as exact_reader
 from api import ptg2_db_sidecars as sidecars
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
     CandidateAuditDecodedRetentionError,
 )
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from tests.ptg2_billing_exact_reader_support import _patch_graph, _scope, _tables
 
 
 class _AuditAbort(BaseException):
@@ -275,3 +277,58 @@ async def test_empty_occurrence_scope_retains_no_result_claim() -> None:
     assert result == {}
     assert sidecars.forward_occurrence_batch_retained_bytes(result) == 0
     assert budget.retained_bytes == 0
+
+
+def _claim_mocked_forward_result(forward_lookup: AsyncMock) -> int:
+    occurrences_by_code = forward_lookup.return_value
+    retained_bytes = sidecars.forward_occurrence_batch_retained_bytes(
+        occurrences_by_code
+    )
+
+    async def read_claimed_result(*_args, retention_budget, **_kwargs):
+        retention_budget.claim(
+            retained_bytes,
+            category="the exact-reader forward result",
+        )
+        return occurrences_by_code
+
+    forward_lookup.side_effect = read_claimed_result
+    return retained_bytes
+
+
+@pytest.mark.asyncio
+async def test_exact_reader_releases_forward_result_claim(monkeypatch) -> None:
+    forward_lookup = _patch_graph(monkeypatch)
+    retained_bytes = _claim_mocked_forward_result(forward_lookup)
+
+    await exact_reader.load_exact_billing_rate_occurrence_witnesses(
+        object(),
+        _tables(),
+        source_scope=_scope(),
+        code_keys=(10,),
+    )
+
+    budget = forward_lookup.await_args.kwargs["retention_budget"]
+    assert budget.peak_retained_bytes == retained_bytes
+    assert budget.retained_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_reader_releases_forward_claim_on_validation_error(
+    monkeypatch,
+) -> None:
+    forward_lookup = _patch_graph(
+        monkeypatch,
+        occurrences_by_code={10: ((5, 100, 0),)},
+    )
+    _claim_mocked_forward_result(forward_lookup)
+
+    with pytest.raises(PTG2ManifestArtifactError, match="escaped its scope"):
+        await exact_reader.load_exact_billing_rate_occurrence_witnesses(
+            object(),
+            _tables(),
+            source_scope=_scope(),
+            code_keys=(10,),
+        )
+
+    assert forward_lookup.await_args.kwargs["retention_budget"].retained_bytes == 0

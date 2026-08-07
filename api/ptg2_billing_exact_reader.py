@@ -402,40 +402,47 @@ async def _load_forward_occurrences(
     provider_set_keys_by_id = set_projection.provider_set_keys_by_id
     provider_set_keys = frozenset(provider_set_keys_by_id.values())
     source_keys = frozenset(group_projection.group_refs_by_source)
-    forward_lookup_hints = ptg2_serving._version_three_forward_lookup_hints(
-        serving_tables
-    )
+    lookup_hints = ptg2_serving._version_three_forward_lookup_hints(serving_tables)
     occurrence_keys = _source_set_coordinates(
         group_refs_by_source=group_projection.group_refs_by_source,
         sets_by_group=group_projection.sets_by_group,
         provider_set_keys_by_id=provider_set_keys_by_id,
         code_keys=code_keys,
     )
-    return _validated_occurrences_by_code(
-        await ptg2_db_sidecars.lookup_forward_occurrences_batch_from_db(
-            session,
-            code_keys,
-            shared_snapshot_key=group_projection.snapshot_key,
-            source_count=group_projection.source_count,
-            provider_set_keys_by_code={
-                code_key: provider_set_keys for code_key in code_keys
-            },
-            source_keys_by_code={code_key: source_keys for code_key in code_keys},
-            occurrence_keys=occurrence_keys,
-            max_occurrences=_MAX_FORWARD_OCCURRENCES,
-            retention_budget=CandidateAuditDecodedRetentionBudget(),
-            schema_name=ptg2_serving.PTG2_SCHEMA,
-            **forward_lookup_hints,
-        ),
-        code_keys=code_keys,
-        provider_set_keys=provider_set_keys,
-        source_keys=source_keys,
-        allowed_set_source_coordinates=frozenset(
-            (provider_set_key, source_key)
-            for _code_key, provider_set_key, source_key in occurrence_keys
-        ),
-        price_item_count=_price_item_count(forward_lookup_hints),
+    retention_budget = CandidateAuditDecodedRetentionBudget()
+    lookup_forward = ptg2_db_sidecars.lookup_forward_occurrences_batch_from_db
+    occurrences_by_code = await lookup_forward(
+        session,
+        code_keys,
+        shared_snapshot_key=group_projection.snapshot_key,
+        source_count=group_projection.source_count,
+        provider_set_keys_by_code={
+            code_key: provider_set_keys for code_key in code_keys
+        },
+        source_keys_by_code={code_key: source_keys for code_key in code_keys},
+        occurrence_keys=occurrence_keys,
+        max_occurrences=_MAX_FORWARD_OCCURRENCES,
+        retention_budget=retention_budget,
+        schema_name=ptg2_serving.PTG2_SCHEMA,
+        **lookup_hints,
     )
+    try:
+        return _validated_occurrences_by_code(
+            occurrences_by_code,
+            code_keys=code_keys,
+            provider_set_keys=provider_set_keys,
+            source_keys=source_keys,
+            allowed_set_source_coordinates=frozenset(
+                (provider_set_key, source_key)
+                for _code_key, provider_set_key, source_key in occurrence_keys
+            ),
+            price_item_count=_price_item_count(lookup_hints),
+        )
+    finally:
+        retained_bytes = ptg2_db_sidecars.forward_occurrence_batch_retained_bytes(
+            occurrences_by_code
+        )
+        retention_budget.release(retained_bytes)
 
 
 async def load_exact_billing_rate_occurrence_witnesses(
