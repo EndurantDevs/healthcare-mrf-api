@@ -1967,10 +1967,14 @@ def _download_failure(
     job: dict[str, Any],
     error: Exception,
 ) -> PTG2DownloadedJob:
-    if not isinstance(job.get("_frozen_rate_file"), dict):
+    is_private_source = bool(job.get("_ptg_progress_private"))
+    if (
+        not is_private_source
+        and not isinstance(job.get("_frozen_rate_file"), dict)
+    ):
         return PTG2DownloadedJob(job=job, error=str(error))
     safe_label = str(
-        job.get("_ptg_progress_label") or "frozen-part"
+        job.get("_ptg_progress_label") or "protected-source"
     )[:128]
     return PTG2DownloadedJob(
         job=job,

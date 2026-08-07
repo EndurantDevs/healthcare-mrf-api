@@ -4318,6 +4318,32 @@ def _ptg_job_display_label(job: Mapping[str, Any]) -> str:
     return str(job.get("_ptg_progress_label") or job.get("url") or "PTG file")
 
 
+def _direct_in_network_job(
+    url: str,
+    *,
+    plan_info: list[dict[str, Any]],
+    source_network_names: list[str],
+    private_intent_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Build one scalar in-network job with optional private progress."""
+
+    job_map: dict[str, Any] = {"type": "in_network", "url": url}
+    if private_intent_sha256 is not None:
+        job_map.update(
+            {
+                "_ptg_progress_label": (
+                    "direct-singleton-" + private_intent_sha256[:12]
+                ),
+                "_ptg_progress_private": True,
+            }
+        )
+    if plan_info:
+        job_map["plan_info"] = plan_info
+    if source_network_names:
+        job_map["source_network_names"] = source_network_names
+    return job_map
+
+
 def _source_file_versions_from_results(
     files: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -7065,6 +7091,7 @@ async def _main_with_artifact_lease(
     frozen_rate_files: list[dict[str, Any]] | None = None,
     frozen_rate_file_set_sha256: str | None = None,
     frozen_rate_file_count: int | None = None,
+    direct_rate_file_intent_sha256: str | None = None,
     provider_ref_url: str | None = None,
     import_id: str | None = None,
     source_key: str | None = None,
@@ -7254,6 +7281,9 @@ async def _main_with_artifact_lease(
         "frozen_rate_files": normalized_frozen_rate_files,
         "frozen_rate_file_set_sha256": normalized_frozen_set_digest,
         "frozen_rate_file_count": len(normalized_frozen_rate_files),
+        "direct_rate_file_intent_sha256": (
+            direct_rate_file_intent_sha256
+        ),
         "source_key": source_key_val,
         "plan_ids": plan_ids or [],
         "plan_name_contains": plan_name_contains or [],
@@ -7726,19 +7756,20 @@ async def _main_with_artifact_lease(
             jobs.extend(toc_jobs)
 
         if in_network_url:
-            direct_job_by_field: dict[str, Any] = {
-                "type": "in_network",
-                "url": in_network_url,
-            }
             direct_in_network_plans = _direct_dispatch_plan_info(
                 plan_ids,
                 plan_market_types,
             )
-            if direct_in_network_plans:
-                direct_job_by_field["plan_info"] = direct_in_network_plans
-            if source_network_name_values:
-                direct_job_by_field["source_network_names"] = source_network_name_values
-            jobs.append(direct_job_by_field)
+            jobs.append(
+                _direct_in_network_job(
+                    in_network_url,
+                    plan_info=direct_in_network_plans,
+                    source_network_names=source_network_name_values,
+                    private_intent_sha256=(
+                        direct_rate_file_intent_sha256
+                    ),
+                )
+            )
         if allowed_url:
             direct_allowed_job_by_field: dict[str, Any] = {
                 "type": "allowed_amounts",
@@ -9099,6 +9130,7 @@ async def run_ptg_command(
     frozen_rate_files: list[dict[str, Any]] | None = None,
     frozen_rate_file_set_sha256: str | None = None,
     frozen_rate_file_count: int | None = None,
+    direct_rate_file_intent_sha256: str | None = None,
     provider_ref_url: str | None = None,
     import_id: str | None = None,
     source_key: str | None = None,

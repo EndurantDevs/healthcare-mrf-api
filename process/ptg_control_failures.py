@@ -6,6 +6,9 @@ from __future__ import annotations
 from typing import Any
 
 from process.ptg_frozen_control import frozen_rate_failure_payload
+from process.ptg_singleton_direct_control import (
+    singleton_direct_failure_payload,
+)
 from process.ptg_parts.ptg2_source_witness_contract import (
     WitnessPayloadLimitError,
 )
@@ -64,6 +67,9 @@ def ptg_failure_error(error: BaseException) -> dict[str, Any]:
     frozen_failure = frozen_rate_failure_payload(error_leaves)
     if frozen_failure is not None:
         return frozen_failure
+    direct_failure = singleton_direct_failure_payload(error_leaves)
+    if direct_failure is not None:
+        return direct_failure
     leaf_messages = tuple(
         dict.fromkeys(
             str(error_leaf).strip()

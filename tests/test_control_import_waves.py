@@ -345,6 +345,8 @@ async def test_route_maps_unhashable_attestation_version_to_bad_request(
 
     class _Request:
         json = _payload()
+        headers = {}
+        body = b""
 
     _Request.json["cohort_attestation"]["schema_version"] = []
     monkeypatch.setattr(control_wave_routes, "require_control_auth", lambda _request: None)

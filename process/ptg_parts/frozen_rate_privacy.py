@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from process.ptg_singleton_direct_control import (
+    DIRECT_RATE_FILE_INTENT_FIELD,
+    DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
+    DIRECT_RATE_FILE_PUBLIC_MARKER,
+)
 
-_FROZEN_MARKER_KEYS = frozenset(
+
+_FROZEN_INPUT_MARKER_KEYS = frozenset(
     {
         "frozen_rate_file_set_contract",
         "frozen_rate_files",
@@ -14,6 +20,14 @@ _FROZEN_MARKER_KEYS = frozenset(
         "frozen_rate_file_proof",
         "frozen_rate_file_proof_sha256",
         "frozen_rate_file_set_protected",
+    }
+)
+_FROZEN_MARKER_KEYS = _FROZEN_INPUT_MARKER_KEYS | frozenset(
+    {
+        DIRECT_RATE_FILE_INTENT_FIELD,
+        DIRECT_RATE_FILE_INTENT_SHA256_FIELD,
+        DIRECT_RATE_FILE_PUBLIC_MARKER,
+        "in_network_url",
     }
 )
 _PRIVATE_SCALAR_KEYS = frozenset(
@@ -27,6 +41,9 @@ _PRIVATE_SCALAR_KEYS = frozenset(
         "engine_source_file_version_id",
         "frozen_rate_file_set_sha256",
         "frozen_rate_file_proof_sha256",
+        "in_network_url",
+        "source_file_id",
+        "source_key",
     }
 )
 _PRIVATE_EVIDENCE_KEYS = frozenset(
@@ -40,6 +57,10 @@ _PRIVATE_EVIDENCE_KEYS = frozenset(
         "successful_files",
         "skipped_files",
         "failed_files",
+        DIRECT_RATE_FILE_INTENT_FIELD,
+        "in_network_url",
+        "source_file_id",
+        "source_key",
     }
 )
 
@@ -139,6 +160,8 @@ def project_frozen_status_event(
     payload = dict(status_payload)
     if not has_frozen_private_evidence(payload):
         return payload
+    direct_digest = _direct_intent_digest(payload)
+    has_frozen_evidence = _has_frozen_input_marker(payload)
     private_values = frozen_private_scalar_values(payload)
     projected = redact_frozen_public_values(
         payload,
@@ -146,9 +169,43 @@ def project_frozen_status_event(
         strip_evidence=True,
     )
     file_count = _frozen_file_count(payload)
-    _set_public_marker(projected.get("params"), file_count)
-    _set_public_marker(projected.get("metrics"), file_count)
+    if has_frozen_evidence:
+        _set_public_marker(projected.get("params"), file_count)
+        _set_public_marker(projected.get("metrics"), file_count)
+    _set_direct_public_marker(projected.get("params"), direct_digest)
+    _set_direct_public_marker(projected.get("metrics"), direct_digest)
     return projected
+
+
+def _has_frozen_input_marker(fragment: Any) -> bool:
+    if isinstance(fragment, Mapping):
+        return bool(_FROZEN_INPUT_MARKER_KEYS & set(fragment)) or any(
+            _has_frozen_input_marker(value) for value in fragment.values()
+        )
+    if isinstance(fragment, (list, tuple)):
+        return any(_has_frozen_input_marker(value) for value in fragment)
+    return False
+
+
+def _direct_intent_digest(fragment: Any) -> str | None:
+    if isinstance(fragment, Mapping):
+        raw_digest = fragment.get(DIRECT_RATE_FILE_INTENT_SHA256_FIELD)
+        if (
+            isinstance(raw_digest, str)
+            and len(raw_digest) == 64
+            and all(character in "0123456789abcdef" for character in raw_digest)
+        ):
+            return raw_digest
+        for value in fragment.values():
+            nested_digest = _direct_intent_digest(value)
+            if nested_digest is not None:
+                return nested_digest
+    elif isinstance(fragment, (list, tuple)):
+        for value in fragment:
+            nested_digest = _direct_intent_digest(value)
+            if nested_digest is not None:
+                return nested_digest
+    return None
 
 
 def _frozen_file_count(fragment: Any) -> int | None:
@@ -174,6 +231,16 @@ def _set_public_marker(fragment: Any, file_count: int | None) -> None:
     fragment["frozen_rate_file_set_protected"] = True
     if file_count is not None:
         fragment["frozen_rate_file_count"] = file_count
+
+
+def _set_direct_public_marker(
+    fragment: Any,
+    intent_digest: str | None,
+) -> None:
+    if not isinstance(fragment, dict) or intent_digest is None:
+        return
+    fragment[DIRECT_RATE_FILE_PUBLIC_MARKER] = True
+    fragment[DIRECT_RATE_FILE_INTENT_SHA256_FIELD] = intent_digest
 
 
 __all__ = [

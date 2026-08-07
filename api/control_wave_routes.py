@@ -8,6 +8,7 @@ from sanic.exceptions import BadRequest, NotFound, SanicException
 from api.control_auth import require_control_auth
 from api.control_import_waves import (
     ImportWaveConflict,
+    MAX_ATTESTATION_CANONICAL_BYTES,
     admit_import_wave,
     get_import_wave,
 )
@@ -40,6 +41,21 @@ async def control_admit_import_wave(request):
     """Record a signed exact-wave admission without publishing it."""
 
     require_control_auth(request)
+    raw_content_length = request.headers.get("content-length")
+    try:
+        declared_content_length = (
+            int(raw_content_length) if raw_content_length is not None else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise BadRequest("Content-Length is invalid") from exc
+    if (
+        declared_content_length is not None
+        and declared_content_length > MAX_ATTESTATION_CANONICAL_BYTES
+    ) or len(request.body or b"") > MAX_ATTESTATION_CANONICAL_BYTES:
+        raise SanicException(
+            "import wave request exceeds its byte limit",
+            status_code=413,
+        )
     try:
         wave, created = await admit_import_wave(request.json)
     except (ImportWaveConflict, PTGWaveCapacityConflict) as exc:

@@ -203,7 +203,11 @@ def test_validated_intent_payload_requires_source_identity_after_normalization(m
         "source_file_import_id": "source-unit",
         "params": {"source_file_import_id": "source-unit"},
     }
-    monkeypatch.setattr(waves, "normalize_protected_frozen_rate_params", Mock(return_value=intent_by_field["params"]))
+    monkeypatch.setattr(
+        waves.direct_wave,
+        "normalized_wave_params",
+        Mock(return_value=intent_by_field["params"]),
+    )
     monkeypatch.setattr(waves, "_assert_ptg_rebuild_request_params", Mock())
     monkeypatch.setattr(
         waves,

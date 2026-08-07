@@ -28,10 +28,8 @@ from process.ptg_parts.ptg_source_worker_admission import (
     guard_ptg_worker_start,
 )
 from process.ptg_wave_claims import claim_wave_job_start, reconcile_wave_claim_exception
-from process.ptg_frozen_control import (
-    frozen_rate_main_kwargs,
-    validated_worker_frozen_rate_params,
-)
+from process.ptg_frozen_control import frozen_rate_main_kwargs, validated_worker_frozen_rate_params
+from process.ptg_singleton_direct_control import singleton_direct_main_kwargs, validated_worker_singleton_direct_params
 from process.ptg_control_failures import ptg_failure_error
 from process.ptg_control_runtime import (
     PTG_CONTROL_HEARTBEAT_SOURCE,
@@ -154,10 +152,8 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 attempt_started_at,
                 attempt_id=attempt_id,
             )
-        params_by_name = await validated_worker_frozen_rate_params(
-            task_payload,
-            params_by_name,
-        )
+        params_by_name = await validated_worker_frozen_rate_params(task_payload, params_by_name)
+        params_by_name = validated_worker_singleton_direct_params(task_payload, params_by_name)
         full_rebuild_scope_digest = _full_rebuild_scope_digest(
             params_by_name,
         )
@@ -191,6 +187,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 in_network_url=params_by_name.get("in_network_url"),
                 allowed_url=params_by_name.get("allowed_url"),
                 **frozen_rate_main_kwargs(params_by_name),
+                **singleton_direct_main_kwargs(params_by_name),
                 provider_ref_url=params_by_name.get("provider_ref_url"),
                 import_id=params_by_name.get("import_id"),
                 source_key=params_by_name.get("source_key"),
