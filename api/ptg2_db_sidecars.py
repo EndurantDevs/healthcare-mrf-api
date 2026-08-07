@@ -58,10 +58,17 @@ _FORWARD_PRICE_KEY_RETAINED_BYTES = 48
 _FORWARD_RESULT_MAP_RETAINED_BYTES = 224
 _FORWARD_RESULT_OCCURRENCE_RETAINED_BYTES = 144
 _FORWARD_RESULT_PRICE_KEY_RETAINED_BYTES = 8
+_FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES = 224
+_FORWARD_OCCURRENCE_BATCH_MUTABLE_CODE_RETAINED_BYTES = 256
+_FORWARD_OCCURRENCE_BATCH_FROZEN_CODE_RETAINED_BYTES = 144
+_FORWARD_OCCURRENCE_BATCH_FROZEN_ROW_RETAINED_BYTES = 8
 # CPython 3.14 retains three non-cached integers (3 * 32 allocator bytes), a
 # three-slot tuple (72, rounded to 80), worst-case list growth attributed per
 # row (32), and a transient three-slot coordinate tuple (also rounded to 80).
 _FORWARD_FANOUT_ROW_RETAINED_BYTES = 288
+_FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES = (
+    _FORWARD_FANOUT_ROW_RETAINED_BYTES
+)
 # The coordinate index retains a resize-safe dict base, then one dict slot,
 # three-slot key tuple, and empty list for every logical fragment coordinate.
 _FORWARD_COORDINATE_MAP_RETAINED_BYTES = 224
@@ -2636,30 +2643,190 @@ async def _forward_batch_shards_and_filters(
     return shard_keys_by_code, filters_by_code, False
 
 
-async def _decoded_forward_batch_keys(
-    session: Any,
-    code_keys: tuple[int, ...],
-    options: _ForwardBatchOptions,
-) -> dict[int, list[tuple[int, int, int]]]:
-    decoded_by_code = {code_key: [] for code_key in code_keys}
+@dataclass
+class _MutableForwardOccurrenceBatch:
+    occurrences_by_code: dict[int, list[tuple[int, int, int]]]
+    retention_budget: CandidateAuditDecodedRetentionBudget | None
+    max_occurrences: int | None
+    occurrence_count: int = 0
 
-    def _retain(
+    def retain(
+        self,
         code_key: int,
         provider_set_key: int,
         price_key: int,
         source_key: int,
     ) -> None:
-        decoded_by_code[code_key].append(
-            (provider_set_key, price_key, source_key)
-        )
+        """Claim and append one occurrence within the total result bound."""
 
-    await _visit_forward_batch_keys(
-        session,
-        code_keys,
-        options,
-        _retain,
+        if (
+            self.max_occurrences is not None
+            and self.occurrence_count >= self.max_occurrences
+        ):
+            raise PTG2ManifestArtifactError(
+                "PTG2 forward occurrence result exceeds its limit"
+            )
+        if self.retention_budget is not None:
+            self.retention_budget.claim(
+                _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES,
+                category="a forward occurrence result row",
+            )
+        try:
+            self.occurrences_by_code[code_key].append(
+                (provider_set_key, price_key, source_key)
+            )
+        except BaseException:
+            if self.retention_budget is not None:
+                self.retention_budget.release(
+                    _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES
+                )
+            raise
+        self.occurrence_count += 1
+
+    def release(self) -> None:
+        """Release every mutable result claim after an incomplete visit."""
+
+        if self.retention_budget is not None:
+            self.retention_budget.release(
+                _mutable_forward_occurrence_batch_retained_bytes(
+                    self.occurrences_by_code
+                )
+            )
+
+
+def _new_mutable_forward_occurrence_batch(
+    code_keys: tuple[int, ...],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    max_occurrences: int | None,
+) -> _MutableForwardOccurrenceBatch:
+    """Allocate the mutable occurrence containers only after claiming them."""
+
+    mutable_container_bytes = (
+        _FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES
+        + len(code_keys) * _FORWARD_OCCURRENCE_BATCH_MUTABLE_CODE_RETAINED_BYTES
     )
-    return decoded_by_code
+    if retention_budget is not None:
+        retention_budget.claim(
+            mutable_container_bytes,
+            category="the mutable forward occurrence result",
+        )
+    try:
+        occurrences_by_code = {code_key: [] for code_key in code_keys}
+    except BaseException:
+        if retention_budget is not None:
+            retention_budget.release(mutable_container_bytes)
+        raise
+    return _MutableForwardOccurrenceBatch(
+        occurrences_by_code,
+        retention_budget,
+        max_occurrences,
+    )
+
+
+async def _decoded_forward_batch_keys(
+    session: Any,
+    code_keys: tuple[int, ...],
+    options: _ForwardBatchOptions,
+    *,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+    max_occurrences: int | None = None,
+) -> dict[int, list[tuple[int, int, int]]]:
+    """Visit bounded forward keys into one fully claimed mutable result."""
+
+    if max_occurrences is not None and (
+        type(max_occurrences) is not int or max_occurrences < 0
+    ):
+        raise ValueError("PTG2 forward occurrence limit must not be negative")
+    mutable_batch = _new_mutable_forward_occurrence_batch(
+        code_keys,
+        retention_budget,
+        max_occurrences,
+    )
+    try:
+        await _visit_forward_batch_keys(
+            session,
+            code_keys,
+            options,
+            mutable_batch.retain,
+            retention_budget=retention_budget,
+        )
+    except BaseException:
+        mutable_batch.release()
+        raise
+    return mutable_batch.occurrences_by_code
+
+
+def _mutable_forward_occurrence_batch_retained_bytes(
+    decoded_by_code: Mapping[int, list[tuple[int, int, int]]],
+) -> int:
+    """Return claims owned by one mutable forward occurrence result."""
+
+    return (
+        _FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES
+        + len(decoded_by_code)
+        * _FORWARD_OCCURRENCE_BATCH_MUTABLE_CODE_RETAINED_BYTES
+        + sum(len(occurrences) for occurrences in decoded_by_code.values())
+        * _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES
+    )
+
+
+def forward_occurrence_batch_retained_bytes(
+    occurrences_by_code: Mapping[int, tuple[tuple[int, int, int], ...]],
+) -> int:
+    """Return the budget claim retained by an immutable occurrence result."""
+
+    if not occurrences_by_code:
+        return 0
+    return (
+        _FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES
+        + len(occurrences_by_code)
+        * _FORWARD_OCCURRENCE_BATCH_FROZEN_CODE_RETAINED_BYTES
+        + sum(len(occurrences) for occurrences in occurrences_by_code.values())
+        * (
+            _FORWARD_OCCURRENCE_BATCH_ROW_RETAINED_BYTES
+            + _FORWARD_OCCURRENCE_BATCH_FROZEN_ROW_RETAINED_BYTES
+        )
+    )
+
+
+def _freeze_forward_occurrence_batch(
+    decoded_by_code: dict[int, list[tuple[int, int, int]]],
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+) -> dict[int, tuple[tuple[int, int, int], ...]]:
+    """Freeze a mutable occurrence result while charging its allocation peak."""
+
+    if retention_budget is None:
+        return {
+            code_key: tuple(occurrences)
+            for code_key, occurrences in decoded_by_code.items()
+        }
+    frozen_container_bytes = (
+        _FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES
+        + len(decoded_by_code)
+        * _FORWARD_OCCURRENCE_BATCH_FROZEN_CODE_RETAINED_BYTES
+        + sum(len(occurrences) for occurrences in decoded_by_code.values())
+        * _FORWARD_OCCURRENCE_BATCH_FROZEN_ROW_RETAINED_BYTES
+    )
+    retention_budget.claim(
+        frozen_container_bytes,
+        category="the frozen forward occurrence result",
+    )
+    try:
+        frozen_by_code = {
+            code_key: tuple(occurrences)
+            for code_key, occurrences in decoded_by_code.items()
+        }
+    except BaseException:
+        retention_budget.release(frozen_container_bytes)
+        raise
+    mutable_container_bytes = (
+        _FORWARD_OCCURRENCE_BATCH_MAP_RETAINED_BYTES
+        + len(decoded_by_code)
+        * _FORWARD_OCCURRENCE_BATCH_MUTABLE_CODE_RETAINED_BYTES
+    )
+    decoded_by_code.clear()
+    retention_budget.release(mutable_container_bytes)
+    return frozen_by_code
 
 
 def _forward_batch_fragment_views(
@@ -3289,28 +3456,86 @@ async def lookup_binary_code_batch_from_db(
     }
 
 
+async def _lookup_forward_occurrences_batch_claimed(
+    session: Any,
+    code_keys: Iterable[int],
+    *,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    max_occurrences: int | None,
+    read_options: Mapping[str, Any],
+) -> dict[int, tuple[tuple[int, int, int], ...]]:
+    """Own normalized-code claims while building one occurrence result."""
+
+    if max_occurrences is not None and (
+        type(max_occurrences) is not int or max_occurrences < 0
+    ):
+        raise ValueError("PTG2 forward occurrence limit must not be negative")
+    options = _ForwardBatchOptions(**read_options)
+    normalized_code_keys, retained_code_key_bytes = retain_unique_integer_keys(
+        (_normalized_code_key(code_key) for code_key in code_keys),
+        retention_budget,
+        category="forward occurrence code",
+    )
+    if not normalized_code_keys:
+        if retention_budget is not None:
+            retention_budget.release(retained_code_key_bytes)
+        return {}
+    decoded_by_code: dict[int, list[tuple[int, int, int]]] | None = None
+    try:
+        decoded_by_code = await _decoded_forward_batch_keys(
+            session,
+            normalized_code_keys,
+            options,
+            retention_budget=retention_budget,
+            max_occurrences=max_occurrences,
+        )
+        return _freeze_forward_occurrence_batch(decoded_by_code, retention_budget)
+    except BaseException:
+        if retention_budget is not None and decoded_by_code is not None:
+            retention_budget.release(
+                _mutable_forward_occurrence_batch_retained_bytes(decoded_by_code)
+            )
+        raise
+    finally:
+        if retention_budget is not None:
+            retention_budget.release(retained_code_key_bytes)
+
+
 async def lookup_forward_occurrences_batch_from_db(
     session: Any,
     code_keys: Iterable[int],
+    *,
+    retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+    max_occurrences: int | None = None,
     **read_options: Any,
 ) -> dict[int, tuple[tuple[int, int, int], ...]]:
-    """Read exact forward occurrence keys without hydrating response labels."""
+    """Read exact forward occurrences and retain their result budget claim.
 
-    options = _ForwardBatchOptions(**read_options)
-    normalized_code_keys = tuple(
-        sorted({_normalized_code_key(code_key) for code_key in code_keys})
+    A supplied budget continues to own the immutable result claim after this
+    call. The result consumer must release
+    :func:`forward_occurrence_batch_retained_bytes` when the result dies.
+    """
+
+    retention_entry_bytes = (
+        0 if retention_budget is None else retention_budget.retained_bytes
     )
-    if not normalized_code_keys:
-        return {}
-    decoded_by_code = await _decoded_forward_batch_keys(
-        session,
-        normalized_code_keys,
-        options,
-    )
-    return {
-        code_key: tuple(decoded_by_code[code_key])
-        for code_key in normalized_code_keys
-    }
+    try:
+        return await _lookup_forward_occurrences_batch_claimed(
+            session,
+            code_keys,
+            retention_budget=retention_budget,
+            max_occurrences=max_occurrences,
+            read_options=read_options,
+        )
+    except BaseException:
+        if (
+            retention_budget is not None
+            and retention_budget.retained_bytes > retention_entry_bytes
+        ):
+            retention_budget.release(
+                retention_budget.retained_bytes - retention_entry_bytes
+            )
+        raise
 
 
 async def lookup_forward_price_index_from_db(
