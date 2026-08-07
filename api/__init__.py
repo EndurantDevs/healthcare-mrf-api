@@ -6,6 +6,7 @@ from sanic.blueprints import Blueprint
 from api.control import blueprint as control_blueprint
 from api.metrics import blueprint as metrics_blueprint
 from api.endpoint.formulary import blueprint as v1_formulary
+from api.endpoint.formulary_fhir import blueprint as v1_formulary_fhir
 from api.endpoint.coverage import blueprint as v1_coverage
 from api.endpoint.codes import blueprint as v1_codes
 from api.endpoint.clinical import blueprint as v1_clinical
@@ -58,6 +59,7 @@ def init_api(api):
             v1_coverage,
             v1_plan,
             v1_formulary,
+            v1_formulary_fhir,
             v1_codes,
             v1_clinical,
             v1_import,
