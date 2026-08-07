@@ -8877,7 +8877,10 @@ async def _cutover_provider_directory_artifact_sources(
             dataset.serving_endpoint_id or dataset.endpoint_id
         )
         if (
-            not dataset.promote_on_cutover
+            not (
+                dataset.promote_on_cutover
+                or dataset.reconcile_source_alias_on_cutover
+            )
             or serving_endpoint_id == dataset.endpoint_id
         ):
             continue
@@ -13400,6 +13403,7 @@ class ProviderDirectoryArtifactDataset:
     previous_dataset_id: str | None = None
     expected_incumbent_dataset_id: str | None = None
     promote_on_cutover: bool = False
+    reconcile_source_alias_on_cutover: bool = False
     dataset_hash: str | None = None
     resource_count: int | None = None
     validated_at: str | None = None
@@ -13541,6 +13545,21 @@ class ProviderDirectoryArtifactDatasetFence:
         ]
 
     @property
+    def source_alias_cutover_datasets(
+        self,
+    ) -> list[ProviderDirectoryArtifactDataset]:
+        """Return datasets whose proven source aliases must move at cutover."""
+
+        return [
+            dataset
+            for dataset in self.datasets
+            if (
+                dataset.promote_on_cutover
+                or dataset.reconcile_source_alias_on_cutover
+            )
+        ]
+
+    @property
     def locked_alias_datasets(self) -> tuple[ProviderDirectoryArtifactDataset, ...]:
         """Return output aliases plus the full reviewed promotion alias set."""
         dataset_by_source_id = {
@@ -13600,7 +13619,10 @@ class ProviderDirectoryArtifactDatasetFence:
                     dataset.source_id,
                     (
                         dataset.endpoint_id
-                        if dataset.promote_on_cutover
+                        if (
+                            dataset.promote_on_cutover
+                            or dataset.reconcile_source_alias_on_cutover
+                        )
                         else dataset.serving_endpoint_id or dataset.endpoint_id
                     ),
                 )
@@ -13645,9 +13667,12 @@ def _provider_directory_artifact_dataset_selection_sql(
     source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
     dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
     selection_sql = (
-        _artifact_dataset_explicit_selection_sql(source_ref)
+        _artifact_dataset_explicit_selection_sql(dataset_ref, source_ref)
         if source_ids
-        else _artifact_dataset_all_source_selection_sql(source_ref)
+        else _artifact_dataset_all_source_selection_sql(
+            dataset_ref,
+            source_ref,
+        )
     )
     options_sql = _artifact_dataset_options_cte(dataset_ref, source_ref)
     ranking_sql = _artifact_dataset_ranking_cte()
@@ -14099,6 +14124,7 @@ def _artifact_dataset_projection_sql() -> str:
         SELECT selected.source_id,
                selected.endpoint_id,
                selected.serving_endpoint_id,
+               selected.reconcile_source_alias_on_cutover,
                selected.source_record_json,
                dataset.dataset_id,
                COALESCE(
@@ -14134,23 +14160,39 @@ def _artifact_dataset_projection_sql() -> str:
     """
 
 
-def _artifact_dataset_explicit_selection_sql(source_ref: str) -> str:
+def _artifact_dataset_explicit_selection_sql(
+    dataset_ref: str,
+    source_ref: str,
+) -> str:
     """Select only caller-requested aliases while retaining endpoint datasets."""
     return f"""
         selected_sources AS MATERIALIZED (
             SELECT source.source_id,
-                   COALESCE(candidate.endpoint_id, source.endpoint_id)
+                   COALESCE(
+                       candidate.endpoint_id,
+                       published_alias.endpoint_id,
+                       source.endpoint_id
+                   )
                        AS endpoint_id,
                    source.endpoint_id AS serving_endpoint_id,
+                   (
+                       candidate.endpoint_id IS NULL
+                       AND published_alias.endpoint_id IS NOT NULL
+                   ) AS reconcile_source_alias_on_cutover,
                    to_jsonb(source) AS source_record_json
               FROM {source_ref} AS source
               {_artifact_validated_candidate_alias_join_sql()}
+              {_artifact_published_alias_reconciliation_join_sql(
+                  dataset_ref,
+                  source_ref,
+              )}
              WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
         )
     """
 
 
 def _artifact_dataset_all_source_selection_sql(
+    dataset_ref: str,
     source_ref: str,
 ) -> str:
     return f"""
@@ -14160,16 +14202,29 @@ def _artifact_dataset_all_source_selection_sql(
              WHERE dataset.selection_rank = 1
         ), selected_sources AS MATERIALIZED (
             SELECT source.source_id,
-                   COALESCE(candidate.endpoint_id, source.endpoint_id)
+                   COALESCE(
+                       candidate.endpoint_id,
+                       published_alias.endpoint_id,
+                       source.endpoint_id
+                   )
                        AS endpoint_id,
                    source.endpoint_id AS serving_endpoint_id,
+                   (
+                       candidate.endpoint_id IS NULL
+                       AND published_alias.endpoint_id IS NOT NULL
+                   ) AS reconcile_source_alias_on_cutover,
                    to_jsonb(source) AS source_record_json
               FROM {source_ref} AS source
               {_artifact_validated_candidate_alias_join_sql()}
+              {_artifact_published_alias_reconciliation_join_sql(
+                  dataset_ref,
+                  source_ref,
+              )}
              WHERE source.endpoint_id IN (
                        SELECT endpoint_id FROM selected_endpoints
                    )
                 OR candidate.endpoint_id IS NOT NULL
+                OR published_alias.endpoint_id IS NOT NULL
         )
     """
 
@@ -14186,6 +14241,60 @@ def _artifact_validated_candidate_alias_join_sql() -> str:
                  candidate.publication_metadata_json::jsonb -> 'source_ids',
                  '[]'::jsonb
              ) @> jsonb_build_array(source.source_id)
+    """
+
+
+def _artifact_published_alias_reconciliation_join_sql(
+    dataset_ref: str,
+    source_ref: str,
+) -> str:
+    """Match a proven publication only when its serving alias is orphaned."""
+
+    reviewed_dataset_gate = _artifact_reviewed_candidate_eligibility_sql(
+        dataset_ref,
+        source_ref,
+    )
+    return f"""
+        LEFT JOIN (
+            SELECT dataset.endpoint_id
+              FROM {dataset_ref} AS dataset
+             WHERE dataset.is_current = true
+               AND dataset.status = :published_status
+               AND dataset.published_at IS NOT NULL
+               AND dataset.superseded_at IS NULL
+               AND {reviewed_dataset_gate}
+        ) AS published_alias
+          ON published_alias.endpoint_id = NULLIF(
+                 source.metadata_json::jsonb
+                     ->> '{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}',
+                 ''
+             )
+         AND published_alias.endpoint_id IS DISTINCT FROM source.endpoint_id
+         AND NOT EXISTS (
+                SELECT 1
+                  FROM {dataset_ref} AS serving_dataset
+                 WHERE serving_dataset.endpoint_id = source.endpoint_id
+                   AND serving_dataset.is_current = true
+                   AND serving_dataset.status = :published_status
+                   AND serving_dataset.published_at IS NOT NULL
+                   AND serving_dataset.superseded_at IS NULL
+             )
+         AND EXISTS (
+                SELECT 1
+                  FROM {dataset_ref} AS published_dataset
+                 WHERE published_dataset.endpoint_id = published_alias.endpoint_id
+                   AND published_dataset.is_current = true
+                   AND published_dataset.status = :published_status
+                   AND published_dataset.published_at IS NOT NULL
+                   AND published_dataset.superseded_at IS NULL
+                   AND jsonb_typeof(
+                           published_dataset.publication_metadata_json::jsonb
+                               -> 'source_ids'
+                       ) = 'array'
+                   AND published_dataset.publication_metadata_json::jsonb
+                           -> 'source_ids'
+                       @> jsonb_build_array(source.source_id)
+             )
     """
 
 
@@ -14252,7 +14361,10 @@ def _provider_directory_artifact_dataset_from_row(
         publication_metadata,
         recorded_expected_resources,
         dataset_id,
-        should_promote=selection_state["promote_on_cutover"],
+        should_repoint_source_alias=(
+            selection_state["promote_on_cutover"]
+            or selection_state["reconcile_source_alias_on_cutover"]
+        ),
     )
     return ProviderDirectoryArtifactDataset(
         source_id=value_by_name["source_id"] or "",
@@ -14274,9 +14386,9 @@ def _artifact_dataset_verification_fields(
     recorded_expected_resources: tuple[str, ...],
     dataset_id: str,
     *,
-    should_promote: bool,
+    should_repoint_source_alias: bool,
 ) -> dict[str, Any]:
-    """Freeze the reviewed source contract attached to artifact promotion."""
+    """Freeze the reviewed source contract attached to alias cutover."""
     verification_campaign_id = _clean_text(
         publication_metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
     )
@@ -14284,7 +14396,7 @@ def _artifact_dataset_verification_fields(
         publication_metadata.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY)
     )
     verification_source_ids, source_contract = ((), ())
-    if should_promote:
+    if should_repoint_source_alias:
         verification_source_ids, source_contract = (
             _artifact_promotion_source_contract(
                 source_record,
@@ -14304,7 +14416,7 @@ def _artifact_dataset_verification_fields(
                     "provider_directory_candidate_status"
                 )
             )
-            if should_promote
+            if should_repoint_source_alias
             else None
         ),
         "verification_source_ids": verification_source_ids,
@@ -14567,6 +14679,9 @@ def _artifact_dataset_state_from_row(
     should_promote_on_cutover = selection_state[
         "should_promote_on_cutover"
     ]
+    should_reconcile_source_alias = selection_state[
+        "should_reconcile_source_alias"
+    ]
     publication_metadata = _json_object(
         dataset_row_map.get("publication_metadata_json")
     )
@@ -14594,6 +14709,9 @@ def _artifact_dataset_state_from_row(
             else None
         ),
         "promote_on_cutover": should_promote_on_cutover,
+        "reconcile_source_alias_on_cutover": (
+            should_reconcile_source_alias
+        ),
         "dataset_hash": dataset_hash,
         "resource_count": (
             int(dataset_row_map.get("resource_count"))
@@ -14620,6 +14738,9 @@ def _artifact_dataset_selection_from_row(
     should_promote_on_cutover = bool(
         dataset_row_map.get("promote_on_cutover")
     )
+    should_reconcile_source_alias = bool(
+        dataset_row_map.get("reconcile_source_alias_on_cutover")
+    )
     current_dataset_count = int(
         dataset_row_map.get("current_dataset_count")
         if dataset_row_map.get("current_dataset_count") is not None
@@ -14642,6 +14763,7 @@ def _artifact_dataset_selection_from_row(
         "status": status,
         "is_current": is_current,
         "should_promote_on_cutover": should_promote_on_cutover,
+        "should_reconcile_source_alias": should_reconcile_source_alias,
         "current_dataset_count": current_dataset_count,
         "current_dataset_id": current_dataset_id,
         "validated_candidate_count": validated_candidate_count,
@@ -14660,7 +14782,15 @@ def _assert_artifact_dataset_selection_state(
     dataset_id: str,
     endpoint_id: str,
 ) -> None:
+    should_reconcile_source_alias = bool(
+        selection_state.get("should_reconcile_source_alias")
+    )
     if selection_state["should_promote_on_cutover"]:
+        if should_reconcile_source_alias:
+            raise RuntimeError(
+                "provider_directory_artifact_alias_cutover_ambiguous:"
+                + dataset_id
+            )
         if selection_state["validated_candidate_count"] != 1:
             raise RuntimeError(
                 "provider_directory_artifact_validated_candidate_ambiguous:"
@@ -14684,6 +14814,16 @@ def _assert_artifact_dataset_selection_state(
                 + dataset_id
             )
         return
+    if should_reconcile_source_alias and (
+        selection_state["status"] != ENDPOINT_DATASET_PUBLISHED
+        or not selection_state["is_current"]
+        or selection_state["current_dataset_count"] != 1
+        or selection_state["current_dataset_id"] != dataset_id
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_alias_reconciliation_invalid:"
+            + dataset_id
+        )
     if (
         selection_state["status"] != ENDPOINT_DATASET_PUBLISHED
         or not selection_state["is_current"]
@@ -14815,6 +14955,7 @@ def _artifact_endpoint_selection_identity(
         dataset.previous_dataset_id,
         dataset.expected_incumbent_dataset_id,
         dataset.promote_on_cutover,
+        dataset.reconcile_source_alias_on_cutover,
         dataset.dataset_hash,
         dataset.resource_count,
         dataset.validated_at,
@@ -14853,7 +14994,7 @@ def _reviewed_promotion_dataset_by_source_id(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> dict[str, ProviderDirectoryArtifactDataset]:
     dataset_by_source_id: dict[str, ProviderDirectoryArtifactDataset] = {}
-    for dataset in fence.promotion_datasets:
+    for dataset in fence.source_alias_cutover_datasets:
         if not (
             dataset.verification_source_status
             == PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
