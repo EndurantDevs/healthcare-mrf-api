@@ -23,21 +23,23 @@ normative.
 - TIN/NPI connector, PTG address, and table-swap components exist as partial
   foundations. Their presence does not prove the end-to-end witness in this
   contract.
-- There is no accepted, active POST billing-identity search on this baseline,
-  no proven request-wide PTG/connector/address generation pin, and no accepted
-  benchmark proving the latency objective below.
+- There is no accepted, active billing-identity-scoped serving mode on this
+  baseline, no proven request-wide PTG/connector/address generation pin, and no
+  accepted benchmark proving the latency objective below.
 
 These observations are baselines to revalidate before implementation. They are
 not statements about a deployed environment or a published dataset.
 
 ### Target state
 
-V1 adds `POST /api/v1/pricing/providers/search-by-procedure`. It restricts
-results by exactly one billing identity before provider-address geo filtering.
-Every result retains an exact, immutable pricing witness and a separately
-sourced NPI-address witness. The target remains inactive until its migrations,
-publication path, API, security controls, and runtime proofs have passed their
-independent gates.
+V1 extends `GET /api/v1/pricing/providers/search-by-procedure` with an optional
+opaque `billing_entity_ref`. Requests without that parameter retain existing
+behavior. Requests with it restrict results by exactly one authenticated
+billing identity before provider-address geo filtering. V1 adds no POST
+operation and accepts no raw tax identity. Every result retains an exact,
+immutable pricing witness and a separately sourced NPI-address witness. The
+target remains inactive until its serving path, API, security controls, and
+runtime proofs have passed their independent gates.
 
 Relevant current foundations include the
 [pricing endpoint](../api/endpoint/pricing.py),
@@ -49,12 +51,14 @@ Relevant current foundations include the
 
 The following decisions are fixed for V1:
 
-1. The new operation is
-   `POST /api/v1/pricing/providers/search-by-procedure`. Existing GET behavior
-   on that resource is unchanged.
-2. One request contains exactly one billing-identity selector:
-   - one exact raw tax identity whose type is `ein` or `npi`, or
-   - one opaque `billing_entity_ref` beginning with `be1_`.
+1. V1 extends the existing
+   `GET /api/v1/pricing/providers/search-by-procedure` operation. Absence of a
+   billing reference preserves its existing behavior; no POST operation is
+   added.
+2. A billing-scoped request contains exactly one opaque
+   `billing_entity_ref=be1_<opaque-reference>`. Duplicate or multi-reference
+   selectors are invalid. Raw EINs and billing NPIs are not accepted by this
+   pricing endpoint, and no raw-identity alias is introduced.
 3. Multi-identity OR semantics are not part of V1.
 4. The server resolves the entitled immutable release and its PTG, connector,
    and address generations. A client cannot select arbitrary source files,
@@ -73,90 +77,96 @@ The following decisions are fixed for V1:
 
 ### Request
 
-The operation is:
+The billing-scoped form uses the existing GET operation and public plan ID:
 
 ```text
-POST /api/v1/pricing/providers/search-by-procedure
-Content-Type: application/json
+GET /api/v1/pricing/providers/search-by-procedure?healthporta_plan_id=<entitled-plan-id>&billing_entity_ref=be1_<opaque-reference>&code_system=CPT&code=<procedure-code>&zip5=<five-digit-ZIP>&limit=25
 ```
 
-The raw-tax-identity form is:
+`billing_entity_ref` is the only V1 billing-identity selector. It is required
+for billing-scoped behavior and MUST occur exactly once. The gateway resolves
+`healthporta_plan_id` to the entitled immutable `plan_release_id`; clients MUST
+NOT supply a release, source file, snapshot, generation, or token-policy
+selector directly. Raw EINs or billing NPIs MUST NOT be accepted in a URL,
+query parameter, header, or GET body. Reserved raw-identity aliases fail closed.
+The public plan ID retains its existing 33-character
+`^hpplan_[0-9A-HJKMNP-TV-Z]{26}$` wire shape.
 
-```json
-{
-  "healthporta_plan_id": "<entitled-plan-id>",
-  "billing_identity": {
-    "tax_identity": {
-      "type": "ein",
-      "value": "<exact-tax-identity>"
-    }
-  },
-  "procedure": {
-    "code_system": "CPT",
-    "code": "<procedure-code>",
-    "modifiers": [],
-    "place_of_service": []
-  },
-  "geo": {
-    "zip5": "<five-digit-ZIP>",
-    "radius_miles": 0
-  },
-  "provider_npi": "<optional-checksum-valid-NPI>",
-  "page": {
-    "limit": 25,
-    "cursor": null
-  }
-}
-```
+The billing-scoped branch has a closed query contract. Its required non-GEO
+parameters are exactly:
 
-`billing_identity.tax_identity.type` is exactly `ein` or `npi`. The reference
-form replaces the complete `tax_identity` member with:
+- `billing_entity_ref`;
+- `healthporta_plan_id`;
+- `code_system`;
+- `code`;
+- `limit`.
 
-```json
-"billing_identity": {
-  "billing_entity_ref": "be1_<opaque-reference>"
-}
-```
+Its optional non-GEO parameters are exactly:
 
-`tax_identity` and `billing_entity_ref` are mutually exclusive and exactly one
-is required. The request therefore carries one billing identity even when
-`provider_npi` is present. `provider_npi` is optional; when present it is an
-exact same-group intersection:
+- `npi`;
+- `modifiers`;
+- `place_of_service`;
+- `include_evidence`;
+- `cursor`.
+
+It also requires exactly one GEO form: `zip5` alone, with `lat`, `long`, and
+`radius_miles` absent; or `lat`, `long`, and `radius_miles` together, with
+`zip5` absent. Every other query parameter, every alias, every duplicate field,
+and every incomplete or mixed GEO form is rejected with the branch's generic
+`404`. In particular, the legacy query surface does not become part of the
+billing-scoped allowlist merely because both modes share one GET operation.
+
+`npi` is optional; when present it is a checksum-valid rendering-provider
+filter and an exact same-group intersection:
 
 ```text
 G is in groups(selected billing identity)
-  AND groups(provider_npi)
+  AND groups(npi)
   AND groups(provider set for the returned rate)
 ```
 
 It MUST NOT initiate an independent NPI pricing lookup.
 
-`geo.zip5` is required. `geo.radius_miles` is between 0 and 100 inclusive; zero
-means exact ZIP. Deployments MAY enforce a lower maximum but MUST NOT silently
-widen or clamp a request. `page.limit` is between 1 and 200 inclusive and
-defaults to 25. Offset pagination is forbidden. Procedure code, modifiers, and
-place-of-service values are exact normalized filters.
+Geo uses exactly one bounded form: `zip5` alone for exact ZIP, or `lat`, `long`,
+and `radius_miles` together for coordinate-radius search. Radius is between 0
+and 100 miles inclusive. Deployments MAY enforce a lower maximum but MUST NOT
+silently widen or clamp a request. `limit` is between 1 and 100 inclusive and
+is required by the V1 gateway contract. `include_evidence` is exactly `true` or
+`false`. Procedure code, modifiers, and place-of-service values are exact
+normalized filters.
 
-The server resolves the caller's entitled immutable plan release, revision,
-snapshot set, and compatible serving generation bundle. Requests cannot name
-an internal snapshot, source file, generation, or token policy.
-
-`billing_identity.tax_identity.value` is sensitive and `writeOnly` in OpenAPI.
-The value MUST NOT be accepted through a URL, query string, or header.
-Validation errors do not echo it.
+Billing-scoped requests use authenticated, encrypted keyset pagination through
+the optional sealed `cursor` parameter. They reject `offset`. Requests without
+`billing_entity_ref` retain the legacy GET parameter and pagination semantics;
+the billing-scoped branch MUST NOT change them.
 
 ### Response and errors
 
-The response reuses the existing provider, rate, and address envelope where it
-is compatible. It adds `pricing_scope=plan_scoped_ptg_tax_identity`,
-`billing_association_scope=tax_identity_match_only`,
-`geo_match_scope=provider_address_evidence`, the matched `be1_` reference,
-per-provider/per-rate witness, site-comparison dimensions, and resolved public
-release/revision references. It never returns raw or masked tax identities,
+The successful billing-scoped response is the closed, top-level
+`BillingSearchResponse`. It does not use the legacy
+`request_id`/`version`/`data`/`meta` wrapper and permits no additional top-level
+properties. Its required top-level fields are exactly:
+
+- `result_state`;
+- `pricing_scope=plan_scoped_ptg_tax_identity`;
+- `billing_association_scope=tax_identity_match_only`;
+- `geo_match_scope=provider_address_evidence`;
+- output-only `plan_release_id`;
+- `billing_entity_ref`;
+- `procedure`;
+- `items`;
+- `pagination`.
+
+`plan_release_id` is the exact immutable release admitted by the gateway and
+matches `^hprelease_[0-9A-HJKMNP-TV-Z]{26}$`; it is response evidence, never a
+public request selector. The closed response includes provider-owned address
+evidence when authorized and requested. V1 exposes no billing-entity site
+comparison and no serving-revision or resolved-snapshot field. Those public
+response claims are deferred. It never returns raw or masked tax identities,
 internal group keys, or source-record identifiers.
 
 An entitled, well-formed search returns HTTP `200` with exactly one of these
-`match_state` values:
+`result_state` values:
 
 - `matched`;
 - `no_matching_tax_identity`;
@@ -165,34 +175,59 @@ An entitled, well-formed search returns HTTP `200` with exactly one of these
 - `no_match_in_radius`;
 - `no_snapshot_for_plan`.
 
-Unknown or unentitled plans and unknown, expired, malformed, or unentitled
-billing references use one indistinguishable generic `404` response. A request
-that has no validated compatible serving generation uses `503`. A signed cursor
-whose retained generation has expired uses `409`. Malformed request structure
-or raw typed-identity syntax uses a generic `400` without echoing the sensitive
-selector.
+The two `tax_identity`-named states are retained wire labels; they do not imply
+that this GET operation accepts a raw tax identity.
 
-Pagination is signed keyset pagination. Every cursor is bound to the normalized
-request fingerprint, authorization scope, generation bundle, snapshot set,
-stable total-order sort tuple, expiry, and key version. Equal-distance and
-equal-rate rows MUST NOT be duplicated or skipped. Cursor serialization and
-signature-key storage are implementation details, but these bindings are not.
+Gateway-shape failures use one indistinguishable generic `404` response with
+`error.code=resource_not_found`: unknown or unentitled plans or references,
+malformed references, missing required parameters, duplicate or unallowed
+parameters, reserved raw-identity aliases, and invalid GEO combinations all
+share that behavior.
 
-The caller needs the dedicated `pricing:billing-search` capability; detailed
-provenance requires a stronger capability.
+After the gateway admits and authenticates the request, an invalid, malformed,
+tampered, or scope-mismatched upstream cursor uses generic `400` with
+`error.code=billing_search_cursor_invalid`. A cursor whose retained generation
+has expired uses `409` with
+`error.code=billing_search_cursor_generation_expired`. A request for which no
+validated compatible serving generation is available uses `503` with
+`error.code=billing_search_serving_unavailable`. These are closed
+`BillingSearchErrorResponse` bodies and never echo the selector or cursor.
+Gateway authentication, authorization, quota, and upstream transport failures
+remain generic `ProblemDetails` responses with `401`, `403`, `429`, `502`, or
+`504`; they are not billing-result states.
+
+Pagination uses authenticated encryption. Every sealed cursor is bound to the
+normalized request fingerprint, authorization scope, generation bundle,
+snapshot set, stable total-order sort tuple, expiry, and key version.
+Equal-distance and equal-rate rows MUST NOT be duplicated or skipped. Cursor
+serialization and encryption-key storage are implementation details, but these
+bindings are not.
+
+The caller needs the dedicated `pricing:billing-search` capability. Setting
+`include_evidence=true` additionally requires the separately frozen
+`pricing:billing-search:provenance` capability; the provenance capability does
+not imply the base capability.
 Billing search has stricter per-tenant and per-principal quotas than ordinary
 procedure search, plus bounded page, group, address, and rate fanout. Exact
-quota numbers and the stronger provenance capability name remain deployment
-configuration, but capability enforcement, auditing, and anti-enumeration
-limits are mandatory.
+quota numbers remain deployment configuration, but capability enforcement,
+auditing, and anti-enumeration limits are mandatory.
 
-### Wire details still deferred
+### Frozen wire details and deployment details still deferred
 
-The OpenAPI implementation may still freeze the POST operation ID, optional
-detailed-provenance sub-schema, cursor byte encoding, signing-key provider, and
-deployment-specific quota values. Those choices cannot weaken the route,
-envelope, selector union, bounds, states, status codes, cursor bindings, or
-capability requirements above.
+The authoritative gateway OpenAPI uses `x-billing-search-contract` and the
+closed `BillingSearchResponse` schema. Healthcare activation MUST remain
+compatible with that contract, retain the existing GET operation ID, and MUST
+NOT add a POST path item.
+
+The outer billing-reference form is frozen as exactly 68 characters matching
+`^be1_[A-Za-z0-9_-]{64}$`; the 64-character suffix is canonical unpadded
+base64url encoding of 48 bytes. The outer cursor form is frozen as at most 2048
+characters matching
+`^bsc1_[a-z0-9][a-z0-9-]{0,31}_[A-Za-z0-9_-]+$`. The inner encrypted cursor
+payload, sealing-key provider, and deployment-specific quota values remain
+implementation or deployment details. Those choices cannot weaken the route,
+closed schemas, opaque-selector rule, bounds, states, status codes, cursor
+bindings, or capability requirements above.
 
 ## 4. Terms and non-claims
 
@@ -239,10 +274,9 @@ entitled plan release
   -> exact group member NPI P
 ```
 
-For a raw EIN or billing NPI, normalization and tokenization happen transiently
-after plan entitlement. For a `billing_entity_ref`, authenticated decoding or
-lookup yields the same typed, policy-bound identity token. The raw selector is
-never persisted as part of the witness.
+Authenticated `billing_entity_ref` verification resolves the policy- and
+snapshot-bound identity token after plan entitlement. No raw identity is
+accepted or persisted on the pricing request path.
 
 The internal witness MUST retain at least:
 
@@ -310,34 +344,10 @@ membership MUST NOT be recycled as an independent address source. This prevents
 the circular claim "the TIN is at this address because its provider is here,
 therefore the provider is confirmed under the TIN at this address."
 
-An optional billing-entity site comparison may use only direct taxpayer/entity
-address evidence, an independently linked organization NPI's address, or direct
-plan/network directory evidence. It produces one deterministic comparison:
-
-- `exact_address` for canonical address equality;
-- `same_site` for premise equality with a unit-level difference;
-- `different`;
-- `not_comparable`.
-
-Site comparison and evidence confidence are separate dimensions. Every
-comparison also emits exactly one confidence value:
-
-- `confirmed` for direct, authoritative evidence supporting the compared
-  relationship and address;
-- `corroborated` for compatible evidence from independent sources;
-- `candidate` for a plausible but not independently established relationship;
-- `conflict` when applicable evidence materially disagrees;
-- `unknown` when the evidence is absent, excluded, stale beyond policy, or
-  otherwise insufficient.
-
-The comparison outcome (`exact_address`, `same_site`, `different`, or
-`not_comparable`) MUST NOT be inferred from the confidence label, or vice versa.
-Comparison output MUST retain its two evidence inputs, rule version,
-independence decision, `independent_source_count`, freshness, conflicts, and a
-machine-readable `circularity_exclusion_reason`. That reason is null only when
-no candidate evidence was excluded as circular. A match proves only the
-supported co-location. It does not relocate the provider, prove ownership, or
-bind the negotiated rate to that site.
+Billing-entity site comparison is not part of the V1 serving projection or
+public response. It remains deferred until a separately reviewed contract can
+prove independent inputs, circularity exclusion, comparison outcomes, and
+confidence semantics without relocating a provider or implying ownership.
 
 Exact-ZIP search compares each eligible NPI address to the requested ZIP only
 after the billing and rate witness is complete. Missing address evidence cannot
@@ -391,12 +401,14 @@ replace its own previous complete generation.
 
 ### Raw tax-identity handling
 
-The service MUST authenticate the caller, resolve tenant capability, and verify
-plan entitlement before tokenizing or searching. The type is normalized first
-and accepts only `ein` or `npi`. EIN normalization accepts only reviewed display
-forms and produces nine ASCII digits. NPI normalization accepts exactly ten
-ASCII digits and requires the CMS 80840/Luhn checksum. Matching is exact; fuzzy,
-prefix, substring, and enumeration searches are forbidden.
+The public pricing service MUST authenticate the caller, resolve tenant
+capability, and verify plan entitlement before resolving an opaque reference.
+It accepts no raw tax identity. Import, projection, or separately authorized
+reference-minting paths may normalize only `ein` or `npi`. EIN normalization
+accepts only reviewed display forms and produces nine ASCII digits. NPI
+normalization accepts exactly ten ASCII digits and requires the CMS 80840/Luhn
+checksum. Matching is exact; fuzzy, prefix, substring, and enumeration searches
+are forbidden.
 
 The normalized value is transformed using a domain-separated,
 policy-versioned HMAC-SHA-256 whose message binds the normalized type and value.
@@ -404,12 +416,13 @@ A bounded locator may index the lookup, but the full HMAC is authoritative and
 MUST be compared before a match is accepted. Policy descriptors and key versions
 are part of the generation contract.
 
-The value inside `billing_identity.tax_identity` is sensitive even when its type
-is `npi`. That taint is distinct from an optional rendering `provider_npi` used
-as a same-group filter. Raw or masked tax-identity values MUST NOT enter:
+A raw billing identity is sensitive even when its type is `npi`. That taint is
+distinct from the public optional rendering `npi` filter used as a same-group
+intersection. Neither permits a raw tax identity on the pricing request path.
+Raw or masked tax-identity values MUST NOT enter:
 
 - URLs, headers, logs, traces, exception text, validation echoes, or debug data;
-- response bodies, signed cursors, or billing references;
+- response bodies, sealed cursor plaintexts or tokens, or billing references;
 - metrics labels, cache keys, Redis keys, manifests, or public fixtures.
 
 Caches use only policy-versioned pseudonymous identities and immutable scope.
@@ -420,22 +433,28 @@ closed.
 ### `be1_` reference boundary
 
 `billing_entity_ref` is the only reusable and response-visible tax-identity
-identifier. A raw EIN or billing NPI is allowed only as transient sensitive
-request input. The reference is opaque, versioned, authenticated, and bound to
-enough policy, snapshot/release, and tenant/entitlement scope to prevent
-substitution or cross-snapshot confusion. The exact encoding remains an
-implementation detail.
+identifier and the only V1 billing selector. A raw EIN or billing NPI is never
+accepted by this GET operation. The reference is opaque, versioned, and
+authenticated; its tag binds the snapshot key and pseudonymous locator derived
+from the full HMAC. Separately, gateway authorization and authenticated
+transport bind the selected plan release and tenant/principal entitlement
+scopes. The outer
+encoding is frozen above; tag derivation and key policy remain internal security
+details.
 
 A `be1_` value may be emitted in an entitled response and reused as the single
 selector in a later entitled request. It MUST NOT reveal a raw or masked TIN,
 an internal group key, or a reversible database identifier. Input verification
-must authenticate the complete reference before lookup; prefix checking alone
-is not verification.
+may strictly decode the locator and perform its bounded pseudonymous candidate
+lookup first. It MUST authenticate the complete locator and tag against the
+authoritative full HMAC and snapshot key before accepting or serving a match;
+prefix checking alone is not verification.
 
 Unknown, expired, malformed, and unentitled references receive
-non-enumerating behavior. Detailed provenance requires a stronger capability
-than ordinary billing search. Access is audited, fanout and page size are
-bounded, and responses use `Cache-Control: private, no-store`.
+non-enumerating behavior. Detailed provenance requires both
+`pricing:billing-search` and `pricing:billing-search:provenance`. Access is
+audited, fanout and page size are bounded, and responses use
+`Cache-Control: private, no-store`.
 
 ## 9. Immutable evidence and serving generations
 
@@ -447,7 +466,6 @@ minimum, the logical model represents:
 - tax-identity-to-NPI/group evidence with explicit relationship class;
 - source-reported business-name evidence separate from identity derivation;
 - NPI/entity address evidence;
-- non-circular site comparisons;
 - evidence-generation build, publish, predecessor, and rollback state.
 
 Affiliation, observed billing, provider attestation, same-organization FHIR
@@ -465,9 +483,9 @@ PTG price generation
 
 Every request pins one bundle for its entire read transaction. A result cannot
 combine a newer price snapshot with an older connector or address projection.
-A cursor is signed and bound to the request fingerprint, authorization scope,
-generation bundle, stable sort tuple, expiry, and key version. Offset pagination
-is not permitted for this operation.
+A cursor is sealed with authenticated encryption and bound to the request
+fingerprint, authorization scope, generation bundle, stable sort tuple, expiry,
+and key version. Offset pagination is not permitted for this operation.
 
 ## 10. Build, atomic publication, and rollback
 
@@ -590,16 +608,16 @@ Implementation is not active until all applicable gates prove:
 - No group, set, rate, source, snapshot, NPI, or address cross-product is
   possible under property and integration tests.
 - A TIN-only group cannot fabricate a provider or address.
-- Exact-address, same-site, different, missing, stale, circular, and conflicting
-  evidence have deterministic outcomes.
-- Match classification and confidence remain independent, and
-  `independent_source_count` plus `circularity_exclusion_reason` survive
-  materialization and response shaping.
-- Raw EIN, raw billing-NPI, and `be1_` requests exercise the same exact witness;
-  an optional `provider_npi` only narrows the same-group intersection.
-- All six successful match states and generic `404`, `503`, and `409` behavior
-  match the frozen API contract without leaking inaccessible plan or reference
-  existence.
+- Missing, stale, circularly derived, and conflicting provider-address evidence
+  cannot fabricate an eligible provider GEO result.
+- Authenticated `be1_` requests preserve the exact billing witness; an optional
+  rendering `npi` only narrows the same-group intersection.
+- The closed top-level response contains exactly the frozen
+  `BillingSearchResponse` fields, uses `result_state`, and includes the selected
+  output-only `plan_release_id` without exposing a revision or snapshot field.
+- All six successful result states and generic `400`, `404`, `409`, and `503`
+  behavior match the frozen API contract without leaking inaccessible plan,
+  reference, or cursor material.
 - Existing GET behavior and OpenAPI remain backward compatible.
 
 ### Privacy and authorization
@@ -632,6 +650,8 @@ The following require later contracts or explicit approval:
 
 - bounded multi-identity OR requests;
 - a radius-search latency SLO;
+- billing-entity site-comparison materialization and public response fields;
+- serving-revision or resolved-snapshot public response fields;
 - licensed roster, CAQH, W-9, credentialed-directory, claims, or 837 ingestion;
 - any ownership, employment, facility, or exact rate-site assertion;
 - production activation and restricted-source publication.
