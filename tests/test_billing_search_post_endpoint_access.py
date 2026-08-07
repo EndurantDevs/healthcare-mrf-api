@@ -13,6 +13,7 @@ from sanic.compat import Header
 
 from api import billing_search_post_endpoint_access as endpoint_access
 from api import billing_search_post_gateway_transport as gateway_transport
+from api import billing_search_post_request as post_request
 from api.billing_search_post_endpoint_access import (
     BillingSearchPostEndpointAccessError,
     authorize_billing_search_post_endpoint,
@@ -212,6 +213,7 @@ def test_endpoint_access_rejects_request_substitution_after_id_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(endpoint_access, "id", lambda _value: 1, raising=False)
+    monkeypatch.setattr(post_request, "id", lambda _value: 1, raising=False)
     body = _body()
     access = _authorize(body, _headers(body))
     replacement_body = _body(tax_identity_value=REPLACEMENT_SYNTHETIC_EIN)
@@ -223,6 +225,59 @@ def test_endpoint_access_rejects_request_substitution_after_id_reuse(
         access,
         "_BillingSearchPostEndpointAccess__request",
         replacement.request,
+    )
+
+    with pytest.raises(BillingSearchPostEndpointAccessError):
+        validate_billing_search_post_endpoint_access(
+            access,
+            trusted_now=NOW,
+        )
+
+
+def test_endpoint_access_rejects_valid_transport_object_substitution() -> None:
+    body = _body()
+    access = _authorize(body, _headers(body))
+    replacement = _authorize(
+        body,
+        _headers(
+            body,
+            metering_request_id="11111111-1111-4111-8111-111111111111",
+            principal_scope_sha256=_sha("replacement-principal"),
+            quota_scope_sha256=_sha("replacement-quota"),
+        ),
+    )
+    object.__setattr__(
+        access,
+        "_BillingSearchPostEndpointAccess__transport",
+        replacement.transport,
+    )
+
+    with pytest.raises(BillingSearchPostEndpointAccessError):
+        validate_billing_search_post_endpoint_access(
+            access,
+            trusted_now=NOW,
+        )
+
+
+def test_endpoint_access_rejects_coordinated_replay_receipt_tampering() -> None:
+    body = _body()
+    access = _authorize(body, _headers(body))
+    replacement_request_id = "11111111-1111-4111-8111-111111111111"
+    object.__setattr__(
+        access.transport,
+        "metering_request_id",
+        replacement_request_id,
+    )
+    object.__setattr__(
+        access.transport,
+        "verified_state_sha256",
+        gateway_transport._verified_state_sha256(
+            access.transport.authorization_context,
+            plan_release_id=access.transport.plan_release_id,
+            request_shape_sha256=access.transport.request_shape_sha256,
+            metering_request_id=replacement_request_id,
+            trusted_now=access.transport.trusted_now,
+        ),
     )
 
     with pytest.raises(BillingSearchPostEndpointAccessError):

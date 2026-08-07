@@ -270,7 +270,7 @@ def _verified_signature(
             raise _fail()
         return key_id
     finally:
-        del body_bytes
+        del body_bytes, keyring
 
 
 def _capabilities(value: object) -> tuple[str, ...]:
@@ -479,7 +479,7 @@ def verify_billing_search_post_transport(
     except Exception:
         raise _fail() from None
     finally:
-        del body_bytes
+        del body_bytes, keyring
 
 
 __all__ = [

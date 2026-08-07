@@ -13,9 +13,7 @@ import re
 BILLING_SEARCH_TRANSPORT_KEYRING_CONTRACT = (
     "healthporta.billing-search-transport-keyring.v1"
 )
-BILLING_SEARCH_TRANSPORT_KEYRING_ENV = (
-    "HLTHPRT_BILLING_SEARCH_TRANSPORT_KEYRING_JSON"
-)
+BILLING_SEARCH_TRANSPORT_KEYRING_ENV = "HLTHPRT_BILLING_SEARCH_TRANSPORT_KEYRING_JSON"
 BILLING_SEARCH_TRANSPORT_MAX_KEYRING_BYTES = 4096
 
 _INVALID = "billing_search_transport_keyring_invalid"
@@ -95,24 +93,14 @@ def _decoded_base64url(encoded_text: object) -> bytes | None:
     canonical_text = (
         base64.urlsafe_b64encode(decoded_bytes).rstrip(b"=").decode("ascii")
     )
-    return (
-        decoded_bytes
-        if hmac.compare_digest(canonical_text, encoded_text)
-        else None
-    )
+    return decoded_bytes if hmac.compare_digest(canonical_text, encoded_text) else None
 
 
-class BillingSearchTransportKeyring:
-    """Immutable active-and-retained HMAC-SHA-256 keyring."""
-
-    __slots__ = ("__active_key_id", "__keys")
-
-    def __init__(
-        self,
-        *,
-        active_key_id: str,
-        keys_by_id: Mapping[str, bytes],
-    ) -> None:
+def _normalized_keyring_or_none(
+    active_key_id: object,
+    keys_by_id: object,
+) -> tuple[str, tuple[tuple[str, bytes], ...]] | None:
+    try:
         normalized_active_id = _canonical_key_id(active_key_id)
         if type(keys_by_id) is not dict or not 1 <= len(keys_by_id) <= _MAX_KEYS:
             raise _fail()
@@ -127,24 +115,44 @@ class BillingSearchTransportKeyring:
         )
         if len({key_id for key_id, _key in normalized_keys}) != len(
             normalized_keys
-        ) or len({key for _key_id, key in normalized_keys}) != len(
-            normalized_keys
-        ):
+        ) or len({key for _key_id, key in normalized_keys}) != len(normalized_keys):
             raise _fail()
-        if normalized_active_id not in {
-            key_id for key_id, _key in normalized_keys
-        }:
+        if normalized_active_id not in {key_id for key_id, _key in normalized_keys}:
             raise _fail()
-        object.__setattr__(
-            self,
-            "_BillingSearchTransportKeyring__active_key_id",
-            normalized_active_id,
-        )
-        object.__setattr__(
-            self,
-            "_BillingSearchTransportKeyring__keys",
-            normalized_keys,
-        )
+        return normalized_active_id, normalized_keys
+    except Exception:
+        return None
+
+
+class BillingSearchTransportKeyring:
+    """Immutable active-and-retained HMAC-SHA-256 keyring."""
+
+    __slots__ = ("__active_key_id", "__keys")
+
+    def __init__(
+        self,
+        *,
+        active_key_id: str,
+        keys_by_id: Mapping[str, bytes],
+    ) -> None:
+        normalized_keyring = _normalized_keyring_or_none(active_key_id, keys_by_id)
+        del active_key_id, keys_by_id
+        if normalized_keyring is None:
+            raise _fail()
+        normalized_active_id, normalized_keys = normalized_keyring
+        try:
+            object.__setattr__(
+                self,
+                "_BillingSearchTransportKeyring__active_key_id",
+                normalized_active_id,
+            )
+            object.__setattr__(
+                self,
+                "_BillingSearchTransportKeyring__keys",
+                normalized_keys,
+            )
+        finally:
+            del normalized_keyring, normalized_keys
 
     def __setattr__(self, attribute_name: str, attribute_value: object) -> None:
         del attribute_name, attribute_value
@@ -164,9 +172,12 @@ class BillingSearchTransportKeyring:
         """Return one retained key without disclosing key availability."""
 
         normalized_key_id = _canonical_key_id(key_id)
-        for retained_key_id, retained_key in self.__keys:
-            if hmac.compare_digest(retained_key_id, normalized_key_id):
-                return retained_key
+        for key_index in range(len(self.__keys)):
+            if hmac.compare_digest(
+                self.__keys[key_index][0],
+                normalized_key_id,
+            ):
+                return self.__keys[key_index][1]
         raise _fail()
 
     def __repr__(self) -> str:
@@ -218,8 +229,7 @@ def _keyring_from_environment(
         if (
             type(document) is not dict
             or frozenset(document) != _DOCUMENT_FIELDS
-            or document.get("contract")
-            != BILLING_SEARCH_TRANSPORT_KEYRING_CONTRACT
+            or document.get("contract") != BILLING_SEARCH_TRANSPORT_KEYRING_CONTRACT
             or type(document.get("keys")) is not list
             or not 1 <= len(document["keys"]) <= _MAX_KEYS
         ):
@@ -249,6 +259,7 @@ def load_billing_search_transport_keyring(
     """Load one closed keyring document from the healthcare environment."""
 
     keyring = _keyring_from_environment(environment_map)
+    del environment_map
     if keyring is None:
         raise _fail()
     return keyring

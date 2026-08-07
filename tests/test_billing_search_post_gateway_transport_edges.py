@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 
 import pytest
@@ -187,6 +188,37 @@ def test_gateway_verified_transport_rejects_wrong_runtime_type() -> None:
             object(),
             trusted_now=NOW,
         )
+
+
+def test_gateway_accepts_a_signature_from_a_retained_rotation_key() -> None:
+    retained_key_id = "synthetic-retained"
+    retained_key = bytes(reversed(KEY))
+    active_key_id = "synthetic-active"
+    context_bytes = gateway_transport._canonical_json_bytes(_context())
+    signature = hmac.new(
+        retained_key,
+        gateway_transport._signature_message(
+            retained_key_id,
+            context_bytes,
+            _body(),
+        ),
+        hashlib.sha256,
+    ).digest()
+    keyring = transport_keys.BillingSearchTransportKeyring(
+        active_key_id=active_key_id,
+        keys_by_id={retained_key_id: retained_key, active_key_id: KEY},
+    )
+
+    verified = gateway_transport.verify_billing_search_post_transport(
+        _base64url(context_bytes),
+        retained_key_id,
+        _base64url(signature),
+        body_bytes=_body(),
+        keyring=keyring,
+        trusted_now=NOW,
+    )
+
+    assert verified.plan_release_id == PLAN_RELEASE_ID
 
 
 def test_gateway_wraps_unexpected_verification_failure(

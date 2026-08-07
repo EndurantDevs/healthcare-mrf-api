@@ -140,9 +140,11 @@ def _request_keyring(
     environment_map: Mapping[str, str] | None,
 ) -> BillingSearchTransportKeyring:
     if keyring is None:
-        return load_billing_search_transport_keyring(
-            os.environ if environment_map is None else environment_map
-        )
+        environment_source = os.environ if environment_map is None else environment_map
+        try:
+            return load_billing_search_transport_keyring(environment_source)
+        finally:
+            del environment_map, environment_source
     if environment_map is not None:
         raise _fail()
     return keyring
@@ -335,15 +337,21 @@ def authorize_billing_search_post_endpoint(
 
     try:
         context_header, key_id_header, signature_header = _closed_header_values(headers)
-        keyring = _request_keyring(keyring, environment_map)
-        transport = verify_billing_search_post_transport(
-            context_header,
-            key_id_header,
-            signature_header,
-            body_bytes=body_bytes,
-            keyring=keyring,
-            trusted_now=trusted_now,
-        )
+        try:
+            keyring = _request_keyring(keyring, environment_map)
+        finally:
+            del environment_map
+        try:
+            transport = verify_billing_search_post_transport(
+                context_header,
+                key_id_header,
+                signature_header,
+                body_bytes=body_bytes,
+                keyring=keyring,
+                trusted_now=trusted_now,
+            )
+        finally:
+            del keyring
         request = parse_billing_search_post_transport(
             body_bytes,
             method=method,

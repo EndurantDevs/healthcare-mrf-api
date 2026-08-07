@@ -258,6 +258,55 @@ def test_endpoint_keyring_loading_covers_both_environment_sources(
         endpoint_access._request_keyring(_keyring(), environment)
 
 
+@pytest.mark.parametrize("use_process_environment", [False, True])
+def test_endpoint_keyring_failure_does_not_retain_environment_document(
+    monkeypatch: pytest.MonkeyPatch,
+    use_process_environment: bool,
+) -> None:
+    sensitive_marker = "synthetic-endpoint-key-document-marker"
+    environment_by_name = {
+        transport_keys.BILLING_SEARCH_TRANSPORT_KEYRING_ENV: sensitive_marker
+    }
+    endpoint_options_by_name = {"environment_map": environment_by_name}
+    if use_process_environment:
+        monkeypatch.setenv(
+            transport_keys.BILLING_SEARCH_TRANSPORT_KEYRING_ENV,
+            sensitive_marker,
+        )
+        endpoint_options_by_name = {}
+    body = _body()
+    with pytest.raises(
+        endpoint_access.BillingSearchPostEndpointAccessError
+    ) as captured:
+        endpoint_access.authorize_billing_search_post_endpoint(
+            body,
+            _signed_headers(body),
+            method=post_transport.BILLING_SEARCH_POST_METHOD,
+            path=post_transport.BILLING_SEARCH_POST_PATH,
+            media_type=post_transport.BILLING_SEARCH_POST_MEDIA_TYPE,
+            trusted_now=NOW,
+            **endpoint_options_by_name,
+        )
+
+    error: BaseException | None = captured.value
+    library_locals = []
+    while error is not None:
+        traceback = error.__traceback__
+        while traceback is not None:
+            module_name = traceback.tb_frame.f_globals.get("__name__", "")
+            if module_name in {
+                "api.billing_search_post_endpoint_access",
+                "api.billing_search_transport_keys",
+            }:
+                library_locals.append(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+        error = error.__context__
+    assert library_locals
+    assert all(
+        sensitive_marker not in repr(local_values) for local_values in library_locals
+    )
+
+
 def test_endpoint_access_object_protocol_is_immutable_and_redacted() -> None:
     body = _body()
     access = _authorize(body, _signed_headers(body))

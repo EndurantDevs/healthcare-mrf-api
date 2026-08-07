@@ -194,6 +194,21 @@ def test_transport_revalidation_binds_the_signed_replay_id():
         )
 
 
+def test_transport_revalidation_rejects_the_current_expiry_boundary():
+    verified = transport.verify_billing_search_post_transport(
+        *_headers(),
+        body_bytes=BODY,
+        keyring=_keyring(),
+        trusted_now=NOW,
+    )
+
+    with pytest.raises(transport.BillingSearchPostTransportAuthenticationError):
+        transport.validate_billing_search_post_verified_transport(
+            verified,
+            trusted_now="2026-08-07T10:01:00Z",
+        )
+
+
 @pytest.mark.parametrize(
     "trusted_now",
     ["2026-08-07T09:59:59Z", "2026-08-07T10:01:00Z"],
