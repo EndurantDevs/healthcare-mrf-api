@@ -4408,6 +4408,88 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+    post:
+      operationId: postPricingProvidersSearchByProcedureByBillingIdentity
+      summary: Find exact billing-identity rates at provider addresses
+      description: |
+        Searches the entitled current plan release through one exact billing
+        identity. The server first restricts rates to the identity's exact
+        provider groups, then returns only group-member providers whose own
+        independently sourced address satisfies the requested geography.
+
+        A matching address is provider location evidence. It does not establish
+        TIN ownership, employment, facility ownership, or an exact rate-to-site
+        relationship. Raw tax-identity values are write-only and are never
+        returned, echoed in errors, placed in cursors, or exposed in provenance.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingIdentityPricingSearchRequest'
+      responses:
+        '200':
+          description: Exact billing-identity search completed with an explicit result state.
+          headers:
+            Cache-Control:
+              description: Prevent shared or persistent caching of identity-scoped results.
+              schema:
+                type: string
+                enum: ['private, no-store']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingIdentityPricingSearchResponse'
+        '400':
+          description: Invalid closed request body or cursor syntax.
+          headers:
+            Cache-Control:
+              description: Prevent shared or persistent caching of identity-scoped errors.
+              schema:
+                type: string
+                enum: ['private, no-store']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingIdentityPricingSearchError'
+        '404':
+          description: |
+            Resource unavailable. Unknown and unentitled plans or opaque
+            references are intentionally indistinguishable.
+          headers:
+            Cache-Control:
+              description: Prevent shared or persistent caching of identity-scoped errors.
+              schema:
+                type: string
+                enum: ['private, no-store']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingIdentityPricingSearchError'
+        '409':
+          description: The cursor's pinned serving generation is no longer retained.
+          headers:
+            Cache-Control:
+              description: Prevent shared or persistent caching of identity-scoped errors.
+              schema:
+                type: string
+                enum: ['private, no-store']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingIdentityPricingSearchError'
+        '503':
+          description: A validated release, identity projection, or serving generation is unavailable.
+          headers:
+            Cache-Control:
+              description: Prevent shared or persistent caching of identity-scoped errors.
+              schema:
+                type: string
+                enum: ['private, no-store']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingIdentityPricingSearchError'
   /pricing/providers/by-procedure:
     get:
       operationId: getPricingProvidersByProcedure
@@ -5336,6 +5418,506 @@ components:
         details:
           type: string
       additionalProperties: true
+    BillingIdentityPricingSearchRequest:
+      type: object
+      description: |
+        Closed request for one entitled billing identity. Exactly one selector
+        arm is required. The optional provider NPI is an exact same-group
+        intersection and never starts an independent provider lookup.
+      required: [healthporta_plan_id, billing_identity, procedure, geo]
+      properties:
+        healthporta_plan_id:
+          type: string
+          pattern: '^hpplan_[0-9A-HJKMNP-TV-Z]{26}$'
+          description: Public plan identifier; the server resolves its current immutable release.
+        billing_identity:
+          $ref: '#/components/schemas/BillingIdentityPricingSelector'
+        procedure:
+          $ref: '#/components/schemas/BillingIdentityPricingProcedureRequest'
+        geo:
+          $ref: '#/components/schemas/BillingIdentityPricingGeoRequest'
+        provider_npi:
+          type: string
+          pattern: '^[0-9]{10}$'
+          description: Optional checksum-valid NPI intersected with the exact billing groups.
+        include_evidence:
+          type: boolean
+          default: false
+          description: Requires the dedicated provenance capability when true.
+        page:
+          $ref: '#/components/schemas/BillingIdentityPricingPageRequest'
+      additionalProperties: false
+    BillingIdentityPricingSelector:
+      description: Exactly one raw tax identity or one opaque billing-entity reference.
+      oneOf:
+        - $ref: '#/components/schemas/BillingIdentityPricingTaxSelector'
+        - $ref: '#/components/schemas/BillingIdentityPricingReferenceSelector'
+    BillingIdentityPricingTaxSelector:
+      type: object
+      required: [tax_identity]
+      properties:
+        tax_identity:
+          $ref: '#/components/schemas/BillingIdentityPricingTaxIdentity'
+      additionalProperties: false
+    BillingIdentityPricingReferenceSelector:
+      type: object
+      required: [billing_entity_ref]
+      properties:
+        billing_entity_ref:
+          type: string
+          pattern: '^be1_[A-Za-z0-9_-]{64}$'
+          description: Authenticated opaque reference returned by a prior entitled lookup.
+      additionalProperties: false
+    BillingIdentityPricingTaxIdentity:
+      type: object
+      description: |
+        Exact typed taxpayer or NPI billing identifier. EIN formatting may use
+        digits alone or the standard separator. NPI values must pass the NPI
+        checksum. The value is transient, sensitive, and never returned.
+      required: [type, value]
+      properties:
+        type:
+          type: string
+          enum: [ein, npi]
+        value:
+          type: string
+          minLength: 9
+          maxLength: 10
+          writeOnly: true
+          description: Sensitive exact identifier; excluded from responses, errors, logs, and cursors.
+      additionalProperties: false
+    BillingIdentityPricingProcedureRequest:
+      type: object
+      required: [code_system, code, modifiers, place_of_service]
+      properties:
+        code_system:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_]{0,31}$'
+        code:
+          type: string
+          pattern: '^[A-Z0-9][A-Z0-9._-]{0,63}$'
+        modifiers:
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          description: Canonically sorted unique exact modifiers.
+          items:
+            type: string
+            pattern: '^[A-Z0-9]{1,8}$'
+        place_of_service:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          description: Canonically sorted unique two-digit place-of-service codes.
+          items:
+            type: string
+            pattern: '^[0-9]{2}$'
+      additionalProperties: false
+    BillingIdentityPricingGeoRequest:
+      type: object
+      required: [zip5, radius_miles]
+      properties:
+        zip5:
+          type: string
+          pattern: '^[0-9]{5}$'
+          description: Required geographic anchor.
+        radius_miles:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Zero requests exact-ZIP matching; a positive value requests radius matching.
+      additionalProperties: false
+    BillingIdentityPricingPageRequest:
+      type: object
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 25
+        cursor:
+          type: string
+          nullable: true
+          minLength: 1
+          maxLength: 2048
+          description: Signed keyset cursor bound to authorization, request, release, and generation.
+      additionalProperties: false
+    BillingIdentityPricingSearchResponse:
+      type: object
+      required:
+        - result_state
+        - pricing_scope
+        - billing_association_scope
+        - geo_match_scope
+        - resolved_release
+        - billing_identity
+        - procedure
+        - items
+        - pagination
+      properties:
+        result_state:
+          type: string
+          enum:
+            - matched
+            - no_matching_tax_identity
+            - tax_identity_unavailable_for_snapshot
+            - no_matching_rates
+            - no_match_in_radius
+            - no_snapshot_for_plan
+        pricing_scope:
+          type: string
+          enum: [plan_scoped_ptg_tax_identity]
+        billing_association_scope:
+          type: string
+          enum: [tax_identity_match_only]
+        geo_match_scope:
+          type: string
+          enum: [provider_address_evidence]
+        resolved_release:
+          $ref: '#/components/schemas/BillingIdentityPricingResolvedRelease'
+        billing_identity:
+          $ref: '#/components/schemas/BillingIdentityPricingIdentityResult'
+        procedure:
+          $ref: '#/components/schemas/BillingIdentityPricingProcedureResult'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BillingIdentityPricingProviderResult'
+        pagination:
+          $ref: '#/components/schemas/BillingIdentityPricingPaginationResult'
+      additionalProperties: false
+    BillingIdentityPricingResolvedRelease:
+      type: object
+      required:
+        - healthporta_plan_id
+        - plan_release_id
+        - plan_version_id
+        - serving_revision_id
+        - release_month
+        - release_status
+        - is_current
+        - binding_set_digest
+        - snapshot_refs
+      properties:
+        healthporta_plan_id:
+          type: string
+          pattern: '^hpplan_[0-9A-HJKMNP-TV-Z]{26}$'
+        plan_release_id:
+          type: string
+          pattern: '^hprelease_[0-9A-HJKMNP-TV-Z]{26}$'
+        plan_version_id:
+          type: string
+          nullable: true
+          pattern: '^hpversion_[0-9A-HJKMNP-TV-Z]{26}$'
+        serving_revision_id:
+          type: string
+          pattern: '^hpserve_[0-9A-HJKMNP-TV-Z]{26}$'
+        release_month:
+          type: string
+          pattern: '^[0-9]{4}-(?:0[1-9]|1[0-2])$'
+        release_status:
+          type: string
+          enum: [published]
+        is_current:
+          type: boolean
+          enum: [true]
+        binding_set_digest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        snapshot_refs:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+      additionalProperties: false
+    BillingIdentityPricingIdentityResult:
+      type: object
+      required: [selector_kind, tax_identity_type, matched_billing_entity_refs]
+      properties:
+        selector_kind:
+          type: string
+          enum: [tax_identity, billing_entity_ref]
+        tax_identity_type:
+          type: string
+          nullable: true
+          enum: [ein, npi]
+          description: Identifier type only; the supplied value is never returned.
+        matched_billing_entity_refs:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^be1_[A-Za-z0-9_-]{64}$'
+      additionalProperties: false
+    BillingIdentityPricingProviderResult:
+      type: object
+      required:
+        - npi
+        - billing_entity_ref
+        - billing_witness_scope
+        - address
+        - distance_miles
+        - billing_entity_site_match
+        - rate_occurrences
+      properties:
+        npi:
+          type: integer
+          minimum: 1000000000
+          maximum: 9999999999
+          description: Checksum-valid provider NPI.
+        billing_entity_ref:
+          type: string
+          pattern: '^be1_[A-Za-z0-9_-]{64}$'
+        billing_witness_scope:
+          type: string
+          enum: [exact_tax_identity_group_rate_npi]
+        address:
+          $ref: '#/components/schemas/BillingIdentityPricingProviderAddress'
+        distance_miles:
+          type: number
+          minimum: 0
+          nullable: true
+        billing_entity_site_match:
+          $ref: '#/components/schemas/BillingIdentityPricingSiteMatch'
+        rate_occurrences:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/BillingIdentityPricingRateOccurrence'
+        address_evidence:
+          $ref: '#/components/schemas/BillingIdentityPricingAddressEvidence'
+      additionalProperties: false
+    BillingIdentityPricingProviderAddress:
+      type: object
+      description: The matched provider's selected address, not an inferred TIN-owned facility.
+      required:
+        - address_kind
+        - first_line
+        - second_line
+        - city
+        - state
+        - postal_code
+        - country_code
+        - purpose
+      properties:
+        address_kind:
+          type: string
+          enum: [physical]
+        first_line:
+          type: string
+          nullable: true
+        second_line:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        state:
+          type: string
+          nullable: true
+        postal_code:
+          type: string
+          nullable: true
+        country_code:
+          type: string
+          nullable: true
+        purpose:
+          type: string
+          nullable: true
+      additionalProperties: false
+    BillingIdentityPricingSiteMatch:
+      type: object
+      description: Phase-one output does not fabricate independent TIN-to-site confirmation.
+      required: [classification, confidence]
+      properties:
+        classification:
+          type: string
+          enum: [not_comparable]
+        confidence:
+          type: string
+          enum: [unknown]
+      additionalProperties: false
+    BillingIdentityPricingAddressEvidence:
+      type: object
+      required: [evidence_level, selection_contract, sources]
+      properties:
+        evidence_level:
+          type: string
+          enum:
+            - nppes_registry_address
+            - multi_issuer_marketplace_address
+            - cms_doctors_source_with_nppes_identity_anchor
+        selection_contract:
+          type: string
+          enum: [ptg2_billing_provider_address_selection_v1]
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/BillingIdentityPricingAddressEvidenceSource'
+      additionalProperties: false
+    BillingIdentityPricingAddressEvidenceSource:
+      type: object
+      required: [dataset, retrieved_at]
+      properties:
+        dataset:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        retrieved_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+    BillingIdentityPricingRateOccurrence:
+      type: object
+      required:
+        - occurrence_ordinal
+        - billing_entity_ref
+        - billing_witness_scope
+        - procedure
+        - prices
+      properties:
+        occurrence_ordinal:
+          type: integer
+          minimum: 1
+        billing_entity_ref:
+          type: string
+          pattern: '^be1_[A-Za-z0-9_-]{64}$'
+        billing_witness_scope:
+          type: string
+          enum: [exact_tax_identity_group_rate_npi]
+        procedure:
+          $ref: '#/components/schemas/BillingIdentityPricingRateProcedure'
+        prices:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/BillingIdentityPricingNegotiatedPrice'
+      additionalProperties: false
+    BillingIdentityPricingProcedureResult:
+      type: object
+      required: [code_system, code, modifiers, place_of_service]
+      properties:
+        code_system:
+          type: string
+        code:
+          type: string
+        modifiers:
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            type: string
+        place_of_service:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+      additionalProperties: false
+    BillingIdentityPricingRateProcedure:
+      type: object
+      required:
+        - code_system
+        - code
+        - negotiation_arrangement
+        - billing_code_type_version
+      properties:
+        code_system:
+          type: string
+        code:
+          type: string
+        negotiation_arrangement:
+          type: string
+          nullable: true
+        billing_code_type_version:
+          type: string
+          nullable: true
+      additionalProperties: false
+    BillingIdentityPricingNegotiatedPrice:
+      type: object
+      required:
+        - negotiated_rate
+        - negotiated_type
+        - expiration_date
+        - service_code
+        - billing_class
+        - setting
+        - billing_code_modifier
+        - additional_information
+      properties:
+        negotiated_rate:
+          type: number
+        negotiated_type:
+          type: string
+          nullable: true
+        expiration_date:
+          type: string
+          nullable: true
+        service_code:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+        billing_class:
+          type: string
+          nullable: true
+        setting:
+          type: string
+          nullable: true
+        billing_code_modifier:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+        additional_information:
+          type: string
+          nullable: true
+      additionalProperties: false
+    BillingIdentityPricingPaginationResult:
+      type: object
+      required: [limit, has_more, next_cursor]
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+          nullable: true
+          minLength: 1
+          maxLength: 2048
+      additionalProperties: false
+    BillingIdentityPricingSearchError:
+      type: object
+      description: Generic value-free error response that never echoes selector input.
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/BillingIdentityPricingSearchErrorDetail'
+      additionalProperties: false
+    BillingIdentityPricingSearchErrorDetail:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - resource_not_found
+            - cursor_generation_expired
+            - billing_search_unavailable
+        message:
+          type: string
+          enum:
+            - Resource not found.
+            - The billing search request could not be completed.
+      additionalProperties: false
     PtgAuditOccurrenceResponse:
       type: object
       required:

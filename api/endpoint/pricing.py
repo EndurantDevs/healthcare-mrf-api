@@ -13,6 +13,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
@@ -24,6 +25,22 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
                         func, or_, select, text)
 
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
+from api.billing_search_access_contract import BILLING_SEARCH_CACHE_CONTROL
+from api.billing_search_post_endpoint_access import (
+    BillingSearchPostEndpointAccessError,
+    authorize_billing_search_post_endpoint,
+)
+from api.billing_search_post_operation import (
+    BillingSearchCursorGenerationExpiredError,
+    BillingSearchPostCursorInvalidError,
+    BillingSearchResourceNotFoundError,
+    BillingSearchPostServingUnavailableError,
+    execute_billing_search_post,
+)
+from api.billing_search_transport_keys import (
+    BillingSearchTransportKeyringError,
+    load_billing_search_transport_keyring,
+)
 from api.control_auth import require_control_auth
 from api.endpoint.pagination import parse_pagination
 from api.ptg2_candidate_audit import (
@@ -151,6 +168,12 @@ def _ptg_json_response(request: Any, payload: Any, *, status: int = 200):
         _json_response(payload, status=status),
         result_count=result_count,
     )
+
+
+def _billing_search_json_response(payload: Any, *, status: int = 200):
+    billing_response = _json_response(payload, status=status)
+    billing_response.headers["Cache-Control"] = BILLING_SEARCH_CACHE_CONTROL
+    return billing_response
 
 
 @contextmanager
@@ -10869,6 +10892,110 @@ async def audit_ptg2_source_witness_batch(request):
 # After the route was renamed to /by-procedure, that path fell through to
 # /providers/<npi> -> "Parameter 'npi' must be an integer", 500-ing every
 # plan-scoped pricing search. Keep the old path pointed at this handler.
+def _billing_search_trusted_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _billing_search_media_type(request: Any) -> str:
+    content_type = getattr(request, "content_type", None)
+    if type(content_type) is not str:
+        return ""
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def _billing_search_error_response(*, status: int, code: str):
+    return _billing_search_json_response(
+        {
+            "error": {
+                "code": code,
+                "message": (
+                    "Resource not found."
+                    if status == 404
+                    else "The billing search request could not be completed."
+                ),
+            }
+        },
+        status=status,
+    )
+
+
+def _authorize_billing_search_request(request: Any, trusted_now: str):
+    """Authenticate one exact body before the route obtains a DB session."""
+
+    transport_keyring = load_billing_search_transport_keyring(os.environ)
+    return authorize_billing_search_post_endpoint(
+        request.body,
+        request.headers,
+        method=request.method,
+        path=request.path,
+        media_type=_billing_search_media_type(request),
+        trusted_now=trusted_now,
+        keyring=transport_keyring,
+    )
+
+
+@blueprint.post(
+    "/providers/search-by-procedure",
+    name="pricing.providers.search_by_procedure_post",
+)
+async def search_providers_by_procedure_billing_identity(request):
+    """Serve one exact billing-identity-scoped provider pricing page."""
+
+    trusted_now = _billing_search_trusted_now()
+    try:
+        access = _authorize_billing_search_request(request, trusted_now)
+    except BillingSearchTransportKeyringError:
+        return _billing_search_error_response(
+            status=503,
+            code="billing_search_unavailable",
+        )
+    except BillingSearchPostEndpointAccessError:
+        return _billing_search_error_response(
+            status=404,
+            code="resource_not_found",
+        )
+    try:
+        execution = await execute_billing_search_post(
+            _get_session(request),
+            access,
+            trusted_now=trusted_now,
+            radius_zip_context_resolver=_lookup_zip_context,
+            environment_map=os.environ,
+        )
+    except BillingSearchResourceNotFoundError:
+        return _billing_search_error_response(
+            status=404,
+            code="resource_not_found",
+        )
+    except BillingSearchCursorGenerationExpiredError:
+        return _billing_search_error_response(
+            status=409,
+            code="cursor_generation_expired",
+        )
+    except BillingSearchPostCursorInvalidError:
+        return _billing_search_error_response(
+            status=400,
+            code="invalid_request",
+        )
+    except BillingSearchPostServingUnavailableError:
+        return _billing_search_error_response(
+            status=503,
+            code="billing_search_unavailable",
+        )
+    logger.info(
+        "Billing search POST completed",
+        extra={
+            "billing_search_audit": execution.audit_record,
+            "billing_search_stage_timings_ms": dict(
+                execution.stage_timings_ms
+            ),
+        },
+    )
+    return _billing_search_json_response(execution.payload)
+
+
 def _reject_resolver_only_procedure_search_params(args) -> None:
     """Direct callers must resolve clinical intent before pricing search."""
 
