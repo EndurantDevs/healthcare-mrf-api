@@ -78,12 +78,20 @@ def test_request_is_redacted_immutable_and_has_safe_service_projection() -> None
     assert repr(service_query) == "<redacted-billing-search-post-service-query>"
     assert copy.copy(request) is request
     assert copy.deepcopy(request) is request
+    assert copy.copy(service_query) is service_query
+    assert copy.deepcopy(service_query) is service_query
     with pytest.raises(BillingSearchPostRequestError):
         pickle.dumps(request)
+    with pytest.raises(BillingSearchPostRequestError):
+        pickle.dumps(service_query)
+    with pytest.raises(BillingSearchPostRequestError):
+        type(service_query)()
     with pytest.raises(TypeError):
         request.limit = 30
     with pytest.raises(TypeError):
         service_query.limit = 30
+    with pytest.raises(TypeError):
+        del service_query.limit
 
     assert request.selector_kind == "tax_identity"
     assert request.tax_identity_type == "ein"
@@ -91,7 +99,20 @@ def test_request_is_redacted_immutable_and_has_safe_service_projection() -> None
     assert not hasattr(request, "tax_identity_value")
     assert request.provider_npi == int(_synthetic_npi())
     assert request.include_evidence is False
+    assert service_query.healthporta_plan_id == request.healthporta_plan_id
+    assert service_query.selector_kind == request.selector_kind
+    assert service_query.tax_identity_type == request.tax_identity_type
+    assert service_query.code_system == "CPT"
+    assert service_query.code == "99213"
+    assert service_query.modifiers == ()
+    assert service_query.place_of_service == ()
+    assert service_query.zip5 == "12345"
+    assert service_query.radius_miles == 0.0
+    assert service_query.provider_npi == request.provider_npi
     assert service_query.include_evidence is False
+    assert service_query.limit == 25
+    assert service_query.cursor is None
+    assert service_query.request_shape_sha256 == request.request_shape_sha256
     assert service_query.procedure_args == {
         "code_system": "CPT",
         "code": "99213",
