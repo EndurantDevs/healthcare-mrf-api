@@ -1082,7 +1082,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260807100000_provider_directory_endpoint_dataset_guard"
+        "20260807110000_fhir_formulary_storage_foundation"
     ]
 
 
