@@ -122,7 +122,7 @@ async def test_bounded_price_hydration_rejects_all_cache_overflow_without_decode
     decode_missing = AsyncMock()
     monkeypatch.setattr(
         ptg2_serving,
-        "_version_three_bounded_price_hydration_for_keys",
+        "_bounded_v3_price_hydration",
         decode_missing,
     )
 

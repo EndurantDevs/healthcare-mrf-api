@@ -5926,12 +5926,10 @@ async def _legacy_shared_graph_members_many(
         max_members=max_members,
         max_total_members=max_projection_members,
     )
-    if max_projection_members is not None and sum(
-        len(member_keys) for member_keys in members_by_owner_key.values()
-    ) > int(max_projection_members):
-        raise PTG2ManifestArtifactError(
-            "PTG2 shared graph selection exceeds max_projection_members"
-        )
+    _require_legacy_projection_bound(
+        members_by_owner_key,
+        max_projection_members,
+    )
     member_keys = {
         member_key
         for members in members_by_owner_key.values()
@@ -5952,6 +5950,20 @@ async def _legacy_shared_graph_members_many(
         )
         for owner_id in owner_ids
     }
+
+
+def _require_legacy_projection_bound(
+    members_by_owner_key: Mapping[int, tuple[int, ...]],
+    max_projection_members: int | None,
+) -> None:
+    """Fail closed if a legacy graph reader escapes its aggregate bound."""
+
+    if max_projection_members is not None and sum(
+        len(member_keys) for member_keys in members_by_owner_key.values()
+    ) > max_projection_members:
+        raise PTG2ManifestArtifactError(
+            "PTG2 shared graph selection exceeds max_projection_members"
+        )
 
 
 def _normalized_projection_member_limit(
@@ -8112,7 +8124,7 @@ async def _version_three_prices_by_key(
     }
 
 
-async def _version_three_bounded_price_hydration_for_keys(
+async def _bounded_v3_price_hydration(
     session,
     serving_tables: PTG2ServingTables,
     normalized_price_keys: tuple[int, ...],
@@ -8205,7 +8217,7 @@ async def _version_three_bounded_prices_by_key(
         )
     if not missing_keys:
         return cached_rows
-    hydration = await _version_three_bounded_price_hydration_for_keys(
+    hydration = await _bounded_v3_price_hydration(
         session,
         serving_tables,
         missing_keys,
@@ -10964,6 +10976,26 @@ def _membership_provenance_sql(address_table: str) -> dict[str, str]:
     }
 
 
+def _membership_site_key_pair_sql(
+    *,
+    include_address_site_key: bool,
+    uses_unified_addresses: bool,
+) -> str:
+    """Return the complete billing-only JSON pair for a premise key."""
+
+    if include_address_site_key and uses_unified_addresses:
+        return "'address_site_key', addr.premise_key::text,"
+    return ""
+
+
+def _membership_tiebreak_sql(*, uses_unified_addresses: bool) -> str:
+    """Return the stable location tiebreak for the selected address table."""
+
+    if uses_unified_addresses:
+        return "addr.location_key"
+    return "COALESCE(addr.address_key::text, ''), COALESCE(addr.type, '')"
+
+
 def _membership_sql_values(
     query_context: _MembershipLocationQuery,
     *,
@@ -10984,10 +11016,9 @@ def _membership_sql_values(
         "location_hash_sql": location_hash_sql,
         "telephone_sql": _ptg2_nullish_text_sql("addr.telephone_number"),
         "fax_sql": _ptg2_nullish_text_sql("addr.fax_number"),
-        "address_site_key_json_pair_sql": (
-            "'address_site_key', addr.premise_key::text,"
-            if include_address_site_key and uses_unified_addresses
-            else ""
+        "address_site_key_json_pair_sql": _membership_site_key_pair_sql(
+            include_address_site_key=include_address_site_key,
+            uses_unified_addresses=uses_unified_addresses,
         ),
         **_membership_provenance_sql(query_context.address_table),
         "distance_sql": query_context.distance_sql,
@@ -10998,13 +11029,8 @@ def _membership_sql_values(
         "address_assurance_sql": query_context.address_assurance_sql,
         "postal_box_rank_sql": address_display_rank_sql("addr"),
         "geo_evidence_level_sql": geo_evidence_level_sql,
-        "location_tiebreak_sql": (
-            "addr.location_key"
-            if uses_unified_addresses
-            else (
-                "COALESCE(addr.address_key::text, ''), "
-                "COALESCE(addr.type, '')"
-            )
+        "location_tiebreak_sql": _membership_tiebreak_sql(
+            uses_unified_addresses=uses_unified_addresses
         ),
         "selected_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
             "selected.geo_evidence_level"

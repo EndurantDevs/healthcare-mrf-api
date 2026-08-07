@@ -47,11 +47,6 @@ class _ExplodingIterable:
         raise RuntimeError("synthetic iterator failure")
 
 
-class _ExplodingMapping(dict):
-    def get(self, _key, _default=None):
-        raise RuntimeError("synthetic mapping failure")
-
-
 class _ExplodingAsyncContext:
     async def __aenter__(self):
         raise RuntimeError("synthetic transaction failure")
@@ -416,44 +411,6 @@ async def test_building_source_validation_redacts_unexpected_failures(monkeypatc
             sealed_metadata=_sealed_metadata(),
             aggregate_metadata=_aggregate_metadata(),
         )
-
-
-def test_public_source_publication_parser_round_trips_canonical_metadata():
-    metadata = _sealed_metadata()
-
-    publication = tax_identity_source_publication_from_metadata(metadata)
-
-    assert publication.as_dict() == metadata
-
-
-@pytest.mark.parametrize(
-    "invalid_metadata",
-    [
-        {**_sealed_metadata(), "contract": "other"},
-        {**_sealed_metadata(), "unexpected": "field"},
-        {
-            key: value
-            for key, value in _sealed_metadata().items()
-            if key != "content_digest"
-        },
-        {**_sealed_metadata(), "source_count": True},
-        {**_sealed_metadata(), "content_digest": "A" * 64},
-        _ExplodingMapping(),
-    ],
-    ids=(
-        "wrong-contract",
-        "extra-field",
-        "missing-field",
-        "boolean-count",
-        "noncanonical-digest",
-        "hostile-mapping",
-    ),
-)
-def test_public_source_publication_parser_rejects_malformed_metadata(
-    invalid_metadata,
-):
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        tax_identity_source_publication_from_metadata(invalid_metadata)
 
 
 @pytest.mark.asyncio

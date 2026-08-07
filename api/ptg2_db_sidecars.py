@@ -4724,6 +4724,42 @@ lookup_shared_provider_code_intersections_from_db = (
 lookup_shared_provider_code_map_from_db = lookup_provider_code_map_from_db
 
 
+def _price_keys_for_membership_aliases(
+    physical_aliases: Iterable[tuple[int, _SharedLogicalBlock]],
+    requested_key_set: AbstractSet[int],
+    block_span: int,
+) -> set[int]:
+    """Select requested price keys covered by one physical alias group."""
+
+    return {
+        price_key
+        for block_key, _alias_block in physical_aliases
+        for price_key in requested_key_set
+        if block_key * block_span
+        <= price_key
+        < (block_key + 1) * block_span
+    }
+
+
+def _claim_price_membership_retention(
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    atom_keys: tuple[int, ...],
+) -> int:
+    """Claim and return the retained bytes for one decoded membership."""
+
+    if retention_budget is None:
+        return 0
+    membership_bytes = (
+        _PRICE_MEMBERSHIP_OWNER_RETAINED_BYTES
+        + len(atom_keys) * _PRICE_MEMBERSHIP_RETAINED_BYTES
+    )
+    retention_budget.claim(
+        membership_bytes,
+        category="a decoded price-to-atom membership",
+    )
+    return membership_bytes
+
+
 async def lookup_price_atom_memberships_from_db(
     session: Any,
     shared_snapshot_key: int,
@@ -4775,14 +4811,11 @@ async def lookup_price_atom_memberships_from_db(
             logical_blocks
         ).values():
             representative_key, logical_block = physical_aliases[0]
-            group_requested_keys = {
-                price_key
-                for block_key, _alias_block in physical_aliases
-                for price_key in requested_key_set
-                if block_key * effective_span
-                <= price_key
-                < (block_key + 1) * effective_span
-            }
+            group_requested_keys = _price_keys_for_membership_aliases(
+                physical_aliases,
+                requested_key_set,
+                effective_span,
+            )
             _claim_logical_block_processing(
                 logical_block,
                 schema_name=schema_name,
@@ -4824,16 +4857,10 @@ async def lookup_price_atom_memberships_from_db(
                     raise PTG2ManifestArtifactError(
                         "PTG2 v3 price-membership artifact contains a " "duplicate key"
                     )
-                membership_bytes = (
-                    _PRICE_MEMBERSHIP_OWNER_RETAINED_BYTES
-                    + len(atom_keys) * _PRICE_MEMBERSHIP_RETAINED_BYTES
+                retained_membership_bytes += _claim_price_membership_retention(
+                    retention_budget,
+                    atom_keys,
                 )
-                if retention_budget is not None:
-                    retention_budget.claim(
-                        membership_bytes,
-                        category="a decoded price-to-atom membership",
-                    )
-                    retained_membership_bytes += membership_bytes
                 memberships_by_price_key[price_key] = atom_keys
     except BaseException:
         if retention_budget is not None:

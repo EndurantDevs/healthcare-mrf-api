@@ -110,7 +110,7 @@ def _source_row(
     manifest_count: Any = 1,
     **source_state_overrides: Any,
 ) -> dict[str, Any]:
-    source_state_row = {
+    source_state_by_field = {
         "manifest_count": manifest_count,
         "contract": "ptg2_provider_group_tax_identity_source_v1",
         "binding_contract": "ptg2_tax_identity_rate_source_binding_v1",
@@ -134,8 +134,8 @@ def _source_row(
             else group_character
         ),
     }
-    source_state_row.update(source_state_overrides)
-    return source_state_row
+    source_state_by_field.update(source_state_overrides)
+    return source_state_by_field
 
 
 def _source_state_row(*, manifest_count: Any = 1) -> dict[str, Any]:
