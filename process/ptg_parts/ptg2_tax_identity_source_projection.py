@@ -25,9 +25,7 @@ from process.ptg_parts.ptg2_tax_identity_source_binding_vector import (
 )
 
 PTG2_TAX_IDENTITY_SOURCE_CONTRACT = "ptg2_provider_group_tax_identity_source_v1"
-PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT = (
-    "ptg2_provider_group_tax_identity_source_content_v1"
-)
+PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT = "ptg2_provider_group_tax_identity_source_content_v1"
 PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT = "ptg2_tax_identity_rate_source_binding_v1"
 _ERROR = "ptg2_tax_identity_source_projection_invalid"
 _MAGIC = b"PTG2TAX1"
@@ -44,9 +42,7 @@ _STATE_COUNT_FIELDS = (
     "malformed_count",
     "unsupported_type_count",
 )
-_BINDING_FIELDS = frozenset(
-    {"contract", "source_type", "identity_kind", "identity_sha256", "source_key"}
-)
+_BINDING_FIELDS = frozenset({"contract", "source_type", "identity_kind", "identity_sha256", "source_key"})
 _SOURCE_DESCRIPTOR_FIELDS = frozenset(
     {
         "name",
@@ -289,6 +285,18 @@ class TaxIdentitySourcePublication:
         }
 
 
+def tax_identity_source_publication_from_metadata(
+    metadata_by_field: Mapping[str, Any],
+) -> TaxIdentitySourcePublication:
+    """Return one canonical pathless publication from sealed metadata."""
+
+    from process.ptg_parts.ptg2_tax_identity_source_publication_parser import (
+        parse_tax_identity_source_publication,
+    )
+
+    return parse_tax_identity_source_publication(metadata_by_field)
+
+
 def _source_ordinal_by_shard(
     raw_entries: Iterable[Mapping[str, Any]],
 ) -> tuple[dict[str, int], bytes]:
@@ -486,4 +494,5 @@ __all__ = [
     "PreparedTaxIdentitySourceProjection",
     "TaxIdentitySourceProjectionError",
     "TaxIdentitySourcePublication",
+    "tax_identity_source_publication_from_metadata",
 ]

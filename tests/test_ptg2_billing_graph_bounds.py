@@ -117,6 +117,18 @@ async def test_legacy_projection_cap_rejects_combined_owner_fanout(
     member_id_lookup.assert_not_awaited()
 
 
+def test_legacy_projection_postread_bound_fails_closed() -> None:
+    members_by_owner_key = {1: (10, 11), 2: (12,)}
+
+    serving._require_legacy_projection_bound(members_by_owner_key, 3)
+    serving._require_legacy_projection_bound(members_by_owner_key, None)
+    with pytest.raises(
+        serving.PTG2ManifestArtifactError,
+        match="exceeds max_projection_members",
+    ):
+        serving._require_legacy_projection_bound(members_by_owner_key, 2)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_limit", (-1, True, 1.5, "1"))
 async def test_legacy_projection_cap_is_strict_before_owner_lookup(

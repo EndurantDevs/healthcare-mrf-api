@@ -270,11 +270,14 @@ async def test_membership_location_rows_executes_standard_query(monkeypatch):
         location_rows,
         *,
         include_response_evidence,
+        use_stored_only,
     ):
-        assert include_response_evidence is False
+        assert not include_response_evidence
+        assert not use_stored_only
         for location_row in location_rows:
             location_row.pop("_geo_evidence_level", None)
             location_row.pop("_geo_evidence_source_id", None)
+        return "available"
 
     monkeypatch.setattr(
         serving,

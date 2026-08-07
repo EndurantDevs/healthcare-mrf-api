@@ -68,6 +68,27 @@ def strict_source_set():
     )
 
 
+def strict_tax_identity_source_publication(*, source_count=2):
+    return {
+        "contract": "ptg2_provider_group_tax_identity_source_v1",
+        "content_contract": "ptg2_provider_group_tax_identity_source_content_v1",
+        "binding_contract": "ptg2_tax_identity_rate_source_binding_v1",
+        "binding_vector_contract": "ptg2_tax_identity_source_binding_vector_v1",
+        "token_policy_id": "ptg-tin-hmac-sha256-v1:test",
+        "token_policy_descriptor_sha256": "1" * 64,
+        "source_ordinal_map_digest": "2" * 64,
+        "source_count": source_count,
+        "provider_group_occurrence_count": 7,
+        "matched_ein_count": 5,
+        "missing_count": 1,
+        "malformed_count": 1,
+        "unsupported_type_count": 0,
+        "content_digest": "3" * 64,
+        "artifact_byte_count": 455,
+        "binding_vector_digest": "4" * 64,
+    }
+
+
 def strict_serving_index(snapshot_key=41):
     audit_sample_map = {
         "contract": "persisted_served_occurrence_sample_v2",
@@ -767,10 +788,164 @@ async def test_snapshot_serving_tables_binds_v4_manifest_to_completed_root() -> 
             ]
         ),
         "strict-v4",
+        include_billing_tax_identity_source=True,
     )
     assert tables.storage_generation == "shared_blocks_v4"
     assert tables.shared_block_layout == "packed_snapshot_maps_v4"
     assert tables.uses_v4_graph is True
+    assert tables.provider_tax_identity_source_publication is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_ignores_source_publication_by_default() -> None:
+    serving_index = strict_v4_serving_index()
+    serving_index["provider_graph"] = {
+        "provider_tax_identity_source": "not-an-object",
+    }
+
+    tables = await ptg2_tables.snapshot_serving_tables(
+        FakeSession(
+            [
+                strict_snapshot_row(serving_index),
+                strict_v4_root_row(serving_index),
+            ]
+        ),
+        "strict-v4-ignored-source-publication",
+    )
+
+    assert tables.provider_tax_identity_source_publication is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_requires_literal_true_source_opt_in() -> None:
+    serving_index = strict_v4_serving_index()
+    serving_index["provider_graph"] = {
+        "provider_tax_identity_source": "not-an-object",
+    }
+
+    tables = await ptg2_tables.snapshot_serving_tables(
+        FakeSession(
+            [
+                strict_snapshot_row(serving_index),
+                strict_v4_root_row(serving_index),
+            ]
+        ),
+        "strict-v4-nonboolean-source-publication-opt-in",
+        include_billing_tax_identity_source=1,
+    )
+
+    assert tables.provider_tax_identity_source_publication is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_opt_in_parses_source_publication() -> None:
+    serving_index = strict_v4_serving_index()
+    publication_metadata = strict_tax_identity_source_publication()
+    serving_index["provider_graph"] = {
+        "provider_tax_identity_source": publication_metadata,
+    }
+
+    tables = await ptg2_tables.snapshot_serving_tables(
+        FakeSession(
+            [
+                strict_snapshot_row(serving_index),
+                strict_v4_root_row(serving_index),
+            ]
+        ),
+        "strict-v4-source-publication",
+        include_billing_tax_identity_source=True,
+    )
+
+    assert tables.provider_tax_identity_source_publication is not None
+    assert (
+        tables.provider_tax_identity_source_publication.as_dict()
+        == publication_metadata
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_publication",
+    [
+        "not-an-object",
+        {**strict_tax_identity_source_publication(), "unexpected": "field"},
+    ],
+    ids=("non-object", "noncanonical-object"),
+)
+async def test_snapshot_serving_tables_opt_in_rejects_malformed_source_publication(
+    raw_publication,
+) -> None:
+    serving_index = strict_v4_serving_index()
+    serving_index["provider_graph"] = {
+        "provider_tax_identity_source": raw_publication,
+    }
+
+    with pytest.raises(
+        ptg2_tables.PTG2ManifestArtifactError,
+        match="source publication is malformed",
+    ):
+        await ptg2_tables.snapshot_serving_tables(
+            FakeSession(
+                [
+                    strict_snapshot_row(serving_index),
+                    strict_v4_root_row(serving_index),
+                ]
+            ),
+            "strict-v4-malformed-source-publication",
+            include_billing_tax_identity_source=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_serving_tables_opt_in_rejects_source_publication_count_mismatch() -> None:
+    serving_index = strict_v4_serving_index()
+    serving_index["provider_graph"] = {
+        "provider_tax_identity_source": strict_tax_identity_source_publication(
+            source_count=1
+        ),
+    }
+
+    with pytest.raises(
+        ptg2_tables.PTG2ManifestArtifactError,
+        match="source publication has the wrong source count",
+    ):
+        await ptg2_tables.snapshot_serving_tables(
+            FakeSession(
+                [
+                    strict_snapshot_row(serving_index),
+                    strict_v4_root_row(serving_index),
+                ]
+            ),
+            "strict-v4-source-publication-count-mismatch",
+            include_billing_tax_identity_source=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_candidate_snapshot_ignores_source_publication_even_when_requested() -> None:
+    serving_index = strict_v4_serving_index()
+    serving_index["provider_graph"] = {
+        "provider_tax_identity_source": "not-an-object",
+    }
+
+    tables = await ptg2_tables.snapshot_serving_tables(
+        FakeSession(
+            [
+                strict_candidate_row(serving_index),
+                strict_v4_root_row(serving_index),
+            ]
+        ),
+        "candidate-v4-ignored-source-publication",
+        candidate_audit_access=PTG2CandidateAuditAccess(
+            snapshot_id="candidate-v4-ignored-source-publication",
+            source_key="source-a",
+            plan_id="TEST-PLAN-001",
+            plan_market_type="group",
+        ),
+        include_billing_tax_identity_source=True,
+    )
+
+    assert tables.provider_tax_identity_source_publication is None
 
 
 @pytest.mark.asyncio

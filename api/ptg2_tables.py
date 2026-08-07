@@ -51,6 +51,11 @@ from process.ptg_parts.ptg2_shared_source_set import (
 from process.ptg_parts.ptg2_source_witness_contract import (
     validate_source_witness_manifest,
 )
+from process.ptg_parts.ptg2_tax_identity_source_projection import (
+    TaxIdentitySourceProjectionError,
+    TaxIdentitySourcePublication,
+    tax_identity_source_publication_from_metadata,
+)
 
 from api.ptg2_types import PTG2ServingTables
 
@@ -125,6 +130,38 @@ def _optional_integer(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _v4_tax_identity_source_publication(
+    serving_index: Mapping[str, Any],
+    *,
+    source_count: int,
+) -> TaxIdentitySourcePublication | None:
+    """Load the optional sealed source geometry without trusting raw JSON."""
+
+    provider_graph = serving_index.get("provider_graph")
+    raw_publication = (
+        provider_graph.get("provider_tax_identity_source")
+        if isinstance(provider_graph, Mapping)
+        else None
+    )
+    if raw_publication in (None, {}):
+        return None
+    if not isinstance(raw_publication, Mapping):
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 tax identity source publication is malformed"
+        )
+    try:
+        publication = tax_identity_source_publication_from_metadata(raw_publication)
+    except TaxIdentitySourceProjectionError as exc:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 tax identity source publication is malformed"
+        ) from exc
+    if publication.source_count != source_count:
+        raise PTG2ManifestArtifactError(
+            "PTG2 V4 tax identity source publication has the wrong source count"
+        )
+    return publication
 
 
 def _has_valid_v4_fields(manifest: Any) -> bool:
@@ -1013,6 +1050,7 @@ async def snapshot_serving_tables(
     snapshot_id: str,
     *,
     candidate_audit_access: PTG2CandidateAuditAccess | None = None,
+    include_billing_tax_identity_source: bool = False,
 ) -> PTG2ServingTables:
     """Load one published snapshot through its sealed shared-layout binding."""
 
@@ -1410,6 +1448,7 @@ async def snapshot_serving_tables(
     network_names = serving_index.get("network_names")
     provider_graph_v4_hot_prefix_by_field: dict[str, Any] | None = None
     provider_graph_v4_inferred_taxonomy_candidates: dict[str, Any] | None = None
+    provider_tax_identity_source_publication = None
     if storage_generation == PTG2_V4_SHARED_GENERATION:
         serving_binary = serving_index.get("serving_binary")
         provider_graph = (
@@ -1444,6 +1483,16 @@ async def snapshot_serving_tables(
                     raw_inferred_taxonomy_candidates
                 )
             )
+        if (
+            candidate_audit_access is None
+            and include_billing_tax_identity_source is True
+        ):
+            provider_tax_identity_source_publication = (
+                _v4_tax_identity_source_publication(
+                    serving_index,
+                    source_count=int(source_count or 0),
+                )
+            )
     return PTG2ServingTables(
         snapshot_id=str(snapshot_id),
         arch_version=PTG2_V3_ARCH_VERSION,
@@ -1472,6 +1521,9 @@ async def snapshot_serving_tables(
         provider_graph_v4_hot_prefix=provider_graph_v4_hot_prefix_by_field,
         provider_graph_v4_inferred_taxonomy_candidates=(
             provider_graph_v4_inferred_taxonomy_candidates
+        ),
+        provider_tax_identity_source_publication=(
+            provider_tax_identity_source_publication
         ),
         source_trace_set_hash=str(
             serving_index.get("source_trace_set_hash") or ""

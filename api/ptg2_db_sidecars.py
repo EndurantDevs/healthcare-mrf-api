@@ -4724,6 +4724,42 @@ lookup_shared_provider_code_intersections_from_db = (
 lookup_shared_provider_code_map_from_db = lookup_provider_code_map_from_db
 
 
+def _price_keys_for_membership_aliases(
+    physical_aliases: Iterable[tuple[int, _SharedLogicalBlock]],
+    requested_key_set: AbstractSet[int],
+    block_span: int,
+) -> set[int]:
+    """Select requested price keys covered by one physical alias group."""
+
+    return {
+        price_key
+        for block_key, _alias_block in physical_aliases
+        for price_key in requested_key_set
+        if block_key * block_span
+        <= price_key
+        < (block_key + 1) * block_span
+    }
+
+
+def _claim_price_membership_retention(
+    retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    atom_keys: tuple[int, ...],
+) -> int:
+    """Claim and return the retained bytes for one decoded membership."""
+
+    if retention_budget is None:
+        return 0
+    membership_bytes = (
+        _PRICE_MEMBERSHIP_OWNER_RETAINED_BYTES
+        + len(atom_keys) * _PRICE_MEMBERSHIP_RETAINED_BYTES
+    )
+    retention_budget.claim(
+        membership_bytes,
+        category="a decoded price-to-atom membership",
+    )
+    return membership_bytes
+
+
 async def lookup_price_atom_memberships_from_db(
     session: Any,
     shared_snapshot_key: int,
@@ -4733,6 +4769,7 @@ async def lookup_price_atom_memberships_from_db(
     block_span: int | None = None,
     schema_name: str = "mrf",
     retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
+    maximum_selected_atom_count: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     """Read requested price-to-atom memberships from fresh shared blocks."""
 
@@ -4746,6 +4783,13 @@ async def lookup_price_atom_memberships_from_db(
         _requested_keys,
     )
 
+    if maximum_selected_atom_count is not None and (
+        type(maximum_selected_atom_count) is not int
+        or maximum_selected_atom_count < 0
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration has an invalid atom limit"
+        )
     requested_keys = _requested_keys(price_keys)
     effective_span = _effective_block_span(
         block_span, PTG2_SERVING_BINARY_V3_PRICE_KEY_BLOCK_SPAN
@@ -4761,51 +4805,62 @@ async def lookup_price_atom_memberships_from_db(
     requested_key_set = set(requested_keys)
     memberships_by_price_key: dict[int, tuple[int, ...]] = {}
     retained_membership_bytes = 0
+    remaining_selected_atom_count = maximum_selected_atom_count
     try:
         for physical_aliases in _logical_blocks_by_physical_identity(
             logical_blocks
         ).values():
             representative_key, logical_block = physical_aliases[0]
-            group_requested_keys = {
-                price_key
-                for block_key, _alias_block in physical_aliases
-                for price_key in requested_key_set
-                if block_key * effective_span
-                <= price_key
-                < (block_key + 1) * effective_span
-            }
+            group_requested_keys = _price_keys_for_membership_aliases(
+                physical_aliases,
+                requested_key_set,
+                effective_span,
+            )
             _claim_logical_block_processing(
                 logical_block,
                 schema_name=schema_name,
             )
+            membership_decode_argument_map: dict[str, Any] = {
+                "block_key": representative_key,
+                "entry_count": logical_block.entry_count,
+                "atom_key_bits": expected_bits,
+                "block_span": effective_span,
+                "requested_price_keys": group_requested_keys,
+            }
+            if remaining_selected_atom_count is not None:
+                membership_decode_argument_map["maximum_selected_atom_count"] = (
+                    remaining_selected_atom_count
+                )
             decoded_memberships = _decode_price_membership_block(
                 logical_block.payload,
-                block_key=representative_key,
-                entry_count=logical_block.entry_count,
-                atom_key_bits=expected_bits,
-                block_span=effective_span,
-                requested_price_keys=group_requested_keys,
+                **membership_decode_argument_map,
             )
             if len(physical_aliases) > 1 and logical_block.entry_count:
                 raise PTG2ManifestArtifactError(
                     "PTG2 v3 price-membership block has an incompatible "
                     "physical alias"
                 )
+            decoded_atom_count = sum(
+                len(atom_keys) for atom_keys in decoded_memberships.values()
+            )
+            if (
+                remaining_selected_atom_count is not None
+                and decoded_atom_count > remaining_selected_atom_count
+            ):
+                raise PTG2ManifestArtifactError(
+                    "PTG2 v3 price hydration exceeds its atom limit"
+                )
+            if remaining_selected_atom_count is not None:
+                remaining_selected_atom_count -= decoded_atom_count
             for price_key, atom_keys in decoded_memberships.items():
                 if price_key in memberships_by_price_key:
                     raise PTG2ManifestArtifactError(
                         "PTG2 v3 price-membership artifact contains a " "duplicate key"
                     )
-                membership_bytes = (
-                    _PRICE_MEMBERSHIP_OWNER_RETAINED_BYTES
-                    + len(atom_keys) * _PRICE_MEMBERSHIP_RETAINED_BYTES
+                retained_membership_bytes += _claim_price_membership_retention(
+                    retention_budget,
+                    atom_keys,
                 )
-                if retention_budget is not None:
-                    retention_budget.claim(
-                        membership_bytes,
-                        category="a decoded price-to-atom membership",
-                    )
-                    retained_membership_bytes += membership_bytes
                 memberships_by_price_key[price_key] = atom_keys
     except BaseException:
         if retention_budget is not None:

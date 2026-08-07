@@ -20,11 +20,14 @@ async def _fetch_provenance(
     schema: str,
     location_keys: list[str],
     admitted_source_ids: list[int],
+    *,
+    use_stored_only: bool = False,
 ):
     return await database.all(
         _schema_sql(serving._ADDRESS_PROVENANCE_SQL, schema),
         location_keys=location_keys,
         admitted_source_ids=admitted_source_ids,
+        stored_only=use_stored_only,
     )
 
 
@@ -135,6 +138,24 @@ async def test_admitted_mrf_recovers_specific_lineage_without_fabrication():
         assert lineage_entry["retrieved_at"] == "2026-07-29"
         assert "mrf-admitted" not in str(lineage_entry["source_record_id"])
         assert "mrf-admitted" not in str(lineage_entry["record_version_id"])
+
+
+@pytest.mark.asyncio
+async def test_stored_only_lineage_does_not_consult_live_mrf_fallback():
+    async with _temporary_schema() as (database, schema):
+        await _insert_admitted_mrf_location(database, schema)
+        await _insert_admitted_mrf_evidence(database, schema)
+        await _insert_admitted_mrf_candidates(database, schema)
+
+        provenance_rows = await _fetch_provenance(
+            database,
+            schema,
+            ["mrf-admitted"],
+            [2],
+            use_stored_only=True,
+        )
+
+        assert provenance_rows == []
 
 
 async def _insert_specific_evidence_candidates(database: Database, schema: str) -> None:

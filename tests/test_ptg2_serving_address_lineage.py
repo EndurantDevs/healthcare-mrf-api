@@ -13,14 +13,15 @@ from tests.ptg2_serving_coverage_paydown_support import (
 )
 
 
-def _location_query():
+def _location_query(*, knn_order_sql=None, address_assurance_sql="TRUE"):
     return serving._MembershipLocationQuery(
         address_table="mrf.entity_address_unified",
         npi_scope_table="mrf.ptg2_v3_npi_scope",
         filter_sql="npi_scope.snapshot_key = :shared_snapshot_key",
         parameter_map={"limit": 2},
         distance_sql="NULL::double precision",
-        knn_order_sql=None,
+        knn_order_sql=knn_order_sql,
+        address_assurance_sql=address_assurance_sql,
     )
 
 
@@ -68,6 +69,7 @@ def test_address_provenance_index_omits_incomplete_or_source_zero_entries():
 
 def test_address_provenance_query_selects_coherent_active_source_lineage():
     sql = serving._ADDRESS_PROVENANCE_SQL
+    normalized_sql = " ".join(sql.split())
 
     assert "UNION ALL" in sql
     assert "SELECT unified.*" not in sql
@@ -89,6 +91,15 @@ def test_address_provenance_query_selects_coherent_active_source_lineage():
     assert "FROM specific_evidence" in sql
     assert serving._ptg2_mrf_lineage_complete_sql("candidate") in sql
     assert "COALESCE(NULLIF(stored.source_record_key" not in sql
+    for coordinate_predicate in (
+        "stored.npi IS NULL OR stored.npi = source.npi",
+        "stored.address_key IS NULL OR stored.address_key = source.address_key",
+        "stored.premise_key IS NULL OR stored.premise_key = source.premise_key",
+    ):
+        assert (
+            "NOT CAST(:stored_only AS boolean) OR " + coordinate_predicate
+            in normalized_sql
+        )
 
 
 def test_address_provenance_uses_sql_admission_label_without_reclassification():
@@ -124,9 +135,7 @@ def test_address_provenance_uses_sql_admission_label_without_reclassification():
     )
 
     address_payload = json.loads(location_rows[0]["address_payload"])
-    assert address_payload["geo_evidence_level"] == (
-        "multi_issuer_marketplace_address"
-    )
+    assert address_payload["geo_evidence_level"] == ("multi_issuer_marketplace_address")
     assert len(address_payload["address_provenance"]) == 1
     assert "_geo_evidence_level" not in location_rows[0]
     assert "_geo_evidence_source_id" not in location_rows[0]
@@ -238,9 +247,7 @@ def _assert_compacted_provider_redaction(
 
 
 def test_unproven_non_geo_address_is_redacted_without_changing_rate_payload():
-    expected_prices = [
-        {"negotiated_rate": "125.00", "billing_class": "professional"}
-    ]
+    expected_prices = [{"negotiated_rate": "125.00", "billing_class": "professional"}]
     expected_rate_summaries = [{"min": "125.00", "max": "125.00"}]
     location_rows = _unproven_location_rows(
         expected_prices,
@@ -354,9 +361,12 @@ async def test_membership_location_rows_preserves_probe_state_after_lineage_drop
         location_rows,
         *,
         include_response_evidence,
+        use_stored_only,
     ):
-        assert include_response_evidence is True
+        assert include_response_evidence
+        assert not use_stored_only
         location_rows.clear()
+        return "available"
 
     monkeypatch.setattr(serving, "_hydrate_address_provenance", drop_unproven_rows)
     session = FakeSession(
@@ -385,9 +395,7 @@ async def test_membership_location_rows_preserves_probe_state_after_lineage_drop
         limit=2,
     )
 
-    assert location_rows == [
-        {"_ptg_probe_empty": True, "_ptg_source_exhausted": False}
-    ]
+    assert location_rows == [{"_ptg_probe_empty": True, "_ptg_source_exhausted": False}]
 
 
 @pytest.mark.asyncio
@@ -424,6 +432,7 @@ async def test_default_lineage_validation_is_one_bounded_set_query(monkeypatch):
     query_parameters = session.calls[0][0][1]
     assert len(query_parameters["location_keys"]) == 64
     assert len(query_parameters["admitted_source_ids"]) == 64
+    assert query_parameters["stored_only"] is False
     assert len(location_rows) == 64
     assert all(
         location_row[serving._PTG_UNPROVEN_ADDRESS_MARKER] is True

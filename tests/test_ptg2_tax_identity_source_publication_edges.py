@@ -21,6 +21,7 @@ from process.ptg_parts.ptg2_tax_identity_source_projection import (
     PTG2_TAX_IDENTITY_SOURCE_CONTENT_CONTRACT,
     PTG2_TAX_IDENTITY_SOURCE_CONTRACT,
     TaxIdentitySourceProjectionError,
+    tax_identity_source_publication_from_metadata,
 )
 from tests.test_ptg2_tax_identity_source_artifact import _ERROR
 
@@ -44,11 +45,6 @@ class _QueryResult:
 class _ExplodingIterable:
     def __iter__(self):
         raise RuntimeError("synthetic iterator failure")
-
-
-class _ExplodingMapping(dict):
-    def get(self, _key, _default=None):
-        raise RuntimeError("synthetic mapping failure")
 
 
 class _ExplodingAsyncContext:
@@ -417,16 +413,6 @@ async def test_building_source_validation_redacts_unexpected_failures(monkeypatc
         )
 
 
-def test_sealed_publication_metadata_fails_closed():
-    invalid_contract = _sealed_metadata()
-    invalid_contract["contract"] = "other"
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        validation._publication_from_metadata(invalid_contract)
-
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        validation._publication_from_metadata(_ExplodingMapping())
-
-
 @pytest.mark.asyncio
 async def test_reused_layout_manifest_and_counts_are_required():
     missing_row_session = SimpleNamespace(
@@ -439,7 +425,7 @@ async def test_reused_layout_manifest_and_counts_are_required():
             snapshot_key=7,
         )
 
-    expected = validation._publication_from_metadata(_sealed_metadata())
+    expected = tax_identity_source_publication_from_metadata(_sealed_metadata())
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         await validation._validate_reused_manifest(
             missing_row_session,
@@ -462,7 +448,7 @@ async def test_reused_layout_manifest_and_counts_are_required():
 
 @pytest.mark.asyncio
 async def test_reused_projection_rejects_binding_count_and_db_failures(monkeypatch):
-    expected = validation._publication_from_metadata(_sealed_metadata())
+    expected = tax_identity_source_publication_from_metadata(_sealed_metadata())
 
     @asynccontextmanager
     async def transaction():

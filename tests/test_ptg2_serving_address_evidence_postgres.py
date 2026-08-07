@@ -34,6 +34,7 @@ from tests.ptg2_serving_address_evidence_postgres_lineage import (
     test_live_nppes_and_cms_use_source_specific_versions_as_whole_rows,
     test_specific_evidence_excludes_retired_and_blank_rows,
     test_stored_compact_run_date_is_complete_without_timestamps,
+    test_stored_only_lineage_does_not_consult_live_mrf_fallback,
 )
 from tests.ptg2_serving_address_evidence_postgres_ranking import (
     test_optimized_membership_requires_distinct_normalized_mrf_issuers,

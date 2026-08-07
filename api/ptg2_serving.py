@@ -5926,6 +5926,10 @@ async def _legacy_shared_graph_members_many(
         max_members=max_members,
         max_total_members=max_projection_members,
     )
+    _require_legacy_projection_bound(
+        members_by_owner_key,
+        max_projection_members,
+    )
     member_keys = {
         member_key
         for members in members_by_owner_key.values()
@@ -5946,6 +5950,20 @@ async def _legacy_shared_graph_members_many(
         )
         for owner_id in owner_ids
     }
+
+
+def _require_legacy_projection_bound(
+    members_by_owner_key: Mapping[int, tuple[int, ...]],
+    max_projection_members: int | None,
+) -> None:
+    """Fail closed if a legacy graph reader escapes its aggregate bound."""
+
+    if max_projection_members is not None and sum(
+        len(member_keys) for member_keys in members_by_owner_key.values()
+    ) > max_projection_members:
+        raise PTG2ManifestArtifactError(
+            "PTG2 shared graph selection exceeds max_projection_members"
+        )
 
 
 def _normalized_projection_member_limit(
@@ -7901,6 +7919,8 @@ async def _version_three_price_memberships(
     normalized_price_keys: tuple[int, ...],
     atom_key_bits: int,
     retention_budget: CandidateAuditDecodedRetentionBudget | None,
+    *,
+    maximum_selected_atom_count: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     membership_argument_map: dict[str, Any] = {
         "atom_key_bits": atom_key_bits,
@@ -7909,6 +7929,10 @@ async def _version_three_price_memberships(
     }
     if retention_budget is not None:
         membership_argument_map["retention_budget"] = retention_budget
+    if maximum_selected_atom_count is not None:
+        membership_argument_map["maximum_selected_atom_count"] = (
+            maximum_selected_atom_count
+        )
     memberships_by_price_key = (
         await lookup_shared_price_atom_memberships_from_db(
             session,
@@ -8007,8 +8031,6 @@ async def _version_three_price_hydration_for_keys(
     finally:
         if retention_budget is not None:
             retention_budget.release(retained_atom_key_bytes)
-
-
 async def _version_three_price_hydration(
     session,
     serving_tables: PTG2ServingTables,
@@ -8092,6 +8114,120 @@ async def _version_three_prices_by_key(
         cache_layout,
         hydration.prices_by_key,
     )
+    return {
+        price_key: (
+            cached_rows[price_key]
+            if price_key in cached_rows
+            else hydration.prices_by_key[price_key]
+        )
+        for price_key in normalized_price_keys
+    }
+
+
+async def _bounded_v3_price_hydration(
+    session,
+    serving_tables: PTG2ServingTables,
+    normalized_price_keys: tuple[int, ...],
+    *,
+    maximum_atom_count: int,
+) -> _VersionThreePriceHydration:
+    """Hydrate one billing key set after bounding all atom memberships."""
+
+    atom_key_bits = _version_three_atom_key_bits(serving_tables)
+    atom_keys_by_price_key = await _version_three_price_memberships(
+        session,
+        serving_tables,
+        normalized_price_keys,
+        atom_key_bits,
+        None,
+        maximum_selected_atom_count=maximum_atom_count,
+    )
+    if sum(len(atom_keys) for atom_keys in atom_keys_by_price_key.values()) > (
+        maximum_atom_count
+    ):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration exceeds its atom limit"
+        )
+    requested_atom_keys, _retained_atom_key_bytes = (
+        _budgeted_hydration_integer_keys(
+            (
+                atom_key
+                for price_key in normalized_price_keys
+                for atom_key in atom_keys_by_price_key.get(price_key, ())
+            ),
+            None,
+            category="billing hydration atom",
+        )
+    )
+    price_atoms_by_key = await _version_three_price_atoms(
+        session,
+        serving_tables,
+        requested_atom_keys,
+        atom_key_bits,
+        None,
+    )
+    dictionary_values = await _version_three_dictionary_values(
+        session,
+        serving_tables,
+        price_atoms_by_key,
+        None,
+    )
+    return _VersionThreePriceHydration(
+        atom_keys_by_price_key,
+        _version_three_price_rows(
+            normalized_price_keys,
+            atom_keys_by_price_key,
+            price_atoms_by_key,
+            dictionary_values,
+            _version_three_price_atom_constants(serving_tables),
+        ),
+    )
+
+
+async def _version_three_bounded_prices_by_key(
+    session,
+    serving_tables: PTG2ServingTables,
+    price_keys: Iterable[int],
+    *,
+    maximum_atom_count: int,
+) -> dict[int, list[dict[str, Any]]]:
+    """Hydrate billing prices under one cache-aware aggregate atom cap."""
+
+    if type(maximum_atom_count) is not int or maximum_atom_count < 0:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration has an invalid atom limit"
+        )
+    _require_strict_shared_v3(serving_tables)
+    normalized_price_keys, _retained_bytes = _budgeted_hydration_integer_keys(
+        price_keys,
+        None,
+        category="billing hydration price",
+    )
+    if not normalized_price_keys:
+        return {}
+    cache_layout = _version_three_price_cache_layout(serving_tables)
+    cached_rows, missing_keys = PRICE_HYDRATION_CACHE.get_many(
+        cache_layout,
+        normalized_price_keys,
+    )
+    cached_atom_count = sum(len(prices) for prices in cached_rows.values())
+    if cached_atom_count > maximum_atom_count:
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration exceeds its atom limit"
+        )
+    if not missing_keys:
+        return cached_rows
+    hydration = await _bounded_v3_price_hydration(
+        session,
+        serving_tables,
+        missing_keys,
+        maximum_atom_count=maximum_atom_count - cached_atom_count,
+    )
+    if any(price_key not in hydration.prices_by_key for price_key in missing_keys):
+        raise PTG2ManifestArtifactError(
+            "PTG2 v3 price hydration omitted a requested price key"
+        )
+    PRICE_HYDRATION_CACHE.admit_many(cache_layout, hydration.prices_by_key)
     return {
         price_key: (
             cached_rows[price_key]
@@ -9519,6 +9655,7 @@ WITH matched AS MATERIALIZED (
             'fax_number_digits', addr.fax_number_digits,
             'fax_extension', addr.fax_extension,
             'address_key', addr.address_key::text,
+            {address_site_key_json_pair_sql}
             'location_key', {location_key_sql},
             'address_sources', {address_sources_sql},
             'source_record_ids', {source_record_ids_sql},
@@ -9712,6 +9849,7 @@ SELECT
         'fax_number_digits', addr.fax_number_digits,
         'fax_extension', addr.fax_extension,
         'address_key', addr.address_key::text,
+        {address_site_key_json_pair_sql}
         'location_key', {location_key_sql},
         'address_sources', {address_sources_sql},
         'source_record_ids', {source_record_ids_sql},
@@ -9806,6 +9944,7 @@ WITH nearest_addresses AS MATERIALIZED (
             'fax_number_digits', addr.fax_number_digits,
             'fax_extension', addr.fax_extension,
             'address_key', addr.address_key::text,
+            {address_site_key_json_pair_sql}
             'location_key', addr.location_key,
             'address_sources', addr.address_sources,
             'source_record_ids', addr.source_record_ids,
@@ -10462,6 +10601,21 @@ WITH requested(location_key, admitted_source_id) AS (
       JOIN stored_evidence AS stored
         ON stored.location_key = source.location_key
        AND stored.source_id = source.source_id
+       AND (
+           NOT CAST(:stored_only AS boolean)
+           OR stored.npi IS NULL
+           OR stored.npi = source.npi
+       )
+       AND (
+           NOT CAST(:stored_only AS boolean)
+           OR stored.address_key IS NULL
+           OR stored.address_key = source.address_key
+       )
+       AND (
+           NOT CAST(:stored_only AS boolean)
+           OR stored.premise_key IS NULL
+           OR stored.premise_key = source.premise_key
+       )
      WHERE stored.source_id <> 0
        AND NULLIF(BTRIM(stored.source_record_key), '') IS NOT NULL
        AND STARTS_WITH(stored.source_record_key, source.source_record_prefix)
@@ -10522,6 +10676,7 @@ WITH requested(location_key, admitted_source_id) AS (
                 candidate.checksum
           LIMIT 1
      ) AS mrf
+     WHERE NOT CAST(:stored_only AS boolean)
 ), live_nppes AS MATERIALIZED (
     SELECT source.location_key,
            1::smallint AS source_id,
@@ -10551,6 +10706,7 @@ WITH requested(location_key, admitted_source_id) AS (
           ORDER BY candidate.date_added DESC, candidate.checksum
           LIMIT 1
      ) AS nppes
+     WHERE NOT CAST(:stored_only AS boolean)
 ), live_cms_doctors AS MATERIALIZED (
     SELECT source.location_key,
            3::smallint AS source_id,
@@ -10580,6 +10736,7 @@ WITH requested(location_key, admitted_source_id) AS (
           ORDER BY candidate.updated_at DESC, candidate.address_checksum
           LIMIT 1
      ) AS doctor
+     WHERE NOT CAST(:stored_only AS boolean)
 ), specific_candidates AS MATERIALIZED (
     SELECT * FROM live_mrf
     UNION ALL
@@ -10764,19 +10921,26 @@ async def _hydrate_address_provenance(
     location_rows: list[dict[str, Any]],
     *,
     include_response_evidence: bool = True,
-) -> None:
+    use_stored_only: bool = False,
+) -> str:
     """Validate selected unified addresses with one set-based lineage query."""
 
     location_requests = _selected_location_requests(location_rows)
     provenance_by_location_key: Mapping[str, list[dict[str, Any]]] = {}
-    if location_requests and await _is_relation_available(
-        session, f"{PTG2_SCHEMA}.entity_address_evidence"
-    ):
+    is_evidence_relation_available = True
+    if use_stored_only or location_requests:
+        is_evidence_relation_available = await _is_relation_available(
+            session, f"{PTG2_SCHEMA}.entity_address_evidence"
+        )
+    if use_stored_only and not is_evidence_relation_available:
+        return "unavailable"
+    if location_requests and is_evidence_relation_available:
         provenance_result = await session.execute(
             text(_ADDRESS_PROVENANCE_SQL),
             {
                 "location_keys": [request[0] for request in location_requests],
                 "admitted_source_ids": [request[1] for request in location_requests],
+                "stored_only": use_stored_only,
             },
         )
         provenance_by_location_key = _index_address_provenance(provenance_result)
@@ -10785,6 +10949,7 @@ async def _hydrate_address_provenance(
         provenance_by_location_key,
         include_response_evidence=include_response_evidence,
     )
+    return "available"
 
 
 def _membership_provenance_sql(address_table: str) -> dict[str, str]:
@@ -10811,8 +10976,30 @@ def _membership_provenance_sql(address_table: str) -> dict[str, str]:
     }
 
 
+def _membership_site_key_pair_sql(
+    *,
+    include_address_site_key: bool,
+    uses_unified_addresses: bool,
+) -> str:
+    """Return the complete billing-only JSON pair for a premise key."""
+
+    if include_address_site_key and uses_unified_addresses:
+        return "'address_site_key', addr.premise_key::text,"
+    return ""
+
+
+def _membership_tiebreak_sql(*, uses_unified_addresses: bool) -> str:
+    """Return the stable location tiebreak for the selected address table."""
+
+    if uses_unified_addresses:
+        return "addr.location_key"
+    return "COALESCE(addr.address_key::text, ''), COALESCE(addr.type, '')"
+
+
 def _membership_sql_values(
     query_context: _MembershipLocationQuery,
+    *,
+    include_address_site_key: bool = False,
 ) -> tuple[dict[str, str], bool]:
     """Build location-template values and report unified-address use."""
 
@@ -10829,6 +11016,10 @@ def _membership_sql_values(
         "location_hash_sql": location_hash_sql,
         "telephone_sql": _ptg2_nullish_text_sql("addr.telephone_number"),
         "fax_sql": _ptg2_nullish_text_sql("addr.fax_number"),
+        "address_site_key_json_pair_sql": _membership_site_key_pair_sql(
+            include_address_site_key=include_address_site_key,
+            uses_unified_addresses=uses_unified_addresses,
+        ),
         **_membership_provenance_sql(query_context.address_table),
         "distance_sql": query_context.distance_sql,
         "address_table": query_context.address_table,
@@ -10838,13 +11029,8 @@ def _membership_sql_values(
         "address_assurance_sql": query_context.address_assurance_sql,
         "postal_box_rank_sql": address_display_rank_sql("addr"),
         "geo_evidence_level_sql": geo_evidence_level_sql,
-        "location_tiebreak_sql": (
-            "addr.location_key"
-            if uses_unified_addresses
-            else (
-                "COALESCE(addr.address_key::text, ''), "
-                "COALESCE(addr.type, '')"
-            )
+        "location_tiebreak_sql": _membership_tiebreak_sql(
+            uses_unified_addresses=uses_unified_addresses
         ),
         "selected_geo_evidence_source_id_sql": _geo_evidence_source_id_sql(
             "selected.geo_evidence_level"
@@ -10874,11 +11060,13 @@ def _membership_location_sql(
     *,
     limit: int,
     offset: int,
+    include_address_site_key: bool = False,
 ) -> str:
     """Render the bounded location SQL for the chosen address source."""
 
     format_values_by_name, uses_unified_addresses = _membership_sql_values(
-        query_context
+        query_context,
+        include_address_site_key=include_address_site_key,
     )
     if query_context.knn_order_sql is None or offset != 0:
         if (
@@ -10928,7 +11116,8 @@ async def _finalize_location_rows(
     *,
     candidate_npis: tuple[int, ...] | None,
     limit: int,
-) -> list[dict[str, Any]]:
+    stored_address_provenance_only: bool = False,
+) -> list[dict[str, Any]] | None:
     """Validate lineage and preserve probe-exhaustion semantics."""
 
     raw_location_count = len(location_rows)
@@ -10941,17 +11130,22 @@ async def _finalize_location_rows(
         None,
     )
     uses_unified_addresses = _is_unified_address_table(query_context.address_table)
+    if stored_address_provenance_only and not uses_unified_addresses:
+        return None
     include_response_evidence = (
         _is_request_flag_enabled(args.get("include_evidence"))
         or _is_request_flag_enabled(args.get("include_debug"))
         or _is_request_flag_enabled(args.get("include_details"))
     )
     if uses_unified_addresses:
-        await _hydrate_address_provenance(
+        provenance_status = await _hydrate_address_provenance(
             session,
             location_rows,
             include_response_evidence=include_response_evidence,
+            use_stored_only=stored_address_provenance_only,
         )
+        if provenance_status != "available":
+            return None
     else:
         for location_row in location_rows:
             location_row.pop("_geo_evidence_level", None)
@@ -10982,6 +11176,7 @@ async def _membership_location_rows(
     candidate_npis: tuple[int, ...] | None,
     limit: int,
     offset: int = 0,
+    stored_address_provenance_only: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Read address candidates scoped to NPIs represented by the snapshot."""
 
@@ -11001,6 +11196,7 @@ async def _membership_location_rows(
         query_context,
         limit=limit,
         offset=offset,
+        include_address_site_key=stored_address_provenance_only,
     )
     location_rows = await _execute_membership_location_sql(
         session,
@@ -11015,6 +11211,7 @@ async def _membership_location_rows(
         location_rows,
         candidate_npis=candidate_npis,
         limit=limit,
+        stored_address_provenance_only=stored_address_provenance_only,
     )
 
 

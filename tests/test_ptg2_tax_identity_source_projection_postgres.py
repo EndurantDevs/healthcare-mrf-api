@@ -40,6 +40,9 @@ from tests.ptg2_tax_identity_source_projection_fixture import (
     ordinal_digest as _ordinal_digest,
     write_sidecar as _sidecar,
 )
+from tests.ptg2_tax_identity_source_resolver_postgres_support import (
+    assert_source_resolver,
+)
 from tests.ptg2_tax_identity_source_postgres_targets import (
     CONFLICTING_SOURCE_SNAPSHOT_ID as _CONFLICTING_SNAPSHOT_ID,
     SOURCE_SNAPSHOT_ID as _SNAPSHOT_ID,
@@ -366,6 +369,7 @@ async def _verify_replay_and_conflict(
 async def _seal_and_verify_stored_projection(
     engine,
     schema_name: str,
+    source_publication,
 ) -> None:
     schema = quoted(schema_name)
     async with engine.begin() as connection:
@@ -399,6 +403,11 @@ async def _seal_and_verify_stored_projection(
                 f"UPDATE {schema}.ptg2_v3_snapshot_layout "
                 "SET state = 'sealed' WHERE snapshot_key = 18"
             )
+        )
+        await assert_source_resolver(
+            connection,
+            schema_name,
+            source_publication,
         )
 
 
@@ -447,7 +456,11 @@ async def test_projector_publishes_replays_rolls_back_and_validates_reuse(
             prepare_projection,
             schema_name,
         )
-        await _seal_and_verify_stored_projection(engine, schema_name)
+        await _seal_and_verify_stored_projection(
+            engine,
+            schema_name,
+            published,
+        )
         await assert_sealed_reuse_proofs(
             engine,
             schema_name=schema_name,

@@ -5,13 +5,19 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from api import ptg2_db_serving_v3, ptg2_db_serving_v3_pages, ptg2_db_sidecars
+from process.ptg_parts import ptg2_serving_binary_v3 as codec
 
 
-def _logical_block() -> ptg2_db_sidecars._SharedLogicalBlock:
+def _logical_block(
+    payload: bytes = b"payload",
+    *,
+    entry_count: int = 1,
+    physical_hash: bytes = b"a" * 32,
+) -> ptg2_db_sidecars._SharedLogicalBlock:
     return ptg2_db_sidecars._SharedLogicalBlock(
-        payload=b"payload",
-        entry_count=1,
-        physical_hashes=(b"a" * 32,),
+        payload=payload,
+        entry_count=entry_count,
+        physical_hashes=(physical_hash,),
     )
 
 
@@ -55,6 +61,47 @@ async def test_membership_reader_parses_once_and_rejects_nonempty_aliases(
             (0, 1),
             block_span=1,
         )
+
+
+@pytest.mark.asyncio
+async def test_membership_reader_enforces_one_atom_limit_across_physical_blocks(
+    monkeypatch,
+):
+    first_block = _logical_block(
+        codec.encode_price_memberships(((0, (10, 11)),), 24),
+        physical_hash=b"a" * 32,
+    )
+    second_block = _logical_block(
+        codec.encode_price_memberships(((1, (12, 13)),), 24),
+        physical_hash=b"b" * 32,
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_shared_logical_blocks_by_key",
+        AsyncMock(return_value={0: first_block, 1: second_block}),
+    )
+    monkeypatch.setattr(
+        ptg2_db_sidecars,
+        "_claim_logical_block_processing",
+        Mock(),
+    )
+    dense_decode = Mock(wraps=codec.decode_dense_keys)
+    monkeypatch.setattr(codec, "decode_dense_keys", dense_decode)
+
+    with pytest.raises(
+        ptg2_db_sidecars.PTG2ManifestArtifactError,
+        match="atom limit",
+    ):
+        await ptg2_db_sidecars.lookup_price_atom_memberships_from_db(
+            None,
+            12,
+            (0, 1),
+            atom_key_bits=24,
+            block_span=1,
+            maximum_selected_atom_count=3,
+        )
+
+    assert dense_decode.call_count == 1
 
 
 @pytest.mark.asyncio
