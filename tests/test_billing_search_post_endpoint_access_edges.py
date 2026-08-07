@@ -151,6 +151,25 @@ def _authorize(
     )
 
 
+def _billing_search_library_traceback_locals(
+    error: BaseException,
+) -> list[dict[str, object]]:
+    library_locals = []
+    current_error: BaseException | None = error
+    while current_error is not None:
+        traceback = current_error.__traceback__
+        while traceback is not None:
+            module_name = traceback.tb_frame.f_globals.get("__name__", "")
+            if module_name in {
+                "api.billing_search_post_endpoint_access",
+                "api.billing_search_transport_keys",
+            }:
+                library_locals.append(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+        current_error = current_error.__context__
+    return library_locals
+
+
 class _ItemsNotCallable:
     items = None
 
@@ -288,19 +307,49 @@ def test_endpoint_keyring_failure_does_not_retain_environment_document(
             **endpoint_options_by_name,
         )
 
-    error: BaseException | None = captured.value
-    library_locals = []
-    while error is not None:
-        traceback = error.__traceback__
-        while traceback is not None:
-            module_name = traceback.tb_frame.f_globals.get("__name__", "")
-            if module_name in {
-                "api.billing_search_post_endpoint_access",
-                "api.billing_search_transport_keys",
-            }:
-                library_locals.append(traceback.tb_frame.f_locals)
-            traceback = traceback.tb_next
-        error = error.__context__
+    library_locals = _billing_search_library_traceback_locals(captured.value)
+    assert library_locals
+    assert all(
+        sensitive_marker not in repr(local_values) for local_values in library_locals
+    )
+
+
+def test_endpoint_header_failure_does_not_retain_environment_document() -> None:
+    sensitive_marker = "synthetic-header-failure-key-document-marker"
+    environment_by_name = {
+        transport_keys.BILLING_SEARCH_TRANSPORT_KEYRING_ENV: sensitive_marker
+    }
+    with pytest.raises(
+        endpoint_access.BillingSearchPostEndpointAccessError
+    ) as captured:
+        endpoint_access.authorize_billing_search_post_endpoint(
+            _body(),
+            {},
+            method=post_transport.BILLING_SEARCH_POST_METHOD,
+            path=post_transport.BILLING_SEARCH_POST_PATH,
+            media_type=post_transport.BILLING_SEARCH_POST_MEDIA_TYPE,
+            trusted_now=NOW,
+            environment_map=environment_by_name,
+        )
+
+    library_locals = _billing_search_library_traceback_locals(captured.value)
+    assert library_locals
+    assert all(
+        sensitive_marker not in repr(local_values) for local_values in library_locals
+    )
+
+
+def test_endpoint_rejecting_two_key_sources_does_not_retain_environment() -> None:
+    sensitive_marker = "synthetic-dual-source-key-document-marker"
+    environment_by_name = {
+        transport_keys.BILLING_SEARCH_TRANSPORT_KEYRING_ENV: sensitive_marker
+    }
+    with pytest.raises(
+        endpoint_access.BillingSearchPostEndpointAccessError
+    ) as captured:
+        endpoint_access._request_keyring(_keyring(), environment_by_name)
+
+    library_locals = _billing_search_library_traceback_locals(captured.value)
     assert library_locals
     assert all(
         sensitive_marker not in repr(local_values) for local_values in library_locals
