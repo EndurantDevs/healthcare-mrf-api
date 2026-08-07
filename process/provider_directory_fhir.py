@@ -13927,11 +13927,19 @@ def _artifact_reviewed_candidate_eligibility_sql(
 def _artifact_dataset_options_cte(
     dataset_ref: str,
     source_ref: str | None = None,
+    *,
+    scope_endpoint_ids: bool = False,
 ) -> str:
     validated_candidate_gate = (
         _artifact_reviewed_candidate_eligibility_sql(dataset_ref, source_ref)
         if source_ref
         else "true"
+    )
+    endpoint_scope = (
+        "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))\n"
+        "           AND "
+        if scope_endpoint_ids
+        else ""
     )
     return f"""
         dataset_options AS MATERIALIZED (
@@ -13955,7 +13963,7 @@ def _artifact_dataset_options_cte(
                ) OVER (PARTITION BY dataset.endpoint_id)
                    AS validated_candidate_count
           FROM {dataset_ref} AS dataset
-         WHERE (
+         WHERE {endpoint_scope}(
                 dataset.is_current = true
             AND dataset.status = :published_status
             AND dataset.superseded_at IS NULL
@@ -17120,7 +17128,11 @@ async def _artifact_eligible_validated_ids(
     )
     option_rows = await executor.all(
         f"""
-        WITH {_artifact_dataset_options_cte(dataset_ref, source_ref)}
+        WITH {_artifact_dataset_options_cte(
+            dataset_ref,
+            source_ref,
+            scope_endpoint_ids=True,
+        )}
         SELECT endpoint_id, dataset_id
           FROM dataset_options
          WHERE endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
