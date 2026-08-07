@@ -21122,6 +21122,10 @@ class _RestPageHarness:
             f"{base}?_getpages=page-{number}&_count=100"
             for number in range(2, pages + 1)
         ]
+        self.source = _cigna_checkpoint_source()
+        self.checkpoint_context = _cigna_checkpoint_context("run_1")
+        self.page_count = 100
+        self.resume_state = None
         self.responses = {
             url: (
                 200,
@@ -21164,10 +21168,15 @@ class _RestPageHarness:
 
     async def _load_checkpoint(self, _context, resource_type, request_url):
         assert (resource_type, request_url) == ("Practitioner", self.urls[0])
-        return importer.PaginationResumeState(self.urls[0], 0, 0, ())
+        return self.resume_state or importer.PaginationResumeState(
+            self.urls[0],
+            0,
+            0,
+            (),
+        )
 
     async def _fetch_page(self, source, request_url, *, timeout):
-        assert source == _cigna_checkpoint_source()
+        assert source == self.source
         page_index = self.urls.index(request_url)
         assert timeout == 3 or (self.deadline_seconds and 0 < timeout <= 3)
         self.requests.append(request_url)
@@ -21207,18 +21216,18 @@ class _RestPageHarness:
         self.deadline_seconds = deadline_seconds
         with _source_http_test_session(self.source_session):
             return await importer._fetch_resource_rows(
-                _cigna_checkpoint_source(),
+                self.source,
                 "Practitioner",
                 per_resource_limit=0,
                 page_limit=0,
-                page_count=100,
+                page_count=self.page_count,
                 timeout=3,
                 run_id="run_1",
                 row_batch_handler=self._write_rows,
                 row_batch_size=1000,
                 retain_rows=False,
                 deadline_seconds=deadline_seconds,
-                pagination_checkpoint=_cigna_checkpoint_context("run_1"),
+                pagination_checkpoint=self.checkpoint_context,
             )
 
     @property
@@ -21291,6 +21300,170 @@ def test_rest_page_prefetch_eligibility_fails_closed(monkeypatch):
         declared_credentialed.return_value = True
         assert is_eligible() is False
     assert is_eligible() is False
+
+
+def test_rest_page_prefetch_deterministic_expansion_is_separately_gated(monkeypatch):
+    """Require a second switch for every replay-safe position source."""
+    monkeypatch.setenv(importer.SOURCE_HTTP_PAGE_PREFETCH_ENV, "true")
+    monkeypatch.delenv(
+        importer.SOURCE_HTTP_DETERMINISTIC_PAGE_PREFETCH_ENV,
+        raising=False,
+    )
+    assert importer._is_prefetch_base_enabled(
+        importer.CIGNA_PROVIDER_DIRECTORY_BASE
+    )
+    assert all(
+        not importer._is_prefetch_base_enabled(api_base)
+        for api_base in importer.REST_PAGE_PREFETCH_DETERMINISTIC_API_BASES
+    )
+    monkeypatch.setenv(
+        importer.SOURCE_HTTP_DETERMINISTIC_PAGE_PREFETCH_ENV,
+        "true",
+    )
+    assert all(
+        importer._is_prefetch_base_enabled(api_base)
+        for api_base in importer.REST_PAGE_PREFETCH_DETERMINISTIC_API_BASES
+    )
+    assert not importer._is_prefetch_base_enabled("https://example.test/fhir")
+
+
+def _deterministic_page_urls(
+    source_record: dict[str, Any],
+    family: str,
+) -> tuple[str, str, str | None]:
+    """Return canonical first/second URLs and any response-issued link."""
+    start_url = importer._resource_start_url(
+        source_record,
+        "Practitioner",
+        page_count=1,
+    )
+    assert start_url is not None
+    response_next_url = None
+    if family == "skip":
+        next_url = importer._synthetic_skip_pagination_next_url(
+            source_record,
+            start_url,
+            1,
+        )
+    elif family == "page_index":
+        next_url = importer._synthetic_offset_pagination_next_url(
+            source_record,
+            start_url,
+            1,
+        )
+    else:
+        api_base = source_record["canonical_api_base"]
+        response_next_url = f"{api_base}/Practitioner?_getpagesoffset=1&_count=1"
+        next_url = importer._resolved_fhir_next_url(
+            source_record,
+            start_url,
+            response_next_url,
+        )
+    assert next_url is not None
+    return start_url, next_url, response_next_url
+
+
+def _deterministic_prefetch_page_scan(monkeypatch, family):
+    """Build a two-page scan for one stateless position-pagination family."""
+    api_base_by_family = {
+        "skip": importer.ARKANSAS_PROVIDER_DIRECTORY_BASE,
+        "page_index": importer.SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE,
+        "numeric_offset": importer.TMHP_PROVIDER_DIRECTORY_BASE,
+    }
+    api_base = api_base_by_family[family]
+    page_scan = _RestPageHarness(monkeypatch)
+    page_scan.source = {
+        "source_id": "source_a",
+        "api_base": api_base,
+        "canonical_api_base": api_base,
+    }
+    page_scan.checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base=api_base,
+        source_scope_hash="scope_a",
+        source_ids=("source_a",),
+        owner_run_id="run_1",
+        retry_of_run_id=None,
+        acquisition_root_run_id="run_1",
+        dataset_id=None,
+        lineage_verified=False,
+    )
+    page_scan.page_count = 1
+    start_url, next_url, response_next_url = _deterministic_page_urls(
+        page_scan.source,
+        family,
+    )
+    page_scan.urls = [start_url, next_url]
+    page_scan.responses = {
+        start_url: (
+            200,
+            _practitioner_search_bundle("prac-1", response_next_url),
+            None,
+            5,
+        ),
+        next_url: (200, {"resourceType": "Bundle", "entry": []}, None, 5),
+    }
+    monkeypatch.setenv(
+        importer.SOURCE_HTTP_DETERMINISTIC_PAGE_PREFETCH_ENV,
+        "true",
+    )
+    return page_scan
+
+
+def _deterministic_prefetch_resume_state(page_scan):
+    """Recreate the durable state written after the first synthetic page."""
+    first_payload = page_scan.responses[page_scan.urls[0]][1]
+    page_identity = importer._synthetic_position_page_identity(
+        page_scan.source,
+        importer._bundle_entries(first_payload),
+    )
+    completeness_by_field = {}
+    if page_identity is not None:
+        completeness_by_field = importer._synthetic_position_page_guard_completeness(
+            page_identity,
+            (page_identity[1],),
+        ) or {}
+    return importer.PaginationResumeState(
+        next_url=page_scan.urls[1],
+        pages_processed=1,
+        rows_processed=1,
+        recent_url_hashes=(importer._pagination_url_hash(page_scan.urls[0]),),
+        resumed=True,
+        completeness=completeness_by_field,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "family",
+    ("skip", "page_index", "numeric_offset"),
+    ids=("skip", "page-index", "numeric-offset"),
+)
+async def test_deterministic_page_families_prefetch_after_validation(
+    monkeypatch,
+    family,
+):
+    """Preserve request and checkpoint order for every expanded family."""
+    page_scan = _deterministic_prefetch_page_scan(monkeypatch, family)
+
+    fetch_result = await page_scan.run()
+
+    assert fetch_result is not None
+    assert fetch_result.complete is True
+    assert fetch_result.page_prefetch_eligible is True
+    assert fetch_result.page_prefetch_started == 1
+    assert fetch_result.page_prefetch_consumed == 1
+    assert page_scan.requests == page_scan.urls
+    assert page_scan.checkpoint_urls == [page_scan.urls[1], None]
+
+    resumed_scan = _deterministic_prefetch_page_scan(monkeypatch, family)
+    resumed_scan.resume_state = _deterministic_prefetch_resume_state(resumed_scan)
+    resumed_result = await resumed_scan.run()
+
+    assert resumed_result is not None
+    assert resumed_result.complete is True
+    assert resumed_result.rows_fetched == 1
+    assert resumed_scan.requests == [resumed_scan.urls[1]]
+    assert resumed_scan.checkpoint_urls == [None]
 
 
 @pytest.mark.asyncio

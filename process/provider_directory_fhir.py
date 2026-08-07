@@ -1067,6 +1067,14 @@ FHIR_SYNTHETIC_SKIP_PAGINATION_BASES = frozenset(
     }
 )
 FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES = NETSMART_PROVIDER_DIRECTORY_BASES
+REST_PAGE_PREFETCH_DETERMINISTIC_API_BASES = frozenset(
+    FHIR_OFFSET_PAGINATION_BASES
+    | FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
+    | {
+        SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE,
+        SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE,
+    }
+)
 INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE = "https://api.interopstation.com/mdhhs/fhir"
 MICHIGAN_PROVIDER_DIRECTORY_BASE = "https://mi.fhir.mhbapp.com/pd/api/v1"
 MICHIGAN_SUPPORTED_RESOURCES = frozenset(
@@ -1174,6 +1182,9 @@ SOURCE_QUOTA_EXHAUSTED_ERROR = "provider_directory_source_quota_exhausted"
 SOURCE_RETRY_NOT_BEFORE_METRIC = "provider_directory_retry_not_before"
 SOURCE_HTTP_KEEPALIVE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_KEEPALIVE"
 SOURCE_HTTP_PAGE_PREFETCH_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH"
+SOURCE_HTTP_DETERMINISTIC_PAGE_PREFETCH_ENV = (
+    "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_DETERMINISTIC"
+)
 SOURCE_HTTP_KEEPALIVE_SECONDS = 60.0
 SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
 SOURCE_TRANSIENT_HTTP_STATUSES = frozenset({423, 429, 500, 502, 503, 504})
@@ -46273,6 +46284,20 @@ def _is_rest_page_prefetch_request_eligible(
     return _rest_page_prefetch_session(source_record, request_url) is not None
 
 
+def _is_prefetch_base_enabled(source_api_base: str | None) -> bool:
+    """Keep deterministic expansion independently reversible from the pilot."""
+    if source_api_base in REST_PAGE_PREFETCH_PILOT_API_BASES:
+        return True
+    return bool(
+        source_api_base in REST_PAGE_PREFETCH_DETERMINISTIC_API_BASES
+        and os.getenv(
+            SOURCE_HTTP_DETERMINISTIC_PAGE_PREFETCH_ENV,
+            "false",
+        ).lower()
+        in {"1", "true", "yes"}
+    )
+
+
 def _is_rest_page_prefetch_eligible(
     source_record: dict[str, Any],
     request_url: str,
@@ -46285,7 +46310,7 @@ def _is_rest_page_prefetch_eligible(
     return bool(
         os.getenv(SOURCE_HTTP_PAGE_PREFETCH_ENV, "false").lower()
         in {"1", "true", "yes"}
-        and source_api_base in REST_PAGE_PREFETCH_PILOT_API_BASES
+        and _is_prefetch_base_enabled(source_api_base)
         and options.checkpoint_context is not None
         and options.checkpoint_context.canonical_api_base == source_api_base
         and options.start_url_count == 1
