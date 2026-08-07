@@ -90,6 +90,9 @@ from process.provider_directory_endpoint_admission import (
     ProviderDirectoryEndpointIdentityError,
     _admit_provider_directory_endpoint_components,
 )
+from process.provider_directory_fhir_census_contract import (
+    current_version_census_request,
+)
 from process.provider_directory_dataset_rehydrate import (
     DEFAULT_BATCH_SIZE as DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
     DatasetScope,
@@ -4743,6 +4746,26 @@ def _uses_source_known_onboarding_gateway(source: dict[str, Any]) -> bool:
     return urllib.parse.urlsplit(_canonical_base(source.get("canonical_api_base") or source.get("api_base")) or "").netloc.lower() in FHIR_ONBOARDING_GATEWAY_HOSTS
 
 
+def _is_manual_only_source(source_record: Mapping[str, Any]) -> bool:
+    """Return whether source transport is disabled pending manual admission."""
+
+    return _source_metadata(dict(source_record)).get(
+        "provider_directory_manual_only"
+    ) is True
+
+
+def _source_rows_allowed_for_probe(
+    source_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Exclude dormant manual sources before any metadata transport."""
+
+    return [
+        source_record
+        for source_record in source_rows
+        if not _is_manual_only_source(source_record)
+    ]
+
+
 def _resource_import_selection_metrics(source_count: int) -> dict[str, int]:
     return {
         "source_import_sources_considered": source_count,
@@ -4756,6 +4779,7 @@ def _resource_import_selection_metrics(source_count: int) -> dict[str, int]:
         "source_import_skipped_open_only": 0,
         "source_import_skipped_validation_status": 0,
         "source_import_skipped_auth_required_policy": 0,
+        "source_import_skipped_manual_only": 0,
         "source_import_sources_selected_live_probe_valid": 0,
         "source_import_sources_selected_checkpoint_retry": 0,
         "source_import_sources_selected_declared_credentialed": 0,
@@ -4772,18 +4796,19 @@ class ResourceImportSourceDecision:
     is_checkpoint_retry: bool
 
 
-def _resource_import_source_decision(
+def _initial_resource_import_source_decision(
     source_record: Mapping[str, Any],
-    *,
-    valid_source_ids: set[str] | None,
-    open_only: bool,
-    include_auth_required: bool,
-    checkpoint_retry_ids: set[str],
     requested_resource_types: list[str] | None,
-) -> ResourceImportSourceDecision:
+) -> ResourceImportSourceDecision | None:
+    """Return a fail-closed decision before probe and auth evaluation."""
+
     if not _canonical_base(source_record.get("api_base")):
         return ResourceImportSourceDecision(
             "source_import_skipped_missing_api_base", None, "", False, False
+        )
+    if _is_manual_only_source(source_record):
+        return ResourceImportSourceDecision(
+            "source_import_skipped_manual_only", None, "", False, False
         )
     blocked_reason = _resource_acquisition_blocked_reason(
         source_record,
@@ -4797,6 +4822,26 @@ def _resource_import_source_decision(
             False,
             False,
         )
+    return None
+
+
+def _resource_import_source_decision(
+    source_record: Mapping[str, Any],
+    *,
+    valid_source_ids: set[str] | None,
+    open_only: bool,
+    include_auth_required: bool,
+    checkpoint_retry_ids: set[str],
+    requested_resource_types: list[str] | None,
+) -> ResourceImportSourceDecision:
+    """Evaluate probe, authentication, and status admission for one source."""
+
+    initial_decision = _initial_resource_import_source_decision(
+        source_record,
+        requested_resource_types,
+    )
+    if initial_decision is not None:
+        return initial_decision
     auth_type = (_clean_text(source_record.get("auth_type")) or "").lower()
     validation = (
         _clean_text(source_record.get("last_validated_status")) or ""
@@ -59723,6 +59768,14 @@ async def process_provider_directory_fhir_data(
 ) -> dict[str, Any]:
     """Run provider-directory discovery, import, and publication."""
     task = _apply_provider_directory_refresh_preset(task or {})
+    census_request = current_version_census_request(
+        task,
+        allowed_resources=DEFAULT_RESOURCES,
+    )
+    if census_request is not None:
+        raise RuntimeError(
+            "provider_directory_current_version_census_not_activated"
+        )
     context = ctx.get("context")
     context_test_mode = bool(
         isinstance(context, dict) and context.get("test_mode")
@@ -60118,9 +60171,13 @@ async def process_provider_directory_fhir_data(
             metrics=metrics_by_key,
         )
         valid_source_ids: set[str] | None = None
-        if not seed_only and probe and source_rows:
+        probe_source_rows = _source_rows_allowed_for_probe(source_rows)
+        metrics_by_key["manual_only_sources_skipped_before_probe"] = (
+            len(source_rows) - len(probe_source_rows)
+        )
+        if not seed_only and probe and probe_source_rows:
             probed, valid, valid_source_ids = await _run_source_probe_batch(
-                source_rows,
+                probe_source_rows,
                 timeout=timeout,
                 concurrency=concurrency,
                 run_id=run_id,
