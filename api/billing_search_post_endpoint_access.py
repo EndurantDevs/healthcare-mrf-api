@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 from typing import Any
 
 from api.billing_search_access_contract import (
@@ -37,6 +38,7 @@ from api.billing_search_transport_keys import (
 
 
 _STATE_DOMAIN = b"HEALTHPORTA_BILLING_SEARCH_POST_ENDPOINT_ACCESS_V1\x00"
+_STATE_AUTH_KEY = secrets.token_bytes(32)
 _HEADER_PREFIX = "x-healthporta-billing-search-"
 _HEADER_NAMES = (
     BILLING_SEARCH_TRANSPORT_CONTEXT_HEADER,
@@ -132,10 +134,10 @@ def _closed_header_values(headers: Mapping[str, Any]) -> tuple[str, str, str]:
     return header_values[0], header_values[1], header_values[2]
 
 
-def _state_sha256(
+def _state_hmac(
     request: BillingSearchPostRequest,
     transport: VerifiedBillingSearchPostTransport,
-) -> str:
+) -> bytes:
     encoded = json.dumps(
         {
             "request_shape_sha256": request.request_shape_sha256,
@@ -145,17 +147,22 @@ def _state_sha256(
         separators=(",", ":"),
         sort_keys=True,
     ).encode("ascii")
-    digest = hashlib.sha256()
-    digest.update(_STATE_DOMAIN)
-    digest.update(len(encoded).to_bytes(8, "big"))
-    digest.update(encoded)
-    return digest.hexdigest()
+    message = b"".join(
+        (
+            _STATE_DOMAIN,
+            id(request).to_bytes(16, "big"),
+            id(transport).to_bytes(16, "big"),
+            len(encoded).to_bytes(8, "big"),
+            encoded,
+        )
+    )
+    return hmac.new(_STATE_AUTH_KEY, message, hashlib.sha256).digest()
 
 
 class BillingSearchPostEndpointAccess:
     """Factory-created request plus authenticated gateway authority."""
 
-    __slots__ = ("__request", "__state_sha256", "__transport")
+    __slots__ = ("__request", "__state_hmac", "__transport")
 
     def __init__(self, *_args, **_kwargs) -> None:
         raise _fail()
@@ -222,8 +229,8 @@ def _new_access(
     )
     object.__setattr__(
         access,
-        "_BillingSearchPostEndpointAccess__state_sha256",
-        _state_sha256(request, transport),
+        "_BillingSearchPostEndpointAccess__state_hmac",
+        _state_hmac(request, transport),
     )
     return access
 
@@ -247,12 +254,12 @@ def _validated_access_or_none(
             detailed_provenance=request.include_evidence,
             trusted_now=transport.trusted_now,
         )
-        expected_state = _state_sha256(request, transport)
+        expected_state = _state_hmac(request, transport)
         supplied_state = object.__getattribute__(
             access,
-            "_BillingSearchPostEndpointAccess__state_sha256",
+            "_BillingSearchPostEndpointAccess__state_hmac",
         )
-        if type(supplied_state) is not str or not hmac.compare_digest(
+        if type(supplied_state) is not bytes or not hmac.compare_digest(
             supplied_state,
             expected_state,
         ):

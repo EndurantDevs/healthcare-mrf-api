@@ -32,16 +32,24 @@ KEY_ID = "synthetic-a"
 KEY = bytes(range(32))
 NOW = "2026-08-07T10:00:10Z"
 SYNTHETIC_EIN = "12-" + "3" * 7
+REPLACEMENT_SYNTHETIC_EIN = "98-" + "7" * 7
 
 
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
 
 
-def _body(*, include_evidence: bool = False) -> bytes:
+def _body(
+    *,
+    include_evidence: bool = False,
+    tax_identity_value: str = SYNTHETIC_EIN,
+) -> bytes:
     payload: dict[str, object] = {
         "billing_identity": {
-            "tax_identity": {"type": "ein", "value": SYNTHETIC_EIN}
+            "tax_identity": {
+                "type": "ein",
+                "value": tax_identity_value,
+            }
         },
         "geo": {"radius_miles": 0, "zip5": "00000"},
         "healthporta_plan_id": PLAN_ID,
@@ -175,6 +183,26 @@ def test_endpoint_access_verifies_transport_shape_and_authority() -> None:
     assert repr(access) == "<redacted-billing-search-post-endpoint-access>"
     assert SYNTHETIC_EIN not in repr(access)
     assert validate_billing_search_post_endpoint_access(access) is access
+
+
+def test_endpoint_access_rejects_valid_request_object_substitution() -> None:
+    body = _body()
+    access = _authorize(body, _headers(body))
+    replacement_body = _body(
+        tax_identity_value=REPLACEMENT_SYNTHETIC_EIN
+    )
+    replacement = _authorize(
+        replacement_body,
+        _headers(replacement_body),
+    )
+    object.__setattr__(
+        access,
+        "_BillingSearchPostEndpointAccess__request",
+        replacement.request,
+    )
+
+    with pytest.raises(BillingSearchPostEndpointAccessError):
+        validate_billing_search_post_endpoint_access(access)
 
 
 def test_endpoint_access_accepts_the_real_sanic_header_mapping() -> None:
