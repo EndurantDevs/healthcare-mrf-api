@@ -8,6 +8,7 @@ import datetime as dt
 from typing import Any
 
 from db.models import db
+from process.formulary_fhir.repository_checkpoint import AliasCompletionFence
 from process.formulary_fhir.repository_checkpoint import FHIRFormularyCheckpointMixin
 from process.formulary_fhir.repository_publish import FHIRFormularyPublicationMixin
 from process.formulary_fhir.repository_shared import AliasRef
@@ -383,6 +384,7 @@ class FHIRFormularyRepository(
 
 
 __all__ = (
+    "AliasCompletionFence",
     "AliasRef",
     "AliasVersionResult",
     "AliasVersionWrite",
