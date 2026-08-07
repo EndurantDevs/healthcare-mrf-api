@@ -34,8 +34,8 @@ from api.ptg2_types import PTG2ServingTables
 from process.provider_directory_profile import is_valid_npi
 
 MAX_HYDRATION_CANDIDATES = 128
-MAX_HYDRATION_PARTITIONS = 16
-MAX_PAGE_HYDRATION_CALLS = 32
+MAX_HYDRATION_PARTITIONS = 8
+MAX_PAGE_HYDRATION_CALLS = 8
 MAX_PAGE_SCOPED_PRICE_KEYS = MAX_PRICE_KEYS
 
 
@@ -276,6 +276,8 @@ async def _hydrate_partition(
     session,
     candidates: tuple[BillingSearchProviderCandidate, ...],
     price_filter_args: Mapping[str, Any],
+    *,
+    atom_budget: int,
 ) -> dict[int, tuple[BillingProviderGeoPriceWitness, ...]]:
     witness_owner_by_id: dict[int, int] = {}
     geo_witnesses: list[BillingProviderGeoWitness] = []
@@ -294,6 +296,7 @@ async def _hydrate_partition(
         candidates[0].serving_tables,
         geo_witnesses=ordered_geo_witnesses,
         price_filter_args=price_filter_args,
+        atom_budget=atom_budget,
     )
     if type(hydrated) is not tuple:
         raise serving_unavailable()
@@ -339,6 +342,7 @@ async def _hydrate_chunk(
             session,
             partition,
             price_filter_args,
+            atom_budget=atom_budget - retained_atom_count,
         )
         for candidate_index, price_witnesses in hydrated_by_candidate.items():
             candidate = partition[candidate_index]

@@ -87,6 +87,8 @@ async def test_aggregate_atom_budget_fails_across_bindings(monkeypatch):
             price_filter_args={},
         )
     assert hydrate.await_count == 2
+    assert hydrate.await_args_list[0].kwargs["atom_budget"] == 1
+    assert hydrate.await_args_list[1].kwargs["atom_budget"] == 0
 
 
 @pytest.mark.asyncio
