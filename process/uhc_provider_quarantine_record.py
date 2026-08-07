@@ -260,14 +260,24 @@ def is_checksum_invalid_npi(raw_npi: Any) -> bool:
 
 
 def is_structurally_invalid_npi(raw_npi: Any) -> bool:
-    """Return true only for an exact nonzero numeric out-of-range NPI."""
+    """Return true only for a bounded, exact structural NPI rejection."""
 
     if (
         not isinstance(raw_npi, str)
         or len(raw_npi) != 10
         or not raw_npi.isascii()
-        or not raw_npi.isdigit()
     ):
+        return False
+    if (
+        raw_npi[2] == "/"
+        and raw_npi[5] == "/"
+        and all(
+            character.isdigit() if index not in {2, 5} else character == "/"
+            for index, character in enumerate(raw_npi)
+        )
+    ):
+        return True
+    if not raw_npi.isdigit():
         return False
     numeric_npi = int(raw_npi)
     return numeric_npi != 0 and not (

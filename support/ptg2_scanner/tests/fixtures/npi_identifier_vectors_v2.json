@@ -1,0 +1,56 @@
+{
+  "contract_id": "healthporta.npi-identifier-classification.v2",
+  "version": 2,
+  "cases": [
+    {
+      "id": "synthetic-valid-lower-range",
+      "value": "1000000491",
+      "classification": "valid"
+    },
+    {
+      "id": "synthetic-valid-upper-range",
+      "value": "2999999990",
+      "classification": "valid"
+    },
+    {
+      "id": "synthetic-checksum-invalid",
+      "value": "1000000492",
+      "classification": "checksum_invalid"
+    },
+    {
+      "id": "synthetic-structural-high-prefix",
+      "value": "3000000000",
+      "classification": "structural_invalid"
+    },
+    {
+      "id": "synthetic-structural-leading-zero",
+      "value": "0999999999",
+      "classification": "structural_invalid"
+    },
+    {
+      "id": "synthetic-structural-slash-delimited",
+      "value": "10/00/0491",
+      "classification": "structural_invalid"
+    },
+    {
+      "id": "synthetic-invalid-short",
+      "value": "123",
+      "classification": "invalid"
+    },
+    {
+      "id": "synthetic-invalid-nondigit",
+      "value": "100000049x",
+      "classification": "invalid"
+    },
+    {
+      "id": "synthetic-invalid-zero",
+      "value": "0000000000",
+      "classification": "invalid"
+    },
+    {
+      "id": "synthetic-invalid-unicode-digits",
+      "value": "１００００００４９１",
+      "classification": "invalid"
+    }
+  ]
+}
