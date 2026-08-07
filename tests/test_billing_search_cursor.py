@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import base64
+import copy
+from dataclasses import asdict
 import json
+import pickle
 
 import pytest
 
@@ -104,6 +107,19 @@ def test_cursor_keyring_is_frozen_after_construction() -> None:
     assert keyring.key_for("k1") == KEY_ONE
 
 
+def test_cursor_keyring_blocks_generic_secret_serialization_and_copying() -> None:
+    keyring = _keyring()
+
+    with pytest.raises(TypeError):
+        asdict(keyring)
+    with pytest.raises(cursor.BillingSearchCursorError) as failure:
+        pickle.dumps(keyring)
+
+    assert copy.copy(keyring) is keyring
+    assert copy.deepcopy(keyring) is keyring
+    assert KEY_ONE not in repr(failure.value).encode("ascii")
+
+
 def test_cursor_rejects_authenticated_noncanonical_json() -> None:
     canonical_plaintext = cursor._canonical_json_bytes(cursor._state_values(_state()))
     duplicate_plaintext = canonical_plaintext.replace(
@@ -176,9 +192,12 @@ def test_cursor_rejects_every_binding_mismatch(
 ) -> None:
     token = _seal(monkeypatch)
 
-    with pytest.raises(
-        cursor.BillingSearchCursorError, match="^billing_search_cursor_invalid$"
-    ):
+    expected_exception = (
+        cursor.BillingSearchCursorGenerationExpired
+        if binding_name in {"generation_bundle_sha256", "snapshot_set_sha256"}
+        else cursor.BillingSearchCursorError
+    )
+    with pytest.raises(expected_exception):
         _open(token, **{binding_name: binding_value})
 
 

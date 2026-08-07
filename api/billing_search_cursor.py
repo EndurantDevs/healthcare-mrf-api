@@ -49,8 +49,18 @@ class BillingSearchCursorError(ValueError):
     """Value-free cursor failure safe for an API boundary."""
 
 
+class BillingSearchCursorGenerationExpired(BillingSearchCursorError):
+    """The cursor's immutable serving generation is no longer current."""
+
+
 def _fail() -> BillingSearchCursorError:
     return BillingSearchCursorError(_INVALID)
+
+
+def _generation_expired() -> BillingSearchCursorGenerationExpired:
+    return BillingSearchCursorGenerationExpired(
+        "billing_search_cursor_generation_expired"
+    )
 
 
 def _canonical_sha256(value: object) -> str:
@@ -102,12 +112,10 @@ def _canonical_sort_key(value: object) -> tuple[int | float | str, ...]:
     return tuple(_canonical_sort_value(member) for member in value)
 
 
-@dataclass(frozen=True, slots=True, repr=False, init=False)
 class BillingSearchCursorKeyring:
     """Immutable active-and-retained AES-256 keyring."""
 
-    __active_key_id: str
-    __keys: tuple[tuple[str, bytes], ...]
+    __slots__ = ("__active_key_id", "__keys")
 
     def __init__(
         self,
@@ -138,6 +146,14 @@ class BillingSearchCursorKeyring:
         )
         object.__setattr__(self, "_BillingSearchCursorKeyring__keys", normalized_keys)
 
+    def __setattr__(self, attribute_name: str, attribute_value: object) -> None:
+        del attribute_name, attribute_value
+        raise TypeError(_INVALID)
+
+    def __delattr__(self, attribute_name: str) -> None:
+        del attribute_name
+        raise TypeError(_INVALID)
+
     @property
     def active_key_id(self) -> str:
         """Return the non-secret active key version."""
@@ -157,6 +173,20 @@ class BillingSearchCursorKeyring:
         return _REDACTED
 
     __str__ = __repr__
+
+    def __copy__(self) -> BillingSearchCursorKeyring:
+        return self
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object],
+    ) -> BillingSearchCursorKeyring:
+        memo[id(self)] = self
+        return self
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise _fail()
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -369,17 +399,24 @@ def open_billing_search_cursor(
         raise _fail() from exc
     state = _decoded_state(plaintext)
     now = _canonical_timestamp(trusted_now)
-    expected_digests = (
+    expected_scope_digests = (
         (state.request_fingerprint_sha256, request_fingerprint_sha256),
         (state.authorization_context_sha256, authorization_context_sha256),
+    )
+    expected_generation_digests = (
         (state.generation_bundle_sha256, generation_bundle_sha256),
         (state.snapshot_set_sha256, snapshot_set_sha256),
     )
     if not state.issued_at <= now < state.expires_at or any(
         not hmac.compare_digest(actual, _canonical_sha256(expected))
-        for actual, expected in expected_digests
+        for actual, expected in expected_scope_digests
     ):
         raise _fail()
+    if any(
+        not hmac.compare_digest(actual, _canonical_sha256(expected))
+        for actual, expected in expected_generation_digests
+    ):
+        raise _generation_expired()
     return state
 
 
@@ -387,6 +424,7 @@ __all__ = [
     "BILLING_SEARCH_CURSOR_CONTRACT",
     "BILLING_SEARCH_CURSOR_MAX_TTL_SECONDS",
     "BillingSearchCursorError",
+    "BillingSearchCursorGenerationExpired",
     "BillingSearchCursorKeyring",
     "BillingSearchCursorState",
     "open_billing_search_cursor",
