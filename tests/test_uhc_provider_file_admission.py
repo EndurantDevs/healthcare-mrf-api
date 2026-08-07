@@ -7,6 +7,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import control_imports
+from process.uhc_provider_file_admission import (
+    is_uhc_official_file_repair_replay,
+    validate_uhc_official_file_admission,
+)
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 
@@ -23,6 +27,52 @@ def _valid_uhc_params(**overrides) -> dict:
     }
     params_by_name.update(overrides)
     return params_by_name
+
+
+def _valid_repair_params(**overrides) -> dict:
+    params_by_name = _valid_uhc_params(
+        provider_directory_dispatch_contract_version=2,
+        provider_directory_dispatch_generation=1,
+        provider_directory_dispatch_id="pdd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        provider_directory_dispatch_request_id=(
+            "11111111-2222-4333-8444-555555555555"
+        ),
+        provider_directory_dispatch_request_fingerprint="b" * 64,
+        provider_directory_dispatch_catalog_digest="c" * 64,
+        provider_directory_repair_id="86066b89-ecb8-42c2-83d0-b65768a08736",
+    )
+    params_by_name.update(overrides)
+    return params_by_name
+
+
+def test_exact_typed_repair_identity_is_explicit() -> None:
+    params = _valid_repair_params()
+    validate_uhc_official_file_admission(params, required=True)
+    assert is_uhc_official_file_repair_replay(params) is True
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("provider_directory_dispatch_contract_version", 1),
+        ("provider_directory_dispatch_generation", 0),
+        ("provider_directory_dispatch_generation", True),
+        ("provider_directory_dispatch_id", "pdd_invalid"),
+        ("provider_directory_dispatch_request_id", "not-a-uuid"),
+        ("provider_directory_dispatch_request_fingerprint", "B" * 64),
+        ("provider_directory_dispatch_catalog_digest", "short"),
+        ("provider_directory_repair_id", "not-a-uuid"),
+    ],
+)
+def test_repair_identity_fails_closed(field_name, invalid_value) -> None:
+    with pytest.raises(
+        ValueError,
+        match="provider_directory_uhc_repair_identity_invalid",
+    ):
+        validate_uhc_official_file_admission(
+            _valid_repair_params(**{field_name: invalid_value}),
+            required=True,
+        )
 
 
 async def _assert_control_admission_rejected(

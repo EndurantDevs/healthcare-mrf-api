@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from types import MappingProxyType
 from typing import Any, Mapping
+from uuid import UUID
 
 from process.uhc_provider_file_source_identity import (
     UHC_PROVIDER_FILE_DISPLAY_NAME,
@@ -23,6 +24,50 @@ UHC_OFFICIAL_ACQUISITION_PROFILE: Mapping[str, object] = MappingProxyType(
     }
 )
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
+_DISPATCH_ID = re.compile(r"pdd_[0-9a-f]{32}")
+
+
+def _is_canonical_uuid(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def is_uhc_official_file_repair_replay(params: Mapping[str, Any]) -> bool:
+    """Return whether params carry one exact typed repair-generation identity."""
+
+    repair_id = params.get("provider_directory_repair_id")
+    if repair_id is None:
+        return False
+    generation = params.get("provider_directory_dispatch_generation")
+    contract_version = params.get(
+        "provider_directory_dispatch_contract_version"
+    )
+    dispatch_id = params.get("provider_directory_dispatch_id")
+    request_id = params.get("provider_directory_dispatch_request_id")
+    request_fingerprint = params.get(
+        "provider_directory_dispatch_request_fingerprint"
+    )
+    catalog_digest = params.get("provider_directory_dispatch_catalog_digest")
+    if not (
+        _is_canonical_uuid(repair_id)
+        and type(generation) is int
+        and generation >= 1
+        and type(contract_version) is int
+        and contract_version == 2
+        and isinstance(dispatch_id, str)
+        and _DISPATCH_ID.fullmatch(dispatch_id) is not None
+        and _is_canonical_uuid(request_id)
+        and isinstance(request_fingerprint, str)
+        and _LOWERCASE_SHA256.fullmatch(request_fingerprint) is not None
+        and isinstance(catalog_digest, str)
+        and _LOWERCASE_SHA256.fullmatch(catalog_digest) is not None
+    ):
+        raise ValueError("provider_directory_uhc_repair_identity_invalid")
+    return True
 
 
 def _requested_source_ids(params: Mapping[str, Any]) -> set[str]:
@@ -136,6 +181,7 @@ def validate_uhc_official_file_admission(
         raise ValueError(
             "provider_directory_uhc_catalog_set_sha256_invalid"
         )
+    is_uhc_official_file_repair_replay(params)
     for field_name, expected_value in UHC_OFFICIAL_ACQUISITION_PROFILE.items():
         actual_value = params.get(field_name)
         if (
@@ -150,6 +196,7 @@ def validate_uhc_official_file_admission(
 
 __all__ = [
     "UHC_OFFICIAL_ACQUISITION_PROFILE",
+    "is_uhc_official_file_repair_replay",
     "is_uhc_official_file_acquisition_requested",
     "should_select_uhc_official_file_source",
     "validate_uhc_official_file_admission",
