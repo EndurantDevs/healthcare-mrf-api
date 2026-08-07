@@ -4,12 +4,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from process.ptg_parts.ptg2_tax_identity_source_projection import (
-        TaxIdentitySourcePublication,
-    )
+from process.ptg_parts.ptg2_tax_identity_source_projection import (
+    TaxIdentitySourcePublication,
+)
 
 _PUBLICATION_FIELDS = frozenset(
     {
@@ -39,7 +38,6 @@ def _publication_from_metadata_values(
     """Build a publication after its outer contract has been validated."""
 
     from process.ptg_parts.ptg2_tax_identity_source_projection import (
-        TaxIdentitySourcePublication,
         _strict_int,
         _strict_policy,
         _strict_sha256,

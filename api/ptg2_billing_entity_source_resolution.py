@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hmac
 from typing import Any
 
 from sqlalchemy import text
@@ -15,14 +16,20 @@ from api.ptg2_billing_entity_group_resolution import (
 )
 from api.ptg2_billing_entity_refs import PTG2BillingAssociationDataError
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_tax_identity_source_binding_vector import (
+    tax_identity_source_binding_vector_digest,
+)
+from process.ptg_parts.ptg2_tax_identity_source_persisted import (
+    SOURCE_BINDING_FIELDS,
+)
 from process.ptg_parts.ptg2_tax_identity_source_projection import (
     PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT,
     PTG2_TAX_IDENTITY_SOURCE_CONTRACT,
-    TaxIdentitySourceProjectionError,
     TaxIdentitySourcePublication,
     tax_identity_source_publication_from_metadata,
 )
 
+_MAX_SOURCE_BINDINGS = 8192
 _MAX_SOURCE_WITNESSES = 8192
 
 
@@ -56,7 +63,7 @@ class ResolvedBillingEntitySourceScope:
 
     @property
     def source_keys(self) -> tuple[int, ...]:
-        """Return stable distinct source ordinals in deterministic order."""
+        """Return stable distinct source keys in deterministic order."""
 
         return tuple(dict.fromkeys(witness.source_key for witness in self.witnesses))
 
@@ -68,64 +75,113 @@ class ResolvedBillingEntitySourceScope:
         )
 
 
-def _source_witness_query(schema_name: str):
+def _source_tables(schema_name: str) -> tuple[str, str, str, str]:
     schema = _quote_ident(schema_name)
-    manifest = f"{schema}.ptg2_provider_tax_identity_source_manifest"
-    binding = f"{schema}.ptg2_provider_tax_identity_source_binding"
-    observation = f"{schema}.ptg2_provider_group_tax_identity_source"
+    return tuple(
+        f"{schema}.{_quote_ident(table_name)}"
+        for table_name in (
+            "ptg2_provider_tax_identity_source_manifest",
+            "ptg2_provider_tax_identity_manifest",
+            "ptg2_provider_tax_identity_source_binding",
+            "ptg2_provider_group_tax_identity_source",
+        )
+    )
+
+
+def _source_geometry_query(schema_name: str):
+    source_manifest, aggregate_manifest, binding, _ = _source_tables(schema_name)
+    binding_columns = ",\n".join(
+        f"                   binding.{field_name} AS binding_{field_name}"
+        for field_name in SOURCE_BINDING_FIELDS
+    )
     return text(f"""
-        WITH witnesses AS (
+        WITH source_geometry AS MATERIALIZED (
+            SELECT manifest.contract,
+                   manifest.binding_contract,
+                   manifest.token_policy_id,
+                   manifest.token_policy_descriptor_sha256,
+                   manifest.source_count,
+                   manifest.provider_group_occurrence_count,
+                   manifest.matched_ein_count,
+                   manifest.missing_count,
+                   manifest.malformed_count,
+                   manifest.unsupported_type_count,
+                   manifest.content_digest,
+                   aggregate.source_shard_count AS aggregate_source_count,
+                   aggregate.source_ordinal_map_digest
+              FROM {source_manifest} AS manifest
+              JOIN {aggregate_manifest} AS aggregate
+                ON aggregate.snapshot_key = manifest.snapshot_key
+             WHERE manifest.snapshot_key = :snapshot_key
+        ), bounded_bindings AS MATERIALIZED (
+            SELECT {", ".join(SOURCE_BINDING_FIELDS)}
+              FROM {binding}
+             WHERE snapshot_key = :snapshot_key
+             ORDER BY source_key
+             LIMIT :binding_limit
+        )
+        SELECT
+            (SELECT COUNT(*) FROM {source_manifest}
+              WHERE snapshot_key = :snapshot_key) AS manifest_count,
+            (SELECT COUNT(*) FROM {aggregate_manifest}
+              WHERE snapshot_key = :snapshot_key) AS aggregate_manifest_count,
+            geometry.contract,
+            geometry.binding_contract,
+            geometry.token_policy_id,
+            geometry.token_policy_descriptor_sha256,
+            geometry.source_count,
+            geometry.provider_group_occurrence_count,
+            geometry.matched_ein_count,
+            geometry.missing_count,
+            geometry.malformed_count,
+            geometry.unsupported_type_count,
+            geometry.content_digest,
+            geometry.aggregate_source_count,
+            geometry.source_ordinal_map_digest,
+{binding_columns}
+          FROM (SELECT TRUE AS anchor) AS anchor
+          LEFT JOIN source_geometry AS geometry ON TRUE
+          LEFT JOIN bounded_bindings AS binding ON TRUE
+         ORDER BY binding.source_key NULLS LAST
+        """)
+
+
+def _source_witness_query(schema_name: str):
+    _, _, binding, observation = _source_tables(schema_name)
+    return text(f"""
+        WITH bounded_witnesses AS MATERIALIZED (
             SELECT association.source_key,
-                   association.source_record_ordinal,
-                   binding.provider_group_count AS source_provider_group_count,
-                   encode(
-                       association.provider_group_global_id_128,
-                       'hex'
-                   ) AS provider_group_ref
+                   association.provider_group_global_id_128,
+                   association.source_record_ordinal
               FROM {observation} AS association
-              JOIN {binding} AS binding
-                ON binding.snapshot_key = association.snapshot_key
-               AND binding.source_key = association.source_key
              WHERE association.snapshot_key = :snapshot_key
                AND association.tin_key = :tin_key
                AND association.tax_identity_state = 'matched_ein'
              ORDER BY association.source_key,
-                      association.source_record_ordinal,
                       association.provider_group_global_id_128
              LIMIT :witness_limit
         )
-        SELECT
-            (SELECT COUNT(*) FROM {manifest}
-              WHERE snapshot_key = :snapshot_key) AS manifest_count,
-            manifest.contract,
-            manifest.binding_contract,
-            manifest.token_policy_id,
-            manifest.token_policy_descriptor_sha256,
-            manifest.source_count,
-            manifest.provider_group_occurrence_count,
-            manifest.matched_ein_count,
-            manifest.missing_count,
-            manifest.malformed_count,
-            manifest.unsupported_type_count,
-            manifest.content_digest,
-            witnesses.source_key,
-            witnesses.source_record_ordinal,
-            witnesses.source_provider_group_count,
-            witnesses.provider_group_ref
-          FROM (SELECT TRUE AS anchor) AS anchor
-          LEFT JOIN {manifest} AS manifest
-            ON manifest.snapshot_key = :snapshot_key
-          LEFT JOIN witnesses ON TRUE
-         ORDER BY witnesses.source_key NULLS LAST,
-                  witnesses.source_record_ordinal NULLS LAST,
-                  witnesses.provider_group_ref NULLS LAST
+        SELECT witness.source_key,
+               witness.source_record_ordinal,
+               binding.provider_group_count AS source_provider_group_count,
+               encode(
+                   witness.provider_group_global_id_128,
+                   'hex'
+               ) AS provider_group_ref
+          FROM bounded_witnesses AS witness
+          JOIN {binding} AS binding
+            ON binding.snapshot_key = :snapshot_key
+           AND binding.source_key = witness.source_key
+         ORDER BY witness.source_key,
+                  witness.source_record_ordinal,
+                  witness.provider_group_global_id_128
         """)
 
 
 def _canonical_source_publication(
-    expected: TaxIdentitySourcePublication,
+    expected: object,
 ) -> TaxIdentitySourcePublication:
-    """Require one canonical sealed source publication."""
+    """Require the canonical strict representation of one sealed publication."""
 
     if type(expected) is not TaxIdentitySourcePublication:
         raise PTG2BillingAssociationDataError(
@@ -135,19 +191,24 @@ def _canonical_source_publication(
         canonical_expected = tax_identity_source_publication_from_metadata(
             expected.as_dict()
         )
-    except TaxIdentitySourceProjectionError as exc:
+    except Exception:
         raise PTG2BillingAssociationDataError(
             "sealed billing source scope is unavailable"
-        ) from exc
+        ) from None
     if canonical_expected != expected:
         raise PTG2BillingAssociationDataError(
             "sealed billing source scope is unavailable"
         )
-    return expected
+    if canonical_expected.source_count > _MAX_SOURCE_BINDINGS:
+        raise PTG2BillingAssociationDataError(
+            "sealed billing source scope exceeds its source limit"
+        )
+    return canonical_expected
 
 
-_SOURCE_STATE_FIELDS = (
+_GEOMETRY_FIELDS = (
     "manifest_count",
+    "aggregate_manifest_count",
     "contract",
     "binding_contract",
     "token_policy_id",
@@ -159,52 +220,113 @@ _SOURCE_STATE_FIELDS = (
     "malformed_count",
     "unsupported_type_count",
     "content_digest",
+    "aggregate_source_count",
+    "source_ordinal_map_digest",
 )
 
 
-def _persisted_source_state(source_state_row: Mapping[str, Any]) -> tuple[Any, ...]:
-    return tuple(source_state_row.get(field) for field in _SOURCE_STATE_FIELDS)
+def _persisted_geometry(source_row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return tuple(source_row.get(field_name) for field_name in _GEOMETRY_FIELDS)
 
 
-def _validated_source_publication(
-    source_state_rows: tuple[Mapping[str, Any], ...],
-    *,
-    expected: TaxIdentitySourcePublication,
-) -> TaxIdentitySourcePublication:
-    """Bind persisted source state to the exact sealed source geometry."""
-
-    if not source_state_rows:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope returned no state"
-        )
-    expected = _canonical_source_publication(expected)
-    states = {
-        _persisted_source_state(source_state_row)
-        for source_state_row in source_state_rows
-    }
-    if len(states) != 1:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope is inconsistent"
-        )
-    expected_state = (
+def _expected_geometry(
+    publication: TaxIdentitySourcePublication,
+) -> tuple[Any, ...]:
+    return (
+        1,
         1,
         PTG2_TAX_IDENTITY_SOURCE_CONTRACT,
         PTG2_TAX_IDENTITY_SOURCE_BINDING_CONTRACT,
-        expected.token_policy_id,
-        expected.token_policy_descriptor_sha256,
-        expected.source_count,
-        expected.provider_group_occurrence_count,
-        expected.matched_ein_count,
-        expected.missing_count,
-        expected.malformed_count,
-        expected.unsupported_type_count,
-        expected.content_digest,
+        publication.token_policy_id,
+        publication.token_policy_descriptor_sha256,
+        publication.source_count,
+        publication.provider_group_occurrence_count,
+        publication.matched_ein_count,
+        publication.missing_count,
+        publication.malformed_count,
+        publication.unsupported_type_count,
+        publication.content_digest,
+        publication.source_count,
+        publication.source_ordinal_map_digest,
     )
-    if states.pop() != expected_state:
+
+
+def _source_binding_records(
+    source_rows: tuple[Mapping[str, Any], ...],
+) -> tuple[dict[str, Any], ...]:
+    records: list[dict[str, Any]] = []
+    for source_row in source_rows:
+        values = tuple(
+            source_row.get(f"binding_{field_name}")
+            for field_name in SOURCE_BINDING_FIELDS
+        )
+        if all(value is None for value in values):
+            continue
+        records.append(dict(zip(SOURCE_BINDING_FIELDS, values, strict=True)))
+    return tuple(records)
+
+
+def _validate_source_bindings(
+    source_rows: tuple[Mapping[str, Any], ...],
+    *,
+    expected: TaxIdentitySourcePublication,
+) -> None:
+    binding_records = _source_binding_records(source_rows)
+    try:
+        binding_digest = tax_identity_source_binding_vector_digest(binding_records)
+        artifact_byte_count = sum(
+            int(binding_record["artifact_byte_count"])
+            for binding_record in binding_records
+        )
+    except Exception:
+        raise PTG2BillingAssociationDataError(
+            "sealed billing source scope is unavailable"
+        ) from None
+    if (
+        len(binding_records) != expected.source_count
+        or artifact_byte_count != expected.artifact_byte_count
+        or not hmac.compare_digest(binding_digest, expected.binding_vector_digest)
+    ):
         raise PTG2BillingAssociationDataError(
             "sealed billing source scope is unavailable"
         )
+
+
+def _validated_source_geometry(
+    source_rows: tuple[Mapping[str, Any], ...],
+    *,
+    expected: TaxIdentitySourcePublication,
+) -> TaxIdentitySourcePublication:
+    """Bind durable source tables to the exact trusted sealed geometry."""
+
+    if not source_rows:
+        raise PTG2BillingAssociationDataError(
+            "sealed billing source scope returned no state"
+        )
+    geometry = _persisted_geometry(source_rows[0])
+    if any(_persisted_geometry(source_row) != geometry for source_row in source_rows):
+        raise PTG2BillingAssociationDataError(
+            "sealed billing source scope is inconsistent"
+        )
+    if geometry != _expected_geometry(expected):
+        raise PTG2BillingAssociationDataError(
+            "sealed billing source scope is unavailable"
+        )
+    _validate_source_bindings(source_rows, expected=expected)
     return expected
+
+
+def _validated_source_publication(
+    source_rows: tuple[Mapping[str, Any], ...],
+    *,
+    expected: object,
+) -> TaxIdentitySourcePublication:
+    """Preserve the #430 validation hook over the stronger geometry proof."""
+
+    return _validated_source_geometry(
+        source_rows,
+        expected=_canonical_source_publication(expected),
+    )
 
 
 def _source_witness_from_row(
@@ -294,13 +416,30 @@ async def resolve_billing_entity_ref_source_scope(
 ) -> ResolvedBillingEntitySourceScope | None:
     """Resolve one ref to exact source/group witnesses in a sealed snapshot."""
 
+    publication = _canonical_source_publication(source_publication)
     tin_key = await _resolve_billing_entity_ref_tin_key(
         session,
         schema_name=schema_name,
         snapshot_key=snapshot_key,
         billing_entity_ref=billing_entity_ref,
     )
-    source_query_result = await session.execute(
+    geometry_result = await session.execute(
+        _source_geometry_query(schema_name),
+        {
+            "snapshot_key": snapshot_key,
+            "binding_limit": publication.source_count + 1,
+        },
+    )
+    geometry_rows = tuple(
+        dict(geometry_row) for geometry_row in geometry_result.mappings()
+    )
+    publication = _validated_source_geometry(
+        geometry_rows,
+        expected=publication,
+    )
+    if tin_key is None:
+        return None
+    witness_result = await session.execute(
         _source_witness_query(schema_name),
         {
             "snapshot_key": snapshot_key,
@@ -308,17 +447,8 @@ async def resolve_billing_entity_ref_source_scope(
             "witness_limit": _MAX_SOURCE_WITNESSES + 1,
         },
     )
-    source_state_rows = tuple(
-        dict(source_state_row) for source_state_row in source_query_result.mappings()
-    )
-    publication = _validated_source_publication(
-        source_state_rows,
-        expected=source_publication,
-    )
-    if tin_key is None:
-        return None
     witnesses = _normalized_source_witnesses(
-        source_state_rows,
+        tuple(dict(witness_row) for witness_row in witness_result.mappings()),
         source_count=publication.source_count,
     )
     return ResolvedBillingEntitySourceScope(
