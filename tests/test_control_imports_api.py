@@ -3451,16 +3451,18 @@ _UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE = [
 
 
 def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
-    """Expose every reviewed runnable and probe-only source exactly once."""
+    """Expose every reviewed source while preserving execution fences."""
     catalog = provider_directory_source_catalog()
     runnable_items = [entry for entry in catalog["items"] if entry["runnable"]]
-    probe_items = [entry for entry in catalog["items"] if not entry["runnable"]]
+    nonrunnable_items = [
+        entry for entry in catalog["items"] if not entry["runnable"]
+    ]
 
     assert (
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (38, 24, 24)
+    ) == (39, 24, 24)
     assert len(catalog["catalog_digest"]) == 64
     assert len(runnable_items) == 24
     assert all(entry["profile_enabled"] for entry in runnable_items)
@@ -3468,8 +3470,13 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         entry["supported_resources"] == entry["resources"]
         for entry in runnable_items
     )
+    assert len(nonrunnable_items) == 15
+    probe_items = [
+        entry
+        for entry in nonrunnable_items
+        if entry["classification"] == "probe_only"
+    ]
     assert len(probe_items) == 14
-    assert all(entry["classification"] == "probe_only" for entry in probe_items)
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
     runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
     assert probe_by_id["capital-blue-cross"]["resources"] == []

@@ -12,7 +12,7 @@ Freshness policy: catalog confirmation expires after `45` days, source reviews a
 
 ## Catalog Inventory Snapshot
 
-This snapshot covers the entire live catalog: `866` sources confirmed in `mrf-dev` against `mrf.provider_directory_source` at `2026-07-11T15:21:05Z`. It is not the curated support matrix below, which tracks `41` entries, including `24` acquisition-configured entries.
+This snapshot covers the entire live catalog: `866` sources confirmed in `mrf-dev` against `mrf.provider_directory_source` at `2026-07-11T15:21:05Z`. It is not the curated support matrix below, which tracks `42` entries, including `25` acquisition-configured entries.
 
 The `103` valid source rows collapse to `25` canonical bases after removing `78` aliases. `24` bases are represented by maintained entries; `1` is not. The only valid canonical base outside the maintained entries is Aetna's credentialed, targeted Medicaid directory. It is documented as an alternate Aetna base rather than a separate fully enumerable carrier directory.
 
@@ -32,11 +32,11 @@ The `103` valid source rows collapse to `25` canonical bases after removing `78`
 
 | Category | Count |
 | --- | ---: |
-| Acquisition-configured | 24 |
+| Acquisition-configured | 25 |
 | Externally supported | 0 |
 | Probe-only | 14 |
 | Known not importable | 3 |
-| Total tracked | 41 |
+| Total tracked | 42 |
 
 ### Credentialed Or Registered Access
 
@@ -90,6 +90,7 @@ The `103` valid source rows collapse to `25` canonical bases after removing `78`
 | Centene (`centene`) | Probe-only | None | Probe | None configured | https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory | pdfhir_00d0fb813f25b5d699a18eaa | Not required | 2026-07-13 | 2026-08-27 | The production base now returns public FHIR metadata from dev egress. Location requires at least one resource search parameter: an _count-only request returns HTTP 400, while address-state=OK with _count=1 returns 200 rows plus a next link. Generic resource acquisition is blocked in the importer because stable exhaustive pagination and equivalent behavior across all directory collections remain unverified. |
 | Contra Costa (`contra-costa`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://ihyml0v6d9.execute-api.us-east-1.amazonaws.com/hxprod | pdfhir_8ee2865f928f1d67b8a86090 | Not required | 2026-07-13 | 2026-08-27 | Seven public collections follow opaque next-link pagination; Endpoint is unsupported and excluded. The official catalog can return HTTP 403, so the confirmed fallback base is retained. Terminal acquisition succeeded, and current artifact plus unified/API readiness is recorded in the tracked verification snapshot. |
 | ALOHR (`alohr`) | Acquisition-configured | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4 | pdfhir_0f81c146991b27031b1ec366 | Required | 2026-07-14 | 2026-08-28 | FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr. The prior five-resource run is not proof for the corrected contract because the source does not expose organization-affiliation relationships. A fresh four-resource GraphQL acquisition, validation, artifact publication, and unified/API proof are pending. |
+| Kaiser Permanente (`kaiser`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc | pdfhir_67f47e3af69543ce63cfbf6d | Not required | 2026-08-08 | 2026-09-22 | The reviewed public R4 source is registered only for an operator-launched cutoff-bounded current-version census. It is excluded from the generic campaign harness, scheduling, the control API, Profile sources, and publication. Two independently exhaustive roots at one frozen cutoff must match before a current dataset or downstream readiness can be claimed. |
 
 ## Current Published Dataset Audit
 
@@ -131,6 +132,7 @@ Audit as of `2026-07-20`. A current published dataset is distinct from configure
 | Centene (`centene`) | Probe-only | - | Not applicable | Stable exhaustive pagination remains unverified. |
 | Contra Costa (`contra-costa`) | Current published (`pdds_6653e89e2f6f...`) | 950,535 | Snapshot-ready | A current dataset exists and a replacement acquisition is active. |
 | ALOHR (`alohr`) | Current published (`pdds_085b7d2da6de...`) | 319,384 | Contract/live mismatch | The published dataset predates GraphQL-bound endpoint identity and its immutable metadata still claims OrganizationAffiliation. A fresh four-resource acquisition, validation, artifact promotion, unified refresh, and API proof are required before readiness can be asserted. |
+| Kaiser Permanente (`kaiser`) | No current dataset | - | Not proven | The reviewed source is registered for manual current-version census acquisition. Two independently exhaustive matching roots, explicit publication, and downstream runtime verification remain pending. |
 | Chorus Community Health Plans | Not importable | - | Not applicable | The documented service is unreachable. |
 | First Medical Health Plan, Inc. | Not importable | - | Not applicable | A user token and production approval are required. |
 | Puerto Rico Medicaid FFS | Not importable | - | Not applicable | No production Provider Directory is published. |
@@ -193,5 +195,6 @@ Verification environment: `mrf-dev`. Campaign: `provider-directory-canonical-acq
 | Centene (`centene`) | Not recorded | Not recorded | Not applicable | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Contra Costa (`contra-costa`) | Current | Succeeded | Complete | Promoted | Ready | 2026-07-12T23:53:00Z | run_600d3643ad2f40898ed4826713484629 | Succeeded (`run_600d3643ad2f40898ed4826713484629`) at `2026-07-12T22:27:09Z` | Verified | 2026-07-12T22:27:09Z | 2026-08-26 | InsurancePlan: 3<br>PractitionerRole: 31,897<br>Practitioner: 6,178<br>Organization: 81,811<br>Location: 81,429<br>HealthcareService: 484,544<br>OrganizationAffiliation: 264,673 | Source rows: 950,535<br>Location rows: 81,429<br>Address rows: 340,410<br>Address keys: 65,585<br>Phone rows: 340,258<br>Coordinate rows: 311,351<br>Role-to-plan refs: 31,897<br>Address Keys: Present<br>Address Overlay: Present<br>Addresses: Present<br>Coordinates: Present<br>Locations: Present<br>Phones: Present<br>Role To Plan Refs: Present |
 | ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not Promoted | Not Ready | 2026-07-14T16:34:49Z | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Kaiser Permanente (`kaiser`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 
 Generated by `scripts/generate_provider_directory_support_docs.py`; do not edit this file directly.

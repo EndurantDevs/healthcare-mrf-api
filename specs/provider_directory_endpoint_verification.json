@@ -3697,6 +3697,13 @@
         ]
       },
       "terminal_status": "succeeded"
+    },
+    "kaiser": {
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "proof_state": "not_recorded",
+      "run_id": null,
+      "terminal_status": null
     }
   },
   "environment": "mrf-dev",

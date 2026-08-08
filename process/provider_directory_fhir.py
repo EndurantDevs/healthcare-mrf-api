@@ -115,6 +115,9 @@ from process.provider_directory_fhir_census_execution import (
     validated_current_version_census_resume_url,
     validated_current_version_census_total,
 )
+from process.provider_directory_fhir_manual_catalog import (
+    reviewed_manual_census_seed_rows,
+)
 from process.provider_directory_dataset_rehydrate import (
     DEFAULT_BATCH_SIZE as DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
     DatasetScope,
@@ -820,6 +823,9 @@ PROVIDER_DIRECTORY_ENDPOINT_ACQUISITION_MANIFEST_PATH = (
     / "specs/provider_directory_endpoint_acquisition_manifest.json"
 )
 PROVIDER_DIRECTORY_ACQUISITION_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition"})
+PROVIDER_DIRECTORY_CATALOG_RETENTION_CLASSIFICATIONS = frozenset(
+    {*PROVIDER_DIRECTORY_ACQUISITION_CLASSIFICATIONS, "manual_acquisition"}
+)
 URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"')]+", re.IGNORECASE)
 ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE = "https://alohr.esante.us/public/providers"
 ALOHR_FHIR_PROVIDER_DIRECTORY_BASE = "https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4"
@@ -51732,7 +51738,7 @@ def _configured_catalog_protected_source_ids(task: dict[str, Any]) -> list[str]:
     for entry in entries:
         if not isinstance(entry, dict):
             raise RuntimeError("provider_directory_acquisition_manifest_invalid")
-        if entry.get("classification") in PROVIDER_DIRECTORY_ACQUISITION_CLASSIFICATIONS:
+        if entry.get("classification") in PROVIDER_DIRECTORY_CATALOG_RETENTION_CLASSIFICATIONS:
             configured_source_ids.extend(_clean_source_id_list(entry.get("source_ids")))
     return sorted(set(configured_source_ids))
 
@@ -61835,6 +61841,7 @@ async def process_provider_directory_fhir_data(
         task,
         allowed_resources=DEFAULT_RESOURCES,
     )
+    reviewed_census_seed_rows: list[dict[str, Any]] = []
     context = ctx.get("context")
     context_test_mode = bool(
         isinstance(context, dict) and context.get("test_mode")
@@ -61930,9 +61937,10 @@ async def process_provider_directory_fhir_data(
         )
         if _clean_text(task.get(field_name))
     )
-    local_supplemental_catalog_input_fields = tuple(
+    local_alternate_catalog_input_fields = tuple(
         field_name
         for field_name in (
+            "seed_db_path",
             "amerihealth_caritas_catalog_path",
             "contra_costa_catalog_path",
             "cms_sma_endpoint_directory_path",
@@ -62054,11 +62062,11 @@ async def process_provider_directory_fhir_data(
                 canonical_backfill_only=canonical_backfill_only,
                 contact_backfill_only=contact_backfill_only,
                 publish_artifacts_only=publish_artifacts_only,
-                local_seed_catalog=seed_db_path is not None,
+                local_seed_catalog=True,
                 local_retest_catalog=retest_results_path is not None,
                 supplemental_catalogs=include_supplemental_catalogs,
                 local_supplemental_catalog_inputs=(
-                    local_supplemental_catalog_input_fields
+                    local_alternate_catalog_input_fields
                 ),
                 remote_catalog_inputs=remote_catalog_input_fields,
                 bulk_export=use_bulk_export,
@@ -62084,6 +62092,9 @@ async def process_provider_directory_fhir_data(
             run_id,
             retry_of_run_id,
             pagination_root_run_id,
+        )
+        reviewed_census_seed_rows = reviewed_manual_census_seed_rows(
+            census_request.source_id
         )
     await _raise_if_resource_import_cancelled(ctx, task)
     await ensure_database(test_mode)
@@ -62198,6 +62209,7 @@ async def process_provider_directory_fhir_data(
     seed_rows: list[dict[str, Any]]
     tmpdir = None
     retest_tmpdir = None
+    retest_path = None
     supplemental_retest_seed_rows: list[dict[str, Any]] = []
     supplemental_catalog_seed_rows: list[dict[str, Any]] = []
     supplemental_catalog_metric_by_name: dict[str, Any] = {
@@ -62215,7 +62227,9 @@ async def process_provider_directory_fhir_data(
         total=1,
         message="resolving Provider Directory source catalog",
     )
-    if test_mode and not task.get("seed_db_path") and not task.get("seed_db_url"):
+    if census_request is not None:
+        seed_rows = reviewed_census_seed_rows
+    elif test_mode and not task.get("seed_db_path") and not task.get("seed_db_url"):
         seed_rows = [
             {
                 "id": "test-cigna",
@@ -62240,38 +62254,46 @@ async def process_provider_directory_fhir_data(
             limit=None if (task.get("retest_results_path") or task.get("retest_results_url")) else limit,
             source_query=source_query,
         )
-    retest_path, retest_tmpdir = _resolve_retest_results(
-        retest_results_path,
-        _clean_text(task.get("retest_results_url")),
-    )
-    if retest_path is not None:
-        supplemental_retest_seed_rows = _seed_rows_from_retest_results(retest_path, source_query=source_query)
-        seed_rows.extend(supplemental_retest_seed_rows)
-    if include_supplemental_catalogs:
-        supplemental_catalog_seed_rows, supplemental_catalog_metric_by_name = _seed_rows_from_supplemental_catalogs(
-            source_query=source_query,
-            timeout=timeout,
-            amerihealth_caritas_catalog_path=_clean_text(task.get("amerihealth_caritas_catalog_path")),
-            amerihealth_caritas_catalog_url=_clean_text(task.get("amerihealth_caritas_catalog_url")),
-            contra_costa_catalog_path=_clean_text(task.get("contra_costa_catalog_path")),
-            contra_costa_catalog_url=_clean_text(task.get("contra_costa_catalog_url")),
-            cms_sma_endpoint_directory_path=_clean_text(task.get("cms_sma_endpoint_directory_path")),
-            cms_sma_endpoint_directory_url=_clean_text(task.get("cms_sma_endpoint_directory_url")),
+    if census_request is None:
+        retest_path, retest_tmpdir = _resolve_retest_results(
+            retest_results_path,
+            _clean_text(task.get("retest_results_url")),
         )
-        supplemental_catalog_metric_by_name["enabled"] = True
-        seed_rows.extend(supplemental_catalog_seed_rows)
+        if retest_path is not None:
+            supplemental_retest_seed_rows = _seed_rows_from_retest_results(
+                retest_path,
+                source_query=source_query,
+            )
+            seed_rows.extend(supplemental_retest_seed_rows)
+        if include_supplemental_catalogs:
+            (
+                supplemental_catalog_seed_rows,
+                supplemental_catalog_metric_by_name,
+            ) = _seed_rows_from_supplemental_catalogs(
+                source_query=source_query,
+                timeout=timeout,
+                amerihealth_caritas_catalog_path=_clean_text(task.get("amerihealth_caritas_catalog_path")),
+                amerihealth_caritas_catalog_url=_clean_text(task.get("amerihealth_caritas_catalog_url")),
+                contra_costa_catalog_path=_clean_text(task.get("contra_costa_catalog_path")),
+                contra_costa_catalog_url=_clean_text(task.get("contra_costa_catalog_url")),
+                cms_sma_endpoint_directory_path=_clean_text(task.get("cms_sma_endpoint_directory_path")),
+                cms_sma_endpoint_directory_url=_clean_text(task.get("cms_sma_endpoint_directory_url")),
+            )
+            supplemental_catalog_metric_by_name["enabled"] = True
+            seed_rows.extend(supplemental_catalog_seed_rows)
 
     try:
         source_rows = _dedupe_source_rows(
             [_source_row_from_seed(seed_record) for seed_record in seed_rows]
         )
-        source_rows = _add_uhc_official_file_source(
-            source_rows,
-            requested_source_ids=requested_source_ids,
-            source_query=source_query,
-            test_mode=test_mode,
-            limit=limit,
-        )
+        if census_request is None:
+            source_rows = _add_uhc_official_file_source(
+                source_rows,
+                requested_source_ids=requested_source_ids,
+                source_query=source_query,
+                test_mode=test_mode,
+                limit=limit,
+            )
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]

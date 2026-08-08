@@ -74,7 +74,8 @@
       "scan": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-19", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "Fresh dev verification found exact broad and ge1900 ranged counts equal for all eight collections (76 InsurancePlan, 631,329 PractitionerRole, 88,045 Practitioner, 60,514 Organization, 215,369 Location, 0 HealthcareService, 967 OrganizationAffiliation, and 0 Endpoint). The 1,000-result search ceiling is handled with pageable <=1,000-row _lastUpdated leaves. Candidate acquisition now uses adaptive half-open _lastUpdated partitions with a one-second minimum leaf width, stable _lastUpdated,_id sorting, pre/post unfiltered and ranged census reconciliation, durable retry checkpoints, full-payload twin fingerprints, and twin-pass staged-row proof. SCAN remains probe-only and non-runnable until a full all-resource campaign produces matching terminal completeness metrics."},
       "centene": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "probe", "limitation": "The production base now returns public FHIR metadata from dev egress. Location requires at least one resource search parameter: an _count-only request returns HTTP 400, while address-state=OK with _count=1 returns 200 rows plus a next link. Generic resource acquisition is blocked in the importer because stable exhaustive pagination and equivalent behavior across all directory collections remain unverified."},
       "contra-costa": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-07-13", "method": "rest", "limitation": "Seven public collections follow opaque next-link pagination; Endpoint is unsupported and excluded. The official catalog can return HTTP 403, so the confirmed fallback base is retained. Terminal acquisition succeeded, and current artifact plus unified/API readiness is recorded in the tracked verification snapshot."},
-      "alohr": {"support_level": "acquisition-configured", "access_requirement": "private-connector", "requires_registration": true, "reviewed_at": "2026-07-14", "method": "graphql", "limitation": "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr. The prior five-resource run is not proof for the corrected contract because the source does not expose organization-affiliation relationships. A fresh four-resource GraphQL acquisition, validation, artifact publication, and unified/API proof are pending."}
+      "alohr": {"support_level": "acquisition-configured", "access_requirement": "private-connector", "requires_registration": true, "reviewed_at": "2026-07-14", "method": "graphql", "limitation": "FHIR REST reads are auth-gated; the maintained GraphQL connector uses tenant alohr. The prior five-resource run is not proof for the corrected contract because the source does not expose organization-affiliation relationships. A fresh four-resource GraphQL acquisition, validation, artifact publication, and unified/API proof are pending."},
+      "kaiser": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-08-08", "method": "rest", "limitation": "The reviewed public R4 source is registered only for an operator-launched cutoff-bounded current-version census. It is excluded from the generic campaign harness, scheduling, the control API, Profile sources, and publication. Two independently exhaustive roots at one frozen cutoff must match before a current dataset or downstream readiness can be claimed."}
     }
   },
   "parameter_profiles": {
@@ -557,6 +558,35 @@
       "launch_mode": "create",
       "resource_profile": "G4",
       "resources": ["Practitioner", "Organization", "Location", "PractitionerRole"]
+    },
+    {
+      "entry_id": "kaiser",
+      "display_name": "Kaiser Permanente",
+      "owner_id": "kaiser-provider-directory",
+      "source_ids": ["pdfhir_67f47e3af69543ce63cfbf6d"],
+      "canonical_base": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc",
+      "classification": "manual_acquisition",
+      "launch_mode": "manual",
+      "resource_profile": "A7",
+      "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"],
+      "manual_current_version_census": {
+        "contract_version": 1,
+        "plan_name": "Kaiser Permanente Provider Directory",
+        "seed_source": "healthporta-reviewed-provider-directory-candidate",
+        "continuation_strategy": "smile-opaque-getpages-v1",
+        "expected_nonempty_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"],
+        "page_count": 250,
+        "verification_campaign_id": "provider-directory-manual-census-2026-08-06-v1",
+        "start_urls": {
+          "InsurancePlan": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/InsurancePlan",
+          "PractitionerRole": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/PractitionerRole",
+          "Practitioner": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/Practitioner",
+          "Organization": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/Organization",
+          "Location": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/Location",
+          "HealthcareService": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/HealthcareService",
+          "OrganizationAffiliation": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/OrganizationAffiliation"
+        }
+      }
     }
   ]
 }

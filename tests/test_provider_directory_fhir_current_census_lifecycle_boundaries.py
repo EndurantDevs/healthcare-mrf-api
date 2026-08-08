@@ -175,7 +175,6 @@ def _exact_task() -> dict[str, object]:
         "linked_resource_deadline_seconds": 0,
         "resource_deadline_seconds": 0,
         "probe": True,
-        "seed_db_path": "/tmp/synthetic-provider-directory.sqlite",
         "bulk_export": False,
         "stale_cleanup": False,
         "publish_artifacts": False,
