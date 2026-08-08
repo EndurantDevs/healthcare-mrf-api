@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import types
 from unittest.mock import AsyncMock
 
@@ -15,6 +16,15 @@ from tests.test_control_import_waves_persistence import (
     _Session,
     _install_admission_dependencies,
 )
+
+
+def test_supersession_timestamp_preserves_an_aware_instant_in_utc():
+    source_timezone = dt.timezone(dt.timedelta(hours=2))
+    source_timestamp = dt.datetime(2026, 8, 8, 3, 2, 3, tzinfo=source_timezone)
+
+    assert supersession._as_aware_utc(source_timestamp) == dt.datetime(
+        2026, 8, 8, 1, 2, 3, tzinfo=dt.UTC
+    )
 
 
 @pytest.mark.asyncio
@@ -60,5 +70,6 @@ async def test_recovery_admission_revalidates_and_persists_supersession_first(
     assert persisted_supersession.recovery_evidence == {"bound": True}
     assert persisted_supersession.recovery_evidence_canonical == b'{"bound":true}'
     assert persisted_supersession.recovery_evidence_sha256 == "d" * 64
+    assert persisted_supersession.created_at.tzinfo is dt.UTC
     assert session.flush_count == 2
     waves.require_wave_admission_capacity.assert_awaited_once()

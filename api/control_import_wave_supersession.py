@@ -17,6 +17,14 @@ from process.ptg_wave_preclaim_supersession_runtime import (
 from process.ptg_wave_state import canonical_json
 
 
+def _as_aware_utc(value: dt.datetime) -> dt.datetime:
+    """Bind the admission clock safely to a PostgreSQL timestamptz column."""
+
+    if value.utcoffset() is None:
+        return value.replace(tzinfo=dt.UTC)
+    return value.astimezone(dt.UTC)
+
+
 def validate_admission_supersession(
     attestation: dict[str, Any],
     *,
@@ -63,7 +71,7 @@ async def persist_admission_supersession(
             recovery_evidence=witness.as_mapping(),
             recovery_evidence_canonical=canonical_json(witness.evidence_mapping()),
             recovery_evidence_sha256=witness.proof_digest,
-            created_at=now,
+            created_at=_as_aware_utc(now),
         )
     )
     await session.flush()

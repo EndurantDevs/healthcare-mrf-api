@@ -735,7 +735,8 @@ jobs:
             --username "$HLTHPRT_DB_USER" \
             ptg_import_wave_recovery_test_ci_runner
           timeout --foreground 295s python -m pytest -q \
-            tests/test_ptg_wave_recovery_storage_postgres.py
+            tests/test_ptg_wave_recovery_storage_postgres.py \
+            tests/test_ptg_wave_recovery_storage_orm_postgres.py
       - name: Run retained UHC semantic publication PostgreSQL gate
         if: matrix.shard == 'core'
         env:
