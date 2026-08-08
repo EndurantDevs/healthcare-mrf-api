@@ -129,6 +129,25 @@ def test_upgrade_adds_model_columns_and_hardened_canonical_functions(monkeypatch
     assert "FROM PUBLIC" in normalized_sql
 
 
+def test_source_guard_ddl_uses_one_asyncpg_command_per_execute(monkeypatch):
+    migration = _load_migration()
+    recorder = _Recorder()
+    monkeypatch.setattr(migration, "op", recorder)
+
+    migration._create_subset_published_source_guard("subset_proof_test")
+
+    ddl_statements = recorder.statements[1:]
+    assert len(ddl_statements) == 5
+    assert [" ".join(statement.split()).split(" ", 3)[:3] for statement in ddl_statements] == [
+        ["CREATE", "CONSTRAINT", "TRIGGER"],
+        ["CREATE", "TRIGGER", '"provider_directory_subset_published_source_truncate_guard"'],
+        ["ALTER", "TABLE", '"subset_proof_test"."provider_directory_source"'],
+        ["ALTER", "TABLE", '"subset_proof_test"."provider_directory_source"'],
+        ["REVOKE", "ALL", "ON"],
+    ]
+    assert all(statement.strip().count(";") == 1 for statement in ddl_statements)
+
+
 def test_downgrade_is_fail_closed_and_restores_legacy_guards(monkeypatch):
     migration, recorder, normalized_sql = _capture(monkeypatch, "downgrade")
 

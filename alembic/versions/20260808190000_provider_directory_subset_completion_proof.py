@@ -2540,13 +2540,29 @@ def _create_subset_published_source_guard(schema: str) -> None:
         AFTER INSERT OR UPDATE OR DELETE ON {source_ref}
         DEFERRABLE INITIALLY DEFERRED
         FOR EACH ROW EXECUTE FUNCTION {guard_ref}();
+        """
+    )
+    op.execute(
+        f"""
         CREATE TRIGGER {_q(_SOURCE_TRUNCATE_GUARD_TRIGGER)}
         BEFORE TRUNCATE ON {source_ref}
         FOR EACH STATEMENT EXECUTE FUNCTION {guard_ref}();
+        """
+    )
+    op.execute(
+        f"""
         ALTER TABLE {source_ref}
             ENABLE ALWAYS TRIGGER {_q(_SOURCE_GUARD_TRIGGER)};
+        """
+    )
+    op.execute(
+        f"""
         ALTER TABLE {source_ref}
             ENABLE ALWAYS TRIGGER {_q(_SOURCE_TRUNCATE_GUARD_TRIGGER)};
+        """
+    )
+    op.execute(
+        f"""
         REVOKE ALL ON FUNCTION {guard_ref}() FROM PUBLIC;
         """
     )
