@@ -11,6 +11,9 @@ from process.ptg_wave_admission_rollback_supersession import (
     DATABASE_FIELDS,
     build_admission_rollback_supersession_proof,
 )
+from process.ptg_wave_materialized_preclaim_supersession_contract import (
+    build_materialized_preclaim_supersession_proof,
+)
 from api.ptg_wave_kubernetes import _job_name
 
 
@@ -109,6 +112,112 @@ def admission_rollback_proof(
     )
 
 
+def materialized_preclaim_proof(
+    *,
+    successor_wave_id: str,
+    intent_count: int,
+) -> dict:
+    """Build one canonical durable-Job failure retirement proof."""
+
+    request_digest = "6" * 64
+    wave_digest = sha256_digest(
+        (
+            PTG_SMALL_WAVE_PROTOCOL_IDENTITY
+            + "\0"
+            + request_digest
+        ).encode("utf-8")
+    )
+    predecessor_map = _materialized_predecessor_map(
+        wave_digest,
+        request_digest,
+        intent_count,
+    )
+    return build_materialized_preclaim_supersession_proof(
+        predecessor=predecessor_map,
+        successor_wave_id=successor_wave_id,
+        prior_recovery={
+            "logical_preclaim_predecessor_wave_id": "retired-wave-unit",
+            "logical_preclaim_proof_digest": "1" * 64,
+            "admission_rollback_predecessor_wave_id": (
+                "retired-request-unit"
+            ),
+            "admission_rollback_proof_digest": "2" * 64,
+        },
+        kubernetes=_materialized_kubernetes_map(
+            wave_digest,
+            predecessor_map,
+        ),
+        redis=_empty_materialized_redis_map(),
+    )
+
+
+def _materialized_predecessor_map(
+    wave_digest: str,
+    request_digest: str,
+    intent_count: int,
+) -> dict:
+    pinned_digest = "d" * 64
+    return {
+        "wave_id": "materialized-wave-unit",
+        "idempotency_key": "materialized-wave-unit",
+        "request_digest": request_digest,
+        "cohort_attestation_digest": "7" * 64,
+        "wave_digest": wave_digest,
+        "release_queue": wave_queue_name(wave_digest),
+        "manifest_digest": "8" * 64,
+        "jobs_digest": "9" * 64,
+        "intent_count": intent_count,
+        "worker_limit": 12,
+        "kubernetes_manifest_identity": "a" * 64,
+        "kubernetes_config_identity": "b" * 64,
+        "pinned_image_reference": (
+            "registry.example/worker@sha256:" + pinned_digest
+        ),
+        "pinned_image_digest": pinned_digest,
+        "runtime_image_identity": "sha256:" + "e" * 64,
+        "kubernetes_job_uid": "materialized-job-uid",
+        "kubernetes_job_receipt_digest": "f" * 64,
+    }
+
+
+def _materialized_kubernetes_map(
+    wave_digest: str,
+    predecessor_map: dict,
+) -> dict:
+    return {
+        "job_name": _job_name(wave_digest),
+        "job_uid": predecessor_map["kubernetes_job_uid"],
+        "job_receipt_digest": predecessor_map[
+            "kubernetes_job_receipt_digest"
+        ],
+        "completion_mode": "Indexed",
+        "completions": 12,
+        "parallelism": 12,
+        "backoff_limit": 0,
+        "failed": 12,
+        "active": 0,
+        "succeeded": 0,
+        "ready": 0,
+        "terminating": 0,
+        "failed_condition": True,
+        "complete_condition": False,
+    }
+
+
+def _empty_materialized_redis_map() -> dict:
+    return {
+        "unclaimed_attestation_digest": "3" * 64,
+        "ready_slot_count": 0,
+        "release_present": False,
+        "queued_ordinal_count": 0,
+        "job_ordinal_count": 0,
+        "result_ordinal_count": 0,
+        "retry_ordinal_count": 0,
+        "in_progress_ordinal_count": 0,
+        "health_check_present": False,
+    }
+
+
 def recovery_proofs(
     *,
     schema_version: str,
@@ -133,11 +242,19 @@ def recovery_proofs(
             successor_wave_id=successor_wave_id,
             intent_count=intent_count,
         )
+    if schema_version == "healthporta.ptg-import-wave-attestation.v5":
+        recovery_proofs_map["materialized_preclaim_supersession"] = (
+            materialized_preclaim_proof(
+                successor_wave_id=successor_wave_id,
+                intent_count=intent_count,
+            )
+        )
     return recovery_proofs_map
 
 
 __all__ = [
     "admission_rollback_proof",
+    "materialized_preclaim_proof",
     "recovery_proofs",
     "supersession_proof",
 ]

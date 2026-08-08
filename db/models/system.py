@@ -357,7 +357,8 @@ class PTGImportWaveQuarantine(Base, JSONOutputMixin):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "reason = 'legacy_uncertain_slots_waiting_pre_receipt'",
+            "reason IN ('legacy_uncertain_slots_waiting_pre_receipt', "
+            "'materialized_preclaim_failure')",
             name="ptg_import_wave_quarantine_reason_check",
         ),
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
@@ -395,7 +396,8 @@ class PTGImportWaveSupersession(Base, JSONOutputMixin):
             name="ptg_import_wave_supersession_distinct_check",
         ),
         CheckConstraint(
-            "recovery_basis = 'logical_preclaim_failure'",
+            "recovery_basis IN ('logical_preclaim_failure', "
+            "'materialized_preclaim_failure')",
             name="ptg_import_wave_supersession_basis_check",
         ),
         CheckConstraint(
