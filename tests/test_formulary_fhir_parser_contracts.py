@@ -13,6 +13,7 @@ import pytest
 from process.formulary_fhir.continuation import (
     FHIRTransportError,
     collection_url,
+    coverage_plan_search_contract,
     medication_search_contract,
     page_query_pairs,
     validated_next_link,
@@ -208,11 +209,34 @@ def test_continuation_rejects_every_unapproved_origin_path_or_query(candidate_ur
         validated_next_link(candidate_url, contract=contract)
 
 
-def test_smile_cursor_is_in_memory_bound_and_redacted():
-    contract = medication_search_contract(_source_config(), "SYNTH-SECRET", CUTOFF)
-    cursor_url = (
-        f"{CANONICAL_BASE}?_getpages=opaque-secret-token"
-        "&_getpagesoffset=2&_count=2&_bundletype=searchset"
+def _smile_cursor_url(contract, *element_pairs: tuple[str, str]) -> str:
+    query_pairs = (
+        ("_bundletype", "searchset"),
+        ("_count", str(contract.page_size)),
+        *element_pairs,
+        ("_getpages", "opaque-secret-token"),
+        ("_getpagesoffset", "2"),
+    )
+    return f"{CANONICAL_BASE}?{urllib.parse.urlencode(query_pairs)}"
+
+
+@pytest.mark.parametrize(
+    "contract",
+    (
+        pytest.param(
+            coverage_plan_search_contract(_source_config(), CUTOFF),
+            id="coverage-plan",
+        ),
+        pytest.param(
+            medication_search_contract(_source_config(), "SYNTH-SECRET", CUTOFF),
+            id="formulary-drug",
+        ),
+    ),
+)
+def test_smile_cursor_requires_exact_resource_projection(contract):
+    cursor_url = _smile_cursor_url(
+        contract,
+        ("_elements", contract.element_projection),
     )
 
     continuation = validated_next_link(cursor_url, contract=contract)
@@ -221,9 +245,52 @@ def test_smile_cursor_is_in_memory_bound_and_redacted():
     assert "opaque-secret-token" not in repr(continuation)
     assert "SYNTH-SECRET" not in repr(contract)
 
+
+@pytest.mark.parametrize(
+    ("element_pairs", "extra_pairs", "error_message"),
+    (
+        pytest.param((), (), "cursor contract", id="missing-elements"),
+        pytest.param(
+            (("_elements", "id,meta"),),
+            (),
+            "cursor contract",
+            id="wrong-elements",
+        ),
+        pytest.param(
+            (("_elements", "id,meta,status,code,extension"),) * 2,
+            (),
+            "query is invalid",
+            id="duplicate-elements",
+        ),
+        pytest.param(
+            (("_elements", "id,meta,status,code,extension"),),
+            (("unreviewed", "true"),),
+            "cursor contract",
+            id="extra-query-field",
+        ),
+    ),
+)
+def test_smile_cursor_rejects_projection_drift(
+    element_pairs,
+    extra_pairs,
+    error_message,
+):
+    contract = medication_search_contract(_source_config(), "SYNTH-SECRET", CUTOFF)
+    cursor_url = _smile_cursor_url(contract, *element_pairs)
+    if extra_pairs:
+        cursor_url = f"{cursor_url}&{urllib.parse.urlencode(extra_pairs)}"
+
+    with pytest.raises(FHIRTransportError, match=error_message):
+        validated_next_link(cursor_url, contract=contract)
+
+
+def test_smile_cursor_rejects_whitespace_in_page_token():
+    contract = medication_search_contract(_source_config(), "SYNTH-SECRET", CUTOFF)
+
     spaced_cursor_url = (
         f"{CANONICAL_BASE}?_getpages=opaque+token"
         "&_getpagesoffset=2&_count=2"
+        f"&_elements={urllib.parse.quote_plus(contract.element_projection)}"
     )
     with pytest.raises(FHIRTransportError, match="cursor contract"):
         validated_next_link(spaced_cursor_url, contract=contract)

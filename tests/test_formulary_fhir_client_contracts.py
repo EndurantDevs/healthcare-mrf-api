@@ -144,10 +144,24 @@ def _next_url(alias, *, offset="2", config=None):
     return f"{collection_url(contract)}?{query_text}"
 
 
+def _smile_next_url(alias):
+    contract = medication_search_contract(_source_config(), alias, CUTOFF)
+    query_text = urllib.parse.urlencode(
+        (
+            ("_bundletype", "searchset"),
+            ("_count", str(contract.page_size)),
+            ("_elements", contract.element_projection),
+            ("_getpages", "opaque-secret-token"),
+            ("_getpagesoffset", "2"),
+        )
+    )
+    return f"{CANONICAL_BASE}?{query_text}"
+
+
 @pytest.mark.asyncio
 async def test_current_version_census_uses_exact_serial_pre_page_post_contract():
     alias = "SYNTH-SECRET"
-    next_url = _next_url(alias)
+    next_url = _smile_next_url(alias)
     session = _Session(
         [
             _count_bundle(2),
@@ -163,6 +177,7 @@ async def test_current_version_census_uses_exact_serial_pre_page_post_contract()
     assert census.exact_total == 2
     assert [resource["id"] for resource in census.resources] == ["drug-a", "drug-b"]
     assert session.peak_active_requests == 1
+    assert session.calls[2][0] == next_url
     assert session.calls[2][1]["params"] is None
     count_query_by_name = dict(session.calls[0][1]["params"])
     page_query_by_name = dict(session.calls[1][1]["params"])
