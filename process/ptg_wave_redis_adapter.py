@@ -4,12 +4,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from arq import create_pool
+from redis.exceptions import (
+    AuthenticationError,
+    AuthorizationError,
+    ConnectionError as RedisConnectionError,
+    TimeoutError as RedisTimeoutError,
+)
 
 from process._ptg_wave_redis_barrier import (
     register_ptg_small_wave_slot,
@@ -27,6 +35,12 @@ from process._ptg_wave_redis_models import (
 )
 from process._ptg_wave_redis_reference import validate_ptg_small_wave_reference
 from process.redis_config import build_redis_settings
+
+
+_REDIS_STARTUP_ATTEMPTS = 5
+_REDIS_STARTUP_ATTEMPT_TIMEOUT_SECONDS = 3.0
+_REDIS_STARTUP_RETRY_DELAY_SECONDS = 3.0
+_REDIS_STARTUP_SLOT_STAGGER_SECONDS = 0.25
 
 
 @dataclass
@@ -97,6 +111,7 @@ async def create_ptg_wave_redis_barrier(
     *,
     pool_factory: Callable[..., Any] = create_pool,
     settings_factory: Callable[[], Any] = build_redis_settings,
+    sleep: Callable[[float], Any] = asyncio.sleep,
 ) -> PTGSmallWaveRedisBarrier:
     """Create the environment-configured Redis barrier for one worker slot."""
 
@@ -104,9 +119,12 @@ async def create_ptg_wave_redis_barrier(
     slot = _identity_attribute(identity, "slot_index")
     pod_uid = _identity_attribute(identity, "pod_uid")
     worker_class = _identity_attribute(identity, "worker_class")
-    redis_pool = pool_factory(settings_factory())
-    if inspect.isawaitable(redis_pool):
-        redis_pool = await redis_pool
+    redis_pool = await create_ptg_wave_redis_pool(
+        identity,
+        pool_factory=pool_factory,
+        settings_factory=settings_factory,
+        sleep=sleep,
+    )
     return PTGSmallWaveRedisBarrier(
         redis_pool=redis_pool,
         reference=reference,
@@ -114,6 +132,74 @@ async def create_ptg_wave_redis_barrier(
         pod_uid=pod_uid,
         worker_class=worker_class,
     )
+
+
+async def create_ptg_wave_redis_pool(
+    identity: Any,
+    *,
+    pool_factory: Callable[..., Any] = create_pool,
+    settings_factory: Callable[[], Any] = build_redis_settings,
+    sleep: Callable[[float], Any] = asyncio.sleep,
+    pool_options: Mapping[str, Any] | None = None,
+) -> Any:
+    """Open one wave-local Redis pool with bounded deterministic startup retry."""
+
+    slot = _identity_attribute(identity, "slot_index")
+    await _sleep(sleep, _slot_stagger_seconds(slot))
+    settings = _single_attempt_settings(settings_factory())
+    options = {} if pool_options is None else dict(pool_options)
+    for attempt_index in range(_REDIS_STARTUP_ATTEMPTS):
+        try:
+            return await _open_pool_once(pool_factory, settings, options)
+        except (
+            ConnectionError,
+            TimeoutError,
+            RedisConnectionError,
+            RedisTimeoutError,
+        ) as error:
+            if isinstance(error, (AuthenticationError, AuthorizationError)):
+                raise
+            if attempt_index == _REDIS_STARTUP_ATTEMPTS - 1:
+                raise
+            await _sleep(sleep, _REDIS_STARTUP_RETRY_DELAY_SECONDS)
+    raise AssertionError("bounded Redis startup loop did not terminate")
+
+
+def _single_attempt_settings(settings: Any) -> Any:
+    """Copy Redis settings so generic worker retry policy stays untouched."""
+
+    wave_settings = copy.copy(settings)
+    if hasattr(wave_settings, "conn_retries"):
+        wave_settings.conn_retries = 0
+    if hasattr(wave_settings, "conn_retry_delay"):
+        wave_settings.conn_retry_delay = 0
+    return wave_settings
+
+
+async def _open_pool_once(
+    pool_factory: Callable[..., Any],
+    settings: Any,
+    options: Mapping[str, Any],
+) -> Any:
+    pool = pool_factory(settings, **options)
+    if not inspect.isawaitable(pool):
+        return pool
+    return await asyncio.wait_for(
+        pool,
+        timeout=_REDIS_STARTUP_ATTEMPT_TIMEOUT_SECONDS,
+    )
+
+
+async def _sleep(sleep: Callable[[float], Any], delay_seconds: float) -> None:
+    result = sleep(delay_seconds)
+    if inspect.isawaitable(result):
+        await result
+
+
+def _slot_stagger_seconds(slot: Any) -> float:
+    if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot < 12:
+        raise PTGSmallWaveValidationError("wave slot must be between zero and eleven")
+    return slot * _REDIS_STARTUP_SLOT_STAGGER_SECONDS
 
 
 def _reference_from_identity(identity: Any) -> PTGSmallWaveReference:
@@ -199,5 +285,6 @@ def _kubernetes_release_mapping(
 
 __all__ = [
     "PTGSmallWaveRedisBarrier",
+    "create_ptg_wave_redis_pool",
     "create_ptg_wave_redis_barrier",
 ]

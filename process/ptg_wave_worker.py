@@ -24,6 +24,7 @@ from api.ptg_wave_kubernetes import (
     PTG_WAVE_WORKER_CLASS,
 )
 from process.ptg_wave_barrier import PTGWaveBarrier, PTGWaveWorkerIdentity, run_after_wave_release
+from process.ptg_wave_redis_adapter import create_ptg_wave_redis_pool
 
 
 async def run_wave_worker(
@@ -87,13 +88,40 @@ async def _drain_wave_queue(identity: PTGWaveWorkerIdentity) -> Any:
             "queue_read_limit": PTG_WAVE_SLOT_COUNT,
         },
     )
-    worker = create_worker(
-        wave_settings,
-        burst=True,
-        max_jobs=1,
-        queue_read_limit=PTG_WAVE_SLOT_COUNT,
+    pool_options_by_name = {
+        "job_serializer": getattr(wave_settings, "job_serializer", None),
+        "job_deserializer": getattr(wave_settings, "job_deserializer", None),
+        "default_queue_name": identity.queue,
+    }
+    redis_pool = await create_ptg_wave_redis_pool(
+        identity,
+        settings_factory=lambda: wave_settings.redis_settings,
+        pool_options=pool_options_by_name,
     )
-    return await worker.async_run()
+    try:
+        worker = create_worker(
+            wave_settings,
+            redis_pool=redis_pool,
+            burst=True,
+            max_jobs=1,
+            queue_read_limit=PTG_WAVE_SLOT_COUNT,
+        )
+        return await worker.async_run()
+    finally:
+        await _close_wave_worker_pool(redis_pool)
+
+
+async def _close_wave_worker_pool(redis_pool: Any) -> None:
+    close_pool = getattr(redis_pool, "aclose", None)
+    if close_pool is not None:
+        close_result = close_pool(close_connection_pool=True)
+    else:
+        close_pool = getattr(redis_pool, "close", None)
+        if close_pool is None:
+            return
+        close_result = close_pool()
+    if inspect.isawaitable(close_result):
+        await close_result
 
 
 if __name__ == "__main__":
