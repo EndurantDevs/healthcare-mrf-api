@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -452,9 +452,10 @@ def test_wave_worker_defers_arq_construction_until_barrier_release():
 def test_released_slot_drains_its_dedicated_queue_with_one_concurrent_job():
     wave_worker_identity = _identity()
     worker_calls: list[tuple[type, dict]] = []
+    redis_pool = object()
 
     class BaseSettings:
-        pass
+        redis_settings = object()
 
     class AsyncWorker:
         async def async_run(self):
@@ -466,14 +467,26 @@ def test_released_slot_drains_its_dedicated_queue_with_one_concurrent_job():
 
     with patch.dict("os.environ", {"HLTHPRT_PTG_WAVE_WORKER_SETTINGS": "process.PTGSmall"}):
         with patch.object(ptg_wave_worker, "import_string", return_value=BaseSettings):
-            with patch.object(ptg_wave_worker, "create_worker", side_effect=create_fake_worker):
-                assert asyncio.run(ptg_wave_worker._drain_wave_queue(wave_worker_identity)) == "ran"
+            with patch.object(
+                ptg_wave_worker,
+                "create_ptg_wave_redis_pool",
+                new=AsyncMock(return_value=redis_pool),
+            ):
+                with patch.object(
+                    ptg_wave_worker,
+                    "create_worker",
+                    side_effect=create_fake_worker,
+                ):
+                    assert asyncio.run(
+                        ptg_wave_worker._drain_wave_queue(wave_worker_identity)
+                    ) == "ran"
 
     worker_settings, worker_options = worker_calls[0]
     assert worker_settings.queue_name == wave_worker_identity.queue
     assert worker_settings.max_jobs == 1
     assert worker_settings.queue_read_limit == 12
     assert worker_options == {
+        "redis_pool": redis_pool,
         "burst": True,
         "max_jobs": 1,
         "queue_read_limit": 12,
