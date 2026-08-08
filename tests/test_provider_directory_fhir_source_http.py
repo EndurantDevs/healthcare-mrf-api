@@ -288,8 +288,10 @@ async def test_source_http_session_closes_on_error_and_cancellation(monkeypatch)
     created_sessions: list[aiohttp.ClientSession] = []
     create_session = importer._source_http_client_session
 
-    def capture_session() -> aiohttp.ClientSession:
-        session = create_session()
+    def capture_session(
+        *, require_verified_tls: bool = False
+    ) -> aiohttp.ClientSession:
+        session = create_session(require_verified_tls=require_verified_tls)
         created_sessions.append(session)
         return session
 

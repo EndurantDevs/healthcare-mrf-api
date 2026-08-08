@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 from scripts import generate_provider_directory_support_docs as generator
-from scripts.research import provider_directory_endpoint_acquisition_harness as harness
 
 
 def test_rendered_support_matrix_represents_each_manifest_entry_once():
@@ -41,11 +40,11 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "clears plan_name and does not claim NH product membership" in rendered_document
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 24 |" in rendered_document
+    assert "| Acquisition-configured | 25 |" in rendered_document
     assert "| Externally supported | 0 |" in rendered_document
     assert "| Probe-only | 14 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
-    assert "| Total tracked | 41 |" in rendered_document
+    assert "| Total tracked | 42 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
     assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required" in rendered_document
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Required" in rendered_document

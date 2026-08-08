@@ -77,7 +77,7 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 51
+    assert len(command_signature.parameters) == 54
     assert "resource_scan_concurrency" in command_signature.parameters
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"
@@ -21973,7 +21973,12 @@ async def test_rest_page_prefetch_pins_anonymous_transport(monkeypatch):
         )
 
     assert fetch_result[0] == 200
-    anonymous_fetch.assert_awaited_once_with(source_session, request_url, timeout=3)
+    anonymous_fetch.assert_awaited_once_with(
+        source_session,
+        request_url,
+        timeout=3,
+        allow_redirects=True,
+    )
 
 
 def _expired_resume_callbacks(

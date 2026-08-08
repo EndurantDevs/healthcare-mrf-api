@@ -25,8 +25,76 @@ CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD = (
 CURRENT_VERSION_CENSUS_START_URLS_FIELD = (
     "provider_directory_current_version_census_start_urls"
 )
+CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD = (
+    "provider_directory_current_version_census_continuation_strategy"
+)
+CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY = (
+    "smile-opaque-getpages-v1"
+)
 CURRENT_VERSION_CENSUS_STRATEGY_VERSION = (
     "provider-directory-fhir-cutoff-bounded-current-version-census-v1"
+)
+_CURRENT_VERSION_CENSUS_BOOLEAN_TASK_FIELDS = frozenset(
+    {
+        "bulk_export",
+        "canonical_backfill_only",
+        "contact_backfill_only",
+        "dataset_followup_only",
+        "dataset_rehydrate_only",
+        "defer_typed_materialization",
+        "full_refresh",
+        "import_resources",
+        "include_auth_required",
+        "include_supplemental_catalogs",
+        "open_only",
+        "probe",
+        "publish_after_acquisition",
+        "publish_artifacts",
+        "publish_artifacts_only",
+        "publish_corroboration",
+        "seed_only",
+        "stale_cleanup",
+        "test",
+        "test_mode",
+    }
+)
+_CURRENT_VERSION_CENSUS_INTEGER_TASK_FIELDS = frozenset(
+    {
+        "bulk_export_max_pending_seconds",
+        "concurrency",
+        "limit",
+        "linked_resource_deadline_seconds",
+        "linked_resource_limit",
+        "page_count",
+        "page_limit",
+        "resource_deadline_seconds",
+        "resource_limit",
+        "resource_scan_concurrency",
+        "source_concurrency",
+        "stream_batch_size",
+        "timeout",
+    }
+)
+_CURRENT_VERSION_CENSUS_TEXT_TASK_FIELDS = frozenset(
+    {
+        "amerihealth_caritas_catalog_url",
+        "amerihealth_caritas_catalog_path",
+        "cms_sma_endpoint_directory_url",
+        "cms_sma_endpoint_directory_path",
+        "contra_costa_catalog_path",
+        "contra_costa_catalog_url",
+        "credential_config_file",
+        "provider_directory_endpoint_scope",
+        "provider_directory_pagination_root_run_id",
+        "refresh_preset",
+        "retest_results_path",
+        "retest_results_url",
+        "retry_of_run_id",
+        "run_id",
+        "seed_db_path",
+        "seed_db_url",
+        "source_query",
+    }
 )
 CURRENT_VERSION_CENSUS_SEMANTICS = "cutoff-bounded-current-version-census"
 _SOURCE_ID_ALIAS_FIELDS = (
@@ -172,6 +240,32 @@ class CurrentVersionCensusRequest:
     )
 
 
+def _validate_current_version_census_task_types(
+    task: Mapping[str, Any],
+) -> None:
+    has_invalid_task_field = bool(
+        any(
+            task.get(field_name) is not None
+            and type(task.get(field_name)) is not bool
+            for field_name in _CURRENT_VERSION_CENSUS_BOOLEAN_TASK_FIELDS
+        )
+        or any(
+            task.get(field_name) is not None
+            and type(task.get(field_name)) is not int
+            for field_name in _CURRENT_VERSION_CENSUS_INTEGER_TASK_FIELDS
+        )
+        or any(
+            task.get(field_name) is not None
+            and type(task.get(field_name)) is not str
+            for field_name in _CURRENT_VERSION_CENSUS_TEXT_TASK_FIELDS
+        )
+    )
+    if has_invalid_task_field:
+        raise ValueError(
+            "provider_directory_current_version_census_task_type_invalid"
+        )
+
+
 def current_version_census_request(
     task: Mapping[str, Any],
     *,
@@ -190,6 +284,7 @@ def current_version_census_request(
                 "provider_directory_current_version_census_cutoff_without_strategy"
             )
         return None
+    _validate_current_version_census_task_types(task)
     if task.get("import_resources") is not True:
         raise ValueError(
             "provider_directory_current_version_census_import_resources_required"
@@ -232,16 +327,86 @@ class CurrentVersionCensusRuntime:
     resource_deadline_seconds: int
     probe: bool
     seed_only: bool
+    test_mode: bool
     dataset_rehydrate_only: bool
+    dataset_followup_only: bool
     canonical_backfill_only: bool
     contact_backfill_only: bool
     publish_artifacts_only: bool
     local_seed_catalog: bool
+    local_retest_catalog: bool
     supplemental_catalogs: bool
+    local_supplemental_catalog_inputs: tuple[str, ...]
     remote_catalog_inputs: tuple[str, ...]
     bulk_export: bool
     stale_cleanup: bool
     publication_requested: bool
+    defer_typed_materialization: bool
+    bounded_source_selection: bool
+    endpoint_scope_configured: bool
+    credential_configured: bool
+    open_only: bool
+    include_auth_required: bool
+
+
+def _validate_current_version_census_runtime_types(
+    runtime: CurrentVersionCensusRuntime,
+) -> None:
+    """Reject JSON type lookalikes before evaluating runtime values."""
+    boolean_controls = (
+        runtime.checkpointing_enabled, runtime.full_refresh,
+        runtime.probe, runtime.seed_only,
+        runtime.test_mode,
+        runtime.dataset_rehydrate_only,
+        runtime.dataset_followup_only,
+        runtime.canonical_backfill_only,
+        runtime.contact_backfill_only,
+        runtime.publish_artifacts_only,
+        runtime.local_seed_catalog,
+        runtime.local_retest_catalog,
+        runtime.supplemental_catalogs,
+        runtime.bulk_export,
+        runtime.stale_cleanup,
+        runtime.publication_requested,
+        runtime.defer_typed_materialization,
+        runtime.bounded_source_selection,
+        runtime.endpoint_scope_configured,
+        runtime.credential_configured,
+        runtime.open_only,
+        runtime.include_auth_required,
+    )
+    integer_controls = (
+        runtime.resource_limit, runtime.page_limit,
+        runtime.stream_batch_size,
+        runtime.source_concurrency,
+        runtime.resource_scan_concurrency,
+        runtime.linked_resource_limit,
+        runtime.linked_resource_deadline_seconds,
+        runtime.resource_deadline_seconds,
+    )
+    has_invalid_remote_inputs = bool(
+        type(runtime.remote_catalog_inputs) is not tuple
+        or any(
+            type(field_name) is not str or not field_name
+            for field_name in runtime.remote_catalog_inputs
+        )
+    )
+    has_invalid_local_supplemental_inputs = bool(
+        type(runtime.local_supplemental_catalog_inputs) is not tuple
+        or any(
+            type(field_name) is not str or not field_name
+            for field_name in runtime.local_supplemental_catalog_inputs
+        )
+    )
+    if (
+        any(type(control) is not bool for control in boolean_controls)
+        or any(type(control) is not int for control in integer_controls)
+        or has_invalid_remote_inputs
+        or has_invalid_local_supplemental_inputs
+    ):
+        raise ValueError(
+            "provider_directory_current_version_census_runtime_type_invalid"
+        )
 
 
 def validate_current_version_census_runtime(
@@ -252,6 +417,7 @@ def validate_current_version_census_runtime(
 
     if not isinstance(request, CurrentVersionCensusRequest):
         raise TypeError("current-version census request required")
+    _validate_current_version_census_runtime_types(runtime)
     invalid_control_by_name = {
         "checkpointing": not runtime.checkpointing_enabled,
         "full_refresh": not runtime.full_refresh,
@@ -267,16 +433,30 @@ def validate_current_version_census_runtime(
         "resource_deadline_seconds": runtime.resource_deadline_seconds != 0,
         "probe": not runtime.probe,
         "seed_only": runtime.seed_only,
+        "test_mode": runtime.test_mode,
         "dataset_rehydrate_only": runtime.dataset_rehydrate_only,
+        "dataset_followup_only": runtime.dataset_followup_only,
         "canonical_backfill_only": runtime.canonical_backfill_only,
         "contact_backfill_only": runtime.contact_backfill_only,
         "publish_artifacts_only": runtime.publish_artifacts_only,
         "local_seed_catalog": not runtime.local_seed_catalog,
+        "local_retest_catalog": runtime.local_retest_catalog,
         "supplemental_catalogs": runtime.supplemental_catalogs,
+        "local_supplemental_catalog_inputs": bool(
+            runtime.local_supplemental_catalog_inputs
+        ),
         "remote_catalog_inputs": bool(runtime.remote_catalog_inputs),
         "bulk_export": runtime.bulk_export,
         "stale_cleanup": runtime.stale_cleanup,
         "publication": runtime.publication_requested,
+        "defer_typed_materialization": (
+            not runtime.defer_typed_materialization
+        ),
+        "bounded_source_selection": runtime.bounded_source_selection,
+        "endpoint_scope": runtime.endpoint_scope_configured,
+        "credential_config": runtime.credential_configured,
+        "open_only": not runtime.open_only,
+        "include_auth_required": runtime.include_auth_required,
     }
     failures = sorted(
         name

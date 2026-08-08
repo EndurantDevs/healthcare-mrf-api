@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, NamedTuple
 
 import aiohttp
+from yarl import URL
 import asyncpg
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import case, func, or_, text as sa_text
@@ -91,7 +92,31 @@ from process.provider_directory_endpoint_admission import (
     _admit_provider_directory_endpoint_components,
 )
 from process.provider_directory_fhir_census_contract import (
+    CurrentVersionCensusRuntime,
     current_version_census_request,
+    validate_current_version_census_runtime,
+)
+from process.provider_directory_fhir_census_binding import (
+    CurrentVersionCensusContract,
+    bind_current_version_census_contract,
+    current_version_census_contract,
+    current_version_census_count_url,
+    validated_current_version_census_count_map,
+)
+from process.provider_directory_fhir_census_execution import (
+    CURRENT_VERSION_CENSUS_BLOCKED_ERROR,
+    CURRENT_VERSION_CENSUS_FETCH_MODE,
+    CURRENT_VERSION_CENSUS_RETRYABLE_ERROR,
+    current_version_census_completed_proof,
+    current_version_census_initial_proof,
+    current_version_census_persisted_pre_count,
+    resolved_current_version_census_next_url,
+    validated_current_version_census_completed_proof,
+    validated_current_version_census_resume_url,
+    validated_current_version_census_total,
+)
+from process.provider_directory_fhir_manual_catalog import (
+    reviewed_manual_census_seed_rows,
 )
 from process.provider_directory_dataset_rehydrate import (
     DEFAULT_BATCH_SIZE as DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
@@ -798,6 +823,9 @@ PROVIDER_DIRECTORY_ENDPOINT_ACQUISITION_MANIFEST_PATH = (
     / "specs/provider_directory_endpoint_acquisition_manifest.json"
 )
 PROVIDER_DIRECTORY_ACQUISITION_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition"})
+PROVIDER_DIRECTORY_CATALOG_RETENTION_CLASSIFICATIONS = frozenset(
+    {*PROVIDER_DIRECTORY_ACQUISITION_CLASSIFICATIONS, "manual_acquisition"}
+)
 URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"')]+", re.IGNORECASE)
 ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE = "https://alohr.esante.us/public/providers"
 ALOHR_FHIR_PROVIDER_DIRECTORY_BASE = "https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4"
@@ -1976,6 +2004,32 @@ class CareSourceOpaqueCursorOutcome:
     retry_not_before: str | None = None
 
 
+@dataclass(frozen=True)
+class CurrentVersionCensusFetch:
+    count: int | None
+    error: str | None = None
+    transient: bool = False
+    retry_not_before: str | None = None
+
+
+@dataclass(frozen=True)
+class CurrentVersionCensusOutcome:
+    proof: dict[str, Any]
+    error: str | None = None
+    retryable: bool = False
+    retry_not_before: str | None = None
+
+
+@dataclass(frozen=True)
+class _ResourceImportCancellation:
+    context: dict[str, Any] | None
+    task: dict[str, Any] | None
+
+    async def check(self) -> None:
+        """Raise before an irreversible acquisition lifecycle transition."""
+        await _raise_if_resource_import_cancelled(self.context, self.task)
+
+
 @dataclass
 class PartitionFetchState:
     """Shared counters for concurrent partitioned FHIR searches."""
@@ -3096,10 +3150,24 @@ def _candidate_base_urls(source_record: dict[str, Any]) -> list[str]:
     return candidates
 
 
-def _candidate_metadata_urls(source: dict[str, Any]) -> list[tuple[str, str]]:
-    urls: list[tuple[str, str]] = []
+def _candidate_metadata_urls(
+    source_record: dict[str, Any],
+) -> list[tuple[str, str]]:
+    census_contract = current_version_census_contract(source_record)
+    if census_contract is not None:
+        api_base = _canonical_base(
+            source_record.get("canonical_api_base")
+            or source_record.get("api_base")
+        )
+        if api_base is None:
+            return []
+        return [
+            (api_base, f"{api_base}/metadata?_format=json"),
+            (api_base, f"{api_base}/metadata"),
+        ]
+    metadata_url_pairs: list[tuple[str, str]] = []
     seen_metadata_urls: set[str] = set()
-    metadata = _source_metadata(source)
+    metadata = _source_metadata(source_record)
     for explicit_url in (
         metadata.get("provider_directory_confirmed_metadata_url"),
         metadata.get("metadata_url"),
@@ -3108,19 +3176,25 @@ def _candidate_metadata_urls(source: dict[str, Any]) -> list[tuple[str, str]]:
         if not metadata_url or metadata_url in seen_metadata_urls:
             continue
         metadata_base = _provider_directory_base_from_metadata_url(metadata_url)
-        api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+        api_base = _canonical_base(
+            source_record.get("canonical_api_base")
+            or source_record.get("api_base")
+        )
         candidate_base = _canonical_base(metadata_base or api_base)
         if not candidate_base:
             continue
-        urls.append((candidate_base, metadata_url))
+        metadata_url_pairs.append((candidate_base, metadata_url))
         seen_metadata_urls.add(metadata_url)
-    for api_base in _candidate_base_urls(source):
-        for url in (f"{api_base}/metadata?_format=json", f"{api_base}/metadata"):
-            if url in seen_metadata_urls:
+    for api_base in _candidate_base_urls(source_record):
+        for candidate_url in (
+            f"{api_base}/metadata?_format=json",
+            f"{api_base}/metadata",
+        ):
+            if candidate_url in seen_metadata_urls:
                 continue
-            urls.append((api_base, url))
-            seen_metadata_urls.add(url)
-    return urls
+            metadata_url_pairs.append((api_base, candidate_url))
+            seen_metadata_urls.add(candidate_url)
+    return metadata_url_pairs
 
 
 def _is_placeholder_url(value: str | None) -> bool:
@@ -3525,6 +3599,11 @@ def _resource_start_url(source_record: dict[str, Any], resource_type: str, *, pa
         resource_type,
         page_count,
     )
+    census_contract = current_version_census_contract(source_record)
+    if census_contract is not None:
+        if resource_type not in census_contract.resources:
+            return None
+        return census_contract.start_url(resource_type, resource_page_count)
     endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
     endpoint = _clean_text(source_record.get(endpoint_field)) if endpoint_field else None
     if endpoint and not _is_placeholder_url(endpoint):
@@ -4799,7 +4878,24 @@ def _source_rows_allowed_for_probe(
         source_record
         for source_record in source_rows
         if not _is_manual_only_source(source_record)
+        or current_version_census_contract(source_record) is not None
     ]
+
+
+def _validate_current_version_census_source_transport(
+    source_record: dict[str, Any],
+) -> None:
+    """Require anonymous reviewed transport before any census network call."""
+
+    if current_version_census_contract(source_record) is None:
+        return
+    if (
+        _has_source_declared_credentialed_access(source_record)
+        or _credential_spec_for_source(source_record)
+    ):
+        raise ValueError(
+            "provider_directory_current_version_census_credentials_forbidden"
+        )
 
 
 def _resource_import_selection_metrics(source_count: int) -> dict[str, int]:
@@ -4842,7 +4938,10 @@ def _initial_resource_import_source_decision(
         return ResourceImportSourceDecision(
             "source_import_skipped_missing_api_base", None, "", False, False
         )
-    if _is_manual_only_source(source_record):
+    if (
+        _is_manual_only_source(source_record)
+        and current_version_census_contract(source_record) is None
+    ):
         return ResourceImportSourceDecision(
             "source_import_skipped_manual_only", None, "", False, False
         )
@@ -36315,8 +36414,11 @@ def _resolve_retest_results(
     return _download_retest_results(retest_results_url, path), tmpdir
 
 
-def _ssl_context() -> ssl.SSLContext:
-    is_tls_verified = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_TLS_VERIFY", "true").lower() not in {"0", "false", "no"}
+def _ssl_context(*, require_verified: bool = False) -> ssl.SSLContext:
+    is_tls_verified = require_verified or os.getenv(
+        "HLTHPRT_PROVIDER_DIRECTORY_TLS_VERIFY",
+        "true",
+    ).lower() not in {"0", "false", "no"}
     context = ssl.create_default_context()
     if not is_tls_verified:
         context.check_hostname = False
@@ -36332,10 +36434,13 @@ def _is_source_http_keepalive_enabled() -> bool:
     }
 
 
-def _source_http_client_session() -> aiohttp.ClientSession:
+def _source_http_client_session(
+    *,
+    require_verified_tls: bool = False,
+) -> aiohttp.ClientSession:
     """Create an anonymous REST client without adding cookies or compression."""
     connector = aiohttp.TCPConnector(
-        ssl=_ssl_context(),
+        ssl=_ssl_context(require_verified=require_verified_tls),
         keepalive_timeout=SOURCE_HTTP_KEEPALIVE_SECONDS,
         ttl_dns_cache=300,
     )
@@ -36356,12 +36461,18 @@ def _is_anonymous_source_url(url: str) -> bool:
 
 
 @contextlib.asynccontextmanager
-async def _source_http_session_scope() -> AsyncIterator[None]:
+async def _source_http_session_scope(
+    *,
+    force: bool = False,
+    require_verified_tls: bool = False,
+) -> AsyncIterator[None]:
     """Reuse anonymous REST connections for one resource-import run."""
-    if not _is_source_http_keepalive_enabled():
+    if not force and not _is_source_http_keepalive_enabled():
         yield
         return
-    async with _source_http_client_session() as session:
+    async with _source_http_client_session(
+        require_verified_tls=require_verified_tls
+    ) as session:
         session_token = _SOURCE_HTTP_SESSION.set(session)
         try:
             yield
@@ -36554,6 +36665,8 @@ async def _fetch_json_with_source_session(
     url: str,
     *,
     timeout: int,
+    allow_redirects: bool = True,
+    preserve_url_bytes: bool = False,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     """Fetch anonymous FHIR JSON through a persistent source session."""
     headers_by_name = {
@@ -36568,12 +36681,13 @@ async def _fetch_json_with_source_session(
         sock_read=timeout,
     )
     started = time.monotonic()
+    request_url = URL(url, encoded=True) if preserve_url_bytes else url
     try:
         async with session.get(
-            url,
+            request_url,
             headers=headers_by_name,
             timeout=request_timeout,
-            allow_redirects=True,
+            allow_redirects=allow_redirects,
         ) as response:
             payload_by_field = await _read_source_http_payload(
                 response,
@@ -37058,6 +37172,27 @@ async def _fetch_source_json_once(
     *,
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    census_contract = current_version_census_contract(source_record)
+    if census_contract is not None:
+        if (
+            _has_source_declared_credentialed_access(source_record)
+            or _credential_spec_for_source(source_record)
+        ):
+            raise RuntimeError(
+                "provider_directory_current_version_census_credentials_forbidden"
+            )
+        census_session = _SOURCE_HTTP_SESSION.get()
+        if census_session is None or census_session.closed:
+            raise RuntimeError(
+                "provider_directory_current_version_census_session_required"
+            )
+        return await _fetch_json_with_source_session(
+            census_session,
+            url,
+            timeout=timeout,
+            allow_redirects=False,
+            preserve_url_bytes=True,
+        )
     await _pace_source_request(source_record)
     pinned_session = _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.get()
     if pinned_session is not None:
@@ -37065,6 +37200,7 @@ async def _fetch_source_json_once(
             pinned_session,
             url,
             timeout=timeout,
+            allow_redirects=True,
         )
     options = _credential_request_options_for_source(source_record, url)
     if not options["headers"] and not options["query_params"]:
@@ -37186,6 +37322,13 @@ async def _fetch_source_json_candidate(
     is_last_candidate: bool,
 ) -> tuple[tuple[int | None, dict[str, Any] | None, str | None, int], bool, int]:
     """Fetch one page-size candidate and report whether to try a smaller page."""
+    if current_version_census_contract(source_record) is not None:
+        fetch_result = await _fetch_current_version_census_json_once(
+            source_record,
+            candidate_url,
+            timeout=timeout,
+        )
+        return fetch_result, False, 0
     empty_collection_retry_delays = _cigna_empty_collection_retry_delays(
         source_record,
         candidate_url,
@@ -37269,6 +37412,31 @@ def _terminal_source_fetch_diagnostic(
     return dict(diagnostic)
 
 
+async def _fetch_current_version_census_json_once(
+    source_record: dict[str, Any],
+    request_url: str,
+    *,
+    timeout: int,
+) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    """Fetch one exact-census request without retries or URL substitution."""
+    fetch_result = _source_fetch_result_with_payload_error(
+        source_record,
+        request_url,
+        await _fetch_source_json_once(
+            source_record,
+            request_url,
+            timeout=timeout,
+        ),
+    )
+    _record_terminal_source_fetch_diagnostic(
+        source_record,
+        request_url,
+        fetch_result,
+        retry_count=0,
+    )
+    return fetch_result
+
+
 async def _fetch_source_json(
     source_record: dict[str, Any],
     url: str,
@@ -37276,6 +37444,12 @@ async def _fetch_source_json(
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     """Fetch FHIR JSON with source retries and page-size fallback."""
+    if current_version_census_contract(source_record) is not None:
+        return await _fetch_current_version_census_json_once(
+            source_record,
+            url,
+            timeout=timeout,
+        )
     total_elapsed_ms = 0
     fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int] = (
         None,
@@ -37555,6 +37729,51 @@ def _resource_access_probe_result(
     }
 
 
+def _resource_access_probe_type(
+    source_record: dict[str, Any],
+    capability_payload: dict[str, Any],
+) -> str | None:
+    census_contract = current_version_census_contract(source_record)
+    supported_resource_types = _capability_resource_types(capability_payload)
+    admitted_resource_types = (
+        frozenset(census_contract.resources)
+        if census_contract is not None
+        else supported_resource_types
+    )
+    return next(
+        (
+            candidate_resource_type
+            for candidate_resource_type in RESOURCE_ACCESS_PROBE_ORDER
+            if candidate_resource_type in supported_resource_types
+            and candidate_resource_type in admitted_resource_types
+        ),
+        None,
+    )
+
+
+def _resource_access_probe_url(
+    source_record: dict[str, Any],
+    candidate_base: str,
+    resource_type: str,
+) -> tuple[dict[str, Any], str | None]:
+    resource_probe_source_map = {
+        **source_record,
+        "api_base": candidate_base,
+        "canonical_api_base": candidate_base,
+    }
+    census_contract = current_version_census_contract(source_record)
+    resource_url = (
+        census_contract.start_url(resource_type, 1)
+        if census_contract is not None
+        else _resource_start_url(
+            resource_probe_source_map,
+            resource_type,
+            page_count=1,
+        )
+    )
+    return resource_probe_source_map, resource_url
+
+
 async def _probe_resource_access(
     source_record: dict[str, Any],
     candidate_base: str,
@@ -37562,25 +37781,20 @@ async def _probe_resource_access(
     *,
     timeout: int,
 ) -> dict[str, Any] | None:
+    """Probe one capability-advertised resource admitted by the source."""
     if _uses_alohr_graphql_connector(source_record):
         return None
-    supported_resource_types = _capability_resource_types(capability_payload)
-    resource_type = next(
-        (
-            candidate_resource_type
-            for candidate_resource_type in RESOURCE_ACCESS_PROBE_ORDER
-            if candidate_resource_type in supported_resource_types
-        ),
-        None,
+    resource_type = _resource_access_probe_type(
+        source_record,
+        capability_payload,
     )
     if not resource_type:
         return None
-    resource_probe_source_map = {
-        **source_record,
-        "api_base": candidate_base,
-        "canonical_api_base": candidate_base,
-    }
-    resource_url = _resource_start_url(resource_probe_source_map, resource_type, page_count=1)
+    resource_probe_source_map, resource_url = _resource_access_probe_url(
+        source_record,
+        candidate_base,
+        resource_type,
+    )
     if not resource_url:
         return None
     targeted_search_error = _aetna_medicaid_targeted_search_error(
@@ -38059,6 +38273,87 @@ def _next_link(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _current_version_census_next_link(
+    payload: dict[str, Any],
+) -> str | None:
+    raw_links = payload.get("link", [])
+    if not isinstance(raw_links, list) or any(
+        not isinstance(link, dict) for link in raw_links
+    ):
+        raise ValueError(
+            "provider_directory_current_version_census_next_link_invalid"
+        )
+    next_urls: list[str] = []
+    for link_by_field in raw_links:
+        if link_by_field.get("relation") != "next":
+            continue
+        raw_url = link_by_field.get("url")
+        if (
+            type(raw_url) is not str
+            or not raw_url
+            or raw_url.strip() != raw_url
+        ):
+            raise ValueError(
+                "provider_directory_current_version_census_next_link_invalid"
+            )
+        next_urls.append(raw_url)
+    if len(next_urls) > 1:
+        raise ValueError("provider_directory_current_version_census_next_link_invalid")
+    return next_urls[0] if next_urls else None
+
+
+def _current_version_census_bundle_error(
+    payload: dict[str, Any],
+    resource_type: str,
+) -> str | None:
+    if payload.get("resourceType") != "Bundle" or payload.get("type") != "searchset":
+        return "provider_directory_current_version_census_searchset_required"
+    raw_entries = payload.get("entry", [])
+    if not isinstance(raw_entries, list):
+        return "provider_directory_current_version_census_entries_invalid"
+    for entry_by_field in raw_entries:
+        resource_by_field = (
+            entry_by_field.get("resource")
+            if isinstance(entry_by_field, dict)
+            else None
+        )
+        if not isinstance(resource_by_field, dict):
+            return "provider_directory_current_version_census_entries_invalid"
+        if resource_by_field.get("resourceType") != resource_type:
+            return "provider_directory_current_version_census_resource_type_mismatch"
+    return None
+
+
+def _parsed_current_version_census_entries(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    entries: list[dict[str, Any]],
+    request_url: str,
+    run_id: str | None,
+    *,
+    normalize_location_contacts: bool,
+) -> list[tuple[type, dict[str, Any]]]:
+    """Parse a complete exact-census page before any row is persisted."""
+
+    parsed_entries: list[tuple[type, dict[str, Any]]] = []
+    for entry_by_field in entries:
+        parsed_entry = parse_fhir_resource(
+            source_record["source_id"],
+            entry_by_field["resource"],
+            resource_url=_clean_text(entry_by_field.get("fullUrl")),
+            acquisition=_rest_bundle_acquisition(entry_by_field, request_url),
+            run_id=run_id,
+            normalize_location_contacts=normalize_location_contacts,
+        )
+        if not parsed_entry or parsed_entry[0] is not model:
+            raise ValueError(
+                "provider_directory_current_version_census_resource_parse_failed"
+            )
+        parsed_entries.append(parsed_entry)
+    return parsed_entries
+
+
 def _synthetic_skip_pagination_next_url(
     source_record: dict[str, Any],
     current_url: str,
@@ -38409,13 +38704,76 @@ def _resolved_idaho_medicaid_next_url(
     return next_url
 
 
+def _current_version_census_page_count(request_url: str) -> int:
+    """Return the one positive page count from an exact-census URL."""
+
+    page_count_values = [
+        query_value
+        for query_name, query_value in urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(request_url).query,
+            keep_blank_values=True,
+        )
+        if query_name.lower() == "_count"
+    ]
+    if (
+        len(page_count_values) != 1
+        or not page_count_values[0].isdigit()
+        or int(page_count_values[0]) <= 0
+    ):
+        raise ValueError(
+            "provider_directory_current_version_census_page_count_invalid"
+        )
+    return int(page_count_values[0])
+
+
+def _resolved_current_version_census_page_url(
+    source_record: dict[str, Any],
+    current_url: str,
+    next_link: str,
+    resource_type: str | None,
+    page_entry_count: int | None,
+) -> str | None:
+    """Resolve one exact-census continuation or report no bound contract."""
+
+    census_contract = current_version_census_contract(source_record)
+    if census_contract is None:
+        return None
+    if resource_type is None or page_entry_count is None:
+        raise ValueError(
+            "provider_directory_current_version_census_page_state_required"
+        )
+    page_count = _current_version_census_page_count(current_url)
+    return resolved_current_version_census_next_url(
+        census_contract,
+        resource_type,
+        current_url,
+        next_link,
+        page_entry_count=page_entry_count,
+        expected_page_count=page_count,
+    ).url
+
+
 def _resolved_fhir_next_url(
     source_record: dict[str, Any],
     current_url: str,
     next_link: str | None,
+    *,
+    resource_type: str | None = None,
+    page_entry_count: int | None = None,
 ) -> str | None:
+    """Resolve a source-specific continuation without widening trust."""
+
     if not next_link:
         return None
+    census_page_url = _resolved_current_version_census_page_url(
+        source_record,
+        current_url,
+        next_link,
+        resource_type,
+        page_entry_count,
+    )
+    if census_page_url is not None:
+        return census_page_url
     next_url = urllib.parse.urljoin(current_url, next_link)
     api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
@@ -44252,7 +44610,18 @@ def _page_token_query_value(url: str) -> str | None:
 
 
 def _has_replay_sensitive_continuation(url: str) -> bool:
-    return _has_cursor_mark_query_parameter(url) or _page_token_query_value(url) is not None
+    query_names = {
+        query_name.lower()
+        for query_name, _query_value in urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(url).query,
+            keep_blank_values=True,
+        )
+    }
+    return bool(
+        _has_cursor_mark_query_parameter(url)
+        or _page_token_query_value(url) is not None
+        or "_getpages" in query_names
+    )
 
 
 def _pagination_url_identity(url: str) -> str:
@@ -44268,7 +44637,7 @@ def _pagination_url_identity(url: str) -> str:
                 "",
             )
         )
-    if not _has_cursor_mark_query_parameter(url):
+    if not _has_replay_sensitive_continuation(url):
         return url
     parsed = urllib.parse.urlsplit(url)
     normalized_query = urllib.parse.urlencode(
@@ -44320,12 +44689,14 @@ def _should_restart_expired_pagination_checkpoint(
     request_url: str,
     resume_state: PaginationResumeState | None,
     has_restart_attempted: bool,
+    is_current_version_census: bool = False,
 ) -> bool:
     is_expired_status = status_code in {400, 404, 410} or (
         status_code == 403 and _is_humana_continuation_token_url(request_url)
     )
     return bool(
-        resume_state
+        not is_current_version_census
+        and resume_state
         and resume_state.resumed
         and not has_restart_attempted
         and fetch_error is None
@@ -47368,6 +47739,7 @@ def _is_caresource_opaque_cursor_census(
     return bool(
         checkpoint_context is not None
         and checkpoint_context.dataset_id
+        and current_version_census_contract(source_record) is None
         and api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE
     )
 
@@ -47643,6 +48015,274 @@ async def _finish_caresource_opaque_cursor_census(
     )
 
 
+def _is_current_version_census_enabled(
+    source_record: dict[str, Any],
+    checkpoint_context: PaginationCheckpointContext | None,
+) -> bool:
+    return bool(
+        checkpoint_context is not None
+        and checkpoint_context.dataset_id
+        and current_version_census_contract(source_record) is not None
+    )
+
+
+async def _fetch_current_version_census_count(
+    source_record: dict[str, Any],
+    start_url: str,
+    *,
+    timeout: int,
+) -> CurrentVersionCensusFetch:
+    census_url = current_version_census_count_url(start_url)
+    status_code, response_payload, fetch_error, _elapsed = await _fetch_source_json(
+        source_record,
+        census_url,
+        timeout=timeout,
+    )
+    if status_code != 200 or fetch_error:
+        failure_detail = fetch_error or f"http_{status_code}"
+        is_transient = _is_transient_source_fetch_failure(
+            status_code,
+            fetch_error,
+        )
+        return CurrentVersionCensusFetch(
+            count=None,
+            error=failure_detail,
+            transient=is_transient,
+            retry_not_before=(
+                _last_updated_partition_retry_not_before(
+                    source_record,
+                    census_url,
+                    status_code,
+                    response_payload,
+                    fetch_error,
+                )
+                if is_transient
+                else None
+            ),
+        )
+    try:
+        exact_count = validated_current_version_census_total(response_payload)
+    except ValueError as exc:
+        return CurrentVersionCensusFetch(count=None, error=str(exc))
+    return CurrentVersionCensusFetch(count=exact_count)
+
+
+def _current_version_census_error_result(
+    model: type,
+    proof_by_field: dict[str, Any],
+    error: str,
+    *,
+    rows_processed: int,
+    pages_processed: int,
+    retryable: bool,
+    retry_not_before: str | None = None,
+) -> ResourceFetchResult:
+    error_prefix = (
+        CURRENT_VERSION_CENSUS_RETRYABLE_ERROR
+        if retryable
+        else CURRENT_VERSION_CENSUS_BLOCKED_ERROR
+    )
+    return ResourceFetchResult(
+        model=model,
+        rows=[],
+        rows_fetched=rows_processed,
+        rows_written=0,
+        pages_fetched=pages_processed,
+        complete=False,
+        row_limit_reached=False,
+        page_limit_reached=False,
+        hard_page_limit_reached=False,
+        next_url_remaining=retryable,
+        error=f"{error_prefix}:{error}",
+        fetch_mode=CURRENT_VERSION_CENSUS_FETCH_MODE,
+        retry_not_before=retry_not_before,
+        fetch_diagnostic=proof_by_field,
+    )
+
+
+def _current_version_census_resume_proof(
+    resume_state: PaginationResumeState,
+    contract: CurrentVersionCensusContract,
+    resource_type: str,
+    start_url: str,
+) -> dict[str, Any] | None:
+    if not resume_state.completeness:
+        has_pristine_checkpoint = bool(
+            not resume_state.complete
+            and resume_state.pages_processed == 0
+            and resume_state.rows_processed == 0
+            and resume_state.next_url == start_url
+        )
+        if not has_pristine_checkpoint:
+            raise ValueError(
+                "provider_directory_current_version_census_"
+                "checkpoint_pre_count_missing"
+            )
+        return None
+    persisted_pre_count = current_version_census_persisted_pre_count(
+        resume_state.completeness,
+        contract,
+        resource_type,
+    )
+    assert persisted_pre_count is not None
+    if resume_state.rows_processed > persisted_pre_count:
+        raise ValueError(
+            "provider_directory_current_version_census_"
+            "checkpoint_rows_exceed_pre_count"
+        )
+    if not resume_state.complete:
+        return dict(resume_state.completeness)
+    return validated_current_version_census_completed_proof(
+        resume_state.completeness,
+        contract,
+        resource_type,
+        rows_processed=resume_state.rows_processed,
+        pages_processed=resume_state.pages_processed,
+    )
+
+
+def _current_version_census_resume_error(
+    model: type,
+    resume_state: PaginationResumeState,
+    error: ValueError,
+) -> ResourceFetchResult:
+    return _current_version_census_error_result(
+        model,
+        dict(resume_state.completeness),
+        str(error),
+        rows_processed=resume_state.rows_processed,
+        pages_processed=resume_state.pages_processed,
+        retryable=False,
+    )
+
+
+def _current_version_census_pre_count_error(
+    model: type,
+    resume_state: PaginationResumeState,
+    contract: CurrentVersionCensusContract,
+    census_fetch: CurrentVersionCensusFetch,
+) -> ResourceFetchResult:
+    return _current_version_census_error_result(
+        model,
+        {"strategy_version": contract.strategy_version, "verified": False},
+        f"pre_census_{census_fetch.error or 'failed'}",
+        rows_processed=resume_state.rows_processed,
+        pages_processed=resume_state.pages_processed,
+        retryable=census_fetch.transient,
+        retry_not_before=census_fetch.retry_not_before,
+    )
+
+
+async def _prepare_current_version_pre_census(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    checkpoint_context: PaginationCheckpointContext,
+    resume_state: PaginationResumeState,
+    start_url: str,
+    *,
+    timeout: int,
+    cancellation: _ResourceImportCancellation,
+) -> dict[str, Any] | ResourceFetchResult:
+    """Load or persist the exact pre-count proof under cancellation fences."""
+    contract = current_version_census_contract(source_record)
+    assert contract is not None
+    try:
+        resume_proof = _current_version_census_resume_proof(
+            resume_state,
+            contract,
+            resource_type,
+            start_url,
+        )
+    except ValueError as exc:
+        return _current_version_census_resume_error(model, resume_state, exc)
+    if resume_proof is not None:
+        return resume_proof
+    await cancellation.check()
+    census_fetch = await _fetch_current_version_census_count(
+        source_record,
+        start_url,
+        timeout=timeout,
+    )
+    await cancellation.check()
+    if census_fetch.count is None:
+        return _current_version_census_pre_count_error(
+            model,
+            resume_state,
+            contract,
+            census_fetch,
+        )
+    proof_by_field = current_version_census_initial_proof(
+        contract,
+        resource_type,
+        census_fetch.count,
+    )
+    await cancellation.check()
+    await _save_pagination_checkpoint_completeness(
+        checkpoint_context,
+        resource_type,
+        proof_by_field,
+    )
+    return proof_by_field
+
+
+async def _finish_current_version_census(
+    source_record: dict[str, Any],
+    resource_type: str,
+    checkpoint_context: PaginationCheckpointContext,
+    start_url: str,
+    proof_by_field: dict[str, Any],
+    *,
+    timeout: int,
+    rows_processed: int,
+    cancellation: _ResourceImportCancellation,
+) -> CurrentVersionCensusOutcome:
+    await cancellation.check()
+    post_census = await _fetch_current_version_census_count(
+        source_record,
+        start_url,
+        timeout=timeout,
+    )
+    await cancellation.check()
+    if post_census.count is None:
+        failed_proof_by_field = {
+            **proof_by_field,
+            "verified": False,
+            "processed_rows": rows_processed,
+        }
+        await _save_pagination_checkpoint_completeness(
+            checkpoint_context,
+            resource_type,
+            failed_proof_by_field,
+        )
+        return CurrentVersionCensusOutcome(
+            proof=failed_proof_by_field,
+            error=f"post_census_{post_census.error or 'failed'}",
+            retryable=post_census.transient,
+            retry_not_before=post_census.retry_not_before,
+        )
+    unique_candidate_rows = await _caresource_unique_candidate_count(
+        checkpoint_context,
+        resource_type,
+    )
+    completed_proof_by_field = current_version_census_completed_proof(
+        proof_by_field,
+        post_count=post_census.count,
+        processed_rows=rows_processed,
+        unique_candidate_rows=unique_candidate_rows,
+    )
+    await cancellation.check()
+    await _save_pagination_checkpoint_completeness(
+        checkpoint_context,
+        resource_type,
+        completed_proof_by_field,
+    )
+    return CurrentVersionCensusOutcome(
+        proof=completed_proof_by_field,
+        error=_clean_text(completed_proof_by_field.get("failure")),
+    )
+
+
 def _rest_page_prefetch_session(
     source_record: dict[str, Any],
     request_url: str,
@@ -47687,6 +48327,8 @@ def _is_rest_page_prefetch_eligible(
     options: RestPagePrefetchEligibility,
 ) -> bool:
     """Fail closed unless the request matches the narrow REST pilot shape."""
+    if current_version_census_contract(source_record) is not None:
+        return False
     source_api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
     )
@@ -47909,7 +48551,16 @@ async def _fetch_resource_rows(
         source_record,
         checkpoint_context,
     )
+    is_current_version_census_enabled = _is_current_version_census_enabled(
+        source_record,
+        checkpoint_context,
+    )
+    resource_import_cancellation = _ResourceImportCancellation(
+        cancel_ctx,
+        cancel_task,
+    )
     caresource_proof_by_field: dict[str, Any] | None = None
+    current_version_proof_by_field: dict[str, Any] | None = None
     if is_caresource_census_enabled:
         assert checkpoint_context is not None
         assert checkpoint_start_url is not None
@@ -47926,6 +48577,49 @@ async def _fetch_resource_rows(
         if isinstance(prepared_census, ResourceFetchResult):
             return prepared_census
         caresource_proof_by_field = prepared_census
+    if is_current_version_census_enabled:
+        assert checkpoint_context is not None
+        assert checkpoint_start_url is not None
+        assert resume_state is not None
+        prepared_current_version_census = (
+            await _prepare_current_version_pre_census(
+                source_record,
+                resource_type,
+                model,
+                checkpoint_context,
+                resume_state,
+                checkpoint_start_url,
+                timeout=resource_timeout,
+                cancellation=resource_import_cancellation,
+            )
+        )
+        if isinstance(prepared_current_version_census, ResourceFetchResult):
+            return prepared_current_version_census
+        current_version_proof_by_field = prepared_current_version_census
+        if not resume_state.complete:
+            try:
+                validated_current_version_census_resume_url(
+                    current_version_census_contract(source_record),
+                    resource_type,
+                    checkpoint_start_url,
+                    resume_state.next_url,
+                    pages_processed=resume_state.pages_processed,
+                    rows_processed=resume_state.rows_processed,
+                    expected_page_count=(
+                        _current_version_census_page_count(
+                            checkpoint_start_url
+                        )
+                    ),
+                )
+            except ValueError as exc:
+                return _current_version_census_error_result(
+                    model,
+                    current_version_proof_by_field,
+                    str(exc),
+                    rows_processed=resume_state.rows_processed,
+                    pages_processed=resume_state.pages_processed,
+                    retryable=False,
+                )
     synthetic_resume_guard_error = _synthetic_position_resume_guard_error(
         source_record,
         resume_state,
@@ -47970,11 +48664,18 @@ async def _fetch_resource_rows(
             hard_page_limit_reached=False,
             next_url_remaining=False,
             fetch_mode=(
-                CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
-                if is_caresource_census_enabled
-                else "checkpoint_complete"
+                CURRENT_VERSION_CENSUS_FETCH_MODE
+                if is_current_version_census_enabled
+                else (
+                    CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+                    if is_caresource_census_enabled
+                    else "checkpoint_complete"
+                )
             ),
-            fetch_diagnostic=caresource_proof_by_field,
+            fetch_diagnostic=(
+                current_version_proof_by_field
+                or caresource_proof_by_field
+            ),
         )
     retained_resource_rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
@@ -48214,10 +48915,19 @@ async def _fetch_resource_rows(
                     timeout=resource_timeout,
                 )
             assert page_fetch_result is not None
+            if is_current_version_census_enabled:
+                await _raise_if_resource_import_cancelled(
+                    cancel_ctx,
+                    cancel_task,
+                )
             source_fetch_elapsed_ms += max(0, int(page_fetch_result[3]))
-            if checkpoint_context and _is_rest_pagination_cooldown_failure(
+            if (
+                checkpoint_context
+                and not is_current_version_census_enabled
+                and _is_rest_pagination_cooldown_failure(
                 page_fetch_result[0],
                 page_fetch_result[2],
+                )
             ):
                 pinned_session_token = (
                     _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.set(
@@ -48283,6 +48993,9 @@ async def _fetch_resource_rows(
                         request_url=url,
                         resume_state=resume_state,
                         has_restart_attempted=has_restart_attempted,
+                        is_current_version_census=(
+                            is_current_version_census_enabled
+                        ),
                     )
                 ):
                     await _reset_pagination_checkpoint(
@@ -48353,6 +49066,15 @@ async def _fetch_resource_rows(
                     break
                 error_message = "non_bundle_payload"
                 break
+            if current_version_census_contract(source_record) is not None:
+                assert response_payload is not None
+                census_bundle_error = _current_version_census_bundle_error(
+                    response_payload,
+                    resource_type,
+                )
+                if census_bundle_error is not None:
+                    error_message = census_bundle_error
+                    break
             pages += 1
             child_urls = _uhc_adaptive_partition_child_urls(source_record, resource_type, url, response_payload)
             if child_urls:
@@ -48363,6 +49085,27 @@ async def _fetch_resource_rows(
             if _is_uhc_partition_cap_exhausted(source_record, url, response_payload):
                 error_message = f"uhc_{resource_type.lower()}_partition_cap_exhausted"
             entries = _bundle_entries(response_payload)
+            parsed_census_entries = None
+            if is_current_version_census_enabled:
+                try:
+                    parsed_census_entries = (
+                        _parsed_current_version_census_entries(
+                            source_record,
+                            resource_type,
+                            model,
+                            entries,
+                            url,
+                            run_id,
+                            normalize_location_contacts=not (
+                                resource_type == "Location"
+                                and row_batch_handler
+                            ),
+                        )
+                    )
+                except ValueError as exc:
+                    error_message = str(exc)
+                    has_next_url = True
+                    break
             synthetic_page_identity = _synthetic_position_page_identity(
                 source_record,
                 entries,
@@ -48385,13 +49128,20 @@ async def _fetch_resource_rows(
                     synthetic_page_identity[1],
                 )[-PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:]
             for entry_index, entry in enumerate(entries):
-                parsed = parse_fhir_resource(
-                    source_record["source_id"],
-                    entry["resource"],
-                    resource_url=_clean_text(entry.get("fullUrl")),
-                    acquisition=_rest_bundle_acquisition(entry, url),
-                    run_id=run_id,
-                    normalize_location_contacts=not (resource_type == "Location" and row_batch_handler),
+                parsed = (
+                    parsed_census_entries[entry_index]
+                    if parsed_census_entries is not None
+                    else parse_fhir_resource(
+                        source_record["source_id"],
+                        entry["resource"],
+                        resource_url=_clean_text(entry.get("fullUrl")),
+                        acquisition=_rest_bundle_acquisition(entry, url),
+                        run_id=run_id,
+                        normalize_location_contacts=not (
+                            resource_type == "Location"
+                            and row_batch_handler
+                        ),
+                    )
                 )
                 if not parsed:
                     continue
@@ -48416,7 +49166,28 @@ async def _fetch_resource_rows(
                     is_deadline_reached = True
                     has_next_url = True
                     break
-            next_url = _next_link(response_payload)
+            if (
+                is_current_version_census_enabled
+                and current_version_proof_by_field is not None
+                and rows_fetched
+                > int(current_version_proof_by_field["pre_count"])
+            ):
+                error_message = (
+                    "provider_directory_current_version_census_"
+                    "processed_count_exceeds_pre_count"
+                )
+                has_next_url = True
+                break
+            try:
+                next_url = (
+                    _current_version_census_next_link(response_payload)
+                    if current_version_census_contract(source_record) is not None
+                    else _next_link(response_payload)
+                )
+            except ValueError as exc:
+                error_message = str(exc)
+                has_next_url = True
+                break
             source_api_base = _canonical_base(
                 source_record.get("canonical_api_base") or source_record.get("api_base")
             )
@@ -48438,6 +49209,8 @@ async def _fetch_resource_rows(
                         source_record,
                         url,
                         next_url,
+                        resource_type=resource_type,
+                        page_entry_count=len(entries),
                     )
             except ValueError as exc:
                 error_message = str(exc)
@@ -48456,6 +49229,10 @@ async def _fetch_resource_rows(
                 resolved_next_url = None
             defer_caresource_terminal_checkpoint = bool(
                 is_caresource_census_enabled and resolved_next_url is None
+            )
+            defer_exact_census_terminal_checkpoint = bool(
+                is_current_version_census_enabled
+                and resolved_next_url is None
             )
             resolved_next_identity = (
                 _pagination_url_identity(resolved_next_url)
@@ -48513,7 +49290,11 @@ async def _fetch_resource_rows(
                     name="provider-directory-rest-page-prefetch",
                 )
             try:
-                if checkpoint_context and not defer_caresource_terminal_checkpoint:
+                if (
+                    checkpoint_context
+                    and not defer_caresource_terminal_checkpoint
+                    and not defer_exact_census_terminal_checkpoint
+                ):
                     await flush_pending_rows()
                     recent_url_hashes.append(request_url_hash)
                     recent_url_hashes = recent_url_hashes[
@@ -48559,6 +49340,7 @@ async def _fetch_resource_rows(
             break
     await flush_pending_rows()
     caresource_outcome: CareSourceOpaqueCursorOutcome | None = None
+    current_version_outcome: CurrentVersionCensusOutcome | None = None
     has_reached_unbounded_terminal_page = (
         not error_message
         and not has_reached_row_limit
@@ -48600,6 +49382,40 @@ async def _fetch_resource_rows(
                 rows_processed=rows_fetched,
                 recent_url_hashes=recent_url_hashes,
             )
+    if is_current_version_census_enabled and has_reached_unbounded_terminal_page:
+        assert checkpoint_context is not None
+        assert checkpoint_start_url is not None
+        assert current_version_proof_by_field is not None
+        current_version_outcome = await _finish_current_version_census(
+            source_record,
+            resource_type,
+            checkpoint_context,
+            checkpoint_start_url,
+            current_version_proof_by_field,
+            timeout=resource_timeout,
+            rows_processed=rows_fetched,
+            cancellation=resource_import_cancellation,
+        )
+        current_version_proof_by_field = current_version_outcome.proof
+        if current_version_outcome.error:
+            error_prefix = (
+                CURRENT_VERSION_CENSUS_RETRYABLE_ERROR
+                if current_version_outcome.retryable
+                else CURRENT_VERSION_CENSUS_BLOCKED_ERROR
+            )
+            error_message = f"{error_prefix}:{current_version_outcome.error}"
+            has_next_url = current_version_outcome.retryable
+            retry_not_before = current_version_outcome.retry_not_before
+        else:
+            await resource_import_cancellation.check()
+            await _save_pagination_checkpoint(
+                checkpoint_context,
+                resource_type,
+                next_url=None,
+                pages_processed=pages,
+                rows_processed=rows_fetched,
+                recent_url_hashes=recent_url_hashes,
+            )
     if (
         not error_message
         and not has_reached_row_limit
@@ -48632,13 +49448,21 @@ async def _fetch_resource_rows(
         next_url_remaining=has_next_url or bool(url) or bool(pending_start_urls),
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
         fetch_mode=(
-            CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
-            if is_caresource_census_enabled
-            else ("checkpointed_paged" if checkpoint_context else "paged")
+            CURRENT_VERSION_CENSUS_FETCH_MODE
+            if is_current_version_census_enabled
+            else (
+                CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+                if is_caresource_census_enabled
+                else ("checkpointed_paged" if checkpoint_context else "paged")
+            )
         ),
         deadline_reached=is_deadline_reached,
         retry_not_before=retry_not_before,
-        fetch_diagnostic=caresource_proof_by_field or fetch_diagnostic,
+        fetch_diagnostic=(
+            current_version_proof_by_field
+            or caresource_proof_by_field
+            or fetch_diagnostic
+        ),
         pagination_cooldown_retries=pagination_cooldown_retries,
         pagination_cooldown_wait_seconds=pagination_cooldown_wait_seconds,
         is_pagination_cooldown_recovered=is_pagination_cooldown_recovered,
@@ -50254,6 +51078,12 @@ def _empty_resource_stats() -> dict[str, Any]:
         "caresource_opaque_cursor_processed_rows": 0,
         "caresource_opaque_cursor_unique_candidate_rows": 0,
         "caresource_opaque_cursor_post_count": 0,
+        "current_version_census_sources": 0,
+        "current_version_census_verified_sources": 0,
+        "current_version_census_pre_count": 0,
+        "current_version_census_processed_rows": 0,
+        "current_version_census_unique_candidate_rows": 0,
+        "current_version_census_post_count": 0,
     }
 
 
@@ -50369,6 +51199,28 @@ def _record_caresource_opaque_cursor_stats(
             resource_stats[f"caresource_opaque_cursor_{proof_field}"] += proof_value
 
 
+def _record_current_version_census_stats(
+    resource_stats: dict[str, Any],
+    fetch_result: ResourceFetchResult,
+) -> None:
+    if fetch_result.fetch_mode != CURRENT_VERSION_CENSUS_FETCH_MODE:
+        return
+    resource_stats["current_version_census_sources"] += 1
+    proof_by_field = fetch_result.fetch_diagnostic
+    if not isinstance(proof_by_field, dict) or proof_by_field.get("verified") is not True:
+        return
+    resource_stats["current_version_census_verified_sources"] += 1
+    for proof_field in (
+        "pre_count",
+        "processed_rows",
+        "unique_candidate_rows",
+        "post_count",
+    ):
+        proof_value = proof_by_field.get(proof_field)
+        if isinstance(proof_value, int) and not isinstance(proof_value, bool):
+            resource_stats[f"current_version_census_{proof_field}"] += proof_value
+
+
 def _record_page_prefetch_stats(
     resource_stats: dict[str, Any],
     fetch_result: ResourceFetchResult,
@@ -50382,6 +51234,36 @@ def _record_page_prefetch_stats(
     resource_stats["page_prefetch_wait_seconds"] += (
         fetch_result.page_prefetch_wait_seconds
     )
+
+
+def _record_bulk_export_fetch_stats(
+    resource_stats: dict[str, Any],
+    fetch_result: ResourceFetchResult,
+    bulk_export_selection: str | None,
+) -> None:
+    """Accumulate Bulk selection and REST fallback metrics."""
+
+    if fetch_result.fetch_mode in {"bulk_export", "checkpointed_bulk_export"}:
+        resource_stats["bulk_export_sources"] += 1
+    requested_selections = {
+        BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE,
+        BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED,
+        BULK_EXPORT_SELECTION_EFFECTIVE,
+    }
+    if bulk_export_selection in requested_selections:
+        resource_stats["bulk_export_requested_sources"] += 1
+    if bulk_export_selection == BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE:
+        resource_stats["bulk_export_ineligible_sources"] += 1
+    elif bulk_export_selection == BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED:
+        resource_stats["bulk_export_checkpoint_blocked_sources"] += 1
+    elif bulk_export_selection == BULK_EXPORT_SELECTION_EFFECTIVE:
+        resource_stats["bulk_export_eligible_sources"] += 1
+    if (
+        bulk_export_selection in requested_selections
+        and fetch_result.fetch_mode
+        in {"paged", "partitioned_paged", "checkpoint_complete"}
+    ):
+        resource_stats["bulk_export_rest_fallback_sources"] += 1
 
 
 def _record_resource_fetch_stats(
@@ -50419,31 +51301,12 @@ def _record_resource_fetch_stats(
         resource_stats["sources_empty"] += 1
     _record_last_updated_partition_stats(resource_stats, fetch_result)
     _record_caresource_opaque_cursor_stats(resource_stats, fetch_result)
-    if fetch_result.fetch_mode in {"bulk_export", "checkpointed_bulk_export"}:
-        resource_stats["bulk_export_sources"] += 1
-    if bulk_export_selection in {
-        BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE,
-        BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED,
-        BULK_EXPORT_SELECTION_EFFECTIVE,
-    }:
-        resource_stats["bulk_export_requested_sources"] += 1
-    if bulk_export_selection == BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE:
-        resource_stats["bulk_export_ineligible_sources"] += 1
-    elif bulk_export_selection == BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED:
-        resource_stats["bulk_export_checkpoint_blocked_sources"] += 1
-    elif bulk_export_selection == BULK_EXPORT_SELECTION_EFFECTIVE:
-        resource_stats["bulk_export_eligible_sources"] += 1
-    if (
-        bulk_export_selection
-        in {
-            BULK_EXPORT_SELECTION_SOURCE_INELIGIBLE,
-            BULK_EXPORT_SELECTION_CHECKPOINT_REQUIRED,
-            BULK_EXPORT_SELECTION_EFFECTIVE,
-        }
-        and fetch_result.fetch_mode
-        in {"paged", "partitioned_paged", "checkpoint_complete"}
-    ):
-        resource_stats["bulk_export_rest_fallback_sources"] += 1
+    _record_current_version_census_stats(resource_stats, fetch_result)
+    _record_bulk_export_fetch_stats(
+        resource_stats,
+        fetch_result,
+        bulk_export_selection,
+    )
 
 
 def _is_resource_fetch_complete_for_publish(result: ResourceFetchResult) -> bool:
@@ -50484,6 +51347,30 @@ def _resource_fetch_timing_diagnostic(
     }
 
 
+def _resource_fetch_completeness_diagnostics(
+    fetch_result: ResourceFetchResult,
+) -> dict[str, Any]:
+    """Return mode-specific completeness proof fields."""
+
+    return {
+        "last_updated_completeness": (
+            fetch_result.fetch_diagnostic
+            if fetch_result.fetch_mode == LAST_UPDATED_PARTITION_FETCH_MODE
+            else None
+        ),
+        "caresource_opaque_cursor_completeness": (
+            fetch_result.fetch_diagnostic
+            if fetch_result.fetch_mode == CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+            else None
+        ),
+        "current_version_census_completeness": (
+            fetch_result.fetch_diagnostic
+            if fetch_result.fetch_mode == CURRENT_VERSION_CENSUS_FETCH_MODE
+            else None
+        ),
+    }
+
+
 def _resource_fetch_diagnostic(
     fetch_result: ResourceFetchResult,
     *,
@@ -50513,19 +51400,11 @@ def _resource_fetch_diagnostic(
             in {
                 LAST_UPDATED_PARTITION_FETCH_MODE,
                 CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
+                CURRENT_VERSION_CENSUS_FETCH_MODE,
             }
             else fetch_result.fetch_diagnostic
         ),
-        "last_updated_completeness": (
-            fetch_result.fetch_diagnostic
-            if fetch_result.fetch_mode == LAST_UPDATED_PARTITION_FETCH_MODE
-            else None
-        ),
-        "caresource_opaque_cursor_completeness": (
-            fetch_result.fetch_diagnostic
-            if fetch_result.fetch_mode == CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
-            else None
-        ),
+        **_resource_fetch_completeness_diagnostics(fetch_result),
         "pagination_cooldown_retries": fetch_result.pagination_cooldown_retries,
         "pagination_cooldown_wait_seconds": (
             fetch_result.pagination_cooldown_wait_seconds
@@ -50859,7 +51738,7 @@ def _configured_catalog_protected_source_ids(task: dict[str, Any]) -> list[str]:
     for entry in entries:
         if not isinstance(entry, dict):
             raise RuntimeError("provider_directory_acquisition_manifest_invalid")
-        if entry.get("classification") in PROVIDER_DIRECTORY_ACQUISITION_CLASSIFICATIONS:
+        if entry.get("classification") in PROVIDER_DIRECTORY_CATALOG_RETENTION_CLASSIFICATIONS:
             configured_source_ids.extend(_clean_source_id_list(entry.get("source_ids")))
     return sorted(set(configured_source_ids))
 
@@ -51635,14 +52514,22 @@ def _resource_endpoint_signature(source: dict[str, Any]) -> tuple[tuple[str, str
         for field in sorted(RESOURCE_ENDPOINT_FIELDS.values())
     )
     connector_contract = _alohr_graphql_acquisition_contract(source)
-    if connector_contract is None:
-        return signature_items
-    return signature_items + (
-        (
-            "connector_acquisition_contract",
-            _stable_identity_json(connector_contract),
-        ),
-    )
+    if connector_contract is not None:
+        signature_items += (
+            (
+                "connector_acquisition_contract",
+                _stable_identity_json(connector_contract),
+            ),
+        )
+    census_contract = current_version_census_contract(source)
+    if census_contract is not None:
+        signature_items += (
+            (
+                "current_version_census_identity",
+                _stable_identity_json(census_contract.identity()),
+            ),
+        )
+    return signature_items
 
 
 def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str, tuple[tuple[str, str], ...]]:
@@ -51672,16 +52559,32 @@ def _provider_directory_endpoint_metadata(
         if connector_contract_json
         else None
     )
+    census_identity_json = endpoint_signature_by_field.get(
+        "current_version_census_identity"
+    )
+    census_identity = (
+        json.loads(census_identity_json)
+        if census_identity_json
+        else None
+    )
     endpoint_metadata_by_field = {
         "identity_version": (
-            "resource-import-group-v2"
-            if connector_contract is not None
-            else "resource-import-group-v1"
+            "resource-import-group-v3"
+            if census_identity is not None
+            else (
+                "resource-import-group-v2"
+                if connector_contract is not None
+                else "resource-import-group-v1"
+            )
         )
     }
     if connector_contract is not None:
         endpoint_metadata_by_field["connector_acquisition_contract"] = (
             connector_contract
+        )
+    if census_identity is not None:
+        endpoint_metadata_by_field["current_version_census_identity"] = (
+            census_identity
         )
     return endpoint_metadata_by_field
 
@@ -51879,6 +52782,39 @@ def _pagination_checkpoint_root_run_id(
     return run_id
 
 
+def _validate_current_version_census_lineage(
+    run_id: str | None,
+    retry_of_run_id: str | None,
+    pagination_root_run_id: str | None,
+) -> None:
+    """Reject ambiguous exact-census lineage before database access."""
+
+    if run_id is None:
+        raise ValueError(
+            "provider_directory_current_version_census_run_id_required"
+        )
+    if retry_of_run_id is None:
+        _pagination_checkpoint_root_run_id(
+            run_id,
+            None,
+            pagination_root_run_id,
+        )
+        return
+    if (
+        retry_of_run_id == run_id
+        or pagination_root_run_id is None
+        or pagination_root_run_id == run_id
+    ):
+        raise ValueError(
+            "provider_directory_current_version_census_retry_lineage_invalid"
+        )
+    _pagination_checkpoint_root_run_id(
+        run_id,
+        retry_of_run_id,
+        pagination_root_run_id,
+    )
+
+
 def _pagination_checkpoint_strategy_version(
     canonical_api_base: str | None,
     last_updated_partition_config: dict[str, Any],
@@ -51908,16 +52844,22 @@ def _pagination_checkpoint_scope_identity(
     last_updated_partition_config = _last_updated_partition_resource_configs(
         source_record
     )
+    census_contract = current_version_census_contract(source_record)
     supports_checkpoint = (
         canonical_api_base in PAGINATION_CHECKPOINT_API_BASES
         or _is_amerihealth_caritas_provider_api_base(canonical_api_base)
         or bool(last_updated_partition_config)
+        or census_contract is not None
     )
     if not source_ids or not supports_checkpoint or not canonical_api_base:
         return None
-    strategy_version = _pagination_checkpoint_strategy_version(
-        canonical_api_base,
-        last_updated_partition_config,
+    strategy_version = (
+        census_contract.strategy_version
+        if census_contract is not None
+        else _pagination_checkpoint_strategy_version(
+            canonical_api_base,
+            last_updated_partition_config,
+        )
     )
     scope_payload_dict = {
         "strategy_version": strategy_version,
@@ -51927,6 +52869,10 @@ def _pagination_checkpoint_scope_identity(
     if last_updated_partition_config:
         scope_payload_dict["last_updated_partition_config"] = (
             last_updated_partition_config
+        )
+    if census_contract is not None:
+        scope_payload_dict["current_version_census_identity"] = (
+            census_contract.identity()
         )
     scope_payload = json.dumps(
         scope_payload_dict,
@@ -54399,6 +55345,48 @@ def _caresource_terminal_failure_details(
     )
 
 
+def _current_version_census_terminal_failure_details(
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+    incomplete_resource_types: list[str],
+) -> str | None:
+    terminal_resource_types = [
+        resource_type
+        for resource_type in incomplete_resource_types
+        if diagnostics_by_resource[resource_type].get("fetch_mode")
+        == CURRENT_VERSION_CENSUS_FETCH_MODE
+        and str(
+            diagnostics_by_resource[resource_type].get("error") or ""
+        ).startswith(CURRENT_VERSION_CENSUS_BLOCKED_ERROR)
+    ]
+    if not terminal_resource_types:
+        return None
+    return ",".join(
+        f"{resource_type}={diagnostics_by_resource[resource_type].get('error')}"
+        for resource_type in terminal_resource_types
+    )
+
+
+def _pagination_terminal_failure_details(
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+    incomplete_resource_types: list[str],
+) -> str | None:
+    """Return the first terminal completeness failure across census modes."""
+
+    failure_helpers = (
+        _last_updated_partition_terminal_failure_details,
+        _caresource_terminal_failure_details,
+        _current_version_census_terminal_failure_details,
+    )
+    for failure_helper in failure_helpers:
+        failure_details = failure_helper(
+            diagnostics_by_resource,
+            incomplete_resource_types,
+        )
+        if failure_details:
+            return failure_details
+    return None
+
+
 def _handle_incomplete_source_pagination(
     source_record: dict[str, Any],
     diagnostics_by_resource: dict[str, dict[str, Any]],
@@ -54406,18 +55394,14 @@ def _handle_incomplete_source_pagination(
     resume_required_entries: set[str] | None,
     require_complete_resources: bool,
 ) -> None:
-    terminal_failure_details = _last_updated_partition_terminal_failure_details(
+    """Fail or record resumability for incomplete source pagination."""
+
+    terminal_failure_details = _pagination_terminal_failure_details(
         diagnostics_by_resource,
         incomplete_resource_types,
     )
     if terminal_failure_details:
         raise RuntimeError(terminal_failure_details)
-    caresource_failure = _caresource_terminal_failure_details(
-        diagnostics_by_resource,
-        incomplete_resource_types,
-    )
-    if caresource_failure:
-        raise RuntimeError(caresource_failure)
     graph_failures = [
         resource_type
         for resource_type in incomplete_resource_types
@@ -57969,9 +58953,6 @@ async def _prepare_resource_import_source_group(
     pagination_root_run_id: str | None,
     is_checkpointing_enabled: bool,
 ) -> tuple[list[dict[str, Any]], EndpointDatasetCandidate | None]:
-    source_id_values = sorted(
-        source_record["source_id"] for source_record in source_records
-    )
     checkpoint_context = _resource_group_pagination_checkpoint_context(
         source_records,
         run_id=run_id,
@@ -58170,6 +59151,7 @@ def _is_finalized_endpoint_dataset_candidate(
 async def _replay_finalized_candidate_and_clear_checkpoints(
     candidate: EndpointDatasetCandidate,
     resource_completion: dict[str, set[str]] | None,
+    source_records: list[dict[str, Any]] | None = None,
 ) -> ResourceImportGroupResult:
     """Return replay proof and retire its completed acquisition checkpoints."""
     is_verification_mismatch = candidate.verification_terminal_status == (
@@ -58179,6 +59161,11 @@ async def _replay_finalized_candidate_and_clear_checkpoints(
         candidate,
         None if is_verification_mismatch else resource_completion,
     )
+    if source_records is not None:
+        _validate_current_version_census_diagnostics(
+            source_records,
+            import_summary[1],
+        )
     await _clear_finalized_endpoint_dataset_pagination_checkpoints(
         candidate,
         None,
@@ -58188,6 +59175,29 @@ async def _replay_finalized_candidate_and_clear_checkpoints(
             "provider_directory_endpoint_dataset_verification_mismatch"
         )
     return import_summary
+
+
+async def _replay_finalized_candidate_after_cancellation(
+    candidate: EndpointDatasetCandidate,
+    resource_completion: dict[str, set[str]] | None,
+    source_records: list[dict[str, Any]],
+    cancellation: _ResourceImportCancellation,
+) -> ResourceImportGroupResult:
+    """Fence replay cleanup behind the shared cancellation authority."""
+    await cancellation.check()
+    if not any(
+        current_version_census_contract(source_record) is not None
+        for source_record in source_records
+    ):
+        return await _replay_finalized_candidate_and_clear_checkpoints(
+            candidate,
+            resource_completion,
+        )
+    return await _replay_finalized_candidate_and_clear_checkpoints(
+        candidate,
+        resource_completion,
+        source_records,
+    )
 
 
 async def _finalize_candidate_and_clear_checkpoints(
@@ -58209,6 +59219,81 @@ async def _finalize_candidate_and_clear_checkpoints(
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_mismatch"
         )
+
+
+def _validate_current_version_census_diagnostics(
+    source_records: list[dict[str, Any]],
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+) -> None:
+    bound_sources = [
+        source_record
+        for source_record in source_records
+        if current_version_census_contract(source_record) is not None
+    ]
+    if not bound_sources:
+        return
+    if len(bound_sources) != 1 or len(source_records) != 1:
+        raise RuntimeError(
+            "provider_directory_current_version_census_source_group_invalid"
+        )
+    contract = current_version_census_contract(bound_sources[0])
+    assert contract is not None
+    if set(diagnostics_by_resource) != set(contract.resources):
+        raise RuntimeError(
+            "provider_directory_current_version_census_diagnostics_incomplete"
+        )
+    count_by_resource: dict[str, int] = {}
+    for resource_type in contract.resources:
+        diagnostic_by_field = diagnostics_by_resource[resource_type]
+        proof_by_field = diagnostic_by_field.get(
+            "current_version_census_completeness"
+        )
+        if (
+            diagnostic_by_field.get("fetch_mode")
+            != CURRENT_VERSION_CENSUS_FETCH_MODE
+            or not isinstance(proof_by_field, dict)
+        ):
+            raise RuntimeError(
+                "provider_directory_current_version_census_proof_incomplete"
+            )
+        try:
+            validated_proof_by_field = (
+                validated_current_version_census_completed_proof(
+                    proof_by_field,
+                    contract,
+                    resource_type,
+                    rows_processed=diagnostic_by_field.get("rows_fetched"),
+                    pages_processed=diagnostic_by_field.get("pages_fetched"),
+                )
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "provider_directory_current_version_census_proof_incomplete"
+            ) from exc
+        count_by_resource[resource_type] = validated_proof_by_field[
+            "pre_count"
+        ]
+    validated_current_version_census_count_map(contract, count_by_resource)
+
+
+async def _validate_and_finalize_import_candidate(
+    candidate: EndpointDatasetCandidate | None,
+    source_records: list[dict[str, Any]],
+    diagnostics_by_resource: dict[str, dict[str, Any]],
+    cancellation: _ResourceImportCancellation,
+) -> None:
+    """Validate an exact census before finalizing its retained candidate."""
+
+    await cancellation.check()
+    _validate_current_version_census_diagnostics(
+        source_records,
+        diagnostics_by_resource,
+    )
+    await cancellation.check()
+    await _finalize_candidate_and_clear_checkpoints(
+        candidate,
+        diagnostics_by_resource,
+    )
 
 
 def _published_endpoint_dataset_import_summary(
@@ -58701,6 +59786,10 @@ async def _import_resources(
             )
     count_by_resource: dict[str, int] = {resource: 0 for resource in resources}
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
+    resource_import_cancellation = _ResourceImportCancellation(
+        cancel_ctx,
+        cancel_task,
+    )
     _validate_provider_directory_endpoint_scope(
         source_records,
         provider_directory_endpoint_scope,
@@ -59267,16 +60356,59 @@ async def _import_resources(
     )
     stale_ready_source_ids_by_resource: dict[str, set[str]] = {}
 
+    async def run_guarded_group(
+        source_records: list[dict[str, Any]],
+        prepared_source_lists: list[list[dict[str, Any]]],
+    ) -> ResourceImportGroupResult:
+        """Prepare, validate, and finalize one checkpoint-owned source group."""
+        if _is_validated_uhc_official_source_group(source_records):
+            return await import_one_group(source_records)
+        prepared_source_records, candidate = (
+            await _prepare_resource_import_source_group(
+                source_records,
+                resources,
+                run_id=run_id,
+                retry_of_run_id=retry_of_run_id,
+                pagination_root_run_id=pagination_root_run_id,
+                is_checkpointing_enabled=is_pagination_checkpointing_enabled,
+            )
+        )
+        prepared_source_lists[0] = prepared_source_records
+        if _is_finalized_endpoint_dataset_candidate(candidate):
+            assert candidate is not None
+            return await _replay_finalized_candidate_after_cancellation(
+                candidate,
+                resource_completion,
+                prepared_source_records,
+                resource_import_cancellation,
+            )
+        diagnostics_by_resource: dict[str, dict[str, Any]] = {}
+        try:
+            import_summary = await import_one_group(prepared_source_records)
+            diagnostics_by_resource = import_summary[1]
+            await _validate_and_finalize_import_candidate(
+                candidate,
+                prepared_source_records,
+                diagnostics_by_resource,
+                resource_import_cancellation,
+            )
+            return import_summary
+        except BaseException as failure:
+            await _mark_failed_endpoint_dataset_without_masking(
+                candidate,
+                diagnostics_by_resource,
+                failure,
+            )
+            raise
+
     async def run_with_limit(source_records: list[dict[str, Any]]) -> ResourceImportGroupResult:
         """Run one import coroutine under the shared concurrency limit."""
         async with semaphore:
-            prepared_source_records = source_records
+            prepared_source_lists = [source_records]
             async with _provider_directory_import_progress_scope(
                 lambda: (completed_groups / max(total_groups, 1)) * 100,
-                lambda: clear_partial_progress(id(prepared_source_records)),
+                lambda: clear_partial_progress(id(prepared_source_lists[0])),
             ):
-                candidate: EndpointDatasetCandidate | None = None
-                diagnostics_by_resource: dict[str, dict[str, Any]] = {}
                 checkpoint_guard_context = (
                     _resource_group_pagination_checkpoint_context(
                         source_records,
@@ -59289,41 +60421,10 @@ async def _import_resources(
                 async with _pagination_checkpoint_worker_guard(
                     checkpoint_guard_context
                 ):
-                    if _is_validated_uhc_official_source_group(source_records):
-                        return await import_one_group(source_records)
-                    prepared_source_records, candidate = (
-                        await _prepare_resource_import_source_group(
-                            source_records,
-                            resources,
-                            run_id=run_id,
-                            retry_of_run_id=retry_of_run_id,
-                            pagination_root_run_id=pagination_root_run_id,
-                            is_checkpointing_enabled=is_pagination_checkpointing_enabled,
-                        )
+                    return await run_guarded_group(
+                        source_records,
+                        prepared_source_lists,
                     )
-                    if _is_finalized_endpoint_dataset_candidate(candidate):
-                        assert candidate is not None
-                        return await _replay_finalized_candidate_and_clear_checkpoints(
-                            candidate,
-                            resource_completion,
-                        )
-                    try:
-                        import_summary = await import_one_group(
-                            prepared_source_records
-                        )
-                        diagnostics_by_resource = import_summary[1]
-                        await _finalize_candidate_and_clear_checkpoints(
-                            candidate,
-                            diagnostics_by_resource,
-                        )
-                        return import_summary
-                    except BaseException as failure:
-                        await _mark_failed_endpoint_dataset_without_masking(
-                            candidate,
-                            diagnostics_by_resource,
-                            failure,
-                        )
-                        raise
 
     async def run_isolated_group(
         source_records: list[dict[str, Any]],
@@ -59437,7 +60538,14 @@ async def _import_resources_with_source_http_session(
     **import_options: Any,
 ) -> dict[str, int]:
     """Run one resource import inside its optional anonymous HTTP session."""
-    async with _source_http_session_scope():
+    force_session = any(
+        current_version_census_contract(source_record) is not None
+        for source_record in source_records
+    )
+    async with _source_http_session_scope(
+        force=force_session,
+        require_verified_tls=force_session,
+    ):
         return await _import_resources(source_records, **import_options)
 
 
@@ -60733,10 +61841,7 @@ async def process_provider_directory_fhir_data(
         task,
         allowed_resources=DEFAULT_RESOURCES,
     )
-    if census_request is not None:
-        raise RuntimeError(
-            "provider_directory_current_version_census_not_activated"
-        )
+    reviewed_census_seed_rows: list[dict[str, Any]] = []
     context = ctx.get("context")
     context_test_mode = bool(
         isinstance(context, dict) and context.get("test_mode")
@@ -60749,15 +61854,9 @@ async def process_provider_directory_fhir_data(
             or context_test_mode
         ),
     )
-    await _raise_if_resource_import_cancelled(ctx, task)
     ctx.setdefault("context", {})
     test_mode = bool(task.get("test") or task.get("test_mode") or ctx["context"].get("test_mode"))
     ctx["context"]["test_mode"] = test_mode
-
-    await ensure_database(test_mode)
-    if not ctx["context"].get("provider_directory_tables_ready"):
-        await _ensure_provider_directory_tables()
-        ctx["context"]["provider_directory_tables_ready"] = True
 
     task_run_id = _clean_text(task.get("run_id"))
     control_run_id = _clean_text(ctx.get("control_run_id"))
@@ -60776,20 +61875,21 @@ async def process_provider_directory_fhir_data(
     )
     endpoint_scope_input = _clean_text(task.get("provider_directory_endpoint_scope"))
     provider_directory_endpoint_scope = endpoint_scope_input.rstrip("/") if endpoint_scope_input else None
-    requested_source_ids = _clean_source_id_list(
-        task.get("source_ids")
-        or task.get("source_id")
-        or task.get("provider_directory_source_ids")
-        or task.get("provider_directory_source_id")
+    requested_source_ids = (
+        [census_request.source_id]
+        if census_request is not None
+        else _clean_source_id_list(
+            task.get("source_ids")
+            or task.get("source_id")
+            or task.get("provider_directory_source_ids")
+            or task.get("provider_directory_source_id")
+        )
     )
     dataset_followup_only = bool(task.get("dataset_followup_only", False))
+    dataset_rehydrate_only = bool(task.get("dataset_rehydrate_only"))
     if dataset_followup_only and bool(task.get("dataset_rehydrate_only")):
         raise ValueError(
             "provider_directory_dataset_followup_replay_scope_invalid"
-        )
-    if bool(task.get("dataset_rehydrate_only")):
-        return await _run_provider_directory_dataset_rehydrate(
-            ctx, task, run_id, requested_source_ids
         )
     limit = int(task.get("limit") or 0) or None
     source_query = _clean_text(task.get("source_query"))
@@ -60824,8 +61924,41 @@ async def process_provider_directory_fhir_data(
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
     include_supplemental_catalogs = _is_bool_or_default(task.get("include_supplemental_catalogs"), False)
+    seed_db_path = _clean_text(task.get("seed_db_path"))
+    retest_results_path = _clean_text(task.get("retest_results_path"))
+    remote_catalog_input_fields = tuple(
+        field_name
+        for field_name in (
+            "seed_db_url",
+            "retest_results_url",
+            "amerihealth_caritas_catalog_url",
+            "contra_costa_catalog_url",
+            "cms_sma_endpoint_directory_url",
+        )
+        if _clean_text(task.get(field_name))
+    )
+    local_alternate_catalog_input_fields = tuple(
+        field_name
+        for field_name in (
+            "seed_db_path",
+            "amerihealth_caritas_catalog_path",
+            "contra_costa_catalog_path",
+            "cms_sma_endpoint_directory_path",
+        )
+        if _clean_text(task.get(field_name))
+    )
+    if (
+        retest_results_path is None
+        and os.getenv("HLTHPRT_PROVIDER_DIRECTORY_RETEST_RESULTS_URL")
+    ):
+        remote_catalog_input_fields += ("retest_results_environment_url",)
     credential_config_file = _clean_text(task.get("credential_config_file"))
     _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.set(credential_config_file)
+    has_credential_configuration = bool(
+        credential_config_file
+        or _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV))
+        or _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV))
+    )
     full_refresh = bool(task.get("full_refresh", False))
     default_resource_limit = 1 if test_mode else (0 if full_refresh else 25)
     default_page_limit = 1 if test_mode else (0 if full_refresh else 3)
@@ -60874,7 +62007,11 @@ async def process_provider_directory_fhir_data(
         stale_cleanup_raw,
         not test_mode and import_resources,
     )
-    resources = _selected_resources(task.get("resources"))
+    resources = (
+        list(census_request.resources)
+        if census_request is not None
+        else _selected_resources(task.get("resources"))
+    )
     should_publish_artifacts = _is_bool_or_default(
         task.get("publish_artifacts"),
         import_resources and set(resources) == set(DEFAULT_RESOURCES),
@@ -60900,6 +62037,73 @@ async def process_provider_directory_fhir_data(
     if should_defer_typed_materialization and publish_after_acquisition:
         raise ValueError(
             "provider_directory_deferred_typed_materialization_incompatible_mode"
+        )
+    if census_request is not None:
+        validate_current_version_census_runtime(
+            census_request,
+            CurrentVersionCensusRuntime(
+                checkpointing_enabled=is_pagination_checkpointing_enabled,
+                full_refresh=full_refresh,
+                resource_limit=resource_limit,
+                page_limit=page_limit,
+                stream_batch_size=stream_batch_size,
+                source_concurrency=source_concurrency,
+                resource_scan_concurrency=resource_scan_concurrency,
+                linked_resource_limit=linked_resource_limit,
+                linked_resource_deadline_seconds=(
+                    linked_resource_deadline_seconds
+                ),
+                resource_deadline_seconds=resource_deadline_seconds,
+                probe=probe,
+                seed_only=seed_only,
+                test_mode=test_mode,
+                dataset_rehydrate_only=dataset_rehydrate_only,
+                dataset_followup_only=dataset_followup_only,
+                canonical_backfill_only=canonical_backfill_only,
+                contact_backfill_only=contact_backfill_only,
+                publish_artifacts_only=publish_artifacts_only,
+                local_seed_catalog=True,
+                local_retest_catalog=retest_results_path is not None,
+                supplemental_catalogs=include_supplemental_catalogs,
+                local_supplemental_catalog_inputs=(
+                    local_alternate_catalog_input_fields
+                ),
+                remote_catalog_inputs=remote_catalog_input_fields,
+                bulk_export=use_bulk_export,
+                stale_cleanup=should_cleanup_stale_rows,
+                publication_requested=bool(
+                    should_publish_artifacts
+                    or publish_after_acquisition
+                    or should_publish_corroboration
+                ),
+                defer_typed_materialization=(
+                    should_defer_typed_materialization
+                ),
+                bounded_source_selection=bool(limit or source_query),
+                endpoint_scope_configured=(
+                    provider_directory_endpoint_scope is not None
+                ),
+                credential_configured=has_credential_configuration,
+                open_only=open_only,
+                include_auth_required=include_auth_required,
+            ),
+        )
+        _validate_current_version_census_lineage(
+            run_id,
+            retry_of_run_id,
+            pagination_root_run_id,
+        )
+        reviewed_census_seed_rows = reviewed_manual_census_seed_rows(
+            census_request.source_id
+        )
+    await _raise_if_resource_import_cancelled(ctx, task)
+    await ensure_database(test_mode)
+    if not ctx["context"].get("provider_directory_tables_ready"):
+        await _ensure_provider_directory_tables()
+        ctx["context"]["provider_directory_tables_ready"] = True
+    if dataset_rehydrate_only:
+        return await _run_provider_directory_dataset_rehydrate(
+            ctx, task, run_id, requested_source_ids
         )
     seen_stage_table_for_publish = (
         _import_seen_stage_table_name(run_id)
@@ -61005,6 +62209,7 @@ async def process_provider_directory_fhir_data(
     seed_rows: list[dict[str, Any]]
     tmpdir = None
     retest_tmpdir = None
+    retest_path = None
     supplemental_retest_seed_rows: list[dict[str, Any]] = []
     supplemental_catalog_seed_rows: list[dict[str, Any]] = []
     supplemental_catalog_metric_by_name: dict[str, Any] = {
@@ -61022,7 +62227,9 @@ async def process_provider_directory_fhir_data(
         total=1,
         message="resolving Provider Directory source catalog",
     )
-    if test_mode and not task.get("seed_db_path") and not task.get("seed_db_url"):
+    if census_request is not None:
+        seed_rows = reviewed_census_seed_rows
+    elif test_mode and not task.get("seed_db_path") and not task.get("seed_db_url"):
         seed_rows = [
             {
                 "id": "test-cigna",
@@ -61036,7 +62243,10 @@ async def process_provider_directory_fhir_data(
             }
         ][: limit or 1]
     else:
-        seed_path, tmpdir = _resolve_seed_db(_clean_text(task.get("seed_db_path")), _clean_text(task.get("seed_db_url")))
+        seed_path, tmpdir = _resolve_seed_db(
+            seed_db_path,
+            _clean_text(task.get("seed_db_url")),
+        )
         if seed_path is None:
             raise RuntimeError("Provider Directory seed database could not be resolved.")
         seed_rows = _seed_rows_from_sqlite(
@@ -61044,41 +62254,56 @@ async def process_provider_directory_fhir_data(
             limit=None if (task.get("retest_results_path") or task.get("retest_results_url")) else limit,
             source_query=source_query,
         )
-    retest_path, retest_tmpdir = _resolve_retest_results(
-        _clean_text(task.get("retest_results_path")),
-        _clean_text(task.get("retest_results_url")),
-    )
-    if retest_path is not None:
-        supplemental_retest_seed_rows = _seed_rows_from_retest_results(retest_path, source_query=source_query)
-        seed_rows.extend(supplemental_retest_seed_rows)
-    if include_supplemental_catalogs:
-        supplemental_catalog_seed_rows, supplemental_catalog_metric_by_name = _seed_rows_from_supplemental_catalogs(
-            source_query=source_query,
-            timeout=timeout,
-            amerihealth_caritas_catalog_path=_clean_text(task.get("amerihealth_caritas_catalog_path")),
-            amerihealth_caritas_catalog_url=_clean_text(task.get("amerihealth_caritas_catalog_url")),
-            contra_costa_catalog_path=_clean_text(task.get("contra_costa_catalog_path")),
-            contra_costa_catalog_url=_clean_text(task.get("contra_costa_catalog_url")),
-            cms_sma_endpoint_directory_path=_clean_text(task.get("cms_sma_endpoint_directory_path")),
-            cms_sma_endpoint_directory_url=_clean_text(task.get("cms_sma_endpoint_directory_url")),
+    if census_request is None:
+        retest_path, retest_tmpdir = _resolve_retest_results(
+            retest_results_path,
+            _clean_text(task.get("retest_results_url")),
         )
-        supplemental_catalog_metric_by_name["enabled"] = True
-        seed_rows.extend(supplemental_catalog_seed_rows)
+        if retest_path is not None:
+            supplemental_retest_seed_rows = _seed_rows_from_retest_results(
+                retest_path,
+                source_query=source_query,
+            )
+            seed_rows.extend(supplemental_retest_seed_rows)
+        if include_supplemental_catalogs:
+            (
+                supplemental_catalog_seed_rows,
+                supplemental_catalog_metric_by_name,
+            ) = _seed_rows_from_supplemental_catalogs(
+                source_query=source_query,
+                timeout=timeout,
+                amerihealth_caritas_catalog_path=_clean_text(task.get("amerihealth_caritas_catalog_path")),
+                amerihealth_caritas_catalog_url=_clean_text(task.get("amerihealth_caritas_catalog_url")),
+                contra_costa_catalog_path=_clean_text(task.get("contra_costa_catalog_path")),
+                contra_costa_catalog_url=_clean_text(task.get("contra_costa_catalog_url")),
+                cms_sma_endpoint_directory_path=_clean_text(task.get("cms_sma_endpoint_directory_path")),
+                cms_sma_endpoint_directory_url=_clean_text(task.get("cms_sma_endpoint_directory_url")),
+            )
+            supplemental_catalog_metric_by_name["enabled"] = True
+            seed_rows.extend(supplemental_catalog_seed_rows)
 
     try:
         source_rows = _dedupe_source_rows(
             [_source_row_from_seed(seed_record) for seed_record in seed_rows]
         )
-        source_rows = _add_uhc_official_file_source(
-            source_rows,
-            requested_source_ids=requested_source_ids,
-            source_query=source_query,
-            test_mode=test_mode,
-            limit=limit,
-        )
+        if census_request is None:
+            source_rows = _add_uhc_official_file_source(
+                source_rows,
+                requested_source_ids=requested_source_ids,
+                source_query=source_query,
+                test_mode=test_mode,
+                limit=limit,
+            )
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
+        census_contract = (
+            bind_current_version_census_contract(census_request, source_rows)
+            if census_request is not None
+            else None
+        )
+        for source_record in source_rows:
+            _validate_current_version_census_source_transport(source_record)
         endpoint_rows_seeded = await _upsert_provider_directory_source_rows(source_rows)
         stale_source_deletion_by_type = {}
         protected_source_ids: list[str] = []
@@ -61137,6 +62362,11 @@ async def process_provider_directory_fhir_data(
             "provider_directory_pagination_root_run_id": pagination_root_run_id,
             "provider_directory_endpoint_scope": provider_directory_endpoint_scope,
             "credential_config_file_configured": bool(credential_config_file),
+            "current_version_census_identity": (
+                census_contract.identity()
+                if census_contract is not None
+                else None
+            ),
         }
         await _mark_provider_directory_progress(
             run_id,
@@ -61155,12 +62385,16 @@ async def process_provider_directory_fhir_data(
             len(source_rows) - len(probe_source_rows)
         )
         if not seed_only and probe and probe_source_rows:
-            probed, valid, valid_source_ids = await _run_source_probe_batch(
-                probe_source_rows,
-                timeout=timeout,
-                concurrency=concurrency,
-                run_id=run_id,
-            )
+            async with _source_http_session_scope(
+                force=census_contract is not None,
+                require_verified_tls=census_contract is not None,
+            ):
+                probed, valid, valid_source_ids = await _run_source_probe_batch(
+                    probe_source_rows,
+                    timeout=timeout,
+                    concurrency=concurrency,
+                    run_id=run_id,
+                )
             metrics_by_key["sources_probed"] = probed
             metrics_by_key["valid_capability_sources"] = valid
         if not seed_only and import_resources and source_rows:
@@ -61501,7 +62735,10 @@ class _ProviderDirectoryFhirCommandOptions:
     retest_results_path: str | None = None
     retest_results_url: str | None = None
     run_id: str | None = None
+    retry_of_run_id: str | None = None
     provider_directory_pagination_root_run_id: str | None = None
+    provider_directory_acquisition_strategy: str | None = None
+    provider_directory_census_cutoff: str | None = None
     source_ids: list[str] | tuple[str, ...] | str | None = None
     limit: int | None = None
     source_query: str | None = None
@@ -61558,10 +62795,16 @@ async def run_provider_directory_fhir_command(
     }
     task_by_field = _apply_provider_directory_refresh_preset(asdict(options))
     validate_uhc_official_file_admission(task_by_field, test_mode=options.test_mode)
-    await startup(runtime_context_by_key)
-    import_result = await process_data(runtime_context_by_key, task_by_field)
-    await shutdown(runtime_context_by_key)
-    return import_result
+    census_request = current_version_census_request(
+        task_by_field,
+        allowed_resources=DEFAULT_RESOURCES,
+    )
+    if census_request is None:
+        await startup(runtime_context_by_key)
+    try:
+        return await process_data(runtime_context_by_key, task_by_field)
+    finally:
+        await shutdown(runtime_context_by_key)
 
 
 run_provider_directory_fhir_command.__annotations__ = {

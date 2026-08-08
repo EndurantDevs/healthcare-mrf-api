@@ -91,10 +91,9 @@ RESOURCE_PROFILES = {
     "NONE": [],
 }
 ACQUISITION_CLASSIFICATIONS = {"acquisition", "bulk_acquisition"}
-SUPPORTED_CLASSIFICATIONS = ACQUISITION_CLASSIFICATIONS | {
-    "probe_only",
-    "external",
-}
+MANUAL_CLASSIFICATION = "manual_acquisition"
+RESOURCE_CLASSIFICATIONS = ACQUISITION_CLASSIFICATIONS | {MANUAL_CLASSIFICATION}
+SUPPORTED_CLASSIFICATIONS = RESOURCE_CLASSIFICATIONS | {"probe_only", "external"}
 PROBE_OMITTED_KEYS = {
     "resources",
     "resource_limit",
@@ -249,8 +248,10 @@ def _validate_manifest_entry(
         raise ManifestError(
             f"{entry_id}: resources do not exactly match resource_profile"
         )
-    if classification not in ACQUISITION_CLASSIFICATIONS and entry.get("resources"):
-        raise ManifestError(f"{entry_id}: only acquisition entries may list resources")
+    if classification not in RESOURCE_CLASSIFICATIONS and entry.get("resources"):
+        raise ManifestError(
+            f"{entry_id}: only acquisition or manual entries may list resources"
+        )
     unique_values_by_kind = {
         "entry": [entry_id],
         "owner": [owner_id],
@@ -286,7 +287,7 @@ def entry_params(manifest: dict[str, Any], entry: dict[str, Any]) -> dict[str, A
     """Build exact importer parameters for one manifest entry."""
 
     classification = str(entry["classification"])
-    if classification == "external":
+    if classification in {"external", MANUAL_CLASSIFICATION}:
         return {}
     params_by_name = dict(manifest["parameter_profiles"][classification])
     params_by_name["retest_results_url"] = manifest["retest_results_url"]
@@ -381,6 +382,8 @@ def terminal_metric_errors(
             entry, operator_result_by_field,
             expected_importer=str(manifest["importer"]),
         )
+    elif classification == MANUAL_CLASSIFICATION:
+        errors = ["manual acquisition requires dedicated current-version census proof"]
     else:
         errors = _result_param_errors(manifest, entry, operator_result_by_field)
     metrics = operator_result_by_field.get("metrics")

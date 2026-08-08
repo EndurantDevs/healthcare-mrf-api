@@ -24,6 +24,9 @@ from process.provider_directory_profile_selection import (
     ProviderDirectoryProfileSelectionError,
     validated_profile_execution,
 )
+from process.provider_directory_fhir_census_contract import (
+    ProviderDirectoryFHIRAcquisitionStrategy,
+)
 from process.provider_directory_refresh_preset import (
     apply_provider_directory_refresh_preset,
 )
@@ -290,6 +293,19 @@ _EPHEMERAL_PARAM_NAMES_BY_IMPORTER = {
         }
     ),
 }
+_PROVIDER_DIRECTORY_CURRENT_VERSION_CENSUS_STRATEGY = (
+    ProviderDirectoryFHIRAcquisitionStrategy.CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS.value
+)
+_CONTROL_HIDDEN_PARAM_NAMES_BY_IMPORTER = {
+    "provider-directory-fhir": frozenset(
+        {
+            "provider_directory_acquisition_strategy",
+            "provider_directory_census_cutoff",
+            "provider_directory_pagination_root_run_id",
+            "retry_of_run_id",
+        }
+    ),
+}
 
 _CANCELABLE_IMPORTERS = {
     "ptg",
@@ -350,6 +366,23 @@ def _param_schema(command: click.Command) -> list[dict[str, Any]]:
     return parameter_schema_list
 
 
+def _control_param_schema(
+    importer: str,
+    command: click.Command,
+) -> list[dict[str, Any]]:
+    """Hide CLI-only controls from the authenticated import API catalog."""
+
+    hidden_names = _CONTROL_HIDDEN_PARAM_NAMES_BY_IMPORTER.get(
+        importer,
+        frozenset(),
+    )
+    return [
+        parameter
+        for parameter in _param_schema(command)
+        if parameter["name"] not in hidden_names
+    ]
+
+
 def _json_safe_default(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -381,7 +414,7 @@ def importer_registry() -> list[dict[str, Any]]:
                 "enqueue_adapter": "arq_single_job" if name in _SINGLE_JOB_ADAPTERS else "pending",
                 "queue": _SINGLE_JOB_ADAPTERS.get(name, {}).get("queue"),
                 "depends_on": list(_IMPORTER_DEPENDENCIES.get(name, [])),
-                "params_schema": _param_schema(command),
+                "params_schema": _control_param_schema(name, command),
             }
         )
     return importers
@@ -1502,6 +1535,8 @@ def _provider_directory_operation(
     params: dict[str, Any],
     metrics: dict[str, Any] | None = None,
 ) -> tuple[str, frozenset[str], str | None]:
+    if _is_current_version_census_control(params):
+        return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
     if any(
         field_name in params
         for field_name in (
@@ -1532,6 +1567,40 @@ def _provider_directory_operation(
     if seed_source_ids is not None:
         return _PROVIDER_DIRECTORY_SCOPED_SEED, seed_source_ids, None
     return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
+
+
+def _is_current_version_census_control(
+    params: dict[str, Any],
+) -> bool:
+    raw_strategy = params.get("provider_directory_acquisition_strategy")
+    return bool(
+        raw_strategy
+        is ProviderDirectoryFHIRAcquisitionStrategy.CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS
+        or (
+            isinstance(raw_strategy, str)
+            and raw_strategy.strip()
+            == _PROVIDER_DIRECTORY_CURRENT_VERSION_CENSUS_STRATEGY
+        )
+    )
+
+
+def _reject_control_current_version_census(
+    importer: str,
+    params: dict[str, Any],
+) -> None:
+    """Keep the current-version census on its reviewed CLI path."""
+
+    raw_cutoff = params.get("provider_directory_census_cutoff")
+    if (
+        importer == "provider-directory-fhir"
+        and (
+            _is_current_version_census_control(params)
+            or raw_cutoff not in (None, "")
+        )
+    ):
+        raise ValueError(
+            "provider_directory_current_version_census_control_api_disabled"
+        )
 
 
 def _classified_provider_directory_runs(
@@ -1883,6 +1952,10 @@ async def create_import_run(
         apply_provider_directory_refresh_preset(raw_params_by_name)
         if importer == "provider-directory-fhir"
         else raw_params_by_name
+    )
+    _reject_control_current_version_census(
+        importer,
+        effective_params_by_name,
     )
     _assert_ptg_rebuild_request_params(
         importer,
