@@ -37,8 +37,10 @@ def test_reviewed_manual_source_manifest_contract():
         "verification_campaign_id",
         "start_urls",
     }
-    assert manual_contract["contract_version"] == 1
-    assert manual_contract["continuation_strategy"] == "smile-opaque-getpages-v1"
+    assert manual_contract["contract_version"] == 2
+    assert manual_contract["continuation_strategy"] == (
+        "smile-opaque-logical-offset-v2"
+    )
     assert manual_contract["expected_nonempty_resources"] == manual_entry["resources"]
     assert manual_contract["page_count"] == 250
     assert set(manual_contract["start_urls"]) == set(manual_entry["resources"])

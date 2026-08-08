@@ -95,6 +95,7 @@ def _complete_diagnostic(source_record, resource_type, count):
         contract,
         resource_type,
         count,
+        expected_page_count=250,
     )
     return {
         "fetch_mode": CURRENT_VERSION_CENSUS_FETCH_MODE,
@@ -104,6 +105,9 @@ def _complete_diagnostic(source_record, resource_type, count):
                 post_count=count,
                 processed_rows=count,
                 unique_candidate_rows=count,
+                pages_processed=1,
+                expected_page_count=250,
+                terminal_page_entry_count=count,
             )
         ),
     }
@@ -184,6 +188,7 @@ def test_strict_next_url_keeps_raw_cursor_and_canonicalizes_replay_identity():
         raw_next_url,
         resource_type="Organization",
         page_entry_count=250,
+        pre_total=500,
     ) == raw_next_url
     assert importer._pagination_url_identity(raw_next_url) == (
         importer._pagination_url_identity(
@@ -313,15 +318,42 @@ async def test_command_census_preflight_runs_before_startup(monkeypatch):
     assert event_names == []
 
 
-def _install_exact_census_fetch_harness(monkeypatch, start_url):
-    event_names = []
-    fetch_mock = AsyncMock(
-        side_effect=(
-            (200, {"resourceType": "Bundle", "type": "searchset", "total": 1}, None, 1),
+def _exact_census_fetch_mock(event_names):
+    """Return a three-step fetch mock that records the post-count boundary."""
+
+    fetch_responses = iter(
+        (
+            (
+                200,
+                {"resourceType": "Bundle", "type": "searchset", "total": 1},
+                None,
+                1,
+            ),
             (200, _organization_bundle(), None, 2),
-            (200, {"resourceType": "Bundle", "type": "searchset", "total": 1}, None, 1),
+            (
+                200,
+                {"resourceType": "Bundle", "type": "searchset", "total": 1},
+                None,
+                1,
+            ),
         )
     )
+
+    async def fetch_page(*_args, **_kwargs):
+        response = next(fetch_responses)
+        if len(fetch_mock.await_args_list) == 3:
+            event_names.append("post-count")
+        return response
+
+    fetch_mock = AsyncMock(side_effect=fetch_page)
+    return fetch_mock
+
+
+def _install_exact_census_fetch_harness(monkeypatch, start_url):
+    """Install one successful terminal exact-census lifecycle harness."""
+
+    event_names = []
+    fetch_mock = _exact_census_fetch_mock(event_names)
 
     async def save_completeness(*_args, **_kwargs):
         event_names.append("proof")
@@ -412,7 +444,7 @@ async def test_exact_census_persists_page_before_verified_terminal_checkpoint(
     assert fetch_result.fetch_diagnostic["verified"] is True
     assert fetch_result.fetch_diagnostic["pre_count"] == 1
     assert fetch_result.fetch_diagnostic["post_count"] == 1
-    assert event_names == ["proof", "rows", "proof", "terminal"]
+    assert event_names == ["proof", "post-count", "rows", "terminal"]
     requested_urls = [call.args[1] for call in fetch_mock.await_args_list]
     assert "_summary=count" in requested_urls[0]
     assert requested_urls[1] == start_url

@@ -21,6 +21,7 @@ from process.provider_directory_fhir_census_contract import (
 )
 from process.provider_directory_fhir_census_execution import (
     CURRENT_VERSION_CENSUS_FETCH_MODE,
+    current_version_census_checkpoint_proof,
     current_version_census_initial_proof,
 )
 
@@ -222,15 +223,25 @@ async def test_unparsed_entry_blocks_page_before_any_row_or_verified_proof(
 
 @pytest.mark.asyncio
 async def test_hostile_identity_bound_resume_is_rejected_before_io(monkeypatch):
+    resume_proof = current_version_census_checkpoint_proof(
+        current_version_census_initial_proof(
+            _contract(),
+            "Organization",
+            500,
+            expected_page_count=250,
+        ),
+        pages_processed=1,
+        rows_processed=1,
+        page_entry_count=1,
+        expected_page_count=250,
+    )
     resume_state = importer.PaginationResumeState(
-        next_url=_cursor_url(1, origin="https://untrusted.example.test/fhir"),
+        next_url=_cursor_url(250, origin="https://untrusted.example.test/fhir"),
         pages_processed=1,
         rows_processed=1,
         recent_url_hashes=(),
         resumed=True,
-        completeness=current_version_census_initial_proof(
-            _contract(), "Organization", 2
-        ),
+        completeness=resume_proof,
     )
     spies = _install_acquisition_spies(monkeypatch, resume_state, ())
 
@@ -252,7 +263,12 @@ async def test_truncated_complete_checkpoint_never_fetches_or_terminalizes(
     monkeypatch,
 ):
     forged_proof_by_field = {
-        **current_version_census_initial_proof(_contract(), "Organization", 1),
+        **current_version_census_initial_proof(
+            _contract(),
+            "Organization",
+            1,
+            expected_page_count=250,
+        ),
         "verified": True,
     }
     resume_state = importer.PaginationResumeState(
@@ -280,29 +296,6 @@ async def test_truncated_complete_checkpoint_never_fetches_or_terminalizes(
 
 
 @pytest.mark.asyncio
-async def test_empty_page_with_continuation_stops_before_next_transport(
-    monkeypatch,
-):
-    spies = _install_acquisition_spies(
-        monkeypatch,
-        _pristine_resume(),
-        (
-            (200, _count_bundle(0), None, 1),
-            (200, _resource_bundle((), next_url=_cursor_url(0)), None, 1),
-        ),
-    )
-
-    acquisition = await _run_acquisition(spies)
-
-    assert acquisition is not None
-    assert "untrusted_current_version_census_pagination_link" in acquisition.error
-    assert spies.fetch.await_count == 2
-    spies.row_write.assert_not_awaited()
-    spies.checkpoint_write.assert_not_awaited()
-    assert spies.proof_write.await_count == 1
-
-
-@pytest.mark.asyncio
 async def test_rows_over_precount_stop_before_next_page_or_postcount(monkeypatch):
     spies = _install_acquisition_spies(
         monkeypatch,
@@ -311,7 +304,7 @@ async def test_rows_over_precount_stop_before_next_page_or_postcount(monkeypatch
             (200, _count_bundle(1), None, 1),
             (
                 200,
-                _resource_bundle(("org-1", "org-2"), next_url=_cursor_url(2)),
+                _resource_bundle(("org-1", "org-2")),
                 None,
                 1,
             ),
@@ -446,7 +439,12 @@ async def test_finalized_replay_validates_exact_proof_before_checkpoint_cleanup(
     monkeypatch,
 ):
     forged_proof_by_field = {
-        **current_version_census_initial_proof(_contract(), "Organization", 1),
+        **current_version_census_initial_proof(
+            _contract(),
+            "Organization",
+            1,
+            expected_page_count=250,
+        ),
         "verified": True,
     }
     replay_summary = (

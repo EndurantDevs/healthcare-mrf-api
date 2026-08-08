@@ -149,6 +149,14 @@ credential-free start URLs, opaque-continuation strategy, expected non-empty
 collections, and page count. The operator supplies the exclusive
 `_lastUpdated` cutoff at launch; a cutoff is never persisted in the manifest.
 
+Continuation contract v2 treats `_getpagesoffset` as a logical window offset:
+each accepted next link advances by the reviewed page count even when the
+returned page is sparse or empty. The checkpoint records logical geometry,
+sparse and empty page counts, and terminal unreturned-row measurement. These
+measurements do not relax completeness: pre-count, post-count, processed rows,
+and unique candidate rows must still be equal. A positive unreturned count is
+failed, remains non-publishable, and cannot satisfy twin-root verification.
+
 Resolve the single reviewed manual entry from the manifest and freeze one
 timezone-aware cutoff for the acquisition pair:
 

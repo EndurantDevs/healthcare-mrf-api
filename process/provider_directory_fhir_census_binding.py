@@ -236,7 +236,7 @@ class CurrentVersionCensusContract:
         """Return source, strategy, cutoff, resources, and reviewed URL hashes."""
 
         return {
-            "contract_version": 1,
+            "contract_version": 2,
             "semantics": CURRENT_VERSION_CENSUS_SEMANTICS,
             "source_id": self.source_id,
             "strategy": self.strategy_version,

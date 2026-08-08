@@ -570,13 +570,13 @@
       "resource_profile": "A7",
       "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"],
       "manual_current_version_census": {
-        "contract_version": 1,
+        "contract_version": 2,
         "plan_name": "Kaiser Permanente Provider Directory",
         "seed_source": "healthporta-reviewed-provider-directory-candidate",
-        "continuation_strategy": "smile-opaque-getpages-v1",
+        "continuation_strategy": "smile-opaque-logical-offset-v2",
         "expected_nonempty_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"],
         "page_count": 250,
-        "verification_campaign_id": "provider-directory-manual-census-2026-08-06-v1",
+        "verification_campaign_id": "provider-directory-manual-census-2026-08-08-v2",
         "start_urls": {
           "InsurancePlan": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/InsurancePlan",
           "PractitionerRole": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/PractitionerRole",

@@ -107,11 +107,14 @@ from process.provider_directory_fhir_census_execution import (
     CURRENT_VERSION_CENSUS_BLOCKED_ERROR,
     CURRENT_VERSION_CENSUS_FETCH_MODE,
     CURRENT_VERSION_CENSUS_RETRYABLE_ERROR,
+    current_version_census_checkpoint_proof,
     current_version_census_completed_proof,
     current_version_census_initial_proof,
     current_version_census_persisted_pre_count,
+    current_version_census_terminal_attempt_proof,
     resolved_current_version_census_next_url,
     validated_current_version_census_completed_proof,
+    validate_census_page_entries,
     validated_current_version_census_resume_url,
     validated_current_version_census_total,
 )
@@ -2018,6 +2021,20 @@ class CurrentVersionCensusOutcome:
     error: str | None = None
     retryable: bool = False
     retry_not_before: str | None = None
+
+
+@dataclass(frozen=True)
+class CurrentVersionCensusTerminalState:
+    """Terminal page coordinates and proof awaiting a post-count."""
+
+    start_url: str
+    proof_by_field: dict[str, Any]
+    timeout_seconds: int
+    rows_processed: int
+    pages_processed: int
+    expected_page_count: int
+    terminal_page_entry_count: int
+    recent_url_hashes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -38732,13 +38749,14 @@ def _resolved_current_version_census_page_url(
     next_link: str,
     resource_type: str | None,
     page_entry_count: int | None,
+    pre_total: int | None,
 ) -> str | None:
     """Resolve one exact-census continuation or report no bound contract."""
 
     census_contract = current_version_census_contract(source_record)
     if census_contract is None:
         return None
-    if resource_type is None or page_entry_count is None:
+    if resource_type is None or page_entry_count is None or pre_total is None:
         raise ValueError(
             "provider_directory_current_version_census_page_state_required"
         )
@@ -38750,6 +38768,7 @@ def _resolved_current_version_census_page_url(
         next_link,
         page_entry_count=page_entry_count,
         expected_page_count=page_count,
+        pre_total=pre_total,
     ).url
 
 
@@ -38760,6 +38779,7 @@ def _resolved_fhir_next_url(
     *,
     resource_type: str | None = None,
     page_entry_count: int | None = None,
+    pre_total: int | None = None,
 ) -> str | None:
     """Resolve a source-specific continuation without widening trust."""
 
@@ -38771,6 +38791,7 @@ def _resolved_fhir_next_url(
         next_link,
         resource_type,
         page_entry_count,
+        pre_total,
     )
     if census_page_url is not None:
         return census_page_url
@@ -48173,6 +48194,87 @@ def _current_version_census_pre_count_error(
     )
 
 
+async def _current_version_census_candidate_parity_error(
+    model: type,
+    checkpoint_context: PaginationCheckpointContext,
+    resource_type: str,
+    resume_state: PaginationResumeState,
+    resume_proof: dict[str, Any] | None,
+    cancellation: _ResourceImportCancellation,
+) -> ResourceFetchResult | None:
+    """Block a persisted attempt whose candidate is ahead of its cursor."""
+
+    has_persisted_attempt = bool(
+        resume_state.resumed
+        or resume_state.complete
+        or resume_state.pages_processed
+        or resume_state.rows_processed
+        or resume_state.completeness
+    )
+    if not has_persisted_attempt:
+        return None
+    await cancellation.check()
+    candidate_row_count = await _caresource_unique_candidate_count(
+        checkpoint_context,
+        resource_type,
+    )
+    await cancellation.check()
+    if candidate_row_count == resume_state.rows_processed:
+        return None
+    return _current_version_census_error_result(
+        model,
+        resume_proof or dict(resume_state.completeness),
+        "provider_directory_current_version_census_"
+        "candidate_checkpoint_mismatch",
+        rows_processed=resume_state.rows_processed,
+        pages_processed=resume_state.pages_processed,
+        retryable=False,
+    )
+
+
+async def _create_current_version_pre_count_proof(
+    source_record: dict[str, Any],
+    resource_type: str,
+    model: type,
+    checkpoint_context: PaginationCheckpointContext,
+    resume_state: PaginationResumeState,
+    start_url: str,
+    timeout: int,
+    cancellation: _ResourceImportCancellation,
+) -> dict[str, Any] | ResourceFetchResult:
+    """Fetch and persist the first proof for a pristine exact-census root."""
+
+    contract = current_version_census_contract(source_record)
+    assert contract is not None
+    await cancellation.check()
+    census_fetch = await _fetch_current_version_census_count(
+        source_record,
+        start_url,
+        timeout=timeout,
+    )
+    await cancellation.check()
+    if census_fetch.count is None:
+        return _current_version_census_pre_count_error(
+            model,
+            resume_state,
+            contract,
+            census_fetch,
+        )
+    proof_by_field = current_version_census_initial_proof(
+        contract,
+        resource_type,
+        census_fetch.count,
+        expected_page_count=_current_version_census_page_count(start_url),
+    )
+    await cancellation.check()
+    await _save_pagination_checkpoint_completeness(
+        checkpoint_context,
+        resource_type,
+        proof_by_field,
+    )
+    return proof_by_field
+
+
 async def _prepare_current_version_pre_census(
     source_record: dict[str, Any],
     resource_type: str,
@@ -48196,86 +48298,135 @@ async def _prepare_current_version_pre_census(
         )
     except ValueError as exc:
         return _current_version_census_resume_error(model, resume_state, exc)
+    parity_error = await _current_version_census_candidate_parity_error(
+        model,
+        checkpoint_context,
+        resource_type,
+        resume_state,
+        resume_proof,
+        cancellation,
+    )
+    if parity_error is not None:
+        return parity_error
     if resume_proof is not None:
         return resume_proof
-    await cancellation.check()
-    census_fetch = await _fetch_current_version_census_count(
+    return await _create_current_version_pre_count_proof(
         source_record,
-        start_url,
-        timeout=timeout,
-    )
-    await cancellation.check()
-    if census_fetch.count is None:
-        return _current_version_census_pre_count_error(
-            model,
-            resume_state,
-            contract,
-            census_fetch,
-        )
-    proof_by_field = current_version_census_initial_proof(
-        contract,
         resource_type,
-        census_fetch.count,
+        model,
+        checkpoint_context,
+        resume_state,
+        start_url,
+        timeout,
+        cancellation,
     )
-    await cancellation.check()
+
+
+async def _persist_current_version_post_count_failure(
+    checkpoint_context: PaginationCheckpointContext,
+    resource_type: str,
+    terminal_state: CurrentVersionCensusTerminalState,
+    post_census: CurrentVersionCensusFetch,
+) -> CurrentVersionCensusOutcome:
+    """Persist a retryable terminal observation without moving its cursor."""
+
+    failed_proof_by_field = current_version_census_terminal_attempt_proof(
+        terminal_state.proof_by_field,
+        pages_processed=terminal_state.pages_processed,
+        processed_rows=terminal_state.rows_processed,
+        expected_page_count=terminal_state.expected_page_count,
+        terminal_page_entry_count=terminal_state.terminal_page_entry_count,
+    )
     await _save_pagination_checkpoint_completeness(
         checkpoint_context,
         resource_type,
-        proof_by_field,
+        failed_proof_by_field,
     )
-    return proof_by_field
+    return CurrentVersionCensusOutcome(
+        proof=failed_proof_by_field,
+        error=f"post_census_{post_census.error or 'failed'}",
+        retryable=post_census.transient,
+        retry_not_before=post_census.retry_not_before,
+    )
+
+
+async def _persist_current_version_terminal_success(
+    checkpoint_context: PaginationCheckpointContext,
+    resource_type: str,
+    terminal_state: CurrentVersionCensusTerminalState,
+    post_count: int,
+    cancellation: _ResourceImportCancellation,
+    persist_terminal_rows: Callable[[], Awaitable[None]],
+) -> dict[str, Any]:
+    """Atomically persist a terminal page and its resulting proof boundary."""
+
+    async with db.transaction():
+        await persist_terminal_rows()
+        await cancellation.check()
+        unique_candidate_rows = await _caresource_unique_candidate_count(
+            checkpoint_context,
+            resource_type,
+        )
+        completed_proof_by_field = current_version_census_completed_proof(
+            terminal_state.proof_by_field,
+            post_count=post_count,
+            processed_rows=terminal_state.rows_processed,
+            unique_candidate_rows=unique_candidate_rows,
+            pages_processed=terminal_state.pages_processed,
+            expected_page_count=terminal_state.expected_page_count,
+            terminal_page_entry_count=terminal_state.terminal_page_entry_count,
+        )
+        await cancellation.check()
+        if completed_proof_by_field.get("verified") is True:
+            await _save_pagination_checkpoint(
+                checkpoint_context,
+                resource_type,
+                next_url=None,
+                pages_processed=terminal_state.pages_processed,
+                rows_processed=terminal_state.rows_processed,
+                recent_url_hashes=list(terminal_state.recent_url_hashes),
+                completeness=completed_proof_by_field,
+            )
+        else:
+            await _save_pagination_checkpoint_completeness(
+                checkpoint_context,
+                resource_type,
+                completed_proof_by_field,
+            )
+    return completed_proof_by_field
 
 
 async def _finish_current_version_census(
     source_record: dict[str, Any],
     resource_type: str,
     checkpoint_context: PaginationCheckpointContext,
-    start_url: str,
-    proof_by_field: dict[str, Any],
-    *,
-    timeout: int,
-    rows_processed: int,
+    terminal_state: CurrentVersionCensusTerminalState,
     cancellation: _ResourceImportCancellation,
+    persist_terminal_rows: Callable[[], Awaitable[None]],
 ) -> CurrentVersionCensusOutcome:
+    """Post-count one terminal window and retain only an exact proof."""
+
     await cancellation.check()
     post_census = await _fetch_current_version_census_count(
         source_record,
-        start_url,
-        timeout=timeout,
+        terminal_state.start_url,
+        timeout=terminal_state.timeout_seconds,
     )
     await cancellation.check()
     if post_census.count is None:
-        failed_proof_by_field = {
-            **proof_by_field,
-            "verified": False,
-            "processed_rows": rows_processed,
-        }
-        await _save_pagination_checkpoint_completeness(
+        return await _persist_current_version_post_count_failure(
             checkpoint_context,
             resource_type,
-            failed_proof_by_field,
+            terminal_state,
+            post_census,
         )
-        return CurrentVersionCensusOutcome(
-            proof=failed_proof_by_field,
-            error=f"post_census_{post_census.error or 'failed'}",
-            retryable=post_census.transient,
-            retry_not_before=post_census.retry_not_before,
-        )
-    unique_candidate_rows = await _caresource_unique_candidate_count(
+    completed_proof_by_field = await _persist_current_version_terminal_success(
         checkpoint_context,
         resource_type,
-    )
-    completed_proof_by_field = current_version_census_completed_proof(
-        proof_by_field,
-        post_count=post_census.count,
-        processed_rows=rows_processed,
-        unique_candidate_rows=unique_candidate_rows,
-    )
-    await cancellation.check()
-    await _save_pagination_checkpoint_completeness(
-        checkpoint_context,
-        resource_type,
-        completed_proof_by_field,
+        terminal_state,
+        post_census.count,
+        cancellation,
+        persist_terminal_rows,
     )
     return CurrentVersionCensusOutcome(
         proof=completed_proof_by_field,
@@ -48555,6 +48706,11 @@ async def _fetch_resource_rows(
         source_record,
         checkpoint_context,
     )
+    current_version_page_count = (
+        _current_version_census_page_count(checkpoint_start_url)
+        if is_current_version_census_enabled and checkpoint_start_url
+        else None
+    )
     resource_import_cancellation = _ResourceImportCancellation(
         cancel_ctx,
         cancel_task,
@@ -48605,11 +48761,8 @@ async def _fetch_resource_rows(
                     resume_state.next_url,
                     pages_processed=resume_state.pages_processed,
                     rows_processed=resume_state.rows_processed,
-                    expected_page_count=(
-                        _current_version_census_page_count(
-                            checkpoint_start_url
-                        )
-                    ),
+                    expected_page_count=current_version_page_count,
+                    proof=current_version_proof_by_field,
                 )
             except ValueError as exc:
                 return _current_version_census_error_result(
@@ -48698,6 +48851,7 @@ async def _fetch_resource_rows(
     error_message: str | None = None
     retry_not_before: str | None = None
     fetch_diagnostic: dict[str, Any] | None = None
+    current_version_terminal_page_entry_count: int | None = None
     pagination_cooldown_retries = 0
     pagination_cooldown_wait_seconds = 0.0
     is_pagination_cooldown_recovered = False
@@ -49085,6 +49239,36 @@ async def _fetch_resource_rows(
             if _is_uhc_partition_cap_exhausted(source_record, url, response_payload):
                 error_message = f"uhc_{resource_type.lower()}_partition_cap_exhausted"
             entries = _bundle_entries(response_payload)
+            current_version_next_link: str | None = None
+            current_version_resolved_next_url: str | None = None
+            if is_current_version_census_enabled:
+                assert current_version_page_count is not None
+                assert current_version_proof_by_field is not None
+                try:
+                    validate_census_page_entries(
+                        len(entries),
+                        current_version_page_count,
+                    )
+                    current_version_next_link = (
+                        _current_version_census_next_link(response_payload)
+                    )
+                    if current_version_next_link:
+                        current_version_resolved_next_url = (
+                            _resolved_fhir_next_url(
+                                source_record,
+                                url,
+                                current_version_next_link,
+                                resource_type=resource_type,
+                                page_entry_count=len(entries),
+                                pre_total=int(
+                                    current_version_proof_by_field["pre_count"]
+                                ),
+                            )
+                        )
+                except ValueError as exc:
+                    error_message = str(exc)
+                    has_next_url = True
+                    break
             parsed_census_entries = None
             if is_current_version_census_enabled:
                 try:
@@ -49153,7 +49337,10 @@ async def _fetch_resource_rows(
                     retained_resource_rows.append(parsed_resource_row)
                 if row_batch_handler:
                     pending_rows.append(parsed_resource_row)
-                    if len(pending_rows) >= max(1, row_batch_size):
+                    if (
+                        not is_current_version_census_enabled
+                        and len(pending_rows) >= max(1, row_batch_size)
+                    ):
                         await flush_pending_rows()
                 if not _can_limit_accept_more(rows_fetched, per_resource_limit):
                     has_reached_row_limit = entry_index < len(entries) - 1
@@ -49178,21 +49365,21 @@ async def _fetch_resource_rows(
                 )
                 has_next_url = True
                 break
-            try:
-                next_url = (
-                    _current_version_census_next_link(response_payload)
-                    if current_version_census_contract(source_record) is not None
-                    else _next_link(response_payload)
-                )
-            except ValueError as exc:
-                error_message = str(exc)
-                has_next_url = True
-                break
+            next_url = current_version_next_link
+            if not is_current_version_census_enabled:
+                try:
+                    next_url = _next_link(response_payload)
+                except ValueError as exc:
+                    error_message = str(exc)
+                    has_next_url = True
+                    break
             source_api_base = _canonical_base(
                 source_record.get("canonical_api_base") or source_record.get("api_base")
             )
             try:
-                if source_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
+                if is_current_version_census_enabled:
+                    resolved_next_url = current_version_resolved_next_url
+                elif source_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
                     resolved_next_url = _synthetic_skip_pagination_next_url(
                         source_record,
                         url,
@@ -49234,6 +49421,21 @@ async def _fetch_resource_rows(
                 is_current_version_census_enabled
                 and resolved_next_url is None
             )
+            if is_current_version_census_enabled:
+                assert current_version_proof_by_field is not None
+                assert current_version_page_count is not None
+                if resolved_next_url is not None:
+                    current_version_proof_by_field = (
+                        current_version_census_checkpoint_proof(
+                            current_version_proof_by_field,
+                            pages_processed=pages,
+                            rows_processed=rows_fetched,
+                            page_entry_count=len(entries),
+                            expected_page_count=current_version_page_count,
+                        )
+                    )
+                else:
+                    current_version_terminal_page_entry_count = len(entries)
             resolved_next_identity = (
                 _pagination_url_identity(resolved_next_url)
                 if resolved_next_url
@@ -49295,27 +49497,37 @@ async def _fetch_resource_rows(
                     and not defer_caresource_terminal_checkpoint
                     and not defer_exact_census_terminal_checkpoint
                 ):
-                    await flush_pending_rows()
                     recent_url_hashes.append(request_url_hash)
                     recent_url_hashes = recent_url_hashes[
                         -PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:
                     ]
                     checkpoint_started_at = time.monotonic()
                     try:
-                        await _save_pagination_checkpoint(
-                            checkpoint_context,
-                            resource_type,
-                            next_url=resolved_next_url,
-                            pages_processed=pages,
-                            rows_processed=rows_fetched,
-                            recent_url_hashes=recent_url_hashes,
-                            completeness=(
-                                _synthetic_position_page_guard_completeness(
-                                    synthetic_page_identity,
-                                    recent_synthetic_page_fingerprints,
-                                )
-                            ),
+                        transaction_scope = (
+                            db.transaction()
+                            if is_current_version_census_enabled
+                            else contextlib.nullcontext()
                         )
+                        async with transaction_scope:
+                            await flush_pending_rows()
+                            await _save_pagination_checkpoint(
+                                checkpoint_context,
+                                resource_type,
+                                next_url=resolved_next_url,
+                                pages_processed=pages,
+                                rows_processed=rows_fetched,
+                                recent_url_hashes=recent_url_hashes,
+                                completeness=(
+                                    current_version_proof_by_field
+                                    if is_current_version_census_enabled
+                                    else (
+                                        _synthetic_position_page_guard_completeness(
+                                            synthetic_page_identity,
+                                            recent_synthetic_page_fingerprints,
+                                        )
+                                    )
+                                ),
+                            )
                     finally:
                         checkpoint_persist_elapsed_seconds += max(
                             0.0,
@@ -49338,7 +49550,11 @@ async def _fetch_resource_rows(
             or not _can_limit_accept_more(rows_fetched, per_resource_limit)
         ):
             break
-    await flush_pending_rows()
+    if is_current_version_census_enabled:
+        if error_message:
+            pending_rows.clear()
+    else:
+        await flush_pending_rows()
     caresource_outcome: CareSourceOpaqueCursorOutcome | None = None
     current_version_outcome: CurrentVersionCensusOutcome | None = None
     has_reached_unbounded_terminal_page = (
@@ -49386,15 +49602,26 @@ async def _fetch_resource_rows(
         assert checkpoint_context is not None
         assert checkpoint_start_url is not None
         assert current_version_proof_by_field is not None
+        assert current_version_page_count is not None
+        assert current_version_terminal_page_entry_count is not None
         current_version_outcome = await _finish_current_version_census(
             source_record,
             resource_type,
             checkpoint_context,
-            checkpoint_start_url,
-            current_version_proof_by_field,
-            timeout=resource_timeout,
-            rows_processed=rows_fetched,
-            cancellation=resource_import_cancellation,
+            CurrentVersionCensusTerminalState(
+                start_url=checkpoint_start_url,
+                proof_by_field=current_version_proof_by_field,
+                timeout_seconds=resource_timeout,
+                rows_processed=rows_fetched,
+                pages_processed=pages,
+                expected_page_count=current_version_page_count,
+                terminal_page_entry_count=(
+                    current_version_terminal_page_entry_count
+                ),
+                recent_url_hashes=tuple(recent_url_hashes),
+            ),
+            resource_import_cancellation,
+            flush_pending_rows,
         )
         current_version_proof_by_field = current_version_outcome.proof
         if current_version_outcome.error:
@@ -49406,16 +49633,6 @@ async def _fetch_resource_rows(
             error_message = f"{error_prefix}:{current_version_outcome.error}"
             has_next_url = current_version_outcome.retryable
             retry_not_before = current_version_outcome.retry_not_before
-        else:
-            await resource_import_cancellation.check()
-            await _save_pagination_checkpoint(
-                checkpoint_context,
-                resource_type,
-                next_url=None,
-                pages_processed=pages,
-                rows_processed=rows_fetched,
-                recent_url_hashes=recent_url_hashes,
-            )
     if (
         not error_message
         and not has_reached_row_limit
