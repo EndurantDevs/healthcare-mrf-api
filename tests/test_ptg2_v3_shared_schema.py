@@ -1082,7 +1082,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260808150000_ptg_import_wave_admission_rollback"
+        "20260808160000_fhir_formulary_serving_index"
     ]
 
 

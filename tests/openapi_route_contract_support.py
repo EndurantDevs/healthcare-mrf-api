@@ -38,6 +38,21 @@ ROUTE_QUERY_PARAM_ADDITIONS = {
         "cursor",
         "healthporta_plan_id",
     },
+    ("get", "/formulary/fhir/"): {"cursor", "limit"},
+    ("get", "/formulary/fhir/{formulary_id}/aliases"): {
+        "cursor",
+        "limit",
+    },
+    ("get", "/formulary/fhir/{formulary_id}/aliases/{alias_id}/drugs"): {
+        "cursor",
+        "limit",
+        "ndc11",
+        "prior_authorization",
+        "quantity_limit",
+        "rxnorm_id",
+        "step_therapy",
+        "tier",
+    },
 }
 ROUTE_QUERY_PARAM_REMOVALS = {
     # Billing search is transport-bound to the canonical path, not aliases.

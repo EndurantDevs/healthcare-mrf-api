@@ -32,6 +32,14 @@ class FHIRFormularyNotFoundError(RuntimeError):
     """Collapse malformed, unknown, and non-current plan identities."""
 
 
+class FHIRFormularyInvalidRequestError(RuntimeError):
+    """Reject malformed public selectors without exposing stored identity."""
+
+
+class FHIRFormularyCursorConflictError(RuntimeError):
+    """Require pagination restart after the current publication changes."""
+
+
 class FHIRFormularyServingUnavailableError(RuntimeError):
     """Fail closed when serving is dormant or stored evidence is invalid."""
 
@@ -271,6 +279,8 @@ __all__ = (
     "FHIR_FORMULARY_CACHE_CONTROL",
     "FHIR_FORMULARY_PUBLIC_ID_PATTERN",
     "FHIR_FORMULARY_SERVING_ENABLED_ENV",
+    "FHIRFormularyCursorConflictError",
+    "FHIRFormularyInvalidRequestError",
     "FHIRFormularyNotFoundError",
     "FHIRFormularyServingUnavailableError",
     "PublicFHIRFormularyDetail",
