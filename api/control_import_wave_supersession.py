@@ -5,7 +5,10 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
-from api.control_import_wave_attestation import SUPERSESSION_ATTESTATION_VERSION
+from api.control_import_wave_attestation import (
+    ROLLBACK_ATTESTATION_VERSION,
+    SUPERSESSION_ATTESTATION_VERSION,
+)
 from db.models import PTGImportWaveSupersession
 from process.ptg_wave_preclaim_supersession import (
     PTGWavePreclaimSupersessionConflict,
@@ -32,7 +35,10 @@ def validate_admission_supersession(
 ) -> dict[str, Any] | None:
     """Validate and bind a v3 supersession proof to its successor wave."""
 
-    if attestation["schema_version"] != SUPERSESSION_ATTESTATION_VERSION:
+    if attestation["schema_version"] not in {
+        SUPERSESSION_ATTESTATION_VERSION,
+        ROLLBACK_ATTESTATION_VERSION,
+    }:
         return None
     try:
         return validate_logical_preclaim_supersession_proof(

@@ -29,6 +29,14 @@ from process.ptg_wave_preclaim_supersession import (
 from process.ptg_wave_preclaim_supersession_runtime import (
     get_logical_preclaim_supersession_candidate,
 )
+from process.ptg_wave_admission_rollback_supersession import (
+    PTGWaveAdmissionRollbackConflict,
+    validate_admission_rollback_predecessor,
+    validate_admission_rollback_successor,
+)
+from process.ptg_wave_admission_rollback_supersession_runtime import (
+    get_admission_rollback_supersession_candidate,
+)
 
 
 async def control_start_ptg_wave_controller(app, _loop):
@@ -75,6 +83,7 @@ async def control_admit_import_wave(request):
         ImportWaveConflict,
         PTGWaveCapacityConflict,
         PTGWavePreclaimSupersessionConflict,
+        PTGWaveAdmissionRollbackConflict,
     ) as exc:
         raise SanicException(str(exc), status_code=409) from exc
     except ValueError as exc:
@@ -159,6 +168,73 @@ async def control_get_logical_preclaim_supersession(
     return response.json(proof, default=str)
 
 
+async def control_get_admission_rollback_supersession(
+    request,
+    wave_id: str,
+):
+    """Observe one GET-only absence candidate for a fresh successor."""
+
+    require_control_auth(request)
+    expected_fields = {
+        "successor_wave_id",
+        "idempotency_key",
+        "request_digest",
+        "wave_digest",
+        "release_queue",
+        "intent_count",
+    }
+    if set(request.args) != expected_fields:
+        raise BadRequest("admission rollback query fields are not exact")
+    try:
+        query_by_field = {
+            field: _single_query_argument(request.args, field)
+            for field in expected_fields
+        }
+        intent_count_text = query_by_field["intent_count"]
+        if (
+            type(intent_count_text) is not str
+            or not intent_count_text.isascii()
+            or not intent_count_text.isdecimal()
+            or (len(intent_count_text) > 1 and intent_count_text[0] == "0")
+        ):
+            raise ValueError("intent_count must be canonical decimal text")
+        descriptor = validate_admission_rollback_predecessor({
+            "wave_id": wave_id,
+            "idempotency_key": query_by_field["idempotency_key"],
+            "request_digest": query_by_field["request_digest"],
+            "wave_digest": query_by_field["wave_digest"],
+            "release_queue": query_by_field["release_queue"],
+            "intent_count": int(intent_count_text),
+        })
+        successor_wave_id = validate_admission_rollback_successor(
+            descriptor["wave_id"],
+            query_by_field["successor_wave_id"],
+        )
+    except (TypeError, ValueError, PTGWaveAdmissionRollbackConflict) as exc:
+        raise BadRequest(str(exc)) from exc
+    try:
+        proof = await get_admission_rollback_supersession_candidate(
+            descriptor,
+            successor_wave_id,
+            redis=getattr(request.app.ctx, "ptg_wave_redis", None),
+        )
+    except PTGWaveAdmissionRollbackConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    return response.json(proof, default=str)
+
+
+def _single_query_argument(arguments, field: str):
+    """Return one query value while rejecting repeated keys."""
+
+    getlist = getattr(arguments, "getlist", None)
+    if callable(getlist):
+        values = getlist(field)
+        if len(values) != 1:
+            raise ValueError(f"{field} must occur exactly once")
+        return values[0]
+    return arguments.get(field)
+
+
 def register_control_wave_routes(blueprint):
     """Register exact-wave endpoints and controller lifecycle hooks."""
 
@@ -178,6 +254,9 @@ def register_control_wave_routes(blueprint):
     blueprint.get(
         "/import-waves/<wave_id>/logical-preclaim-supersession"
     )(control_get_logical_preclaim_supersession)
+    blueprint.get(
+        "/import-waves/<wave_id>/admission-rollback-supersession"
+    )(control_get_admission_rollback_supersession)
     return blueprint
 
 

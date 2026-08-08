@@ -13,7 +13,6 @@ from urllib.parse import urlsplit
 
 import pytest
 
-
 asyncpg = pytest.importorskip("asyncpg")
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +21,9 @@ MIGRATION_PATH = ROOT / "alembic" / "versions" / (
 )
 JSON_NULL_PATCH_PATH = ROOT / "alembic" / "versions" / (
     "20260808140000_ptg_import_wave_json_null_preclaim.py"
+)
+ADMISSION_ROLLBACK_PATH = ROOT / "alembic" / "versions" / (
+    "20260808150000_ptg_import_wave_admission_rollback.py"
 )
 POSTGRES_DSN_ENV = "HLTHPRT_PTG_IMPORT_WAVE_RECOVERY_POSTGRES_DSN"
 _DISPOSABLE_DATABASE_RE = re.compile(
@@ -66,6 +68,8 @@ async def _create_wave_table(connection, quoted: str) -> None:
         f"""
         CREATE TABLE {quoted}.ptg_import_wave (
             wave_id varchar(64) PRIMARY KEY,
+            idempotency_key varchar(160) NOT NULL UNIQUE,
+            request_digest varchar(64) NOT NULL,
             state text NOT NULL,
             uncertainty_resume_state text,
             k8s_post_ticket text,
@@ -119,7 +123,7 @@ async def _create_support_tables(connection, quoted: str) -> None:
             run_id text PRIMARY KEY, importer text, status text,
             source_file_import_id text, import_id text, phase_detail text,
             started_at timestamptz, finished_at timestamptz, snapshot_id text,
-            error jsonb, progress jsonb, metrics jsonb
+            error jsonb, progress jsonb, params jsonb, metrics jsonb
         )
         """
     )
@@ -151,13 +155,16 @@ async def _seed_predecessor(connection, quoted: str) -> None:
     await connection.execute(
         f"""
         INSERT INTO {quoted}.ptg_import_wave (
-            wave_id, state, uncertainty_resume_state, k8s_post_ticket,
+            wave_id, idempotency_key, request_digest, state,
+            uncertainty_resume_state, k8s_post_ticket,
             k8s_post_started_at, intent_count, wave_digest, manifest_digest,
             jobs_digest, release_queue, queue, worker_class, resource_class,
             worker_limit
         ) VALUES (
-            'predecessor-wave', 'uncertain', 'slots_waiting', 'post-ticket',
-            clock_timestamp(), 1, $1, $1, $1, 'arq:PTGSmall:wave:' || $1,
+            'predecessor-wave', 'predecessor-wave', $1::text, 'uncertain',
+            'slots_waiting', 'post-ticket',
+            clock_timestamp(), 1, $1::text, $1::text, $1::text,
+            'arq:PTGSmall:wave:' || $1::text,
             'arq:PTGSmall', 'process.PTGSmall', 'small', 12
         )
         """,
@@ -220,6 +227,13 @@ async def _install_migration(connection, monkeypatch, schema: str) -> object:
     async with connection.transaction():
         for statement in patch_statements:
             await connection.execute(statement)
+    rollback = _load_migration(ADMISSION_ROLLBACK_PATH)
+    rollback_statements: list[str] = []
+    monkeypatch.setattr(rollback.op, "execute", rollback_statements.append)
+    rollback.upgrade()
+    async with connection.transaction():
+        for statement in rollback_statements:
+            await connection.execute(statement)
     return migration
 
 
@@ -274,13 +288,15 @@ async def _insert_successor(connection, schema: str, wave_id: str, state: str, c
     await connection.execute(
         f"""
         INSERT INTO {_quote(schema)}.ptg_import_wave (
-            wave_id, state, intent_count, wave_digest, manifest_digest,
+            wave_id, idempotency_key, request_digest, state, intent_count,
+            wave_digest, manifest_digest,
             jobs_digest, release_queue, queue, worker_class, resource_class,
             worker_limit, cohort_attestation
-        ) VALUES ($1, $2, 1, $3, $3, $3, 'arq:PTGSmall:wave:' || $3,
-                  'arq:PTGSmall', 'process.PTGSmall', 'small', 12, $4::jsonb)
+        ) VALUES ($1, $1, $3, $2, 1, $4, $4, $4,
+                  'arq:PTGSmall:wave:' || $4,
+                  'arq:PTGSmall', 'process.PTGSmall', 'small', 12, $5::jsonb)
         """,
-        wave_id, state, "b" * 64, json.dumps(cohort),
+        wave_id, state, "c" * 64, "b" * 64, json.dumps(cohort),
     )
 
 

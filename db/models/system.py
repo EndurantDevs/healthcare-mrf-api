@@ -32,6 +32,7 @@ __all__ = (
     "ImportLog",
     "ImportRun",
     "PTGImportWave",
+    "PTGImportWaveAdmissionRollback",
     "PTGImportWaveClaim",
     "PTGImportWaveIntent",
     "PTGImportWaveOutcome",
@@ -410,6 +411,82 @@ class PTGImportWaveSupersession(Base, JSONOutputMixin):
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
     predecessor_wave_id = Column(String(64), nullable=False)
+    successor_wave_id = Column(String(64), nullable=False)
+    recovery_basis = Column(String(64), nullable=False)
+    recovery_evidence = Column(JSONB, nullable=False)
+    recovery_evidence_canonical = Column(LargeBinary, nullable=False)
+    recovery_evidence_sha256 = Column(String(64), nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class PTGImportWaveAdmissionRollback(Base, JSONOutputMixin):
+    """Append-only retirement of one proved-absent admission request."""
+
+    __tablename__ = "ptg_import_wave_admission_rollback"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("predecessor_wave_id"),
+        ForeignKeyConstraint(
+            ("successor_wave_id",),
+            (PTGImportWave.wave_id,),
+            name="ptg_wave_rollback_successor_wave_fkey",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        UniqueConstraint(
+            "predecessor_idempotency_key",
+            name="ptg_wave_rollback_predecessor_idempotency_key",
+        ),
+        UniqueConstraint(
+            "predecessor_request_digest",
+            name="ptg_wave_rollback_predecessor_request_digest_key",
+        ),
+        UniqueConstraint(
+            "predecessor_wave_digest",
+            name="ptg_wave_rollback_predecessor_wave_digest_key",
+        ),
+        UniqueConstraint(
+            "successor_wave_id",
+            name="ptg_wave_rollback_successor_wave_id_key",
+        ),
+        CheckConstraint(
+            "predecessor_wave_id <> successor_wave_id",
+            name="ptg_wave_rollback_distinct_check",
+        ),
+        CheckConstraint(
+            "recovery_basis = 'admission_rollback_absent'",
+            name="ptg_wave_rollback_basis_check",
+        ),
+        CheckConstraint(
+            "predecessor_request_digest ~ '^[0-9a-f]{64}$' "
+            "AND predecessor_wave_digest ~ '^[0-9a-f]{64}$' "
+            "AND predecessor_release_queue = "
+            "'arq:PTGSmall:wave:' || predecessor_wave_digest "
+            "AND predecessor_intent_count BETWEEN 1 AND 4096",
+            name="ptg_wave_rollback_predecessor_check",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(recovery_evidence) = 'object' "
+            "AND recovery_evidence_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND octet_length(recovery_evidence_canonical) > 0 "
+            "AND encode(sha256(recovery_evidence_canonical), 'hex') "
+            "= recovery_evidence_sha256 "
+            "AND convert_from(recovery_evidence_canonical, 'UTF8')::jsonb "
+            "= recovery_evidence - 'proof_digest'",
+            name="ptg_wave_rollback_evidence_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    predecessor_wave_id = Column(String(64), nullable=False)
+    predecessor_idempotency_key = Column(String(160), nullable=False)
+    predecessor_request_digest = Column(String(64), nullable=False)
+    predecessor_wave_digest = Column(String(64), nullable=False)
+    predecessor_release_queue = Column(String(160), nullable=False)
+    predecessor_intent_count = Column(Integer, nullable=False)
     successor_wave_id = Column(String(64), nullable=False)
     recovery_basis = Column(String(64), nullable=False)
     recovery_evidence = Column(JSONB, nullable=False)

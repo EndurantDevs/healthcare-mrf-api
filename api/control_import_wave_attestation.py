@@ -13,6 +13,7 @@ from typing import Any
 LEGACY_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v1"
 ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v2"
 SUPERSESSION_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v3"
+ROLLBACK_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v4"
 _ATTESTATION_DOMAINS = {
     LEGACY_ATTESTATION_VERSION: (
         b"healthporta.ptg-import-wave-attestation.v1\0"
@@ -20,6 +21,9 @@ _ATTESTATION_DOMAINS = {
     ATTESTATION_VERSION: b"healthporta.ptg-import-wave-attestation.v2\0",
     SUPERSESSION_ATTESTATION_VERSION: (
         b"healthporta.ptg-import-wave-attestation.v3\0"
+    ),
+    ROLLBACK_ATTESTATION_VERSION: (
+        b"healthporta.ptg-import-wave-attestation.v4\0"
     ),
 }
 AUTHORIZATION_BASIS = (
@@ -111,8 +115,13 @@ def _verify_attestation(
         "schema_version", "wave_id", "idempotency_key", "snapshot",
         "partition", "intents", "signature",
     }
-    if schema_version == SUPERSESSION_ATTESTATION_VERSION:
+    if isinstance(schema_version, str) and schema_version in {
+        SUPERSESSION_ATTESTATION_VERSION,
+        ROLLBACK_ATTESTATION_VERSION,
+    }:
         expected_attestation_fields.add("supersession")
+    if schema_version == ROLLBACK_ATTESTATION_VERSION:
+        expected_attestation_fields.add("admission_rollback_supersession")
     if set(attestation) != expected_attestation_fields:
         raise ValueError("cohort_attestation fields are not exact")
     if (
@@ -148,7 +157,11 @@ def _validate_snapshot(
         "catalog_generation",
     }
     expected_snapshot_fields = digest_fields | {"entitlement_coverage_count"}
-    if schema_version in {ATTESTATION_VERSION, SUPERSESSION_ATTESTATION_VERSION}:
+    if schema_version in {
+        ATTESTATION_VERSION,
+        SUPERSESSION_ATTESTATION_VERSION,
+        ROLLBACK_ATTESTATION_VERSION,
+    }:
         expected_snapshot_fields |= {
             "authorization_basis",
             "authorization_digest",
@@ -167,7 +180,11 @@ def _validate_snapshot(
         raise ValueError(
             "snapshot.entitlement_coverage_count must be a positive integer"
         )
-    if schema_version in {ATTESTATION_VERSION, SUPERSESSION_ATTESTATION_VERSION}:
+    if schema_version in {
+        ATTESTATION_VERSION,
+        SUPERSESSION_ATTESTATION_VERSION,
+        ROLLBACK_ATTESTATION_VERSION,
+    }:
         if count < 0:
             raise ValueError(
                 "snapshot.entitlement_coverage_count must be non-negative"

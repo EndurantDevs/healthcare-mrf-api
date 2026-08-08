@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 from process.ptg_wave_state import canonical_json, sha256_digest
+from process._ptg_wave_redis_encoding import (
+    PTG_SMALL_WAVE_PROTOCOL_IDENTITY,
+    wave_queue_name,
+)
+from process.ptg_wave_admission_rollback_supersession import (
+    DATABASE_FIELDS,
+    build_admission_rollback_supersession_proof,
+)
+from api.ptg_wave_kubernetes import _job_name
 
 
 def supersession_proof(*, successor_wave_id: str, intent_count: int) -> dict:
@@ -58,4 +67,77 @@ def supersession_proof(*, successor_wave_id: str, intent_count: int) -> dict:
     }
 
 
-__all__ = ["supersession_proof"]
+def admission_rollback_proof(
+    *,
+    successor_wave_id: str,
+    intent_count: int,
+) -> dict:
+    """Build a canonical absent-admission predecessor proof."""
+
+    request_digest = "5" * 64
+    wave_digest = sha256_digest(
+        (
+            PTG_SMALL_WAVE_PROTOCOL_IDENTITY
+            + "\0"
+            + request_digest
+        ).encode("utf-8")
+    )
+    predecessor_map = {
+        "wave_id": "retired-request-unit",
+        "idempotency_key": "retired-request-unit",
+        "request_digest": request_digest,
+        "wave_digest": wave_digest,
+        "release_queue": wave_queue_name(wave_digest),
+        "intent_count": intent_count,
+    }
+    return build_admission_rollback_supersession_proof(
+        predecessor_map,
+        successor_wave_id,
+        database={name: 0 for name in DATABASE_FIELDS},
+        kubernetes={
+            "job_name": _job_name(wave_digest),
+            "job_present": False,
+            "pod_count": 0,
+        },
+        redis={
+            "queue_name": predecessor_map["release_queue"],
+            "queued_entry_count": 0,
+            "ready_slot_count": 0,
+            "release_present": False,
+            "health_check_present": False,
+        },
+    )
+
+
+def recovery_proofs(
+    *,
+    schema_version: str,
+    successor_wave_id: str,
+    intent_count: int,
+) -> dict:
+    """Build only the recovery proofs required by one attestation version."""
+
+    recovery_proofs_map = {}
+    if schema_version in {
+        "healthporta.ptg-import-wave-attestation.v3",
+        "healthporta.ptg-import-wave-attestation.v4",
+    }:
+        recovery_proofs_map["supersession"] = supersession_proof(
+            successor_wave_id=successor_wave_id,
+            intent_count=intent_count,
+        )
+    if schema_version == "healthporta.ptg-import-wave-attestation.v4":
+        recovery_proofs_map[
+            "admission_rollback_supersession"
+        ] = admission_rollback_proof(
+            successor_wave_id=successor_wave_id,
+            intent_count=intent_count,
+        )
+    return recovery_proofs_map
+
+
+__all__ = [
+    "admission_rollback_proof",
+    "recovery_proofs",
+    "supersession_proof",
+]

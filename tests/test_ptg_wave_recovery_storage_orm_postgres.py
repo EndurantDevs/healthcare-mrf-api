@@ -14,6 +14,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api import control_import_wave_supersession as supersession
 from db.models import PTGImportWaveSupersession
+from process import ptg_wave_admission_rollback_supersession_runtime as rollback_runtime
+from process.ptg_wave_admission_rollback_supersession import DATABASE_FIELDS
+from tests.ptg_wave_supersession_fixtures import admission_rollback_proof
 from tests.test_ptg_wave_recovery_storage_postgres import (
     _dsn,
     _evidence,
@@ -30,11 +33,13 @@ def _successor_insert(schema: str):
     return text(
         f"""
         INSERT INTO {quoted}.ptg_import_wave (
-            wave_id, state, intent_count, wave_digest, manifest_digest,
+            wave_id, idempotency_key, request_digest, state, intent_count,
+            wave_digest, manifest_digest,
             jobs_digest, release_queue, queue, worker_class, resource_class,
             worker_limit, cohort_attestation
         ) VALUES (
-            :wave_id, 'admitted', 1, :digest, :digest, :digest,
+            :wave_id, :wave_id, :request_digest, 'admitted', 1,
+            :digest, :digest, :digest,
             'arq:PTGSmall:wave:' || :digest, 'arq:PTGSmall',
             'process.PTGSmall', 'small', 12, CAST(:cohort AS jsonb)
         )
@@ -79,6 +84,7 @@ async def _persist_with_orm(
                 _successor_insert(schema),
                 {
                     "wave_id": wave_id,
+                    "request_digest": "c" * 64,
                     "digest": "b" * 64,
                     "cohort": json.dumps(cohort_map),
                 },
@@ -101,6 +107,18 @@ async def test_orm_supersession_binds_naive_admission_clock_as_utc(monkeypatch):
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         await _install_migration(connection, monkeypatch, schema)
+        rollback_proof = admission_rollback_proof(
+            successor_wave_id="orm-successor",
+            intent_count=17,
+        )
+        async with session_factory() as observation_session:
+            database_absence = await (
+                rollback_runtime._database_absence_observation(
+                    observation_session,
+                    rollback_proof["predecessor"],
+                )
+            )
+        assert database_absence == {name: 0 for name in DATABASE_FIELDS}
         wave_id = "orm-successor"
         evidence, _canonical = _evidence(wave_id)
         witness = _supersession_witness(evidence)
