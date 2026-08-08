@@ -107,3 +107,44 @@ def test_provider_directory_metrics_record_bulk_export_outcomes():
     )
     assert stats_by_type["Location"]["bulk_export_requested_sources"] == 3
     assert stats_by_type["Location"]["bulk_export_rest_fallback_sources"] == 2
+
+
+def test_provider_directory_metrics_record_reviewed_subset_outcomes():
+    stats = fhir._empty_resource_stats()
+    unverified = _fetch_result(
+        fetch_mode=fhir.SERVER_ISSUED_SUBSET_FETCH_MODE,
+        fetch_diagnostic=None,
+    )
+    fhir._record_current_version_census_stats(stats, unverified)
+    assert stats["server_issued_subset_sources"] == 1
+    assert stats["server_issued_subset_verified_sources"] == 0
+
+    verified = _fetch_result(
+        complete=True,
+        fetch_mode=fhir.SERVER_ISSUED_SUBSET_FETCH_MODE,
+        fetch_diagnostic={
+            "verified": True,
+            "advertised_pre": 4,
+            "advertised_post": 4,
+            "returned_unique": 2,
+            "deficit": True,
+        },
+    )
+    fhir._record_current_version_census_stats(stats, verified)
+    assert stats["server_issued_subset_verified_sources"] == 1
+    assert stats["server_issued_subset_advertised_pre"] == 4
+    assert stats["server_issued_subset_returned_unique"] == 2
+    assert stats["server_issued_subset_deficit"] == 0
+
+    stats_by_type = {}
+    fhir._record_resource_fetch_stats(
+        stats_by_type,
+        "Organization",
+        verified,
+    )
+    assert stats_by_type["Organization"][
+        "server_issued_subset_verified_sources"
+    ] == 1
+    assert stats_by_type["Organization"][
+        "server_issued_subset_traversal_completed_sources"
+    ] == 1

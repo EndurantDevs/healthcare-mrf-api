@@ -328,3 +328,107 @@ def build_coverage_inputs() -> tuple[Any, ...]:
         relation_proof_by_type,
         verification_metadata_by_field,
     )
+
+
+def _persisted_subset_metadata(
+    candidate: Any,
+    diagnostics: dict[str, Any],
+    completed_content: Any,
+) -> dict[str, Any]:
+    verification_metadata_by_field = {
+        importer.TWIN_ROOT_VERIFICATION_METADATA_KEY: {
+            "result": "baseline_recorded"
+        }
+    }
+    return {
+        "source_ids": list(candidate.source_ids),
+        "selected_resources": list(candidate.selected_resources),
+        importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: (
+            candidate.verification_campaign_id
+        ),
+        importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: {
+            "synthetic": "sealed"
+        },
+        **verification_metadata_by_field,
+        **importer._subset_replay_metadata(
+            candidate,
+            diagnostics,
+            completed_content,
+        ),
+        **importer._subset_dataset_coverage_metadata(
+            candidate,
+            diagnostics,
+            completed_content,
+            {},
+            verification_metadata_by_field,
+        ),
+    }
+
+
+def _persisted_subset_records(
+    candidate: Any,
+    completed_content: Any,
+    metadata_by_field: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    completion_proof = completed_content.completion_proof
+    completion_sha256 = completed_content.completion_proof_sha256
+    assert completion_proof is not None
+    assert completion_sha256 is not None
+    dataset_by_field = {
+        "dataset_id": candidate.dataset_id,
+        "endpoint_id": candidate.endpoint_id,
+        "acquisition_root_run_id": candidate.acquisition_root_run_id,
+        "dataset_hash": completed_content.dataset_hash,
+        "resource_count": completed_content.resource_count,
+        "completion_proof_required_version": 3,
+        "completion_proof_json": completion_proof,
+        "completion_proof_sha256": completion_sha256,
+        "publication_metadata_json": metadata_by_field,
+    }
+    embedded_proof_by_field = {
+        "completion_proof": completion_proof,
+        "completion_proof_sha256": completion_sha256,
+        "resource_hashes": completed_content.resource_hashes,
+        "resource_counts": completed_content.resource_counts,
+    }
+    stored_summary_by_field = {
+        "dataset_hash": completed_content.dataset_hash,
+        "resource_count": completed_content.resource_count,
+        "resource_hashes": completed_content.resource_hashes,
+        "resource_counts": completed_content.resource_counts,
+    }
+    return dataset_by_field, embedded_proof_by_field, stored_summary_by_field
+
+
+def build_persisted_subset_inputs() -> tuple[Any, ...]:
+    """Build one internally consistent terminal v3 dataset and metadata."""
+
+    _contract_value, candidate, diagnostics, content_proof = (
+        build_finalization_inputs()
+    )
+    completed_content = importer._content_proof_with_subset_completion(
+        candidate,
+        diagnostics,
+        content_proof,
+    )
+    metadata_by_field = _persisted_subset_metadata(
+        candidate,
+        diagnostics,
+        completed_content,
+    )
+    dataset_by_field, embedded_proof_by_field, stored_summary_by_field = (
+        _persisted_subset_records(
+            candidate,
+            completed_content,
+            metadata_by_field,
+        )
+    )
+    return (
+        candidate,
+        diagnostics,
+        completed_content,
+        dataset_by_field,
+        metadata_by_field,
+        embedded_proof_by_field,
+        stored_summary_by_field,
+    )
