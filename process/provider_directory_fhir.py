@@ -48118,11 +48118,7 @@ def _current_version_census_resume_proof(
         contract,
         resource_type,
     )
-    if persisted_pre_count is None:
-        raise ValueError(
-            "provider_directory_current_version_census_"
-            "checkpoint_pre_count_missing"
-        )
+    assert persisted_pre_count is not None
     if resume_state.rows_processed > persisted_pre_count:
         raise ValueError(
             "provider_directory_current_version_census_"
@@ -48650,18 +48646,6 @@ async def _fetch_resource_rows(
                 pages_processed=resume_state.pages_processed,
                 retryable=False,
             )
-        if is_current_version_census_enabled and (
-            not current_version_proof_by_field
-            or current_version_proof_by_field.get("verified") is not True
-        ):
-            return _current_version_census_error_result(
-                model,
-                current_version_proof_by_field or {},
-                "checkpoint_completion_proof_missing",
-                rows_processed=resume_state.rows_processed,
-                pages_processed=resume_state.pages_processed,
-                retryable=False,
-            )
         return ResourceFetchResult(
             model=model,
             rows=[],
@@ -49035,27 +49019,6 @@ async def _fetch_resource_rows(
                         if isinstance(prepared_census, ResourceFetchResult):
                             return prepared_census
                         caresource_proof_by_field = prepared_census
-                    if is_current_version_census_enabled:
-                        prepared_current_version_census = (
-                            await _prepare_current_version_pre_census(
-                                source_record,
-                                resource_type,
-                                model,
-                                checkpoint_context,
-                                resume_state,
-                                checkpoint_start_url,
-                                timeout=resource_timeout,
-                                cancellation=resource_import_cancellation,
-                            )
-                        )
-                        if isinstance(
-                            prepared_current_version_census,
-                            ResourceFetchResult,
-                        ):
-                            return prepared_current_version_census
-                        current_version_proof_by_field = (
-                            prepared_current_version_census
-                        )
                     retained_resource_rows.clear()
                     pending_rows.clear()
                     rows_fetched = 0
