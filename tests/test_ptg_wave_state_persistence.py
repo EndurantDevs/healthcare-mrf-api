@@ -27,6 +27,9 @@ class _Result:
     def scalar_one_or_none(self):
         return self._scalar
 
+    def scalar(self):
+        return self._scalar
+
 
 class _Session:
     def __init__(self, *results):
@@ -452,7 +455,11 @@ async def test_uncertainty_mark_and_resolution_are_state_bound(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_wave_receipts_is_read_only_and_handles_absence(monkeypatch):
-    results = [_Result(scalar=None), _Result(scalar=_wave())]
+    results = [
+        _Result(scalar=None),
+        _Result(scalar=_wave()),
+        _Result(scalar=0),
+    ]
 
     async def execute(_statement):
         return results.pop(0)

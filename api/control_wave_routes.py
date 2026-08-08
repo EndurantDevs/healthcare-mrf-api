@@ -37,6 +37,12 @@ from process.ptg_wave_admission_rollback_supersession import (
 from process.ptg_wave_admission_rollback_supersession_runtime import (
     get_admission_rollback_supersession_candidate,
 )
+from process.ptg_wave_materialized_preclaim_supersession_contract import (
+    PTGWaveMaterializedPreclaimConflict,
+)
+from process.ptg_wave_materialized_preclaim_supersession_runtime import (
+    get_materialized_preclaim_supersession_candidate,
+)
 
 
 async def control_start_ptg_wave_controller(app, _loop):
@@ -84,6 +90,7 @@ async def control_admit_import_wave(request):
         PTGWaveCapacityConflict,
         PTGWavePreclaimSupersessionConflict,
         PTGWaveAdmissionRollbackConflict,
+        PTGWaveMaterializedPreclaimConflict,
     ) as exc:
         raise SanicException(str(exc), status_code=409) from exc
     except ValueError as exc:
@@ -223,6 +230,33 @@ async def control_get_admission_rollback_supersession(
     return response.json(proof, default=str)
 
 
+async def control_get_materialized_preclaim_supersession(
+    request,
+    wave_id: str,
+):
+    """Observe a successor-bound failed-Job candidate without mutation."""
+
+    require_control_auth(request)
+    if set(request.args) != {"successor_wave_id"}:
+        raise BadRequest("materialized preclaim query fields are not exact")
+    try:
+        successor_wave_id = validate_admission_rollback_successor(
+            wave_id,
+            _single_query_argument(request.args, "successor_wave_id"),
+        )
+    except (TypeError, ValueError, PTGWaveAdmissionRollbackConflict) as exc:
+        raise BadRequest(str(exc)) from exc
+    try:
+        proof = await get_materialized_preclaim_supersession_candidate(
+            wave_id,
+            successor_wave_id,
+            redis=getattr(request.app.ctx, "ptg_wave_redis", None),
+        )
+    except PTGWaveMaterializedPreclaimConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    return response.json(proof, default=str)
+
+
 def _single_query_argument(arguments, field: str):
     """Return one query value while rejecting repeated keys."""
 
@@ -257,6 +291,9 @@ def register_control_wave_routes(blueprint):
     blueprint.get(
         "/import-waves/<wave_id>/admission-rollback-supersession"
     )(control_get_admission_rollback_supersession)
+    blueprint.get(
+        "/import-waves/<wave_id>/materialized-preclaim-supersession"
+    )(control_get_materialized_preclaim_supersession)
     return blueprint
 
 

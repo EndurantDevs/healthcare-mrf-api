@@ -14,6 +14,9 @@ LEGACY_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v1"
 ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v2"
 SUPERSESSION_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v3"
 ROLLBACK_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v4"
+MATERIALIZED_PRECLAIM_ATTESTATION_VERSION = (
+    "healthporta.ptg-import-wave-attestation.v5"
+)
 _ATTESTATION_DOMAINS = {
     LEGACY_ATTESTATION_VERSION: (
         b"healthporta.ptg-import-wave-attestation.v1\0"
@@ -24,6 +27,9 @@ _ATTESTATION_DOMAINS = {
     ),
     ROLLBACK_ATTESTATION_VERSION: (
         b"healthporta.ptg-import-wave-attestation.v4\0"
+    ),
+    MATERIALIZED_PRECLAIM_ATTESTATION_VERSION: (
+        b"healthporta.ptg-import-wave-attestation.v5\0"
     ),
 }
 AUTHORIZATION_BASIS = (
@@ -122,6 +128,8 @@ def _verify_attestation(
         expected_attestation_fields.add("supersession")
     if schema_version == ROLLBACK_ATTESTATION_VERSION:
         expected_attestation_fields.add("admission_rollback_supersession")
+    if schema_version == MATERIALIZED_PRECLAIM_ATTESTATION_VERSION:
+        expected_attestation_fields.add("materialized_preclaim_supersession")
     if set(attestation) != expected_attestation_fields:
         raise ValueError("cohort_attestation fields are not exact")
     if (
@@ -161,6 +169,7 @@ def _validate_snapshot(
         ATTESTATION_VERSION,
         SUPERSESSION_ATTESTATION_VERSION,
         ROLLBACK_ATTESTATION_VERSION,
+        MATERIALIZED_PRECLAIM_ATTESTATION_VERSION,
     }:
         expected_snapshot_fields |= {
             "authorization_basis",
@@ -184,6 +193,7 @@ def _validate_snapshot(
         ATTESTATION_VERSION,
         SUPERSESSION_ATTESTATION_VERSION,
         ROLLBACK_ATTESTATION_VERSION,
+        MATERIALIZED_PRECLAIM_ATTESTATION_VERSION,
     }:
         if count < 0:
             raise ValueError(

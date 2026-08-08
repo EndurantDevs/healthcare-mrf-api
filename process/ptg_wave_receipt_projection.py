@@ -7,13 +7,19 @@ from typing import Any
 from process.ptg_parts.ptg_wave_admission_fence import PTG_WAVE_TERMINAL_STATES
 
 
-def wave_receipt_mapping(wave: Any) -> dict[str, Any]:
+def wave_receipt_mapping(
+    wave: Any,
+    *,
+    retired: bool = False,
+) -> dict[str, Any]:
     """Project one durable wave without causing reconciliation or I/O."""
 
     return {
         "wave_id": wave.wave_id, "wave_digest": wave.wave_digest, "state": wave.state,
         "state_version": wave.state_version,
-        "capacity_owning": wave.state not in PTG_WAVE_TERMINAL_STATES,
+        "capacity_owning": (
+            wave.state not in PTG_WAVE_TERMINAL_STATES and not retired
+        ),
         "intent_count": wave.intent_count,
         "physical_coordinate_count": wave.physical_coordinate_count,
         "imported_coordinate_count": wave.imported_coordinate_count,

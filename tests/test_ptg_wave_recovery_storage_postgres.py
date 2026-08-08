@@ -25,6 +25,9 @@ JSON_NULL_PATCH_PATH = ROOT / "alembic" / "versions" / (
 ADMISSION_ROLLBACK_PATH = ROOT / "alembic" / "versions" / (
     "20260808150000_ptg_import_wave_admission_rollback.py"
 )
+MATERIALIZED_PRECLAIM_PATH = ROOT / "alembic" / "versions" / (
+    "20260808180000_ptg_import_wave_materialized_preclaim.py"
+)
 POSTGRES_DSN_ENV = "HLTHPRT_PTG_IMPORT_WAVE_RECOVERY_POSTGRES_DSN"
 _DISPOSABLE_DATABASE_RE = re.compile(
     r"^ptg_import_wave_recovery_test_[a-z0-9][a-z0-9_]{7,}$"
@@ -70,6 +73,7 @@ async def _create_wave_table(connection, quoted: str) -> None:
             wave_id varchar(64) PRIMARY KEY,
             idempotency_key varchar(160) NOT NULL UNIQUE,
             request_digest varchar(64) NOT NULL,
+            cohort_attestation_digest varchar(64),
             state text NOT NULL,
             uncertainty_resume_state text,
             k8s_post_ticket text,
@@ -110,6 +114,12 @@ async def _create_wave_table(connection, quoted: str) -> None:
             worker_class text NOT NULL,
             resource_class text NOT NULL,
             worker_limit integer NOT NULL,
+            protocol_identity text,
+            kubernetes_manifest_identity text,
+            kubernetes_config_identity text,
+            pinned_image_reference text,
+            pinned_image_digest text,
+            runtime_image_identity text,
             cohort_attestation jsonb NOT NULL DEFAULT '{{}}'::jsonb
         )
         """
@@ -233,6 +243,17 @@ async def _install_migration(connection, monkeypatch, schema: str) -> object:
     rollback.upgrade()
     async with connection.transaction():
         for statement in rollback_statements:
+            await connection.execute(statement)
+    materialized = _load_migration(MATERIALIZED_PRECLAIM_PATH)
+    materialized_statements: list[str] = []
+    monkeypatch.setattr(
+        materialized.op,
+        "execute",
+        materialized_statements.append,
+    )
+    materialized.upgrade()
+    async with connection.transaction():
+        for statement in materialized_statements:
             await connection.execute(statement)
     return migration
 
@@ -407,7 +428,6 @@ async def test_successor_binding_rejects_terminal_or_unrelated_rows_and_rolls_ba
     finally:
         await connection.execute(f"DROP SCHEMA IF EXISTS {_quote(schema)} CASCADE")
         await connection.close()
-
 
 @pytest.mark.asyncio
 async def test_successor_binding_accepts_atomic_admission_and_canonical_evidence(monkeypatch):

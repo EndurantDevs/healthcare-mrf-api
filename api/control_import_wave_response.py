@@ -4,14 +4,24 @@ from __future__ import annotations
 
 from typing import Any
 
-from db.models import PTGImportWave
+from sqlalchemy import select
+
+from api.control_import_wave_attestation import _identifier
+from api.control_import_wave_materialized_preclaim import (
+    is_materialized_preclaim_retired,
+)
+from db.models import PTGImportWave, db
 from process.ptg_parts.ptg_wave_admission_fence import (
     PTG_WAVE_CAPACITY_OWNING_STATES,
     PTG_WAVE_TERMINAL_STATES,
 )
 
 
-def wave_response(wave: PTGImportWave) -> dict[str, Any]:
+def wave_response(
+    wave: PTGImportWave,
+    *,
+    retired: bool = False,
+) -> dict[str, Any]:
     """Project one durable wave without changing its persisted state."""
 
     return {
@@ -27,7 +37,9 @@ def wave_response(wave: PTGImportWave) -> dict[str, Any]:
         "jobs_digest": wave.jobs_digest, "manifest_digest": wave.manifest_digest,
         "wave_digest": wave.wave_digest, "enqueue_time_ms": wave.enqueue_time_ms,
         "state": wave.state, "state_version": wave.state_version,
-        "capacity_owning": wave.state in PTG_WAVE_CAPACITY_OWNING_STATES,
+        "capacity_owning": (
+            wave.state in PTG_WAVE_CAPACITY_OWNING_STATES and not retired
+        ),
         "terminal": wave.state in PTG_WAVE_TERMINAL_STATES, "queue": wave.queue,
         "release_queue": wave.release_queue, "worker_class": wave.worker_class,
         "resource_class": wave.resource_class, "worker_limit": wave.worker_limit,
@@ -46,4 +58,16 @@ def wave_response(wave: PTGImportWave) -> dict[str, Any]:
     }
 
 
-__all__ = ["wave_response"]
+async def get_import_wave(wave_id: str) -> dict[str, Any] | None:
+    """Return one durable wave projection without mutating its state."""
+
+    result = await db.execute(select(PTGImportWave).where(
+        PTGImportWave.wave_id == _identifier(wave_id, "wave_id", 64)))
+    wave = result.scalar_one_or_none()
+    if wave is None:
+        return None
+    retired = await is_materialized_preclaim_retired(db, wave.wave_id)
+    return wave_response(wave, retired=retired)
+
+
+__all__ = ["get_import_wave", "wave_response"]

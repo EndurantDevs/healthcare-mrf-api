@@ -13,11 +13,12 @@ import hmac
 from typing import Any
 
 from arq.jobs import serialize_job as arq_serialize_job
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from api.control_frozen_rate_files import validated_control_import_payload
 from api.control_import_wave_attestation import (
     ATTESTATION_VERSION,
+    MATERIALIZED_PRECLAIM_ATTESTATION_VERSION,
     ROLLBACK_ATTESTATION_VERSION,
     SUPERSESSION_ATTESTATION_VERSION,
     _canonical,
@@ -28,16 +29,22 @@ from api.control_import_wave_attestation import (
     _verify_attestation,
     sign_cohort_attestation,
 )
+from api.control_import_wave_materialized_preclaim import (
+    require_materialized_preclaim_replay_allowed,
+)
 from api.control_imports import (
     _assert_ptg_rebuild_request_params,
     _import_param_views,
     _normalize_triggered_by,
 )
 from api import control_import_wave_direct as direct_wave
-from api.control_import_wave_response import wave_response as _wave_response
+from api.control_import_wave_response import (
+    get_import_wave,
+    wave_response as _wave_response,
+)
 from api.control_import_wave_recovery import (
     persist_admission_recoveries,
-    validate_admission_recovery_proofs,
+    project_admission_recovery_proofs,
 )
 from db.models import (
     ImportRun,
@@ -254,7 +261,7 @@ def validate_import_wave_payload(
         attestation["intents"],
         wave_id=wave_id,
     )
-    supersession, admission_rollback = validate_admission_recovery_proofs(
+    recovery_proofs = project_admission_recovery_proofs(
         attestation,
         wave_id=wave_id,
     )
@@ -280,16 +287,12 @@ def validate_import_wave_payload(
     validated_request_map = {
         "wave_id": wave_id, "idempotency_key": idempotency_key,
         "attestation": attestation, "snapshot": snapshot, "partition": partition,
-        "supersession": supersession,
         "intents": intents, "request_digest": request_digest,
         "attestation_digest": _sha256(_canonical(attestation)),
         "signature_digest": _sha256(attestation["signature"].encode()),
         "wave_digest": wave_digest, "release_queue": f"{QUEUE}:wave:{wave_digest}",
     }
-    if attestation["schema_version"] == ROLLBACK_ATTESTATION_VERSION:
-        validated_request_map["admission_rollback_supersession"] = (
-            admission_rollback
-        )
+    validated_request_map.update(recovery_proofs)
     return validated_request_map
 
 
@@ -452,6 +455,7 @@ async def admit_import_wave(
         if existing is not None:
             if existing.request_digest != request["request_digest"]:
                 raise ImportWaveConflict("wave_id or idempotency_key conflicts with immutable request digest")
+            await require_materialized_preclaim_replay_allowed(session, existing.wave_id)
             return _wave_response(existing), False
         await persist_admission_recoveries(
             session,
@@ -480,16 +484,7 @@ async def admit_import_wave(
         return _wave_response(wave), True
 
 
-async def get_import_wave(wave_id: str) -> dict[str, Any] | None:
-    """Return one durable wave projection without mutating its state."""
-
-    result = await db.execute(select(PTGImportWave).where(
-        PTGImportWave.wave_id == _identifier(wave_id, "wave_id", 64)))
-    wave = result.scalar_one_or_none()
-    return _wave_response(wave) if wave is not None else None
-
-
 __all__ = [
-    "ATTESTATION_VERSION", "ROLLBACK_ATTESTATION_VERSION", "SUPERSESSION_ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
+    "ATTESTATION_VERSION", "MATERIALIZED_PRECLAIM_ATTESTATION_VERSION", "ROLLBACK_ATTESTATION_VERSION", "SUPERSESSION_ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
     "sign_cohort_attestation", "validate_import_wave_payload",
 ]
