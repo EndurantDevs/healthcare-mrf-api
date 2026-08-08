@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from db.models import (
     ProviderDirectoryAPIEndpoint,
@@ -116,6 +117,10 @@ def test_dataset_models_preserve_publication_and_resource_identity_contracts():
     )
     assert ProviderDirectoryDatasetResource.__table__.c.payload_hash.nullable is False
     assert ProviderDirectoryDatasetResource.__table__.c.payload_json.nullable is False
+    assert isinstance(
+        ProviderDirectoryEndpointDataset.__table__.c.completion_proof_json.type,
+        postgresql.JSONB,
+    )
 
     current_index = next(
         index

@@ -180,6 +180,71 @@ async def _assert_active_index_shape(url, schema: str) -> None:
     assert shape.expression_keys is False
 
 
+async def _assert_subset_completion_column_shapes(url, schema: str) -> None:
+    connection = await _connect(url)
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT relation.relname AS table_name,
+                   attribute.attname AS column_name,
+                   pg_catalog.format_type(
+                       attribute.atttypid,
+                       attribute.atttypmod
+                   ) AS column_type,
+                   attribute.attnotnull AS not_null,
+                   column_default.oid IS NOT NULL AS has_default
+              FROM pg_catalog.pg_attribute AS attribute
+              JOIN pg_catalog.pg_class AS relation
+                ON relation.oid = attribute.attrelid
+              JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = relation.relnamespace
+              LEFT JOIN pg_catalog.pg_attrdef AS column_default
+                ON column_default.adrelid = relation.oid
+               AND column_default.adnum = attribute.attnum
+             WHERE namespace.nspname = $1
+               AND (relation.relname, attribute.attname) IN (
+                    ('provider_directory_endpoint_dataset',
+                     'completion_proof_required_version'),
+                    ('provider_directory_endpoint_dataset',
+                     'completion_proof_json'),
+                    ('provider_directory_endpoint_dataset',
+                     'completion_proof_sha256'),
+                    ('provider_directory_dataset_resource',
+                     'acquired_resource_sha256')
+               )
+            """,
+            schema,
+        )
+    finally:
+        await connection.close()
+    observed = {
+        (row["table_name"], row["column_name"]): (
+            row["column_type"],
+            row["not_null"],
+            row["has_default"],
+        )
+        for row in rows
+    }
+    assert observed == {
+        (
+            "provider_directory_endpoint_dataset",
+            "completion_proof_required_version",
+        ): ("integer", False, False),
+        (
+            "provider_directory_endpoint_dataset",
+            "completion_proof_json",
+        ): ("jsonb", False, False),
+        (
+            "provider_directory_endpoint_dataset",
+            "completion_proof_sha256",
+        ): ("character varying(64)", False, False),
+        (
+            "provider_directory_dataset_resource",
+            "acquired_resource_sha256",
+        ): ("character varying(64)", False, False),
+    }
+
+
 def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
     url = _database_url()
     asyncio.run(_assert_active_index_shape(url, "mrf"))
@@ -212,6 +277,9 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
         )
         _run_alembic(environment, "upgrade", "head")
         asyncio.run(_assert_active_index_shape(url, ADOPTION_SCHEMA))
+        asyncio.run(
+            _assert_subset_completion_column_shapes(url, ADOPTION_SCHEMA)
+        )
 
         _run_alembic(environment, "downgrade", PRE_REPAIR_REVISION)
 
@@ -232,5 +300,8 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
         asyncio.run(install_legacy_index())
         _run_alembic(environment, "upgrade", "head")
         asyncio.run(_assert_active_index_shape(url, ADOPTION_SCHEMA))
+        asyncio.run(
+            _assert_subset_completion_column_shapes(url, ADOPTION_SCHEMA)
+        )
     finally:
         asyncio.run(drop_adoption_schema())

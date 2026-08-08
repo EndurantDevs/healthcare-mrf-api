@@ -13,6 +13,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from db.migration_adoption import add_column_if_missing
+
 
 revision = "20260808190000_provider_directory_subset_completion_proof"
 down_revision = "20260808180000_ptg_import_wave_materialized_preclaim"
@@ -207,11 +209,22 @@ def _relation_schema_fence_sql(
     schema: str,
     relation: str,
     expected_columns: tuple[str, ...],
+    *,
+    compatible_columns: tuple[str, ...] | None = None,
 ) -> str:
     relation_ref = _qf(schema, relation)
     expected_array = ", ".join(
         _ql(column) for column in sorted(expected_columns)
     )
+    compatible_clause = ""
+    if compatible_columns is not None:
+        compatible_array = ", ".join(
+            _ql(column) for column in sorted(compatible_columns)
+        )
+        compatible_clause = (
+            "\n           AND observed_columns IS DISTINCT FROM "
+            f"ARRAY[{compatible_array}]::text[]"
+        )
     return f"""
     DO $migration$
     DECLARE
@@ -224,7 +237,65 @@ def _relation_schema_fence_sql(
            AND attribute.attnum > 0
            AND NOT attribute.attisdropped;
         IF observed_columns IS DISTINCT FROM
-                ARRAY[{expected_array}]::text[] THEN
+                ARRAY[{expected_array}]::text[]{compatible_clause} THEN
+            RAISE EXCEPTION
+                'provider_directory_subset_completion_schema_changed'
+                USING ERRCODE = '55000';
+        END IF;
+    END;
+    $migration$;
+    """
+
+
+def _subset_column_shape_fence_sql(schema: str) -> str:
+    dataset_ref = _qf(schema, _ENDPOINT_DATASET)
+    resource_ref = _qf(schema, _DATASET_RESOURCE)
+    return f"""
+    DO $migration$
+    DECLARE
+        invalid_column_count bigint;
+    BEGIN
+        SELECT count(*)
+          INTO invalid_column_count
+          FROM (
+                VALUES
+                    (
+                        {_ql(dataset_ref)}::regclass,
+                        'completion_proof_required_version',
+                        'integer'
+                    ),
+                    (
+                        {_ql(dataset_ref)}::regclass,
+                        'completion_proof_json',
+                        'jsonb'
+                    ),
+                    (
+                        {_ql(dataset_ref)}::regclass,
+                        'completion_proof_sha256',
+                        'character varying(64)'
+                    ),
+                    (
+                        {_ql(resource_ref)}::regclass,
+                        'acquired_resource_sha256',
+                        'character varying(64)'
+                    )
+               ) AS expected(relation_oid, column_name, column_type)
+          LEFT JOIN pg_catalog.pg_attribute AS attribute
+            ON attribute.attrelid = expected.relation_oid
+           AND attribute.attname = expected.column_name
+           AND attribute.attnum > 0
+           AND NOT attribute.attisdropped
+          LEFT JOIN pg_catalog.pg_attrdef AS column_default
+            ON column_default.adrelid = expected.relation_oid
+           AND column_default.adnum = attribute.attnum
+         WHERE attribute.attname IS NULL
+            OR pg_catalog.format_type(
+                    attribute.atttypid,
+                    attribute.atttypmod
+                ) IS DISTINCT FROM expected.column_type
+            OR attribute.attnotnull
+            OR column_default.oid IS NOT NULL;
+        IF invalid_column_count <> 0 THEN
             RAISE EXCEPTION
                 'provider_directory_subset_completion_schema_changed'
                 USING ERRCODE = '55000';
@@ -3251,6 +3322,7 @@ def upgrade() -> None:
             schema,
             _ENDPOINT_DATASET,
             _LEGACY_ENDPOINT_DATASET_COLUMNS,
+            compatible_columns=_SUBSET_ENDPOINT_DATASET_COLUMNS,
         )
     )
     op.execute(
@@ -3258,6 +3330,7 @@ def upgrade() -> None:
             schema,
             _DATASET_RESOURCE,
             _LEGACY_DATASET_RESOURCE_COLUMNS,
+            compatible_columns=_SUBSET_DATASET_RESOURCE_COLUMNS,
         )
     )
     op.execute(_guard_trigger_shape_fence_sql(schema))
@@ -3268,7 +3341,8 @@ def upgrade() -> None:
         )
     )
 
-    op.add_column(
+    add_column_if_missing(
+        op,
         _ENDPOINT_DATASET,
         sa.Column(
             "completion_proof_required_version",
@@ -3277,7 +3351,8 @@ def upgrade() -> None:
         ),
         schema=schema,
     )
-    op.add_column(
+    add_column_if_missing(
+        op,
         _ENDPOINT_DATASET,
         sa.Column(
             "completion_proof_json",
@@ -3286,16 +3361,19 @@ def upgrade() -> None:
         ),
         schema=schema,
     )
-    op.add_column(
+    add_column_if_missing(
+        op,
         _ENDPOINT_DATASET,
         sa.Column("completion_proof_sha256", sa.String(64), nullable=True),
         schema=schema,
     )
-    op.add_column(
+    add_column_if_missing(
+        op,
         _DATASET_RESOURCE,
         sa.Column("acquired_resource_sha256", sa.String(64), nullable=True),
         schema=schema,
     )
+    op.execute(_subset_column_shape_fence_sql(schema))
     _create_subset_baseline_generation_index(schema)
     _create_proof_functions(schema)
 

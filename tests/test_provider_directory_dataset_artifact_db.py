@@ -12,6 +12,9 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
+from tests.provider_directory_subset_completion_pg_setup import (
+    install_subset_canonical_functions,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -59,7 +62,10 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         "created_at timestamp, "
         "validated_at timestamp, "
         "published_at timestamp, "
-        "publication_metadata_json json"
+        "publication_metadata_json json, "
+        "completion_proof_required_version integer, "
+        "completion_proof_json jsonb, "
+        "completion_proof_sha256 varchar(64)"
         ");"
     )
     await database.status(
@@ -69,9 +75,11 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         "resource_id varchar(256) NOT NULL, "
         "payload_hash varchar(64) NOT NULL, "
         "payload_json json NOT NULL, "
+        "acquired_resource_sha256 varchar(64), "
         "PRIMARY KEY (dataset_id, resource_type, resource_id)"
         ");"
     )
+    await install_subset_canonical_functions(database, schema)
     for model in (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS):
         await database.status(
             importer._provider_directory_artifact_scope_table_sql(

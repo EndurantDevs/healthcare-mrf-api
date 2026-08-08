@@ -108,6 +108,9 @@ def test_upgrade_adds_model_columns_and_hardened_canonical_functions(monkeypatch
     assert "provider_directory_subset_acquired_digest_marker_invalid" in (
         normalized_sql
     )
+    assert "pg_catalog.format_type" in normalized_sql
+    assert "'completion_proof_json', 'jsonb'" in normalized_sql
+    assert normalized_sql.count("observed_columns IS DISTINCT FROM") >= 6
     assert "verification_baseline" in normalized_sql
     assert "verification_mismatch" in normalized_sql
     assert migration._SOURCE_GUARD in normalized_sql

@@ -107,7 +107,10 @@ async def _create_dataset_table(database: Database, schema: str) -> None:
             validated_at timestamp,
             published_at timestamp,
             superseded_at timestamp,
-            publication_metadata_json jsonb
+            publication_metadata_json jsonb,
+            completion_proof_required_version integer,
+            completion_proof_json jsonb,
+            completion_proof_sha256 varchar(64)
         );
         """
     )
