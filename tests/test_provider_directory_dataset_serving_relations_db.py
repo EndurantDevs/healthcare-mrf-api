@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
+from tests import provider_directory_subset_completion_pg_setup as subset_setup
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -39,9 +40,13 @@ async def _create_tables(database: Database, schema: str) -> None:
         "status varchar(32) NOT NULL DEFAULT 'published', "
         "is_current boolean NOT NULL DEFAULT true, "
         "superseded_at timestamptz, "
-        "publication_metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb"
+        "publication_metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb, "
+        "completion_proof_required_version integer, "
+        "completion_proof_json jsonb, "
+        "completion_proof_sha256 varchar(64)"
         ");"
     )
+    await subset_setup.install_subset_canonical_functions(database, schema)
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_dataset_resource ("
         "dataset_id varchar(96) NOT NULL, "
@@ -49,6 +54,7 @@ async def _create_tables(database: Database, schema: str) -> None:
         "resource_id varchar(256) NOT NULL, "
         "payload_hash varchar(64) NOT NULL, "
         "payload_json jsonb NOT NULL, "
+        "acquired_resource_sha256 varchar(64), "
         "PRIMARY KEY (dataset_id, resource_type, resource_id)"
         ");"
     )
@@ -101,8 +107,7 @@ async def _insert_resource(
     )
 
 async def _insert_endpoint_dataset_fixtures(
-    database: Database,
-    schema: str,
+    database: Database, schema: str
 ) -> None:
     await database.status(
         f"INSERT INTO {schema}.provider_directory_source "
