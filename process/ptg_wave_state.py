@@ -14,9 +14,14 @@ import json
 import re
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
-from db.models import PTGImportWave, PTGImportWaveClaim, db
+from db.models import (
+    PTGImportWave,
+    PTGImportWaveClaim,
+    PTGImportWaveQuarantine,
+    db,
+)
 from process.ptg_parts.ptg_wave_admission_fence import PTG_WAVE_TERMINAL_STATES
 from process.ptg_wave_receipt_projection import wave_receipt_mapping
 from process.ptg_wave_release_validation import validate_release_receipt
@@ -467,7 +472,12 @@ async def get_wave_receipts(wave_id: str) -> dict[str, Any] | None:
     wave = wave_query_result.scalar_one_or_none()
     if wave is None:
         return None
-    return wave_receipt_mapping(wave)
+    retired = await db.scalar(
+        select(func.count())
+        .select_from(PTGImportWaveQuarantine)
+        .where(PTGImportWaveQuarantine.predecessor_wave_id == wave.wave_id)
+    )
+    return wave_receipt_mapping(wave, retired=bool(retired))
 
 
 __all__ = [

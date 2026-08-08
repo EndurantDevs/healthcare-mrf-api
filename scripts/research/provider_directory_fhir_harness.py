@@ -562,15 +562,21 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
     token = args.control_token or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
     if not control_url or not token:
         return CaseResult(case_id=case_id, kind="control", status="skipped", elapsed_seconds=0, error="control URL/token not supplied")
+    request_payload_by_field = _control_request_payload(args)
+    request = urllib.request.Request(
+        f"{control_url}/imports",
+        data=json.dumps(request_payload_by_field).encode("utf-8"),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    return _post_control_request(case_id, request, started, args.timeout)
+
+
+def _control_request_payload(args: argparse.Namespace) -> dict[str, Any]:
     request_payload_by_field = {
         "importer": "provider-directory-fhir",
         "idempotency_key": f"provider-directory-fhir-harness-{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M%S')}",
-        "params": {
-            "import_resources": True,
-            "full_refresh": args.full_refresh,
-            "concurrency": args.concurrency,
-            "timeout": args.timeout,
-        },
+        "params": {"import_resources": True, "full_refresh": args.full_refresh, "concurrency": args.concurrency, "timeout": args.timeout},
     }
     if args.refresh_preset:
         request_payload_by_field["params"]["refresh_preset"] = args.refresh_preset
@@ -602,14 +608,14 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         request_payload_by_field["params"]["retest_results_path"] = args.retest_results_path
     if args.retest_results_url:
         request_payload_by_field["params"]["retest_results_url"] = args.retest_results_url
-    request = urllib.request.Request(
-        f"{control_url}/imports",
-        data=json.dumps(request_payload_by_field).encode("utf-8"),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
-    )
+    return request_payload_by_field
+
+
+def _post_control_request(
+    case_id: str, request: urllib.request.Request, started: float, timeout: float
+) -> CaseResult:
     try:
-        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read(1024 * 1024)
         parsed = json.loads(body.decode("utf-8"))
         return CaseResult(

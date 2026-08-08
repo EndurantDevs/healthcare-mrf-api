@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from api.control_import_wave_attestation import (
+    MATERIALIZED_PRECLAIM_ATTESTATION_VERSION,
+    ROLLBACK_ATTESTATION_VERSION,
+)
 from api.control_import_wave_admission_rollback import (
     persist_admission_rollback_supersession,
     validate_admission_rollback_supersession,
@@ -11,6 +15,10 @@ from api.control_import_wave_admission_rollback import (
 from api.control_import_wave_supersession import (
     persist_admission_supersession,
     validate_admission_supersession,
+)
+from api.control_import_wave_materialized_preclaim import (
+    persist_materialized_preclaim_supersession,
+    validate_materialized_preclaim_supersession,
 )
 from process.ptg_wave_admission_rollback_supersession import (
     PTGWaveAdmissionRollbackConflict,
@@ -46,25 +54,48 @@ async def persist_admission_recoveries(
         now=now,
         redis=redis,
     )
+    await persist_materialized_preclaim_supersession(
+        session,
+        request,
+        now=now,
+        redis=redis,
+    )
 
 
-def validate_admission_recovery_proofs(
+def project_admission_recovery_proofs(
     attestation: dict[str, Any],
     *,
     wave_id: str,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Validate the versioned logical and absent-admission proofs."""
+) -> dict[str, dict[str, Any] | None]:
+    """Validate and project only proofs allowed by the schema version."""
 
-    return (
-        validate_admission_supersession(attestation, wave_id=wave_id),
-        validate_admission_rollback_supersession(
+    recovery_proof_map = {
+        "supersession": validate_admission_supersession(
             attestation,
             wave_id=wave_id,
-        ),
-    )
+        )
+    }
+    if attestation["schema_version"] == ROLLBACK_ATTESTATION_VERSION:
+        recovery_proof_map["admission_rollback_supersession"] = (
+            validate_admission_rollback_supersession(
+                attestation,
+                wave_id=wave_id,
+            )
+        )
+    if (
+        attestation["schema_version"]
+        == MATERIALIZED_PRECLAIM_ATTESTATION_VERSION
+    ):
+        recovery_proof_map["materialized_preclaim_supersession"] = (
+            validate_materialized_preclaim_supersession(
+                attestation,
+                wave_id=wave_id,
+            )
+        )
+    return recovery_proof_map
 
 
 __all__ = [
     "persist_admission_recoveries",
-    "validate_admission_recovery_proofs",
+    "project_admission_recovery_proofs",
 ]

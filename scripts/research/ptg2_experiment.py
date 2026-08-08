@@ -2001,6 +2001,17 @@ def build_serving_by_code_db_records(serving_rows: Any) -> dict[str, Any]:
         row_count += 1
         _serving_row_digest_update(source_digest, code_key, provider_set_key, provider_count, price_set_id)
     current_payload, current_count = flush_code(current_code, current_payload, current_count)
+    return _serving_by_code_record_summary(
+        binary_records, price_set_values, row_count, source_digest
+    )
+
+
+def _serving_by_code_record_summary(
+    binary_records: list[tuple[str, int, int, int, bytes]],
+    price_set_values: list[str],
+    row_count: int,
+    source_digest: Any,
+) -> dict[str, Any]:
     binary_records.insert(
         0,
         (
@@ -3389,34 +3400,9 @@ def run_suite(
     timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     output_root = report_dir / f"run-{timestamp}"
     output_root.mkdir(parents=True, exist_ok=True)
-    experiment_results: list[RunResult] = []
-    for case in cases:
-        selected_variant_ids = list(case.get("variants") or variants.keys())
-        if variant_ids:
-            selected_variant_ids = [variant_id for variant_id in selected_variant_ids if variant_id in variant_ids]
-        for variant_id in selected_variant_ids:
-            variant = variants[variant_id]
-            kind = str(case.get("kind") or "scanner_fixture")
-            if kind == "scanner_fixture":
-                experiment_results.append(
-                    run_scanner_fixture(
-                        case=case,
-                        variant=variant,
-                        suite=suite,
-                        output_root=output_root,
-                        dry_run=dry_run,
-                    )
-                )
-            else:
-                experiment_results.append(
-                    run_local_ptg_cli(
-                        case=case,
-                        variant=variant,
-                        suite=suite,
-                        output_root=output_root,
-                        dry_run=dry_run,
-                    )
-                )
+    experiment_results = _run_selected_cases(
+        suite, cases, variants, variant_ids, output_root, dry_run
+    )
     experiment_report_map = {
         "schema_version": 1,
         "generated_at": timestamp,
@@ -3434,6 +3420,31 @@ def run_suite(
     )
     write_report(output_root, experiment_report_map)
     return experiment_report_map
+
+
+def _run_selected_cases(
+    suite: dict[str, Any],
+    cases: list[dict[str, Any]],
+    variants: dict[str, dict[str, Any]],
+    variant_ids: set[str] | None,
+    output_root: Path,
+    dry_run: bool,
+) -> list[RunResult]:
+    experiment_results: list[RunResult] = []
+    for case in cases:
+        selected_variant_ids = list(case.get("variants") or variants.keys())
+        if variant_ids:
+            selected_variant_ids = [item for item in selected_variant_ids if item in variant_ids]
+        for variant_id in selected_variant_ids:
+            runner = run_scanner_fixture if str(case.get("kind") or "scanner_fixture") == "scanner_fixture" else run_local_ptg_cli
+            experiment_results.append(runner(
+                case=case,
+                variant=variants[variant_id],
+                suite=suite,
+                output_root=output_root,
+                dry_run=dry_run,
+            ))
+    return experiment_results
 
 
 def evaluate_gates(

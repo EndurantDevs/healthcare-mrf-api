@@ -413,6 +413,11 @@ def _install_admission_dependencies(monkeypatch, session, *, prepared=None):
     monkeypatch.setattr(waves, "guard_source_attempt", AsyncMock())
     monkeypatch.setattr(waves, "acquire_ptg_admission_lock", AsyncMock())
     monkeypatch.setattr(waves, "persist_admission_recoveries", AsyncMock())
+    monkeypatch.setattr(
+        waves,
+        "require_materialized_preclaim_replay_allowed",
+        AsyncMock(),
+    )
     monkeypatch.setattr(waves, "require_wave_admission_capacity", AsyncMock())
     monkeypatch.setattr(waves, "_new_wave_record", Mock(return_value=wave))
     monkeypatch.setattr(waves, "_persist_wave_intents", AsyncMock())
@@ -458,7 +463,11 @@ async def test_admission_replay_and_conflicts_are_immutable(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_wave_handles_found_and_absent(monkeypatch):
-    results = [_Result(scalar=None), _Result(scalar=_wave_record())]
+    results = [
+        _Result(scalar=None),
+        _Result(scalar=_wave_record()),
+        _Result(scalar=None),
+    ]
 
     async def execute(_statement):
         return results.pop(0)

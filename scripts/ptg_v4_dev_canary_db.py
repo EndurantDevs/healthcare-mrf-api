@@ -149,48 +149,65 @@ async def _collect_v4_database_rows(
         snapshot_id=scope.snapshot_id,
         snapshot_manifest=snapshot_by_field["snapshot_manifest"],
     )
-    physical_storage = await collect_physical_storage(
-        connection,
-        PhysicalStorageRequest(
-            schema_name=scope.schema_name,
-            snapshot_id=scope.snapshot_id,
-            snapshot_key=snapshot_key,
-            import_run_id=str(snapshot_by_field["import_run_id"]),
-            relation_manifests=relation_rows,
-            baseline=scope.storage_baseline,
-            import_started_at=scope.import_started_at,
-            import_finished_at=scope.import_finished_at,
-            retained_raw_artifacts=retained_raw_artifacts,
-        ),
+    physical_storage = await _physical_storage_evidence(
+        connection, scope, snapshot_key, snapshot_by_field, relation_rows, retained_raw_artifacts
     )
-    return {
+    evidence_by_section = {
         "snapshot": snapshot_by_field,
         "root": root_by_field,
         "exact_counts": exact_counts,
         "relations": relation_rows,
         "inferred_taxonomy_candidates": inferred_taxonomy_candidates,
         "provider_tax_identity": provider_tax_identity,
-        "heavy_owners": await _heavy_owner_diagnostics(
-            connection,
-            scope.schema_name,
-            snapshot_key,
-        ),
-        "provider_graph_diagnostic": await _provider_graph_diagnostic(
-            connection,
-            scope.schema_name,
-            snapshot_key,
-        ),
-        "reference_equivalence": await collect_reference_equivalence(
-            connection,
-            scope.schema_name,
-            ReferenceEquivalenceScope(
-                v4_snapshot_id=scope.snapshot_id,
-                reference_snapshot_id=scope.reference_snapshot_id,
-                rollback_owner_id=scope.rollback_owner_id,
-            ),
-        ),
         "physical_storage": physical_storage,
     }
+    return await _add_v4_database_diagnostics(
+        evidence_by_section, connection, scope, snapshot_key
+    )
+
+
+async def _physical_storage_evidence(
+    connection: asyncpg.Connection,
+    scope: _DatabaseEvidenceScope,
+    snapshot_key: int,
+    snapshot_by_field: Mapping[str, Any],
+    relation_rows: list[dict[str, Any]],
+    retained_raw_artifacts: Mapping[str, Any],
+) -> dict[str, Any]:
+    return await collect_physical_storage(
+        connection,
+        PhysicalStorageRequest(
+            schema_name=scope.schema_name, snapshot_id=scope.snapshot_id,
+            snapshot_key=snapshot_key, import_run_id=str(snapshot_by_field["import_run_id"]),
+            relation_manifests=relation_rows, baseline=scope.storage_baseline,
+            import_started_at=scope.import_started_at, import_finished_at=scope.import_finished_at,
+            retained_raw_artifacts=retained_raw_artifacts,
+        ),
+    )
+
+
+async def _add_v4_database_diagnostics(
+    database_rows: dict[str, Any],
+    connection: asyncpg.Connection,
+    scope: _DatabaseEvidenceScope,
+    snapshot_key: int,
+) -> dict[str, Any]:
+    database_rows["heavy_owners"] = await _heavy_owner_diagnostics(
+        connection, scope.schema_name, snapshot_key
+    )
+    database_rows["provider_graph_diagnostic"] = await _provider_graph_diagnostic(
+        connection, scope.schema_name, snapshot_key
+    )
+    database_rows["reference_equivalence"] = await collect_reference_equivalence(
+        connection,
+        scope.schema_name,
+        ReferenceEquivalenceScope(
+            v4_snapshot_id=scope.snapshot_id,
+            reference_snapshot_id=scope.reference_snapshot_id,
+            rollback_owner_id=scope.rollback_owner_id,
+        ),
+    )
+    return database_rows
 
 
 async def _snapshot_and_root(
