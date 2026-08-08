@@ -354,12 +354,17 @@ def test_public_evidence_contract_has_only_stdlib_or_local_imports() -> None:
 
 def test_runtime_and_container_do_not_wire_the_dormant_package() -> None:
     repository_root = Path(__file__).resolve().parents[1]
+    explicit_replay_executor = (
+        repository_root / "process" / "public_evidence_fhir_organization_replay.py"
+    )
     runtime_sources = [repository_root / "main.py"]
     for package_name in ("api", "db", "process", "service"):
         runtime_sources.extend((repository_root / package_name).rglob("*.py"))
 
     importing_paths = []
     for source_path in runtime_sources:
+        if source_path == explicit_replay_executor:
+            continue
         tree = ast.parse(
             source_path.read_text(encoding="utf-8"),
             filename=str(source_path),

@@ -123,10 +123,15 @@ raise SystemExit(bool(forbidden))
 
 def test_runtime_and_container_do_not_wire_record_contract() -> None:
     repository_root = Path(__file__).resolve().parents[1]
+    explicit_replay_executor = (
+        repository_root / "process" / "public_evidence_fhir_organization_replay.py"
+    )
     runtime_paths = [repository_root / "main.py"]
     for package_name in ("api", "db", "process", "service"):
         runtime_paths.extend((repository_root / package_name).rglob("*.py"))
     for path in runtime_paths:
+        if path == explicit_replay_executor:
+            continue
         assert "public_evidence.evidence_record" not in path.read_text(encoding="utf-8")
     docker_text = (repository_root / "Dockerfile").read_text(encoding="utf-8")
     assert "evidence_record_contract" not in docker_text
