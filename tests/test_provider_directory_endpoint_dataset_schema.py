@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from db.models import (
     ProviderDirectoryAPIEndpoint,
@@ -116,6 +117,10 @@ def test_dataset_models_preserve_publication_and_resource_identity_contracts():
     )
     assert ProviderDirectoryDatasetResource.__table__.c.payload_hash.nullable is False
     assert ProviderDirectoryDatasetResource.__table__.c.payload_json.nullable is False
+    assert isinstance(
+        ProviderDirectoryEndpointDataset.__table__.c.completion_proof_json.type,
+        postgresql.JSONB,
+    )
 
     current_index = next(
         index
@@ -145,7 +150,39 @@ def test_source_endpoint_link_is_nullable_indexed_and_set_null_on_delete():
     } in ProviderDirectorySource.__my_additional_indexes__
 
 
+def _assert_revision_model_columns(recorder, models_by_table):
+    later_columns_by_table = {
+        "provider_directory_endpoint_dataset": {
+            "acquisition_root_run_id",
+            "completion_proof_required_version",
+            "completion_proof_json",
+            "completion_proof_sha256",
+        },
+        "provider_directory_dataset_resource": {
+            "acquired_resource_sha256",
+        },
+    }
+    for table_name, model_class in models_by_table.items():
+        revision_columns = [
+            table_item.name
+            for table_item in recorder.tables[table_name]["items"]
+            if isinstance(table_item, sa.Column)
+        ]
+        expected_columns = [
+            column_name
+            for column_name in model_class.__table__.columns.keys()
+            if column_name not in later_columns_by_table.get(table_name, set())
+        ]
+        assert revision_columns == expected_columns
+        assert (
+            recorder.tables[table_name]["schema"]
+            == model_class.__table__.schema
+        )
+
+
 def test_endpoint_dataset_migration_mirrors_models(monkeypatch):
+    """Keep the predecessor revision aligned before later proof columns."""
+
     migration = _load_migration()
     recorder = _OpRecorder()
     monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
@@ -161,22 +198,7 @@ def test_endpoint_dataset_migration_mirrors_models(monkeypatch):
         "provider_directory_dataset_resource": ProviderDirectoryDatasetResource,
     }
     assert set(recorder.tables) == set(models_by_table)
-    for table_name, model_cls in models_by_table.items():
-        columns = [
-            table_item.name
-            for table_item in recorder.tables[table_name]["items"]
-            if isinstance(table_item, sa.Column)
-        ]
-        revision_model_columns = [
-            column_name
-            for column_name in model_cls.__table__.columns.keys()
-            if not (
-                table_name == "provider_directory_endpoint_dataset"
-                and column_name == "acquisition_root_run_id"
-            )
-        ]
-        assert columns == revision_model_columns
-        assert recorder.tables[table_name]["schema"] == model_cls.__table__.schema
+    _assert_revision_model_columns(recorder, models_by_table)
 
     current_index = recorder.indexes["provider_directory_endpoint_dataset_current_idx"]
     assert current_index["table"] == "provider_directory_endpoint_dataset"

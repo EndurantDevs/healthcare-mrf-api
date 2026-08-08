@@ -108,6 +108,16 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     ) in workflow
     assert "timeout --foreground 295s python -m pytest" in workflow
     assert "timeout --foreground 295s cargo llvm-cov" in workflow
+    lifecycle_step = workflow.split(
+        "      - name: Run TIN-to-NPI connector PostgreSQL lifecycle gate\n",
+        1,
+    )[1].split("      - name:", 1)[0]
+    assert "timeout --foreground 295s python -m pytest -q" in lifecycle_step
+    assert "tests/test_tin_npi_connector_postgres.py" in lifecycle_step
+    assert (
+        "tests/test_provider_directory_subset_completion_postgres.py"
+        in lifecycle_step
+    )
     for workflow_line in workflow.splitlines():
         if (
             "python -m pytest" in workflow_line

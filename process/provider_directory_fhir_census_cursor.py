@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Source-neutral Smile opaque-cursor validation for exact FHIR censuses."""
+"""Source-neutral Smile opaque-cursor validation for reviewed FHIR traversal."""
 
 from __future__ import annotations
 
@@ -15,11 +15,17 @@ from process.provider_directory_fhir_census_binding import (
 )
 from process.provider_directory_fhir_census_contract import (
     CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
+    SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY,
 )
 from process.provider_directory_fhir_census_page_geometry import (
     validate_current_version_census_checkpoint_geometry,
     validate_census_page_entries,
     validate_current_version_census_resume_state,
+)
+from process.provider_directory_fhir_census_resume import (
+    resume_prior_page_entry_count,
+    validate_resume_identity_evidence,
+    validated_initial_resume_url,
 )
 
 
@@ -34,6 +40,7 @@ class CurrentVersionCensusContinuation:
 
     url: str
     identity: str
+    shape_identity: str
     token: str
     offset: int
 
@@ -134,6 +141,8 @@ def _smile_cursor_parts(
 def _validate_continuation_location(
     parsed_base: urllib.parse.SplitResult,
     parsed_next: urllib.parse.SplitResult,
+    *,
+    require_reviewed_parent_path: bool = False,
 ) -> None:
     expected_origin = (
         (parsed_base.hostname or "").lower(),
@@ -143,10 +152,13 @@ def _validate_continuation_location(
         (parsed_next.hostname or "").lower(),
         _effective_https_port(parsed_next),
     )
-    allowed_paths = {
-        _normalized_path(parsed_base.path),
-        _normalized_path(parsed_base.path.rsplit("/", 1)[0]),
-    }
+    reviewed_resource_path = _normalized_path(parsed_base.path)
+    reviewed_parent_path = _normalized_path(parsed_base.path.rsplit("/", 1)[0])
+    allowed_paths = (
+        {reviewed_parent_path}
+        if require_reviewed_parent_path
+        else {reviewed_resource_path, reviewed_parent_path}
+    )
     if (
         parsed_next.scheme.lower() != "https"
         or next_origin != expected_origin
@@ -225,6 +237,34 @@ def _cursor_identity(
     ).hexdigest()
 
 
+def _cursor_shape_identity(
+    parsed_next: urllib.parse.SplitResult,
+    query_items: list[tuple[str, str]],
+    *,
+    page_entry_count: int,
+) -> str:
+    """Hash root-neutral hop shape while masking the opaque search token."""
+
+    shape_payload_by_field = {
+        "page_entry_count": page_entry_count,
+        "path": _normalized_path(parsed_next.path),
+        "query": sorted(
+            (
+                query_name.lower(),
+                "opaque" if query_name.lower() == "_getpages" else query_value,
+            )
+            for query_name, query_value in query_items
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            shape_payload_by_field,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _validate_resumed_continuation_url(
     contract: CurrentVersionCensusContract,
     resource_type: str,
@@ -232,7 +272,8 @@ def _validate_resumed_continuation_url(
     next_url: str | None,
     *,
     expected_page_count: int,
-) -> int:
+    prior_page_entry_count: int,
+) -> tuple[int, str, str]:
     if (
         not next_url
         or next_url == start_url
@@ -244,12 +285,24 @@ def _validate_resumed_continuation_url(
         )
     parsed_base = urllib.parse.urlsplit(dict(contract.start_urls)[resource_type])
     parsed_next = urllib.parse.urlsplit(next_url)
-    _validate_continuation_location(parsed_base, parsed_next)
-    _cursor_token, cursor_offset, _query_items = _smile_cursor_parts(
+    _validate_continuation_location(
+        parsed_base,
+        parsed_next,
+        require_reviewed_parent_path=contract.is_server_issued_subset_v3,
+    )
+    _cursor_token, cursor_offset, query_items = _smile_cursor_parts(
         parsed_next,
         expected_page_count=expected_page_count,
     )
-    return cursor_offset
+    return (
+        cursor_offset,
+        _cursor_identity(parsed_next, query_items),
+        _cursor_shape_identity(
+            parsed_next,
+            query_items,
+            page_entry_count=prior_page_entry_count,
+        ),
+    )
 
 
 def validate_census_resume_url(
@@ -266,6 +319,7 @@ def validate_census_resume_url(
         resume_state.rows_processed,
         resume_state.expected_page_count,
         resume_state.pre_total,
+        allow_sparse_logical_offsets=contract.is_server_issued_subset_v3,
     )
     validate_current_version_census_checkpoint_geometry(
         resume_state.proof_by_field,
@@ -273,25 +327,29 @@ def validate_census_resume_url(
         rows_processed=resume_state.rows_processed,
         expected_page_count=resume_state.expected_page_count,
     )
-    if start_url != contract.start_url(
-        resource_type,
-        resume_state.expected_page_count,
-    ):
-        raise ValueError(
-            "provider_directory_current_version_census_resume_start_url_invalid"
-        )
-    if resume_state.pages_processed == 0:
-        if next_url != start_url:
-            raise ValueError(
-                "provider_directory_current_version_census_resume_url_invalid"
-            )
-        return start_url
-    cursor_offset = _validate_resumed_continuation_url(
+    initial_url = validated_initial_resume_url(
         contract,
         resource_type,
         start_url,
         next_url,
         expected_page_count=resume_state.expected_page_count,
+        pages_processed=resume_state.pages_processed,
+    )
+    if initial_url is not None:
+        return initial_url
+    prior_page_entry_count = resume_prior_page_entry_count(
+        contract,
+        resume_state.proof_by_field,
+    )
+    cursor_offset, continuation_identity, continuation_shape_identity = (
+        _validate_resumed_continuation_url(
+            contract,
+            resource_type,
+            start_url,
+            next_url,
+            expected_page_count=resume_state.expected_page_count,
+            prior_page_entry_count=prior_page_entry_count,
+        )
     )
     if cursor_offset != (
         resume_state.pages_processed * resume_state.expected_page_count
@@ -299,8 +357,47 @@ def validate_census_resume_url(
         raise ValueError(
             "provider_directory_current_version_census_resume_offset_invalid"
         )
+    validate_resume_identity_evidence(
+        contract,
+        resume_state.proof_by_field,
+        continuation_identity,
+        continuation_shape_identity,
+    )
     assert next_url is not None
     return next_url
+
+
+def _validate_next_link_request(
+    contract: CurrentVersionCensusContract,
+    resource_type: str,
+    next_link: str,
+    page_entry_count: int,
+    expected_page_count: int,
+    pre_total: int,
+) -> None:
+    """Validate fixed strategy and page inputs before cursor parsing."""
+
+    expected_strategy = (
+        SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY
+        if contract.is_server_issued_subset_v3
+        else CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY
+    )
+    if contract.continuation_strategy != expected_strategy:
+        raise ValueError(
+            "provider_directory_current_version_census_continuation_unsupported"
+        )
+    if (
+        resource_type not in contract.resources
+        or not next_link
+        or next_link.startswith("//")
+        or next_link.strip() != next_link
+    ):
+        raise ValueError("untrusted_current_version_census_pagination_link")
+    validate_census_page_entries(page_entry_count, expected_page_count)
+    if isinstance(pre_total, bool) or not isinstance(pre_total, int) or pre_total < 0:
+        raise ValueError(
+            "provider_directory_current_version_census_pre_count_invalid"
+        )
 
 
 def resolved_current_version_census_next_url(
@@ -315,34 +412,24 @@ def resolved_current_version_census_next_url(
 ) -> CurrentVersionCensusContinuation:
     """Validate one bounded cursor while preserving upstream URL bytes."""
 
-    if (
-        contract.continuation_strategy
-        != CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY
-    ):
-        raise ValueError(
-            "provider_directory_current_version_census_continuation_unsupported"
-        )
-    if (
-        resource_type not in contract.resources
-        or not next_link
-        or next_link.startswith("//")
-        or next_link.strip() != next_link
-    ):
-        raise ValueError("untrusted_current_version_census_pagination_link")
-    validate_census_page_entries(
+    _validate_next_link_request(
+        contract,
+        resource_type,
+        next_link,
         page_entry_count,
         expected_page_count,
+        pre_total,
     )
-    if isinstance(pre_total, bool) or not isinstance(pre_total, int) or pre_total < 0:
-        raise ValueError(
-            "provider_directory_current_version_census_pre_count_invalid"
-        )
     reviewed_url = dict(contract.start_urls)[resource_type]
     parsed_base = urllib.parse.urlsplit(reviewed_url)
     parsed_current = urllib.parse.urlsplit(current_url)
     next_url = urllib.parse.urljoin(current_url, next_link)
     parsed_next = urllib.parse.urlsplit(next_url)
-    _validate_continuation_location(parsed_base, parsed_next)
+    _validate_continuation_location(
+        parsed_base,
+        parsed_next,
+        require_reviewed_parent_path=contract.is_server_issued_subset_v3,
+    )
     cursor_token, cursor_offset, query_items = _smile_cursor_parts(
         parsed_next,
         expected_page_count=expected_page_count,
@@ -355,11 +442,16 @@ def resolved_current_version_census_next_url(
         cursor_offset,
         expected_page_count,
     )
-    if cursor_offset >= pre_total:
+    if not contract.is_server_issued_subset_v3 and cursor_offset >= pre_total:
         raise ValueError("untrusted_current_version_census_pagination_link")
     return CurrentVersionCensusContinuation(
         next_url,
         _cursor_identity(parsed_next, query_items),
+        _cursor_shape_identity(
+            parsed_next,
+            query_items,
+            page_entry_count=page_entry_count,
+        ),
         cursor_token,
         cursor_offset,
     )

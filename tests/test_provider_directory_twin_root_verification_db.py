@@ -107,7 +107,10 @@ async def _create_dataset_table(database: Database, schema: str) -> None:
             validated_at timestamp,
             published_at timestamp,
             superseded_at timestamp,
-            publication_metadata_json jsonb
+            publication_metadata_json jsonb,
+            completion_proof_required_version integer,
+            completion_proof_json jsonb,
+            completion_proof_sha256 varchar(64)
         );
         """
     )
@@ -123,9 +126,7 @@ async def _create_dataset_table(database: Database, schema: str) -> None:
 
 
 async def _insert_baseline(
-    database: Database,
-    schema: str,
-    baseline: dict[str, object],
+    database: Database, schema: str, baseline: dict[str, object]
 ) -> None:
     await database.status(
         f"""
@@ -187,10 +188,7 @@ async def _insert_terminal_successor(
 
 
 async def _set_terminal_successor_status(
-    database: Database,
-    schema: str,
-    status: str,
-    is_current: bool,
+    database: Database, schema: str, status: str, is_current: bool
 ) -> None:
     await database.status(
         f"""

@@ -17,11 +17,21 @@ from process.provider_directory_fhir_census_binding import (
     _validate_reviewed_start_url,
 )
 from process.provider_directory_fhir_census_contract import (
+    CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD,
     CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD,
     CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
-    CURRENT_VERSION_CENSUS_SEMANTICS,
-    CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
+    CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD,
     CURRENT_VERSION_CENSUS_START_URLS_FIELD,
+    CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD,
+    SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
+    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_SEMANTICS,
+    SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY,
+    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+    SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
 )
 
 
@@ -43,7 +53,7 @@ MANUAL_CURRENT_VERSION_CENSUS_RESOURCES = (
     "OrganizationAffiliation",
 )
 MANUAL_SOURCE_PENDING_STATUS = (
-    "pending_two_matching_exhaustive_acquisitions"
+    "pending_two_matching_reviewed_subset_acquisitions"
 )
 MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD = (
     "provider_directory_verification_campaign_id"
@@ -65,6 +75,11 @@ _MANUAL_ENTRY_FIELDS = frozenset(
 _MANUAL_CENSUS_FIELDS = frozenset(
     {
         "contract_version",
+        "semantics",
+        "strategy_version",
+        "traversal_version",
+        "canonicalization_version",
+        "completion_scopes",
         "plan_name",
         "seed_source",
         "continuation_strategy",
@@ -214,6 +229,8 @@ def _validated_manual_config(
     canonical_base: str,
     resources: tuple[str, ...],
 ) -> dict[str, Any]:
+    """Validate the reviewed v3 acquisition configuration."""
+
     raw_config = raw_entry.get(MANUAL_CURRENT_VERSION_CENSUS_FIELD)
     if type(raw_config) is not dict:
         raise _manifest_error("manual_contract_shape")
@@ -223,7 +240,7 @@ def _validated_manual_config(
         raise _manifest_error("manual_contract_fields")
     if (
         type(raw_config.get("contract_version")) is not int
-        or raw_config["contract_version"] != 2
+        or raw_config["contract_version"] != 3
     ):
         raise _manifest_error("contract_version_invalid")
     plan_name = _strict_text(raw_config.get("plan_name"), field_name="plan_name")
@@ -231,12 +248,9 @@ def _validated_manual_config(
         raw_config.get("seed_source"),
         field_name="seed_source",
     )
-    continuation_strategy = _strict_text(
-        raw_config.get("continuation_strategy"),
-        field_name="continuation_strategy",
+    continuation_strategy, fixed_identity_by_field = (
+        _validated_manual_fixed_identity(raw_config)
     )
-    if continuation_strategy != CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY:
-        raise _manifest_error("continuation_strategy_invalid")
     expected_nonempty_resources = _strict_resources(
         raw_config.get("expected_nonempty_resources"),
         field_name="expected_nonempty_resources",
@@ -254,6 +268,8 @@ def _validated_manual_config(
         "continuation_strategy": continuation_strategy,
         "expected_nonempty_resources": expected_nonempty_resources,
         "page_count": page_count,
+        "contract_version": 3,
+        **fixed_identity_by_field,
         "verification_campaign_id": verification_campaign_id,
         "start_urls": _validated_start_urls(
             raw_config.get("start_urls"),
@@ -261,6 +277,34 @@ def _validated_manual_config(
             resources=resources,
         ),
     }
+
+
+def _validated_manual_fixed_identity(
+    raw_config: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Validate fixed strategy fields and return their canonical projection."""
+
+    continuation_strategy = _strict_text(
+        raw_config.get("continuation_strategy"),
+        field_name="continuation_strategy",
+    )
+    if continuation_strategy != SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY:
+        raise _manifest_error("continuation_strategy_invalid")
+    fixed_identity_by_field = {
+        "semantics": SERVER_ISSUED_SUBSET_SEMANTICS,
+        "strategy_version": SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+        "traversal_version": SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
+        "canonicalization_version": (
+            SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION
+        ),
+        "completion_scopes": list(SERVER_ISSUED_SUBSET_COMPLETION_SCOPES),
+    }
+    if any(
+        raw_config.get(field_name) != expected_identity
+        for field_name, expected_identity in fixed_identity_by_field.items()
+    ):
+        raise _manifest_error("v3_identity_invalid")
+    return continuation_strategy, fixed_identity_by_field
 
 
 def _stable_seed_source_id(seed_row: Mapping[str, Any]) -> str:
@@ -323,6 +367,8 @@ def _validated_manual_entry(
 
 
 def _manual_seed_row(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Build one deterministic dormant seed and guard its opaque identity."""
+
     resources = tuple(entry["resources"])
     page_count = int(entry["page_count"])
     canonical_base = str(entry["canonical_base"])
@@ -334,48 +380,71 @@ def _manual_seed_row(entry: Mapping[str, Any]) -> dict[str, Any]:
         "auth_type": "none",
         "requires_registration": False,
         "source": entry["seed_source"],
-        "source_detail": "reviewed manual current-version census source",
+        "source_detail": "reviewed manual server-issued traversal subset source",
         "source_url": canonical_base,
         "note": (
-            "Manual-only source pending two matching exhaustive acquisitions; "
+            "Manual-only source pending two matching reviewed subset acquisitions; "
             "publication is not authorized."
         ),
-        "metadata_json": {
-            "provider_directory_override": (
-                "reviewed_manual_current_version_census"
-            ),
-            "provider_directory_manual_only": True,
-            "provider_directory_confirmed_base": canonical_base,
-            "provider_directory_confirmed_metadata_url": (
-                f"{canonical_base}/metadata"
-            ),
-            "provider_directory_confirmed_catalog_url": canonical_base,
-            "provider_directory_supported_resources": list(resources),
-            "provider_directory_fully_enumerable_resources": list(resources),
-            "provider_directory_expected_nonempty_resources": list(
-                entry["expected_nonempty_resources"]
-            ),
-            "provider_directory_resource_page_count_caps": {
-                resource_type: page_count for resource_type in resources
-            },
-            "provider_directory_coverage_mode": "full",
-            "provider_directory_acquisition_enabled": True,
-            "provider_directory_candidate_status": MANUAL_SOURCE_PENDING_STATUS,
-            MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD: entry[
-                "verification_campaign_id"
-            ],
-            CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD: (
-                CURRENT_VERSION_CENSUS_SEMANTICS
-            ),
-            CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD: entry[
-                "continuation_strategy"
-            ],
-            CURRENT_VERSION_CENSUS_START_URLS_FIELD: dict(entry["start_urls"]),
-        },
+        "metadata_json": _manual_seed_metadata(
+            entry,
+            resources,
+            page_count,
+            canonical_base,
+        ),
     }
     if _stable_seed_source_id(seed_row_by_field) != entry["source_id"]:
         raise _manifest_error("source_identity_drift")
     return seed_row_by_field
+
+
+def _manual_seed_metadata(
+    entry: Mapping[str, Any],
+    resources: tuple[str, ...],
+    page_count: int,
+    canonical_base: str,
+) -> dict[str, Any]:
+    """Project the reviewed subset identity into dormant source metadata."""
+
+    return {
+        "provider_directory_override": "reviewed_manual_current_version_census",
+        "provider_directory_manual_only": True,
+        "provider_directory_confirmed_base": canonical_base,
+        "provider_directory_confirmed_metadata_url": f"{canonical_base}/metadata",
+        "provider_directory_confirmed_catalog_url": canonical_base,
+        "provider_directory_supported_resources": list(resources),
+        "provider_directory_fully_enumerable_resources": [],
+        "provider_directory_server_issued_subset_resources": list(resources),
+        "provider_directory_expected_nonempty_resources": list(
+            entry["expected_nonempty_resources"]
+        ),
+        "provider_directory_resource_page_count_caps": {
+            resource_type: page_count for resource_type in resources
+        },
+        "provider_directory_coverage_mode": SERVER_ISSUED_SUBSET_SEMANTICS,
+        "provider_directory_acquisition_enabled": True,
+        "provider_directory_candidate_status": MANUAL_SOURCE_PENDING_STATUS,
+        MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD: entry[
+            "verification_campaign_id"
+        ],
+        CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD: (
+            SERVER_ISSUED_SUBSET_SEMANTICS
+        ),
+        CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD: entry["contract_version"],
+        CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD: page_count,
+        CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD: entry["strategy_version"],
+        CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD: entry["traversal_version"],
+        CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD: entry[
+            "canonicalization_version"
+        ],
+        CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD: list(
+            entry["completion_scopes"]
+        ),
+        CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD: entry[
+            "continuation_strategy"
+        ],
+        CURRENT_VERSION_CENSUS_START_URLS_FIELD: dict(entry["start_urls"]),
+    }
 
 
 def reviewed_manual_census_seed_rows(

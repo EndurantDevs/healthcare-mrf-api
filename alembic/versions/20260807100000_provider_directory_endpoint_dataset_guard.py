@@ -31,6 +31,11 @@ ENDPOINT_DATASET_IMMUTABLE_COLUMNS = (
     "created_at",
     "validated_at",
 )
+ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS = (
+    "completion_proof_required_version",
+    "completion_proof_json",
+    "completion_proof_sha256",
+)
 
 
 def _schema() -> str:
@@ -56,10 +61,20 @@ def _qf(schema: str, relation: str) -> str:
 
 
 def _endpoint_dataset_schema_fence_sql(schema: str) -> str:
-    expected_columns = sorted(
+    expected_legacy_columns = sorted(
         ENDPOINT_DATASET_MUTABLE_COLUMNS + ENDPOINT_DATASET_IMMUTABLE_COLUMNS
     )
-    expected_array = ", ".join(f"'{column}'" for column in expected_columns)
+    expected_current_columns = sorted(
+        ENDPOINT_DATASET_MUTABLE_COLUMNS
+        + ENDPOINT_DATASET_IMMUTABLE_COLUMNS
+        + ENDPOINT_DATASET_FORWARD_COMPATIBLE_COLUMNS
+    )
+    legacy_array = ", ".join(
+        f"'{column}'" for column in expected_legacy_columns
+    )
+    current_array = ", ".join(
+        f"'{column}'" for column in expected_current_columns
+    )
     dataset_ref = _qf(schema, "provider_directory_endpoint_dataset")
     return f"""
     DO $migration$
@@ -72,7 +87,9 @@ def _endpoint_dataset_schema_fence_sql(schema: str) -> str:
          WHERE attribute.attrelid = {_ql(dataset_ref)}::regclass
            AND attribute.attnum > 0
            AND NOT attribute.attisdropped;
-        IF observed_columns IS DISTINCT FROM ARRAY[{expected_array}]::text[] THEN
+        IF observed_columns IS DISTINCT FROM ARRAY[{legacy_array}]::text[]
+           AND observed_columns IS DISTINCT FROM
+                ARRAY[{current_array}]::text[] THEN
             RAISE EXCEPTION
                 'provider_directory_endpoint_dataset_guard_schema_changed'
                 USING ERRCODE = '55000';

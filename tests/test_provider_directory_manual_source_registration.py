@@ -28,7 +28,12 @@ def test_reviewed_manual_source_manifest_contract():
     assert manual_entry["resource_profile"] == "A7"
     assert len(manual_entry["resources"]) == 7
     assert set(manual_contract) == {
+        "canonicalization_version",
+        "completion_scopes",
         "contract_version",
+        "semantics",
+        "strategy_version",
+        "traversal_version",
         "plan_name",
         "seed_source",
         "continuation_strategy",
@@ -37,9 +42,10 @@ def test_reviewed_manual_source_manifest_contract():
         "verification_campaign_id",
         "start_urls",
     }
-    assert manual_contract["contract_version"] == 2
+    assert manual_contract["contract_version"] == 3
+    assert manual_contract["semantics"] == "server-issued-traversal-subset"
     assert manual_contract["continuation_strategy"] == (
-        "smile-opaque-logical-offset-v2"
+        "smile-opaque-logical-offset-v3"
     )
     assert manual_contract["expected_nonempty_resources"] == manual_entry["resources"]
     assert manual_contract["page_count"] == 250

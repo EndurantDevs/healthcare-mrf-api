@@ -1025,6 +1025,9 @@ class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
     published_at = Column(TIMESTAMP)
     superseded_at = Column(TIMESTAMP)
     publication_metadata_json = Column(JSON)
+    completion_proof_required_version = Column(Integer)
+    completion_proof_json = Column(JSONB)
+    completion_proof_sha256 = Column(String(64))
 
 
 class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
@@ -1060,6 +1063,7 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
     resource_id = Column(String(256), nullable=False)
     payload_hash = Column(String(64), nullable=False)
     payload_json = Column(JSON, nullable=False)
+    acquired_resource_sha256 = Column(String(64))
 
 
 class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):

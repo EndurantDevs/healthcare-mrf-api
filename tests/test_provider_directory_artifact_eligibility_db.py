@@ -12,6 +12,9 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
+from tests.provider_directory_subset_completion_pg_setup import (
+    install_subset_canonical_functions,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -53,7 +56,10 @@ async def _create_tables(database: Database, schema: str) -> None:
             is_current boolean NOT NULL DEFAULT false,
             resource_count bigint NOT NULL DEFAULT 0,
             superseded_at timestamp,
-            publication_metadata_json jsonb
+            publication_metadata_json jsonb,
+            completion_proof_required_version integer,
+            completion_proof_json jsonb,
+            completion_proof_sha256 varchar(64)
         );
         """
     )
@@ -66,6 +72,7 @@ async def _create_tables(database: Database, schema: str) -> None:
         );
         """
     )
+    await install_subset_canonical_functions(database, schema)
 
 
 def _source_metadata(

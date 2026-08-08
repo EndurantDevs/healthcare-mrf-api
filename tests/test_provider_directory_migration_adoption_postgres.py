@@ -30,6 +30,53 @@ PRE_REPAIR_REVISION = "20260714120000_ptg2_v3_schema_gc_consistency"
 ADOPTION_SCHEMA = "mrf_provider_directory_adoption"
 PLAN_TABLE = "provider_directory_dataset_insurance_plan"
 ACTIVE_INDEX = "provider_directory_dataset_insurance_plan_active_lookup_idx"
+_SUBSET_COLUMN_SHAPE_SQL = """
+SELECT relation.relname AS table_name,
+       attribute.attname AS column_name,
+       pg_catalog.format_type(
+           attribute.atttypid,
+           attribute.atttypmod
+       ) AS column_type,
+       attribute.attnotnull AS not_null,
+       column_default.oid IS NOT NULL AS has_default
+  FROM pg_catalog.pg_attribute AS attribute
+  JOIN pg_catalog.pg_class AS relation
+    ON relation.oid = attribute.attrelid
+  JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = relation.relnamespace
+  LEFT JOIN pg_catalog.pg_attrdef AS column_default
+    ON column_default.adrelid = relation.oid
+   AND column_default.adnum = attribute.attnum
+ WHERE namespace.nspname = $1
+   AND (relation.relname, attribute.attname) IN (
+        ('provider_directory_endpoint_dataset',
+         'completion_proof_required_version'),
+        ('provider_directory_endpoint_dataset',
+         'completion_proof_json'),
+        ('provider_directory_endpoint_dataset',
+         'completion_proof_sha256'),
+        ('provider_directory_dataset_resource',
+         'acquired_resource_sha256')
+   )
+"""
+_EXPECTED_SUBSET_COLUMN_SHAPES = {
+    (
+        "provider_directory_endpoint_dataset",
+        "completion_proof_required_version",
+    ): ("integer", False, False),
+    (
+        "provider_directory_endpoint_dataset",
+        "completion_proof_json",
+    ): ("jsonb", False, False),
+    (
+        "provider_directory_endpoint_dataset",
+        "completion_proof_sha256",
+    ): ("character varying(64)", False, False),
+    (
+        "provider_directory_dataset_resource",
+        "acquired_resource_sha256",
+    ): ("character varying(64)", False, False),
+}
 
 RUNTIME_SCHEMA_SEED = r"""
 import asyncio
@@ -180,7 +227,41 @@ async def _assert_active_index_shape(url, schema: str) -> None:
     assert shape.expression_keys is False
 
 
+async def _assert_subset_completion_column_shapes(
+    database_url,
+    schema_name: str,
+) -> None:
+    """Require the exact nullable proof-column types after adoption."""
+
+    connection = await _connect(database_url)
+    try:
+        column_records = await connection.fetch(
+            _SUBSET_COLUMN_SHAPE_SQL,
+            schema_name,
+        )
+    finally:
+        await connection.close()
+    observed_shapes_by_column = {
+        (column_record["table_name"], column_record["column_name"]): (
+            column_record["column_type"],
+            column_record["not_null"],
+            column_record["has_default"],
+        )
+        for column_record in column_records
+    }
+    assert observed_shapes_by_column == _EXPECTED_SUBSET_COLUMN_SHAPES
+
+
+async def _assert_adopted_schema(database_url, schema_name: str) -> None:
+    """Require the exact adopted index and subset-proof column shapes."""
+
+    await _assert_active_index_shape(database_url, schema_name)
+    await _assert_subset_completion_column_shapes(database_url, schema_name)
+
+
 def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
+    """Adopt current ORM columns and preserve the exact repair cycle."""
+
     url = _database_url()
     asyncio.run(_assert_active_index_shape(url, "mrf"))
     environment = _database_environment(url, ADOPTION_SCHEMA)
@@ -211,7 +292,7 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
             check=True,
         )
         _run_alembic(environment, "upgrade", "head")
-        asyncio.run(_assert_active_index_shape(url, ADOPTION_SCHEMA))
+        asyncio.run(_assert_adopted_schema(url, ADOPTION_SCHEMA))
 
         _run_alembic(environment, "downgrade", PRE_REPAIR_REVISION)
 
@@ -231,6 +312,6 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
 
         asyncio.run(install_legacy_index())
         _run_alembic(environment, "upgrade", "head")
-        asyncio.run(_assert_active_index_shape(url, ADOPTION_SCHEMA))
+        asyncio.run(_assert_adopted_schema(url, ADOPTION_SCHEMA))
     finally:
         asyncio.run(drop_adoption_schema())

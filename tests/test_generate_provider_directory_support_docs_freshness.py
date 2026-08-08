@@ -90,6 +90,47 @@ def test_support_metadata_retains_audited_source_details(entry_id, expected_deta
     assert expected_detail in limitation
 
 
+def test_reviewed_manual_subset_support_never_claims_exhaustive():
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    manual_entries = [
+        entry
+        for entry in manifest["entries"]
+        if entry["classification"] == "manual_acquisition"
+    ]
+    assert len(manual_entries) == 1
+    entry_id = manual_entries[0]["entry_id"]
+    limitation = manifest["support_documentation"]["entry_support"][
+        entry_id
+    ]["limitation"]
+    current_audit = generator.load_current_dataset_audit(
+        generator.DEFAULT_CURRENT_DATASET_AUDIT
+    )
+    audit_notes = [
+        entry["note"]
+        for entry in current_audit["records"]
+        if entry.get("entry_id") == entry_id
+    ]
+    assert len(audit_notes) == 1
+    generated_support = generator.DEFAULT_OUTPUT.read_text(encoding="utf-8")
+
+    for support_text in (limitation, audit_notes[0]):
+        normalized_text = support_text.lower()
+        for required_text in (
+            "server-issued traversal subset",
+            "advertised",
+            "returned",
+            "deficit",
+            "absence",
+            "unknown",
+            "root-neutral subset proof",
+        ):
+            assert required_text in normalized_text
+        assert "exhaustive" not in normalized_text
+        assert "current-version census" not in normalized_text
+        assert "census acquisition" not in normalized_text
+        assert support_text in generated_support
+
+
 def test_amerihealth_uses_one_carrier_acquisition_and_five_probe_aliases():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
     support_by_entry = manifest["support_documentation"]["entry_support"]
