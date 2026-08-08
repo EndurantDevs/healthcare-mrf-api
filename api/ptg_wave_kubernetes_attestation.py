@@ -179,7 +179,10 @@ def _require_actual_template(
     desired_template = _mapping(desired_spec.get("template"), "desired Job template")
     template_metadata = _mapping(template.get("metadata"), "actual template metadata")
     _require_metadata_contract(template_metadata, contract, "actual Job template")
-    normalized_template_map = _normalize_kubernetes_defaulted_template(template)
+    normalized_template_map = _normalize_kubernetes_defaulted_template(
+        template,
+        desired_template,
+    )
     if _worker_config_identity_from_template(normalized_template_map) != contract.config_identity:
         raise PTGWaveContractError("actual Job worker config differs from its identity")
     pod_spec = _mapping(template.get("spec"), "actual Job pod spec")
@@ -206,11 +209,16 @@ def _require_actual_template(
 
 def _normalize_kubernetes_defaulted_template(
     template: Mapping[str, Any],
+    desired_template: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    """Remove the sole server default allowed during Job template attestation."""
+    """Remove the bounded server defaults allowed during Job attestation."""
 
     pod_spec = template.get("spec")
-    if not isinstance(pod_spec, Mapping):
+    desired_pod_spec = desired_template.get("spec")
+    if not isinstance(pod_spec, Mapping) or not isinstance(
+        desired_pod_spec,
+        Mapping,
+    ):
         return template
     containers = pod_spec.get("containers")
     if not isinstance(containers, list):
@@ -226,9 +234,51 @@ def _normalize_kubernetes_defaulted_template(
         normalized_containers.append(normalized_container_map)
     normalized_pod_spec_map = dict(pod_spec)
     normalized_pod_spec_map["containers"] = normalized_containers
+    if "volumes" in pod_spec:
+        normalized_pod_spec_map["volumes"] = (
+            _normalize_kubernetes_defaulted_volumes(
+                pod_spec["volumes"],
+                desired_pod_spec.get("volumes"),
+            )
+        )
     normalized_template_map = dict(template)
     normalized_template_map["spec"] = normalized_pod_spec_map
     return normalized_template_map
+
+
+def _normalize_kubernetes_defaulted_volumes(
+    volumes: Any,
+    desired_volumes: Any,
+) -> Any:
+    """Remove only an omitted Secret defaultMode defaulted to decimal 420."""
+
+    if not isinstance(volumes, list) or not isinstance(desired_volumes, list):
+        return volumes
+    if len(volumes) != len(desired_volumes):
+        return volumes
+    normalized_volumes = []
+    for volume, desired_volume in zip(volumes, desired_volumes, strict=True):
+        if not isinstance(volume, Mapping) or not isinstance(
+            desired_volume,
+            Mapping,
+        ):
+            return volumes
+        normalized_volume_map = dict(volume)
+        secret = volume.get("secret")
+        desired_secret = desired_volume.get("secret")
+        if (
+            volume.get("name") == desired_volume.get("name")
+            and isinstance(secret, Mapping)
+            and isinstance(desired_secret, Mapping)
+            and "defaultMode" not in desired_secret
+            and type(secret.get("defaultMode")) is int
+            and secret["defaultMode"] == 420
+        ):
+            normalized_secret_map = dict(secret)
+            del normalized_secret_map["defaultMode"]
+            normalized_volume_map["secret"] = normalized_secret_map
+        normalized_volumes.append(normalized_volume_map)
+    return normalized_volumes
 
 
 def _normalize_kubernetes_defaulted_environment(environment: Any) -> Any:

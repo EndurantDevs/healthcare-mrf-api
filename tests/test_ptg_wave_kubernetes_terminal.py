@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import pytest
 
+from api import control_workers
 from api.ptg_wave_kubernetes import (
     PTGWaveContractError,
     PTG_WAVE_SLOT_COUNT,
@@ -154,6 +155,58 @@ def test_existing_job_attestation_accepts_kubernetes_defaulted_field_ref_api_ver
     existing_job = attest_existing_ptg_wave_job(manifest, actual_job)
 
     assert existing_job.job_uid == "job-uid-123"
+
+
+def _manifest_with_secret_volume(monkeypatch) -> dict:
+    monkeypatch.setattr(
+        control_workers,
+        "_worker_job_secret_volumes",
+        lambda _worker_spec: [
+            {
+                "volume": {
+                    "name": "worker-secret",
+                    "secret": {"secretName": "worker-secret"},
+                },
+                "volumeMount": {
+                    "name": "worker-secret",
+                    "mountPath": "/run/secrets/worker",
+                    "readOnly": True,
+                },
+            }
+        ],
+    )
+    return _manifest()
+
+
+def test_existing_job_attestation_accepts_defaulted_secret_volume_mode(
+    monkeypatch,
+):
+    manifest = _manifest_with_secret_volume(monkeypatch)
+    actual_job = _actual_job(manifest)
+    actual_secret = actual_job["spec"]["template"]["spec"]["volumes"][0][
+        "secret"
+    ]
+    assert "defaultMode" not in actual_secret
+    actual_secret["defaultMode"] = 420
+
+    existing_job = attest_existing_ptg_wave_job(manifest, actual_job)
+
+    assert existing_job.job_uid == "job-uid-123"
+
+
+@pytest.mark.parametrize("default_mode", [0, 416, 420.0, 511])
+def test_existing_job_attestation_rejects_nondefault_secret_volume_modes(
+    monkeypatch,
+    default_mode,
+):
+    manifest = _manifest_with_secret_volume(monkeypatch)
+    actual_job = _actual_job(manifest)
+    actual_job["spec"]["template"]["spec"]["volumes"][0]["secret"][
+        "defaultMode"
+    ] = default_mode
+
+    with pytest.raises(PTGWaveContractError, match="worker config"):
+        attest_existing_ptg_wave_job(manifest, actual_job)
 
 
 @pytest.mark.parametrize(
