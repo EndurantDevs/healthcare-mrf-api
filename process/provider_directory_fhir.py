@@ -9128,14 +9128,59 @@ async def _supersede_artifact_dataset_incumbent(
         )
 
 
+def _artifact_publish_eligibility_metadata_columns() -> str:
+    """Return only metadata fields used by the final publication gate."""
+    return f"""
+        {UHC_RETAINED_PUBLICATION_METADATA_KEY} jsonb,
+        source_ids jsonb,
+        selected_resources jsonb,
+        {UHC_RETAINED_SUMMARY_INPUT_METADATA_KEY} jsonb,
+        {PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY} jsonb,
+        {SOURCE_SUMMARY_METADATA_KEY} jsonb
+    """
+
+
 _PUBLISH_VALIDATED_ARTIFACT_DATASET_SQL = """
+            WITH artifact_publish_candidate_json AS MATERIALIZED (
+            SELECT candidate.dataset_id,
+                   candidate.endpoint_id,
+                   candidate.publication_metadata_json::jsonb
+                       AS full_metadata_jsonb
+              FROM __ENDPOINT_DATASET_TABLE__ AS candidate
+             WHERE candidate.dataset_id = :dataset_id
+               AND candidate.endpoint_id = :endpoint_id
+            ), artifact_publish_candidate_metadata AS MATERIALIZED (
+            SELECT candidate.dataset_id AS candidate_dataset_id,
+                   candidate.endpoint_id AS candidate_endpoint_id,
+                   COALESCE(
+                       candidate.full_metadata_jsonb
+                           ? :uhc_publication_key,
+                       false
+                   ) AS uhc_publication_present,
+                   to_jsonb(metadata_fields)
+                       AS eligibility_metadata_jsonb
+              FROM artifact_publish_candidate_json AS candidate
+              CROSS JOIN LATERAL jsonb_to_record(
+                   CASE
+                       WHEN jsonb_typeof(candidate.full_metadata_jsonb)
+                           = 'object'
+                       THEN candidate.full_metadata_jsonb
+                       ELSE '{}'::jsonb
+                   END
+              ) AS metadata_fields(
+                   __ARTIFACT_PUBLISH_ELIGIBILITY_METADATA_COLUMNS__
+              )
+            )
             UPDATE __ENDPOINT_DATASET_TABLE__
                SET status = :published_status,
                    is_current = true,
                    published_at = now(),
                    superseded_at = NULL
+              FROM artifact_publish_candidate_metadata AS candidate
              WHERE dataset_id = :dataset_id
                AND endpoint_id = :endpoint_id
+               AND candidate.candidate_dataset_id = dataset_id
+               AND candidate.candidate_endpoint_id = endpoint_id
                AND COALESCE(acquisition_root_run_id, import_run_id)
                    IS NOT DISTINCT FROM :evidence_run_id
                AND previous_dataset_id IS NOT DISTINCT FROM :incumbent_dataset_id
@@ -9146,134 +9191,133 @@ _PUBLISH_VALIDATED_ARTIFACT_DATASET_SQL = """
                AND superseded_at IS NULL
                AND (
                     NOT (
-                        COALESCE(publication_metadata_json::jsonb, '{}'::jsonb)
-                            ? :uhc_publication_key
+                        candidate.uhc_publication_present
                         OR COALESCE(
-                            publication_metadata_json::jsonb -> 'source_ids',
+                            candidate.eligibility_metadata_jsonb -> 'source_ids',
                             '[]'::jsonb
                         ) @> jsonb_build_array(CAST(:uhc_source_id AS text))
                     )
                     OR (
-                        publication_metadata_json::jsonb
+                        candidate.eligibility_metadata_jsonb
                             -> :uhc_publication_key ->> 'contract_id'
                             = :uhc_publication_contract_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_publication_key -> 'complete'
                             = 'true'::jsonb
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_publication_key ->> 'source_id'
                             = :uhc_source_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_publication_key ->> 'dataset_id'
                             = dataset_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_publication_key
                             ->> 'acquisition_root_run_id'
                             = acquisition_root_run_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_publication_key
                             ->> 'semantic_contract_id'
                             = :uhc_semantic_contract_id
-                        AND publication_metadata_json::jsonb -> 'source_ids'
+                        AND candidate.eligibility_metadata_jsonb -> 'source_ids'
                             = jsonb_build_array(CAST(:uhc_source_id AS text))
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> 'selected_resources'
                             = CAST(:uhc_selected_resources AS jsonb)
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_summary_input_key -> 'complete'
                             = 'true'::jsonb
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_summary_input_key ->> 'contract_id'
                             = :uhc_summary_input_contract_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_summary_input_key ->> 'source_id'
                             = :uhc_source_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_summary_input_key
                             ->> 'semantic_contract_id'
                             = :uhc_semantic_contract_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :uhc_summary_input_key ->> 'input_sha256'
-                            = publication_metadata_json::jsonb
+                            = candidate.eligibility_metadata_jsonb
                                 -> :uhc_publication_key
                                 ->> 'summary_input_sha256'
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :outcome_key -> 'complete'
                             = 'true'::jsonb
                         AND CAST(
-                            publication_metadata_json::jsonb
+                            candidate.eligibility_metadata_jsonb
                                 -> :outcome_key ->> 'version'
                             AS integer
                         ) = 1
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :outcome_key ->> 'dataset_id'
                             = dataset_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :outcome_key ->> 'endpoint_id'
                             = endpoint_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :outcome_key
                             ->> 'acquisition_root_run_id'
                             = acquisition_root_run_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :outcome_key ->> 'dataset_hash'
                             = dataset_hash
                         AND CAST(
-                            publication_metadata_json::jsonb
+                            candidate.eligibility_metadata_jsonb
                                 -> :outcome_key ->> 'resource_count'
                             AS bigint
                         ) = resource_count
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key ->> 'dataset_id'
                             = dataset_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key ->> 'endpoint_id'
                             = endpoint_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key -> 'complete'
                             = 'true'::jsonb
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key ->> 'contract_id'
                             = :source_summary_contract_id
                         AND CAST(
-                            publication_metadata_json::jsonb
+                            candidate.eligibility_metadata_jsonb
                                 -> :source_summary_key ->> 'contract_version'
                             AS integer
                         ) = :source_summary_contract_version
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key
                             ->> 'acquisition_root_run_id'
                             = acquisition_root_run_id
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key ->> 'dataset_hash'
                             = dataset_hash
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key
                             ->> 'semantic_contract_id'
                             = :uhc_semantic_contract_id
                         AND CAST(
-                            publication_metadata_json::jsonb
+                            candidate.eligibility_metadata_jsonb
                                 -> :source_summary_key ->> 'total_resources'
                             AS bigint
                         ) = resource_count
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key -> 'resource_counts'
-                            = publication_metadata_json::jsonb
+                            = candidate.eligibility_metadata_jsonb
                                 -> :outcome_key -> 'resource_counts'
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key -> 'source_ids'
-                            = publication_metadata_json::jsonb
+                            = candidate.eligibility_metadata_jsonb
                                 -> :outcome_key -> 'source_ids'
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key -> 'source_ids'
-                            = publication_metadata_json::jsonb -> 'source_ids'
-                        AND publication_metadata_json::jsonb
+                            = candidate.eligibility_metadata_jsonb -> 'source_ids'
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key -> 'selected_resources'
-                            = publication_metadata_json::jsonb
+                            = candidate.eligibility_metadata_jsonb
                                 -> :outcome_key -> 'selected_resources'
-                        AND publication_metadata_json::jsonb
+                        AND candidate.eligibility_metadata_jsonb
                             -> :source_summary_key -> 'selected_resources'
-                            = publication_metadata_json::jsonb
+                            = candidate.eligibility_metadata_jsonb
                                 -> 'selected_resources'
                     )
                );
@@ -9287,6 +9331,9 @@ async def _publish_validated_artifact_dataset(
     publish_sql = _PUBLISH_VALIDATED_ARTIFACT_DATASET_SQL.replace(
         "__ENDPOINT_DATASET_TABLE__",
         _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__),
+    ).replace(
+        "__ARTIFACT_PUBLISH_ELIGIBILITY_METADATA_COLUMNS__",
+        _artifact_publish_eligibility_metadata_columns(),
     )
     promoted_count = await db.status(
         publish_sql,
