@@ -398,6 +398,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /formulary/fhir/:
+    get:
+      operationId: listFHIRFormularies
+      summary: List current published FHIR formularies
+      description: |
+        Returns opaque current formulary identifiers and allowlisted metadata.
+        Pagination cursors are encrypted, bound to the full catalog publication
+        state, and must be restarted when that state changes.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+          description: Opaque continuation returned by this exact operation.
+      responses:
+        '200':
+          description: Current published FHIR formularies
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/FHIRFormularyCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FHIRFormularyPage'
+        '400':
+          $ref: '#/components/responses/FHIRFormularyInvalidRequest'
+        '409':
+          $ref: '#/components/responses/FHIRFormularyCursorStale'
+        '503':
+          $ref: '#/components/responses/FHIRFormularyServingUnavailable'
   /formulary/fhir/{formulary_id}:
     get:
       operationId: getFHIRFormularyDetail
@@ -428,6 +467,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FHIRFormularyDetail'
+        '400':
+          $ref: '#/components/responses/FHIRFormularyInvalidRequest'
         '404':
           description: Malformed, unknown, or unavailable formulary identifier
           headers:
@@ -446,6 +487,187 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FHIRFormularyServingUnavailableResponse'
+  /formulary/fhir/{formulary_id}/aliases:
+    get:
+      operationId: listFHIRFormularyAliases
+      summary: List opaque aliases for one current FHIR formulary
+      parameters:
+        - name: formulary_id
+          in: path
+          required: true
+          description: Opaque public identifier for one current FHIR formulary.
+          schema:
+            type: string
+            minLength: 31
+            maxLength: 31
+            pattern: '^fhir_[a-z2-7]{26}$'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+        - name: cursor
+          in: query
+          description: Opaque continuation returned by this exact operation.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+      responses:
+        '200':
+          description: Current opaque DrugPlan aliases
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/FHIRFormularyCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FHIRFormularyAliasPage'
+        '400':
+          $ref: '#/components/responses/FHIRFormularyInvalidRequest'
+        '404':
+          $ref: '#/components/responses/FHIRFormularyNotFound'
+        '409':
+          $ref: '#/components/responses/FHIRFormularyCursorStale'
+        '503':
+          $ref: '#/components/responses/FHIRFormularyServingUnavailable'
+  /formulary/fhir/{formulary_id}/aliases/{alias_id}/drugs:
+    get:
+      operationId: listFHIRFormularyDrugs
+      summary: List drugs and utilization rules for one exact alias
+      description: |
+        Requires one opaque alias so memberships from distinct DrugPlans are
+        never merged. The opaque drug identifier is version-scoped and changes
+        when the published medication content changes.
+      parameters:
+        - name: formulary_id
+          in: path
+          required: true
+          description: Opaque public identifier for one current FHIR formulary.
+          schema:
+            type: string
+            minLength: 31
+            maxLength: 31
+            pattern: '^fhir_[a-z2-7]{26}$'
+        - name: alias_id
+          in: path
+          required: true
+          description: Opaque alias identifier returned by the formulary.
+          schema:
+            type: string
+            minLength: 52
+            maxLength: 52
+            pattern: '^ffa_[0-9a-f]{48}$'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+        - name: cursor
+          in: query
+          description: Opaque continuation returned by this exact operation.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+        - name: rxnorm_id
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9]{1,64}$'
+        - name: ndc11
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9]{11}$'
+        - name: tier
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+        - name: prior_authorization
+          in: query
+          schema:
+            type: boolean
+        - name: step_therapy
+          in: query
+          schema:
+            type: boolean
+        - name: quantity_limit
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Current alias-scoped medications
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/FHIRFormularyCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FHIRFormularyDrugPage'
+        '400':
+          $ref: '#/components/responses/FHIRFormularyInvalidRequest'
+        '404':
+          $ref: '#/components/responses/FHIRFormularyNotFound'
+        '409':
+          $ref: '#/components/responses/FHIRFormularyCursorStale'
+        '503':
+          $ref: '#/components/responses/FHIRFormularyServingUnavailable'
+  /formulary/fhir/{formulary_id}/aliases/{alias_id}/drugs/{drug_id}:
+    get:
+      operationId: getFHIRFormularyDrug
+      summary: Retrieve one current version-scoped drug and its rules
+      parameters:
+        - name: formulary_id
+          in: path
+          required: true
+          description: Opaque public identifier for one current FHIR formulary.
+          schema:
+            type: string
+            minLength: 31
+            maxLength: 31
+            pattern: '^fhir_[a-z2-7]{26}$'
+        - name: alias_id
+          in: path
+          required: true
+          description: Opaque alias identifier returned by the formulary.
+          schema:
+            type: string
+            minLength: 52
+            maxLength: 52
+            pattern: '^ffa_[0-9a-f]{48}$'
+        - name: drug_id
+          in: path
+          required: true
+          description: Opaque version-scoped drug identifier returned by the alias.
+          schema:
+            type: string
+            minLength: 52
+            maxLength: 52
+            pattern: '^ffm_[0-9a-f]{48}$'
+      responses:
+        '200':
+          description: Current alias-scoped medication detail
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/FHIRFormularyCacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FHIRFormularyDrug'
+        '400':
+          $ref: '#/components/responses/FHIRFormularyInvalidRequest'
+        '404':
+          $ref: '#/components/responses/FHIRFormularyNotFound'
+        '503':
+          $ref: '#/components/responses/FHIRFormularyServingUnavailable'
   /formulary/ids:
     get:
       operationId: getFormularyIds
@@ -5521,6 +5743,90 @@ components:
       schema:
         type: string
         enum: ['private, no-store']
+  parameters:
+    FHIRFormularyIdPath:
+      name: formulary_id
+      in: path
+      required: true
+      description: Opaque public identifier for one current FHIR formulary.
+      schema:
+        type: string
+        minLength: 31
+        maxLength: 31
+        pattern: '^fhir_[a-z2-7]{26}$'
+    FHIRFormularyAliasIdPath:
+      name: alias_id
+      in: path
+      required: true
+      description: Opaque alias identifier returned by the formulary.
+      schema:
+        type: string
+        minLength: 52
+        maxLength: 52
+        pattern: '^ffa_[0-9a-f]{48}$'
+    FHIRFormularyDrugIdPath:
+      name: drug_id
+      in: path
+      required: true
+      description: Opaque version-scoped drug identifier returned by the alias.
+      schema:
+        type: string
+        minLength: 52
+        maxLength: 52
+        pattern: '^ffm_[0-9a-f]{48}$'
+    FHIRFormularyPageLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    FHIRFormularyCursor:
+      name: cursor
+      in: query
+      description: Opaque continuation returned by this exact operation.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+  responses:
+    FHIRFormularyInvalidRequest:
+      description: Invalid or unsupported public selector
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/FHIRFormularyCacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FHIRFormularyInvalidRequestResponse'
+    FHIRFormularyNotFound:
+      description: Malformed, unknown, foreign, or unavailable identifier
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/FHIRFormularyCacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FHIRFormularyNotFoundResponse'
+    FHIRFormularyCursorStale:
+      description: Current publication changed; restart pagination
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/FHIRFormularyCacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FHIRFormularyCursorStaleResponse'
+    FHIRFormularyServingUnavailable:
+      description: Serving is disabled, misconfigured, or temporarily unavailable
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/FHIRFormularyCacheControl'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FHIRFormularyServingUnavailableResponse'
   schemas:
     Error:
       type: object
@@ -8704,6 +9010,184 @@ components:
           type: string
           format: date-time
           maxLength: 40
+    FHIRFormularyPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/FHIRFormularyDetail'
+        next_cursor:
+          type: string
+          minLength: 1
+          maxLength: 512
+          nullable: true
+    FHIRFormularyAlias:
+      type: object
+      additionalProperties: false
+      required: [formulary_id, alias_id, drug_count]
+      properties:
+        formulary_id:
+          type: string
+          minLength: 31
+          maxLength: 31
+          pattern: '^fhir_[a-z2-7]{26}$'
+        alias_id:
+          type: string
+          minLength: 52
+          maxLength: 52
+          pattern: '^ffa_[0-9a-f]{48}$'
+        drug_count:
+          type: integer
+          minimum: 0
+    FHIRFormularyAliasPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/FHIRFormularyAlias'
+        next_cursor:
+          type: string
+          minLength: 1
+          maxLength: 512
+          nullable: true
+    FHIRFormularyAlternatives:
+      type: object
+      additionalProperties: false
+      required: [resolved_drug_ids, unresolved_count]
+      properties:
+        resolved_drug_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 52
+            maxLength: 52
+            pattern: '^ffm_[0-9a-f]{48}$'
+        unresolved_count:
+          type: integer
+          minimum: 0
+          maximum: 100
+    FHIRFormularyDrug:
+      type: object
+      additionalProperties: false
+      description: |
+        One current alias membership. drug_id is opaque and version-scoped; it
+        changes when the published medication content changes.
+      required:
+        [formulary_id, alias_id, drug_id, status, name, rxnorm_id, ndc11,
+         last_updated, tier, prior_authorization, step_therapy, quantity_limit,
+         alternatives]
+      properties:
+        formulary_id:
+          type: string
+          minLength: 31
+          maxLength: 31
+          pattern: '^fhir_[a-z2-7]{26}$'
+        alias_id:
+          type: string
+          minLength: 52
+          maxLength: 52
+          pattern: '^ffa_[0-9a-f]{48}$'
+        drug_id:
+          type: string
+          minLength: 52
+          maxLength: 52
+          pattern: '^ffm_[0-9a-f]{48}$'
+        status:
+          type: string
+          maxLength: 32
+          nullable: true
+        name:
+          type: string
+          maxLength: 2048
+          nullable: true
+        rxnorm_id:
+          type: string
+          pattern: '^[0-9]{1,64}$'
+          nullable: true
+        ndc11:
+          type: string
+          pattern: '^[0-9]{11}$'
+          nullable: true
+        last_updated:
+          type: string
+          format: date-time
+          maxLength: 40
+        tier:
+          type: string
+          maxLength: 256
+          nullable: true
+        prior_authorization:
+          type: boolean
+          nullable: true
+        step_therapy:
+          type: boolean
+          nullable: true
+        quantity_limit:
+          type: boolean
+          nullable: true
+        alternatives:
+          $ref: '#/components/schemas/FHIRFormularyAlternatives'
+    FHIRFormularyDrugPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/FHIRFormularyDrug'
+        next_cursor:
+          type: string
+          minLength: 1
+          maxLength: 512
+          nullable: true
+    FHIRFormularyInvalidRequestResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/FHIRFormularyInvalidRequestError'
+    FHIRFormularyInvalidRequestError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [formulary_fhir_invalid_request]
+        message:
+          type: string
+          enum: [FHIR formulary request is invalid.]
+    FHIRFormularyCursorStaleResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/FHIRFormularyCursorStaleError'
+    FHIRFormularyCursorStaleError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [formulary_fhir_cursor_stale]
+        message:
+          type: string
+          enum: [FHIR formulary pagination must restart.]
     FHIRFormularyNotFoundResponse:
       type: object
       additionalProperties: false

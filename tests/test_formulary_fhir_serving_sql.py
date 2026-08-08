@@ -220,12 +220,13 @@ async def test_endpoint_without_request_session_fails_closed():
 
 
 def test_serving_modules_are_select_only_and_have_no_acquisition_surface():
-    serving_source = (ROOT / "api" / "formulary_fhir_serving.py").read_text(
-        encoding="utf-8"
-    )
-    endpoint_source = (
-        ROOT / "api" / "endpoint" / "formulary_fhir.py"
-    ).read_text(encoding="utf-8")
+    serving_paths = [
+        *(ROOT / "api").glob("formulary_fhir_*.py"),
+        ROOT / "api" / "endpoint" / "formulary_fhir.py",
+    ]
+    sources_by_path = {
+        path: path.read_text(encoding="utf-8") for path in serving_paths
+    }
 
     for forbidden_symbol in (
         "FHIRFormularyClient",
@@ -237,7 +238,8 @@ def test_serving_modules_are_select_only_and_have_no_acquisition_surface():
         "aiohttp",
         "socket",
     ):
-        assert forbidden_symbol not in serving_source
-        assert forbidden_symbol not in endpoint_source
+        for path, source_text in sources_by_path.items():
+            assert forbidden_symbol not in source_text, path
     for write_statement in ("INSERT ", "UPDATE ", "DELETE ", "LOCK TABLE"):
-        assert write_statement not in serving_source
+        for path, source_text in sources_by_path.items():
+            assert write_statement not in source_text, path

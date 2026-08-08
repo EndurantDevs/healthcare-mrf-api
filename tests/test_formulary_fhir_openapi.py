@@ -68,7 +68,7 @@ def test_fhir_formulary_detail_route_has_one_public_path_selector():
             "schema": PUBLIC_ID_SCHEMA,
         }
     ]
-    assert set(operation["responses"]) == {"200", "404", "503"}
+    assert set(operation["responses"]) == {"200", "400", "404", "503"}
 
 
 def test_fhir_formulary_detail_and_period_are_closed_and_fully_required():
@@ -115,6 +115,7 @@ def test_fhir_formulary_responses_are_private_and_exactly_typed():
     operation = specification["paths"][OPERATION_PATH]["get"]
     expected_schema_by_status = {
         "200": "FHIRFormularyDetail",
+        "400": "FHIRFormularyInvalidRequestResponse",
         "404": "FHIRFormularyNotFoundResponse",
         "503": "FHIRFormularyServingUnavailableResponse",
     }
@@ -127,6 +128,11 @@ def test_fhir_formulary_responses_are_private_and_exactly_typed():
     ] == {"type": "string", "enum": ["private, no-store"]}
     for status, schema_name in expected_schema_by_status.items():
         documented_response = operation["responses"][status]
+        if "$ref" in documented_response:
+            response_name = documented_response["$ref"].rsplit("/", 1)[-1]
+            documented_response = specification["components"]["responses"][
+                response_name
+            ]
         assert (
             documented_response["headers"]["Cache-Control"]
             == expected_header_by_field

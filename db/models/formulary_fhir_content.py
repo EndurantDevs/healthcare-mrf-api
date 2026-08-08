@@ -146,6 +146,10 @@ class FHIRFormularyAliasMembership(Base, JSONOutputMixin):
             "name": "fhir_formulary_membership_rxnorm_idx",
             "where": "rxnorm_id IS NOT NULL",
         },
+        {
+            "index_elements": ("alias_version_id", "medication_version_id"),
+            "name": "fhir_formulary_membership_medication_version_idx",
+        },
     ]
 
     source_id = Column(String(64), nullable=False)
