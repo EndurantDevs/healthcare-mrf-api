@@ -47,12 +47,17 @@ def test_manual_adapter_is_manage_only_and_never_publishes():
 
 
 def test_reviewed_candidate_is_library_only_and_never_publishes():
-    candidate_source = (
+    reviewed_source = (
         ROOT / "process" / "formulary_fhir" / "reviewed_source.py"
     ).read_text(encoding="utf-8")
-    assert 'intent="none"' in candidate_source
-    assert "publish_dataset" not in candidate_source
-    assert "publish_verified_seed" not in candidate_source
+    twin_source = (
+        ROOT / "process" / "formulary_fhir" / "reviewed_twin.py"
+    ).read_text(encoding="utf-8")
+    assert 'intent="none"' in reviewed_source
+    assert '"requested" if publish_requested else "none"' in twin_source
+    for candidate_source in (reviewed_source, twin_source):
+        assert "publish_dataset" not in candidate_source
+        assert "publish_verified_seed" not in candidate_source
     synchronizer_source = (
         ROOT / "process" / "formulary_fhir" / "synchronizer.py"
     ).read_text(encoding="utf-8")
@@ -69,6 +74,7 @@ def test_reviewed_candidate_is_library_only_and_never_publishes():
     for runtime_path in runtime_paths:
         runtime_source = runtime_path.read_text(encoding="utf-8")
         assert "verify_reviewed_source_candidate" not in runtime_source
+        assert "verify_reviewed_source_twins" not in runtime_source
         assert "register_reviewed_source" not in runtime_source
 
 
