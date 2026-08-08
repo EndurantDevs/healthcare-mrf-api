@@ -649,6 +649,9 @@ jobs:
           tests/test_public_evidence_storage_postgres.py
           tests/test_public_evidence_reference_roots_postgres.py
           tests/test_public_evidence_record_postgres_parity.py
+          tests/test_public_evidence_npi_enumeration_postgres.py
+          tests/test_public_evidence_npi_enumeration_catalog_postgres.py
+          tests/test_public_evidence_npi_enumeration_adversarial_postgres.py
           tests/test_formulary_fhir_storage_postgres.py
           tests/test_formulary_fhir_twin_admission_postgres.py
           tests/test_formulary_fhir_twin_repository_postgres.py
