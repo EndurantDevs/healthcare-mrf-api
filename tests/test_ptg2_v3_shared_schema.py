@@ -1082,7 +1082,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260808090000_public_evidence_storage_foundation"
+        "20260808100000_public_evidence_reference_roots"
     ]
 
 

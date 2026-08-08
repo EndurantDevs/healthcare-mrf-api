@@ -626,6 +626,7 @@ jobs:
           tests/test_public_evidence_storage_interval_postgres.py
           tests/test_public_evidence_storage_nulls_postgres.py
           tests/test_public_evidence_storage_postgres.py
+          tests/test_public_evidence_reference_roots_postgres.py
           tests/test_formulary_fhir_storage_postgres.py
           tests/test_formulary_fhir_repository_postgres.py
           tests/test_formulary_fhir_synchronizer_postgres.py

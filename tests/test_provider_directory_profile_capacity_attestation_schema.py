@@ -87,7 +87,7 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260808090000_public_evidence_storage_foundation"
+        "20260808100000_public_evidence_reference_roots"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (
