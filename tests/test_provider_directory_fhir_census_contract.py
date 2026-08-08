@@ -1,10 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Generic admission proof for cutoff-bounded current-version FHIR census."""
+"""Generic admission proof for reviewed current-version FHIR acquisition."""
 
 from __future__ import annotations
 
 import datetime
+import importlib
 import urllib.parse
 
 import pytest
@@ -24,6 +25,26 @@ from process.provider_directory_fhir_census_contract import (
     ProviderDirectoryFHIRAcquisitionStrategy,
     current_version_census_request,
     validate_current_version_census_runtime,
+)
+
+binding_module = importlib.import_module(
+    "process.provider_directory_fhir_census_binding"
+)
+contract_module = importlib.import_module(
+    "process.provider_directory_fhir_census_contract"
+)
+cursor_module = importlib.import_module(
+    "process.provider_directory_fhir_census_cursor"
+)
+execution_module = importlib.import_module(
+    "process.provider_directory_fhir_census_execution"
+)
+geometry_module = importlib.import_module(
+    "process.provider_directory_fhir_census_page_geometry"
+)
+importer = importlib.import_module("process.provider_directory_fhir")
+urls_module = importlib.import_module(
+    "process.provider_directory_fhir_census_urls"
 )
 EXACT_STRATEGY = (
     ProviderDirectoryFHIRAcquisitionStrategy.CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS.value
@@ -124,7 +145,7 @@ def test_configured_strategy_rejects_silently_ignored_cutoff():
 
 
 def _safe_runtime() -> CurrentVersionCensusRuntime:
-    """Return the sole exhaustive, serial, nonpublishing runtime shape."""
+    """Return the sole unbounded, serial, nonpublishing runtime shape."""
     return CurrentVersionCensusRuntime(
         checkpointing_enabled=True,
         full_refresh=True,
@@ -161,7 +182,48 @@ def _safe_runtime() -> CurrentVersionCensusRuntime:
     )
 
 
-def test_runtime_requires_exhaustive_serial_unpublished_controls():
+def test_shared_manual_runtime_contract_uses_neutral_scope_language():
+    shared_surfaces = (
+        binding_module,
+        binding_module.CurrentVersionCensusContract,
+        contract_module,
+        contract_module.CurrentVersionCensusRuntime,
+        contract_module.current_version_census_request,
+        cursor_module,
+        execution_module,
+        execution_module.current_version_census_initial_proof,
+        execution_module.validated_current_version_census_completed_proof,
+        geometry_module,
+        urls_module,
+        validate_current_version_census_runtime,
+        importer._fetch_current_version_census_json_once,
+        importer._parsed_current_version_census_entries,
+        importer._current_version_census_page_count,
+        importer._resolved_current_version_census_page_url,
+        importer._observe_partition_census_value,
+        importer._create_current_version_pre_count_proof,
+        importer._validate_current_version_census_lineage,
+        importer._validate_and_finalize_import_candidate,
+    )
+    disallowed_phrases = (
+        "exact census",
+        "exact-census",
+        "exhaustive",
+        "fhir census",
+        "manual census",
+        "pre-census",
+    )
+
+    for shared_surface in shared_surfaces:
+        runtime_contract = (shared_surface.__doc__ or "").lower()
+        assert runtime_contract
+        assert all(
+            phrase not in runtime_contract
+            for phrase in disallowed_phrases
+        )
+
+
+def test_runtime_requires_unbounded_serial_unpublished_controls():
     """Reject value or type drift from the admitted runtime shape."""
     request = _request()
     assert request is not None

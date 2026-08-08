@@ -12,6 +12,7 @@ from api import control_imports
 
 
 EXACT_CENSUS_STRATEGY = "cutoff-bounded-current-version-census"
+SUBSET_CENSUS_STRATEGY = "server-issued-traversal-subset"
 
 
 def _census_params(**overrides):
@@ -58,6 +59,15 @@ def _census_params(**overrides):
                 )
             },
             id="whitespace-normalized-strategy",
+        ),
+        pytest.param(
+            {},
+            {
+                "provider_directory_acquisition_strategy": (
+                    SUBSET_CENSUS_STRATEGY
+                )
+            },
+            id="reviewed-subset-v3-strategy",
         ),
         pytest.param(
             {},
@@ -157,3 +167,21 @@ def test_control_classifier_keeps_census_exclusive_with_forged_endpoint():
     assert operation_kind == control_imports._PROVIDER_DIRECTORY_EXCLUSIVE
     assert source_ids == frozenset()
     assert endpoint_scope is None
+
+
+def test_control_classifier_keeps_reviewed_subset_v3_exclusive():
+    params = _census_params(
+        provider_directory_acquisition_strategy=SUBSET_CENSUS_STRATEGY,
+        source_concurrency=1,
+        stale_cleanup=False,
+        publish_artifacts=False,
+        publish_after_acquisition=False,
+        publish_corroboration=False,
+    )
+
+    assert control_imports._is_current_version_census_control(params) is True
+    assert control_imports._provider_directory_operation(params) == (
+        control_imports._PROVIDER_DIRECTORY_EXCLUSIVE,
+        frozenset(),
+        None,
+    )

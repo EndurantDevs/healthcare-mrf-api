@@ -77,6 +77,10 @@ def test_guard_column_contract_matches_the_endpoint_dataset_model(monkeypatch):
     )
     model_columns = {
         column.name for column in ProviderDirectoryEndpointDataset.__table__.columns
+    } - {
+        "completion_proof_required_version",
+        "completion_proof_json",
+        "completion_proof_sha256",
     }
 
     assert model_columns == set(migration.ENDPOINT_DATASET_MUTABLE_COLUMNS) | set(

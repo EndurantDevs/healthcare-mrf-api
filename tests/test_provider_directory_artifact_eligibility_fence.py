@@ -89,6 +89,9 @@ def test_candidate_eligibility_projection_is_compact_and_fail_closed():
     for field_name in (
         "source_ids jsonb",
         "completion_proof_v1 jsonb",
+        f"{importer.SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY} jsonb",
+        f"{importer.SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY} text",
+        f"{importer.SERVER_ISSUED_SUBSET_COVERAGE_KEY} jsonb",
         "selected_resources jsonb",
         "expected_resources jsonb",
         f"{importer.TWIN_ROOT_VERIFICATION_METADATA_KEY} jsonb",

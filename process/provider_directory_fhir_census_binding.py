@@ -1,57 +1,60 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Reviewed source and URL binding for the current-version census contract."""
+"""Reviewed source and URL binding for current-version FHIR acquisition."""
 
 from __future__ import annotations
 
 import hashlib
-import ipaddress
-import re
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from process.provider_directory_fhir_census_contract import (
+    CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD,
     CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
     CURRENT_VERSION_CENSUS_CONTRACT_FIELD,
+    CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD,
     CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD,
     CURRENT_VERSION_CENSUS_SEMANTICS,
     CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
     CURRENT_VERSION_CENSUS_START_URLS_FIELD,
+    CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
     CURRENT_VERSION_CENSUS_STRATEGY_VERSION,
+    CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD,
+    SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
+    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_RESOURCE_TYPES,
+    SERVER_ISSUED_SUBSET_SEMANTICS,
+    SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY,
+    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+    SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
     CurrentVersionCensusRequest,
+    ProviderDirectoryFHIRAcquisitionStrategy,
     _clean_text,
     _strict_text_vector,
+)
+from process.provider_directory_fhir_subset_identity import (
+    is_reviewed_subset_contract,
+    validated_subset_identity_values,
+)
+from process.provider_directory_fhir_census_urls import (
+    _normalized_base_url,
+    _reviewed_start_urls,
+    _validate_reviewed_start_url,
 )
 
 
 _MANUAL_ONLY_FIELD = "provider_directory_manual_only"
 _SUPPORTED_RESOURCES_FIELD = "provider_directory_supported_resources"
 _ENUMERABLE_RESOURCES_FIELD = "provider_directory_fully_enumerable_resources"
+_SUBSET_RESOURCES_FIELD = "provider_directory_server_issued_subset_resources"
+_VERIFICATION_CAMPAIGN_FIELD = "provider_directory_verification_campaign_id"
 _EXPECTED_NONEMPTY_RESOURCES_FIELD = (
     "provider_directory_expected_nonempty_resources"
 )
 _CONTROL_QUERY_NAMES = frozenset({"_count", "_summary", "_total"})
-_PUBLIC_HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_CONTINUATION_QUERY_NAMES = frozenset(
-    {
-        "_continuationtoken",
-        "_getpages",
-        "_getpagesid",
-        "_getpagesoffset",
-        "_offset",
-        "_page",
-        "_page_token",
-        "_searchid",
-        "_skip",
-        "cursor",
-        "cursormark",
-        "ct",
-        "nexttoken",
-        "page",
-        "pagetoken",
-    }
-)
 
 
 def _strict_metadata_resources(
@@ -69,117 +72,9 @@ def _strict_metadata_resources(
     return configured_resources
 
 
-def _normalized_base_url(raw_value: Any) -> urllib.parse.SplitResult:
-    raw_url = _clean_text(raw_value)
-    if raw_url is None or any(character.isspace() for character in raw_url):
-        raise ValueError(
-            "provider_directory_current_version_census_base_url_invalid"
-        )
-    try:
-        parsed_url = urllib.parse.urlsplit(raw_url)
-        port = parsed_url.port
-    except ValueError as exc:
-        raise ValueError(
-            "provider_directory_current_version_census_base_url_invalid"
-        ) from exc
-    hostname = (parsed_url.hostname or "").lower()
-    normalized_hostname = hostname.rstrip(".")
-    if (
-        parsed_url.scheme.lower() != "https"
-        or not normalized_hostname
-        or parsed_url.username is not None
-        or parsed_url.password is not None
-        or parsed_url.fragment
-        or port not in (None, 443)
-        or hostname != normalized_hostname
-        or parsed_url.netloc.lower()
-        not in {normalized_hostname, f"{normalized_hostname}:443"}
-    ):
-        raise ValueError(
-            "provider_directory_current_version_census_base_url_invalid"
-        )
-    try:
-        literal_ip = ipaddress.ip_address(normalized_hostname)
-    except ValueError:
-        literal_ip = None
-    if literal_ip is not None:
-        raise ValueError(
-            "provider_directory_current_version_census_base_url_invalid"
-        )
-    host_labels = normalized_hostname.split(".")
-    if (
-        len(host_labels) < 2
-        or normalized_hostname == "localhost"
-        or normalized_hostname.endswith((".localhost", ".local"))
-        or host_labels[-1].isdigit()
-        or len(normalized_hostname) > 253
-        or any(
-            _PUBLIC_HOST_LABEL_RE.fullmatch(host_label) is None
-            for host_label in host_labels
-        )
-    ):
-        raise ValueError(
-            "provider_directory_current_version_census_base_url_invalid"
-        )
-    return parsed_url
-
-
-def _https_origin(parsed_url: urllib.parse.SplitResult) -> tuple[str, int]:
-    """Return the already validated public HTTPS origin."""
-
-    return (parsed_url.hostname or "").lower(), parsed_url.port or 443
-
-
-def _validate_reviewed_start_url(
-    raw_url: Any,
-    *,
-    canonical_base: urllib.parse.SplitResult,
-    resource_type: str,
-) -> str:
-    if not isinstance(raw_url, str) or not raw_url.strip():
-        raise ValueError(
-            "provider_directory_current_version_census_start_url_invalid"
-        )
-    reviewed_url = raw_url.strip()
-    parsed_url = _normalized_base_url(reviewed_url)
-    if _https_origin(parsed_url) != _https_origin(canonical_base):
-        raise ValueError(
-            "provider_directory_current_version_census_start_url_origin_mismatch"
-        )
-    expected_path = f"{canonical_base.path.rstrip('/')}/{resource_type}"
-    if parsed_url.path.rstrip("/") != expected_path:
-        raise ValueError(
-            "provider_directory_current_version_census_start_url_path_mismatch"
-        )
-    query_names = {
-        query_name.lower()
-        for query_name, _query_value in urllib.parse.parse_qsl(
-            parsed_url.query,
-            keep_blank_values=True,
-        )
-    }
-    if query_names.intersection(_CONTINUATION_QUERY_NAMES):
-        raise ValueError(
-            "provider_directory_current_version_census_start_url_contains_continuation"
-        )
-    if query_names.intersection({"_summary", "_total"}):
-        raise ValueError(
-            "provider_directory_current_version_census_start_url_contains_count_control"
-        )
-    if any(
-        query_name == "_lastupdated"
-        or query_name.startswith("_lastupdated:")
-        for query_name in query_names
-    ):
-        raise ValueError(
-            "provider_directory_current_version_census_start_url_contains_last_updated"
-        )
-    return reviewed_url
-
-
 @dataclass(frozen=True)
 class CurrentVersionCensusContract:
-    """Reviewed source binding for one manual current-version census."""
+    """Reviewed source binding for one manual current-version acquisition."""
 
     source_id: str
     cutoff: str
@@ -188,6 +83,21 @@ class CurrentVersionCensusContract:
     start_urls: tuple[tuple[str, str], ...]
     continuation_strategy: str
     strategy_version: str = CURRENT_VERSION_CENSUS_STRATEGY_VERSION
+    contract_version: int = 2
+    semantics: str = CURRENT_VERSION_CENSUS_SEMANTICS
+    page_count: int | None = None
+    traversal_version: str = "provider-directory-fhir-smile-logical-offset-v2"
+    canonicalization_version: str = (
+        "provider-directory-fhir-current-version-resource-json-v1"
+    )
+    completion_scopes: tuple[str, ...] = ()
+    campaign_id: str | None = None
+
+    @property
+    def is_server_issued_subset_v3(self) -> bool:
+        """Return whether every field matches the reviewed subset identity."""
+
+        return is_reviewed_subset_contract(self)
 
     def start_url(self, resource_type: str, page_count: int) -> str:
         """Return the reviewed URL with source filters and cutoff preserved."""
@@ -199,6 +109,10 @@ class CurrentVersionCensusContract:
         ):
             raise ValueError(
                 "provider_directory_current_version_census_page_count_invalid"
+            )
+        if self.page_count is not None and page_count != self.page_count:
+            raise ValueError(
+                "provider_directory_current_version_census_page_count_identity_mismatch"
             )
         start_url_by_resource = dict(self.start_urls)
         try:
@@ -235,9 +149,9 @@ class CurrentVersionCensusContract:
     def identity(self) -> dict[str, Any]:
         """Return source, strategy, cutoff, resources, and reviewed URL hashes."""
 
-        return {
-            "contract_version": 2,
-            "semantics": CURRENT_VERSION_CENSUS_SEMANTICS,
+        identity_by_field = {
+            "contract_version": self.contract_version,
+            "semantics": self.semantics,
             "source_id": self.source_id,
             "strategy": self.strategy_version,
             "cutoff": self.cutoff,
@@ -253,6 +167,15 @@ class CurrentVersionCensusContract:
                 for resource_type, start_url in self.start_urls
             },
         }
+        if self.contract_version == 3:
+            identity_by_field.update(
+                page_count=self.page_count,
+                traversal_version=self.traversal_version,
+                canonicalization_version=self.canonicalization_version,
+                completion_scopes=list(self.completion_scopes),
+                campaign_id=self.campaign_id,
+            )
+        return identity_by_field
 
 
 def _reviewed_metadata(
@@ -282,36 +205,45 @@ def _reviewed_metadata(
     return metadata
 
 
-def _reviewed_start_urls(
+def _reviewed_resource_configuration(
     request: CurrentVersionCensusRequest,
-    source_record: Mapping[str, Any],
     metadata: Mapping[str, Any],
-) -> tuple[tuple[str, str], ...]:
-    raw_start_url_by_resource = metadata.get(
-        CURRENT_VERSION_CENSUS_START_URLS_FIELD
+) -> tuple[tuple[str, ...], str, bool]:
+    """Validate resource scope and continuation strategy for one request."""
+
+    _strict_metadata_resources(
+        metadata,
+        _SUPPORTED_RESOURCES_FIELD,
+        request.resources,
     )
-    if not isinstance(raw_start_url_by_resource, Mapping):
+    is_subset_v3 = (
+        request.strategy
+        is ProviderDirectoryFHIRAcquisitionStrategy.SERVER_ISSUED_TRAVERSAL_SUBSET
+    )
+    resource_scope_field = (
+        _SUBSET_RESOURCES_FIELD
+        if is_subset_v3
+        else _ENUMERABLE_RESOURCES_FIELD
+    )
+    _strict_metadata_resources(metadata, resource_scope_field, request.resources)
+    expected_nonempty_resources = _strict_text_vector(
+        metadata.get(_EXPECTED_NONEMPTY_RESOURCES_FIELD),
+        field_name=_EXPECTED_NONEMPTY_RESOURCES_FIELD,
+        allowed_values=frozenset(request.resources),
+    )
+    continuation_strategy = _clean_text(
+        metadata.get(CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD)
+    )
+    expected_continuation_strategy = (
+        SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY
+        if is_subset_v3
+        else CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY
+    )
+    if continuation_strategy != expected_continuation_strategy:
         raise ValueError(
-            "provider_directory_current_version_census_start_urls_required"
+            "provider_directory_current_version_census_continuation_strategy_not_reviewed"
         )
-    if set(raw_start_url_by_resource) != set(request.resources):
-        raise ValueError(
-            "provider_directory_current_version_census_start_urls_must_match_resources"
-        )
-    canonical_base = _normalized_base_url(
-        source_record.get("canonical_api_base") or source_record.get("api_base")
-    )
-    return tuple(
-        (
-            resource_type,
-            _validate_reviewed_start_url(
-                raw_start_url_by_resource[resource_type],
-                canonical_base=canonical_base,
-                resource_type=resource_type,
-            ),
-        )
-        for resource_type in request.resources
-    )
+    return expected_nonempty_resources, continuation_strategy, is_subset_v3
 
 
 def bind_current_version_census_contract(
@@ -326,28 +258,31 @@ def bind_current_version_census_contract(
         )
     source_record = source_records[0]
     metadata = _reviewed_metadata(request, source_record)
-    _strict_metadata_resources(
-        metadata,
-        _SUPPORTED_RESOURCES_FIELD,
-        request.resources,
-    )
-    _strict_metadata_resources(
-        metadata,
-        _ENUMERABLE_RESOURCES_FIELD,
-        request.resources,
-    )
-    expected_nonempty_resources = _strict_text_vector(
-        metadata.get(_EXPECTED_NONEMPTY_RESOURCES_FIELD),
-        field_name=_EXPECTED_NONEMPTY_RESOURCES_FIELD,
-        allowed_values=frozenset(request.resources),
-    )
-    continuation_strategy = _clean_text(
-        metadata.get(CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD)
-    )
-    if continuation_strategy != CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY:
-        raise ValueError(
-            "provider_directory_current_version_census_continuation_strategy_not_reviewed"
+    (
+        expected_nonempty_resources,
+        continuation_strategy,
+        is_subset_v3,
+    ) = _reviewed_resource_configuration(request, metadata)
+    if is_subset_v3:
+        (
+            contract_version,
+            page_count,
+            strategy_version,
+            traversal_version,
+            canonicalization_version,
+            completion_scopes,
+            campaign_id,
+        ) = validated_subset_identity_values(metadata)
+    else:
+        contract_version = 2
+        page_count = None
+        strategy_version = CURRENT_VERSION_CENSUS_STRATEGY_VERSION
+        traversal_version = "provider-directory-fhir-smile-logical-offset-v2"
+        canonicalization_version = (
+            "provider-directory-fhir-current-version-resource-json-v1"
         )
+        completion_scopes = ()
+        campaign_id = None
     contract = CurrentVersionCensusContract(
         source_id=request.source_id,
         cutoff=request.cutoff,
@@ -355,6 +290,18 @@ def bind_current_version_census_contract(
         expected_nonempty_resources=expected_nonempty_resources,
         start_urls=_reviewed_start_urls(request, source_record, metadata),
         continuation_strategy=continuation_strategy,
+        contract_version=contract_version,
+        semantics=(
+            SERVER_ISSUED_SUBSET_SEMANTICS
+            if is_subset_v3
+            else CURRENT_VERSION_CENSUS_SEMANTICS
+        ),
+        page_count=page_count,
+        strategy_version=strategy_version,
+        traversal_version=traversal_version,
+        canonicalization_version=canonicalization_version,
+        completion_scopes=completion_scopes,
+        campaign_id=campaign_id,
     )
     source_record[CURRENT_VERSION_CENSUS_CONTRACT_FIELD] = contract
     return contract

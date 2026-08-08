@@ -1,10 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Logical-window geometry for current-version FHIR census checkpoints."""
+"""Logical-window geometry for reviewed FHIR traversal checkpoints."""
 
 from __future__ import annotations
 
 from typing import Any, Mapping
+
+from process.provider_directory_fhir_subset_execution import (
+    append_subset_checkpoint_evidence,
+    validate_subset_checkpoint_sequences,
+)
 
 
 CURRENT_VERSION_CENSUS_PAGE_GEOMETRY_VERSION = 2
@@ -65,6 +70,8 @@ def validate_current_version_census_resume_state(
     rows_processed: int,
     expected_page_count: int,
     pre_total: int,
+    *,
+    allow_sparse_logical_offsets: bool = False,
 ) -> None:
     """Bind resumable rows to bounded fixed-width logical windows."""
 
@@ -82,7 +89,10 @@ def validate_current_version_census_resume_state(
     logical_next_offset = pages_processed * expected_page_count
     if (
         pages_processed <= 0
-        or logical_next_offset >= pre_total
+        or (
+            not allow_sparse_logical_offsets
+            and logical_next_offset >= pre_total
+        )
         or rows_processed > min(pre_total, logical_next_offset)
     ):
         raise ValueError(
@@ -180,6 +190,13 @@ def validate_current_version_census_checkpoint_geometry(
         raise ValueError(
             "provider_directory_current_version_census_page_geometry_invalid"
         )
+    validate_subset_checkpoint_sequences(
+        proof_by_field,
+        normalized_geometry_by_field,
+        pages_processed=pages_processed,
+        rows_processed=rows_processed,
+        expected_page_count=expected_page_count,
+    )
     return normalized_geometry_by_field
 
 
@@ -229,7 +246,10 @@ def _validate_checkpoint_advance(
         or isinstance(pre_count, bool)
         or not isinstance(pre_count, int)
         or rows_processed > pre_count
-        or logical_next_offset >= pre_count
+        or (
+            proof_by_field.get("contract_version") != 3
+            and logical_next_offset >= pre_count
+        )
     )
     if has_invalid_advance:
         raise ValueError(
@@ -244,6 +264,8 @@ def current_version_census_checkpoint_proof(
     rows_processed: int,
     page_entry_count: int,
     expected_page_count: int,
+    continuation_identity_sha256: str | None = None,
+    continuation_shape_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Advance measurement for one validated nonterminal logical window."""
 
@@ -283,7 +305,15 @@ def current_version_census_checkpoint_proof(
         "empty_pages": previous_geometry_by_field["empty_pages"]
         + int(page_entry_count == 0),
     }
-    return updated_proof_by_field
+    return append_subset_checkpoint_evidence(
+        proof_by_field,
+        updated_proof_by_field,
+        pages_processed=pages_processed,
+        page_entry_count=page_entry_count,
+        expected_page_count=expected_page_count,
+        continuation_identity_sha256=continuation_identity_sha256,
+        continuation_shape_sha256=continuation_shape_sha256,
+    )
 
 
 def _active_checkpoint_proof(
@@ -297,6 +327,11 @@ def _active_checkpoint_proof(
         "terminal_page_geometry",
         "unique_candidate_rows",
         "unreturned_count",
+        "advertised_pre",
+        "advertised_post",
+        "returned_unique",
+        "deficit",
+        "terminal_reason",
     }
     active_proof_by_field = {
         field_name: field_value
@@ -348,8 +383,13 @@ def _terminal_page_context(
         or processed_rows - previous_rows != terminal_page_entry_count
         or isinstance(pre_count, bool)
         or not isinstance(pre_count, int)
-        or (pre_count > 0 and terminal_page_start_offset >= pre_count)
-        or (pre_count == 0 and terminal_page_start_offset != 0)
+        or (
+            proof_by_field.get("contract_version") != 3
+            and (
+                (pre_count > 0 and terminal_page_start_offset >= pre_count)
+                or (pre_count == 0 and terminal_page_start_offset != 0)
+            )
+        )
     )
     if has_invalid_terminal:
         raise ValueError(

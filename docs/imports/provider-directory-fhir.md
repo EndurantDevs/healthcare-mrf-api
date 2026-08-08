@@ -139,23 +139,42 @@ Use this sequence for a campaign or documentation review:
    evidence; it skips only the HTTP checks. Use `--api-latency-slo-ms 0` only
    for diagnostics where latency enforcement is deliberately disabled.
 
-### Manual current-version census sources
+### Manual reviewed current-version subset sources
 
 An entry classified as `manual_acquisition` is reviewed acquisition input, not
 a generally runnable catalog source. It remains outside scheduled refreshes,
 the generic campaign launcher, the control API, and Profile publication. Its
-`manual_current_version_census` block pins the source identity, resource set,
-credential-free start URLs, opaque-continuation strategy, expected non-empty
-collections, and page count. The operator supplies the exclusive
-`_lastUpdated` cutoff at launch; a cutoff is never persisted in the manifest.
+`manual_current_version_census` block pins the reviewed v3 source identity,
+all seven resource families, credential-free start URLs, server-issued opaque
+continuation strategy, expected non-empty collections, campaign, completion
+scopes, and page count. The operator supplies one exclusive `_lastUpdated`
+cutoff at launch; a cutoff is never persisted in the manifest.
 
-Continuation contract v2 treats `_getpagesoffset` as a logical window offset:
-each accepted next link advances by the reviewed page count even when the
-returned page is sparse or empty. The checkpoint records logical geometry,
-sparse and empty page counts, and terminal unreturned-row measurement. These
-measurements do not relax completeness: pre-count, post-count, processed rows,
-and unique candidate rows must still be equal. A positive unreturned count is
-failed, remains non-publishable, and cannot satisfy twin-root verification.
+The v3 contract declares `server-issued-traversal-subset` for every reviewed
+resource family. It follows only a validated source-issued next link and treats
+`_getpagesoffset` as a logical offset that must advance by exactly the reviewed
+page count. Sparse and empty pages remain valid while a next link exists. A
+resource terminates successfully only when the source returns no next link and
+its cutoff-filtered advertised count is stable before and after traversal.
+The proof records advertised, returned unique, and exact deficit counts; it has
+no percentage threshold and requires returned unique to be no greater than
+advertised. Even a zero final deficit remains subset evidence under this
+reviewed campaign. Absence from the returned subset is unknown, not evidence
+that a provider-directory resource does not exist.
+
+Each completed root retains sealed, token-inclusive replay commitments that
+prove its source-issued continuation chain. A separate root-neutral completion
+proof binds continuation query shape and offset geometry, ordered raw acquired
+resource hashes, transport-neutral projected content hashes, and dataset
+counts and hashes without retaining URLs, tokens, or root identifiers. Root A
+and Root B must each have valid replay evidence and must match on the entire
+root-neutral proof. Publication stays off until that reviewed twin-root gate
+and the separate artifact review both pass.
+
+Direct database publication and source-catalog mutations use PostgreSQL
+`READ COMMITTED` isolation. The v3 persistence guards fail closed at other
+isolation levels so a stale transaction snapshot cannot bypass the final
+source and sole-alias check.
 
 Resolve the single reviewed manual entry from the manifest and freeze one
 timezone-aware cutoff for the acquisition pair:
@@ -182,7 +201,7 @@ resource cursors, stale cleanup, or publication flags:
 ```bash
 python main.py start provider-directory-fhir \
   --run-id "$PROVIDER_DIRECTORY_CENSUS_RUN_ID" \
-  --acquisition-strategy cutoff-bounded-current-version-census \
+  --acquisition-strategy server-issued-traversal-subset \
   --census-cutoff "$PROVIDER_DIRECTORY_CENSUS_CUTOFF" \
   --source-id "$PROVIDER_DIRECTORY_MANUAL_SOURCE_ID" \
   --resources "$PROVIDER_DIRECTORY_MANUAL_RESOURCES" \
@@ -205,13 +224,15 @@ python main.py start provider-directory-fhir \
   --defer-typed-materialization
 ```
 
-A successful run retains a verified candidate and its exact census proof but
-does not make the candidate current. Before running the same command a second
-time, set `PROVIDER_DIRECTORY_CENSUS_RUN_ID` to a different globally unique
-root ID while preserving the identical cutoff. Do not pass retry or
-pagination-root arguments for either fresh root. The two successful runs must
-have distinct acquisition roots and matching exhaustive content. A retry must
-use a new `--run-id` plus `--retry-of-run-id <previous-run-id>` and
+A successful traversal remains non-current and non-published. Root A is
+retained as the immutable verification baseline. Before running the same
+command a second time, set `PROVIDER_DIRECTORY_CENSUS_RUN_ID` to a different
+globally unique root ID while preserving the identical cutoff. Do not pass
+retry or pagination-root arguments for either fresh root. Root B must have a
+distinct acquisition root, separately valid replay evidence, and the same
+advertised/returned/deficit vector, neutral geometry, and content proof as
+Root A. A retry must use a new `--run-id` plus
+`--retry-of-run-id <previous-run-id>` and
 `--pagination-root-run-id <original-root-run-id>`; it resumes the original root
 and is not a second root. Publication, Profile admission, and API verification
 remain separate reviewed operations after the twin-root gate passes.

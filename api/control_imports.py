@@ -296,6 +296,9 @@ _EPHEMERAL_PARAM_NAMES_BY_IMPORTER = {
 _PROVIDER_DIRECTORY_CURRENT_VERSION_CENSUS_STRATEGY = (
     ProviderDirectoryFHIRAcquisitionStrategy.CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS.value
 )
+_PROVIDER_DIRECTORY_SERVER_ISSUED_SUBSET_STRATEGY = (
+    ProviderDirectoryFHIRAcquisitionStrategy.SERVER_ISSUED_TRAVERSAL_SUBSET.value
+)
 _CONTROL_HIDDEN_PARAM_NAMES_BY_IMPORTER = {
     "provider-directory-fhir": frozenset(
         {
@@ -1575,11 +1578,17 @@ def _is_current_version_census_control(
     raw_strategy = params.get("provider_directory_acquisition_strategy")
     return bool(
         raw_strategy
-        is ProviderDirectoryFHIRAcquisitionStrategy.CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS
+        in {
+            ProviderDirectoryFHIRAcquisitionStrategy.CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS,
+            ProviderDirectoryFHIRAcquisitionStrategy.SERVER_ISSUED_TRAVERSAL_SUBSET,
+        }
         or (
             isinstance(raw_strategy, str)
             and raw_strategy.strip()
-            == _PROVIDER_DIRECTORY_CURRENT_VERSION_CENSUS_STRATEGY
+            in {
+                _PROVIDER_DIRECTORY_CURRENT_VERSION_CENSUS_STRATEGY,
+                _PROVIDER_DIRECTORY_SERVER_ISSUED_SUBSET_STRATEGY,
+            }
         )
     )
 

@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Admission contract for a cutoff-bounded current-version FHIR census.
+"""Admission contract for reviewed current-version FHIR acquisition.
 
 This contract bounds the versions visible in a FHIR search by ``_lastUpdated``.
 It does not recreate a historical snapshot because superseded versions are not
@@ -15,18 +15,24 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
-
-CURRENT_VERSION_CENSUS_CONTRACT_FIELD = (
-    "_provider_directory_current_version_census_contract"
-)
-CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD = (
-    "provider_directory_current_version_census_strategy"
-)
-CURRENT_VERSION_CENSUS_START_URLS_FIELD = (
-    "provider_directory_current_version_census_start_urls"
-)
-CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD = (
-    "provider_directory_current_version_census_continuation_strategy"
+from process.provider_directory_fhir_subset_identity import (
+    CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD,
+    CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_CONTRACT_FIELD,
+    CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD,
+    CURRENT_VERSION_CENSUS_START_URLS_FIELD,
+    CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD,
+    SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
+    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_RESOURCE_TYPES,
+    SERVER_ISSUED_SUBSET_SEMANTICS,
+    SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY,
+    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+    SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
 )
 CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY = (
     "smile-opaque-logical-offset-v2"
@@ -112,6 +118,7 @@ class ProviderDirectoryFHIRAcquisitionStrategy(str, Enum):
     CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS = (
         "cutoff-bounded-current-version-census"
     )
+    SERVER_ISSUED_TRAVERSAL_SUBSET = "server-issued-traversal-subset"
 
 
 def acquisition_strategy_values() -> tuple[str, ...]:
@@ -272,7 +279,7 @@ def current_version_census_request(
     allowed_resources: Sequence[str],
     now: datetime.datetime | None = None,
 ) -> CurrentVersionCensusRequest | None:
-    """Parse manual census identity and reject ignored or ambiguous fields."""
+    """Parse manual acquisition identity and reject ambiguous fields."""
 
     strategy = _strategy_from_value(
         task.get("provider_directory_acquisition_strategy")
@@ -308,12 +315,13 @@ def current_version_census_request(
         source_id=source_ids[0],
         cutoff=_canonical_cutoff(raw_cutoff, now=now),
         resources=resources,
+        strategy=strategy,
     )
 
 
 @dataclass(frozen=True)
 class CurrentVersionCensusRuntime:
-    """Execution controls admitted for the manual census strategy."""
+    """Execution controls admitted for reviewed manual acquisition."""
 
     checkpointing_enabled: bool
     full_refresh: bool
@@ -413,7 +421,7 @@ def validate_current_version_census_runtime(
     request: CurrentVersionCensusRequest,
     runtime: CurrentVersionCensusRuntime,
 ) -> None:
-    """Keep the dormant manual strategy exhaustive, serial, and unpublished."""
+    """Keep the dormant manual strategy unbounded, serial, and unpublished."""
 
     if not isinstance(request, CurrentVersionCensusRequest):
         raise TypeError("current-version census request required")

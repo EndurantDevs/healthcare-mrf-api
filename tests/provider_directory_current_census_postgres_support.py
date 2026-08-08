@@ -160,7 +160,10 @@ async def _create_endpoint_tables(
             validated_at timestamp,
             published_at timestamp,
             superseded_at timestamp,
-            publication_metadata_json jsonb NOT NULL DEFAULT '{{}}'::jsonb
+            publication_metadata_json jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+            completion_proof_required_version integer,
+            completion_proof_json jsonb,
+            completion_proof_sha256 varchar(64)
         );
         """
     )
@@ -173,6 +176,7 @@ async def _create_endpoint_tables(
             resource_id varchar(256) NOT NULL,
             payload_hash varchar(64) NOT NULL,
             payload_json jsonb NOT NULL,
+            acquired_resource_sha256 varchar(64),
             PRIMARY KEY (dataset_id, resource_type, resource_id)
         );
         """

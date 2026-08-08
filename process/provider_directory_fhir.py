@@ -92,6 +92,23 @@ from process.provider_directory_endpoint_admission import (
     _admit_provider_directory_endpoint_components,
 )
 from process.provider_directory_fhir_census_contract import (
+    CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD,
+    CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_CONTRACT_FIELD,
+    CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD,
+    CURRENT_VERSION_CENSUS_START_URLS_FIELD,
+    CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD,
+    SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
+    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_RESOURCE_TYPES,
+    SERVER_ISSUED_SUBSET_SEMANTICS,
+    SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY,
+    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+    SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
     CurrentVersionCensusRuntime,
     current_version_census_request,
     validate_current_version_census_runtime,
@@ -103,20 +120,36 @@ from process.provider_directory_fhir_census_binding import (
     current_version_census_count_url,
     validated_current_version_census_count_map,
 )
+from process.provider_directory_fhir_census_cursor import (
+    CurrentVersionCensusContinuation,
+    resolved_current_version_census_next_url,
+)
 from process.provider_directory_fhir_census_execution import (
     CURRENT_VERSION_CENSUS_BLOCKED_ERROR,
     CURRENT_VERSION_CENSUS_FETCH_MODE,
     CURRENT_VERSION_CENSUS_RETRYABLE_ERROR,
+    SERVER_ISSUED_SUBSET_FETCH_MODE,
     current_version_census_checkpoint_proof,
     current_version_census_completed_proof,
     current_version_census_initial_proof,
     current_version_census_persisted_pre_count,
     current_version_census_terminal_attempt_proof,
-    resolved_current_version_census_next_url,
     validated_current_version_census_completed_proof,
     validate_census_page_entries,
     validated_current_version_census_resume_url,
     validated_current_version_census_total,
+)
+from process.provider_directory_fhir_subset_completion import (
+    SERVER_ISSUED_SUBSET_REQUIRED_VERSION,
+    build_subset_completion_proof,
+    build_subset_replay_evidence,
+    canonical_payload_sha256 as subset_payload_sha256,
+    canonical_sha256 as subset_canonical_sha256,
+    validate_subset_completion_proof_pair,
+    validate_subset_replay_evidence_pair,
+)
+from process.provider_directory_fhir_subset_identity import (
+    server_issued_subset_source_scope_payload,
 )
 from process.provider_directory_fhir_manual_catalog import (
     reviewed_manual_census_seed_rows,
@@ -1386,6 +1419,12 @@ PROVIDER_DIRECTORY_TWIN_ROOT_PENDING = (
 PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED = (
     "verified_two_matching_exhaustive_acquisitions"
 )
+PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING = (
+    "pending_two_matching_reviewed_subset_acquisitions"
+)
+PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED = (
+    "verified_two_matching_reviewed_subset_acquisitions"
+)
 PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY = (
     "provider_directory_verification_campaign_id"
 )
@@ -1413,6 +1452,16 @@ REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID = {
     ),
 }
 TWIN_ROOT_VERIFICATION_METADATA_KEY = "twin_root_verification_v1"
+SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY = (
+    "server_issued_subset_replay_evidence"
+)
+SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY = (
+    "server_issued_subset_replay_evidence_sha256"
+)
+SERVER_ISSUED_SUBSET_COVERAGE_KEY = "server_issued_subset_coverage"
+_SERVER_ISSUED_SUBSET_INTERNAL_REPLAY_KEY = (
+    "_server_issued_subset_replay_evidence"
+)
 PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY = (
     "outcome_resource_counts_v1"
 )
@@ -1440,6 +1489,40 @@ TWIN_ROOT_ACQUISITION_METADATA_KEYS = (
     LAST_UPDATED_PARTITION_METADATA_KEY,
     "provider_directory_acquisition_enabled",
     "provider_directory_coverage_mode",
+)
+SERVER_ISSUED_SUBSET_ACQUISITION_METADATA_KEYS = (
+    "provider_directory_manual_only",
+    "provider_directory_server_issued_subset_resources",
+    CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD,
+    CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD,
+    CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_START_URLS_FIELD,
+)
+ARTIFACT_SOURCE_CONTRACT_METADATA_KEYS = (
+    "provider_directory_supported_resources",
+    "provider_directory_fully_enumerable_resources",
+    "provider_directory_resource_page_count_caps",
+    LAST_UPDATED_PARTITION_METADATA_KEY,
+    "provider_directory_acquisition_enabled",
+    "provider_directory_coverage_mode",
+)
+SERVER_ISSUED_SUBSET_ARTIFACT_METADATA_KEYS = (
+    "provider_directory_manual_only",
+    "provider_directory_server_issued_subset_resources",
+    CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD,
+    CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD,
+    CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD,
+    CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_START_URLS_FIELD,
 )
 IMMUTABLE_ENDPOINT_DATASET_STATUSES = (
     ENDPOINT_DATASET_VALIDATED,
@@ -1917,6 +2000,8 @@ class EndpointDatasetCandidate:
     validated_metadata: dict[str, Any] | None = None
     already_published: bool = False
     published_metadata: dict[str, Any] | None = None
+    completion_proof_required_version: int | None = None
+    subset_contract: CurrentVersionCensusContract | None = None
 
 
 @dataclass(frozen=True)
@@ -1954,6 +2039,9 @@ class EndpointDatasetContentProof:
     resource_counts: dict[str, int]
     source_metrics: dict[str, int] | None = None
     proof_metadata: dict[str, Any] | None = None
+    acquired_resource_hashes: dict[str, str] | None = None
+    completion_proof: dict[str, Any] | None = None
+    completion_proof_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3508,6 +3596,10 @@ def _resource_acquisition_blocked_reason(
         isinstance(fully_enumerable_resources, list)
         and not fully_enumerable_resources
         and not has_partition_opt_in
+        and not (
+            (contract := current_version_census_contract(source)) is not None
+            and contract.is_server_issued_subset_v3
+        )
     ):
         return "fully_enumerable_resources_empty"
     return None
@@ -4490,6 +4582,8 @@ def _source_group_twin_root_verification_profile(
         if status not in {
             PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
             PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
+            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED,
         }:
             raise RuntimeError(
                 "provider_directory_endpoint_dataset_verification_status_invalid"
@@ -4504,7 +4598,10 @@ def _source_group_twin_root_verification_profile(
             "provider_directory_endpoint_dataset_verification_profile_ambiguous"
         )
     status, campaign_id = next(iter(profiles), (None, None))
-    return status == PROVIDER_DIRECTORY_TWIN_ROOT_PENDING, campaign_id
+    return status in {
+        PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
+    }, campaign_id
 
 
 def _needs_source_group_twin_root_verification(
@@ -13652,6 +13749,9 @@ class ProviderDirectoryArtifactDataset:
     resource_count: int | None = None
     validated_at: str | None = None
     publication_metadata_hash: str | None = None
+    completion_proof_required_version: int | None = None
+    completion_proof_sha256: str | None = None
+    completion_proof_cutoff: str | None = None
     verification_source_status: str | None = None
     verification_campaign_id: str | None = None
     verification_source_scope_hash: str | None = None
@@ -14020,8 +14120,10 @@ def _artifact_matched_proof_sql(
 def _artifact_twin_proof_equality_sql(
     candidate_proof: str,
     baseline_proof: str,
+    *,
+    include_subset_completion: bool = False,
 ) -> str:
-    fields = (
+    fields = [
         "endpoint_id",
         "source_ids",
         "selected_resources",
@@ -14032,23 +14134,351 @@ def _artifact_twin_proof_equality_sql(
         "resource_count",
         "resource_hashes",
         "resource_counts",
-    )
+    ]
+    if include_subset_completion:
+        fields.extend(("completion_proof", "completion_proof_sha256"))
     return "\n               AND ".join(
         f"{candidate_proof} -> '{field}' = {baseline_proof} -> '{field}'"
         for field in fields
     )
 
 
-def _artifact_source_contract_sql(
-    source_ref: str,
-    metadata: str,
-    required_status: str,
+def _artifact_subset_parent_pair_sql(sql_by_field: Mapping[str, str]) -> str:
+    """Return atomic parent proof, replay, and fixed coverage predicates."""
+
+    dataset = sql_by_field["dataset"]
+    proof = sql_by_field["completion_proof"]
+    proof_sha = sql_by_field["completion_sha256"]
+    canonical_sha = sql_by_field["canonical_sha256_function"]
+    replay = sql_by_field["replay_evidence"]
+    replay_sha = sql_by_field["replay_sha256"]
+    coverage = sql_by_field["coverage"]
+    return f"""
+        {dataset}.completion_proof_required_version =
+            {SERVER_ISSUED_SUBSET_REQUIRED_VERSION}
+        AND jsonb_typeof({proof}) = 'object'
+        AND {proof_sha} ~ '^[0-9a-f]{{64}}$'
+        AND {canonical_sha}({proof}) = {proof_sha}
+        AND jsonb_typeof({replay}) = 'object'
+        AND {replay_sha} ~ '^[0-9a-f]{{64}}$'
+        AND {canonical_sha}({replay}) = {replay_sha}
+        AND {replay} ->> 'completion_proof_sha256' = {proof_sha}
+        AND jsonb_typeof({coverage}) = 'object'
+        AND {coverage} ->> 'scope' = 'server_issued_traversal_subset'
+        AND {coverage} ->> 'cutoff' = {proof} ->> 'cutoff'
+        AND {coverage} ->> 'proof_sha256' = {proof_sha}
+        AND {coverage} -> 'traversal_complete' = 'true'::jsonb
+        AND {coverage} ->> 'absence_semantics' = 'unknown_under_subset'
+        AND {coverage} ->> 'missing_target_semantics' =
+            'preserved_not_synthesized'
+        AND {coverage} ->> 'publication_state_at_completion' =
+            'not_published'
+    """
+
+
+def _artifact_subset_parent_coverage_sql(
+    sql_by_field: Mapping[str, str],
 ) -> str:
-    source_ids = f"COALESCE({metadata} -> 'source_ids', 'null'::jsonb)"
-    safe_source_ids = (
-        f"CASE WHEN jsonb_typeof({source_ids}) = 'array' "
-        f"THEN {source_ids} ELSE '[]'::jsonb END"
+    """Bind safe aggregate coverage and canonical dataset proof fields."""
+
+    dataset = sql_by_field["dataset"]
+    proof = sql_by_field["completion_proof"]
+    proof_sha = sql_by_field["completion_sha256"]
+    embedded = sql_by_field["embedded_proof"]
+    metadata = sql_by_field["metadata"]
+    coverage = sql_by_field["coverage"]
+    return f"""
+        {coverage} -> 'resources' = (
+            SELECT jsonb_object_agg(
+                       resource_type,
+                       {coverage} -> 'resources' -> resource_type
+                   )
+              FROM jsonb_each({proof} -> 'resources')
+                   AS completion_resource(resource_type, resource_proof)
+        )
+        AND NOT EXISTS (
+            SELECT 1
+              FROM (VALUES ('advertised_pre'), ('advertised_post'),
+                           ('returned_unique'), ('deficit'))
+                   AS count_field(field_name)
+             WHERE {coverage} -> count_field.field_name IS DISTINCT FROM (
+                    SELECT to_jsonb(
+                               sum((resource_proof
+                                   ->> count_field.field_name)::bigint)
+                           )
+                      FROM jsonb_each({proof} -> 'resources')
+                           AS resource(resource_type, resource_proof)
+             )
+        )
+        AND {embedded} -> 'completion_proof' = {proof}
+        AND {embedded} ->> 'completion_proof_sha256' = {proof_sha}
+        AND {proof} ->> 'campaign_id' =
+            {metadata} ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
+        AND {proof} -> 'dataset' ->> 'hash' = {dataset}.dataset_hash
+        AND {proof} -> 'dataset' -> 'count' =
+            to_jsonb({dataset}.resource_count)
+        AND {proof} -> 'dataset' -> 'resource_hashes' =
+            {embedded} -> 'resource_hashes'
+        AND {proof} -> 'dataset' -> 'resource_counts' =
+            {embedded} -> 'resource_counts'
+    """
+
+
+def _artifact_subset_parent_diagnostics_sql(
+    sql_by_field: Mapping[str, str],
+) -> str:
+    """Bind safe per-resource diagnostics to canonical resource counts."""
+
+    metadata = sql_by_field["metadata"]
+    proof = sql_by_field["completion_proof"]
+    replay = sql_by_field["replay_evidence"]
+    diagnostic = f"{metadata} -> 'resource_diagnostics'"
+    return f"""
+        jsonb_typeof({diagnostic}) = 'object'
+        AND CASE WHEN jsonb_typeof({diagnostic}) = 'object'
+                 THEN (SELECT count(*) FROM jsonb_object_keys({diagnostic}))
+                 ELSE 0 END = 7
+        AND jsonb_typeof({replay} -> 'resources') = 'object'
+        AND CASE WHEN jsonb_typeof({replay} -> 'resources') = 'object'
+                 THEN (SELECT count(*)
+                         FROM jsonb_object_keys({replay} -> 'resources'))
+                 ELSE 0 END = 7
+        AND NOT EXISTS (
+            SELECT 1
+              FROM jsonb_each({proof} -> 'resources')
+                   AS completion_resource(resource_type, resource_proof)
+             WHERE {diagnostic} -> resource_type
+                       -> 'server_issued_subset_completeness' ->> 'cutoff'
+                       IS DISTINCT FROM {proof} ->> 'cutoff'
+                OR {diagnostic} -> resource_type
+                       -> 'server_issued_subset_completeness' -> 'page_count'
+                       IS DISTINCT FROM {proof} -> 'page_count'
+                OR {diagnostic} -> resource_type
+                       -> 'server_issued_subset_completeness' ->> 'campaign_id'
+                       IS DISTINCT FROM {proof} ->> 'campaign_id'
+                OR {diagnostic} -> resource_type
+                       -> 'server_issued_subset_completeness' -> 'advertised_pre'
+                       IS DISTINCT FROM resource_proof -> 'advertised_pre'
+                OR {diagnostic} -> resource_type
+                       -> 'server_issued_subset_completeness' -> 'advertised_post'
+                       IS DISTINCT FROM resource_proof -> 'advertised_post'
+                OR {diagnostic} -> resource_type
+                       -> 'server_issued_subset_completeness' -> 'returned_unique'
+                       IS DISTINCT FROM resource_proof -> 'returned_unique'
+                OR {diagnostic} -> resource_type
+                       -> 'server_issued_subset_completeness' -> 'deficit'
+                       IS DISTINCT FROM resource_proof -> 'deficit'
+        )
+    """
+
+
+def _artifact_subset_parent_replay_sql(
+    sql_by_field: Mapping[str, str],
+) -> str:
+    """Bind sealed per-root replay evidence to neutral page geometry."""
+
+    proof = sql_by_field["completion_proof"]
+    replay = sql_by_field["replay_evidence"]
+    canonical_sha = sql_by_field["canonical_sha256_function"]
+    return f"""
+        NOT EXISTS (
+            SELECT 1
+              FROM jsonb_each({proof} -> 'resources')
+                   AS completion_resource(resource_type, resource_proof)
+             WHERE {replay} -> 'resources' -> resource_type -> 'pages'
+                       IS DISTINCT FROM resource_proof -> 'pages'
+                OR {replay} -> 'resources' -> resource_type
+                       -> 'continuation_shape_sha256'
+                       IS DISTINCT FROM resource_proof
+                           -> 'continuation_shape_sha256'
+                OR jsonb_typeof(
+                       {replay} -> 'resources' -> resource_type
+                           -> 'continuation_hop_sha256'
+                   ) IS DISTINCT FROM 'array'
+                OR CASE
+                       WHEN jsonb_typeof(
+                           {replay} -> 'resources' -> resource_type
+                               -> 'continuation_hop_sha256'
+                       ) = 'array'
+                       THEN jsonb_array_length(
+                           {replay} -> 'resources' -> resource_type
+                               -> 'continuation_hop_sha256'
+                       )
+                       ELSE -1
+                   END IS DISTINCT FROM
+                       (resource_proof ->> 'pages')::integer - 1
+                OR {canonical_sha}(
+                       {replay} -> 'resources' -> resource_type
+                           -> 'continuation_hop_sha256'
+                   ) IS DISTINCT FROM
+                       {replay} -> 'resources' -> resource_type
+                           ->> 'continuation_hop_chain_sha256'
+        )
+    """
+
+
+def _artifact_subset_parent_proof_sql(
+    dataset_alias: str,
+    metadata: str,
+    embedded_proof: str,
+) -> str:
+    """Bind one direct marker/proof pair to its row and embedded twin proof."""
+
+    sql_by_field = {
+        "dataset": dataset_alias,
+        "metadata": metadata,
+        "embedded_proof": embedded_proof,
+        "completion_proof": f"{dataset_alias}.completion_proof_json",
+        "completion_sha256": f"{dataset_alias}.completion_proof_sha256",
+        "canonical_sha256_function": _qt(
+            _schema(), "provider_directory_subset_canonical_sha256"
+        ),
+        "replay_evidence": (
+            f"{metadata} -> '{SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY}'"
+        ),
+        "replay_sha256": (
+            f"{metadata} ->> '{SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY}'"
+        ),
+        "coverage": f"{metadata} -> '{SERVER_ISSUED_SUBSET_COVERAGE_KEY}'",
+    }
+    fragments = (
+        _artifact_subset_parent_pair_sql(sql_by_field),
+        _artifact_subset_parent_coverage_sql(sql_by_field),
+        _artifact_subset_parent_diagnostics_sql(sql_by_field),
+        _artifact_subset_parent_replay_sql(sql_by_field),
     )
+    return "\n        AND ".join(fragment.strip() for fragment in fragments)
+
+
+def _artifact_subset_source_fixed_sql(
+    source_metadata: str,
+    completion_proof: str,
+    completion_scopes_json: str,
+) -> str:
+    """Return fixed reviewed v3 source identity predicates."""
+
+    return f"""
+        {source_metadata} -> 'provider_directory_manual_only'
+            = 'true'::jsonb
+        AND {source_metadata} -> '{CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD}'
+            = '{SERVER_ISSUED_SUBSET_REQUIRED_VERSION}'::jsonb
+        AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD}'
+            = '{SERVER_ISSUED_SUBSET_SEMANTICS}'
+        AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD}'
+            = '{SERVER_ISSUED_SUBSET_STRATEGY_VERSION}'
+        AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD}'
+            = '{SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION}'
+        AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD}'
+            = '{SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION}'
+        AND {source_metadata} -> '{CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD}'
+            = '{completion_scopes_json}'::jsonb
+        AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD}'
+            = '{SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY}'
+        AND {source_metadata} -> '{CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD}'
+            = {completion_proof} -> 'page_count'
+        AND {source_metadata} ->> '{PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY}'
+            = {completion_proof} ->> 'campaign_id'
+    """
+
+
+def _artifact_subset_source_resources_sql(
+    source_metadata: str,
+    allowed_resources_sql: str,
+) -> str:
+    """Return exact reviewed resource-set predicates."""
+
+    return f"""
+        AND jsonb_typeof(
+                {source_metadata}
+                    -> 'provider_directory_server_issued_subset_resources'
+            ) = 'array'
+        AND jsonb_array_length(
+                {source_metadata}
+                    -> 'provider_directory_server_issued_subset_resources'
+            ) = 7
+        AND NOT EXISTS (
+            SELECT 1
+              FROM jsonb_array_elements_text(
+                       {source_metadata}
+                         -> 'provider_directory_server_issued_subset_resources'
+                   ) AS subset_resource(resource_type)
+             WHERE subset_resource.resource_type
+                   <> ALL(ARRAY[{allowed_resources_sql}]::text[])
+        )
+        AND (
+            SELECT count(DISTINCT subset_resource.resource_type)
+              FROM jsonb_array_elements_text(
+                       {source_metadata}
+                         -> 'provider_directory_server_issued_subset_resources'
+                   ) AS subset_resource(resource_type)
+        ) = 7
+    """
+
+
+def _artifact_subset_source_urls_sql(
+    source_metadata: str,
+    allowed_resources_sql: str,
+) -> str:
+    """Return exact reviewed start-URL key predicates."""
+
+    return f"""
+        AND jsonb_typeof(
+                {source_metadata} -> '{CURRENT_VERSION_CENSUS_START_URLS_FIELD}'
+            ) = 'object'
+        AND CASE
+                WHEN jsonb_typeof(
+                    {source_metadata}
+                        -> '{CURRENT_VERSION_CENSUS_START_URLS_FIELD}'
+                ) = 'object'
+                THEN (
+                    SELECT count(*)
+                      FROM jsonb_object_keys(
+                          {source_metadata}
+                              -> '{CURRENT_VERSION_CENSUS_START_URLS_FIELD}'
+                      )
+                )
+                ELSE 0
+            END = 7
+        AND {source_metadata} -> '{CURRENT_VERSION_CENSUS_START_URLS_FIELD}'
+            ?& ARRAY[{allowed_resources_sql}]::text[]
+    """
+
+
+def _artifact_subset_source_identity_sql(
+    source_metadata: str,
+    dataset_alias: str = "dataset",
+) -> str:
+    """Bind the reviewed source's fixed v3 identity to its parent proof."""
+
+    completion_scopes_json = json.dumps(
+        list(SERVER_ISSUED_SUBSET_COMPLETION_SCOPES), separators=(",", ":")
+    )
+    allowed_resources_sql = ", ".join(
+        f"'{resource_type}'"
+        for resource_type in SERVER_ISSUED_SUBSET_RESOURCE_TYPES
+    )
+    fragments = (
+        _artifact_subset_source_fixed_sql(
+            source_metadata,
+            f"{dataset_alias}.completion_proof_json",
+            completion_scopes_json,
+        ),
+        _artifact_subset_source_resources_sql(
+            source_metadata, allowed_resources_sql
+        ),
+        _artifact_subset_source_urls_sql(
+            source_metadata, allowed_resources_sql
+        ),
+    )
+    return "\n".join(fragment.rstrip() for fragment in fragments)
+
+
+def _artifact_source_id_list_sql(
+    source_ids: str,
+    safe_source_ids: str,
+) -> str:
+    """Require a nonempty, duplicate-free source-id array."""
+
     return f"""
         jsonb_typeof({source_ids}) = 'array'
         AND jsonb_array_length({safe_source_ids}) > 0
@@ -14057,6 +14487,35 @@ def _artifact_source_contract_sql(
               FROM jsonb_array_elements_text({safe_source_ids})
                    AS attached_source(source_id)
         )
+    """
+
+
+def _artifact_source_contract_sql(
+    source_ref: str,
+    metadata: str,
+    required_status: str,
+    *,
+    require_subset_identity: bool = False,
+) -> str:
+    """Require every attached source to retain its reviewed status and scope."""
+
+    source_ids = f"COALESCE({metadata} -> 'source_ids', 'null'::jsonb)"
+    safe_source_ids = (
+        f"CASE WHEN jsonb_typeof({source_ids}) = 'array' "
+        f"THEN {source_ids} ELSE '[]'::jsonb END"
+    )
+    subset_source_identity_sql = (
+        _artifact_subset_source_identity_sql(
+            "current_source.metadata_json::jsonb"
+        )
+        if require_subset_identity
+        else "true"
+    )
+    source_id_list_sql = _artifact_source_id_list_sql(
+        source_ids, safe_source_ids
+    )
+    return f"""
+        {source_id_list_sql}
         AND NOT EXISTS (
             SELECT 1
               FROM jsonb_array_elements_text({safe_source_ids})
@@ -14075,6 +14534,7 @@ def _artifact_source_contract_sql(
                    AND current_source.metadata_json::jsonb
                          ->> '{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}'
                          = dataset.endpoint_id
+                   AND {subset_source_identity_sql}
              )
         )
         AND NOT EXISTS (
@@ -14164,6 +14624,33 @@ def _artifact_matched_anchor_sql(dataset_ref: str, metadata: str) -> str:
     """
 
 
+def _artifact_completion_marker_sql(
+    candidate_alias: str,
+    baseline_alias: str,
+    completion_proof_required_version: int | None,
+) -> str:
+    """Return legacy-null or v3-required completion marker predicates."""
+
+    if (
+        completion_proof_required_version
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+    ):
+        return f"""
+               AND {candidate_alias}.completion_proof_required_version =
+                   {SERVER_ISSUED_SUBSET_REQUIRED_VERSION}
+               AND {baseline_alias}.completion_proof_required_version =
+                   {SERVER_ISSUED_SUBSET_REQUIRED_VERSION}
+        """
+    return f"""
+               AND {candidate_alias}.completion_proof_required_version IS NULL
+               AND {candidate_alias}.completion_proof_json IS NULL
+               AND {candidate_alias}.completion_proof_sha256 IS NULL
+               AND {baseline_alias}.completion_proof_required_version IS NULL
+               AND {baseline_alias}.completion_proof_json IS NULL
+               AND {baseline_alias}.completion_proof_sha256 IS NULL
+    """
+
+
 def _artifact_baseline_proof_sql(
     dataset_ref: str,
     metadata: str,
@@ -14171,6 +14658,7 @@ def _artifact_baseline_proof_sql(
     *,
     candidate_alias: str = "dataset",
     baseline_alias: str = "verification_baseline",
+    completion_proof_required_version: int | None = None,
 ) -> str:
     """Require an immutable baseline whose full proof matches the candidate."""
     baseline_metadata = f"{baseline_alias}.publication_metadata_json::jsonb"
@@ -14182,12 +14670,24 @@ def _artifact_baseline_proof_sql(
     exact_proof_sql = _artifact_twin_proof_equality_sql(
         candidate_proof,
         baseline_proof,
+        include_subset_completion=(
+            completion_proof_required_version
+            == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        ),
     )
     baseline_contract_sql = _artifact_baseline_contract_sql(
         baseline_alias,
         baseline_metadata,
         baseline_verification,
         baseline_proof,
+        completion_proof_required_version=(
+            completion_proof_required_version
+        ),
+    )
+    completion_marker_sql = _artifact_completion_marker_sql(
+        candidate_alias,
+        baseline_alias,
+        completion_proof_required_version,
     )
     return f"""
         EXISTS (
@@ -14200,6 +14700,7 @@ def _artifact_baseline_proof_sql(
                AND {baseline_alias}.is_current = false
                AND {baseline_alias}.status =
                    '{ENDPOINT_DATASET_VERIFICATION_BASELINE}'
+               {completion_marker_sql}
                AND {baseline_contract_sql}
                AND {baseline_metadata} ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
                      = {metadata} ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
@@ -14217,8 +14718,20 @@ def _artifact_baseline_contract_sql(
     baseline_metadata: str,
     baseline_verification: str,
     baseline_proof: str,
+    *,
+    completion_proof_required_version: int | None = None,
 ) -> str:
     """Bind baseline proof fields to the immutable baseline dataset row."""
+    subset_parent_proof_sql = (
+        _artifact_subset_parent_proof_sql(
+            baseline_alias,
+            baseline_metadata,
+            baseline_proof,
+        )
+        if completion_proof_required_version
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        else "true"
+    )
     return f"""
         {baseline_metadata} ->> '{TWIN_ROOT_VERIFICATION_ROLE_KEY}'
             = '{TWIN_ROOT_BASELINE_CANDIDATE_ROLE}'
@@ -14242,6 +14755,37 @@ def _artifact_baseline_contract_sql(
         AND {baseline_proof} ->> 'dataset_hash' = {baseline_alias}.dataset_hash
         AND {baseline_proof} ->> 'resource_count'
             = {baseline_alias}.resource_count::text
+        AND {subset_parent_proof_sql}
+    """
+
+
+def _artifact_subset_candidate_eligibility_sql(
+    dataset_ref: str,
+    source_ref: str,
+    metadata: str,
+    verification: str,
+    proof: str,
+) -> str:
+    """Return the exact v3 reviewed-candidate eligibility branch."""
+
+    subset_baseline_proof_sql = _artifact_baseline_proof_sql(
+        dataset_ref,
+        metadata,
+        verification,
+        completion_proof_required_version=(
+            SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        ),
+    )
+    return f"""
+        {_artifact_source_contract_sql(
+            source_ref,
+            metadata,
+            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED,
+            require_subset_identity=True,
+        )}
+        AND {_artifact_matched_proof_sql(metadata, verification, proof)}
+        AND {_artifact_subset_parent_proof_sql("dataset", metadata, proof)}
+        AND {subset_baseline_proof_sql}
     """
 
 
@@ -14251,6 +14795,8 @@ def _artifact_reviewed_candidate_eligibility_sql(
     *,
     metadata: str = "dataset.publication_metadata_json::jsonb",
 ) -> str:
+    """Return legacy and v3 twin-proof eligibility alternatives."""
+
     verification = f"{metadata} -> '{TWIN_ROOT_VERIFICATION_METADATA_KEY}'"
     proof = f"{verification} -> 'proof'"
     matched_proof_sql = _artifact_matched_proof_sql(
@@ -14259,10 +14805,22 @@ def _artifact_reviewed_candidate_eligibility_sql(
     baseline_proof_sql = _artifact_baseline_proof_sql(
         dataset_ref, metadata, verification
     )
+    subset_eligibility_sql = _artifact_subset_candidate_eligibility_sql(
+        dataset_ref, source_ref, metadata, verification, proof
+    )
     return f"""
         (
-            {_artifact_profile_absence_sql(source_ref, metadata)}
+            (
+                dataset.completion_proof_required_version IS NULL
+                AND dataset.completion_proof_json IS NULL
+                AND dataset.completion_proof_sha256 IS NULL
+                AND {_artifact_profile_absence_sql(source_ref, metadata)}
+            )
             OR (
+                dataset.completion_proof_required_version IS NULL
+                AND dataset.completion_proof_json IS NULL
+                AND dataset.completion_proof_sha256 IS NULL
+                AND
                 {_artifact_source_contract_sql(
                     source_ref, metadata, PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
                 )}
@@ -14273,6 +14831,9 @@ def _artifact_reviewed_candidate_eligibility_sql(
                         AND {_artifact_matched_anchor_sql(dataset_ref, metadata)}
                     )
                 )
+            )
+            OR (
+                {subset_eligibility_sql}
             )
         )
     """
@@ -14292,6 +14853,10 @@ def _artifact_candidate_eligibility_metadata_columns() -> str:
         dataset_hash text,
         resource_count text,
         completion_proof_v1 jsonb,
+        resource_diagnostics jsonb,
+        {SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY} jsonb,
+        {SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY} text,
+        {SERVER_ISSUED_SUBSET_COVERAGE_KEY} jsonb,
         selected_resources jsonb,
         expected_resources jsonb
     """
@@ -14308,6 +14873,9 @@ def _artifact_candidate_eligibility_ctes(dataset_ref: str) -> str:
                dataset.acquisition_root_run_id,
                dataset.dataset_hash,
                dataset.resource_count,
+               dataset.completion_proof_required_version,
+               dataset.completion_proof_json,
+               dataset.completion_proof_sha256,
                dataset.publication_metadata_json::jsonb
                    AS full_metadata_jsonb
           FROM {dataset_ref} AS dataset
@@ -14321,6 +14889,9 @@ def _artifact_candidate_eligibility_ctes(dataset_ref: str) -> str:
                candidate.acquisition_root_run_id,
                candidate.dataset_hash,
                candidate.resource_count,
+               candidate.completion_proof_required_version,
+               candidate.completion_proof_json,
+               candidate.completion_proof_sha256,
                (
                    to_jsonb(metadata_fields)
                        - '{metadata_key}'
@@ -14459,6 +15030,9 @@ def _artifact_dataset_projection_sql() -> str:
                dataset.dataset_hash,
                dataset.resource_count,
                dataset.validated_at,
+               dataset.completion_proof_required_version,
+               dataset.completion_proof_json,
+               dataset.completion_proof_sha256,
                dataset.publication_metadata_json,
                dataset.current_dataset_count,
                dataset.current_dataset_id,
@@ -14643,23 +15217,35 @@ def _artifact_dataset_resource_profile(
     return tuple(sorted(resource_types))
 
 
-def _provider_directory_artifact_dataset_from_row(
-    dataset_row: Any,
-) -> ProviderDirectoryArtifactDataset | None:
-    """Build one immutable artifact selection from a query result."""
-    dataset_row_map = _pagination_checkpoint_row_mapping(dataset_row)
+def _artifact_dataset_row_identity(
+    dataset_row_map: Mapping[str, Any],
+) -> tuple[dict[str, str | None], str] | None:
+    """Return required artifact identifiers and its serving endpoint."""
+
     value_by_name = {
         key: _clean_text(dataset_row_map.get(key))
         for key in ("source_id", "endpoint_id", "dataset_id", "evidence_run_id")
     }
     if not all(value_by_name.values()):
         return None
-    dataset_id = value_by_name["dataset_id"] or ""
     serving_endpoint_id = (
         _clean_text(dataset_row_map.get("serving_endpoint_id"))
         or value_by_name["endpoint_id"]
         or ""
     )
+    return value_by_name, serving_endpoint_id
+
+
+def _provider_directory_artifact_dataset_from_row(
+    dataset_row: Any,
+) -> ProviderDirectoryArtifactDataset | None:
+    """Build one immutable artifact selection from a query result."""
+    dataset_row_map = _pagination_checkpoint_row_mapping(dataset_row)
+    identity = _artifact_dataset_row_identity(dataset_row_map)
+    if identity is None:
+        return None
+    value_by_name, serving_endpoint_id = identity
+    dataset_id = value_by_name["dataset_id"] or ""
     selected_resources, expected_resources, recorded_expected_resources = (
         _artifact_dataset_profiles_from_row(dataset_row_map, dataset_id)
     )
@@ -14672,6 +15258,11 @@ def _provider_directory_artifact_dataset_from_row(
     publication_metadata = _json_object(
         dataset_row_map.get("publication_metadata_json")
     )
+    _validate_finalized_subset_completion_pair(
+        dataset_row_map,
+        publication_metadata,
+    )
+    completion_proof = _json_object(dataset_row_map.get("completion_proof_json"))
     verification_fields_by_name = _artifact_dataset_verification_fields(
         source_record,
         publication_metadata,
@@ -14681,6 +15272,10 @@ def _provider_directory_artifact_dataset_from_row(
             selection_state["promote_on_cutover"]
             or selection_state["reconcile_source_alias_on_cutover"]
         ),
+        completion_proof_required_version=selection_state[
+            "completion_proof_required_version"
+        ],
+        completion_proof_cutoff=_clean_text(completion_proof.get("cutoff")),
     )
     return ProviderDirectoryArtifactDataset(
         source_id=value_by_name["source_id"] or "",
@@ -14703,6 +15298,8 @@ def _artifact_dataset_verification_fields(
     dataset_id: str,
     *,
     should_repoint_source_alias: bool,
+    completion_proof_required_version: int | None,
+    completion_proof_cutoff: str | None,
 ) -> dict[str, Any]:
     """Freeze the reviewed source contract attached to alias cutover."""
     verification_campaign_id = _clean_text(
@@ -14721,6 +15318,10 @@ def _artifact_dataset_verification_fields(
                 dataset_id=dataset_id,
                 verification_campaign_id=verification_campaign_id,
                 verification_source_scope_hash=verification_source_scope_hash,
+                completion_proof_required_version=(
+                    completion_proof_required_version
+                ),
+                completion_proof_cutoff=completion_proof_cutoff,
             )
         )
     return {
@@ -14805,6 +15406,150 @@ def _is_artifact_source_verification_profile_present(
     )
 
 
+def _source_contract_metadata_keys(
+    metadata: Mapping[str, Any],
+    *,
+    artifact: bool,
+) -> tuple[str, ...]:
+    """Preserve legacy tuples while extending only shaped v3 identities."""
+
+    base_keys = (
+        ARTIFACT_SOURCE_CONTRACT_METADATA_KEYS
+        if artifact
+        else TWIN_ROOT_ACQUISITION_METADATA_KEYS
+    )
+    is_subset_shape = bool(
+        metadata.get(CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD)
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        and metadata.get(CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD)
+        == SERVER_ISSUED_SUBSET_SEMANTICS
+    )
+    if not is_subset_shape:
+        return base_keys
+    subset_keys = (
+        SERVER_ISSUED_SUBSET_ARTIFACT_METADATA_KEYS
+        if artifact
+        else SERVER_ISSUED_SUBSET_ACQUISITION_METADATA_KEYS
+    )
+    return base_keys + subset_keys
+
+
+def _is_reviewed_subset_source_metadata(metadata: Mapping[str, Any]) -> bool:
+    resources = metadata.get(
+        "provider_directory_server_issued_subset_resources"
+    )
+    start_urls = metadata.get(CURRENT_VERSION_CENSUS_START_URLS_FIELD)
+    return bool(
+        metadata.get("provider_directory_manual_only") is True
+        and type(resources) is list
+        and len(resources) == len(SERVER_ISSUED_SUBSET_RESOURCE_TYPES)
+        and set(resources) == set(SERVER_ISSUED_SUBSET_RESOURCE_TYPES)
+        and isinstance(start_urls, Mapping)
+        and set(start_urls) == set(SERVER_ISSUED_SUBSET_RESOURCE_TYPES)
+        and metadata.get(CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD)
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        and metadata.get(CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD)
+        == SERVER_ISSUED_SUBSET_SEMANTICS
+        and metadata.get(CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD)
+        == SERVER_ISSUED_SUBSET_STRATEGY_VERSION
+        and metadata.get(CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD)
+        == SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION
+        and metadata.get(CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD)
+        == SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION
+        and metadata.get(CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD)
+        == list(SERVER_ISSUED_SUBSET_COMPLETION_SCOPES)
+        and metadata.get(CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD)
+        == SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY
+        and type(metadata.get(CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD)) is int
+        and 1 <= metadata[CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD] <= 1000
+        and bool(
+            _clean_text(
+                metadata.get(
+                    PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+                )
+            )
+        )
+    )
+
+
+def _has_validated_artifact_verification_profile(
+    source_record: dict[str, Any],
+    dataset_id: str,
+    verification_campaign_id: str | None,
+    completion_proof_required_version: int | None,
+) -> bool:
+    """Validate status and reviewed identity; return profile presence."""
+
+    has_verification_profile = _is_artifact_source_verification_profile_present(
+        source_record
+    )
+    source_metadata = _source_metadata(source_record)
+    expected_verified_status = (
+        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED
+        if completion_proof_required_version
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        else PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+    )
+    if has_verification_profile and _clean_text(
+        source_metadata.get("provider_directory_candidate_status")
+    ) != expected_verified_status:
+        raise RuntimeError(
+            "provider_directory_artifact_candidate_status_not_verified:"
+            + dataset_id
+        )
+    is_subset = (
+        completion_proof_required_version
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+    )
+    campaign = _clean_text(
+        source_metadata.get(
+            PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+        )
+    )
+    if is_subset and (
+        not _is_reviewed_subset_source_metadata(source_metadata)
+        or campaign != verification_campaign_id
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_subset_contract_invalid:" + dataset_id
+        )
+    if completion_proof_required_version not in (
+        None,
+        SERVER_ISSUED_SUBSET_REQUIRED_VERSION,
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_subset_contract_invalid:" + dataset_id
+        )
+    return has_verification_profile
+
+
+def _artifact_scope_source(
+    source_record: dict[str, Any],
+    completion_proof_cutoff: str | None,
+    recorded_expected_resources: tuple[str, ...] | None,
+    dataset_id: str,
+    *,
+    profile_required: bool,
+) -> dict[str, Any]:
+    """Reconstruct the source contract and validate its resource profile."""
+
+    scope_source = _artifact_source_with_subset_contract(
+        source_record, completion_proof_cutoff
+    )
+    current_expected_resources = _endpoint_dataset_expected_resources(
+        [scope_source]
+    )
+    if profile_required and (
+        recorded_expected_resources is None
+        or current_expected_resources != recorded_expected_resources
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_candidate_resource_profile_changed:"
+            + dataset_id
+        )
+    return scope_source
+
+
 def _artifact_promotion_source_contract(
     source_record: dict[str, Any],
     publication_metadata: dict[str, Any],
@@ -14813,45 +15558,35 @@ def _artifact_promotion_source_contract(
     dataset_id: str,
     verification_campaign_id: str | None,
     verification_source_scope_hash: str | None,
+    completion_proof_required_version: int | None = None,
+    completion_proof_cutoff: str | None = None,
 ) -> tuple[tuple[str, ...], tuple[Any, ...]]:
     """Build and validate the current source contract for one promotion."""
-    has_verification_profile = _is_artifact_source_verification_profile_present(
-        source_record
+    has_verification_profile = _has_validated_artifact_verification_profile(
+        source_record,
+        dataset_id,
+        verification_campaign_id,
+        completion_proof_required_version,
     )
-    if has_verification_profile and _clean_text(
-        _source_metadata(source_record).get(
-            "provider_directory_candidate_status"
-        )
-    ) != PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED:
-        raise RuntimeError(
-            "provider_directory_artifact_candidate_status_not_verified:"
-            + dataset_id
-        )
     source_ids = _artifact_verification_source_ids(
         publication_metadata,
         dataset_id,
         source_record,
         is_required=has_verification_profile,
     )
-    current_expected_resources = _endpoint_dataset_expected_resources(
-        [source_record]
-    )
-    if (
-        has_verification_profile
-        and (
-            recorded_expected_resources is None
-            or current_expected_resources != recorded_expected_resources
-        )
-    ):
-        raise RuntimeError(
-            "provider_directory_artifact_candidate_resource_profile_changed:"
-            + dataset_id
-        )
-    contract = _artifact_source_verification_contract(
+    scope_source = _artifact_scope_source(
         source_record,
+        completion_proof_cutoff,
+        recorded_expected_resources,
+        dataset_id,
+        profile_required=has_verification_profile,
+    )
+    contract = _artifact_source_verification_contract(
+        scope_source,
         verification_campaign_id=verification_campaign_id,
         verification_source_scope_hash=verification_source_scope_hash,
         source_ids=source_ids,
+        completion_proof_cutoff=completion_proof_cutoff,
     )
     current_scope_hash = contract[-1][1]
     if has_verification_profile and (
@@ -14866,13 +15601,103 @@ def _artifact_promotion_source_contract(
     return source_ids, contract
 
 
+def _artifact_subset_contract_from_metadata(
+    source_id: str,
+    source_metadata: Mapping[str, Any],
+    completion_proof_cutoff: str,
+) -> CurrentVersionCensusContract:
+    """Reconstruct one reviewed v3 contract from durable metadata."""
+
+    resources = tuple(
+        source_metadata["provider_directory_server_issued_subset_resources"]
+    )
+    expected_nonempty_resources = tuple(
+        source_metadata.get(
+            "provider_directory_expected_nonempty_resources",
+            (),
+        )
+    )
+    start_url_by_resource = source_metadata[
+        CURRENT_VERSION_CENSUS_START_URLS_FIELD
+    ]
+    return CurrentVersionCensusContract(
+        source_id=source_id,
+        cutoff=completion_proof_cutoff,
+        resources=resources,
+        expected_nonempty_resources=expected_nonempty_resources,
+        start_urls=tuple(
+            (resource_type, start_url_by_resource[resource_type])
+            for resource_type in resources
+        ),
+        continuation_strategy=source_metadata[
+            CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD
+        ],
+        strategy_version=source_metadata[
+            CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD
+        ],
+        contract_version=source_metadata[
+            CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD
+        ],
+        semantics=source_metadata[
+            CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD
+        ],
+        page_count=source_metadata[CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD],
+        traversal_version=source_metadata[
+            CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD
+        ],
+        canonicalization_version=source_metadata[
+            CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD
+        ],
+        completion_scopes=tuple(
+            source_metadata[CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD]
+        ),
+        campaign_id=_clean_text(
+            source_metadata.get(
+                PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+            )
+        ),
+    )
+
+
+def _artifact_source_with_subset_contract(
+    source_record: dict[str, Any],
+    completion_proof_cutoff: str | None,
+) -> dict[str, Any]:
+    """Reconstruct the admitted v3 contract from durable neutral identity."""
+
+    if completion_proof_cutoff is None:
+        return source_record
+    source_metadata = _source_metadata(source_record)
+    if not _is_reviewed_subset_source_metadata(source_metadata):
+        raise RuntimeError(
+            "provider_directory_artifact_subset_contract_invalid"
+        )
+    contract = _artifact_subset_contract_from_metadata(
+        _clean_text(source_record.get("source_id")) or "",
+        source_metadata,
+        completion_proof_cutoff,
+    )
+    if not contract.is_server_issued_subset_v3:
+        raise RuntimeError(
+            "provider_directory_artifact_subset_contract_invalid"
+        )
+    scoped_source_by_field = dict(source_record)
+    scoped_source_by_field[CURRENT_VERSION_CENSUS_CONTRACT_FIELD] = contract
+    return scoped_source_by_field
+
+
 def _artifact_current_source_scope_hashes(
     source_record: dict[str, Any],
     source_ids: tuple[str, ...],
+    completion_proof_cutoff: str | None,
 ) -> tuple[str | None, str | None]:
     """Return legacy checkpoint and reviewed verification scope hashes."""
-    checkpoint_identity = _pagination_checkpoint_scope_identity(
+    scope_source = _artifact_source_with_subset_contract(
         source_record,
+        completion_proof_cutoff,
+    )
+    checkpoint_identity = _pagination_checkpoint_scope_identity(
+        scope_source,
         list(source_ids),
     )
     checkpoint_scope_hash = (
@@ -14883,12 +15708,32 @@ def _artifact_current_source_scope_hashes(
         and checkpoint_scope_hash
     ):
         return checkpoint_scope_hash, checkpoint_scope_hash
+    subset_scope_hash = _server_issued_subset_source_scope_hash(
+        [scope_source],
+        list(source_ids),
+    )
+    if subset_scope_hash is not None:
+        return checkpoint_scope_hash, subset_scope_hash
     reviewed_scope_hash = _twin_root_verification_scope_hash(
-        [source_record],
+        [scope_source],
         list(source_ids),
         checkpoint_scope_hash,
     )
     return checkpoint_scope_hash, reviewed_scope_hash
+
+
+def _artifact_source_identity_fields(
+    source_metadata: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Return the legacy-or-v3 source configuration identity fields."""
+
+    return tuple(
+        _artifact_source_contract_json_value(source_metadata, key)
+        for key in _source_contract_metadata_keys(
+            source_metadata,
+            artifact=True,
+        )
+    )
 
 
 def _artifact_source_verification_contract(
@@ -14897,13 +15742,19 @@ def _artifact_source_verification_contract(
     verification_campaign_id: str | None,
     verification_source_scope_hash: str | None,
     source_ids: tuple[str, ...],
+    completion_proof_cutoff: str | None,
 ) -> tuple[Any, ...]:
     """Freeze source admission and acquisition config used by an artifact."""
-    source_metadata = _source_metadata(source_record)
+    contract_source = _artifact_source_with_subset_contract(
+        source_record,
+        completion_proof_cutoff,
+    )
+    source_metadata = _source_metadata(contract_source)
     checkpoint_scope_hash, current_verification_scope_hash = (
         _artifact_current_source_scope_hashes(
-            source_record,
+            contract_source,
             source_ids,
+            completion_proof_cutoff,
         )
     )
     return (
@@ -14927,20 +15778,10 @@ def _artifact_source_verification_contract(
         ),
         (
             "current_expected_resources",
-            _endpoint_dataset_expected_resources([source_record]),
+            _endpoint_dataset_expected_resources([contract_source]),
         ),
-        *(
-            _artifact_source_contract_json_value(source_metadata, key)
-            for key in (
-                "provider_directory_supported_resources",
-                "provider_directory_fully_enumerable_resources",
-                "provider_directory_resource_page_count_caps",
-                LAST_UPDATED_PARTITION_METADATA_KEY,
-                "provider_directory_acquisition_enabled",
-                "provider_directory_coverage_mode",
-            )
-        ),
-        ("acquisition_config", _resource_import_group_key(source_record)),
+        *_artifact_source_identity_fields(source_metadata),
+        ("acquisition_config", _resource_import_group_key(contract_source)),
         (
             "current_checkpoint_source_scope_hash",
             checkpoint_scope_hash,
@@ -14982,11 +15823,59 @@ def _artifact_dataset_profiles_from_row(
     )
 
 
+def _artifact_candidate_proof_fields(
+    dataset_row_map: Mapping[str, Any],
+    dataset_id: str,
+    *,
+    promotion_required: bool,
+) -> tuple[str | None, str | None, dict[str, Any]]:
+    """Validate and return the row proof fields required for promotion."""
+
+    publication_metadata = _json_object(
+        dataset_row_map.get("publication_metadata_json")
+    )
+    dataset_hash = _clean_text(dataset_row_map.get("dataset_hash"))
+    validated_at_value = dataset_row_map.get("validated_at")
+    validated_at = (
+        str(validated_at_value) if validated_at_value is not None else None
+    )
+    if promotion_required and (
+        not dataset_hash or validated_at is None or not publication_metadata
+    ):
+        raise RuntimeError(
+            "provider_directory_artifact_validated_candidate_proof_invalid:"
+            + dataset_id
+        )
+    return dataset_hash, validated_at, publication_metadata
+
+
+def _artifact_completion_state_from_row(
+    dataset_row_map: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the direct completion marker and proof identity fields."""
+
+    marker = dataset_row_map.get("completion_proof_required_version")
+    completion_proof = _json_object(
+        dataset_row_map.get("completion_proof_json")
+    )
+    return {
+        "completion_proof_required_version": (
+            int(marker) if marker is not None else None
+        ),
+        "completion_proof_sha256": _clean_text(
+            dataset_row_map.get("completion_proof_sha256")
+        ),
+        "completion_proof_cutoff": _clean_text(completion_proof.get("cutoff")),
+    }
+
+
 def _artifact_dataset_state_from_row(
     dataset_row_map: dict[str, Any],
     dataset_id: str,
     endpoint_id: str,
 ) -> dict[str, Any]:
+    """Validate and project artifact lifecycle and completion state."""
+
     selection_state = _artifact_dataset_selection_from_row(
         dataset_row_map,
         dataset_id,
@@ -14998,23 +15887,13 @@ def _artifact_dataset_state_from_row(
     should_reconcile_source_alias = selection_state[
         "should_reconcile_source_alias"
     ]
-    publication_metadata = _json_object(
-        dataset_row_map.get("publication_metadata_json")
-    )
-    dataset_hash = _clean_text(dataset_row_map.get("dataset_hash"))
-    validated_at_value = dataset_row_map.get("validated_at")
-    validated_at = (
-        str(validated_at_value) if validated_at_value is not None else None
-    )
-    if should_promote_on_cutover and (
-        not dataset_hash
-        or validated_at is None
-        or not publication_metadata
-    ):
-        raise RuntimeError(
-            "provider_directory_artifact_validated_candidate_proof_invalid:"
-            + dataset_id
+    dataset_hash, validated_at, publication_metadata = (
+        _artifact_candidate_proof_fields(
+            dataset_row_map,
+            dataset_id,
+            promotion_required=should_promote_on_cutover,
         )
+    )
     return {
         "status": selection_state["status"],
         "is_current": selection_state["is_current"],
@@ -15036,6 +15915,7 @@ def _artifact_dataset_state_from_row(
         ),
         "validated_at": validated_at,
         "publication_metadata_hash": _identity_hash(publication_metadata),
+        **_artifact_completion_state_from_row(dataset_row_map),
     }
 
 
@@ -15217,6 +16097,8 @@ def _artifact_dataset_for_source(
     source_id: str,
     dataset_rows: list[Any],
 ) -> ProviderDirectoryArtifactDataset:
+    """Build a promotion candidate only after full proof validation."""
+
     candidates = [
         dataset
         for dataset_row in dataset_rows
@@ -15276,6 +16158,9 @@ def _artifact_endpoint_selection_identity(
         dataset.resource_count,
         dataset.validated_at,
         dataset.publication_metadata_hash,
+        dataset.completion_proof_required_version,
+        dataset.completion_proof_sha256,
+        dataset.completion_proof_cutoff,
         dataset.source_verification_contract_hash,
     )
 
@@ -15344,12 +16229,29 @@ def _reviewed_promotion_dataset_by_source_id(
 ) -> dict[str, ProviderDirectoryArtifactDataset]:
     dataset_by_source_id: dict[str, ProviderDirectoryArtifactDataset] = {}
     for dataset in fence.source_alias_cutover_datasets:
+        expected_verified_status = (
+            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED
+            if dataset.completion_proof_required_version
+            == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+            else PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+        )
         if not (
             dataset.verification_source_status
-            == PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+            == expected_verified_status
             and dataset.verification_campaign_id
             and dataset.verification_source_scope_hash
             and dataset.verification_source_ids
+            and (
+                (
+                    dataset.completion_proof_required_version
+                    == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+                    and dataset.completion_proof_sha256 is not None
+                )
+                or (
+                    dataset.completion_proof_required_version is None
+                    and dataset.completion_proof_sha256 is None
+                )
+            )
         ):
             continue
         for source_id in dataset.verification_source_ids:
@@ -15371,6 +16273,10 @@ def _artifact_promotion_alias_from_row(
     serving_endpoint_id = _clean_text(source_row_map.get("endpoint_id"))
     source_record = _json_object(source_row_map.get("source_record_json"))
     source_metadata = _source_metadata(source_record)
+    scope_source = _artifact_source_with_subset_contract(
+        source_record,
+        dataset.completion_proof_cutoff,
+    )
     if (
         not source_id
         or not serving_endpoint_id
@@ -15390,7 +16296,7 @@ def _artifact_promotion_alias_from_row(
             )
         )
         != dataset.endpoint_id
-        or _endpoint_dataset_expected_resources([source_record])
+        or _endpoint_dataset_expected_resources([scope_source])
         != dataset.recorded_expected_resources
     ):
         raise RuntimeError(
@@ -15398,10 +16304,11 @@ def _artifact_promotion_alias_from_row(
             + (source_id or "missing")
         )
     source_contract = _artifact_source_verification_contract(
-        source_record,
+        scope_source,
         verification_campaign_id=dataset.verification_campaign_id,
         verification_source_scope_hash=dataset.verification_source_scope_hash,
         source_ids=dataset.verification_source_ids,
+        completion_proof_cutoff=dataset.completion_proof_cutoff,
     )
     if source_contract[-1][1] != dataset.verification_source_scope_hash:
         raise RuntimeError(
@@ -17590,6 +18497,7 @@ def _assert_locked_artifact_source_contract(
             dataset.verification_source_scope_hash
         ),
         source_ids=dataset.verification_source_ids,
+        completion_proof_cutoff=dataset.completion_proof_cutoff,
     )
     if (
         current_contract != expected_contract
@@ -17640,6 +18548,8 @@ def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
                dataset.validated_at,
                dataset.published_at,
                dataset.superseded_at,
+               dataset.completion_proof_required_version,
+               dataset.completion_proof_sha256,
                {current_ids_sql}
                dataset.publication_metadata_json
           FROM {dataset_ref} AS dataset
@@ -17774,6 +18684,8 @@ def _artifact_fence_dataset_row_identity(
         _identity_hash(
             _json_object(dataset_row_map.get("publication_metadata_json"))
         ),
+        dataset_row_map.get("completion_proof_required_version"),
+        _clean_text(dataset_row_map.get("completion_proof_sha256")),
     )
 
 
@@ -17790,6 +18702,8 @@ def _expected_artifact_fence_dataset_identity(
         dataset.resource_count,
         dataset.validated_at,
         dataset.publication_metadata_hash,
+        dataset.completion_proof_required_version,
+        dataset.completion_proof_sha256,
     )
 
 
@@ -17802,7 +18716,7 @@ def _is_artifact_fence_dataset_row_exact(
     for field_index, (actual_value, expected_value) in enumerate(
         zip(actual_identity, expected_identity_by_name)
     ):
-        if field_index >= 5 and expected_value is None:
+        if field_index in {5, 6, 7, 8} and expected_value is None:
             continue
         if actual_value != expected_value:
             return False
@@ -34555,7 +35469,34 @@ def _canonical_resource_payload(row: dict[str, Any]) -> dict[str, Any]:
             "last_seen_run_id",
             "observed_at",
             "updated_at",
+            "_acquired_resource_sha256",
         }
+    }
+
+
+_SUBSET_TRANSPORT_PAYLOAD_FIELDS = frozenset(
+    {
+        "resource_url",
+        "fhir_self_url",
+        "fhir_fetch_url",
+        "fhir_fetch_mode",
+    }
+)
+
+
+def _endpoint_dataset_hash_payload(
+    payload: Mapping[str, Any],
+    *,
+    is_server_issued_subset: bool,
+) -> dict[str, Any]:
+    """Remove transport coordinates only from the v3 content-hash view."""
+
+    if not is_server_issued_subset:
+        return dict(payload)
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _SUBSET_TRANSPORT_PAYLOAD_FIELDS
     }
 
 
@@ -34602,7 +35543,7 @@ def _canonical_resource_rows(
 
 def _endpoint_dataset_resource_rows(
     model: type,
-    rows: list[dict[str, Any]],
+    resource_rows: list[dict[str, Any]],
     *,
     dataset_id: str | None,
 ) -> list[dict[str, Any]]:
@@ -34610,23 +35551,43 @@ def _endpoint_dataset_resource_rows(
     if not dataset_id or not resource_type:
         return []
     resources_by_id: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        resource_id = _clean_text(row.get("resource_id"))
+    for resource_row_by_field in resource_rows:
+        resource_id = _clean_text(resource_row_by_field.get("resource_id"))
         if not resource_id:
             continue
-        payload = _canonical_resource_payload(row)
+        acquired_resource_sha256 = resource_row_by_field.get(
+            "_acquired_resource_sha256"
+        )
+        payload_by_field = _canonical_resource_payload(resource_row_by_field)
+        if acquired_resource_sha256 is not None and (
+            type(acquired_resource_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", acquired_resource_sha256) is None
+        ):
+            raise ValueError(
+                "provider_directory_subset_acquired_content_invalid"
+            )
+        hash_payload_by_field = _endpoint_dataset_hash_payload(
+            payload_by_field,
+            is_server_issued_subset=(acquired_resource_sha256 is not None),
+        )
+        payload_hash = (
+            subset_payload_sha256(hash_payload_by_field)
+            if acquired_resource_sha256 is not None
+            else hashlib.sha256(
+                json.dumps(
+                    hash_payload_by_field,
+                    sort_keys=True,
+                    default=_json_default,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
         resources_by_id[resource_id] = {
             "dataset_id": dataset_id,
             "resource_type": resource_type,
             "resource_id": resource_id,
-            "payload_hash": hashlib.sha256(
-                json.dumps(
-                    payload,
-                    sort_keys=True,
-                    default=_json_default,
-                ).encode("utf-8")
-            ).hexdigest(),
-            "payload_json": payload,
+            "payload_hash": payload_hash,
+            "payload_json": payload_by_field,
+            "acquired_resource_sha256": acquired_resource_sha256,
         }
     return [resources_by_id[resource_id] for resource_id in sorted(resources_by_id)]
 
@@ -37553,7 +38514,7 @@ async def _fetch_current_version_census_json_once(
     *,
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
-    """Fetch one exact-census request without retries or URL substitution."""
+    """Fetch one reviewed traversal request without retries or substitution."""
     fetch_result = _source_fetch_result_with_payload_error(
         source_record,
         request_url,
@@ -38469,13 +39430,15 @@ def _parsed_current_version_census_entries(
     *,
     normalize_location_contacts: bool,
 ) -> list[tuple[type, dict[str, Any]]]:
-    """Parse a complete exact-census page before any row is persisted."""
+    """Parse one complete reviewed traversal page before persistence."""
 
     parsed_entries: list[tuple[type, dict[str, Any]]] = []
+    contract = current_version_census_contract(source_record)
     for entry_by_field in entries:
+        raw_resource = entry_by_field["resource"]
         parsed_entry = parse_fhir_resource(
             source_record["source_id"],
-            entry_by_field["resource"],
+            raw_resource,
             resource_url=_clean_text(entry_by_field.get("fullUrl")),
             acquisition=_rest_bundle_acquisition(entry_by_field, request_url),
             run_id=run_id,
@@ -38484,6 +39447,10 @@ def _parsed_current_version_census_entries(
         if not parsed_entry or parsed_entry[0] is not model:
             raise ValueError(
                 "provider_directory_current_version_census_resource_parse_failed"
+            )
+        if contract is not None and contract.is_server_issued_subset_v3:
+            parsed_entry[1]["_acquired_resource_sha256"] = (
+                subset_canonical_sha256(raw_resource)
             )
         parsed_entries.append(parsed_entry)
     return parsed_entries
@@ -38840,7 +39807,7 @@ def _resolved_idaho_medicaid_next_url(
 
 
 def _current_version_census_page_count(request_url: str) -> int:
-    """Return the one positive page count from an exact-census URL."""
+    """Return the one positive page count from a reviewed traversal URL."""
 
     page_count_values = [
         query_value
@@ -38861,15 +39828,15 @@ def _current_version_census_page_count(request_url: str) -> int:
     return int(page_count_values[0])
 
 
-def _resolved_current_version_census_page_url(
+def _resolved_current_version_census_continuation(
     source_record: dict[str, Any],
     current_url: str,
     next_link: str,
     resource_type: str | None,
     page_entry_count: int | None,
     pre_total: int | None,
-) -> str | None:
-    """Resolve one exact-census continuation or report no bound contract."""
+) -> CurrentVersionCensusContinuation | None:
+    """Resolve one bound continuation and retain its neutral hop identity."""
 
     census_contract = current_version_census_contract(source_record)
     if census_contract is None:
@@ -38887,7 +39854,28 @@ def _resolved_current_version_census_page_url(
         page_entry_count=page_entry_count,
         expected_page_count=page_count,
         pre_total=pre_total,
-    ).url
+    )
+
+
+def _resolved_current_version_census_page_url(
+    source_record: dict[str, Any],
+    current_url: str,
+    next_link: str,
+    resource_type: str | None,
+    page_entry_count: int | None,
+    pre_total: int | None,
+) -> str | None:
+    """Resolve one reviewed continuation or report no bound contract."""
+
+    continuation = _resolved_current_version_census_continuation(
+        source_record,
+        current_url,
+        next_link,
+        resource_type,
+        page_entry_count,
+        pre_total,
+    )
+    return continuation.url if continuation is not None else None
 
 
 def _resolved_fhir_next_url(
@@ -46584,6 +47572,9 @@ async def _upsert_dataset_resource_rows_on_connection(
             set_={
                 "payload_hash": statement.excluded.payload_hash,
                 "payload_json": statement.excluded.payload_json,
+                "acquired_resource_sha256": (
+                    statement.excluded.acquired_resource_sha256
+                ),
             },
         )
         await connection.status(statement)
@@ -47125,7 +48116,7 @@ async def _observe_partition_census_value(
     fetch_options: LastUpdatedPartitionFetchOptions,
     census_request: LastUpdatedCensusRequest,
 ) -> ResourceFetchResult | None:
-    """Fetch and durably record one exact census observation."""
+    """Fetch and durably record one partition census observation."""
     if getattr(state.census, census_request.field_name) is not None:
         return None
     if (
@@ -48215,6 +49206,7 @@ def _current_version_census_error_result(
     pages_processed: int,
     retryable: bool,
     retry_not_before: str | None = None,
+    contract: CurrentVersionCensusContract | None = None,
 ) -> ResourceFetchResult:
     error_prefix = (
         CURRENT_VERSION_CENSUS_RETRYABLE_ERROR
@@ -48233,9 +49225,32 @@ def _current_version_census_error_result(
         hard_page_limit_reached=False,
         next_url_remaining=retryable,
         error=f"{error_prefix}:{error}",
-        fetch_mode=CURRENT_VERSION_CENSUS_FETCH_MODE,
+        fetch_mode=_current_version_census_fetch_mode(
+            proof_by_field,
+            contract=contract,
+        ),
         retry_not_before=retry_not_before,
         fetch_diagnostic=proof_by_field,
+    )
+
+
+def _current_version_census_fetch_mode(
+    proof_by_field: Mapping[str, Any] | None,
+    *,
+    contract: CurrentVersionCensusContract | None = None,
+) -> str:
+    return (
+        SERVER_ISSUED_SUBSET_FETCH_MODE
+        if (
+            contract is not None
+            and contract.is_server_issued_subset_v3
+        )
+        or (
+            isinstance(proof_by_field, Mapping)
+            and proof_by_field.get("contract_version")
+            == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        )
+        else CURRENT_VERSION_CENSUS_FETCH_MODE
     )
 
 
@@ -48283,6 +49298,7 @@ def _current_version_census_resume_proof(
 def _current_version_census_resume_error(
     model: type,
     resume_state: PaginationResumeState,
+    contract: CurrentVersionCensusContract,
     error: ValueError,
 ) -> ResourceFetchResult:
     return _current_version_census_error_result(
@@ -48292,6 +49308,7 @@ def _current_version_census_resume_error(
         rows_processed=resume_state.rows_processed,
         pages_processed=resume_state.pages_processed,
         retryable=False,
+        contract=contract,
     )
 
 
@@ -48309,6 +49326,7 @@ def _current_version_census_pre_count_error(
         pages_processed=resume_state.pages_processed,
         retryable=census_fetch.transient,
         retry_not_before=census_fetch.retry_not_before,
+        contract=contract,
     )
 
 
@@ -48318,6 +49336,7 @@ async def _current_version_census_candidate_parity_error(
     resource_type: str,
     resume_state: PaginationResumeState,
     resume_proof: dict[str, Any] | None,
+    contract: CurrentVersionCensusContract,
     cancellation: _ResourceImportCancellation,
 ) -> ResourceFetchResult | None:
     """Block a persisted attempt whose candidate is ahead of its cursor."""
@@ -48347,6 +49366,7 @@ async def _current_version_census_candidate_parity_error(
         rows_processed=resume_state.rows_processed,
         pages_processed=resume_state.pages_processed,
         retryable=False,
+        contract=contract,
     )
 
 
@@ -48360,7 +49380,7 @@ async def _create_current_version_pre_count_proof(
     timeout: int,
     cancellation: _ResourceImportCancellation,
 ) -> dict[str, Any] | ResourceFetchResult:
-    """Fetch and persist the first proof for a pristine exact-census root."""
+    """Persist the first advertised-count proof for a pristine reviewed root."""
 
     contract = current_version_census_contract(source_record)
     assert contract is not None
@@ -48415,13 +49435,19 @@ async def _prepare_current_version_pre_census(
             start_url,
         )
     except ValueError as exc:
-        return _current_version_census_resume_error(model, resume_state, exc)
+        return _current_version_census_resume_error(
+            model,
+            resume_state,
+            contract,
+            exc,
+        )
     parity_error = await _current_version_census_candidate_parity_error(
         model,
         checkpoint_context,
         resource_type,
         resume_state,
         resume_proof,
+        contract,
         cancellation,
     )
     if parity_error is not None:
@@ -48871,9 +49897,13 @@ async def _fetch_resource_rows(
             return prepared_current_version_census
         current_version_proof_by_field = prepared_current_version_census
         if not resume_state.complete:
+            current_version_contract = current_version_census_contract(
+                source_record
+            )
+            assert current_version_contract is not None
             try:
                 validated_current_version_census_resume_url(
-                    current_version_census_contract(source_record),
+                    current_version_contract,
                     resource_type,
                     checkpoint_start_url,
                     resume_state.next_url,
@@ -48890,6 +49920,7 @@ async def _fetch_resource_rows(
                     rows_processed=resume_state.rows_processed,
                     pages_processed=resume_state.pages_processed,
                     retryable=False,
+                    contract=current_version_contract,
                 )
     synthetic_resume_guard_error = _synthetic_position_resume_guard_error(
         source_record,
@@ -48935,7 +49966,10 @@ async def _fetch_resource_rows(
             hard_page_limit_reached=False,
             next_url_remaining=False,
             fetch_mode=(
-                CURRENT_VERSION_CENSUS_FETCH_MODE
+                _current_version_census_fetch_mode(
+                    current_version_proof_by_field,
+                    contract=current_version_census_contract(source_record),
+                )
                 if is_current_version_census_enabled
                 else (
                     CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
@@ -49359,6 +50393,8 @@ async def _fetch_resource_rows(
             entries = _bundle_entries(response_payload)
             current_version_next_link: str | None = None
             current_version_resolved_next_url: str | None = None
+            current_version_continuation_identity: str | None = None
+            current_version_continuation_shape_identity: str | None = None
             if is_current_version_census_enabled:
                 assert current_version_page_count is not None
                 assert current_version_proof_by_field is not None
@@ -49371,17 +50407,27 @@ async def _fetch_resource_rows(
                         _current_version_census_next_link(response_payload)
                     )
                     if current_version_next_link:
-                        current_version_resolved_next_url = (
-                            _resolved_fhir_next_url(
+                        current_version_continuation = (
+                            _resolved_current_version_census_continuation(
                                 source_record,
                                 url,
                                 current_version_next_link,
-                                resource_type=resource_type,
-                                page_entry_count=len(entries),
-                                pre_total=int(
+                                resource_type,
+                                len(entries),
+                                int(
                                     current_version_proof_by_field["pre_count"]
                                 ),
                             )
+                        )
+                        assert current_version_continuation is not None
+                        current_version_resolved_next_url = (
+                            current_version_continuation.url
+                        )
+                        current_version_continuation_identity = (
+                            current_version_continuation.identity
+                        )
+                        current_version_continuation_shape_identity = (
+                            current_version_continuation.shape_identity
                         )
                 except ValueError as exc:
                     error_message = str(exc)
@@ -49550,6 +50596,12 @@ async def _fetch_resource_rows(
                             rows_processed=rows_fetched,
                             page_entry_count=len(entries),
                             expected_page_count=current_version_page_count,
+                            continuation_identity_sha256=(
+                                current_version_continuation_identity
+                            ),
+                            continuation_shape_sha256=(
+                                current_version_continuation_shape_identity
+                            ),
                         )
                     )
                 else:
@@ -49783,7 +50835,10 @@ async def _fetch_resource_rows(
         next_url_remaining=has_next_url or bool(url) or bool(pending_start_urls),
         error=error_message or ("deadline_reached" if is_deadline_reached else None),
         fetch_mode=(
-            CURRENT_VERSION_CENSUS_FETCH_MODE
+            _current_version_census_fetch_mode(
+                current_version_proof_by_field,
+                contract=current_version_census_contract(source_record),
+            )
             if is_current_version_census_enabled
             else (
                 CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
@@ -51368,6 +52423,8 @@ def _record_uhc_plan_graph_completion(
 
 
 def _empty_resource_stats() -> dict[str, Any]:
+    """Return zeroed resource accounting for a source with no acquired rows."""
+
     return {
         "sources_attempted": 0,
         "sources_completed": 0,
@@ -51419,6 +52476,21 @@ def _empty_resource_stats() -> dict[str, Any]:
         "current_version_census_processed_rows": 0,
         "current_version_census_unique_candidate_rows": 0,
         "current_version_census_post_count": 0,
+        **_empty_subset_resource_stats(),
+    }
+
+
+def _empty_subset_resource_stats() -> dict[str, int]:
+    """Return explicit subset accounting without exact-census aliases."""
+
+    return {
+        "server_issued_subset_sources": 0,
+        "server_issued_subset_verified_sources": 0,
+        "server_issued_subset_traversal_completed_sources": 0,
+        "server_issued_subset_advertised_pre": 0,
+        "server_issued_subset_advertised_post": 0,
+        "server_issued_subset_returned_unique": 0,
+        "server_issued_subset_deficit": 0,
     }
 
 
@@ -51538,6 +52610,27 @@ def _record_current_version_census_stats(
     resource_stats: dict[str, Any],
     fetch_result: ResourceFetchResult,
 ) -> None:
+    if fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE:
+        resource_stats["server_issued_subset_sources"] += 1
+        proof_by_field = fetch_result.fetch_diagnostic
+        if (
+            not isinstance(proof_by_field, dict)
+            or proof_by_field.get("verified") is not True
+        ):
+            return
+        resource_stats["server_issued_subset_verified_sources"] += 1
+        for proof_field in (
+            "advertised_pre",
+            "advertised_post",
+            "returned_unique",
+            "deficit",
+        ):
+            proof_value = proof_by_field.get(proof_field)
+            if type(proof_value) is int:
+                resource_stats[f"server_issued_subset_{proof_field}"] += (
+                    proof_value
+                )
+        return
     if fetch_result.fetch_mode != CURRENT_VERSION_CENSUS_FETCH_MODE:
         return
     resource_stats["current_version_census_sources"] += 1
@@ -51627,7 +52720,12 @@ def _record_resource_fetch_stats(
     _record_pagination_cooldown_stats(resource_stats, fetch_result)
     if fetch_result.complete:
         resource_stats["sources_completed"] += 1
-        resource_stats["collection_complete_sources"] += 1
+        if fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE:
+            resource_stats[
+                "server_issued_subset_traversal_completed_sources"
+            ] += 1
+        else:
+            resource_stats["collection_complete_sources"] += 1
     if fetch_result.is_bounded:
         resource_stats["sources_bounded"] += 1
     if fetch_result.error:
@@ -51687,6 +52785,21 @@ def _resource_fetch_completeness_diagnostics(
 ) -> dict[str, Any]:
     """Return mode-specific completeness proof fields."""
 
+    subset_proof = (
+        _sanitized_server_issued_subset_execution_proof(
+            fetch_result.fetch_diagnostic
+        )
+        if fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE
+        else None
+    )
+    replay_evidence = (
+        _server_issued_subset_internal_replay_evidence(
+            fetch_result.fetch_diagnostic
+        )
+        if fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE
+        else None
+    )
+
     return {
         "last_updated_completeness": (
             fetch_result.fetch_diagnostic
@@ -51703,6 +52816,110 @@ def _resource_fetch_completeness_diagnostics(
             if fetch_result.fetch_mode == CURRENT_VERSION_CENSUS_FETCH_MODE
             else None
         ),
+        "server_issued_subset_completeness": (
+            subset_proof
+        ),
+        "server_issued_subset_coverage": (
+            _server_issued_subset_coverage(fetch_result.fetch_diagnostic)
+            if fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE
+            else None
+        ),
+        **(
+            {_SERVER_ISSUED_SUBSET_INTERNAL_REPLAY_KEY: replay_evidence}
+            if replay_evidence is not None
+            else {}
+        ),
+    }
+
+
+def _sanitized_server_issued_subset_execution_proof(
+    proof_by_field: Any,
+) -> dict[str, Any] | None:
+    """Exclude root-specific opaque-hop hashes from status diagnostics."""
+
+    if not isinstance(proof_by_field, Mapping):
+        return None
+    return {
+        field_name: field_value
+        for field_name, field_value in proof_by_field.items()
+        if field_name != "continuation_hop_sha256"
+    }
+
+
+def _server_issued_subset_internal_replay_evidence(
+    proof_by_field: Any,
+) -> dict[str, Any] | None:
+    """Retain token-inclusive replay hashes only for sealed dataset evidence."""
+
+    if not isinstance(proof_by_field, Mapping):
+        return None
+    continuation_hop_sha256 = proof_by_field.get(
+        "continuation_hop_sha256"
+    )
+    if type(continuation_hop_sha256) is not list:
+        return None
+    return {"continuation_hop_sha256": list(continuation_hop_sha256)}
+
+
+def _server_issued_subset_coverage(
+    proof_by_field: Any,
+) -> dict[str, Any] | None:
+    """Return safe resource-level coverage without implying absent targets."""
+
+    if not isinstance(proof_by_field, Mapping):
+        return None
+    geometry = proof_by_field.get("terminal_page_geometry")
+    continuation_shape_sha256 = proof_by_field.get(
+        "continuation_shape_sha256"
+    )
+    return {
+        "cutoff": proof_by_field.get("cutoff"),
+        "scope": "server_issued_traversal_subset",
+        "advertised_pre": proof_by_field.get("advertised_pre"),
+        "advertised_post": proof_by_field.get("advertised_post"),
+        "returned_unique": proof_by_field.get("returned_unique"),
+        "deficit": proof_by_field.get("deficit"),
+        "geometry": (
+            {
+                "pages": geometry.get("pages_processed"),
+                "logical_terminal_offset": geometry.get(
+                    "terminal_page_start_offset"
+                ),
+                "sparse_pages": geometry.get("sparse_pages"),
+                "empty_pages": geometry.get("empty_pages"),
+                "page_entry_counts_sha256": subset_canonical_sha256(
+                    proof_by_field.get("page_entry_counts")
+                ),
+                "geometry_sha256": subset_canonical_sha256(
+                    {
+                        **dict(geometry),
+                        "page_entry_counts": proof_by_field.get(
+                            "page_entry_counts"
+                        ),
+                    }
+                ),
+            }
+            if isinstance(geometry, Mapping)
+            else None
+        ),
+        "continuation": (
+            {
+                "validated_hops": len(continuation_shape_sha256),
+                "chain_sha256": subset_canonical_sha256(
+                    continuation_shape_sha256
+                ),
+            }
+            if type(continuation_shape_sha256) is list
+            else None
+        ),
+        "twin_state": "pending_matching_reviewed_root",
+        "proof_state": (
+            "resource_terminal_verified"
+            if proof_by_field.get("verified") is True
+            else "not_verified"
+        ),
+        "unresolved_reference_count": None,
+        "absence_semantics": "unknown_under_subset",
     }
 
 
@@ -51712,9 +52929,26 @@ def _resource_fetch_diagnostic(
     rows_written: int,
 ) -> dict[str, Any]:
     """Return one resource fetch's nonsecret operational diagnostics."""
+    is_server_issued_subset = (
+        fetch_result.fetch_mode == SERVER_ISSUED_SUBSET_FETCH_MODE
+    )
     return {
         "complete": fetch_result.complete,
-        "collection_complete": fetch_result.complete,
+        "collection_complete": (
+            False if is_server_issued_subset else fetch_result.complete
+        ),
+        **(
+            {
+                "traversal_complete": fetch_result.complete,
+                "source_continuation_exhausted": bool(
+                    fetch_result.complete
+                    and not fetch_result.next_url_remaining
+                ),
+                "absence_semantics": "unknown_under_subset",
+            }
+            if is_server_issued_subset
+            else {}
+        ),
         "plan_graph_complete": False,
         "bounded": fetch_result.is_bounded,
         "error": fetch_result.error,
@@ -51729,16 +52963,7 @@ def _resource_fetch_diagnostic(
         "deadline_reached": fetch_result.deadline_reached,
         "next_url_remaining": fetch_result.next_url_remaining,
         "retry_not_before": fetch_result.retry_not_before,
-        "source_fetch": (
-            None
-            if fetch_result.fetch_mode
-            in {
-                LAST_UPDATED_PARTITION_FETCH_MODE,
-                CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
-                CURRENT_VERSION_CENSUS_FETCH_MODE,
-            }
-            else fetch_result.fetch_diagnostic
-        ),
+        "source_fetch": _safe_source_fetch_diagnostic(fetch_result),
         **_resource_fetch_completeness_diagnostics(fetch_result),
         "pagination_cooldown_retries": fetch_result.pagination_cooldown_retries,
         "pagination_cooldown_wait_seconds": (
@@ -51756,6 +52981,24 @@ def _resource_fetch_diagnostic(
     }
 
 
+def _safe_source_fetch_diagnostic(
+    fetch_result: ResourceFetchResult,
+) -> dict[str, Any] | None:
+    """Hide source transport detail for reviewed cursor proof modes."""
+
+    hidden_fetch_modes = {
+        LAST_UPDATED_PARTITION_FETCH_MODE,
+        CARESOURCE_OPAQUE_CURSOR_FETCH_MODE,
+        CURRENT_VERSION_CENSUS_FETCH_MODE,
+        SERVER_ISSUED_SUBSET_FETCH_MODE,
+    }
+    return (
+        None
+        if fetch_result.fetch_mode in hidden_fetch_modes
+        else fetch_result.fetch_diagnostic
+    )
+
+
 async def _update_source_resource_import_metadata(
     source_ids: list[str],
     *,
@@ -51767,7 +53010,7 @@ async def _update_source_resource_import_metadata(
     payload = {
         "run_id": run_id,
         "observed_at": _now().isoformat(timespec="seconds") + "Z",
-        "resources": diagnostics,
+        "resources": _sanitized_resource_diagnostics(diagnostics),
     }
     payload_json = json.dumps(payload, sort_keys=True, default=str)
     for source_id in source_ids:
@@ -53122,7 +54365,7 @@ def _validate_current_version_census_lineage(
     retry_of_run_id: str | None,
     pagination_root_run_id: str | None,
 ) -> None:
-    """Reject ambiguous exact-census lineage before database access."""
+    """Reject ambiguous reviewed traversal lineage before database access."""
 
     if run_id is None:
         raise ValueError(
@@ -53425,10 +54668,12 @@ async def _checkpoint_candidate_dataset_id(
 async def _endpoint_dataset_state(dataset_id: str) -> dict[str, Any]:
     row = await db.first(
         f"""
-        SELECT endpoint_id, import_run_id, acquisition_root_run_id, status,
+        SELECT dataset_id, endpoint_id, import_run_id,
+               acquisition_root_run_id, status,
                is_current, previous_dataset_id, dataset_hash, resource_count,
                validated_at, published_at,
-               publication_metadata_json
+               publication_metadata_json, completion_proof_required_version,
+               completion_proof_json, completion_proof_sha256
           FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
          WHERE dataset_id = :dataset_id;
         """,
@@ -53465,7 +54710,8 @@ async def _assert_locked_endpoint_candidate(
     existing_candidate = await connection.first(
         f"""
         SELECT dataset_id, endpoint_id, acquisition_root_run_id, status,
-               is_current, publication_metadata_json
+               is_current, publication_metadata_json,
+               completion_proof_required_version
           FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
          WHERE dataset_id = :dataset_id
          FOR UPDATE;
@@ -53487,6 +54733,8 @@ async def _assert_locked_endpoint_candidate(
         in IMMUTABLE_ENDPOINT_DATASET_STATUSES
         or _clean_text(existing_candidate_map.get("acquisition_root_run_id"))
         != candidate.acquisition_root_run_id
+        or existing_candidate_map.get("completion_proof_required_version")
+        != candidate.completion_proof_required_version
     ):
         raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
     if candidate.repair_empty_orphan:
@@ -53515,6 +54763,9 @@ def _assert_empty_orphan_candidate_identity(
         TWIN_ROOT_VERIFICATION_ROLE_KEY: candidate.verification_role,
         TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY: (
             candidate.verification_baseline_dataset_id
+        ),
+        "completion_proof_required_version": (
+            candidate.completion_proof_required_version
         ),
     }
     existing_metadata = existing_candidate_map.get("publication_metadata_json")
@@ -53575,6 +54826,347 @@ async def _assert_empty_endpoint_dataset_orphan(
         )
 
 
+def _validated_subset_coverage_root(
+    metadata: Mapping[str, Any],
+    completion_proof: Mapping[str, Any],
+    completion_sha256: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Validate fixed coverage identity and return both resource maps."""
+
+    coverage = metadata.get(SERVER_ISSUED_SUBSET_COVERAGE_KEY)
+    expected_fields = {
+        "cutoff",
+        "scope",
+        "advertised_pre",
+        "advertised_post",
+        "returned_unique",
+        "deficit",
+        "resources",
+        "traversal_complete",
+        "twin_state",
+        "proof_sha256",
+        "unresolved_reference_count",
+        "unresolved_reference_counts",
+        "missing_target_semantics",
+        "absence_semantics",
+        "publication_state_at_completion",
+    }
+    resources = (
+        coverage.get("resources") if isinstance(coverage, Mapping) else None
+    )
+    twin_verification = metadata.get(TWIN_ROOT_VERIFICATION_METADATA_KEY)
+    expected_twin_state = (
+        twin_verification.get("result")
+        if isinstance(twin_verification, Mapping)
+        else "not_required"
+    )
+    if (
+        not isinstance(coverage, Mapping)
+        or set(coverage) != expected_fields
+        or coverage.get("cutoff") != completion_proof["cutoff"]
+        or coverage.get("scope") != "server_issued_traversal_subset"
+        or coverage.get("traversal_complete") is not True
+        or coverage.get("twin_state") != expected_twin_state
+        or coverage.get("proof_sha256") != completion_sha256
+        or coverage.get("missing_target_semantics")
+        != "preserved_not_synthesized"
+        or coverage.get("absence_semantics") != "unknown_under_subset"
+        or coverage.get("publication_state_at_completion") != "not_published"
+        or not isinstance(resources, Mapping)
+        or set(resources) != set(SERVER_ISSUED_SUBSET_RESOURCE_TYPES)
+    ):
+        raise ValueError("provider_directory_subset_coverage_invalid")
+    return coverage, resources
+
+
+def _validate_subset_coverage_totals(
+    coverage: Mapping[str, Any],
+    completion_resources: Mapping[str, Any],
+) -> None:
+    """Require aggregate counters to equal their per-resource totals."""
+
+    for count_name in (
+        "advertised_pre",
+        "advertised_post",
+        "returned_unique",
+        "deficit",
+    ):
+        if coverage.get(count_name) != sum(
+            resource[count_name] for resource in completion_resources.values()
+        ):
+            raise ValueError("provider_directory_subset_coverage_invalid")
+
+
+def _validate_subset_resource_geometry(
+    geometry: Any,
+    resource_proof: Mapping[str, Any],
+) -> None:
+    """Bind sanitized page geometry to one canonical resource proof."""
+
+    expected_fields = {
+        "pages",
+        "logical_terminal_offset",
+        "sparse_pages",
+        "empty_pages",
+        "page_entry_counts_sha256",
+        "geometry_sha256",
+    }
+    if (
+        not isinstance(geometry, Mapping)
+        or set(geometry) != expected_fields
+        or geometry.get("pages") != resource_proof["pages"]
+        or geometry.get("logical_terminal_offset")
+        != resource_proof["logical_terminal_offset"]
+        or geometry.get("sparse_pages") != resource_proof["sparse_pages"]
+        or geometry.get("empty_pages") != resource_proof["empty_pages"]
+        or geometry.get("page_entry_counts_sha256")
+        != subset_canonical_sha256(resource_proof["page_entry_counts"])
+        or geometry.get("geometry_sha256")
+        != resource_proof["geometry_sha256"]
+    ):
+        raise ValueError("provider_directory_subset_coverage_invalid")
+
+
+def _validate_subset_resource_continuation(
+    continuation: Any,
+    resource_proof: Mapping[str, Any],
+) -> None:
+    """Bind sanitized continuation geometry to one canonical proof."""
+
+    if (
+        not isinstance(continuation, Mapping)
+        or set(continuation) != {"validated_hops", "chain_sha256"}
+        or continuation.get("validated_hops")
+        != resource_proof["pages"] - 1
+        or continuation.get("chain_sha256")
+        != resource_proof["continuation_shape_chain_sha256"]
+    ):
+        raise ValueError("provider_directory_subset_coverage_invalid")
+
+
+def _validate_subset_resource_coverage(
+    resource_coverage: Any,
+    resource_proof: Mapping[str, Any],
+    cutoff: str,
+) -> None:
+    """Validate one resource's safe coverage projection."""
+
+    expected_fields = {
+        "cutoff", "scope", "advertised_pre", "advertised_post",
+        "returned_unique", "deficit", "geometry", "continuation",
+        "twin_state", "proof_state", "unresolved_reference_count",
+        "absence_semantics",
+    }
+    if (
+        not isinstance(resource_coverage, Mapping)
+        or set(resource_coverage) != expected_fields
+        or resource_coverage.get("cutoff") != cutoff
+        or resource_coverage.get("scope")
+        != "server_issued_traversal_subset"
+        or any(
+            resource_coverage.get(count_name) != resource_proof[count_name]
+            for count_name in (
+                "advertised_pre", "advertised_post", "returned_unique", "deficit"
+            )
+        )
+        or resource_coverage.get("absence_semantics")
+        != "unknown_under_subset"
+        or resource_coverage.get("twin_state")
+        != "pending_matching_reviewed_root"
+        or resource_coverage.get("proof_state")
+        != "resource_terminal_verified"
+        or resource_coverage.get("unresolved_reference_count") is not None
+    ):
+        raise ValueError("provider_directory_subset_coverage_invalid")
+    _validate_subset_resource_geometry(
+        resource_coverage.get("geometry"), resource_proof
+    )
+    _validate_subset_resource_continuation(
+        resource_coverage.get("continuation"), resource_proof
+    )
+
+
+def _validate_subset_unresolved_coverage(
+    coverage: Mapping[str, Any],
+) -> None:
+    """Validate the optional exact unresolved-reference accounting."""
+
+    unresolved_count = coverage.get("unresolved_reference_count")
+    unresolved_counts = coverage.get("unresolved_reference_counts")
+    if (unresolved_count is None) != (unresolved_counts is None):
+        raise ValueError("provider_directory_subset_coverage_invalid")
+    if unresolved_counts is not None and (
+        not isinstance(unresolved_counts, Mapping)
+        or set(unresolved_counts)
+        != {
+            PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
+            PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY,
+        }
+        or any(type(count) is not int or count < 0 for count in unresolved_counts.values())
+        or unresolved_count != sum(unresolved_counts.values())
+    ):
+        raise ValueError("provider_directory_subset_coverage_invalid")
+
+
+def _validate_subset_dataset_coverage(
+    metadata: Mapping[str, Any],
+    completion_proof: Mapping[str, Any],
+    completion_sha256: str,
+) -> None:
+    """Bind sanitized status coverage to the canonical completion proof."""
+
+    coverage, resources = _validated_subset_coverage_root(
+        metadata, completion_proof, completion_sha256
+    )
+    completion_resources = completion_proof["resources"]
+    _validate_subset_coverage_totals(coverage, completion_resources)
+    for resource_type, resource_proof in completion_resources.items():
+        _validate_subset_resource_coverage(
+            resources.get(resource_type),
+            resource_proof,
+            completion_proof["cutoff"],
+        )
+    _validate_subset_unresolved_coverage(coverage)
+
+
+def _validated_parent_subset_completion_pair(
+    dataset_map: Mapping[str, Any],
+) -> tuple[dict[str, Any], str] | None:
+    """Validate the direct parent marker and atomic canonical proof pair."""
+
+    marker = dataset_map.get("completion_proof_required_version")
+    proof_json = dataset_map.get("completion_proof_json")
+    proof_sha256 = dataset_map.get("completion_proof_sha256")
+    if marker is None:
+        if proof_json is not None or proof_sha256 is not None:
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_verification_proof_invalid"
+            )
+        return None
+    if marker != SERVER_ISSUED_SUBSET_REQUIRED_VERSION:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_proof_invalid"
+        )
+    try:
+        completion_proof, completion_sha256 = (
+            validate_subset_completion_proof_pair(proof_json, proof_sha256)
+        )
+        metadata = _json_object(
+            dataset_map.get("publication_metadata_json")
+        )
+        validate_subset_replay_evidence_pair(
+            metadata.get(SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY),
+            metadata.get(
+                SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY
+            ),
+            completion_proof,
+            completion_sha256,
+        )
+        _validate_subset_dataset_coverage(
+            metadata,
+            completion_proof,
+            completion_sha256,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_proof_invalid"
+        ) from exc
+    return completion_proof, completion_sha256
+
+
+def _validated_persisted_subset_completion_pair(
+    dataset_map: Mapping[str, Any],
+    embedded_proof: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> tuple[dict[str, Any], str] | None:
+    completion_pair = _validated_parent_subset_completion_pair(dataset_map)
+    if completion_pair is None:
+        if (
+            embedded_proof.get("completion_proof") is not None
+            or embedded_proof.get("completion_proof_sha256") is not None
+        ):
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_verification_proof_invalid"
+            )
+        return None
+    completion_proof, completion_sha256 = completion_pair
+    dataset_proof = completion_proof["dataset"]
+    if (
+        embedded_proof.get("completion_proof") != completion_proof
+        or embedded_proof.get("completion_proof_sha256") != completion_sha256
+        or completion_proof["campaign_id"]
+        != metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
+        or dataset_proof["hash"] != dataset_map.get("dataset_hash")
+        or dataset_proof["count"] != dataset_map.get("resource_count")
+        or dataset_proof["resource_hashes"]
+        != embedded_proof.get("resource_hashes")
+        or dataset_proof["resource_counts"]
+        != embedded_proof.get("resource_counts")
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_proof_invalid"
+        )
+    return completion_proof, completion_sha256
+
+
+def _validate_finalized_subset_completion_pair(
+    dataset_map: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> None:
+    """Require a valid direct v3 pair on every finalized replay path."""
+
+    completion_pair = _validated_parent_subset_completion_pair(dataset_map)
+    if completion_pair is None:
+        return
+    completion_proof, _completion_sha256 = completion_pair
+    dataset_id = _clean_text(dataset_map.get("dataset_id"))
+    endpoint_id = _clean_text(dataset_map.get("endpoint_id"))
+    acquisition_root_run_id = _clean_text(
+        dataset_map.get("acquisition_root_run_id")
+    )
+    source_ids = metadata.get("source_ids")
+    selected_resources = metadata.get("selected_resources")
+    if (
+        dataset_id is None
+        or endpoint_id is None
+        or acquisition_root_run_id is None
+        or type(source_ids) is not list
+        or type(selected_resources) is not list
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_proof_invalid"
+        )
+    try:
+        stored_proof = validate_stored_dataset_proof_metadata(
+            metadata.get(PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY),
+            dataset_id=dataset_id,
+            endpoint_id=endpoint_id,
+            acquisition_root_run_id=acquisition_root_run_id,
+            source_ids=source_ids,
+            selected_resources=selected_resources,
+        )
+    except ProviderDirectoryProofStoreError as exc:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_proof_invalid"
+        ) from exc
+    completion_dataset = completion_proof["dataset"]
+    if (
+        completion_proof["campaign_id"]
+        != metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
+        or completion_dataset["hash"] != dataset_map.get("dataset_hash")
+        or completion_dataset["count"] != dataset_map.get("resource_count")
+        or completion_dataset["hash"] != stored_proof.get("dataset_hash")
+        or completion_dataset["count"] != stored_proof.get("resource_count")
+        or completion_dataset["resource_hashes"]
+        != stored_proof.get("resource_hashes")
+        or completion_dataset["resource_counts"]
+        != stored_proof.get("resource_counts")
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_proof_invalid"
+        )
+
+
 def _twin_root_dataset_proof(
     dataset_map: dict[str, Any],
     *,
@@ -53624,6 +55216,11 @@ def _twin_root_dataset_proof(
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_proof_invalid"
         )
+    _validated_persisted_subset_completion_pair(
+        dataset_map,
+        proof,
+        metadata,
+    )
     return proof
 
 
@@ -53680,6 +55277,12 @@ def _assert_compatible_twin_root_baseline(
     dataset_map: dict[str, Any],
 ) -> None:
     proof = _twin_root_baseline_proof(dataset_map)
+    if dataset_map.get("completion_proof_required_version") != (
+        candidate.completion_proof_required_version
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_baseline_incompatible"
+        )
     expected_identity_by_field = {
         "endpoint_id": candidate.endpoint_id,
         "source_ids": list(candidate.source_ids),
@@ -53708,6 +55311,8 @@ def _locked_endpoint_verification_state_sql(dataset_ref: str) -> str:
     return f"""
         SELECT dataset_id, endpoint_id, acquisition_root_run_id, status,
                dataset_hash, resource_count, publication_metadata_json,
+               completion_proof_required_version,
+               completion_proof_json, completion_proof_sha256,
                ({baseline_count_sql}) AS verification_baseline_count
           FROM {dataset_ref} AS state
          WHERE state.endpoint_id = :endpoint_id
@@ -53919,11 +55524,13 @@ def _endpoint_dataset_candidate_upsert_sql() -> str:
         INSERT INTO {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS candidate (
             dataset_id, endpoint_id, import_run_id, acquisition_root_run_id,
             previous_dataset_id, status, is_current, resource_count,
-            created_at, publication_metadata_json
+            created_at, publication_metadata_json,
+            completion_proof_required_version
         ) VALUES (
             :dataset_id, :endpoint_id, :import_run_id,
             :acquisition_root_run_id, :previous_dataset_id, :status,
-            false, 0, now(), CAST(:publication_metadata_json AS jsonb)
+            false, 0, now(), CAST(:publication_metadata_json AS jsonb),
+            :completion_proof_required_version
         )
         ON CONFLICT (dataset_id) DO UPDATE SET
             import_run_id = EXCLUDED.import_run_id,
@@ -53931,6 +55538,8 @@ def _endpoint_dataset_candidate_upsert_sql() -> str:
                 candidate.previous_dataset_id,
                 EXCLUDED.previous_dataset_id
             ),
+            completion_proof_required_version =
+                candidate.completion_proof_required_version,
             status = CASE
                 WHEN candidate.is_current
                   OR candidate.status = ANY(
@@ -53965,6 +55574,9 @@ async def _upsert_endpoint_dataset_candidate(
         status=ENDPOINT_DATASET_ACQUIRING,
         immutable_statuses=list(IMMUTABLE_ENDPOINT_DATASET_STATUSES),
         publication_metadata_json=json.dumps(metadata, sort_keys=True),
+        completion_proof_required_version=(
+            candidate.completion_proof_required_version
+        ),
     )
 
 
@@ -53988,6 +55600,9 @@ def _endpoint_dataset_candidate_metadata(
         TWIN_ROOT_VERIFICATION_ROLE_KEY: candidate.verification_role,
         TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY: (
             candidate.verification_baseline_dataset_id
+        ),
+        "completion_proof_required_version": (
+            candidate.completion_proof_required_version
         ),
     }
 
@@ -54160,7 +55775,10 @@ def _twin_root_source_acquisition_contract(
         ),
         *(
             _artifact_source_contract_json_value(source_metadata, key)
-            for key in TWIN_ROOT_ACQUISITION_METADATA_KEYS
+            for key in _source_contract_metadata_keys(
+                source_metadata,
+                artifact=False,
+            )
         ),
         ("effective_resource_page_count_caps", effective_page_caps),
         ("resource_and_credential_endpoints", _resource_import_group_key(source_record)),
@@ -54207,6 +55825,40 @@ def _twin_root_verification_scope_hash(
     return _identity_hash(scope_payload_by_field)
 
 
+def _server_issued_subset_source_scope_hash(
+    source_records: list[dict[str, Any]],
+    source_ids: list[str],
+) -> str | None:
+    """Return the DB-reproducible v3 source scope, when applicable."""
+
+    if len(source_records) != 1:
+        return None
+    source_record = source_records[0]
+    contract = current_version_census_contract(source_record)
+    if contract is None or not contract.is_server_issued_subset_v3:
+        return None
+    canonical_api_base = _canonical_base(
+        source_record.get("canonical_api_base")
+        or source_record.get("api_base")
+    )
+    if canonical_api_base is None:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_scope_required"
+        )
+    try:
+        scope_payload = server_issued_subset_source_scope_payload(
+            source_record,
+            tuple(source_ids),
+            contract.cutoff,
+            canonical_api_base,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_scope_required"
+        ) from exc
+    return subset_canonical_sha256(scope_payload)
+
+
 def _twin_root_scope_hash(
     source_records: list[dict[str, Any]],
     campaign_id: str | None,
@@ -54235,6 +55887,12 @@ def _twin_root_scope_hash(
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_scope_mismatch"
         )
+    subset_scope_hash = _server_issued_subset_source_scope_hash(
+        source_records,
+        source_ids,
+    )
+    if subset_scope_hash is not None:
+        return subset_scope_hash
     return _twin_root_verification_scope_hash(
         source_records,
         source_ids,
@@ -54544,6 +56202,10 @@ def _finalized_endpoint_dataset_verification_fields(
     verification_campaign_id: str | None,
     verification_source_scope_hash: str | None,
 ) -> dict[str, Any]:
+    _validate_finalized_subset_completion_pair(
+        existing_dataset_map,
+        metadata,
+    )
     verification_fields = _persisted_endpoint_dataset_verification_fields(
         metadata,
         requires_twin_root_verification=requires_twin_root_verification,
@@ -54885,6 +56547,54 @@ def _candidate_partition_initializations(
     return tuple(initializations)
 
 
+def _candidate_subset_contract(
+    source_records: list[dict[str, Any]],
+) -> tuple[CurrentVersionCensusContract | None, int | None]:
+    """Return the sole bound v3 contract and its persisted marker."""
+
+    subset_contracts = [
+        contract
+        for source_record in source_records
+        if (contract := current_version_census_contract(source_record))
+        is not None
+        and contract.is_server_issued_subset_v3
+    ]
+    if len(subset_contracts) == 1 and len(source_records) == 1:
+        return subset_contracts[0], SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+    return (subset_contracts[0] if subset_contracts else None), None
+
+
+def _candidate_bound_checkpoint_context(
+    checkpoint_context: PaginationCheckpointContext | None,
+    endpoint_id: str,
+    selection: EndpointDatasetCandidateSelection,
+) -> PaginationCheckpointContext | None:
+    """Bind a checkpoint context to the selected dataset lineage."""
+
+    if checkpoint_context is None:
+        return None
+    return replace(
+        checkpoint_context,
+        endpoint_id=endpoint_id,
+        dataset_id=selection.dataset_id,
+        lineage_verified=True,
+    )
+
+
+def _candidate_source_ids(
+    source_records: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    """Return the sorted nonempty source identity set."""
+
+    return tuple(
+        sorted(
+            source_id
+            for source_record in source_records
+            if (source_id := _clean_text(source_record.get("source_id")))
+        )
+    )
+
+
 def _build_endpoint_dataset_candidate(
     source_records: list[dict[str, Any]],
     endpoint_id: str,
@@ -54895,22 +56605,14 @@ def _build_endpoint_dataset_candidate(
     checkpoint_context: PaginationCheckpointContext | None,
     requires_twin_root_verification: bool,
 ) -> EndpointDatasetCandidate:
-    bound_checkpoint_context = (
-        replace(
-            checkpoint_context,
-            endpoint_id=endpoint_id,
-            dataset_id=selection.dataset_id,
-            lineage_verified=True,
-        )
-        if checkpoint_context is not None
-        else None
+    """Bind one acquiring dataset row to its selected source contract."""
+
+    bound_checkpoint_context = _candidate_bound_checkpoint_context(
+        checkpoint_context, endpoint_id, selection
     )
-    source_ids = tuple(
-        sorted(
-            source_id
-            for source_record in source_records
-            if (source_id := _clean_text(source_record.get("source_id")))
-        )
+    source_ids = _candidate_source_ids(source_records)
+    subset_contract, proof_required_version = _candidate_subset_contract(
+        source_records
     )
     return EndpointDatasetCandidate(
         endpoint_id=endpoint_id,
@@ -54930,19 +56632,17 @@ def _build_endpoint_dataset_candidate(
             else requires_twin_root_verification
         ),
         verification_campaign_id=selection.verification_campaign_id,
-        verification_source_scope_hash=(
-            selection.verification_source_scope_hash
-        ),
+        verification_source_scope_hash=selection.verification_source_scope_hash,
         verification_role=selection.verification_role,
-        verification_baseline_dataset_id=(
-            selection.verification_baseline_dataset_id
-        ),
+        verification_baseline_dataset_id=selection.verification_baseline_dataset_id,
         verification_terminal_status=selection.verification_terminal_status,
         verification_terminal_metadata=selection.verification_terminal_metadata,
         already_validated=selection.already_validated,
         validated_metadata=selection.validated_metadata,
         already_published=selection.already_published,
         published_metadata=selection.published_metadata,
+        completion_proof_required_version=proof_required_version,
+        subset_contract=subset_contract,
     )
 
 
@@ -55055,6 +56755,12 @@ def _endpoint_dataset_selected_resources(
     fully_enumerable_resources = _source_fully_enumerable_resource_types(
         source_record
     )
+    subset_contract = current_version_census_contract(source_record)
+    if (
+        subset_contract is not None
+        and subset_contract.is_server_issued_subset_v3
+    ):
+        fully_enumerable_resources = None
     if _uses_alohr_graphql_connector(source_record):
         supported_resources = set(ALOHR_GRAPHQL_RESOURCE_TYPES)
     unique_requested_resources = list(dict.fromkeys(requested_resources))
@@ -55688,7 +57394,10 @@ def _current_version_census_terminal_failure_details(
         resource_type
         for resource_type in incomplete_resource_types
         if diagnostics_by_resource[resource_type].get("fetch_mode")
-        == CURRENT_VERSION_CENSUS_FETCH_MODE
+        in {
+            CURRENT_VERSION_CENSUS_FETCH_MODE,
+            SERVER_ISSUED_SUBSET_FETCH_MODE,
+        }
         and str(
             diagnostics_by_resource[resource_type].get("error") or ""
         ).startswith(CURRENT_VERSION_CENSUS_BLOCKED_ERROR)
@@ -56499,6 +58208,12 @@ def _network_plan_source_ctes(
               JOIN target_dataset AS dataset
                 ON dataset.dataset_id = resource.dataset_id
              WHERE resource.resource_type = 'InsurancePlan'
+        ), organization_ids AS MATERIALIZED (
+            SELECT resource.resource_id
+              FROM {resource_ref} AS resource
+              JOIN target_dataset AS dataset
+                ON dataset.dataset_id = resource.dataset_id
+             WHERE resource.resource_type = 'Organization'
         ), network_references AS MATERIALIZED (
             SELECT plan.insurance_plan_resource_id,
                    reference.ordinality,
@@ -56566,7 +58281,13 @@ def _network_plan_proof_select() -> str:
               WHERE network_resource_id IS NULL)::bigint
                 AS invalid_network_reference_count,
             (SELECT COUNT(*) FROM expected_edges)::bigint
-                AS expected_edge_count;
+                AS expected_edge_count,
+            (SELECT COUNT(*)
+               FROM expected_edges AS edge
+               LEFT JOIN organization_ids AS organization
+                 ON organization.resource_id = edge.network_resource_id
+              WHERE organization.resource_id IS NULL)::bigint
+                AS unresolved_reference_count;
     """
 
 
@@ -56896,6 +58617,7 @@ DATASET_NETWORK_PLAN_COUNT_FIELDS = (
     "valid_network_reference_count",
     "invalid_network_reference_count",
     "expected_edge_count",
+    "unresolved_reference_count",
 )
 
 
@@ -57153,6 +58875,12 @@ def _affiliation_org_source_ctes(
               JOIN target_dataset AS dataset
                 ON dataset.dataset_id = resource.dataset_id
              WHERE resource.resource_type = 'OrganizationAffiliation'
+        ), organization_ids AS MATERIALIZED (
+            SELECT resource.resource_id
+              FROM {resource_ref} AS resource
+              JOIN target_dataset AS dataset
+                ON dataset.dataset_id = resource.dataset_id
+             WHERE resource.resource_type = 'Organization'
         ), normalized_affiliations AS MATERIALIZED (
             SELECT affiliation_resource_id,
                    CASE
@@ -57238,7 +58966,14 @@ def _affiliation_org_proof_select() -> str:
                 AND participating_organization_resource_id IS NULL)::bigint
                 AS invalid_reference_count,
             (SELECT COUNT(*) FROM expected_edges)::bigint
-                AS expected_edge_count;
+                AS expected_edge_count,
+            (SELECT COUNT(*)
+               FROM expected_edges AS edge
+               LEFT JOIN organization_ids AS organization
+                 ON organization.resource_id =
+                    edge.participating_organization_resource_id
+              WHERE organization.resource_id IS NULL)::bigint
+                AS unresolved_reference_count;
     """
 
 
@@ -57324,6 +59059,7 @@ AFFILIATION_ORGANIZATION_PROOF_COUNT_FIELDS = (
     "valid_reference_count",
     "invalid_reference_count",
     "expected_edge_count",
+    "unresolved_reference_count",
 )
 
 
@@ -57429,9 +59165,10 @@ def _endpoint_dataset_publication_metadata(
     diagnostics: dict[str, dict[str, Any]],
     **extra: Any,
 ) -> dict[str, Any]:
+    stored_diagnostics = _sanitized_resource_diagnostics(diagnostics)
     metadata = {
         **_endpoint_dataset_candidate_metadata(candidate),
-        "resource_diagnostics": diagnostics,
+        "resource_diagnostics": stored_diagnostics,
         "reused_from_checkpoint": candidate.reused_from_checkpoint,
         **extra,
     }
@@ -57440,7 +59177,7 @@ def _endpoint_dataset_publication_metadata(
         "terminal_run_id": candidate.import_run_id,
         "source_ids": list(candidate.source_ids),
         "selected_resources": list(candidate.selected_resources),
-        "resource_diagnostics": diagnostics,
+        "resource_diagnostics": stored_diagnostics,
         **(
             {
                 TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: (
@@ -57456,6 +59193,22 @@ def _endpoint_dataset_publication_metadata(
         ),
     }
     return metadata
+
+
+def _sanitized_resource_diagnostics(
+    diagnostics: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Remove internal replay evidence from operational/status payloads."""
+
+    return {
+        resource_type: {
+            field_name: field_value
+            for field_name, field_value in diagnostic.items()
+            if field_name != _SERVER_ISSUED_SUBSET_INTERNAL_REPLAY_KEY
+        }
+        for resource_type, diagnostic in diagnostics.items()
+        if isinstance(diagnostic, Mapping)
+    }
 
 
 def _is_endpoint_dataset_publishable(
@@ -57545,7 +59298,11 @@ def _endpoint_dataset_hash_page_sql(
                 )
            )
         """
-    payload_projection = ", payload_json" if include_payload_json else ""
+    payload_projection = (
+        ", payload_json, acquired_resource_sha256"
+        if include_payload_json
+        else ""
+    )
     return f"""
         SELECT resource_type, resource_id, payload_hash{payload_projection}
           FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
@@ -57657,13 +59414,24 @@ def _assert_endpoint_dataset_resource_payload_hash(resource_row: Any) -> None:
         raise ProviderDirectoryArtifactBuildStale(
             "provider_directory_endpoint_dataset_payload_invalid"
         )
-    payload_hash = hashlib.sha256(
-        json.dumps(
-            raw_payload,
-            sort_keys=True,
-            default=_json_default,
-        ).encode("utf-8")
-    ).hexdigest()
+    acquired_resource_sha256 = resource_map.get(
+        "acquired_resource_sha256"
+    )
+    hash_payload_by_field = _endpoint_dataset_hash_payload(
+        raw_payload,
+        is_server_issued_subset=(acquired_resource_sha256 is not None),
+    )
+    payload_hash = (
+        subset_payload_sha256(hash_payload_by_field)
+        if acquired_resource_sha256 is not None
+        else hashlib.sha256(
+            json.dumps(
+                hash_payload_by_field,
+                sort_keys=True,
+                default=_json_default,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     if payload_hash != _clean_text(resource_map.get("payload_hash")):
         raise ProviderDirectoryArtifactBuildStale(
             "provider_directory_endpoint_dataset_payload_hash_mismatch"
@@ -57726,38 +59494,50 @@ async def _acquiring_uhc_metadata(
     )
 
 
+async def _uhc_candidate_content_proof(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> EndpointDatasetContentProof | None:
+    """Return the retained canonical proof only for the legacy source."""
+
+    if candidate.source_ids != (UHC_RETAINED_SOURCE_ID,):
+        return None
+    metadata = await _acquiring_uhc_metadata(connection, candidate)
+    try:
+        uhc_proof = validate_uhc_canonical_content_proof(
+            metadata.get(UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY),
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=candidate.acquisition_root_run_id or "",
+        )
+    except UhcCanonicalProofError as error:
+        raise RuntimeError(
+            "provider_directory_uhc_canonical_proof_invalid"
+        ) from error
+    if tuple(sorted(uhc_proof["resource_counts"])) != candidate.selected_resources:
+        raise RuntimeError(
+            "provider_directory_uhc_canonical_proof_scope_changed"
+        )
+    return EndpointDatasetContentProof(
+        dataset_hash=uhc_proof["dataset_hash"],
+        resource_count=uhc_proof["resource_count"],
+        resource_hashes=dict(uhc_proof["resource_hashes"]),
+        resource_counts=dict(uhc_proof["resource_counts"]),
+    )
+
+
 async def _candidate_endpoint_dataset_content_proof(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> EndpointDatasetContentProof:
-    if candidate.source_ids == (UHC_RETAINED_SOURCE_ID,):
-        metadata = await _acquiring_uhc_metadata(connection, candidate)
-        try:
-            uhc_proof = validate_uhc_canonical_content_proof(
-                metadata.get(UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY),
-                dataset_id=candidate.dataset_id,
-                endpoint_id=candidate.endpoint_id,
-                acquisition_root_run_id=(
-                    candidate.acquisition_root_run_id or ""
-                ),
-            )
-        except UhcCanonicalProofError as error:
-            raise RuntimeError(
-                "provider_directory_uhc_canonical_proof_invalid"
-            ) from error
-        if (
-            tuple(sorted(uhc_proof["resource_counts"]))
-            != candidate.selected_resources
-        ):
-            raise RuntimeError(
-                "provider_directory_uhc_canonical_proof_scope_changed"
-            )
-        return EndpointDatasetContentProof(
-            dataset_hash=uhc_proof["dataset_hash"],
-            resource_count=uhc_proof["resource_count"],
-            resource_hashes=dict(uhc_proof["resource_hashes"]),
-            resource_counts=dict(uhc_proof["resource_counts"]),
-        )
+    """Build the stored projected and raw-resource content commitments."""
+
+    retained_content_proof = await _uhc_candidate_content_proof(
+        connection,
+        candidate,
+    )
+    if retained_content_proof is not None:
+        return retained_content_proof
     acquisition_root_run_id = _clean_text(candidate.acquisition_root_run_id)
     if acquisition_root_run_id is None:
         raise RuntimeError(
@@ -57772,7 +59552,7 @@ async def _candidate_endpoint_dataset_content_proof(
         source_ids=candidate.source_ids,
         selected_resources=candidate.selected_resources,
     )
-    return EndpointDatasetContentProof(
+    content_proof = EndpointDatasetContentProof(
         dataset_hash=stored_proof.dataset_hash,
         resource_count=stored_proof.resource_count,
         resource_hashes=stored_proof.resource_hashes,
@@ -57780,6 +59560,74 @@ async def _candidate_endpoint_dataset_content_proof(
         source_metrics=stored_proof.source_metrics,
         proof_metadata=stored_proof.metadata,
     )
+    if candidate.completion_proof_required_version != (
+        SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+    ):
+        return content_proof
+    acquired_resource_hashes = await _subset_acquired_resource_hashes(
+        connection,
+        candidate,
+        content_proof.resource_counts,
+    )
+    return replace(
+        content_proof,
+        acquired_resource_hashes=acquired_resource_hashes,
+    )
+
+
+async def _subset_acquired_resource_hashes(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    expected_count_by_type: dict[str, int],
+) -> dict[str, str]:
+    """Hash ordered raw-resource digests without retaining private transport data."""
+
+    acquired_resource_rows = await connection.all(
+        f"""
+        SELECT resource_type, resource_id,
+               acquired_resource_sha256
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = ANY(CAST(:resource_types AS varchar[]))
+         ORDER BY resource_type, resource_id;
+        """,
+        dataset_id=candidate.dataset_id,
+        resource_types=list(candidate.selected_resources),
+    )
+    entry_by_type: dict[str, list[dict[str, str]]] = {
+        resource_type: [] for resource_type in candidate.selected_resources
+    }
+    for acquired_resource_row in acquired_resource_rows:
+        row_map = _pagination_checkpoint_row_mapping(acquired_resource_row)
+        resource_type = _clean_text(row_map.get("resource_type"))
+        resource_id = _clean_text(row_map.get("resource_id"))
+        acquired_sha256 = _clean_text(
+            row_map.get("acquired_resource_sha256")
+        )
+        if (
+            resource_type not in entry_by_type
+            or resource_id is None
+            or acquired_sha256 is None
+            or re.fullmatch(r"[0-9a-f]{64}", acquired_sha256) is None
+        ):
+            raise RuntimeError(
+                "provider_directory_subset_acquired_content_invalid"
+            )
+        entry_by_type[resource_type].append(
+            {"resource_id": resource_id, "sha256": acquired_sha256}
+        )
+    if any(
+        len(entry_by_type[resource_type])
+        != expected_count_by_type.get(resource_type)
+        for resource_type in candidate.selected_resources
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_acquired_content_count_mismatch"
+        )
+    return {
+        resource_type: subset_canonical_sha256(entry_by_type[resource_type])
+        for resource_type in sorted(entry_by_type)
+    }
 
 
 def _outcome_resource_count_proof(
@@ -58335,7 +60183,7 @@ def _twin_root_content_proof(
     candidate: EndpointDatasetCandidate,
     content_proof: EndpointDatasetContentProof,
 ) -> dict[str, Any]:
-    return {
+    proof_by_field = {
         "endpoint_id": candidate.endpoint_id,
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "source_ids": list(candidate.source_ids),
@@ -58352,6 +60200,34 @@ def _twin_root_content_proof(
         "resource_hashes": content_proof.resource_hashes,
         "resource_counts": content_proof.resource_counts,
     }
+    if candidate.completion_proof_required_version is not None:
+        try:
+            completion_proof, completion_sha256 = (
+                validate_subset_completion_proof_pair(
+                    content_proof.completion_proof,
+                    content_proof.completion_proof_sha256,
+                )
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "provider_directory_subset_completion_proof_invalid"
+            ) from exc
+        if (
+            candidate.subset_contract is None
+            or completion_proof["campaign_id"]
+            != candidate.subset_contract.campaign_id
+            or completion_proof["cutoff"] != candidate.subset_contract.cutoff
+            or completion_proof["page_count"]
+            != candidate.subset_contract.page_count
+        ):
+            raise RuntimeError(
+                "provider_directory_subset_completion_contract_mismatch"
+            )
+        proof_by_field.update(
+            completion_proof=completion_proof,
+            completion_proof_sha256=completion_sha256,
+        )
+    return proof_by_field
 
 
 def _twin_root_mismatch_fields(
@@ -58371,6 +60247,8 @@ def _twin_root_mismatch_fields(
             "resource_count",
             "resource_hashes",
             "resource_counts",
+            "completion_proof",
+            "completion_proof_sha256",
         )
         if baseline_proof.get(field_name) != candidate_proof.get(field_name)
     ]
@@ -58503,7 +60381,8 @@ async def _lock_endpoint_dataset_for_validation(
     candidate_record = await connection.first(
         f"""
         SELECT dataset_id, acquisition_root_run_id, is_current, status,
-               previous_dataset_id
+               previous_dataset_id, completion_proof_required_version,
+               completion_proof_json, completion_proof_sha256
           FROM {dataset_ref}
          WHERE dataset_id = :dataset_id
            AND endpoint_id = :endpoint_id
@@ -58521,6 +60400,10 @@ async def _lock_endpoint_dataset_for_validation(
         in IMMUTABLE_ENDPOINT_DATASET_STATUSES
         or _clean_text(candidate_record_map.get("acquisition_root_run_id"))
         != candidate.acquisition_root_run_id
+        or candidate_record_map.get("completion_proof_required_version")
+        != candidate.completion_proof_required_version
+        or candidate_record_map.get("completion_proof_json") is not None
+        or candidate_record_map.get("completion_proof_sha256") is not None
     ):
         raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
     current_dataset_record = await connection.first(
@@ -58544,6 +60427,35 @@ async def _lock_endpoint_dataset_for_validation(
     return current_dataset_id
 
 
+def _store_validated_endpoint_dataset_sql() -> str:
+    """Return the marker- and proof-guarded terminal UPDATE."""
+
+    dataset_ref = _qt(
+        _schema(),
+        ProviderDirectoryEndpointDataset.__tablename__,
+    )
+    return f"""
+        UPDATE {dataset_ref}
+           SET previous_dataset_id = :previous_dataset_id,
+               dataset_hash = :dataset_hash, status = :status,
+               is_current = false, resource_count = :resource_count,
+               validated_at = CASE WHEN :marks_validated THEN now() ELSE NULL END,
+               published_at = NULL, superseded_at = NULL,
+               publication_metadata_json = CAST(:publication_metadata_json AS jsonb),
+               completion_proof_json = CAST(:completion_proof_json AS jsonb),
+               completion_proof_sha256 = :completion_proof_sha256
+         WHERE dataset_id = :dataset_id AND endpoint_id = :endpoint_id
+           AND acquisition_root_run_id IS NOT DISTINCT FROM
+               :acquisition_root_run_id
+           AND is_current = false
+           AND completion_proof_required_version IS NOT DISTINCT FROM
+               :completion_proof_required_version
+           AND completion_proof_json IS NULL
+           AND completion_proof_sha256 IS NULL
+           AND NOT status = ANY(CAST(:immutable_statuses AS varchar[]));
+    """
+
+
 async def _store_validated_endpoint_dataset(
     connection: Any,
     candidate: EndpointDatasetCandidate,
@@ -58553,28 +60465,21 @@ async def _store_validated_endpoint_dataset(
     metadata: dict[str, Any],
     *,
     status: str = ENDPOINT_DATASET_VALIDATED,
+    completion_proof_pair: tuple[
+        dict[str, Any] | None,
+        str | None,
+    ] | None = None,
 ) -> None:
+    """Atomically terminalize one candidate with its immutable proof pair."""
+
+    serialized_completion_proof, completion_proof_sha256 = (
+        _serialized_subset_completion_proof_pair(
+            candidate,
+            completion_proof_pair,
+        )
+    )
     validated_count = await connection.status(
-        f"""
-        UPDATE {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
-           SET previous_dataset_id = :previous_dataset_id,
-               dataset_hash = :dataset_hash,
-               status = :status,
-               is_current = false,
-               resource_count = :resource_count,
-               validated_at = CASE
-                   WHEN :marks_validated THEN now()
-                   ELSE NULL
-               END,
-               published_at = NULL,
-               superseded_at = NULL,
-               publication_metadata_json = CAST(:publication_metadata_json AS jsonb)
-         WHERE dataset_id = :dataset_id
-           AND endpoint_id = :endpoint_id
-           AND acquisition_root_run_id IS NOT DISTINCT FROM :acquisition_root_run_id
-           AND is_current = false
-           AND NOT status = ANY(CAST(:immutable_statuses AS varchar[]));
-        """,
+        _store_validated_endpoint_dataset_sql(),
         previous_dataset_id=previous_dataset_id,
         dataset_hash=dataset_hash,
         status=status,
@@ -58584,6 +60489,11 @@ async def _store_validated_endpoint_dataset(
             sort_keys=True,
             default=_json_default,
         ),
+        completion_proof_json=serialized_completion_proof,
+        completion_proof_sha256=completion_proof_sha256,
+        completion_proof_required_version=(
+            candidate.completion_proof_required_version
+        ),
         dataset_id=candidate.dataset_id,
         endpoint_id=candidate.endpoint_id,
         acquisition_root_run_id=candidate.acquisition_root_run_id,
@@ -58592,6 +60502,55 @@ async def _store_validated_endpoint_dataset(
     )
     if _coerce_rowcount(validated_count) <= 0:
         raise RuntimeError("provider_directory_endpoint_dataset_validation_lost")
+
+
+def _serialized_subset_completion_proof_pair(
+    candidate: EndpointDatasetCandidate,
+    completion_proof_pair: tuple[
+        dict[str, Any] | None,
+        str | None,
+    ] | None,
+) -> tuple[str | None, str | None]:
+    if candidate.completion_proof_required_version is None:
+        if completion_proof_pair not in (None, (None, None)):
+            raise RuntimeError(
+                "provider_directory_subset_completion_proof_unexpected"
+            )
+        return None, None
+    if (
+        candidate.completion_proof_required_version
+        != SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        or completion_proof_pair is None
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_completion_proof_required"
+        )
+    try:
+        completion_proof, completion_sha256 = (
+            validate_subset_completion_proof_pair(*completion_proof_pair)
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_subset_completion_proof_invalid"
+        ) from exc
+    contract = candidate.subset_contract
+    if (
+        contract is None
+        or completion_proof["campaign_id"] != contract.campaign_id
+        or completion_proof["cutoff"] != contract.cutoff
+        or completion_proof["page_count"] != contract.page_count
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_completion_contract_mismatch"
+        )
+    return (
+        json.dumps(
+            completion_proof,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        completion_sha256,
+    )
 
 
 async def _validated_endpoint_bulk_transaction_times(
@@ -58723,12 +60682,26 @@ async def _store_endpoint_dataset_verification_result(
         content_proof.resource_count,
         metadata,
     )
+    completion_proof_pair = (
+        content_proof.completion_proof,
+        content_proof.completion_proof_sha256,
+    )
+    store_options_by_name: dict[str, Any] = {}
+    if (
+        candidate.completion_proof_required_version
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+    ):
+        store_options_by_name["completion_proof_pair"] = completion_proof_pair
     if final_status == ENDPOINT_DATASET_VALIDATED:
-        await _store_validated_endpoint_dataset(*positional_arguments)
+        await _store_validated_endpoint_dataset(
+            *positional_arguments,
+            **store_options_by_name,
+        )
         return
     await _store_validated_endpoint_dataset(
         *positional_arguments,
         status=final_status,
+        **store_options_by_name,
     )
 
 
@@ -58741,7 +60714,9 @@ async def _retire_matched_twin_root_baseline_payload(
     """Retain immutable baseline proof while retiring its duplicate payload."""
     baseline_dataset_id = candidate.verification_baseline_dataset_id
     if (
-        final_status != ENDPOINT_DATASET_VALIDATED
+        candidate.completion_proof_required_version
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        or final_status != ENDPOINT_DATASET_VALIDATED
         or candidate.verification_role
         != TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE
         or not baseline_dataset_id
@@ -58897,6 +60872,7 @@ async def _validate_endpoint_dataset_candidate(
 async def _endpoint_dataset_validation_proofs(
     connection: Any,
     candidate: EndpointDatasetCandidate,
+    diagnostics: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[
     EndpointDatasetContentProof,
     dict[str, dict[str, Any]],
@@ -58907,6 +60883,11 @@ async def _endpoint_dataset_validation_proofs(
     content_proof = await _candidate_endpoint_dataset_content_proof(
         connection,
         candidate,
+    )
+    content_proof = _content_proof_with_subset_completion(
+        candidate,
+        diagnostics or {},
+        content_proof,
     )
     final_status, verification_metadata, mismatch_fields = (
         await _locked_twin_root_verification_decision(
@@ -58928,6 +60909,121 @@ async def _endpoint_dataset_validation_proofs(
         verification_metadata,
         mismatch_fields,
     )
+
+
+def _content_proof_with_subset_completion(
+    candidate: EndpointDatasetCandidate,
+    diagnostics: dict[str, dict[str, Any]],
+    content_proof: EndpointDatasetContentProof,
+) -> EndpointDatasetContentProof:
+    """Attach the canonical v3 proof only for a marker-bound full resource set."""
+
+    if candidate.completion_proof_required_version is None:
+        return content_proof
+    if (
+        candidate.completion_proof_required_version
+        != SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        or candidate.subset_contract is None
+        or content_proof.acquired_resource_hashes is None
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_completion_proof_identity_invalid"
+        )
+    resource_proof_by_type: dict[str, dict[str, Any]] = {}
+    for resource_type in candidate.subset_contract.resources:
+        diagnostic = diagnostics.get(resource_type)
+        proof = (
+            diagnostic.get("server_issued_subset_completeness")
+            if isinstance(diagnostic, dict)
+            else None
+        )
+        if not isinstance(proof, dict):
+            raise RuntimeError(
+                "provider_directory_subset_completion_proof_incomplete"
+            )
+        resource_proof_by_type[resource_type] = proof
+    try:
+        completion_proof, completion_sha256 = build_subset_completion_proof(
+            contract=candidate.subset_contract,
+            resource_proof_by_type=resource_proof_by_type,
+            dataset_hash=content_proof.dataset_hash,
+            resource_count=content_proof.resource_count,
+            resource_hash_by_type=content_proof.resource_hashes,
+            acquired_resource_hash_by_type=(
+                content_proof.acquired_resource_hashes
+            ),
+            resource_count_by_type=content_proof.resource_counts,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_subset_completion_proof_invalid"
+        ) from exc
+    return replace(
+        content_proof,
+        completion_proof=completion_proof,
+        completion_proof_sha256=completion_sha256,
+    )
+
+
+def _subset_replay_metadata(
+    candidate: EndpointDatasetCandidate,
+    diagnostics: Mapping[str, Any],
+    content_proof: EndpointDatasetContentProof,
+) -> dict[str, Any]:
+    """Build the per-root opaque-hop evidence kept outside twin equality."""
+
+    if candidate.completion_proof_required_version is None:
+        return {}
+    if (
+        candidate.completion_proof_required_version
+        != SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        or candidate.subset_contract is None
+        or content_proof.completion_proof is None
+        or content_proof.completion_proof_sha256 is None
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_replay_evidence_invalid"
+        )
+    execution_proof_by_type: dict[str, dict[str, Any]] = {}
+    for resource_type in candidate.subset_contract.resources:
+        diagnostic = diagnostics.get(resource_type)
+        safe_proof = (
+            diagnostic.get("server_issued_subset_completeness")
+            if isinstance(diagnostic, Mapping)
+            else None
+        )
+        internal_evidence = (
+            diagnostic.get(_SERVER_ISSUED_SUBSET_INTERNAL_REPLAY_KEY)
+            if isinstance(diagnostic, Mapping)
+            else None
+        )
+        if (
+            not isinstance(safe_proof, Mapping)
+            or not isinstance(internal_evidence, Mapping)
+        ):
+            raise RuntimeError(
+                "provider_directory_subset_replay_evidence_invalid"
+            )
+        execution_proof_by_type[resource_type] = {
+            **dict(safe_proof),
+            "continuation_hop_sha256": internal_evidence.get(
+                "continuation_hop_sha256"
+            ),
+        }
+    try:
+        replay_evidence, replay_sha256 = build_subset_replay_evidence(
+            resource_proof_by_type=execution_proof_by_type,
+            completion_proof=content_proof.completion_proof,
+            completion_sha256=content_proof.completion_proof_sha256,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_subset_replay_evidence_invalid"
+        ) from exc
+    return {
+        SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY: replay_evidence,
+        SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY: replay_sha256,
+    }
 
 
 async def _endpoint_dataset_source_summary_metadata(
@@ -59016,6 +61112,51 @@ async def _validated_uhc_source_summary_metadata(
     }
 
 
+def _validated_stored_content_proof_metadata(
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+) -> dict[str, Any]:
+    """Validate optional proof shards and return their sealed projection."""
+
+    if content_proof.proof_metadata is None:
+        return {}
+    acquisition_root_run_id = _clean_text(candidate.acquisition_root_run_id)
+    if acquisition_root_run_id is None:
+        raise RuntimeError(
+            "provider_directory_content_proof_acquisition_root_required"
+        )
+    validated_proof = validate_stored_dataset_proof_metadata(
+        content_proof.proof_metadata,
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+        acquisition_root_run_id=acquisition_root_run_id,
+        source_ids=candidate.source_ids,
+        selected_resources=candidate.selected_resources,
+    )
+    expected_values = (
+        content_proof.dataset_hash,
+        content_proof.resource_count,
+        content_proof.resource_hashes,
+        content_proof.resource_counts,
+        content_proof.source_metrics,
+    )
+    proof_values = tuple(
+        validated_proof[field_name]
+        for field_name in (
+            "dataset_hash",
+            "resource_count",
+            "resource_hashes",
+            "resource_counts",
+            "source_metrics",
+        )
+    )
+    if proof_values != expected_values:
+        raise RuntimeError(
+            "provider_directory_content_proof_metadata_changed"
+        )
+    return {PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: validated_proof}
+
+
 def _dataset_validation_metadata(
     candidate: EndpointDatasetCandidate,
     diagnostics: dict[str, dict[str, Any]],
@@ -59025,40 +61166,24 @@ def _dataset_validation_metadata(
     verification_metadata: dict[str, Any],
     source_summary_metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    content_proof_metadata_by_key: dict[str, Any] = {}
-    if content_proof.proof_metadata is not None:
-        acquisition_root_run_id = _clean_text(
-            candidate.acquisition_root_run_id
-        )
-        if acquisition_root_run_id is None:
-            raise RuntimeError(
-                "provider_directory_content_proof_acquisition_root_required"
-            )
-        validated_proof = validate_stored_dataset_proof_metadata(
-            content_proof.proof_metadata,
-            dataset_id=candidate.dataset_id,
-            endpoint_id=candidate.endpoint_id,
-            acquisition_root_run_id=acquisition_root_run_id,
-            source_ids=candidate.source_ids,
-            selected_resources=candidate.selected_resources,
-        )
-        if (
-            validated_proof["dataset_hash"] != content_proof.dataset_hash
-            or validated_proof["resource_count"]
-            != content_proof.resource_count
-            or validated_proof["resource_hashes"]
-            != content_proof.resource_hashes
-            or validated_proof["resource_counts"]
-            != content_proof.resource_counts
-            or validated_proof["source_metrics"]
-            != content_proof.source_metrics
-        ):
-            raise RuntimeError(
-                "provider_directory_content_proof_metadata_changed"
-            )
-        content_proof_metadata_by_key[
-            PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
-        ] = validated_proof
+    """Build sealed validation metadata, replay evidence, and coverage."""
+
+    content_proof_metadata_by_key = _validated_stored_content_proof_metadata(
+        candidate,
+        content_proof,
+    )
+    replay_metadata = _subset_replay_metadata(
+        candidate,
+        diagnostics,
+        content_proof,
+    )
+    coverage_metadata = _subset_dataset_coverage_metadata(
+        candidate,
+        diagnostics,
+        content_proof,
+        relation_proof_by_name,
+        verification_metadata,
+    )
     return _endpoint_dataset_publication_metadata(
         candidate,
         diagnostics,
@@ -59074,7 +61199,132 @@ def _dataset_validation_metadata(
         **verification_metadata,
         **source_summary_metadata,
         **content_proof_metadata_by_key,
+        **replay_metadata,
+        **coverage_metadata,
     )
+
+
+def _subset_resource_coverage_map(
+    diagnostics: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return sanitized terminal coverage for every reviewed family."""
+
+    coverage_by_resource: dict[str, Any] = {}
+    for resource_type in SERVER_ISSUED_SUBSET_RESOURCE_TYPES:
+        diagnostic = diagnostics.get(resource_type)
+        proof = (
+            diagnostic.get("server_issued_subset_completeness")
+            if isinstance(diagnostic, Mapping)
+            else None
+        )
+        coverage = _server_issued_subset_coverage(proof)
+        if coverage is None:
+            raise RuntimeError("provider_directory_subset_coverage_invalid")
+        coverage_by_resource[resource_type] = coverage
+    return coverage_by_resource
+
+
+def _subset_unresolved_relation_counts(
+    relation_proof_by_name: Mapping[str, Any],
+) -> dict[str, int]:
+    """Return exact missing-target counts only after relation validation."""
+
+    unresolved_by_relation: dict[str, int] = {}
+    for relation_name in (
+        PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_METADATA_KEY,
+        PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_METADATA_KEY,
+    ):
+        relation_proof = relation_proof_by_name.get(relation_name)
+        if not isinstance(relation_proof, Mapping):
+            unresolved_by_relation = {}
+            break
+        unresolved_count = relation_proof.get("unresolved_reference_count")
+        if (
+            type(unresolved_count) is not int
+            or unresolved_count < 0
+        ):
+            raise RuntimeError("provider_directory_subset_coverage_invalid")
+        unresolved_by_relation[relation_name] = unresolved_count
+    return unresolved_by_relation
+
+
+def _subset_dataset_coverage(
+    diagnostics: Mapping[str, Any],
+    completion_proof: Mapping[str, Any],
+    completion_sha256: str,
+    relation_proof_by_name: Mapping[str, Any],
+    verification_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the sealed safe coverage object from validated proof inputs."""
+
+    coverage_by_resource = _subset_resource_coverage_map(diagnostics)
+    unresolved_by_relation = _subset_unresolved_relation_counts(
+        relation_proof_by_name
+    )
+    twin_verification = verification_metadata.get(
+        TWIN_ROOT_VERIFICATION_METADATA_KEY
+    )
+    twin_state = (
+        twin_verification.get("result")
+        if isinstance(twin_verification, Mapping)
+        else "not_required"
+    )
+    resources = completion_proof["resources"]
+    return {
+        "cutoff": completion_proof["cutoff"],
+        "scope": "server_issued_traversal_subset",
+        **{
+            count_name: sum(
+                resource[count_name] for resource in resources.values()
+            )
+            for count_name in (
+                "advertised_pre", "advertised_post", "returned_unique", "deficit"
+            )
+        },
+        "resources": coverage_by_resource,
+        "traversal_complete": True,
+        "twin_state": twin_state,
+        "proof_sha256": completion_sha256,
+        "unresolved_reference_count": (
+            sum(unresolved_by_relation.values())
+            if unresolved_by_relation
+            else None
+        ),
+        "unresolved_reference_counts": (
+            dict(sorted(unresolved_by_relation.items()))
+            if unresolved_by_relation
+            else None
+        ),
+        "missing_target_semantics": "preserved_not_synthesized",
+        "absence_semantics": "unknown_under_subset",
+        "publication_state_at_completion": "not_published",
+    }
+
+
+def _subset_dataset_coverage_metadata(
+    candidate: EndpointDatasetCandidate,
+    diagnostics: Mapping[str, Any],
+    content_proof: EndpointDatasetContentProof,
+    relation_proof_by_name: Mapping[str, Any],
+    verification_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Summarize honest subset coverage without asserting absent resources."""
+
+    if candidate.completion_proof_required_version is None:
+        return {}
+    completion_proof = content_proof.completion_proof
+    completion_sha256 = content_proof.completion_proof_sha256
+    if not isinstance(completion_proof, Mapping) or not completion_sha256:
+        raise RuntimeError("provider_directory_subset_coverage_invalid")
+    return {
+        SERVER_ISSUED_SUBSET_COVERAGE_KEY: _subset_dataset_coverage(
+            diagnostics,
+            completion_proof,
+            completion_sha256,
+            relation_proof_by_name,
+            verification_metadata,
+        )
+    }
 
 
 async def _store_dataset_validation_state(
@@ -59142,7 +61392,11 @@ async def _persist_endpoint_dataset_validation(
         final_status,
         verification_metadata,
         mismatch_fields,
-    ) = await _endpoint_dataset_validation_proofs(connection, candidate)
+    ) = await _endpoint_dataset_validation_proofs(
+        connection,
+        candidate,
+        diagnostics,
+    )
     source_summary_metadata = await _endpoint_dataset_source_summary_metadata(
         connection,
         candidate,
@@ -59497,9 +61751,15 @@ async def _replay_finalized_candidate_and_clear_checkpoints(
         None if is_verification_mismatch else resource_completion,
     )
     if source_records is not None:
+        finalized_metadata, _state_name = (
+            _finalized_endpoint_dataset_metadata(candidate)
+        )
         _validate_current_version_census_diagnostics(
             source_records,
-            import_summary[1],
+            _diagnostics_with_persisted_subset_replay(
+                import_summary[1],
+                finalized_metadata,
+            ),
         )
     await _clear_finalized_endpoint_dataset_pagination_checkpoints(
         candidate,
@@ -59556,10 +61816,78 @@ async def _finalize_candidate_and_clear_checkpoints(
         )
 
 
+def _diagnostic_validation_proof(
+    contract: CurrentVersionCensusContract,
+    diagnostic_by_field: Mapping[str, Any],
+    proof_by_field: dict[str, Any],
+) -> dict[str, Any]:
+    """Rejoin token-specific replay only for internal v3 validation."""
+
+    if not contract.is_server_issued_subset_v3:
+        return proof_by_field
+    replay_evidence = diagnostic_by_field.get(
+        _SERVER_ISSUED_SUBSET_INTERNAL_REPLAY_KEY
+    )
+    if not isinstance(replay_evidence, Mapping):
+        return proof_by_field
+    return {
+        **proof_by_field,
+        "continuation_hop_sha256": replay_evidence.get(
+            "continuation_hop_sha256"
+        ),
+    }
+
+
+def _validated_census_diagnostic_count(
+    contract: CurrentVersionCensusContract,
+    resource_type: str,
+    diagnostic_by_field: Mapping[str, Any],
+) -> int:
+    """Validate one terminal diagnostic and return its stable pre-count."""
+
+    expected_fetch_mode = (
+        SERVER_ISSUED_SUBSET_FETCH_MODE
+        if contract.is_server_issued_subset_v3
+        else CURRENT_VERSION_CENSUS_FETCH_MODE
+    )
+    diagnostic_key = (
+        "server_issued_subset_completeness"
+        if contract.is_server_issued_subset_v3
+        else "current_version_census_completeness"
+    )
+    proof_by_field = diagnostic_by_field.get(diagnostic_key)
+    if (
+        diagnostic_by_field.get("fetch_mode") != expected_fetch_mode
+        or not isinstance(proof_by_field, dict)
+    ):
+        raise RuntimeError(
+            "provider_directory_current_version_census_proof_incomplete"
+        )
+    try:
+        validated_proof_by_field = validated_current_version_census_completed_proof(
+            _diagnostic_validation_proof(
+                contract,
+                diagnostic_by_field,
+                proof_by_field,
+            ),
+            contract,
+            resource_type,
+            rows_processed=diagnostic_by_field.get("rows_fetched"),
+            pages_processed=diagnostic_by_field.get("pages_fetched"),
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_current_version_census_proof_incomplete"
+        ) from exc
+    return validated_proof_by_field["pre_count"]
+
+
 def _validate_current_version_census_diagnostics(
     source_records: list[dict[str, Any]],
     diagnostics_by_resource: dict[str, dict[str, Any]],
 ) -> None:
+    """Require a terminal identity-bound proof for every selected family."""
+
     bound_sources = [
         source_record
         for source_record in source_records
@@ -59577,38 +61905,47 @@ def _validate_current_version_census_diagnostics(
         raise RuntimeError(
             "provider_directory_current_version_census_diagnostics_incomplete"
         )
-    count_by_resource: dict[str, int] = {}
-    for resource_type in contract.resources:
-        diagnostic_by_field = diagnostics_by_resource[resource_type]
-        proof_by_field = diagnostic_by_field.get(
-            "current_version_census_completeness"
+    count_by_resource = {
+        resource_type: _validated_census_diagnostic_count(
+            contract,
+            resource_type,
+            diagnostics_by_resource[resource_type],
         )
-        if (
-            diagnostic_by_field.get("fetch_mode")
-            != CURRENT_VERSION_CENSUS_FETCH_MODE
-            or not isinstance(proof_by_field, dict)
-        ):
-            raise RuntimeError(
-                "provider_directory_current_version_census_proof_incomplete"
-            )
-        try:
-            validated_proof_by_field = (
-                validated_current_version_census_completed_proof(
-                    proof_by_field,
-                    contract,
-                    resource_type,
-                    rows_processed=diagnostic_by_field.get("rows_fetched"),
-                    pages_processed=diagnostic_by_field.get("pages_fetched"),
-                )
-            )
-        except ValueError as exc:
-            raise RuntimeError(
-                "provider_directory_current_version_census_proof_incomplete"
-            ) from exc
-        count_by_resource[resource_type] = validated_proof_by_field[
-            "pre_count"
-        ]
+        for resource_type in contract.resources
+    }
     validated_current_version_census_count_map(contract, count_by_resource)
+
+
+def _diagnostics_with_persisted_subset_replay(
+    diagnostics_by_resource: Mapping[str, Any],
+    metadata: Any,
+) -> dict[str, dict[str, Any]]:
+    """Reattach sealed per-root hashes only for internal replay validation."""
+
+    diagnostics_by_resource = {
+        resource_type: dict(diagnostic)
+        for resource_type, diagnostic in diagnostics_by_resource.items()
+        if isinstance(diagnostic, Mapping)
+    }
+    if not isinstance(metadata, Mapping):
+        return diagnostics_by_resource
+    replay_evidence = metadata.get(SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY)
+    replay_resources = (
+        replay_evidence.get("resources")
+        if isinstance(replay_evidence, Mapping)
+        else None
+    )
+    if not isinstance(replay_resources, Mapping):
+        return diagnostics_by_resource
+    for resource_type, diagnostic in diagnostics_by_resource.items():
+        replay_resource = replay_resources.get(resource_type)
+        if isinstance(replay_resource, Mapping):
+            diagnostic[_SERVER_ISSUED_SUBSET_INTERNAL_REPLAY_KEY] = {
+                "continuation_hop_sha256": replay_resource.get(
+                    "continuation_hop_sha256"
+                )
+            }
+    return diagnostics_by_resource
 
 
 async def _validate_and_finalize_import_candidate(
@@ -59617,7 +61954,7 @@ async def _validate_and_finalize_import_candidate(
     diagnostics_by_resource: dict[str, dict[str, Any]],
     cancellation: _ResourceImportCancellation,
 ) -> None:
-    """Validate an exact census before finalizing its retained candidate."""
+    """Validate a reviewed traversal before finalizing its retained candidate."""
 
     await cancellation.check()
     _validate_current_version_census_diagnostics(

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import datetime
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -66,10 +67,10 @@ def _load_mutated_manifest(tmp_path: Path, mutate) -> None:
     )
 
 
-def _exact_task(entry: dict, **overrides) -> dict:
+def _reviewed_subset_task(entry: dict, **overrides) -> dict:
     task_by_field = {
         "provider_directory_acquisition_strategy": (
-            "cutoff-bounded-current-version-census"
+            "server-issued-traversal-subset"
         ),
         "provider_directory_census_cutoff": CUTOFF,
         "source_ids": list(entry["source_ids"]),
@@ -132,9 +133,10 @@ def test_reviewed_manifest_seed_binds_exact_identity_without_cutoff():
         manual_catalog.MANUAL_SOURCE_PENDING_STATUS
     )
     assert metadata["provider_directory_supported_resources"] == entry["resources"]
-    assert metadata["provider_directory_fully_enumerable_resources"] == entry[
-        "resources"
-    ]
+    assert metadata["provider_directory_fully_enumerable_resources"] == []
+    assert metadata["provider_directory_server_issued_subset_resources"] == (
+        entry["resources"]
+    )
     assert metadata["provider_directory_resource_page_count_caps"] == {
         resource_type: entry["manual_current_version_census"]["page_count"]
         for resource_type in entry["resources"]
@@ -146,7 +148,7 @@ def test_reviewed_manifest_seed_binds_exact_identity_without_cutoff():
     )
 
     request = current_version_census_request(
-        _exact_task(entry),
+        _reviewed_subset_task(entry),
         allowed_resources=importer.DEFAULT_RESOURCES,
         now=datetime.datetime(2026, 8, 2, tzinfo=datetime.UTC),
     )
@@ -165,6 +167,80 @@ def test_reviewed_manifest_seed_binds_exact_identity_without_cutoff():
     assert metadata[CURRENT_VERSION_CENSUS_START_URLS_FIELD] == entry[
         "manual_current_version_census"
     ]["start_urls"]
+
+
+@pytest.mark.parametrize("manual_only", (False, None))
+def test_reviewed_subset_manual_only_is_identity_bound(manual_only):
+    entry = _manual_entry()
+    seed_row = manual_catalog.reviewed_manual_census_seed_rows(
+        entry["source_ids"][0]
+    )[0]
+    source_record = importer._source_row_from_seed(seed_row)
+    original_contract = importer._twin_root_source_acquisition_contract(
+        source_record
+    )
+    mutated = copy.deepcopy(source_record)
+    metadata = mutated["metadata_json"]
+    if manual_only is None:
+        metadata.pop("provider_directory_manual_only")
+    else:
+        metadata["provider_directory_manual_only"] = manual_only
+
+    assert importer._is_reviewed_subset_source_metadata(metadata) is False
+    assert (
+        importer._twin_root_source_acquisition_contract(mutated)
+        != original_contract
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="artifact_subset_contract_invalid",
+    ):
+        importer._artifact_source_with_subset_contract(mutated, CUTOFF)
+
+    identity_sql = importer._artifact_subset_source_identity_sql(
+        "source.metadata_json::jsonb"
+    )
+    assert "provider_directory_manual_only" in identity_sql
+    assert "= 'true'::jsonb" in identity_sql
+
+
+def test_legacy_source_contract_hashes_remain_byte_exact():
+    legacy_source_record_by_field = {
+        "source_id": "legacy-source",
+        "api_base": "https://legacy.example.test/fhir",
+        "canonical_api_base": "https://legacy.example.test/fhir",
+        "metadata_json": {
+            "provider_directory_supported_resources": ["Organization"],
+            "provider_directory_fully_enumerable_resources": ["Organization"],
+            "provider_directory_expected_nonempty_resources": ["Organization"],
+            "provider_directory_resource_page_count_caps": {"Organization": 100},
+            "provider_directory_page_count_caps": {"Organization": 100},
+            "provider_directory_resource_page_count_cap": 100,
+            "provider_directory_acquisition_enabled": True,
+            "provider_directory_coverage_mode": "exhaustive",
+        },
+    }
+    twin_contract = importer._twin_root_source_acquisition_contract(
+        legacy_source_record_by_field
+    )
+    artifact_contract = importer._artifact_source_verification_contract(
+        legacy_source_record_by_field,
+        verification_campaign_id=None,
+        verification_source_scope_hash=None,
+        source_ids=("legacy-source",),
+        completion_proof_cutoff=None,
+    )
+
+    def digest(contract):
+        identity = importer._stable_identity_json(contract).encode("utf-8")
+        return hashlib.sha256(identity).hexdigest()
+
+    assert digest(twin_contract) == (
+        "122e90674eb2537f48013790fc1f7f4a324de6c8eeeaf3d54b1f3ab7f46eec35"
+    )
+    assert digest(artifact_contract) == (
+        "268326d29dd8c07f7cbb0b757f258401bea0da796b3ab28c463f044ea2629481"
+    )
 
 
 def test_reviewed_manual_source_is_protected_from_catalog_cleanup():
@@ -241,7 +317,7 @@ class _CatalogResolved(Exception):
 
 
 @pytest.mark.asyncio
-async def test_exact_process_uses_only_the_reviewed_local_catalog(monkeypatch):
+async def test_subset_process_uses_only_the_reviewed_local_catalog(monkeypatch):
     entry = _manual_entry()
     _clear_catalog_and_credential_environment(monkeypatch)
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
@@ -268,7 +344,7 @@ async def test_exact_process_uses_only_the_reviewed_local_catalog(monkeypatch):
     resolver_mock_by_name = {
         resolver_name: Mock(
             side_effect=AssertionError(
-                f"{resolver_name} must not resolve an exact census source"
+                    f"{resolver_name} must not resolve a reviewed subset source"
             )
         )
         for resolver_name in (
@@ -290,7 +366,7 @@ async def test_exact_process_uses_only_the_reviewed_local_catalog(monkeypatch):
     with pytest.raises(_CatalogResolved):
         await importer.process_provider_directory_fhir_data(
             {"context": {}},
-            _exact_task(entry),
+            _reviewed_subset_task(entry),
         )
 
     for resolver_mock in resolver_mock_by_name.values():
@@ -302,7 +378,7 @@ async def test_exact_process_uses_only_the_reviewed_local_catalog(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_exact_process_rejects_arbitrary_seed_database_before_io(
+async def test_subset_process_rejects_arbitrary_seed_database_before_io(
     monkeypatch,
     tmp_path,
 ):
@@ -317,7 +393,7 @@ async def test_exact_process_rejects_arbitrary_seed_database_before_io(
     ):
         await importer.process_provider_directory_fhir_data(
             {"context": {}},
-            _exact_task(
+            _reviewed_subset_task(
                 entry,
                 seed_db_path=str(tmp_path / "alternate.sqlite"),
             ),
@@ -327,7 +403,7 @@ async def test_exact_process_rejects_arbitrary_seed_database_before_io(
 
 
 @pytest.mark.asyncio
-async def test_exact_runtime_preflight_precedes_reviewed_catalog_resolution(
+async def test_subset_runtime_preflight_precedes_catalog_resolution(
     monkeypatch,
 ):
     entry = _manual_entry()
@@ -344,7 +420,7 @@ async def test_exact_runtime_preflight_precedes_reviewed_catalog_resolution(
     with pytest.raises(ValueError, match="census_runtime_invalid"):
         await importer.process_provider_directory_fhir_data(
             {"context": {}},
-            _exact_task(entry, full_refresh=False),
+            _reviewed_subset_task(entry, full_refresh=False),
         )
 
     catalog_loader.assert_not_called()
@@ -369,7 +445,10 @@ async def test_unknown_manual_source_rejects_before_database_or_cancellation(
     with pytest.raises(RuntimeError, match="source_resolution_ambiguous"):
         await importer.process_provider_directory_fhir_data(
             {"context": {}},
-            _exact_task(entry, source_ids=["synthetic-unknown-source"]),
+            _reviewed_subset_task(
+                entry,
+                source_ids=["synthetic-unknown-source"],
+            ),
         )
 
     cancellation_check.assert_not_awaited()

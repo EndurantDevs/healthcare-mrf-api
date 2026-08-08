@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Execution proofs for a reviewed current-version Provider Directory census."""
+"""Execution proofs for reviewed current-version Provider Directory traversal."""
 
 from __future__ import annotations
 
@@ -26,9 +26,14 @@ from process.provider_directory_fhir_census_page_geometry import (
     current_version_census_terminal_page_geometry,
     validate_census_page_entries,
 )
+from process.provider_directory_fhir_subset_execution import (
+    has_valid_subset_completed_fields,
+    subset_completed_fields,
+)
 
 
 CURRENT_VERSION_CENSUS_FETCH_MODE = "current_version_exact_census"
+SERVER_ISSUED_SUBSET_FETCH_MODE = "server_issued_traversal_subset"
 CURRENT_VERSION_CENSUS_BLOCKED_ERROR = (
     "provider_directory_current_version_census_completeness_blocked"
 )
@@ -86,7 +91,7 @@ def current_version_census_initial_proof(
     *,
     expected_page_count: int,
 ) -> dict[str, Any]:
-    """Create the durable pre-census proof bound to the admitted contract."""
+    """Create the durable initial proof bound to the admitted contract."""
 
     if resource_type not in contract.resources:
         raise ValueError(
@@ -96,7 +101,11 @@ def current_version_census_initial_proof(
         raise ValueError(
             "provider_directory_current_version_census_pre_count_invalid"
         )
-    return {
+    if contract.page_count is not None and expected_page_count != contract.page_count:
+        raise ValueError(
+            "provider_directory_current_version_census_page_count_identity_mismatch"
+        )
+    initial_proof_by_field = {
         "strategy_version": contract.strategy_version,
         "contract_identity": current_version_census_proof_identity(contract),
         "cutoff": contract.cutoff,
@@ -107,6 +116,20 @@ def current_version_census_initial_proof(
             current_version_census_initial_page_geometry(expected_page_count)
         ),
     }
+    if contract.is_server_issued_subset_v3:
+        initial_proof_by_field.update(
+            contract_version=contract.contract_version,
+            semantics=contract.semantics,
+            traversal_version=contract.traversal_version,
+            canonicalization_version=contract.canonicalization_version,
+            completion_scopes=list(contract.completion_scopes),
+            page_count=expected_page_count,
+            campaign_id=contract.campaign_id,
+            page_entry_counts=[],
+            continuation_hop_sha256=[],
+            continuation_shape_sha256=[],
+        )
+    return initial_proof_by_field
 
 
 def current_version_census_persisted_pre_count(
@@ -124,6 +147,16 @@ def current_version_census_persisted_pre_count(
         "cutoff": contract.cutoff,
         "resource_type": resource_type,
     }
+    if contract.is_server_issued_subset_v3:
+        expected_by_field.update(
+            contract_version=contract.contract_version,
+            semantics=contract.semantics,
+            traversal_version=contract.traversal_version,
+            canonicalization_version=contract.canonicalization_version,
+            completion_scopes=list(contract.completion_scopes),
+            page_count=contract.page_count,
+            campaign_id=contract.campaign_id,
+        )
     if any(
         completeness.get(field_name) != expected_value
         for field_name, expected_value in expected_by_field.items()
@@ -157,17 +190,39 @@ def _current_version_census_failure(
     return None
 
 
-def current_version_census_completed_proof(
-    initial_proof: Mapping[str, Any],
+def _completion_failure(
+    is_subset_v3: bool,
     *,
+    pre_count: int,
     post_count: int,
     processed_rows: int,
     unique_candidate_rows: int,
-    pages_processed: int,
-    expected_page_count: int,
-    terminal_page_entry_count: int,
-) -> dict[str, Any]:
-    """Require advertised-total equality before marking a resource verified."""
+) -> str | None:
+    """Return the exact or declared-subset terminal failure code."""
+
+    if not is_subset_v3:
+        return _current_version_census_failure(
+            pre_count=pre_count,
+            post_count=post_count,
+            processed_rows=processed_rows,
+            unique_candidate_rows=unique_candidate_rows,
+        )
+    if post_count != pre_count:
+        return "census_drift"
+    if processed_rows != unique_candidate_rows:
+        return "duplicate_resource_ids"
+    if unique_candidate_rows > pre_count:
+        return "returned_count_exceeds_advertised"
+    return None
+
+
+def _validated_completion_counts(
+    initial_proof: Mapping[str, Any],
+    post_count: int,
+    processed_rows: int,
+    unique_candidate_rows: int,
+) -> dict[str, int]:
+    """Return nonnegative integer counters without bool coercion."""
 
     count_by_name = {
         "pre_count": initial_proof.get("pre_count"),
@@ -182,6 +237,53 @@ def current_version_census_completed_proof(
         raise ValueError(
             "provider_directory_current_version_census_proof_count_invalid"
         )
+    return count_by_name
+
+
+def _completed_proof_by_field(
+    initial_proof: Mapping[str, Any],
+    count_by_name: Mapping[str, int],
+    terminal_page_geometry: Mapping[str, Any],
+    failure: str | None,
+) -> dict[str, Any]:
+    reusable_proof_by_field = {
+        field_name: field_value
+        for field_name, field_value in initial_proof.items()
+        if field_name not in {"failure", "last_terminal_page_geometry"}
+    }
+    return {
+        **reusable_proof_by_field,
+        "post_count": count_by_name["post_count"],
+        "processed_rows": count_by_name["processed_rows"],
+        "unique_candidate_rows": count_by_name["unique_candidate_rows"],
+        "unreturned_count": max(
+            count_by_name["pre_count"]
+            - count_by_name["unique_candidate_rows"],
+            0,
+        ),
+        "terminal_page_geometry": terminal_page_geometry,
+        "verified": failure is None,
+    }
+
+
+def current_version_census_completed_proof(
+    initial_proof: Mapping[str, Any],
+    *,
+    post_count: int,
+    processed_rows: int,
+    unique_candidate_rows: int,
+    pages_processed: int,
+    expected_page_count: int,
+    terminal_page_entry_count: int,
+) -> dict[str, Any]:
+    """Require advertised-total equality before marking a resource verified."""
+
+    count_by_name = _validated_completion_counts(
+        initial_proof,
+        post_count,
+        processed_rows,
+        unique_candidate_rows,
+    )
     pre_count = count_by_name["pre_count"]
     terminal_page_geometry = current_version_census_terminal_page_geometry(
         initial_proof,
@@ -190,26 +292,31 @@ def current_version_census_completed_proof(
         expected_page_count=expected_page_count,
         terminal_page_entry_count=terminal_page_entry_count,
     )
-    failure = _current_version_census_failure(
+    is_subset_v3 = initial_proof.get("contract_version") == 3
+    failure = _completion_failure(
+        is_subset_v3,
         pre_count=pre_count,
         post_count=post_count,
         processed_rows=processed_rows,
         unique_candidate_rows=unique_candidate_rows,
     )
-    reusable_proof_by_field = {
-        field_name: field_value
-        for field_name, field_value in initial_proof.items()
-        if field_name not in {"failure", "last_terminal_page_geometry"}
-    }
-    completed_proof_by_field = {
-        **reusable_proof_by_field,
-        "post_count": post_count,
-        "processed_rows": processed_rows,
-        "unique_candidate_rows": unique_candidate_rows,
-        "unreturned_count": max(pre_count - unique_candidate_rows, 0),
-        "terminal_page_geometry": terminal_page_geometry,
-        "verified": failure is None,
-    }
+    completed_proof_by_field = _completed_proof_by_field(
+        initial_proof,
+        count_by_name,
+        terminal_page_geometry,
+        failure,
+    )
+    if is_subset_v3:
+        completed_proof_by_field.update(
+            subset_completed_fields(
+                initial_proof,
+                pre_count=pre_count,
+                post_count=post_count,
+                unique_candidate_rows=unique_candidate_rows,
+                pages_processed=pages_processed,
+                terminal_page_entry_count=terminal_page_entry_count,
+            )
+        )
     if failure is not None:
         completed_proof_by_field["failure"] = failure
     return completed_proof_by_field
@@ -231,6 +338,16 @@ def _has_valid_completed_counts(count_by_name: Mapping[str, Any]) -> bool:
     ):
         return False
     return len(set(count_by_name.values())) == 1
+
+
+def _has_valid_subset_counts(count_by_name: Mapping[str, Any]) -> bool:
+    return bool(
+        all(type(count) is int and count >= 0 for count in count_by_name.values())
+        and count_by_name["pre_count"] == count_by_name["post_count"]
+        and count_by_name["processed_rows"]
+        == count_by_name["unique_candidate_rows"]
+        and count_by_name["unique_candidate_rows"] <= count_by_name["pre_count"]
+    )
 
 
 def _has_valid_terminal_geometry(
@@ -291,7 +408,7 @@ def validated_current_version_census_completed_proof(
     rows_processed: int | None = None,
     pages_processed: int | None = None,
 ) -> dict[str, Any]:
-    """Require a complete, identity-bound four-way census proof."""
+    """Require an identity-bound terminal proof and its count equations."""
 
     current_version_census_persisted_pre_count(
         completeness,
@@ -299,8 +416,24 @@ def validated_current_version_census_completed_proof(
         resource_type,
     )
     count_by_name = _completed_count_map(completeness)
+    is_subset_v3 = contract.is_server_issued_subset_v3
+    has_valid_counts = (
+        _has_valid_subset_counts(count_by_name)
+        if is_subset_v3
+        else _has_valid_completed_counts(count_by_name)
+    )
+    has_valid_subset_fields = (
+        has_valid_subset_completed_fields(
+            completeness,
+            count_by_name,
+            contract.page_count,
+        )
+        if is_subset_v3
+        else True
+    )
     has_valid_proof = bool(
-        _has_valid_completed_counts(count_by_name)
+        has_valid_counts
+        and has_valid_subset_fields
         and _has_valid_terminal_geometry(
             completeness,
             count_by_name,
