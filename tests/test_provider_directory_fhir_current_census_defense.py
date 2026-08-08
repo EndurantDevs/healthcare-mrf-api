@@ -399,7 +399,6 @@ def _exact_census_task():
         "linked_resource_deadline_seconds": 0,
         "resource_deadline_seconds": 0,
         "probe": True,
-        "seed_db_path": "/tmp/synthetic-provider-directory.sqlite",
         "bulk_export": False,
         "stale_cleanup": False,
         "publish_artifacts": False,
@@ -447,6 +446,7 @@ async def test_credential_environment_is_rejected_before_database(
         "_ensure_provider_directory_tables",
         table_setup_mock,
     )
+    monkeypatch.setattr(importer, "reviewed_manual_census_seed_rows", lambda _source_id: [{}])
 
     with pytest.raises(ValueError, match="runtime_invalid:credential_config"):
         await importer.process_provider_directory_fhir_data(

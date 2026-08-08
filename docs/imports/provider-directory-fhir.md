@@ -139,6 +139,75 @@ Use this sequence for a campaign or documentation review:
    evidence; it skips only the HTTP checks. Use `--api-latency-slo-ms 0` only
    for diagnostics where latency enforcement is deliberately disabled.
 
+### Manual current-version census sources
+
+An entry classified as `manual_acquisition` is reviewed acquisition input, not
+a generally runnable catalog source. It remains outside scheduled refreshes,
+the generic campaign launcher, the control API, and Profile publication. Its
+`manual_current_version_census` block pins the source identity, resource set,
+credential-free start URLs, opaque-continuation strategy, expected non-empty
+collections, and page count. The operator supplies the exclusive
+`_lastUpdated` cutoff at launch; a cutoff is never persisted in the manifest.
+
+Resolve the single reviewed manual entry from the manifest and freeze one
+timezone-aware cutoff for the acquisition pair:
+
+```bash
+MANUAL_ENTRY_JSON="$(jq -cer \
+  '[.entries[] | select(.classification == "manual_acquisition")] | if length == 1 then .[0] else error("expected exactly one reviewed manual entry") end' \
+  specs/provider_directory_endpoint_acquisition_manifest.json)"
+PROVIDER_DIRECTORY_MANUAL_SOURCE_ID="$(jq -r \
+  '.source_ids | if length == 1 then .[0] else error("expected one source id") end' \
+  <<<"$MANUAL_ENTRY_JSON")"
+PROVIDER_DIRECTORY_MANUAL_RESOURCES="$(jq -r '.resources | join(",")' \
+  <<<"$MANUAL_ENTRY_JSON")"
+PROVIDER_DIRECTORY_MANUAL_PAGE_COUNT="$(jq -r \
+  '.manual_current_version_census.page_count' <<<"$MANUAL_ENTRY_JSON")"
+PROVIDER_DIRECTORY_CENSUS_CUTOFF="<timezone-aware-ISO-8601-cutoff>"
+PROVIDER_DIRECTORY_CENSUS_RUN_ID="<globally-unique-first-root-run-id>"
+```
+
+Launch the acquisition only from the worker CLI. Do not add a seed database,
+retest catalog, supplemental catalog, credentials, bounded limits, concurrent
+resource cursors, stale cleanup, or publication flags:
+
+```bash
+python main.py start provider-directory-fhir \
+  --run-id "$PROVIDER_DIRECTORY_CENSUS_RUN_ID" \
+  --acquisition-strategy cutoff-bounded-current-version-census \
+  --census-cutoff "$PROVIDER_DIRECTORY_CENSUS_CUTOFF" \
+  --source-id "$PROVIDER_DIRECTORY_MANUAL_SOURCE_ID" \
+  --resources "$PROVIDER_DIRECTORY_MANUAL_RESOURCES" \
+  --import-resources \
+  --full-refresh \
+  --page-count "$PROVIDER_DIRECTORY_MANUAL_PAGE_COUNT" \
+  --resource-limit 0 \
+  --page-limit 0 \
+  --resource-deadline-seconds 0 \
+  --linked-resource-limit 0 \
+  --linked-resource-deadline-seconds 0 \
+  --stream-batch-size 5000 \
+  --source-concurrency 1 \
+  --resource-scan-concurrency 1 \
+  --no-include-supplemental-catalogs \
+  --no-bulk-export \
+  --no-stale-cleanup \
+  --no-publish-artifacts \
+  --no-publish-corroboration \
+  --defer-typed-materialization
+```
+
+A successful run retains a verified candidate and its exact census proof but
+does not make the candidate current. Before running the same command a second
+time, set `PROVIDER_DIRECTORY_CENSUS_RUN_ID` to a different globally unique
+root ID while preserving the identical cutoff. Do not pass retry or
+pagination-root arguments for either fresh root. The two successful runs must
+have distinct acquisition roots and matching exhaustive content. A retry must
+use a new `--run-id` plus `--retry-of-run-id <previous-run-id>` and
+`--pagination-root-run-id <original-root-run-id>`; it resumes the original root
+and is not a second root. Publication, Profile admission, and API verification
+remain separate reviewed operations after the twin-root gate passes.
+
 ## Source
 
 The importer uses the public `provider-directory-db` SQLite catalog by default:

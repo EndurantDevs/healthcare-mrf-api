@@ -159,6 +159,7 @@ def _validate_endpoint_classification(
             True,
         ),
         "bulk_acquisition": ("acquisition-configured", {"bulk"}, True),
+        "manual_acquisition": ("acquisition-configured", {"rest"}, True),
         "probe_only": ("probe-only", {"probe"}, False),
         "external": ("externally-supported", {"graphql"}, False),
     }.get(classification)
