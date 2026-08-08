@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
-from process.formulary_fhir.types import MedicationRecord
+from process.formulary_fhir.types import AlternativeCorrection, MedicationRecord
 
 
 PublicationIntent = Literal["none", "requested", "seed"]
@@ -238,6 +238,10 @@ class AliasVersionWrite:
     expected_count: int
     medications: tuple[MedicationRecord, ...] = field(repr=False)
     fence_token: int
+    alternative_correction: AlternativeCorrection | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.dataset.source_id != self.alias.source_id:
@@ -248,6 +252,10 @@ class AliasVersionWrite:
             raise ValueError("FHIR formulary medications must be an exact tuple")
         if type(self.fence_token) is not int or self.fence_token <= 0:
             raise ValueError("FHIR formulary checkpoint fence is invalid")
+        if self.alternative_correction is not None and type(
+            self.alternative_correction
+        ) is not AlternativeCorrection:
+            raise ValueError("FHIR formulary alternative correction is invalid")
 
 
 @dataclass(frozen=True, slots=True)

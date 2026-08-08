@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "importer": "formulary-fhir",
+  "reviewed_at": "2026-08-08",
+  "source": {
+    "source_id": "fhir-formulary-primary",
+    "canonical_base": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc",
+    "display_name": "Kaiser Permanente Formulary FHIR",
+    "enabled": true,
+    "runtime_config_json": {
+      "timeout_seconds": 120,
+      "max_attempts": 3,
+      "page_size": 100,
+      "max_pages": 100000,
+      "max_total_resources": 10000000,
+      "max_response_bytes": 20971520
+    },
+    "metadata_json": {
+      "access_requirement": "none",
+      "alternative_reference_correction": {
+        "prefix": "MI-",
+        "rule_version": "mi-prefix-v1"
+      },
+      "fhir_release": "R4",
+      "launch_mode": "manual-library",
+      "publication_intent": "none",
+      "resource_types": [
+        "List",
+        "MedicationKnowledge"
+      ],
+      "verification_state": "pending-first-exhaustive-verification"
+    }
+  }
+}

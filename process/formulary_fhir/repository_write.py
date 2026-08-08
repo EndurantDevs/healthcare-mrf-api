@@ -11,6 +11,7 @@ from process.formulary_fhir.repository_batch import insert_alias_content
 from process.formulary_fhir.repository_checkpoint import require_alias
 from process.formulary_fhir.repository_checkpoint import save_checkpoint_row
 from process.formulary_fhir.repository_coverage import put_coverage_plan
+from process.formulary_fhir.repository_proof import source_medication_variant_hash
 from process.formulary_fhir.repository_shared import AliasRef
 from process.formulary_fhir.repository_shared import AliasVersionResult
 from process.formulary_fhir.repository_shared import AliasVersionWrite
@@ -20,7 +21,6 @@ from process.formulary_fhir.repository_shared import DatasetRef
 from process.formulary_fhir.repository_shared import PriorAliasState
 from process.formulary_fhir.repository_shared import json_text
 from process.formulary_fhir.repository_shared import lock_dataset
-from process.formulary_fhir.repository_shared import medication_variant_hash
 from process.formulary_fhir.repository_shared import membership_hash
 from process.formulary_fhir.repository_shared import persisted_membership_proof
 from process.formulary_fhir.repository_shared import row_mapping
@@ -58,7 +58,10 @@ def _prepare_alias_version(
     if len(medications_by_id) != write.expected_count:
         raise RuntimeError("FHIR formulary exact alias count is inconsistent")
     variants_by_id = {
-        medication_id: medication_variant_hash(medication)
+        medication_id: source_medication_variant_hash(
+            medication,
+            write.alternative_correction,
+        )
         for medication_id, medication in medications_by_id.items()
     }
     computed_hash = membership_hash(variants_by_id)
@@ -217,6 +220,7 @@ async def _persist_full_alias(
         alias_version_id,
         prepared.medications_by_id,
         prepared.variants_by_id,
+        alternative_correction=write.alternative_correction,
     )
     await _assert_persisted_membership(
         database,

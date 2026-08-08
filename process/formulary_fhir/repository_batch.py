@@ -13,6 +13,7 @@ from process.formulary_fhir.repository_shared import json_text
 from process.formulary_fhir.repository_shared import row_mapping
 from process.formulary_fhir.repository_shared import stable_id
 from process.formulary_fhir.repository_shared import table_name
+from process.formulary_fhir.types import AlternativeCorrection
 from process.formulary_fhir.types import MedicationRecord
 
 
@@ -228,12 +229,15 @@ async def _insert_memberships(
 def _alternative_rows(
     medications: Sequence[MedicationRecord],
     known_medication_ids: set[str],
+    *,
+    correction: AlternativeCorrection | None = None,
 ) -> list[tuple[str, Any]]:
     alternative_rows: list[tuple[str, Any]] = []
     for medication in medications:
         evidence_rows = resolve_alternative_references(
             medication.alternative_references,
             known_medication_ids=known_medication_ids,
+            correction=correction,
         )
         alternative_rows.extend(
             (medication.upstream_medication_id, evidence)
@@ -359,6 +363,8 @@ async def insert_alias_content(
     alias_version_id: str,
     medications_by_id: Mapping[str, MedicationRecord],
     variants_by_id: Mapping[str, str],
+    *,
+    alternative_correction: AlternativeCorrection | None = None,
 ) -> None:
     """Persist one exact alias in bounded statements inside one transaction."""
 
@@ -374,7 +380,11 @@ async def insert_alias_content(
         medications,
         variants_by_id,
     )
-    alternative_rows = _alternative_rows(medications, set(variants_by_id))
+    alternative_rows = _alternative_rows(
+        medications,
+        set(variants_by_id),
+        correction=alternative_correction,
+    )
     await _insert_alternatives(database, alias_version_id, alternative_rows)
     await _assert_alternatives(
         database,

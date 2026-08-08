@@ -46,6 +46,32 @@ def test_manual_adapter_is_manage_only_and_never_publishes():
         assert "verify-formulary-fhir" not in runtime_source
 
 
+def test_reviewed_candidate_is_library_only_and_never_publishes():
+    candidate_source = (
+        ROOT / "process" / "formulary_fhir" / "reviewed_source.py"
+    ).read_text(encoding="utf-8")
+    assert 'intent="none"' in candidate_source
+    assert "publish_dataset" not in candidate_source
+    assert "publish_verified_seed" not in candidate_source
+    synchronizer_source = (
+        ROOT / "process" / "formulary_fhir" / "synchronizer.py"
+    ).read_text(encoding="utf-8")
+    assert "LIBRARY_ONLY_LAUNCH_MODE" in synchronizer_source
+    assert "reviewed synchronization" in synchronizer_source
+    runtime_paths = [
+        ROOT / "main.py",
+        ROOT / "process" / "__init__.py",
+        ROOT / "process" / "formulary_fhir" / "__init__.py",
+        ROOT / "api" / "control_imports.py",
+        ROOT / "api" / "control_workers.py",
+    ]
+    runtime_paths.extend((ROOT / "api" / "endpoint").glob("*.py"))
+    for runtime_path in runtime_paths:
+        runtime_source = runtime_path.read_text(encoding="utf-8")
+        assert "verify_reviewed_source_candidate" not in runtime_source
+        assert "register_reviewed_source" not in runtime_source
+
+
 def test_synthetic_canary_is_smoke_only_socket_free_and_never_publishes():
     canary_source = (
         ROOT / "process" / "formulary_fhir" / "synthetic_canary.py"
