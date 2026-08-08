@@ -31,8 +31,11 @@ from process.formulary_fhir.repository_shared import PublicationIntent
 from process.formulary_fhir.repository_shared import strict_text
 from process.formulary_fhir.repository_shared import utc_timestamp
 from process.formulary_fhir.source import EnabledSourceBinding
+from process.formulary_fhir.source import LIBRARY_ONLY_LAUNCH_MODE
 from process.formulary_fhir.source import load_enabled_source
 from process.formulary_fhir.source import require_source_unchanged
+from process.formulary_fhir.types import AlternativeCorrection
+from process.formulary_fhir.types import FHIRSourceConfigurationError
 from sqlalchemy import exc as sqlalchemy_error
 
 
@@ -170,27 +173,29 @@ async def _write_alias_plan(
     alias_plan: AliasCensusPlan,
     prior: PriorAliasState | None,
     fence_token: int,
+    alternative_correction: AlternativeCorrection | None = None,
 ) -> _AliasOutcome:
     if alias_plan.mode == "reuse":
         if prior is None:
             raise RuntimeError("FHIR formulary alias reuse has no predecessor")
-        result = await repository.link_reused_alias(
+        alias_result = await repository.link_reused_alias(
             dataset=dataset,
             alias=work_item.alias,
             prior=prior,
             fence_token=fence_token,
         )
     else:
-        result = await repository.put_alias_version(
+        alias_result = await repository.put_alias_version(
             AliasVersionWrite(
                 dataset=dataset,
                 alias=work_item.alias,
                 expected_count=alias_plan.expected_count,
                 medications=alias_plan.medications,
                 fence_token=fence_token,
+                alternative_correction=alternative_correction,
             )
         )
-    _require_alias_result(result, dataset, work_item.alias, alias_plan)
+    _require_alias_result(alias_result, dataset, work_item.alias, alias_plan)
     return _AliasOutcome(alias_plan.mode, alias_plan.expected_count, False)
 
 
@@ -244,6 +249,7 @@ async def _synchronize_alias(
         alias_plan,
         prior,
         completion_fence.fence_token,
+        binding.alternative_correction,
     )
 
 
@@ -411,6 +417,10 @@ async def synchronize_verified_dataset(
     normalized_run_id = strict_text(run_id, "run id", 64)
     cutoff_at = utc_timestamp(cutoff, "synchronization cutoff")
     binding = await load_enabled_source(normalized_source_id, database=database)
+    if binding.launch_mode == LIBRARY_ONLY_LAUNCH_MODE:
+        raise FHIRSourceConfigurationError(
+            "FHIR formulary source requires reviewed synchronization"
+        )
     repository = FHIRFormularyRepository(
         source_id=normalized_source_id,
         database=database,

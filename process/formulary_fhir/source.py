@@ -14,12 +14,15 @@ from process.formulary_fhir.repository_shared import row_mapping
 from process.formulary_fhir.repository_shared import strict_hash
 from process.formulary_fhir.repository_shared import strict_text
 from process.formulary_fhir.repository_shared import table_name
+from process.formulary_fhir.types import AlternativeCorrection
 from process.formulary_fhir.types import FHIRSourceConfigurationError
 from process.formulary_fhir.types import FormularySourceConfig
 from process.formulary_fhir.types import enabled_source_config
 
 
 SOURCE_CONFIGURATION_DOMAIN = "fhir-formulary-source-configuration-v1"
+ALTERNATIVE_CORRECTION_METADATA_FIELD = "alternative_reference_correction"
+LIBRARY_ONLY_LAUNCH_MODE = "manual-library"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -29,12 +32,23 @@ class EnabledSourceBinding:
     source_id: str
     config: FormularySourceConfig = field(repr=False)
     configuration_hash: str = field(repr=False)
+    alternative_correction: AlternativeCorrection | None = field(
+        default=None,
+        repr=False,
+    )
+    launch_mode: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         strict_text(self.source_id, "source id", 64)
         if type(self.config) is not FormularySourceConfig:
             raise ValueError("FHIR formulary source binding is invalid")
         strict_hash(self.configuration_hash, "source configuration hash")
+        if self.alternative_correction is not None and type(
+            self.alternative_correction
+        ) is not AlternativeCorrection:
+            raise ValueError("FHIR formulary source binding is invalid")
+        if self.launch_mode is not None:
+            strict_text(self.launch_mode, "source launch mode", 64)
 
     def __repr__(self) -> str:
         return (
@@ -72,6 +86,35 @@ def _configuration_hash(
     return digest.hexdigest()
 
 
+def _alternative_correction(
+    metadata_by_field: dict[str, Any],
+) -> AlternativeCorrection | None:
+    if ALTERNATIVE_CORRECTION_METADATA_FIELD not in metadata_by_field:
+        return None
+    correction_by_field = metadata_by_field[
+        ALTERNATIVE_CORRECTION_METADATA_FIELD
+    ]
+    if type(correction_by_field) is not dict or set(correction_by_field) != {
+        "prefix",
+        "rule_version",
+    }:
+        raise ValueError("source correction metadata mismatch")
+    return AlternativeCorrection(
+        prefix=correction_by_field.get("prefix"),
+        rule_version=correction_by_field.get("rule_version"),
+    )
+
+
+def _launch_mode(metadata_by_field: dict[str, Any]) -> str | None:
+    if "launch_mode" not in metadata_by_field:
+        return None
+    raw_launch_mode = metadata_by_field.get("launch_mode")
+    launch_mode = strict_text(raw_launch_mode, "source launch mode", 64)
+    if launch_mode != LIBRARY_ONLY_LAUNCH_MODE:
+        raise ValueError("source launch mode mismatch")
+    return launch_mode
+
+
 def _binding_from_row(
     source_id: str,
     source_by_field: dict[str, Any],
@@ -95,6 +138,8 @@ def _binding_from_row(
                 source_by_field,
                 metadata_by_field,
             ),
+            alternative_correction=_alternative_correction(metadata_by_field),
+            launch_mode=_launch_mode(metadata_by_field),
         )
     except (TypeError, ValueError, RuntimeError):
         raise FHIRSourceConfigurationError(
@@ -141,7 +186,9 @@ async def require_source_unchanged(
 
 
 __all__ = (
+    "ALTERNATIVE_CORRECTION_METADATA_FIELD",
     "EnabledSourceBinding",
+    "LIBRARY_ONLY_LAUNCH_MODE",
     "load_enabled_source",
     "require_source_unchanged",
 )

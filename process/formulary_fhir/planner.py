@@ -14,9 +14,9 @@ from process.formulary_fhir.continuation import coverage_plan_search_contract
 from process.formulary_fhir.continuation import medication_search_contract
 from process.formulary_fhir.parser import parse_coverage_plan
 from process.formulary_fhir.parser import parse_medication_knowledge
+from process.formulary_fhir.repository_proof import source_medication_variant_hash
 from process.formulary_fhir.repository_shared import PriorAliasState
 from process.formulary_fhir.repository_shared import json_text
-from process.formulary_fhir.repository_shared import medication_variant_hash
 from process.formulary_fhir.repository_shared import membership_hash
 from process.formulary_fhir.source import EnabledSourceBinding
 from process.formulary_fhir.types import CoveragePlanRecord
@@ -289,7 +289,10 @@ def plan_alias_census(
     )
     medications = _parsed_medications(census, work.source_plan_identifier)
     variants_by_medication_id = {
-        medication.upstream_medication_id: medication_variant_hash(medication)
+        medication.upstream_medication_id: source_medication_variant_hash(
+            medication,
+            binding.alternative_correction,
+        )
         for medication in medications
     }
     computed_membership_hash = membership_hash(variants_by_medication_id)

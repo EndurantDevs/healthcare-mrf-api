@@ -17,6 +17,7 @@ from process.formulary_fhir.planner import plan_alias_census
 from process.formulary_fhir.planner import plan_coverage_census
 from process.formulary_fhir.repository import PriorAliasState
 from process.formulary_fhir.source import EnabledSourceBinding
+from process.formulary_fhir.types import AlternativeCorrection
 from process.formulary_fhir.types import CurrentVersionCensus
 from process.formulary_fhir.types import enabled_source_config
 
@@ -29,7 +30,9 @@ def _fixture(name: str) -> dict[str, object]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
-def _binding() -> EnabledSourceBinding:
+def _binding(
+    correction: AlternativeCorrection | None = None,
+) -> EnabledSourceBinding:
     config = enabled_source_config(
         canonical_base="https://synthetic.invalid/fhir",
         enabled=True,
@@ -42,7 +45,12 @@ def _binding() -> EnabledSourceBinding:
             "max_response_bytes": 1_048_576,
         },
     )
-    return EnabledSourceBinding("source-alpha", config, "a" * 64)
+    return EnabledSourceBinding(
+        "source-alpha",
+        config,
+        "a" * 64,
+        alternative_correction=correction,
+    )
 
 
 def _coverage_census(
@@ -192,6 +200,49 @@ def test_alias_plan_uses_full_membership_hash_for_reuse():
     assert full_plan.mode == "full"
     assert reuse_plan.mode == "reuse"
     assert changed_plan.mode == "full"
+
+
+def test_correction_policy_is_bound_to_membership_reuse_proof():
+    uncorrected_binding = _binding()
+    corrected_binding = _binding(
+        AlternativeCorrection(prefix="PRE-", rule_version="prefix-rule-v1")
+    )
+    coverage_plan = plan_coverage_census(
+        corrected_binding,
+        _coverage_census((_one_alias_plan(),)),
+        CUTOFF,
+    )
+    work = coverage_plan.work_items[0]
+    census = _medication_census("SYNTH-A", (_medication("SYNTH-A"),))
+    uncorrected_plan = plan_alias_census(
+        uncorrected_binding,
+        work,
+        census,
+        CUTOFF,
+        None,
+    )
+    prior = PriorAliasState(
+        source_id="source-alpha",
+        public_id=work.plan.public_id,
+        alias_id="ffa_" + "1" * 48,
+        source_plan_identifier="SYNTH-A",
+        alias_version_id="ffav_" + "2" * 48,
+        expected_count=1,
+        cutoff_at=CUTOFF - dt.timedelta(days=1),
+        variants_by_medication_id={},
+        membership_hash=uncorrected_plan.membership_hash,
+    )
+
+    corrected_plan = plan_alias_census(
+        corrected_binding,
+        work,
+        census,
+        CUTOFF,
+        prior,
+    )
+
+    assert corrected_plan.membership_hash != uncorrected_plan.membership_hash
+    assert corrected_plan.mode == "full"
 
 
 def test_alias_plan_rejects_crossed_duplicates_and_contract_mismatch():

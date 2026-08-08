@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +50,7 @@ SOURCE_RUNTIME_BOUNDS = {
     "max_total_resources": (1, 10_000_000),
     "max_response_bytes": (1_024, 20 * 1_024 * 1_024),
 }
+ALTERNATIVE_CORRECTION_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9.-]{1,16}\Z")
 
 
 class FHIRSourceConfigurationError(ValueError):
@@ -222,6 +224,18 @@ class MedicationPolicyFields:
 class AlternativeCorrection:
     prefix: str = field(repr=False)
     rule_version: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.prefix) is not str
+            or not ALTERNATIVE_CORRECTION_PREFIX_PATTERN.fullmatch(self.prefix)
+            or type(self.rule_version) is not str
+            or not self.rule_version
+            or len(self.rule_version) > 64
+            or self.rule_version != self.rule_version.strip()
+            or any(not character.isprintable() for character in self.rule_version)
+        ):
+            raise ValueError("FHIR alternative correction policy is invalid")
 
     def __repr__(self) -> str:
         return f"AlternativeCorrection(rule_version={self.rule_version!r})"
