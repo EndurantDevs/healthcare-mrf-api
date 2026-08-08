@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import control_import_wave_supersession as supersession
+from api import control_import_wave_recovery as recovery
 from api import control_import_waves as waves
 from db.models import PTGImportWaveSupersession
 from tests.test_control_import_waves_persistence import (
@@ -33,6 +34,16 @@ async def test_recovery_admission_revalidates_and_persists_supersession_first(
 ):
     session = _Session(_Result(rows=[]))
     request, _wave = _install_admission_dependencies(monkeypatch, session)
+    monkeypatch.setattr(
+        recovery,
+        "find_admission_retirement_collision",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        waves,
+        "persist_admission_recoveries",
+        recovery.persist_admission_recoveries,
+    )
     supersession_proof_map = {
         "predecessor": {"wave_id": "predecessor-wave"},
         "proof_digest": "d" * 64,

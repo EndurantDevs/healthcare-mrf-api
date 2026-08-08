@@ -412,6 +412,7 @@ def _install_admission_dependencies(monkeypatch, session, *, prepared=None):
     monkeypatch.setattr(waves, "require_source_attempt_capabilities", AsyncMock())
     monkeypatch.setattr(waves, "guard_source_attempt", AsyncMock())
     monkeypatch.setattr(waves, "acquire_ptg_admission_lock", AsyncMock())
+    monkeypatch.setattr(waves, "persist_admission_recoveries", AsyncMock())
     monkeypatch.setattr(waves, "require_wave_admission_capacity", AsyncMock())
     monkeypatch.setattr(waves, "_new_wave_record", Mock(return_value=wave))
     monkeypatch.setattr(waves, "_persist_wave_intents", AsyncMock())

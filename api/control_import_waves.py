@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from api.control_frozen_rate_files import validated_control_import_payload
 from api.control_import_wave_attestation import (
     ATTESTATION_VERSION,
+    ROLLBACK_ATTESTATION_VERSION,
     SUPERSESSION_ATTESTATION_VERSION,
     _canonical,
     _identifier,
@@ -34,9 +35,9 @@ from api.control_imports import (
 )
 from api import control_import_wave_direct as direct_wave
 from api.control_import_wave_response import wave_response as _wave_response
-from api.control_import_wave_supersession import (
-    persist_admission_supersession,
-    validate_admission_supersession,
+from api.control_import_wave_recovery import (
+    persist_admission_recoveries,
+    validate_admission_recovery_proofs,
 )
 from db.models import (
     ImportRun,
@@ -253,7 +254,10 @@ def validate_import_wave_payload(
         attestation["intents"],
         wave_id=wave_id,
     )
-    supersession = validate_admission_supersession(attestation, wave_id=wave_id)
+    supersession, admission_rollback = validate_admission_recovery_proofs(
+        attestation,
+        wave_id=wave_id,
+    )
     if partition["imported_coordinate_count"] != len(intents):
         raise ValueError("partition imported_coordinate_count must equal signed intent count")
     imported_coordinate_digest = _sha256(
@@ -273,7 +277,7 @@ def validate_import_wave_payload(
     }
     request_digest = _sha256(_canonical(unsigned_attestation_map))
     wave_digest = _sha256((PROTOCOL_IDENTITY + "\0" + request_digest).encode())
-    return {
+    validated_request_map = {
         "wave_id": wave_id, "idempotency_key": idempotency_key,
         "attestation": attestation, "snapshot": snapshot, "partition": partition,
         "supersession": supersession,
@@ -282,6 +286,11 @@ def validate_import_wave_payload(
         "signature_digest": _sha256(attestation["signature"].encode()),
         "wave_digest": wave_digest, "release_queue": f"{QUEUE}:wave:{wave_digest}",
     }
+    if attestation["schema_version"] == ROLLBACK_ATTESTATION_VERSION:
+        validated_request_map["admission_rollback_supersession"] = (
+            admission_rollback
+        )
+    return validated_request_map
 
 
 class _SessionExecutor:
@@ -444,7 +453,7 @@ async def admit_import_wave(
             if existing.request_digest != request["request_digest"]:
                 raise ImportWaveConflict("wave_id or idempotency_key conflicts with immutable request digest")
             return _wave_response(existing), False
-        await persist_admission_supersession(
+        await persist_admission_recoveries(
             session,
             request,
             now=now,
@@ -481,6 +490,6 @@ async def get_import_wave(wave_id: str) -> dict[str, Any] | None:
 
 
 __all__ = [
-    "ATTESTATION_VERSION", "SUPERSESSION_ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
+    "ATTESTATION_VERSION", "ROLLBACK_ATTESTATION_VERSION", "SUPERSESSION_ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
     "sign_cohort_attestation", "validate_import_wave_payload",
 ]

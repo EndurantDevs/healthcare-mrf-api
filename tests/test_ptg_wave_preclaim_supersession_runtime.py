@@ -313,6 +313,34 @@ async def test_logical_preclaim_route_is_get_only_and_forwards_exact_query(
 
 
 @pytest.mark.asyncio
+async def test_logical_preclaim_route_maps_observation_drift_to_conflict(
+    monkeypatch,
+):
+    monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
+    monkeypatch.setattr(
+        routes,
+        "get_logical_preclaim_supersession_candidate",
+        AsyncMock(
+            side_effect=PTGWavePreclaimSupersessionConflict(
+                "logical predecessor state changed"
+            )
+        ),
+    )
+    request = SimpleNamespace(
+        args={"successor_wave_id": "successor-wave"},
+        app=SimpleNamespace(ctx=SimpleNamespace(ptg_wave_redis=object())),
+    )
+
+    with pytest.raises(SanicException) as exc_info:
+        await routes.control_get_logical_preclaim_supersession(
+            request,
+            "predecessor-wave",
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_admission_route_maps_locked_proof_drift_to_conflict(monkeypatch):
     monkeypatch.setattr(routes, "require_control_auth", lambda _request: None)
     monkeypatch.setattr(

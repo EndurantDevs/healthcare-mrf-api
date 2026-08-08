@@ -137,6 +137,8 @@ def test_wave_redis_startup_stagger_is_exact_for_twelve_slots() -> None:
     assert [_slot_stagger_seconds(slot) for slot in PTG_SMALL_WAVE_SLOTS] == [
         slot / 4 for slot in PTG_SMALL_WAVE_SLOTS
     ]
+    with pytest.raises(PTGSmallWaveValidationError, match="wave slot"):
+        _slot_stagger_seconds(True)
 
 
 @pytest.mark.asyncio
