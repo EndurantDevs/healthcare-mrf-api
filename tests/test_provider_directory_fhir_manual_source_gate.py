@@ -89,7 +89,7 @@ async def test_census_request_rejects_before_database_or_transport(monkeypatch):
     monkeypatch.setattr(importer, "_run_source_probe_batch", probe_mock)
     monkeypatch.setattr(importer, "_import_resources", import_mock)
 
-    with pytest.raises(RuntimeError, match="census_not_activated"):
+    with pytest.raises(ValueError, match="census_runtime_invalid"):
         await importer.process_provider_directory_fhir_data(
             {"context": {}},
             {

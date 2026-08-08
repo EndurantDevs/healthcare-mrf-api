@@ -96,6 +96,9 @@ from process.provider_directory_fhir import (
     shutdown as provider_directory_fhir_shutdown,
     startup as provider_directory_fhir_startup,
 )
+from process.provider_directory_fhir_census_contract import (
+    acquisition_strategy_values as provider_directory_acquisition_strategy_values,
+)
 from process.partd_formulary_network import (
     finish_main as finish_partd_formulary_network,
     main as initiate_partd_formulary_network,
@@ -1259,6 +1262,28 @@ def provider_enrichment(test: bool):
 @click.option("--retest-results-url", help="URL for provider-directory-db retest_results.json supplemental source file.")
 @click.option("--credential-config-file", help="Path to secret-backed Provider Directory credentials JSON file.")
 @click.option("--run-id", help="Existing Provider Directory FHIR run id to scope artifact publishing.")
+@click.option("--retry-of-run-id", help="Immediate failed run whose exact census checkpoint is resumed.")
+@click.option(
+    "--pagination-root-run-id",
+    "provider_directory_pagination_root_run_id",
+    help="Immutable acquisition root shared by an exact census retry.",
+)
+@click.option(
+    "--acquisition-strategy",
+    "provider_directory_acquisition_strategy",
+    type=click.Choice(provider_directory_acquisition_strategy_values()),
+    default="configured",
+    show_default=True,
+    help="Select configured acquisition or a manual cutoff-bounded current-version census.",
+)
+@click.option(
+    "--census-cutoff",
+    "provider_directory_census_cutoff",
+    help=(
+        "Timezone-aware exclusive _lastUpdated upper bound for a manual "
+        "current-version census; this does not create a historical snapshot."
+    ),
+)
 @click.option(
     "--source-id",
     multiple=True,
@@ -1395,6 +1420,10 @@ def provider_directory_fhir(
     retest_results_url: str | None,
     credential_config_file: str | None,
     run_id: str | None,
+    retry_of_run_id: str | None,
+    provider_directory_pagination_root_run_id: str | None,
+    provider_directory_acquisition_strategy: str,
+    provider_directory_census_cutoff: str | None,
     source_id: tuple[str, ...],
     limit: int | None,
     source_query: str | None,
@@ -1446,6 +1475,14 @@ def provider_directory_fhir(
             retest_results_url=retest_results_url,
             credential_config_file=credential_config_file,
             run_id=run_id,
+            retry_of_run_id=retry_of_run_id,
+            provider_directory_pagination_root_run_id=(
+                provider_directory_pagination_root_run_id
+            ),
+            provider_directory_acquisition_strategy=(
+                provider_directory_acquisition_strategy
+            ),
+            provider_directory_census_cutoff=provider_directory_census_cutoff,
             source_ids=list(source_id),
             limit=limit,
             source_query=source_query,
