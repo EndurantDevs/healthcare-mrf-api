@@ -663,7 +663,9 @@ def downgrade() -> None:
     preclaim_guard_function = _qt(schema, _PRECLAIM_GUARD_FUNCTION)
     successor_binding_function = _qt(schema, _SUCCESSOR_BINDING_FUNCTION)
     quarantined_wave_guard_function = _qt(schema, _QUARANTINED_WAVE_GUARD_FUNCTION)
-    capacity_owner_index = _qt(schema, _CAPACITY_OWNER_INDEX)
+    # PostgreSQL creates the index in the table's schema and does not accept a
+    # schema-qualified index name in CREATE INDEX.
+    capacity_owner_index = _q(_CAPACITY_OWNER_INDEX)
     op.execute(
         f"LOCK TABLE {wave}, {quarantine}, {supersession} "
         "IN ACCESS EXCLUSIVE MODE"

@@ -149,7 +149,7 @@ def test_downgrade_refuses_recovery_evidence_and_restores_prior_owner_index(monk
     assert "DROP TRIGGER \"ptg_import_wave_quarantine_update_guard\"" in sql
     assert "DROP FUNCTION \"wave_recovery_test\".\"ptg_import_wave_quarantine_update_guard\"()" in sql
     assert "DROP FUNCTION \"wave_recovery_test\".\"ptg_import_wave_supersession_successor_binding_guard\"()" in sql
-    assert "CREATE UNIQUE INDEX \"wave_recovery_test\".\"ptg_import_wave_single_capacity_owner_idx\"" in sql
+    assert "CREATE UNIQUE INDEX \"ptg_import_wave_single_capacity_owner_idx\"" in sql
 
 
 def test_models_bind_immutable_predecessor_and_successor_contracts():

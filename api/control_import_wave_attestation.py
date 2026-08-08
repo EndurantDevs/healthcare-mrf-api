@@ -107,11 +107,6 @@ def _verify_attestation(
     if not isinstance(attestation, dict):
         raise ValueError("cohort_attestation must be an object")
     schema_version = attestation.get("schema_version")
-    if (
-        not isinstance(schema_version, str)
-        or schema_version not in _ATTESTATION_DOMAINS
-    ):
-        raise ValueError("cohort_attestation schema_version is unsupported")
     expected_attestation_fields = {
         "schema_version", "wave_id", "idempotency_key", "snapshot",
         "partition", "intents", "signature",
@@ -120,6 +115,11 @@ def _verify_attestation(
         expected_attestation_fields.add("supersession")
     if set(attestation) != expected_attestation_fields:
         raise ValueError("cohort_attestation fields are not exact")
+    if (
+        not isinstance(schema_version, str)
+        or schema_version not in _ATTESTATION_DOMAINS
+    ):
+        raise ValueError("cohort_attestation schema_version is unsupported")
     signature = _digest(attestation["signature"], "cohort_attestation.signature")
     unsigned_attestation_map = {
         key: field_value
