@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
 import uuid
 
@@ -212,8 +211,6 @@ async def _reuse_generation(
     repository: FHIRFormularyRepository,
     run_id: str,
     prior,
-    *,
-    publish: bool,
 ):
     dataset = await repository.begin_dataset(
         run_id=run_id,
@@ -233,10 +230,7 @@ async def _reuse_generation(
         fence_token=1,
     )
     await repository.verify_dataset(dataset=dataset)
-    publication = (
-        await repository.publish_dataset(dataset=dataset) if publish else None
-    )
-    return dataset, result, publication
+    return dataset, result
 
 
 async def _assert_graph_and_isolation(alias_version_id: str) -> None:
@@ -338,77 +332,18 @@ async def _run_repository_proof() -> None:
     prior = next(iter(snapshot.aliases.values()))
     loaded_prior = await repository_a.load_prior_alias_state(prior)
     assert len(loaded_prior.variants_by_medication_id) == ALIAS_SIZE
-    _dataset_two, reuse_result, publication_two = await _reuse_generation(
+    _dataset_two, reuse_result = await _reuse_generation(
         repository_a,
         "run-source-a-second",
         prior,
-        publish=True,
     )
     assert reuse_result.alias_version_id == alias_result.alias_version_id
-    assert publication_two is not None and publication_two.generation == 2
-    current_snapshot = await repository_a.current_snapshot()
-    current_prior = next(iter(current_snapshot.aliases.values()))
     await _assert_sibling_reuse_rejected(repository_a)
-    stale_dataset, _result, _publication = await _reuse_generation(
-        repository_a,
-        "run-source-a-stale",
-        current_prior,
-        publish=False,
-    )
-    _winner_dataset, _winner_result, winner_publication = await _reuse_generation(
-        repository_a,
-        "run-source-a-winner",
-        current_prior,
-        publish=True,
-    )
-    assert winner_publication is not None and winner_publication.generation == 3
-    with pytest.raises(RuntimeError, match="predecessor is stale"):
-        await repository_a.publish_dataset(dataset=stale_dataset)
     await _assert_graph_and_isolation(alias_result.alias_version_id)
 
 
-async def _assert_competing_publication_cas(
-    repository: FHIRFormularyRepository,
-    prior: PriorAliasState,
-) -> None:
-    candidates = []
-    for suffix in ("one", "two"):
-        candidate, _reuse_result, _publication = await _reuse_generation(
-            repository,
-            f"run-source-a-candidate-{suffix}",
-            prior,
-            publish=False,
-        )
-        candidates.append(candidate)
-    outcomes = await asyncio.gather(
-        *(repository.publish_dataset(dataset=candidate) for candidate in candidates),
-        return_exceptions=True,
-    )
-    publications = [
-        outcome for outcome in outcomes if not isinstance(outcome, BaseException)
-    ]
-    errors = [
-        outcome for outcome in outcomes if isinstance(outcome, BaseException)
-    ]
-    assert len(publications) == len(errors) == 1
-    assert isinstance(errors[0], RuntimeError)
-    assert "predecessor is stale" in str(errors[0])
-    winner = publications[0]
-    datasets_by_id = {candidate.dataset_id: candidate for candidate in candidates}
-    repeated = await repository.publish_dataset(
-        dataset=datasets_by_id[winner.dataset_id]
-    )
-    assert repeated == winner
-    generation = await db.scalar(
-        f"SELECT generation FROM {table_name('fhir_formulary_current')} "
-        "WHERE source_id = :source_id;",
-        source_id=SOURCE_A,
-    )
-    assert generation == 2
-
-
 @pytest.mark.asyncio
-async def test_repository_postgres_exact_graph_publication_and_rollback(monkeypatch):
+async def test_repository_postgres_exact_graph_seed_reuse_and_rollback(monkeypatch):
     database_url = _database_url()
     schema_name = f"fhir_formulary_test_{uuid.uuid4().hex}"
     engine = create_async_engine(
@@ -429,33 +364,6 @@ async def test_repository_postgres_exact_graph_publication_and_rollback(monkeypa
             f"SELECT count(*) FROM {table_name('fhir_formulary_dataset')};"
         )
         assert retained_datasets == 0
-    finally:
-        await db.disconnect()
-        await _drop_schema(engine, schema_name)
-        await engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_repository_postgres_serializes_competing_publications(monkeypatch):
-    """Prove source-lock serialization, stale rejection, and idempotence."""
-
-    database_url = _database_url()
-    schema_name = f"fhir_formulary_test_{uuid.uuid4().hex}"
-    engine = create_async_engine(
-        database_url.set(drivername="postgresql+asyncpg")
-    )
-    try:
-        await _prepare_repository_schema(
-            monkeypatch,
-            database_url,
-            schema_name,
-            engine,
-        )
-        repository = FHIRFormularyRepository(source_id=SOURCE_A)
-        await _build_seed(repository, SOURCE_A, medication_count=1)
-        snapshot = await repository.current_snapshot()
-        prior = next(iter(snapshot.aliases.values()))
-        await _assert_competing_publication_cas(repository, prior)
     finally:
         await db.disconnect()
         await _drop_schema(engine, schema_name)

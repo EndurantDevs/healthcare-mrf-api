@@ -408,10 +408,10 @@ async def test_publication_locks_source_before_dataset_and_pointer(monkeypatch):
     )
     monkeypatch.setattr(
         repository_publish,
-        "lock_dataset",
+        "_locked_publication_dataset",
         AsyncMock(
             side_effect=lambda *_args, **_kwargs: (
-                events.append("dataset-lock"),
+                events.append("admission-dataset-locks"),
                 _dataset_row(status="verified", publish_requested=True),
             )[1]
         ),
@@ -446,7 +446,7 @@ async def test_publication_locks_source_before_dataset_and_pointer(monkeypatch):
     assert events == [
         "transaction-enter",
         "source-lock",
-        "dataset-lock",
+        "admission-dataset-locks",
         "pointer-lock",
         "pointer-switch",
         "dataset-published",

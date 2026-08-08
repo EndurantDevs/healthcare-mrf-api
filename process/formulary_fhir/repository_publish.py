@@ -7,6 +7,9 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
+from process.formulary_fhir.repository_admission import (
+    verify_twin_admission_for_publication,
+)
 from process.formulary_fhir.repository_shared import DatasetRef
 from process.formulary_fhir.repository_shared import PublicationResult
 from process.formulary_fhir.repository_shared import lock_dataset
@@ -152,6 +155,28 @@ async def _mark_published(
         raise RuntimeError("FHIR formulary publication transition failed")
 
 
+async def _locked_publication_dataset(
+    database: Any,
+    source_id: str,
+    dataset: DatasetRef,
+    *,
+    seed_proof: bool,
+) -> dict[str, Any]:
+    if seed_proof:
+        return await lock_dataset(
+            database,
+            source_id,
+            dataset,
+            allowed_statuses={"verified", "published"},
+        )
+    _admission, dataset_by_field = await verify_twin_admission_for_publication(
+        database,
+        source_id,
+        dataset,
+    )
+    return dataset_by_field
+
+
 async def _publish(
     database: Any,
     source_id: str,
@@ -161,11 +186,11 @@ async def _publish(
 ) -> PublicationResult:
     async with database.transaction():
         await lock_source(database, source_id)
-        dataset_by_field = await lock_dataset(
+        dataset_by_field = await _locked_publication_dataset(
             database,
             source_id,
             dataset,
-            allowed_statuses={"verified", "published"},
+            seed_proof=seed_proof,
         )
         current_by_field = await _locked_current(database, source_id)
         existing_result = _idempotent_result(
