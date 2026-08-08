@@ -223,7 +223,7 @@ def _validated_manual_config(
         raise _manifest_error("manual_contract_fields")
     if (
         type(raw_config.get("contract_version")) is not int
-        or raw_config["contract_version"] != 1
+        or raw_config["contract_version"] != 2
     ):
         raise _manifest_error("contract_version_invalid")
     plan_name = _strict_text(raw_config.get("plan_name"), field_name="plan_name")

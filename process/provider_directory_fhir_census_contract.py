@@ -29,7 +29,7 @@ CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD = (
     "provider_directory_current_version_census_continuation_strategy"
 )
 CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY = (
-    "smile-opaque-getpages-v1"
+    "smile-opaque-logical-offset-v2"
 )
 CURRENT_VERSION_CENSUS_STRATEGY_VERSION = (
     "provider-directory-fhir-cutoff-bounded-current-version-census-v1"

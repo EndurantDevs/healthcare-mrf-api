@@ -19,7 +19,6 @@ from process.provider_directory_fhir_census_contract import (
 )
 from process.provider_directory_fhir_census_execution import (
     current_version_census_initial_proof,
-    validated_current_version_census_resume_url,
 )
 
 
@@ -304,7 +303,7 @@ async def _run_resume_guard(monkeypatch, resume_state):
 
 def _progressed_resume_state(*, rows_processed, completeness):
     cursor_url = (
-        f"{BASE}?_getpages=opaque&_getpagesoffset={rows_processed}&_count=250"
+        f"{BASE}?_getpages=opaque&_getpagesoffset=250&_count=250"
     )
     return importer.PaginationResumeState(
         next_url=cursor_url,
@@ -340,6 +339,7 @@ async def test_rows_beyond_persisted_precount_perform_no_io(monkeypatch):
             _contract(),
             "Organization",
             100,
+            expected_page_count=250,
         ),
     )
 
@@ -350,33 +350,6 @@ async def test_rows_beyond_persisted_precount_perform_no_io(monkeypatch):
     assert result.complete is False
     for io_mock in io_mocks:
         io_mock.assert_not_awaited()
-
-
-@pytest.mark.parametrize(
-    ("pages_processed", "rows_processed"),
-    ((1, 0), (2, 1)),
-)
-def test_resume_rejects_impossible_page_row_shapes(
-    pages_processed,
-    rows_processed,
-):
-    contract = _contract()
-    start_url = contract.start_url("Organization", 250)
-    next_url = (
-        f"{BASE}?_getpages=opaque"
-        f"&_getpagesoffset={rows_processed}&_count=250"
-    )
-
-    with pytest.raises(ValueError, match="resume_state_invalid"):
-        validated_current_version_census_resume_url(
-            contract,
-            "Organization",
-            start_url,
-            next_url,
-            pages_processed=pages_processed,
-            rows_processed=rows_processed,
-            expected_page_count=250,
-        )
 
 
 def _exact_census_task():

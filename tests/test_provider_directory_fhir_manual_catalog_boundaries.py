@@ -143,7 +143,7 @@ def test_manual_config_rejects_non_mapping_contract():
             "persisted_cutoff_forbidden",
         ),
         ("unexpected_field", True, "manual_contract_fields"),
-        ("contract_version", 2, "contract_version_invalid"),
+        ("contract_version", 1, "contract_version_invalid"),
         (
             "continuation_strategy",
             "synthetic-unsupported",

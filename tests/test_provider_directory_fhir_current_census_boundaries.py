@@ -27,6 +27,7 @@ from process.provider_directory_fhir_census_contract import (
 )
 from process.provider_directory_fhir_census_execution import (
     CURRENT_VERSION_CENSUS_FETCH_MODE,
+    current_version_census_checkpoint_proof,
     current_version_census_initial_proof,
     current_version_census_persisted_pre_count,
     resolved_current_version_census_next_url,
@@ -102,14 +103,39 @@ def _cursor(offset: int, *, origin: str = BASE) -> str:
     )
 
 
+def _initial_proof(pre_count: int = 500) -> dict[str, object]:
+    return current_version_census_initial_proof(
+        _contract(),
+        RESOURCE_TYPE,
+        pre_count,
+        expected_page_count=250,
+    )
+
+
+def _resumed_proof(rows_processed: int = 1) -> dict[str, object]:
+    return current_version_census_checkpoint_proof(
+        _initial_proof(),
+        pages_processed=1,
+        rows_processed=rows_processed,
+        page_entry_count=rows_processed,
+        expected_page_count=250,
+    )
+
+
 def test_execution_proof_boundaries_reject_unbound_or_invalid_state():
     contract = _contract()
     with pytest.raises(ValueError, match="resource_not_bound"):
-        current_version_census_initial_proof(contract, "Location", 0)
+        current_version_census_initial_proof(
+            contract,
+            "Location",
+            0,
+            expected_page_count=250,
+        )
     proof_by_field = current_version_census_initial_proof(
         contract,
         RESOURCE_TYPE,
         1,
+        expected_page_count=250,
     )
     proof_by_field["pre_count"] = True
     with pytest.raises(ValueError, match="checkpoint_pre_count_invalid"):
@@ -127,41 +153,47 @@ def test_resume_url_boundaries_reject_each_invalid_state():
         validated_current_version_census_resume_url(
             contract, RESOURCE_TYPE, f"{BASE}/Location", start_url,
             pages_processed=0, rows_processed=0, expected_page_count=250,
+            proof=_initial_proof(),
         )
     with pytest.raises(ValueError, match="resume_url_invalid"):
         validated_current_version_census_resume_url(
             contract, RESOURCE_TYPE, start_url, None,
             pages_processed=0, rows_processed=0, expected_page_count=250,
+            proof=_initial_proof(),
         )
     with pytest.raises(ValueError, match="resume_url_invalid"):
         validated_current_version_census_resume_url(
             contract, RESOURCE_TYPE, start_url, start_url,
             pages_processed=1, rows_processed=1, expected_page_count=250,
+            proof=_resumed_proof(),
         )
     with pytest.raises(ValueError, match="resume_offset_invalid"):
         validated_current_version_census_resume_url(
             contract, RESOURCE_TYPE, start_url, _cursor(2),
             pages_processed=1, rows_processed=1, expected_page_count=250,
+            proof=_resumed_proof(),
         )
 
 
 def test_resume_url_rejects_invalid_page_state_and_malformed_port():
     contract = _contract()
     start_url = contract.start_url(RESOURCE_TYPE, 250)
-    with pytest.raises(ValueError, match="page_state_invalid"):
+    with pytest.raises(ValueError, match="resume_state_invalid"):
         validated_current_version_census_resume_url(
             contract, RESOURCE_TYPE, start_url, start_url,
             pages_processed=0, rows_processed=True, expected_page_count=250,
+            proof=_initial_proof(),
         )
     with pytest.raises(ValueError, match="untrusted_current_version"):
         validated_current_version_census_resume_url(
             contract,
             RESOURCE_TYPE,
             start_url,
-            _cursor(1, origin="https://directory.example.test:bad/fhir"),
+            _cursor(250, origin="https://directory.example.test:bad/fhir"),
             pages_processed=1,
             rows_processed=1,
             expected_page_count=250,
+            proof=_resumed_proof(),
         )
 
 
@@ -175,6 +207,7 @@ def test_continuation_rejects_an_unreviewed_strategy():
             _cursor(250),
             page_entry_count=250,
             expected_page_count=250,
+            pre_total=500,
         )
 
 
@@ -238,6 +271,7 @@ def test_exact_pagination_helper_boundaries_fail_closed():
             _cursor(250),
             None,
             250,
+            500,
         )
 
 

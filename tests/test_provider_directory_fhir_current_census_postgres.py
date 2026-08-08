@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from typing import Any
-
 import pytest
 
 from process.provider_directory_fhir_census_binding import (
@@ -36,6 +35,19 @@ from tests.provider_directory_current_census_postgres_support import (
     proof_shard_counts,
 )
 
+def checkpoint_page_geometry() -> dict[str, int]:
+    """Return the exact durable geometry after the first full window."""
+
+    return {
+        "version": 2,
+        "page_count": 1,
+        "checkpointed_pages": 1,
+        "checkpointed_rows": 1,
+        "logical_next_offset": 1,
+        "sparse_pages": 0,
+        "empty_pages": 0,
+    }
+
 
 def assert_initial_checkpoint(checkpoint: dict[str, Any], contract: Any) -> None:
     assert checkpoint["next_url"] == NEXT_URL
@@ -51,6 +63,7 @@ def assert_initial_checkpoint(checkpoint: dict[str, Any], contract: Any) -> None
         "resource_type": RESOURCE_TYPE,
         "pre_count": 2,
         "verified": False,
+        "page_geometry": checkpoint_page_geometry(),
     }
 
 
@@ -84,7 +97,20 @@ def assert_completed_checkpoint(checkpoint: dict[str, Any], contract: Any) -> No
         "post_count": 2,
         "processed_rows": 2,
         "unique_candidate_rows": 2,
+        "unreturned_count": 0,
         "verified": True,
+        "page_geometry": checkpoint_page_geometry(),
+        "terminal_page_geometry": {
+            "version": 2,
+            "page_count": 1,
+            "pages_processed": 2,
+            "processed_rows": 2,
+            "terminal_page_start_offset": 1,
+            "logical_window_end_offset": 2,
+            "terminal_page_entries": 1,
+            "sparse_pages": 0,
+            "empty_pages": 0,
+        },
     }
 
 

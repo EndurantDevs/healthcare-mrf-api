@@ -641,6 +641,7 @@ jobs:
           tests/test_provider_directory_migration_adoption_postgres.py
           tests/test_provider_directory_caresource_census_db.py
           tests/test_provider_directory_fhir_current_census_postgres.py
+          tests/test_provider_directory_fhir_current_census_atomicity_postgres.py
           tests/test_mrf_file_source_cursor_migration.py
           tests/test_public_evidence_storage_catalog_postgres.py
           tests/test_public_evidence_storage_interval_postgres.py

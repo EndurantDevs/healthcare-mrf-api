@@ -244,7 +244,8 @@ async def test_invalid_exact_next_link_stops_before_post_count(monkeypatch):
     )
     assert "next_link_invalid" in result.error
     assert spies.fetch.await_count == 2
-    spies.rows.assert_awaited_once()
+    spies.rows.assert_not_awaited()
+    spies.checkpoint.assert_not_awaited()
 
 
 @pytest.mark.asyncio
