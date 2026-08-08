@@ -3353,6 +3353,45 @@ async def test_artifact_dataset_row_transitions_require_exact_matches(
         await importer._publish_validated_artifact_dataset(dataset)
 
 
+@pytest.mark.asyncio
+async def test_artifact_dataset_promotion_parses_compact_metadata_once(
+    monkeypatch,
+):
+    """Exclude large unused proof arrays from the final promotion gate."""
+    status = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "status", status)
+
+    await importer._publish_validated_artifact_dataset(
+        _promotion_dataset()
+    )
+
+    publish_sql = status.await_args.args[0]
+    assert "artifact_publish_candidate_json AS MATERIALIZED" in publish_sql
+    assert (
+        "artifact_publish_candidate_metadata AS MATERIALIZED"
+        in publish_sql
+    )
+    assert "jsonb_to_record" in publish_sql
+    assert publish_sql.count("publication_metadata_json::jsonb") == 1
+    assert "candidate.eligibility_metadata_jsonb" in publish_sql
+    assert "candidate.uhc_publication_present" in publish_sql
+    assert "COALESCE(" in publish_sql
+    assert (
+        "__ARTIFACT_PUBLISH_ELIGIBILITY_METADATA_COLUMNS__"
+        not in publish_sql
+    )
+
+    projected_columns = (
+        importer._artifact_publish_eligibility_metadata_columns()
+    )
+    assert importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY not in (
+        projected_columns
+    )
+    assert importer.UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY not in (
+        projected_columns
+    )
+
+
 def test_artifact_bundle_ordering_rejects_schema_and_target_ambiguity():
     """Sort one-schema bundles and reject ambiguous publication targets."""
     stage_b = _artifact_stage(
