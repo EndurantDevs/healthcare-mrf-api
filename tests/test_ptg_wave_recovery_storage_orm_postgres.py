@@ -61,7 +61,7 @@ async def _persist_with_orm(
     evidence: dict[str, object],
     naive_utc: dt.datetime,
 ) -> None:
-    """Insert successor and supersession through one ORM transaction."""
+    """Flush supersession first, then bind its successor in one transaction."""
 
     cohort_map = {
         "schema_version": "healthporta.ptg-import-wave-attestation.v3",
@@ -70,6 +70,11 @@ async def _persist_with_orm(
     }
     async with session_factory() as session:
         async with session.begin():
+            await supersession.persist_admission_supersession(
+                session,
+                {"wave_id": wave_id, "supersession": evidence},
+                now=naive_utc,
+            )
             await session.execute(
                 _successor_insert(schema),
                 {
@@ -77,11 +82,6 @@ async def _persist_with_orm(
                     "digest": "b" * 64,
                     "cohort": json.dumps(cohort_map),
                 },
-            )
-            await supersession.persist_admission_supersession(
-                session,
-                {"wave_id": wave_id, "supersession": evidence},
-                now=naive_utc,
             )
 
 

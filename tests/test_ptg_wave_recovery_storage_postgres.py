@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = ROOT / "alembic" / "versions" / (
     "20260807120000_ptg_import_wave_recovery_storage.py"
 )
+JSON_NULL_PATCH_PATH = ROOT / "alembic" / "versions" / (
+    "20260808140000_ptg_import_wave_json_null_preclaim.py"
+)
 POSTGRES_DSN_ENV = "HLTHPRT_PTG_IMPORT_WAVE_RECOVERY_POSTGRES_DSN"
 _DISPOSABLE_DATABASE_RE = re.compile(
     r"^ptg_import_wave_recovery_test_[a-z0-9][a-z0-9_]{7,}$"
@@ -34,9 +37,9 @@ class _Operations:
         self.statements.append(statement)
 
 
-def _load_migration():
+def _load_migration(path: Path = MIGRATION_PATH):
     module_spec = importlib.util.spec_from_file_location(
-        "ptg_import_wave_recovery_storage_postgres_migration", MIGRATION_PATH,
+        f"ptg_import_wave_recovery_storage_{path.stem}", path,
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
@@ -164,10 +167,11 @@ async def _seed_predecessor(connection, quoted: str) -> None:
         f"""
         INSERT INTO {quoted}.import_run (
             run_id, importer, status, source_file_import_id, import_id,
-            phase_detail, progress, metrics
+            phase_detail, error, progress, metrics
         ) VALUES (
             'run-1', 'ptg', 'queued', 'source-1', 'source-1',
             'wave admitted; controller materialization pending',
+            'null'::jsonb,
             '{{"unit":"run","total":1,"done":0,"pct":0,"message":"wave admitted; controller materialization pending"}}',
             jsonb_build_object(
                 'wave_id', 'predecessor-wave', 'queue', 'arq:PTGSmall:wave:' || $1,
@@ -208,6 +212,13 @@ async def _install_migration(connection, monkeypatch, schema: str) -> object:
     migration.upgrade()
     async with connection.transaction():
         for statement in operations.statements:
+            await connection.execute(statement)
+    patch = _load_migration(JSON_NULL_PATCH_PATH)
+    patch_statements: list[str] = []
+    monkeypatch.setattr(patch.op, "execute", patch_statements.append)
+    patch.upgrade()
+    async with connection.transaction():
+        for statement in patch_statements:
             await connection.execute(statement)
     return migration
 
