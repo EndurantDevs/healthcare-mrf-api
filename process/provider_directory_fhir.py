@@ -14201,8 +14201,9 @@ def _artifact_baseline_contract_sql(
 def _artifact_reviewed_candidate_eligibility_sql(
     dataset_ref: str,
     source_ref: str,
+    *,
+    metadata: str = "dataset.publication_metadata_json::jsonb",
 ) -> str:
-    metadata = "dataset.publication_metadata_json::jsonb"
     verification = f"{metadata} -> '{TWIN_ROOT_VERIFICATION_METADATA_KEY}'"
     proof = f"{verification} -> 'proof'"
     matched_proof_sql = _artifact_matched_proof_sql(
@@ -14226,6 +14227,77 @@ def _artifact_reviewed_candidate_eligibility_sql(
                     )
                 )
             )
+        )
+    """
+
+
+def _artifact_candidate_eligibility_metadata_columns() -> str:
+    """Return the compact JSON record fields used by candidate admission."""
+    metadata_key = TWIN_ROOT_VERIFICATION_METADATA_KEY
+    return f"""
+        requires_twin_root_verification text,
+        {TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY} text,
+        {TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY} text,
+        {TWIN_ROOT_VERIFICATION_ROLE_KEY} text,
+        {TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY} text,
+        {metadata_key} jsonb,
+        source_ids jsonb,
+        dataset_hash text,
+        resource_count text,
+        completion_proof_v1 jsonb,
+        selected_resources jsonb,
+        expected_resources jsonb
+    """
+
+
+def _artifact_candidate_eligibility_ctes(dataset_ref: str) -> str:
+    """Parse large candidate proofs once and retain only eligibility fields."""
+    metadata_key = TWIN_ROOT_VERIFICATION_METADATA_KEY
+    metadata_columns = _artifact_candidate_eligibility_metadata_columns()
+    return f"""
+        artifact_candidate_json AS MATERIALIZED (
+        SELECT dataset.dataset_id,
+               dataset.endpoint_id,
+               dataset.acquisition_root_run_id,
+               dataset.dataset_hash,
+               dataset.resource_count,
+               dataset.publication_metadata_json::jsonb
+                   AS full_metadata_jsonb
+          FROM {dataset_ref} AS dataset
+         WHERE dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
+           AND dataset.is_current = false
+           AND dataset.status = :validated_status
+           AND dataset.superseded_at IS NULL
+        ), artifact_candidate_metadata AS MATERIALIZED (
+        SELECT candidate.dataset_id,
+               candidate.endpoint_id,
+               candidate.acquisition_root_run_id,
+               candidate.dataset_hash,
+               candidate.resource_count,
+               (
+                   to_jsonb(metadata_fields)
+                       - '{metadata_key}'
+               ) || CASE
+                    WHEN candidate.full_metadata_jsonb IS NULL THEN
+                        jsonb_build_object(
+                            '{metadata_key}', NULL::jsonb
+                        )
+                    WHEN candidate.full_metadata_jsonb ? '{metadata_key}' THEN
+                        jsonb_build_object(
+                            '{metadata_key}',
+                            candidate.full_metadata_jsonb
+                                -> '{metadata_key}'
+                        )
+                    ELSE '{{}}'::jsonb
+               END AS eligibility_metadata_jsonb
+          FROM artifact_candidate_json AS candidate
+          CROSS JOIN LATERAL jsonb_to_record(
+               CASE
+                   WHEN jsonb_typeof(candidate.full_metadata_jsonb) = 'object'
+                   THEN candidate.full_metadata_jsonb
+                   ELSE '{{}}'::jsonb
+               END
+          ) AS metadata_fields({metadata_columns})
         )
     """
 
@@ -17606,21 +17678,20 @@ async def _artifact_eligible_validated_ids(
         _schema(),
         ProviderDirectorySource.__tablename__,
     )
+    reviewed_candidate_gate = _artifact_reviewed_candidate_eligibility_sql(
+        dataset_ref,
+        source_ref,
+        metadata="dataset.eligibility_metadata_jsonb",
+    )
     option_rows = await executor.all(
         f"""
-        WITH {_artifact_dataset_options_cte(
-            dataset_ref,
-            source_ref,
-            scope_endpoint_ids=True,
-        )}
-        SELECT endpoint_id, dataset_id
-          FROM dataset_options
-         WHERE endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))
-           AND status = :validated_status
-         ORDER BY endpoint_id, dataset_id;
+        WITH {_artifact_candidate_eligibility_ctes(dataset_ref)}
+        SELECT dataset.endpoint_id, dataset.dataset_id
+          FROM artifact_candidate_metadata AS dataset
+         WHERE {reviewed_candidate_gate}
+         ORDER BY dataset.endpoint_id, dataset.dataset_id;
         """,
         endpoint_ids=selected_endpoint_ids,
-        published_status=ENDPOINT_DATASET_PUBLISHED,
         validated_status=ENDPOINT_DATASET_VALIDATED,
     )
     eligible_ids_by_endpoint: dict[str, list[str]] = {}
