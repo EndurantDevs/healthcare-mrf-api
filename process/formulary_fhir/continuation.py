@@ -307,6 +307,20 @@ def _is_valid_offset(offset_text: str, contract: FHIRSearchContract) -> bool:
     )
 
 
+def _is_exact_element_set(candidate_text: str, expected_text: str) -> bool:
+    candidate_names = candidate_text.split(",")
+    expected_names = expected_text.split(",")
+    return bool(
+        all(candidate_names)
+        and all(expected_names)
+        and not any(character.isspace() for character in candidate_text)
+        and not any(character.isspace() for character in expected_text)
+        and len(candidate_names) == len(set(candidate_names))
+        and len(expected_names) == len(set(expected_names))
+        and set(candidate_names) == set(expected_names)
+    )
+
+
 def _validate_smile_query(
     query_pairs: tuple[tuple[str, str], ...],
     contract: FHIRSearchContract,
@@ -318,7 +332,10 @@ def _validate_smile_query(
         required_names.issubset(query_by_name)
         and set(query_by_name).issubset(allowed_names)
         and query_by_name["_count"] == str(contract.page_size)
-        and query_by_name["_elements"] == contract.element_projection
+        and _is_exact_element_set(
+            query_by_name["_elements"],
+            contract.element_projection,
+        )
         and _is_valid_cursor_token(query_by_name["_getpages"])
         and _is_valid_offset(query_by_name["_getpagesoffset"], contract)
         and query_by_name.get("_bundletype", "searchset") == "searchset"

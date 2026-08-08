@@ -220,6 +220,16 @@ def _smile_cursor_url(contract, *element_pairs: tuple[str, str]) -> str:
     return f"{CANONICAL_BASE}?{urllib.parse.urlencode(query_pairs)}"
 
 
+def _projection_permutations(contract) -> tuple[str, ...]:
+    element_names = contract.element_projection.split(",")
+    return (
+        contract.element_projection,
+        ",".join(reversed(element_names)),
+        ",".join((*element_names[1:], element_names[0])),
+        ",".join(sorted(element_names)),
+    )
+
+
 @pytest.mark.parametrize(
     "contract",
     (
@@ -233,29 +243,65 @@ def _smile_cursor_url(contract, *element_pairs: tuple[str, str]) -> str:
         ),
     ),
 )
-def test_smile_cursor_requires_exact_resource_projection(contract):
-    cursor_url = _smile_cursor_url(
-        contract,
-        ("_elements", contract.element_projection),
+def test_smile_cursor_accepts_duplicate_free_projection_permutations(contract):
+    for element_projection in _projection_permutations(contract):
+        cursor_url = _smile_cursor_url(
+            contract,
+            ("_elements", element_projection),
+        )
+
+        continuation = validated_next_link(cursor_url, contract=contract)
+
+        assert continuation.search_contract_hash == contract.contract_hash
+        assert "opaque-secret-token" not in repr(continuation)
+        assert "SYNTH-SECRET" not in repr(contract)
+
+
+@pytest.mark.parametrize(
+    "contract",
+    (
+        pytest.param(
+            coverage_plan_search_contract(_source_config(), CUTOFF),
+            id="coverage-plan",
+        ),
+        pytest.param(
+            medication_search_contract(_source_config(), "SYNTH-SECRET", CUTOFF),
+            id="formulary-drug",
+        ),
+    ),
+)
+def test_smile_cursor_rejects_nonexact_resource_projection(contract):
+    element_names = contract.element_projection.split(",")
+    invalid_projections = (
+        "",
+        f",{contract.element_projection}",
+        f"{contract.element_projection},",
+        contract.element_projection.replace(",", ",,", 1),
+        ",".join(element_names[:-1]),
+        ",".join((*element_names, "unreviewed")),
+        ",".join((*element_names, element_names[0])),
+        f" {contract.element_projection}",
+        f"{contract.element_projection} ",
+        contract.element_projection.replace(",", ", ", 1),
+        contract.element_projection.replace(",", ",\t", 1),
+        contract.element_projection.replace(",", ",\n", 1),
+        contract.element_projection.replace(",", ",\N{NO-BREAK SPACE}", 1),
+        ",".join((element_names[0].upper(), *element_names[1:])),
     )
 
-    continuation = validated_next_link(cursor_url, contract=contract)
-
-    assert continuation.search_contract_hash == contract.contract_hash
-    assert "opaque-secret-token" not in repr(continuation)
-    assert "SYNTH-SECRET" not in repr(contract)
+    for invalid_projection in invalid_projections:
+        cursor_url = _smile_cursor_url(
+            contract,
+            ("_elements", invalid_projection),
+        )
+        with pytest.raises(FHIRTransportError, match="cursor contract"):
+            validated_next_link(cursor_url, contract=contract)
 
 
 @pytest.mark.parametrize(
     ("element_pairs", "extra_pairs", "error_message"),
     (
-        pytest.param((), (), "cursor contract", id="missing-elements"),
-        pytest.param(
-            (("_elements", "id,meta"),),
-            (),
-            "cursor contract",
-            id="wrong-elements",
-        ),
+        pytest.param((), (), "cursor contract", id="missing-elements-field"),
         pytest.param(
             (("_elements", "id,meta,status,code,extension"),) * 2,
             (),
@@ -270,7 +316,7 @@ def test_smile_cursor_requires_exact_resource_projection(contract):
         ),
     ),
 )
-def test_smile_cursor_rejects_projection_drift(
+def test_smile_cursor_rejects_query_field_drift(
     element_pairs,
     extra_pairs,
     error_message,

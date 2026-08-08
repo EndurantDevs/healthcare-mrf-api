@@ -146,11 +146,14 @@ def _next_url(alias, *, offset="2", config=None):
 
 def _smile_next_url(alias):
     contract = medication_search_contract(_source_config(), alias, CUTOFF)
+    reordered_elements = ",".join(
+        reversed(contract.element_projection.split(","))
+    )
     query_text = urllib.parse.urlencode(
         (
             ("_bundletype", "searchset"),
             ("_count", str(contract.page_size)),
-            ("_elements", contract.element_projection),
+            ("_elements", reordered_elements),
             ("_getpages", "opaque-secret-token"),
             ("_getpagesoffset", "2"),
         )
@@ -181,6 +184,9 @@ async def test_current_version_census_uses_exact_serial_pre_page_post_contract()
     assert session.calls[2][1]["params"] is None
     count_query_by_name = dict(session.calls[0][1]["params"])
     page_query_by_name = dict(session.calls[1][1]["params"])
+    next_query_by_name = dict(
+        urllib.parse.parse_qsl(urllib.parse.urlsplit(next_url).query)
+    )
     assert count_query_by_name == {
         "DrugPlan": alias,
         "_lastUpdated": "lt2026-08-06T00:00:00Z",
@@ -194,6 +200,10 @@ async def test_current_version_census_uses_exact_serial_pre_page_post_contract()
     assert page_query_by_name["_total"] == "accurate"
     assert page_query_by_name["_count"] == "2"
     assert page_query_by_name["_elements"] == "id,meta,status,code,extension"
+    assert next_query_by_name["_elements"] != page_query_by_name["_elements"]
+    assert set(next_query_by_name["_elements"].split(",")) == set(
+        page_query_by_name["_elements"].split(",")
+    )
     assert alias not in repr(census)
     assert "drug-a" not in repr(census)
 
