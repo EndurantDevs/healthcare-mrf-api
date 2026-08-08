@@ -82,6 +82,27 @@ def _executor(*query_results):
     return executor
 
 
+def test_candidate_eligibility_projection_is_compact_and_fail_closed():
+    projection_sql = importer._artifact_candidate_eligibility_ctes(
+        "dataset_table"
+    )
+    for field_name in (
+        "source_ids jsonb",
+        "completion_proof_v1 jsonb",
+        "selected_resources jsonb",
+        "expected_resources jsonb",
+        f"{importer.TWIN_ROOT_VERIFICATION_METADATA_KEY} jsonb",
+    ):
+        assert field_name in projection_sql
+    assert importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY not in (
+        projection_sql
+    )
+    assert "full_metadata_jsonb IS NULL" in projection_sql
+    assert "jsonb_typeof(candidate.full_metadata_jsonb) = 'object'" in (
+        projection_sql
+    )
+
+
 @pytest.mark.asyncio
 async def test_locked_fence_ignores_ineligible_old_generation_candidate():
     candidate = _promotion_dataset()
@@ -128,7 +149,9 @@ async def test_locked_fence_ignores_ineligible_old_generation_candidate():
     await importer._lock_and_verify_artifact_dataset_fence(fence, executor)
 
     eligibility_sql = executor.all.await_args_list[-1].args[0]
-    assert "dataset_options" in eligibility_sql
+    assert "artifact_candidate_metadata" in eligibility_sql
+    assert "jsonb_to_record" in eligibility_sql
+    assert "dataset.eligibility_metadata_jsonb" in eligibility_sql
     assert executor.all.await_args_list[-1].kwargs["endpoint_ids"] == [
         "candidate_endpoint"
     ]

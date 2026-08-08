@@ -463,19 +463,17 @@ async def test_artifact_candidate_selection_covers_empty_and_valid_rows():
     selection_sql = executor.all.await_args.args[0]
     endpoint_scope = "dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[]))"
     normalized_sql = " ".join(selection_sql.split())
-    scoped_option_union = (
+    scoped_candidate_filter = (
         "WHERE dataset.endpoint_id = ANY(CAST(:endpoint_ids AS varchar[])) "
-        "AND ( ( dataset.is_current = true "
-        "AND dataset.status = :published_status "
-        "AND dataset.superseded_at IS NULL ) OR ( "
-        "dataset.is_current = false"
+        "AND dataset.is_current = false "
+        "AND dataset.status = :validated_status "
+        "AND dataset.superseded_at IS NULL"
     )
-    assert scoped_option_union in normalized_sql
+    assert scoped_candidate_filter in normalized_sql
     assert selection_sql.count(endpoint_scope) == 1
-    assert (
-        "FROM dataset_options WHERE endpoint_id = "
-        "ANY(CAST(:endpoint_ids AS varchar[]))"
-    ) in normalized_sql
+    assert "FROM artifact_candidate_metadata AS dataset" in normalized_sql
+    assert "jsonb_to_record" in normalized_sql
+    assert "dataset.eligibility_metadata_jsonb" in normalized_sql
     assert executor.all.await_args.kwargs["endpoint_ids"] == ["endpoint-a"]
 
 
@@ -491,4 +489,3 @@ def test_complete_artifact_stage_bundle_matches_expected_relation():
         {"network_catalog": {"published": True}},
         fhir.ProviderDirectoryArtifactBundle(stages=[stage]),
     )
-
