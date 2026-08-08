@@ -417,6 +417,7 @@ async def _verify_registered_candidate(
             run_id=run_id,
             cutoff_at=cutoff_at,
             intent="none",
+            force_full=False,
         )
 
 
