@@ -413,7 +413,7 @@ def build_public_evidence_record(
             evidence,
             authority,
         )
-        return PublicEvidenceRecord(
+        normalized_record = PublicEvidenceRecord(
             PUBLIC_EVIDENCE_RECORD_CONTRACT,
             PUBLIC_EVIDENCE_FOUNDATION_SCOPE,
             normalized_input.release,
@@ -430,10 +430,11 @@ def build_public_evidence_record(
             _canonical_sha256("evidence_record_contract", contract_payload),
             authority,
         )
-    except PublicEvidenceRecordError:
-        raise
     except Exception:
-        raise _fail() from None
+        normalized_error = _fail()
+    else:
+        return normalized_record
+    raise normalized_error
 
 
 def _raw_from_record(record: PublicEvidenceRecord) -> dict[str, object]:
@@ -470,9 +471,9 @@ def _validate_supplied_semantics(
 
 def validate_public_evidence_record(candidate: object) -> PublicEvidenceRecord:
     """Rebuild an exact record; validation grants no serving authority."""
-    if type(candidate) is not PublicEvidenceRecord:
-        raise _fail()
     try:
+        if type(candidate) is not PublicEvidenceRecord:
+            raise _fail()
         if (
             type(candidate.contract) is not str
             or candidate.contract != PUBLIC_EVIDENCE_RECORD_CONTRACT
@@ -492,8 +493,8 @@ def validate_public_evidence_record(candidate: object) -> PublicEvidenceRecord:
         digest = _strict_sha256(candidate.contract_sha256)
         if not hmac.compare_digest(digest, rebuilt.contract_sha256):
             raise _fail()
-        return rebuilt
-    except PublicEvidenceRecordError:
-        raise
     except Exception:
-        raise _fail() from None
+        normalized_error = _fail()
+    else:
+        return rebuilt
+    raise normalized_error
