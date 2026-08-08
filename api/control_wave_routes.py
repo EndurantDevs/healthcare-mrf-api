@@ -23,6 +23,12 @@ from process.ptg_wave_outcomes import (
     record_linkage_ack,
 )
 from process.ptg_wave_state import get_wave_receipts
+from process.ptg_wave_preclaim_supersession import (
+    PTGWavePreclaimSupersessionConflict,
+)
+from process.ptg_wave_preclaim_supersession_runtime import (
+    get_logical_preclaim_supersession_candidate,
+)
 
 
 async def control_start_ptg_wave_controller(app, _loop):
@@ -57,8 +63,19 @@ async def control_admit_import_wave(request):
             status_code=413,
         )
     try:
-        wave, created = await admit_import_wave(request.json)
-    except (ImportWaveConflict, PTGWaveCapacityConflict) as exc:
+        wave, created = await admit_import_wave(
+            request.json,
+            redis=getattr(
+                getattr(getattr(request, "app", None), "ctx", None),
+                "ptg_wave_redis",
+                None,
+            ),
+        )
+    except (
+        ImportWaveConflict,
+        PTGWaveCapacityConflict,
+        PTGWavePreclaimSupersessionConflict,
+    ) as exc:
         raise SanicException(str(exc), status_code=409) from exc
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
@@ -121,6 +138,27 @@ async def control_get_import_wave_proof(request, wave_id: str):
     return response.json(proof, default=str)
 
 
+async def control_get_logical_preclaim_supersession(
+    request,
+    wave_id: str,
+):
+    """Observe one exact GET-only candidate for a fresh successor admission."""
+
+    require_control_auth(request)
+    successor_wave_id = request.args.get("successor_wave_id")
+    if not isinstance(successor_wave_id, str) or not successor_wave_id:
+        raise BadRequest("successor_wave_id is required")
+    try:
+        proof = await get_logical_preclaim_supersession_candidate(
+            wave_id,
+            successor_wave_id,
+            redis=getattr(request.app.ctx, "ptg_wave_redis", None),
+        )
+    except PTGWavePreclaimSupersessionConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    return response.json(proof, default=str)
+
+
 def register_control_wave_routes(blueprint):
     """Register exact-wave endpoints and controller lifecycle hooks."""
 
@@ -137,6 +175,9 @@ def register_control_wave_routes(blueprint):
     blueprint.get("/import-waves/<wave_id>/proof")(
         control_get_import_wave_proof
     )
+    blueprint.get(
+        "/import-waves/<wave_id>/logical-preclaim-supersession"
+    )(control_get_logical_preclaim_supersession)
     return blueprint
 
 

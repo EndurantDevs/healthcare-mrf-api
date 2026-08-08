@@ -87,7 +87,7 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260807110000_fhir_formulary_storage_foundation"
+        "20260807120000_ptg_import_wave_recovery_storage"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (

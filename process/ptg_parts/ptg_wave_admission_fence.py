@@ -7,9 +7,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import exists, select, text
 
-from db.models import ImportRun, PTGImportWave, PTGImportWaveIntent
+from db.models import (
+    ImportRun,
+    PTGImportWave,
+    PTGImportWaveIntent,
+    PTGImportWaveSupersession,
+)
 
 
 PTG_ADMISSION_LOCK_NAME = "import-run-admission:ptg-source-file"
@@ -62,8 +67,17 @@ async def _capacity_owning_waves(executor: Any) -> list[Any]:
         return []
     if not await _has_wave_table(executor, "ptg_import_wave"):
         return []
+    superseded = exists(
+        select(PTGImportWaveSupersession.predecessor_wave_id).where(
+            PTGImportWaveSupersession.predecessor_wave_id
+            == PTGImportWave.wave_id
+        )
+    )
     return await _all(executor, select(PTGImportWave.wave_id, PTGImportWave.state)
-                      .where(PTGImportWave.state.in_(PTG_WAVE_CAPACITY_OWNING_STATES))
+                      .where(
+                          PTGImportWave.state.in_(PTG_WAVE_CAPACITY_OWNING_STATES),
+                          ~superseded,
+                      )
                       .order_by(PTGImportWave.created_at, PTGImportWave.wave_id).limit(2))
 
 
@@ -95,9 +109,20 @@ async def require_wave_admission_capacity(executor: Any) -> None:
 
     if await _capacity_owning_waves(executor):
         raise PTGWaveCapacityConflict("PTG wave capacity is already reserved")
+    superseded_wave_run = exists(
+        select(PTGImportWaveIntent.run_id)
+        .join(
+            PTGImportWaveSupersession,
+            PTGImportWaveSupersession.predecessor_wave_id
+            == PTGImportWaveIntent.wave_id,
+        )
+        .where(PTGImportWaveIntent.run_id == ImportRun.run_id)
+    )
     active = await _all(executor, select(ImportRun.run_id).where(
         ImportRun.importer.in_(PTG_WAVE_FENCED_IMPORTERS),
-        ImportRun.status.in_(PTG_ACTIVE_RUN_STATES)).order_by(ImportRun.created_at, ImportRun.run_id).limit(1))
+        ImportRun.status.in_(PTG_ACTIVE_RUN_STATES),
+        ~superseded_wave_run,
+    ).order_by(ImportRun.created_at, ImportRun.run_id).limit(1))
     if active:
         raise PTGWaveCapacityConflict("active PTG work prevents wave admission")
 

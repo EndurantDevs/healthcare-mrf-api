@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from api.control_frozen_rate_files import validated_control_import_payload
 from api.control_import_wave_attestation import (
     ATTESTATION_VERSION,
+    SUPERSESSION_ATTESTATION_VERSION,
     _canonical,
     _identifier,
     _sha256,
@@ -32,7 +33,17 @@ from api.control_imports import (
     _normalize_triggered_by,
 )
 from api import control_import_wave_direct as direct_wave
-from db.models import ImportRun, PTGImportWave, PTGImportWaveIntent, db
+from api.control_import_wave_response import wave_response as _wave_response
+from api.control_import_wave_supersession import (
+    persist_admission_supersession,
+    validate_admission_supersession,
+)
+from db.models import (
+    ImportRun,
+    PTGImportWave,
+    PTGImportWaveIntent,
+    db,
+)
 from process.ptg_parts.frozen_rate_binding_store import insert_or_compare_frozen_binding
 from process.ptg_parts.ptg_source_attempt_actions import record_source_attempt_event
 from process.ptg_parts.ptg_source_attempt_guard import (
@@ -41,8 +52,6 @@ from process.ptg_parts.ptg_source_attempt_guard import (
     source_file_import_id_from_payload,
 )
 from process.ptg_parts.ptg_wave_admission_fence import (
-    PTG_WAVE_CAPACITY_OWNING_STATES,
-    PTG_WAVE_TERMINAL_STATES,
     acquire_ptg_admission_lock,
     require_wave_admission_capacity,
 )
@@ -244,6 +253,7 @@ def validate_import_wave_payload(
         attestation["intents"],
         wave_id=wave_id,
     )
+    supersession = validate_admission_supersession(attestation, wave_id=wave_id)
     if partition["imported_coordinate_count"] != len(intents):
         raise ValueError("partition imported_coordinate_count must equal signed intent count")
     imported_coordinate_digest = _sha256(
@@ -266,6 +276,7 @@ def validate_import_wave_payload(
     return {
         "wave_id": wave_id, "idempotency_key": idempotency_key,
         "attestation": attestation, "snapshot": snapshot, "partition": partition,
+        "supersession": supersession,
         "intents": intents, "request_digest": request_digest,
         "attestation_digest": _sha256(_canonical(attestation)),
         "signature_digest": _sha256(attestation["signature"].encode()),
@@ -399,40 +410,11 @@ async def _persist_wave_intents(
         ))
 
 
-def _wave_response(wave: PTGImportWave) -> dict[str, Any]:
-    return {
-        "wave_id": wave.wave_id, "request_digest": wave.request_digest,
-        "cohort_attestation_digest": wave.cohort_attestation_digest,
-        "physical_coordinate_count": wave.physical_coordinate_count,
-        "physical_coordinate_digest": wave.physical_coordinate_digest,
-        "imported_coordinate_count": wave.imported_coordinate_count,
-        "imported_coordinate_digest": wave.imported_coordinate_digest,
-        "reused_coordinate_count": wave.reused_coordinate_count,
-        "reused_coordinate_digest": wave.reused_coordinate_digest,
-        "partition_digest": wave.partition_digest, "intent_count": wave.intent_count,
-        "jobs_digest": wave.jobs_digest, "manifest_digest": wave.manifest_digest,
-        "wave_digest": wave.wave_digest, "enqueue_time_ms": wave.enqueue_time_ms,
-        "state": wave.state, "state_version": wave.state_version,
-        "capacity_owning": wave.state in PTG_WAVE_CAPACITY_OWNING_STATES,
-        "terminal": wave.state in PTG_WAVE_TERMINAL_STATES, "queue": wave.queue,
-        "release_queue": wave.release_queue, "worker_class": wave.worker_class,
-        "resource_class": wave.resource_class, "worker_limit": wave.worker_limit,
-        "protocol_identity": wave.protocol_identity, "serializer_identity": wave.serializer_identity,
-        "kubernetes_job_uid": wave.kubernetes_job_uid,
-        "kubernetes_job_receipt_digest": wave.kubernetes_job_receipt_digest,
-        "kubernetes_ready_attestation_digest": wave.kubernetes_ready_attestation_digest,
-        "redis_release_attestation_digest": wave.redis_release_attestation_digest,
-        "outcomes_digest": wave.outcomes_digest,
-        "linkage_ack_digest": wave.linkage_ack_digest,
-        "terminal_evidence_digest": wave.terminal_evidence_digest,
-        "redis_cleanup_evidence_digest": wave.redis_cleanup_evidence_digest,
-        "kubernetes_delete_evidence_digest": wave.kubernetes_delete_evidence_digest,
-        "cleanup_evidence_digest": wave.cleanup_evidence_digest,
-        "resolved_at": wave.resolved_at,
-    }
-
-
-async def admit_import_wave(admission_request: object) -> tuple[dict[str, Any], bool]:
+async def admit_import_wave(
+    admission_request: object,
+    *,
+    redis: Any = None,
+) -> tuple[dict[str, Any], bool]:
     """Atomically admit one authenticated complete wave or return its exact replay."""
 
     request = validate_import_wave_payload(admission_request)
@@ -462,6 +444,12 @@ async def admit_import_wave(admission_request: object) -> tuple[dict[str, Any], 
             if existing.request_digest != request["request_digest"]:
                 raise ImportWaveConflict("wave_id or idempotency_key conflicts with immutable request digest")
             return _wave_response(existing), False
+        await persist_admission_supersession(
+            session,
+            request,
+            now=now,
+            redis=redis,
+        )
         await require_wave_admission_capacity(executor)
         wave = _new_wave_record(
             request,
@@ -493,6 +481,6 @@ async def get_import_wave(wave_id: str) -> dict[str, Any] | None:
 
 
 __all__ = [
-    "ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
+    "ATTESTATION_VERSION", "SUPERSESSION_ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
     "sign_cohort_attestation", "validate_import_wave_payload",
 ]

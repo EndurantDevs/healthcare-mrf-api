@@ -137,6 +137,54 @@ def test_existing_job_is_attested_before_any_pods_or_status_exist():
     assert existing_job.runtime_image_identity == _RUNTIME_IMAGE_IDENTITY
 
 
+def test_existing_job_attestation_accepts_kubernetes_defaulted_field_ref_api_version():
+    manifest = _manifest()
+    actual_job = _actual_job(manifest)
+    environment = actual_job["spec"]["template"]["spec"]["containers"][0]["env"]
+    field_refs = [
+        environment_entry["valueFrom"]["fieldRef"]
+        for environment_entry in environment
+        if environment_entry.get("valueFrom", {}).get("fieldRef") is not None
+    ]
+    assert field_refs
+    assert all("apiVersion" not in field_ref for field_ref in field_refs)
+    for field_ref in field_refs:
+        field_ref["apiVersion"] = "v1"
+
+    existing_job = attest_existing_ptg_wave_job(manifest, actual_job)
+
+    assert existing_job.job_uid == "job-uid-123"
+
+
+@pytest.mark.parametrize(
+    ("api_version", "field_path"),
+    [
+        ("v2", None),
+        ("v1beta1", None),
+        ("v1", "metadata.name"),
+    ],
+)
+def test_existing_job_attestation_rejects_noncanonical_field_ref_changes(
+    api_version,
+    field_path,
+):
+    manifest = _manifest()
+    actual_job = _actual_job(manifest)
+    field_ref = next(
+        environment_entry
+        for environment_entry in actual_job["spec"]["template"]["spec"]["containers"][0][
+            "env"
+        ]
+        if environment_entry.get("valueFrom", {}).get("fieldRef") is not None
+    )["valueFrom"]["fieldRef"]
+    field_ref["apiVersion"] = api_version
+    if field_path is not None:
+        field_ref["fieldPath"] = field_path
+
+    with pytest.raises(PTGWaveContractError, match="worker config"):
+        attest_existing_ptg_wave_job(manifest, actual_job)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

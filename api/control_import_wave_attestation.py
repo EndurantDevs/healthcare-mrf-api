@@ -12,11 +12,15 @@ from typing import Any
 
 LEGACY_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v1"
 ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v2"
+SUPERSESSION_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v3"
 _ATTESTATION_DOMAINS = {
     LEGACY_ATTESTATION_VERSION: (
         b"healthporta.ptg-import-wave-attestation.v1\0"
     ),
     ATTESTATION_VERSION: b"healthporta.ptg-import-wave-attestation.v2\0",
+    SUPERSESSION_ATTESTATION_VERSION: (
+        b"healthporta.ptg-import-wave-attestation.v3\0"
+    ),
 }
 AUTHORIZATION_BASIS = (
     "complete_subscriptions_and_client_visible_bindings_v1"
@@ -102,24 +106,26 @@ def _verify_attestation(
 ) -> dict[str, Any]:
     if not isinstance(attestation, dict):
         raise ValueError("cohort_attestation must be an object")
+    schema_version = attestation.get("schema_version")
     expected_attestation_fields = {
         "schema_version", "wave_id", "idempotency_key", "snapshot",
         "partition", "intents", "signature",
     }
+    if schema_version == SUPERSESSION_ATTESTATION_VERSION:
+        expected_attestation_fields.add("supersession")
     if set(attestation) != expected_attestation_fields:
         raise ValueError("cohort_attestation fields are not exact")
+    if (
+        not isinstance(schema_version, str)
+        or schema_version not in _ATTESTATION_DOMAINS
+    ):
+        raise ValueError("cohort_attestation schema_version is unsupported")
     signature = _digest(attestation["signature"], "cohort_attestation.signature")
     unsigned_attestation_map = {
         key: field_value
         for key, field_value in attestation.items()
         if key != "signature"
     }
-    schema_version = unsigned_attestation_map["schema_version"]
-    if (
-        not isinstance(schema_version, str)
-        or schema_version not in _ATTESTATION_DOMAINS
-    ):
-        raise ValueError("cohort_attestation schema_version is unsupported")
     expected_signature = sign_cohort_attestation(
         unsigned_attestation_map,
         key=_attestation_key(attestation_key),
@@ -142,7 +148,7 @@ def _validate_snapshot(
         "catalog_generation",
     }
     expected_snapshot_fields = digest_fields | {"entitlement_coverage_count"}
-    if schema_version == ATTESTATION_VERSION:
+    if schema_version in {ATTESTATION_VERSION, SUPERSESSION_ATTESTATION_VERSION}:
         expected_snapshot_fields |= {
             "authorization_basis",
             "authorization_digest",
@@ -161,7 +167,7 @@ def _validate_snapshot(
         raise ValueError(
             "snapshot.entitlement_coverage_count must be a positive integer"
         )
-    if schema_version == ATTESTATION_VERSION:
+    if schema_version in {ATTESTATION_VERSION, SUPERSESSION_ATTESTATION_VERSION}:
         if count < 0:
             raise ValueError(
                 "snapshot.entitlement_coverage_count must be non-negative"
