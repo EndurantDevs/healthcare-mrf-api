@@ -12,7 +12,9 @@ from process.provider_directory_fhir_census_binding import (
     validated_current_version_census_count_map,
 )
 from process.provider_directory_fhir_census_contract import (
+    CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
     CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
     CURRENT_VERSION_CENSUS_START_URLS_FIELD,
     CurrentVersionCensusRuntime,
     ProviderDirectoryFHIRAcquisitionStrategy,
@@ -56,6 +58,9 @@ def _source_record():
         "metadata_json": {
             "provider_directory_manual_only": True,
             CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD: EXACT_STRATEGY,
+            CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD: (
+                CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY
+            ),
             "provider_directory_supported_resources": list(RESOURCE_TYPES),
             "provider_directory_fully_enumerable_resources": list(
                 RESOURCE_TYPES
@@ -251,16 +256,26 @@ def test_runtime_validator_requires_typed_request():
                 resource_deadline_seconds=0,
                 probe=True,
                 seed_only=False,
+                test_mode=False,
                 dataset_rehydrate_only=False,
+                dataset_followup_only=False,
                 canonical_backfill_only=False,
                 contact_backfill_only=False,
                 publish_artifacts_only=False,
                 local_seed_catalog=True,
+                local_retest_catalog=False,
                 supplemental_catalogs=False,
+                local_supplemental_catalog_inputs=(),
                 remote_catalog_inputs=(),
                 bulk_export=False,
                 stale_cleanup=False,
                 publication_requested=False,
+                defer_typed_materialization=True,
+                bounded_source_selection=False,
+                endpoint_scope_configured=False,
+                credential_configured=False,
+                open_only=True,
+                include_auth_required=False,
             ),
         )
 

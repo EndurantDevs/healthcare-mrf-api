@@ -15,7 +15,9 @@ from process.provider_directory_fhir_census_binding import (
     validated_current_version_census_count_map,
 )
 from process.provider_directory_fhir_census_contract import (
+    CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
     CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
+    CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
     CURRENT_VERSION_CENSUS_START_URLS_FIELD,
     CURRENT_VERSION_CENSUS_STRATEGY_VERSION,
     CurrentVersionCensusRuntime,
@@ -63,6 +65,9 @@ def _source_record(**metadata_overrides):
     metadata_by_field = {
         "provider_directory_manual_only": True,
         CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD: EXACT_STRATEGY,
+        CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD: (
+            CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY
+        ),
         "provider_directory_supported_resources": list(RESOURCE_TYPES),
         "provider_directory_fully_enumerable_resources": list(RESOURCE_TYPES),
         "provider_directory_expected_nonempty_resources": ["Organization"],
@@ -118,10 +123,9 @@ def test_configured_strategy_rejects_silently_ignored_cutoff():
         _request(provider_directory_acquisition_strategy="configured")
 
 
-def test_runtime_requires_exhaustive_serial_unpublished_controls():
-    request = _request()
-    assert request is not None
-    safe_runtime = CurrentVersionCensusRuntime(
+def _safe_runtime() -> CurrentVersionCensusRuntime:
+    """Return the sole exhaustive, serial, nonpublishing runtime shape."""
+    return CurrentVersionCensusRuntime(
         checkpointing_enabled=True,
         full_refresh=True,
         resource_limit=0,
@@ -134,17 +138,34 @@ def test_runtime_requires_exhaustive_serial_unpublished_controls():
         resource_deadline_seconds=0,
         probe=True,
         seed_only=False,
+        test_mode=False,
         dataset_rehydrate_only=False,
+        dataset_followup_only=False,
         canonical_backfill_only=False,
         contact_backfill_only=False,
         publish_artifacts_only=False,
         local_seed_catalog=True,
+        local_retest_catalog=False,
         supplemental_catalogs=False,
+        local_supplemental_catalog_inputs=(),
         remote_catalog_inputs=(),
         bulk_export=False,
         stale_cleanup=False,
         publication_requested=False,
+        defer_typed_materialization=True,
+        bounded_source_selection=False,
+        endpoint_scope_configured=False,
+        credential_configured=False,
+        open_only=True,
+        include_auth_required=False,
     )
+
+
+def test_runtime_requires_exhaustive_serial_unpublished_controls():
+    """Reject value or type drift from the admitted runtime shape."""
+    request = _request()
+    assert request is not None
+    safe_runtime = _safe_runtime()
     validate_current_version_census_runtime(request, safe_runtime)
     with pytest.raises(ValueError, match="resource_scan_concurrency"):
         validate_current_version_census_runtime(
@@ -156,6 +177,41 @@ def test_runtime_requires_exhaustive_serial_unpublished_controls():
                 }
             ),
         )
+    with pytest.raises(ValueError, match="runtime_type_invalid"):
+        validate_current_version_census_runtime(
+            request,
+            CurrentVersionCensusRuntime(
+                **{
+                    **safe_runtime.__dict__,
+                    "source_concurrency": True,
+                }
+            ),
+        )
+    with pytest.raises(ValueError, match="local_supplemental_catalog_inputs"):
+        validate_current_version_census_runtime(
+            request,
+            CurrentVersionCensusRuntime(
+                **{
+                    **safe_runtime.__dict__,
+                    "local_supplemental_catalog_inputs": (
+                        "cms_sma_endpoint_directory_path",
+                    ),
+                }
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "task_override",
+    (
+        {"probe": "true"},
+        {"source_concurrency": True},
+        {"run_id": 123},
+    ),
+)
+def test_request_rejects_runtime_type_lookalikes(task_override):
+    with pytest.raises(ValueError, match="task_type_invalid"):
+        _request(**task_override)
 
 
 @pytest.mark.parametrize(

@@ -12,9 +12,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from process.provider_directory_fhir_census_contract import (
+    CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
     CURRENT_VERSION_CENSUS_CONTRACT_FIELD,
     CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
     CURRENT_VERSION_CENSUS_SEMANTICS,
+    CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
     CURRENT_VERSION_CENSUS_START_URLS_FIELD,
     CURRENT_VERSION_CENSUS_STRATEGY_VERSION,
     CurrentVersionCensusRequest,
@@ -184,6 +186,7 @@ class CurrentVersionCensusContract:
     resources: tuple[str, ...]
     expected_nonempty_resources: tuple[str, ...]
     start_urls: tuple[tuple[str, str], ...]
+    continuation_strategy: str
     strategy_version: str = CURRENT_VERSION_CENSUS_STRATEGY_VERSION
 
     def start_url(self, resource_type: str, page_count: int) -> str:
@@ -242,6 +245,7 @@ class CurrentVersionCensusContract:
             "expected_nonempty_resources": list(
                 self.expected_nonempty_resources
             ),
+            "continuation_strategy": self.continuation_strategy,
             "reviewed_start_url_sha256_by_resource": {
                 resource_type: hashlib.sha256(
                     start_url.encode("utf-8")
@@ -337,12 +341,20 @@ def bind_current_version_census_contract(
         field_name=_EXPECTED_NONEMPTY_RESOURCES_FIELD,
         allowed_values=frozenset(request.resources),
     )
+    continuation_strategy = _clean_text(
+        metadata.get(CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD)
+    )
+    if continuation_strategy != CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY:
+        raise ValueError(
+            "provider_directory_current_version_census_continuation_strategy_not_reviewed"
+        )
     contract = CurrentVersionCensusContract(
         source_id=request.source_id,
         cutoff=request.cutoff,
         resources=request.resources,
         expected_nonempty_resources=expected_nonempty_resources,
         start_urls=_reviewed_start_urls(request, source_record, metadata),
+        continuation_strategy=continuation_strategy,
     )
     source_record[CURRENT_VERSION_CENSUS_CONTRACT_FIELD] = contract
     return contract
