@@ -10,6 +10,7 @@ import pytest
 
 from api.ptg_wave_kubernetes import build_ptg_wave_job
 from process.ptg_wave_preclaim_supersession import (
+    PTGWavePreclaimObservation,
     PTGWavePreclaimSupersessionConflict,
     attest_logical_preclaim_supersession,
     validate_logical_preclaim_supersession_proof,
@@ -151,7 +152,7 @@ def _intents_and_runs(wave: SimpleNamespace) -> tuple[list, list]:
 
 
 def _empty_redis_attestation(wave: SimpleNamespace) -> dict:
-    evidence = {
+    redis_attestation_map = {
         "schema_version": "healthporta.ptg-wave.redis-unclaimed-failure.v1",
         "wave_id": wave.wave_digest,
         "queue_name": wave.release_queue,
@@ -172,8 +173,8 @@ def _empty_redis_attestation(wave: SimpleNamespace) -> dict:
         "health_check_present": False,
     }
     return {
-        **evidence,
-        "attestation_digest": sha256_digest(canonical_json(evidence)),
+        **redis_attestation_map,
+        "attestation_digest": sha256_digest(canonical_json(redis_attestation_map)),
     }
 
 
@@ -187,14 +188,22 @@ def _attest(
     wave = _wave() if wave is None else wave
     intents, runs = _intents_and_runs(wave)
     return attest_logical_preclaim_supersession(
-        wave,
-        intents,
-        runs,
-        [] if claims is None else claims,
-        [] if outcomes is None else outcomes,
-        [],
-        _actual_job(wave.kubernetes_manifest) if actual_job is None else actual_job,
-        _empty_redis_attestation(wave) if redis is None else redis,
+        PTGWavePreclaimObservation(
+            predecessor_wave=wave,
+            intents=intents,
+            runs=runs,
+            claims=[] if claims is None else claims,
+            outcomes=[] if outcomes is None else outcomes,
+            worker_start_event_ordinals=[],
+            actual_job=(
+                _actual_job(wave.kubernetes_manifest)
+                if actual_job is None
+                else actual_job
+            ),
+            redis_unclaimed_attestation=(
+                _empty_redis_attestation(wave) if redis is None else redis
+            ),
+        ),
         "successor-wave",
     )
 
@@ -353,14 +362,16 @@ def test_witness_blocks_claims_outcomes_or_nonpristine_run():
     runs[0].started_at = object()
     with pytest.raises(PTGWavePreclaimSupersessionConflict, match="not pristine"):
         attest_logical_preclaim_supersession(
-            wave,
-            intents,
-            runs,
-            [],
-            [],
-            [],
-            _actual_job(wave.kubernetes_manifest),
-            _empty_redis_attestation(wave),
+            PTGWavePreclaimObservation(
+                predecessor_wave=wave,
+                intents=intents,
+                runs=runs,
+                claims=[],
+                outcomes=[],
+                worker_start_event_ordinals=[],
+                actual_job=_actual_job(wave.kubernetes_manifest),
+                redis_unclaimed_attestation=_empty_redis_attestation(wave),
+            ),
             "successor-wave",
         )
 
@@ -373,13 +384,15 @@ def test_witness_blocks_worker_start_event_marker():
         match="no worker start events",
     ):
         attest_logical_preclaim_supersession(
-            wave,
-            intents,
-            runs,
-            [],
-            [],
-            [0],
-            _actual_job(wave.kubernetes_manifest),
-            _empty_redis_attestation(wave),
+            PTGWavePreclaimObservation(
+                predecessor_wave=wave,
+                intents=intents,
+                runs=runs,
+                claims=[],
+                outcomes=[],
+                worker_start_event_ordinals=[0],
+                actual_job=_actual_job(wave.kubernetes_manifest),
+                redis_unclaimed_attestation=_empty_redis_attestation(wave),
+            ),
             "successor-wave",
         )

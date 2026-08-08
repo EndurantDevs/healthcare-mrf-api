@@ -22,6 +22,7 @@ from process.ptg_wave_controller import PTGWaveBundle, restore_wave_manifest
 from process.ptg_wave_failure_snapshots import _worker_start_event_ordinals
 from process.ptg_wave_preclaim_supersession import (
     PTGWaveLogicalPreclaimSupersessionWitness,
+    PTGWavePreclaimObservation,
     PTGWavePreclaimSupersessionConflict,
     attest_logical_preclaim_supersession,
     validate_logical_preclaim_supersession_proof,
@@ -123,6 +124,43 @@ async def _load_preclaim_database_snapshot(
     *,
     lock_rows: bool,
 ) -> _PreclaimDatabaseSnapshot:
+    """Load one authoritative predecessor snapshot in fixed lock order."""
+
+    wave = await _load_quarantined_predecessor(
+        session,
+        predecessor_wave_id,
+        lock_rows=lock_rows,
+    )
+    intents = await _load_predecessor_intents(
+        session,
+        predecessor_wave_id,
+        lock_rows=lock_rows,
+    )
+    runs, claims, outcomes = await _load_preclaim_related_rows(
+        session,
+        predecessor_wave_id,
+        intents,
+        lock_rows=lock_rows,
+    )
+    worker_events = tuple(
+        await _worker_start_event_ordinals(session, intents)
+    )
+    return _PreclaimDatabaseSnapshot(
+        wave=wave,
+        intents=intents,
+        runs=runs,
+        claims=claims,
+        outcomes=outcomes,
+        worker_start_event_ordinals=worker_events,
+    )
+
+
+async def _load_quarantined_predecessor(
+    session: Any,
+    predecessor_wave_id: str,
+    *,
+    lock_rows: bool,
+) -> PTGImportWave:
     wave_statement = select(PTGImportWave).where(
         PTGImportWave.wave_id == predecessor_wave_id
     )
@@ -140,6 +178,15 @@ async def _load_preclaim_database_snapshot(
         raise PTGWavePreclaimSupersessionConflict(
             "predecessor is not the quarantined legacy pre-receipt wave"
         )
+    return wave
+
+
+async def _load_predecessor_intents(
+    session: Any,
+    predecessor_wave_id: str,
+    *,
+    lock_rows: bool,
+) -> tuple[PTGImportWaveIntent, ...]:
     intents_statement = (
         select(PTGImportWaveIntent)
         .where(PTGImportWaveIntent.wave_id == predecessor_wave_id)
@@ -147,7 +194,20 @@ async def _load_preclaim_database_snapshot(
     )
     if lock_rows:
         intents_statement = intents_statement.with_for_update()
-    intents = tuple((await session.execute(intents_statement)).scalars().all())
+    return tuple((await session.execute(intents_statement)).scalars().all())
+
+
+async def _load_preclaim_related_rows(
+    session: Any,
+    predecessor_wave_id: str,
+    intents: tuple[PTGImportWaveIntent, ...],
+    *,
+    lock_rows: bool,
+) -> tuple[
+    tuple[ImportRun, ...],
+    tuple[PTGImportWaveClaim, ...],
+    tuple[PTGImportWaveOutcome, ...],
+]:
     run_ids = [intent.run_id for intent in intents]
     runs_statement = select(ImportRun).where(ImportRun.run_id.in_(run_ids)).order_by(
         ImportRun.run_id
@@ -169,15 +229,7 @@ async def _load_preclaim_database_snapshot(
     runs = tuple((await session.execute(runs_statement)).scalars().all())
     claims = tuple((await session.execute(claims_statement)).scalars().all())
     outcomes = tuple((await session.execute(outcomes_statement)).scalars().all())
-    worker_events = tuple(await _worker_start_event_ordinals(session, intents))
-    return _PreclaimDatabaseSnapshot(
-        wave=wave,
-        intents=intents,
-        runs=runs,
-        claims=claims,
-        outcomes=outcomes,
-        worker_start_event_ordinals=worker_events,
-    )
+    return runs, claims, outcomes
 
 
 async def _observe_external_preclaim_state(
@@ -203,14 +255,18 @@ async def _observe_external_preclaim_state(
         manifest,
     )
     return attest_logical_preclaim_supersession(
-        snapshot.wave,
-        snapshot.intents,
-        snapshot.runs,
-        snapshot.claims,
-        snapshot.outcomes,
-        snapshot.worker_start_event_ordinals,
-        actual_job,
-        redis_attestation.as_mapping(),
+        PTGWavePreclaimObservation(
+            predecessor_wave=snapshot.wave,
+            intents=snapshot.intents,
+            runs=snapshot.runs,
+            claims=snapshot.claims,
+            outcomes=snapshot.outcomes,
+            worker_start_event_ordinals=(
+                snapshot.worker_start_event_ordinals
+            ),
+            actual_job=actual_job,
+            redis_unclaimed_attestation=redis_attestation.as_mapping(),
+        ),
         successor_wave_id,
     )
 

@@ -138,7 +138,7 @@ async def control_get_import_wave_proof(request, wave_id: str):
     return response.json(proof, default=str)
 
 
-async def control_get_import_wave_logical_preclaim_supersession(
+async def control_get_logical_preclaim_supersession(
     request,
     wave_id: str,
 ):
@@ -177,7 +177,7 @@ def register_control_wave_routes(blueprint):
     )
     blueprint.get(
         "/import-waves/<wave_id>/logical-preclaim-supersession"
-    )(control_get_import_wave_logical_preclaim_supersession)
+    )(control_get_logical_preclaim_supersession)
     return blueprint
 
 

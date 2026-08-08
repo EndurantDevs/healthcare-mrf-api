@@ -10,7 +10,6 @@ It does not infer, store, or depend on historical Pod membership.
 from __future__ import annotations
 
 import json
-from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -18,15 +17,21 @@ from typing import Any
 from api.ptg_wave_kubernetes import (
     PTGWaveContractError,
     PTG_WAVE_SLOT_COUNT,
-    _job_name,
 )
 from api.ptg_wave_kubernetes_attestation import attest_existing_ptg_wave_job
 from process.ptg_wave_failure_snapshots import _is_prestart_run_pristine
-from process.ptg_wave_state import PTGWaveStateConflict, canonical_json, sha256_digest
+from process.ptg_wave_state import canonical_json, sha256_digest
+from process.ptg_wave_preclaim_supersession_contract import (
+    PTGWaveLogicalPreclaimSupersessionWitness,
+    PTGWavePreclaimSupersessionConflict,
+    _is_exact_bool,
+    _require_exact_int,
+    _require_text,
+    _require_wave_id,
+    validate_logical_preclaim_supersession_proof,
+)
 
 
-_SCHEMA_VERSION = "healthporta.ptg-wave.logical-preclaim-supersession.v1"
-_RECOVERY_BASIS = "logical_preclaim_failure"
 _REDIS_ATTESTATION_FIELDS = frozenset(
     {
         "schema_version",
@@ -52,261 +57,22 @@ _REDIS_ATTESTATION_FIELDS = frozenset(
 )
 
 
-class PTGWavePreclaimSupersessionConflict(PTGWaveStateConflict):
-    """A predecessor cannot safely support logical pre-claim supersession."""
-
-
-def validate_logical_preclaim_supersession_proof(
-    proof: Any,
-    *,
-    predecessor_wave_id: str | None = None,
-    successor_wave_id: str | None = None,
-) -> dict[str, Any]:
-    """Validate one exact canonical logical pre-claim proof mapping."""
-
-    top_fields = {
-        "schema_version",
-        "recovery_basis",
-        "predecessor",
-        "successor_wave_id",
-        "database",
-        "kubernetes",
-        "redis",
-        "proof_digest",
-    }
-    if not isinstance(proof, Mapping) or set(proof) != top_fields:
-        raise PTGWavePreclaimSupersessionConflict(
-            "logical pre-claim proof fields are not exact"
-        )
-    if (
-        _require_exact_text(proof["schema_version"], "logical pre-claim proof schema version")
-        != _SCHEMA_VERSION
-        or _require_exact_text(proof["recovery_basis"], "logical pre-claim proof basis")
-        != _RECOVERY_BASIS
-    ):
-        raise PTGWavePreclaimSupersessionConflict(
-            "logical pre-claim proof version or basis is unsupported"
-        )
-    predecessor = _exact_mapping(
-        proof["predecessor"],
-        {"wave_id", "wave_digest", "manifest_digest", "jobs_digest", "intent_count"},
-        "logical pre-claim predecessor",
-    )
-    predecessor_id = _validated_wave_id(predecessor["wave_id"], "predecessor wave ID")
-    successor_id = _validated_wave_id(proof["successor_wave_id"], "successor wave ID")
-    if predecessor_id == successor_id:
-        raise PTGWavePreclaimSupersessionConflict(
-            "successor wave ID must differ from the predecessor"
-        )
-    if predecessor_wave_id is not None:
-        expected_predecessor_id = _validated_wave_id(
-            predecessor_wave_id, "expected predecessor wave ID"
-        )
-        if predecessor_id != expected_predecessor_id:
-            raise PTGWavePreclaimSupersessionConflict(
-                "logical pre-claim proof identifies another predecessor"
-            )
-    if successor_wave_id is not None:
-        expected_successor_id = _validated_wave_id(
-            successor_wave_id, "expected successor wave ID"
-        )
-        if successor_id != expected_successor_id:
-            raise PTGWavePreclaimSupersessionConflict(
-                "logical pre-claim proof identifies another successor"
-            )
-    for name in ("wave_digest", "manifest_digest", "jobs_digest"):
-        _require_digest(predecessor[name], f"predecessor {name}")
-    intent_count = _require_exact_int(
-        predecessor["intent_count"], "logical pre-claim proof intent count"
-    )
-    if not 1 <= intent_count <= 4096:
-        raise PTGWavePreclaimSupersessionConflict(
-            "logical pre-claim proof intent count is invalid"
-        )
-    database = _exact_mapping(
-        proof["database"],
-        {"pristine_run_count", "claim_count", "outcome_count", "worker_start_event_count"},
-        "logical pre-claim database proof",
-    )
-    _require_exact_int(
-        database["pristine_run_count"], "logical pre-claim database pristine run count"
-    )
-    for name in ("claim_count", "outcome_count", "worker_start_event_count"):
-        _require_exact_int(database[name], f"logical pre-claim database {name}")
-    if database != {
-        "pristine_run_count": intent_count,
-        "claim_count": 0,
-        "outcome_count": 0,
-        "worker_start_event_count": 0,
-    }:
-        raise PTGWavePreclaimSupersessionConflict(
-            "logical pre-claim database proof is not empty and pristine"
-        )
-    kubernetes = _exact_mapping(
-        proof["kubernetes"],
-        {
-            "job_name", "job_uid", "completion_mode", "completions",
-            "parallelism", "backoff_limit", "failed", "active", "succeeded",
-            "ready", "terminating", "failed_condition", "complete_condition",
-        },
-        "logical pre-claim Kubernetes proof",
-    )
-    _require_text(kubernetes["job_name"], "Kubernetes Job name")
-    _require_text(kubernetes["job_uid"], "Kubernetes Job UID")
-    _require_exact_text(kubernetes["completion_mode"], "Kubernetes completion mode")
-    for name in (
-        "completions", "parallelism", "backoff_limit", "failed", "active",
-        "succeeded", "ready", "terminating",
-    ):
-        _require_exact_int(kubernetes[name], f"Kubernetes {name}")
-    for name in ("failed_condition", "complete_condition"):
-        _require_exact_bool(kubernetes[name], f"Kubernetes {name}")
-    expected_kubernetes = {
-        "job_name": _job_name(predecessor["wave_digest"]),
-        "job_uid": kubernetes["job_uid"],
-        "completion_mode": "Indexed",
-        "completions": PTG_WAVE_SLOT_COUNT,
-        "parallelism": PTG_WAVE_SLOT_COUNT,
-        "backoff_limit": 0,
-        "failed": PTG_WAVE_SLOT_COUNT,
-        "active": 0,
-        "succeeded": 0,
-        "ready": 0,
-        "terminating": 0,
-        "failed_condition": True,
-        "complete_condition": False,
-    }
-    if kubernetes != expected_kubernetes:
-        raise PTGWavePreclaimSupersessionConflict(
-            "logical pre-claim Kubernetes proof is not exact"
-        )
-    redis = _exact_mapping(
-        proof["redis"],
-        {
-            "unclaimed_attestation_digest", "ready_slot_count", "release_present",
-            "queued_ordinal_count", "job_ordinal_count", "result_ordinal_count",
-            "retry_ordinal_count", "in_progress_ordinal_count", "health_check_present",
-        },
-        "logical pre-claim Redis proof",
-    )
-    _require_digest(
-        redis["unclaimed_attestation_digest"],
-        "Redis unclaimed attestation digest",
-    )
-    for name in (
-        "ready_slot_count", "queued_ordinal_count", "job_ordinal_count",
-        "result_ordinal_count", "retry_ordinal_count", "in_progress_ordinal_count",
-    ):
-        _require_exact_int(redis[name], f"Redis {name}")
-    for name in ("release_present", "health_check_present"):
-        _require_exact_bool(redis[name], f"Redis {name}")
-    if redis != {
-        "unclaimed_attestation_digest": redis["unclaimed_attestation_digest"],
-        "ready_slot_count": 0,
-        "release_present": False,
-        "queued_ordinal_count": 0,
-        "job_ordinal_count": 0,
-        "result_ordinal_count": 0,
-        "retry_ordinal_count": 0,
-        "in_progress_ordinal_count": 0,
-        "health_check_present": False,
-    }:
-        raise PTGWavePreclaimSupersessionConflict(
-            "logical pre-claim Redis proof is not empty"
-        )
-    proof_digest = proof["proof_digest"]
-    _require_digest(proof_digest, "logical pre-claim proof digest")
-    unsigned = {name: proof[name] for name in proof if name != "proof_digest"}
-    if proof_digest != sha256_digest(canonical_json(unsigned)):
-        raise PTGWavePreclaimSupersessionConflict(
-            "logical pre-claim proof digest is invalid"
-        )
-    return deepcopy(dict(proof))
-
-
 @dataclass(frozen=True)
-class PTGWaveLogicalPreclaimSupersessionWitness:
-    """Canonical proof that binds one failed predecessor to its successor."""
+class PTGWavePreclaimObservation:
+    """One atomic predecessor snapshot with both external observations."""
 
-    predecessor_wave_id: str
-    predecessor_wave_digest: str
-    successor_wave_id: str
-    manifest_digest: str
-    jobs_digest: str
-    intent_count: int
-    job_name: str
-    job_uid: str
-    redis_attestation_digest: str
-    proof_digest: str
-
-    def evidence_mapping(self) -> dict[str, Any]:
-        """Return the stable, unsigned proof payload.
-
-        This is intentionally a logical witness: it contains neither Pod
-        identity nor volatile Kubernetes metadata such as timestamps,
-        resourceVersions, or event observations.
-        """
-
-        return {
-            "schema_version": _SCHEMA_VERSION,
-            "recovery_basis": _RECOVERY_BASIS,
-            "predecessor": {
-                "wave_id": self.predecessor_wave_id,
-                "wave_digest": self.predecessor_wave_digest,
-                "manifest_digest": self.manifest_digest,
-                "jobs_digest": self.jobs_digest,
-                "intent_count": self.intent_count,
-            },
-            "successor_wave_id": self.successor_wave_id,
-            "database": {
-                "pristine_run_count": self.intent_count,
-                "claim_count": 0,
-                "outcome_count": 0,
-                "worker_start_event_count": 0,
-            },
-            "kubernetes": {
-                "job_name": self.job_name,
-                "job_uid": self.job_uid,
-                "completion_mode": "Indexed",
-                "completions": PTG_WAVE_SLOT_COUNT,
-                "parallelism": PTG_WAVE_SLOT_COUNT,
-                "backoff_limit": 0,
-                "failed": PTG_WAVE_SLOT_COUNT,
-                "active": 0,
-                "succeeded": 0,
-                "ready": 0,
-                "terminating": 0,
-                "failed_condition": True,
-                "complete_condition": False,
-            },
-            "redis": {
-                "unclaimed_attestation_digest": self.redis_attestation_digest,
-                "ready_slot_count": 0,
-                "release_present": False,
-                "queued_ordinal_count": 0,
-                "job_ordinal_count": 0,
-                "result_ordinal_count": 0,
-                "retry_ordinal_count": 0,
-                "in_progress_ordinal_count": 0,
-                "health_check_present": False,
-            },
-        }
-
-    def as_mapping(self) -> dict[str, Any]:
-        """Return canonical proof data together with its SHA-256 digest."""
-
-        return {**self.evidence_mapping(), "proof_digest": self.proof_digest}
+    predecessor_wave: Any
+    intents: Sequence[Any]
+    runs: Sequence[Any]
+    claims: Sequence[Any]
+    outcomes: Sequence[Any]
+    worker_start_event_ordinals: Sequence[Any]
+    actual_job: Mapping[str, Any]
+    redis_unclaimed_attestation: Mapping[str, Any]
 
 
 def attest_logical_preclaim_supersession(
-    predecessor_wave: Any,
-    intents: Sequence[Any],
-    runs: Sequence[Any],
-    claims: Sequence[Any],
-    outcomes: Sequence[Any],
-    worker_start_event_ordinals: Sequence[Any],
-    actual_job: Mapping[str, Any],
-    redis_unclaimed_attestation: Mapping[str, Any],
+    observation: PTGWavePreclaimObservation,
     successor_wave_id: str,
 ) -> PTGWaveLogicalPreclaimSupersessionWitness:
     """Return a witness only for an exact, fully unclaimed predecessor.
@@ -316,38 +82,82 @@ def attest_logical_preclaim_supersession(
     does not interpret an all-failed Job as evidence of any particular Pods.
     """
 
-    _require_sequence(intents, "intents")
-    _require_sequence(runs, "runs")
-    _require_sequence(claims, "claims")
-    _require_sequence(outcomes, "outcomes")
-    _require_sequence(worker_start_event_ordinals, "worker start event ordinals")
-    _require_predecessor_preclaim_boundary(predecessor_wave)
+    predecessor_wave_id = _validate_preclaim_observation(
+        observation,
+        successor_wave_id,
+    )
+    job_name, job_uid = _attest_terminal_preclaim_job(
+        observation.predecessor_wave,
+        observation.actual_job,
+    )
+    redis_digest = _attest_empty_unclaimed_redis(
+        observation.predecessor_wave,
+        observation.redis_unclaimed_attestation,
+    )
+    return _build_preclaim_witness(
+        observation.predecessor_wave,
+        predecessor_wave_id=predecessor_wave_id,
+        successor_wave_id=successor_wave_id,
+        job_name=job_name,
+        job_uid=job_uid,
+        redis_digest=redis_digest,
+    )
+
+
+def _validate_preclaim_observation(
+    observation: PTGWavePreclaimObservation,
+    successor_wave_id: str,
+) -> str:
+    _require_sequence(observation.intents, "intents")
+    _require_sequence(observation.runs, "runs")
+    _require_sequence(observation.claims, "claims")
+    _require_sequence(observation.outcomes, "outcomes")
+    _require_sequence(
+        observation.worker_start_event_ordinals,
+        "worker start event ordinals",
+    )
+    _require_predecessor_preclaim_boundary(observation.predecessor_wave)
     _require_wave_id(successor_wave_id, "successor wave ID")
-    predecessor_wave_id = _text_attr(predecessor_wave, "wave_id")
+    predecessor_wave_id = _text_attr(observation.predecessor_wave, "wave_id")
     if successor_wave_id == predecessor_wave_id:
         raise PTGWavePreclaimSupersessionConflict(
             "successor wave ID must differ from the predecessor"
         )
-    _require_exact_intents_and_pristine_runs(predecessor_wave, intents, runs)
-    if claims:
+    _require_exact_intents_and_pristine_runs(
+        observation.predecessor_wave,
+        observation.intents,
+        observation.runs,
+    )
+    if observation.claims:
         raise PTGWavePreclaimSupersessionConflict(
             "logical pre-claim supersession requires no claims"
         )
-    if outcomes:
+    if observation.outcomes:
         raise PTGWavePreclaimSupersessionConflict(
             "logical pre-claim supersession requires no outcomes"
         )
-    if worker_start_event_ordinals:
+    if observation.worker_start_event_ordinals:
         raise PTGWavePreclaimSupersessionConflict(
             "logical pre-claim supersession requires no worker start events"
         )
-    job_name, job_uid = _attest_terminal_preclaim_job(predecessor_wave, actual_job)
-    redis_digest = _attest_empty_unclaimed_redis(
-        predecessor_wave, redis_unclaimed_attestation
-    )
-    values = {
+    return predecessor_wave_id
+
+
+def _build_preclaim_witness(
+    predecessor_wave: Any,
+    *,
+    predecessor_wave_id: str,
+    successor_wave_id: str,
+    job_name: str,
+    job_uid: str,
+    redis_digest: str,
+) -> PTGWaveLogicalPreclaimSupersessionWitness:
+    witness_field_map = {
         "predecessor_wave_id": predecessor_wave_id,
-        "predecessor_wave_digest": _text_attr(predecessor_wave, "wave_digest"),
+        "predecessor_wave_digest": _text_attr(
+            predecessor_wave,
+            "wave_digest",
+        ),
         "successor_wave_id": successor_wave_id,
         "manifest_digest": _text_attr(predecessor_wave, "manifest_digest"),
         "jobs_digest": _text_attr(predecessor_wave, "jobs_digest"),
@@ -356,11 +166,12 @@ def attest_logical_preclaim_supersession(
         "job_uid": job_uid,
         "redis_attestation_digest": redis_digest,
     }
-    unsigned = PTGWaveLogicalPreclaimSupersessionWitness(
-        **values, proof_digest=""
+    unsigned_evidence_map = PTGWaveLogicalPreclaimSupersessionWitness(
+        **witness_field_map, proof_digest=""
     ).evidence_mapping()
     return PTGWaveLogicalPreclaimSupersessionWitness(
-        **values, proof_digest=sha256_digest(canonical_json(unsigned))
+        **witness_field_map,
+        proof_digest=sha256_digest(canonical_json(unsigned_evidence_map)),
     )
 
 
@@ -432,11 +243,18 @@ def _require_exact_intents_and_pristine_runs(
         raise PTGWavePreclaimSupersessionConflict(
             "logical pre-claim supersession requires every admitted intent and run"
         )
-    ordinal_intents = [(_ordinal_attr(item), item) for item in intents]
+    ordinal_intents = [(_ordinal_attr(intent), intent) for intent in intents]
     ordered_intents = [
-        item for _, item in sorted(ordinal_intents, key=lambda item: item[0])
+        intent
+        for _, intent in sorted(
+            ordinal_intents,
+            key=lambda ordinal_intent: ordinal_intent[0],
+        )
     ]
-    if [ordinal for ordinal, _ in sorted(ordinal_intents)] != list(range(intent_count)):
+    ordered_ordinals = [
+        ordinal for ordinal, _ in sorted(ordinal_intents, key=lambda entry: entry[0])
+    ]
+    if ordered_ordinals != list(range(intent_count)):
         raise PTGWavePreclaimSupersessionConflict(
             "predecessor intents are not complete contiguous ordinals"
         )
@@ -489,7 +307,7 @@ def _attest_terminal_preclaim_job(
         raise PTGWavePreclaimSupersessionConflict(
             "actual Job does not exactly attest the predecessor manifest"
         ) from exc
-    expected = (
+    expected_attributes = (
         ("wave_digest", attested.wave_digest),
         ("release_queue", attested.queue),
         ("manifest_digest", attested.manifest_digest),
@@ -501,7 +319,10 @@ def _attest_terminal_preclaim_job(
         ("pinned_image_digest", attested.image_identity.rsplit("@sha256:", 1)[1]),
         ("runtime_image_identity", attested.runtime_image_identity),
     )
-    if any(getattr(wave, name, None) != value for name, value in expected):
+    if any(
+        getattr(wave, name, None) != expected_attribute_value
+        for name, expected_attribute_value in expected_attributes
+    ):
         raise PTGWavePreclaimSupersessionConflict(
             "actual Job manifest attestation does not bind durable predecessor identity"
         )
@@ -541,8 +362,8 @@ def _require_terminal_status(actual_job: Mapping[str, Any]) -> None:
     if not isinstance(status, Mapping):
         raise PTGWavePreclaimSupersessionConflict("actual Job terminal status is missing")
     for name in ("active", "succeeded", "ready", "terminating"):
-        value = status.get(name, 0)
-        if type(value) is not int or value != 0:
+        status_count = status.get(name, 0)
+        if type(status_count) is not int or status_count != 0:
             raise PTGWavePreclaimSupersessionConflict(
                 f"actual Job {name} must be zero or absent"
             )
@@ -596,8 +417,8 @@ def _attest_empty_unclaimed_redis(wave: Any, receipt: Mapping[str, Any]) -> str:
     for name in ("job_count", "target_key_count"):
         _require_exact_int(receipt[name], f"Redis unclaimed attestation {name}")
     for name in ("release_present", "health_check_present"):
-        _require_exact_bool(receipt[name], f"Redis unclaimed attestation {name}")
-    expected = {
+        _is_exact_bool(receipt[name], f"Redis unclaimed attestation {name}")
+    expected_redis_receipt_map = {
         "schema_version": "healthporta.ptg-wave.redis-unclaimed-failure.v1",
         "wave_id": wave.wave_digest,
         "queue_name": wave.release_queue,
@@ -617,7 +438,10 @@ def _attest_empty_unclaimed_redis(wave: Any, receipt: Mapping[str, Any]) -> str:
         "in_progress_ordinals": [],
         "health_check_present": False,
     }
-    if any(receipt.get(name) != value for name, value in expected.items()):
+    if any(
+        receipt.get(name) != expected_receipt_value
+        for name, expected_receipt_value in expected_redis_receipt_map.items()
+    ):
         raise PTGWavePreclaimSupersessionConflict(
             "Redis unclaimed attestation is not the empty pre-release state"
         )
@@ -638,38 +462,6 @@ def _attest_empty_unclaimed_redis(wave: Any, receipt: Mapping[str, Any]) -> str:
 def _require_sequence(value: Any, name: str) -> None:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise PTGWavePreclaimSupersessionConflict(f"{name} must be a sequence")
-
-
-def _exact_mapping(value: Any, fields: set[str], name: str) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != fields:
-        raise PTGWavePreclaimSupersessionConflict(f"{name} fields are not exact")
-    return dict(value)
-
-
-def _require_digest(value: Any, name: str) -> None:
-    if (
-        type(value) is not str
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise PTGWavePreclaimSupersessionConflict(
-            f"{name} must be a lowercase SHA-256 digest"
-        )
-
-
-def _require_text(value: Any, name: str) -> None:
-    if type(value) is not str or not value or value != value.strip() or len(value) > 160:
-        raise PTGWavePreclaimSupersessionConflict(f"{name} must be a non-empty bounded string")
-
-
-def _require_wave_id(value: Any, name: str) -> None:
-    if type(value) is not str or not value or value != value.strip() or len(value) > 64:
-        raise PTGWavePreclaimSupersessionConflict(f"{name} must be a non-empty bounded string")
-
-
-def _validated_wave_id(value: Any, name: str) -> str:
-    _require_wave_id(value, name)
-    return value
 
 
 def _text_attr(value: Any, name: str) -> str:
@@ -698,26 +490,9 @@ def _ordinal_attr(value: Any) -> int:
     return ordinal
 
 
-def _require_exact_int(value: Any, name: str) -> int:
-    if type(value) is not int:
-        raise PTGWavePreclaimSupersessionConflict(f"{name} must be an exact integer")
-    return value
-
-
-def _require_exact_bool(value: Any, name: str) -> bool:
-    if type(value) is not bool:
-        raise PTGWavePreclaimSupersessionConflict(f"{name} must be an exact boolean")
-    return value
-
-
-def _require_exact_text(value: Any, name: str) -> str:
-    if type(value) is not str:
-        raise PTGWavePreclaimSupersessionConflict(f"{name} must be an exact string")
-    return value
-
-
 __all__ = [
     "PTGWaveLogicalPreclaimSupersessionWitness",
+    "PTGWavePreclaimObservation",
     "PTGWavePreclaimSupersessionConflict",
     "attest_logical_preclaim_supersession",
     "validate_logical_preclaim_supersession_proof",

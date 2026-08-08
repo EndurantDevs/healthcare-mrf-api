@@ -9,12 +9,10 @@ import contextlib
 import logging
 import os
 import sys
-from dataclasses import dataclass
 from typing import Any, Iterable
 
 from arq import create_pool
 from arq.constants import health_check_key_suffix
-from sqlalchemy import exists, select
 
 from api.ptg_wave_kubernetes import (
     PTGWaveContractError,
@@ -40,13 +38,7 @@ from api.ptg_wave_kubernetes_terminal_attestation import (
 from api.ptg_wave_kubernetes_failure_attestation import (
     attest_preclaim_failure_ptg_wave_kubernetes_objects,
 )
-from db.models import (
-    ImportRun,
-    PTGImportWave,
-    PTGImportWaveIntent,
-    PTGImportWaveQuarantine,
-    db,
-)
+from db.models import ImportRun, PTGImportWave, db
 from process._ptg_wave_redis_models import (
     PTGSmallWaveJob,
     PTGSmallWaveManifest,
@@ -101,6 +93,10 @@ from process.ptg_wave_state import (
     resolve_uncertainty,
     sha256_digest,
 )
+from process.ptg_wave_controller_bundle import (
+    PTGWaveBundle,
+    load_capacity_owning_wave,
+)
 from process.redis_config import build_redis_settings
 from process import ptg_wave_controller_isolation as _controller_isolation
 from process import ptg_wave_controller_operations as _controller_operations
@@ -125,12 +121,6 @@ _PTG_BASE_QUEUES = (
 
 class PTGWaveControllerHold(RuntimeError):
     """The controller observed a safe, nonterminal condition and must wait."""
-
-
-@dataclass(frozen=True)
-class PTGWaveBundle:
-    wave: PTGImportWave
-    intents: tuple[PTGImportWaveIntent, ...]
 
 
 def is_controller_enabled(environ: dict[str, str] | None = None) -> bool:
@@ -160,39 +150,6 @@ def _controller_runtime_config() -> tuple[str, str]:
         barrier_factory=BARRIER_FACTORY,
     )
     return image, runtime_image
-
-
-async def load_capacity_owning_wave() -> PTGWaveBundle | None:
-    """Load the sole capacity-owning PTG wave and its complete intent set."""
-
-    async with db.session() as session:
-        waves = (await session.execute(
-            select(PTGImportWave)
-            .where(
-                PTGImportWave.state.in_(PTG_WAVE_CAPACITY_OWNING_STATES),
-                ~exists(
-                    select(PTGImportWaveQuarantine.predecessor_wave_id).where(
-                        PTGImportWaveQuarantine.predecessor_wave_id
-                        == PTGImportWave.wave_id
-                    )
-                ),
-            )
-            .order_by(PTGImportWave.created_at, PTGImportWave.wave_id)
-            .limit(2)
-        )).scalars().all()
-        if not waves:
-            return None
-        if len(waves) != 1:
-            raise PTGWaveStateConflict("PTG wave capacity ownership is ambiguous")
-        wave = waves[0]
-        intents = tuple((await session.execute(
-            select(PTGImportWaveIntent)
-            .where(PTGImportWaveIntent.wave_id == wave.wave_id)
-            .order_by(PTGImportWaveIntent.ordinal)
-        )).scalars().all())
-    if len(intents) != wave.intent_count or [item.ordinal for item in intents] != list(range(wave.intent_count)):
-        raise PTGWaveStateConflict("persisted exact-wave intents are incomplete")
-    return PTGWaveBundle(wave=wave, intents=intents)
 
 
 def restore_wave_manifest(bundle: PTGWaveBundle) -> PTGSmallWaveManifest:

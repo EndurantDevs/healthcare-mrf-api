@@ -179,8 +179,8 @@ def _require_actual_template(
     desired_template = _mapping(desired_spec.get("template"), "desired Job template")
     template_metadata = _mapping(template.get("metadata"), "actual template metadata")
     _require_metadata_contract(template_metadata, contract, "actual Job template")
-    normalized_template = _normalize_kubernetes_defaulted_template(template)
-    if _worker_config_identity_from_template(normalized_template) != contract.config_identity:
+    normalized_template_map = _normalize_kubernetes_defaulted_template(template)
+    if _worker_config_identity_from_template(normalized_template_map) != contract.config_identity:
         raise PTGWaveContractError("actual Job worker config differs from its identity")
     pod_spec = _mapping(template.get("spec"), "actual Job pod spec")
     desired_pod_spec = _mapping(desired_template.get("spec"), "desired Job pod spec")
@@ -219,16 +219,16 @@ def _normalize_kubernetes_defaulted_template(
     for container in containers:
         if not isinstance(container, Mapping):
             return template
-        normalized_container = dict(container)
-        normalized_container["env"] = _normalize_kubernetes_defaulted_environment(
+        normalized_container_map = dict(container)
+        normalized_container_map["env"] = _normalize_kubernetes_defaulted_environment(
             container.get("env")
         )
-        normalized_containers.append(normalized_container)
-    normalized_pod_spec = dict(pod_spec)
-    normalized_pod_spec["containers"] = normalized_containers
-    normalized_template = dict(template)
-    normalized_template["spec"] = normalized_pod_spec
-    return normalized_template
+        normalized_containers.append(normalized_container_map)
+    normalized_pod_spec_map = dict(pod_spec)
+    normalized_pod_spec_map["containers"] = normalized_containers
+    normalized_template_map = dict(template)
+    normalized_template_map["spec"] = normalized_pod_spec_map
+    return normalized_template_map
 
 
 def _normalize_kubernetes_defaulted_environment(environment: Any) -> Any:
@@ -236,27 +236,27 @@ def _normalize_kubernetes_defaulted_environment(environment: Any) -> Any:
 
     if not isinstance(environment, list):
         return environment
-    normalized_environment = []
+    normalized_environment_entries = []
     for entry in environment:
         if not isinstance(entry, Mapping):
-            normalized_environment.append(entry)
+            normalized_environment_entries.append(entry)
             continue
         value_from = entry.get("valueFrom")
         if not isinstance(value_from, Mapping):
-            normalized_environment.append(entry)
+            normalized_environment_entries.append(entry)
             continue
         field_ref = value_from.get("fieldRef")
         if not isinstance(field_ref, Mapping) or field_ref.get("apiVersion") != "v1":
-            normalized_environment.append(entry)
+            normalized_environment_entries.append(entry)
             continue
-        normalized_field_ref = dict(field_ref)
-        del normalized_field_ref["apiVersion"]
-        normalized_value_from = dict(value_from)
-        normalized_value_from["fieldRef"] = normalized_field_ref
-        normalized_entry = dict(entry)
-        normalized_entry["valueFrom"] = normalized_value_from
-        normalized_environment.append(normalized_entry)
-    return normalized_environment
+        normalized_field_ref_map = dict(field_ref)
+        del normalized_field_ref_map["apiVersion"]
+        normalized_value_from_map = dict(value_from)
+        normalized_value_from_map["fieldRef"] = normalized_field_ref_map
+        normalized_environment_entry_map = dict(entry)
+        normalized_environment_entry_map["valueFrom"] = normalized_value_from_map
+        normalized_environment_entries.append(normalized_environment_entry_map)
+    return normalized_environment_entries
 
 
 def _attest_actual_pod(

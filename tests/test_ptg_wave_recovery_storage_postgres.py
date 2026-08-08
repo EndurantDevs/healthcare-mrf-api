@@ -58,9 +58,7 @@ def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-async def _create_prerequisites(connection, schema: str) -> None:
-    quoted = _quote(schema)
-    await connection.execute(f'CREATE SCHEMA {quoted}')
+async def _create_wave_table(connection, quoted: str) -> None:
     await connection.execute(
         f"""
         CREATE TABLE {quoted}.ptg_import_wave (
@@ -109,6 +107,9 @@ async def _create_prerequisites(connection, schema: str) -> None:
         )
         """
     )
+
+
+async def _create_support_tables(connection, quoted: str) -> None:
     await connection.execute(
         f"""
         CREATE TABLE {quoted}.import_run (
@@ -140,6 +141,9 @@ async def _create_prerequisites(connection, schema: str) -> None:
         )
         """
     )
+
+
+async def _seed_predecessor(connection, quoted: str) -> None:
     digest = "a" * 64
     await connection.execute(
         f"""
@@ -184,6 +188,16 @@ async def _create_prerequisites(connection, schema: str) -> None:
     )
 
 
+async def _create_prerequisites(connection, schema: str) -> None:
+    """Create the isolated storage contract and one pristine predecessor."""
+
+    quoted = _quote(schema)
+    await connection.execute(f'CREATE SCHEMA {quoted}')
+    await _create_wave_table(connection, quoted)
+    await _create_support_tables(connection, quoted)
+    await _seed_predecessor(connection, quoted)
+
+
 async def _install_migration(connection, monkeypatch, schema: str) -> object:
     await _create_prerequisites(connection, schema)
     migration = _load_migration()
@@ -198,18 +212,24 @@ async def _install_migration(connection, monkeypatch, schema: str) -> object:
     return migration
 
 
-def _signed_evidence(unsigned: dict[str, object]) -> tuple[dict[str, object], bytes]:
+def _signed_evidence(
+    unsigned_evidence_map: dict[str, object],
+) -> tuple[dict[str, object], bytes]:
     canonical = json.dumps(
-        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        unsigned_evidence_map,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode("utf-8")
     return {
-        **unsigned, "proof_digest": hashlib.sha256(canonical).hexdigest(),
+        **unsigned_evidence_map,
+        "proof_digest": hashlib.sha256(canonical).hexdigest(),
     }, canonical
 
 
 def _evidence(successor_wave_id: str) -> tuple[dict[str, object], bytes]:
     digest = "a" * 64
-    unsigned = {
+    unsigned_evidence_map = {
         "schema_version": "healthporta.ptg-wave.logical-preclaim-supersession.v1",
         "recovery_basis": "logical_preclaim_failure",
         "predecessor": {
@@ -236,7 +256,7 @@ def _evidence(successor_wave_id: str) -> tuple[dict[str, object], bytes]:
             "in_progress_ordinal_count": 0, "health_check_present": False,
         },
     }
-    return _signed_evidence(unsigned)
+    return _signed_evidence(unsigned_evidence_map)
 
 
 async def _insert_successor(connection, schema: str, wave_id: str, state: str, cohort: dict) -> None:
@@ -269,6 +289,84 @@ async def _insert_supersession(connection, schema: str, wave_id: str, evidence: 
     )
 
 
+async def _assert_predecessor_immutable(connection, quoted: str) -> None:
+    with pytest.raises(asyncpg.PostgresError, match="QUARANTINED_IMMUTABLE"):
+        await connection.execute(
+            f"UPDATE {quoted}.ptg_import_wave SET state = 'materializing' "
+            "WHERE wave_id = 'predecessor-wave'"
+        )
+
+
+async def _assert_successor_variants_rejected(connection, schema: str) -> None:
+    quoted = _quote(schema)
+    for wave_id, state, successor_cohort_map in (
+        ("terminal-successor", "failed", {}),
+        ("wrong-schema-successor", "admitted", {
+            "schema_version": "healthporta.ptg-import-wave-attestation.v2",
+        }),
+        ("wrong-envelope-successor", "admitted", {
+            "schema_version": "healthporta.ptg-import-wave-attestation.v3",
+            "wave_id": "wrong-envelope-successor", "supersession": {},
+        }),
+    ):
+        evidence, canonical = _evidence(wave_id)
+        if not successor_cohort_map:
+            successor_cohort_map = {
+                "schema_version": "healthporta.ptg-import-wave-attestation.v3",
+                "wave_id": wave_id, "supersession": evidence,
+            }
+        with pytest.raises(asyncpg.PostgresError, match="SUCCESSOR_BINDING_INVALID"):
+            async with connection.transaction():
+                await _insert_successor(
+                    connection, schema, wave_id, state, successor_cohort_map,
+                )
+                await _insert_supersession(connection, schema, wave_id, evidence, canonical)
+        assert await connection.fetchval(
+            f"SELECT count(*) FROM {quoted}.ptg_import_wave_supersession"
+        ) == 0
+        assert await connection.fetchval(
+            f"SELECT count(*) FROM {quoted}.ptg_import_wave WHERE wave_id = $1",
+            wave_id,
+        ) == 0
+
+
+async def _assert_invalid_evidence_rejected(connection, schema: str) -> None:
+    quoted = _quote(schema)
+    for wave_id, mutate in (
+        ("missing-kubernetes", lambda evidence: evidence.pop("kubernetes")),
+        ("decimal-completions", lambda evidence: evidence["kubernetes"].update(
+            completions=12.0,
+        )),
+        ("string-release-present", lambda evidence: evidence["redis"].update(
+            release_present="false",
+        )),
+        ("numeric-job-uid", lambda evidence: evidence["kubernetes"].update(job_uid=7)),
+        ("wrong-job-name", lambda evidence: evidence["kubernetes"].update(
+            job_name="other-job",
+        )),
+    ):
+        evidence, _canonical = _evidence(wave_id)
+        unsigned_evidence_map = deepcopy(evidence)
+        unsigned_evidence_map.pop("proof_digest")
+        mutate(unsigned_evidence_map)
+        evidence, canonical = _signed_evidence(unsigned_evidence_map)
+        successor_cohort_map = {
+            "schema_version": "healthporta.ptg-import-wave-attestation.v3",
+            "wave_id": wave_id, "supersession": evidence,
+        }
+        with pytest.raises(asyncpg.PostgresError, match="EVIDENCE_INVALID"):
+            async with connection.transaction():
+                await _insert_successor(
+                    connection, schema, wave_id, "admitted", successor_cohort_map,
+                )
+                await _insert_supersession(
+                    connection, schema, wave_id, evidence, canonical,
+                )
+        assert await connection.fetchval(
+            f"SELECT count(*) FROM {quoted}.ptg_import_wave_supersession"
+        ) == 0
+
+
 @pytest.mark.asyncio
 async def test_successor_binding_rejects_terminal_or_unrelated_rows_and_rolls_back(monkeypatch):
     dsn = _dsn()
@@ -276,74 +374,9 @@ async def test_successor_binding_rejects_terminal_or_unrelated_rows_and_rolls_ba
     connection = await asyncpg.connect(dsn)
     try:
         await _install_migration(connection, monkeypatch, schema)
-        quoted = _quote(schema)
-        with pytest.raises(asyncpg.PostgresError, match="QUARANTINED_IMMUTABLE"):
-            await connection.execute(
-                f"UPDATE {quoted}.ptg_import_wave SET state = 'materializing' "
-                "WHERE wave_id = 'predecessor-wave'"
-            )
-        for wave_id, state, cohort in (
-            ("terminal-successor", "failed", {}),
-            ("wrong-schema-successor", "admitted", {
-                "schema_version": "healthporta.ptg-import-wave-attestation.v2",
-            }),
-            ("wrong-envelope-successor", "admitted", {
-                "schema_version": "healthporta.ptg-import-wave-attestation.v3",
-                "wave_id": "wrong-envelope-successor", "supersession": {},
-            }),
-        ):
-            evidence, canonical = _evidence(wave_id)
-            if not cohort:
-                cohort = {
-                    "schema_version": "healthporta.ptg-import-wave-attestation.v3",
-                    "wave_id": wave_id, "supersession": evidence,
-                }
-            with pytest.raises(asyncpg.PostgresError, match="SUCCESSOR_BINDING_INVALID"):
-                async with connection.transaction():
-                    await _insert_successor(connection, schema, wave_id, state, cohort)
-                    await _insert_supersession(connection, schema, wave_id, evidence, canonical)
-            assert await connection.fetchval(
-                f"SELECT count(*) FROM {quoted}.ptg_import_wave_supersession"
-            ) == 0
-            assert await connection.fetchval(
-                f"SELECT count(*) FROM {quoted}.ptg_import_wave WHERE wave_id = $1",
-                wave_id,
-            ) == 0
-        for wave_id, mutate in (
-            ("missing-kubernetes", lambda evidence: evidence.pop("kubernetes")),
-            ("decimal-completions", lambda evidence: evidence["kubernetes"].update(
-                completions=12.0,
-            )),
-            ("string-release-present", lambda evidence: evidence["redis"].update(
-                release_present="false",
-            )),
-            ("numeric-job-uid", lambda evidence: evidence["kubernetes"].update(
-                job_uid=7,
-            )),
-            ("wrong-job-name", lambda evidence: evidence["kubernetes"].update(
-                job_name="other-job",
-            )),
-        ):
-            evidence, _canonical = _evidence(wave_id)
-            unsigned = deepcopy(evidence)
-            unsigned.pop("proof_digest")
-            mutate(unsigned)
-            evidence, canonical = _signed_evidence(unsigned)
-            cohort = {
-                "schema_version": "healthporta.ptg-import-wave-attestation.v3",
-                "wave_id": wave_id, "supersession": evidence,
-            }
-            with pytest.raises(asyncpg.PostgresError, match="EVIDENCE_INVALID"):
-                async with connection.transaction():
-                    await _insert_successor(
-                        connection, schema, wave_id, "admitted", cohort,
-                    )
-                    await _insert_supersession(
-                        connection, schema, wave_id, evidence, canonical,
-                    )
-            assert await connection.fetchval(
-                f"SELECT count(*) FROM {quoted}.ptg_import_wave_supersession"
-            ) == 0
+        await _assert_predecessor_immutable(connection, _quote(schema))
+        await _assert_successor_variants_rejected(connection, schema)
+        await _assert_invalid_evidence_rejected(connection, schema)
     finally:
         await connection.execute(f"DROP SCHEMA IF EXISTS {_quote(schema)} CASCADE")
         await connection.close()
@@ -358,12 +391,18 @@ async def test_successor_binding_accepts_atomic_admission_and_canonical_evidence
         await _install_migration(connection, monkeypatch, schema)
         wave_id = "admitted-successor"
         evidence, canonical = _evidence(wave_id)
-        cohort = {
+        successor_cohort_map = {
             "schema_version": "healthporta.ptg-import-wave-attestation.v3",
             "wave_id": wave_id, "supersession": evidence,
         }
         async with connection.transaction():
-            await _insert_successor(connection, schema, wave_id, "admitted", cohort)
+            await _insert_successor(
+                connection,
+                schema,
+                wave_id,
+                "admitted",
+                successor_cohort_map,
+            )
             await _insert_supersession(connection, schema, wave_id, evidence, canonical)
         quoted = _quote(schema)
         await connection.execute(

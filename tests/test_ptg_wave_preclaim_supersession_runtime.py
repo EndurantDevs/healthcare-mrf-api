@@ -196,12 +196,16 @@ async def test_locked_admission_rejects_existing_supersession_and_proof_drift(
     monkeypatch.setattr(runtime, "_supersession_row", AsyncMock(return_value=None))
     loader = AsyncMock(return_value=snapshot)
     monkeypatch.setattr(runtime, "_load_preclaim_database_snapshot", loader)
-    drifted = dict(proof)
-    drifted["proof_digest"] = "0" * 64
+    drifted_proof_map = dict(proof)
+    drifted_proof_map["proof_digest"] = "0" * 64
     monkeypatch.setattr(
         runtime,
         "_observe_external_preclaim_state",
-        AsyncMock(return_value=SimpleNamespace(as_mapping=lambda: drifted)),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                as_mapping=lambda: drifted_proof_map,
+            )
+        ),
     )
 
     with pytest.raises(PTGWavePreclaimSupersessionConflict, match="differs"):
@@ -254,26 +258,30 @@ async def test_locked_admission_rejects_claim_outcome_or_worker_start_drift(
 async def test_logical_preclaim_route_is_get_only_and_forwards_exact_query(
     monkeypatch,
 ):
-    registered = []
+    registered_routes = []
 
     class _Blueprint:
         def listener(self, _name):
             return lambda function: function
 
         def get(self, path):
-            return lambda function: registered.append(("GET", path, function)) or function
+            return lambda function: registered_routes.append(
+                ("GET", path, function)
+            ) or function
 
         def post(self, path):
-            return lambda function: registered.append(("POST", path, function)) or function
+            return lambda function: registered_routes.append(
+                ("POST", path, function)
+            ) or function
 
     routes.register_control_wave_routes(_Blueprint())
     assert (
         "GET",
         "/import-waves/<wave_id>/logical-preclaim-supersession",
-    ) in [(method, path) for method, path, _ in registered]
+    ) in [(method, path) for method, path, _ in registered_routes]
     assert not any(
         method == "POST" and "logical-preclaim-supersession" in path
-        for method, path, _ in registered
+        for method, path, _ in registered_routes
     )
 
     candidate = AsyncMock(return_value={"proof_digest": "a" * 64})
@@ -289,7 +297,7 @@ async def test_logical_preclaim_route_is_get_only_and_forwards_exact_query(
         app=SimpleNamespace(ctx=SimpleNamespace(ptg_wave_redis="redis-observer")),
     )
 
-    response = await routes.control_get_import_wave_logical_preclaim_supersession(
+    response = await routes.control_get_logical_preclaim_supersession(
         request, "predecessor-wave"
     )
 
@@ -299,7 +307,7 @@ async def test_logical_preclaim_route_is_get_only_and_forwards_exact_query(
     )
 
     with pytest.raises(BadRequest, match="successor_wave_id is required"):
-        await routes.control_get_import_wave_logical_preclaim_supersession(
+        await routes.control_get_logical_preclaim_supersession(
             SimpleNamespace(args={}, app=request.app), "predecessor-wave"
         )
 

@@ -244,26 +244,26 @@ async def test_quarantine_only_silences_controller_selection(monkeypatch):
 async def test_normal_work_still_blocks_and_supersession_is_predecessor_scoped(monkeypatch):
     capacity_owning_waves = fence._capacity_owning_waves
     monkeypatch.setattr(fence, "_capacity_owning_waves", AsyncMock(return_value=[]))
-    captured = []
+    captured_statements = []
 
     async def active_run(_executor, statement):
-        captured.append(statement)
+        captured_statements.append(statement)
         return [("normal-active-run",)]
 
     monkeypatch.setattr(fence, "_all", active_run)
     with pytest.raises(fence.PTGWaveCapacityConflict, match="active PTG work"):
         await fence.require_wave_admission_capacity(object())
 
-    active_sql = _sql(captured[0])
+    active_sql = _sql(captured_statements[0])
     assert "ptg_import_wave_supersession" in active_sql
     assert "ptg_import_wave_intent" in active_sql
     assert "ptg_import_wave_quarantine" not in active_sql
 
-    captured.clear()
+    captured_statements.clear()
     monkeypatch.setattr(fence, "_has_wave_table", AsyncMock(return_value=True))
     monkeypatch.setattr(fence, "_all", active_run)
     executor = type("Executor", (), {"all": object()})()
     assert await capacity_owning_waves(executor)
-    owner_sql = _sql(captured[0])
+    owner_sql = _sql(captured_statements[0])
     assert "ptg_import_wave_supersession" in owner_sql
     assert "ptg_import_wave_quarantine" not in owner_sql
