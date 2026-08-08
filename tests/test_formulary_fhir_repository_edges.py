@@ -64,7 +64,7 @@ async def test_dataset_query_helpers_return_exact_mappings():
 
 @pytest.mark.asyncio
 async def test_dataset_insert_and_error_clear_validate_affected_rows():
-    database = SimpleNamespace(status=AsyncMock(side_effect=[1, 1, 2, 0]))
+    database = SimpleNamespace(status=AsyncMock(side_effect=[1, 1, 2, 2]))
     await repository_module._insert_dataset(
         database,
         "source-a",
@@ -89,6 +89,29 @@ async def test_dataset_insert_and_error_clear_validate_affected_rows():
         )
     with pytest.raises(RuntimeError, match="resume failed"):
         await repository_module._clear_dataset_error(database, "source-a", _dataset())
+
+
+@pytest.mark.asyncio
+async def test_error_clear_accepts_verified_and_already_clear_building():
+    database = SimpleNamespace(status=AsyncMock(return_value=0))
+
+    await repository_module._clear_dataset_error(
+        database,
+        "source-a",
+        _dataset(status="verified"),
+    )
+    assert database.status.await_args.kwargs["dataset_status"] == "verified"
+
+    await repository_module._clear_dataset_error(database, "source-a", _dataset())
+    assert "error_json IS NOT NULL" in database.status.await_args.args[0]
+    assert database.status.await_args.kwargs["dataset_status"] == "building"
+
+    with pytest.raises(RuntimeError, match="not resumable"):
+        await repository_module._clear_dataset_error(
+            database,
+            "source-a",
+            _dataset(status="failed"),
+        )
 
 
 @pytest.mark.asyncio

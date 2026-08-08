@@ -65,6 +65,9 @@ def test_reviewed_candidate_is_library_only_and_never_publishes():
     assert "reviewed synchronization" in synchronizer_source
     runtime_paths = [
         ROOT / "main.py",
+        ROOT / "service" / "start_api.sh",
+        ROOT / "service" / "run_import.sh",
+        ROOT / "api" / "__init__.py",
         ROOT / "process" / "__init__.py",
         ROOT / "process" / "formulary_fhir" / "__init__.py",
         ROOT / "api" / "control_imports.py",
@@ -193,3 +196,66 @@ def test_synthetic_seed_publisher_has_no_runtime_or_deployment_reachability():
     )
     assert "COPY process/ /opt/process/" in dockerfile_source
     assert "COPY scripts/ /opt/scripts/" in dockerfile_source
+
+
+def test_reviewed_operator_modules_are_separated_and_dormant():
+    acquisition_source = (
+        ROOT / "process" / "formulary_fhir" / "reviewed_acquisition.py"
+    ).read_text(encoding="utf-8")
+    publication_source = (
+        ROOT / "process" / "formulary_fhir" / "reviewed_publication.py"
+    ).read_text(encoding="utf-8")
+
+    assert "publish_dataset" not in acquisition_source
+    assert "publish_verified_seed" not in acquisition_source
+    for acquisition_or_client_import in (
+        "FHIRFormularyClient",
+        "verify_reviewed_source_twins",
+        "acquire_reviewed_twins",
+        "_run_verified_sync",
+        "synchronize_verified_dataset",
+        "aiohttp",
+        "socket",
+    ):
+        assert acquisition_or_client_import not in publication_source
+
+    runtime_paths = [
+        ROOT / "main.py",
+        ROOT / "process" / "__init__.py",
+        ROOT / "process" / "formulary_fhir" / "__init__.py",
+        ROOT / "api" / "control_imports.py",
+        ROOT / "api" / "control_workers.py",
+    ]
+    runtime_paths.extend((ROOT / "api" / "endpoint").glob("*.py"))
+    forbidden_runtime_names = (
+        "acquire_reviewed_twins",
+        "publish_reviewed_candidate",
+        "HLTHPRT_FHIR_FORMULARY_REVIEWED_ACQUISITION_ENABLED",
+        "HLTHPRT_FHIR_FORMULARY_REVIEWED_PUBLICATION_ENABLED",
+        "formulary_fhir_reviewed_operator",
+    )
+    for runtime_path in runtime_paths:
+        runtime_source = runtime_path.read_text(encoding="utf-8")
+        for forbidden_runtime_name in forbidden_runtime_names:
+            assert forbidden_runtime_name not in runtime_source
+
+
+def test_reviewed_operator_library_and_script_paths_are_packaged():
+    dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    workflow_source = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    operator_script = (
+        ROOT / "scripts" / "smoke" / "formulary_fhir_reviewed_operator.py"
+    )
+
+    assert (ROOT / "process" / "formulary_fhir" / "reviewed_operation.py").is_file()
+    assert (ROOT / "process" / "formulary_fhir" / "reviewed_acquisition.py").is_file()
+    assert (ROOT / "process" / "formulary_fhir" / "reviewed_publication.py").is_file()
+    assert operator_script.is_file()
+    assert "COPY process/ /opt/process/" in dockerfile_source
+    assert "COPY scripts/ /opt/scripts/" in dockerfile_source
+    assert str(operator_script.relative_to(ROOT)) in workflow_source
+    assert "tests/test_formulary_fhir_reviewed_operator_postgres.py" in (
+        workflow_source
+    )

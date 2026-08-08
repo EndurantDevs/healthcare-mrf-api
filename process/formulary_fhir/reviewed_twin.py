@@ -85,6 +85,7 @@ async def _synchronize_candidate(
             run_id=run_id,
             cutoff_at=cutoff_at,
             intent=intent,
+            force_full=True,
         )
 
 

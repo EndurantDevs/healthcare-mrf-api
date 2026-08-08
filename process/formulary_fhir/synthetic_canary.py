@@ -391,6 +391,7 @@ async def _verify_enabled_candidate(
             run_id=CANARY_RUN_ID,
             cutoff_at=CANARY_CUTOFF,
             intent="seed",
+            force_full=False,
         )
     return _candidate_result(
         binding.configuration_hash,

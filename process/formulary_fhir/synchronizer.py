@@ -27,6 +27,7 @@ from process.formulary_fhir.repository import DatasetRef
 from process.formulary_fhir.repository import DatasetVerification
 from process.formulary_fhir.repository import FHIRFormularyRepository
 from process.formulary_fhir.repository import PriorAliasState
+from process.formulary_fhir.repository_admission_proof import require_full_checkpoints
 from process.formulary_fhir.repository_shared import PublicationIntent
 from process.formulary_fhir.repository_shared import strict_text
 from process.formulary_fhir.repository_shared import utc_timestamp
@@ -208,12 +209,19 @@ async def _synchronize_alias(
     dataset: DatasetRef,
     current: CurrentSnapshot,
     work_item: _AliasWorkItem,
+    force_full: bool,
 ) -> _AliasOutcome:
+    if type(force_full) is not bool:
+        raise RuntimeError("FHIR formulary full-acquisition mode is invalid")
     checkpoint = await repository.completed_alias_checkpoint(
         dataset=dataset,
         alias=work_item.alias,
     )
     if checkpoint is not None:
+        if force_full and checkpoint.acquisition_mode != "full":
+            raise RuntimeError(
+                "FHIR formulary full acquisition cannot resume reused content"
+            )
         return _completed_outcome(checkpoint)
     completion_fence = await repository.next_alias_completion_fence(
         dataset=dataset,
@@ -232,10 +240,10 @@ async def _synchronize_alias(
         dataset.cutoff_at,
         prior,
     )
-    if (
-        completion_fence.prior_acquisition_mode == "full"
-        and alias_plan.mode == "reuse"
-    ):
+    requires_full = bool(
+        force_full or completion_fence.prior_acquisition_mode == "full"
+    )
+    if requires_full and alias_plan.mode == "reuse":
         alias_plan = AliasCensusPlan(
             medications=alias_plan.medications,
             expected_count=alias_plan.expected_count,
@@ -342,6 +350,65 @@ async def _record_failure(
     await _shield_lifecycle(update)
 
 
+async def _verified_replay_result(
+    *,
+    binding: EnabledSourceBinding,
+    client: Any,
+    repository: FHIRFormularyRepository,
+    database: Any,
+    dataset: DatasetRef,
+    force_full: bool,
+) -> SynchronizationResult:
+    """Revalidate a verified root and any required full checkpoints."""
+    await require_source_unchanged(binding, database=database)
+    verification = await repository.verify_dataset(dataset=dataset)
+    if force_full:
+        await require_full_checkpoints(
+            database,
+            dataset,
+            verification.alias_count,
+        )
+    resumed_outcomes = tuple(
+        _AliasOutcome("verified", 0, True)
+        for _index in range(verification.alias_count)
+    )
+    return _result(dataset, verification, resumed_outcomes, client)
+
+
+async def _new_verified_result(
+    *,
+    binding: EnabledSourceBinding,
+    client: Any,
+    repository: FHIRFormularyRepository,
+    database: Any,
+    dataset: DatasetRef,
+    coverage_plan: CoverageCensusPlan,
+    force_full: bool,
+) -> SynchronizationResult:
+    """Build and verify every alias for a new deterministic root."""
+    current = await repository.current_snapshot()
+    _require_predecessor(dataset, current)
+    work_items = await _persist_coverage_plans(repository, dataset, coverage_plan)
+    outcomes = tuple(
+        [
+            await _synchronize_alias(
+                binding=binding,
+                client=client,
+                repository=repository,
+                database=database,
+                dataset=dataset,
+                current=current,
+                work_item=work_item,
+                force_full=force_full,
+            )
+            for work_item in work_items
+        ]
+    )
+    await require_source_unchanged(binding, database=database)
+    verification = await repository.verify_dataset(dataset=dataset)
+    return _result(dataset, verification, outcomes, client)
+
+
 async def _run_verified_sync(
     *,
     binding: EnabledSourceBinding,
@@ -351,7 +418,12 @@ async def _run_verified_sync(
     run_id: str,
     cutoff_at: dt.datetime,
     intent: PublicationIntent,
+    force_full: bool,
 ) -> SynchronizationResult:
+    """Build or replay one exact verified, nonpublishing generation."""
+
+    if type(force_full) is not bool:
+        raise RuntimeError("FHIR formulary full-acquisition mode is invalid")
     coverage_census = await client.coverage_plan_current_census(cutoff=cutoff_at)
     coverage_plan = plan_coverage_census(binding, coverage_census, cutoff_at)
     await require_source_unchanged(binding, database=database)
@@ -363,37 +435,23 @@ async def _run_verified_sync(
     )
     try:
         if dataset.status == "verified":
-            await require_source_unchanged(binding, database=database)
-            verification = await repository.verify_dataset(dataset=dataset)
-            resumed_outcomes = tuple(
-                _AliasOutcome("verified", 0, True)
-                for _index in range(verification.alias_count)
+            return await _verified_replay_result(
+                binding=binding,
+                client=client,
+                repository=repository,
+                database=database,
+                dataset=dataset,
+                force_full=force_full,
             )
-            return _result(dataset, verification, resumed_outcomes, client)
-        current = await repository.current_snapshot()
-        _require_predecessor(dataset, current)
-        work_items = await _persist_coverage_plans(
-            repository,
-            dataset,
-            coverage_plan,
+        return await _new_verified_result(
+            binding=binding,
+            client=client,
+            repository=repository,
+            database=database,
+            dataset=dataset,
+            coverage_plan=coverage_plan,
+            force_full=force_full,
         )
-        outcomes = tuple(
-            [
-                await _synchronize_alias(
-                    binding=binding,
-                    client=client,
-                    repository=repository,
-                    database=database,
-                    dataset=dataset,
-                    current=current,
-                    work_item=work_item,
-                )
-                for work_item in work_items
-            ]
-        )
-        await require_source_unchanged(binding, database=database)
-        verification = await repository.verify_dataset(dataset=dataset)
-        return _result(dataset, verification, outcomes, client)
     except BaseException as error:
         await _record_failure(repository, dataset, error)
         raise
@@ -434,6 +492,7 @@ async def synchronize_verified_dataset(
             run_id=normalized_run_id,
             cutoff_at=cutoff_at,
             intent="none",
+            force_full=False,
         )
 
 

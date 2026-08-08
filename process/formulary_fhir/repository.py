@@ -159,14 +159,17 @@ async def _clear_dataset_error(
     source_id: str,
     dataset: DatasetRef,
 ) -> None:
+    if dataset.status not in {"building", "verified"}:
+        raise RuntimeError("FHIR formulary dataset is not resumable")
     updated_count = await database.status(
         f"UPDATE {table_name('fhir_formulary_dataset')} SET error_json = NULL "
         "WHERE source_id = :source_id AND dataset_id = :dataset_id "
-        "AND status IN ('building', 'verified');",
+        "AND status = :dataset_status AND error_json IS NOT NULL;",
         source_id=source_id,
         dataset_id=dataset.dataset_id,
+        dataset_status=dataset.status,
     )
-    if updated_count != 1:
+    if updated_count not in {0, 1}:
         raise RuntimeError("FHIR formulary dataset resume failed")
 
 
