@@ -91,43 +91,51 @@ def parse_args() -> argparse.Namespace:
             "Use with --resolve-raw-artifacts-from-db for strict live/deployed assurance."
         ),
     )
+    _add_database_arguments(parser)
+    _add_sampling_argument(parser)
+    _add_displayed_address_argument(parser)
+    _add_report_requirement_arguments(parser)
+    parser.add_argument("--strict", action="store_true", help="Exit 1 when the assurance report is not ok.")
+    return parser.parse_args()
+
+
+def _add_database_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db-host", default=os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1")
     parser.add_argument("--db-port", type=int, default=int(os.getenv("HLTHPRT_DB_PORT") or "5432"))
     parser.add_argument("--database", default=os.getenv("HLTHPRT_DB_DATABASE") or "healthporta")
     parser.add_argument("--db-user", default=os.getenv("HLTHPRT_DB_USER") or "postgres")
     parser.add_argument("--db-password", default=os.getenv("HLTHPRT_DB_PASSWORD") or "")
     parser.add_argument("--db-schema", default=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+
+
+def _add_sampling_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-samples", type=int, default=5, help="Maximum raw direct-location samples per artifact.")
+
+
+def _add_displayed_address_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--allow-missing-displayed-address",
-        action="store_true",
+        "--allow-missing-displayed-address", action="store_true",
         help=(
-            "Accept rows that explicitly set displayed_address_present=false and expose no usable address. "
-            "Use this for schema/provenance checks, not for member-facing displayed-address assurance."
+            "Accept rows that explicitly set displayed_address_present=false "
+            "and expose no usable address. Use this for schema/provenance "
+            "checks, not for member-facing displayed-address assurance."
         ),
     )
+
+
+def _add_report_requirement_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--require-network-names", action="store_true", help="Fail when any PTG row in the API payload lacks retained network_names.")
+    parser.add_argument("--require-source-file-version-id", action="store_true", help="Fail when any PTG row in the API payload lacks source_trace.source_file_version_id.")
     parser.add_argument(
-        "--require-network-names",
-        action="store_true",
-        help="Fail when any PTG row in the API payload lacks retained network_names.",
-    )
-    parser.add_argument(
-        "--require-source-file-version-id",
-        action="store_true",
-        help="Fail when any PTG row in the API payload lacks source_trace.source_file_version_id.",
-    )
-    parser.add_argument(
-        "--require-network-bound-address",
-        action="store_true",
+        "--require-network-bound-address", action="store_true",
         help=(
-            "Fail when a displayed pricing address is only inferred from provider identity. "
-            "Use this for member-facing exact-office assurance; it requires payer-confirmed "
-            "location evidence or payer Provider Directory plan/network corroboration, plus retained "
-            "network_names and source_trace.source_file_version_id."
+            "Fail when a displayed pricing address is only inferred from "
+            "provider identity. Use this for member-facing exact-office "
+            "assurance; it requires payer-confirmed location evidence or "
+            "payer Provider Directory plan/network corroboration, plus "
+            "retained network_names and source_trace.source_file_version_id."
         ),
     )
-    parser.add_argument("--strict", action="store_true", help="Exit 1 when the assurance report is not ok.")
-    return parser.parse_args()
 
 
 def _fetch_api_payload(url: str, api_key: str | None, timeout: float) -> Any:
@@ -198,6 +206,30 @@ async def _resolve_raw_artifacts_from_db(
     except ImportError as exc:  # pragma: no cover - depends on runtime image.
         raise RuntimeError("asyncpg is required for --resolve-raw-artifacts-from-db") from exc
 
+    source_file_version_rows = await _fetch_source_file_version_rows(
+        source_file_version_ids,
+        host=host,
+        port=port,
+        database=database,
+        user=user,
+        password=password,
+        schema=schema,
+    )
+    return _raw_artifact_resolutions(source_file_version_ids, source_file_version_rows)
+
+
+async def _fetch_source_file_version_rows(
+    source_file_version_ids: list[str],
+    *,
+    host: str,
+    port: int,
+    database: str,
+    user: str,
+    password: str,
+    schema: str,
+) -> list[Any]:
+    import asyncpg
+
     table = f"{_quote_identifier(schema)}.ptg2_source_file_version"
     conn = await asyncpg.connect(
         host=host,
@@ -219,6 +251,12 @@ async def _resolve_raw_artifacts_from_db(
     finally:
         await conn.close()
 
+    return source_file_version_rows
+
+
+def _raw_artifact_resolutions(
+    source_file_version_ids: list[str], source_file_version_rows: list[Any]
+) -> list[dict[str, Any]]:
     rows_by_id = {
         str(source_file_version_row["source_file_version_id"]): source_file_version_row
         for source_file_version_row in source_file_version_rows
@@ -322,34 +360,11 @@ def run_price_address_assurance_report() -> int:
         if api_payload is not None
         else list(args.source_file_version_id)
     )
-    raw_artifact_paths = list(args.raw_artifact)
-    raw_artifact_resolutions: list[dict[str, Any]] = []
-    raw_artifact_source_file_version_ids_by_path: dict[str, list[str]] = {}
-    if args.resolve_raw_artifacts_from_db:
-        raw_artifact_resolutions = asyncio.run(
-            _resolve_raw_artifacts_from_db(
-                source_file_version_ids,
-                host=args.db_host,
-                port=args.db_port,
-                database=args.database,
-                user=args.db_user,
-                password=args.db_password,
-                schema=args.db_schema,
-            )
-        )
-        raw_artifact_paths.extend(
-            str(resolution["raw_artifact_path"])
-            for resolution in raw_artifact_resolutions
-            if resolution.get("status") == "resolved" and resolution.get("raw_artifact_path")
-        )
-        for resolution in raw_artifact_resolutions:
-            if resolution.get("status") != "resolved" or not resolution.get("raw_artifact_path"):
-                continue
-            path = str(resolution["raw_artifact_path"])
-            source_file_version_id = str(resolution.get("source_file_version_id") or "").strip()
-            if source_file_version_id:
-                raw_artifact_source_file_version_ids_by_path.setdefault(path, []).append(source_file_version_id)
-        raw_artifact_paths = _dedupe(raw_artifact_paths)
+    (
+        raw_artifact_paths,
+        raw_artifact_resolutions,
+        raw_artifact_source_file_version_ids_by_path,
+    ) = _requested_raw_artifacts(args, source_file_version_ids)
     report = build_price_address_assurance_report(
         api_payload=api_payload,
         raw_artifact_paths=raw_artifact_paths,
@@ -378,6 +393,33 @@ def run_price_address_assurance_report() -> int:
     if args.strict and not report["ok"]:
         return 1
     return 0
+
+
+def _requested_raw_artifacts(
+    args: argparse.Namespace, source_file_version_ids: list[str]
+) -> tuple[list[str], list[dict[str, Any]], dict[str, list[str]]]:
+    raw_artifact_paths = list(args.raw_artifact)
+    if not args.resolve_raw_artifacts_from_db:
+        return raw_artifact_paths, [], {}
+    resolutions = asyncio.run(
+        _resolve_raw_artifacts_from_db(
+            source_file_version_ids,
+            host=args.db_host,
+            port=args.db_port,
+            database=args.database,
+            user=args.db_user,
+            password=args.db_password,
+            schema=args.db_schema,
+        )
+    )
+    source_ids_by_path: dict[str, list[str]] = {}
+    for resolution in resolutions:
+        path = resolution.get("raw_artifact_path")
+        source_file_version_id = str(resolution.get("source_file_version_id") or "").strip()
+        if resolution.get("status") == "resolved" and path and source_file_version_id:
+            source_ids_by_path.setdefault(str(path), []).append(source_file_version_id)
+            raw_artifact_paths.append(str(path))
+    return _dedupe(raw_artifact_paths), resolutions, source_ids_by_path
 
 
 def main() -> int:

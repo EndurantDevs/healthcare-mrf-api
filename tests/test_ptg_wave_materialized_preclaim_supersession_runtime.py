@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -9,6 +10,7 @@ import pytest
 from sanic.exceptions import BadRequest, SanicException
 
 from api import control_wave_routes as routes
+from api import control_import_wave_materialized_preclaim as preclaim
 from process import ptg_wave_materialized_preclaim_supersession_runtime as runtime
 from process.ptg_wave_materialized_preclaim_supersession_contract import (
     PTGWaveMaterializedPreclaimConflict,
@@ -58,6 +60,19 @@ class _Context:
 
     async def __aexit__(self, exc_type, exc, traceback):
         return False
+
+
+class _WriteSession(_ReadSession):
+    def __init__(self, *results):
+        super().__init__(*results)
+        self.added = []
+        self.flush_count = 0
+
+    def add(self, row):
+        self.added.append(row)
+
+    async def flush(self):
+        self.flush_count += 1
 
 
 class _RedisAttestation:
@@ -347,3 +362,126 @@ async def test_materialized_route_maps_observation_drift_to_conflict(monkeypatch
         )
 
     assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_runtime_internal_read_guards_cover_locked_and_invalid_paths(monkeypatch):
+    snapshot = _snapshot()
+    loaded = await runtime._load_predecessor_wave(
+        _ReadSession(_Result(snapshot.wave), _Result(None)),
+        "materialized-wave",
+        lock_rows=True,
+    )
+    assert loaded is snapshot.wave
+
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="missing"):
+        await runtime._load_predecessor_wave(
+            _ReadSession(_Result(None), _Result(None)),
+            "materialized-wave",
+            lock_rows=False,
+        )
+
+    session = _ReadSession(
+        _Result(values=snapshot.intents),
+        _Result(values=snapshot.runs),
+        _Result(values=()),
+        _Result(values=()),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_worker_start_event_ordinals",
+        AsyncMock(return_value=()),
+    )
+    work_rows = await runtime._load_work_rows(
+        session, "materialized-wave", lock_rows=True
+    )
+    assert work_rows[-1] == ()
+
+    monkeypatch.setattr(
+        runtime,
+        "_worker_start_event_ordinals",
+        AsyncMock(side_effect=RuntimeError("synthetic worker event failure")),
+    )
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="worker events"):
+        await runtime._load_work_rows(
+            _ReadSession(_Result(values=()), _Result(values=()), _Result(values=()), _Result(values=())),
+            "materialized-wave",
+            lock_rows=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_observation_and_storage_guards_reject_absent_or_conflicting_state(monkeypatch):
+    snapshot = _snapshot()
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="Redis observer"):
+        await runtime._observe(snapshot, "successor-wave", redis=None)
+
+    monkeypatch.setattr(runtime, "get_wave_job", Mock(return_value=None))
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="Job is unavailable"):
+        await runtime._observe(snapshot, "successor-wave", redis=object())
+
+    locked_row = await runtime._supersession_row(
+        _ReadSession(_Result(None)), "materialized-wave", lock_row=True
+    )
+    assert locked_row is None
+
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="another recovery"):
+        runtime._existing_proof(
+            SimpleNamespace(recovery_basis="other", successor_wave_id="successor-wave"),
+            predecessor_wave_id="materialized-wave",
+            successor_wave_id="successor-wave",
+        )
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="invalid"):
+        runtime._wave_id(" ", "synthetic wave ID")
+
+
+@pytest.mark.asyncio
+async def test_materialized_preclaim_persistence_covers_empty_and_attested_requests(monkeypatch):
+    no_proof_session = _WriteSession()
+    await preclaim.persist_materialized_preclaim_supersession(
+        no_proof_session,
+        {"wave_id": "successor-wave"},
+        now=dt.datetime.now(dt.UTC),
+        redis=object(),
+    )
+    assert no_proof_session.added == []
+
+    proof = _attest()
+    session = _WriteSession()
+    monkeypatch.setattr(
+        preclaim,
+        "attest_locked_materialized_preclaim_supersession",
+        AsyncMock(return_value=proof),
+    )
+    await preclaim.persist_materialized_preclaim_supersession(
+        session,
+        {"wave_id": "successor-wave", "materialized_preclaim_supersession": proof},
+        now=dt.datetime.now(dt.UTC),
+        redis=object(),
+    )
+    assert session.flush_count == 2
+    assert len(session.added) == 2
+
+
+@pytest.mark.asyncio
+async def test_materialized_preclaim_persistence_read_and_validation_boundaries(monkeypatch):
+    retired = await preclaim.is_materialized_preclaim_retired(
+        _ReadSession(_Result("retired-wave")),
+        "retired-wave",
+        lock_row=True,
+    )
+    assert retired is True
+
+    monkeypatch.setattr(
+        preclaim,
+        "is_materialized_preclaim_retired",
+        AsyncMock(return_value=True),
+    )
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="retired"):
+        await preclaim.require_materialized_preclaim_replay_allowed(
+            object(), "retired-wave"
+        )
+
+    assert preclaim.validate_materialized_preclaim_supersession(
+        {"schema_version": "older"}, wave_id="successor-wave"
+    ) is None

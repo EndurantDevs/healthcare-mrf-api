@@ -96,25 +96,7 @@ def validate_reference_evidence(
     item_count = int(evidence_by_field.get("item_count") or -1)
     if item_count < 1 or item_count > 25:
         failures.append("public V3 reference is not a bounded exact public page")
-    query = evidence_by_field.get("query")
-    fixed_query = dict(query) if isinstance(query, Mapping) else {}
-    reference_snapshot_id = str(
-        evidence_by_field.get("reference_snapshot_id") or ""
-    ).strip()
-    if (
-        not reference_snapshot_id
-        or fixed_query.get("snapshot_id") != reference_snapshot_id
-        or fixed_query.get("code_system") != "CPT"
-        or fixed_query.get("code") != "70553"
-        or fixed_query.get("limit") != 25
-        or fixed_query.get("offset") != 0
-        or fixed_query.get("npi") is not None
-        or fixed_query.get("mode") not in (None, "")
-        or fixed_query.get("include_providers") is not True
-        or fixed_query.get("order_by") != "negotiated_rate"
-        or fixed_query.get("order") != "asc"
-    ):
-        failures.append("public V3 reference does not use the fixed CPT 70553 query")
+    failures.extend(_fixed_query_failures(evidence_by_field))
     item_digests = evidence_by_field.get("item_digests")
     digest_rows = list(item_digests) if isinstance(item_digests, list) else []
     if (
@@ -141,6 +123,30 @@ def validate_reference_evidence(
     if expected_spec is not None:
         failures.extend(_reference_query_failures(evidence_by_field, expected_spec))
     return failures
+
+
+def _fixed_query_failures(evidence_by_field: Mapping[str, Any]) -> list[str]:
+    query = evidence_by_field.get("query")
+    fixed_query = dict(query) if isinstance(query, Mapping) else {}
+    reference_snapshot_id = str(
+        evidence_by_field.get("reference_snapshot_id") or ""
+    ).strip()
+    expected_query_by_field = {
+        "snapshot_id": reference_snapshot_id,
+        "code_system": "CPT",
+        "code": "70553",
+        "limit": 25,
+        "offset": 0,
+        "npi": None,
+        "include_providers": True,
+        "order_by": "negotiated_rate",
+        "order": "asc",
+    }
+    if not reference_snapshot_id or any(
+        fixed_query.get(key) != value for key, value in expected_query_by_field.items()
+    ) or fixed_query.get("mode") not in (None, ""):
+        return ["public V3 reference does not use the fixed CPT 70553 query"]
+    return []
 
 
 def compare_v4_document_to_reference(

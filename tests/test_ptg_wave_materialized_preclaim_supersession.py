@@ -305,6 +305,19 @@ def test_materialized_proof_hides_unexpected_external_error_details(monkeypatch)
     assert "private Kubernetes" not in str(exc_info.value)
 
 
+def test_materialized_proof_preserves_known_external_conflicts(monkeypatch):
+    known_conflict = PTGWaveMaterializedPreclaimConflict("synthetic conflict")
+    monkeypatch.setattr(
+        materialized,
+        "_attest_terminal_preclaim_job",
+        lambda *_args: (_ for _ in ()).throw(known_conflict),
+    )
+
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict) as exc_info:
+        _attest()
+    assert exc_info.value is known_conflict
+
+
 def test_materialized_proof_rejects_coerced_scalar_types():
     proof = _attest()
     proof["kubernetes"]["failed"] = 12.0
@@ -320,3 +333,74 @@ def test_materialized_proof_rejects_coerced_scalar_types():
     proof["predecessor"]["runtime_image_identity"] = "sha256:" + "z" * 64
     with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="SHA-256"):
         validate_materialized_preclaim_supersession_proof(proof)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda proof: proof.__setitem__("schema_version", "unsupported"),
+        lambda proof: proof.__setitem__("successor_wave_id", "materialized-wave"),
+        lambda proof: proof["predecessor"].__setitem__(
+            "idempotency_key", "other-wave"
+        ),
+        lambda proof: proof["predecessor"].__setitem__("wave_digest", "e" * 64),
+        lambda proof: proof["predecessor"].__setitem__("intent_count", 0),
+        lambda proof: proof["predecessor"].__setitem__("worker_limit", 1),
+        lambda proof: proof["predecessor"].__setitem__(
+            "pinned_image_reference", "invalid"
+        ),
+        lambda proof: proof["predecessor"].__setitem__(
+            "runtime_image_identity", "invalid"
+        ),
+        lambda proof: proof["kubernetes"].__setitem__("failed_condition", 1),
+        lambda proof: proof["kubernetes"].__setitem__("failed", 11),
+        lambda proof: proof["redis"].__setitem__("ready_slot_count", 1),
+        lambda proof: proof["redis"].pop("health_check_present"),
+        lambda proof: proof["predecessor"].__setitem__("kubernetes_job_uid", ""),
+    ),
+)
+def test_materialized_proof_validator_rejects_each_exact_contract_boundary(mutate):
+    """Each closed-contract guard must reject its own invalid boundary."""
+
+    proof = _attest()
+    mutate(proof)
+
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict):
+        validate_materialized_preclaim_supersession_proof(proof)
+
+
+def test_materialized_proof_validator_rejects_another_expected_predecessor():
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="another predecessor"):
+        validate_materialized_preclaim_supersession_proof(
+            _attest(),
+            predecessor_wave_id="other-wave",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("k8s_post_ticket", None),
+        ("kubernetes_job_receipt", "not-a-mapping"),
+    ),
+)
+def test_materialized_proof_rejects_missing_or_nonmapping_durable_receipts(
+    field_name,
+    field_value,
+):
+    wave = _materialized_wave()
+    setattr(wave, field_name, field_value)
+
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict):
+        _attest(wave)
+
+
+def test_materialized_proof_rejects_nonsequence_work_and_job_uid_drift():
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="sequence"):
+        _attest(claims="not-a-sequence")
+
+    wave = _materialized_wave()
+    actual_job = _actual_job(wave.kubernetes_manifest)
+    actual_job["metadata"]["uid"] = "different-job-uid"
+    with pytest.raises(PTGWaveMaterializedPreclaimConflict, match="UID differs"):
+        _attest(wave, actual_job=actual_job)
