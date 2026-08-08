@@ -14,6 +14,7 @@ from api.control_import_wave_attestation import (
     ATTESTATION_VERSION,
     AUTHORIZATION_BASIS,
     LEGACY_ATTESTATION_VERSION,
+    SUPERSESSION_ATTESTATION_VERSION,
 )
 from api.control_import_waves import (
     ImportWaveConflict,
@@ -25,6 +26,7 @@ from process.ptg_parts.ptg_wave_admission_fence import (
     PTGWaveOwnershipConflict,
     is_ptg_wave_owned_run,
 )
+from process.ptg_wave_state import canonical_json, sha256_digest
 
 
 _KEY = "test-control-key"
@@ -49,12 +51,12 @@ def _unsigned(
         "entitlement_coverage_digest": "8" * 64,
         "catalog_generation": "9" * 64,
     }
-    if schema_version == ATTESTATION_VERSION:
+    if schema_version in {ATTESTATION_VERSION, SUPERSESSION_ATTESTATION_VERSION}:
         snapshot_by_field.update(
             authorization_basis=AUTHORIZATION_BASIS,
             authorization_digest="7" * 64,
         )
-    return {
+    unsigned = {
         "schema_version": schema_version,
         "wave_id": "wave-unit",
         "idempotency_key": "wave-unit-key",
@@ -83,6 +85,60 @@ def _unsigned(
             for ordinal in range(count)
         ],
     }
+    if schema_version == SUPERSESSION_ATTESTATION_VERSION:
+        unsigned["supersession"] = _supersession_proof(
+            successor_wave_id=unsigned["wave_id"],
+            intent_count=count,
+        )
+    return unsigned
+
+
+def _supersession_proof(*, successor_wave_id: str, intent_count: int) -> dict:
+    unsigned = {
+        "schema_version": "healthporta.ptg-wave.logical-preclaim-supersession.v1",
+        "recovery_basis": "logical_preclaim_failure",
+        "predecessor": {
+            "wave_id": "retired-wave-unit",
+            "wave_digest": "1" * 64,
+            "manifest_digest": "2" * 64,
+            "jobs_digest": "3" * 64,
+            "intent_count": intent_count,
+        },
+        "successor_wave_id": successor_wave_id,
+        "database": {
+            "pristine_run_count": intent_count,
+            "claim_count": 0,
+            "outcome_count": 0,
+            "worker_start_event_count": 0,
+        },
+        "kubernetes": {
+            "job_name": "hpw-ptg-wave-" + "1" * 40,
+            "job_uid": "synthetic-job-uid",
+            "completion_mode": "Indexed",
+            "completions": 12,
+            "parallelism": 12,
+            "backoff_limit": 0,
+            "failed": 12,
+            "active": 0,
+            "succeeded": 0,
+            "ready": 0,
+            "terminating": 0,
+            "failed_condition": True,
+            "complete_condition": False,
+        },
+        "redis": {
+            "unclaimed_attestation_digest": "4" * 64,
+            "ready_slot_count": 0,
+            "release_present": False,
+            "queued_ordinal_count": 0,
+            "job_ordinal_count": 0,
+            "result_ordinal_count": 0,
+            "retry_ordinal_count": 0,
+            "in_progress_ordinal_count": 0,
+            "health_check_present": False,
+        },
+    }
+    return {**unsigned, "proof_digest": sha256_digest(canonical_json(unsigned))}
 
 
 def _payload(
@@ -334,6 +390,28 @@ def test_canonical_signed_replay_has_stable_request_identity():
     replay = validate_import_wave_payload(copy.deepcopy(_payload()), attestation_key=_KEY)
     assert replay["request_digest"] == first["request_digest"]
     assert replay["release_queue"] == first["release_queue"]
+
+
+def test_v3_supersession_proof_is_signed_and_successor_bound():
+    payload = _payload(schema_version=SUPERSESSION_ATTESTATION_VERSION)
+    validated = validate_import_wave_payload(payload, attestation_key=_KEY)
+
+    assert validated["supersession"] == payload["cohort_attestation"]["supersession"]
+    assert validated["supersession"]["successor_wave_id"] == "wave-unit"
+
+    tampered = copy.deepcopy(payload)
+    tampered["cohort_attestation"]["supersession"]["successor_wave_id"] = "other"
+    unsigned_attestation_map = {
+        key: value
+        for key, value in tampered["cohort_attestation"].items()
+        if key != "signature"
+    }
+    tampered["cohort_attestation"]["signature"] = sign_cohort_attestation(
+        unsigned_attestation_map,
+        key=_KEY,
+    )
+    with pytest.raises(ValueError, match="another successor"):
+        validate_import_wave_payload(tampered, attestation_key=_KEY)
 
 
 @pytest.mark.asyncio

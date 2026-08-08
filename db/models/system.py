@@ -22,6 +22,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -34,6 +35,8 @@ __all__ = (
     "PTGImportWaveClaim",
     "PTGImportWaveIntent",
     "PTGImportWaveOutcome",
+    "PTGImportWaveQuarantine",
+    "PTGImportWaveSupersession",
     "MRFCrawlRun",
     "MRFDiscoveryBatch",
     "MRFDiscoverySourceCheckpoint",
@@ -338,6 +341,81 @@ class PTGImportWave(Base, JSONOutputMixin):
     terminal_summary = Column(JSON)
     cleanup_evidence_digest = Column(String(64))
     cleanup_summary = Column(JSON)
+
+
+class PTGImportWaveQuarantine(Base, JSONOutputMixin):
+    """Append-only controller exclusion for one unresolved legacy wave."""
+
+    __tablename__ = "ptg_import_wave_quarantine"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("predecessor_wave_id"),
+        ForeignKeyConstraint(
+            ("predecessor_wave_id",), (PTGImportWave.wave_id,),
+            name="ptg_import_wave_quarantine_predecessor_wave_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "reason = 'legacy_uncertain_slots_waiting_pre_receipt'",
+            name="ptg_import_wave_quarantine_reason_check",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    predecessor_wave_id = Column(String(64), nullable=False)
+    reason = Column(String(64), nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class PTGImportWaveSupersession(Base, JSONOutputMixin):
+    """Append-only recovery linkage that retires only its predecessor wave."""
+
+    __tablename__ = "ptg_import_wave_supersession"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("predecessor_wave_id"),
+        ForeignKeyConstraint(
+            ("predecessor_wave_id",), (PTGImportWave.wave_id,),
+            name="ptg_import_wave_supersession_predecessor_wave_fkey",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ("successor_wave_id",), (PTGImportWave.wave_id,),
+            name="ptg_import_wave_supersession_successor_wave_fkey",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        UniqueConstraint(
+            "successor_wave_id",
+            name="ptg_import_wave_supersession_successor_wave_id_key",
+        ),
+        CheckConstraint(
+            "predecessor_wave_id <> successor_wave_id",
+            name="ptg_import_wave_supersession_distinct_check",
+        ),
+        CheckConstraint(
+            "recovery_basis = 'logical_preclaim_failure'",
+            name="ptg_import_wave_supersession_basis_check",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(recovery_evidence) = 'object' "
+            "AND recovery_evidence_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND octet_length(recovery_evidence_canonical) > 0 "
+            "AND encode(sha256(recovery_evidence_canonical), 'hex') "
+            "= recovery_evidence_sha256 "
+            "AND convert_from(recovery_evidence_canonical, 'UTF8')::jsonb "
+            "= recovery_evidence - 'proof_digest'",
+            name="ptg_import_wave_supersession_evidence_check",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    predecessor_wave_id = Column(String(64), nullable=False)
+    successor_wave_id = Column(String(64), nullable=False)
+    recovery_basis = Column(String(64), nullable=False)
+    recovery_evidence = Column(JSONB, nullable=False)
+    recovery_evidence_canonical = Column(LargeBinary, nullable=False)
+    recovery_evidence_sha256 = Column(String(64), nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 
 class PTGImportWaveIntent(Base, JSONOutputMixin):

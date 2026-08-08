@@ -40,7 +40,13 @@ from api.ptg_wave_kubernetes_terminal_attestation import (
 from api.ptg_wave_kubernetes_failure_attestation import (
     attest_preclaim_failure_ptg_wave_kubernetes_objects,
 )
-from db.models import ImportRun, PTGImportWave, PTGImportWaveIntent, db
+from db.models import (
+    ImportRun,
+    PTGImportWave,
+    PTGImportWaveIntent,
+    PTGImportWaveQuarantine,
+    db,
+)
 from process._ptg_wave_redis_models import (
     PTGSmallWaveJob,
     PTGSmallWaveManifest,
@@ -162,7 +168,15 @@ async def load_capacity_owning_wave() -> PTGWaveBundle | None:
     async with db.session() as session:
         waves = (await session.execute(
             select(PTGImportWave)
-            .where(PTGImportWave.state.in_(PTG_WAVE_CAPACITY_OWNING_STATES))
+            .where(
+                PTGImportWave.state.in_(PTG_WAVE_CAPACITY_OWNING_STATES),
+                ~exists(
+                    select(PTGImportWaveQuarantine.predecessor_wave_id).where(
+                        PTGImportWaveQuarantine.predecessor_wave_id
+                        == PTGImportWave.wave_id
+                    )
+                ),
+            )
             .order_by(PTGImportWave.created_at, PTGImportWave.wave_id)
             .limit(2)
         )).scalars().all()

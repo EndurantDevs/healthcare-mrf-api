@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from api.control_frozen_rate_files import validated_control_import_payload
 from api.control_import_wave_attestation import (
     ATTESTATION_VERSION,
+    SUPERSESSION_ATTESTATION_VERSION,
     _canonical,
     _identifier,
     _sha256,
@@ -32,7 +33,13 @@ from api.control_imports import (
     _normalize_triggered_by,
 )
 from api import control_import_wave_direct as direct_wave
-from db.models import ImportRun, PTGImportWave, PTGImportWaveIntent, db
+from db.models import (
+    ImportRun,
+    PTGImportWave,
+    PTGImportWaveIntent,
+    PTGImportWaveSupersession,
+    db,
+)
 from process.ptg_parts.frozen_rate_binding_store import insert_or_compare_frozen_binding
 from process.ptg_parts.ptg_source_attempt_actions import record_source_attempt_event
 from process.ptg_parts.ptg_source_attempt_guard import (
@@ -47,6 +54,14 @@ from process.ptg_parts.ptg_wave_admission_fence import (
     require_wave_admission_capacity,
 )
 from process.serialization import serialize_job
+from process.ptg_wave_preclaim_supersession import (
+    PTGWavePreclaimSupersessionConflict,
+    validate_logical_preclaim_supersession_proof,
+)
+from process.ptg_wave_preclaim_supersession_runtime import (
+    attest_locked_logical_preclaim_supersession,
+)
+from process.ptg_wave_state import canonical_json
 
 
 QUEUE = "arq:PTGSmall"
@@ -244,6 +259,15 @@ def validate_import_wave_payload(
         attestation["intents"],
         wave_id=wave_id,
     )
+    supersession = None
+    if attestation["schema_version"] == SUPERSESSION_ATTESTATION_VERSION:
+        try:
+            supersession = validate_logical_preclaim_supersession_proof(
+                attestation["supersession"],
+                successor_wave_id=wave_id,
+            )
+        except PTGWavePreclaimSupersessionConflict as exc:
+            raise ValueError(str(exc)) from exc
     if partition["imported_coordinate_count"] != len(intents):
         raise ValueError("partition imported_coordinate_count must equal signed intent count")
     imported_coordinate_digest = _sha256(
@@ -266,6 +290,7 @@ def validate_import_wave_payload(
     return {
         "wave_id": wave_id, "idempotency_key": idempotency_key,
         "attestation": attestation, "snapshot": snapshot, "partition": partition,
+        "supersession": supersession,
         "intents": intents, "request_digest": request_digest,
         "attestation_digest": _sha256(_canonical(attestation)),
         "signature_digest": _sha256(attestation["signature"].encode()),
@@ -432,7 +457,11 @@ def _wave_response(wave: PTGImportWave) -> dict[str, Any]:
     }
 
 
-async def admit_import_wave(admission_request: object) -> tuple[dict[str, Any], bool]:
+async def admit_import_wave(
+    admission_request: object,
+    *,
+    redis: Any = None,
+) -> tuple[dict[str, Any], bool]:
     """Atomically admit one authenticated complete wave or return its exact replay."""
 
     request = validate_import_wave_payload(admission_request)
@@ -462,6 +491,32 @@ async def admit_import_wave(admission_request: object) -> tuple[dict[str, Any], 
             if existing.request_digest != request["request_digest"]:
                 raise ImportWaveConflict("wave_id or idempotency_key conflicts with immutable request digest")
             return _wave_response(existing), False
+        supersession_proof = request.get("supersession")
+        if supersession_proof is not None:
+            predecessor_wave_id = supersession_proof["predecessor"][
+                "wave_id"
+            ]
+            witness = await attest_locked_logical_preclaim_supersession(
+                session,
+                predecessor_wave_id,
+                request["wave_id"],
+                supersession_proof,
+                redis=redis,
+            )
+            session.add(
+                PTGImportWaveSupersession(
+                    predecessor_wave_id=predecessor_wave_id,
+                    successor_wave_id=request["wave_id"],
+                    recovery_basis="logical_preclaim_failure",
+                    recovery_evidence=witness.as_mapping(),
+                    recovery_evidence_canonical=canonical_json(
+                        witness.evidence_mapping(),
+                    ),
+                    recovery_evidence_sha256=witness.proof_digest,
+                    created_at=now,
+                )
+            )
+            await session.flush()
         await require_wave_admission_capacity(executor)
         wave = _new_wave_record(
             request,
@@ -493,6 +548,6 @@ async def get_import_wave(wave_id: str) -> dict[str, Any] | None:
 
 
 __all__ = [
-    "ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
+    "ATTESTATION_VERSION", "SUPERSESSION_ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
     "sign_cohort_attestation", "validate_import_wave_payload",
 ]

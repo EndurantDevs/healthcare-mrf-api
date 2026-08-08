@@ -436,6 +436,53 @@ async def test_admission_persists_new_wave_after_guard_and_capacity(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_recovery_admission_revalidates_and_persists_supersession_first(
+    monkeypatch,
+):
+    session = _Session(_Result(rows=[]))
+    request, _wave = _install_admission_dependencies(monkeypatch, session)
+    proof = {
+        "predecessor": {"wave_id": "predecessor-wave"},
+        "proof_digest": "d" * 64,
+    }
+    request["supersession"] = proof
+    witness = types.SimpleNamespace(
+        as_mapping=lambda: {"bound": True},
+        evidence_mapping=lambda: {"bound": True},
+        proof_digest="d" * 64,
+    )
+    attest = AsyncMock(return_value=witness)
+    monkeypatch.setattr(
+        waves,
+        "attest_locked_logical_preclaim_supersession",
+        attest,
+    )
+
+    _response, created = await waves.admit_import_wave(
+        {"signed": True},
+        redis="synthetic-redis",
+    )
+
+    assert created is True
+    attest.assert_awaited_once_with(
+        session,
+        "predecessor-wave",
+        "wave-unit",
+        proof,
+        redis="synthetic-redis",
+    )
+    supersession = session.added[0]
+    assert isinstance(supersession, waves.PTGImportWaveSupersession)
+    assert supersession.predecessor_wave_id == "predecessor-wave"
+    assert supersession.successor_wave_id == "wave-unit"
+    assert supersession.recovery_evidence == {"bound": True}
+    assert supersession.recovery_evidence_canonical == b'{"bound":true}'
+    assert supersession.recovery_evidence_sha256 == "d" * 64
+    assert session.flush_count == 2
+    waves.require_wave_admission_capacity.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_admission_replay_and_conflicts_are_immutable(monkeypatch):
     existing = _wave_record()
     session = _Session(_Result(rows=[existing]))
