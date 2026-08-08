@@ -312,12 +312,13 @@ def _validate_smile_query(
     contract: FHIRSearchContract,
 ) -> None:
     query_by_name = dict(query_pairs)
-    required_names = {"_count", "_getpages", "_getpagesoffset"}
+    required_names = {"_count", "_elements", "_getpages", "_getpagesoffset"}
     allowed_names = required_names | {"_bundletype", "_pretty"}
     is_valid = bool(
         required_names.issubset(query_by_name)
         and set(query_by_name).issubset(allowed_names)
         and query_by_name["_count"] == str(contract.page_size)
+        and query_by_name["_elements"] == contract.element_projection
         and _is_valid_cursor_token(query_by_name["_getpages"])
         and _is_valid_offset(query_by_name["_getpagesoffset"], contract)
         and query_by_name.get("_bundletype", "searchset") == "searchset"
