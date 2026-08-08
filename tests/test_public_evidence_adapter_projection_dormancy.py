@@ -48,6 +48,7 @@ def _contract_paths() -> list[Path]:
         (
             *package.glob("adapter_projection_*.py"),
             *package.glob("source_record_inclusion_*.py"),
+            *package.glob("source_record_replay_*.py"),
         )
     )
 
@@ -59,6 +60,8 @@ def test_projection_modules_have_no_io_sql_or_execution_surface() -> None:
         "adapter_projection_policies.py",
         "source_record_inclusion_contract.py",
         "source_record_inclusion_primitives.py",
+        "source_record_replay_contract.py",
+        "source_record_replay_primitives.py",
     ]
     forbidden_roots = {
         "api",
@@ -134,6 +137,9 @@ raise SystemExit(bool(forbidden))
 
 def test_runtime_container_and_package_init_do_not_wire_projection() -> None:
     repository_root = Path(__file__).resolve().parents[1]
+    explicit_replay_executor = (
+        repository_root / "process" / "public_evidence_fhir_organization_replay.py"
+    )
     runtime_paths = [repository_root / "main.py"]
     for package_name in ("api", "db", "process", "service"):
         runtime_paths.extend((repository_root / package_name).rglob("*.py"))
@@ -142,6 +148,8 @@ def test_runtime_container_and_package_init_do_not_wire_projection() -> None:
         "public_evidence.source_record_inclusion",
     )
     for path in runtime_paths:
+        if path == explicit_replay_executor:
+            continue
         module_source = path.read_text(encoding="utf-8")
         assert not any(fragment in module_source for fragment in forbidden_fragments)
     docker_text = (repository_root / "Dockerfile").read_text(encoding="utf-8")

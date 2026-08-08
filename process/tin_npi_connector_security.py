@@ -412,6 +412,15 @@ class _TinHmacTokenPolicy:
         return _InertSecretSnapshot, ()
 
 
+def validate_tin_hmac_token_policy(candidate: object) -> TinTokenProjector:
+    """Return one connector-owned policy capability or fail closed."""
+
+    if type(candidate) is not _TinHmacTokenPolicy:
+        raise TinNpiConnectorError("TIN token policy capability is invalid")
+    candidate._validated_material()
+    return candidate
+
+
 def load_tin_token_policy(
     *,
     token_policy_id: str,
