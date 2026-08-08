@@ -91,7 +91,12 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     assert "scripts/ci/shard_pytest_nodeids.py" in workflow
     assert "mrf-python-coverage-main-${{ matrix.shard-index }}" in workflow
     assert "pattern: mrf-python-coverage-main-*" in workflow
-    assert "name: postgres18 postgis tests (${{ matrix.shard }})" in workflow
+    assert (
+        "  address-canonical-db-tests:\n"
+        "    name: postgres18 postgis tests (${{ matrix.shard }})\n"
+        "    runs-on: ubuntu-latest\n"
+        "    timeout-minutes: 10"
+    ) in workflow
     assert "mrf-python-coverage-postgres-${{ matrix.shard }}" in workflow
     assert "pattern: mrf-python-coverage-postgres-*" in workflow
     assert "if: matrix.shard == 'core'" in workflow

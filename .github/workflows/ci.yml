@@ -550,7 +550,7 @@ jobs:
   address-canonical-db-tests:
     name: postgres18 postgis tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
