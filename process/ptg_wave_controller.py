@@ -13,6 +13,7 @@ from typing import Any, Iterable
 
 from arq import create_pool
 from arq.constants import health_check_key_suffix
+from sqlalchemy import exists, select
 
 from api.ptg_wave_kubernetes import (
     PTGWaveContractError,
@@ -38,7 +39,7 @@ from api.ptg_wave_kubernetes_terminal_attestation import (
 from api.ptg_wave_kubernetes_failure_attestation import (
     attest_preclaim_failure_ptg_wave_kubernetes_objects,
 )
-from db.models import ImportRun, PTGImportWave, db
+from db.models import ImportRun, PTGImportWave, PTGImportWaveIntent, db
 from process._ptg_wave_redis_models import (
     PTGSmallWaveJob,
     PTGSmallWaveManifest,

@@ -290,6 +290,29 @@ async def test_facade_helpers_delegate_to_owner_modules(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_real_facade_supplies_isolation_query_dependencies(monkeypatch):
+    database_result = types.SimpleNamespace(all=lambda: [])
+    execute = AsyncMock(return_value=database_result)
+    redis_idle = AsyncMock()
+    monkeypatch.setattr(controller.db, "execute", execute)
+    monkeypatch.setattr(
+        controller._controller_isolation,
+        "_require_generic_redis_idle",
+        redis_idle,
+    )
+    monkeypatch.setattr(controller, "list_generic_ptg_jobs", Mock(return_value=[]))
+    bundle = controller.PTGWaveBundle(
+        wave=_wave(state="admitted", intent_count=0),
+        intents=(),
+    )
+
+    await controller._require_ptg_only_idle(bundle, object())
+
+    execute.assert_awaited_once()
+    redis_idle.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "outcome",
     [None, controller.PTGWaveControllerHold("wait"), RuntimeError("failure")],
