@@ -146,26 +146,38 @@ def test_finalized_dataset_replay_rejects_metadata_identity_and_diagnostics():
         importer._assert_finalized_endpoint_dataset_replay(candidate)
 
 
+@pytest.mark.parametrize(
+    "unexpected_empty_error",
+    (
+        importer.CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR,
+        importer.EXPECTED_NONEMPTY_RESOURCE_ERROR,
+    ),
+    ids=("legacy-policy", "generic-policy"),
+)
 @pytest.mark.asyncio
-async def test_unexpected_empty_checkpoint_reset_is_guarded_and_exact(monkeypatch):
-    saver = AsyncMock()
-    monkeypatch.setattr(importer, "_save_pagination_checkpoint", saver)
-    result = SimpleNamespace(error=importer.CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR)
+async def test_unexpected_empty_checkpoint_reset_is_guarded_and_exact(
+    monkeypatch,
+    unexpected_empty_error,
+):
+    checkpoint_saver = AsyncMock()
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", checkpoint_saver)
+    unexpected_empty_result = SimpleNamespace(error=unexpected_empty_error)
     await importer._reset_unexpected_empty_pagination_checkpoint(
-        {}, "Practitioner", 100, result
+        {}, "Practitioner", 100, unexpected_empty_result
     )
-    saver.assert_not_awaited()
+    checkpoint_saver.assert_not_awaited()
 
-    source_by_field = {"_pagination_checkpoint_context": _context()}
+    checkpoint_context = _context()
+    source_by_field = {"_pagination_checkpoint_context": checkpoint_context}
     monkeypatch.setattr(
         importer,
         "_partitioned_resource_start_urls",
         lambda *_args, **_kwargs: ["one", "two"],
     )
     await importer._reset_unexpected_empty_pagination_checkpoint(
-        source_by_field, "Practitioner", 100, result
+        source_by_field, "Practitioner", 100, unexpected_empty_result
     )
-    saver.assert_not_awaited()
+    checkpoint_saver.assert_not_awaited()
 
     monkeypatch.setattr(
         importer,
@@ -173,9 +185,23 @@ async def test_unexpected_empty_checkpoint_reset_is_guarded_and_exact(monkeypatc
         lambda *_args, **_kwargs: ["https://example.test/fhir/Practitioner"],
     )
     await importer._reset_unexpected_empty_pagination_checkpoint(
-        source_by_field, "Practitioner", 100, result
+        source_by_field, "Practitioner", 100, unexpected_empty_result
     )
-    saver.assert_awaited_once()
+    checkpoint_saver.assert_awaited_once_with(
+        checkpoint_context,
+        "Practitioner",
+        next_url="https://example.test/fhir/Practitioner",
+        pages_processed=0,
+        rows_processed=0,
+        recent_url_hashes=[],
+    )
+
+    checkpoint_saver.reset_mock()
+    unrelated_result = SimpleNamespace(error="unrelated_fetch_error")
+    await importer._reset_unexpected_empty_pagination_checkpoint(
+        source_by_field, "Practitioner", 100, unrelated_result
+    )
+    checkpoint_saver.assert_not_awaited()
 
 
 def test_bulk_dataset_freshness_requires_complete_and_monotonic_times(monkeypatch):
