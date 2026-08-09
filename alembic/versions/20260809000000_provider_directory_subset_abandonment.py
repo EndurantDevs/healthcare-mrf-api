@@ -1,8 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Seal abandoned Provider Directory reviewed subset acquisitions.
 
-Revision ID: 20260808220000_provider_directory_subset_abandonment
-Revises: 20260808210000_provider_directory_subset_payload_guard_repair
+Revision ID: 20260809000000_provider_directory_subset_abandonment
+Revises: 20260808230000_npi_canonical_publication_receipt
 """
 
 from __future__ import annotations
@@ -14,8 +14,8 @@ from types import ModuleType
 
 from alembic import op
 
-revision = "20260808220000_provider_directory_subset_abandonment"
-down_revision = "20260808210000_provider_directory_subset_payload_guard_repair"
+revision = "20260809000000_provider_directory_subset_abandonment"
+down_revision = "20260808230000_npi_canonical_publication_receipt"
 branch_labels = None
 depends_on = None
 

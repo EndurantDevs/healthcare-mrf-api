@@ -32,7 +32,7 @@ PAYLOAD_GUARD_REPAIR_MIGRATION_PATH = (
 )
 ABANDONMENT_MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
-    / "alembic/versions/20260808220000_provider_directory_subset_abandonment.py"
+    / "alembic/versions/20260809000000_provider_directory_subset_abandonment.py"
 )
 
 

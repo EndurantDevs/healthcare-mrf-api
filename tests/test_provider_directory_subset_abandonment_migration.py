@@ -9,7 +9,7 @@ from pathlib import Path
 
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
-    / "alembic/versions/20260808220000_provider_directory_subset_abandonment.py"
+    / "alembic/versions/20260809000000_provider_directory_subset_abandonment.py"
 )
 
 
@@ -73,10 +73,10 @@ def test_upgrade_installs_additive_fail_closed_abandonment_guards(monkeypatch):
     migration, recorder, normalized_sql = _capture(monkeypatch, "upgrade")
 
     assert migration.revision == (
-        "20260808220000_provider_directory_subset_abandonment"
+        "20260809000000_provider_directory_subset_abandonment"
     )
     assert migration.down_revision == (
-        "20260808210000_provider_directory_subset_payload_guard_repair"
+        "20260808230000_npi_canonical_publication_receipt"
     )
     assert normalized_sql.startswith("LOCK TABLE")
     assert normalized_sql.count("CREATE OR REPLACE FUNCTION") == 4
