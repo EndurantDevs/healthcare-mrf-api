@@ -316,10 +316,12 @@ def test_archive_identity_rejects_unsafe_or_inexact_inputs(overrides) -> None:
         lambda row: row.__setitem__(0, "1003000101"),
         lambda row: row.__setitem__(1, "3"),
         lambda row: row.__setitem__(2, "2026-01-01"),
-        lambda row: row.__setitem__(3, "09/01/2026"),
+        lambda row: row.__setitem__(2, "09/01/2026"),
     ),
 )
-def test_row_scan_rejects_invalid_npi_type_date_or_future_event(mutator) -> None:
+def test_row_scan_rejects_invalid_npi_type_date_or_future_enumeration(
+    mutator,
+) -> None:
     row_values = list(active_type_1_row())
     mutator(row_values)
     with pytest.raises(NppesRegistryReplayError):

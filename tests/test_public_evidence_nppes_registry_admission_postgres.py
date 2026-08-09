@@ -176,7 +176,10 @@ async def _assert_triggers(connection: asyncpg.Connection, schema: str) -> None:
     trigger_rows = await connection.fetch(
         "SELECT relation.relname, trigger_record.tgname, trigger_record.tgtype::integer, "
         "trigger_record.tgenabled::text, trigger_record.tgdeferrable, "
-        "trigger_record.tginitdeferred, procedure_namespace.nspname AS function_schema "
+        "trigger_record.tginitdeferred, procedure_namespace.nspname AS function_schema, "
+        "procedure.proname AS function_name, procedure.prosecdef AS security_definer, "
+        "procedure.proconfig = ARRAY['search_path=pg_catalog']::text[] "
+        "AS exact_search_path "
         "FROM pg_trigger AS trigger_record "
         "JOIN pg_class AS relation ON relation.oid=trigger_record.tgrelid "
         "JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
@@ -202,13 +205,7 @@ async def _assert_triggers(connection: asyncpg.Connection, schema: str) -> None:
         for trigger_row in task_triggers
         if "integrity_guard" in trigger_row["tgname"]
     ]
-    assert len(integrity_rows) == 2
-    assert all(
-        trigger_row["tgtype"] == 5
-        and trigger_row["tgdeferrable"]
-        and trigger_row["tginitdeferred"]
-        for trigger_row in integrity_rows
-    )
+    _assert_integrity_triggers(integrity_rows)
     append_rows = [
         trigger_row
         for trigger_row in task_triggers
@@ -227,6 +224,27 @@ async def _assert_triggers(connection: asyncpg.Connection, schema: str) -> None:
         in {f"{table}_integrity_guard" for table in ALTERED_TABLES[1:]}
         for trigger_row in trigger_rows
     )
+
+
+def _assert_integrity_triggers(integrity_rows: list[asyncpg.Record]) -> None:
+    assert len(integrity_rows) == 2
+    assert all(
+        trigger_row["tgtype"] == 5
+        and trigger_row["tgdeferrable"]
+        and trigger_row["tginitdeferred"]
+        and trigger_row["security_definer"]
+        and trigger_row["exact_search_path"]
+        for trigger_row in integrity_rows
+    )
+    assert {
+        trigger_row["relname"]: trigger_row["function_name"]
+        for trigger_row in integrity_rows
+    } == {
+        NEW_TABLES[0]: (
+            "validate_public_evidence_nppes_registry_admission_lifecycle_v2"
+        ),
+        NEW_TABLES[3]: "validate_public_evidence_nppes_chain_admission",
+    }
 
 
 async def _assert_private(connection: asyncpg.Connection, schema: str) -> None:
@@ -252,6 +270,7 @@ async def _assert_private(connection: asyncpg.Connection, schema: str) -> None:
         "WHERE namespace.nspname=$1 "
         "AND (procedure.proname LIKE 'public_evidence_nppes_%' "
         "OR procedure.proname='nppes_registry_payload_digest' "
+        "OR procedure.proname LIKE 'validate_public_evidence_nppes_%' "
         "OR procedure.proname LIKE 'guard_%_admission_append') "
         "AND has_function_privilege('public', procedure.oid, 'EXECUTE')",
         schema,
@@ -422,7 +441,7 @@ async def test_downgrade_is_empty_only_and_restores_legacy_contract(
             await admit_replay(connection, schema, replay)
             with pytest.raises(
                 DBAPIError,
-                match="nppes_registry_admission_downgrade_requires_empty_slice",
+                match="nppes_lifecycle_downgrade_requires_empty_admission",
             ):
                 await run_migration_action(engine, migration, "downgrade")
             assert await connection.fetchval(

@@ -191,7 +191,7 @@ async def _create_runtime_roots(engine: AsyncEngine, schema_name: str) -> None:
 async def npi_publication_schema() -> (
     AsyncIterator[tuple[AsyncEngine, Any, str, Any]]
 ):
-    """Install 170000, 220000, and 230000 in one disposable schema."""
+    """Install NPI enumeration, NPPES lifecycle admission, and publication."""
 
     async with nppes_admission_schema() as (
         engine,

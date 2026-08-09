@@ -26,6 +26,10 @@ _MEMBER = "public_evidence_nppes_registry_member"
 _CHAIN = "public_evidence_nppes_registry_chain_admission"
 _CHAIN_SEAL = "public_evidence_nppes_registry_chain_admission_seal"
 _CHAIN_ARCHIVE = "public_evidence_nppes_registry_chain_archive"
+_ADMISSION_VALIDATOR = (
+    "validate_public_evidence_nppes_registry_admission_lifecycle_v2"
+)
+_CHAIN_VALIDATOR = "validate_public_evidence_nppes_chain_admission"
 _SOURCE_IDENTITY = "public_evidence_source_identity"
 _SOURCE_RELEASE = "public_evidence_source_release"
 _SOURCE_RECORD = "public_evidence_source_record"
@@ -303,13 +307,14 @@ def _classify_trigger_records(
     )
 
 
-async def _has_exact_triggers(connection: object, schema: str) -> bool:
-    """Return whether all NPPES admission triggers match the exact catalog."""
-
-    trigger_records = list(await connection.fetch(
+async def _trigger_records(connection: object, schema: str) -> list[object]:
+    return list(await connection.fetch(
         "SELECT relation.relname, trigger_record.tgname, trigger_record.tgtype::integer, "
         "trigger_record.tgenabled::text, trigger_record.tgdeferrable, "
-        "trigger_record.tginitdeferred, procedure_namespace.nspname AS function_schema "
+        "trigger_record.tginitdeferred, procedure_namespace.nspname AS function_schema, "
+        "procedure.proname AS function_name, procedure.prosecdef AS security_definer, "
+        "procedure.proconfig = ARRAY['search_path=pg_catalog']::text[] "
+        "AS exact_search_path "
         "FROM pg_trigger AS trigger_record JOIN pg_class AS relation "
         "ON relation.oid=trigger_record.tgrelid JOIN pg_namespace AS namespace "
         "ON namespace.oid=relation.relnamespace JOIN pg_proc AS procedure "
@@ -318,13 +323,26 @@ async def _has_exact_triggers(connection: object, schema: str) -> bool:
         "AND NOT trigger_record.tgisinternal",
         schema,
     ))
+
+
+async def _has_exact_triggers(connection: object, schema: str) -> bool:
+    """Return whether all NPPES admission triggers match the exact catalog."""
+
+    trigger_records = await _trigger_records(connection, schema)
     (
         task_trigger_records,
         integrity_trigger_records,
         append_trigger_records,
         immutable_trigger_records,
     ) = _classify_trigger_records(trigger_records)
-    old_names = {f"{table_name}_integrity_guard" for table_name in (_COMMON, _SOURCE_LINK, _TYPED)}
+    old_names = {
+        f"{table_name}_integrity_guard"
+        for table_name in (_COMMON, _SOURCE_LINK, _TYPED)
+    }
+    expected_integrity_function_by_table = {
+        _ADMISSION: _ADMISSION_VALIDATOR,
+        _CHAIN: _CHAIN_VALIDATOR,
+    }
     return (
         len(integrity_trigger_records) == 2
         and len(append_trigger_records) == len(_APPEND_TABLES)
@@ -349,8 +367,14 @@ async def _has_exact_triggers(connection: object, schema: str) -> bool:
             trigger_record["tgtype"] == 5
             and trigger_record["tgdeferrable"]
             and trigger_record["tginitdeferred"]
+            and trigger_record["security_definer"]
+            and trigger_record["exact_search_path"]
             for trigger_record in integrity_trigger_records
         )
+        and {
+            trigger_record["relname"]: trigger_record["function_name"]
+            for trigger_record in integrity_trigger_records
+        } == expected_integrity_function_by_table
     )
 
 
@@ -369,6 +393,7 @@ async def _has_private_acl(connection: object, schema: str) -> bool:
         "ON namespace.oid=procedure.pronamespace WHERE namespace.nspname=$1 "
         "AND (procedure.proname LIKE 'public_evidence_nppes_%' "
         "OR procedure.proname='nppes_registry_payload_digest' "
+        "OR procedure.proname LIKE 'validate_public_evidence_nppes_%' "
         "OR procedure.proname LIKE 'guard_%_admission_append') "
         "AND has_function_privilege('public', procedure.oid, 'EXECUTE')",
         schema,

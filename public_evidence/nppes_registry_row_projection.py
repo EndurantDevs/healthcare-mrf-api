@@ -95,18 +95,14 @@ def _effective_state(
     deactivation: datetime | None,
     reactivation: datetime | None,
 ) -> tuple[str, datetime | None]:
-    if reactivation is not None and (
-        deactivation is None or reactivation <= deactivation
-    ):
-        raise replay_error()
-    is_reactivated = (
-        deactivation is not None
-        and reactivation is not None
-        and reactivation > deactivation
+    """Apply latest-event state with reactivation winning same-day ties."""
+
+    is_deactivated = deactivation is not None and (
+        reactivation is None or reactivation < deactivation
     )
-    if deactivation is not None and not is_reactivated:
+    if is_deactivated:
         return "deactivated", deactivation
-    return "active", reactivation if is_reactivated else enumeration
+    return "active", reactivation if reactivation is not None else enumeration
 
 
 def _canonical_payload(
@@ -149,21 +145,30 @@ def _temporal_projection(
     ],
     entity_type: str | None,
 ) -> tuple[str, str | None, str | None]:
-    if any(
-        source_date is not None and source_date > snapshot
-        for source_date in source_dates
-    ):
-        raise replay_error()
+    """Project only lifecycle events effective by the archive snapshot."""
+
     enumeration, _, deactivation, reactivation = source_dates
+    if enumeration is not None and enumeration > snapshot:
+        raise replay_error()
+    eligible_deactivation = (
+        deactivation
+        if deactivation is not None and deactivation <= snapshot
+        else None
+    )
+    eligible_reactivation = (
+        reactivation
+        if reactivation is not None and reactivation <= snapshot
+        else None
+    )
     if enumeration is not None and any(
         event is not None and enumeration > event
-        for event in (deactivation, reactivation)
+        for event in (eligible_deactivation, eligible_reactivation)
     ):
         raise replay_error()
     enumeration_state, effective_start = _effective_state(
         enumeration,
-        deactivation,
-        reactivation,
+        eligible_deactivation,
+        eligible_reactivation,
     )
     if effective_start is None:
         return enumeration_state, None, "effective_start_not_disclosed"

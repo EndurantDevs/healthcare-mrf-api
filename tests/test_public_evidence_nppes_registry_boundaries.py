@@ -114,7 +114,6 @@ def test_compiled_header_fast_path_is_exact_and_value_safe():
         (active_type_1_row(), True),
         (("bad", *active_type_1_row()[1:]), 1),
         (("0000000000", *active_type_1_row()[1:]), 1),
-        (("1003000100", "1", "05/23/2005", "05/01/2026", "", "06/15/2026"), 1),
     ),
 )
 def test_row_scan_rejects_value_npi_and_ordinal_boundaries(row_values, ordinal):

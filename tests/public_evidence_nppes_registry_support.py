@@ -65,6 +65,50 @@ def reactivated_type_1_row() -> tuple[str, ...]:
     )
 
 
+def equal_day_reactivated_type_1_row() -> tuple[str, ...]:
+    return (
+        "1003000100",
+        "1",
+        "05/23/2005",
+        "07/12/2026",
+        "06/15/2026",
+        "06/15/2026",
+    )
+
+
+def orphan_reactivated_type_2_row() -> tuple[str, ...]:
+    return (
+        "1003000118",
+        "2",
+        "05/23/2005",
+        "07/12/2026",
+        "",
+        "06/15/2026",
+    )
+
+
+def future_deactivation_type_1_row() -> tuple[str, ...]:
+    return (
+        "1003022534",
+        "1",
+        "05/23/2005",
+        "07/12/2026",
+        "07/13/2026",
+        "",
+    )
+
+
+def future_last_update_type_1_row() -> tuple[str, ...]:
+    return (
+        "1000000012",
+        "1",
+        "05/23/2005",
+        "07/13/2026",
+        "",
+        "",
+    )
+
+
 def sparse_deactivated_row() -> tuple[str, ...]:
     return (
         "1003001314",
