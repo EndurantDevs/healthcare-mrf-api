@@ -307,6 +307,7 @@ async def _run_outer_import(
     run_id: str,
     *,
     retry_of_run_id: str | None = None,
+    pagination_resume_required: set[str] | None = None,
 ) -> dict[str, int]:
     return await importer._import_resources(
         [source_record],
@@ -321,10 +322,11 @@ async def _run_outer_import(
         defer_typed_materialization=True,
         retry_of_run_id=retry_of_run_id,
         pagination_root_run_id=(ROOT_RUN_ID if retry_of_run_id else None),
+        pagination_resume_required=pagination_resume_required,
     )
 
 
-async def _run_outer_failed_phase(
+async def _run_outer_resumable_phase(
     monkeypatch: pytest.MonkeyPatch,
     source_record: dict[str, Any],
     database: Any,
@@ -333,7 +335,7 @@ async def _run_outer_failed_phase(
     start_url: str,
     dataset_id: str,
 ) -> None:
-    """Retain a failed candidate's exact checkpoint and durable page proof."""
+    """Retain an acquiring candidate's exact cursor and durable page proof."""
 
     requested_urls: list[str] = []
     monkeypatch.setattr(
@@ -348,20 +350,17 @@ async def _run_outer_failed_phase(
             requested_urls,
         ),
     )
-    with pytest.raises(
-        RuntimeError,
-        match="provider_directory_current_version_census_proof_incomplete",
-    ):
-        await _run_outer_import(source_record, ROOT_RUN_ID)
+    resume_required_entries: set[str] = set()
+    await _run_outer_import(source_record, ROOT_RUN_ID, pagination_resume_required=resume_required_entries)
 
     dataset = await endpoint_dataset_record(database, schema)
     checkpoint = await checkpoint_record(database, schema)
     assert requested_urls == [count_url, start_url, NEXT_URL]
+    assert resume_required_entries == {f"{source_record['source_id']}:{RESOURCE_TYPE}"}
     assert dataset["dataset_id"] == dataset_id
-    assert dataset["status"] == importer.ENDPOINT_DATASET_FAILED
-    assert dataset["import_run_id"] == ROOT_RUN_ID
-    assert dataset["acquisition_root_run_id"] == ROOT_RUN_ID
-    assert dataset["resource_count"] == 1
+    assert dataset["status"] == importer.ENDPOINT_DATASET_ACQUIRING
+    assert dataset["import_run_id"] == dataset["acquisition_root_run_id"] == ROOT_RUN_ID
+    assert dataset["resource_count"] == 0
     assert checkpoint["dataset_id"] == dataset_id
     assert_initial_checkpoint(checkpoint, census_contract())
     assert await candidate_resource_ids(database, schema, dataset_id) == [
@@ -460,10 +459,10 @@ async def _assert_outer_finalized(
 
 
 @pytest.mark.asyncio
-async def test_postgres_outer_lifecycle_reuses_failed_exact_census_candidate(
+async def test_postgres_outer_lifecycle_resumes_acquiring_census_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prove failed-to-acquiring reuse and normal immutable finalization."""
+    """Prove acquiring reuse and normal immutable finalization."""
 
     async def ignore_source_metadata(*_args: Any, **_kwargs: Any) -> None:
         return None
@@ -492,7 +491,7 @@ async def test_postgres_outer_lifecycle_reuses_failed_exact_census_candidate(
     )
 
     async with census_database(monkeypatch, seed_dataset=False) as (database, schema):
-        await _run_outer_failed_phase(
+        await _run_outer_resumable_phase(
             monkeypatch, source_record, database, schema, count_url, start_url, dataset_id
         )
         await _run_outer_retry_phase(

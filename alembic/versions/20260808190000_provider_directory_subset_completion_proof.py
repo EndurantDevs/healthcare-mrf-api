@@ -2151,7 +2151,7 @@ def _subset_dataset_content_sql(schema: str) -> str:
                    ALL(ARRAY[{resource_types_sql}]::text[])
                 OR child.payload_hash IS DISTINCT FROM
                    {payload_sha256_ref}(
-                       child.payload_json
+                       child.payload_json::jsonb
                        - 'resource_url'
                        - 'fhir_self_url'
                        - 'fhir_fetch_url'

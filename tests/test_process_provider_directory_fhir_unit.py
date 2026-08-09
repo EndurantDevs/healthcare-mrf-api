@@ -6849,6 +6849,40 @@ async def test_deferred_materialization_requires_checkpoint_safe_mode():
         )
 
 
+
+@pytest.mark.asyncio
+async def test_deferred_materialization_rejects_source_specific_connector(
+    monkeypatch,
+):
+    """Reject deferred typing when a source requires a custom connector."""
+
+    monkeypatch.setattr(
+        importer,
+        "_uses_alohr_graphql_connector",
+        lambda _source_record: True,
+    )
+    with pytest.raises(
+        ValueError,
+        match="provider_directory_deferred_typed_materialization_source_unsupported",
+    ):
+        await importer._import_resources(
+            [
+                {
+                    "source_id": "source-a",
+                    "api_base": "https://directory.example.test/fhir",
+                }
+            ],
+            resources=[],
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=100,
+            timeout=15,
+            run_id="run_1",
+            defer_typed_materialization=True,
+            is_pagination_checkpointing_enabled=True,
+        )
+
+
 def _alohr_graphql_fixture_page(root_key: str):
     if root_key == "providers":
         return (
@@ -19095,10 +19129,52 @@ def _scan_practitioner_role_fetch_result():
     )
 
 
+def _patch_scan_seen_stage(monkeypatch):
+    """Install isolated seen-stage fakes for a streamed scan lookup."""
+
+    seen_stage_table = "provider_directory_import_seen_stage_test"
+    prepare_seen_stage = AsyncMock()
+    drop_seen_stage = AsyncMock()
+    stage_mock_by_name = {
+        "_ensure_import_seen_stage_table": AsyncMock(
+            return_value=seen_stage_table
+        ),
+        "_prepare_import_seen_stage_lookup": prepare_seen_stage,
+        "_delete_stale_resource_rows": AsyncMock(return_value=0),
+        "_drop_import_seen_stage_table": drop_seen_stage,
+    }
+    for function_name, stage_mock in stage_mock_by_name.items():
+        monkeypatch.setattr(importer, function_name, stage_mock)
+    return seen_stage_table, prepare_seen_stage, drop_seen_stage
+
+
+def _assert_scan_seen_stage_options(
+    options,
+    seen_stage_table,
+    prepare_seen_stage,
+    drop_seen_stage,
+):
+    """Require a scan lookup to read only the staged source identities."""
+
+    assert options.retain_rows is False
+    assert options.seed_stage_table == seen_stage_table
+    assert options.seed_source_ids == ("scan",)
+    assert options.existing_seed_source_ids == ()
+    assert prepare_seen_stage.await_args_list == [
+        call(seen_stage_table),
+        call(seen_stage_table),
+    ]
+    drop_seen_stage.assert_awaited_once_with(seen_stage_table)
+
+
 @pytest.mark.asyncio
 async def test_import_resources_does_not_retain_streamed_scan_roles_for_linked_fallback(monkeypatch):
+    """Stream scan roles without retaining fallback seed payloads."""
     _stub_resource_import_metadata(monkeypatch)
     captured_scan_options: list[importer.ScanPractitionerRoleFetchOptions] = []
+    seen_stage_table, prepare_seen_stage, drop_seen_stage = (
+        _patch_scan_seen_stage(monkeypatch)
+    )
 
     async def fake_fetch_resource_rows(source, resource_type, **kwargs):
         if resource_type == "PractitionerRole":
@@ -19141,11 +19217,17 @@ async def test_import_resources_does_not_retain_streamed_scan_roles_for_linked_f
         run_id="run_1",
         linked_resource_limit=50000,
         stream_batch_size=5000,
+        stale_cleanup=True,
     )
 
     assert counts == {"PractitionerRole": 1, "Practitioner": 1}
     assert captured_scan_options
-    assert captured_scan_options[0].retain_rows is False
+    _assert_scan_seen_stage_options(
+        captured_scan_options[0],
+        seen_stage_table,
+        prepare_seen_stage,
+        drop_seen_stage,
+    )
 
 
 @pytest.mark.asyncio
@@ -22933,6 +23015,102 @@ async def test_candidate_checkpoint_clears_after_validation_inside_guard(monkeyp
         "clear",
         "guard_exit",
     ]
+
+
+def _patch_resumable_candidate_flow(monkeypatch):
+    """Patch one synthetic candidate to retain an incomplete cursor."""
+    _stub_resource_import_metadata(monkeypatch)
+    source_by_field = {
+        "source_id": "source-a",
+        "api_base": "https://directory.example.test/fhir",
+        "canonical_api_base": "https://directory.example.test/fhir",
+    }
+    checkpoint_context = _checkpoint_context(
+        owner_run_id="run_1",
+        acquisition_root_run_id="run_1",
+        dataset_id="dataset_1",
+    )
+    endpoint_candidate = _checkpoint_validation_candidate(
+        source_by_field,
+        checkpoint_context,
+    )
+    events = _patch_candidate_checkpoint_flow(
+        monkeypatch,
+        checkpoint_context,
+        endpoint_candidate,
+    )
+    resume_required_entries: set[str] = set()
+
+    async def request_resume(
+        prepared_source,
+        diagnostics_by_resource,
+        resume_entries,
+        **_kwargs,
+    ):
+        assert prepared_source["source_id"] == source_by_field["source_id"]
+        assert tuple(diagnostics_by_resource) == ("Location",)
+        assert resume_entries is not resume_required_entries
+        resume_entries.add(f"{source_by_field['source_id']}:Location")
+        events.append("resume")
+
+    monkeypatch.setattr(
+        importer,
+        "_finalize_source_pagination_checkpoints",
+        request_resume,
+    )
+    mark_failed = AsyncMock()
+    cancellation_check = AsyncMock()
+    monkeypatch.setattr(
+        importer,
+        "_mark_endpoint_dataset_candidate",
+        mark_failed,
+    )
+    monkeypatch.setattr(
+        importer._ResourceImportCancellation,
+        "check",
+        cancellation_check,
+    )
+    return (
+        source_by_field,
+        events,
+        resume_required_entries,
+        mark_failed,
+        cancellation_check,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resumable_source_skips_proof_finalization_inside_guard(monkeypatch):
+    """Keep an incomplete candidate resumable until its cursor is exhausted."""
+
+    (
+        source_by_field,
+        events,
+        resume_required_entries,
+        mark_failed,
+        cancellation_check,
+    ) = _patch_resumable_candidate_flow(monkeypatch)
+
+    counts = await importer._import_resources(
+        [source_by_field],
+        resources=["Location"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+        stream_batch_size=1,
+        is_pagination_checkpointing_enabled=True,
+        pagination_resume_required=resume_required_entries,
+    )
+
+    assert counts == {"Location": 1}
+    assert resume_required_entries == {
+        f"{source_by_field['source_id']}:Location"
+    }
+    assert events == ["guard_enter", "fetch", "write", "resume", "guard_exit"]
+    cancellation_check.assert_awaited_once()
+    mark_failed.assert_not_awaited()
 
 
 @pytest.mark.asyncio

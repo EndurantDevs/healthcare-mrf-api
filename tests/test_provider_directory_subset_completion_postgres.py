@@ -31,6 +31,9 @@ from tests.provider_directory_subset_completion_pg_setup import (
     prove_payload_canonicalization_parity,
     run_subset_migration,
 )
+from tests.provider_directory_subset_payload_guard_pg import (
+    prove_subset_payload_guard_repair,
+)
 from tests.provider_directory_subset_completion_pg_support import (
     valid_evidence_pairs,
 )
@@ -131,6 +134,13 @@ async def test_subset_proof_migration_clean_downgrade_restores_legacy(
         assert remaining_columns == 0
     finally:
         await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_subset_payload_guard_repair_supports_physical_json(monkeypatch):
+    """Replace the deployed guard body before lifecycle bookkeeping."""
+
+    await prove_subset_payload_guard_repair(monkeypatch)
 
 
 @pytest.mark.asyncio
