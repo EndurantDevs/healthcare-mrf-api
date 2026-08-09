@@ -57,7 +57,7 @@ async def _write_practitioner_batch(
             resource_rows,
             dataset_id=DATASET_ID,
             track_seen=False,
-            resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+            resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
         )
     return await importer._upsert_resource_rows(
         importer.ProviderDirectoryPractitioner,
@@ -68,7 +68,7 @@ async def _write_practitioner_batch(
         source_ids=["source-a"],
         dataset_scope=importer.EndpointDatasetWriteScope(
             DATASET_ID,
-            importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+            importer.LEGACY_RESOURCE_HASH_CONTRACT,
         ),
     )
 

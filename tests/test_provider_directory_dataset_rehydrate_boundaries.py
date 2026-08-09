@@ -7,7 +7,7 @@ import hashlib
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -16,6 +16,11 @@ from process import provider_directory_dataset_rehydrate as rehydrate
 from process import provider_directory_dataset_rehydrate_scope as rehydrate_scope
 from process import provider_directory_dataset_rehydrate_store as rehydrate_store
 from process import provider_directory_dataset_rehydrate_types as rehydrate_types
+from process.provider_directory_resource_hash import (
+    LEGACY_RESOURCE_HASH_CONTRACT,
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+)
 
 
 def _mapped_payload():
@@ -188,6 +193,8 @@ def _scope(**changes):
         "dataset_hash": _dataset_hash(),
         "resource_count": 1,
         "resource_types": ("Location",),
+        "resource_hash_contract": LEGACY_RESOURCE_HASH_CONTRACT,
+        "semantic_projection_as_of": None,
         "publication_metadata_hash": "a" * 64,
         "published_at": dt.datetime.now(dt.UTC),
     }
@@ -204,6 +211,85 @@ def _context(database, *, runtime=None, scope=None, expected_count=1):
         ProviderDirectoryLocation,
         expected_count,
     )
+
+
+def test_scope_decodes_exact_persisted_hash_contract_and_projection_date(
+    monkeypatch,
+):
+    v3_record = _scope_record()
+    v3_record["publication_metadata_json"].update(
+        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of="2026-08-09",
+        proof_resource_scope=["Location"],
+        provider_directory_content_proof_v1={"sealed": True},
+    )
+    validate_proof = Mock(
+        return_value={"resource_counts": {"Location": 1}}
+    )
+    monkeypatch.setattr(
+        rehydrate_scope,
+        "validate_stored_dataset_proof_metadata",
+        validate_proof,
+    )
+    v3_scope = rehydrate_scope._decode_dataset_scope(
+        _request(),
+        v3_record,
+    )
+    assert v3_scope.resource_hash_contract == (
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    )
+    assert v3_scope.semantic_projection_as_of == "2026-08-09"
+    assert v3_scope.resource_types == ("Location",)
+    assert validate_proof.call_args.kwargs["proof_resource_scope"] == (
+        "Location",
+    )
+
+    v2_record = _scope_record()
+    v2_record["publication_metadata_json"]["resource_hash_contract"] = (
+        TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+    )
+    v2_scope = rehydrate_scope._decode_dataset_scope(
+        _request(),
+        v2_record,
+    )
+    assert v2_scope.resource_hash_contract == (
+        TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+    )
+    assert v2_scope.semantic_projection_as_of is None
+
+
+@pytest.mark.parametrize(
+    "invalid_projection_as_of",
+    [None, "2026-8-9", " 2026-08-09", dt.date(2026, 8, 9)],
+)
+def test_scope_rejects_invalid_v3_projection_date(invalid_projection_as_of):
+    scope_record = _scope_record()
+    scope_record["publication_metadata_json"].update(
+        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of=invalid_projection_as_of,
+    )
+
+    with pytest.raises(
+        rehydrate_types.DatasetRehydrationError,
+        match="hash_identity_invalid",
+    ):
+        rehydrate_scope._decode_dataset_scope(_request(), scope_record)
+
+
+def test_scope_rejects_noncanonical_v3_proof_resource_scope():
+    scope_record = _scope_record()
+    scope_record["publication_metadata_json"].update(
+        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of="2026-08-09",
+        proof_resource_scope=["Practitioner", "Location"],
+        provider_directory_content_proof_v1={"sealed": True},
+    )
+
+    with pytest.raises(
+        rehydrate_types.DatasetRehydrationError,
+        match="proof_scope_invalid",
+    ):
+        rehydrate_scope._decode_dataset_scope(_request(), scope_record)
 
 
 @pytest.mark.asyncio
@@ -471,6 +557,7 @@ def test_payload_validation_rejects_each_unsafe_shape(
             resource_id,
             rehydrate_types._payload_hash(payload),
             payload,
+            resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
         )
         == expected_reason
     )

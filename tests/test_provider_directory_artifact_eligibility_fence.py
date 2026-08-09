@@ -125,6 +125,56 @@ def test_candidate_eligibility_projection_is_compact_and_fail_closed():
     assert "jsonb_typeof(candidate.full_metadata_jsonb) = 'object'" in (
         projection_sql
     )
+    for identity_field in (
+        importer.RESOURCE_HASH_CONTRACT_METADATA_KEY,
+        importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
+        importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY,
+    ):
+        assert f"? '{identity_field}'" in projection_sql
+        assert f"-> '{identity_field}'" in projection_sql
+
+
+def test_twin_artifact_sql_binds_optional_semantic_hash_identity():
+    matched_sql = " ".join(
+        importer._artifact_matched_proof_sql(
+            "candidate_metadata",
+            "candidate_verification",
+            "candidate_proof",
+        ).split()
+    )
+    twin_equality_sql = " ".join(
+        importer._artifact_twin_proof_equality_sql(
+            "candidate_proof",
+            "baseline_proof",
+        ).split()
+    )
+    baseline_sql = " ".join(
+        importer._artifact_baseline_proof_sql(
+            "dataset_table",
+            "candidate_metadata",
+            "candidate_verification",
+        ).split()
+    )
+    for identity_field in (
+        importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
+        importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY,
+    ):
+        assert (
+            f"(candidate_proof -> '{identity_field}') "
+            "IS NOT DISTINCT FROM "
+            f"(candidate_metadata -> '{identity_field}')"
+        ) in matched_sql
+        assert (
+            f"(candidate_proof -> '{identity_field}') "
+            "IS NOT DISTINCT FROM "
+            f"(baseline_proof -> '{identity_field}')"
+        ) in twin_equality_sql
+        assert identity_field in baseline_sql
+        assert "IS NOT DISTINCT FROM" in baseline_sql
+    assert importer.RESOURCE_HASH_CONTRACT_METADATA_KEY in baseline_sql
+    assert importer.LEGACY_RESOURCE_HASH_CONTRACT in baseline_sql
+    assert importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT in baseline_sql
+    assert importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT in baseline_sql
 
 
 def test_reviewed_candidate_sql_has_closed_single_root_policy_branch():

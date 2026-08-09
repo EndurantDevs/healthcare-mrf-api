@@ -17,6 +17,7 @@ from process.provider_directory_resource_hash import (
     LEGACY_RESOURCE_HASH_CONTRACT,
     RESOURCE_HASH_CONTRACT_METADATA_KEY,
     RESOURCE_TRANSPORT_PAYLOAD_FIELDS,
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     legacy_resource_payload_sha256,
 )
@@ -217,6 +218,7 @@ def test_legacy_transport_hash_remains_readable():
             "practitioner-1",
             legacy_hash,
             mapped_payload_by_field,
+            resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
         )
         is None
     )
@@ -250,6 +252,7 @@ def test_legacy_hash_does_not_hide_semantic_changes():
             "practitioner-1",
             legacy_hash,
             changed_payload_by_field,
+            resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
         )
         == "payload_hash_mismatch"
     )
@@ -279,7 +282,7 @@ def test_dataset_contract_defaults_fresh_and_normalizes_legacy_metadata():
 
     assert (
         importer._dataset_resource_hash_contract({})
-        == TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
     )
     legacy_state_by_field = {
         "publication_metadata_json": {"source_ids": ["source-1"]}
@@ -323,7 +326,7 @@ def test_dataset_contract_accepts_known_marker_and_rejects_unknown_marker():
 @pytest.mark.parametrize(
     ("existing_state_by_field", "expected_contract"),
     [
-        ({}, TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT),
+        ({}, SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
         (
             {"publication_metadata_json": {"source_ids": ["source-1"]}},
             LEGACY_RESOURCE_HASH_CONTRACT,

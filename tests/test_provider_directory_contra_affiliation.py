@@ -46,6 +46,7 @@ def _dataset_payload(raw_resource: dict) -> dict:
         model,
         [row],
         dataset_id="dataset-a",
+        resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
     )
     assert len(dataset_rows) == 1
     return dataset_rows[0]["payload_json"]

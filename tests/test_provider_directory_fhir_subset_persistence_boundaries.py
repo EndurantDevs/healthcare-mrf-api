@@ -27,6 +27,77 @@ def _persisted_inputs():
     return build_persisted_subset_inputs()
 
 
+def test_reviewed_subset_hash_contract_is_version_fenced():
+    assert importer._candidate_resource_hash_contract(
+        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        importer.SERVER_ISSUED_SUBSET_REQUIRED_VERSION,
+    ) == importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+    assert importer._candidate_resource_hash_contract(
+        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+        importer.SERVER_ISSUED_SUBSET_REQUIRED_VERSION,
+    ) == importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+    assert importer._candidate_resource_hash_contract(
+        importer.LEGACY_RESOURCE_HASH_CONTRACT,
+        importer.SERVER_ISSUED_SUBSET_REQUIRED_VERSION,
+    ) == importer.LEGACY_RESOURCE_HASH_CONTRACT
+
+    candidate, *_unused = _persisted_inputs()
+    assert candidate.resource_hash_contract == (
+        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="subset_resource_hash_contract_invalid",
+    ):
+        importer._assert_candidate_hash_contract_supported(
+            replace(
+                candidate,
+                resource_hash_contract=(
+                    importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+                ),
+                semantic_projection_as_of="2026-08-09",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        importer.ENDPOINT_DATASET_VALIDATED,
+        importer.ENDPOINT_DATASET_PUBLISHED,
+        importer.ENDPOINT_DATASET_VERIFICATION_BASELINE,
+        importer.ENDPOINT_DATASET_VERIFICATION_MISMATCH,
+    ],
+)
+def test_finalized_subset_rejects_persisted_semantic_contract_without_source_hint(
+    terminal_status,
+):
+    persisted_state = {
+        "status": terminal_status,
+        "completion_proof_required_version": (
+            importer.SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        ),
+        "publication_metadata_json": {
+            "resource_hash_contract": (
+                importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            ),
+            "semantic_projection_as_of": "2026-08-09",
+        },
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="subset_resource_hash_contract_invalid",
+    ):
+        importer._existing_endpoint_dataset_finalized_selection(
+            persisted_state,
+            "dataset-1",
+            "endpoint-1",
+            "root-1",
+            importer.EndpointDatasetVerificationProfile(False),
+        )
+
+
 def test_parent_completion_pair_accepts_exact_pair_and_legacy_absence():
     _, _, content, dataset, _, _, _ = _persisted_inputs()
 

@@ -30,6 +30,10 @@ def _candidate() -> importer.EndpointDatasetCandidate:
         requires_twin_root_verification=True,
         verification_campaign_id="reviewed-candidates-v1",
         verification_source_scope_hash="scope-v1",
+        semantic_projection_as_of="2026-08-09",
+        proof_resource_scope=(
+            importer._provider_directory_proof_resource_scope(resources)
+        ),
     )
 
 
@@ -51,6 +55,12 @@ def _baseline(candidate: importer.EndpointDatasetCandidate) -> dict[str, object]
         "resource_count": content.resource_count,
         "publication_metadata_json": {
             importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: candidate.resource_hash_contract,
+            importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: (
+                candidate.semantic_projection_as_of
+            ),
+            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: (
+                list(candidate.proof_resource_scope or ())
+            ),
             "source_ids": list(candidate.source_ids),
             "selected_resources": list(candidate.selected_resources),
             "expected_resources": list(candidate.expected_resources),

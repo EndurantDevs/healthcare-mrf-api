@@ -24,6 +24,7 @@ def _candidate() -> importer.EndpointDatasetCandidate:
         import_run_id="root_candidate",
         previous_dataset_id="dataset_current",
         requires_twin_root_verification=False,
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
     )
 
 
@@ -91,6 +92,11 @@ async def test_non_twin_candidate_preserves_full_resource_count_proof(
         acquisition_root_run_id=candidate.acquisition_root_run_id,
         source_ids=candidate.source_ids,
         selected_resources=candidate.selected_resources,
+        proof_resource_scope=None,
+        expected_resource_hash_contract=(
+            importer.LEGACY_RESOURCE_HASH_CONTRACT
+        ),
+        expected_semantic_projection_as_of=None,
     )
     legacy_builder.assert_not_awaited()
 

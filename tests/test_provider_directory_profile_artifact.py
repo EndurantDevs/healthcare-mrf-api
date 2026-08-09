@@ -659,6 +659,59 @@ async def test_artifact_scope_exact_projection_includes_sources_and_batches(
     assert projection_query.await_count == 7
 
 
+@pytest.mark.asyncio
+async def test_exact_projection_includes_a_proven_linked_resource_family(
+    monkeypatch,
+):
+    practitioner_model = next(
+        model
+        for model in importer.RESOURCE_MODELS
+        if importer.RESOURCE_TYPES_BY_MODEL[model] == "Practitioner"
+    )
+    linked_dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id="source_a",
+        endpoint_id="endpoint_a",
+        dataset_id="dataset_a",
+        evidence_run_id="run_a",
+        selected_resources=("InsurancePlan",),
+        retained_resources=("InsurancePlan", "Practitioner"),
+    )
+    projection_query = AsyncMock(
+        side_effect=(
+            {
+                "projected_rows": 1,
+                "projected_logical_bytes": 128,
+                "last_cursor": "practitioner-1",
+            },
+            {
+                "projected_rows": 0,
+                "projected_logical_bytes": 0,
+                "last_cursor": None,
+            },
+        )
+    )
+    monkeypatch.setattr(importer.db, "first", projection_query)
+
+    projection = await (
+        importer._provider_directory_artifact_resource_exact_projection(
+            "fixture",
+            practitioner_model,
+            importer.ProviderDirectoryArtifactDatasetFence((linked_dataset,)),
+            frozenset({"Practitioner"}),
+            batch_size=100,
+        )
+    )
+
+    assert projection.resource_type == "Practitioner"
+    assert projection.projected_rows == 1
+    assert projection.projected_logical_bytes == 128
+    assert [batch.dataset_id for batch in projection.batches] == [
+        "dataset_a",
+        "dataset_a",
+    ]
+    assert projection_query.await_count == 2
+
+
 def test_profile_aggregation_is_deterministic_and_evidence_bounded():
     sql = profile.profile_insert_sql(
         evidence_ref='"fixture"."evidence"',

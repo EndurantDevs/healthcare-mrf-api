@@ -192,6 +192,9 @@ def build_dataset_candidate(
         verification_role=importer.TWIN_ROOT_BASELINE_CANDIDATE_ROLE,
         completion_proof_required_version=3,
         subset_contract=contract,
+        resource_hash_contract=(
+            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+        ),
     )
 
 
@@ -288,6 +291,9 @@ def build_coverage_inputs() -> tuple[Any, ...]:
         previous_dataset_id=None,
         completion_proof_required_version=3,
         subset_contract=contract,
+        resource_hash_contract=(
+            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+        ),
     )
     diagnostic_by_type = {
         resource_type: {

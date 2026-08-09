@@ -939,6 +939,9 @@ def _uhc_source_local_candidate_fence():
         previous_dataset_id="dataset-old",
         expected_resources=tuple(sorted(importer.UHC_SUPPORTED_RESOURCES)),
         already_validated=True,
+        resource_hash_contract=(
+            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+        ),
     )
     dataset = importer.ProviderDirectoryArtifactDataset(
         source_id=importer.UHC_RETAINED_SOURCE_ID,
@@ -1293,6 +1296,9 @@ async def test_uhc_candidate_value_reflects_empty_validated_and_published_state(
     )
     assert empty.previous_dataset_id == "dataset-old"
     assert empty.reused_from_checkpoint is False
+    assert empty.resource_hash_contract == (
+        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+    )
 
     validated = await importer._uhc_candidate_from_state(
         "endpoint-uhc",
@@ -1307,6 +1313,9 @@ async def test_uhc_candidate_value_reflects_empty_validated_and_published_state(
     )
     assert validated.already_validated is True
     assert validated.validated_metadata == {"resource_count": 7}
+    assert validated.resource_hash_contract == (
+        importer.LEGACY_RESOURCE_HASH_CONTRACT
+    )
 
     published = await importer._uhc_candidate_from_state(
         "endpoint-uhc",
@@ -1320,6 +1329,44 @@ async def test_uhc_candidate_value_reflects_empty_validated_and_published_state(
     )
     assert published.already_published is True
     assert published.published_metadata == {"resource_count": 7}
+
+    retained_v2 = await importer._uhc_candidate_from_state(
+        "endpoint-uhc",
+        "dataset-uhc",
+        "run-root",
+        {
+            "status": importer.ENDPOINT_DATASET_ACQUIRING,
+            "is_current": False,
+            "publication_metadata_json": {
+                "resource_hash_contract": (
+                    importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+                )
+            },
+        },
+    )
+    assert retained_v2.resource_hash_contract == (
+        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="retained_resource_hash_contract_invalid",
+    ):
+        await importer._uhc_candidate_from_state(
+            "endpoint-uhc",
+            "dataset-uhc",
+            "run-root",
+            {
+                "status": importer.ENDPOINT_DATASET_ACQUIRING,
+                "is_current": False,
+                "publication_metadata_json": {
+                    "resource_hash_contract": (
+                        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+                    ),
+                    "semantic_projection_as_of": "2026-08-09",
+                },
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -1404,7 +1451,9 @@ async def test_uhc_candidate_copy_and_content_proof_require_exact_counts(
         },
     )
 
-    executor = SimpleNamespace(status=AsyncMock(side_effect=[1, 0]))
+    executor = SimpleNamespace(
+        status=AsyncMock(side_effect=[1, "DELETE 0", 0])
+    )
 
     @contextlib.asynccontextmanager
     async def mutation(_dataset_ids):
@@ -1427,7 +1476,11 @@ async def test_uhc_candidate_copy_and_content_proof_require_exact_counts(
     )
     with pytest.raises(RuntimeError, match="copy_incomplete"):
         await importer._replace_uhc_candidate_resources(candidate, stage)
-    executor.status.side_effect = [1, 1]
+    assert any(
+        importer.PROVIDER_DIRECTORY_PROOF_SHARD_TABLE in call.args[0]
+        for call in executor.status.await_args_list
+    )
+    executor.status.side_effect = [1, "DELETE 0", 1]
     assert await importer._replace_uhc_candidate_resources(
         candidate,
         stage,
@@ -1948,6 +2001,8 @@ async def test_dataset_rehydration_runtime_callbacks(monkeypatch):
         dataset_hash="a" * 64,
         resource_count=1,
         resource_types=("Organization",),
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of=None,
         publication_metadata_hash="b" * 64,
         published_at="2026-07-28T00:00:00Z",
     )
@@ -1956,6 +2011,17 @@ async def test_dataset_rehydration_runtime_callbacks(monkeypatch):
         [{}],
         scope,
     ) == 2
+    importer._upsert_resource_rows.assert_awaited_once_with(
+        importer.ProviderDirectoryOrganization,
+        [{}],
+        run_id="root-a",
+        track_seen=False,
+        canonical_api_base="https://example.test/fhir",
+        source_ids=["source-a"],
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of=None,
+        derive_location_contacts=False,
+    )
     await runtime.cancel_check()
     await runtime.progress_callback({"phase": "copy"})
     importer.mark_control_run.side_effect = RuntimeError("diagnostic only")
@@ -6754,6 +6820,9 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
 
     upsert_calls = []
     persisted_proof = AsyncMock()
+    accumulated_rows = AsyncMock(
+        side_effect=lambda _database, rows, **_kwargs: rows
+    )
 
     @contextlib.asynccontextmanager
     async def fake_transaction():
@@ -6766,6 +6835,11 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
     monkeypatch.setattr(importer.db, "transaction", fake_transaction)
     monkeypatch.setattr(importer, "persist_dataset_proof_shard", persisted_proof)
+    monkeypatch.setattr(
+        importer,
+        "_accumulated_endpoint_dataset_rows",
+        accumulated_rows,
+    )
 
     resource_rows = [
         {
@@ -6787,6 +6861,7 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
         dataset_scope=importer.EndpointDatasetWriteScope(
             "dataset_1",
             importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+            "2026-01-01",
         ),
     )
 
@@ -6806,13 +6881,168 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
         "mrf",
         dataset_call[1],
         dataset_id="dataset_1",
+        expected_resource_hash_contract=(
+            importer.DEFAULT_RESOURCE_HASH_CONTRACT
+        ),
     )
+
+
+@pytest.mark.asyncio
+async def test_datasetless_upsert_defaults_to_v2_and_explicit_v3_requires_date(
+    monkeypatch,
+):
+    """Keep compatibility writes historical unless v3 is fully anchored."""
+
+    persisted_rows = AsyncMock(return_value=[])
+    typed_upsert = AsyncMock(return_value=1)
+    monkeypatch.setattr(
+        importer,
+        "_persist_endpoint_dataset_rows",
+        persisted_rows,
+    )
+    monkeypatch.setattr(importer, "_upsert_rows", typed_upsert)
+    resource_rows = [
+        {
+            "source_id": "source_a",
+            "resource_id": "practitioner-1",
+            "names": [],
+        }
+    ]
+
+    assert await importer._upsert_resource_rows(
+        ProviderDirectoryPractitioner,
+        resource_rows,
+        run_id="run_1",
+        track_seen=False,
+    ) == 1
+    assert persisted_rows.await_args.kwargs == {
+        "resource_hash_contract": (
+            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+        ),
+        "semantic_projection_as_of": None,
+    }
+    assert persisted_rows.await_count == 1
+    assert typed_upsert.await_count == 1
+
+    with pytest.raises(
+        RuntimeError,
+        match="semantic_projection_as_of_missing",
+    ):
+        await importer._upsert_resource_rows(
+            ProviderDirectoryPractitioner,
+            resource_rows,
+            run_id="run_1",
+            track_seen=False,
+            resource_hash_contract=(
+                importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            ),
+        )
+    assert persisted_rows.await_count == 1
+    assert typed_upsert.await_count == 1
+
+    assert await importer._upsert_resource_rows(
+        ProviderDirectoryPractitioner,
+        resource_rows,
+        run_id="run_1",
+        track_seen=False,
+        resource_hash_contract=(
+            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        ),
+        semantic_projection_as_of="2026-08-09",
+    ) == 1
+    assert persisted_rows.await_count == 2
+    assert persisted_rows.await_args.kwargs == {
+        "resource_hash_contract": (
+            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        ),
+        "semantic_projection_as_of": "2026-08-09",
+    }
+    assert typed_upsert.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_v3_materializes_the_accumulated_payload_for_every_model(
+    monkeypatch,
+):
+    """Keep non-Practitioner typed provenance aligned with retained content."""
+
+    incoming_rows = [
+        {
+            "source_id": "source_a",
+            "resource_id": "organization-1",
+            "name": "Example Organization",
+            "resource_url": "https://directory.example.test/observed-first",
+            "fhir_meta": {"lastUpdated": "2026-08-09T10:00:00Z"},
+        }
+    ]
+    accumulated_payload = {
+        "resource_id": "organization-1",
+        "name": "Example Organization",
+        "resource_url": "https://directory.example.test/selected-winner",
+        "fhir_meta": {"lastUpdated": "2026-08-09T11:00:00Z"},
+    }
+    persisted_rows = AsyncMock(
+        return_value=[
+            {
+                "dataset_id": "dataset_1",
+                "resource_type": "Organization",
+                "resource_id": "organization-1",
+                "payload_hash": "a" * 64,
+                "payload_json": accumulated_payload,
+            }
+        ]
+    )
+    canonical_upsert = AsyncMock()
+    typed_upsert = AsyncMock(return_value=1)
+
+    @contextlib.asynccontextmanager
+    async def fake_transaction():
+        yield None
+
+    monkeypatch.setattr(
+        importer,
+        "_persist_endpoint_dataset_rows",
+        persisted_rows,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_upsert_canonical_resource_edges",
+        canonical_upsert,
+    )
+    monkeypatch.setattr(importer, "_upsert_rows", typed_upsert)
+    monkeypatch.setattr(importer.db, "transaction", fake_transaction)
+
+    assert await importer._upsert_resource_rows(
+        ProviderDirectoryOrganization,
+        incoming_rows,
+        run_id="run_1",
+        track_seen=False,
+        canonical_api_base="https://directory.example.test/fhir",
+        source_ids=["source_a"],
+        dataset_scope=importer.EndpointDatasetWriteScope(
+            "dataset_1",
+            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+            "2026-08-09",
+        ),
+    ) == 1
+
+    materialized_rows = typed_upsert.await_args.args[1]
+    assert materialized_rows[0]["resource_url"] == (
+        "https://directory.example.test/selected-winner"
+    )
+    assert materialized_rows[0]["fhir_meta"] == (
+        accumulated_payload["fhir_meta"]
+    )
+    assert canonical_upsert.await_args.args[1] == materialized_rows
 
 
 @pytest.mark.asyncio
 async def test_dataset_backed_upsert_can_defer_legacy_materialization(monkeypatch):
     upsert_calls = []
     persisted_proof = AsyncMock()
+    accumulated_rows = AsyncMock(
+        side_effect=lambda _database, rows, **_kwargs: rows
+    )
 
     @contextlib.asynccontextmanager
     async def fake_transaction():
@@ -6825,6 +7055,11 @@ async def test_dataset_backed_upsert_can_defer_legacy_materialization(monkeypatc
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
     monkeypatch.setattr(importer.db, "transaction", fake_transaction)
     monkeypatch.setattr(importer, "persist_dataset_proof_shard", persisted_proof)
+    monkeypatch.setattr(
+        importer,
+        "_accumulated_endpoint_dataset_rows",
+        accumulated_rows,
+    )
 
     resource_rows = [
         {
@@ -6840,6 +7075,7 @@ async def test_dataset_backed_upsert_can_defer_legacy_materialization(monkeypatc
         track_seen=False,
         dataset_id="dataset_1",
         resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of="2026-01-01",
     )
 
     assert written == 1
@@ -6851,6 +7087,9 @@ async def test_dataset_backed_upsert_can_defer_legacy_materialization(monkeypatc
         "mrf",
         upsert_calls[0][1],
         dataset_id="dataset_1",
+        expected_resource_hash_contract=(
+            importer.DEFAULT_RESOURCE_HASH_CONTRACT
+        ),
     )
 
 
@@ -7072,6 +7311,7 @@ async def test_alohr_alias_group_uses_compatibility_owner(monkeypatch):
         None,
         "dataset_alohr",
         importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+        "2026-01-01",
     )
     source_ids, diagnostics, counts, _linked, stats, _stale, _ready = (
         await importer._import_alohr_graphql_source_group(
@@ -9653,6 +9893,7 @@ def test_contra_costa_affiliation_telecom_preserves_phone_and_fax_in_dataset_pay
         affiliation_model,
         [affiliation_row],
         dataset_id="dataset_contra_costa",
+        resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
     )
     expected_dataset_payload_dict = importer._canonical_resource_payload(affiliation_row)
 
@@ -9746,6 +9987,7 @@ def test_healthcare_service_preserves_controlled_plan_net_context_in_artifact_pa
         parsed_model,
         [parsed_row],
         dataset_id="dataset_1",
+        resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
     )
 
     expected_accepting_patients = [
@@ -10446,6 +10688,7 @@ class _AliasImportCapture:
             selected_resources=tuple(resource_types),
             import_run_id=options["run_id"],
             previous_dataset_id=None,
+            semantic_projection_as_of="2026-01-01",
         )
 
     async def finalize_candidate(self, _candidate, diagnostics):
@@ -10459,6 +10702,11 @@ class _AliasImportCapture:
 
         monkeypatch.setattr(importer, "_upsert_rows", self.upsert)
         monkeypatch.setattr(importer.db, "transaction", fake_transaction)
+        monkeypatch.setattr(
+            importer,
+            "_accumulated_endpoint_dataset_rows",
+            AsyncMock(side_effect=lambda _database, rows, **_kwargs: rows),
+        )
         monkeypatch.setattr(
             importer,
             "persist_dataset_proof_shard",
@@ -10988,6 +11236,171 @@ def test_artifact_dataset_legacy_metadata_uses_current_source_profile():
     )
 
 
+@pytest.mark.parametrize(
+    ("resource_hash_contract", "proof_resource_scope"),
+    (
+        (
+            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+            ("InsurancePlan", "Location", "Organization"),
+        ),
+        (importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT, None),
+    ),
+)
+def test_artifact_dataset_projects_every_validated_proof_family(
+    monkeypatch,
+    resource_hash_contract,
+    proof_resource_scope,
+):
+    publication_metadata = {
+        "source_ids": ["source_a"],
+        "selected_resources": ["InsurancePlan"],
+        "resource_hash_contract": resource_hash_contract,
+        importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: {
+            "sealed": True
+        },
+    }
+    if proof_resource_scope is not None:
+        publication_metadata.update(
+            semantic_projection_as_of="2026-08-09",
+            proof_resource_scope=list(proof_resource_scope),
+        )
+    validate_proof = Mock(
+        return_value={
+            "resource_counts": {
+                "InsurancePlan": 1,
+                "Location": 2,
+                "Organization": 1,
+            }
+        }
+    )
+    monkeypatch.setattr(
+        importer,
+        "validate_stored_dataset_proof_metadata",
+        validate_proof,
+    )
+
+    dataset = importer._provider_directory_artifact_dataset_from_row(
+        {
+            "source_id": "source_a",
+            "endpoint_id": "endpoint_1",
+            "source_record_json": _artifact_source_record(
+                "source_a",
+                ("InsurancePlan",),
+            ),
+            "dataset_id": "dataset_current",
+            "evidence_run_id": "acquisition_root",
+            "selected_resources": ["InsurancePlan"],
+            "recorded_expected_resources": ["InsurancePlan"],
+            "publication_metadata_json": publication_metadata,
+        }
+    )
+
+    assert dataset is not None
+    assert dataset.selected_resources == ("InsurancePlan",)
+    assert dataset.artifact_resources == (
+        "InsurancePlan",
+        "Location",
+        "Organization",
+    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence((dataset,))
+    assert importer._artifact_scope_resource_pairs(
+        fence,
+        frozenset({"Location", "Organization"}),
+    ) == [
+        ("dataset_current", "Location"),
+        ("dataset_current", "Organization"),
+    ]
+    assert importer._artifact_scope_resource_datasets(
+        fence,
+        frozenset({"Location"}),
+        "Location",
+    ) == [dataset]
+    importer._assert_provider_directory_artifact_target_dependencies(
+        fence,
+        publish_artifacts_targets={"address_overlay"},
+        publish_corroboration=False,
+    )
+    assert validate_proof.call_args.kwargs["proof_resource_scope"] == (
+        proof_resource_scope
+    )
+
+
+def test_artifact_dataset_rejects_unvalidated_retained_scope(monkeypatch):
+    monkeypatch.setattr(
+        importer,
+        "validate_stored_dataset_proof_metadata",
+        Mock(
+            side_effect=importer.ProviderDirectoryProofStoreError(
+                "scope mismatch"
+            )
+        ),
+    )
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="artifact_content_proof_invalid:dataset_current",
+    ):
+        importer._provider_directory_artifact_dataset_from_row(
+            {
+                "source_id": "source_a",
+                "endpoint_id": "endpoint_1",
+                "source_record_json": _artifact_source_record(
+                    "source_a",
+                    ("InsurancePlan",),
+                ),
+                "dataset_id": "dataset_current",
+                "evidence_run_id": "acquisition_root",
+                "selected_resources": ["InsurancePlan"],
+                "recorded_expected_resources": ["InsurancePlan"],
+                "publication_metadata_json": {
+                    "source_ids": ["source_a"],
+                    "selected_resources": ["InsurancePlan"],
+                    "resource_hash_contract": (
+                        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+                    ),
+                    "semantic_projection_as_of": "2026-08-09",
+                    "proof_resource_scope": [
+                        "InsurancePlan",
+                        "Location",
+                        "Organization",
+                    ],
+                    importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: {
+                        "sealed": True
+                    },
+                },
+            }
+        )
+
+
+def test_uhc_artifact_dataset_rejects_semantic_v3_marker():
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="artifact_content_proof_invalid:dataset_uhc",
+    ):
+        importer._provider_directory_artifact_dataset_from_row(
+            {
+                "source_id": importer.UHC_RETAINED_SOURCE_ID,
+                "endpoint_id": "endpoint_uhc",
+                "source_record_json": _artifact_source_record(
+                    importer.UHC_RETAINED_SOURCE_ID,
+                    ("Practitioner",),
+                ),
+                "dataset_id": "dataset_uhc",
+                "evidence_run_id": "root_uhc",
+                "selected_resources": ["Practitioner"],
+                "recorded_expected_resources": ["Practitioner"],
+                "publication_metadata_json": {
+                    "source_ids": [importer.UHC_RETAINED_SOURCE_ID],
+                    "selected_resources": ["Practitioner"],
+                    "resource_hash_contract": (
+                        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+                    ),
+                    "semantic_projection_as_of": "2026-08-09",
+                    "proof_resource_scope": ["Practitioner"],
+                },
+            }
+        )
+
+
 def test_artifact_dataset_recorded_profile_ignores_alias_profile_drift():
     changed_source_dataset = importer._provider_directory_artifact_dataset_from_row(
         {
@@ -11142,6 +11555,31 @@ def test_artifact_relation_scope_wires_address_and_network_builders():
             "network_stage",
             source_ids=["source_a"],
         )
+        organization_overlay_sql = (
+            importer._address_overlay_component_insert_sql(
+                "mrf",
+                "address_overlay_stage",
+                component="organization_address",
+                run_id="run_1",
+                source_ids=["source_a"],
+            )
+        )
+        role_overlay_sql = importer._address_overlay_component_insert_sql(
+            "mrf",
+            "address_overlay_stage",
+            component="practitioner_role",
+            run_id="run_1",
+            source_ids=["source_a"],
+        )
+        affiliation_overlay_sql = (
+            importer._address_overlay_component_insert_sql(
+                "mrf",
+                "address_overlay_stage",
+                component="organization_affiliation",
+                run_id="run_1",
+                source_ids=["source_a"],
+            )
+        )
     finally:
         importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(
             relation_token
@@ -11153,6 +11591,17 @@ def test_artifact_relation_scope_wires_address_and_network_builders():
     assert 'FROM "mrf"."role_scope" AS role' in network_sql
     assert 'JOIN "mrf"."organization_scope" AS network_org' in network_sql
     assert 'JOIN "mrf"."source_scope" AS src' in network_sql
+    assert 'FROM "mrf"."organization_scope" AS organization' in (
+        organization_overlay_sql
+    )
+    assert 'FROM "mrf"."role_scope" AS role' in role_overlay_sql
+    assert 'JOIN "mrf"."location_scope" AS loc' in role_overlay_sql
+    assert 'FROM "mrf"."affiliation_scope" AS affiliation' in (
+        affiliation_overlay_sql
+    )
+    assert 'JOIN "mrf"."organization_scope" AS organization' in (
+        affiliation_overlay_sql
+    )
 
 
 @pytest.mark.asyncio
@@ -11426,6 +11875,31 @@ def test_artifact_target_dependencies_fail_before_an_unsafe_target_build():
             publish_artifacts_targets={"corroboration"},
             publish_corroboration=True,
         )
+
+
+def test_linked_proof_families_do_not_claim_complete_root_dependencies():
+    partial_role_dataset = _artifact_dataset(
+        selected_resources=("PractitionerRole",),
+        retained_resources=(
+            "Location",
+            "Organization",
+            "Practitioner",
+            "PractitionerRole",
+        ),
+    )
+    healthcare_service_dataset = _artifact_dataset(
+        selected_resources=("HealthcareService",),
+        retained_resources=("HealthcareService", "Location"),
+    )
+
+    assert importer._artifact_target_dependency_violation(
+        "address_overlay",
+        partial_role_dataset,
+    ).startswith("address_overlay:source_a:")
+    assert importer._artifact_target_dependency_violation(
+        "address_overlay",
+        healthcare_service_dataset,
+    ) is None
 
 
 @pytest.mark.parametrize(
@@ -12051,6 +12525,7 @@ def _endpoint_dataset_candidate() -> importer.EndpointDatasetCandidate:
         selected_resources=("Practitioner",),
         import_run_id="run_2",
         previous_dataset_id="dataset_old",
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
     )
 
 
@@ -12780,6 +13255,11 @@ class _AtomicCandidateInitializationHarness:
             for dataset_id in params["dataset_ids"]
         ]
 
+    async def scalar(self, sql, **_params):
+        assert "pg_advisory_xact_lock" in str(sql)
+        self.events.append("resource_family_lock")
+        return True
+
     async def status(self, sql, **_params):
         sql_text = str(sql)
         if "provider_directory_pagination_checkpoint" in sql_text:
@@ -12822,6 +13302,7 @@ async def test_partition_candidate_and_initial_checkpoint_share_transaction(
         previous_dataset_id=None,
         expected_resources=("Practitioner",),
         checkpoint_context=context,
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
     )
     initialization = importer._last_updated_partition_initialization(
         "Practitioner",
@@ -12846,6 +13327,7 @@ async def test_partition_candidate_and_initial_checkpoint_share_transaction(
         "candidate_rows_clear",
         "content_proof_clear",
         "dataset_resource_parent_lock",
+        "resource_family_lock",
         "checkpoint_upsert",
         "rollback",
     ]
@@ -12906,11 +13388,14 @@ async def test_uncheckpointed_candidate_cleanup_is_root_fenced(monkeypatch):
         previous_dataset_id=None,
     )
     status_mock = AsyncMock(return_value=1)
+    parent_lock = AsyncMock(
+        return_value={"dataset_id": candidate.dataset_id}
+    )
 
     @contextlib.asynccontextmanager
     async def mutation_fence(dataset_ids, **_kwargs):
         assert dataset_ids == [candidate.dataset_id]
-        yield type("CleanupExecutor", (), {"status": status_mock})()
+        yield SimpleNamespace(first=parent_lock, status=status_mock)
 
     monkeypatch.setattr(
         importer,
@@ -12920,6 +13405,7 @@ async def test_uncheckpointed_candidate_cleanup_is_root_fenced(monkeypatch):
 
     await importer._clear_uncheckpointed_endpoint_dataset_candidate(candidate)
 
+    assert "FOR UPDATE" in parent_lock.await_args.args[0]
     cleanup_sql = status_mock.await_args_list[0].args[0]
     assert "acquisition_root_run_id IS NOT DISTINCT FROM" in cleanup_sql
     assert (
@@ -13073,6 +13559,10 @@ def _published_endpoint_dataset_metadata_by_field():
         importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (
             importer.DEFAULT_RESOURCE_HASH_CONTRACT
         ),
+        importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: "2026-01-01",
+        importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: [
+            "Practitioner"
+        ],
         "resource_diagnostics": {
             "Practitioner": {
                 "complete": True,
@@ -13140,6 +13630,8 @@ def test_finalized_endpoint_dataset_summary_rejects_invalid_diagnostics(
         expected_resources=("Practitioner",),
         already_validated=True,
         validated_metadata=metadata,
+        semantic_projection_as_of="2026-01-01",
+        proof_resource_scope=("Practitioner",),
     )
 
     with pytest.raises(
@@ -13386,6 +13878,7 @@ def _mock_maine_endpoint_candidate_storage(monkeypatch):
                 acquisition_root_run_id="run_maine",
                 previous_dataset_id=None,
                 reused_from_checkpoint=False,
+                semantic_projection_as_of="2026-01-01",
             )
         ),
     )
@@ -23406,6 +23899,7 @@ def _checkpoint_validation_candidate(source_record, checkpoint_context):
         import_run_id="run_1",
         previous_dataset_id=None,
         checkpoint_context=checkpoint_context,
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
     )
 
 
@@ -24991,7 +25485,9 @@ def _parallel_resource_source():
         **_cigna_checkpoint_source(),
         "_endpoint_id": "endpoint_a",
         "_endpoint_dataset_id": "dataset_a",
-        "_resource_hash_contract": importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+        "_resource_hash_contract": (
+            importer.LEGACY_RESOURCE_HASH_CONTRACT
+        ),
         "_partition_checkpoint_source_ids": ("source_a",),
         "_pagination_checkpoint_context": checkpoint_context,
     }
@@ -28157,6 +28653,8 @@ class _LastUpdatedPartitionFetchHarness:
                 for resource in resources
             ),
             candidate_hashes_by_id=candidate_hashes_by_id,
+            resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
+            semantic_projection_as_of=None,
         )
 
     async def _stage_rows(self, _connection, staged_rows, **_kwargs):
@@ -29664,9 +30162,10 @@ async def test_partition_source_group_binds_candidate_checkpoint_context(monkeyp
             return_value=importer.EndpointDatasetCandidateSelection(
                 dataset_id="dataset_partition",
                 acquisition_root_run_id="run_partition",
-                previous_dataset_id="dataset_previous",
-                reused_from_checkpoint=False,
-            )
+                    previous_dataset_id="dataset_previous",
+                    reused_from_checkpoint=False,
+                    semantic_projection_as_of="2026-01-01",
+                )
         ),
     )
     ensure_candidate = AsyncMock()
@@ -29932,6 +30431,8 @@ def _atomic_partition_pass_state_and_stage():
             },
         ),
         candidate_hashes_by_id={"prac-1": "candidate-hash"},
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of=None,
     )
     return partition_plan, partition_config, state, candidate_stage
 
@@ -31983,6 +32484,11 @@ async def test_dataset_resource_proof_rejects_only_lookup_rows(monkeypatch):
         "_lock_mutable_endpoint_dataset_resource_parents",
         AsyncMock(),
     )
+    monkeypatch.setattr(
+        importer,
+        "_accumulated_endpoint_dataset_rows",
+        AsyncMock(side_effect=lambda _connection, rows, **_kwargs: rows),
+    )
     persist = AsyncMock()
     monkeypatch.setattr(importer, "persist_dataset_proof_shard", persist)
 
@@ -31999,6 +32505,7 @@ async def test_dataset_resource_proof_rejects_only_lookup_rows(monkeypatch):
                 }
             ],
             persist_content_proof=True,
+            resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
         )
 
     connection.status.assert_awaited_once()
@@ -32016,6 +32523,7 @@ async def test_dataset_resource_proof_rejects_only_lookup_rows(monkeypatch):
             }
         ],
         persist_content_proof=True,
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
     )
     persist.assert_awaited_once()
 
@@ -32358,6 +32866,11 @@ async def test_dataset_resource_proof_filters_fail_closed(monkeypatch):
         "_max_rows_per_statement",
         Mock(return_value=100),
     )
+    monkeypatch.setattr(
+        importer,
+        "_accumulated_endpoint_dataset_rows",
+        AsyncMock(side_effect=lambda _connection, rows, **_kwargs: rows),
+    )
     with pytest.raises(RuntimeError, match="proof_rows_missing"):
         await importer._upsert_dataset_resource_rows_on_connection(
             connection,
@@ -32371,6 +32884,7 @@ async def test_dataset_resource_proof_filters_fail_closed(monkeypatch):
                 }
             ],
             persist_content_proof=True,
+            resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
         )
 
 

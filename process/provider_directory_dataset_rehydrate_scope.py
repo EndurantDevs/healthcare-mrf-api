@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import hashlib
 import json
 import re
@@ -24,6 +25,16 @@ from process.provider_directory_dataset_rehydrate_types import (
     _record_fields,
     _run_cancel_check,
     _table_ref,
+)
+from process.provider_directory_resource_hash import (
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    persisted_resource_hash_contract,
+)
+from process.provider_directory_proof_store import (
+    PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
+    PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
+    ProviderDirectoryProofStoreError,
+    validate_stored_dataset_proof_metadata,
 )
 
 
@@ -117,6 +128,18 @@ def _decode_dataset_scope(
     publication_metadata = _json_object(
         scope_fields_by_name.get("publication_metadata_json")
     )
+    try:
+        resource_hash_contract = persisted_resource_hash_contract(
+            publication_metadata
+        )
+        semantic_projection_as_of = _semantic_projection_as_of(
+            publication_metadata,
+            resource_hash_contract,
+        )
+    except ValueError as error:
+        raise DatasetRehydrationError(
+            "provider_directory_dataset_rehydrate_hash_identity_invalid"
+        ) from error
     selected_resource_types = publication_metadata.get("selected_resources")
     published_source_ids = publication_metadata.get("source_ids")
     if _is_scope_invalid(
@@ -128,6 +151,20 @@ def _decode_dataset_scope(
         raise DatasetRehydrationError(
             "provider_directory_dataset_rehydrate_scope_not_current"
         )
+    try:
+        retained_resource_types = _retained_resource_types(
+            request,
+            scope_fields_by_name,
+            publication_metadata,
+            selected_resource_types,
+            published_source_ids,
+            resource_hash_contract,
+            semantic_projection_as_of,
+        )
+    except (ProviderDirectoryProofStoreError, ValueError) as error:
+        raise DatasetRehydrationError(
+            "provider_directory_dataset_rehydrate_proof_scope_invalid"
+        ) from error
     return DatasetScope(
         source_id=request.source_id,
         dataset_id=request.dataset_id,
@@ -138,10 +175,96 @@ def _decode_dataset_scope(
         ).rstrip("/"),
         dataset_hash=_clean_text(scope_fields_by_name.get("dataset_hash")),
         resource_count=int(scope_fields_by_name.get("resource_count") or 0),
-        resource_types=tuple(selected_resource_types),
+        resource_types=retained_resource_types,
+        resource_hash_contract=resource_hash_contract,
+        semantic_projection_as_of=semantic_projection_as_of,
         publication_metadata_hash=_payload_hash(publication_metadata),
         published_at=scope_fields_by_name.get("published_at"),
     )
+
+
+def _retained_resource_types(
+    request: RehydrationRequest,
+    scope_fields_by_name: dict[str, Any],
+    publication_metadata: dict[str, Any],
+    selected_resource_types: list[str],
+    published_source_ids: list[str],
+    resource_hash_contract: str,
+    semantic_projection_as_of: str | None,
+) -> tuple[str, ...]:
+    """Recover every proof-bearing family, including linked resources."""
+
+    has_proof_resource_scope = (
+        PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        in publication_metadata
+    )
+    raw_proof_resource_scope = publication_metadata.get(
+        PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+    )
+    proof_resource_scope = None
+    if raw_proof_resource_scope is not None:
+        if (
+            not _is_unique_text_list(raw_proof_resource_scope)
+            or any(
+                resource_type != resource_type.strip()
+                for resource_type in raw_proof_resource_scope
+            )
+            or raw_proof_resource_scope != sorted(raw_proof_resource_scope)
+        ):
+            raise ValueError("provider_directory_proof_resource_scope_invalid")
+        proof_resource_scope = tuple(raw_proof_resource_scope)
+        if not set(selected_resource_types).issubset(proof_resource_scope):
+            raise ValueError("provider_directory_proof_resource_scope_invalid")
+    is_semantic_v3 = (
+        resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    )
+    if has_proof_resource_scope != is_semantic_v3:
+        raise ValueError("provider_directory_proof_resource_scope_invalid")
+    raw_content_proof = publication_metadata.get(
+        PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+    )
+    if raw_content_proof is None:
+        if is_semantic_v3:
+            raise ValueError("provider_directory_content_proof_missing")
+        return tuple(selected_resource_types)
+    stored_proof = validate_stored_dataset_proof_metadata(
+        raw_content_proof,
+        dataset_id=request.dataset_id,
+        endpoint_id=_clean_text(scope_fields_by_name.get("endpoint_id")),
+        acquisition_root_run_id=request.acquisition_root_run_id,
+        source_ids=published_source_ids,
+        selected_resources=selected_resource_types,
+        proof_resource_scope=proof_resource_scope,
+        expected_resource_hash_contract=resource_hash_contract,
+        expected_semantic_projection_as_of=semantic_projection_as_of,
+    )
+    return tuple(stored_proof["resource_counts"])
+
+
+def _semantic_projection_as_of(
+    publication_metadata: dict[str, Any],
+    resource_hash_contract: str,
+) -> str | None:
+    """Decode the immutable v3 projection date from published metadata."""
+
+    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        return None
+    projection_as_of = publication_metadata.get("semantic_projection_as_of")
+    if (
+        type(projection_as_of) is not str
+        or len(projection_as_of) != 10
+        or projection_as_of != projection_as_of.strip()
+    ):
+        raise ValueError("provider_directory_semantic_projection_as_of_invalid")
+    try:
+        projection_date = datetime.date.fromisoformat(projection_as_of)
+    except ValueError as error:
+        raise ValueError(
+            "provider_directory_semantic_projection_as_of_invalid"
+        ) from error
+    if projection_date.isoformat() != projection_as_of:
+        raise ValueError("provider_directory_semantic_projection_as_of_invalid")
+    return projection_as_of
 
 
 def _json_object(json_value: Any) -> dict[str, Any]:

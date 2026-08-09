@@ -22,6 +22,11 @@ from process.provider_directory_proof_store import (
     persist_dataset_proof_shard,
     validate_stored_dataset_proof_metadata,
 )
+from process.provider_directory_resource_hash import (
+    LEGACY_RESOURCE_HASH_CONTRACT,
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    resource_payload_sha256_for_contract,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -87,7 +92,10 @@ class _MemoryProofConnection:
         self.parent = {
             "endpoint_id": ENDPOINT_ID,
             "acquisition_root_run_id": ROOT_RUN_ID,
-            "publication_metadata_json": {"source_ids": SOURCE_IDS},
+            "publication_metadata_json": {
+                "source_ids": SOURCE_IDS,
+                "selected_resources": SELECTED_RESOURCES,
+            },
         }
 
     async def status(self, sql, **params):
@@ -220,6 +228,72 @@ async def test_durable_shards_reuse_retried_batch_and_build_exact_summary():
 
 
 @pytest.mark.asyncio
+async def test_legacy_sealed_proof_retains_a_linked_family_outside_roots():
+    connection = _MemoryProofConnection()
+    connection.parent["publication_metadata_json"]["selected_resources"] = [
+        "Practitioner"
+    ]
+    dataset_resources = [
+        _dataset_resource(
+            "Practitioner",
+            "practitioner-1",
+            {"npi": "123"},
+        ),
+        _dataset_resource(
+            "Organization",
+            "organization-1",
+            {"npi": "123"},
+        ),
+    ]
+    await _persist_rows_by_resource(connection, dataset_resources)
+    proof = await build_stored_dataset_proof(
+        connection,
+        "mrf",
+        dataset_id=DATASET_ID,
+        endpoint_id=ENDPOINT_ID,
+        acquisition_root_run_id=ROOT_RUN_ID,
+        source_ids=SOURCE_IDS,
+        selected_resources=["Practitioner"],
+        expected_resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
+    )
+    publication_metadata = {
+        "source_ids": SOURCE_IDS,
+        "selected_resources": ["Practitioner"],
+        PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: proof.metadata,
+    }
+
+    artifact_dataset = importer._provider_directory_artifact_dataset_from_row(
+        {
+            "source_id": "source-a",
+            "endpoint_id": ENDPOINT_ID,
+            "source_record_json": {
+                "source_id": "source-a",
+                "metadata_json": {
+                    "provider_directory_supported_resources": [
+                        "Practitioner"
+                    ],
+                    "provider_directory_fully_enumerable_resources": [
+                        "Practitioner"
+                    ],
+                },
+            },
+            "dataset_id": DATASET_ID,
+            "evidence_run_id": ROOT_RUN_ID,
+            "selected_resources": ["Practitioner"],
+            "recorded_expected_resources": ["Practitioner"],
+            "publication_metadata_json": publication_metadata,
+        }
+    )
+
+    assert artifact_dataset is not None
+    assert artifact_dataset.selected_resources == ("Practitioner",)
+    assert artifact_dataset.artifact_resources == (
+        "Organization",
+        "Practitioner",
+    )
+
+
+@pytest.mark.asyncio
 async def test_durable_shards_reject_conflicting_retry_identity():
     connection = _MemoryProofConnection()
     original = _dataset_resource(
@@ -301,6 +375,7 @@ def _artifact_context(proof):
         expected_resources=tuple(SELECTED_RESOURCES),
         import_run_id=ROOT_RUN_ID,
         previous_dataset_id=None,
+        resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
     )
     return dataset, candidate
 
@@ -434,7 +509,10 @@ async def test_locked_parent_lineage_decodes_json_and_rejects_invalid_scope():
                 "endpoint_id": ENDPOINT_ID,
                 "acquisition_root_run_id": ROOT_RUN_ID,
                 "publication_metadata_json": json.dumps(
-                    {"source_ids": SOURCE_IDS}
+                    {
+                        "source_ids": SOURCE_IDS,
+                        "selected_resources": SELECTED_RESOURCES,
+                    }
                 ),
             }
         )
@@ -443,12 +521,22 @@ async def test_locked_parent_lineage_decodes_json_and_rejects_invalid_scope():
         connection,
         "mrf",
         DATASET_ID,
-    ) == (ENDPOINT_ID, ROOT_RUN_ID, SOURCE_IDS)
+    ) == (
+        ENDPOINT_ID,
+        ROOT_RUN_ID,
+        SOURCE_IDS,
+        SELECTED_RESOURCES,
+        None,
+        "transport_bound_v1",
+    )
     for source_ids in (None, [], [""]):
         connection.first.return_value = {
             "endpoint_id": ENDPOINT_ID,
             "acquisition_root_run_id": ROOT_RUN_ID,
-            "publication_metadata_json": {"source_ids": source_ids},
+            "publication_metadata_json": {
+                "source_ids": source_ids,
+                "selected_resources": SELECTED_RESOURCES,
+            },
         }
         with pytest.raises(ProviderDirectoryProofStoreError, match="source scope"):
             await proof_store._locked_dataset_proof_lineage(
@@ -456,6 +544,152 @@ async def test_locked_parent_lineage_decodes_json_and_rejects_invalid_scope():
                 "mrf",
                 DATASET_ID,
             )
+    for selected_resources in (
+        None,
+        [],
+        [" Practitioner"],
+        ["Practitioner", "Practitioner"],
+        ["Practitioner", "Organization"],
+    ):
+        connection.first.return_value = {
+            "endpoint_id": ENDPOINT_ID,
+            "acquisition_root_run_id": ROOT_RUN_ID,
+            "publication_metadata_json": {
+                "source_ids": SOURCE_IDS,
+                "selected_resources": selected_resources,
+            },
+        }
+        with pytest.raises(
+            ProviderDirectoryProofStoreError,
+            match="resource scope",
+        ):
+            await proof_store._locked_dataset_proof_lineage(
+                connection,
+                "mrf",
+                DATASET_ID,
+            )
+
+
+@pytest.mark.asyncio
+async def test_persisted_shard_rejects_resource_outside_parent_scope():
+    connection = _MemoryProofConnection()
+    connection.parent["publication_metadata_json"] = {
+        "source_ids": SOURCE_IDS,
+        "selected_resources": ["Practitioner"],
+        "proof_resource_scope": ["Practitioner"],
+        "resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    }
+    organization = _dataset_resource(
+        "Organization",
+        "organization-outside-scope",
+        {"name": "Example"},
+    )
+    organization["payload_hash"] = resource_payload_sha256_for_contract(
+        organization["payload_json"],
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    )
+
+    with pytest.raises(
+        ProviderDirectoryProofStoreError,
+        match="parent resource scope changed",
+    ):
+        await persist_dataset_proof_shard(
+            connection,
+            "mrf",
+            [organization],
+            dataset_id=DATASET_ID,
+        )
+    assert connection.shards == {}
+
+
+@pytest.mark.asyncio
+async def test_stored_semantic_proof_rejects_extra_resource_family():
+    connection = _MemoryProofConnection()
+    connection.parent["publication_metadata_json"] = {
+        "source_ids": SOURCE_IDS,
+        "selected_resources": ["Practitioner"],
+        "proof_resource_scope": ["Practitioner"],
+        "resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    }
+    practitioner = _dataset_resource(
+        "Practitioner",
+        "practitioner-1",
+        {
+            "npi": "123",
+            "names": [{"family": "Example", "given": ["A"]}],
+            "family_name": "Example",
+            "given_names": ["A"],
+            "full_name": "A Example",
+        },
+    )
+    practitioner["payload_hash"] = resource_payload_sha256_for_contract(
+        practitioner["payload_json"],
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    )
+    await persist_dataset_proof_shard(
+        connection,
+        "mrf",
+        [practitioner],
+        dataset_id=DATASET_ID,
+    )
+    organization = _dataset_resource(
+        "Organization",
+        "organization-1",
+        {"name": "Example"},
+    )
+    organization["payload_hash"] = resource_payload_sha256_for_contract(
+        organization["payload_json"],
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    )
+    descriptor, compressed = proof_store.build_dataset_proof_shard(
+        [organization],
+        dataset_id=DATASET_ID,
+        endpoint_id=ENDPOINT_ID,
+        acquisition_root_run_id=ROOT_RUN_ID,
+        source_ids=SOURCE_IDS,
+        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    )
+    await connection.status(
+        "INSERT INTO provider_directory_dataset_proof_shard",
+        **proof_store._proof_shard_insert_params(descriptor, compressed),
+    )
+
+    with pytest.raises(
+        ProviderDirectoryProofStoreError,
+        match="resource scope changed",
+    ):
+        await build_stored_dataset_proof(
+            connection,
+            "mrf",
+            dataset_id=DATASET_ID,
+            endpoint_id=ENDPOINT_ID,
+            acquisition_root_run_id=ROOT_RUN_ID,
+            source_ids=SOURCE_IDS,
+            selected_resources=["Practitioner"],
+            proof_resource_scope=["Practitioner"],
+            expected_resource_hash_contract=(
+                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            ),
+            expected_semantic_projection_as_of="2026-08-09",
+        )
+    with pytest.raises(
+        ProviderDirectoryProofStoreError,
+        match="resource scope is invalid",
+    ):
+        proof_store._validated_resource_maps(
+            {
+                "resource_counts": {
+                    "Organization": 1,
+                    "Practitioner": 1,
+                },
+                "resource_hashes": {
+                    "Organization": "a" * 64,
+                    "Practitioner": "b" * 64,
+                },
+            },
+            ["Practitioner"],
+            exact_scope=True,
+        )
 
 
 @pytest.mark.asyncio

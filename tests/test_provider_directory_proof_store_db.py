@@ -122,6 +122,7 @@ async def _create_tables(database: Database, schema: str) -> None:
             resource_id varchar(256) NOT NULL,
             payload_hash varchar(64) NOT NULL,
             payload_json jsonb NOT NULL,
+            acquired_resource_sha256 varchar(64),
             PRIMARY KEY (dataset_id, resource_type, resource_id)
         );
         """
@@ -140,7 +141,12 @@ async def _create_tables(database: Database, schema: str) -> None:
         endpoint_id=ENDPOINT_ID,
         root_run_id=ROOT_RUN_ID,
         status=importer.ENDPOINT_DATASET_ACQUIRING,
-        metadata_json=json.dumps({"source_ids": list(SOURCE_IDS)}),
+        metadata_json=json.dumps(
+            {
+                "source_ids": list(SOURCE_IDS),
+                "selected_resources": list(SELECTED_RESOURCES),
+            }
+        ),
     )
     for model in LEGACY_MIRROR_MODELS:
         await database.status(
@@ -207,6 +213,7 @@ def _candidate(
         expected_resources=selected_resources,
         import_run_id=root_run_id,
         previous_dataset_id=None,
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
     )
 
 
@@ -236,6 +243,7 @@ async def _write_resource_batch(connection, dataset_resources) -> None:
                 if dataset_resource["resource_type"] == resource_type
             ],
             persist_content_proof=True,
+            resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
         )
 
 
@@ -389,10 +397,10 @@ async def test_postgres_normal_fhir_batch_commits_resource_with_proof(
             ],
             run_id=ROOT_RUN_ID,
             track_seen=False,
-            dataset_scope=importer.EndpointDatasetWriteScope(
-                DATASET_ID,
-                importer.DEFAULT_RESOURCE_HASH_CONTRACT,
-            ),
+                dataset_scope=importer.EndpointDatasetWriteScope(
+                    DATASET_ID,
+                    importer.LEGACY_RESOURCE_HASH_CONTRACT,
+                ),
         )
 
         assert written == 1

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 import importlib
 import json
 import uuid
@@ -356,6 +357,52 @@ async def test_real_postgres_dataset_scope_keeps_explicit_sources_and_cleans(mon
         assert artifact_scope_metrics_by_name["artifact_scope_alias_count"] == 1
         assert artifact_scope_metrics_by_name["artifact_scope_dataset_rows"] == 1
         assert artifact_scope_metrics_by_name["artifact_scope_projected_rows"] == 1
+        assert await _scope_table_names(database, schema) == []
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_scope_materializes_a_proven_linked_family(
+    monkeypatch,
+):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        selected_fence = (
+            await importer._resolve_provider_directory_artifact_datasets(
+                ["source_primary"]
+            )
+        )
+        selected_dataset = selected_fence.datasets[0]
+        retained_dataset = replace(
+            selected_dataset,
+            retained_resources=("Location", "Practitioner"),
+        )
+        retained_fence = replace(
+            selected_fence,
+            datasets=(retained_dataset,),
+        )
+
+        async with importer._provider_directory_artifact_dataset_scope(
+            run_id="artifact-linked-run",
+            source_ids=["source_primary"],
+            fence=retained_fence,
+            metrics={},
+        ):
+            practitioner_scope_table = (
+                importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()[
+                    "provider_directory_practitioner"
+                ]
+            )
+            practitioner_rows = await database.all(
+                f"SELECT source_id, resource_id, full_name "
+                f"FROM {schema}.{practitioner_scope_table};"
+            )
+            assert [dict(row._mapping) for row in practitioner_rows] == [
+                {
+                    "source_id": "source_primary",
+                    "resource_id": "linked-practitioner-1",
+                    "full_name": "Unvalidated Linked Practitioner",
+                }
+            ]
+
         assert await _scope_table_names(database, schema) == []
 
 

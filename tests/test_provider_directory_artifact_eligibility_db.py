@@ -174,6 +174,42 @@ def _ordinary_metadata() -> dict[str, object]:
     }
 
 
+def _metadata_with_hash_identity(
+    metadata: dict[str, object],
+    resource_hash_contract: str,
+) -> dict[str, object]:
+    updated_metadata = copy.deepcopy(metadata)
+    updated_metadata[importer.RESOURCE_HASH_CONTRACT_METADATA_KEY] = (
+        resource_hash_contract
+    )
+    if (
+        resource_hash_contract
+        == importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        proof_resource_scope = list(
+            importer._provider_directory_proof_resource_scope(
+                updated_metadata["selected_resources"]
+            )
+        )
+        semantic_projection_as_of = "2026-08-09"
+        updated_metadata[
+            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        ] = proof_resource_scope
+        updated_metadata[
+            importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
+        ] = semantic_projection_as_of
+        proof = updated_metadata[
+            importer.TWIN_ROOT_VERIFICATION_METADATA_KEY
+        ]["proof"]
+        proof[
+            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        ] = proof_resource_scope
+        proof[importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY] = (
+            semantic_projection_as_of
+        )
+    return updated_metadata
+
+
 async def _insert_sources(database: Database, schema: str) -> None:
     metadata = json.dumps(_source_metadata())
     await database.status(
@@ -312,6 +348,71 @@ async def _set_all_source_profiles(
         await _set_source_metadata(database, schema, source_id, metadata)
 
 
+async def _set_twin_metadata(
+    database: Database,
+    schema: str,
+    *,
+    baseline_metadata: dict[str, object],
+    candidate_metadata: dict[str, object],
+) -> None:
+    for dataset_id, metadata in (
+        ("dataset_baseline", baseline_metadata),
+        ("dataset_exact_matched", candidate_metadata),
+    ):
+        await database.status(
+            f"""
+            UPDATE {schema}.provider_directory_endpoint_dataset
+               SET publication_metadata_json = CAST(:metadata AS jsonb)
+             WHERE dataset_id = :dataset_id;
+            """,
+            dataset_id=dataset_id,
+            metadata=json.dumps(metadata),
+        )
+
+
+async def _compact_candidate_ids(
+    database: Database,
+) -> list[str]:
+    current_dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id="source_a",
+        endpoint_id=ENDPOINT_ID,
+        serving_endpoint_id=SERVING_ENDPOINT_ID,
+        dataset_id="dataset_current",
+        evidence_run_id="root_current",
+        recorded_expected_resources=(),
+        status=importer.ENDPOINT_DATASET_PUBLISHED,
+        is_current=True,
+    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (current_dataset,),
+        should_select_validated_candidates=True,
+    )
+    eligible_ids_by_endpoint = await importer._artifact_eligible_validated_ids(
+        fence,
+        database,
+    )
+    return eligible_ids_by_endpoint.get(ENDPOINT_ID, [])
+
+
+async def _assert_candidate_eligibility(
+    database: Database,
+    schema: str,
+    *,
+    expected: bool,
+    case_name: str,
+) -> None:
+    option_ids = _option_ids(await _artifact_options(database, schema))
+    compact_candidate_ids = await _compact_candidate_ids(database)
+    assert ("dataset_exact_matched" in option_ids) is expected, (
+        case_name,
+        option_ids,
+    )
+    assert ("dataset_exact_matched" in compact_candidate_ids) is expected, (
+        case_name,
+        compact_candidate_ids,
+    )
+
+
 def _option_ids(options: list[dict]) -> list[str]:
     return [str(option["dataset_id"]) for option in options]
 
@@ -366,6 +467,205 @@ async def test_verified_gate_keeps_incumbent_and_exact_matched_candidate(
         assert _option_ids(await _artifact_options(database, schema)) == [
             "dataset_current"
         ]
+
+@pytest.mark.asyncio
+async def test_twin_hash_identity_is_exact_in_options_and_compact_fence(
+    monkeypatch,
+):
+    async with _candidate_database(monkeypatch) as (database, schema):
+        await _set_all_source_profiles(
+            database,
+            schema,
+            importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+        )
+
+        explicit_v1_candidate = _metadata_with_hash_identity(
+            _matched_metadata(),
+            importer.LEGACY_RESOURCE_HASH_CONTRACT,
+        )
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=_baseline_metadata(),
+            candidate_metadata=explicit_v1_candidate,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=True,
+            case_name="markerless-v1 baseline with explicit-v1 candidate",
+        )
+
+        explicit_v2_baseline = _metadata_with_hash_identity(
+            _baseline_metadata(),
+            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+        )
+        explicit_v2_candidate = _metadata_with_hash_identity(
+            _matched_metadata(),
+            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+        )
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=explicit_v2_baseline,
+            candidate_metadata=explicit_v2_candidate,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=True,
+            case_name="matching explicit-v2 parents",
+        )
+
+        semantic_baseline = _metadata_with_hash_identity(
+            _baseline_metadata(),
+            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        )
+        semantic_candidate = _metadata_with_hash_identity(
+            _matched_metadata(),
+            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        )
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=semantic_baseline,
+            candidate_metadata=semantic_candidate,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=True,
+            case_name="matching semantic-v3 parents and proofs",
+        )
+
+        candidate_proof_drift = copy.deepcopy(semantic_candidate)
+        candidate_proof_drift[
+            importer.TWIN_ROOT_VERIFICATION_METADATA_KEY
+        ]["proof"][
+            importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
+        ] = "2026-08-10"
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=semantic_baseline,
+            candidate_metadata=candidate_proof_drift,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=False,
+            case_name="candidate proof projection date drift",
+        )
+
+        baseline_proof_drift = copy.deepcopy(semantic_baseline)
+        baseline_proof_drift[
+            importer.TWIN_ROOT_VERIFICATION_METADATA_KEY
+        ]["proof"][
+            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        ] = ["Practitioner"]
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=baseline_proof_drift,
+            candidate_metadata=semantic_candidate,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=False,
+            case_name="baseline proof resource scope drift",
+        )
+
+        candidate_parent_and_proof_drift = copy.deepcopy(semantic_candidate)
+        candidate_parent_and_proof_drift[
+            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        ] = ["Organization", "Practitioner"]
+        candidate_parent_and_proof_drift[
+            importer.TWIN_ROOT_VERIFICATION_METADATA_KEY
+        ]["proof"][
+            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        ] = ["Organization", "Practitioner"]
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=semantic_baseline,
+            candidate_metadata=candidate_parent_and_proof_drift,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=False,
+            case_name="candidate parent and proof scope drift",
+        )
+
+        baseline_parent_and_proof_drift = copy.deepcopy(semantic_baseline)
+        baseline_parent_and_proof_drift[
+            importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
+        ] = "2026-08-10"
+        baseline_parent_and_proof_drift[
+            importer.TWIN_ROOT_VERIFICATION_METADATA_KEY
+        ]["proof"][
+            importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
+        ] = "2026-08-10"
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=baseline_parent_and_proof_drift,
+            candidate_metadata=semantic_candidate,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=False,
+            case_name="baseline parent and proof projection date drift",
+        )
+
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=explicit_v2_baseline,
+            candidate_metadata=explicit_v1_candidate,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=False,
+            case_name="candidate and baseline hash contract mismatch",
+        )
+
+        invalid_contract_candidate = copy.deepcopy(explicit_v1_candidate)
+        invalid_contract_candidate[
+            importer.RESOURCE_HASH_CONTRACT_METADATA_KEY
+        ] = None
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=_baseline_metadata(),
+            candidate_metadata=invalid_contract_candidate,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=False,
+            case_name="explicit-null hash contract",
+        )
+
+        invalid_contract_candidate[
+            importer.RESOURCE_HASH_CONTRACT_METADATA_KEY
+        ] = "unknown_contract"
+        await _set_twin_metadata(
+            database,
+            schema,
+            baseline_metadata=_baseline_metadata(),
+            candidate_metadata=invalid_contract_candidate,
+        )
+        await _assert_candidate_eligibility(
+            database,
+            schema,
+            expected=False,
+            case_name="unknown hash contract",
+        )
+
 
 @pytest.mark.asyncio
 async def test_verified_gate_rejects_config_and_profile_drift(monkeypatch):

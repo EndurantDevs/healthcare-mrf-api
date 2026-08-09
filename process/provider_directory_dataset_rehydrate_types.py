@@ -41,6 +41,8 @@ class DatasetScope:
     dataset_hash: str
     resource_count: int
     resource_types: tuple[str, ...]
+    resource_hash_contract: str
+    semantic_projection_as_of: str | None
     publication_metadata_hash: str
     published_at: Any
 

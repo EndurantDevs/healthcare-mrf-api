@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from typing import Any
 
 from sqlalchemy import types as sa_types
@@ -43,7 +44,12 @@ from process.provider_directory_dataset_rehydrate_types import (
     _table_ref,
 )
 from process.provider_directory_resource_hash import (
-    is_resource_payload_hash_match,
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    resource_content_hash_payload,
+    resource_payload_sha256_for_contract,
+)
+from process.provider_directory_fhir_subset_completion import (
+    canonical_payload_sha256 as subset_payload_sha256,
 )
 
 
@@ -276,7 +282,8 @@ async def _read_retained_batch(
         cursor_filter = "AND resource_id > :cursor"
         query_params_by_name["cursor"] = checkpoint.last_resource_id
     retained_records = await context.runtime.database.all(
-        f"""SELECT resource_id, payload_hash, payload_json
+        f"""SELECT resource_id, payload_hash, payload_json,
+                   acquired_resource_sha256
               FROM {_table_ref(context.runtime.schema, DATASET_RESOURCE_TABLE)}
              WHERE dataset_id=:dataset_id AND resource_type=:resource_type
                {cursor_filter}
@@ -307,6 +314,10 @@ def _map_retained_batch(
             resource_id,
             _clean_text(retained_fields.get("payload_hash")),
             mapped_payload,
+            resource_hash_contract=scope.resource_hash_contract,
+            acquired_resource_sha256=retained_fields.get(
+                "acquired_resource_sha256"
+            ),
         )
         if rejection_reason:
             rejection_reasons.append(rejection_reason)
@@ -445,13 +456,37 @@ def _validate_payload(
     resource_id: str,
     stored_hash: str,
     mapped_payload: Any,
+    *,
+    resource_hash_contract: str,
+    acquired_resource_sha256: Any = None,
 ) -> str | None:
     """Return a stable reason when a retained mapped payload is unsafe."""
-    if (
-        not resource_id
-        or not isinstance(mapped_payload, dict)
-        or not is_resource_payload_hash_match(mapped_payload, stored_hash)
-    ):
+    if not resource_id or not isinstance(mapped_payload, dict):
+        return "payload_hash_mismatch"
+    try:
+        if acquired_resource_sha256 is not None:
+            if (
+                resource_hash_contract
+                == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            ):
+                return "payload_hash_mismatch"
+            if (
+                type(acquired_resource_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", acquired_resource_sha256)
+                is None
+            ):
+                return "payload_hash_mismatch"
+            expected_hash = subset_payload_sha256(
+                resource_content_hash_payload(mapped_payload)
+            )
+        else:
+            expected_hash = resource_payload_sha256_for_contract(
+                mapped_payload,
+                resource_hash_contract,
+            )
+    except (TypeError, ValueError):
+        return "payload_hash_mismatch"
+    if stored_hash != expected_hash:
         return "payload_hash_mismatch"
     reserved_fields = {"source_id", "last_seen_run_id", "observed_at", "updated_at"}
     if mapped_payload.get("resource_id") != resource_id or reserved_fields & set(

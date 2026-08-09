@@ -23,6 +23,16 @@ from process.provider_directory_dataset_rehydrate import (
     rehydrate_current_dataset,
 )
 from process.provider_directory_dataset_rehydrate_types import ResourceProof
+from process.provider_directory_resource_hash import (
+    LEGACY_RESOURCE_HASH_CONTRACT,
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+    resource_payload_sha256_for_contract,
+)
+from process.provider_directory_fhir_subset_completion import (
+    canonical_payload_sha256 as subset_payload_sha256,
+)
+from process.provider_directory_resource_hash import resource_content_hash_payload
 
 
 def _payload() -> dict[str, object]:
@@ -42,7 +52,80 @@ def _hash(mapped_payload: dict[str, object]) -> str:
 
 def test_retained_payload_accepts_exact_mapped_typed_shape():
     payload = _payload()
-    assert _validate_payload(ProviderDirectoryLocation, "location-1", _hash(payload), payload) is None
+    assert _validate_payload(
+        ProviderDirectoryLocation,
+        "location-1",
+        _hash(payload),
+        payload,
+        resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
+    ) is None
+
+
+def test_retained_payload_is_validated_under_exact_dataset_contract():
+    payload = {
+        **_payload(),
+        "resource_url": "https://directory.example.test/Location/location-1",
+    }
+    legacy_hash = resource_payload_sha256_for_contract(
+        payload,
+        LEGACY_RESOURCE_HASH_CONTRACT,
+    )
+    neutral_hash = resource_payload_sha256_for_contract(
+        payload,
+        TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+    )
+    assert legacy_hash != neutral_hash
+
+    assert _validate_payload(
+        ProviderDirectoryLocation,
+        "location-1",
+        neutral_hash,
+        payload,
+        resource_hash_contract=TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+    ) is None
+    assert _validate_payload(
+        ProviderDirectoryLocation,
+        "location-1",
+        neutral_hash,
+        payload,
+        resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
+    ) == "payload_hash_mismatch"
+
+
+def test_retained_subset_payload_uses_its_reviewed_canonical_hash():
+    payload = {
+        **_payload(),
+        "resource_url": "https://directory.example.test/Location/location-1",
+    }
+    acquired_sha256 = "a" * 64
+    subset_hash = subset_payload_sha256(
+        resource_content_hash_payload(payload)
+    )
+
+    assert _validate_payload(
+        ProviderDirectoryLocation,
+        "location-1",
+        subset_hash,
+        payload,
+        resource_hash_contract=TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+        acquired_resource_sha256=acquired_sha256,
+    ) is None
+    assert _validate_payload(
+        ProviderDirectoryLocation,
+        "location-1",
+        subset_hash,
+        payload,
+        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        acquired_resource_sha256="bad",
+    ) == "payload_hash_mismatch"
+    assert _validate_payload(
+        ProviderDirectoryLocation,
+        "location-1",
+        subset_hash,
+        payload,
+        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        acquired_resource_sha256=acquired_sha256,
+    ) == "payload_hash_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -111,6 +194,7 @@ def test_uhc_retained_payload_accepts_organization_plan_evidence(
         resource_id,
         _hash(payload),
         payload,
+        resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
     ) is None
 
 
@@ -123,7 +207,13 @@ def test_uhc_retained_payload_accepts_organization_plan_evidence(
     ],
 )
 def test_retained_payload_rejects_wrong_shape_or_provenance(payload, expected):
-    assert _validate_payload(ProviderDirectoryLocation, "location-1", _hash(payload), payload) == expected
+    assert _validate_payload(
+        ProviderDirectoryLocation,
+        "location-1",
+        _hash(payload),
+        payload,
+        resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
+    ) == expected
 
 
 def test_exact_proof_rejects_rows_outside_dataset_membership():

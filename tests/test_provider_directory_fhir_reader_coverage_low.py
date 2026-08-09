@@ -286,7 +286,10 @@ def test_canonical_row_builder_empty_boundaries():
     )
     assert (
         fhir._endpoint_dataset_resource_rows(
-            ProviderDirectoryPractitioner, [{}], dataset_id="dataset"
+            ProviderDirectoryPractitioner,
+            [{}],
+            dataset_id="dataset",
+            resource_hash_contract=fhir.DEFAULT_RESOURCE_HASH_CONTRACT,
         )
         == []
     )

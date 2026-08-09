@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import datetime
 import hashlib
 import heapq
 import json
@@ -14,12 +15,30 @@ import tempfile
 from typing import Any, Iterable, Mapping
 import zlib
 
+from process.provider_directory_resource_hash import (
+    LEGACY_RESOURCE_HASH_CONTRACT,
+    RESOURCE_HASH_CONTRACTS,
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    composed_practitioner_semantic_sha256,
+    persisted_resource_hash_contract,
+    practitioner_name_hashes,
+    practitioner_semantic_base_sha256,
+    practitioner_semantic_payload_sha256,
+    resource_payload_sha256_for_contract,
+)
+
 
 PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID = (
     "healthporta.provider-directory.content-proof.v1"
 )
+PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID = (
+    "healthporta.provider-directory.content-proof.v2"
+)
 PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY = (
     "provider_directory_content_proof_v1"
+)
+PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY = (
+    "proof_resource_scope"
 )
 PROVIDER_DIRECTORY_PROOF_SHARD_TABLE = (
     "provider_directory_dataset_proof_shard"
@@ -40,6 +59,7 @@ _SOURCE_METRIC_FIELDS = {
     "distinct_npis",
     "geocoded_locations",
 }
+_SEMANTIC_PROJECTION_AS_OF_FIELD = "semantic_projection_as_of"
 
 
 class ProviderDirectoryProofStoreError(RuntimeError):
@@ -63,6 +83,7 @@ class _ProofLineage:
     acquisition_root_run_id: str
     source_ids: list[str]
     selected_resources: list[str]
+    proof_resource_scope: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +95,19 @@ class _MergedDatasetProof:
     source_metrics_by_name: dict[str, int]
     npi_set_sha256: str
     shard_descriptors: list[dict[str, Any]]
+    resource_hash_contract: str = LEGACY_RESOURCE_HASH_CONTRACT
+    semantic_union_diagnostics: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _MergedResourceSummary:
+    dataset_hash: str
+    resource_count: int
+    resource_hash_by_type: dict[str, str]
+    resource_count_by_type: dict[str, int]
+    source_metrics_by_name: dict[str, int]
+    resource_hash_contract: str
+    semantic_union_diagnostics: dict[str, int]
 
 
 def _stable_json(value: Any) -> str:
@@ -140,7 +174,14 @@ def _payload_metrics(
     return npi, address_records, addressed_location, geocoded_location
 
 
-def _proof_record(dataset_row: Mapping[str, Any]) -> list[Any]:
+def _proof_record(
+    dataset_row: Mapping[str, Any],
+    resource_hash_contract: str = LEGACY_RESOURCE_HASH_CONTRACT,
+) -> list[Any]:
+    if resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof hash contract is invalid"
+        )
     resource_type = _clean_text(dataset_row.get("resource_type"))
     resource_id = _clean_text(dataset_row.get("resource_id"))
     payload_hash = _clean_text(dataset_row.get("payload_hash"))
@@ -154,18 +195,55 @@ def _proof_record(dataset_row: Mapping[str, Any]) -> list[Any]:
         raise ProviderDirectoryProofStoreError(
             "provider directory proof row is invalid"
         )
-    return [
+    proof_record = [
         resource_type,
         resource_id,
         payload_hash,
         *_payload_metrics(resource_type, payload_by_field),
     ]
+    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        return proof_record
+    try:
+        if resource_type == "Practitioner":
+            base_hash = practitioner_semantic_base_sha256(payload_by_field)
+            name_hashes = list(practitioner_name_hashes(payload_by_field))
+            expected_payload_hash = practitioner_semantic_payload_sha256(
+                payload_by_field
+            )
+        else:
+            expected_payload_hash = resource_payload_sha256_for_contract(
+                payload_by_field,
+                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+            )
+            base_hash = expected_payload_hash
+            name_hashes = []
+    except ValueError as error:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory semantic proof payload is invalid"
+        ) from error
+    if payload_hash != expected_payload_hash:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory semantic proof payload hash changed"
+        )
+    return [
+        *proof_record,
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        base_hash,
+        name_hashes,
+    ]
 
 
-def _framed_records(dataset_rows: Iterable[Mapping[str, Any]]) -> list[bytes]:
+def _framed_records(
+    dataset_rows: Iterable[Mapping[str, Any]],
+    *,
+    resource_hash_contract: str = LEGACY_RESOURCE_HASH_CONTRACT,
+) -> list[bytes]:
     records_by_key: dict[tuple[str, str], bytes] = {}
     for dataset_row in dataset_rows:
-        proof_record = _proof_record(dataset_row)
+        proof_record = _proof_record(
+            dataset_row,
+            resource_hash_contract,
+        )
         key = proof_record[0], proof_record[1]
         encoded = _stable_json(proof_record).encode()
         existing = records_by_key.get(key)
@@ -226,8 +304,14 @@ def build_dataset_proof_shard(
     endpoint_id: str,
     acquisition_root_run_id: str,
     source_ids: Iterable[str],
+    resource_hash_contract: str = LEGACY_RESOURCE_HASH_CONTRACT,
 ) -> tuple[dict[str, Any], bytes]:
     """Create one content-addressed retry-idempotent batch proof."""
+
+    if resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof hash contract is invalid"
+        )
 
     (
         cleaned_dataset_id,
@@ -240,7 +324,10 @@ def build_dataset_proof_shard(
         acquisition_root_run_id,
         source_ids,
     )
-    record_lines = _framed_records(dataset_rows)
+    record_lines = _framed_records(
+        dataset_rows,
+        resource_hash_contract=resource_hash_contract,
+    )
     if not record_lines:
         raise ProviderDirectoryProofStoreError(
             "provider directory proof shard is empty"
@@ -328,7 +415,7 @@ async def _locked_dataset_proof_lineage(
     connection: Any,
     schema: str,
     dataset_id: str,
-) -> tuple[str, str, list[str]]:
+) -> tuple[str, str, list[str], list[str], list[str] | None, str]:
     """Lock and return the mutable candidate's exact source lineage."""
 
     parent_by_field = _row_mapping(
@@ -340,14 +427,19 @@ async def _locked_dataset_proof_lineage(
              WHERE dataset_id=:dataset_id
                AND status='acquiring'
                AND is_current=false
-             FOR UPDATE;
+             FOR SHARE;
             """,
             dataset_id=dataset_id,
         )
     )
     metadata = parent_by_field.get("publication_metadata_json")
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError as error:
+            raise ProviderDirectoryProofStoreError(
+                "provider directory proof parent resource scope is invalid"
+            ) from error
     source_ids = (
         metadata.get("source_ids") if isinstance(metadata, Mapping) else None
     )
@@ -362,10 +454,68 @@ async def _locked_dataset_proof_lineage(
         raise ProviderDirectoryProofStoreError(
             "provider directory proof parent source scope is invalid"
         )
+    try:
+        selected_resources = _validated_string_list(
+            metadata.get("selected_resources")
+            if isinstance(metadata, Mapping)
+            else None,
+            "parent resource scope",
+        )
+    except ProviderDirectoryProofStoreError as error:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof parent resource scope is invalid"
+        ) from error
+    try:
+        resource_hash_contract = persisted_resource_hash_contract(metadata)
+    except ValueError as error:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof parent hash contract is invalid"
+        ) from error
+    has_proof_resource_scope = bool(
+        isinstance(metadata, Mapping)
+        and PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY in metadata
+    )
+    raw_proof_resource_scope = (
+        metadata.get(PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY)
+        if has_proof_resource_scope
+        else None
+    )
+    proof_resource_scope = None
+    if raw_proof_resource_scope is not None:
+        try:
+            proof_resource_scope = _validated_string_list(
+                raw_proof_resource_scope,
+                "parent proof resource scope",
+            )
+        except ProviderDirectoryProofStoreError as error:
+            raise ProviderDirectoryProofStoreError(
+                "provider directory proof parent resource scope is invalid"
+            ) from error
+        if not set(selected_resources).issubset(proof_resource_scope):
+            raise ProviderDirectoryProofStoreError(
+                "provider directory proof parent resource scope is invalid"
+            )
+    if (
+        resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and has_proof_resource_scope
+    ):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof parent resource scope is invalid"
+        )
+    if (
+        resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and (not has_proof_resource_scope or proof_resource_scope is None)
+    ):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof parent resource scope is invalid"
+        )
     return (
         _clean_text(parent_by_field.get("endpoint_id")),
         _clean_text(parent_by_field.get("acquisition_root_run_id")),
         source_ids,
+        selected_resources,
+        proof_resource_scope,
+        resource_hash_contract,
     )
 
 
@@ -488,21 +638,39 @@ async def persist_dataset_proof_shard(
     dataset_rows: Iterable[Mapping[str, Any]],
     *,
     dataset_id: str,
+    expected_resource_hash_contract: str | None = None,
 ) -> dict[str, Any]:
     """Persist one retry-idempotent resource-family batch proof."""
 
-    endpoint_id, root_run_id, source_ids = await _locked_dataset_proof_lineage(
-        connection,
-        schema,
-        dataset_id,
-    )
+    (
+        endpoint_id,
+        root_run_id,
+        source_ids,
+        selected_resources,
+        proof_resource_scope,
+        resource_hash_contract,
+    ) = await _locked_dataset_proof_lineage(connection, schema, dataset_id)
+    if (
+        expected_resource_hash_contract is not None
+        and resource_hash_contract != expected_resource_hash_contract
+    ):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof parent hash contract changed"
+        )
     descriptor_by_field, compressed = build_dataset_proof_shard(
         dataset_rows,
         dataset_id=dataset_id,
         endpoint_id=endpoint_id,
         acquisition_root_run_id=root_run_id,
         source_ids=source_ids,
+        resource_hash_contract=resource_hash_contract,
     )
+    if proof_resource_scope is not None and not set(
+        descriptor_by_field["resource_counts"]
+    ).issubset(proof_resource_scope):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof parent resource scope changed"
+        )
     table_ref = f'"{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"'
     await _insert_dataset_proof_shard(
         connection,
@@ -614,18 +782,43 @@ def _decoded_record(line: bytes) -> list[Any]:
         raise ProviderDirectoryProofStoreError(
             "provider directory proof record is invalid"
         ) from error
-    if (
-        not isinstance(record, list)
-        or len(record) != 7
-        or not all(isinstance(record[index], str) for index in range(4))
-        or _HASH_RE.fullmatch(record[2]) is None
-        or any(
+    base_shape_valid = bool(
+        isinstance(record, list)
+        and len(record) in {7, 10}
+        and all(isinstance(record[index], str) for index in range(4))
+        and _HASH_RE.fullmatch(record[2]) is not None
+        and not any(
             isinstance(record[index], bool)
             or not isinstance(record[index], int)
             or record[index] < 0
             for index in range(4, 7)
         )
-    ):
+    )
+    semantic_shape_valid = bool(
+        base_shape_valid
+        and len(record) == 10
+        and record[7] == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and isinstance(record[8], str)
+        and _HASH_RE.fullmatch(record[8]) is not None
+        and isinstance(record[9], list)
+        and record[9] == sorted(set(record[9]))
+        and all(
+            isinstance(name_hash, str)
+            and _HASH_RE.fullmatch(name_hash) is not None
+            for name_hash in record[9]
+        )
+    )
+    if semantic_shape_valid:
+        if record[0] == "Practitioner":
+            semantic_shape_valid = record[2] == (
+                composed_practitioner_semantic_sha256(
+                    record[8],
+                    record[9],
+                )
+            )
+        else:
+            semantic_shape_valid = record[8] == record[2] and record[9] == []
+    if not base_shape_valid or (len(record) == 10 and not semantic_shape_valid):
         raise ProviderDirectoryProofStoreError(
             "provider directory proof record shape changed"
         )
@@ -750,11 +943,66 @@ def _observe_resource_metrics(
         npi_spool.add(proof_record[3].encode())
 
 
-def _merged_resource_proof(
+def _finalized_proof_record_group(
+    records: list[list[Any]],
+) -> tuple[list[Any], dict[str, int]]:
+    """Reduce one exact identity while retaining every observed name digest."""
+
+    distinct_records = {
+        _stable_json(record): record for record in records
+    }
+    if len(distinct_records) == 1:
+        return next(iter(distinct_records.values())), {
+            "collision_identities": 0,
+            "observation_variants": 0,
+            "union_name_count": 0,
+            "added_name_count": 0,
+        }
+    unique_records = list(distinct_records.values())
+    if (
+        any(len(record) != 10 for record in unique_records)
+        or any(record[0] != "Practitioner" for record in unique_records)
+        or len({record[7] for record in unique_records}) != 1
+        or len({record[8] for record in unique_records}) != 1
+        or len({_stable_json(record[3:7]) for record in unique_records}) != 1
+    ):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof shards conflict"
+        )
+    union_name_hashes = sorted(
+        {
+            name_hash
+            for record in unique_records
+            for name_hash in record[9]
+        }
+    )
+    base_hash = unique_records[0][8]
+    merged_record = [
+        unique_records[0][0],
+        unique_records[0][1],
+        composed_practitioner_semantic_sha256(
+            base_hash,
+            union_name_hashes,
+        ),
+        *unique_records[0][3:7],
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        base_hash,
+        union_name_hashes,
+    ]
+    return merged_record, {
+        "collision_identities": 1,
+        "observation_variants": len(unique_records),
+        "union_name_count": len(union_name_hashes),
+        "added_name_count": len(union_name_hashes)
+        - min(len(record[9]) for record in unique_records),
+    }
+
+
+def _merged_resource_proof_summary(
     record_spool: _RecordSpool,
     npi_spool: _RecordSpool,
-) -> tuple[str, int, dict[str, str], dict[str, int], dict[str, int]]:
-    """Merge exact resource identities while spooling unique NPI inputs."""
+) -> _MergedResourceSummary:
+    """Merge exact identities and composable v3 Practitioner observations."""
 
     dataset_digest = hashlib.sha256()
     resource_digest_by_type: dict[str, Any] = {}
@@ -764,26 +1012,35 @@ def _merged_resource_proof(
         "addressed_locations": 0,
         "geocoded_locations": 0,
     }
-    previous_key: tuple[str, str] | None = None
-    previous_line: bytes | None = None
+    semantic_union_diagnostics = {
+        "collision_identities": 0,
+        "observation_variants": 0,
+        "union_name_count": 0,
+        "added_name_count": 0,
+    }
     resource_count = 0
-    for line in heapq.merge(
-        *(record_spool.lines(path) for path in record_spool.bounded_paths())
-    ):
-        proof_record = _decoded_record(line)
-        resource_key = proof_record[0], proof_record[1]
-        if resource_key == previous_key:
-            if line != previous_line:
-                raise ProviderDirectoryProofStoreError(
-                    "provider directory proof shards conflict"
-                )
-            continue
-        if previous_key is not None and resource_key < previous_key:
+    current_key: tuple[str, str] | None = None
+    current_records: list[list[Any]] = []
+    observed_contract: str | None = None
+
+    def finalize_group() -> None:
+        nonlocal resource_count, observed_contract
+        if not current_records:
+            return
+        proof_record, group_diagnostics = _finalized_proof_record_group(
+            current_records
+        )
+        record_contract = (
+            proof_record[7]
+            if len(proof_record) == 10
+            else LEGACY_RESOURCE_HASH_CONTRACT
+        )
+        if observed_contract is None:
+            observed_contract = record_contract
+        elif observed_contract != record_contract:
             raise ProviderDirectoryProofStoreError(
-                "provider directory proof merge order changed"
+                "provider directory proof shard contract changed"
             )
-        previous_key = resource_key
-        previous_line = line
         identity_bytes = _stable_json(proof_record[:3]).encode()
         if resource_count:
             dataset_digest.update(b"\n")
@@ -798,17 +1055,55 @@ def _merged_resource_proof(
             resource_count_by_type.get(proof_record[0], 0) + 1
         )
         _observe_resource_metrics(metrics_by_name, proof_record, npi_spool)
+        for diagnostic_name, diagnostic_value in group_diagnostics.items():
+            semantic_union_diagnostics[diagnostic_name] += diagnostic_value
         resource_count += 1
+
+    for line in heapq.merge(
+        *(record_spool.lines(path) for path in record_spool.bounded_paths())
+    ):
+        proof_record = _decoded_record(line)
+        resource_key = proof_record[0], proof_record[1]
+        if current_key is not None and resource_key < current_key:
+            raise ProviderDirectoryProofStoreError(
+                "provider directory proof merge order changed"
+            )
+        if current_key is not None and resource_key != current_key:
+            finalize_group()
+            current_records = []
+        current_key = resource_key
+        current_records.append(proof_record)
+    finalize_group()
     resource_hash_by_type = {
         resource_type: resource_digest_by_type[resource_type].hexdigest()
         for resource_type in sorted(resource_digest_by_type)
     }
+    return _MergedResourceSummary(
+        dataset_hash=dataset_digest.hexdigest(),
+        resource_count=resource_count,
+        resource_hash_by_type=resource_hash_by_type,
+        resource_count_by_type=dict(sorted(resource_count_by_type.items())),
+        source_metrics_by_name=metrics_by_name,
+        resource_hash_contract=(
+            observed_contract or LEGACY_RESOURCE_HASH_CONTRACT
+        ),
+        semantic_union_diagnostics=semantic_union_diagnostics,
+    )
+
+
+def _merged_resource_proof(
+    record_spool: _RecordSpool,
+    npi_spool: _RecordSpool,
+) -> tuple[str, int, dict[str, str], dict[str, int], dict[str, int]]:
+    """Keep the established tuple interface for focused proof callers."""
+
+    merged = _merged_resource_proof_summary(record_spool, npi_spool)
     return (
-        dataset_digest.hexdigest(),
-        resource_count,
-        resource_hash_by_type,
-        dict(sorted(resource_count_by_type.items())),
-        metrics_by_name,
+        merged.dataset_hash,
+        merged.resource_count,
+        merged.resource_hash_by_type,
+        merged.resource_count_by_type,
+        merged.source_metrics_by_name,
     )
 
 
@@ -834,25 +1129,31 @@ def _merged_npi_proof(npi_spool: _RecordSpool) -> tuple[int, str]:
 def _complete_spools(
     record_spool: _RecordSpool,
     npi_spool: _RecordSpool,
-) -> tuple[str, int, dict[str, str], dict[str, int], dict[str, int], str]:
+) -> tuple[
+    str,
+    int,
+    dict[str, str],
+    dict[str, int],
+    dict[str, int],
+    str,
+    str,
+    dict[str, int],
+]:
     """Merge resource identities and exact source metrics once."""
 
-    (
-        dataset_hash,
-        resource_count,
-        resource_hash_by_type,
-        resource_count_by_type,
-        metrics_by_name,
-    ) = _merged_resource_proof(record_spool, npi_spool)
+    merged = _merged_resource_proof_summary(record_spool, npi_spool)
     distinct_npis, npi_sha256 = _merged_npi_proof(npi_spool)
+    metrics_by_name = dict(merged.source_metrics_by_name)
     metrics_by_name["distinct_npis"] = distinct_npis
     return (
-        dataset_hash,
-        resource_count,
-        resource_hash_by_type,
-        resource_count_by_type,
+        merged.dataset_hash,
+        merged.resource_count,
+        merged.resource_hash_by_type,
+        merged.resource_count_by_type,
         metrics_by_name,
         npi_sha256,
+        merged.resource_hash_contract,
+        merged.semantic_union_diagnostics,
     )
 
 
@@ -915,6 +1216,7 @@ def _validated_proof_lineage(
     acquisition_root_run_id: str,
     source_ids: Iterable[str],
     selected_resources: Iterable[str],
+    proof_resource_scope: Iterable[str] | None = None,
 ) -> _ProofLineage:
     """Normalize and validate the immutable proof finalization scope."""
 
@@ -927,6 +1229,16 @@ def _validated_proof_lineage(
             for resource_type in selected_resources
         }
     )
+    expected_proof_resource_scope = (
+        sorted(
+            {
+                _clean_text(resource_type)
+                for resource_type in proof_resource_scope
+            }
+        )
+        if proof_resource_scope is not None
+        else None
+    )
     if (
         not _clean_text(dataset_id)
         or not _clean_text(endpoint_id)
@@ -935,6 +1247,19 @@ def _validated_proof_lineage(
         or any(not source_id for source_id in expected_sources)
         or not expected_resources
         or any(not resource_type for resource_type in expected_resources)
+        or (
+            expected_proof_resource_scope is not None
+            and (
+                not expected_proof_resource_scope
+                or any(
+                    not resource_type
+                    for resource_type in expected_proof_resource_scope
+                )
+                or not set(expected_resources).issubset(
+                    expected_proof_resource_scope
+                )
+            )
+        )
     ):
         raise ProviderDirectoryProofStoreError(
             "provider directory proof finalization lineage is invalid"
@@ -945,7 +1270,14 @@ def _validated_proof_lineage(
         acquisition_root_run_id=acquisition_root_run_id,
         source_ids=expected_sources,
         selected_resources=expected_resources,
+        proof_resource_scope=expected_proof_resource_scope,
     )
+
+
+def _lineage_resource_scope(lineage: _ProofLineage) -> list[str]:
+    """Return the exact proof families or the historical minimum roots."""
+
+    return lineage.proof_resource_scope or lineage.selected_resources
 
 
 async def _merged_stored_dataset_proof(
@@ -976,7 +1308,7 @@ async def _merged_stored_dataset_proof(
         merged_fields = _complete_spools(record_spool, npi_spool)
     resource_hash_by_type = merged_fields[2]
     resource_count_by_type = merged_fields[3]
-    for resource_type in lineage.selected_resources:
+    for resource_type in _lineage_resource_scope(lineage):
         resource_count_by_type.setdefault(resource_type, 0)
         resource_hash_by_type.setdefault(
             resource_type,
@@ -990,6 +1322,8 @@ async def _merged_stored_dataset_proof(
         source_metrics_by_name=merged_fields[4],
         npi_set_sha256=merged_fields[5],
         shard_descriptors=shard_descriptors,
+        resource_hash_contract=merged_fields[6],
+        semantic_union_diagnostics=merged_fields[7],
     )
 
 
@@ -1022,9 +1356,14 @@ def _verified_public_shards(
 ) -> list[dict[str, Any]]:
     """Verify every shard belongs to the candidate and return public fields."""
 
-    if not set(lineage.selected_resources).issubset(
-        merged_proof.resource_count_by_type
-    ):
+    merged_resource_types = set(merged_proof.resource_count_by_type)
+    expected_resource_types = set(_lineage_resource_scope(lineage))
+    resource_scope_changed = (
+        merged_resource_types != expected_resource_types
+        if lineage.proof_resource_scope is not None
+        else not expected_resource_types.issubset(merged_resource_types)
+    )
+    if resource_scope_changed:
         raise ProviderDirectoryProofStoreError(
             "provider directory proof resource scope changed"
         )
@@ -1060,17 +1399,34 @@ def _sealed_dataset_proof_metadata(
     lineage: _ProofLineage,
     merged_proof: _MergedDatasetProof,
     public_descriptors: list[dict[str, Any]],
+    semantic_projection_as_of: str | None,
 ) -> dict[str, Any]:
     """Seal the merged dataset proof and revalidate its public contract."""
 
+    is_semantic_union = merged_proof.resource_hash_contract == (
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    )
     proof_by_field = {
-        "contract_id": PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
+        "contract_id": (
+            PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
+            if is_semantic_union
+            else PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
+        ),
         "complete": True,
         "dataset_id": lineage.dataset_id,
         "endpoint_id": lineage.endpoint_id,
         "acquisition_root_run_id": lineage.acquisition_root_run_id,
         "source_ids": lineage.source_ids,
         "selected_resources": lineage.selected_resources,
+        **(
+            {
+                PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: (
+                    lineage.proof_resource_scope
+                )
+            }
+            if lineage.proof_resource_scope is not None
+            else {}
+        ),
         "dataset_hash": merged_proof.dataset_hash,
         "resource_count": merged_proof.resource_count,
         "resource_hashes": merged_proof.resource_hash_by_type,
@@ -1083,6 +1439,25 @@ def _sealed_dataset_proof_metadata(
             for descriptor_by_field in public_descriptors
         ),
         "shards": public_descriptors,
+        **(
+            {
+                "resource_hash_contract": (
+                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+                ),
+                _SEMANTIC_PROJECTION_AS_OF_FIELD: (
+                    _validated_semantic_projection_as_of(
+                        semantic_projection_as_of
+                    )
+                ),
+                "semantic_union": dict(
+                    sorted(
+                        merged_proof.semantic_union_diagnostics.items()
+                    )
+                ),
+            }
+            if is_semantic_union
+            else {}
+        ),
     }
     proof_by_field["proof_sha256"] = _json_hash(proof_by_field)
     return validate_stored_dataset_proof_metadata(
@@ -1092,6 +1467,11 @@ def _sealed_dataset_proof_metadata(
         acquisition_root_run_id=lineage.acquisition_root_run_id,
         source_ids=lineage.source_ids,
         selected_resources=lineage.selected_resources,
+        proof_resource_scope=lineage.proof_resource_scope,
+        expected_resource_hash_contract=merged_proof.resource_hash_contract,
+        expected_semantic_projection_as_of=(
+            semantic_projection_as_of if is_semantic_union else None
+        ),
     )
 
 
@@ -1104,6 +1484,9 @@ async def build_stored_dataset_proof(
     acquisition_root_run_id: str,
     source_ids: Iterable[str],
     selected_resources: Iterable[str],
+    proof_resource_scope: Iterable[str] | None = None,
+    expected_resource_hash_contract: str | None = None,
+    expected_semantic_projection_as_of: str | None = None,
 ) -> ProviderDirectoryStoredProof:
     """Merge durable shards without reading canonical JSON from PostgreSQL."""
 
@@ -1113,6 +1496,7 @@ async def build_stored_dataset_proof(
         acquisition_root_run_id=acquisition_root_run_id,
         source_ids=source_ids,
         selected_resources=selected_resources,
+        proof_resource_scope=proof_resource_scope,
     )
     merged_proof = await _merged_stored_dataset_proof(
         connection,
@@ -1124,6 +1508,13 @@ async def build_stored_dataset_proof(
         lineage,
         merged_proof,
         public_descriptors,
+        expected_semantic_projection_as_of,
+    )
+    _assert_expected_proof_contract(
+        proof_by_field,
+        expected_resource_hash_contract,
+        expected_semantic_projection_as_of,
+        lineage.proof_resource_scope,
     )
     return ProviderDirectoryStoredProof(
         dataset_hash=merged_proof.dataset_hash,
@@ -1152,11 +1543,40 @@ def _validated_count(value: Any, field_name: str, *, positive: bool = False) -> 
     return value
 
 
+def _validated_semantic_projection_as_of(value: Any) -> str:
+    """Validate one exact root-scoped semantic projection date."""
+
+    if (
+        type(value) is not str
+        or len(value) != 10
+        or value != value.strip()
+    ):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory semantic projection date is invalid"
+        )
+    try:
+        projection_date = datetime.date.fromisoformat(value)
+    except ValueError as error:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory semantic projection date is invalid"
+        ) from error
+    if projection_date.isoformat() != value:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory semantic projection date is invalid"
+        )
+    return value
+
+
 def _validated_string_list(value: Any, field_name: str) -> list[str]:
     if (
         not isinstance(value, list)
         or not value
-        or any(not isinstance(item, str) or not item for item in value)
+        or any(
+            not isinstance(item, str)
+            or not item
+            or item != item.strip()
+            for item in value
+        )
         or value != sorted(set(value))
     ):
         raise ProviderDirectoryProofStoreError(
@@ -1168,6 +1588,8 @@ def _validated_string_list(value: Any, field_name: str) -> list[str]:
 def _validated_resource_maps(
     proof_by_field: Mapping[str, Any],
     expected_resources: list[str],
+    *,
+    exact_scope: bool = False,
 ) -> tuple[dict[str, int], dict[str, str]]:
     raw_count_by_type = proof_by_field.get("resource_counts")
     raw_hash_by_type = proof_by_field.get("resource_hashes")
@@ -1182,7 +1604,13 @@ def _validated_resource_maps(
     resource_hash_by_type = dict(raw_hash_by_type)
     if (
         set(resource_count_by_type) != set(resource_hash_by_type)
-        or not set(expected_resources).issubset(resource_count_by_type)
+        or (
+            set(expected_resources) != set(resource_count_by_type)
+            if exact_scope
+            else not set(expected_resources).issubset(
+                resource_count_by_type
+            )
+        )
         or list(resource_count_by_type) != sorted(resource_count_by_type)
         or list(resource_hash_by_type) != sorted(resource_hash_by_type)
     ):
@@ -1327,7 +1755,10 @@ def _validate_metadata_lineage(
 
     if (
         proof_by_field.get("contract_id")
-        != PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
+        not in {
+            PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
+            PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID,
+        }
         or proof_by_field.get("complete") is not True
         or proof_by_field.get("dataset_id") != lineage.dataset_id
         or proof_by_field.get("endpoint_id") != lineage.endpoint_id
@@ -1346,6 +1777,18 @@ def _validate_metadata_lineage(
             "resource scope",
         )
         != lineage.selected_resources
+        or (
+            _validated_string_list(
+                proof_by_field.get(
+                    PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+                ),
+                "proof resource scope",
+            )
+            != lineage.proof_resource_scope
+            if lineage.proof_resource_scope is not None
+            else PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+            in proof_by_field
+        )
     ):
         raise ProviderDirectoryProofStoreError(
             "provider directory content proof lineage is invalid"
@@ -1367,7 +1810,8 @@ def _validate_metadata_summary(
     resource_count_by_type, _resource_hash_by_type = (
         _validated_resource_maps(
             proof_by_field,
-            lineage.selected_resources,
+            _lineage_resource_scope(lineage),
+            exact_scope=lineage.proof_resource_scope is not None,
         )
     )
     if sum(resource_count_by_type.values()) != resource_count:
@@ -1384,6 +1828,112 @@ def _validate_metadata_summary(
         )
     for metric_name, metric_value in source_metrics_by_name.items():
         _validated_count(metric_value, metric_name)
+    semantic_contract = proof_by_field.get("contract_id") == (
+        PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
+    )
+    if semantic_contract != (lineage.proof_resource_scope is not None):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory content proof contract changed"
+        )
+    semantic_union = proof_by_field.get("semantic_union")
+    if semantic_contract:
+        if (
+            proof_by_field.get("resource_hash_contract")
+            != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            or _validated_semantic_projection_as_of(
+                proof_by_field.get(_SEMANTIC_PROJECTION_AS_OF_FIELD)
+            )
+            != proof_by_field.get(_SEMANTIC_PROJECTION_AS_OF_FIELD)
+            or not isinstance(semantic_union, Mapping)
+            or set(semantic_union)
+            != {
+                "added_name_count",
+                "collision_identities",
+                "observation_variants",
+                "union_name_count",
+            }
+        ):
+            raise ProviderDirectoryProofStoreError(
+                "provider directory semantic proof summary is invalid"
+            )
+        for field_name, field_value in semantic_union.items():
+            _validated_count(field_value, field_name)
+    elif (
+        "resource_hash_contract" in proof_by_field
+        or _SEMANTIC_PROJECTION_AS_OF_FIELD in proof_by_field
+        or semantic_union is not None
+    ):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory content proof contract changed"
+        )
+
+
+def _assert_expected_proof_contract(
+    proof_by_field: Mapping[str, Any],
+    expected_resource_hash_contract: str | None,
+    expected_semantic_projection_as_of: str | None,
+    expected_proof_resource_scope: Iterable[str] | None,
+) -> None:
+    """Bind a sealed proof shape to the candidate's persisted contract."""
+
+    if expected_resource_hash_contract is None:
+        if (
+            expected_semantic_projection_as_of is not None
+            or expected_proof_resource_scope is not None
+        ):
+            raise ProviderDirectoryProofStoreError(
+                "provider directory expected semantic projection date is invalid"
+            )
+        return
+    if expected_resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory expected proof contract is invalid"
+        )
+    is_semantic_proof = proof_by_field.get("contract_id") == (
+        PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
+    )
+    expects_semantic_proof = expected_resource_hash_contract == (
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    )
+    if is_semantic_proof != expects_semantic_proof:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory content proof contract changed"
+        )
+    if expects_semantic_proof and proof_by_field.get(
+        "resource_hash_contract"
+    ) != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory semantic proof contract changed"
+        )
+    if expects_semantic_proof:
+        expected_scope = _validated_string_list(
+            list(expected_proof_resource_scope or ()),
+            "expected proof resource scope",
+        )
+        if proof_by_field.get(
+            PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        ) != expected_scope:
+            raise ProviderDirectoryProofStoreError(
+                "provider directory proof resource scope changed"
+            )
+        expected_projection_as_of = _validated_semantic_projection_as_of(
+            expected_semantic_projection_as_of
+        )
+        if proof_by_field.get(
+            _SEMANTIC_PROJECTION_AS_OF_FIELD
+        ) != expected_projection_as_of:
+            raise ProviderDirectoryProofStoreError(
+                "provider directory semantic projection date changed"
+            )
+    elif (
+        expected_semantic_projection_as_of is not None
+        or expected_proof_resource_scope is not None
+        or PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        in proof_by_field
+    ):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory expected semantic projection date is invalid"
+        )
 
 
 def _validate_metadata_shards(
@@ -1415,6 +1965,15 @@ def _validate_metadata_shards(
         )
         for descriptor_by_field in shard_descriptors
     ]
+    if lineage.proof_resource_scope is not None and any(
+        not set(descriptor_by_field["resource_counts"]).issubset(
+            lineage.proof_resource_scope
+        )
+        for descriptor_by_field in validated_shards
+    ):
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof shard resource scope changed"
+        )
     shard_ids = [
         descriptor_by_field["shard_id"]
         for descriptor_by_field in validated_shards
@@ -1459,6 +2018,9 @@ def validate_stored_dataset_proof_metadata(
     acquisition_root_run_id: str,
     source_ids: Iterable[str],
     selected_resources: Iterable[str],
+    proof_resource_scope: Iterable[str] | None = None,
+    expected_resource_hash_contract: str | None = None,
+    expected_semantic_projection_as_of: str | None = None,
 ) -> dict[str, Any]:
     """Validate a sealed generic proof without reopening canonical JSON."""
 
@@ -1473,9 +2035,16 @@ def validate_stored_dataset_proof_metadata(
         acquisition_root_run_id=acquisition_root_run_id,
         source_ids=source_ids,
         selected_resources=selected_resources,
+        proof_resource_scope=proof_resource_scope,
     )
     _validate_metadata_lineage(proof_by_field, lineage)
     _validate_metadata_summary(proof_by_field, lineage)
+    _assert_expected_proof_contract(
+        proof_by_field,
+        expected_resource_hash_contract,
+        expected_semantic_projection_as_of,
+        proof_resource_scope,
+    )
     _validate_metadata_shards(proof_by_field, lineage)
     _validate_metadata_hash(proof_by_field)
     return proof_by_field
@@ -1515,7 +2084,9 @@ async def delete_dataset_resource_proof_shards(
 __all__ = [
     "PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID",
     "PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY",
+    "PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY",
     "PROVIDER_DIRECTORY_PROOF_SHARD_TABLE",
+    "PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID",
     "ProviderDirectoryProofStoreError",
     "ProviderDirectoryStoredProof",
     "build_dataset_proof_shard",
