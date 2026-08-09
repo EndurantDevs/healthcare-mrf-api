@@ -457,6 +457,7 @@ jobs:
               test -x /opt/support/ptg2_scanner/target/release/ptg2_scanner
               test -x /opt/support/ptg2_scanner/target/release/ptg2_provider_graph_v4
               /opt/venv/bin/python -c "import ptg2_address_canon as m; assert hasattr(m, '\''intersect_sorted_u32'\''); assert hasattr(m, '\''ptg2_decode_u32_le'\'')"
+              /opt/venv/bin/python -B -c "import public_evidence; import process.npi"
             '
       - name: Prove reviewed formulary operator is packaged and dormant
         run: |

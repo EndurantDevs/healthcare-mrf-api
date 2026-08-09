@@ -352,7 +352,7 @@ def test_public_evidence_contract_has_only_stdlib_or_local_imports() -> None:
     assert not unexpected, sorted(unexpected)
 
 
-def test_runtime_and_container_do_not_wire_the_dormant_package() -> None:
+def test_runtime_and_container_wire_only_authorized_public_evidence_adapters() -> None:
     repository_root = Path(__file__).resolve().parents[1]
     authorized_runtime_adapters = {
         "process/npi_canonical_publication.py",
@@ -392,4 +392,4 @@ def test_runtime_and_container_do_not_wire_the_dormant_package() -> None:
 
     assert set(importing_paths) == authorized_runtime_adapters
     dockerfile = (repository_root / "Dockerfile").read_text(encoding="utf-8")
-    assert "public_evidence" not in dockerfile
+    assert "COPY public_evidence/ /opt/public_evidence/" in dockerfile
