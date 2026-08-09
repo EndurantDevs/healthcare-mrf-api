@@ -108,6 +108,45 @@ async def attest_locked_materialized_preclaim_supersession(
     return observed
 
 
+async def attest_locked_materialized_preclaim_abandonment(
+    session: Any,
+    predecessor_wave_id: str,
+    cutover_id: str,
+    *,
+    redis: Any,
+) -> dict[str, Any]:
+    """Observe one pristine materialized wave for a non-wave cutover.
+
+    The existing proof format is deliberately reused.  Its
+    ``successor_wave_id`` slot binds the immutable proof to ``cutover_id``;
+    this function does not create or require a successor wave row.
+    """
+
+    predecessor_wave_id = _wave_id(predecessor_wave_id, "predecessor wave ID")
+    cutover_id = _wave_id(cutover_id, "cutover ID")
+    if cutover_id == predecessor_wave_id:
+        raise PTGWaveMaterializedPreclaimConflict(
+            "cutover ID must differ from the predecessor wave ID"
+        )
+    if await _supersession_row(
+        session, predecessor_wave_id, lock_row=True
+    ) is not None:
+        raise PTGWaveMaterializedPreclaimConflict(
+            "predecessor already has an immutable supersession"
+        )
+    snapshot = await _load_snapshot(
+        session, predecessor_wave_id, lock_rows=True
+    )
+    if any(
+        getattr(run, "node_id", None) is not None
+        for run in snapshot.runs
+    ):
+        raise PTGWaveMaterializedPreclaimConflict(
+            "materialized predecessor runs must be unassigned"
+        )
+    return await _observe(snapshot, cutover_id, redis=redis)
+
+
 async def _load_snapshot(
     session: Any,
     predecessor_wave_id: str,
@@ -341,6 +380,7 @@ def _wave_id(value: Any, name: str) -> str:
 
 
 __all__ = [
+    "attest_locked_materialized_preclaim_abandonment",
     "attest_locked_materialized_preclaim_supersession",
     "get_materialized_preclaim_supersession_candidate",
 ]

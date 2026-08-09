@@ -12,6 +12,9 @@ from api.control_import_waves import (
     admit_import_wave,
     get_import_wave,
 )
+from api.control_import_wave_abandonment import (
+    abandon_materialized_preclaim_wave,
+)
 from process.ptg_parts.ptg_wave_admission_fence import PTGWaveCapacityConflict
 from process.ptg_wave_controller import (
     start_ptg_wave_controller,
@@ -257,6 +260,29 @@ async def control_get_materialized_preclaim_supersession(
     return response.json(proof, default=str)
 
 
+async def control_abandon_materialized_preclaim_wave(
+    request,
+    wave_id: str,
+):
+    """Quarantine one pristine materialized wave for ordinary admission."""
+
+    require_control_auth(request)
+    payload = request.json if isinstance(request.json, dict) else {}
+    if set(payload) != {"cutover_id"}:
+        raise BadRequest("request must contain only cutover_id")
+    try:
+        result, created = await abandon_materialized_preclaim_wave(
+            wave_id,
+            payload["cutover_id"],
+            redis=getattr(request.app.ctx, "ptg_wave_redis", None),
+        )
+    except PTGWaveMaterializedPreclaimConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(result, status=201 if created else 200, default=str)
+
+
 def _single_query_argument(arguments, field: str):
     """Return one query value while rejecting repeated keys."""
 
@@ -294,6 +320,9 @@ def register_control_wave_routes(blueprint):
     blueprint.get(
         "/import-waves/<wave_id>/materialized-preclaim-supersession"
     )(control_get_materialized_preclaim_supersession)
+    blueprint.post(
+        "/import-waves/<wave_id>/materialized-preclaim-abandonment"
+    )(control_abandon_materialized_preclaim_wave)
     return blueprint
 
 

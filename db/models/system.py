@@ -345,7 +345,7 @@ class PTGImportWave(Base, JSONOutputMixin):
 
 
 class PTGImportWaveQuarantine(Base, JSONOutputMixin):
-    """Append-only controller exclusion for one unresolved legacy wave."""
+    """Append-only controller exclusion and audited retirement for one wave."""
 
     __tablename__ = "ptg_import_wave_quarantine"
     __main_table__ = __tablename__
@@ -361,10 +361,37 @@ class PTGImportWaveQuarantine(Base, JSONOutputMixin):
             "'materialized_preclaim_failure')",
             name="ptg_import_wave_quarantine_reason_check",
         ),
+        CheckConstraint(
+            "(recovery_basis IS NULL AND successor_wave_id IS NULL "
+            "AND recovery_evidence IS NULL "
+            "AND recovery_evidence_canonical IS NULL "
+            "AND recovery_evidence_sha256 IS NULL) OR "
+            "(reason = 'materialized_preclaim_failure' "
+            "AND recovery_basis = 'materialized_preclaim_failure' "
+            "AND successor_wave_id IS NOT NULL "
+            "AND successor_wave_id <> predecessor_wave_id "
+            "AND jsonb_typeof(recovery_evidence) = 'object' "
+            "AND recovery_evidence_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND octet_length(recovery_evidence_canonical) > 0 "
+            "AND encode(sha256(recovery_evidence_canonical), 'hex') "
+            "= recovery_evidence_sha256 "
+            "AND convert_from(recovery_evidence_canonical, 'UTF8')::jsonb "
+            "= recovery_evidence - 'proof_digest')",
+            name="ptg_import_wave_quarantine_abandonment_evidence_check",
+        ),
+        UniqueConstraint(
+            "successor_wave_id",
+            name="ptg_import_wave_quarantine_cutover_id_key",
+        ),
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
     predecessor_wave_id = Column(String(64), nullable=False)
     reason = Column(String(64), nullable=False)
+    cutover_id = Column("successor_wave_id", String(64))
+    recovery_basis = Column(String(64))
+    recovery_evidence = Column(JSONB)
+    recovery_evidence_canonical = Column(LargeBinary)
+    recovery_evidence_sha256 = Column(String(64))
     created_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 

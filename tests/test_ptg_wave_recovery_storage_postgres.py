@@ -130,7 +130,7 @@ async def _create_support_tables(connection, quoted: str) -> None:
     await connection.execute(
         f"""
         CREATE TABLE {quoted}.import_run (
-            run_id text PRIMARY KEY, importer text, status text,
+            run_id text PRIMARY KEY, node_id text, importer text, status text,
             source_file_import_id text, import_id text, phase_detail text,
             started_at timestamptz, finished_at timestamptz, snapshot_id text,
             error jsonb, progress jsonb, params jsonb, metrics jsonb
