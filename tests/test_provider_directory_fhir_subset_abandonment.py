@@ -33,6 +33,7 @@ from tests.provider_directory_fhir_subset_abandonment_support import (
     AbandonmentDatabase,
     RESOURCE_TYPES,
     SOURCE_SCOPE_SHA256,
+    VERIFICATION_SCOPE_SHA256,
     abandonment_inputs,
 )
 
@@ -174,15 +175,75 @@ async def test_selector_locks_exact_evidence_and_builds_private_selection():
     )
 
     assert selection.prior_status == "failed"
+    assert selection.endpoint_id == "endpoint-a"
+    assert selection.source_scope_sha256 == SOURCE_SCOPE_SHA256
+    assert (
+        database.candidate_row["publication_metadata_json"]
+        ["verification_source_scope_hash"]
+        == VERIFICATION_SCOPE_SHA256
+    )
+    assert selection.source_scope_sha256 != VERIFICATION_SCOPE_SHA256
     assert selection.resource_types == RESOURCE_TYPES
-    expected_resource_count = sum(row["rows_processed"] for row in checkpoint_rows)
+    expected_resource_count = sum(
+        checkpoint_row["rows_processed"] for checkpoint_row in checkpoint_rows
+    )
     assert selection.marker_by_field["resource_count"] == expected_resource_count
     assert len(checkpoint_rows) == len(RESOURCE_TYPES)
     call_text = " ".join(call[1] for call in database.calls)
+    endpoint_lock_calls = [
+        parameters
+        for method, statement, parameters in database.calls
+        if method == "scalar" and "hashtextextended" in statement
+        and "endpoint_id" in parameters
+    ]
+    assert endpoint_lock_calls == [{"endpoint_id": "endpoint-a"}]
+    source_lock_parameters = next(
+        parameters
+        for method, statement, parameters in database.calls
+        if method == "all" and "SELECT source.*" in statement
+        and "FOR UPDATE OF source" in statement
+    )
+    assert source_lock_parameters["endpoint_id"] == "endpoint-a"
     assert "provider-directory-pagination:" in str(database.calls)
     assert "LOCK TABLE" in call_text
     assert "FOR UPDATE OF dataset" in call_text
     assert "FOR UPDATE OF checkpoint" in call_text
+
+
+@pytest.mark.asyncio
+async def test_selector_rejects_collapsed_or_malformed_scope_domains():
+    malformed_databases = []
+
+    invalid_verification_scope = AbandonmentDatabase()
+    invalid_verification_scope.candidate_row["publication_metadata_json"][
+        "verification_source_scope_hash"
+    ] = "invalid"
+    malformed_databases.append(invalid_verification_scope)
+
+    mismatched_campaign = AbandonmentDatabase()
+    mismatched_campaign.candidate_row["publication_metadata_json"][
+        "verification_campaign_id"
+    ] = "campaign-b"
+    malformed_databases.append(mismatched_campaign)
+
+    mixed_checkpoint_scopes = AbandonmentDatabase()
+    mixed_checkpoint_scopes.checkpoint_rows[0]["source_scope_hash"] = "3" * 64
+    malformed_databases.append(mixed_checkpoint_scopes)
+
+    collapsed_scope_domains = AbandonmentDatabase()
+    collapsed_scope_domains.candidate_row["publication_metadata_json"][
+        "verification_source_scope_hash"
+    ] = SOURCE_SCOPE_SHA256
+    malformed_databases.append(collapsed_scope_domains)
+
+    for database in malformed_databases:
+        with pytest.raises(ReviewedSubsetAbandonmentError) as error:
+            await selected_reviewed_subset_abandonment(
+                database,
+                "source-a",
+                RESOURCE_TYPES,
+            )
+        assert error.value.code == "evidence"
 
 
 @pytest.mark.asyncio

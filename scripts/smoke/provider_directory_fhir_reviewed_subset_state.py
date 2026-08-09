@@ -23,6 +23,12 @@ os.environ.setdefault("HLTHPRT_LOG_CFG", str(ROOT / "logging.yaml"))
 COMMAND = "sync-verified-state"
 EVIDENCE_COMMAND = "render-neutral-evidence"
 ABANDON_COMMAND = "abandon-expired-root"
+_ENABLED_ENV_BY_COMMAND = {
+    COMMAND: "HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED",
+    ABANDON_COMMAND: (
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED"
+    ),
+}
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
 SAFE_ERROR_CODES = frozenset(
     {
@@ -52,6 +58,12 @@ class RedactedArgumentParser(argparse.ArgumentParser):
         """Exit with fixed JSON instead of echoing rejected arguments."""
 
         self.exit(2, _error_json("invalid_arguments") + "\n")
+
+
+class _DormantGateError(RuntimeError):
+    """Fail before runtime imports when a mutating operator is disabled."""
+
+    code = "disabled"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -191,6 +203,13 @@ async def _run_operator(
     *,
     database: Any | None = None,
 ) -> str:
+    enabled_environment = _ENABLED_ENV_BY_COMMAND.get(command)
+    if (
+        database is None
+        and enabled_environment is not None
+        and os.getenv(enabled_environment) != "true"
+    ):
+        raise _DormantGateError()
     active_task = asyncio.current_task()
     if active_task is None:
         raise RuntimeError("reviewed subset operator task is unavailable")

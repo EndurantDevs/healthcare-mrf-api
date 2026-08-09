@@ -21,12 +21,18 @@ from tests.provider_directory_fhir_subset_abandonment_pg_support import (
     OWNER_RUN_ID,
     ROOT_RUN_ID,
     SOURCE_ID,
+    authorize_operator,
     close_abandonment_scenario,
     create_abandonment_relations,
     guard_handoff_context,
     retained_evidence_snapshot,
     runtime_database,
     seed_expired_root,
+)
+from tests.provider_directory_fhir_subset_abandonment_pg_assertions import (
+    assert_scope_domains_are_distinct,
+    assert_serving_alias_and_decoy_preserved,
+    prove_collapsed_scope_domains_are_rejected,
 )
 from tests.provider_directory_reviewed_subset_activation_pg_support import (
     load_activation_migration,
@@ -94,17 +100,6 @@ async def _prove_adoption_rejects_preenacted_state(
             raise AssertionError("pre-enacted abandonment was adopted")
     finally:
         await adoption_transaction.rollback()
-
-
-def _authorize_operator(monkeypatch) -> None:
-    monkeypatch.setenv(ABANDONMENT_ENABLED_ENV, "true")
-    monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
-        lambda: SOURCE_ID,
-    )
-
-
 async def _prove_busy_locks_preserve_evidence(scenario, database) -> None:
     for lock_key in (
         f"provider-directory-pagination:{CANONICAL_API_BASE}",
@@ -391,6 +386,8 @@ async def _assert_sealed_state(scenario, migration, before_by_relation) -> None:
         DATASET_ID,
     )
     assert checkpoint_count == 7
+    await assert_serving_alias_and_decoy_preserved(scenario)
+    await assert_scope_domains_are_distinct(scenario)
     is_valid = await scenario.connection.fetchval(
         f"SELECT {scenario.quoted_schema}." f'"{migration._VALID}"($1)',
         DATASET_ID,
@@ -478,7 +475,12 @@ async def prove_reviewed_subset_abandonment_lifecycle(monkeypatch) -> None:
         await _prove_adoption_rejects_preenacted_state(scenario, migration)
         async with scenario.connection.transaction():
             await run_subset_migration(migration, "upgrade", scenario.connection)
-        _authorize_operator(monkeypatch)
+        authorize_operator(monkeypatch, ABANDONMENT_ENABLED_ENV)
+        await prove_collapsed_scope_domains_are_rejected(
+            scenario,
+            database,
+            abandonment,
+        )
         await _prove_busy_locks_preserve_evidence(scenario, database)
         before_by_relation = await retained_evidence_snapshot(scenario)
         await _seal_while_writer_waits(monkeypatch, scenario, database, writer)

@@ -336,6 +336,14 @@ def _valid_function_sql(schema: str) -> str:
                 = checkpoint_summary.terminal_error_codes
         AND candidate.publication_metadata_json::jsonb -> 'selected_resources'
                 = checkpoint_summary.resource_types
+        AND candidate.publication_metadata_json::jsonb
+                ->> 'verification_source_scope_hash'
+                ~ '^[0-9a-f]{{64}}$'
+        AND NULLIF(
+                candidate.publication_metadata_json::jsonb
+                    ->> 'verification_campaign_id',
+                ''
+            ) IS NOT NULL
         AND jsonb_typeof(
                 candidate.publication_metadata_json::jsonb -> 'source_ids'
             ) = 'array'
@@ -344,6 +352,9 @@ def _valid_function_sql(schema: str) -> str:
             ) = 1
         AND checkpoint_summary.source_scope_hash
                 = candidate.marker ->> 'source_scope_sha256'
+        AND candidate.publication_metadata_json::jsonb
+                ->> 'verification_source_scope_hash'
+                IS DISTINCT FROM checkpoint_summary.source_scope_hash
         AND checkpoint_summary.scope_count = 1
         AND checkpoint_summary.invalid_state_count = 0
         AND checkpoint_summary.checkpoint_count
@@ -509,10 +520,16 @@ def _dataset_guard_sql(schema: str) -> str:
                      WHERE source.source_id =
                                NEW.publication_metadata_json::jsonb
                                    #>> '{{source_ids,0}}'
-                       AND source.endpoint_id = NEW.endpoint_id
+                       AND source.metadata_json::jsonb
+                              ->> 'provider_directory_configured_endpoint_id'
+                              = NEW.endpoint_id
                        AND source.metadata_json::jsonb
                               ->> 'provider_directory_candidate_status'
                               = 'pending_two_matching_reviewed_subset_acquisitions'
+                       AND source.metadata_json::jsonb
+                              ->> 'provider_directory_verification_campaign_id'
+                              = NEW.publication_metadata_json::jsonb
+                                  ->> 'verification_campaign_id'
                        AND NOT source.metadata_json::jsonb ?
                               'provider_directory_reviewed_subset_activation_v1'
                        AND source.metadata_json::jsonb

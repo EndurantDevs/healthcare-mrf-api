@@ -26,16 +26,19 @@ from process.provider_directory_fhir_subset_activation_contract import (
 
 RESOURCE_TYPES = tuple(sorted(SERVER_ISSUED_SUBSET_RESOURCE_TYPES))
 SOURCE_SCOPE_SHA256 = "1" * 64
+VERIFICATION_SCOPE_SHA256 = "2" * 64
+SERVING_ENDPOINT_ID = "endpoint-serving"
 
 
 def _source_fixture() -> dict:
     return {
         "source_id": "source-a",
-        "endpoint_id": "endpoint-a",
+        "endpoint_id": SERVING_ENDPOINT_ID,
         "canonical_api_base": "https://directory.example.test/fhir",
         "metadata_json": {
             "provider_directory_candidate_status": PENDING_STATUS,
             "provider_directory_configured_endpoint_id": "endpoint-a",
+            "provider_directory_verification_campaign_id": "campaign-a",
             "last_resource_import": {
                 "run_id": "owner-a",
                 "resources": {
@@ -67,7 +70,8 @@ def _candidate_fixture() -> dict:
         "publication_metadata_json": {
             "source_ids": ["source-a"],
             "selected_resources": list(RESOURCE_TYPES),
-            "verification_source_scope_hash": SOURCE_SCOPE_SHA256,
+            "verification_source_scope_hash": VERIFICATION_SCOPE_SHA256,
+            "verification_campaign_id": "campaign-a",
         },
     }
 

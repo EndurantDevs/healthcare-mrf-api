@@ -18,6 +18,7 @@ from process.provider_directory_fhir_census_contract import (
     CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
 )
 from process.provider_directory_fhir_census_execution import (
+    CURRENT_VERSION_CENSUS_RETRYABLE_ERROR,
     current_version_census_checkpoint_proof,
     current_version_census_initial_proof,
     validated_current_version_census_resume_url,
@@ -336,7 +337,9 @@ async def test_empty_window_checkpoint_survives_transient_transport(
         ),
     )
     acquisition = await _run_acquisition(operation_spies)
-    assert acquisition.error == "transient"
+    assert acquisition.error == (
+        f"{CURRENT_VERSION_CENSUS_RETRYABLE_ERROR}:transient"
+    )
     assert acquisition.next_url_remaining is True
     operation_spies.row_write.assert_not_awaited()
     operation_spies.checkpoint_write.assert_awaited_once()

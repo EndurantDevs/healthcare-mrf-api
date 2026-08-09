@@ -16,7 +16,11 @@ import pytest
 from process.provider_directory_fhir_subset_activation import (
     ReviewedSubsetActivationError,
 )
+from process.provider_directory_fhir_subset_activation_contract import (
+    STATE_SYNC_ENABLED_ENV,
+)
 from process.provider_directory_fhir_subset_abandonment_contract import (
+    ABANDONMENT_ENABLED_ENV,
     ReviewedSubsetAbandonmentError,
     ReviewedSubsetAbandonmentResult,
 )
@@ -152,6 +156,35 @@ def test_parser_accepts_only_fixed_command_and_no_selectors(capsys):
     assert capsys.readouterr().err == (
         '{"code":"invalid_arguments","status":"error"}\n'
     )
+
+
+@pytest.mark.parametrize(
+    ("command_name", "enabled_environment"),
+    (
+        ("COMMAND", STATE_SYNC_ENABLED_ENV),
+        ("ABANDON_COMMAND", ABANDONMENT_ENABLED_ENV),
+    ),
+)
+def test_disabled_mutations_stop_before_runtime_imports(
+    monkeypatch,
+    capsys,
+    command_name,
+    enabled_environment,
+):
+    """Emit one closed line without loading a database for a dormant command."""
+
+    script_module = _script_module()
+    command = getattr(script_module, command_name)
+    operation = AsyncMock()
+    monkeypatch.delenv(enabled_environment, raising=False)
+    monkeypatch.setattr(script_module, "_execute_operation", operation)
+
+    assert script_module._ENABLED_ENV_BY_COMMAND[command] == enabled_environment
+    assert script_module.run_command([command]) == 1
+    operation.assert_not_awaited()
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == '{"code":"disabled","status":"error"}\n'
 
 
 @pytest.mark.asyncio

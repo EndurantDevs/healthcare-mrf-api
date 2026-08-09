@@ -23,15 +23,20 @@ from tests.provider_directory_subset_completion_pg_setup import (
 from tests.provider_directory_subset_completion_pg_support import (
     RESOURCE_TYPES,
     VALID_SOURCE_SCOPE_SHA256,
+    valid_source_metadata,
 )
 from tests.tin_npi_connector_postgres_support import POSTGRES_DSN_ENV
 
 CANONICAL_API_BASE = "https://directory.example.test/fhir"
 DATASET_ID = "dataset-abandoned"
 ENDPOINT_ID = "endpoint-a"
+SERVING_ENDPOINT_ID = "endpoint-serving"
 OWNER_RUN_ID = "owner-abandoned"
 ROOT_RUN_ID = "root-abandoned"
 SOURCE_ID = "synthetic-source"
+VERIFICATION_CAMPAIGN_ID = valid_source_metadata(
+    "pending_two_matching_reviewed_subset_acquisitions"
+)["provider_directory_verification_campaign_id"]
 
 
 def guard_handoff_context(importer):
@@ -177,16 +182,43 @@ def terminal_diagnostics() -> dict[str, dict[str, object]]:
     }
 
 
+def authorize_operator(monkeypatch, enabled_env: str) -> None:
+    """Bind the selector-free operator to the neutral reviewed fixture."""
+
+    monkeypatch.setenv(enabled_env, "true")
+    monkeypatch.setattr(
+        "process.provider_directory_fhir_manual_catalog."
+        "reviewed_manual_census_source_id",
+        lambda: SOURCE_ID,
+    )
+
+
 async def seed_expired_root(scenario) -> None:
     """Seed one exact seven-resource failed root before guard adoption."""
 
+    await _seed_source_alias(scenario)
+    await insert_subset_candidate(
+        scenario,
+        dataset_id=DATASET_ID,
+        root_run_id=ROOT_RUN_ID,
+        resource_count=0,
+    )
+    await _seed_serving_decoy(scenario)
+    await _bind_expired_candidate_identity(scenario)
+    await insert_valid_subset_resources(scenario, DATASET_ID)
+    await _seed_proof_shard(scenario)
+    await _seed_pagination_checkpoints(scenario)
+
+
+async def _seed_source_alias(scenario) -> None:
     await scenario.connection.execute(
         f"""
         INSERT INTO {scenario.quoted_schema}.provider_directory_api_endpoint (
             endpoint_id
-        ) VALUES ($1)
+        ) VALUES ($1), ($2)
         """,
         ENDPOINT_ID,
+        SERVING_ENDPOINT_ID,
     )
     await replace_subset_source(
         scenario,
@@ -196,12 +228,58 @@ async def seed_expired_root(scenario) -> None:
             "resources": terminal_diagnostics(),
         },
     )
-    await insert_subset_candidate(
-        scenario,
-        dataset_id=DATASET_ID,
-        root_run_id=ROOT_RUN_ID,
-        resource_count=0,
+    await scenario.connection.execute(
+        f"""
+        UPDATE {scenario.quoted_schema}.provider_directory_source
+           SET endpoint_id = $1
+         WHERE source_id = $2
+        """,
+        SERVING_ENDPOINT_ID,
+        SOURCE_ID,
     )
+    await scenario.connection.execute(
+        f"""
+        INSERT INTO {scenario.quoted_schema}.provider_directory_source (
+            source_id, endpoint_id, canonical_api_base,
+            requires_registration, requires_api_key, auth_type, metadata_json
+        ) VALUES (
+            'synthetic-serving-sibling', $1, $2,
+            false, false, 'none', $3::jsonb
+        )
+        """,
+        SERVING_ENDPOINT_ID,
+        CANONICAL_API_BASE,
+        json.dumps(
+            {
+                "provider_directory_configured_endpoint_id": SERVING_ENDPOINT_ID
+            }
+        ),
+    )
+
+
+async def _seed_serving_decoy(scenario) -> None:
+    await scenario.connection.execute(
+        f"""
+        INSERT INTO {scenario.quoted_schema}.provider_directory_endpoint_dataset (
+            dataset_id, endpoint_id, acquisition_root_run_id, status,
+            is_current, resource_count, publication_metadata_json,
+            completion_proof_required_version
+        ) VALUES (
+            'dataset-serving-decoy', $1, 'root-serving-decoy', 'failed',
+            false, 0, $2::jsonb, NULL
+        )
+        """,
+        SERVING_ENDPOINT_ID,
+        json.dumps(
+            {
+                "source_ids": [SOURCE_ID],
+                "selected_resources": list(RESOURCE_TYPES),
+            }
+        ),
+    )
+
+
+async def _bind_expired_candidate_identity(scenario) -> None:
     await scenario.connection.execute(
         f"""
         UPDATE {scenario.quoted_schema}.provider_directory_endpoint_dataset
@@ -216,13 +294,11 @@ async def seed_expired_root(scenario) -> None:
                 "source_ids": [SOURCE_ID],
                 "selected_resources": list(RESOURCE_TYPES),
                 "verification_source_scope_hash": VALID_SOURCE_SCOPE_SHA256,
+                "verification_campaign_id": VERIFICATION_CAMPAIGN_ID,
             }
         ),
         DATASET_ID,
     )
-    await insert_valid_subset_resources(scenario, DATASET_ID)
-    await _seed_proof_shard(scenario)
-    await _seed_pagination_checkpoints(scenario)
 
 
 async def _seed_proof_shard(scenario) -> None:
@@ -271,7 +347,7 @@ async def _seed_pagination_checkpoints(scenario) -> None:
             (
                 CANONICAL_API_BASE,
                 resource_type,
-                VALID_SOURCE_SCOPE_SHA256,
+                "1" * 64,
                 DATASET_ID,
                 json.dumps([SOURCE_ID]),
                 ROOT_RUN_ID,

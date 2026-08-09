@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Mapping
 
 from process.provider_directory_fhir_subset_abandonment_contract import (
@@ -23,6 +24,7 @@ from process.provider_directory_fhir_subset_abandonment_contract import (
     validated_terminal_diagnostics,
 )
 from process.provider_directory_fhir_subset_abandonment_evidence import (
+    require_distinct_scope_domains,
     retained_evidence_counts,
     validated_checkpoint_summary,
 )
@@ -48,6 +50,13 @@ def _is_activated_source(metadata_by_field: Mapping[str, Any]) -> bool:
     )
 
 
+def _configured_endpoint_id(source_row: Mapping[str, Any]) -> str | None:
+    source_metadata = _json_object(source_row.get("metadata_json"))
+    return _text(
+        source_metadata.get("provider_directory_configured_endpoint_id")
+    )
+
+
 async def _initial_source_row(
     database: Any,
     expected_source_id: str,
@@ -68,6 +77,7 @@ async def _initial_source_row(
     if (
         _text(source_row.get("source_id")) != expected_source_id
         or _text(source_row.get("endpoint_id")) is None
+        or _configured_endpoint_id(source_row) is None
         or _text(source_row.get("canonical_api_base")) is None
         or not (
             _is_pending_source(source_metadata) or _is_activated_source(source_metadata)
@@ -82,7 +92,7 @@ async def _lock_endpoint_scope(
     source_row: Mapping[str, Any],
     held_pagination_guard_key: str | None,
 ) -> None:
-    endpoint_id = _text(source_row.get("endpoint_id")) or ""
+    endpoint_id = _configured_endpoint_id(source_row) or ""
     canonical_api_base = _text(source_row.get("canonical_api_base")) or ""
     pagination_lock_key = f"provider-directory-pagination:{canonical_api_base}"
     if (
@@ -141,13 +151,14 @@ async def _lock_endpoint_scope(
 async def _locked_source_row(
     database: Any,
     expected_source_id: str,
-    endpoint_id: str,
+    configured_endpoint_id: str,
+    serving_endpoint_id: str,
     canonical_api_base: str,
 ) -> dict[str, Any]:
     source_rows = await database.all(
         f"""
         SELECT source.*
-          FROM {_quoted_relation('provider_directory_source')} AS source
+         FROM {_quoted_relation('provider_directory_source')} AS source
          WHERE source.source_id = :source_id
             OR source.endpoint_id = :endpoint_id
             OR source.metadata_json::jsonb
@@ -157,7 +168,7 @@ async def _locked_source_row(
          FOR UPDATE OF source;
         """,
         source_id=expected_source_id,
-        endpoint_id=endpoint_id,
+        endpoint_id=configured_endpoint_id,
     )
     if len(source_rows) != 1:
         raise ReviewedSubsetAbandonmentError("evidence")
@@ -165,8 +176,13 @@ async def _locked_source_row(
     source_metadata = _json_object(source_row.get("metadata_json"))
     if (
         _text(source_row.get("source_id")) != expected_source_id
-        or _text(source_row.get("endpoint_id")) != endpoint_id
+        or _text(source_row.get("endpoint_id")) != serving_endpoint_id
+        or _configured_endpoint_id(source_row) != configured_endpoint_id
         or _text(source_row.get("canonical_api_base")) != canonical_api_base
+        or not (
+            _is_pending_source(source_metadata)
+            or _is_activated_source(source_metadata)
+        )
     ):
         raise ReviewedSubsetAbandonmentError("evidence")
     return source_row
@@ -240,6 +256,46 @@ def _source_terminal_diagnostics(
         _json_object(last_import.get("resources")),
         resource_types,
     )
+
+
+def _validate_candidate_verification_identity(
+    source_row: Mapping[str, Any],
+    candidate_row: Mapping[str, Any],
+    expected_source_id: str,
+    expected_endpoint_id: str,
+    resource_types: tuple[str, ...],
+) -> None:
+    source_metadata = _json_object(source_row.get("metadata_json"))
+    candidate_metadata = _json_object(
+        candidate_row.get("publication_metadata_json")
+    )
+    verification_scope = _text(
+        candidate_metadata.get("verification_source_scope_hash")
+    )
+    verification_campaign = _text(
+        candidate_metadata.get("verification_campaign_id")
+    )
+    if (
+        _text(candidate_row.get("endpoint_id")) != expected_endpoint_id
+        or candidate_row.get("is_current") is not False
+        or candidate_row.get("completion_proof_required_version") != 3
+        or candidate_row.get("completion_proof_json") is not None
+        or candidate_row.get("completion_proof_sha256") is not None
+        or _text(candidate_row.get("status"))
+        not in (ELIGIBLE_PRIOR_STATUSES | {ABANDONED_STATUS})
+        or _json_text_tuple(candidate_metadata.get("source_ids"))
+        != (expected_source_id,)
+        or _json_text_tuple(candidate_metadata.get("selected_resources"))
+        != resource_types
+        or verification_scope is None
+        or re.fullmatch(r"[0-9a-f]{64}", verification_scope) is None
+        or verification_campaign is None
+        or verification_campaign
+        != _text(
+            source_metadata.get("provider_directory_verification_campaign_id")
+        )
+    ):
+        raise ReviewedSubsetAbandonmentError("evidence")
 
 
 def _selection_from_rows(
@@ -351,6 +407,7 @@ async def _new_abandonment_selection(
         source_by_field,
         resource_types,
     )
+    require_distinct_scope_domains(candidate_by_field, source_scope_sha256)
     resource_count, proof_shard_count, proof_row_count = await retained_evidence_counts(
         database,
         candidate_by_field,
@@ -396,11 +453,12 @@ async def selected_reviewed_subset_abandonment(
         initial_source,
         held_pagination_guard_key,
     )
-    endpoint_id = _text(initial_source.get("endpoint_id")) or ""
+    endpoint_id = _configured_endpoint_id(initial_source) or ""
     source_by_field = await _locked_source_row(
         database,
         expected_source_id,
         endpoint_id,
+        _text(initial_source.get("endpoint_id")) or "",
         _text(initial_source.get("canonical_api_base")) or "",
     )
     candidate_by_field = await _locked_candidate_row(
@@ -408,6 +466,13 @@ async def selected_reviewed_subset_abandonment(
         source_id=expected_source_id,
         endpoint_id=endpoint_id,
         resource_types=resource_types,
+    )
+    _validate_candidate_verification_identity(
+        source_by_field,
+        candidate_by_field,
+        expected_source_id,
+        endpoint_id,
+        resource_types,
     )
     prior_status = _text(candidate_by_field.get("status")) or ""
     if prior_status == ABANDONED_STATUS:

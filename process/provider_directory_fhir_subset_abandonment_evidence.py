@@ -17,6 +17,22 @@ from process.provider_directory_fhir_subset_abandonment_contract import (
 )
 
 
+def require_distinct_scope_domains(
+    candidate_by_field: Mapping[str, Any],
+    checkpoint_scope_sha256: str,
+) -> None:
+    """Reject a verification digest copied from the pagination domain."""
+
+    candidate_metadata = _json_object(
+        candidate_by_field.get("publication_metadata_json")
+    )
+    if (
+        _text(candidate_metadata.get("verification_source_scope_hash"))
+        == checkpoint_scope_sha256
+    ):
+        raise ReviewedSubsetAbandonmentError("evidence")
+
+
 def _checkpoint_identity_context(
     checkpoint_rows: Sequence[Mapping[str, Any]],
     candidate_by_field: Mapping[str, Any],
@@ -26,9 +42,6 @@ def _checkpoint_identity_context(
     candidate_metadata = _json_object(
         candidate_by_field.get("publication_metadata_json")
     )
-    source_scope_sha256 = _text(
-        candidate_metadata.get("verification_source_scope_hash")
-    )
     expected_source_ids = _json_text_tuple(candidate_metadata.get("source_ids"))
     expected_owner = _text(candidate_by_field.get("import_run_id"))
     expected_root = _text(candidate_by_field.get("acquisition_root_run_id"))
@@ -36,6 +49,15 @@ def _checkpoint_identity_context(
     checkpoint_resource_types = tuple(
         checkpoint_by_field.get("resource_type")
         for checkpoint_by_field in checkpoint_rows
+    )
+    checkpoint_scope_hashes = {
+        _text(checkpoint_by_field.get("source_scope_hash"))
+        for checkpoint_by_field in checkpoint_rows
+    }
+    source_scope_sha256 = (
+        next(iter(checkpoint_scope_hashes))
+        if len(checkpoint_scope_hashes) == 1
+        else None
     )
     if (
         source_scope_sha256 is None

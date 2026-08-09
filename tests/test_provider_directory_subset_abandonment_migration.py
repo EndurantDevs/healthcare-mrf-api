@@ -95,6 +95,11 @@ def test_upgrade_installs_additive_fail_closed_abandonment_guards(monkeypatch):
     assert "provider-directory-pagination:" in normalized_sql
     assert "FOR SHARE OF dataset" in normalized_sql
     assert "provider_directory_reviewed_subset_activation_v1" in normalized_sql
+    assert (
+        "->> 'provider_directory_configured_endpoint_id' = NEW.endpoint_id"
+        in normalized_sql
+    )
+    assert "AND source.endpoint_id = NEW.endpoint_id" not in normalized_sql
     assert all(
         len(trigger_name.encode("utf-8")) <= 63
         for trigger_name in _abandonment_trigger_names(migration)
@@ -139,6 +144,9 @@ def test_validator_binds_closed_marker_and_retained_evidence_counts():
     assert "completion_proof_required_version = 3" in validation_sql
     assert "completion_proof_json IS NULL" in validation_sql
     assert "completion_proof_sha256 IS NULL" in validation_sql
+    assert "verification_source_scope_hash" in validation_sql
+    assert "verification_campaign_id" in validation_sql
+    assert "IS DISTINCT FROM checkpoint_summary.source_scope_hash" in validation_sql
     assert "provider_directory_bulk_acquisition_checkpoint" in validation_sql
     assert "jsonb_each_text" in validation_sql
     assert "IS DISTINCT FROM checkpoint.rows_processed" in validation_sql
