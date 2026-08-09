@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 from process.provider_directory_fhir_subset_canonical import canonical_sha256
 from process.provider_directory_fhir_subset_identity import (
     server_issued_subset_source_scope_payload,
+    subset_source_endpoint_identity,
 )
 from process.provider_directory_fhir_subset_activation_contract import (
     PENDING_STATUS,
@@ -39,19 +40,21 @@ def _activation_source(
         raise ReviewedSubsetActivationError("evidence")
     source_by_field = dict(source_rows[0])
     source_id = _text(source_by_field.get("source_id"))
-    endpoint_id = _text(source_by_field.get("endpoint_id"))
     canonical_api_base = _text(source_by_field.get("canonical_api_base"))
     source_metadata = source_by_field.get("metadata_json")
+    try:
+        _, configured_endpoint_id = subset_source_endpoint_identity(
+            source_by_field
+        )
+    except ValueError:
+        raise ReviewedSubsetActivationError("evidence") from None
     if (
         source_id != expected_source_id
-        or endpoint_id is None
         or canonical_api_base is None
         or source_by_field.get("requires_registration") is not False
         or source_by_field.get("requires_api_key") is not False
         or source_by_field.get("auth_type") != "none"
         or not isinstance(source_metadata, Mapping)
-        or source_metadata.get("provider_directory_configured_endpoint_id")
-        != endpoint_id
     ):
         raise ReviewedSubsetActivationError("evidence")
     try:
@@ -78,7 +81,7 @@ def _activation_source(
         or scope_sha256 != evidence.verification_source_scope_sha256
     ):
         raise ReviewedSubsetActivationError("evidence")
-    return source_by_field, endpoint_id, source_contract_sha256
+    return source_by_field, configured_endpoint_id, source_contract_sha256
 
 
 def _is_candidate_lifecycle_valid(candidate: Mapping[str, Any]) -> bool:

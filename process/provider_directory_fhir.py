@@ -9181,11 +9181,12 @@ async def _finish_provider_directory_prepared_stage(
 async def _promote_provider_directory_artifact_datasets(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> None:
-    """Flip validated candidates only after every serving relation is installed."""
+    """Atomically move incumbents, aliases, and validated candidates in order."""
     for dataset in fence.promotion_datasets:
         await _supersede_artifact_dataset_incumbent(dataset)
-        await _publish_validated_artifact_dataset(dataset)
     await _cutover_provider_directory_artifact_sources(fence)
+    for dataset in fence.promotion_datasets:
+        await _publish_validated_artifact_dataset(dataset)
 
 
 def _provider_directory_profile_selection_catalog() -> dict[str, Any]:
@@ -9224,13 +9225,21 @@ async def _cutover_provider_directory_artifact_sources(
             or serving_endpoint_id == dataset.endpoint_id
         ):
             continue
+        configured_endpoint_cas = (
+            "\n               AND metadata_json::jsonb"
+            f" ->> '{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}'"
+            " = :endpoint_id"
+            if dataset.completion_proof_required_version
+            == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+            else ""
+        )
         updated_count = await db.status(
             f"""
             UPDATE {source_ref}
                SET endpoint_id = :endpoint_id,
                    updated_at = now()
              WHERE source_id = :source_id
-               AND endpoint_id = :serving_endpoint_id;
+               AND endpoint_id = :serving_endpoint_id{configured_endpoint_cas};
             """,
             source_id=dataset.source_id,
             endpoint_id=dataset.endpoint_id,

@@ -40,6 +40,9 @@ def _reviewed_source_record():
     )[0]
     source_record = importer._source_row_from_seed(seed)
     source_record["endpoint_id"] = "synthetic-endpoint"
+    source_record["metadata_json"][
+        "provider_directory_configured_endpoint_id"
+    ] = "synthetic-endpoint"
     return source_record
 
 

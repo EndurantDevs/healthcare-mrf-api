@@ -73,6 +73,9 @@ SERVER_ISSUED_SUBSET_SOURCE_SCOPE_VERSION = (
 SERVER_ISSUED_SUBSET_ACTIVATION_SOURCE_CONTRACT_VERSION = (
     "provider-directory-fhir-reviewed-subset-source-contract-v1"
 )
+CONFIGURED_ENDPOINT_ID_METADATA_FIELD = (
+    "provider_directory_configured_endpoint_id"
+)
 SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS = (
     "provider_directory_supported_resources",
     "provider_directory_fully_enumerable_resources",
@@ -92,8 +95,32 @@ SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS = (
     CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
     CURRENT_VERSION_CENSUS_START_URLS_FIELD,
     SERVER_ISSUED_SUBSET_CAMPAIGN_FIELD,
-    "provider_directory_configured_endpoint_id",
+    CONFIGURED_ENDPOINT_ID_METADATA_FIELD,
 )
+
+
+def subset_source_endpoint_identity(
+    source_record: Mapping[str, Any],
+) -> tuple[str, str]:
+    """Return the serving snapshot and configured acquisition endpoint."""
+
+    metadata = source_record.get("metadata_json")
+    serving_endpoint_id = source_record.get("endpoint_id")
+    configured_endpoint_id = (
+        metadata.get(CONFIGURED_ENDPOINT_ID_METADATA_FIELD)
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    if (
+        type(serving_endpoint_id) is not str
+        or not serving_endpoint_id
+        or serving_endpoint_id != serving_endpoint_id.strip()
+        or type(configured_endpoint_id) is not str
+        or not configured_endpoint_id
+        or configured_endpoint_id != configured_endpoint_id.strip()
+    ):
+        raise ValueError("provider_directory_subset_endpoint_identity_invalid")
+    return serving_endpoint_id, configured_endpoint_id
 
 
 def subset_activation_source_contract_payload(
@@ -103,14 +130,19 @@ def subset_activation_source_contract_payload(
 
     metadata = source_record.get("metadata_json")
     source_id = source_record.get("source_id")
-    endpoint_id = source_record.get("endpoint_id")
     canonical_api_base = source_record.get("canonical_api_base")
+    try:
+        _, configured_endpoint_id = subset_source_endpoint_identity(
+            source_record
+        )
+    except ValueError:
+        raise ValueError(
+            "provider_directory_subset_activation_source_invalid"
+        ) from None
     if (
         not isinstance(metadata, Mapping)
         or type(source_id) is not str
         or not source_id
-        or type(endpoint_id) is not str
-        or not endpoint_id
         or type(canonical_api_base) is not str
         or not canonical_api_base
     ):
@@ -121,7 +153,7 @@ def subset_activation_source_contract_payload(
         ),
         "source": {
             "source_id": source_id,
-            "endpoint_id": endpoint_id,
+            "endpoint_id": configured_endpoint_id,
             "canonical_api_base": canonical_api_base,
             "requires_registration": source_record.get(
                 "requires_registration"
@@ -148,12 +180,17 @@ def server_issued_subset_source_scope_payload(
     if not isinstance(metadata, Mapping):
         raise ValueError("provider_directory_subset_source_scope_invalid")
     source_id = source_record.get("source_id")
-    endpoint_id = source_record.get("endpoint_id")
+    try:
+        _, configured_endpoint_id = subset_source_endpoint_identity(
+            source_record
+        )
+    except ValueError:
+        raise ValueError(
+            "provider_directory_subset_source_scope_invalid"
+        ) from None
     if (
         type(source_id) is not str
         or not source_id
-        or type(endpoint_id) is not str
-        or not endpoint_id
         or source_ids != (source_id,)
         or not cutoff
         or not canonical_api_base
@@ -165,7 +202,7 @@ def server_issued_subset_source_scope_payload(
         "cutoff": cutoff,
         "source": {
             "source_id": source_id,
-            "endpoint_id": endpoint_id,
+            "endpoint_id": configured_endpoint_id,
             "canonical_api_base": canonical_api_base,
             "requires_registration": source_record.get(
                 "requires_registration"
