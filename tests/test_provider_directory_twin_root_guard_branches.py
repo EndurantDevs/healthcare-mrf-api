@@ -22,6 +22,9 @@ def _candidate(**changes):
 
 def _orphan_metadata(candidate) -> dict[str, object]:
     return {
+        importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (
+            candidate.resource_hash_contract
+        ),
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
         "source_ids": list(candidate.source_ids),

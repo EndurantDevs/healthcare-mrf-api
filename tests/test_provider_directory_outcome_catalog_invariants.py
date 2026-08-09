@@ -122,6 +122,9 @@ def test_validated_dataset_selection_rejects_current_metadata_and_proof_gaps():
 
 def _replay_metadata(candidate):
     return {
+        importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (
+            candidate.resource_hash_contract
+        ),
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
         "expected_resources": list(candidate.expected_resources),
@@ -139,6 +142,13 @@ def test_finalized_dataset_replay_rejects_metadata_identity_and_diagnostics():
         importer._assert_finalized_endpoint_dataset_replay(candidate)
 
     candidate = _candidate()
+    mismatched_metadata = _replay_metadata(candidate)
+    mismatched_metadata["source_ids"] = ["source-other"]
+    with pytest.raises(RuntimeError, match="published_identity_mismatch"):
+        importer._assert_finalized_endpoint_dataset_replay(
+            _candidate(published_metadata=mismatched_metadata)
+        )
+
     metadata = _replay_metadata(candidate)
     metadata["resource_diagnostics"] = None
     candidate = _candidate(published_metadata=metadata)

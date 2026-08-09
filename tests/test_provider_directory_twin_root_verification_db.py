@@ -50,6 +50,7 @@ def _baseline(candidate: importer.EndpointDatasetCandidate) -> dict[str, object]
         "status": importer.ENDPOINT_DATASET_VERIFICATION_BASELINE,
         "resource_count": content.resource_count,
         "publication_metadata_json": {
+            importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: candidate.resource_hash_contract,
             "source_ids": list(candidate.source_ids),
             "selected_resources": list(candidate.selected_resources),
             "expected_resources": list(candidate.expected_resources),

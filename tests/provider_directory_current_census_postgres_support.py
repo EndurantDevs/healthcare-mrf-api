@@ -397,6 +397,7 @@ async def fetch_practitioners(
             model,
             resource_rows,
             DATASET_ID,
+            resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
         )
         return len(dataset_rows)
 

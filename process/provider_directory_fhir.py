@@ -195,6 +195,15 @@ from process.provider_directory_proof_store import (
     persist_dataset_proof_shard,
     validate_stored_dataset_proof_metadata,
 )
+from process.provider_directory_resource_hash import (
+    DEFAULT_RESOURCE_HASH_CONTRACT,
+    RESOURCE_HASH_CONTRACTS,
+    RESOURCE_HASH_CONTRACT_METADATA_KEY,
+    persisted_resource_hash_contract,
+    resource_content_hash_payload,
+    is_resource_payload_hash_match,
+    resource_payload_sha256_for_contract,
+)
 from process.uhc_retained_dataset import (
     UHC_RETAINED_PUBLICATION_CONTRACT_ID,
     UHC_RETAINED_PUBLICATION_METADATA_KEY,
@@ -2048,6 +2057,7 @@ class EndpointDatasetCandidate:
     published_metadata: dict[str, Any] | None = None
     completion_proof_required_version: int | None = None
     subset_contract: CurrentVersionCensusContract | None = None
+    resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT
 
 
 @dataclass(frozen=True)
@@ -2068,6 +2078,24 @@ class EndpointDatasetCandidateSelection:
     validated_metadata: dict[str, Any] | None = None
     already_published: bool = False
     published_metadata: dict[str, Any] | None = None
+    resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT
+
+
+@dataclass(frozen=True)
+class EndpointDatasetWriteScope:
+    dataset_id: str
+    resource_hash_contract: str
+
+    def __post_init__(self) -> None:
+        """Reject incomplete or unknown dataset-write contracts."""
+
+        if (
+            not self.dataset_id
+            or self.resource_hash_contract not in RESOURCE_HASH_CONTRACTS
+        ):
+            raise ValueError(
+                "provider_directory_resource_hash_contract_required"
+            )
 
 
 @dataclass(frozen=True)
@@ -20427,6 +20455,9 @@ def _source_summary_candidate_from_metadata_record(
             selected_resources=dataset.selected_resources,
             import_run_id=dataset.evidence_run_id,
             previous_dataset_id=dataset.previous_dataset_id,
+            resource_hash_contract=_dataset_resource_hash_contract(
+                {"publication_metadata_json": publication_metadata}
+            ),
             expected_resources=dataset.expected_resources,
         ),
         publication_metadata,
@@ -35613,32 +35644,6 @@ def _canonical_resource_payload(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-_SUBSET_TRANSPORT_PAYLOAD_FIELDS = frozenset(
-    {
-        "resource_url",
-        "fhir_self_url",
-        "fhir_fetch_url",
-        "fhir_fetch_mode",
-    }
-)
-
-
-def _endpoint_dataset_hash_payload(
-    payload: Mapping[str, Any],
-    *,
-    is_server_issued_subset: bool,
-) -> dict[str, Any]:
-    """Remove transport coordinates only from the v3 content-hash view."""
-
-    if not is_server_issued_subset:
-        return dict(payload)
-    return {
-        key: value
-        for key, value in payload.items()
-        if key not in _SUBSET_TRANSPORT_PAYLOAD_FIELDS
-    }
-
-
 def _canonical_resource_rows(
     model,
     resource_rows: list[dict[str, Any]],
@@ -35646,6 +35651,7 @@ def _canonical_resource_rows(
     canonical_api_base: str | None,
     run_id: str | None,
     store_payload: bool = True,
+    resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT,
 ) -> list[dict[str, Any]]:
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
     api_base = _canonical_base(canonical_api_base)
@@ -35657,9 +35663,10 @@ def _canonical_resource_rows(
         if not resource_id:
             continue
         payload_by_field = _canonical_resource_payload(resource_row_by_field)
-        payload_hash = hashlib.sha256(
-            json.dumps(payload_by_field, sort_keys=True, default=_json_default).encode("utf-8")
-        ).hexdigest()
+        payload_hash = resource_payload_sha256_for_contract(
+            payload_by_field,
+            resource_hash_contract,
+        )
         observed_at = resource_row_by_field.get("observed_at") or _now()
         resource_rows_by_id[resource_id] = {
             "canonical_api_base": api_base,
@@ -35685,6 +35692,7 @@ def _endpoint_dataset_resource_rows(
     resource_rows: list[dict[str, Any]],
     *,
     dataset_id: str | None,
+    resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT,
 ) -> list[dict[str, Any]]:
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
     if not dataset_id or not resource_type:
@@ -35705,20 +35713,15 @@ def _endpoint_dataset_resource_rows(
             raise ValueError(
                 "provider_directory_subset_acquired_content_invalid"
             )
-        hash_payload_by_field = _endpoint_dataset_hash_payload(
-            payload_by_field,
-            is_server_issued_subset=(acquired_resource_sha256 is not None),
-        )
         payload_hash = (
-            subset_payload_sha256(hash_payload_by_field)
+            subset_payload_sha256(
+                resource_content_hash_payload(payload_by_field)
+            )
             if acquired_resource_sha256 is not None
-            else hashlib.sha256(
-                json.dumps(
-                    hash_payload_by_field,
-                    sort_keys=True,
-                    default=_json_default,
-                ).encode("utf-8")
-            ).hexdigest()
+            else resource_payload_sha256_for_contract(
+                payload_by_field,
+                resource_hash_contract,
+            )
         )
         resources_by_id[resource_id] = {
             "dataset_id": dataset_id,
@@ -47815,6 +47818,7 @@ async def _stage_last_updated_partition_window(
         model,
         parsed_rows,
         dataset_id=context.dataset_id,
+        resource_hash_contract=source_record.get("_resource_hash_contract"),
     )
     if len(staged_rows) != len(resources):
         raise RuntimeError(
@@ -51752,7 +51756,10 @@ async def _import_linked_resource_rows(
                 seen_table=seen_table,
                 canonical_api_base=canonical_api_base,
                 source_ids=edge_source_ids,
-                dataset_id=dataset_id,
+                dataset_scope=_endpoint_dataset_write_scope(
+                    source_record,
+                    dataset_id,
+                ),
             )
             if imported:
                 resource_name = model.__name__.removeprefix("ProviderDirectory")
@@ -52460,7 +52467,9 @@ async def _write_uhc_plan_graph_resources(
             canonical_api_base=source_record.get("canonical_api_base")
             or source_record.get("api_base"),
             source_ids=[source_record["source_id"]],
-            dataset_id=source_record.get("_endpoint_dataset_id"),
+            dataset_scope=_endpoint_dataset_write_scope(
+                source_record
+            ),
         )
     return written_counts_by_resource
 
@@ -53231,6 +53240,7 @@ async def _upsert_canonical_resource_edges(
     run_id: str | None,
     track_seen: bool,
     store_payload: bool,
+    resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT,
 ) -> None:
     """Persist canonical resources and their source edges."""
     canonical_rows = _canonical_resource_rows(
@@ -53239,6 +53249,7 @@ async def _upsert_canonical_resource_edges(
         canonical_api_base=canonical_api_base,
         run_id=run_id,
         store_payload=store_payload,
+        resource_hash_contract=resource_hash_contract,
     )
     if canonical_rows:
         await _upsert_rows(
@@ -53279,6 +53290,8 @@ async def _persist_endpoint_dataset_rows(
     model: type,
     resource_rows: list[dict[str, Any]],
     dataset_id: str | None,
+    *,
+    resource_hash_contract: str,
 ) -> list[dict[str, Any]]:
     """Persist immutable endpoint rows and their proof shard transactionally."""
 
@@ -53286,6 +53299,7 @@ async def _persist_endpoint_dataset_rows(
         model,
         resource_rows,
         dataset_id=dataset_id,
+        resource_hash_contract=resource_hash_contract,
     )
     if not dataset_rows:
         return dataset_rows
@@ -53307,6 +53321,7 @@ async def _upsert_deferred_resource_rows(
     *,
     dataset_id: str | None,
     track_seen: bool,
+    resource_hash_contract: str | None = None,
 ) -> int:
     """Retain a checkpointed FHIR batch without compatibility materialization."""
 
@@ -53320,13 +53335,37 @@ async def _upsert_deferred_resource_rows(
         raise ValueError(
             "provider_directory_deferred_typed_materialization_seen_tracking_unsupported"
         )
+    if resource_hash_contract is None:
+        raise ValueError(
+            "provider_directory_resource_hash_contract_required"
+        )
     resource_rows = _resource_rows_with_location_contacts(model, resource_rows)
     dataset_rows = await _persist_endpoint_dataset_rows(
         model,
         resource_rows,
         dataset_id,
+        resource_hash_contract=resource_hash_contract,
     )
     return len(dataset_rows)
+
+
+def _endpoint_dataset_write_scope(
+    source_record: Mapping[str, Any],
+    dataset_id: str | None = None,
+) -> EndpointDatasetWriteScope | None:
+    """Build one complete dataset-write scope from prepared source state."""
+
+    resolved_dataset_id = _clean_text(
+        dataset_id or source_record.get("_endpoint_dataset_id")
+    )
+    if not resolved_dataset_id:
+        return None
+    return EndpointDatasetWriteScope(
+        dataset_id=resolved_dataset_id,
+        resource_hash_contract=source_record.get(
+            "_resource_hash_contract"
+        ),
+    )
 
 
 async def _upsert_resource_rows(
@@ -53338,14 +53377,25 @@ async def _upsert_resource_rows(
     seen_table: str | None = None,
     canonical_api_base: str | None = None,
     source_ids: list[str] | None = None,
-    dataset_id: str | None = None,
+    dataset_scope: EndpointDatasetWriteScope | None = None,
 ) -> int:
     """Persist one FHIR batch with its durable dataset proof shard."""
 
     if not resource_rows:
         return 0
+    dataset_id = dataset_scope.dataset_id if dataset_scope else None
+    effective_resource_hash_contract = (
+        dataset_scope.resource_hash_contract
+        if dataset_scope
+        else DEFAULT_RESOURCE_HASH_CONTRACT
+    )
     resource_rows = _resource_rows_with_location_contacts(model, resource_rows)
-    await _persist_endpoint_dataset_rows(model, resource_rows, dataset_id)
+    await _persist_endpoint_dataset_rows(
+        model,
+        resource_rows,
+        dataset_id,
+        resource_hash_contract=effective_resource_hash_contract,
+    )
     if canonical_api_base and source_ids:
         await _upsert_canonical_resource_edges(
             model,
@@ -53355,6 +53405,7 @@ async def _upsert_resource_rows(
             run_id=run_id,
             track_seen=track_seen,
             store_payload=not bool(dataset_id),
+            resource_hash_contract=effective_resource_hash_contract,
         )
     if track_seen:
         await _mark_resource_rows_seen(model, resource_rows, run_id, seen_table=seen_table)
@@ -54896,6 +54947,42 @@ async def _endpoint_dataset_state(dataset_id: str) -> dict[str, Any]:
     return _pagination_checkpoint_row_mapping(row)
 
 
+def _dataset_resource_hash_contract(
+    dataset_map: Mapping[str, Any],
+) -> str:
+    """Select the immutable hash contract for one existing or fresh root."""
+
+    if not dataset_map:
+        return DEFAULT_RESOURCE_HASH_CONTRACT
+    raw_metadata = dataset_map.get("publication_metadata_json")
+    if raw_metadata is None:
+        metadata = None
+    elif isinstance(raw_metadata, Mapping):
+        metadata = raw_metadata
+    elif isinstance(raw_metadata, str):
+        try:
+            decoded_metadata = json.loads(raw_metadata)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "provider_directory_resource_hash_contract_invalid"
+            ) from exc
+        if not isinstance(decoded_metadata, dict):
+            raise RuntimeError(
+                "provider_directory_resource_hash_contract_invalid"
+            )
+        metadata = decoded_metadata
+    else:
+        raise RuntimeError(
+            "provider_directory_resource_hash_contract_invalid"
+        )
+    try:
+        return persisted_resource_hash_contract(metadata)
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_resource_hash_contract_invalid"
+        ) from exc
+
+
 async def _current_endpoint_dataset_id(
     endpoint_id: str,
     *,
@@ -54949,6 +55036,8 @@ async def _assert_locked_endpoint_candidate(
         != candidate.acquisition_root_run_id
         or existing_candidate_map.get("completion_proof_required_version")
         != candidate.completion_proof_required_version
+        or _dataset_resource_hash_contract(existing_candidate_map)
+        != candidate.resource_hash_contract
     ):
         raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
     if candidate.repair_empty_orphan:
@@ -54987,6 +55076,10 @@ def _assert_empty_orphan_candidate_identity(
         existing_metadata.get(key) == expected_field_value
         for key, expected_field_value in expected_metadata_by_field.items()
     )
+    has_exact_hash_contract = (
+        _dataset_resource_hash_contract(existing_candidate_map)
+        == candidate.resource_hash_contract
+    )
     if (
         not existing_candidate_map
         or _clean_text(existing_candidate_map.get("endpoint_id"))
@@ -54994,6 +55087,7 @@ def _assert_empty_orphan_candidate_identity(
         or _clean_text(existing_candidate_map.get("status"))
         != ENDPOINT_DATASET_ACQUIRING
         or not has_exact_metadata
+        or not has_exact_hash_contract
     ):
         raise RuntimeError(
             "provider_directory_endpoint_dataset_orphan_identity_mismatch"
@@ -55698,6 +55792,9 @@ def _candidate_with_locked_twin_root_admission(
             verification_baseline_dataset_id=_clean_text(
                 baseline.get("dataset_id")
             ),
+            resource_hash_contract=_dataset_resource_hash_contract(
+                baseline
+            ),
         )
     if candidate.verification_role == TWIN_ROOT_BASELINE_CANDIDATE_ROLE:
         if candidate.verification_baseline_dataset_id or state:
@@ -55718,7 +55815,23 @@ def _candidate_with_locked_twin_root_admission(
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_admission_mismatch"
         )
+    _assert_twin_root_resource_hash_contract(candidate, baseline)
     return candidate
+
+
+def _assert_twin_root_resource_hash_contract(
+    candidate: EndpointDatasetCandidate,
+    baseline: Mapping[str, Any],
+) -> None:
+    """Prevent one twin campaign from mixing content-hash contracts."""
+
+    if (
+        _dataset_resource_hash_contract(baseline)
+        != candidate.resource_hash_contract
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_baseline_incompatible"
+        )
 
 
 async def _assert_no_conflicting_endpoint_candidate(
@@ -55817,6 +55930,9 @@ def _endpoint_dataset_candidate_metadata(
         ),
         "completion_proof_required_version": (
             candidate.completion_proof_required_version
+        ),
+        RESOURCE_HASH_CONTRACT_METADATA_KEY: (
+            candidate.resource_hash_contract
         ),
     }
 
@@ -56313,6 +56429,9 @@ def _verification_terminal_endpoint_dataset_selection(
             existing_dataset_map.get("previous_dataset_id")
         ),
         reused_from_checkpoint=False,
+        resource_hash_contract=_dataset_resource_hash_contract(
+            existing_dataset_map
+        ),
         verification_terminal_status=status,
         verification_terminal_metadata=terminal_metadata,
         **verification_fields,
@@ -56402,6 +56521,9 @@ def _published_endpoint_dataset_selection(
             existing_dataset_map.get("previous_dataset_id")
         ),
         reused_from_checkpoint=False,
+        resource_hash_contract=_dataset_resource_hash_contract(
+            existing_dataset_map
+        ),
         already_published=True,
         published_metadata=published_metadata,
         **verification_fields,
@@ -56490,6 +56612,9 @@ def _validated_endpoint_dataset_selection(
             existing_dataset_map.get("previous_dataset_id")
         ),
         reused_from_checkpoint=False,
+        resource_hash_contract=_dataset_resource_hash_contract(
+            existing_dataset_map
+        ),
         already_validated=True,
         validated_metadata=validated_metadata,
         **verification_fields,
@@ -56637,6 +56762,9 @@ async def _select_resumable_endpoint_dataset_candidate(
         previous_dataset_id=previous_dataset_id,
         reused_from_checkpoint=checkpoint_dataset_id is not None,
         repair_empty_orphan=should_repair_empty_orphan,
+        resource_hash_contract=_dataset_resource_hash_contract(
+            existing_dataset_map
+        ),
         **verification_fields_by_name,
     )
 
@@ -56686,6 +56814,15 @@ def _assert_finalized_endpoint_dataset_replay(
     if not isinstance(metadata, dict):
         raise RuntimeError(
             f"provider_directory_endpoint_dataset_{state_name}_metadata_invalid"
+        )
+    if (
+        _dataset_resource_hash_contract(
+            {"publication_metadata_json": metadata}
+        )
+        != candidate.resource_hash_contract
+    ):
+        raise RuntimeError(
+            f"provider_directory_endpoint_dataset_{state_name}_identity_mismatch"
         )
     expected_identity_by_field = {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
@@ -56836,6 +56973,7 @@ def _build_endpoint_dataset_candidate(
         selected_resources=selected_resources,
         import_run_id=run_id,
         previous_dataset_id=selection.previous_dataset_id,
+        resource_hash_contract=selection.resource_hash_contract,
         expected_resources=expected_resources,
         checkpoint_context=bound_checkpoint_context,
         reused_from_checkpoint=selection.reused_from_checkpoint,
@@ -57952,6 +58090,7 @@ class AlohrGraphQLImportOptions:
     checkpoint_context: PaginationCheckpointContext | None
     resume_required_entries: set[str] | None
     dataset_id: str | None = None
+    resource_hash_contract: str | None = None
 
 
 @dataclass
@@ -58095,7 +58234,14 @@ async def _write_alohr_graphql_page(
             seen_table=import_state.options.seen_table,
             canonical_api_base=import_state.canonical_api_base,
             source_ids=[import_state.compatibility_source_id],
-            dataset_id=import_state.options.dataset_id,
+            dataset_scope=_endpoint_dataset_write_scope(
+                {
+                    "_resource_hash_contract": (
+                        import_state.options.resource_hash_contract
+                    )
+                },
+                import_state.options.dataset_id,
+            ),
         )
         prior_count = import_state.source_counts_by_resource.get(resource_type, 0)
         import_state.source_counts_by_resource[resource_type] = prior_count + written_count
@@ -59643,22 +59789,14 @@ def _assert_endpoint_dataset_resource_payload_hash(resource_row: Any) -> None:
     acquired_resource_sha256 = resource_map.get(
         "acquired_resource_sha256"
     )
-    hash_payload_by_field = _endpoint_dataset_hash_payload(
-        raw_payload,
-        is_server_issued_subset=(acquired_resource_sha256 is not None),
-    )
-    payload_hash = (
-        subset_payload_sha256(hash_payload_by_field)
+    stored_hash = _clean_text(resource_map.get("payload_hash"))
+    payload_hash_matches = (
+        subset_payload_sha256(resource_content_hash_payload(raw_payload))
+        == stored_hash
         if acquired_resource_sha256 is not None
-        else hashlib.sha256(
-            json.dumps(
-                hash_payload_by_field,
-                sort_keys=True,
-                default=_json_default,
-            ).encode("utf-8")
-        ).hexdigest()
+        else is_resource_payload_hash_match(raw_payload, stored_hash)
     )
-    if payload_hash != _clean_text(resource_map.get("payload_hash")):
+    if not payload_hash_matches:
         raise ProviderDirectoryArtifactBuildStale(
             "provider_directory_endpoint_dataset_payload_hash_mismatch"
         )
@@ -60854,6 +60992,11 @@ async def _locked_twin_root_verification_decision(
                 candidate,
                 locked_state,
             )
+            assert baseline_dataset_map is not None
+            _assert_twin_root_resource_hash_contract(
+                candidate,
+                baseline_dataset_map,
+            )
     return _twin_root_verification_decision(
         candidate, content_proof, baseline_dataset_map
     )
@@ -61795,6 +61938,9 @@ async def _prepare_resource_import_source_group(
         if candidate is not None:
             source_record["_endpoint_id"] = candidate.endpoint_id
             source_record["_endpoint_dataset_id"] = candidate.dataset_id
+            source_record["_resource_hash_contract"] = (
+                candidate.resource_hash_contract
+            )
         if checkpoint_context is not None:
             source_record["_pagination_checkpoint_context"] = checkpoint_context
         if checkpoint_owner_run_id:
@@ -62991,13 +63137,22 @@ async def _import_resources(
                 resource_rows,
                 partition_source["source_id"],
             )
-            dataset_id = partition_source.get("_endpoint_dataset_id")
+            dataset_scope = _endpoint_dataset_write_scope(
+                partition_source
+            )
             if defer_typed_materialization:
                 return await _upsert_deferred_resource_rows(
                     model,
                     compatibility_rows,
-                    dataset_id=dataset_id,
+                    dataset_id=(
+                        dataset_scope.dataset_id if dataset_scope else None
+                    ),
                     track_seen=stale_cleanup,
+                    resource_hash_contract=(
+                        dataset_scope.resource_hash_contract
+                        if dataset_scope
+                        else None
+                    ),
                 )
             return await _upsert_resource_rows(
                 model,
@@ -63010,7 +63165,7 @@ async def _import_resources(
                     or partition_source.get("api_base")
                 ),
                 source_ids=[partition_source["source_id"]],
-                dataset_id=dataset_id,
+                dataset_scope=dataset_scope,
             )
 
         if _uses_alohr_graphql_connector(partition_source):
@@ -63032,6 +63187,9 @@ async def _import_resources(
                     checkpoint_context=partition_source.get("_pagination_checkpoint_context"),
                     resume_required_entries=resume_required_entries,
                     dataset_id=partition_source.get("_endpoint_dataset_id"),
+                    resource_hash_contract=partition_source.get(
+                        "_resource_hash_contract"
+                    ),
                 ),
             )
         if _uses_uhc_official_file_connector(partition_source):
@@ -63901,6 +64059,7 @@ async def _uhc_candidate_from_state(
                 exclude_dataset_id=dataset_id,
             )
         ),
+        resource_hash_contract=_dataset_resource_hash_contract(state),
         expected_resources=selected_resources,
         reused_from_checkpoint=bool(state),
         already_validated=status == ENDPOINT_DATASET_VALIDATED,
