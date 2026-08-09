@@ -82,18 +82,27 @@ def _qf(schema: str, relation: str) -> str:
     return _predecessor()._qf(schema, relation)
 
 
-def _source_contract_payload_sql() -> str:
+def _source_contract_payload_sql(
+    *,
+    use_configured_endpoint_identity: bool = False,
+) -> str:
     previous = _predecessor()
     source_metadata = "active_source.metadata_json::jsonb"
     metadata_identity = previous._subset_source_metadata_identity_sql(
         source_metadata
+    )
+    endpoint_identity = (
+        f"{source_metadata} ->> "
+        "'provider_directory_configured_endpoint_id'"
+        if use_configured_endpoint_identity
+        else "active_source.endpoint_id"
     )
     return f"""
         pg_catalog.jsonb_build_object(
             'identity_version', {_ql(_SOURCE_CONTRACT)},
             'source', pg_catalog.jsonb_build_object(
                 'source_id', active_source.source_id,
-                'endpoint_id', active_source.endpoint_id,
+                'endpoint_id', {endpoint_identity},
                 'canonical_api_base', active_source.canonical_api_base,
                 'requires_registration', active_source.requires_registration,
                 'requires_api_key', active_source.requires_api_key,
@@ -222,7 +231,12 @@ def _activation_matched_twin_sql(schema: str) -> str:
     )
 
 
-def _activation_valid_function_sql(schema: str) -> str:
+def _activation_valid_function_sql(
+    schema: str,
+    *,
+    use_configured_endpoint_identity: bool = False,
+    replace_existing: bool = False,
+) -> str:
     previous = _predecessor()
     source_ref = _qf(schema, _SOURCE)
     dataset_ref = _qf(schema, _ENDPOINT_DATASET)
@@ -236,11 +250,26 @@ def _activation_valid_function_sql(schema: str) -> str:
         schema,
         require_verified=True,
         dataset_alias="candidate",
+        use_configured_endpoint_identity=use_configured_endpoint_identity,
+        require_physical_match=not use_configured_endpoint_identity,
     )
-    source_contract_payload = _source_contract_payload_sql()
+    source_contract_payload = _source_contract_payload_sql(
+        use_configured_endpoint_identity=use_configured_endpoint_identity,
+    )
+    marker_endpoint_identity = (
+        "active_source.metadata_json::jsonb "
+        "->> 'provider_directory_configured_endpoint_id'"
+        if use_configured_endpoint_identity
+        else "active_source.endpoint_id"
+    )
+    create_function = (
+        "CREATE OR REPLACE FUNCTION"
+        if replace_existing
+        else "CREATE FUNCTION"
+    )
     proof_statuses = ", ".join(_ql(status) for status in _PROOF_BEARING_STATUSES)
     return f"""
-    CREATE FUNCTION {function_ref}(candidate_source_id text)
+    {create_function} {function_ref}(candidate_source_id text)
     RETURNS boolean
     LANGUAGE sql
     STABLE
@@ -271,7 +300,7 @@ def _activation_valid_function_sql(schema: str) -> str:
                     {_ql(_VERIFIED_STATUS)}
                 AND ({_activation_marker_shape_sql(marker)})
                 AND {marker} ->> 'source_id' = active_source.source_id
-                AND {marker} ->> 'endpoint_id' = active_source.endpoint_id
+                AND {marker} ->> 'endpoint_id' = {marker_endpoint_identity}
                 AND {marker} ->> 'verification_campaign_id' =
                     candidate.completion_proof_json ->> 'campaign_id'
                 AND {marker} ->> 'cutoff' =
@@ -337,15 +366,63 @@ def _activation_valid_function_sql(schema: str) -> str:
     """
 
 
-def _source_guard_function_sql(schema: str) -> str:
+def _source_guard_function_sql(
+    schema: str,
+    *,
+    allow_effective_endpoint_cutover: bool = False,
+    replace_existing: bool = False,
+) -> str:
     source_ref = _qf(schema, _SOURCE)
+    dataset_ref = _qf(schema, _ENDPOINT_DATASET)
     guard_ref = _qf(schema, _SOURCE_GUARD_FUNCTION)
     valid_ref = _qf(schema, _ACTIVATION_VALID_FUNCTION)
     key = _ql(_ACTIVATION_KEY)
     pending = _ql(_PENDING_STATUS)
     verified = _ql(_VERIFIED_STATUS)
+    if allow_effective_endpoint_cutover:
+        active_endpoint_transition_sql = f"""
+                AND (
+                    NEW.endpoint_id IS NOT DISTINCT FROM OLD.endpoint_id
+                    OR (
+                        NEW.endpoint_id IS DISTINCT FROM OLD.endpoint_id
+                        AND pg_catalog.to_jsonb(NEW)
+                                - ARRAY['endpoint_id', 'updated_at']::text[]
+                            = pg_catalog.to_jsonb(OLD)
+                                - ARRAY['endpoint_id', 'updated_at']::text[]
+                        AND NEW.updated_at IS NOT DISTINCT FROM
+                            pg_catalog.transaction_timestamp()
+                        AND NEW.endpoint_id = new_metadata
+                                ->> 'provider_directory_configured_endpoint_id'
+                        AND NEW.endpoint_id = new_metadata -> {key}
+                                ->> 'endpoint_id'
+                        AND EXISTS (
+                            SELECT 1
+                              FROM {dataset_ref} AS activation_candidate
+                             WHERE activation_candidate.dataset_id =
+                                    new_metadata -> {key}
+                                        -> 'candidate' ->> 'dataset_id'
+                               AND activation_candidate.endpoint_id =
+                                    NEW.endpoint_id
+                               AND activation_candidate.completion_proof_required_version
+                                    = 3
+                               AND activation_candidate.status = 'published'
+                               AND activation_candidate.is_current IS TRUE
+                               AND activation_candidate.validated_at IS NOT NULL
+                               AND activation_candidate.published_at IS NOT NULL
+                               AND activation_candidate.superseded_at IS NULL
+                        )
+                    )
+                )
+        """
+    else:
+        active_endpoint_transition_sql = ""
+    create_function = (
+        "CREATE OR REPLACE FUNCTION"
+        if replace_existing
+        else "CREATE FUNCTION"
+    )
     return f"""
-    CREATE FUNCTION {guard_ref}()
+    {create_function} {guard_ref}()
     RETURNS trigger
     LANGUAGE plpgsql
     SECURITY DEFINER
@@ -471,6 +548,7 @@ def _source_guard_function_sql(schema: str) -> str:
                     {verified}
                 AND pg_catalog.jsonb_typeof(old_metadata -> {key}) = 'object'
                 AND new_metadata -> {key} = old_metadata -> {key}
+                {active_endpoint_transition_sql}
                 AND {valid_ref}(NEW.source_id) IS TRUE
             ) THEN
                 NULL;

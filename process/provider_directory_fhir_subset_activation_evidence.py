@@ -20,6 +20,9 @@ from process.provider_directory_fhir_subset_activation_contract import (
     reviewed_subset_source_contract_sha256,
 )
 from process import provider_directory_fhir_subset_activation_selection as selection
+from process.provider_directory_fhir_subset_identity import (
+    subset_source_endpoint_identity,
+)
 
 
 _PROOF_BEARING_STATUSES = (
@@ -105,8 +108,13 @@ async def _initial_evidence_identity(
     if len(initial_source_rows) != 1:
         raise ReviewedSubsetActivationError("evidence")
     initial_source = _row_mapping(initial_source_rows[0])
-    endpoint_id = _text(initial_source.get("endpoint_id"))
     source_metadata = initial_source.get("metadata_json")
+    try:
+        _, configured_endpoint_id = subset_source_endpoint_identity(
+            initial_source
+        )
+    except ValueError:
+        raise ReviewedSubsetActivationError("evidence") from None
     campaign_id = (
         _text(
             source_metadata.get("provider_directory_verification_campaign_id")
@@ -114,15 +122,15 @@ async def _initial_evidence_identity(
         if isinstance(source_metadata, Mapping)
         else None
     )
-    if endpoint_id is None or campaign_id is None:
+    if campaign_id is None:
         raise ReviewedSubsetActivationError("evidence")
-    return endpoint_id, campaign_id
+    return configured_endpoint_id, campaign_id
 
 
 async def _evidence_source_rows(
     database: Any,
     expected_source_id: str,
-    endpoint_id: str,
+    configured_endpoint_id: str,
 ) -> tuple[dict[str, Any], ...]:
     source_rows = await database.all(
         f"""
@@ -136,14 +144,14 @@ async def _evidence_source_rows(
          ORDER BY source.source_id;
         """,
         source_id=expected_source_id,
-        endpoint_id=endpoint_id,
+        endpoint_id=configured_endpoint_id,
     )
     return tuple(_row_mapping(source_row) for source_row in source_rows)
 
 
 async def _evidence_dataset_rows(
     database: Any,
-    endpoint_id: str,
+    configured_endpoint_id: str,
     campaign_id: str,
 ) -> tuple[dict[str, Any], ...]:
     dataset_rows = await database.all(
@@ -158,7 +166,7 @@ async def _evidence_dataset_rows(
                    ->> 'verification_campaign_id' = :campaign_id
          ORDER BY dataset.dataset_id;
         """,
-        endpoint_id=endpoint_id,
+        endpoint_id=configured_endpoint_id,
         campaign_id=campaign_id,
         proof_statuses=list(_PROOF_BEARING_STATUSES),
     )
@@ -175,18 +183,18 @@ async def _read_activation_evidence(
         await database.status(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;"
         )
-        endpoint_id, campaign_id = await _initial_evidence_identity(
+        configured_endpoint_id, campaign_id = await _initial_evidence_identity(
             database,
             expected_source_id,
         )
         source_rows = await _evidence_source_rows(
             database,
             expected_source_id,
-            endpoint_id,
+            configured_endpoint_id,
         )
         dataset_rows = await _evidence_dataset_rows(
             database,
-            endpoint_id,
+            configured_endpoint_id,
             campaign_id,
         )
         return _derived_activation_evidence(

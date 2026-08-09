@@ -33,6 +33,9 @@ from process.provider_directory_fhir_subset_activation_contract import (
     PENDING_STATUS,
     VERIFIED_STATUS,
 )
+from process.provider_directory_fhir_subset_identity import (
+    subset_source_endpoint_identity,
+)
 
 
 def _is_pending_source(metadata_by_field: Mapping[str, Any]) -> bool:
@@ -51,10 +54,10 @@ def _is_activated_source(metadata_by_field: Mapping[str, Any]) -> bool:
 
 
 def _configured_endpoint_id(source_row: Mapping[str, Any]) -> str | None:
-    source_metadata = _json_object(source_row.get("metadata_json"))
-    return _text(
-        source_metadata.get("provider_directory_configured_endpoint_id")
-    )
+    try:
+        return subset_source_endpoint_identity(source_row)[1]
+    except ValueError:
+        return None
 
 
 async def _initial_source_row(

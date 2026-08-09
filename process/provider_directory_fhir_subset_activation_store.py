@@ -23,6 +23,10 @@ from process.provider_directory_fhir_subset_activation_contract import (
 from process.provider_directory_fhir_subset_activation_selection import (
     validated_reviewed_subset_activation_selection,
 )
+from process.provider_directory_fhir_subset_identity import (
+    CONFIGURED_ENDPOINT_ID_METADATA_FIELD,
+    subset_source_endpoint_identity,
+)
 
 
 async def _initial_source_record(
@@ -42,10 +46,11 @@ async def _initial_source_record(
     if len(source_rows) != 1:
         raise ReviewedSubsetActivationError("state")
     source_row = _row_mapping(source_rows[0])
-    if (
-        _text(source_row.get("source_id")) != expected_source_id
-        or _text(source_row.get("endpoint_id")) is None
-    ):
+    try:
+        subset_source_endpoint_identity(source_row)
+    except ValueError:
+        raise ReviewedSubsetActivationError("state") from None
+    if _text(source_row.get("source_id")) != expected_source_id:
         raise ReviewedSubsetActivationError("state")
     return source_row
 
@@ -90,7 +95,7 @@ async def _locked_source_rows(
     database: Any,
     *,
     expected_source_id: str,
-    endpoint_id: str,
+    configured_endpoint_id: str,
 ) -> tuple[dict[str, Any], ...]:
     source_rows = await database.all(
         f"""
@@ -105,7 +110,7 @@ async def _locked_source_rows(
          FOR UPDATE OF source;
         """,
         source_id=expected_source_id,
-        endpoint_id=endpoint_id,
+        endpoint_id=configured_endpoint_id,
     )
     return tuple(_row_mapping(source_row) for source_row in source_rows)
 
@@ -121,7 +126,7 @@ async def _lock_activation_source_table(database: Any) -> None:
 async def _locked_dataset_rows(
     database: Any,
     *,
-    endpoint_id: str,
+    configured_endpoint_id: str,
     campaign_id: str,
     scope_sha256: str,
 ) -> tuple[dict[str, Any], ...]:
@@ -146,7 +151,7 @@ async def _locked_dataset_rows(
          ORDER BY dataset.dataset_id
          FOR UPDATE OF dataset;
         """,
-        endpoint_id=endpoint_id,
+        endpoint_id=configured_endpoint_id,
         campaign_id=campaign_id,
         scope_sha256=scope_sha256,
     )
@@ -178,24 +183,32 @@ def _has_exact_activation_marker(
     )
 
 
-async def _activate_source(
-    database: Any,
-    *,
+def _activation_endpoint_identity(
     selection: ReviewedSubsetActivationSelection,
     source_row: Mapping[str, Any],
-) -> ReviewedSubsetActivationResult:
-    marker_by_field = selection.metadata_marker()
-    source_metadata = source_row.get("metadata_json")
-    if not isinstance(source_metadata, Mapping):
+) -> tuple[str, str]:
+    """Return the exact serving snapshot and configured activation endpoint."""
+
+    try:
+        serving_endpoint_id, configured_endpoint_id = (
+            subset_source_endpoint_identity(source_row)
+        )
+    except ValueError:
+        raise ReviewedSubsetActivationError("state") from None
+    if configured_endpoint_id != selection.endpoint_id:
         raise ReviewedSubsetActivationError("state")
-    if _has_exact_activation_marker(source_row, marker_by_field):
-        return ReviewedSubsetActivationResult(activated=False)
-    if (
-        source_metadata.get("provider_directory_candidate_status")
-        != PENDING_STATUS
-        or ACTIVATION_METADATA_KEY in source_metadata
-    ):
-        raise ReviewedSubsetActivationError("state")
+    return serving_endpoint_id, configured_endpoint_id
+
+
+async def _cas_activate_source(
+    database: Any,
+    selection: ReviewedSubsetActivationSelection,
+    marker_by_field: Mapping[str, Any],
+    serving_endpoint_id: str,
+    configured_endpoint_id: str,
+) -> None:
+    """Compare and swap one pending source to the reviewed verified state."""
+
     updated_count = await database.status(
         f"""
         UPDATE {_quoted_relation('provider_directory_source')}
@@ -212,13 +225,17 @@ async def _activate_source(
                ),
                updated_at = pg_catalog.transaction_timestamp()
          WHERE source_id = :source_id
-           AND endpoint_id = :endpoint_id
+           AND endpoint_id = :serving_endpoint_id
+           AND metadata_json::jsonb ->> :configured_endpoint_key
+                   = :configured_endpoint_id
            AND metadata_json::jsonb
                    ->> 'provider_directory_candidate_status' = :pending_status
            AND NOT (metadata_json::jsonb ? :activation_key);
         """,
         source_id=selection.source_id,
-        endpoint_id=selection.endpoint_id,
+        serving_endpoint_id=serving_endpoint_id,
+        configured_endpoint_key=CONFIGURED_ENDPOINT_ID_METADATA_FIELD,
+        configured_endpoint_id=configured_endpoint_id,
         pending_status=PENDING_STATUS,
         verified_status=VERIFIED_STATUS,
         activation_key=ACTIVATION_METADATA_KEY,
@@ -230,6 +247,39 @@ async def _activate_source(
     )
     if updated_count != 1:
         raise ReviewedSubsetActivationError("state")
+
+
+async def _activate_source(
+    database: Any,
+    *,
+    selection: ReviewedSubsetActivationSelection,
+    source_row: Mapping[str, Any],
+) -> ReviewedSubsetActivationResult:
+    """Apply or replay one exact reviewed activation marker."""
+
+    marker_by_field = selection.metadata_marker()
+    source_metadata = source_row.get("metadata_json")
+    if not isinstance(source_metadata, Mapping):
+        raise ReviewedSubsetActivationError("state")
+    serving_endpoint_id, configured_endpoint_id = _activation_endpoint_identity(
+        selection,
+        source_row,
+    )
+    if _has_exact_activation_marker(source_row, marker_by_field):
+        return ReviewedSubsetActivationResult(activated=False)
+    if (
+        source_metadata.get("provider_directory_candidate_status")
+        != PENDING_STATUS
+        or ACTIVATION_METADATA_KEY in source_metadata
+    ):
+        raise ReviewedSubsetActivationError("state")
+    await _cas_activate_source(
+        database,
+        selection,
+        marker_by_field,
+        serving_endpoint_id,
+        configured_endpoint_id,
+    )
     await database.status(
         "SET CONSTRAINTS "
         f'"{_schema_name()}".'
@@ -237,6 +287,23 @@ async def _activate_source(
         "IMMEDIATE;"
     )
     return ReviewedSubsetActivationResult(activated=True)
+
+
+async def _initial_activation_identity(
+    database: Any,
+    expected_source_id: str,
+) -> tuple[str, str, str]:
+    """Return the serving, configured, and campaign identity snapshot."""
+
+    initial_source = await _initial_source_record(database, expected_source_id)
+    serving_endpoint_id, configured_endpoint_id = (
+        subset_source_endpoint_identity(initial_source)
+    )
+    return (
+        serving_endpoint_id,
+        configured_endpoint_id,
+        _activation_campaign_id(initial_source),
+    )
 
 
 async def sync_reviewed_subset_transaction(
@@ -252,25 +319,38 @@ async def sync_reviewed_subset_transaction(
         )
         if isolation != "read committed":
             raise ReviewedSubsetActivationError("state")
-        initial_source = await _initial_source_record(
-            runtime_database,
-            expected_source_id,
+        serving_endpoint_id, configured_endpoint_id, campaign_id = (
+            await _initial_activation_identity(
+                runtime_database,
+                expected_source_id,
+            )
         )
-        endpoint_id = _text(initial_source.get("endpoint_id")) or ""
-        campaign_id = _activation_campaign_id(initial_source)
-        await _lock_activation_endpoint(runtime_database, endpoint_id)
-        await _lock_activation_api_endpoint(runtime_database, endpoint_id)
+        await _lock_activation_endpoint(runtime_database, configured_endpoint_id)
+        await _lock_activation_api_endpoint(
+            runtime_database, configured_endpoint_id
+        )
         await _lock_activation_source_table(runtime_database)
         source_rows = await _locked_source_rows(
             runtime_database,
             expected_source_id=expected_source_id,
-            endpoint_id=endpoint_id,
+            configured_endpoint_id=configured_endpoint_id,
         )
         if len(source_rows) != 1:
             raise ReviewedSubsetActivationError("evidence")
+        try:
+            locked_endpoint_identity = subset_source_endpoint_identity(
+                source_rows[0]
+            )
+        except ValueError:
+            raise ReviewedSubsetActivationError("evidence") from None
+        if locked_endpoint_identity != (
+            serving_endpoint_id,
+            configured_endpoint_id,
+        ):
+            raise ReviewedSubsetActivationError("evidence")
         dataset_rows = await _locked_dataset_rows(
             runtime_database,
-            endpoint_id=endpoint_id,
+            configured_endpoint_id=configured_endpoint_id,
             campaign_id=campaign_id,
             scope_sha256=evidence.verification_source_scope_sha256,
         )

@@ -2289,8 +2289,16 @@ def _subset_source_scope_payload_sql(
     source_metadata: str,
     dataset_metadata: str,
     dataset_alias: str,
+    *,
+    use_configured_endpoint_identity: bool = False,
 ) -> str:
     metadata_identity = _subset_source_metadata_identity_sql(source_metadata)
+    endpoint_identity = (
+        f"{source_metadata} ->> "
+        "'provider_directory_configured_endpoint_id'"
+        if use_configured_endpoint_identity
+        else f"{source_alias}.endpoint_id"
+    )
     return f"""
         pg_catalog.jsonb_build_object(
             'identity_version', {_ql(_SUBSET_SOURCE_SCOPE_VERSION)},
@@ -2298,7 +2306,7 @@ def _subset_source_scope_payload_sql(
             'cutoff', {dataset_alias}.completion_proof_json -> 'cutoff',
             'source', pg_catalog.jsonb_build_object(
                 'source_id', {source_alias}.source_id,
-                'endpoint_id', {source_alias}.endpoint_id,
+                'endpoint_id', {endpoint_identity},
                 'canonical_api_base', {source_alias}.canonical_api_base,
                 'requires_registration', {source_alias}.requires_registration,
                 'requires_api_key', {source_alias}.requires_api_key,
@@ -2424,6 +2432,8 @@ def _subset_source_sql(
     *,
     require_verified: bool,
     dataset_alias: str = "NEW",
+    use_configured_endpoint_identity: bool = False,
+    require_physical_match: bool = True,
 ) -> str:
     """Bind a terminal row to its current reviewed manual source."""
 
@@ -2439,6 +2449,7 @@ def _subset_source_sql(
         source_metadata,
         metadata,
         dataset_alias,
+        use_configured_endpoint_identity=use_configured_endpoint_identity,
     )
     canonical_sha256_ref = _qf(schema, _CANONICAL_SHA256_FUNCTION)
     if require_verified:
@@ -2451,6 +2462,14 @@ def _subset_source_sql(
             + _ql(_SUBSET_VERIFIED_SOURCE_STATUS)
             + ")"
         )
+    if require_physical_match:
+        physical_endpoint_sql = (
+            f"current_source.endpoint_id = {dataset_alias}.endpoint_id"
+        )
+    else:
+        physical_endpoint_sql = (
+            "NULLIF(current_source.endpoint_id, '') IS NOT NULL"
+        )
     return f"""
         pg_catalog.jsonb_typeof({metadata} -> 'source_ids') = 'array'
         AND pg_catalog.jsonb_array_length({metadata} -> 'source_ids') = 1
@@ -2459,7 +2478,7 @@ def _subset_source_sql(
               FROM {source_ref} AS current_source
              WHERE current_source.source_id =
                     {metadata} -> 'source_ids' ->> 0
-               AND current_source.endpoint_id = {dataset_alias}.endpoint_id
+               AND {physical_endpoint_sql}
                AND current_source.canonical_api_base IS NOT NULL
                AND current_source.requires_registration IS FALSE
                AND current_source.requires_api_key IS FALSE
@@ -2490,7 +2509,12 @@ def _subset_source_sql(
     """
 
 
-def _subset_published_source_guard_sql(schema: str) -> str:
+def _subset_published_source_guard_sql(
+    schema: str,
+    *,
+    use_configured_endpoint_identity: bool = False,
+    replace_existing: bool = False,
+) -> str:
     """Reject source mutations that invalidate published subset evidence."""
 
     guard_ref = _qf(schema, _SOURCE_GUARD)
@@ -2499,9 +2523,16 @@ def _subset_published_source_guard_sql(schema: str) -> str:
         schema,
         require_verified=True,
         dataset_alias="published_dataset",
+        use_configured_endpoint_identity=use_configured_endpoint_identity,
+        require_physical_match=True,
+    )
+    create_function = (
+        "CREATE OR REPLACE FUNCTION"
+        if replace_existing
+        else "CREATE FUNCTION"
     )
     return f"""
-    CREATE FUNCTION {guard_ref}()
+    {create_function} {guard_ref}()
     RETURNS trigger
     LANGUAGE plpgsql
     SECURITY DEFINER
@@ -2651,7 +2682,11 @@ def _drop_subset_published_source_guard(schema: str) -> None:
     op.execute(f"DROP FUNCTION {guard_ref}();")
 
 
-def _subset_endpoint_dataset_guard_sql(schema: str) -> str:
+def _subset_endpoint_dataset_guard_sql(
+    schema: str,
+    *,
+    use_configured_endpoint_identity: bool = False,
+) -> str:
     guard_ref = _qf(schema, _ENDPOINT_DATASET_GUARD)
     source_ref = _qf(schema, _SOURCE)
     pair_valid_ref = _qf(schema, _PROOF_PAIR_VALID_FUNCTION)
@@ -2669,10 +2704,14 @@ def _subset_endpoint_dataset_guard_sql(schema: str) -> str:
     terminal_source_sql = _subset_source_sql(
         schema,
         require_verified=False,
+        use_configured_endpoint_identity=use_configured_endpoint_identity,
+        require_physical_match=not use_configured_endpoint_identity,
     )
     published_source_sql = _subset_source_sql(
         schema,
         require_verified=True,
+        use_configured_endpoint_identity=use_configured_endpoint_identity,
+        require_physical_match=True,
     )
     dataset_content_sql = _subset_dataset_content_sql(schema)
     return f"""

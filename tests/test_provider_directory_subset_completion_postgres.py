@@ -65,6 +65,9 @@ from tests.provider_directory_fhir_subset_abandonment_pg_cases import (
     prove_reviewed_subset_abandonment_guard_handoff,
     prove_reviewed_subset_abandonment_lifecycle,
 )
+from tests.provider_directory_effective_endpoint_pg_cases import (
+    prove_effective_endpoint_activation_and_publication,
+)
 from tests.tin_npi_connector_postgres_support import TransactionalSchema
 
 
@@ -390,6 +393,15 @@ async def test_reviewed_subset_activation_serializes_artifact_publication(
     """Prove activation and artifact publication share one endpoint lock."""
 
     await prove_activation_artifact_publication_is_serialized(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_effective_endpoint_identity_survives_atomic_publication(
+    monkeypatch,
+):
+    """Keep configured proof identity stable across serving cutover."""
+
+    await prove_effective_endpoint_activation_and_publication(monkeypatch)
 
 
 @pytest.mark.asyncio

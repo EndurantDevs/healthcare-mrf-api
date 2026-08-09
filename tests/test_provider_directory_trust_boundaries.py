@@ -3266,12 +3266,13 @@ async def test_artifact_stage_install_and_finish_fail_closed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_artifact_dataset_promotion_orders_pointer_changes(monkeypatch):
-    """Supersede, publish, and then cut over source aliases in that order."""
+    """Supersede, cut over source aliases, and then publish in that order."""
     dataset = _promotion_dataset()
     fence = importer.ProviderDirectoryArtifactDatasetFence((dataset,))
-    supersede = AsyncMock()
-    publish = AsyncMock()
-    cutover = AsyncMock()
+    events = []
+    supersede = AsyncMock(side_effect=lambda _dataset: events.append("supersede"))
+    publish = AsyncMock(side_effect=lambda _dataset: events.append("publish"))
+    cutover = AsyncMock(side_effect=lambda _fence: events.append("cutover"))
     monkeypatch.setattr(
         importer,
         "_supersede_artifact_dataset_incumbent",
@@ -3288,9 +3289,7 @@ async def test_artifact_dataset_promotion_orders_pointer_changes(monkeypatch):
         cutover,
     )
     await importer._promote_provider_directory_artifact_datasets(fence)
-    supersede.assert_awaited_once_with(dataset)
-    publish.assert_awaited_once_with(dataset)
-    cutover.assert_awaited_once_with(fence)
+    assert events == ["supersede", "cutover", "publish"]
 
 
 @pytest.mark.asyncio
