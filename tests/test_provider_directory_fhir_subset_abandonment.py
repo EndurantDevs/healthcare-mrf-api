@@ -316,6 +316,55 @@ async def test_store_retry_remains_idempotent_after_source_activation():
     )
 
 
+@pytest.mark.parametrize(
+    "failure_boundary",
+    ("isolation", "checkpoint_cas", "candidate_cas", "guard", "replay_guard"),
+)
+@pytest.mark.asyncio
+async def test_store_fails_closed_at_each_transactional_boundary(
+    monkeypatch,
+    failure_boundary,
+):
+    """Reject isolation, CAS, and relational-validation drift without success."""
+
+    database = AbandonmentDatabase(already_applied=failure_boundary == "replay_guard")
+    if failure_boundary == "isolation":
+        original_scalar = database.scalar
+
+        async def scalar(statement, **parameters):
+            if "transaction_isolation" in statement:
+                database.calls.append(("scalar", statement, parameters))
+                return "repeatable read"
+            return await original_scalar(statement, **parameters)
+
+        monkeypatch.setattr(database, "scalar", scalar)
+    elif failure_boundary in {"guard", "replay_guard"}:
+        database.valid = False
+    else:
+        original_status = database.status
+        failed_relation = (
+            "pagination_checkpoint"
+            if failure_boundary == "checkpoint_cas"
+            else "endpoint_dataset"
+        )
+
+        async def status(statement, **parameters):
+            if "UPDATE" in statement and failed_relation in statement:
+                database.calls.append(("status", statement, parameters))
+                return 0
+            return await original_status(statement, **parameters)
+
+        monkeypatch.setattr(database, "status", status)
+
+    with pytest.raises(ReviewedSubsetAbandonmentError) as error:
+        await sync_reviewed_subset_abandonment_transaction(
+            database,
+            "source-a",
+            RESOURCE_TYPES,
+        )
+    assert error.value.code == "state"
+
+
 @pytest.mark.asyncio
 async def test_operator_is_selector_free_and_gate_bound(monkeypatch):
     database = AbandonmentDatabase()
