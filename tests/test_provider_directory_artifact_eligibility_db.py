@@ -14,7 +14,6 @@ from sqlalchemy.exc import OperationalError
 from db.connection import Database
 from tests.provider_directory_subset_completion_pg_setup import (
     install_subset_canonical_functions,
-    load_migration,
 )
 from tests.provider_directory_artifact_eligibility_support import (
     content_proof as _content_proof,
@@ -77,10 +76,6 @@ async def _create_tables(database: Database, schema: str) -> None:
         """
     )
     await install_subset_canonical_functions(database, schema)
-    migration = load_migration()
-    await database.status(
-        migration._content_proof_valid_function_sql(schema)
-    )
 
 
 def _source_metadata(
