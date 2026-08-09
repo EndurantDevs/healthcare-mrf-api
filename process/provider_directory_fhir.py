@@ -57750,28 +57750,31 @@ def _is_resource_diagnostic_acquisition_complete(
 
 
 async def _reset_unexpected_empty_pagination_checkpoint(
-    source: dict[str, Any],
+    source_record: dict[str, Any],
     resource_type: str,
     page_count: int,
-    result: ResourceFetchResult,
+    fetch_result: ResourceFetchResult,
 ) -> None:
-    context = source.get("_pagination_checkpoint_context")
+    checkpoint_context = source_record.get("_pagination_checkpoint_context")
     if (
-        not isinstance(context, PaginationCheckpointContext)
-        or result.error != CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR
+        not isinstance(checkpoint_context, PaginationCheckpointContext)
+        or fetch_result.error not in {
+            CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR,
+            EXPECTED_NONEMPTY_RESOURCE_ERROR,
+        }
     ):
         return
-    start_urls = _partitioned_resource_start_urls(
-        source,
+    resource_start_urls = _partitioned_resource_start_urls(
+        source_record,
         resource_type,
         page_count=page_count,
     )
-    if len(start_urls) != 1:
+    if len(resource_start_urls) != 1:
         return
     await _save_pagination_checkpoint(
-        context,
+        checkpoint_context,
         resource_type,
-        next_url=start_urls[0],
+        next_url=resource_start_urls[0],
         pages_processed=0,
         rows_processed=0,
         recent_url_hashes=[],
