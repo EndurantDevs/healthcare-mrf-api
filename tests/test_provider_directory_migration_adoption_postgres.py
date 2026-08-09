@@ -77,6 +77,17 @@ _EXPECTED_SUBSET_COLUMN_SHAPES = {
         "acquired_resource_sha256",
     ): ("character varying(64)", False, False),
 }
+_EXPECTED_ACTIVATION_FUNCTIONS = {
+    "provider_directory_reviewed_subset_activation_valid",
+    "guard_provider_directory_reviewed_subset_activation_source",
+    "guard_provider_directory_reviewed_subset_activation_dataset",
+}
+_EXPECTED_ACTIVATION_TRIGGERS = {
+    "provider_directory_reviewed_subset_activation_source_guard",
+    "provider_directory_reviewed_subset_source_truncate_guard",
+    "provider_directory_reviewed_subset_activation_dataset_guard",
+    "provider_directory_reviewed_subset_dataset_truncate_guard",
+}
 
 RUNTIME_SCHEMA_SEED = r"""
 import asyncio
@@ -252,11 +263,100 @@ async def _assert_subset_completion_column_shapes(
     assert observed_shapes_by_column == _EXPECTED_SUBSET_COLUMN_SHAPES
 
 
+async def _activation_object_shape_records(
+    database_url,
+    schema_name: str,
+) -> tuple[list, list]:
+    """Read the installed activation function and trigger identities."""
+
+    connection = await _connect(database_url)
+    try:
+        function_records = await connection.fetch(
+            """
+            SELECT function_row.proname, function_row.prosecdef,
+                   function_row.proconfig
+              FROM pg_catalog.pg_proc AS function_row
+              JOIN pg_catalog.pg_namespace AS function_namespace
+                ON function_namespace.oid = function_row.pronamespace
+             WHERE function_namespace.nspname = $1
+               AND function_row.proname = ANY($2::text[])
+            """,
+            schema_name,
+            sorted(_EXPECTED_ACTIVATION_FUNCTIONS),
+        )
+        trigger_records = await connection.fetch(
+            """
+            SELECT trigger_row.tgname,
+                   trigger_row.tgenabled::text AS tgenabled
+              FROM pg_catalog.pg_trigger AS trigger_row
+              JOIN pg_catalog.pg_class AS relation
+                ON relation.oid = trigger_row.tgrelid
+              JOIN pg_catalog.pg_namespace AS relation_namespace
+                ON relation_namespace.oid = relation.relnamespace
+             WHERE relation_namespace.nspname = $1
+               AND trigger_row.tgname = ANY($2::text[])
+               AND trigger_row.tgisinternal IS FALSE
+            """,
+            schema_name,
+            sorted(_EXPECTED_ACTIVATION_TRIGGERS),
+        )
+    finally:
+        await connection.close()
+    return function_records, trigger_records
+
+
+def _assert_activation_function_shapes(function_records) -> None:
+    """Require the three hardened activation functions."""
+
+    assert {
+        function_record["proname"] for function_record in function_records
+    } == (
+        _EXPECTED_ACTIVATION_FUNCTIONS
+    )
+    assert all(
+        function_record["prosecdef"] is True
+        for function_record in function_records
+    )
+    assert all(
+        function_record["proconfig"] == ["search_path=pg_catalog"]
+        for function_record in function_records
+    )
+
+
+def _assert_activation_trigger_shapes(trigger_records) -> None:
+    """Require the four activation triggers to remain ENABLE ALWAYS."""
+
+    assert {
+        trigger_record["tgname"] for trigger_record in trigger_records
+    } == (
+        _EXPECTED_ACTIVATION_TRIGGERS
+    )
+    assert all(
+        trigger_record["tgenabled"] == "A"
+        for trigger_record in trigger_records
+    )
+
+
+async def _assert_activation_object_shapes(
+    database_url,
+    schema_name: str,
+) -> None:
+    """Require the hardened activation functions and ALWAYS triggers."""
+
+    function_records, trigger_records = await _activation_object_shape_records(
+        database_url,
+        schema_name,
+    )
+    _assert_activation_function_shapes(function_records)
+    _assert_activation_trigger_shapes(trigger_records)
+
+
 async def _assert_adopted_schema(database_url, schema_name: str) -> None:
     """Require the exact adopted index and subset-proof column shapes."""
 
     await _assert_active_index_shape(database_url, schema_name)
     await _assert_subset_completion_column_shapes(database_url, schema_name)
+    await _assert_activation_object_shapes(database_url, schema_name)
 
 
 def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():

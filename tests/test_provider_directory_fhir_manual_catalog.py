@@ -146,7 +146,6 @@ def test_reviewed_manifest_seed_binds_exact_identity_without_cutoff():
         "_lastUpdated" not in start_url
         for start_url in metadata[CURRENT_VERSION_CENSUS_START_URLS_FIELD].values()
     )
-
     request = current_version_census_request(
         _reviewed_subset_task(entry),
         allowed_resources=importer.DEFAULT_RESOURCES,
@@ -167,6 +166,14 @@ def test_reviewed_manifest_seed_binds_exact_identity_without_cutoff():
     assert metadata[CURRENT_VERSION_CENSUS_START_URLS_FIELD] == entry[
         "manual_current_version_census"
     ]["start_urls"]
+
+
+def test_reviewed_manual_source_resolves_without_runtime_selector():
+    entry = _manual_entry()
+
+    assert manual_catalog.reviewed_manual_census_source_id() == (
+        entry["source_ids"][0]
+    )
 
 
 @pytest.mark.parametrize("manual_only", (False, None))
@@ -310,6 +317,13 @@ def test_manual_manifest_rejects_source_identity_drift(tmp_path):
 
     with pytest.raises(RuntimeError, match="source_identity_drift"):
         _load_mutated_manifest(tmp_path, mutate)
+
+    manifest = copy.deepcopy(_manifest_document())
+    mutate(_manual_entry(manifest))
+    with pytest.raises(RuntimeError, match="source_identity_drift"):
+        manual_catalog.reviewed_manual_census_source_id(
+            manifest_path=_write_manifest(tmp_path, manifest)
+        )
 
 
 class _CatalogResolved(Exception):

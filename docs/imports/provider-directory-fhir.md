@@ -176,6 +176,11 @@ Direct database publication and source-catalog mutations use PostgreSQL
 isolation levels so a stale transaction snapshot cannot bypass the final
 source and sole-alias check.
 
+After two roots match, use the separate
+[reviewed subset state-sync runbook](provider-directory-reviewed-subset-activation.md)
+to review the neutral desired-state evidence and activate the source. The
+selector-free state sync is default-off and does not publish a dataset.
+
 Resolve the single reviewed manual entry from the manifest and freeze one
 timezone-aware cutoff for the acquisition pair:
 

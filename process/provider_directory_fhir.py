@@ -151,6 +151,10 @@ from process.provider_directory_fhir_subset_completion import (
 from process.provider_directory_fhir_subset_identity import (
     server_issued_subset_source_scope_payload,
 )
+from process.provider_directory_fhir_subset_activation_contract import (
+    ACTIVATION_METADATA_KEY as REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+    VERIFIED_STATUS as REVIEWED_SUBSET_VERIFIED_STATUS,
+)
 from process.provider_directory_fhir_manual_catalog import (
     reviewed_manual_census_seed_rows,
 )
@@ -18336,6 +18340,7 @@ async def _lock_and_verify_artifact_dataset_fence(
     if not fence.datasets:
         return
     query_executor = executor or db
+    await _lock_artifact_fence_endpoint_advisories(fence, query_executor)
     await _lock_artifact_fence_endpoints(fence, query_executor)
     locked_alias_rows = await _lock_artifact_fence_aliases(
         fence,
@@ -18356,6 +18361,20 @@ async def _lock_and_verify_artifact_dataset_fence(
         locked_dataset_rows,
         eligible_ids_by_endpoint,
     )
+
+
+async def _lock_artifact_fence_endpoint_advisories(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    executor: Any,
+) -> None:
+    """Serialize each endpoint before taking source or dataset row locks."""
+
+    for endpoint_id in fence.endpoint_ids:
+        await executor.status(
+            "SELECT pg_catalog.pg_advisory_xact_lock("
+            "pg_catalog.hashtextextended(:endpoint_id, 0));",
+            endpoint_id=endpoint_id,
+        )
 
 
 async def _lock_artifact_cutover_fence(
@@ -35193,6 +35212,76 @@ def _location_address_key_update_sql(
     )
 
 
+def _preserved_source_activation_expression(
+    target_metadata: Any,
+    merged_metadata: Any,
+) -> Any:
+    """Keep an existing sealed activation marker across catalog upserts."""
+
+    activation_marker = target_metadata.op("->")(
+        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY
+    )
+    preserved_activation = func.jsonb_build_object(
+        "provider_directory_candidate_status",
+        REVIEWED_SUBSET_VERIFIED_STATUS,
+        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+        activation_marker,
+    )
+    return case(
+        (
+            func.jsonb_typeof(activation_marker) == "object",
+            merged_metadata.op("||")(preserved_activation),
+        ),
+        else_=merged_metadata,
+    )
+
+
+def _preserved_source_activation_sql(
+    target_metadata: str,
+    merged_metadata: str,
+) -> str:
+    """Render COPY-upsert parity for sealed activation preservation."""
+
+    activation_key = REVIEWED_SUBSET_ACTIVATION_METADATA_KEY
+    return (
+        "CASE WHEN pg_catalog.jsonb_typeof("
+        f"{target_metadata} -> '{activation_key}') = 'object' "
+        f"THEN ({merged_metadata}) || pg_catalog.jsonb_build_object("
+        "'provider_directory_candidate_status', "
+        f"'{REVIEWED_SUBSET_VERIFIED_STATUS}', "
+        f"'{activation_key}', {target_metadata} -> '{activation_key}') "
+        f"ELSE {merged_metadata} END"
+    )
+
+
+def _source_metadata_update_expression(table, excluded_value):
+    target_metadata = func.coalesce(
+        table.c.metadata_json.cast(JSONB), func.jsonb_build_object()
+    )
+    incoming_metadata = func.coalesce(
+        excluded_value.cast(JSONB), func.jsonb_build_object()
+    )
+    effective_metadata = _preserved_source_activation_expression(
+        target_metadata,
+        target_metadata.op("||")(incoming_metadata),
+    )
+    return case(
+        (
+            func.coalesce(
+                incoming_metadata.op("->>")(
+                    "provider_directory_acquisition_enabled"
+                ),
+                "false",
+            )
+            == "true",
+            effective_metadata.op("-")(
+                "provider_directory_acquisition_blocked_reason"
+            ),
+        ),
+        else_=effective_metadata,
+    )
+
+
 def _effective_update_expression(table, statement, column: str):
     excluded_value = getattr(statement.excluded, column)
     if (
@@ -35222,28 +35311,7 @@ def _effective_update_expression(table, statement, column: str):
     ):
         return func.coalesce(table.c.endpoint_id, excluded_value)
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
-        target_metadata = func.coalesce(
-            table.c.metadata_json.cast(JSONB), func.jsonb_build_object()
-        )
-        incoming_metadata = func.coalesce(
-            excluded_value.cast(JSONB), func.jsonb_build_object()
-        )
-        merged_metadata = target_metadata.op("||")(incoming_metadata)
-        return case(
-            (
-                func.coalesce(
-                    incoming_metadata.op("->>")(
-                        "provider_directory_acquisition_enabled"
-                    ),
-                    "false",
-                )
-                == "true",
-                merged_metadata.op("-")(
-                    "provider_directory_acquisition_blocked_reason"
-                ),
-            ),
-            else_=merged_metadata,
-        )
+        return _source_metadata_update_expression(table, excluded_value)
     if table.name == ProviderDirectorySource.__tablename__ and column in PROVIDER_DIRECTORY_SOURCE_PROBE_STATE_COLUMNS:
         return case(
             (statement.excluded.last_probe_status.is_(None), getattr(table.c, column)),
@@ -35252,6 +35320,34 @@ def _effective_update_expression(table, statement, column: str):
     if column == "address_key" and _should_preserve_null_location_address_key(table):
         return _location_address_key_update_expression(table, statement.excluded)
     return excluded_value
+
+
+def _source_metadata_update_sql(
+    column: str,
+    *,
+    target_prefix: str,
+    incoming_prefix: str,
+) -> str:
+    quoted = _q(column)
+    target_metadata = (
+        f"COALESCE({target_prefix}.{quoted}::jsonb, '{{}}'::jsonb)"
+    )
+    merged_metadata = (
+        f"{target_metadata} || "
+        f"COALESCE({incoming_prefix}.{quoted}::jsonb, '{{}}'::jsonb)"
+    )
+    effective_metadata = _preserved_source_activation_sql(
+        target_metadata,
+        merged_metadata,
+    )
+    return (
+        "CASE WHEN COALESCE("
+        f"{incoming_prefix}.{quoted}::jsonb ->> "
+        "'provider_directory_acquisition_enabled', 'false') = 'true' "
+        f"THEN ({effective_metadata}) - "
+        "'provider_directory_acquisition_blocked_reason' "
+        f"ELSE {effective_metadata} END"
+    )
 
 
 def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_prefix: str) -> str:
@@ -35285,18 +35381,10 @@ def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_pr
             f"{incoming_prefix}.{_q(column)})"
         )
     if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
-        quoted = _q(column)
-        merged_metadata = (
-            f"COALESCE({target_prefix}.{quoted}::jsonb, '{{}}'::jsonb) "
-            f"|| COALESCE({incoming_prefix}.{quoted}::jsonb, '{{}}'::jsonb)"
-        )
-        return (
-            "CASE WHEN COALESCE("
-            f"{incoming_prefix}.{quoted}::jsonb ->> "
-            "'provider_directory_acquisition_enabled', 'false') = 'true' "
-            f"THEN ({merged_metadata}) - "
-            "'provider_directory_acquisition_blocked_reason' "
-            f"ELSE {merged_metadata} END"
+        return _source_metadata_update_sql(
+            column,
+            target_prefix=target_prefix,
+            incoming_prefix=incoming_prefix,
         )
     if table.name == ProviderDirectorySource.__tablename__ and column in PROVIDER_DIRECTORY_SOURCE_PROBE_STATE_COLUMNS:
         quoted = _q(column)
@@ -38858,8 +38946,14 @@ def _resource_access_probe_url(
         "canonical_api_base": candidate_base,
     }
     census_contract = current_version_census_contract(source_record)
+    contract_page_count = (
+        census_contract.page_count
+        if census_contract is not None
+        and census_contract.page_count is not None
+        else 1
+    )
     resource_url = (
-        census_contract.start_url(resource_type, 1)
+        census_contract.start_url(resource_type, contract_page_count)
         if census_contract is not None
         else _resource_start_url(
             resource_probe_source_map,

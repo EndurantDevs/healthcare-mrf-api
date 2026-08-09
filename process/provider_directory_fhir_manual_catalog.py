@@ -35,9 +35,8 @@ from process.provider_directory_fhir_census_contract import (
 )
 
 
-DEFAULT_MANUAL_SOURCE_MANIFEST = (
-    Path(__file__).resolve().parents[1]
-    / "specs/provider_directory_endpoint_acquisition_manifest.json"
+DEFAULT_MANUAL_SOURCE_MANIFEST = Path(__file__).resolve().parents[1] / (
+    "specs/provider_directory_endpoint_acquisition_manifest.json"
 )
 MANUAL_ACQUISITION_CLASSIFICATION = "manual_acquisition"
 MANUAL_ACQUISITION_LAUNCH_MODE = "manual"
@@ -52,12 +51,8 @@ MANUAL_CURRENT_VERSION_CENSUS_RESOURCES = (
     "HealthcareService",
     "OrganizationAffiliation",
 )
-MANUAL_SOURCE_PENDING_STATUS = (
-    "pending_two_matching_reviewed_subset_acquisitions"
-)
-MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD = (
-    "provider_directory_verification_campaign_id"
-)
+MANUAL_SOURCE_PENDING_STATUS = "pending_two_matching_reviewed_subset_acquisitions"
+MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD = "provider_directory_verification_campaign_id"
 _MANUAL_ENTRY_FIELDS = frozenset(
     {
         "entry_id",
@@ -93,9 +88,7 @@ _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 
 
 def _manifest_error(reason: str) -> RuntimeError:
-    return RuntimeError(
-        f"provider_directory_manual_source_manifest_invalid:{reason}"
-    )
+    return RuntimeError(f"provider_directory_manual_source_manifest_invalid:{reason}")
 
 
 def _strict_text(value: Any, *, field_name: str) -> str:
@@ -124,10 +117,24 @@ def _has_persisted_cutoff(value: Any) -> bool:
     return False
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate manifest members at every JSON object depth."""
+
+    object_by_field: dict[str, Any] = {}
+    for field_name, value in pairs:
+        if field_name in object_by_field:
+            raise ValueError("duplicate manifest field")
+        object_by_field[field_name] = value
+    return object_by_field
+
+
 def _load_manifest(manifest_path: Path) -> dict[str, Any]:
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_json_object,
+        )
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise _manifest_error("document_unreadable") from exc
     if (
         type(manifest) is not dict
@@ -145,17 +152,20 @@ def _manual_entry_for_source(
     requested_source_id: str,
 ) -> dict[str, Any]:
     matching_entries = []
+    source_owner_count = 0
     for raw_entry in manifest["entries"]:
         if type(raw_entry) is not dict:
             raise _manifest_error("entry_shape")
-        if raw_entry.get("classification") != MANUAL_ACQUISITION_CLASSIFICATION:
-            continue
         raw_source_ids = raw_entry.get("source_ids")
         if type(raw_source_ids) is not list:
             raise _manifest_error("source_ids_invalid")
         if requested_source_id in raw_source_ids:
+            source_owner_count += 1
+        if raw_entry.get("classification") != MANUAL_ACQUISITION_CLASSIFICATION:
+            continue
+        if requested_source_id in raw_source_ids:
             matching_entries.append(raw_entry)
-    if len(matching_entries) != 1:
+    if len(matching_entries) != 1 or source_owner_count != 1:
         raise _manifest_error("source_resolution_ambiguous")
     return matching_entries[0]
 
@@ -383,8 +393,8 @@ def _manual_seed_row(entry: Mapping[str, Any]) -> dict[str, Any]:
         "source_detail": "reviewed manual server-issued traversal subset source",
         "source_url": canonical_base,
         "note": (
-            "Manual-only source pending two matching reviewed subset acquisitions; "
-            "publication is not authorized."
+            "Manual-only source state is controlled by reviewed subset evidence; "
+            "publication remains separately proof-gated."
         ),
         "metadata_json": _manual_seed_metadata(
             entry,
@@ -462,3 +472,29 @@ def reviewed_manual_census_seed_rows(
     raw_entry = _manual_entry_for_source(manifest, source_id)
     entry = _validated_manual_entry(raw_entry, source_id)
     return [_manual_seed_row(entry)]
+
+
+def reviewed_manual_census_source_id(
+    *,
+    manifest_path: Path = DEFAULT_MANUAL_SOURCE_MANIFEST,
+) -> str:
+    """Resolve the sole reviewed manual source without accepting a selector."""
+
+    manifest = _load_manifest(manifest_path)
+    manual_entries = [
+        raw_entry
+        for raw_entry in manifest["entries"]
+        if type(raw_entry) is dict
+        and raw_entry.get("classification")
+        == MANUAL_ACQUISITION_CLASSIFICATION
+    ]
+    if len(manual_entries) != 1:
+        raise _manifest_error("source_resolution_ambiguous")
+    source_ids = manual_entries[0].get("source_ids")
+    if type(source_ids) is not list or len(source_ids) != 1:
+        raise _manifest_error("source_ids_invalid")
+    source_id = _strict_text(source_ids[0], field_name="source_id")
+    resolved_entry = _manual_entry_for_source(manifest, source_id)
+    validated_entry = _validated_manual_entry(resolved_entry, source_id)
+    _manual_seed_row(validated_entry)
+    return source_id

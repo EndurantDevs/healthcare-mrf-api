@@ -93,7 +93,8 @@ async def extend_source_fixture_table(scenario):
             ADD COLUMN requires_registration boolean NOT NULL DEFAULT false,
             ADD COLUMN requires_api_key boolean NOT NULL DEFAULT false,
             ADD COLUMN auth_type varchar(64),
-            ADD COLUMN metadata_json jsonb
+            ADD COLUMN metadata_json jsonb,
+            ADD COLUMN updated_at timestamp
         """
     )
 

@@ -82,6 +82,19 @@ def _executor(*query_results):
     return executor
 
 
+def _assert_endpoint_advisories(executor, expected_endpoint_ids) -> None:
+    """Require endpoint advisory locks in deterministic sorted order."""
+
+    advisory_calls = [
+        call
+        for call in executor.status.await_args_list
+        if "pg_advisory_xact_lock" in call.args[0]
+    ]
+    assert [call.kwargs["endpoint_id"] for call in advisory_calls] == (
+        expected_endpoint_ids
+    )
+
+
 def test_candidate_eligibility_projection_is_compact_and_fail_closed():
     projection_sql = importer._artifact_candidate_eligibility_ctes(
         "dataset_table"
@@ -108,6 +121,8 @@ def test_candidate_eligibility_projection_is_compact_and_fail_closed():
 
 @pytest.mark.asyncio
 async def test_locked_fence_ignores_ineligible_old_generation_candidate():
+    """Lock only the exact reviewed candidate after endpoint serialization."""
+
     candidate = _promotion_dataset()
     fence = importer.ProviderDirectoryArtifactDatasetFence(
         (candidate,),
@@ -151,6 +166,10 @@ async def test_locked_fence_ignores_ineligible_old_generation_candidate():
 
     await importer._lock_and_verify_artifact_dataset_fence(fence, executor)
 
+    _assert_endpoint_advisories(
+        executor,
+        ["candidate_endpoint", "serving_endpoint_old"],
+    )
     eligibility_sql = executor.all.await_args_list[-1].args[0]
     assert "artifact_candidate_metadata" in eligibility_sql
     assert "jsonb_to_record" in eligibility_sql
