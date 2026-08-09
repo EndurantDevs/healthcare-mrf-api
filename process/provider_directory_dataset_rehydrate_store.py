@@ -114,6 +114,42 @@ async def _save_checkpoint(
     )
 
 
+async def _sync_canonical_payload_hashes(
+    context: ResourceContext,
+    typed_rows: list[dict[str, object]],
+) -> None:
+    """Preserve each validated immutable dataset hash in canonical output."""
+
+    resource_ids = sorted(
+        {
+            _clean_text(typed_row_by_field.get("resource_id"))
+            for typed_row_by_field in typed_rows
+        }
+        - {""}
+    )
+    if not resource_ids:
+        return
+    await context.runtime.database.status(
+        f"""
+        UPDATE {_table_ref(context.runtime.schema, CANONICAL_TABLE)} AS canonical
+           SET payload_hash = retained.payload_hash
+          FROM {_table_ref(context.runtime.schema, DATASET_RESOURCE_TABLE)} AS retained
+         WHERE retained.dataset_id=:dataset_id
+           AND retained.resource_type=:resource_type
+           AND retained.resource_id=ANY(CAST(:resource_ids AS varchar[]))
+           AND canonical.canonical_api_base=:canonical_base
+           AND canonical.resource_type=retained.resource_type
+           AND canonical.resource_id=retained.resource_id
+           AND canonical.last_seen_run_id=:root_run_id;
+        """,
+        dataset_id=context.scope.dataset_id,
+        resource_type=context.resource_type,
+        resource_ids=resource_ids,
+        canonical_base=context.scope.canonical_api_base,
+        root_run_id=context.scope.acquisition_root_run_id,
+    )
+
+
 def _checkpoint_key(context: ResourceContext) -> dict[str, str]:
     """Return SQL parameters identifying one resource checkpoint."""
     return {

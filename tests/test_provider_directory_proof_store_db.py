@@ -389,7 +389,10 @@ async def test_postgres_normal_fhir_batch_commits_resource_with_proof(
             ],
             run_id=ROOT_RUN_ID,
             track_seen=False,
-            dataset_id=DATASET_ID,
+            dataset_scope=importer.EndpointDatasetWriteScope(
+                DATASET_ID,
+                importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+            ),
         )
 
         assert written == 1

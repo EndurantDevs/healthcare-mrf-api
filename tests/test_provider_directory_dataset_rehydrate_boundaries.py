@@ -14,6 +14,7 @@ import pytest
 from db.models import ProviderDirectoryLocation, ProviderDirectoryPractitioner
 from process import provider_directory_dataset_rehydrate as rehydrate
 from process import provider_directory_dataset_rehydrate_scope as rehydrate_scope
+from process import provider_directory_dataset_rehydrate_store as rehydrate_store
 from process import provider_directory_dataset_rehydrate_types as rehydrate_types
 
 
@@ -218,13 +219,28 @@ async def test_rehydrate_executes_guard_digest_batch_proof_and_progress():
     assert result["dataset_id"] == "dataset-1"
     assert result["resources"]["Location"]["state"] == "complete"
     assert database.transaction_count == 2
-    assert [call[1]["state"] for call in database.status_calls] == [
+    assert [
+        parameters["state"]
+        for _statement, parameters in database.status_calls
+        if "state" in parameters
+    ] == [
         "running",
         "running",
         "complete",
     ]
+    assert sum(
+        "SET payload_hash = retained.payload_hash" in statement
+        for statement, _parameters in database.status_calls
+    ) == 1
     progress_callback.assert_awaited_once()
     assert "pg_advisory_unlock" in database.connection.calls[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_empty_hash_sync_skips_database_write():
+    database = _RehydrateDatabase()
+    await rehydrate_store._sync_canonical_payload_hashes(_context(database), [])
+    assert database.status_calls == []
 
 
 @pytest.mark.asyncio

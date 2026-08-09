@@ -30,6 +30,7 @@ from process.provider_directory_dataset_rehydrate import (
     RehydrationRuntime,
     rehydrate_current_dataset,
 )
+from process.provider_directory_resource_hash import resource_payload_sha256
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -66,6 +67,16 @@ def _fixture_payloads() -> tuple[dict[str, object], ...]:
             "city_name": "Louisville",
             "state_code": "KY",
             "postal_code": "40202",
+            "resource_url": (
+                f"https://directory.fixture.test/fhir/Location/location-{location_number}"
+            ),
+            "fhir_self_url": (
+                f"https://directory.fixture.test/fhir/Location/location-{location_number}"
+            ),
+            "fhir_fetch_url": (
+                f"https://directory.fixture.test/fhir/Location?page={location_number}"
+            ),
+            "fhir_fetch_mode": "rest_bundle",
         }
         for location_number in range(1, 4)
     )
@@ -302,6 +313,16 @@ async def _insert_extra_membership(database: Database) -> None:
             publication_metadata_hash="unused",
             published_at=None,
         ),
+    )
+
+
+def test_fixture_payloads_use_historical_transport_hashes():
+    """Keep the PostgreSQL fixture on the legacy read-compatibility path."""
+
+    assert all(
+        _payload_hash(mapped_payload)
+        != resource_payload_sha256(mapped_payload)
+        for mapped_payload in _fixture_payloads()
     )
 
 

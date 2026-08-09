@@ -24,6 +24,7 @@ from process.provider_directory_dataset_rehydrate_store import (
     _load_checkpoint,
     _load_resource_proof,
     _save_checkpoint,
+    _sync_canonical_payload_hashes,
 )
 from process.provider_directory_dataset_rehydrate_types import (
     DATASET_RESOURCE_TABLE,
@@ -37,10 +38,12 @@ from process.provider_directory_dataset_rehydrate_types import (
     ResourceContext,
     RetainedBatch,
     _clean_text,
-    _payload_hash,
     _record_fields,
     _run_cancel_check,
     _table_ref,
+)
+from process.provider_directory_resource_hash import (
+    is_resource_payload_hash_match,
 )
 
 
@@ -247,6 +250,10 @@ async def _process_one_batch(
             raise DatasetRehydrationError(
                 "provider_directory_dataset_rehydrate_upsert_count_mismatch"
             )
+        await _sync_canonical_payload_hashes(
+            context,
+            retained_batch.typed_rows,
+        )
         next_checkpoint = _advance_checkpoint(
             checkpoint, retained_batch, mapped_count=mapped_count
         )
@@ -443,7 +450,7 @@ def _validate_payload(
     if (
         not resource_id
         or not isinstance(mapped_payload, dict)
-        or _payload_hash(mapped_payload) != stored_hash
+        or not is_resource_payload_hash_match(mapped_payload, stored_hash)
     ):
         return "payload_hash_mismatch"
     reserved_fields = {"source_id", "last_seen_run_id", "observed_at", "updated_at"}

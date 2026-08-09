@@ -48,6 +48,7 @@ from db.models import (
 )
 from scripts.research import provider_directory_fhir_harness as harness
 from process.provider_directory_proof_store import build_dataset_proof_shard
+from process.provider_directory_resource_hash import LEGACY_RESOURCE_HASH_CONTRACT
 from tests.provider_directory_fhir_subset_completion_support import (
     build_subset_contract,
 )
@@ -6693,6 +6694,8 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
 
 @pytest.mark.asyncio
 async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(monkeypatch):
+    """Keep one contract across immutable and compatibility hash writes."""
+
     upsert_calls = []
     persisted_proof = AsyncMock()
 
@@ -6706,11 +6709,7 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
 
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
     monkeypatch.setattr(importer.db, "transaction", fake_transaction)
-    monkeypatch.setattr(
-        importer,
-        "persist_dataset_proof_shard",
-        persisted_proof,
-    )
+    monkeypatch.setattr(importer, "persist_dataset_proof_shard", persisted_proof)
 
     resource_rows = [
         {
@@ -6729,7 +6728,10 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
         track_seen=False,
         canonical_api_base="https://payer.example/fhir",
         source_ids=["source_a"],
-        dataset_id="dataset_1",
+        dataset_scope=importer.EndpointDatasetWriteScope(
+            "dataset_1",
+            importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+        ),
     )
 
     assert written == 1
@@ -6781,6 +6783,7 @@ async def test_dataset_backed_upsert_can_defer_legacy_materialization(monkeypatc
         resource_rows,
         track_seen=False,
         dataset_id="dataset_1",
+        resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
     )
 
     assert written == 1
@@ -7012,6 +7015,7 @@ async def test_alohr_alias_group_uses_compatibility_owner(monkeypatch):
         None,
         None,
         "dataset_alohr",
+        importer.DEFAULT_RESOURCE_HASH_CONTRACT,
     )
     source_ids, diagnostics, counts, _linked, stats, _stale, _ready = (
         await importer._import_alohr_graphql_source_group(
@@ -13010,6 +13014,9 @@ def _published_endpoint_dataset_metadata_by_field():
         "selected_resources": ["Practitioner"],
         "expected_resources": ["Practitioner"],
         "source_ids": ["source_a"],
+        importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (
+            importer.DEFAULT_RESOURCE_HASH_CONTRACT
+        ),
         "resource_diagnostics": {
             "Practitioner": {
                 "complete": True,
@@ -23347,6 +23354,8 @@ def _checkpoint_validation_candidate(source_record, checkpoint_context):
 
 
 def _patch_candidate_checkpoint_flow(monkeypatch, checkpoint_context, endpoint_candidate):
+    """Install a synthetic candidate with its complete write contract."""
+
     events: list[str] = []
 
     @contextlib.asynccontextmanager
@@ -23357,12 +23366,9 @@ def _patch_candidate_checkpoint_flow(monkeypatch, checkpoint_context, endpoint_c
 
     async def fake_prepare(source_records, *_args, **_kwargs):
         prepared_source_lookup = dict(source_records[0])
-        prepared_source_lookup["_pagination_checkpoint_context"] = (
-            checkpoint_context
-        )
-        prepared_source_lookup["_endpoint_dataset_id"] = (
-            endpoint_candidate.dataset_id
-        )
+        prepared_source_lookup["_pagination_checkpoint_context"] = checkpoint_context
+        prepared_source_lookup["_endpoint_dataset_id"] = endpoint_candidate.dataset_id
+        prepared_source_lookup["_resource_hash_contract"] = endpoint_candidate.resource_hash_contract
         return [prepared_source_lookup], endpoint_candidate
 
     async def fake_fetch(source_lookup, _resource_type, **kwargs):
@@ -24929,6 +24935,7 @@ def _parallel_resource_source():
         **_cigna_checkpoint_source(),
         "_endpoint_id": "endpoint_a",
         "_endpoint_dataset_id": "dataset_a",
+        "_resource_hash_contract": importer.DEFAULT_RESOURCE_HASH_CONTRACT,
         "_partition_checkpoint_source_ids": ("source_a",),
         "_pagination_checkpoint_context": checkpoint_context,
     }
@@ -31614,7 +31621,10 @@ async def test_locked_endpoint_candidate_rejects_conflicts_and_validates_repairs
         "status": importer.ENDPOINT_DATASET_ACQUIRING,
         "is_current": False,
     }
-    candidate = _endpoint_candidate(repair_empty_orphan=True)
+    candidate = _endpoint_candidate(
+        repair_empty_orphan=True,
+        resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
+    )
     await importer._assert_locked_endpoint_candidate(connection, candidate)
     identity_check.assert_called_once()
 
