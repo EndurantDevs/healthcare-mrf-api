@@ -355,7 +355,7 @@ def _validated_selection_identity(
         and not context.root_policy.is_twin_root_required
     )
     if (
-        source_metadata.get("provider_directory_candidate_status")
+        _text(source_metadata.get("provider_directory_candidate_status"))
         not in expected_statuses
         or (
             context.root_policy is not None

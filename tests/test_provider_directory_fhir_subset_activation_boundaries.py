@@ -15,6 +15,7 @@ import pytest
 
 from process import provider_directory_fhir_subset_activation as activation
 from process import provider_directory_fhir_subset_activation_contract as contract
+from process import provider_directory_fhir_subset_activation_proofs as proofs
 from process import provider_directory_fhir_subset_activation_selection as selection
 from process import provider_directory_fhir_subset_activation_store as store
 from tests.provider_directory_fhir_subset_activation_support import (
@@ -199,8 +200,8 @@ def test_root_proof_and_metadata_boundaries(monkeypatch):
 
     with pytest.raises(activation.ReviewedSubsetActivationError):
         selection._metadata({"publication_metadata_json": None})
-    assert selection._root_neutral_proof(None) is None
-    assert selection._root_neutral_proof({"proof": None}) is None
+    assert proofs._root_neutral_proof(None) is None
+    assert proofs._root_neutral_proof({"proof": None}) is None
 
 
 def test_replay_and_coverage_digest_boundaries(monkeypatch):
@@ -228,19 +229,22 @@ def test_selection_rejects_invalid_source_status_shape():
     _source_record, _dataset_rows, evidence = activation_inputs()
     with pytest.raises(activation.ReviewedSubsetActivationError) as error:
         selection._selection_from_roots(
-            {
+            selection._SelectionContext(
+                source_by_field={
                 "source_id": "synthetic-source",
                 "metadata_json": {
                     "provider_directory_candidate_status": [],
                 },
-            },
-            {},
-            {},
-            {},
-            {},
-            evidence,
-            "endpoint-a",
-            evidence.source_contract_sha256,
+                },
+                baseline={},
+                candidate={},
+                baseline_metadata={},
+                candidate_metadata={},
+                evidence=evidence,
+                endpoint_id="endpoint-a",
+                source_contract_sha256=evidence.source_contract_sha256,
+                root_policy=None,
+            )
         )
     assert error.value.code == "evidence"
 
