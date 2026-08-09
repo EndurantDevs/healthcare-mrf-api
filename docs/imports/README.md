@@ -14,7 +14,7 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 | RC/POS code sets | `python main.py start code-sets` | none | official Revenue Center and CMS Place of Service labels in `code_catalog` |
 | MS-DRG reference | `python main.py start ms-drg` | none | CMS MS-DRG labels plus MS-DRG to ICD-10-CM/PCS grouping relationships |
 | Clinical reference | `python main.py start clinical-reference` | none | official-code condition, treatment, clinical-area, and crosswalk reference tables |
-| NPI | `python main.py start npi` | `process.NPI_finish` worker | NPPES provider directory import |
+| NPI | `python main.py start npi` | inline shutdown in `process.NPI` | NPPES provider directory import |
 | NUCC | `python main.py start nucc` | shutdown publish in worker | NUCC taxonomy import |
 | Geo | `python main.py start geo` | none | ZIP/city/state lookup support load |
 | Geo Census | `python main.py start geo-census` | none | Census ZIP/ZCTA profile metrics for local geo enrichment |

@@ -125,8 +125,8 @@ def test_schema_caches_fail_closed_and_expire_deterministically(monkeypatch):
     assert cache_by_key == {}
     assert npi._filter_cache_get() is None
     assert npi._filter_cache_set({"city": True}) == {"city": True}
-    assert npi._primary_total_cache_get() is None
-    assert npi._primary_total_cache_set(3) == 3
+    assert npi._primary_total_cache_get("publication-1") is None
+    assert npi._primary_total_cache_set("publication-1", 3) == 3
 
     monkeypatch.setattr(npi, "ENABLE_NPI_SCHEMA_CACHE", True)
     monkeypatch.setattr(npi.time, "monotonic", lambda: 1_000.0)
@@ -162,16 +162,24 @@ def test_schema_caches_fail_closed_and_expire_deterministically(monkeypatch):
     )
     assert npi._filter_cache_get() is None
 
-    monkeypatch.setattr(
-        npi,
-        "_NPI_PRIMARY_TOTAL_CACHE_STATE",
-        {"entry": None},
+
+
+def test_primary_total_cache_is_publication_scoped_and_expires(monkeypatch):
+    monkeypatch.setattr(npi, "ENABLE_NPI_SCHEMA_CACHE", True)
+    monkeypatch.setattr(npi.time, "monotonic", lambda: 1_000.0)
+    monkeypatch.setattr(npi, "_NPI_SCHEMA_CACHE_TTL_SECONDS", 100.0)
+    monkeypatch.setattr(npi, "_NPI_PRIMARY_TOTAL_CACHE_STATE", {"entry": None})
+
+    assert npi._primary_total_cache_get("publication-1") is None
+    npi._primary_total_cache_set("publication-1", 4)
+    assert npi._primary_total_cache_get("publication-1") == 4
+    assert npi._primary_total_cache_get("publication-2") is None
+    npi._NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] = (
+        0.0,
+        "publication-1",
+        4,
     )
-    assert npi._primary_total_cache_get() is None
-    npi._primary_total_cache_set(4)
-    assert npi._primary_total_cache_get() == 4
-    npi._NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] = (0.0, 4)
-    assert npi._primary_total_cache_get() is None
+    assert npi._primary_total_cache_get("publication-1") is None
 
 
 def test_model_table_and_limited_cache_boundaries(monkeypatch):

@@ -220,14 +220,17 @@ def _collect_distinct_carrier_matches(
         entry = distinct[carrier_key]
         entry["label"] = entry["label"] or carrier_label
         entry["count"] += 1
-        entry["importable"] = _has_cached_carrier_match(
+        is_importable = _has_cached_carrier_match(
             importable_match_cache_by_carrier,
             carrier_key,
             carrier_label,
             line_importable_candidates,
             matcher,
         )
-        entry["catalog"] = _has_cached_carrier_match(
+        entry["importable"] = is_importable
+        if is_importable:
+            catalog_match_cache_by_carrier[carrier_key] = True
+        entry["catalog"] = is_importable or _has_cached_carrier_match(
             catalog_match_cache_by_carrier,
             carrier_key,
             carrier_label,
@@ -235,6 +238,55 @@ def _collect_distinct_carrier_matches(
             matcher,
         )
     return distinct
+
+
+def _audit_carrier_line(
+    csv_rows: Sequence[Mapping[str, str]],
+    line: str,
+    column: str,
+    all_candidates: Sequence[Any],
+    importable_candidates: Sequence[Any],
+    matcher: Matcher,
+) -> tuple[CarrierCoverageStats, list[tuple[str, int]]]:
+    line_all_candidates = _filter_candidates_by_line(all_candidates, line)
+    line_importable_candidates = _filter_candidates_by_line(
+        importable_candidates,
+        line,
+    )
+    carrier_mentions = list(_iter_carrier_mentions(csv_rows, column))
+    distinct = _collect_distinct_carrier_matches(
+        csv_rows,
+        column=column,
+        line_all_candidates=line_all_candidates,
+        line_importable_candidates=line_importable_candidates,
+        matcher=matcher,
+    )
+    unmatched = sorted(
+        (
+            (str(entry["label"]), int(entry["count"]))
+            for entry in distinct.values()
+            if not entry["catalog"]
+        ),
+        key=lambda item: (-item[1], item[0].lower()),
+    )
+    distinct_catalog = sum(1 for entry in distinct.values() if entry["catalog"])
+    return CarrierCoverageStats(
+        line=line,
+        column=column,
+        mentions_total=len(carrier_mentions),
+        placeholders=sum(1 for _label, _key, is_placeholder in carrier_mentions if is_placeholder),
+        importable_mentions=sum(
+            int(entry["count"]) for entry in distinct.values() if entry["importable"]
+        ),
+        catalog_mentions=sum(
+            int(entry["count"]) for entry in distinct.values() if entry["catalog"]
+        ),
+        unmatched_mentions=sum(count for _label, count in unmatched),
+        distinct_total=len(distinct),
+        distinct_importable=sum(1 for entry in distinct.values() if entry["importable"]),
+        distinct_catalog=distinct_catalog,
+        distinct_unmatched=len(distinct) - distinct_catalog,
+    ), unmatched
 
 
 def audit_carrier_rows(
@@ -251,82 +303,16 @@ def audit_carrier_rows(
     csv_rows = list(client_rows)
 
     for line, column in line_columns:
-        line_all_candidates = _filter_candidates_by_line(all_candidates, line)
-        line_importable_candidates = _filter_candidates_by_line(importable_candidates, line)
-        mentions_total = 0
-        placeholders = 0
-        importable_mentions = 0
-        catalog_mentions = 0
-        unmatched_mentions = 0
-        distinct: dict[str, dict[str, Any]] = defaultdict(
-            lambda: {"label": "", "count": 0, "importable": False, "catalog": False}
-        )
-        importable_match_cache_by_carrier: dict[str, bool] = {}
-        catalog_match_cache_by_carrier: dict[str, bool] = {}
-
-        for carrier_label, carrier_key, is_placeholder in _iter_carrier_mentions(
-            csv_rows, column
-        ):
-            mentions_total += 1
-            if is_placeholder:
-                placeholders += 1
-                continue
-            entry = distinct[carrier_key]
-            entry["label"] = entry["label"] or carrier_label
-            entry["count"] += 1
-            has_importable_match = _has_cached_carrier_match(
-                importable_match_cache_by_carrier,
-                carrier_key,
-                carrier_label,
-                line_importable_candidates,
-                matcher,
-            )
-            if has_importable_match:
-                catalog_match_cache_by_carrier[carrier_key] = True
-            has_catalog_match = catalog_match_cache_by_carrier.get(carrier_key)
-            if has_catalog_match is None:
-                has_catalog_match = _has_cached_carrier_match(
-                    catalog_match_cache_by_carrier,
-                    carrier_key,
-                    carrier_label,
-                    line_all_candidates,
-                    matcher,
-                )
-            if has_importable_match:
-                importable_mentions += 1
-                entry["importable"] = True
-            if has_catalog_match:
-                catalog_mentions += 1
-                entry["catalog"] = True
-            if not has_catalog_match:
-                unmatched_mentions += 1
-
-        distinct_importable = sum(1 for entry in distinct.values() if entry["importable"])
-        distinct_catalog = sum(1 for entry in distinct.values() if entry["catalog"])
-        unmatched = sorted(
-            (
-                (str(entry["label"]), int(entry["count"]))
-                for entry in distinct.values()
-                if not entry["catalog"]
-            ),
-            key=lambda item: (-item[1], item[0].lower()),
+        line_stats, unmatched = _audit_carrier_line(
+            csv_rows,
+            line,
+            column,
+            all_candidates,
+            importable_candidates,
+            matcher,
         )
         unmatched_by_line[line] = unmatched
-        coverage_stats_list.append(
-            CarrierCoverageStats(
-                line=line,
-                column=column,
-                mentions_total=mentions_total,
-                placeholders=placeholders,
-                importable_mentions=importable_mentions,
-                catalog_mentions=catalog_mentions,
-                unmatched_mentions=unmatched_mentions,
-                distinct_total=len(distinct),
-                distinct_importable=distinct_importable,
-                distinct_catalog=distinct_catalog,
-                distinct_unmatched=len(distinct) - distinct_catalog,
-            )
-        )
+        coverage_stats_list.append(line_stats)
 
     return coverage_stats_list, unmatched_by_line
 

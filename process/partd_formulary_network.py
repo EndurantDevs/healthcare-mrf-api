@@ -287,68 +287,71 @@ def _row_index(row: dict[str, Any]) -> dict[str, Any]:
         index_by_normalized_key[_normalize_key(key)] = value
     return index_by_normalized_key
 
+_DISPENSING_FEE_CANDIDATES_BY_TARGET = {
+    "dispensing_fee_brand_30": (
+        "branddispensingfee30dayssupply",
+        "branddispensingfee30day",
+        "branddispensingfee30",
+        "brandfee30dayssupply",
+    ),
+    "dispensing_fee_brand_60": (
+        "branddispensingfee60dayssupply",
+        "branddispensingfee60day",
+        "branddispensingfee60",
+        "brandfee60dayssupply",
+    ),
+    "dispensing_fee_brand_90": (
+        "branddispensingfee90dayssupply",
+        "branddispensingfee90day",
+        "branddispensingfee90",
+        "brandfee90dayssupply",
+    ),
+    "dispensing_fee_generic_30": (
+        "genericdispensingfee30dayssupply",
+        "genericdispensingfee30day",
+        "genericdispensingfee30",
+        "genericfee30dayssupply",
+    ),
+    "dispensing_fee_generic_60": (
+        "genericdispensingfee60dayssupply",
+        "genericdispensingfee60day",
+        "genericdispensingfee60",
+        "genericfee60dayssupply",
+    ),
+    "dispensing_fee_generic_90": (
+        "genericdispensingfee90dayssupply",
+        "genericdispensingfee90day",
+        "genericdispensingfee90",
+        "genericfee90dayssupply",
+    ),
+    "dispensing_fee_selected_drug_30": (
+        "selecteddrugdispensingfee30dayssupply",
+        "selecteddrugdispensingfee30day",
+        "selecteddrugdispensingfee30",
+        "selecteddrugsdispensingfee30dayssupply",
+    ),
+    "dispensing_fee_selected_drug_60": (
+        "selecteddrugdispensingfee60dayssupply",
+        "selecteddrugdispensingfee60day",
+        "selecteddrugdispensingfee60",
+        "selecteddrugsdispensingfee60dayssupply",
+    ),
+    "dispensing_fee_selected_drug_90": (
+        "selecteddrugdispensingfee90dayssupply",
+        "selecteddrugdispensingfee90day",
+        "selecteddrugdispensingfee90",
+        "selecteddrugsdispensingfee90dayssupply",
+    ),
+}
+
+
 def _extract_dispensing_fee_fields(
     source_field_map: dict[str, Any],
 ) -> dict[str, float | None]:
     """Extract normalized dispensing fees from a source row."""
-    candidates_by_target = {
-        "dispensing_fee_brand_30": (
-            "branddispensingfee30dayssupply",
-            "branddispensingfee30day",
-            "branddispensingfee30",
-            "brandfee30dayssupply",
-        ),
-        "dispensing_fee_brand_60": (
-            "branddispensingfee60dayssupply",
-            "branddispensingfee60day",
-            "branddispensingfee60",
-            "brandfee60dayssupply",
-        ),
-        "dispensing_fee_brand_90": (
-            "branddispensingfee90dayssupply",
-            "branddispensingfee90day",
-            "branddispensingfee90",
-            "brandfee90dayssupply",
-        ),
-        "dispensing_fee_generic_30": (
-            "genericdispensingfee30dayssupply",
-            "genericdispensingfee30day",
-            "genericdispensingfee30",
-            "genericfee30dayssupply",
-        ),
-        "dispensing_fee_generic_60": (
-            "genericdispensingfee60dayssupply",
-            "genericdispensingfee60day",
-            "genericdispensingfee60",
-            "genericfee60dayssupply",
-        ),
-        "dispensing_fee_generic_90": (
-            "genericdispensingfee90dayssupply",
-            "genericdispensingfee90day",
-            "genericdispensingfee90",
-            "genericfee90dayssupply",
-        ),
-        "dispensing_fee_selected_drug_30": (
-            "selecteddrugdispensingfee30dayssupply",
-            "selecteddrugdispensingfee30day",
-            "selecteddrugdispensingfee30",
-            "selecteddrugsdispensingfee30dayssupply",
-        ),
-        "dispensing_fee_selected_drug_60": (
-            "selecteddrugdispensingfee60dayssupply",
-            "selecteddrugdispensingfee60day",
-            "selecteddrugdispensingfee60",
-            "selecteddrugsdispensingfee60dayssupply",
-        ),
-        "dispensing_fee_selected_drug_90": (
-            "selecteddrugdispensingfee90dayssupply",
-            "selecteddrugdispensingfee90day",
-            "selecteddrugdispensingfee90",
-            "selecteddrugsdispensingfee90dayssupply",
-        ),
-    }
+
     extracted_by_field: dict[str, float | None] = {}
-    for target_key, candidates in candidates_by_target.items():
+    for target_key, candidates in _DISPENSING_FEE_CANDIDATES_BY_TARGET.items():
         extracted_by_field[target_key] = _to_float(
             _row_value(source_field_map, *candidates)
         )
@@ -2598,6 +2601,9 @@ async def main(test_mode: bool = False, import_id: str | None = None):  # pragma
         )
     )
     return run_id
+
+
+queue_partd_formulary_import = main
 
 
 async def finish_main(

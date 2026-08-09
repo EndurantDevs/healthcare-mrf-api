@@ -8,18 +8,18 @@
     "collection_name_mismatch": 0,
     "comment_noise": 0,
     "confusable_function_names": 0,
-    "deep_nesting": 45,
+    "deep_nesting": 44,
     "function_name_shape": 0,
     "global_state_usage": 1,
     "inline_suppressions": 2,
     "long_files": 191,
-    "long_functions": 388,
+    "long_functions": 383,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
-    "too_many_locals": 144,
-    "too_many_parameters": 60
+    "too_many_locals": 142,
+    "too_many_parameters": 59
   },
   "issue_ids": {
     "ambiguous_function_names": [
@@ -38,7 +38,6 @@
     "confusable_function_names": [],
     "deep_nesting": [
       "deep_nesting:api/endpoint/npi.py:get_near_npi",
-      "deep_nesting:api/endpoint/npi.py:get_npi._update_address",
       "deep_nesting:api/endpoint/npi.py:list_providers.get_results",
       "deep_nesting:api/endpoint/plan.py:get_plan._unique",
       "deep_nesting:api/endpoint/pricing.py:autocomplete_procedures",
@@ -442,7 +441,6 @@
       "long_function:process/florida_mqa_profile.py:_facts_for_row",
       "long_function:process/florida_mqa_profile.py:_financial_responsibility_facts",
       "long_function:process/florida_mqa_profile.py:_iter_rows",
-      "long_function:process/florida_mqa_profile.py:_mapped_profile_data_fact",
       "long_function:process/florida_mqa_profile.py:_mark_failed_run_status",
       "long_function:process/florida_mqa_profile.py:_medical_cannabis_fact",
       "long_function:process/florida_mqa_profile.py:_normalized_pipe_values",
@@ -494,7 +492,6 @@
       "long_function:process/openaddresses.py:refresh_archive_geocodes_from_openaddresses_sharded",
       "long_function:process/openaddresses.py:shutdown",
       "long_function:process/partd_formulary_network.py:_activity_row_from_source",
-      "long_function:process/partd_formulary_network.py:_extract_dispensing_fee_fields",
       "long_function:process/partd_formulary_network.py:_flush_batches",
       "long_function:process/partd_formulary_network.py:_flush_batches._activity_stage_rows",
       "long_function:process/partd_formulary_network.py:_materialize_activity_snapshot",
@@ -648,7 +645,6 @@
       "long_function:scripts/research/provider_directory_coverage_audit.py:render_markdown",
       "long_function:scripts/research/provider_directory_fhir_harness.py:_fixture_resources",
       "long_function:scripts/research/provider_directory_fhir_harness.py:_run_cli_case",
-      "long_function:scripts/research/provider_directory_fhir_harness.py:_run_sql_typing_case_async",
       "long_function:scripts/research/ptg2_experiment.py:analyze_local_serving_sidecar_candidate",
       "long_function:scripts/research/ptg2_experiment.py:analyze_postgres_binary_candidate",
       "long_function:scripts/research/ptg2_experiment.py:analyze_postgres_posting_candidate",
@@ -660,7 +656,6 @@
       "long_function:scripts/research/ptg2_experiment.py:verify_local_import_against_original",
       "long_function:scripts/research/ptg2_experiment.py:write_serving_by_code_candidate",
       "long_function:scripts/research/ptg2_experiment.py:write_serving_by_provider_set_candidate",
-      "long_function:scripts/research/ptg_client_carrier_coverage_audit.py:audit_carrier_rows",
       "long_function:scripts/smoke/provider_directory_address_corroboration_smoke.py:_seed",
       "long_function:scripts/smoke/provider_directory_address_corroboration_smoke.py:run_smoke",
       "long_function:scripts/validation/ptg2_v3_capacity_gate.py:_validate_postgresql",
@@ -669,7 +664,6 @@
       "long_function:scripts/validation/ptg2_v3_capacity_gate.py:example_measurement",
       "long_function:scripts/validation/ptg2_v3_source_api_audit.py:AuditRunner._build_latency_reports",
       "long_function:tests/test_address_canonical_db.py:test_address_sql_is_parallel_safe",
-      "long_function:tests/test_florida_mqa_profile.py:test_composer_deduplicates_equal_cross_source_fact_and_keeps_both_evidence_paths",
       "long_function:tests/test_mrf_source_discovery.py:test_master_list_keeps_high_value_public_aliases",
       "long_function:tests/test_ptg2_shared_snapshot_publish_postgres.py:test_real_postgres_strict_shared_v3_publish_and_cache_free_reads",
       "long_function:tests/test_ptg2_v4_snapshot_maps.py:test_real_postgres_v4_root_pack_overlap_and_publication"
@@ -688,7 +682,6 @@
       "too_many_locals:api/endpoint/npi.py:_fetch_ffs_summary_overrides",
       "too_many_locals:api/endpoint/npi.py:_fetch_provider_enrichment_summary_map",
       "too_many_locals:api/endpoint/npi.py:_match_candidate_query",
-      "too_many_locals:api/endpoint/npi.py:_normalize_match_candidate_params",
       "too_many_locals:api/endpoint/npi.py:get_facility_connected_providers",
       "too_many_locals:api/endpoint/npi.py:get_near_npi",
       "too_many_locals:api/endpoint/npi.py:get_npi",
@@ -819,7 +812,6 @@
       "too_many_locals:scripts/research/ptg2_experiment.py:verify_local_import_against_original",
       "too_many_locals:scripts/research/ptg2_experiment.py:write_serving_by_code_candidate",
       "too_many_locals:scripts/research/ptg2_experiment.py:write_serving_by_provider_set_candidate",
-      "too_many_locals:scripts/research/ptg_client_carrier_coverage_audit.py:audit_carrier_rows",
       "too_many_locals:scripts/validation/ptg2_v3_capacity_gate.py:evaluate_evidence",
       "too_many_locals:tests/test_ptg2_shared_snapshot_publish_postgres.py:test_real_postgres_strict_shared_v3_publish_and_cache_free_reads",
       "too_many_locals:tests/test_ptg2_v4_snapshot_maps.py:test_real_postgres_v4_root_pack_overlap_and_publication"
@@ -883,8 +875,7 @@
       "too_many_parameters:process/ptg_parts/rust_scanner.py:_aiter_compact_serving_records_rust",
       "too_many_parameters:process/ptg_parts/rust_scanner.py:_iter_compact_serving_records_rust",
       "too_many_parameters:process/ptg_parts/source_pointers.py:_publish_ptg2_source_pointers",
-      "too_many_parameters:process/ptg_parts/source_pointers.py:_stage_ptg2_source_candidate",
-      "too_many_parameters:scripts/validation/ptg2_v3_capacity_gate.py:_example_signed_api_evidence_payload"
+      "too_many_parameters:process/ptg_parts/source_pointers.py:_stage_ptg2_source_candidate"
     ]
   },
   "one_time_debt_reset": {

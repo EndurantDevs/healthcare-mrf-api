@@ -64,20 +64,45 @@ async def test_filter_capabilities_use_cache_and_schema_results(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fast_primary_count_uses_cache_and_unified_scalar(monkeypatch):
-    monkeypatch.setattr(npi_module, "_primary_total_cache_get", lambda: 7)
+    publication_identity = "1:nppub1_" + "a" * 43
+    count_identity = publication_identity + "|address:npi-publication"
+    monkeypatch.setattr(
+        npi_module,
+        "_npi_canonical_publication_identity",
+        AsyncMock(return_value=publication_identity),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_address_serving_model",
+        AsyncMock(return_value=npi_module.NPIAddress),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_primary_total_cache_get",
+        lambda identity: 7 if identity == count_identity else None,
+    )
     assert await npi_module._fast_primary_npi_count() == 7
 
-    monkeypatch.setattr(npi_module, "_primary_total_cache_get", lambda: None)
+    monkeypatch.setattr(
+        npi_module,
+        "_primary_total_cache_get",
+        lambda _identity: None,
+    )
     monkeypatch.setattr(
         npi_module,
         "_address_serving_model",
         AsyncMock(return_value=npi_module.EntityAddressUnified),
     )
+    monkeypatch.setattr(
+        npi_module,
+        "_npi_count_cache_identity",
+        AsyncMock(return_value=publication_identity),
+    )
     monkeypatch.setattr(npi_module.db, "scalar", AsyncMock(return_value=9))
     monkeypatch.setattr(
         npi_module,
         "_primary_total_cache_set",
-        lambda value: value,
+        lambda identity, value: value if identity == publication_identity else 0,
     )
     assert await npi_module._fast_primary_npi_count() == 9
 

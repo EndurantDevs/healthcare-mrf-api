@@ -5841,15 +5841,20 @@ def _example_lifecycle_rows(
     )
 
 
+@dataclass(frozen=True)
+class _ExampleApiEvidenceIdentity:
+    process_instance_digest: str
+    run_digest: str
+    scope_digest: str
+    contention_run_id: str
+
+
 def _example_signed_api_evidence_payload(
     class_name: str,
     ordinal: int,
     process_started_at: datetime,
     server_observed_at: datetime,
-    process_instance_digest: str,
-    run_digest: str,
-    scope_digest: str,
-    contention_run_id: str,
+    identity: _ExampleApiEvidenceIdentity,
     latency_ms: int,
 ) -> dict[str, Any]:
     return {
@@ -5862,20 +5867,20 @@ def _example_signed_api_evidence_payload(
         "observation_ordinal": _API_OBSERVATION_ORDINAL,
         "page_limit": _API_PAGE_LIMIT,
         "path": _API_QUERY_PATH,
-        "process_instance_digest": process_instance_digest,
+        "process_instance_digest": identity.process_instance_digest,
         "process_started_at": _timestamp_text(process_started_at),
         "query_contract": _API_QUERY_CONTRACT_ID,
         "query_contract_digest": _API_QUERY_CONTRACT_DIGEST,
         "release_digest": EXAMPLE_RELEASE_DIGEST,
         "response_body_sha256": _synthetic_digest(f"synthetic-{class_name}-response-{ordinal}"),
         "response_status": 200,
-        "run_digest": run_digest,
-        "scope_digest": scope_digest,
+        "run_digest": identity.run_digest,
+        "scope_digest": identity.scope_digest,
         "semantic_query_digest": _synthetic_digest(f"synthetic-{class_name}-query-{ordinal}"),
         "server_received_at": _timestamp_text(server_observed_at),
         "server_observed_at": _timestamp_text(server_observed_at),
         "server_duration_ns": latency_ms * 1_000_000,
-        "contention_run_id": contention_run_id,
+        "contention_run_id": identity.contention_run_id,
         "semantic_class": class_name,
         "selection_method": _HTTP_SELECTION_METHODS[class_name],
         "selection_ordinal": ordinal,
@@ -5914,15 +5919,18 @@ def _example_http_class_rows(
         process_instance_digest = _synthetic_digest(
             f"synthetic-{class_name}-process-{ordinal}"
         )
+        identity = _ExampleApiEvidenceIdentity(
+            process_instance_digest=process_instance_digest,
+            run_digest=run_digest,
+            scope_digest=scope_digest,
+            contention_run_id=contention_run_id,
+        )
         signed_payload = _example_signed_api_evidence_payload(
             class_name,
             ordinal,
             process_started_at,
             server_observed_at,
-            process_instance_digest,
-            run_digest,
-            scope_digest,
-            contention_run_id,
+            identity,
             latency_ms,
         )
         signature = _EXAMPLE_API_EVIDENCE_PRIVATE_KEY.sign(

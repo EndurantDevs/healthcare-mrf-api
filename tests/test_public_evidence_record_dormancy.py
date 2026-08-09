@@ -123,16 +123,26 @@ raise SystemExit(bool(forbidden))
 
 def test_runtime_and_container_do_not_wire_record_contract() -> None:
     repository_root = Path(__file__).resolve().parents[1]
-    explicit_replay_executor = (
-        repository_root / "process" / "public_evidence_fhir_organization_replay.py"
-    )
+    authorized_record_adapters = {
+        repository_root / "process" / "npi_canonical_publication.py",
+        repository_root / "process" / "nppes_public_evidence_chain.py",
+        repository_root / "process" / "nppes_public_evidence_chain_rows.py",
+        repository_root / "process" / "nppes_public_evidence_replay.py",
+        repository_root / "process" / "nppes_public_evidence_rows.py",
+        repository_root / "process" / "public_evidence_fhir_organization_replay.py",
+    }
     runtime_paths = [repository_root / "main.py"]
     for package_name in ("api", "db", "process", "service"):
         runtime_paths.extend((repository_root / package_name).rglob("*.py"))
     for path in runtime_paths:
-        if path == explicit_replay_executor:
+        if path in authorized_record_adapters:
             continue
         assert "public_evidence.evidence_record" not in path.read_text(encoding="utf-8")
+    assert all(
+        "public_evidence.evidence_record"
+        in adapter_path.read_text(encoding="utf-8")
+        for adapter_path in authorized_record_adapters
+    )
     docker_text = (repository_root / "Dockerfile").read_text(encoding="utf-8")
     assert "evidence_record_contract" not in docker_text
 

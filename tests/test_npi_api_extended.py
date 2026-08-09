@@ -166,6 +166,11 @@ def _install_profile_transition_cache_dependencies(
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
     monkeypatch.setattr(
         npi_module,
+        "_npi_canonical_publication_identity",
+        AsyncMock(return_value="1:nppub1_" + "a" * 43),
+    )
+    monkeypatch.setattr(
+        npi_module,
         "_fetch_provider_directory_profile_map",
         profile_fetch,
     )
@@ -319,6 +324,11 @@ async def test_fast_has_insurance_count_global_uses_count_star_and_cache(monkeyp
     monkeypatch.setattr(npi_module, "db", types.SimpleNamespace(session=lambda: FakeSessionContext()))
     monkeypatch.setattr(npi_module, "ENABLE_NPI_SCHEMA_CACHE", True)
     monkeypatch.setattr(npi_module, "_NPI_HAS_INSURANCE_TOTAL_CACHE", {})
+    monkeypatch.setattr(
+        npi_module,
+        "_npi_canonical_publication_identity",
+        AsyncMock(return_value="1:nppub1_" + "a" * 43),
+    )
 
     first = await npi_module._fast_has_insurance_count(None, None)
     second = await npi_module._fast_has_insurance_count(None, None)
@@ -352,9 +362,14 @@ async def test_fast_has_insurance_count_city_uses_distinct(monkeypatch):
     monkeypatch.setattr(npi_module, "db", types.SimpleNamespace(session=lambda: FakeSessionContext()))
     monkeypatch.setattr(npi_module, "ENABLE_NPI_SCHEMA_CACHE", True)
     monkeypatch.setattr(npi_module, "_NPI_HAS_INSURANCE_TOTAL_CACHE", {})
+    monkeypatch.setattr(
+        npi_module,
+        "_npi_canonical_publication_identity",
+        AsyncMock(return_value="1:nppub1_" + "a" * 43),
+    )
 
-    value = await npi_module._fast_has_insurance_count("MIAMI", None)
-    assert value == 7
+    insurance_count = await npi_module._fast_has_insurance_count("MIAMI", None)
+    assert insurance_count == 7
     assert len(calls) == 1
     assert "count(distinct" in calls[0].lower()
 
@@ -485,6 +500,10 @@ async def test_get_all_returns_rows(monkeypatch):
     assert response_body["rows"][0]["phone_number"] == "3125551212"
     assert response_body["rows"][0]["phone_extension"] == "44"
     assert response_body["rows"][0]["fax_number_digits"] == "3125550199"
+    assert "employer_identification_number" not in response_body["rows"][0]
+    assert "parent_organization_tin" not in response_body["rows"][0]
+    assert "data_employer_identification_number" not in json.dumps(response_body)
+    assert "data_parent_organization_tin" not in json.dumps(response_body)
 
 
 def _build_near_row(npi_value: int) -> list:
@@ -539,6 +558,8 @@ async def test_get_near_npi(monkeypatch):
     assert response_body[0]["taxonomy_list"]
     assert response_body[0]["do_business_as"] == ['DBA']
     assert response_body[0]["phone_number"] == "2175550100"
+    assert "employer_identification_number" not in response_body[0]
+    assert "parent_organization_tin" not in response_body[0]
 
 
 @pytest.mark.asyncio
@@ -771,6 +792,8 @@ async def test_build_npi_details(monkeypatch):
     assert response_body["taxonomy_group_list"]
     assert response_body["taxonomy_group_list"] == [{"group": 2}]
     assert response_body["address_list"]
+    assert "employer_identification_number" not in response_body
+    assert "parent_organization_tin" not in response_body
 
 
 @pytest.mark.asyncio
@@ -1519,14 +1542,15 @@ async def test_get_npi_uses_cached_address(monkeypatch):
     assert response_body["address_list"][0]["lat"] == 40.0
 
 
-@pytest.mark.asyncio
-async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latless(monkeypatch):
+def _install_latless_detail_cache_collaborators(monkeypatch):
+    """Install a deterministic latless detail builder and cache identities."""
+
     monkeypatch.setenv("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "false")
     monkeypatch.setenv("HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE", "false")
-    build_calls = []
+    build_call_npis = []
 
     async def fake_build(_npi, **_kwargs):
-        build_calls.append(_npi)
+        build_call_npis.append(_npi)
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -1555,6 +1579,11 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
     monkeypatch.setattr(
         npi_module,
+        "_npi_canonical_publication_identity",
+        AsyncMock(return_value="1:nppub1_" + "a" * 43),
+    )
+    monkeypatch.setattr(
+        npi_module,
         "_provider_directory_address_overlay_serving_identity",
         AsyncMock(return_value="oid:101"),
     )
@@ -1567,6 +1596,14 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
     )
     monkeypatch.setattr(npi_module, "db", FakeDB())
     monkeypatch.setattr(npi_module, "download_it", AsyncMock(side_effect=AssertionError("unexpected geocode call")))
+    return build_call_npis
+
+
+@pytest.mark.asyncio
+async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latless(monkeypatch):
+    """Cache a latless detail response when synchronous geocoding is disabled."""
+
+    build_call_npis = _install_latless_detail_cache_collaborators(monkeypatch)
 
     request = types.SimpleNamespace(
         args={},
@@ -1578,7 +1615,7 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
     response_body = json.loads(first.body)
     assert response_body["address_list"][0]["lat"] is None
     assert first.body == second.body
-    assert len(build_calls) == 1
+    assert len(build_call_npis) == 1
 
 
 @pytest.mark.asyncio
@@ -1657,6 +1694,11 @@ async def test_get_npi_cache_tracks_address_overlay_serving_identity(
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE", npi_module.OrderedDict())
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 300.0)
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
+    monkeypatch.setattr(
+        npi_module,
+        "_npi_canonical_publication_identity",
+        AsyncMock(return_value="1:nppub1_" + "a" * 43),
+    )
     overlay_identity = AsyncMock(
         side_effect=["oid:101", "oid:101", "oid:202"]
     )

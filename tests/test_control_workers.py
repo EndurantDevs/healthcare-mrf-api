@@ -398,6 +398,47 @@ def test_ensure_worker_uses_explicit_ptg_lane(monkeypatch, tmp_path):
     assert captured_by_field["env"]["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
 
 
+def test_ensure_worker_targets_exact_npi_job(monkeypatch, tmp_path):
+    class FakeProcess:
+        pid = 790
+
+    captured_by_field: dict[str, object] = {}
+
+    monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
+
+    def fake_popen(cmd, *, env, **_kwargs):
+        captured_by_field["cmd"] = cmd
+        captured_by_field["env"] = env
+        return FakeProcess()
+
+    monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        control_workers,
+        "_is_pid_running",
+        lambda pid: pid == FakeProcess.pid,
+    )
+    monkeypatch.setattr(control_workers, "_is_pid_spec_match", lambda pid, spec: True)
+
+    worker_result_by_field = control_workers.ensure_worker(
+        {
+            "importer": "npi",
+            "run_id": "run_npi",
+            "job_id": "npi_start_run_npi",
+        }
+    )
+
+    assert worker_result_by_field["status"] == "started"
+    assert worker_result_by_field["items"][0]["worker_class"] == "process.NPI"
+    assert captured_by_field["cmd"][-2:] == ["worker-once", "process.NPI"]
+    assert captured_by_field["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:NPI"
+    assert captured_by_field["env"]["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.NPI"
+    assert (
+        captured_by_field["env"]["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"]
+        == "npi_start_run_npi"
+    )
+
+
 def test_ensure_worker_starts_entity_address_unified_shared_worker(monkeypatch, tmp_path):
     class FakeProcess:
         pid = 2468

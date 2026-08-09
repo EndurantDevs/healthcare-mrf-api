@@ -47,6 +47,24 @@ _CONTROL_RUN_NOT_MARKED = False
 logger = logging.getLogger(__name__)
 
 
+def _committed_target_result(
+    control_context: dict[str, Any],
+    *,
+    target_module: str,
+) -> dict[str, Any] | None:
+    """Return the exact NPI result already committed with its database state."""
+
+    context = control_context.get("context")
+    if (
+        target_module != "process.npi"
+        or not isinstance(context, dict)
+        or context.get("control_run_terminal_committed") is not True
+    ):
+        return None
+    committed_result = context.get("_control_committed_result")
+    return committed_result if type(committed_result) is dict else None
+
+
 @dataclass
 class _ControlRunHeartbeatPersistenceGate:
     """Coordinate heartbeat persistence and exact-run suppression."""
@@ -146,6 +164,67 @@ async def suppress_control_run_heartbeat_persistence(
             gate.suppression_depth -= 1
 
 
+async def _project_control_target_success(
+    run_id: str,
+    *,
+    target_function: str,
+    target_result: Any,
+    control_context: dict[str, Any],
+    run_shutdown: bool,
+    attempt_id: str | None,
+    attempt_started_at: str | None,
+) -> None:
+    """Project one successful target result through the terminal status seam."""
+
+    job_context_by_field = control_context.get("context") if run_shutdown else None
+    terminal_metrics = _terminal_metrics_from_result(target_result, context=job_context_by_field)
+    terminal_progress = _terminal_progress_from_result(
+        target_function,
+        target_result,
+    ) or _terminal_progress_from_result(target_function, terminal_metrics)
+    is_database_state_committed = bool(
+        isinstance(job_context_by_field, dict)
+        and job_context_by_field.get("control_run_terminal_committed")
+    )
+    terminal_projection = _mark_and_flush_terminal_control_run(
+        run_id,
+        phase_detail=(
+            str(terminal_progress["phase"])
+            if terminal_progress is not None
+            else f"{target_function} succeeded"
+        ),
+        progress_message=(
+            str(terminal_progress["message"])
+            if terminal_progress is not None
+            else "succeeded"
+        ),
+        metrics=terminal_metrics,
+        progress=terminal_progress,
+        preserve_finished_at=bool(
+            isinstance(job_context_by_field, dict)
+            and job_context_by_field.get("preserve_control_run_finished_at")
+        ),
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at,
+        snapshot_id=_terminal_snapshot_id(terminal_metrics),
+        database_state_committed=is_database_state_committed,
+        database_heartbeat_at=(
+            job_context_by_field.get("_control_committed_heartbeat_at")
+            if is_database_state_committed
+            else None
+        ),
+        database_finished_at=(
+            job_context_by_field.get("_control_committed_finished_at")
+            if is_database_state_committed
+            else None
+        ),
+    )
+    if is_database_state_committed:
+        await _drain_committed_terminal_projection(terminal_projection)
+    else:
+        await terminal_projection
+
+
 async def control_single_job_start(
     ctx: dict[str, Any],
     task: dict[str, Any] | None = None,
@@ -176,6 +255,10 @@ async def control_single_job_start(
 
     started_at = dt.datetime.now(dt.UTC).isoformat(timespec="microseconds")
     attempt_id = f"{run_id}:{uuid.uuid4().hex}" if run_id else None
+    if run_id:
+        job_context_by_field = ctx.setdefault("context", {})
+        job_context_by_field["_control_attempt_id"] = attempt_id
+        job_context_by_field["_control_attempt_started_at"] = started_at
     live_token = None
     heartbeat_task = None
     if run_id:
@@ -254,82 +337,83 @@ async def control_single_job_start(
             shutdown = getattr(module, "shutdown", None)
             if shutdown is None:
                 raise RuntimeError(f"{target_module} does not expose shutdown(ctx)")
-            await shutdown(ctx)
+            shutdown_result = await shutdown(ctx)
+            if shutdown_result is not None:
+                target_result = shutdown_result
             ctx.setdefault("context", {})["run"] = 0
     except ImportCancelledError:
-        await mark_control_run(
-            run_id,
-            status="canceled",
-            phase_detail=f"{target_function} canceled",
-            progress_message="canceled",
-            attempt_id=attempt_id,
-            attempt_started_at=started_at if run_id else None,
+        committed_result = _committed_target_result(
+            ctx,
+            target_module=target_module,
         )
-        await _flush_terminal_status_events()
-        return {"status": "canceled", "run_id": run_id}
+        if committed_result is None:
+            await mark_control_run(
+                run_id,
+                status="canceled",
+                phase_detail=f"{target_function} canceled",
+                progress_message="canceled",
+                attempt_id=attempt_id,
+                attempt_started_at=started_at if run_id else None,
+            )
+            await _flush_terminal_status_events()
+            return {"status": "canceled", "run_id": run_id}
+        target_result = committed_result
     except asyncio.CancelledError as exc:
-        await mark_control_run(
-            run_id,
-            status="failed",
-            phase_detail=f"{target_function} interrupted",
-            progress_message="interrupted",
-            error={"code": "import_interrupted", "message": "worker task was cancelled"},
-            attempt_id=attempt_id,
-            attempt_started_at=started_at if run_id else None,
+        committed_result = _committed_target_result(
+            ctx,
+            target_module=target_module,
         )
-        await _flush_terminal_status_events()
-        return {"status": "failed", "run_id": run_id, "error": str(exc)}
+        if committed_result is None:
+            await mark_control_run(
+                run_id,
+                status="failed",
+                phase_detail=f"{target_function} interrupted",
+                progress_message="interrupted",
+                error={
+                    "code": "import_interrupted",
+                    "message": "worker task was cancelled",
+                },
+                attempt_id=attempt_id,
+                attempt_started_at=started_at if run_id else None,
+            )
+            await _flush_terminal_status_events()
+            return {"status": "failed", "run_id": run_id, "error": str(exc)}
+        target_result = committed_result
+        current_task = asyncio.current_task()
+        while current_task is not None and current_task.cancelling():
+            current_task.uncancel()
     except Exception as exc:
-        await mark_control_run(
-            run_id,
-            status="failed",
-            phase_detail=f"{target_function} failed",
-            progress_message="failed",
-            error=_control_failure_error(exc), metrics=_terminal_metrics_from_context(ctx.get("context")),
-            attempt_id=attempt_id,
-            attempt_started_at=started_at if run_id else None,
+        committed_result = _committed_target_result(
+            ctx,
+            target_module=target_module,
         )
-        await _flush_terminal_status_events()
-        raise
+        if committed_result is None:
+            await mark_control_run(
+                run_id,
+                status="failed",
+                phase_detail=f"{target_function} failed",
+                progress_message="failed",
+                error=_control_failure_error(exc),
+                metrics=_terminal_metrics_from_context(ctx.get("context")),
+                attempt_id=attempt_id,
+                attempt_started_at=started_at if run_id else None,
+            )
+            await _flush_terminal_status_events()
+            raise
+        target_result = committed_result
     finally:
         await _stop_live_progress_heartbeat(heartbeat_task)
         if live_token is not None:
             reset_live_progress_context(live_token)
-    terminal_metrics = _terminal_metrics_from_result(
-        target_result,
-        context=ctx.get("context") if run_shutdown else None,
-    )
-    terminal_progress = _terminal_progress_from_result(
-        target_function,
-        terminal_metrics or target_result,
-    )
-    terminal_phase_detail = (
-        str(terminal_progress["phase"])
-        if terminal_progress is not None
-        else f"{target_function} succeeded"
-    )
-    terminal_progress_message = (
-        str(terminal_progress["message"])
-        if terminal_progress is not None
-        else "succeeded"
-    )
-    preserve_finished_at = bool(
-        run_shutdown
-        and isinstance(ctx.get("context"), dict)
-        and ctx["context"].get("preserve_control_run_finished_at")
-    )
-    await mark_control_run(
+    await _project_control_target_success(
         run_id,
-        status="succeeded",
-        phase_detail=terminal_phase_detail,
-        progress_message=terminal_progress_message,
-        metrics=terminal_metrics,
-        progress=terminal_progress,
-        preserve_finished_at=preserve_finished_at,
+        target_function=target_function,
+        target_result=target_result,
+        control_context=ctx,
+        run_shutdown=run_shutdown,
         attempt_id=attempt_id,
         attempt_started_at=started_at if run_id else None,
     )
-    await _flush_terminal_status_events()
     return {
         "status": "succeeded",
         "run_id": run_id,
@@ -602,8 +686,16 @@ def _terminal_progress_from_result(
 
 
 def _terminal_metrics_from_result(result: Any, *, context: Any = None) -> dict[str, Any] | None:
-    metrics = dict(result) if isinstance(result, dict) else (
+    metrics = (
+        {
+            key: value
+            for key, value in result.items()
+            if key != "terminal_progress"
+        }
+        if isinstance(result, dict)
+        else (
         {"result": result} if isinstance(result, (int, float, str, bool)) else None
+        )
     )
     context_metrics = _terminal_metrics_from_context(context)
     if metrics is None:
@@ -670,39 +762,45 @@ async def _flush_terminal_status_events() -> None:
     await flush_status_events(timeout_seconds=timeout)
 
 
-async def mark_control_run(
+async def _mark_and_flush_terminal_control_run(
+    run_id: str,
+    **mark_by_name: Any,
+) -> None:
+    """Project one terminal state and flush its status event."""
+
+    await mark_control_run(run_id, status="succeeded", **mark_by_name)
+    await _flush_terminal_status_events()
+
+
+async def _drain_committed_terminal_projection(awaitable: Any) -> None:
+    """Finish post-commit projection even when the worker task is canceled."""
+
+    projection_task = asyncio.create_task(awaitable)
+    while True:
+        try:
+            await asyncio.shield(projection_task)
+            break
+        except asyncio.CancelledError:
+            continue
+    current_task = asyncio.current_task()
+    while current_task is not None and current_task.cancelling():
+        current_task.uncancel()
+
+
+def _control_progress_by_field(
     run_id: str,
     *,
     status: str,
-    phase_detail: str,
     progress_message: str,
-    error: dict[str, Any] | None = None,
-    metrics: dict[str, Any] | None = None,
-    progress: dict[str, Any] | None = None,
-    snapshot_id: str | None = None,
-    preserve_finished_at: bool = False,
-    attempt_id: str | None = None,
-    attempt_started_at: str | None = None,
-):
-    """Persist and publish one authoritative control-run lifecycle transition."""
+    supplied_progress: dict[str, Any] | None,
+    is_terminal: bool,
+    attempt_id: str | None,
+    attempt_started_at: str | None,
+) -> dict[str, Any]:
+    """Build the exact progress projection for one control transition."""
 
-    if not run_id:
-        return _CONTROL_RUN_NOT_MARKED
-    attempt_id, attempt_started_at = _control_attempt_for_run(
-        run_id,
-        attempt_id=attempt_id,
-        attempt_started_at=attempt_started_at,
-    )
-    now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
-    is_terminal = status in {
-        "succeeded",
-        "failed",
-        "canceled",
-        "cancelled",
-        "dead_letter",
-    }
-    if progress is not None:
-        progress_by_field = progress
+    if supplied_progress is not None:
+        progress_by_field = dict(supplied_progress)
     elif status == "succeeded":
         progress_by_field = {
             "unit": "run",
@@ -740,16 +838,110 @@ async def mark_control_run(
             "pct": 0,
             "message": progress_message,
         }
-    progress_by_field = dict(progress_by_field)
     if attempt_id and attempt_started_at:
         progress_by_field["attempt_id"] = attempt_id
         progress_by_field["attempt_started_at"] = attempt_started_at
-    live_started_at = (attempt_started_at or now) if status == "running" else None
-    live_finished_at = now if is_terminal and not preserve_finished_at else None
+    return progress_by_field
+
+
+@dataclass(frozen=True)
+class _ControlTransitionTimes:
+    now: dt.datetime
+    committed_heartbeat: dt.datetime | None
+    committed_finished: dt.datetime | None
+    live_started_at: object
+    live_finished_at: dt.datetime | None
+
+
+def _control_transition_times(
+    *,
+    status: str,
+    is_terminal: bool,
+    attempt_started_at: str | None,
+    preserve_finished_at: bool,
+    database_state_committed: bool,
+    database_heartbeat_at: object,
+    database_finished_at: object,
+) -> _ControlTransitionTimes:
+    """Resolve database and live-event times for one control transition."""
+
+    now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
+    if database_state_committed:
+        if status != "succeeded":
+            raise ValueError("only succeeded control state can already be committed")
+        committed_heartbeat = _committed_control_timestamp(database_heartbeat_at)
+        committed_finished = _committed_control_timestamp(database_finished_at)
+    else:
+        committed_heartbeat = None
+        committed_finished = None
+    return _ControlTransitionTimes(
+        now,
+        committed_heartbeat,
+        committed_finished,
+        (attempt_started_at or now) if status == "running" else None,
+        (
+            committed_finished
+            if database_state_committed
+            else (now if is_terminal and not preserve_finished_at else None)
+        ),
+    )
+
+
+async def mark_control_run(
+    run_id: str,
+    *,
+    status: str,
+    phase_detail: str,
+    progress_message: str,
+    error: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+    progress: dict[str, Any] | None = None,
+    snapshot_id: str | None = None,
+    preserve_finished_at: bool = False,
+    attempt_id: str | None = None,
+    attempt_started_at: str | None = None,
+    database_state_committed: bool = False,
+    database_heartbeat_at: object = None,
+    database_finished_at: object = None,
+):
+    """Persist and publish one authoritative control-run lifecycle transition."""
+
+    if not run_id:
+        return _CONTROL_RUN_NOT_MARKED
+    attempt_id, attempt_started_at = _control_attempt_for_run(
+        run_id,
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at,
+    )
+    is_terminal = status in {
+        "succeeded",
+        "failed",
+        "canceled",
+        "cancelled",
+        "dead_letter",
+    }
+    progress_by_field = _control_progress_by_field(
+        run_id,
+        status=status,
+        progress_message=progress_message,
+        supplied_progress=progress,
+        is_terminal=is_terminal,
+        attempt_id=attempt_id,
+        attempt_started_at=attempt_started_at,
+    )
+    transition_times = _control_transition_times(
+        status=status,
+        is_terminal=is_terminal,
+        attempt_started_at=attempt_started_at,
+        preserve_finished_at=preserve_finished_at,
+        database_state_committed=database_state_committed,
+        database_heartbeat_at=database_heartbeat_at,
+        database_finished_at=database_finished_at,
+    )
     update_values_by_field: dict[str, Any] = {
         "status": status,
         "phase_detail": phase_detail,
-        "heartbeat_at": now,
+        "heartbeat_at": transition_times.now,
         "progress": progress_by_field,
         "error": error,
     }
@@ -758,18 +950,22 @@ async def mark_control_run(
     if snapshot_id:
         update_values_by_field["snapshot_id"] = snapshot_id
     if status == "running":
-        update_values_by_field["started_at"] = func.coalesce(ImportRun.started_at, now)
+        update_values_by_field["started_at"] = func.coalesce(
+            ImportRun.started_at,
+            transition_times.now,
+        )
         update_values_by_field["finished_at"] = None
     if is_terminal and not preserve_finished_at:
-        update_values_by_field["finished_at"] = now
-    should_update_database = bool(
-        status == "running" and attempt_id and attempt_started_at
-    ) or await _should_update_control_run_db(
-        run_id=run_id,
-        status=status,
-        phase_detail=phase_detail,
-        error=error,
-        snapshot_id=snapshot_id,
+        update_values_by_field["finished_at"] = transition_times.now
+    should_update_database = not database_state_committed and (
+        bool(status == "running" and attempt_id and attempt_started_at)
+        or await _should_update_control_run_db(
+            run_id=run_id,
+            status=status,
+            phase_detail=phase_detail,
+            error=error,
+            snapshot_id=snapshot_id,
+        )
     )
     if should_update_database:
         stmt = update(ImportRun).where(ImportRun.run_id == run_id)
@@ -785,8 +981,15 @@ async def mark_control_run(
                         "attempt_started_at"
                     ].as_string().is_(None)
                 )
-        elif status in {"running", "succeeded", "failed", "dead_letter"}:
-            stmt = stmt.where(ImportRun.status.notin_(["canceling", "canceled"]))
+        elif is_terminal:
+            stmt = stmt.where(
+                or_(
+                    ImportRun.status.notin_(sorted(_TERMINAL_STATUSES)),
+                    ImportRun.status == status,
+                )
+            )
+            if status in {"succeeded", "failed", "dead_letter"}:
+                stmt = stmt.where(ImportRun.status != "canceling")
         if status == "running" and attempt_id and attempt_started_at:
             stmt = _where_newer_control_attempt_claim(
                 stmt,
@@ -810,8 +1013,16 @@ async def mark_control_run(
         "status": status,
         "phase": progress_by_field.get("phase") or phase_detail,
         "message": progress_by_field.get("message") or progress_message,
-        "started_at": isoformat_utc(live_started_at) if live_started_at else None,
-        "finished_at": isoformat_utc(live_finished_at) if live_finished_at else None,
+        "started_at": (
+            isoformat_utc(transition_times.live_started_at)
+            if transition_times.live_started_at
+            else None
+        ),
+        "finished_at": (
+            isoformat_utc(transition_times.live_finished_at)
+            if transition_times.live_finished_at
+            else None
+        ),
         "snapshot_id": snapshot_id,
         "publish_event": False,
     }
@@ -823,11 +1034,17 @@ async def mark_control_run(
         "metrics": metrics or {},
         "error": error,
         "snapshot_id": snapshot_id,
-        "heartbeat_at": isoformat_utc(now),
-        "started_at": isoformat_utc(live_started_at) if live_started_at else None,
+        "heartbeat_at": isoformat_utc(
+            transition_times.committed_heartbeat or transition_times.now
+        ),
+        "started_at": (
+            isoformat_utc(transition_times.live_started_at)
+            if transition_times.live_started_at
+            else None
+        ),
         "finished_at": (
-            isoformat_utc(live_finished_at)
-            if live_finished_at
+            isoformat_utc(transition_times.live_finished_at)
+            if transition_times.live_finished_at
             else None
         ),
     })
@@ -843,6 +1060,39 @@ async def mark_control_run(
         status_event_payload=status_event_by_field,
     )
     return _CONTROL_RUN_MARKED
+
+
+def _terminal_snapshot_id(metrics: object) -> str | None:
+    """Return a bounded immutable snapshot identity from terminal metrics."""
+
+    if not isinstance(metrics, dict):
+        return None
+    publication = metrics.get("npi_canonical_publication")
+    if not isinstance(publication, dict):
+        return None
+    publication_ref = publication.get("publication_ref")
+    if type(publication_ref) is not str or not publication_ref.startswith("nppub1_"):
+        return None
+    if len(publication_ref) != 50:
+        return None
+    return publication_ref
+
+
+def _committed_control_timestamp(value: object) -> dt.datetime:
+    """Parse one exact UTC timestamp read from an already-committed run."""
+
+    if type(value) is not str:
+        raise ValueError("committed control timestamp is invalid")
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("committed control timestamp is invalid") from None
+    if (
+        parsed.tzinfo != dt.UTC
+        or parsed.isoformat(timespec="microseconds") != value
+    ):
+        raise ValueError("committed control timestamp is invalid")
+    return parsed
 
 
 def _control_attempt_for_run(
@@ -1004,7 +1254,17 @@ def _isolated_control_job_context(ctx: dict[str, Any], run_id: str) -> dict[str,
     job_context_map = (
         dict(shared_context_map) if isinstance(shared_context_map, dict) else {}
     )
-    for key in ("audit", "finished_at", "preserve_control_run_finished_at"):
+    for key in (
+        "audit",
+        "finished_at",
+        "preserve_control_run_finished_at",
+        "control_run_terminal_committed",
+        "_control_committed_heartbeat_at",
+        "_control_committed_finished_at",
+        "_control_committed_result",
+        "_control_attempt_id",
+        "_control_attempt_started_at",
+    ):
         job_context_map.pop(key, None)
     if run_id:
         isolated_context_map["control_run_id"] = run_id

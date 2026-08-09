@@ -115,6 +115,8 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "payload": "control_wrapped",
         "target_module": "process.npi",
         "target_function": "process_data",
+        "run_shutdown": True,
+        "job_prefix": "npi_start",
     },
     "nucc": {
         "queue": "arq:NUCC",
@@ -1310,6 +1312,7 @@ async def find_active_runs_by_importer(importer: str) -> list[dict[str, Any]]:
 
 
 _PROVIDER_DIRECTORY_ADMISSION_LOCK_KEY = "import-run-admission:provider-directory-fhir"
+_NPI_ADMISSION_LOCK_KEY = "import-run-admission:npi"
 _PROVIDER_DIRECTORY_ACQUISITION = "acquisition"
 _PROVIDER_DIRECTORY_SCOPED_ARTIFACT = "scoped_artifact"
 _PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT = "scoped_relation_artifact"
@@ -1928,6 +1931,31 @@ async def _admit_wave_fenced_import_run(
     return None
 
 
+async def _admit_npi_import_run(
+    import_row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Serialize NPI admission so only one active run can reach its worker."""
+
+    async with db.acquire() as connection:
+        await connection.scalar(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            lock_key=_NPI_ADMISSION_LOCK_KEY,
+        )
+        idempotency_key = import_row.get("idempotency_key")
+        if idempotency_key:
+            active_run = await _active_idempotency_run(
+                connection,
+                str(idempotency_key),
+            )
+            if active_run:
+                return active_run
+        active_runs = await _active_importer_runs(connection, "npi")
+        if active_runs:
+            return active_runs[0]
+        await connection.status(insert(ImportRun).values(**import_row))
+    return None
+
+
 async def _admit_import_row(
     importer: str,
     import_run_values_by_name: dict[str, Any],
@@ -1940,6 +1968,8 @@ async def _admit_import_row(
         return await _admit_ptg_source_file_run(import_run_values_by_name)
     if importer in PTG_WAVE_FENCED_IMPORTERS:
         return await _admit_wave_fenced_import_run(import_run_values_by_name)
+    if importer == "npi":
+        return await _admit_npi_import_run(import_run_values_by_name)
     await db.execute(insert(ImportRun).values(**import_run_values_by_name))
     return None
 
@@ -1962,6 +1992,11 @@ async def create_import_run(
         if importer == "provider-directory-fhir"
         else raw_params_by_name
     )
+    if importer == "npi" and any(
+        bool(effective_params_by_name.get(parameter_name))
+        for parameter_name in ("test", "test_mode")
+    ):
+        raise ValueError("NPI test mode requires an isolated database")
     _reject_control_current_version_census(
         importer,
         effective_params_by_name,
@@ -2561,7 +2596,7 @@ async def _persist_cancel_request(
 
     cancel_progress_by_name = cancel_state_by_name["progress"]
     canceled_now = bool(cancel_state_by_name["canceled_now"])
-    update_result = await db.execute(
+    cancel_update = (
         update(ImportRun)
         .where(ImportRun.run_id == run_id)
         .where(ImportRun.status.not_in(TERMINAL_STATUSES))
@@ -2576,6 +2611,15 @@ async def _persist_cancel_request(
             metrics=run_metrics_by_name,
         )
     )
+    attempt_pair = _cancel_attempt_pair(cancel_progress_by_name)
+    if attempt_pair is not None:
+        attempt_id, attempt_started_at = attempt_pair
+        cancel_update = cancel_update.where(
+            ImportRun.progress["attempt_id"].as_string() == attempt_id,
+            ImportRun.progress["attempt_started_at"].as_string()
+            == attempt_started_at,
+        )
+    update_result = await db.execute(cancel_update)
     updated = await get_import_run(run_id)
     if getattr(update_result, "rowcount", 1) == 0:
         return updated
@@ -2627,13 +2671,38 @@ def _cancel_progress_by_name(
 ) -> dict[str, Any]:
     """Return terminal or in-progress cancellation progress."""
 
-    return {
+    cancel_progress_by_name = {
         "unit": "run",
         "total": 1,
         "done": 1 if canceled_now else 0,
         "pct": 100 if canceled_now else current_progress.get("pct", 0),
         "message": "canceled" if canceled_now else "cancel requested",
     }
+    attempt_pair = _cancel_attempt_pair(current_progress)
+    if attempt_pair is not None:
+        attempt_id, attempt_started_at = attempt_pair
+        cancel_progress_by_name["attempt_id"] = attempt_id
+        cancel_progress_by_name["attempt_started_at"] = attempt_started_at
+    return cancel_progress_by_name
+
+
+def _cancel_attempt_pair(
+    progress_by_name: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Return a complete exact-attempt fence or no attempt fence."""
+
+    attempt_id = progress_by_name.get("attempt_id")
+    attempt_started_at = progress_by_name.get("attempt_started_at")
+    if (
+        type(attempt_id) is str
+        and bool(attempt_id)
+        and attempt_id == attempt_id.strip()
+        and type(attempt_started_at) is str
+        and bool(attempt_started_at)
+        and attempt_started_at == attempt_started_at.strip()
+    ):
+        return attempt_id, attempt_started_at
+    return None
 
 
 def _has_terminalized_active_worker_cancel_signal(cancel_signal: dict[str, Any]) -> bool:

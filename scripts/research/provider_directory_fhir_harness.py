@@ -328,6 +328,38 @@ CREATE TABLE {schema}.provider_directory_import_seen_stage_test (
 """
 
 
+async def _assert_sql_typing_queries(engine: Any, schema: str) -> None:
+    """Execute both generated location-key SQL variants."""
+    from sqlalchemy import text
+
+    importer = importlib.import_module("process.provider_directory_fhir")
+    async with engine.begin() as conn:
+        query_params_by_name = {
+            "run_id": "run_sql_typing",
+            "after_source_id": None,
+            "after_resource_id": None,
+            "batch_size": 10,
+        }
+        sql = importer.provider_directory_location_address_key_batch_sql(
+            schema,
+            run_id="run_sql_typing",
+        )
+        batch_result_row = (
+            await conn.execute(text(sql), query_params_by_name)
+        ).fetchone()
+        assert batch_result_row is not None
+        assert batch_result_row.candidate_rows == 0
+        seen_sql = importer.provider_directory_location_address_key_batch_sql(
+            schema,
+            run_id="run_sql_typing",
+            seen_table="provider_directory_import_seen_stage_test",
+        )
+        seen_row = (
+            await conn.execute(text(seen_sql), query_params_by_name)
+        ).fetchone()
+        assert seen_row is not None and seen_row.candidate_rows == 0
+
+
 async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
     """Exercise generated SQL against an isolated PostgreSQL schema."""
     started = time.monotonic()
@@ -344,10 +376,7 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
     error: str | None = None
     try:
         import asyncpg
-        from sqlalchemy import text
         from sqlalchemy.ext.asyncio import create_async_engine
-
-        importer = importlib.import_module("process.provider_directory_fhir")
 
         async def raw(sql: str) -> None:
             """Execute schema lifecycle SQL outside SQLAlchemy transactions."""
@@ -361,32 +390,7 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
         await raw(_sql_typing_ddl(schema))
         is_schema_created = True
         engine = create_async_engine(sqlalchemy_url)
-        async with engine.begin() as conn:
-            query_params_by_name = {
-                "run_id": "run_sql_typing",
-                "after_source_id": None,
-                "after_resource_id": None,
-                "batch_size": 10,
-            }
-            sql = importer.provider_directory_location_address_key_batch_sql(
-                schema,
-                run_id="run_sql_typing",
-            )
-            batch_result_row = (
-                await conn.execute(text(sql), query_params_by_name)
-            ).fetchone()
-            assert batch_result_row is not None
-            assert batch_result_row.candidate_rows == 0
-
-            seen_sql = importer.provider_directory_location_address_key_batch_sql(
-                schema,
-                run_id="run_sql_typing",
-                seen_table="provider_directory_import_seen_stage_test",
-            )
-            seen_row = (
-                await conn.execute(text(seen_sql), query_params_by_name)
-            ).fetchone()
-            assert seen_row is not None and seen_row.candidate_rows == 0
+        await _assert_sql_typing_queries(engine, schema)
     except Exception as exc:
         status = "failed"
         error = str(exc)
