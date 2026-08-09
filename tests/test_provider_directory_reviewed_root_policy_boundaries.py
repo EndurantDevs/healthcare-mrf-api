@@ -90,10 +90,12 @@ def test_artifact_policy_sql_and_subset_identity_boundaries():
 def test_artifact_source_and_dataset_policy_parsing():
     policy_one = ReviewedRootPolicy(1).document()
     policy_two = ReviewedRootPolicy(2).document()
-    source_record = {"metadata_json": {REVIEWED_ROOT_POLICY_METADATA_KEY: policy_one}}
+    source_by_field = {
+        "metadata_json": {REVIEWED_ROOT_POLICY_METADATA_KEY: policy_one}
+    }
 
     with pytest.raises(RuntimeError, match="policy_changed"):
-        importer._artifact_reviewed_root_policy(source_record, {}, "dataset-a")
+        importer._artifact_reviewed_root_policy(source_by_field, {}, "dataset-a")
     with pytest.raises(RuntimeError, match="policy_invalid"):
         importer._artifact_reviewed_root_policy(
             {"metadata_json": {REVIEWED_ROOT_POLICY_METADATA_KEY: {}}},
@@ -101,13 +103,13 @@ def test_artifact_source_and_dataset_policy_parsing():
             "dataset-a",
         )
     assert importer._artifact_reviewed_root_policy(
-        source_record,
+        source_by_field,
         {REVIEWED_ROOT_POLICY_METADATA_KEY: policy_one},
         "dataset-a",
     ) == ReviewedRootPolicy(1)
     with pytest.raises(RuntimeError, match="policy_changed"):
         importer._artifact_reviewed_root_policy(
-            source_record,
+            source_by_field,
             {REVIEWED_ROOT_POLICY_METADATA_KEY: policy_two},
             "dataset-a",
         )
