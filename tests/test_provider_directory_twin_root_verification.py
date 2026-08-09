@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 

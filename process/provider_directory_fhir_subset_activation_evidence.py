@@ -9,6 +9,11 @@ import importlib
 import json
 from typing import Any, Mapping, Sequence
 
+from process.provider_directory_fhir_root_policy import (
+    POLICY_VERIFIED_STATUS,
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+    ReviewedRootPolicy,
+)
 from process.provider_directory_fhir_subset_activation_contract import (
     STATE_SYNC_TIMEOUT_SECONDS,
     VERIFIED_STATUS,
@@ -34,6 +39,66 @@ _PROOF_BEARING_STATUSES = (
 )
 
 
+def _completion_activation_evidence(
+    source_by_field: Mapping[str, Any],
+    dataset_rows: Sequence[Mapping[str, Any]],
+    root_policy: ReviewedRootPolicy | None,
+) -> ReviewedSubsetActivationEvidence:
+    baseline, candidate = selection._activation_roots(
+        dataset_rows,
+        root_policy,
+    )
+    try:
+        importer = importlib.import_module("process.provider_directory_fhir")
+        baseline_pair = (
+            importer._validated_parent_subset_completion_pair(baseline)
+            if baseline is not None
+            else None
+        )
+        candidate_pair = importer._validated_parent_subset_completion_pair(
+            candidate
+        )
+        baseline_metadata = (
+            selection._metadata(baseline)
+            if baseline is not None
+            else None
+        )
+        candidate_metadata = selection._metadata(candidate)
+        if root_policy is None or root_policy.is_twin_root_required:
+            if baseline is None or baseline_metadata is None:
+                raise ValueError("baseline")
+            importer._twin_root_baseline_proof(baseline)
+            importer._assert_matched_twin_root_dataset_proof(candidate)
+            if (
+                baseline_pair is None
+                or candidate_pair is None
+                or baseline_pair != candidate_pair
+            ):
+                raise ValueError("completion pair")
+        elif candidate_pair is None:
+            raise ValueError("completion pair")
+        scope_sha256 = candidate_metadata.get(
+            "verification_source_scope_hash"
+        )
+        if (
+            baseline_metadata is not None
+            and scope_sha256
+            != baseline_metadata.get("verification_source_scope_hash")
+        ):
+            raise ValueError("scope")
+        return ReviewedSubsetActivationEvidence(
+            source_contract_sha256=(
+                reviewed_subset_source_contract_sha256(source_by_field)
+            ),
+            cutoff=(candidate_pair or baseline_pair)[0]["cutoff"],
+            verification_source_scope_sha256=scope_sha256,
+            completion_proof_sha256=(candidate_pair or baseline_pair)[1],
+            root_policy=root_policy,
+        )
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        raise ReviewedSubsetActivationError("evidence") from None
+
+
 def _derived_activation_evidence(
     source_rows: Sequence[Mapping[str, Any]],
     dataset_rows: Sequence[Mapping[str, Any]],
@@ -44,42 +109,15 @@ def _derived_activation_evidence(
     if len(source_rows) != 1:
         raise ReviewedSubsetActivationError("evidence")
     source_by_field = dict(source_rows[0])
-    baseline, candidate = selection._activation_roots(dataset_rows)
-    try:
-        importer = importlib.import_module("process.provider_directory_fhir")
-        importer._twin_root_baseline_proof(baseline)
-        importer._assert_matched_twin_root_dataset_proof(candidate)
-        baseline_pair = importer._validated_parent_subset_completion_pair(
-            baseline
-        )
-        candidate_pair = importer._validated_parent_subset_completion_pair(
-            candidate
-        )
-        baseline_metadata = selection._metadata(baseline)
-        candidate_metadata = selection._metadata(candidate)
-        if (
-            baseline_pair is None
-            or candidate_pair is None
-            or baseline_pair != candidate_pair
-        ):
-            raise ValueError("completion pair")
-        scope_sha256 = candidate_metadata.get(
-            "verification_source_scope_hash"
-        )
-        if scope_sha256 != baseline_metadata.get(
-            "verification_source_scope_hash"
-        ):
-            raise ValueError("scope")
-        evidence = ReviewedSubsetActivationEvidence(
-            source_contract_sha256=(
-                reviewed_subset_source_contract_sha256(source_by_field)
-            ),
-            cutoff=baseline_pair[0]["cutoff"],
-            verification_source_scope_sha256=scope_sha256,
-            completion_proof_sha256=baseline_pair[1],
-        )
-    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
-        raise ReviewedSubsetActivationError("evidence") from None
+    source_metadata = source_by_field.get("metadata_json")
+    if not isinstance(source_metadata, Mapping):
+        raise ReviewedSubsetActivationError("evidence")
+    root_policy = selection._reviewed_root_policy(source_metadata)
+    evidence = _completion_activation_evidence(
+        source_by_field,
+        dataset_rows,
+        root_policy,
+    )
     selection.validated_reviewed_subset_activation_selection(
         source_rows=source_rows,
         dataset_rows=dataset_rows,
@@ -87,6 +125,29 @@ def _derived_activation_evidence(
         evidence=evidence,
     )
     return evidence
+
+
+def _scope_policy_sql(
+    root_policy: ReviewedRootPolicy | None,
+) -> tuple[str, dict[str, Any]]:
+    if root_policy is None:
+        return (
+            "NOT (dataset.publication_metadata_json::jsonb "
+            "? :root_policy_key)",
+            {"root_policy_key": REVIEWED_ROOT_POLICY_METADATA_KEY},
+        )
+    return (
+        "dataset.publication_metadata_json::jsonb "
+        "-> :root_policy_key = CAST(:root_policy AS jsonb)",
+        {
+            "root_policy_key": REVIEWED_ROOT_POLICY_METADATA_KEY,
+            "root_policy": json.dumps(
+                root_policy.document(),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        },
+    )
 
 
 async def _initial_evidence_identity(
@@ -153,12 +214,42 @@ async def _evidence_dataset_rows(
     database: Any,
     configured_endpoint_id: str,
     campaign_id: str,
+    root_policy: ReviewedRootPolicy | None,
 ) -> tuple[dict[str, Any], ...]:
+    """Select all proof-bearing rows in the uniquely policy-bound scope."""
+
+    policy_predicate, policy_params_by_name = _scope_policy_sql(root_policy)
     dataset_rows = await database.all(
         f"""
+        WITH candidate_scope AS MATERIALIZED (
+            SELECT DISTINCT
+                   dataset.publication_metadata_json::jsonb
+                       ->> 'verification_source_scope_hash' AS scope_sha256
+              FROM {_quoted_relation('provider_directory_endpoint_dataset')}
+                   AS dataset
+             WHERE dataset.endpoint_id = :endpoint_id
+               AND dataset.completion_proof_required_version = 3
+               AND dataset.status = ANY(:proof_statuses)
+               AND dataset.publication_metadata_json::jsonb
+                       ->> 'verification_campaign_id' = :campaign_id
+               AND NULLIF(
+                       dataset.publication_metadata_json::jsonb
+                           ->> 'verification_source_scope_hash',
+                       ''
+                   ) IS NOT NULL
+               AND ({policy_predicate})
+        ), selected_scope AS MATERIALIZED (
+            SELECT pg_catalog.min(candidate_scope.scope_sha256) AS scope_sha256
+              FROM candidate_scope
+            HAVING pg_catalog.count(*) = 1
+        )
         SELECT dataset.*
           FROM {_quoted_relation('provider_directory_endpoint_dataset')}
                AS dataset
+          JOIN selected_scope
+            ON selected_scope.scope_sha256 =
+               dataset.publication_metadata_json::jsonb
+                   ->> 'verification_source_scope_hash'
          WHERE dataset.endpoint_id = :endpoint_id
            AND dataset.completion_proof_required_version = 3
            AND dataset.status = ANY(:proof_statuses)
@@ -169,6 +260,7 @@ async def _evidence_dataset_rows(
         endpoint_id=configured_endpoint_id,
         campaign_id=campaign_id,
         proof_statuses=list(_PROOF_BEARING_STATUSES),
+        **policy_params_by_name,
     )
     return tuple(_row_mapping(dataset_row) for dataset_row in dataset_rows)
 
@@ -192,10 +284,17 @@ async def _read_activation_evidence(
             expected_source_id,
             configured_endpoint_id,
         )
+        if len(source_rows) != 1:
+            raise ReviewedSubsetActivationError("evidence")
+        source_metadata = source_rows[0].get("metadata_json")
+        if not isinstance(source_metadata, Mapping):
+            raise ReviewedSubsetActivationError("evidence")
+        root_policy = selection._reviewed_root_policy(source_metadata)
         dataset_rows = await _evidence_dataset_rows(
             database,
             configured_endpoint_id,
             campaign_id,
+            root_policy,
         )
         return _derived_activation_evidence(
             source_rows,
@@ -244,14 +343,23 @@ def reviewed_subset_activation_verified_manifest_json(
 
     if type(evidence) is not ReviewedSubsetActivationEvidence:
         raise ReviewedSubsetActivationError("evidence")
-    return json.dumps(
-        {
-            "schema_version": 1,
+    manifest_by_field = {
+            "schema_version": (
+                2 if evidence.root_policy is not None else 1
+            ),
             "importer": "provider-directory-fhir",
             "operation": "reviewed-subset-source-state-sync",
-            "desired_candidate_status": VERIFIED_STATUS,
+            "desired_candidate_status": (
+                POLICY_VERIFIED_STATUS
+                if evidence.root_policy is not None
+                else VERIFIED_STATUS
+            ),
             "evidence": evidence.evidence_document(),
-        },
+        }
+    if evidence.root_policy is not None:
+        manifest_by_field["root_policy"] = evidence.root_policy.document()
+    return json.dumps(
+        manifest_by_field,
         sort_keys=True,
         separators=(",", ":"),
     )

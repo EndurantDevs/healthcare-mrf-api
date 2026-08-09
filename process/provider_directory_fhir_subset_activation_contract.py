@@ -12,6 +12,12 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
+from process.provider_directory_fhir_root_policy import (
+    POLICY_PENDING_STATUS,
+    POLICY_VERIFIED_STATUS,
+    ReviewedRootPolicy,
+    reviewed_root_policy_from_document,
+)
 from process.provider_directory_fhir_subset_canonical import canonical_sha256
 from process.provider_directory_fhir_subset_identity import (
     subset_activation_source_contract_payload,
@@ -31,6 +37,12 @@ ACTIVATION_METADATA_KEY = "provider_directory_reviewed_subset_activation_v1"
 ACTIVATION_CONTRACT_VERSION = (
     "provider-directory-reviewed-subset-activation-v1"
 )
+ACTIVATION_METADATA_KEY_V2 = (
+    "provider_directory_reviewed_subset_activation_v2"
+)
+ACTIVATION_CONTRACT_VERSION_V2 = (
+    "provider-directory-reviewed-subset-activation-v2"
+)
 STATE_SYNC_TIMEOUT_SECONDS = 120
 MANIFEST_FIELDS = frozenset(
     {
@@ -41,6 +53,7 @@ MANIFEST_FIELDS = frozenset(
         "evidence",
     }
 )
+MANIFEST_FIELDS_V2 = MANIFEST_FIELDS | {"root_policy"}
 EVIDENCE_FIELDS = frozenset(
     {
         "source_contract_sha256",
@@ -76,6 +89,7 @@ class ReviewedSubsetActivationEvidence:
     cutoff: str
     verification_source_scope_sha256: str
     completion_proof_sha256: str
+    root_policy: ReviewedRootPolicy | None = None
 
     def evidence_document(self) -> dict[str, str]:
         """Return the neutral manifest evidence without database identities."""
@@ -96,17 +110,27 @@ class ReviewedSubsetActivationManifest:
 
     desired_candidate_status: str
     evidence: ReviewedSubsetActivationEvidence | None
+    root_policy: ReviewedRootPolicy | None = None
 
     @property
     def is_verified(self) -> bool:
         """Return whether the manifest authorizes the verified state."""
 
-        return self.desired_candidate_status == VERIFIED_STATUS
+        expected_status = (
+            POLICY_VERIFIED_STATUS
+            if self.root_policy is not None
+            else VERIFIED_STATUS
+        )
+        return self.desired_candidate_status == expected_status
 
     def require_verified_evidence(self) -> ReviewedSubsetActivationEvidence:
         """Fail closed unless the manifest contains complete verified evidence."""
 
-        if not self.is_verified or self.evidence is None:
+        if (
+            not self.is_verified
+            or self.evidence is None
+            or self.evidence.root_policy != self.root_policy
+        ):
             raise ReviewedSubsetActivationError("disabled")
         return self.evidence
 
@@ -130,12 +154,47 @@ class ReviewedSubsetActivationSelection:
     candidate_replay_evidence_sha256: str
     baseline_coverage_sha256: str
     candidate_coverage_sha256: str
+    root_policy: ReviewedRootPolicy | None = None
+
+    @property
+    def pending_status(self) -> str:
+        """Return the status expected before this activation."""
+
+        return (
+            POLICY_PENDING_STATUS
+            if self.root_policy is not None
+            else PENDING_STATUS
+        )
+
+    @property
+    def verified_status(self) -> str:
+        """Return the status written by this activation."""
+
+        return (
+            POLICY_VERIFIED_STATUS
+            if self.root_policy is not None
+            else VERIFIED_STATUS
+        )
+
+    @property
+    def activation_metadata_key(self) -> str:
+        """Return the versioned marker key for this activation."""
+
+        return (
+            ACTIVATION_METADATA_KEY_V2
+            if self.root_policy is not None
+            else ACTIVATION_METADATA_KEY
+        )
 
     def metadata_marker(self) -> dict[str, Any]:
         """Return the closed private database marker for the selected twins."""
 
-        return {
-            "contract_version": ACTIVATION_CONTRACT_VERSION,
+        marker_by_field = {
+            "contract_version": (
+                ACTIVATION_CONTRACT_VERSION_V2
+                if self.root_policy is not None
+                else ACTIVATION_CONTRACT_VERSION
+            ),
             "source_contract_sha256": self.source_contract_sha256,
             "cutoff": self.cutoff,
             "verification_source_scope_sha256": (
@@ -145,14 +204,6 @@ class ReviewedSubsetActivationSelection:
             "source_id": self.source_id,
             "endpoint_id": self.endpoint_id,
             "verification_campaign_id": self.campaign_id,
-            "baseline": {
-                "dataset_id": self.baseline_dataset_id,
-                "acquisition_root_run_id": self.baseline_root_run_id,
-                "replay_evidence_sha256": (
-                    self.baseline_replay_evidence_sha256
-                ),
-                "coverage_sha256": self.baseline_coverage_sha256,
-            },
             "candidate": {
                 "dataset_id": self.candidate_dataset_id,
                 "acquisition_root_run_id": self.candidate_root_run_id,
@@ -162,6 +213,27 @@ class ReviewedSubsetActivationSelection:
                 "coverage_sha256": self.candidate_coverage_sha256,
             },
         }
+        if self.root_policy is None:
+            marker_by_field["baseline"] = {
+                "dataset_id": self.baseline_dataset_id,
+                "acquisition_root_run_id": self.baseline_root_run_id,
+                "replay_evidence_sha256": (
+                    self.baseline_replay_evidence_sha256
+                ),
+                "coverage_sha256": self.baseline_coverage_sha256,
+            }
+            return marker_by_field
+        marker_by_field["root_policy"] = self.root_policy.document()
+        if self.root_policy.is_twin_root_required:
+            marker_by_field["baseline"] = {
+                "dataset_id": self.baseline_dataset_id,
+                "acquisition_root_run_id": self.baseline_root_run_id,
+                "replay_evidence_sha256": (
+                    self.baseline_replay_evidence_sha256
+                ),
+                "coverage_sha256": self.baseline_coverage_sha256,
+            }
+        return marker_by_field
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,25 +292,53 @@ def _validated_manifest_document(
     manifest_by_field: object,
 ) -> ReviewedSubsetActivationManifest:
     try:
+        if type(manifest_by_field) is not dict:
+            raise ValueError("manifest shape")
+        schema_version = manifest_by_field.get("schema_version")
+        is_v2 = type(schema_version) is int and schema_version == 2
+        expected_fields = MANIFEST_FIELDS_V2 if is_v2 else MANIFEST_FIELDS
         if (
-            type(manifest_by_field) is not dict
-            or set(manifest_by_field) != MANIFEST_FIELDS
-            or type(manifest_by_field.get("schema_version")) is not int
-            or manifest_by_field.get("schema_version") != 1
+            set(manifest_by_field) != expected_fields
+            or type(schema_version) is not int
+            or schema_version not in (1, 2)
             or manifest_by_field.get("importer") != "provider-directory-fhir"
             or manifest_by_field.get("operation")
             != "reviewed-subset-source-state-sync"
         ):
             raise ValueError("manifest shape")
+        root_policy = (
+            reviewed_root_policy_from_document(
+                manifest_by_field.get("root_policy")
+            )
+            if is_v2
+            else None
+        )
         desired_status = manifest_by_field.get("desired_candidate_status")
         raw_evidence = manifest_by_field.get("evidence")
-        if desired_status == PENDING_STATUS and raw_evidence is None:
-            return ReviewedSubsetActivationManifest(desired_status, None)
-        if desired_status != VERIFIED_STATUS:
+        pending_status = (
+            POLICY_PENDING_STATUS if is_v2 else PENDING_STATUS
+        )
+        verified_status = (
+            POLICY_VERIFIED_STATUS if is_v2 else VERIFIED_STATUS
+        )
+        if desired_status == pending_status and raw_evidence is None:
+            return ReviewedSubsetActivationManifest(
+                desired_status,
+                None,
+                root_policy,
+            )
+        if desired_status != verified_status:
             raise ValueError("desired state")
+        evidence = _activation_evidence(raw_evidence)
+        if root_policy is not None:
+            evidence = ReviewedSubsetActivationEvidence(
+                **evidence.evidence_document(),
+                root_policy=root_policy,
+            )
         return ReviewedSubsetActivationManifest(
             desired_status,
-            _activation_evidence(raw_evidence),
+            evidence,
+            root_policy,
         )
     except (OverflowError, TypeError, ValueError):
         raise ReviewedSubsetActivationError() from None

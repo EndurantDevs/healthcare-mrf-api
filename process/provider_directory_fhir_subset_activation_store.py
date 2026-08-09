@@ -9,8 +9,7 @@ from typing import Any, Mapping
 
 from process.provider_directory_fhir_subset_activation_contract import (
     ACTIVATION_METADATA_KEY,
-    PENDING_STATUS,
-    VERIFIED_STATUS,
+    ACTIVATION_METADATA_KEY_V2,
     ReviewedSubsetActivationError,
     ReviewedSubsetActivationEvidence,
     ReviewedSubsetActivationResult,
@@ -172,14 +171,22 @@ def _activation_campaign_id(source_row: Mapping[str, Any]) -> str:
 
 def _has_exact_activation_marker(
     source_row: Mapping[str, Any],
+    selection: ReviewedSubsetActivationSelection,
     marker_by_field: Mapping[str, Any],
 ) -> bool:
     source_metadata = source_row.get("metadata_json")
+    other_activation_key = (
+        ACTIVATION_METADATA_KEY
+        if selection.activation_metadata_key == ACTIVATION_METADATA_KEY_V2
+        else ACTIVATION_METADATA_KEY_V2
+    )
     return bool(
         isinstance(source_metadata, Mapping)
         and source_metadata.get("provider_directory_candidate_status")
-        == VERIFIED_STATUS
-        and source_metadata.get(ACTIVATION_METADATA_KEY) == marker_by_field
+        == selection.verified_status
+        and source_metadata.get(selection.activation_metadata_key)
+        == marker_by_field
+        and other_activation_key not in source_metadata
     )
 
 
@@ -230,15 +237,22 @@ async def _cas_activate_source(
                    = :configured_endpoint_id
            AND metadata_json::jsonb
                    ->> 'provider_directory_candidate_status' = :pending_status
-           AND NOT (metadata_json::jsonb ? :activation_key);
+           AND NOT (
+               metadata_json::jsonb
+               ?| CAST(:activation_keys AS text[])
+           );
         """,
         source_id=selection.source_id,
         serving_endpoint_id=serving_endpoint_id,
         configured_endpoint_key=CONFIGURED_ENDPOINT_ID_METADATA_FIELD,
         configured_endpoint_id=configured_endpoint_id,
-        pending_status=PENDING_STATUS,
-        verified_status=VERIFIED_STATUS,
-        activation_key=ACTIVATION_METADATA_KEY,
+        pending_status=selection.pending_status,
+        verified_status=selection.verified_status,
+        activation_key=selection.activation_metadata_key,
+        activation_keys=[
+            ACTIVATION_METADATA_KEY,
+            ACTIVATION_METADATA_KEY_V2,
+        ],
         activation_marker=json.dumps(
             marker_by_field,
             sort_keys=True,
@@ -265,12 +279,22 @@ async def _activate_source(
         selection,
         source_row,
     )
-    if _has_exact_activation_marker(source_row, marker_by_field):
+    if _has_exact_activation_marker(
+        source_row,
+        selection,
+        marker_by_field,
+    ):
         return ReviewedSubsetActivationResult(activated=False)
     if (
         source_metadata.get("provider_directory_candidate_status")
-        != PENDING_STATUS
-        or ACTIVATION_METADATA_KEY in source_metadata
+        != selection.pending_status
+        or any(
+            activation_key in source_metadata
+            for activation_key in (
+                ACTIVATION_METADATA_KEY,
+                ACTIVATION_METADATA_KEY_V2,
+            )
+        )
     ):
         raise ReviewedSubsetActivationError("state")
     await _cas_activate_source(

@@ -28,10 +28,15 @@ _ENDPOINT_DATASET = "provider_directory_endpoint_dataset"
 _DATASET_RESOURCE = "provider_directory_dataset_resource"
 _SOURCE = "provider_directory_source"
 _ACTIVATION_KEY = "provider_directory_reviewed_subset_activation_v1"
+_ACTIVATION_KEY_V2 = "provider_directory_reviewed_subset_activation_v2"
 _PENDING_STATUS = "pending_two_matching_reviewed_subset_acquisitions"
 _VERIFIED_STATUS = "verified_two_matching_reviewed_subset_acquisitions"
+_POLICY_PENDING_STATUS = "pending_reviewed_subset_acquisition"
+_POLICY_VERIFIED_STATUS = "verified_reviewed_subset_acquisition"
 _ACTIVATION_CONTRACT = "provider-directory-reviewed-subset-activation-v1"
+_ACTIVATION_CONTRACT_V2 = "provider-directory-reviewed-subset-activation-v2"
 _SOURCE_CONTRACT = "provider-directory-fhir-reviewed-subset-source-contract-v1"
+_SOURCE_CONTRACT_V2 = "provider-directory-fhir-reviewed-subset-source-contract-v2"
 _ACTIVATION_VALID_FUNCTION = "provider_directory_reviewed_subset_activation_valid"
 _SOURCE_GUARD_FUNCTION = "guard_provider_directory_reviewed_subset_activation_source"
 _DATASET_GUARD_FUNCTION = "guard_provider_directory_reviewed_subset_activation_dataset"
@@ -85,11 +90,18 @@ def _qf(schema: str, relation: str) -> str:
 def _source_contract_payload_sql(
     *,
     use_configured_endpoint_identity: bool = False,
+    include_reviewed_root_policy: bool = False,
 ) -> str:
     previous = _predecessor()
     source_metadata = "active_source.metadata_json::jsonb"
     metadata_identity = previous._subset_source_metadata_identity_sql(
-        source_metadata
+        source_metadata,
+        include_reviewed_root_policy=include_reviewed_root_policy,
+    )
+    identity_version = (
+        _SOURCE_CONTRACT_V2
+        if include_reviewed_root_policy
+        else _SOURCE_CONTRACT
     )
     endpoint_identity = (
         f"{source_metadata} ->> "
@@ -99,7 +111,7 @@ def _source_contract_payload_sql(
     )
     return f"""
         pg_catalog.jsonb_build_object(
-            'identity_version', {_ql(_SOURCE_CONTRACT)},
+            'identity_version', {_ql(identity_version)},
             'source', pg_catalog.jsonb_build_object(
                 'source_id', active_source.source_id,
                 'endpoint_id', {endpoint_identity},
@@ -174,50 +186,175 @@ def _activation_marker_shape_sql(marker: str) -> str:
     """
 
 
-def _activation_matched_twin_sql(schema: str) -> str:
-    """Extend the predecessor match proof to retained superseded candidates."""
+def _activation_marker_v2_shape_sql(marker: str) -> str:
+    """Validate the closed count-one or count-two activation marker."""
 
-    matched_twin_sql = _predecessor()._subset_matched_twin_sql(schema).replace(
-        "NEW.",
-        "candidate.",
+    common_fields = (
+        "contract_version",
+        "source_contract_sha256",
+        "cutoff",
+        "verification_source_scope_sha256",
+        "completion_proof_sha256",
+        "source_id",
+        "endpoint_id",
+        "verification_campaign_id",
+        "candidate",
+        "root_policy",
     )
-    active_lifecycle_sql = """
+    root_fields = (
+        "dataset_id",
+        "acquisition_root_run_id",
+        "replay_evidence_sha256",
+        "coverage_sha256",
+    )
+    common_fields_sql = ", ".join(_ql(field_name) for field_name in common_fields)
+    count_two_fields_sql = common_fields_sql + ", " + _ql("baseline")
+    root_fields_sql = ", ".join(_ql(field_name) for field_name in root_fields)
+    digest_fields = (
+        "source_contract_sha256",
+        "verification_source_scope_sha256",
+        "completion_proof_sha256",
+    )
+    string_fields = (
+        "contract_version",
+        "source_contract_sha256",
+        "cutoff",
+        "verification_source_scope_sha256",
+        "completion_proof_sha256",
+        "source_id",
+        "endpoint_id",
+        "verification_campaign_id",
+    )
+    string_type_sql = "\n        AND ".join(
+        f"pg_catalog.jsonb_typeof({marker} -> {_ql(field_name)}) = 'string'"
+        for field_name in string_fields
+    )
+    digest_sql = "\n        AND ".join(
+        f"{marker} ->> {_ql(field_name)} ~ '^[0-9a-f]{{64}}$'"
+        for field_name in digest_fields
+    )
+    candidate = f"({marker} -> 'candidate')"
+    baseline = f"({marker} -> 'baseline')"
+    root_shape_sql = f"""
+        pg_catalog.jsonb_typeof({candidate}) = 'object'
+        AND {candidate} ?& ARRAY[{root_fields_sql}]::text[]
+        AND {candidate} - ARRAY[{root_fields_sql}]::text[] = '{{}}'::jsonb
+        AND NOT EXISTS (
+            SELECT 1
+              FROM pg_catalog.jsonb_each({candidate}) AS field(name, value)
+             WHERE pg_catalog.jsonb_typeof(field.value) <> 'string'
+        )
+        AND {candidate} ->> 'dataset_id' <> ''
+        AND {candidate} ->> 'acquisition_root_run_id' <> ''
+        AND {candidate} ->> 'replay_evidence_sha256' ~ '^[0-9a-f]{{64}}$'
+        AND {candidate} ->> 'coverage_sha256' ~ '^[0-9a-f]{{64}}$'
+    """
+    baseline_shape_sql = f"""
+        pg_catalog.jsonb_typeof({baseline}) = 'object'
+        AND {baseline} ?& ARRAY[{root_fields_sql}]::text[]
+        AND {baseline} - ARRAY[{root_fields_sql}]::text[] = '{{}}'::jsonb
+        AND NOT EXISTS (
+            SELECT 1
+              FROM pg_catalog.jsonb_each({baseline}) AS field(name, value)
+             WHERE pg_catalog.jsonb_typeof(field.value) <> 'string'
+        )
+        AND {baseline} ->> 'dataset_id' <> ''
+        AND {baseline} ->> 'acquisition_root_run_id' <> ''
+        AND {baseline} ->> 'replay_evidence_sha256' ~ '^[0-9a-f]{{64}}$'
+        AND {baseline} ->> 'coverage_sha256' ~ '^[0-9a-f]{{64}}$'
+    """
+    root_policy = f"({marker} -> 'root_policy')"
+    root_policy_one_sql = f"""
+        {root_policy} = pg_catalog.jsonb_build_object(
+            'policy_version',
+                {_ql(_predecessor()._REVIEWED_ROOT_POLICY_VERSION)},
+            'required_root_count', 1
+        )
+    """
+    root_policy_two_sql = root_policy_one_sql.replace(
+        "'required_root_count', 1",
+        "'required_root_count', 2",
+    )
+    return f"""
+        pg_catalog.jsonb_typeof({marker}) = 'object'
+        AND {string_type_sql}
+        AND {marker} ->> 'contract_version' = {_ql(_ACTIVATION_CONTRACT_V2)}
+        AND {digest_sql}
+        AND {marker} ->> 'cutoff' ~
+            '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:'
+            '[0-9]{{2}}:[0-9]{{2}}\\.[0-9]{{6}}Z$'
+        AND {marker} ->> 'source_id' <> ''
+        AND {marker} ->> 'endpoint_id' <> ''
+        AND {marker} ->> 'verification_campaign_id' <> ''
         AND (
             (
-                candidate.status = 'validated'
-                AND candidate.is_current IS FALSE
-                AND candidate.validated_at IS NOT NULL
-                AND candidate.published_at IS NULL
-                AND candidate.superseded_at IS NULL
+                ({root_policy_one_sql})
+                AND {marker} ?& ARRAY[{common_fields_sql}]::text[]
+                AND {marker} - ARRAY[{common_fields_sql}]::text[] = '{{}}'::jsonb
+                AND ({root_shape_sql})
             ) OR (
-                candidate.status = 'published'
-                AND candidate.is_current IS TRUE
-                AND candidate.validated_at IS NOT NULL
-                AND candidate.published_at IS NOT NULL
-                AND candidate.superseded_at IS NULL
+                ({root_policy_two_sql})
+                AND {marker} ?& ARRAY[{count_two_fields_sql}]::text[]
+                AND {marker} - ARRAY[{count_two_fields_sql}]::text[] = '{{}}'::jsonb
+                AND ({root_shape_sql})
+                AND ({baseline_shape_sql})
             )
         )
     """
-    retained_lifecycle_sql = """
+
+
+def _activation_matched_twin_sql(
+    schema: str,
+    *,
+    reviewed_root_policy_aware: bool = False,
+    dataset_alias: str = "candidate",
+) -> str:
+    """Extend the predecessor match proof to retained superseded candidates."""
+
+    matched_twin_sql = _predecessor()._subset_matched_twin_sql(
+        schema,
+        reviewed_root_policy_aware=reviewed_root_policy_aware,
+    ).replace(
+        "NEW.",
+        f"{dataset_alias}.",
+    )
+    active_lifecycle_sql = f"""
         AND (
             (
-                candidate.status = 'validated'
-                AND candidate.is_current IS FALSE
-                AND candidate.validated_at IS NOT NULL
-                AND candidate.published_at IS NULL
-                AND candidate.superseded_at IS NULL
+                {dataset_alias}.status = 'validated'
+                AND {dataset_alias}.is_current IS FALSE
+                AND {dataset_alias}.validated_at IS NOT NULL
+                AND {dataset_alias}.published_at IS NULL
+                AND {dataset_alias}.superseded_at IS NULL
             ) OR (
-                candidate.status = 'published'
-                AND candidate.is_current IS TRUE
-                AND candidate.validated_at IS NOT NULL
-                AND candidate.published_at IS NOT NULL
-                AND candidate.superseded_at IS NULL
+                {dataset_alias}.status = 'published'
+                AND {dataset_alias}.is_current IS TRUE
+                AND {dataset_alias}.validated_at IS NOT NULL
+                AND {dataset_alias}.published_at IS NOT NULL
+                AND {dataset_alias}.superseded_at IS NULL
+            )
+        )
+    """
+    retained_lifecycle_sql = f"""
+        AND (
+            (
+                {dataset_alias}.status = 'validated'
+                AND {dataset_alias}.is_current IS FALSE
+                AND {dataset_alias}.validated_at IS NOT NULL
+                AND {dataset_alias}.published_at IS NULL
+                AND {dataset_alias}.superseded_at IS NULL
             ) OR (
-                candidate.status = 'superseded'
-                AND candidate.is_current IS FALSE
-                AND candidate.validated_at IS NOT NULL
-                AND candidate.published_at IS NOT NULL
-                AND candidate.superseded_at IS NOT NULL
+                {dataset_alias}.status = 'published'
+                AND {dataset_alias}.is_current IS TRUE
+                AND {dataset_alias}.validated_at IS NOT NULL
+                AND {dataset_alias}.published_at IS NOT NULL
+                AND {dataset_alias}.superseded_at IS NULL
+            ) OR (
+                {dataset_alias}.status = 'superseded'
+                AND {dataset_alias}.is_current IS FALSE
+                AND {dataset_alias}.validated_at IS NOT NULL
+                AND {dataset_alias}.published_at IS NOT NULL
+                AND {dataset_alias}.superseded_at IS NOT NULL
             )
         )
     """
@@ -236,6 +373,7 @@ def _activation_valid_function_sql(
     *,
     use_configured_endpoint_identity: bool = False,
     replace_existing: bool = False,
+    reviewed_root_policy_aware: bool = False,
 ) -> str:
     previous = _predecessor()
     source_ref = _qf(schema, _SOURCE)
@@ -245,16 +383,60 @@ def _activation_valid_function_sql(
     marker = f"(active_source.metadata_json::jsonb -> {_ql(_ACTIVATION_KEY)})"
     baseline_metadata = "baseline.publication_metadata_json::jsonb"
     candidate_metadata = "candidate.publication_metadata_json::jsonb"
-    matched_twin_sql = _activation_matched_twin_sql(schema)
+    matched_twin_sql = _activation_matched_twin_sql(
+        schema,
+        reviewed_root_policy_aware=reviewed_root_policy_aware,
+    )
     source_valid_sql = previous._subset_source_sql(
         schema,
         require_verified=True,
         dataset_alias="candidate",
         use_configured_endpoint_identity=use_configured_endpoint_identity,
         require_physical_match=not use_configured_endpoint_identity,
+        reviewed_root_policy_aware=reviewed_root_policy_aware,
     )
     source_contract_payload = _source_contract_payload_sql(
         use_configured_endpoint_identity=use_configured_endpoint_identity,
+    )
+    policy_marker = (
+        f"(active_source.metadata_json::jsonb -> {_ql(_ACTIVATION_KEY_V2)})"
+    )
+    policy_candidate_metadata = (
+        "policy_candidate.publication_metadata_json::jsonb"
+    )
+    policy_baseline_metadata = (
+        "policy_baseline.publication_metadata_json::jsonb"
+    )
+    policy_source_contract_payload = _source_contract_payload_sql(
+        use_configured_endpoint_identity=use_configured_endpoint_identity,
+        include_reviewed_root_policy=True,
+    )
+    policy_source_valid_sql = previous._subset_source_sql(
+        schema,
+        require_verified=True,
+        dataset_alias="policy_candidate",
+        use_configured_endpoint_identity=use_configured_endpoint_identity,
+        require_physical_match=not use_configured_endpoint_identity,
+        reviewed_root_policy_aware=True,
+    )
+    policy_matched_twin_sql = _activation_matched_twin_sql(
+        schema,
+        reviewed_root_policy_aware=True,
+        dataset_alias="policy_candidate",
+    )
+    policy_single_root_sql = previous._subset_single_root_sql(
+        schema,
+        dataset_alias="policy_candidate",
+    )
+    policy_marker_one_sql = f"""
+        {policy_marker} -> 'root_policy' = pg_catalog.jsonb_build_object(
+            'policy_version', {_ql(previous._REVIEWED_ROOT_POLICY_VERSION)},
+            'required_root_count', 1
+        )
+    """
+    policy_marker_two_sql = policy_marker_one_sql.replace(
+        "'required_root_count', 1",
+        "'required_root_count', 2",
     )
     marker_endpoint_identity = (
         "active_source.metadata_json::jsonb "
@@ -268,6 +450,116 @@ def _activation_valid_function_sql(
         else "CREATE FUNCTION"
     )
     proof_statuses = ", ".join(_ql(status) for status in _PROOF_BEARING_STATUSES)
+    policy_ctes_sql = ""
+    policy_activation_sql = ""
+    if reviewed_root_policy_aware:
+        policy_ctes_sql = f"""
+        , policy_candidate AS MATERIALIZED (
+            SELECT dataset.*
+              FROM {dataset_ref} AS dataset
+              JOIN active_source
+                ON dataset.dataset_id =
+                   {policy_marker} -> 'candidate' ->> 'dataset_id'
+        ), policy_baseline AS MATERIALIZED (
+            SELECT dataset.*
+              FROM {dataset_ref} AS dataset
+              JOIN active_source
+                ON dataset.dataset_id =
+                   {policy_marker} -> 'baseline' ->> 'dataset_id'
+        )
+        """
+        policy_activation_sql = f"""
+        OR COALESCE((
+            SELECT (
+                active_source.metadata_json::jsonb
+                    ->> 'provider_directory_candidate_status' =
+                    {_ql(_POLICY_VERIFIED_STATUS)}
+                AND active_source.metadata_json::jsonb
+                    ? {_ql(_ACTIVATION_KEY_V2)}
+                AND NOT (active_source.metadata_json::jsonb
+                    ? {_ql(_ACTIVATION_KEY)})
+                AND ({_activation_marker_v2_shape_sql(policy_marker)})
+                AND active_source.metadata_json::jsonb
+                        -> {_ql(previous._REVIEWED_ROOT_POLICY_KEY)} =
+                    {policy_marker} -> 'root_policy'
+                AND {policy_candidate_metadata}
+                        -> {_ql(previous._REVIEWED_ROOT_POLICY_KEY)} =
+                    {policy_marker} -> 'root_policy'
+                AND {policy_marker} ->> 'source_id' = active_source.source_id
+                AND {policy_marker} ->> 'endpoint_id' =
+                    {marker_endpoint_identity}
+                AND {policy_marker} ->> 'verification_campaign_id' =
+                    policy_candidate.completion_proof_json ->> 'campaign_id'
+                AND {policy_marker} ->> 'cutoff' =
+                    policy_candidate.completion_proof_json ->> 'cutoff'
+                AND {policy_marker} ->> 'verification_source_scope_sha256' =
+                    {policy_candidate_metadata} ->>
+                    {_ql(previous._TWIN_SCOPE_KEY)}
+                AND {policy_marker} ->> 'completion_proof_sha256' =
+                    policy_candidate.completion_proof_sha256
+                AND {policy_marker} ->> 'source_contract_sha256' =
+                    {canonical_sha256_ref}({policy_source_contract_payload})
+                AND {policy_marker} -> 'candidate' ->> 'dataset_id' =
+                    policy_candidate.dataset_id
+                AND {policy_marker} -> 'candidate' ->>
+                        'acquisition_root_run_id' =
+                    policy_candidate.acquisition_root_run_id
+                AND {policy_marker} -> 'candidate' ->>
+                        'replay_evidence_sha256' =
+                    {policy_candidate_metadata} ->>
+                    {_ql(previous._REPLAY_EVIDENCE_SHA256_KEY)}
+                AND {policy_marker} -> 'candidate' ->> 'coverage_sha256' =
+                    {canonical_sha256_ref}(
+                        {policy_candidate_metadata} ->
+                        {_ql(previous._SUBSET_COVERAGE_KEY)}
+                    )
+                AND (
+                    (
+                        ({policy_marker_one_sql})
+                        AND ({policy_single_root_sql})
+                    ) OR (
+                        ({policy_marker_two_sql})
+                        AND policy_baseline.dataset_id IS NOT NULL
+                        AND {policy_marker} -> 'baseline' ->> 'dataset_id' =
+                            policy_baseline.dataset_id
+                        AND {policy_marker} -> 'baseline' ->>
+                                'acquisition_root_run_id' =
+                            policy_baseline.acquisition_root_run_id
+                        AND {policy_marker} -> 'baseline' ->>
+                                'replay_evidence_sha256' =
+                            {policy_baseline_metadata} ->>
+                            {_ql(previous._REPLAY_EVIDENCE_SHA256_KEY)}
+                        AND {policy_marker} -> 'baseline' ->> 'coverage_sha256' =
+                            {canonical_sha256_ref}(
+                                {policy_baseline_metadata} ->
+                                {_ql(previous._SUBSET_COVERAGE_KEY)}
+                            )
+                        AND ({policy_matched_twin_sql})
+                    )
+                )
+                AND ({policy_source_valid_sql})
+                AND (
+                    SELECT pg_catalog.count(*)
+                      FROM {dataset_ref} AS generation
+                     WHERE generation.endpoint_id = policy_candidate.endpoint_id
+                       AND generation.completion_proof_required_version = 3
+                       AND generation.status IN ({proof_statuses})
+                       AND generation.publication_metadata_json::jsonb
+                            ->> {_ql(previous._TWIN_CAMPAIGN_KEY)} =
+                            {policy_candidate_metadata} ->>
+                            {_ql(previous._TWIN_CAMPAIGN_KEY)}
+                       AND generation.publication_metadata_json::jsonb
+                            ->> {_ql(previous._TWIN_SCOPE_KEY)} =
+                            {policy_candidate_metadata} ->>
+                            {_ql(previous._TWIN_SCOPE_KEY)}
+                ) = ({policy_marker} -> 'root_policy'
+                        ->> 'required_root_count')::integer
+            )
+              FROM active_source
+              JOIN policy_candidate ON true
+              LEFT JOIN policy_baseline ON true
+        ), false)
+        """
     return f"""
     {create_function} {function_ref}(candidate_source_id text)
     RETURNS boolean
@@ -293,11 +585,14 @@ def _activation_valid_function_sql(
                 ON dataset.dataset_id =
                    {marker} -> 'baseline' ->> 'dataset_id'
         )
+        {policy_ctes_sql}
         SELECT COALESCE((
             SELECT (
                 active_source.metadata_json::jsonb
                     ->> 'provider_directory_candidate_status' =
                     {_ql(_VERIFIED_STATUS)}
+                AND NOT (active_source.metadata_json::jsonb
+                    ? {_ql(_ACTIVATION_KEY_V2)})
                 AND ({_activation_marker_shape_sql(marker)})
                 AND {marker} ->> 'source_id' = active_source.source_id
                 AND {marker} ->> 'endpoint_id' = {marker_endpoint_identity}
@@ -361,7 +656,8 @@ def _activation_valid_function_sql(
               FROM active_source
               JOIN candidate ON true
               JOIN baseline ON true
-        ), false);
+        ), false)
+        {policy_activation_sql};
     $function$;
     """
 
@@ -371,16 +667,23 @@ def _source_guard_function_sql(
     *,
     allow_effective_endpoint_cutover: bool = False,
     replace_existing: bool = False,
+    reviewed_root_policy_aware: bool = False,
 ) -> str:
     source_ref = _qf(schema, _SOURCE)
     dataset_ref = _qf(schema, _ENDPOINT_DATASET)
     guard_ref = _qf(schema, _SOURCE_GUARD_FUNCTION)
     valid_ref = _qf(schema, _ACTIVATION_VALID_FUNCTION)
     key = _ql(_ACTIVATION_KEY)
+    policy_key = _ql(_ACTIVATION_KEY_V2)
     pending = _ql(_PENDING_STATUS)
     verified = _ql(_VERIFIED_STATUS)
-    if allow_effective_endpoint_cutover:
-        active_endpoint_transition_sql = f"""
+    policy_pending = _ql(_POLICY_PENDING_STATUS)
+    policy_verified = _ql(_POLICY_VERIFIED_STATUS)
+
+    def _active_endpoint_transition_sql(marker_key: str) -> str:
+        if not allow_effective_endpoint_cutover:
+            return ""
+        return f"""
                 AND (
                     NEW.endpoint_id IS NOT DISTINCT FROM OLD.endpoint_id
                     OR (
@@ -393,13 +696,13 @@ def _source_guard_function_sql(
                             pg_catalog.transaction_timestamp()
                         AND NEW.endpoint_id = new_metadata
                                 ->> 'provider_directory_configured_endpoint_id'
-                        AND NEW.endpoint_id = new_metadata -> {key}
+                        AND NEW.endpoint_id = new_metadata -> {marker_key}
                                 ->> 'endpoint_id'
                         AND EXISTS (
                             SELECT 1
                               FROM {dataset_ref} AS activation_candidate
                              WHERE activation_candidate.dataset_id =
-                                    new_metadata -> {key}
+                                    new_metadata -> {marker_key}
                                         -> 'candidate' ->> 'dataset_id'
                                AND activation_candidate.endpoint_id =
                                     NEW.endpoint_id
@@ -414,8 +717,93 @@ def _source_guard_function_sql(
                     )
                 )
         """
-    else:
-        active_endpoint_transition_sql = ""
+    active_endpoint_transition_sql = _active_endpoint_transition_sql(key)
+    policy_active_endpoint_transition_sql = _active_endpoint_transition_sql(
+        policy_key
+    )
+    policy_truncate_sql = (
+        f"""
+                    OR active_source.metadata_json::jsonb ? {policy_key}
+                    OR active_source.metadata_json::jsonb
+                         ->> 'provider_directory_candidate_status' =
+                         {policy_verified}
+        """
+        if reviewed_root_policy_aware
+        else ""
+    )
+    policy_old_active_sql = (
+        f"""
+                OR old_metadata ? {policy_key}
+                OR old_metadata ->> 'provider_directory_candidate_status' =
+                   {policy_verified}
+        """
+        if reviewed_root_policy_aware
+        else ""
+    )
+    policy_new_active_sql = (
+        f"""
+                OR new_metadata ? {policy_key}
+                OR new_metadata ->> 'provider_directory_candidate_status' =
+                   {policy_verified}
+        """
+        if reviewed_root_policy_aware
+        else ""
+    )
+    policy_transition_sql = (
+        f"""
+                OR (
+                    old_metadata ->> 'provider_directory_candidate_status' =
+                        {policy_pending}
+                    AND NOT (old_metadata ?| ARRAY[{key}, {policy_key}]::text[])
+                    AND new_metadata ->> 'provider_directory_candidate_status' =
+                        {policy_verified}
+                    AND pg_catalog.jsonb_typeof(new_metadata -> {policy_key}) =
+                        'object'
+                    AND new_metadata -> {policy_key} -> 'root_policy' =
+                        new_metadata ->
+                        {_ql(_predecessor()._REVIEWED_ROOT_POLICY_KEY)}
+                    AND pg_catalog.to_jsonb(NEW)
+                            - ARRAY['metadata_json', 'updated_at']::text[]
+                        = pg_catalog.to_jsonb(OLD)
+                            - ARRAY['metadata_json', 'updated_at']::text[]
+                    AND new_metadata
+                            - ARRAY[
+                                'provider_directory_candidate_status',
+                                {_ql(_ACTIVATION_KEY_V2)}
+                              ]::text[]
+                        = old_metadata
+                            - ARRAY[
+                                'provider_directory_candidate_status',
+                                {_ql(_ACTIVATION_KEY_V2)}
+                              ]::text[]
+                    AND NEW.updated_at IS NOT DISTINCT FROM
+                        pg_catalog.transaction_timestamp()
+                    AND {valid_ref}(NEW.source_id) IS TRUE
+                )
+        """
+        if reviewed_root_policy_aware
+        else ""
+    )
+    policy_replay_sql = (
+        f"""
+                OR (
+                    old_metadata ->> 'provider_directory_candidate_status' =
+                        {policy_verified}
+                    AND new_metadata ->> 'provider_directory_candidate_status' =
+                        {policy_verified}
+                    AND pg_catalog.jsonb_typeof(old_metadata -> {policy_key}) =
+                        'object'
+                    AND NOT (old_metadata ? {key})
+                    AND NOT (new_metadata ? {key})
+                    AND new_metadata -> {policy_key} =
+                        old_metadata -> {policy_key}
+                    {policy_active_endpoint_transition_sql}
+                    AND {valid_ref}(NEW.source_id) IS TRUE
+                )
+        """
+        if reviewed_root_policy_aware
+        else ""
+    )
     create_function = (
         "CREATE OR REPLACE FUNCTION"
         if replace_existing
@@ -449,6 +837,7 @@ def _source_guard_function_sql(
                  WHERE active_source.metadata_json::jsonb ? {key}
                     OR active_source.metadata_json::jsonb
                          ->> 'provider_directory_candidate_status' = {verified}
+                    {policy_truncate_sql}
             ) THEN
                 RAISE EXCEPTION
                     'provider_directory_reviewed_subset_activation_truncate_forbidden'
@@ -461,7 +850,8 @@ def _source_guard_function_sql(
             old_metadata := OLD.metadata_json::jsonb;
             old_active := COALESCE(old_metadata ? {key}, false)
                 OR old_metadata ->> 'provider_directory_candidate_status' =
-                   {verified};
+                   {verified}
+                {policy_old_active_sql};
             affected_source_ids := pg_catalog.array_append(
                 affected_source_ids,
                 OLD.source_id
@@ -479,7 +869,8 @@ def _source_guard_function_sql(
             new_metadata := NEW.metadata_json::jsonb;
             new_active := COALESCE(new_metadata ? {key}, false)
                 OR new_metadata ->> 'provider_directory_candidate_status' =
-                   {verified};
+                   {verified}
+                {policy_new_active_sql};
             affected_source_ids := pg_catalog.array_append(
                 affected_source_ids,
                 NEW.source_id
@@ -518,10 +909,11 @@ def _source_guard_function_sql(
             IF (
                 old_metadata ->> 'provider_directory_candidate_status' =
                     {pending}
-                AND NOT (old_metadata ? {key})
+                AND NOT (old_metadata ?| ARRAY[{key}, {policy_key}]::text[])
                 AND new_metadata ->> 'provider_directory_candidate_status' =
                     {verified}
                 AND pg_catalog.jsonb_typeof(new_metadata -> {key}) = 'object'
+                AND NOT (new_metadata ? {policy_key})
                 AND pg_catalog.to_jsonb(NEW)
                         - ARRAY['metadata_json', 'updated_at']::text[]
                     = pg_catalog.to_jsonb(OLD)
@@ -539,7 +931,9 @@ def _source_guard_function_sql(
                 AND NEW.updated_at IS NOT DISTINCT FROM
                     pg_catalog.transaction_timestamp()
                 AND {valid_ref}(NEW.source_id) IS TRUE
-            ) THEN
+            )
+                {policy_transition_sql}
+            THEN
                 NULL;
             ELSIF (
                 old_metadata ->> 'provider_directory_candidate_status' =
@@ -548,9 +942,13 @@ def _source_guard_function_sql(
                     {verified}
                 AND pg_catalog.jsonb_typeof(old_metadata -> {key}) = 'object'
                 AND new_metadata -> {key} = old_metadata -> {key}
+                AND NOT (old_metadata ? {policy_key})
+                AND NOT (new_metadata ? {policy_key})
                 {active_endpoint_transition_sql}
                 AND {valid_ref}(NEW.source_id) IS TRUE
-            ) THEN
+            )
+                {policy_replay_sql}
+            THEN
                 NULL;
             ELSE
                 RAISE EXCEPTION
@@ -568,6 +966,7 @@ def _source_guard_function_sql(
                         OR active_source.metadata_json::jsonb
                              ->> 'provider_directory_candidate_status' =
                              {verified}
+                        {policy_truncate_sql}
                    )
                    AND (
                         active_source.source_id = ANY(affected_source_ids)
@@ -593,14 +992,74 @@ def _source_guard_function_sql(
     """
 
 
-def _dataset_guard_function_sql(schema: str) -> str:
+def _dataset_guard_function_sql(
+    schema: str,
+    *,
+    replace_existing: bool = False,
+    reviewed_root_policy_aware: bool = False,
+) -> str:
     source_ref = _qf(schema, _SOURCE)
     guard_ref = _qf(schema, _DATASET_GUARD_FUNCTION)
     key = _ql(_ACTIVATION_KEY)
+    policy_key = _ql(_ACTIVATION_KEY_V2)
     verified = _ql(_VERIFIED_STATUS)
+    policy_verified = _ql(_POLICY_VERIFIED_STATUS)
     proof_statuses = ", ".join(_ql(status) for status in _PROOF_BEARING_STATUSES)
+    create_function = (
+        "CREATE OR REPLACE FUNCTION"
+        if replace_existing
+        else "CREATE FUNCTION"
+    )
+    policy_truncate_sql = (
+        f"""
+                    OR active_source.metadata_json::jsonb ? {policy_key}
+                    OR active_source.metadata_json::jsonb
+                         ->> 'provider_directory_candidate_status' =
+                         {policy_verified}
+        """
+        if reviewed_root_policy_aware
+        else ""
+    )
+    policy_invalid_sql = (
+        f"""
+                OR (
+                    (
+                        active_source.metadata_json::jsonb ? {policy_key}
+                        OR active_source.metadata_json::jsonb
+                             ->> 'provider_directory_candidate_status' =
+                             {policy_verified}
+                    )
+                    AND (
+                        pg_catalog.jsonb_typeof(
+                            active_source.metadata_json::jsonb -> {policy_key}
+                        ) IS DISTINCT FROM 'object'
+                        OR active_source.metadata_json::jsonb ? {key}
+                        OR (
+                            NEW.dataset_id IS DISTINCT FROM
+                                active_source.metadata_json::jsonb -> {policy_key}
+                                    -> 'candidate' ->> 'dataset_id'
+                            AND NEW.dataset_id IS DISTINCT FROM
+                                active_source.metadata_json::jsonb -> {policy_key}
+                                    -> 'baseline' ->> 'dataset_id'
+                            AND NEW.publication_metadata_json::jsonb
+                                    ->> 'verification_campaign_id'
+                                IS NOT DISTINCT FROM
+                                active_source.metadata_json::jsonb -> {policy_key}
+                                    ->> 'verification_campaign_id'
+                            AND NEW.publication_metadata_json::jsonb
+                                    ->> 'verification_source_scope_hash'
+                                IS NOT DISTINCT FROM
+                                active_source.metadata_json::jsonb -> {policy_key}
+                                    ->> 'verification_source_scope_sha256'
+                        )
+                    )
+                )
+        """
+        if reviewed_root_policy_aware
+        else ""
+    )
     return f"""
-    CREATE FUNCTION {guard_ref}()
+    {create_function} {guard_ref}()
     RETURNS trigger
     LANGUAGE plpgsql
     SECURITY DEFINER
@@ -616,6 +1075,7 @@ def _dataset_guard_function_sql(schema: str) -> str:
                  WHERE active_source.metadata_json::jsonb ? {key}
                     OR active_source.metadata_json::jsonb
                          ->> 'provider_directory_candidate_status' = {verified}
+                    {policy_truncate_sql}
             ) THEN
                 RAISE EXCEPTION
                     'provider_directory_reviewed_subset_activation_dataset_truncate_forbidden'
@@ -656,32 +1116,39 @@ def _dataset_guard_function_sql(schema: str) -> str:
                          NEW.endpoint_id
                )
                AND (
-                    active_source.metadata_json::jsonb ? {key}
-                    OR active_source.metadata_json::jsonb
-                         ->> 'provider_directory_candidate_status' = {verified}
-               )
-               AND (
-                    pg_catalog.jsonb_typeof(
-                        active_source.metadata_json::jsonb -> {key}
-                    ) IS DISTINCT FROM 'object'
-                    OR (
-                        NEW.dataset_id IS DISTINCT FROM
-                            active_source.metadata_json::jsonb -> {key}
-                                -> 'baseline' ->> 'dataset_id'
-                        AND NEW.dataset_id IS DISTINCT FROM
-                            active_source.metadata_json::jsonb -> {key}
-                                -> 'candidate' ->> 'dataset_id'
-                        AND NEW.publication_metadata_json::jsonb
-                                ->> 'verification_campaign_id'
-                            IS NOT DISTINCT FROM
-                            active_source.metadata_json::jsonb -> {key}
-                                ->> 'verification_campaign_id'
-                        AND NEW.publication_metadata_json::jsonb
-                                ->> 'verification_source_scope_hash'
-                            IS NOT DISTINCT FROM
-                            active_source.metadata_json::jsonb -> {key}
-                                ->> 'verification_source_scope_sha256'
+                    (
+                        (
+                            active_source.metadata_json::jsonb ? {key}
+                            OR active_source.metadata_json::jsonb
+                                 ->> 'provider_directory_candidate_status' =
+                                 {verified}
+                        )
+                        AND (
+                            pg_catalog.jsonb_typeof(
+                                active_source.metadata_json::jsonb -> {key}
+                            ) IS DISTINCT FROM 'object'
+                            OR active_source.metadata_json::jsonb ? {policy_key}
+                            OR (
+                                NEW.dataset_id IS DISTINCT FROM
+                                    active_source.metadata_json::jsonb -> {key}
+                                        -> 'baseline' ->> 'dataset_id'
+                                AND NEW.dataset_id IS DISTINCT FROM
+                                    active_source.metadata_json::jsonb -> {key}
+                                        -> 'candidate' ->> 'dataset_id'
+                                AND NEW.publication_metadata_json::jsonb
+                                        ->> 'verification_campaign_id'
+                                    IS NOT DISTINCT FROM
+                                    active_source.metadata_json::jsonb -> {key}
+                                        ->> 'verification_campaign_id'
+                                AND NEW.publication_metadata_json::jsonb
+                                        ->> 'verification_source_scope_hash'
+                                    IS NOT DISTINCT FROM
+                                    active_source.metadata_json::jsonb -> {key}
+                                        ->> 'verification_source_scope_sha256'
+                            )
+                        )
                     )
+                    {policy_invalid_sql}
                )
         ) THEN
             RAISE EXCEPTION

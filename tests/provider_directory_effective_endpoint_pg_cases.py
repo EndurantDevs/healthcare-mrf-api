@@ -36,6 +36,10 @@ _MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "alembic/versions/20260809010000_provider_directory_effective_endpoint_identity.py"
 )
+_ROOT_POLICY_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions/20260809030000_provider_directory_reviewed_root_policy.py"
+)
 _SERVING_ENDPOINT_ID = "endpoint-serving"
 
 
@@ -43,6 +47,17 @@ def _load_effective_endpoint_migration():
     module_spec = importlib.util.spec_from_file_location(
         "provider_directory_effective_endpoint_postgres_migration",
         _MIGRATION_PATH,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
+
+
+def _load_root_policy_migration():
+    module_spec = importlib.util.spec_from_file_location(
+        "provider_directory_root_policy_postgres_migration",
+        _ROOT_POLICY_MIGRATION_PATH,
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
@@ -378,6 +393,12 @@ async def prove_effective_endpoint_activation_and_publication(monkeypatch):
             scenario,
             effective_migration,
         )
+        async with scenario.connection.transaction():
+            await run_subset_migration(
+                _load_root_policy_migration(),
+                "upgrade",
+                scenario.connection,
+            )
         activation_result = await activation.sync_reviewed_subset_verified_state(
             database=activation_database
         )

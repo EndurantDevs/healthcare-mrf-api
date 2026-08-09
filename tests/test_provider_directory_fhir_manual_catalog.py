@@ -25,6 +25,11 @@ from process.provider_directory_fhir_census_contract import (
     CURRENT_VERSION_CENSUS_START_URLS_FIELD,
     current_version_census_request,
 )
+from process.provider_directory_fhir_root_policy import (
+    POLICY_PENDING_STATUS,
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+    ReviewedRootPolicy,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -166,6 +171,24 @@ def test_reviewed_manifest_seed_binds_exact_identity_without_cutoff():
     assert metadata[CURRENT_VERSION_CENSUS_START_URLS_FIELD] == entry[
         "manual_current_version_census"
     ]["start_urls"]
+
+
+@pytest.mark.parametrize("required_root_count", (1, 2))
+def test_reviewed_seed_persists_explicit_root_policy(required_root_count):
+    entry = _manual_entry()
+    seed_row = manual_catalog.reviewed_manual_census_seed_rows(
+        entry["source_ids"][0],
+        root_policy=ReviewedRootPolicy(required_root_count),
+    )[0]
+
+    metadata = seed_row["metadata_json"]
+    assert metadata["provider_directory_candidate_status"] == (
+        POLICY_PENDING_STATUS
+    )
+    assert metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] == {
+        "policy_version": "provider-directory-reviewed-root-policy-v1",
+        "required_root_count": required_root_count,
+    }
 
 
 def test_reviewed_manual_source_resolves_without_runtime_selector():

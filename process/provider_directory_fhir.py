@@ -39,7 +39,7 @@ import aiohttp
 from yarl import URL
 import asyncpg
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import case, func, or_, text as sa_text
+from sqlalchemy import and_, case, func, literal, or_, text as sa_text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -151,8 +151,19 @@ from process.provider_directory_fhir_subset_completion import (
 from process.provider_directory_fhir_subset_identity import (
     server_issued_subset_source_scope_payload,
 )
+from process.provider_directory_fhir_root_policy import (
+    DEFAULT_REQUIRED_ROOT_COUNT,
+    POLICY_PENDING_STATUS as PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+    POLICY_VERIFIED_STATUS as PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+    REVIEWED_ROOT_POLICY_VERSION,
+    ReviewedRootPolicy,
+    reviewed_root_policy_for_status,
+    reviewed_root_policy_from_document,
+)
 from process.provider_directory_fhir_subset_activation_contract import (
     ACTIVATION_METADATA_KEY as REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+    ACTIVATION_METADATA_KEY_V2 as REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
     VERIFIED_STATUS as REVIEWED_SUBSET_VERIFIED_STATUS,
 )
 from process.provider_directory_fhir_manual_catalog import (
@@ -2045,6 +2056,7 @@ class EndpointDatasetCandidate:
     reused_from_checkpoint: bool = False
     repair_empty_orphan: bool = False
     requires_twin_root_verification: bool = False
+    reviewed_root_policy: ReviewedRootPolicy | None = None
     verification_campaign_id: str | None = None
     verification_source_scope_hash: str | None = None
     verification_role: str | None = None
@@ -2068,6 +2080,7 @@ class EndpointDatasetCandidateSelection:
     reused_from_checkpoint: bool
     repair_empty_orphan: bool = False
     requires_twin_root_verification: bool | None = None
+    reviewed_root_policy: ReviewedRootPolicy | None = None
     verification_campaign_id: str | None = None
     verification_source_scope_hash: str | None = None
     verification_role: str | None = None
@@ -2103,6 +2116,7 @@ class EndpointDatasetVerificationProfile:
     is_twin_root_required: bool
     campaign_id: str | None = None
     source_scope_hash: str | None = None
+    reviewed_root_policy: ReviewedRootPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -4638,44 +4652,116 @@ def _source_group_twin_root_verification_profile(
     source_records: list[dict[str, Any]],
 ) -> tuple[bool, str | None]:
     """Parse an explicit, alias-consistent reviewed-candidate generation."""
-    profiles: set[tuple[str | None, str | None]] = set()
-    for source_record in source_records:
-        metadata = _source_metadata(source_record)
-        has_status = "provider_directory_candidate_status" in metadata
-        status = _clean_text(metadata.get("provider_directory_candidate_status"))
-        campaign_id = _clean_text(
-            metadata.get(PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY)
+    profile = _source_group_reviewed_root_policy_profile(source_records)
+    return profile.is_twin_root_required, profile.campaign_id
+
+
+_ReviewedProfileKey = tuple[str | None, str | None, int | None, bool]
+
+
+def _reviewed_source_profile_key(
+    source_record: dict[str, Any],
+) -> _ReviewedProfileKey:
+    metadata = _source_metadata(source_record)
+    has_status = "provider_directory_candidate_status" in metadata
+    status = _clean_text(metadata.get("provider_directory_candidate_status"))
+    campaign_id = _clean_text(
+        metadata.get(PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY)
+    )
+    if not has_status:
+        if campaign_id:
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_verification_campaign_unexpected"
+            )
+        try:
+            reviewed_root_policy_for_status(metadata, None)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        return None, None, None, False
+    valid_statuses = {
+        PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+        PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
+        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED,
+        PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+        PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
+    }
+    if status not in valid_statuses:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_status_invalid"
         )
-        if not has_status:
-            if campaign_id:
-                raise RuntimeError(
-                    "provider_directory_endpoint_dataset_verification_campaign_unexpected"
-                )
-            profiles.add((None, None))
-            continue
-        if status not in {
-            PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
-            PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
-            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED,
-        }:
+    if not campaign_id:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_campaign_required"
+        )
+    is_policy_status = status in {
+        PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+        PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
+    }
+    is_subset_status = status in {
+        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
+        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED,
+        PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+        PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
+    }
+    if not is_subset_status:
+        if REVIEWED_ROOT_POLICY_METADATA_KEY in metadata:
             raise RuntimeError(
-                "provider_directory_endpoint_dataset_verification_status_invalid"
+                "provider_directory_reviewed_root_policy_scope_invalid"
             )
-        if not campaign_id:
-            raise RuntimeError(
-                "provider_directory_endpoint_dataset_verification_campaign_required"
-            )
-        profiles.add((status, campaign_id))
+        return status, campaign_id, None, False
+    try:
+        root_policy = reviewed_root_policy_for_status(metadata, status)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    return status, campaign_id, root_policy.required_root_count, is_policy_status
+
+
+def _verification_profile_from_key(
+    profile_key: _ReviewedProfileKey,
+) -> EndpointDatasetVerificationProfile:
+    status, campaign_id, required_root_count, is_policy_status = profile_key
+    reviewed_root_policy = (
+        ReviewedRootPolicy(required_root_count)
+        if is_policy_status and required_root_count is not None
+        else None
+    )
+    is_pending = status in {
+        PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
+        PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+    }
+    is_twin_root_required = bool(
+        is_pending
+        and (
+            reviewed_root_policy.is_twin_root_required
+            if reviewed_root_policy is not None
+            else True
+        )
+    )
+    return EndpointDatasetVerificationProfile(
+        is_twin_root_required=is_twin_root_required,
+        campaign_id=campaign_id,
+        reviewed_root_policy=reviewed_root_policy,
+    )
+
+
+def _source_group_reviewed_root_policy_profile(
+    source_records: list[dict[str, Any]],
+) -> EndpointDatasetVerificationProfile:
+    """Parse one alias-consistent campaign and immutable root policy."""
+
+    profiles = {
+        _reviewed_source_profile_key(source_record)
+        for source_record in source_records
+    }
     if len(profiles) > 1:
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_profile_ambiguous"
         )
-    status, campaign_id = next(iter(profiles), (None, None))
-    return status in {
-        PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
-        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING,
-    }, campaign_id
+    return _verification_profile_from_key(
+        next(iter(profiles), (None, None, None, False))
+    )
 
 
 def _needs_source_group_twin_root_verification(
@@ -13839,6 +13925,7 @@ class ProviderDirectoryArtifactDataset:
     verification_campaign_id: str | None = None
     verification_source_scope_hash: str | None = None
     verification_source_ids: tuple[str, ...] = ()
+    reviewed_root_policy: ReviewedRootPolicy | None = None
     source_verification_contract: tuple[Any, ...] = ()
     source_verification_contract_hash: str | None = None
 
@@ -14129,6 +14216,7 @@ def _artifact_profile_absence_sql(source_ref: str, metadata: str) -> str:
             {metadata} ->> '{TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY}', ''
         ) IS NULL
         AND NOT ({metadata} ? '{TWIN_ROOT_VERIFICATION_METADATA_KEY}')
+        AND NOT ({metadata} ? '{REVIEWED_ROOT_POLICY_METADATA_KEY}')
         AND NOT EXISTS (
             SELECT 1
               FROM {source_ref} AS profile_source
@@ -14261,6 +14349,8 @@ def _artifact_subset_parent_pair_sql(sql_by_field: Mapping[str, str]) -> str:
 
 def _artifact_subset_parent_coverage_sql(
     sql_by_field: Mapping[str, str],
+    *,
+    bind_embedded_completion: bool = True,
 ) -> str:
     """Bind safe aggregate coverage and canonical dataset proof fields."""
 
@@ -14270,6 +14360,14 @@ def _artifact_subset_parent_coverage_sql(
     embedded = sql_by_field["embedded_proof"]
     metadata = sql_by_field["metadata"]
     coverage = sql_by_field["coverage"]
+    embedded_completion_sql = (
+        f"""
+        AND {embedded} -> 'completion_proof' = {proof}
+        AND {embedded} ->> 'completion_proof_sha256' = {proof_sha}
+        """
+        if bind_embedded_completion
+        else ""
+    )
     return f"""
         {coverage} -> 'resources' = (
             SELECT jsonb_object_agg(
@@ -14293,8 +14391,7 @@ def _artifact_subset_parent_coverage_sql(
                            AS resource(resource_type, resource_proof)
              )
         )
-        AND {embedded} -> 'completion_proof' = {proof}
-        AND {embedded} ->> 'completion_proof_sha256' = {proof_sha}
+        {embedded_completion_sql}
         AND {proof} ->> 'campaign_id' =
             {metadata} ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
         AND {proof} -> 'dataset' ->> 'hash' = {dataset}.dataset_hash
@@ -14305,6 +14402,76 @@ def _artifact_subset_parent_coverage_sql(
         AND {proof} -> 'dataset' -> 'resource_counts' =
             {embedded} -> 'resource_counts'
     """
+
+
+def _artifact_stored_content_proof_sql(
+    dataset_alias: str,
+    metadata: str,
+    stored_proof: str,
+) -> str:
+    """Bind a canonical stored content proof to one finalized subset row."""
+
+    content_proof_valid = _qt(
+        _schema(), "provider_directory_subset_content_proof_valid"
+    )
+    completion_proof = f"{dataset_alias}.completion_proof_json"
+    return f"""
+        {content_proof_valid}(
+            {stored_proof},
+            {dataset_alias}.dataset_id,
+            {dataset_alias}.endpoint_id,
+            {dataset_alias}.acquisition_root_run_id,
+            {metadata} -> 'source_ids',
+            {metadata} -> 'selected_resources',
+            {dataset_alias}.dataset_hash,
+            {dataset_alias}.resource_count,
+            {completion_proof} -> 'dataset' -> 'resource_hashes',
+            {completion_proof} -> 'dataset' -> 'resource_counts'
+        ) IS TRUE
+    """
+
+
+def _artifact_subset_single_root_proof_sql(
+    dataset_alias: str,
+    metadata: str,
+    stored_proof: str,
+) -> str:
+    """Bind one direct completion/replay/coverage/content proof set."""
+
+    sql_by_field = {
+        "dataset": dataset_alias,
+        "metadata": metadata,
+        "embedded_proof": stored_proof,
+        "completion_proof": f"{dataset_alias}.completion_proof_json",
+        "completion_sha256": f"{dataset_alias}.completion_proof_sha256",
+        "canonical_sha256_function": _qt(
+            _schema(), "provider_directory_subset_canonical_sha256"
+        ),
+        "replay_evidence": (
+            f"{metadata} -> '{SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY}'"
+        ),
+        "replay_sha256": (
+            f"{metadata} ->> '{SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY}'"
+        ),
+        "coverage": f"{metadata} -> '{SERVER_ISSUED_SUBSET_COVERAGE_KEY}'",
+    }
+    fragments = (
+        _artifact_subset_parent_pair_sql(sql_by_field),
+        _artifact_subset_parent_coverage_sql(
+            sql_by_field,
+            bind_embedded_completion=False,
+        ),
+        _artifact_subset_parent_diagnostics_sql(sql_by_field),
+        _artifact_subset_parent_replay_sql(sql_by_field),
+        _artifact_stored_content_proof_sql(
+            dataset_alias,
+            metadata,
+            stored_proof,
+        ),
+    )
+    return "\n        AND ".join(
+        fragment.strip() for fragment in fragments
+    )
 
 
 def _artifact_subset_parent_diagnostics_sql(
@@ -14573,30 +14740,36 @@ def _artifact_source_id_list_sql(
     """
 
 
-def _artifact_source_contract_sql(
+def _artifact_source_policy_sql(
+    source_metadata: str,
+    metadata: str,
+    reviewed_root_count: int | None,
+    require_policy_absent: bool,
+) -> str:
+    if reviewed_root_count is not None and require_policy_absent:
+        raise ValueError("provider_directory_artifact_root_policy_ambiguous")
+    if reviewed_root_count is not None:
+        return f"""
+                   AND {source_metadata} -> '{REVIEWED_ROOT_POLICY_METADATA_KEY}'
+                         = {metadata} -> '{REVIEWED_ROOT_POLICY_METADATA_KEY}'
+        """
+    if require_policy_absent:
+        return f"""
+                   AND NOT ({source_metadata}
+                         ? '{REVIEWED_ROOT_POLICY_METADATA_KEY}')
+        """
+    return ""
+
+
+def _artifact_source_contract_body_sql(
     source_ref: str,
     metadata: str,
     required_status: str,
-    *,
-    require_subset_identity: bool = False,
+    safe_source_ids: str,
+    source_id_list_sql: str,
+    reviewed_root_policy_sql: str,
+    subset_source_identity_sql: str,
 ) -> str:
-    """Require every attached source to retain its reviewed status and scope."""
-
-    source_ids = f"COALESCE({metadata} -> 'source_ids', 'null'::jsonb)"
-    safe_source_ids = (
-        f"CASE WHEN jsonb_typeof({source_ids}) = 'array' "
-        f"THEN {source_ids} ELSE '[]'::jsonb END"
-    )
-    subset_source_identity_sql = (
-        _artifact_subset_source_identity_sql(
-            "current_source.metadata_json::jsonb"
-        )
-        if require_subset_identity
-        else "true"
-    )
-    source_id_list_sql = _artifact_source_id_list_sql(
-        source_ids, safe_source_ids
-    )
     return f"""
         {source_id_list_sql}
         AND NOT EXISTS (
@@ -14617,6 +14790,7 @@ def _artifact_source_contract_sql(
                    AND current_source.metadata_json::jsonb
                          ->> '{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}'
                          = dataset.endpoint_id
+                   {reviewed_root_policy_sql}
                    AND {subset_source_identity_sql}
              )
         )
@@ -14633,6 +14807,68 @@ def _artifact_source_contract_sql(
                        @> jsonb_build_array(current_source.source_id)
         )
     """
+
+
+def _artifact_source_contract_sql(
+    source_ref: str,
+    metadata: str,
+    required_status: str,
+    *,
+    require_subset_identity: bool = False,
+    reviewed_root_count: int | None = None,
+    require_reviewed_root_policy_absent: bool = False,
+) -> str:
+    """Require every attached source to retain its reviewed status and scope."""
+
+    source_ids = f"COALESCE({metadata} -> 'source_ids', 'null'::jsonb)"
+    safe_source_ids = (
+        f"CASE WHEN jsonb_typeof({source_ids}) = 'array' "
+        f"THEN {source_ids} ELSE '[]'::jsonb END"
+    )
+    subset_source_identity_sql = (
+        _artifact_subset_source_identity_sql(
+            "current_source.metadata_json::jsonb"
+        )
+        if require_subset_identity
+        else "true"
+    )
+    source_metadata = "current_source.metadata_json::jsonb"
+    reviewed_root_policy_sql = _artifact_source_policy_sql(
+        source_metadata,
+        metadata,
+        reviewed_root_count,
+        require_reviewed_root_policy_absent,
+    )
+    source_id_list_sql = _artifact_source_id_list_sql(
+        source_ids, safe_source_ids
+    )
+    return _artifact_source_contract_body_sql(
+        source_ref,
+        metadata,
+        required_status,
+        safe_source_ids,
+        source_id_list_sql,
+        reviewed_root_policy_sql,
+        subset_source_identity_sql,
+    )
+
+
+def _artifact_reviewed_root_policy_sql(
+    metadata: str,
+    required_root_count: int,
+) -> str:
+    """Bind a dataset to one exact closed reviewed-root policy."""
+
+    policy = ReviewedRootPolicy(required_root_count)
+    policy_version = str(policy.document()["policy_version"]).replace(
+        "'", "''"
+    )
+    return (
+        f"{metadata} -> '{REVIEWED_ROOT_POLICY_METADATA_KEY}' "
+        "= pg_catalog.jsonb_build_object("
+        f"'policy_version', '{policy_version}', "
+        f"'required_root_count', {policy.required_root_count})"
+    )
 
 
 def _artifact_ordinary_proof_sql(metadata: str) -> str:
@@ -14734,6 +14970,74 @@ def _artifact_completion_marker_sql(
     """
 
 
+def _artifact_baseline_policy_sql(
+    baseline_metadata: str,
+    reviewed_root_count: int | None,
+    require_policy_absent: bool,
+) -> str:
+    if reviewed_root_count is not None and require_policy_absent:
+        raise ValueError("provider_directory_artifact_root_policy_ambiguous")
+    if reviewed_root_count is not None:
+        return _artifact_reviewed_root_policy_sql(
+            baseline_metadata,
+            reviewed_root_count,
+        )
+    if require_policy_absent:
+        return (
+            f"NOT ({baseline_metadata} ? "
+            f"'{REVIEWED_ROOT_POLICY_METADATA_KEY}')"
+        )
+    return "true"
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactBaselineProofFragments:
+    dataset_ref: str
+    metadata: str
+    verification: str
+    candidate_alias: str
+    baseline_alias: str
+    baseline_metadata: str
+    completion_marker_sql: str
+    baseline_policy_sql: str
+    baseline_contract_sql: str
+    exact_proof_sql: str
+
+
+def _artifact_baseline_exists_sql(
+    fragments: _ArtifactBaselineProofFragments,
+) -> str:
+    return f"""
+        EXISTS (
+            SELECT 1
+              FROM {fragments.dataset_ref} AS {fragments.baseline_alias}
+             WHERE {fragments.baseline_alias}.dataset_id =
+                   {fragments.metadata}
+                     ->> '{TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY}'
+               AND {fragments.baseline_alias}.endpoint_id =
+                   {fragments.candidate_alias}.endpoint_id
+               AND {fragments.baseline_alias}.is_current = false
+               AND {fragments.baseline_alias}.status =
+                   '{ENDPOINT_DATASET_VERIFICATION_BASELINE}'
+               {fragments.completion_marker_sql}
+               AND {fragments.baseline_policy_sql}
+               AND {fragments.baseline_contract_sql}
+               AND {fragments.baseline_metadata}
+                     ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
+                     = {fragments.metadata}
+                         ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
+               AND {fragments.baseline_metadata}
+                     ->> '{TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY}'
+                     = {fragments.metadata}
+                         ->> '{TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY}'
+               AND {fragments.verification}
+                     ->> 'baseline_acquisition_root_run_id'
+                     = {fragments.baseline_alias}.acquisition_root_run_id
+               AND {fragments.exact_proof_sql}
+        )
+    """
+
+
 def _artifact_baseline_proof_sql(
     dataset_ref: str,
     metadata: str,
@@ -14742,6 +15046,8 @@ def _artifact_baseline_proof_sql(
     candidate_alias: str = "dataset",
     baseline_alias: str = "verification_baseline",
     completion_proof_required_version: int | None = None,
+    reviewed_root_count: int | None = None,
+    require_reviewed_root_policy_absent: bool = False,
 ) -> str:
     """Require an immutable baseline whose full proof matches the candidate."""
     baseline_metadata = f"{baseline_alias}.publication_metadata_json::jsonb"
@@ -14772,28 +15078,25 @@ def _artifact_baseline_proof_sql(
         baseline_alias,
         completion_proof_required_version,
     )
-    return f"""
-        EXISTS (
-            SELECT 1
-              FROM {dataset_ref} AS {baseline_alias}
-             WHERE {baseline_alias}.dataset_id =
-                   {metadata}
-                     ->> '{TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY}'
-               AND {baseline_alias}.endpoint_id = {candidate_alias}.endpoint_id
-               AND {baseline_alias}.is_current = false
-               AND {baseline_alias}.status =
-                   '{ENDPOINT_DATASET_VERIFICATION_BASELINE}'
-               {completion_marker_sql}
-               AND {baseline_contract_sql}
-               AND {baseline_metadata} ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
-                     = {metadata} ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
-               AND {baseline_metadata} ->> '{TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY}'
-                     = {metadata} ->> '{TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY}'
-               AND {verification} ->> 'baseline_acquisition_root_run_id'
-                     = {baseline_alias}.acquisition_root_run_id
-               AND {exact_proof_sql}
+    baseline_policy_sql = _artifact_baseline_policy_sql(
+        baseline_metadata,
+        reviewed_root_count,
+        require_reviewed_root_policy_absent,
+    )
+    return _artifact_baseline_exists_sql(
+        _ArtifactBaselineProofFragments(
+            dataset_ref=dataset_ref,
+            metadata=metadata,
+            verification=verification,
+            candidate_alias=candidate_alias,
+            baseline_alias=baseline_alias,
+            baseline_metadata=baseline_metadata,
+            completion_marker_sql=completion_marker_sql,
+            baseline_policy_sql=baseline_policy_sql,
+            baseline_contract_sql=baseline_contract_sql,
+            exact_proof_sql=exact_proof_sql,
         )
-    """
+    )
 
 
 def _artifact_baseline_contract_sql(
@@ -14842,6 +15145,87 @@ def _artifact_baseline_contract_sql(
     """
 
 
+def _artifact_subset_twin_branch_sql(
+    dataset_ref: str,
+    source_ref: str,
+    metadata: str,
+    verification: str,
+    proof: str,
+    reviewed_root_count: int | None,
+) -> str:
+    is_legacy = reviewed_root_count is None
+    baseline_proof_sql = _artifact_baseline_proof_sql(
+        dataset_ref,
+        metadata,
+        verification,
+        completion_proof_required_version=SERVER_ISSUED_SUBSET_REQUIRED_VERSION,
+        reviewed_root_count=reviewed_root_count,
+        require_reviewed_root_policy_absent=is_legacy,
+    )
+    matched_proof_sql = f"""
+        {_artifact_matched_proof_sql(metadata, verification, proof)}
+        AND {_artifact_subset_parent_proof_sql("dataset", metadata, proof)}
+    """
+    policy_sql = (
+        f"NOT ({metadata} ? '{REVIEWED_ROOT_POLICY_METADATA_KEY}')"
+        if is_legacy
+        else _artifact_reviewed_root_policy_sql(metadata, reviewed_root_count)
+    )
+    required_status = (
+        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED
+        if is_legacy
+        else PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED
+    )
+    return f"""
+        {policy_sql}
+        AND {_artifact_source_contract_sql(
+            source_ref,
+            metadata,
+            required_status,
+            require_subset_identity=True,
+            reviewed_root_count=reviewed_root_count,
+            require_reviewed_root_policy_absent=is_legacy,
+        )}
+        AND {matched_proof_sql}
+        AND {baseline_proof_sql}
+    """
+
+
+def _artifact_subset_single_branch_sql(
+    source_ref: str,
+    metadata: str,
+) -> str:
+    content_proof = (
+        f"{metadata} -> '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'"
+    )
+    coverage = f"{metadata} -> '{SERVER_ISSUED_SUBSET_COVERAGE_KEY}'"
+    return f"""
+        {_artifact_reviewed_root_policy_sql(metadata, 1)}
+        AND {metadata} -> 'requires_twin_root_verification' = 'false'::jsonb
+        AND NOT ({metadata} ? '{TWIN_ROOT_VERIFICATION_ROLE_KEY}')
+        AND NOT ({metadata} ? '{TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY}')
+        AND NOT ({metadata} ? '{TWIN_ROOT_VERIFICATION_METADATA_KEY}')
+        AND {_artifact_source_contract_sql(
+            source_ref,
+            metadata,
+            PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED,
+            require_subset_identity=True,
+            reviewed_root_count=1,
+        )}
+        AND {_artifact_subset_single_root_proof_sql(
+            "dataset", metadata, content_proof
+        )}
+        AND {coverage} ->> 'twin_state' = 'not_required'
+        AND NOT EXISTS (
+            SELECT 1
+              FROM jsonb_each({coverage} -> 'resources')
+                   AS covered_resource(resource_type, resource_coverage)
+             WHERE resource_coverage ->> 'twin_state' <> 'not_required'
+                OR resource_coverage ->> 'twin_state' IS NULL
+        )
+    """
+
+
 def _artifact_subset_candidate_eligibility_sql(
     dataset_ref: str,
     source_ref: str,
@@ -14849,26 +15233,17 @@ def _artifact_subset_candidate_eligibility_sql(
     verification: str,
     proof: str,
 ) -> str:
-    """Return the exact v3 reviewed-candidate eligibility branch."""
+    """Return exact legacy-twin and policy-bound v3 eligibility branches."""
 
-    subset_baseline_proof_sql = _artifact_baseline_proof_sql(
-        dataset_ref,
-        metadata,
-        verification,
-        completion_proof_required_version=(
-            SERVER_ISSUED_SUBSET_REQUIRED_VERSION
-        ),
+    legacy_twin_sql = _artifact_subset_twin_branch_sql(
+        dataset_ref, source_ref, metadata, verification, proof, None
     )
+    policy_twin_sql = _artifact_subset_twin_branch_sql(
+        dataset_ref, source_ref, metadata, verification, proof, 2
+    )
+    policy_single_sql = _artifact_subset_single_branch_sql(source_ref, metadata)
     return f"""
-        {_artifact_source_contract_sql(
-            source_ref,
-            metadata,
-            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED,
-            require_subset_identity=True,
-        )}
-        AND {_artifact_matched_proof_sql(metadata, verification, proof)}
-        AND {_artifact_subset_parent_proof_sql("dataset", metadata, proof)}
-        AND {subset_baseline_proof_sql}
+        (({legacy_twin_sql}) OR ({policy_twin_sql}) OR ({policy_single_sql}))
     """
 
 
@@ -14903,9 +15278,13 @@ def _artifact_reviewed_candidate_eligibility_sql(
                 dataset.completion_proof_required_version IS NULL
                 AND dataset.completion_proof_json IS NULL
                 AND dataset.completion_proof_sha256 IS NULL
+                AND NOT ({metadata} ? '{REVIEWED_ROOT_POLICY_METADATA_KEY}')
                 AND
                 {_artifact_source_contract_sql(
-                    source_ref, metadata, PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+                    source_ref,
+                    metadata,
+                    PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+                    require_reviewed_root_policy_absent=True,
                 )}
                 AND (
                     ({matched_proof_sql} AND {baseline_proof_sql})
@@ -14926,12 +15305,14 @@ def _artifact_candidate_eligibility_metadata_columns() -> str:
     """Return the compact JSON record fields used by candidate admission."""
     metadata_key = TWIN_ROOT_VERIFICATION_METADATA_KEY
     return f"""
-        requires_twin_root_verification text,
+        requires_twin_root_verification jsonb,
         {TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY} text,
         {TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY} text,
         {TWIN_ROOT_VERIFICATION_ROLE_KEY} text,
         {TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY} text,
         {metadata_key} jsonb,
+        {REVIEWED_ROOT_POLICY_METADATA_KEY} jsonb,
+        {PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY} jsonb,
         source_ids jsonb,
         dataset_hash text,
         resource_count text,
@@ -14945,10 +15326,54 @@ def _artifact_candidate_eligibility_metadata_columns() -> str:
     """
 
 
+def _artifact_optional_metadata_sql(
+    metadata_key: str,
+    *,
+    materialize_null_record: bool = False,
+) -> str:
+    null_record_sql = (
+        f"WHEN candidate.full_metadata_jsonb IS NULL THEN "
+        f"jsonb_build_object('{metadata_key}', NULL::jsonb)"
+        if materialize_null_record
+        else ""
+    )
+    return f"""
+        CASE
+            {null_record_sql}
+            WHEN candidate.full_metadata_jsonb ? '{metadata_key}' THEN
+                jsonb_build_object(
+                    '{metadata_key}',
+                    candidate.full_metadata_jsonb -> '{metadata_key}'
+                )
+            ELSE '{{}}'::jsonb
+        END
+    """
+
+
+def _artifact_optional_metadata_fields_sql() -> str:
+    return " || ".join(
+        (
+            _artifact_optional_metadata_sql(TWIN_ROOT_VERIFICATION_ROLE_KEY),
+            _artifact_optional_metadata_sql(
+                TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY
+            ),
+            _artifact_optional_metadata_sql(
+                TWIN_ROOT_VERIFICATION_METADATA_KEY,
+                materialize_null_record=True,
+            ),
+            _artifact_optional_metadata_sql(REVIEWED_ROOT_POLICY_METADATA_KEY),
+            _artifact_optional_metadata_sql(
+                PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+            ),
+        )
+    )
+
+
 def _artifact_candidate_eligibility_ctes(dataset_ref: str) -> str:
     """Parse large candidate proofs once and retain only eligibility fields."""
     metadata_key = TWIN_ROOT_VERIFICATION_METADATA_KEY
     metadata_columns = _artifact_candidate_eligibility_metadata_columns()
+    optional_metadata_sql = _artifact_optional_metadata_fields_sql()
     return f"""
         artifact_candidate_json AS MATERIALIZED (
         SELECT dataset.dataset_id,
@@ -14977,20 +15402,12 @@ def _artifact_candidate_eligibility_ctes(dataset_ref: str) -> str:
                candidate.completion_proof_sha256,
                (
                    to_jsonb(metadata_fields)
+                       - '{TWIN_ROOT_VERIFICATION_ROLE_KEY}'
+                       - '{TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY}'
                        - '{metadata_key}'
-               ) || CASE
-                    WHEN candidate.full_metadata_jsonb IS NULL THEN
-                        jsonb_build_object(
-                            '{metadata_key}', NULL::jsonb
-                        )
-                    WHEN candidate.full_metadata_jsonb ? '{metadata_key}' THEN
-                        jsonb_build_object(
-                            '{metadata_key}',
-                            candidate.full_metadata_jsonb
-                                -> '{metadata_key}'
-                        )
-                    ELSE '{{}}'::jsonb
-               END AS eligibility_metadata_jsonb
+                       - '{REVIEWED_ROOT_POLICY_METADATA_KEY}'
+                       - '{PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'
+               ) || {optional_metadata_sql} AS eligibility_metadata_jsonb
           FROM artifact_candidate_json AS candidate
           CROSS JOIN LATERAL jsonb_to_record(
                CASE
@@ -15374,39 +15791,15 @@ def _provider_directory_artifact_dataset_from_row(
     )
 
 
-def _artifact_dataset_verification_fields(
+def _artifact_verification_field_map(
     source_record: dict[str, Any],
-    publication_metadata: dict[str, Any],
-    recorded_expected_resources: tuple[str, ...],
-    dataset_id: str,
-    *,
     should_repoint_source_alias: bool,
-    completion_proof_required_version: int | None,
-    completion_proof_cutoff: str | None,
+    verification_campaign_id: str | None,
+    verification_source_scope_hash: str | None,
+    verification_source_ids: tuple[str, ...],
+    reviewed_root_policy: ReviewedRootPolicy | None,
+    source_contract: tuple[Any, ...],
 ) -> dict[str, Any]:
-    """Freeze the reviewed source contract attached to alias cutover."""
-    verification_campaign_id = _clean_text(
-        publication_metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
-    )
-    verification_source_scope_hash = _clean_text(
-        publication_metadata.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY)
-    )
-    verification_source_ids, source_contract = ((), ())
-    if should_repoint_source_alias:
-        verification_source_ids, source_contract = (
-            _artifact_promotion_source_contract(
-                source_record,
-                publication_metadata,
-                recorded_expected_resources,
-                dataset_id=dataset_id,
-                verification_campaign_id=verification_campaign_id,
-                verification_source_scope_hash=verification_source_scope_hash,
-                completion_proof_required_version=(
-                    completion_proof_required_version
-                ),
-                completion_proof_cutoff=completion_proof_cutoff,
-            )
-        )
     return {
         "verification_campaign_id": verification_campaign_id,
         "verification_source_scope_hash": verification_source_scope_hash,
@@ -15420,11 +15813,70 @@ def _artifact_dataset_verification_fields(
             else None
         ),
         "verification_source_ids": verification_source_ids,
+        "reviewed_root_policy": reviewed_root_policy,
         "source_verification_contract": source_contract,
         "source_verification_contract_hash": (
             _identity_hash(source_contract) if source_contract else None
         ),
     }
+
+
+def _artifact_dataset_verification_fields(
+    source_record: dict[str, Any],
+    publication_metadata: dict[str, Any],
+    recorded_expected_resources: tuple[str, ...],
+    dataset_id: str,
+    *,
+    should_repoint_source_alias: bool,
+    completion_proof_required_version: int | None,
+    completion_proof_cutoff: str | None,
+) -> dict[str, Any]:
+    """Freeze the reviewed source contract attached to alias cutover."""
+    reviewed_root_policy = (
+        _artifact_reviewed_root_policy(
+            source_record,
+            publication_metadata,
+            dataset_id,
+        )
+        if should_repoint_source_alias
+        else _artifact_dataset_root_policy(publication_metadata, dataset_id)
+    )
+    verification_campaign_id = _clean_text(
+        publication_metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
+    )
+    verification_source_scope_hash = _clean_text(
+        publication_metadata.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY)
+    )
+    verification_source_ids, source_contract = ((), ())
+    if should_repoint_source_alias:
+        verification_source_ids, source_contract = (
+            _artifact_promotion_source_contract(
+                source_record,
+                publication_metadata,
+                recorded_expected_resources,
+                _ArtifactPromotionEvidence(
+                    dataset_id=dataset_id,
+                    verification_campaign_id=verification_campaign_id,
+                    verification_source_scope_hash=(
+                        verification_source_scope_hash
+                    ),
+                    completion_proof_required_version=(
+                        completion_proof_required_version
+                    ),
+                    completion_proof_cutoff=completion_proof_cutoff,
+                    reviewed_root_policy=reviewed_root_policy,
+                ),
+            )
+        )
+    return _artifact_verification_field_map(
+        source_record,
+        should_repoint_source_alias,
+        verification_campaign_id,
+        verification_source_scope_hash,
+        verification_source_ids,
+        reviewed_root_policy,
+        source_contract,
+    )
 
 
 def _artifact_source_contract_metadata_value(
@@ -15514,6 +15966,8 @@ def _source_contract_metadata_keys(
         if artifact
         else SERVER_ISSUED_SUBSET_ACQUISITION_METADATA_KEYS
     )
+    if REVIEWED_ROOT_POLICY_METADATA_KEY in metadata:
+        subset_keys = subset_keys + (REVIEWED_ROOT_POLICY_METADATA_KEY,)
     return base_keys + subset_keys
 
 
@@ -15555,11 +16009,44 @@ def _is_reviewed_subset_source_metadata(metadata: Mapping[str, Any]) -> bool:
     )
 
 
+def _artifact_expected_verified_status(
+    source_metadata: dict[str, Any],
+    dataset_id: str,
+    completion_proof_required_version: int | None,
+    reviewed_root_policy: ReviewedRootPolicy | None,
+) -> tuple[ReviewedRootPolicy | None, str]:
+    if (
+        reviewed_root_policy is None
+        and REVIEWED_ROOT_POLICY_METADATA_KEY in source_metadata
+    ):
+        try:
+            reviewed_root_policy = reviewed_root_policy_from_document(
+                source_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "provider_directory_artifact_reviewed_root_policy_invalid:"
+                + dataset_id
+            ) from exc
+    expected_status = (
+        PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED
+        if reviewed_root_policy is not None
+        else (
+            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED
+            if completion_proof_required_version
+            == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+            else PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+        )
+    )
+    return reviewed_root_policy, expected_status
+
+
 def _has_validated_artifact_verification_profile(
     source_record: dict[str, Any],
     dataset_id: str,
     verification_campaign_id: str | None,
     completion_proof_required_version: int | None,
+    reviewed_root_policy: ReviewedRootPolicy | None = None,
 ) -> bool:
     """Validate status and reviewed identity; return profile presence."""
 
@@ -15567,11 +16054,11 @@ def _has_validated_artifact_verification_profile(
         source_record
     )
     source_metadata = _source_metadata(source_record)
-    expected_verified_status = (
-        PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED
-        if completion_proof_required_version
-        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
-        else PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+    _, expected_verified_status = _artifact_expected_verified_status(
+        source_metadata,
+        dataset_id,
+        completion_proof_required_version,
+        reviewed_root_policy,
     )
     if has_verification_profile and _clean_text(
         source_metadata.get("provider_directory_candidate_status")
@@ -15606,6 +16093,64 @@ def _has_validated_artifact_verification_profile(
     return has_verification_profile
 
 
+def _artifact_reviewed_root_policy(
+    source_record: Mapping[str, Any],
+    publication_metadata: Mapping[str, Any],
+    dataset_id: str,
+) -> ReviewedRootPolicy | None:
+    """Validate the explicit policy shared by source and dataset evidence."""
+
+    source_metadata = _source_metadata(dict(source_record))
+    has_source_policy = REVIEWED_ROOT_POLICY_METADATA_KEY in source_metadata
+    has_dataset_policy = (
+        REVIEWED_ROOT_POLICY_METADATA_KEY in publication_metadata
+    )
+    if has_source_policy != has_dataset_policy:
+        raise RuntimeError(
+            "provider_directory_artifact_reviewed_root_policy_changed:"
+            + dataset_id
+        )
+    if not has_source_policy:
+        return None
+    try:
+        source_policy = reviewed_root_policy_from_document(
+            source_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+        )
+        dataset_policy = reviewed_root_policy_from_document(
+            publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_artifact_reviewed_root_policy_invalid:"
+            + dataset_id
+        ) from exc
+    if source_policy != dataset_policy:
+        raise RuntimeError(
+            "provider_directory_artifact_reviewed_root_policy_changed:"
+            + dataset_id
+        )
+    return source_policy
+
+
+def _artifact_dataset_root_policy(
+    publication_metadata: Mapping[str, Any],
+    dataset_id: str,
+) -> ReviewedRootPolicy | None:
+    """Parse only the immutable dataset policy for an incumbent artifact."""
+
+    if REVIEWED_ROOT_POLICY_METADATA_KEY not in publication_metadata:
+        return None
+    try:
+        return reviewed_root_policy_from_document(
+            publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_artifact_reviewed_root_policy_invalid:"
+            + dataset_id
+        ) from exc
+
+
 def _artifact_scope_source(
     source_record: dict[str, Any],
     completion_proof_cutoff: str | None,
@@ -15633,53 +16178,59 @@ def _artifact_scope_source(
     return scope_source
 
 
+@dataclass(frozen=True, slots=True)
+class _ArtifactPromotionEvidence:
+    dataset_id: str
+    verification_campaign_id: str | None
+    verification_source_scope_hash: str | None
+    completion_proof_required_version: int | None = None
+    completion_proof_cutoff: str | None = None
+    reviewed_root_policy: ReviewedRootPolicy | None = None
+
+
 def _artifact_promotion_source_contract(
     source_record: dict[str, Any],
     publication_metadata: dict[str, Any],
     recorded_expected_resources: tuple[str, ...] | None,
-    *,
-    dataset_id: str,
-    verification_campaign_id: str | None,
-    verification_source_scope_hash: str | None,
-    completion_proof_required_version: int | None = None,
-    completion_proof_cutoff: str | None = None,
+    evidence: _ArtifactPromotionEvidence,
 ) -> tuple[tuple[str, ...], tuple[Any, ...]]:
     """Build and validate the current source contract for one promotion."""
     has_verification_profile = _has_validated_artifact_verification_profile(
         source_record,
-        dataset_id,
-        verification_campaign_id,
-        completion_proof_required_version,
+        evidence.dataset_id,
+        evidence.verification_campaign_id,
+        evidence.completion_proof_required_version,
+        evidence.reviewed_root_policy,
     )
     source_ids = _artifact_verification_source_ids(
         publication_metadata,
-        dataset_id,
+        evidence.dataset_id,
         source_record,
         is_required=has_verification_profile,
     )
     scope_source = _artifact_scope_source(
         source_record,
-        completion_proof_cutoff,
+        evidence.completion_proof_cutoff,
         recorded_expected_resources,
-        dataset_id,
+        evidence.dataset_id,
         profile_required=has_verification_profile,
     )
     contract = _artifact_source_verification_contract(
         scope_source,
-        verification_campaign_id=verification_campaign_id,
-        verification_source_scope_hash=verification_source_scope_hash,
+        verification_campaign_id=evidence.verification_campaign_id,
+        verification_source_scope_hash=evidence.verification_source_scope_hash,
         source_ids=source_ids,
-        completion_proof_cutoff=completion_proof_cutoff,
+        completion_proof_cutoff=evidence.completion_proof_cutoff,
     )
     current_scope_hash = contract[-1][1]
     if has_verification_profile and (
-        not verification_campaign_id
-        or not verification_source_scope_hash
-        or current_scope_hash != verification_source_scope_hash
+        not evidence.verification_campaign_id
+        or not evidence.verification_source_scope_hash
+        or current_scope_hash != evidence.verification_source_scope_hash
     ):
         raise RuntimeError(
             "provider_directory_artifact_candidate_source_scope_changed:"
-            + dataset_id
+            + evidence.dataset_id
         )
     return source_ids, contract
 
@@ -16313,10 +16864,14 @@ def _reviewed_promotion_dataset_by_source_id(
     dataset_by_source_id: dict[str, ProviderDirectoryArtifactDataset] = {}
     for dataset in fence.source_alias_cutover_datasets:
         expected_verified_status = (
-            PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED
-            if dataset.completion_proof_required_version
-            == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
-            else PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+            PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED
+            if dataset.reviewed_root_policy is not None
+            else (
+                PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED
+                if dataset.completion_proof_required_version
+                == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+                else PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
+            )
         )
         if not (
             dataset.verification_source_status
@@ -16347,15 +16902,27 @@ def _reviewed_promotion_dataset_by_source_id(
     return dataset_by_source_id
 
 
-def _artifact_promotion_alias_from_row(
+def _validated_artifact_promotion_source(
     dataset: ProviderDirectoryArtifactDataset,
     source_row: Any,
-) -> ProviderDirectoryArtifactDataset:
+) -> tuple[str, str, dict[str, Any]]:
     source_row_map = _pagination_checkpoint_row_mapping(source_row)
     source_id = _clean_text(source_row_map.get("source_id"))
     serving_endpoint_id = _clean_text(source_row_map.get("endpoint_id"))
     source_record = _json_object(source_row_map.get("source_record_json"))
     source_metadata = _source_metadata(source_record)
+    source_root_policy = _artifact_reviewed_root_policy(
+        source_record,
+        (
+            {
+                REVIEWED_ROOT_POLICY_METADATA_KEY:
+                    dataset.reviewed_root_policy.document()
+            }
+            if dataset.reviewed_root_policy is not None
+            else {}
+        ),
+        dataset.dataset_id,
+    )
     scope_source = _artifact_source_with_subset_contract(
         source_record,
         dataset.completion_proof_cutoff,
@@ -16381,11 +16948,24 @@ def _artifact_promotion_alias_from_row(
         != dataset.endpoint_id
         or _endpoint_dataset_expected_resources([scope_source])
         != dataset.recorded_expected_resources
+        or source_root_policy != dataset.reviewed_root_policy
     ):
         raise RuntimeError(
             "provider_directory_artifact_promotion_source_contract_invalid:"
             + (source_id or "missing")
         )
+    return source_id, serving_endpoint_id, scope_source
+
+
+def _artifact_promotion_alias_from_row(
+    dataset: ProviderDirectoryArtifactDataset,
+    source_row: Any,
+) -> ProviderDirectoryArtifactDataset:
+    """Bind one locked source alias to its reviewed promotion contract."""
+
+    source_id, serving_endpoint_id, scope_source = (
+        _validated_artifact_promotion_source(dataset, source_row)
+    )
     source_contract = _artifact_source_verification_contract(
         scope_source,
         verification_campaign_id=dataset.verification_campaign_id,
@@ -35301,18 +35881,42 @@ def _preserved_source_activation_expression(
     """Keep an existing sealed activation marker across catalog upserts."""
 
     activation_marker = target_metadata.op("->")(
-        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY
+        literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY)
+    )
+    activation_marker_v2 = target_metadata.op("->")(
+        literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2)
+    )
+    root_policy = target_metadata.op("->")(
+        literal(REVIEWED_ROOT_POLICY_METADATA_KEY)
     )
     preserved_activation = func.jsonb_build_object(
-        "provider_directory_candidate_status",
-        REVIEWED_SUBSET_VERIFIED_STATUS,
-        REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+        literal("provider_directory_candidate_status"),
+        literal(REVIEWED_SUBSET_VERIFIED_STATUS),
+        literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY),
         activation_marker,
+    )
+    preserved_activation_v2 = func.jsonb_build_object(
+        literal("provider_directory_candidate_status"),
+        literal(PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED),
+        literal(REVIEWED_ROOT_POLICY_METADATA_KEY),
+        root_policy,
+        literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2),
+        activation_marker_v2,
     )
     return case(
         (
-            func.jsonb_typeof(activation_marker) == "object",
-            merged_metadata.op("||")(preserved_activation),
+            func.jsonb_typeof(activation_marker) == literal("object"),
+            merged_metadata.op("-")(
+                literal(REVIEWED_ROOT_POLICY_METADATA_KEY)
+            ).op("-")(
+                literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2)
+            ).op("||")(preserved_activation),
+        ),
+        (
+            func.jsonb_typeof(activation_marker_v2) == literal("object"),
+            merged_metadata.op("-")(
+                literal(REVIEWED_SUBSET_ACTIVATION_METADATA_KEY)
+            ).op("||")(preserved_activation_v2),
         ),
         else_=merged_metadata,
     )
@@ -35325,13 +35929,100 @@ def _preserved_source_activation_sql(
     """Render COPY-upsert parity for sealed activation preservation."""
 
     activation_key = REVIEWED_SUBSET_ACTIVATION_METADATA_KEY
+    activation_key_v2 = REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2
+    root_policy_key = REVIEWED_ROOT_POLICY_METADATA_KEY
     return (
         "CASE WHEN pg_catalog.jsonb_typeof("
         f"{target_metadata} -> '{activation_key}') = 'object' "
-        f"THEN ({merged_metadata}) || pg_catalog.jsonb_build_object("
+        f"THEN (({merged_metadata}) - "
+        f"'{root_policy_key}' - '{activation_key_v2}') || "
+        "pg_catalog.jsonb_build_object("
         "'provider_directory_candidate_status', "
         f"'{REVIEWED_SUBSET_VERIFIED_STATUS}', "
         f"'{activation_key}', {target_metadata} -> '{activation_key}') "
+        "WHEN pg_catalog.jsonb_typeof("
+        f"{target_metadata} -> '{activation_key_v2}') = 'object' "
+        f"THEN (({merged_metadata}) - '{activation_key}') || "
+        "pg_catalog.jsonb_build_object("
+        "'provider_directory_candidate_status', "
+        f"'{PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED}', "
+        f"'{root_policy_key}', {target_metadata} -> '{root_policy_key}', "
+        f"'{activation_key_v2}', {target_metadata} -> '{activation_key_v2}') "
+        f"ELSE {merged_metadata} END"
+    )
+
+
+def _preserved_source_reviewed_root_policy_expression(
+    target_metadata: Any,
+    merged_metadata: Any,
+) -> Any:
+    """Keep the audited campaign policy across catalog upserts."""
+
+    policy = target_metadata.op("->")(
+        literal(REVIEWED_ROOT_POLICY_METADATA_KEY)
+    )
+    candidate_status = target_metadata.op("->>")(
+        literal("provider_directory_candidate_status")
+    )
+    preserved_policy = func.jsonb_build_object(
+        literal(REVIEWED_ROOT_POLICY_METADATA_KEY),
+        policy,
+    )
+    preserved_policy_and_status = func.jsonb_build_object(
+        literal(REVIEWED_ROOT_POLICY_METADATA_KEY),
+        policy,
+        literal("provider_directory_candidate_status"),
+        candidate_status,
+    )
+    has_policy = func.jsonb_typeof(policy) == literal("object")
+    return case(
+        (
+            and_(
+                has_policy,
+                candidate_status.in_(
+                    (
+                        literal(PROVIDER_DIRECTORY_ROOT_POLICY_PENDING),
+                        literal(PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED),
+                    )
+                ),
+            ),
+            merged_metadata.op("||")(preserved_policy_and_status),
+        ),
+        (
+            has_policy,
+            merged_metadata.op("||")(preserved_policy),
+        ),
+        else_=merged_metadata,
+    )
+
+
+def _preserved_source_reviewed_root_policy_sql(
+    target_metadata: str,
+    merged_metadata: str,
+) -> str:
+    """Render COPY-upsert parity for campaign-policy preservation."""
+
+    policy_key = REVIEWED_ROOT_POLICY_METADATA_KEY
+    status_key = "provider_directory_candidate_status"
+    policy = f"{target_metadata} -> '{policy_key}'"
+    status = f"{target_metadata} ->> '{status_key}'"
+    preserved_policy = (
+        "pg_catalog.jsonb_build_object("
+        f"'{policy_key}', {policy})"
+    )
+    preserved_policy_and_status = (
+        "pg_catalog.jsonb_build_object("
+        f"'{policy_key}', {policy}, '{status_key}', {status})"
+    )
+    return (
+        "CASE WHEN pg_catalog.jsonb_typeof("
+        f"{policy}) = 'object' AND {status} IN ("
+        f"'{PROVIDER_DIRECTORY_ROOT_POLICY_PENDING}', "
+        f"'{PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED}') "
+        f"THEN ({merged_metadata}) || {preserved_policy_and_status} "
+        "WHEN pg_catalog.jsonb_typeof("
+        f"{policy}) = 'object' "
+        f"THEN ({merged_metadata}) || {preserved_policy} "
         f"ELSE {merged_metadata} END"
     )
 
@@ -35343,21 +36034,27 @@ def _source_metadata_update_expression(table, excluded_value):
     incoming_metadata = func.coalesce(
         excluded_value.cast(JSONB), func.jsonb_build_object()
     )
+    policy_preserved_metadata = (
+        _preserved_source_reviewed_root_policy_expression(
+            target_metadata,
+            target_metadata.op("||")(incoming_metadata),
+        )
+    )
     effective_metadata = _preserved_source_activation_expression(
         target_metadata,
-        target_metadata.op("||")(incoming_metadata),
+        policy_preserved_metadata,
     )
     return case(
         (
             func.coalesce(
                 incoming_metadata.op("->>")(
-                    "provider_directory_acquisition_enabled"
+                    literal("provider_directory_acquisition_enabled")
                 ),
-                "false",
+                literal("false"),
             )
-            == "true",
+            == literal("true"),
             effective_metadata.op("-")(
-                "provider_directory_acquisition_blocked_reason"
+                literal("provider_directory_acquisition_blocked_reason")
             ),
         ),
         else_=effective_metadata,
@@ -35418,9 +36115,13 @@ def _source_metadata_update_sql(
         f"{target_metadata} || "
         f"COALESCE({incoming_prefix}.{quoted}::jsonb, '{{}}'::jsonb)"
     )
-    effective_metadata = _preserved_source_activation_sql(
+    policy_preserved_metadata = _preserved_source_reviewed_root_policy_sql(
         target_metadata,
         merged_metadata,
+    )
+    effective_metadata = _preserved_source_activation_sql(
+        target_metadata,
+        policy_preserved_metadata,
     )
     return (
         "CASE WHEN COALESCE("
@@ -55052,6 +55753,45 @@ def _assert_empty_orphan_candidate_identity(
     candidate: EndpointDatasetCandidate,
 ) -> None:
     """Require an empty orphan row to retain its exact acquisition identity."""
+
+    expected_metadata_by_field = _empty_orphan_expected_metadata(candidate)
+    existing_metadata = existing_candidate_map.get("publication_metadata_json")
+    has_exact_metadata = isinstance(existing_metadata, dict) and all(
+        existing_metadata.get(key) == expected_field_value
+        for key, expected_field_value in expected_metadata_by_field.items()
+    )
+    if (
+        candidate.reviewed_root_policy is not None
+        and not candidate.reviewed_root_policy.is_twin_root_required
+        and isinstance(existing_metadata, dict)
+        and any(
+            field_name in existing_metadata
+            for field_name in (
+                TWIN_ROOT_VERIFICATION_ROLE_KEY,
+                TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY,
+                TWIN_ROOT_VERIFICATION_METADATA_KEY,
+            )
+        )
+    ):
+        has_exact_metadata = False
+    if (
+        not existing_candidate_map
+        or _clean_text(existing_candidate_map.get("endpoint_id"))
+        != candidate.endpoint_id
+        or _clean_text(existing_candidate_map.get("status"))
+        != ENDPOINT_DATASET_ACQUIRING
+        or not has_exact_metadata
+        or _dataset_resource_hash_contract(existing_candidate_map)
+        != candidate.resource_hash_contract
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_orphan_identity_mismatch"
+        )
+
+
+def _empty_orphan_expected_metadata(
+    candidate: EndpointDatasetCandidate,
+) -> dict[str, Any]:
     expected_metadata_by_field = {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
@@ -55071,27 +55811,20 @@ def _assert_empty_orphan_candidate_identity(
             candidate.completion_proof_required_version
         ),
     }
-    existing_metadata = existing_candidate_map.get("publication_metadata_json")
-    has_exact_metadata = isinstance(existing_metadata, dict) and all(
-        existing_metadata.get(key) == expected_field_value
-        for key, expected_field_value in expected_metadata_by_field.items()
-    )
-    has_exact_hash_contract = (
-        _dataset_resource_hash_contract(existing_candidate_map)
-        == candidate.resource_hash_contract
-    )
-    if (
-        not existing_candidate_map
-        or _clean_text(existing_candidate_map.get("endpoint_id"))
-        != candidate.endpoint_id
-        or _clean_text(existing_candidate_map.get("status"))
-        != ENDPOINT_DATASET_ACQUIRING
-        or not has_exact_metadata
-        or not has_exact_hash_contract
-    ):
-        raise RuntimeError(
-            "provider_directory_endpoint_dataset_orphan_identity_mismatch"
+    if candidate.reviewed_root_policy is not None:
+        expected_metadata_by_field[REVIEWED_ROOT_POLICY_METADATA_KEY] = (
+            candidate.reviewed_root_policy.document()
         )
+        if not candidate.reviewed_root_policy.is_twin_root_required:
+            expected_metadata_by_field.pop(
+                TWIN_ROOT_VERIFICATION_ROLE_KEY,
+                None,
+            )
+            expected_metadata_by_field.pop(
+                TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY,
+                None,
+            )
+    return expected_metadata_by_field
 
 
 async def _assert_empty_endpoint_dataset_orphan(
@@ -55256,6 +55989,8 @@ def _validate_subset_resource_coverage(
     resource_coverage: Any,
     resource_proof: Mapping[str, Any],
     cutoff: str,
+    *,
+    expected_twin_state: str = "pending_matching_reviewed_root",
 ) -> None:
     """Validate one resource's safe coverage projection."""
 
@@ -55280,7 +56015,7 @@ def _validate_subset_resource_coverage(
         or resource_coverage.get("absence_semantics")
         != "unknown_under_subset"
         or resource_coverage.get("twin_state")
-        != "pending_matching_reviewed_root"
+        != expected_twin_state
         or resource_coverage.get("proof_state")
         != "resource_terminal_verified"
         or resource_coverage.get("unresolved_reference_count") is not None
@@ -55333,6 +56068,11 @@ def _validate_subset_dataset_coverage(
             resources.get(resource_type),
             resource_proof,
             completion_proof["cutoff"],
+            expected_twin_state=(
+                "not_required"
+                if coverage.get("twin_state") == "not_required"
+                else "pending_matching_reviewed_root"
+            ),
         )
     _validate_subset_unresolved_coverage(coverage)
 
@@ -55910,7 +56650,7 @@ async def _upsert_endpoint_dataset_candidate(
 def _endpoint_dataset_candidate_metadata(
     candidate: EndpointDatasetCandidate,
 ) -> dict[str, Any]:
-    return {
+    metadata = {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
         "expected_resources": list(candidate.expected_resources),
@@ -55935,6 +56675,17 @@ def _endpoint_dataset_candidate_metadata(
             candidate.resource_hash_contract
         ),
     }
+    if candidate.reviewed_root_policy is not None:
+        metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] = (
+            candidate.reviewed_root_policy.document()
+        )
+        if not candidate.reviewed_root_policy.is_twin_root_required:
+            metadata.pop(TWIN_ROOT_VERIFICATION_ROLE_KEY, None)
+            metadata.pop(
+                TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY,
+                None,
+            )
+    return metadata
 
 
 async def _lock_endpoint_dataset_candidate_admission(
@@ -56783,6 +57534,14 @@ def _resumable_candidate_verification_fields(
     }
     existing_metadata = existing_dataset_map.get("publication_metadata_json")
     if existing_dataset_map and isinstance(existing_metadata, dict):
+        _assert_persisted_reviewed_root_policy(
+            existing_metadata,
+            verification_profile.reviewed_root_policy,
+        )
+        _assert_persisted_reviewed_root_policy_fields(
+            existing_metadata,
+            verification_profile,
+        )
         return _persisted_endpoint_dataset_verification_fields(
             existing_metadata,
             requires_twin_root_verification=(
@@ -56792,6 +57551,62 @@ def _resumable_candidate_verification_fields(
             verification_source_scope_hash=verification_profile.source_scope_hash,
         )
     return verification_fields_by_name
+
+
+def _assert_persisted_reviewed_root_policy(
+    metadata: Mapping[str, Any],
+    expected_policy: ReviewedRootPolicy | None,
+) -> None:
+    """Reject retries or replays under a different root requirement."""
+
+    if expected_policy is None:
+        if REVIEWED_ROOT_POLICY_METADATA_KEY in metadata:
+            raise RuntimeError(
+                "provider_directory_reviewed_root_policy_profile_mismatch"
+            )
+        return
+    raw_policy = metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+    try:
+        persisted_policy = reviewed_root_policy_from_document(raw_policy)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if persisted_policy != expected_policy:
+        raise RuntimeError(
+            "provider_directory_reviewed_root_policy_profile_mismatch"
+        )
+
+
+def _assert_persisted_reviewed_root_policy_fields(
+    metadata: Mapping[str, Any],
+    profile: EndpointDatasetVerificationProfile,
+) -> None:
+    """Bind policy-bearing retries to the same generation and role shape."""
+
+    policy = profile.reviewed_root_policy
+    if policy is None:
+        return
+    if (
+        metadata.get("requires_twin_root_verification")
+        is not policy.is_twin_root_required
+        or metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
+        != profile.campaign_id
+        or metadata.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY)
+        != profile.source_scope_hash
+    ):
+        raise RuntimeError(
+            "provider_directory_reviewed_root_policy_profile_mismatch"
+        )
+    if not policy.is_twin_root_required and any(
+        field_name in metadata
+        for field_name in (
+            TWIN_ROOT_VERIFICATION_ROLE_KEY,
+            TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY,
+            TWIN_ROOT_VERIFICATION_METADATA_KEY,
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_reviewed_root_policy_single_root_invalid"
+        )
 
 
 def _finalized_endpoint_dataset_metadata(
@@ -56810,6 +57625,8 @@ def _finalized_endpoint_dataset_metadata(
 def _assert_finalized_endpoint_dataset_replay(
     candidate: EndpointDatasetCandidate,
 ) -> None:
+    """Require a terminal replay to retain its exact candidate identity."""
+
     metadata, state_name = _finalized_endpoint_dataset_metadata(candidate)
     if not isinstance(metadata, dict):
         raise RuntimeError(
@@ -56824,28 +57641,15 @@ def _assert_finalized_endpoint_dataset_replay(
         raise RuntimeError(
             f"provider_directory_endpoint_dataset_{state_name}_identity_mismatch"
         )
-    expected_identity_by_field = {
-        "acquisition_root_run_id": candidate.acquisition_root_run_id,
-        "selected_resources": list(candidate.selected_resources),
-        "expected_resources": list(candidate.expected_resources),
-        "source_ids": list(candidate.source_ids),
-    }
-    if candidate.requires_twin_root_verification:
-        expected_identity_by_field.update(
-            {
-                "requires_twin_root_verification": True,
-                TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: (
-                    candidate.verification_campaign_id
-                ),
-                TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: (
-                    candidate.verification_source_scope_hash
-                ),
-                TWIN_ROOT_VERIFICATION_ROLE_KEY: candidate.verification_role,
-                TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY: (
-                    candidate.verification_baseline_dataset_id
-                ),
-            }
-        )
+    _assert_persisted_reviewed_root_policy(
+        metadata,
+        candidate.reviewed_root_policy,
+    )
+    expected_identity_by_field = _finalized_replay_identity(
+        candidate,
+        metadata,
+        state_name,
+    )
     if any(
         metadata.get(key) != expected_field_value
         for key, expected_field_value in expected_identity_by_field.items()
@@ -56857,6 +57661,83 @@ def _assert_finalized_endpoint_dataset_replay(
         raise RuntimeError(
             f"provider_directory_endpoint_dataset_{state_name}_diagnostics_invalid"
         )
+
+
+def _finalized_replay_identity(
+    candidate: EndpointDatasetCandidate,
+    metadata: Mapping[str, Any],
+    state_name: str,
+) -> dict[str, Any]:
+    """Return the exact immutable field map required for terminal replay."""
+
+    expected_identity_by_field = _base_finalized_replay_identity(candidate)
+    if candidate.reviewed_root_policy is not None:
+        expected_identity_by_field.update(
+            _policy_finalized_replay_identity(candidate, metadata, state_name)
+        )
+    elif candidate.requires_twin_root_verification:
+        expected_identity_by_field.update(
+            _twin_finalized_replay_identity(candidate)
+        )
+    return expected_identity_by_field
+
+
+def _base_finalized_replay_identity(
+    candidate: EndpointDatasetCandidate,
+) -> dict[str, Any]:
+    return {
+        "acquisition_root_run_id": candidate.acquisition_root_run_id,
+        "selected_resources": list(candidate.selected_resources),
+        "expected_resources": list(candidate.expected_resources),
+        "source_ids": list(candidate.source_ids),
+    }
+
+
+def _twin_finalized_replay_identity(
+    candidate: EndpointDatasetCandidate,
+) -> dict[str, Any]:
+    return {
+        "requires_twin_root_verification": True,
+        TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: candidate.verification_campaign_id,
+        TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: (
+            candidate.verification_source_scope_hash
+        ),
+        TWIN_ROOT_VERIFICATION_ROLE_KEY: candidate.verification_role,
+        TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY: (
+            candidate.verification_baseline_dataset_id
+        ),
+    }
+
+
+def _policy_finalized_replay_identity(
+    candidate: EndpointDatasetCandidate,
+    metadata: Mapping[str, Any],
+    state_name: str,
+) -> dict[str, Any]:
+    policy = candidate.reviewed_root_policy
+    if policy is None:
+        return {}
+    if not policy.is_twin_root_required and any(
+        field_name in metadata
+        for field_name in (
+            TWIN_ROOT_VERIFICATION_ROLE_KEY,
+            TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY,
+            TWIN_ROOT_VERIFICATION_METADATA_KEY,
+        )
+    ):
+        raise RuntimeError(
+            f"provider_directory_endpoint_dataset_{state_name}_identity_mismatch"
+        )
+    identity_by_field = {
+        "requires_twin_root_verification": policy.is_twin_root_required,
+        TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: candidate.verification_campaign_id,
+        TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: (
+            candidate.verification_source_scope_hash
+        ),
+    }
+    if policy.is_twin_root_required:
+        identity_by_field.update(_twin_finalized_replay_identity(candidate))
+    return identity_by_field
 
 
 def _assert_published_endpoint_dataset_replay(
@@ -56954,7 +57835,7 @@ def _build_endpoint_dataset_candidate(
     selection: EndpointDatasetCandidateSelection,
     run_id: str | None,
     checkpoint_context: PaginationCheckpointContext | None,
-    requires_twin_root_verification: bool,
+    verification_profile: EndpointDatasetVerificationProfile,
 ) -> EndpointDatasetCandidate:
     """Bind one acquiring dataset row to its selected source contract."""
 
@@ -56981,7 +57862,12 @@ def _build_endpoint_dataset_candidate(
         requires_twin_root_verification=(
             selection.requires_twin_root_verification
             if selection.requires_twin_root_verification is not None
-            else requires_twin_root_verification
+            else verification_profile.is_twin_root_required
+        ),
+        reviewed_root_policy=(
+            selection.reviewed_root_policy
+            if selection.reviewed_root_policy is not None
+            else verification_profile.reviewed_root_policy
         ),
         verification_campaign_id=selection.verification_campaign_id,
         verification_source_scope_hash=selection.verification_source_scope_hash,
@@ -56996,6 +57882,36 @@ def _build_endpoint_dataset_candidate(
         completion_proof_required_version=proof_required_version,
         subset_contract=subset_contract,
     )
+
+
+def _assert_candidate_reviewed_root_policy(
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    """Require one policy-bearing candidate to retain its closed contract."""
+
+    policy = candidate.reviewed_root_policy
+    if policy is None:
+        return
+    if (
+        candidate.requires_twin_root_verification
+        is not policy.is_twin_root_required
+        or not candidate.acquisition_root_run_id
+        or not candidate.verification_campaign_id
+        or not candidate.verification_source_scope_hash
+        or candidate.completion_proof_required_version
+        != SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        or candidate.subset_contract is None
+    ):
+        raise RuntimeError(
+            "provider_directory_reviewed_root_policy_candidate_invalid"
+        )
+    if not policy.is_twin_root_required and (
+        candidate.verification_role is not None
+        or candidate.verification_baseline_dataset_id is not None
+    ):
+        raise RuntimeError(
+            "provider_directory_reviewed_root_policy_single_root_invalid"
+        )
 
 
 async def _initialize_endpoint_dataset_candidate(
@@ -57018,6 +57934,21 @@ async def _initialize_endpoint_dataset_candidate(
     )
 
 
+def _candidate_resource_scope(
+    source_records: list[dict[str, Any]],
+    resources: list[str],
+) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
+    endpoint_id = _endpoint_id_for_source_records(source_records)
+    selected_resources = tuple(sorted(set(resources)))
+    if endpoint_id is None or not selected_resources:
+        return None
+    return (
+        endpoint_id,
+        selected_resources,
+        _endpoint_dataset_expected_resources(source_records),
+    )
+
+
 async def _prepare_endpoint_dataset_candidate(
     source_records: list[dict[str, Any]],
     resources: list[str],
@@ -57028,13 +57959,10 @@ async def _prepare_endpoint_dataset_candidate(
     checkpoint_context: PaginationCheckpointContext | None,
 ) -> EndpointDatasetCandidate | None:
     """Create a candidate only for the requested endpoint resource profile."""
-    endpoint_id = _endpoint_id_for_source_records(source_records)
-    if endpoint_id is None:
+    resource_scope = _candidate_resource_scope(source_records, resources)
+    if resource_scope is None:
         return None
-    selected_resources = tuple(sorted(set(resources)))
-    if not selected_resources:
-        return None
-    expected_resources = _endpoint_dataset_expected_resources(source_records)
+    endpoint_id, selected_resources, expected_resources = resource_scope
     verification_profile = _endpoint_dataset_verification_profile(
         source_records,
         checkpoint_context,
@@ -57056,10 +57984,14 @@ async def _prepare_endpoint_dataset_candidate(
         selection,
         run_id,
         checkpoint_context,
-        verification_profile.is_twin_root_required,
+        verification_profile,
     )
+    _assert_candidate_reviewed_root_policy(candidate)
     if (
-        candidate.requires_twin_root_verification
+        (
+            candidate.requires_twin_root_verification
+            or candidate.reviewed_root_policy is not None
+        )
         and not candidate.acquisition_root_run_id
     ):
         raise RuntimeError(
@@ -57083,18 +58015,18 @@ def _endpoint_dataset_verification_profile(
     checkpoint_context: PaginationCheckpointContext | None,
 ) -> EndpointDatasetVerificationProfile:
     """Derive the immutable campaign and scope required by this source group."""
-    needs_twin_root_verification, verification_campaign_id = (
-        _source_group_twin_root_verification_profile(source_records)
-    )
+    source_profile = _source_group_reviewed_root_policy_profile(source_records)
+    verification_campaign_id = source_profile.campaign_id
     verification_source_scope_hash = _twin_root_scope_hash(
         source_records,
         verification_campaign_id,
         checkpoint_context,
     )
     return EndpointDatasetVerificationProfile(
-        is_twin_root_required=needs_twin_root_verification,
+        is_twin_root_required=source_profile.is_twin_root_required,
         campaign_id=verification_campaign_id,
         source_scope_hash=verification_source_scope_hash,
+        reviewed_root_policy=source_profile.reviewed_root_policy,
     )
 
 
@@ -60618,11 +61550,34 @@ def _twin_root_mismatch_fields(
     ]
 
 
+def _assert_twin_root_decision_policy(
+    candidate: EndpointDatasetCandidate,
+    baseline: dict[str, Any] | None,
+) -> None:
+    policy = candidate.reviewed_root_policy
+    if policy is not None and (
+        candidate.requires_twin_root_verification
+        is not policy.is_twin_root_required
+        or (
+            not policy.is_twin_root_required
+            and (
+                candidate.verification_role is not None
+                or candidate.verification_baseline_dataset_id is not None
+                or baseline is not None
+            )
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_reviewed_root_policy_candidate_invalid"
+        )
+
+
 def _twin_root_verification_decision(
     candidate: EndpointDatasetCandidate,
     content_proof: EndpointDatasetContentProof,
     baseline: dict[str, Any] | None,
 ) -> tuple[str, dict[str, Any], list[str]]:
+    _assert_twin_root_decision_policy(candidate, baseline)
     if not candidate.requires_twin_root_verification:
         return ENDPOINT_DATASET_VALIDATED, {}, []
     proof = _twin_root_content_proof(candidate, content_proof)
@@ -61575,6 +62530,8 @@ def _dataset_validation_metadata(
 
 def _subset_resource_coverage_map(
     diagnostics: Mapping[str, Any],
+    *,
+    twin_state: str = "pending_matching_reviewed_root",
 ) -> dict[str, Any]:
     """Return sanitized terminal coverage for every reviewed family."""
 
@@ -61589,6 +62546,7 @@ def _subset_resource_coverage_map(
         coverage = _server_issued_subset_coverage(proof)
         if coverage is None:
             raise RuntimeError("provider_directory_subset_coverage_invalid")
+        coverage["twin_state"] = twin_state
         coverage_by_resource[resource_type] = coverage
     return coverage_by_resource
 
@@ -61617,7 +62575,24 @@ def _subset_unresolved_relation_counts(
     return unresolved_by_relation
 
 
+def _subset_aggregate_coverage_counts(
+    resources: Mapping[str, Mapping[str, Any]],
+) -> dict[str, int]:
+    return {
+        count_name: sum(
+            resource[count_name] for resource in resources.values()
+        )
+        for count_name in (
+            "advertised_pre",
+            "advertised_post",
+            "returned_unique",
+            "deficit",
+        )
+    }
+
+
 def _subset_dataset_coverage(
+    candidate: EndpointDatasetCandidate,
     diagnostics: Mapping[str, Any],
     completion_proof: Mapping[str, Any],
     completion_sha256: str,
@@ -61626,7 +62601,18 @@ def _subset_dataset_coverage(
 ) -> dict[str, Any]:
     """Build the sealed safe coverage object from validated proof inputs."""
 
-    coverage_by_resource = _subset_resource_coverage_map(diagnostics)
+    is_single_root = bool(
+        candidate.reviewed_root_policy is not None
+        and not candidate.reviewed_root_policy.is_twin_root_required
+    )
+    coverage_by_resource = _subset_resource_coverage_map(
+        diagnostics,
+        twin_state=(
+            "not_required"
+            if is_single_root
+            else "pending_matching_reviewed_root"
+        ),
+    )
     unresolved_by_relation = _subset_unresolved_relation_counts(
         relation_proof_by_name
     )
@@ -61642,14 +62628,7 @@ def _subset_dataset_coverage(
     return {
         "cutoff": completion_proof["cutoff"],
         "scope": "server_issued_traversal_subset",
-        **{
-            count_name: sum(
-                resource[count_name] for resource in resources.values()
-            )
-            for count_name in (
-                "advertised_pre", "advertised_post", "returned_unique", "deficit"
-            )
-        },
+        **_subset_aggregate_coverage_counts(resources),
         "resources": coverage_by_resource,
         "traversal_complete": True,
         "twin_state": twin_state,
@@ -61687,6 +62666,7 @@ def _subset_dataset_coverage_metadata(
         raise RuntimeError("provider_directory_subset_coverage_invalid")
     return {
         SERVER_ISSUED_SUBSET_COVERAGE_KEY: _subset_dataset_coverage(
+            candidate,
             diagnostics,
             completion_proof,
             completion_sha256,
@@ -65287,8 +66267,21 @@ async def process_provider_directory_fhir_data(
             retry_of_run_id,
             pagination_root_run_id,
         )
+        root_policy_document = task.get(
+            "provider_directory_reviewed_root_policy"
+        )
+        reviewed_root_policy = (
+            reviewed_root_policy_from_document(root_policy_document)
+            if root_policy_document is not None
+            else None
+        )
         reviewed_census_seed_rows = reviewed_manual_census_seed_rows(
-            census_request.source_id
+            census_request.source_id,
+            root_policy=reviewed_root_policy,
+        )
+    elif task.get("provider_directory_reviewed_root_policy") is not None:
+        raise ValueError(
+            "provider_directory_reviewed_root_policy_scope_invalid"
         )
     await _raise_if_resource_import_cancelled(ctx, task)
     await ensure_database(test_mode)
@@ -65933,6 +66926,7 @@ class _ProviderDirectoryFhirCommandOptions:
     provider_directory_pagination_root_run_id: str | None = None
     provider_directory_acquisition_strategy: str | None = None
     provider_directory_census_cutoff: str | None = None
+    provider_directory_reviewed_root_count: int = DEFAULT_REQUIRED_ROOT_COUNT
     source_ids: list[str] | tuple[str, ...] | str | None = None
     limit: int | None = None
     source_query: str | None = None
@@ -65987,7 +66981,22 @@ async def run_provider_directory_fhir_command(
     runtime_context_by_key: dict[str, Any] = {
         "context": {"test_mode": options.test_mode}
     }
-    task_by_field = _apply_provider_directory_refresh_preset(asdict(options))
+    command_options = asdict(options)
+    required_root_count = command_options.pop(
+        "provider_directory_reviewed_root_count"
+    )
+    task_by_field = _apply_provider_directory_refresh_preset(command_options)
+    if (
+        options.provider_directory_acquisition_strategy
+        == "server-issued-traversal-subset"
+    ):
+        task_by_field["provider_directory_reviewed_root_policy"] = (
+            ReviewedRootPolicy(required_root_count).document()
+        )
+    elif required_root_count != DEFAULT_REQUIRED_ROOT_COUNT:
+        raise ValueError(
+            "provider_directory_reviewed_root_policy_scope_invalid"
+        )
     validate_uhc_official_file_admission(task_by_field, test_mode=options.test_mode)
     census_request = current_version_census_request(
         task_by_field,

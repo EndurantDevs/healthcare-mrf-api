@@ -156,6 +156,41 @@ def test_artifact_profile_rejects_subset_identity_and_unknown_marker():
         )
 
 
+def test_artifact_profile_accepts_exact_single_root_policy():
+    source_record = _reviewed_source_record()
+    metadata = source_record["metadata_json"]
+    metadata["provider_directory_candidate_status"] = (
+        importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED
+    )
+    metadata[importer.REVIEWED_ROOT_POLICY_METADATA_KEY] = (
+        importer.ReviewedRootPolicy(1).document()
+    )
+    campaign = metadata[
+        importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+    ]
+
+    assert importer._has_validated_artifact_verification_profile(
+        source_record,
+        "synthetic-dataset",
+        campaign,
+        3,
+    ) is True
+
+    metadata[importer.REVIEWED_ROOT_POLICY_METADATA_KEY][
+        "required_root_count"
+    ] = 3
+    with pytest.raises(
+        RuntimeError,
+        match="artifact_reviewed_root_policy_invalid",
+    ):
+        importer._has_validated_artifact_verification_profile(
+            source_record,
+            "synthetic-dataset",
+            campaign,
+            3,
+        )
+
+
 def test_completion_serialization_rejects_marker_and_contract_drift():
     candidate, _, content, _, _, _, _ = build_persisted_subset_inputs()
     proof_pair = (

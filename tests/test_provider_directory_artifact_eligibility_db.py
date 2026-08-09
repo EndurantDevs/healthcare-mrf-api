@@ -14,6 +14,10 @@ from sqlalchemy.exc import OperationalError
 from db.connection import Database
 from tests.provider_directory_subset_completion_pg_setup import (
     install_subset_canonical_functions,
+    load_migration,
+)
+from tests.provider_directory_artifact_eligibility_support import (
+    content_proof as _content_proof,
 )
 
 
@@ -73,6 +77,10 @@ async def _create_tables(database: Database, schema: str) -> None:
         """
     )
     await install_subset_canonical_functions(database, schema)
+    migration = load_migration()
+    await database.status(
+        migration._content_proof_valid_function_sql(schema)
+    )
 
 
 def _source_metadata(
@@ -101,25 +109,6 @@ def _source_metadata(
             importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
         ] = campaign_id
     return metadata
-
-
-def _content_proof(root_run_id: str) -> dict[str, object]:
-    return {
-        "endpoint_id": ENDPOINT_ID,
-        "acquisition_root_run_id": root_run_id,
-        "source_ids": ["source_a", "source_b"],
-        "selected_resources": ["Organization", "Practitioner"],
-        "expected_resources": ["Organization", "Practitioner"],
-        importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: CAMPAIGN_ID,
-        importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: SOURCE_SCOPE_HASH,
-        "dataset_hash": DATASET_HASH,
-        "resource_count": RESOURCE_COUNT,
-        "resource_hashes": {
-            "Organization": "b" * 64,
-            "Practitioner": "c" * 64,
-        },
-        "resource_counts": {"Organization": 1, "Practitioner": 1},
-    }
 
 
 def _baseline_metadata() -> dict[str, object]:
@@ -382,7 +371,6 @@ async def test_verified_gate_keeps_incumbent_and_exact_matched_candidate(
         assert _option_ids(await _artifact_options(database, schema)) == [
             "dataset_current"
         ]
-
 
 @pytest.mark.asyncio
 async def test_verified_gate_rejects_config_and_profile_drift(monkeypatch):

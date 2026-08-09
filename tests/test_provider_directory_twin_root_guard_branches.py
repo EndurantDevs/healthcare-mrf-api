@@ -220,18 +220,22 @@ def test_artifact_contract_rejects_profile_and_scope_drift():
             source_record,
             publication_metadata_by_field,
             ("Practitioner",),
-            dataset_id="dataset_candidate",
-            verification_campaign_id="campaign-v1",
-            verification_source_scope_hash="wrong-scope",
+            importer._ArtifactPromotionEvidence(
+                dataset_id="dataset_candidate",
+                verification_campaign_id="campaign-v1",
+                verification_source_scope_hash="wrong-scope",
+            ),
         )
     with pytest.raises(RuntimeError, match="source_scope_changed"):
         importer._artifact_promotion_source_contract(
             source_record,
             publication_metadata_by_field,
             ("Organization",),
-            dataset_id="dataset_candidate",
-            verification_campaign_id="campaign-v1",
-            verification_source_scope_hash="wrong-scope",
+            importer._ArtifactPromotionEvidence(
+                dataset_id="dataset_candidate",
+                verification_campaign_id="campaign-v1",
+                verification_source_scope_hash="wrong-scope",
+            ),
         )
 
 
