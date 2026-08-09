@@ -13,7 +13,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -100,8 +99,14 @@ def _command_text(args: list[str]) -> str:
 
 
 def _provider_directory_cli_report() -> dict[str, Any]:
-    help_text = _command_text(["main.py", "start", PROVIDER_DIRECTORY_IMPORTER, "--help"])
-    missing_options = [option for option in REQUIRED_PROVIDER_DIRECTORY_CLI_OPTIONS if option not in help_text]
+    help_text = _command_text(
+        ["main.py", "start", PROVIDER_DIRECTORY_IMPORTER, "--help"]
+    )
+    missing_options = [
+        option
+        for option in REQUIRED_PROVIDER_DIRECTORY_CLI_OPTIONS
+        if option not in help_text
+    ]
     return {
         "ok": not missing_options,
         "missing": missing_options,
@@ -110,8 +115,12 @@ def _provider_directory_cli_report() -> dict[str, Any]:
 
 
 def _coverage_audit_cli_report() -> dict[str, Any]:
-    help_text = _command_text(["scripts/research/provider_directory_coverage_audit.py", "--help"])
-    missing_options = [option for option in REQUIRED_COVERAGE_AUDIT_OPTIONS if option not in help_text]
+    help_text = _command_text(
+        ["scripts/research/provider_directory_coverage_audit.py", "--help"]
+    )
+    missing_options = [
+        option for option in REQUIRED_COVERAGE_AUDIT_OPTIONS if option not in help_text
+    ]
     return {
         "ok": not missing_options,
         "missing": missing_options,
@@ -120,8 +129,14 @@ def _coverage_audit_cli_report() -> dict[str, Any]:
 
 
 def _harness_cli_report() -> dict[str, Any]:
-    help_text = _command_text(["scripts/research/provider_directory_fhir_harness.py", "--help"])
-    missing_options = [option for option in REQUIRED_PROVIDER_DIRECTORY_HARNESS_OPTIONS if option not in help_text]
+    help_text = _command_text(
+        ["scripts/research/provider_directory_fhir_harness.py", "--help"]
+    )
+    missing_options = [
+        option
+        for option in REQUIRED_PROVIDER_DIRECTORY_HARNESS_OPTIONS
+        if option not in help_text
+    ]
     return {
         "ok": not missing_options,
         "missing": missing_options,
@@ -133,9 +148,9 @@ def _importer_schema_report() -> dict[str, Any]:
     from api.control_imports import importer_registry
 
     importer_by_name = {
-        str(item.get("name") or ""): item
-        for item in importer_registry()
-        if isinstance(item, dict)
+        str(schema_entry.get("name") or ""): schema_entry
+        for schema_entry in importer_registry()
+        if isinstance(schema_entry, dict)
     }
     provider_directory = importer_by_name.get(PROVIDER_DIRECTORY_IMPORTER) or {}
     parameter_schemas = list(provider_directory.get("params_schema") or [])
@@ -144,7 +159,11 @@ def _importer_schema_report() -> dict[str, Any]:
         for param in parameter_schemas
         if isinstance(param, dict)
     }
-    missing_schema_fields = [name for name in REQUIRED_PROVIDER_DIRECTORY_SCHEMA_PARAMS if name not in by_name]
+    missing_schema_fields = [
+        name
+        for name in REQUIRED_PROVIDER_DIRECTORY_SCHEMA_PARAMS
+        if name not in by_name
+    ]
     refresh_preset = by_name.get("refresh_preset") or {}
     refresh_choices = list(refresh_preset.get("choices") or [])
     if "monthly-full" not in refresh_choices:
@@ -188,7 +207,9 @@ def _monthly_preset_report() -> dict[str, Any]:
 
 
 def _serving_readiness_contract_report() -> dict[str, Any]:
-    coverage_audit = importlib.import_module("scripts.research.provider_directory_coverage_audit")
+    coverage_audit = importlib.import_module(
+        "scripts.research.provider_directory_coverage_audit"
+    )
     skipped_ptg_summary = getattr(coverage_audit, "_skipped_ptg_summary")
     serving_readiness_summary = getattr(coverage_audit, "_serving_readiness_summary")
     readiness_payload_map = {
@@ -225,7 +246,9 @@ def _serving_readiness_contract_report() -> dict[str, Any]:
         for check in readiness.get("checks") or []
         if isinstance(check, dict)
     }
-    missing_checks = [name for name in REQUIRED_SERVING_READINESS_CHECKS if name not in checks_by_name]
+    missing_checks = [
+        name for name in REQUIRED_SERVING_READINESS_CHECKS if name not in checks_by_name
+    ]
     phone_check = checks_by_name.get("searchable_phone_overlay") or {}
     if phone_check.get("required") is not True:
         missing_checks.append("searchable_phone_overlay.required.true")
@@ -239,9 +262,36 @@ def _serving_readiness_contract_report() -> dict[str, Any]:
     }
 
 
-def _reviewed_subset_state_sync_report() -> dict[str, Any]:
-    """Prove the selector-free operator is packaged and default-off."""
+def _disabled_reviewed_subset_operation_report(
+    command_name: str,
+    disabled_environment: str,
+) -> dict[str, Any]:
+    """Run one packaged operator with its one-shot gate absent."""
 
+    expected_output = '{"code":"disabled","status":"error"}'
+    environment_by_name = dict(os.environ)
+    environment_by_name.pop(disabled_environment, None)
+    operator_result = subprocess.run(
+        [sys.executable, "-B", str(REVIEWED_SUBSET_OPERATOR), command_name],
+        cwd=ROOT,
+        env=environment_by_name,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return {
+        "exit_code": operator_result.returncode,
+        "output_matches": operator_result.stdout.strip() == expected_output,
+    }
+
+
+def _reviewed_subset_state_sync_report() -> dict[str, Any]:
+    """Prove the selector-free operators are packaged and default-off."""
+
+    from process.provider_directory_fhir_subset_abandonment_contract import (
+        ABANDONMENT_ENABLED_ENV,
+    )
     from process.provider_directory_fhir_subset_activation_contract import (
         PENDING_STATUS,
         STATE_SYNC_ENABLED_ENV,
@@ -255,46 +305,40 @@ def _reviewed_subset_state_sync_report() -> dict[str, Any]:
         if not path.is_file()
     ]
     manifest = reviewed_subset_activation_manifest(REVIEWED_SUBSET_MANIFEST)
-    environment_by_name = dict(os.environ)
-    environment_by_name.pop(STATE_SYNC_ENABLED_ENV, None)
-    operator_result = subprocess.run(
-        [sys.executable, "-B", str(REVIEWED_SUBSET_OPERATOR), "sync-verified-state"],
-        cwd=ROOT,
-        env=environment_by_name,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    output_lines = operator_result.stdout.splitlines()
-    observed_output = output_lines[-1] if output_lines else ""
-    expected_output = '{"code":"disabled","status":"error"}'
+    operation_by_name = {
+        command_name: _disabled_reviewed_subset_operation_report(
+            command_name,
+            disabled_environment,
+        )
+        for command_name, disabled_environment in (
+            ("sync-verified-state", STATE_SYNC_ENABLED_ENV),
+            ("abandon-expired-root", ABANDONMENT_ENABLED_ENV),
+        )
+    }
     is_manifest_valid = (
-        (
-            manifest.desired_candidate_status == PENDING_STATUS
-            and manifest.evidence is None
-        )
-        or (
-            manifest.desired_candidate_status == VERIFIED_STATUS
-            and manifest.evidence is not None
-        )
+        manifest.desired_candidate_status == PENDING_STATUS
+        and manifest.evidence is None
+    ) or (
+        manifest.desired_candidate_status == VERIFIED_STATUS
+        and manifest.evidence is not None
     )
     return {
         "ok": (
             not missing_paths
             and is_manifest_valid
-            and operator_result.returncode == 1
-            and observed_output == expected_output
+            and all(
+                operation["exit_code"] == 1 and operation["output_matches"]
+                for operation in operation_by_name.values()
+            )
         ),
         "missing": missing_paths,
-        "default_off": (
-            operator_result.returncode == 1
-            and observed_output == expected_output
+        "default_off": all(
+            operation["exit_code"] == 1 and operation["output_matches"]
+            for operation in operation_by_name.values()
         ),
+        "operations": operation_by_name,
         "desired_state": manifest.desired_candidate_status,
         "evidence_present": manifest.evidence is not None,
-        "operator_exit_code": operator_result.returncode,
-        "operator_output_matches": observed_output == expected_output,
     }
 
 
@@ -310,9 +354,7 @@ def build_report() -> dict[str, Any]:
         "reviewed_subset_state_sync": _reviewed_subset_state_sync_report(),
     }
     failures_by_name = {
-        name: check
-        for name, check in checks_by_name.items()
-        if not check.get("ok")
+        name: check for name, check in checks_by_name.items() if not check.get("ok")
     }
     return {
         "ok": not failures_by_name,
@@ -335,14 +377,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "json":
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
-        print("Provider Directory runtime contract: " + ("PASS" if report["ok"] else "FAIL"))
+        print(
+            "Provider Directory runtime contract: "
+            + ("PASS" if report["ok"] else "FAIL")
+        )
         for name, check in report["checks"].items():
             status = "PASS" if check.get("ok") else "FAIL"
             print(f"- {name}: {status}")
             if check.get("missing"):
                 print(f"  missing: {', '.join(check['missing'])}")
             if check.get("mismatched"):
-                print(f"  mismatched: {json.dumps(check['mismatched'], sort_keys=True)}")
+                print(
+                    f"  mismatched: {json.dumps(check['mismatched'], sort_keys=True)}"
+                )
     return 0 if report["ok"] else 1
 
 

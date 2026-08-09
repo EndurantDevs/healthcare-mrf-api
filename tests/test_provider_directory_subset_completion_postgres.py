@@ -61,6 +61,10 @@ from tests.provider_directory_reviewed_subset_activation_pg_support import (
     insert_activation_generation,
     load_activation_migration,
 )
+from tests.provider_directory_fhir_subset_abandonment_pg_cases import (
+    prove_reviewed_subset_abandonment_guard_handoff,
+    prove_reviewed_subset_abandonment_lifecycle,
+)
 from tests.tin_npi_connector_postgres_support import TransactionalSchema
 
 
@@ -141,6 +145,22 @@ async def test_subset_payload_guard_repair_supports_physical_json(monkeypatch):
     """Replace the deployed guard body before lifecycle bookkeeping."""
 
     await prove_subset_payload_guard_repair(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_reviewed_subset_abandonment_is_fail_closed_and_serialized(
+    monkeypatch,
+):
+    """Seal exact expired evidence and reject every later mutation."""
+
+    await prove_reviewed_subset_abandonment_lifecycle(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_reviewed_subset_abandonment_precedes_fresh_admission(monkeypatch):
+    """Keep a queued fresh worker behind the committed terminal seal."""
+
+    await prove_reviewed_subset_abandonment_guard_handoff(monkeypatch)
 
 
 @pytest.mark.asyncio

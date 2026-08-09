@@ -48,6 +48,9 @@ from db.models import (
 )
 from scripts.research import provider_directory_fhir_harness as harness
 from process.provider_directory_proof_store import build_dataset_proof_shard
+from tests.provider_directory_fhir_subset_completion_support import (
+    build_subset_contract,
+)
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -21886,6 +21889,106 @@ def test_rest_page_prefetch_eligibility_fails_closed(monkeypatch):
     assert is_eligible() is False
 
 
+def _reviewed_subset_prefetch_inputs(monkeypatch):
+    contract = build_subset_contract()
+    source_by_field = {
+        "source_id": contract.source_id,
+        "api_base": "https://directory.example.test/fhir",
+        "canonical_api_base": "https://directory.example.test/fhir",
+        importer.CURRENT_VERSION_CENSUS_CONTRACT_FIELD: contract,
+    }
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base=source_by_field["canonical_api_base"],
+        source_scope_hash="1" * 64,
+        source_ids=(contract.source_id,),
+        owner_run_id="run-fresh",
+        acquisition_root_run_id="run-fresh",
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        lineage_verified=True,
+    )
+    options = importer.RestPagePrefetchEligibility(
+        checkpoint_context=checkpoint_context,
+        start_url_count=1,
+        is_partitioned_fetch=False,
+        row_batch_handler=AsyncMock(return_value=1),
+        row_batch_size=1000,
+        retain_rows=False,
+        per_resource_limit=0,
+        page_limit=0,
+    )
+    request_url = contract.start_url("Practitioner", contract.page_count)
+    monkeypatch.setattr(
+        importer,
+        "_credential_spec_for_source",
+        lambda _source: {},
+    )
+    monkeypatch.setattr(
+        importer,
+        "_has_source_declared_credentialed_access",
+        lambda _source: False,
+    )
+    return source_by_field, checkpoint_context, options, request_url
+
+
+def test_reviewed_subset_prefetch_requires_fresh_bound_lineage(monkeypatch):
+    """Admit only a fresh candidate-bound reviewed v3 traversal."""
+
+    source_by_field, checkpoint_context, options, request_url = (
+        _reviewed_subset_prefetch_inputs(monkeypatch)
+    )
+    monkeypatch.delenv(importer.SOURCE_HTTP_PAGE_PREFETCH_ENV, raising=False)
+    monkeypatch.setenv(importer.SOURCE_HTTP_SUBSET_PAGE_PREFETCH_ENV, "true")
+
+    with _source_http_test_session():
+        assert not importer._is_rest_page_prefetch_eligible(
+            source_by_field,
+            request_url,
+            options,
+        )
+        monkeypatch.setenv(importer.SOURCE_HTTP_PAGE_PREFETCH_ENV, "true")
+        monkeypatch.delenv(
+            importer.SOURCE_HTTP_SUBSET_PAGE_PREFETCH_ENV,
+            raising=False,
+        )
+        assert not importer._is_rest_page_prefetch_eligible(
+            source_by_field,
+            request_url,
+            options,
+        )
+        monkeypatch.setenv(
+            importer.SOURCE_HTTP_SUBSET_PAGE_PREFETCH_ENV,
+            "true",
+        )
+        assert importer._is_rest_page_prefetch_eligible(
+            source_by_field,
+            request_url,
+            options,
+        )
+        for drifted_context in (
+            dataclasses.replace(checkpoint_context, lineage_verified=False),
+            dataclasses.replace(checkpoint_context, endpoint_id=None),
+            dataclasses.replace(checkpoint_context, dataset_id=None),
+            dataclasses.replace(
+                checkpoint_context,
+                owner_run_id="run-retry",
+                retry_of_run_id="run-fresh",
+            ),
+            dataclasses.replace(
+                checkpoint_context,
+                source_ids=("source-b",),
+            ),
+        ):
+            assert not importer._is_rest_page_prefetch_eligible(
+                source_by_field,
+                request_url,
+                dataclasses.replace(
+                    options,
+                    checkpoint_context=drifted_context,
+                ),
+            )
+
+
 def test_rest_page_prefetch_deterministic_expansion_is_separately_gated(monkeypatch):
     """Require a second switch for every replay-safe position source."""
     monkeypatch.setenv(importer.SOURCE_HTTP_PAGE_PREFETCH_ENV, "true")
@@ -22560,6 +22663,330 @@ def test_caresource_terminal_proof_failure_cannot_enter_resume_queue():
         )
 
 
+def test_reviewed_subset_terminal_cursor_cannot_enter_resume_queue():
+    diagnostic_by_field = {
+        "bounded": False,
+        "complete": False,
+        "error": f"{importer.CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:http_410",
+        "fetch_mode": importer.SERVER_ISSUED_SUBSET_FETCH_MODE,
+        "source_fetch": None,
+    }
+    resume_entries: set[str] = set()
+
+    with pytest.raises(
+        importer.ProviderDirectoryPaginationTerminalFailure,
+        match="http_410",
+    ) as failure:
+        importer._handle_incomplete_source_pagination(
+            {"_pagination_checkpoint_context": _checkpoint_context()},
+            {"Location": diagnostic_by_field},
+            ["Location"],
+            resume_entries,
+            True,
+        )
+
+    assert resume_entries == set()
+    assert failure.value.diagnostics_by_resource == {
+        "Location": diagnostic_by_field
+    }
+
+
+def _terminal_guard_lease(canonical_api_base, source_id, database):
+    """Build one active synthetic lease for terminal-hook unit tests."""
+
+    return importer._PaginationCheckpointGuardLease(
+        context=importer.PaginationCheckpointContext(
+            canonical_api_base=canonical_api_base,
+            source_scope_hash="1" * 64,
+            source_ids=(source_id,),
+            owner_run_id="run-a",
+            acquisition_root_run_id="run-a",
+        ),
+        database=database,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewed_subset_terminal_hook_seals_only_exact_checked_in_source(
+    monkeypatch,
+):
+    """Run the selector-free seal only after an exact reviewed v3 failure."""
+
+    contract = build_subset_contract()
+    source_by_field = {
+        "source_id": contract.source_id,
+        "api_base": "https://directory.example.test/fhir",
+        "canonical_api_base": "https://directory.example.test/fhir",
+        importer.CURRENT_VERSION_CENSUS_CONTRACT_FIELD: contract,
+    }
+    diagnostic_by_resource = {
+        resource_type: {
+            "bounded": False,
+            "complete": False,
+            "error": (
+                f"{importer.CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:http_410"
+            ),
+            "fetch_mode": importer.SERVER_ISSUED_SUBSET_FETCH_MODE,
+        }
+        for resource_type in contract.resources
+    }
+    failure = importer.ProviderDirectoryPaginationTerminalFailure(
+        "synthetic terminal traversal",
+        diagnostic_by_resource,
+    )
+    seal = AsyncMock()
+    monkeypatch.setattr(
+        "process.provider_directory_fhir_manual_catalog."
+        "reviewed_manual_census_source_id",
+        lambda: contract.source_id,
+    )
+    monkeypatch.setattr(
+        "process.provider_directory_fhir_subset_abandonment_store."
+        "sync_reviewed_subset_abandonment_transaction",
+        seal,
+    )
+    guard_database = object()
+    guard_lease = _terminal_guard_lease(
+        source_by_field["canonical_api_base"],
+        contract.source_id,
+        guard_database,
+    )
+
+    await importer._abandon_terminal_reviewed_subset_without_masking(
+        [source_by_field],
+        failure,
+        guard_lease,
+    )
+
+    seal.assert_awaited_once_with(
+        guard_database,
+        contract.source_id,
+        tuple(sorted(contract.resources)),
+        held_pagination_guard_key=guard_lease.lock_key,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewed_subset_terminal_hook_ignores_nonexact_groups(
+    monkeypatch,
+):
+    """Never seal a partial, multi-source, or unreviewed traversal."""
+
+    contract = build_subset_contract()
+    source_by_field = {
+        "source_id": contract.source_id,
+        importer.CURRENT_VERSION_CENSUS_CONTRACT_FIELD: contract,
+    }
+    failure = importer.ProviderDirectoryPaginationTerminalFailure(
+        "synthetic partial traversal",
+        {
+            contract.resources[0]: {
+                "bounded": False,
+                "complete": False,
+                "error": (
+                    f"{importer.CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:http_410"
+                ),
+                "fetch_mode": importer.SERVER_ISSUED_SUBSET_FETCH_MODE,
+            }
+        },
+    )
+    seal = AsyncMock()
+    monkeypatch.setattr(
+        "process.provider_directory_fhir_subset_abandonment_store."
+        "sync_reviewed_subset_abandonment_transaction",
+        seal,
+    )
+    guard_lease = _terminal_guard_lease(
+        "https://directory.example.test/fhir",
+        contract.source_id,
+        object(),
+    )
+
+    await importer._abandon_terminal_reviewed_subset_without_masking(
+        [source_by_field],
+        failure,
+        guard_lease,
+    )
+    await importer._abandon_terminal_reviewed_subset_without_masking(
+        [source_by_field, dict(source_by_field)],
+        failure,
+        guard_lease,
+    )
+
+    seal.assert_not_awaited()
+
+
+def _terminal_abandonment_flow(store_failure):
+    """Build one exact reviewed terminal failure and retained candidate."""
+
+    contract = build_subset_contract()
+    source_by_field = {
+        "source_id": contract.source_id,
+        "api_base": "https://directory.example.test/fhir",
+        "canonical_api_base": "https://directory.example.test/fhir",
+        importer.CURRENT_VERSION_CENSUS_CONTRACT_FIELD: contract,
+    }
+    checkpoint_context = importer.PaginationCheckpointContext(
+        canonical_api_base=source_by_field["canonical_api_base"],
+        source_scope_hash="1" * 64,
+        source_ids=(contract.source_id,),
+        owner_run_id="run-a",
+        acquisition_root_run_id="run-a",
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        lineage_verified=True,
+    )
+    candidate = importer.EndpointDatasetCandidate(
+        endpoint_id="endpoint-a",
+        dataset_id="dataset-a",
+        acquisition_root_run_id="run-a",
+        source_ids=(contract.source_id,),
+        selected_resources=tuple(contract.resources),
+        import_run_id="run-a",
+        previous_dataset_id=None,
+        checkpoint_context=checkpoint_context,
+    )
+    diagnostics_by_resource = {
+        resource_type: {
+            "bounded": False,
+            "complete": False,
+            "error": f"{importer.CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:http_410",
+            "fetch_mode": importer.SERVER_ISSUED_SUBSET_FETCH_MODE,
+        }
+        for resource_type in contract.resources
+    }
+    return SimpleNamespace(
+        contract=contract,
+        source_by_field=source_by_field,
+        checkpoint_context=checkpoint_context,
+        candidate=candidate,
+        terminal_failure=importer.ProviderDirectoryPaginationTerminalFailure(
+            "synthetic terminal traversal",
+            diagnostics_by_resource,
+        ),
+        store_failure=store_failure,
+        events=[],
+    )
+
+
+def _terminal_abandonment_callbacks(flow):
+    """Return event-recording callbacks for the automatic seal flow."""
+
+    @contextlib.asynccontextmanager
+    async def worker_guard(_context):
+        flow.events.append("guard_enter")
+        try:
+            yield importer._PaginationCheckpointGuardLease(
+                context=flow.checkpoint_context,
+                database=importer.db,
+            )
+        finally:
+            flow.events.append("guard_exit")
+
+    async def prepare_sources(source_records, *_args, **_kwargs):
+        prepared_by_field = dict(source_records[0])
+        prepared_by_field["_pagination_checkpoint_context"] = (
+            flow.checkpoint_context
+        )
+        prepared_by_field["_endpoint_dataset_id"] = flow.candidate.dataset_id
+        return [prepared_by_field], flow.candidate
+
+    async def fail_scan(_runner, _resource_types):
+        flow.events.append("scan")
+        raise flow.terminal_failure
+
+    async def retain_metadata(*_args, **_kwargs):
+        flow.events.append("metadata")
+
+    async def fail_candidate(_candidate, status, *_args, **_kwargs):
+        assert status == importer.ENDPOINT_DATASET_FAILED
+        flow.events.append("candidate_failed")
+        return {}
+
+    async def seal(*_args, **_kwargs):
+        flow.events.append("store")
+        if flow.store_failure is not None:
+            raise flow.store_failure
+
+    return {
+        "_pagination_checkpoint_worker_guard": worker_guard,
+        "_prepare_resource_import_source_group": prepare_sources,
+        "_update_source_resource_import_metadata": retain_metadata,
+        "_mark_endpoint_dataset_candidate": fail_candidate,
+        "scan": fail_scan,
+        "seal": seal,
+    }
+
+
+def _patch_terminal_abandonment_flow(monkeypatch, flow):
+    """Install the exact terminal flow callbacks without changing ordering."""
+
+    callbacks_by_name = _terminal_abandonment_callbacks(flow)
+    for callback_name in (
+        "_pagination_checkpoint_worker_guard",
+        "_prepare_resource_import_source_group",
+        "_update_source_resource_import_metadata",
+        "_mark_endpoint_dataset_candidate",
+    ):
+        monkeypatch.setattr(importer, callback_name, callbacks_by_name[callback_name])
+    monkeypatch.setattr(
+        importer.ResourceGroupScanRunner,
+        "scan",
+        callbacks_by_name["scan"],
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resource_group_pagination_checkpoint_context",
+        lambda *_args, **_kwargs: flow.checkpoint_context,
+    )
+    monkeypatch.setattr(
+        "process.provider_directory_fhir_manual_catalog."
+        "reviewed_manual_census_source_id",
+        lambda: flow.contract.source_id,
+    )
+    monkeypatch.setattr(
+        "process.provider_directory_fhir_subset_abandonment_store."
+        "sync_reviewed_subset_abandonment_transaction",
+        callbacks_by_name["seal"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_failure", (None, RuntimeError("synthetic store")))
+async def test_terminal_flow_seals_under_worker_guard_without_masking(
+    monkeypatch,
+    store_failure,
+):
+    """Retain failure state and seal before releasing the worker guard."""
+
+    flow = _terminal_abandonment_flow(store_failure)
+    _patch_terminal_abandonment_flow(monkeypatch, flow)
+    with pytest.raises(
+        importer.ProviderDirectoryPaginationTerminalFailure
+    ) as observed_failure:
+        await importer._import_resources(
+            [flow.source_by_field],
+            resources=list(flow.contract.resources),
+            per_resource_limit=0,
+            page_limit=0,
+            page_count=flow.contract.page_count,
+            timeout=3,
+            run_id="run-a",
+            stream_batch_size=1,
+            is_pagination_checkpointing_enabled=True,
+        )
+
+    assert observed_failure.value is flow.terminal_failure
+    assert flow.events == [
+        "guard_enter",
+        "scan",
+        "metadata",
+        "candidate_failed",
+        "store",
+        "guard_exit",
+    ]
+
+
 def test_pagination_checkpoint_mode_requires_acquisition_only():
     enabled_options_by_name = {
         "run_id": "run_1",
@@ -22600,6 +23027,7 @@ def test_pagination_guard_serializes_same_endpoint_across_roots():
 @pytest.mark.asyncio
 async def test_pagination_guard_uses_dedicated_connection(monkeypatch):
     guard_connection = AsyncMock()
+    guard_connection.execute.return_value = SimpleNamespace(scalar=lambda: True)
     open_connection = AsyncMock(return_value=guard_connection)
     monkeypatch.setattr(
         importer,
@@ -22610,22 +23038,26 @@ async def test_pagination_guard_uses_dedicated_connection(monkeypatch):
     async with importer._pagination_checkpoint_worker_guard(
         _cigna_checkpoint_context("run_1")
     ):
-        assert guard_connection.fetchval.await_count == 1
+        assert guard_connection.execute.await_count == 1
 
     open_connection.assert_awaited_once_with()
-    assert guard_connection.fetchval.await_count == 2
-    assert "pg_advisory_lock" in guard_connection.fetchval.await_args_list[0].args[0]
-    assert "pg_advisory_unlock" in guard_connection.fetchval.await_args_list[1].args[0]
+    assert guard_connection.execute.await_count == 2
+    assert "pg_advisory_lock" in str(
+        guard_connection.execute.await_args_list[0].args[0]
+    )
+    assert "pg_advisory_unlock" in str(
+        guard_connection.execute.await_args_list[1].args[0]
+    )
+    assert guard_connection.commit.await_count == 2
     guard_connection.close.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
-async def test_pagination_guard_terminates_connection_when_lock_wait_is_cancelled(
+async def test_pagination_guard_invalidates_connection_when_lock_wait_is_cancelled(
     monkeypatch,
 ):
     guard_connection = AsyncMock()
-    guard_connection.fetchval.side_effect = asyncio.CancelledError
-    guard_connection.terminate = Mock()
+    guard_connection.execute.side_effect = asyncio.CancelledError
     monkeypatch.setattr(
         importer,
         "_open_pagination_checkpoint_guard_connection",
@@ -22638,8 +23070,8 @@ async def test_pagination_guard_terminates_connection_when_lock_wait_is_cancelle
         ):
             raise AssertionError("guard must not yield after cancellation")
 
-    guard_connection.terminate.assert_called_once_with()
-    guard_connection.close.assert_not_awaited()
+    guard_connection.invalidate.assert_awaited_once_with()
+    guard_connection.close.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -29985,22 +30417,25 @@ class _GuardConnection:
         self.acquire_error = acquire_error
         self.unlock_error = unlock_error
         self.close_error = close_error
-        self.fetch_count = 0
-        self.terminated = False
+        self.execute_count = 0
+        self.invalidated = False
 
-    async def fetchval(self, *_args):
-        self.fetch_count += 1
-        error = self.acquire_error if self.fetch_count == 1 else self.unlock_error
+    async def execute(self, *_args):
+        self.execute_count += 1
+        error = self.acquire_error if self.execute_count == 1 else self.unlock_error
         if error is not None:
             raise error
-        return 1
+        return SimpleNamespace(scalar=lambda: 1)
+
+    async def commit(self):
+        return None
 
     async def close(self):
         if self.close_error is not None:
             raise self.close_error
 
-    def terminate(self):
-        self.terminated = True
+    async def invalidate(self):
+        self.invalidated = True
 
 
 @pytest.mark.asyncio
@@ -30037,35 +30472,27 @@ async def test_pagination_worker_guard_fails_closed(
             async with importer._pagination_checkpoint_worker_guard(
                 _checkpoint_context()
             ):
-                assert connection.fetch_count == 1
+                assert connection.execute_count == 1
     else:
         async with importer._pagination_checkpoint_worker_guard(_checkpoint_context()):
-            assert connection.fetch_count == 1
-    assert connection.terminated is True
+            assert connection.execute_count == 1
+    assert connection.invalidated is True
 
 
 @pytest.mark.asyncio
 async def test_guard_connection_connects_lazily(monkeypatch):
-    class _URL:
-        def set(self, **_kwargs):
-            return self
-
-        def render_as_string(self, **_kwargs):
-            return "postgresql://db.example.test/healthporta"
+    engine_connect = AsyncMock(return_value=object())
 
     async def connect_database():
-        importer.db.engine = SimpleNamespace(url=_URL())
+        importer.db.engine = SimpleNamespace(connect=engine_connect)
 
     monkeypatch.setattr(importer.db, "engine", None)
     monkeypatch.setattr(importer.db, "connect", AsyncMock(side_effect=connect_database))
-    connect = AsyncMock(return_value=object())
-    monkeypatch.setattr(importer.asyncpg, "connect", connect)
-
     connection = await importer._open_pagination_checkpoint_guard_connection()
 
-    assert connection is connect.return_value
+    assert connection is engine_connect.return_value
     importer.db.connect.assert_awaited_once()
-    connect.assert_awaited_once_with(dsn="postgresql://db.example.test/healthporta")
+    engine_connect.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -30964,6 +31391,22 @@ def test_checkpoint_text_and_identity_helpers_fail_closed():
                 "state": importer.PAGINATION_CHECKPOINT_ACTIVE,
                 "start_url_hash": "start-hash",
                 "next_url": None,
+            },
+            _checkpoint_context(),
+            "start-hash",
+        )
+        is None
+    )
+    assert (
+        importer._compatible_pagination_resume_state(
+            {
+                "dataset_id": "dataset-a",
+                "source_ids": ["source-a"],
+                "owner_run_id": "run-current",
+                "acquisition_root_run_id": "run-root",
+                "state": importer.PAGINATION_CHECKPOINT_ACQUISITION_ABANDONED,
+                "start_url_hash": "start-hash",
+                "next_url": "https://directory.example.test/fhir/next",
             },
             _checkpoint_context(),
             "start-hash",
@@ -32722,20 +33165,16 @@ async def test_plan_graph_guard_checkpoint_adoption_and_query_root(
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_guard_connection_uses_engine_url(monkeypatch):
-    """Checkpoint guard connection renders the configured engine URL."""
-    class URL:
-        def set(self, **_kwargs):
-            return self
+async def test_checkpoint_guard_connection_uses_engine_backend(monkeypatch):
+    """Checkpoint guard owns one connection from the configured engine."""
 
-        def render_as_string(self, **_kwargs):
-            return "postgresql://example.test/database"
-
-    monkeypatch.setattr(importer.db, "engine", SimpleNamespace(url=URL()))
     connect = AsyncMock(return_value=object())
-    monkeypatch.setattr(importer.asyncpg, "connect", connect)
-    await importer._open_pagination_checkpoint_guard_connection()
-    connect.assert_awaited_once()
+    monkeypatch.setattr(importer.db, "engine", SimpleNamespace(connect=connect))
+
+    connection = await importer._open_pagination_checkpoint_guard_connection()
+
+    assert connection is connect.return_value
+    connect.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

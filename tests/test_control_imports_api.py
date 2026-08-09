@@ -241,6 +241,19 @@ def test_provider_directory_runtime_contract_preflight_passes():
     assert report["checks"]["importer_schema"]["ok"] is True
     assert report["checks"]["monthly_preset"]["ok"] is True
     assert report["checks"]["serving_readiness_contract"]["ok"] is True
+    subset_state = report["checks"]["reviewed_subset_state_sync"]
+    assert subset_state["ok"] is True
+    assert subset_state["default_off"] is True
+    assert subset_state["operations"] == {
+        "abandon-expired-root": {
+            "exit_code": 1,
+            "output_matches": True,
+        },
+        "sync-verified-state": {
+            "exit_code": 1,
+            "output_matches": True,
+        },
+    }
 
 
 def test_control_wrapped_publish_importers_request_shutdown():

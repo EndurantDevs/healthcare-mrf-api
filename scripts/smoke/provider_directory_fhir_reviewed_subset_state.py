@@ -22,6 +22,13 @@ os.environ.setdefault("HLTHPRT_LOG_CFG", str(ROOT / "logging.yaml"))
 
 COMMAND = "sync-verified-state"
 EVIDENCE_COMMAND = "render-neutral-evidence"
+ABANDON_COMMAND = "abandon-expired-root"
+_ENABLED_ENV_BY_COMMAND = {
+    COMMAND: "HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED",
+    ABANDON_COMMAND: (
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED"
+    ),
+}
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
 SAFE_ERROR_CODES = frozenset(
     {
@@ -53,6 +60,12 @@ class RedactedArgumentParser(argparse.ArgumentParser):
         self.exit(2, _error_json("invalid_arguments") + "\n")
 
 
+class _DormantGateError(RuntimeError):
+    """Fail before runtime imports when a mutating operator is disabled."""
+
+    code = "disabled"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = RedactedArgumentParser(
         allow_abbrev=False,
@@ -61,7 +74,10 @@ def _parser() -> argparse.ArgumentParser:
             "Provider Directory subset state. No selector is accepted."
         ),
     )
-    parser.add_argument("command", choices=(COMMAND, EVIDENCE_COMMAND))
+    parser.add_argument(
+        "command",
+        choices=(COMMAND, EVIDENCE_COMMAND, ABANDON_COMMAND),
+    )
     return parser
 
 
@@ -162,11 +178,23 @@ async def _execute_evidence_render(database: Any) -> str:
     return reviewed_subset_activation_verified_manifest_json(evidence)
 
 
+async def _execute_abandonment(database: Any) -> str:
+    from process.provider_directory_fhir_subset_abandonment import (
+        abandon_reviewed_subset_expired_root,
+        abandonment_result_json,
+    )
+
+    result = await abandon_reviewed_subset_expired_root(database=database)
+    return abandonment_result_json(result)
+
+
 async def _execute_operation(database: Any, command: str) -> str:
     if command == COMMAND:
         return await _execute_state_sync(database)
     if command == EVIDENCE_COMMAND:
         return await _execute_evidence_render(database)
+    if command == ABANDON_COMMAND:
+        return await _execute_abandonment(database)
     raise RuntimeError("reviewed subset operator command is invalid")
 
 
@@ -175,6 +203,13 @@ async def _run_operator(
     *,
     database: Any | None = None,
 ) -> str:
+    enabled_environment = _ENABLED_ENV_BY_COMMAND.get(command)
+    if (
+        database is None
+        and enabled_environment is not None
+        and os.getenv(enabled_environment) != "true"
+    ):
+        raise _DormantGateError()
     active_task = asyncio.current_task()
     if active_task is None:
         raise RuntimeError("reviewed subset operator task is unavailable")

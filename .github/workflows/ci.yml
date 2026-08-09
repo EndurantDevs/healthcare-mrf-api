@@ -478,23 +478,25 @@ jobs:
               operation_last_line=$(printf "%s\n" "$operation_output" | tail -n 1)
               test "$operation_last_line" = '\''{"code":"disabled","status":"error"}'\''
             '
-      - name: Prove reviewed Provider subset state sync is packaged and dormant
+      - name: Prove reviewed Provider subset operators are packaged and dormant
         run: |
           docker run --rm --platform linux/amd64 \
             --entrypoint /bin/sh \
             healthcare-mrf-api:ptg-v4-gate \
             -ec '
-              set +e
-              operation_output=$(env \
-                -u HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED \
-                /opt/venv/bin/python -B \
-                /opt/scripts/smoke/provider_directory_fhir_reviewed_subset_state.py \
-                sync-verified-state 2>&1)
-              operation_status=$?
-              set -e
-              test "$operation_status" -eq 1
-              operation_last_line=$(printf "%s\n" "$operation_output" | tail -n 1)
-              test "$operation_last_line" = '\''{"code":"disabled","status":"error"}'\''
+              for operation in sync-verified-state abandon-expired-root; do
+                set +e
+                operation_output=$(env \
+                  -u HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED \
+                  -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED \
+                  /opt/venv/bin/python -B \
+                  /opt/scripts/smoke/provider_directory_fhir_reviewed_subset_state.py \
+                  "$operation" 2>&1)
+                operation_status=$?
+                set -e
+                test "$operation_status" -eq 1
+                test "$operation_output" = '\''{"code":"disabled","status":"error"}'\''
+              done
             '
 
   security:
@@ -660,6 +662,7 @@ jobs:
           tests/test_provider_directory_migration_adoption_postgres.py
           tests/test_provider_directory_caresource_census_db.py
           tests/test_provider_directory_fhir_current_census_postgres.py
+          tests/test_provider_directory_fhir_current_census_terminal_postgres.py
           tests/test_provider_directory_fhir_current_census_atomicity_postgres.py
           tests/test_mrf_file_source_cursor_migration.py
           tests/test_public_evidence_storage_catalog_postgres.py

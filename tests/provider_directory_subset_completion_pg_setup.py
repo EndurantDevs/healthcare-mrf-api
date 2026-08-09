@@ -30,6 +30,10 @@ PAYLOAD_GUARD_REPAIR_MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "alembic/versions/20260808210000_provider_directory_subset_payload_guard_repair.py"
 )
+ABANDONMENT_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions/20260809000000_provider_directory_subset_abandonment.py"
+)
 
 
 class MigrationSqlCapture(SqlCapture):
@@ -181,6 +185,17 @@ def load_payload_guard_repair_migration():
     module_spec = importlib.util.spec_from_file_location(
         "provider_directory_subset_payload_guard_repair_postgres_migration",
         PAYLOAD_GUARD_REPAIR_MIGRATION_PATH,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
+
+
+def load_abandonment_migration():
+    module_spec = importlib.util.spec_from_file_location(
+        "provider_directory_subset_abandonment_postgres_migration",
+        ABANDONMENT_MIGRATION_PATH,
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)

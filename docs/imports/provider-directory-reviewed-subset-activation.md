@@ -1,9 +1,10 @@
 # Reviewed Provider Directory subset state sync
 
-This selector-free operator is the only supported way to move the fixed
-reviewed Provider Directory source from pending twin review to verified twin
-review. It is default-off, changes no dataset state, and does not publish or
-make a dataset current.
+The selector-free activation subcommand is the only supported way to move the
+fixed reviewed Provider Directory source from pending twin review to verified
+twin review. It is default-off, changes no dataset state, and does not publish
+or make a dataset current. The separately gated abandonment subcommand below
+seals one proofless failed dataset without activating or publishing it.
 
 ## Review the neutral desired state
 
@@ -75,6 +76,44 @@ marker, and `updated_at`. The private marker binds the selected baseline and
 candidate identities, but those identities never enter the checked-in
 manifest or operator output. Ordinary source catalog upserts preserve the
 verified marker and status while PostgreSQL rejects fixed-contract drift.
+
+## Abandon an expired acquisition root
+
+A reviewed v3 traversal whose exact retained continuation cursors all return
+HTTP 410 is not resumable. The importer retains sanitized per-resource
+diagnostics and attempts to seal the proofless non-current root as
+`acquisition_abandoned` on the same database backend while the endpoint worker
+guard remains held. The seal commits before that guard is released, so a queued
+fresh root cannot overtake the terminal disposition. The original import still
+exits nonzero; abandonment never turns a failed import into success.
+
+For a previously retained root, use the same packaged selector-free operator.
+It accepts no source, endpoint, dataset, root, owner, cursor, or resource
+selectors. Its gate is enabled only for the one-shot Job:
+
+```console
+HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED=true \
+  /opt/venv/bin/python -B \
+  /opt/scripts/smoke/provider_directory_fhir_reviewed_subset_state.py \
+  abandon-expired-root
+```
+
+At `READ COMMITTED`, the transaction locks the pagination scope, endpoint,
+sole source alias, exact proofless candidate, and its ordered checkpoint rows.
+It requires the checked-in reviewed source, one complete seven-resource set of
+permanent cursor diagnostics, exact latest-owner lineage, no bulk checkpoint,
+and parity across resources, proof shards, and checkpoint counts. It changes
+only checkpoint lifecycle fields and the parent status, resource count, and
+closed identifier-free marker. A replay returns `already_applied=true` only
+while the retained evidence still validates, including after source
+activation.
+
+Abandonment does not publish, delete, reset, or reuse the old root. Its rows,
+proof shards, checkpoints, cursor commitments, and failed Job evidence remain
+immutable for audit. Continue only with a genuinely fresh acquisition root and
+no retry or pagination-root arguments. Root A and Root B must use distinct new
+roots, the same newly frozen cutoff and reviewed transport policy, and must
+still independently produce matching terminal proofs.
 
 ## Publication and rollback boundary
 
