@@ -1271,6 +1271,17 @@ def provider_enrichment(test: bool):
     ),
 )
 @click.option(
+    "--reviewed-root-count",
+    "provider_directory_reviewed_root_count",
+    type=click.IntRange(1, 2),
+    default=2,
+    show_default=True,
+    help=(
+        "Required complete reviewed acquisition roots for a fresh manual "
+        "campaign. One root provides reduced repeatability assurance."
+    ),
+)
+@click.option(
     "--source-id",
     multiple=True,
     help="Provider Directory source id to scope artifact publishing. Can be passed more than once.",
@@ -1410,6 +1421,7 @@ def provider_directory_fhir(
     provider_directory_pagination_root_run_id: str | None,
     provider_directory_acquisition_strategy: str,
     provider_directory_census_cutoff: str | None,
+    provider_directory_reviewed_root_count: int,
     source_id: tuple[str, ...],
     limit: int | None,
     source_query: str | None,
@@ -1469,6 +1481,9 @@ def provider_directory_fhir(
                 provider_directory_acquisition_strategy
             ),
             provider_directory_census_cutoff=provider_directory_census_cutoff,
+            provider_directory_reviewed_root_count=(
+                provider_directory_reviewed_root_count
+            ),
             source_ids=list(source_id),
             limit=limit,
             source_query=source_query,

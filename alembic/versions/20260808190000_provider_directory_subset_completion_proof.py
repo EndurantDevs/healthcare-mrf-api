@@ -52,6 +52,9 @@ _REPLAY_SHAPE_VALID_FUNCTION = (
 _COVERAGE_SHAPE_VALID_FUNCTION = (
     "provider_directory_subset_coverage_shape_valid"
 )
+_CONTENT_PROOF_VALID_FUNCTION = (
+    "provider_directory_subset_content_proof_valid"
+)
 _REPLAY_EVIDENCE_KEY = "server_issued_subset_replay_evidence"
 _REPLAY_EVIDENCE_SHA256_KEY = (
     "server_issued_subset_replay_evidence_sha256"
@@ -66,6 +69,15 @@ _BASELINE_GENERATION_INDEX = "pd_endpoint_dataset_subset_baseline_generation_key
 _SUBSET_SOURCE_SCOPE_VERSION = (
     "provider-directory-fhir-server-issued-subset-source-scope-v1"
 )
+_SUBSET_SOURCE_SCOPE_VERSION_V2 = (
+    "provider-directory-fhir-server-issued-subset-source-scope-v2"
+)
+_REVIEWED_ROOT_POLICY_KEY = "provider_directory_reviewed_root_policy_v1"
+_REVIEWED_ROOT_POLICY_VERSION = "provider-directory-reviewed-root-policy-v1"
+_ROOT_POLICY_PENDING_SOURCE_STATUS = "pending_reviewed_subset_acquisition"
+_ROOT_POLICY_VERIFIED_SOURCE_STATUS = "verified_reviewed_subset_acquisition"
+_CONTENT_PROOF_KEY = "provider_directory_content_proof_v1"
+_CONTENT_PROOF_CONTRACT = "healthporta.provider-directory.content-proof.v1"
 _SUBSET_VERIFIED_SOURCE_STATUS = (
     "verified_two_matching_reviewed_subset_acquisitions"
 )
@@ -1223,12 +1235,28 @@ def _replay_shape_valid_function_sql(schema: str) -> str:
     """
 
 
-def _coverage_shape_valid_function_sql(schema: str) -> str:
+def _coverage_shape_valid_function_sql(
+    schema: str,
+    *,
+    replace_existing: bool = False,
+    reviewed_root_policy_aware: bool = False,
+) -> str:
     coverage_valid_ref = _qf(schema, _COVERAGE_SHAPE_VALID_FUNCTION)
     canonical_sha256_ref = _qf(schema, _CANONICAL_SHA256_FUNCTION)
     resource_types_sql = ", ".join(_ql(value) for value in _SUBSET_RESOURCE_TYPES)
+    create_function = (
+        "CREATE OR REPLACE FUNCTION"
+        if replace_existing
+        else "CREATE FUNCTION"
+    )
+    expected_resource_twin_state = (
+        "(CASE WHEN expected_twin_state = 'not_required' "
+        "THEN 'not_required' ELSE 'pending_matching_reviewed_root' END)"
+        if reviewed_root_policy_aware
+        else "'pending_matching_reviewed_root'"
+    )
     return f"""
-    CREATE FUNCTION {coverage_valid_ref}(
+    {create_function} {coverage_valid_ref}(
         coverage_candidate jsonb,
         completion_candidate jsonb,
         completion_sha256 text,
@@ -1337,7 +1365,7 @@ def _coverage_shape_valid_function_sql(schema: str) -> str:
                OR resource_coverage ->> 'scope' IS DISTINCT FROM
                     'server_issued_traversal_subset'
                OR resource_coverage ->> 'twin_state' IS DISTINCT FROM
-                    'pending_matching_reviewed_root'
+                    {expected_resource_twin_state}
                OR resource_coverage ->> 'proof_state' IS DISTINCT FROM
                     'resource_terminal_verified'
                OR resource_coverage -> 'unresolved_reference_count'
@@ -1441,6 +1469,336 @@ def _coverage_shape_valid_function_sql(schema: str) -> str:
                     ) THEN
                 RETURN FALSE;
             END IF;
+        END IF;
+        RETURN TRUE;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN FALSE;
+    END;
+    $function$;
+    """
+
+
+def _content_proof_valid_function_sql(
+    schema: str,
+    *,
+    replace_existing: bool = False,
+) -> str:
+    """Validate the complete stored-content proof used by one-root policy."""
+
+    function_ref = _qf(schema, _CONTENT_PROOF_VALID_FUNCTION)
+    canonical_json_ref = _qf(schema, _CANONICAL_JSON_FUNCTION)
+    canonical_sha256_ref = _qf(schema, _CANONICAL_SHA256_FUNCTION)
+    create_function = (
+        "CREATE OR REPLACE FUNCTION"
+        if replace_existing
+        else "CREATE FUNCTION"
+    )
+    proof_fields = (
+        "contract_id", "complete", "dataset_id", "endpoint_id",
+        "acquisition_root_run_id", "source_ids", "selected_resources",
+        "dataset_hash", "resource_count", "resource_hashes",
+        "resource_counts", "source_metrics", "npi_set_sha256",
+        "shard_count", "shard_set_sha256", "shards", "proof_sha256",
+    )
+    descriptor_fields = (
+        "shard_id", "dataset_id", "endpoint_id",
+        "acquisition_root_run_id", "source_ids", "resource_count",
+        "resource_counts", "first_identity", "last_identity",
+        "input_sha256", "artifact_sha256", "artifact_byte_count",
+    )
+    proof_fields_sql = ", ".join(_ql(value) for value in proof_fields)
+    descriptor_fields_sql = ", ".join(
+        _ql(value) for value in descriptor_fields
+    )
+    metric_fields_sql = ", ".join(
+        _ql(value)
+        for value in (
+            "address_records", "addressed_locations",
+            "distinct_npis", "geocoded_locations",
+        )
+    )
+    return f"""
+    {create_function} {function_ref}(
+        candidate jsonb,
+        expected_dataset_id text,
+        expected_endpoint_id text,
+        expected_root_run_id text,
+        expected_source_ids jsonb,
+        expected_selected_resources jsonb,
+        expected_dataset_hash text,
+        expected_resource_count bigint,
+        expected_resource_hashes jsonb,
+        expected_resource_counts jsonb
+    ) RETURNS boolean
+    LANGUAGE plpgsql
+    IMMUTABLE
+    STRICT
+    PARALLEL SAFE
+    SECURITY DEFINER
+    SET search_path = pg_catalog
+    AS $function$
+    DECLARE
+        descriptor jsonb;
+        descriptor_index integer;
+        previous_shard_id text := NULL;
+        current_shard_id text;
+        descriptor_count numeric;
+        descriptor_count_sum numeric := 0;
+        expected_shard_id text;
+        computed_shard_set_sha256 text;
+        resource_count_sum numeric;
+        metric_value jsonb;
+    BEGIN
+        IF pg_catalog.jsonb_typeof(candidate) IS DISTINCT FROM 'object'
+           OR NOT (candidate ?& ARRAY[{proof_fields_sql}]::text[])
+           OR candidate - ARRAY[{proof_fields_sql}]::text[] <> '{{}}'::jsonb
+           OR candidate ->> 'contract_id' IS DISTINCT FROM
+                {_ql(_CONTENT_PROOF_CONTRACT)}
+           OR candidate -> 'complete' IS DISTINCT FROM 'true'::jsonb
+           OR candidate ->> 'dataset_id' IS DISTINCT FROM expected_dataset_id
+           OR candidate ->> 'endpoint_id' IS DISTINCT FROM expected_endpoint_id
+           OR candidate ->> 'acquisition_root_run_id' IS DISTINCT FROM
+                expected_root_run_id
+           OR candidate -> 'source_ids' IS DISTINCT FROM expected_source_ids
+           OR candidate -> 'selected_resources' IS DISTINCT FROM
+                expected_selected_resources
+           OR candidate ->> 'dataset_hash' IS DISTINCT FROM
+                expected_dataset_hash
+           OR candidate -> 'resource_count' IS DISTINCT FROM
+                pg_catalog.to_jsonb(expected_resource_count)
+           OR candidate -> 'resource_hashes' IS DISTINCT FROM
+                expected_resource_hashes
+           OR candidate -> 'resource_counts' IS DISTINCT FROM
+                expected_resource_counts
+           OR candidate ->> 'npi_set_sha256' !~ '^[0-9a-f]{{64}}$'
+           OR candidate ->> 'shard_set_sha256' !~ '^[0-9a-f]{{64}}$'
+           OR candidate ->> 'proof_sha256' !~ '^[0-9a-f]{{64}}$'
+           OR {canonical_sha256_ref}(candidate - 'proof_sha256')
+                IS DISTINCT FROM candidate ->> 'proof_sha256'
+           OR pg_catalog.jsonb_typeof(candidate -> 'resource_counts')
+                IS DISTINCT FROM 'object'
+           OR pg_catalog.jsonb_typeof(candidate -> 'resource_hashes')
+                IS DISTINCT FROM 'object'
+           OR (candidate -> 'resource_counts')
+                - ARRAY(
+                    SELECT selected.value
+                      FROM pg_catalog.jsonb_array_elements_text(
+                           expected_selected_resources
+                      ) AS selected(value)
+                  ) <> '{{}}'::jsonb
+           OR (candidate -> 'resource_hashes')
+                - ARRAY(
+                    SELECT selected.value
+                      FROM pg_catalog.jsonb_array_elements_text(
+                           expected_selected_resources
+                      ) AS selected(value)
+                  ) <> '{{}}'::jsonb
+           OR EXISTS (
+                SELECT 1
+                  FROM pg_catalog.jsonb_array_elements_text(
+                       expected_selected_resources
+                  ) AS selected(value)
+                 WHERE NOT (candidate -> 'resource_counts' ? selected.value)
+                    OR NOT (candidate -> 'resource_hashes' ? selected.value)
+           ) THEN
+            RETURN FALSE;
+        END IF;
+
+        SELECT pg_catalog.sum((count_value #>> '{{}}')::numeric)
+          INTO resource_count_sum
+          FROM pg_catalog.jsonb_each(
+               candidate -> 'resource_counts'
+          ) AS resource_count(resource_type, count_value)
+         WHERE pg_catalog.jsonb_typeof(count_value) = 'number'
+           AND count_value #>> '{{}}' ~ '^(0|[1-9][0-9]*)$';
+        IF resource_count_sum IS DISTINCT FROM expected_resource_count
+           OR EXISTS (
+                SELECT 1
+                  FROM pg_catalog.jsonb_each(
+                       candidate -> 'resource_counts'
+                  ) AS resource_count(resource_type, count_value)
+                 WHERE pg_catalog.jsonb_typeof(count_value) <> 'number'
+                    OR count_value #>> '{{}}' !~ '^(0|[1-9][0-9]*)$'
+                    OR candidate -> 'resource_hashes' ->> resource_type
+                        !~ '^[0-9a-f]{{64}}$'
+           ) THEN
+            RETURN FALSE;
+        END IF;
+
+        IF pg_catalog.jsonb_typeof(candidate -> 'source_metrics')
+                IS DISTINCT FROM 'object'
+           OR NOT (candidate -> 'source_metrics'
+                   ?& ARRAY[{metric_fields_sql}]::text[])
+           OR (candidate -> 'source_metrics')
+                   - ARRAY[{metric_fields_sql}]::text[] <> '{{}}'::jsonb THEN
+            RETURN FALSE;
+        END IF;
+        FOR metric_value IN
+            SELECT metric.value
+              FROM pg_catalog.jsonb_each(candidate -> 'source_metrics') AS metric
+        LOOP
+            IF pg_catalog.jsonb_typeof(metric_value) <> 'number'
+               OR metric_value #>> '{{}}' !~ '^(0|[1-9][0-9]*)$' THEN
+                RETURN FALSE;
+            END IF;
+        END LOOP;
+
+        IF pg_catalog.jsonb_typeof(candidate -> 'shard_count') <> 'number'
+           OR candidate ->> 'shard_count' !~ '^[1-9][0-9]*$'
+           OR pg_catalog.jsonb_typeof(candidate -> 'shards') <> 'array'
+           OR pg_catalog.jsonb_array_length(candidate -> 'shards') < 1
+           OR pg_catalog.jsonb_array_length(candidate -> 'shards')
+                IS DISTINCT FROM (candidate ->> 'shard_count')::integer THEN
+            RETURN FALSE;
+        END IF;
+
+        FOR descriptor, descriptor_index IN
+            SELECT shard.value, shard.ordinality::integer
+              FROM pg_catalog.jsonb_array_elements(candidate -> 'shards')
+                   WITH ORDINALITY AS shard(value, ordinality)
+             ORDER BY shard.ordinality
+        LOOP
+            IF pg_catalog.jsonb_typeof(descriptor) <> 'object'
+               OR NOT (descriptor ?& ARRAY[{descriptor_fields_sql}]::text[])
+               OR descriptor - ARRAY[{descriptor_fields_sql}]::text[]
+                    <> '{{}}'::jsonb
+               OR descriptor ->> 'dataset_id' IS DISTINCT FROM
+                    expected_dataset_id
+               OR descriptor ->> 'endpoint_id' IS DISTINCT FROM
+                    expected_endpoint_id
+               OR descriptor ->> 'acquisition_root_run_id' IS DISTINCT FROM
+                    expected_root_run_id
+               OR descriptor -> 'source_ids' IS DISTINCT FROM
+                    expected_source_ids
+               OR descriptor ->> 'input_sha256' !~ '^[0-9a-f]{{64}}$'
+               OR descriptor ->> 'artifact_sha256' !~ '^[0-9a-f]{{64}}$'
+               OR descriptor ->> 'shard_id' !~ '^[0-9a-f]{{64}}$'
+               OR pg_catalog.jsonb_typeof(descriptor -> 'resource_count')
+                    <> 'number'
+               OR descriptor ->> 'resource_count' !~ '^[1-9][0-9]*$'
+               OR pg_catalog.jsonb_typeof(descriptor -> 'artifact_byte_count')
+                    <> 'number'
+               OR descriptor ->> 'artifact_byte_count' !~ '^[1-9][0-9]*$'
+               OR pg_catalog.jsonb_typeof(descriptor -> 'resource_counts')
+                    <> 'object'
+               OR descriptor -> 'resource_counts' = '{{}}'::jsonb
+               OR (descriptor -> 'resource_counts')
+                    - ARRAY(
+                        SELECT selected.value
+                          FROM pg_catalog.jsonb_array_elements_text(
+                               expected_selected_resources
+                          ) AS selected(value)
+                      ) <> '{{}}'::jsonb
+               OR pg_catalog.jsonb_typeof(descriptor -> 'first_identity')
+                    <> 'array'
+               OR pg_catalog.jsonb_array_length(
+                    descriptor -> 'first_identity'
+                  ) <> 3
+               OR pg_catalog.jsonb_typeof(descriptor -> 'last_identity')
+                    <> 'array'
+               OR pg_catalog.jsonb_array_length(
+                    descriptor -> 'last_identity'
+                  ) <> 3
+               OR EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.jsonb_array_elements(
+                           (descriptor -> 'first_identity') ||
+                           (descriptor -> 'last_identity')
+                      ) AS identity_part(value)
+                     WHERE pg_catalog.jsonb_typeof(identity_part.value)
+                            <> 'string'
+                        OR identity_part.value #>> '{{}}' = ''
+               )
+               OR descriptor -> 'first_identity' ->> 2
+                    !~ '^[0-9a-f]{{64}}$'
+               OR descriptor -> 'last_identity' ->> 2
+                    !~ '^[0-9a-f]{{64}}$'
+               OR pg_catalog.jsonb_build_array(
+                    descriptor -> 'first_identity' -> 0,
+                    descriptor -> 'first_identity' -> 1
+                  ) > pg_catalog.jsonb_build_array(
+                    descriptor -> 'last_identity' -> 0,
+                    descriptor -> 'last_identity' -> 1
+                  ) THEN
+                RETURN FALSE;
+            END IF;
+            SELECT pg_catalog.sum((count_value #>> '{{}}')::numeric)
+              INTO descriptor_count
+              FROM pg_catalog.jsonb_each(
+                   descriptor -> 'resource_counts'
+              ) AS resource_count(resource_type, count_value)
+             WHERE pg_catalog.jsonb_typeof(count_value) = 'number'
+               AND count_value #>> '{{}}' ~ '^[1-9][0-9]*$';
+            IF descriptor_count IS DISTINCT FROM
+                    (descriptor ->> 'resource_count')::numeric
+               OR EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.jsonb_each(
+                           descriptor -> 'resource_counts'
+                      ) AS resource_count(resource_type, count_value)
+                     WHERE pg_catalog.jsonb_typeof(count_value) <> 'number'
+                        OR count_value #>> '{{}}' !~ '^[1-9][0-9]*$'
+               ) THEN
+                RETURN FALSE;
+            END IF;
+            expected_shard_id := {canonical_sha256_ref}(
+                pg_catalog.jsonb_build_array(
+                    expected_dataset_id,
+                    expected_endpoint_id,
+                    expected_root_run_id,
+                    expected_source_ids,
+                    descriptor ->> 'input_sha256'
+                )
+            );
+            current_shard_id := descriptor ->> 'shard_id';
+            IF current_shard_id IS DISTINCT FROM expected_shard_id
+               OR (previous_shard_id IS NOT NULL
+                   AND current_shard_id <= previous_shard_id) THEN
+                RETURN FALSE;
+            END IF;
+            previous_shard_id := current_shard_id;
+            descriptor_count_sum := descriptor_count_sum + descriptor_count;
+        END LOOP;
+
+        SELECT pg_catalog.encode(
+                   pg_catalog.sha256(
+                       pg_catalog.convert_to(
+                           pg_catalog.string_agg(
+                               {canonical_json_ref}(shard.value),
+                               E'\\n' ORDER BY shard.ordinality
+                           ),
+                           'UTF8'
+                       )
+                   ),
+                   'hex'
+               )
+          INTO computed_shard_set_sha256
+          FROM pg_catalog.jsonb_array_elements(candidate -> 'shards')
+               WITH ORDINALITY AS shard(value, ordinality);
+        IF descriptor_count_sum IS DISTINCT FROM expected_resource_count
+           OR EXISTS (
+                SELECT 1
+                  FROM pg_catalog.jsonb_each_text(
+                       expected_resource_counts
+                  ) AS expected_count(resource_type, count_text)
+                 WHERE (
+                    SELECT COALESCE(
+                               pg_catalog.sum(
+                                   (shard.value -> 'resource_counts'
+                                       ->> expected_count.resource_type)::numeric
+                               ),
+                               0::numeric
+                           )
+                      FROM pg_catalog.jsonb_array_elements(
+                           candidate -> 'shards'
+                      ) AS shard(value)
+                     WHERE shard.value -> 'resource_counts'
+                            ? expected_count.resource_type
+                 ) IS DISTINCT FROM expected_count.count_text::numeric
+           )
+           OR computed_shard_set_sha256 IS DISTINCT FROM
+                candidate ->> 'shard_set_sha256' THEN
+            RETURN FALSE;
         END IF;
         RETURN TRUE;
     EXCEPTION WHEN OTHERS THEN
@@ -1745,7 +2103,23 @@ def _endpoint_dataset_lifecycle_sql(
     """
 
 
-def _subset_matched_twin_sql(schema: str) -> str:
+def _reviewed_root_policy_sql(metadata: str, required_root_count: int) -> str:
+    """Return exact closed root-policy JSON equality."""
+
+    return f"""
+        {metadata} -> {_ql(_REVIEWED_ROOT_POLICY_KEY)} =
+            pg_catalog.jsonb_build_object(
+                'policy_version', {_ql(_REVIEWED_ROOT_POLICY_VERSION)},
+                'required_root_count', {required_root_count}
+            )
+    """
+
+
+def _subset_matched_twin_sql(
+    schema: str,
+    *,
+    reviewed_root_policy_aware: bool = False,
+) -> str:
     """Require one exact sealed v3 baseline behind validated publication."""
 
     dataset_ref = _qf(schema, _ENDPOINT_DATASET)
@@ -1762,6 +2136,29 @@ def _subset_matched_twin_sql(schema: str) -> str:
         metadata,
         proof,
     )
+    candidate_policy_sql = "true"
+    baseline_policy_sql = "true"
+    if reviewed_root_policy_aware:
+        candidate_policy_sql = f"""
+            (
+                NOT ({metadata} ? {_ql(_REVIEWED_ROOT_POLICY_KEY)})
+                OR ({_reviewed_root_policy_sql(metadata, 2)})
+            )
+        """
+        baseline_policy_sql = f"""
+            (
+                (
+                    NOT ({metadata} ? {_ql(_REVIEWED_ROOT_POLICY_KEY)})
+                    AND NOT (
+                        {baseline_metadata} ? {_ql(_REVIEWED_ROOT_POLICY_KEY)}
+                    )
+                ) OR (
+                    ({_reviewed_root_policy_sql(metadata, 2)})
+                    AND {baseline_metadata} -> {_ql(_REVIEWED_ROOT_POLICY_KEY)}
+                        = {metadata} -> {_ql(_REVIEWED_ROOT_POLICY_KEY)}
+                )
+            )
+        """
     return f"""
         pg_catalog.jsonb_typeof({verification}) = 'object'
         AND {verification} ?& ARRAY[
@@ -1789,6 +2186,7 @@ def _subset_matched_twin_sql(schema: str) -> str:
         AND {verification} -> 'mismatch_fields' = '[]'::jsonb
         AND {verification} ->> 'baseline_dataset_id' =
             {metadata} ->> {_ql(_TWIN_BASELINE_DATASET_KEY)}
+        AND ({candidate_policy_sql})
         AND {proof} ->> 'endpoint_id' = NEW.endpoint_id
         AND {proof} ->> 'acquisition_root_run_id' =
             NEW.acquisition_root_run_id
@@ -1842,6 +2240,7 @@ def _subset_matched_twin_sql(schema: str) -> str:
                     NEW.completion_proof_sha256
                AND baseline.dataset_hash = NEW.dataset_hash
                AND baseline.resource_count = NEW.resource_count
+               AND ({baseline_policy_sql})
                AND pg_catalog.jsonb_typeof({baseline_verification}) = 'object'
                AND {baseline_metadata} -> 'requires_twin_root_verification' =
                     'true'::jsonb
@@ -1885,6 +2284,39 @@ def _subset_matched_twin_sql(schema: str) -> str:
                     ->> {_ql(_TWIN_SCOPE_KEY)} =
                     {metadata} ->> {_ql(_TWIN_SCOPE_KEY)}
         ) = 1
+    """
+
+
+def _subset_single_root_sql(
+    schema: str,
+    *,
+    dataset_alias: str = "NEW",
+) -> str:
+    """Bind a policy-one terminal row to its sealed direct content proof."""
+
+    metadata = f"{dataset_alias}.publication_metadata_json::jsonb"
+    content_proof = f"({metadata} -> {_ql(_CONTENT_PROOF_KEY)})"
+    content_proof_valid_ref = _qf(schema, _CONTENT_PROOF_VALID_FUNCTION)
+    return f"""
+        ({_reviewed_root_policy_sql(metadata, 1)})
+        AND {metadata} -> 'requires_twin_root_verification' = 'false'::jsonb
+        AND NOT ({metadata} ? {_ql(_TWIN_ROLE_KEY)})
+        AND NOT ({metadata} ? {_ql(_TWIN_BASELINE_DATASET_KEY)})
+        AND NOT ({metadata} ? {_ql(_TWIN_VERIFICATION_KEY)})
+        AND {content_proof_valid_ref}(
+            {content_proof},
+            {dataset_alias}.dataset_id,
+            {dataset_alias}.endpoint_id,
+            {dataset_alias}.acquisition_root_run_id,
+            {metadata} -> 'source_ids',
+            {metadata} -> 'selected_resources',
+            {dataset_alias}.dataset_hash,
+            {dataset_alias}.resource_count,
+            {dataset_alias}.completion_proof_json
+                -> 'dataset' -> 'resource_hashes',
+            {dataset_alias}.completion_proof_json
+                -> 'dataset' -> 'resource_counts'
+        ) IS TRUE
     """
 
 
@@ -2273,13 +2705,20 @@ def _drop_subset_baseline_generation_index(schema: str) -> None:
     )
 
 
-def _subset_source_metadata_identity_sql(source_metadata: str) -> str:
+def _subset_source_metadata_identity_sql(
+    source_metadata: str,
+    *,
+    include_reviewed_root_policy: bool = False,
+) -> str:
+    metadata_fields = _SUBSET_SOURCE_SCOPE_METADATA_FIELDS
+    if include_reviewed_root_policy:
+        metadata_fields += (_REVIEWED_ROOT_POLICY_KEY,)
     entries = ",\n".join(
         "                pg_catalog.jsonb_build_array("
         + _ql(field_name)
         + f", {source_metadata} ? {_ql(field_name)}, "
         + f"{source_metadata} -> {_ql(field_name)})"
-        for field_name in _SUBSET_SOURCE_SCOPE_METADATA_FIELDS
+        for field_name in metadata_fields
     )
     return "pg_catalog.jsonb_build_array(\n" + entries + "\n            )"
 
@@ -2291,8 +2730,17 @@ def _subset_source_scope_payload_sql(
     dataset_alias: str,
     *,
     use_configured_endpoint_identity: bool = False,
+    include_reviewed_root_policy: bool = False,
 ) -> str:
-    metadata_identity = _subset_source_metadata_identity_sql(source_metadata)
+    metadata_identity = _subset_source_metadata_identity_sql(
+        source_metadata,
+        include_reviewed_root_policy=include_reviewed_root_policy,
+    )
+    identity_version = (
+        _SUBSET_SOURCE_SCOPE_VERSION_V2
+        if include_reviewed_root_policy
+        else _SUBSET_SOURCE_SCOPE_VERSION
+    )
     endpoint_identity = (
         f"{source_metadata} ->> "
         "'provider_directory_configured_endpoint_id'"
@@ -2301,7 +2749,7 @@ def _subset_source_scope_payload_sql(
     )
     return f"""
         pg_catalog.jsonb_build_object(
-            'identity_version', {_ql(_SUBSET_SOURCE_SCOPE_VERSION)},
+            'identity_version', {_ql(identity_version)},
             'source_ids', {dataset_metadata} -> 'source_ids',
             'cutoff', {dataset_alias}.completion_proof_json -> 'cutoff',
             'source', pg_catalog.jsonb_build_object(
@@ -2434,6 +2882,7 @@ def _subset_source_sql(
     dataset_alias: str = "NEW",
     use_configured_endpoint_identity: bool = False,
     require_physical_match: bool = True,
+    reviewed_root_policy_aware: bool = False,
 ) -> str:
     """Bind a terminal row to its current reviewed manual source."""
 
@@ -2451,9 +2900,20 @@ def _subset_source_sql(
         dataset_alias,
         use_configured_endpoint_identity=use_configured_endpoint_identity,
     )
+    policy_scope_payload_sql = _subset_source_scope_payload_sql(
+        "current_source",
+        source_metadata,
+        metadata,
+        dataset_alias,
+        use_configured_endpoint_identity=use_configured_endpoint_identity,
+        include_reviewed_root_policy=True,
+    )
     canonical_sha256_ref = _qf(schema, _CANONICAL_SHA256_FUNCTION)
     if require_verified:
         source_status_sql = f"= {_ql(_SUBSET_VERIFIED_SOURCE_STATUS)}"
+        policy_source_status_sql = (
+            f"= {_ql(_ROOT_POLICY_VERIFIED_SOURCE_STATUS)}"
+        )
     else:
         source_status_sql = (
             "IN ("
@@ -2462,6 +2922,52 @@ def _subset_source_sql(
             + _ql(_SUBSET_VERIFIED_SOURCE_STATUS)
             + ")"
         )
+        policy_source_status_sql = (
+            "IN ("
+            + _ql(_ROOT_POLICY_PENDING_SOURCE_STATUS)
+            + ", "
+            + _ql(_ROOT_POLICY_VERIFIED_SOURCE_STATUS)
+            + ")"
+        )
+    legacy_source_identity_sql = f"""
+        NOT ({metadata} ? {_ql(_REVIEWED_ROOT_POLICY_KEY)})
+        AND NOT ({source_metadata} ? {_ql(_REVIEWED_ROOT_POLICY_KEY)})
+        AND {source_metadata}
+             ->> 'provider_directory_candidate_status'
+             {source_status_sql}
+        AND {canonical_sha256_ref}({scope_payload_sql}) =
+             {metadata} ->> {_ql(_TWIN_SCOPE_KEY)}
+    """
+    policy_source_identity_sql = f"""
+        pg_catalog.jsonb_typeof(
+            {metadata} -> {_ql(_REVIEWED_ROOT_POLICY_KEY)}
+        ) = 'object'
+        AND {metadata} -> {_ql(_REVIEWED_ROOT_POLICY_KEY)} =
+            pg_catalog.jsonb_build_object(
+                'policy_version', {_ql(_REVIEWED_ROOT_POLICY_VERSION)},
+                'required_root_count',
+                    {metadata} -> {_ql(_REVIEWED_ROOT_POLICY_KEY)}
+                        -> 'required_root_count'
+            )
+        AND {metadata} -> {_ql(_REVIEWED_ROOT_POLICY_KEY)}
+                -> 'required_root_count' IN ('1'::jsonb, '2'::jsonb)
+        AND {source_metadata} -> {_ql(_REVIEWED_ROOT_POLICY_KEY)} =
+            {metadata} -> {_ql(_REVIEWED_ROOT_POLICY_KEY)}
+        AND {source_metadata}
+             ->> 'provider_directory_candidate_status'
+             {policy_source_status_sql}
+        AND {canonical_sha256_ref}({policy_scope_payload_sql}) =
+             {metadata} ->> {_ql(_TWIN_SCOPE_KEY)}
+    """
+    source_identity_sql = (
+        f"(({legacy_source_identity_sql}) OR ({policy_source_identity_sql}))"
+        if reviewed_root_policy_aware
+        else f"({source_metadata} ->> "
+             "'provider_directory_candidate_status' "
+             f"{source_status_sql} AND "
+             f"{canonical_sha256_ref}({scope_payload_sql}) = "
+             f"{metadata} ->> {_ql(_TWIN_SCOPE_KEY)})"
+    )
     if require_physical_match:
         physical_endpoint_sql = (
             f"current_source.endpoint_id = {dataset_alias}.endpoint_id"
@@ -2485,14 +2991,10 @@ def _subset_source_sql(
                AND current_source.auth_type = 'none'
                AND pg_catalog.jsonb_typeof({source_metadata}) = 'object'
                AND {source_metadata}
-                    ->> 'provider_directory_candidate_status'
-                    {source_status_sql}
-               AND {source_metadata}
                     ->> 'provider_directory_configured_endpoint_id' =
                     {dataset_alias}.endpoint_id
                AND ({fixed_identity_sql})
-               AND {canonical_sha256_ref}({scope_payload_sql}) =
-                    {metadata} ->> {_ql(_TWIN_SCOPE_KEY)}
+               AND ({source_identity_sql})
         )
         AND NOT EXISTS (
             SELECT 1
@@ -2514,6 +3016,7 @@ def _subset_published_source_guard_sql(
     *,
     use_configured_endpoint_identity: bool = False,
     replace_existing: bool = False,
+    reviewed_root_policy_aware: bool = False,
 ) -> str:
     """Reject source mutations that invalidate published subset evidence."""
 
@@ -2525,6 +3028,7 @@ def _subset_published_source_guard_sql(
         dataset_alias="published_dataset",
         use_configured_endpoint_identity=use_configured_endpoint_identity,
         require_physical_match=True,
+        reviewed_root_policy_aware=reviewed_root_policy_aware,
     )
     create_function = (
         "CREATE OR REPLACE FUNCTION"
@@ -2686,6 +3190,7 @@ def _subset_endpoint_dataset_guard_sql(
     schema: str,
     *,
     use_configured_endpoint_identity: bool = False,
+    reviewed_root_policy_aware: bool = False,
 ) -> str:
     guard_ref = _qf(schema, _ENDPOINT_DATASET_GUARD)
     source_ref = _qf(schema, _SOURCE)
@@ -2698,7 +3203,11 @@ def _subset_endpoint_dataset_guard_sql(
         _SUBSET_IMMUTABLE_COMPARISON_SQL,
         subset_metadata_is_immutable=True,
     )
-    matched_twin_sql = _subset_matched_twin_sql(schema)
+    matched_twin_sql = _subset_matched_twin_sql(
+        schema,
+        reviewed_root_policy_aware=reviewed_root_policy_aware,
+    )
+    single_root_sql = _subset_single_root_sql(schema)
     baseline_twin_sql = _subset_baseline_twin_sql()
     mismatch_twin_sql = _subset_mismatch_twin_sql(schema)
     terminal_source_sql = _subset_source_sql(
@@ -2706,12 +3215,37 @@ def _subset_endpoint_dataset_guard_sql(
         require_verified=False,
         use_configured_endpoint_identity=use_configured_endpoint_identity,
         require_physical_match=not use_configured_endpoint_identity,
+        reviewed_root_policy_aware=reviewed_root_policy_aware,
     )
     published_source_sql = _subset_source_sql(
         schema,
         require_verified=True,
         use_configured_endpoint_identity=use_configured_endpoint_identity,
         require_physical_match=True,
+        reviewed_root_policy_aware=reviewed_root_policy_aware,
+    )
+    metadata = "NEW.publication_metadata_json::jsonb"
+    expected_coverage_state_sql = (
+        f"CASE WHEN ({_reviewed_root_policy_sql(metadata, 1)}) "
+        "THEN 'not_required' ELSE "
+        f"{metadata} -> {_ql(_TWIN_VERIFICATION_KEY)} ->> 'result' END"
+        if reviewed_root_policy_aware
+        else f"{metadata} -> {_ql(_TWIN_VERIFICATION_KEY)} ->> 'result'"
+    )
+    twin_terminal_policy_sql = (
+        f"""
+        (
+            NOT ({metadata} ? {_ql(_REVIEWED_ROOT_POLICY_KEY)})
+            OR ({_reviewed_root_policy_sql(metadata, 2)})
+        )
+        """
+        if reviewed_root_policy_aware
+        else "true"
+    )
+    validated_proof_sql = (
+        f"(({matched_twin_sql}) OR ({single_root_sql}))"
+        if reviewed_root_policy_aware
+        else f"({matched_twin_sql})"
     )
     dataset_content_sql = _subset_dataset_content_sql(schema)
     return f"""
@@ -2871,8 +3405,7 @@ def _subset_endpoint_dataset_guard_sql(
                         -> {_ql(_SUBSET_COVERAGE_KEY)},
                     NEW.completion_proof_json,
                     NEW.completion_proof_sha256,
-                    NEW.publication_metadata_json::jsonb
-                        -> {_ql(_TWIN_VERIFICATION_KEY)} ->> 'result'
+                    {expected_coverage_state_sql}
                 ) IS DISTINCT FROM TRUE
            ) THEN
             RAISE EXCEPTION
@@ -2882,7 +3415,10 @@ def _subset_endpoint_dataset_guard_sql(
 
         IF NEW.completion_proof_required_version = 3
            AND NEW.status = 'verification_baseline'
-           AND ({baseline_twin_sql}) IS DISTINCT FROM TRUE THEN
+           AND (
+                ({baseline_twin_sql}) IS DISTINCT FROM TRUE
+                OR ({twin_terminal_policy_sql}) IS DISTINCT FROM TRUE
+           ) THEN
             RAISE EXCEPTION
                 'provider_directory_subset_baseline_twin_invalid'
                 USING ERRCODE = '55000';
@@ -2890,7 +3426,10 @@ def _subset_endpoint_dataset_guard_sql(
 
         IF NEW.completion_proof_required_version = 3
            AND NEW.status = 'verification_mismatch'
-           AND ({mismatch_twin_sql}) IS DISTINCT FROM TRUE THEN
+           AND (
+                ({mismatch_twin_sql}) IS DISTINCT FROM TRUE
+                OR ({twin_terminal_policy_sql}) IS DISTINCT FROM TRUE
+           ) THEN
             RAISE EXCEPTION
                 'provider_directory_subset_mismatch_twin_invalid'
                 USING ERRCODE = '55000';
@@ -2898,7 +3437,7 @@ def _subset_endpoint_dataset_guard_sql(
 
         IF NEW.completion_proof_required_version = 3
            AND NEW.status IN ('validated', 'published')
-           AND ({matched_twin_sql}) IS DISTINCT FROM TRUE THEN
+           AND ({validated_proof_sql}) IS DISTINCT FROM TRUE THEN
             RAISE EXCEPTION
                 'provider_directory_subset_matched_twin_invalid'
                 USING ERRCODE = '55000';
@@ -3292,10 +3831,24 @@ def _completion_digest_check(schema: str) -> str:
     """
 
 
-def _subset_replay_evidence_check(schema: str) -> str:
+def _subset_replay_evidence_check(
+    schema: str,
+    *,
+    reviewed_root_policy_aware: bool = False,
+) -> str:
     canonical_sha256_ref = _qf(schema, _CANONICAL_SHA256_FUNCTION)
     replay_shape_valid_ref = _qf(schema, _REPLAY_SHAPE_VALID_FUNCTION)
     coverage_shape_valid_ref = _qf(schema, _COVERAGE_SHAPE_VALID_FUNCTION)
+    expected_twin_state_sql = (
+        f"CASE WHEN ({_reviewed_root_policy_sql('publication_metadata_json::jsonb', 1)}) "
+        "THEN 'not_required' ELSE publication_metadata_json::jsonb "
+        f"-> {_ql(_TWIN_VERIFICATION_KEY)} ->> 'result' END"
+        if reviewed_root_policy_aware
+        else (
+            "publication_metadata_json::jsonb "
+            f"-> {_ql(_TWIN_VERIFICATION_KEY)} ->> 'result'"
+        )
+    )
     return f"""
     completion_proof_required_version IS DISTINCT FROM 3
     OR status NOT IN ({_TERMINAL_STATUSES_SQL})
@@ -3329,8 +3882,7 @@ def _subset_replay_evidence_check(schema: str) -> str:
                 -> {_ql(_SUBSET_COVERAGE_KEY)},
             completion_proof_json,
             completion_proof_sha256,
-            publication_metadata_json::jsonb
-                -> {_ql(_TWIN_VERIFICATION_KEY)} ->> 'result'
+            {expected_twin_state_sql}
         ) IS TRUE
     )
     """

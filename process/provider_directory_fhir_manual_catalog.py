@@ -17,15 +17,6 @@ from process.provider_directory_fhir_census_binding import (
     _validate_reviewed_start_url,
 )
 from process.provider_directory_fhir_census_contract import (
-    CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD,
-    CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD,
-    CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD,
-    CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD,
-    CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD,
-    CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD,
-    CURRENT_VERSION_CENSUS_START_URLS_FIELD,
-    CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
-    CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD,
     SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
     SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_SEMANTICS,
@@ -33,6 +24,12 @@ from process.provider_directory_fhir_census_contract import (
     SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
 )
+from process.provider_directory_fhir_manual_seed import (
+    MANUAL_SOURCE_PENDING_STATUS,
+    MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD,
+    manual_seed_metadata,
+)
+from process.provider_directory_fhir_root_policy import ReviewedRootPolicy
 
 
 DEFAULT_MANUAL_SOURCE_MANIFEST = Path(__file__).resolve().parents[1] / (
@@ -51,8 +48,6 @@ MANUAL_CURRENT_VERSION_CENSUS_RESOURCES = (
     "HealthcareService",
     "OrganizationAffiliation",
 )
-MANUAL_SOURCE_PENDING_STATUS = "pending_two_matching_reviewed_subset_acquisitions"
-MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD = "provider_directory_verification_campaign_id"
 _MANUAL_ENTRY_FIELDS = frozenset(
     {
         "entry_id",
@@ -376,7 +371,10 @@ def _validated_manual_entry(
     }
 
 
-def _manual_seed_row(entry: Mapping[str, Any]) -> dict[str, Any]:
+def _manual_seed_row(
+    entry: Mapping[str, Any],
+    root_policy: ReviewedRootPolicy | None = None,
+) -> dict[str, Any]:
     """Build one deterministic dormant seed and guard its opaque identity."""
 
     resources = tuple(entry["resources"])
@@ -396,11 +394,12 @@ def _manual_seed_row(entry: Mapping[str, Any]) -> dict[str, Any]:
             "Manual-only source state is controlled by reviewed subset evidence; "
             "publication remains separately proof-gated."
         ),
-        "metadata_json": _manual_seed_metadata(
+        "metadata_json": manual_seed_metadata(
             entry,
             resources,
             page_count,
             canonical_base,
+            root_policy,
         ),
     }
     if _stable_seed_source_id(seed_row_by_field) != entry["source_id"]:
@@ -408,59 +407,11 @@ def _manual_seed_row(entry: Mapping[str, Any]) -> dict[str, Any]:
     return seed_row_by_field
 
 
-def _manual_seed_metadata(
-    entry: Mapping[str, Any],
-    resources: tuple[str, ...],
-    page_count: int,
-    canonical_base: str,
-) -> dict[str, Any]:
-    """Project the reviewed subset identity into dormant source metadata."""
-
-    return {
-        "provider_directory_override": "reviewed_manual_current_version_census",
-        "provider_directory_manual_only": True,
-        "provider_directory_confirmed_base": canonical_base,
-        "provider_directory_confirmed_metadata_url": f"{canonical_base}/metadata",
-        "provider_directory_confirmed_catalog_url": canonical_base,
-        "provider_directory_supported_resources": list(resources),
-        "provider_directory_fully_enumerable_resources": [],
-        "provider_directory_server_issued_subset_resources": list(resources),
-        "provider_directory_expected_nonempty_resources": list(
-            entry["expected_nonempty_resources"]
-        ),
-        "provider_directory_resource_page_count_caps": {
-            resource_type: page_count for resource_type in resources
-        },
-        "provider_directory_coverage_mode": SERVER_ISSUED_SUBSET_SEMANTICS,
-        "provider_directory_acquisition_enabled": True,
-        "provider_directory_candidate_status": MANUAL_SOURCE_PENDING_STATUS,
-        MANUAL_SOURCE_VERIFICATION_CAMPAIGN_FIELD: entry[
-            "verification_campaign_id"
-        ],
-        CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD: (
-            SERVER_ISSUED_SUBSET_SEMANTICS
-        ),
-        CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD: entry["contract_version"],
-        CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD: page_count,
-        CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD: entry["strategy_version"],
-        CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD: entry["traversal_version"],
-        CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD: entry[
-            "canonicalization_version"
-        ],
-        CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD: list(
-            entry["completion_scopes"]
-        ),
-        CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD: entry[
-            "continuation_strategy"
-        ],
-        CURRENT_VERSION_CENSUS_START_URLS_FIELD: dict(entry["start_urls"]),
-    }
-
-
 def reviewed_manual_census_seed_rows(
     requested_source_id: str,
     *,
     manifest_path: Path = DEFAULT_MANUAL_SOURCE_MANIFEST,
+    root_policy: ReviewedRootPolicy | None = None,
 ) -> list[dict[str, Any]]:
     """Return the sole local reviewed seed bound to an opaque source ID."""
 
@@ -471,7 +422,7 @@ def reviewed_manual_census_seed_rows(
     manifest = _load_manifest(manifest_path)
     raw_entry = _manual_entry_for_source(manifest, source_id)
     entry = _validated_manual_entry(raw_entry, source_id)
-    return [_manual_seed_row(entry)]
+    return [_manual_seed_row(entry, root_policy)]
 
 
 def reviewed_manual_census_source_id(

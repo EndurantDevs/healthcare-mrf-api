@@ -20,6 +20,20 @@ from tests.provider_directory_reviewed_subset_activation_pg_support import (
     is_activation_valid,
     publish_candidate_sql,
 )
+from tests.provider_directory_fhir_subset_abandonment_pg_support import (
+    create_abandonment_relations,
+)
+from tests.provider_directory_effective_endpoint_pg_cases import (
+    _load_effective_endpoint_migration,
+)
+from tests.provider_directory_reviewed_root_policy_pg import (
+    _load_policy_migration,
+    _run_upgrade_with_context,
+)
+from tests.provider_directory_subset_completion_pg_setup import (
+    load_abandonment_migration,
+    load_payload_guard_repair_migration,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -57,6 +71,15 @@ async def _publication_scenario(monkeypatch, *, require_eligibility: bool):
         scenario, migration, evidence_pairs = await _create_activation_scenario(
             scoped_patch
         )
+        await create_abandonment_relations(scenario)
+        async with scenario.connection.transaction():
+            for successor in (
+                load_payload_guard_repair_migration(),
+                load_abandonment_migration(),
+                _load_effective_endpoint_migration(),
+                _load_policy_migration(),
+            ):
+                await _run_upgrade_with_context(scenario, successor)
         activation_database = _runtime_database()
         publication_database = _runtime_database()
         fence = _artifact_publication_fence(

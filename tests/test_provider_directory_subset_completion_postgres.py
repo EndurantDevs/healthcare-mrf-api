@@ -61,6 +61,9 @@ from tests.provider_directory_reviewed_subset_activation_pg_support import (
     insert_activation_generation,
     load_activation_migration,
 )
+from tests.provider_directory_reviewed_root_policy_pg import (
+    prove_single_root_policy_lifecycle,
+)
 from tests.provider_directory_fhir_subset_abandonment_pg_cases import (
     prove_reviewed_subset_abandonment_guard_handoff,
     prove_reviewed_subset_abandonment_lifecycle,
@@ -209,6 +212,13 @@ async def test_reviewed_subset_activation_is_exact_and_fail_closed(monkeypatch):
         )
     finally:
         await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_reviewed_single_root_policy_completes_and_publishes(monkeypatch):
+    """Prove reduced-assurance policy is one complete guarded lifecycle."""
+
+    await prove_single_root_policy_lifecycle(monkeypatch)
 
 
 async def _activation_object_counts(scenario) -> tuple[int, int]:

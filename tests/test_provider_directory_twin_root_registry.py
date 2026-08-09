@@ -17,6 +17,7 @@ _UNSET = object()
 def _source_row(
     status: object = _UNSET,
     campaign_id: object = _UNSET,
+    required_root_count: object = _UNSET,
 ) -> dict[str, str]:
     metadata: dict[str, object] = {}
     if status is not _UNSET:
@@ -25,6 +26,11 @@ def _source_row(
         metadata[
             importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
         ] = campaign_id
+    if required_root_count is not _UNSET:
+        metadata[importer.REVIEWED_ROOT_POLICY_METADATA_KEY] = {
+            "policy_version": importer.REVIEWED_ROOT_POLICY_VERSION,
+            "required_root_count": required_root_count,
+        }
     return {"metadata_json": json.dumps(metadata)}
 
 
@@ -92,6 +98,47 @@ def test_source_registry_status_controls_twin_root_requirement():
     assert importer._source_group_twin_root_verification_profile(
         [verified_row]
     ) == (False, CAMPAIGN_ID)
+
+
+@pytest.mark.parametrize(
+    ("required_root_count", "requires_twin_root"),
+    ((1, False), (2, True)),
+)
+def test_policy_status_controls_reviewed_root_requirement(
+    required_root_count,
+    requires_twin_root,
+):
+    source_row = _source_row(
+        importer.PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+        CAMPAIGN_ID,
+        required_root_count,
+    )
+
+    profile = importer._source_group_reviewed_root_policy_profile([source_row])
+
+    assert profile.is_twin_root_required is requires_twin_root
+    assert profile.campaign_id == CAMPAIGN_ID
+    assert profile.reviewed_root_policy == importer.ReviewedRootPolicy(
+        required_root_count
+    )
+
+
+def test_policy_status_rejects_alias_root_count_drift():
+    with pytest.raises(RuntimeError, match="verification_profile_ambiguous"):
+        importer._source_group_reviewed_root_policy_profile(
+            [
+                _source_row(
+                    importer.PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+                    CAMPAIGN_ID,
+                    1,
+                ),
+                _source_row(
+                    importer.PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
+                    CAMPAIGN_ID,
+                    2,
+                ),
+            ]
+        )
 
 
 @pytest.mark.parametrize(
@@ -175,3 +222,93 @@ async def test_established_retry_preserves_absent_verification_requirement(
         _verification_profile(False),
     )
     assert selection.requires_twin_root_verification is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata_mutation",
+    (
+        lambda metadata: metadata.pop("requires_twin_root_verification"),
+        lambda metadata: metadata.update(
+            verification_campaign_id="different-campaign"
+        ),
+        lambda metadata: metadata.update(
+            verification_source_scope_hash="different-scope"
+        ),
+        lambda metadata: metadata.update(
+            verification_role=importer.TWIN_ROOT_BASELINE_CANDIDATE_ROLE
+        ),
+        lambda metadata: metadata.update(
+            twin_root_verification_v1=None
+        ),
+    ),
+)
+async def test_single_root_retry_rejects_policy_profile_drift(
+    monkeypatch,
+    metadata_mutation,
+):
+    _disable_checkpoint_lookup(monkeypatch)
+    metadata = {
+        "requires_twin_root_verification": False,
+        importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: CAMPAIGN_ID,
+        importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: "scope-v1",
+        importer.REVIEWED_ROOT_POLICY_METADATA_KEY: {
+            "policy_version": importer.REVIEWED_ROOT_POLICY_VERSION,
+            "required_root_count": 1,
+        },
+    }
+    metadata_mutation(metadata)
+    profile = importer.EndpointDatasetVerificationProfile(
+        is_twin_root_required=False,
+        campaign_id=CAMPAIGN_ID,
+        source_scope_hash="scope-v1",
+        reviewed_root_policy=importer.ReviewedRootPolicy(1),
+    )
+
+    with pytest.raises(RuntimeError, match="reviewed_root_policy"):
+        await _select_resumable_dataset(
+            _resumable_dataset(metadata),
+            profile,
+        )
+
+
+@pytest.mark.asyncio
+async def test_single_root_retry_accepts_production_policy_shape(monkeypatch):
+    _disable_checkpoint_lookup(monkeypatch)
+    metadata = {
+        "requires_twin_root_verification": False,
+        importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: CAMPAIGN_ID,
+        importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: "scope-v1",
+        importer.REVIEWED_ROOT_POLICY_METADATA_KEY: {
+            "policy_version": importer.REVIEWED_ROOT_POLICY_VERSION,
+            "required_root_count": 1,
+        },
+    }
+    profile = importer.EndpointDatasetVerificationProfile(
+        is_twin_root_required=False,
+        campaign_id=CAMPAIGN_ID,
+        source_scope_hash="scope-v1",
+        reviewed_root_policy=importer.ReviewedRootPolicy(1),
+    )
+
+    selection = await _select_resumable_dataset(
+        _resumable_dataset(metadata),
+        profile,
+    )
+
+    assert selection.requires_twin_root_verification is False
+    assert selection.verification_campaign_id == CAMPAIGN_ID
+
+
+@pytest.mark.asyncio
+async def test_legacy_retry_rejects_even_null_policy_key(monkeypatch):
+    _disable_checkpoint_lookup(monkeypatch)
+    dataset = _resumable_dataset(
+        {importer.REVIEWED_ROOT_POLICY_METADATA_KEY: None}
+    )
+
+    with pytest.raises(RuntimeError, match="reviewed_root_policy"):
+        await _select_resumable_dataset(
+            dataset,
+            _verification_profile(False),
+        )

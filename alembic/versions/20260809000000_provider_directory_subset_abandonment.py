@@ -431,13 +431,69 @@ def _valid_function_sql(schema: str) -> str:
     """
 
 
-def _dataset_guard_sql(schema: str) -> str:
+def _dataset_guard_sql(
+    schema: str,
+    *,
+    reviewed_root_policy_aware: bool = False,
+) -> str:
     subset = _subset()
     dataset_ref = subset._qf(schema, _DATASET)
     source_ref = subset._qf(schema, _SOURCE)
     checkpoint_ref = subset._qf(schema, _CHECKPOINT)
     valid_ref = subset._qf(schema, _VALID)
     guard_ref = subset._qf(schema, _DATASET_GUARD)
+    source_activation_absence_sql = (
+        "AND NOT (source.metadata_json::jsonb ?| ARRAY["
+        "'provider_directory_reviewed_subset_activation_v1', "
+        "'provider_directory_reviewed_subset_activation_v2'"
+        "]::text[])"
+        if reviewed_root_policy_aware
+        else (
+            "AND NOT source.metadata_json::jsonb ? "
+            "'provider_directory_reviewed_subset_activation_v1'"
+        )
+    )
+    if reviewed_root_policy_aware:
+        policy_key = subset._ql(subset._REVIEWED_ROOT_POLICY_KEY)
+        source_status_sql = f"""
+                       AND (
+                            (
+                                source.metadata_json::jsonb
+                                    ->> 'provider_directory_candidate_status'
+                                    = 'pending_two_matching_reviewed_subset_acquisitions'
+                                AND NOT (
+                                    source.metadata_json::jsonb ? {policy_key}
+                                )
+                                AND NOT (
+                                    NEW.publication_metadata_json::jsonb
+                                        ? {policy_key}
+                                )
+                            ) OR (
+                                source.metadata_json::jsonb
+                                    ->> 'provider_directory_candidate_status'
+                                    = 'pending_reviewed_subset_acquisition'
+                                AND source.metadata_json::jsonb -> {policy_key}
+                                    = NEW.publication_metadata_json::jsonb
+                                        -> {policy_key}
+                                AND (
+                                    ({subset._reviewed_root_policy_sql(
+                                        "NEW.publication_metadata_json::jsonb",
+                                        1,
+                                    )})
+                                    OR ({subset._reviewed_root_policy_sql(
+                                        "NEW.publication_metadata_json::jsonb",
+                                        2,
+                                    )})
+                                )
+                            )
+                       )
+        """
+    else:
+        source_status_sql = """
+                       AND source.metadata_json::jsonb
+                              ->> 'provider_directory_candidate_status'
+                              = 'pending_two_matching_reviewed_subset_acquisitions'
+        """
     return f"""
     CREATE OR REPLACE FUNCTION {guard_ref}()
     RETURNS trigger
@@ -523,15 +579,12 @@ def _dataset_guard_sql(schema: str) -> str:
                        AND source.metadata_json::jsonb
                               ->> 'provider_directory_configured_endpoint_id'
                               = NEW.endpoint_id
-                       AND source.metadata_json::jsonb
-                              ->> 'provider_directory_candidate_status'
-                              = 'pending_two_matching_reviewed_subset_acquisitions'
+                       {source_status_sql}
                        AND source.metadata_json::jsonb
                               ->> 'provider_directory_verification_campaign_id'
                               = NEW.publication_metadata_json::jsonb
                                   ->> 'verification_campaign_id'
-                       AND NOT source.metadata_json::jsonb ?
-                              'provider_directory_reviewed_subset_activation_v1'
+                       {source_activation_absence_sql}
                        AND source.metadata_json::jsonb
                               #>> '{{last_resource_import,run_id}}'
                               = NEW.import_run_id

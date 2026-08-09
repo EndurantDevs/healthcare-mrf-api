@@ -100,6 +100,7 @@ def test_candidate_eligibility_projection_is_compact_and_fail_closed():
         "dataset_table"
     )
     for field_name in (
+        "requires_twin_root_verification jsonb",
         "source_ids jsonb",
         "completion_proof_v1 jsonb",
         f"{importer.SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY} jsonb",
@@ -108,15 +109,39 @@ def test_candidate_eligibility_projection_is_compact_and_fail_closed():
         "selected_resources jsonb",
         "expected_resources jsonb",
         f"{importer.TWIN_ROOT_VERIFICATION_METADATA_KEY} jsonb",
+        f"{importer.REVIEWED_ROOT_POLICY_METADATA_KEY} jsonb",
+        f"{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY} jsonb",
     ):
         assert field_name in projection_sql
-    assert importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY not in (
-        projection_sql
+    assert (
+        f"? '{importer.REVIEWED_ROOT_POLICY_METADATA_KEY}'"
+        in projection_sql
+    )
+    assert (
+        f"? '{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}'"
+        in projection_sql
     )
     assert "full_metadata_jsonb IS NULL" in projection_sql
     assert "jsonb_typeof(candidate.full_metadata_jsonb) = 'object'" in (
         projection_sql
     )
+
+
+def test_reviewed_candidate_sql_has_closed_single_root_policy_branch():
+    eligibility_sql = importer._artifact_subset_candidate_eligibility_sql(
+        "dataset_table",
+        "source_table",
+        "dataset.publication_metadata_json::jsonb",
+        "dataset.publication_metadata_json::jsonb -> 'twin_root_verification_v1'",
+        "dataset.publication_metadata_json::jsonb -> 'twin_root_verification_v1' -> 'proof'",
+    )
+
+    assert importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED in eligibility_sql
+    assert importer.REVIEWED_ROOT_POLICY_METADATA_KEY in eligibility_sql
+    assert importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY in eligibility_sql
+    assert "'required_root_count', 1" in eligibility_sql
+    assert "'required_root_count', 2" in eligibility_sql
+    assert "twin_state' = 'not_required'" in eligibility_sql
 
 
 @pytest.mark.asyncio

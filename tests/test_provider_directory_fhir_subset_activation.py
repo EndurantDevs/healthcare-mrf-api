@@ -47,6 +47,14 @@ def _write_manifest(tmp_path, manifest_by_field):
 def _manifest_for_evidence(evidence):
     manifest_by_field = _verified_manifest()
     manifest_by_field["evidence"] = evidence.evidence_document()
+    if evidence.root_policy is not None:
+        manifest_by_field.update(
+            schema_version=2,
+            desired_candidate_status=(
+                "verified_reviewed_subset_acquisition"
+            ),
+            root_policy=evidence.root_policy.document(),
+        )
     return manifest_by_field
 
 

@@ -204,13 +204,14 @@ def load_abandonment_migration():
 
 
 async def install_subset_canonical_functions(database, schema: str) -> None:
-    """Install the production digest functions in a reduced DB fixture."""
+    """Install artifact-query functions in a reduced DB fixture."""
 
     migration = load_migration()
     for statement in (
         migration._canonical_json_runtime_fence_sql(),
         migration._canonical_json_function_sql(schema),
         migration._canonical_sha256_function_sql(schema),
+        migration._content_proof_valid_function_sql(schema),
     ):
         await database.status(statement)
 

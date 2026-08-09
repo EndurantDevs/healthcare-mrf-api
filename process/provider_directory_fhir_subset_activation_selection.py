@@ -5,9 +5,17 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from process.provider_directory_fhir_subset_canonical import canonical_sha256
+from process.provider_directory_fhir_root_policy import (
+    LEGACY_REVIEWED_STATUSES,
+    POLICY_REVIEWED_STATUSES,
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+    ReviewedRootPolicy,
+    reviewed_root_policy_from_document,
+)
 from process.provider_directory_fhir_subset_identity import (
     server_issued_subset_source_scope_payload,
     subset_source_endpoint_identity,
@@ -22,6 +30,9 @@ from process.provider_directory_fhir_subset_activation_contract import (
     _text,
     reviewed_subset_source_contract_sha256,
 )
+from process.provider_directory_fhir_subset_activation_proofs import (
+    validate_candidate_baseline_binding,
+)
 
 
 def _metadata(row_by_field: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -31,11 +42,34 @@ def _metadata(row_by_field: Mapping[str, Any]) -> Mapping[str, Any]:
     return metadata_by_field
 
 
+def _reviewed_root_policy(
+    source_metadata: Mapping[str, Any],
+) -> ReviewedRootPolicy | None:
+    """Resolve legacy v1 or explicit reviewed-root policy identity."""
+
+    source_status = source_metadata.get(
+        "provider_directory_candidate_status"
+    )
+    try:
+        if source_status in POLICY_REVIEWED_STATUSES:
+            return reviewed_root_policy_from_document(
+                source_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+            )
+        if (
+            source_status in LEGACY_REVIEWED_STATUSES
+            and REVIEWED_ROOT_POLICY_METADATA_KEY not in source_metadata
+        ):
+            return None
+    except (TypeError, ValueError):
+        raise ReviewedSubsetActivationError("evidence") from None
+    raise ReviewedSubsetActivationError("evidence")
+
+
 def _activation_source(
     source_rows: Sequence[Mapping[str, Any]],
     expected_source_id: str,
     evidence: ReviewedSubsetActivationEvidence,
-) -> tuple[dict[str, Any], str, str]:
+) -> tuple[dict[str, Any], str, str, ReviewedRootPolicy | None]:
     if len(source_rows) != 1:
         raise ReviewedSubsetActivationError("evidence")
     source_by_field = dict(source_rows[0])
@@ -56,6 +90,9 @@ def _activation_source(
         or source_by_field.get("auth_type") != "none"
         or not isinstance(source_metadata, Mapping)
     ):
+        raise ReviewedSubsetActivationError("evidence")
+    root_policy = _reviewed_root_policy(source_metadata)
+    if evidence.root_policy != root_policy:
         raise ReviewedSubsetActivationError("evidence")
     try:
         importer = importlib.import_module("process.provider_directory_fhir")
@@ -81,7 +118,12 @@ def _activation_source(
         or scope_sha256 != evidence.verification_source_scope_sha256
     ):
         raise ReviewedSubsetActivationError("evidence")
-    return source_by_field, configured_endpoint_id, source_contract_sha256
+    return (
+        source_by_field,
+        configured_endpoint_id,
+        source_contract_sha256,
+        root_policy,
+    )
 
 
 def _is_candidate_lifecycle_valid(candidate: Mapping[str, Any]) -> bool:
@@ -113,9 +155,22 @@ def _is_candidate_lifecycle_valid(candidate: Mapping[str, Any]) -> bool:
 
 def _activation_roots(
     dataset_rows: Sequence[Mapping[str, Any]],
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    root_policy: ReviewedRootPolicy | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Select exactly one immutable baseline and one matched candidate."""
 
+    if root_policy is not None and not root_policy.is_twin_root_required:
+        if len(dataset_rows) != 1:
+            raise ReviewedSubsetActivationError("evidence")
+        candidate_by_field = dict(dataset_rows[0])
+        if not _is_candidate_lifecycle_valid(candidate_by_field):
+            raise ReviewedSubsetActivationError("evidence")
+        if (
+            _text(candidate_by_field.get("dataset_id")) is None
+            or _text(candidate_by_field.get("acquisition_root_run_id")) is None
+        ):
+            raise ReviewedSubsetActivationError("evidence")
+        return None, candidate_by_field
     if len(dataset_rows) != 2:
         raise ReviewedSubsetActivationError("evidence")
     baseline_rows = [
@@ -154,23 +209,49 @@ def _activation_roots(
     return baseline, candidate
 
 
-def _validated_root_proofs(
+def _validated_single_root_proof(
+    importer: Any,
+    candidate: dict[str, Any],
+    evidence: ReviewedSubsetActivationEvidence,
+    root_policy: ReviewedRootPolicy,
+) -> tuple[None, Mapping[str, Any]]:
+    candidate_pair = importer._validated_parent_subset_completion_pair(candidate)
+    candidate_metadata = _metadata(candidate)
+    importer._validate_finalized_subset_completion_pair(
+        candidate,
+        candidate_metadata,
+    )
+    if (
+        candidate_pair is None
+        or candidate_pair[1] != evidence.completion_proof_sha256
+        or candidate_pair[0].get("cutoff") != evidence.cutoff
+        or candidate_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+        != root_policy.document()
+        or candidate_metadata.get("requires_twin_root_verification") is not False
+        or any(
+            field_name in candidate_metadata
+            for field_name in (
+                "verification_role",
+                "verification_baseline_dataset_id",
+                "twin_root_verification_v1",
+            )
+        )
+    ):
+        raise ValueError("single root proof")
+    return None, candidate_metadata
+
+
+def _validated_twin_root_proofs(
+    importer: Any,
     baseline: dict[str, Any],
     candidate: dict[str, Any],
     evidence: ReviewedSubsetActivationEvidence,
+    root_policy: ReviewedRootPolicy | None,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-    try:
-        importer = importlib.import_module("process.provider_directory_fhir")
-        importer._twin_root_baseline_proof(baseline)
-        importer._assert_matched_twin_root_dataset_proof(candidate)
-        baseline_pair = importer._validated_parent_subset_completion_pair(
-            baseline
-        )
-        candidate_pair = importer._validated_parent_subset_completion_pair(
-            candidate
-        )
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        raise ReviewedSubsetActivationError("evidence") from None
+    importer._twin_root_baseline_proof(baseline)
+    importer._assert_matched_twin_root_dataset_proof(candidate)
+    baseline_pair = importer._validated_parent_subset_completion_pair(baseline)
+    candidate_pair = importer._validated_parent_subset_completion_pair(candidate)
     if (
         baseline_pair is None
         or candidate_pair is None
@@ -178,51 +259,44 @@ def _validated_root_proofs(
         or baseline_pair[1] != evidence.completion_proof_sha256
         or baseline_pair[0].get("cutoff") != evidence.cutoff
     ):
-        raise ReviewedSubsetActivationError("evidence")
-    return _metadata(baseline), _metadata(candidate)
-
-
-def _root_neutral_proof(verification_by_field: object) -> dict | None:
-    if not isinstance(verification_by_field, Mapping):
-        return None
-    proof_by_field = verification_by_field.get("proof")
-    if not isinstance(proof_by_field, Mapping):
-        return None
-    return {
-        field_name: field_value
-        for field_name, field_value in proof_by_field.items()
-        if field_name != "acquisition_root_run_id"
-    }
-
-
-def _validate_candidate_baseline_binding(
-    baseline: Mapping[str, Any],
-    baseline_metadata: Mapping[str, Any],
-    candidate_metadata: Mapping[str, Any],
-) -> None:
-    baseline_verification = baseline_metadata.get(
-        "twin_root_verification_v1"
-    )
-    candidate_verification = candidate_metadata.get(
-        "twin_root_verification_v1"
-    )
-    baseline_dataset_id = _text(baseline.get("dataset_id"))
-    baseline_root_run_id = _text(baseline.get("acquisition_root_run_id"))
-    if (
-        not isinstance(candidate_verification, Mapping)
-        or baseline_dataset_id is None
-        or baseline_root_run_id is None
-        or candidate_metadata.get("verification_baseline_dataset_id")
-        != baseline_dataset_id
-        or candidate_verification.get("baseline_dataset_id")
-        != baseline_dataset_id
-        or candidate_verification.get("baseline_acquisition_root_run_id")
-        != baseline_root_run_id
-        or _root_neutral_proof(baseline_verification) is None
-        or _root_neutral_proof(baseline_verification)
-        != _root_neutral_proof(candidate_verification)
+        raise ValueError("completion proof")
+    baseline_metadata = _metadata(baseline)
+    candidate_metadata = _metadata(candidate)
+    if root_policy is not None and (
+        baseline_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+        != root_policy.document()
+        or candidate_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+        != root_policy.document()
+        or baseline_metadata.get("requires_twin_root_verification")
+        is not True
+        or candidate_metadata.get("requires_twin_root_verification")
+        is not True
     ):
-        raise ReviewedSubsetActivationError("evidence")
+        raise ValueError("root policy")
+    return baseline_metadata, candidate_metadata
+
+
+def _validated_root_proofs(
+    baseline: dict[str, Any] | None,
+    candidate: dict[str, Any],
+    evidence: ReviewedSubsetActivationEvidence,
+    root_policy: ReviewedRootPolicy | None = None,
+) -> tuple[Mapping[str, Any] | None, Mapping[str, Any]]:
+    """Validate the selected root proof branch and return its metadata."""
+
+    try:
+        importer = importlib.import_module("process.provider_directory_fhir")
+        if root_policy is not None and not root_policy.is_twin_root_required:
+            return _validated_single_root_proof(
+                importer, candidate, evidence, root_policy
+            )
+        if baseline is None:
+            raise ValueError("baseline")
+        return _validated_twin_root_proofs(
+            importer, baseline, candidate, evidence, root_policy
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        raise ReviewedSubsetActivationError("evidence") from None
 
 
 def _selection_digest(
@@ -247,57 +321,132 @@ def _selection_coverage_sha256(
         raise ReviewedSubsetActivationError("evidence") from None
 
 
-def _selection_from_roots(
-    source_by_field: Mapping[str, Any],
-    baseline: Mapping[str, Any],
-    candidate: Mapping[str, Any],
-    baseline_metadata: Mapping[str, Any],
-    candidate_metadata: Mapping[str, Any],
-    evidence: ReviewedSubsetActivationEvidence,
-    endpoint_id: str,
-    source_contract_sha256: str,
-) -> ReviewedSubsetActivationSelection:
-    source_id = _text(source_by_field.get("source_id")) or ""
-    source_metadata = source_by_field["metadata_json"]
-    campaign_id = _text(candidate_metadata.get("verification_campaign_id"))
+@dataclass(frozen=True, slots=True)
+class _SelectionContext:
+    source_by_field: Mapping[str, Any]
+    baseline: Mapping[str, Any] | None
+    candidate: Mapping[str, Any]
+    baseline_metadata: Mapping[str, Any] | None
+    candidate_metadata: Mapping[str, Any]
+    evidence: ReviewedSubsetActivationEvidence
+    endpoint_id: str
+    source_contract_sha256: str
+    root_policy: ReviewedRootPolicy | None
+
+
+def _validated_selection_identity(
+    context: _SelectionContext,
+) -> tuple[str, str | None, str | None]:
+    """Validate source, generation, endpoint, and root identity fields."""
+    source_id = _text(context.source_by_field.get("source_id")) or ""
+    source_metadata = context.source_by_field["metadata_json"]
+    campaign_id = _text(
+        context.candidate_metadata.get("verification_campaign_id")
+    )
     scope_sha256 = _text(
-        candidate_metadata.get("verification_source_scope_hash")
+        context.candidate_metadata.get("verification_source_scope_hash")
+    )
+    expected_statuses = POLICY_REVIEWED_STATUSES if context.root_policy else (
+        PENDING_STATUS,
+        VERIFIED_STATUS,
+    )
+    is_single_root = bool(
+        context.root_policy is not None
+        and not context.root_policy.is_twin_root_required
     )
     if (
-        source_metadata.get("provider_directory_candidate_status")
-        not in (PENDING_STATUS, VERIFIED_STATUS)
+        _text(source_metadata.get("provider_directory_candidate_status"))
+        not in expected_statuses
+        or (
+            context.root_policy is not None
+            and source_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+            != context.root_policy.document()
+        )
         or source_metadata.get("provider_directory_verification_campaign_id")
         != campaign_id
-        or campaign_id != baseline_metadata.get("verification_campaign_id")
-        or scope_sha256 != evidence.verification_source_scope_sha256
-        or scope_sha256
-        != baseline_metadata.get("verification_source_scope_hash")
-        or baseline_metadata.get("source_ids") != [source_id]
-        or candidate_metadata.get("source_ids") != [source_id]
-        or _text(baseline.get("endpoint_id")) != endpoint_id
-        or _text(candidate.get("endpoint_id")) != endpoint_id
+        or (
+            context.baseline_metadata is not None
+            and campaign_id
+            != context.baseline_metadata.get("verification_campaign_id")
+        )
+        or scope_sha256 != context.evidence.verification_source_scope_sha256
+        or (
+            context.baseline_metadata is not None
+            and scope_sha256
+            != context.baseline_metadata.get("verification_source_scope_hash")
+        )
+        or (
+            context.baseline_metadata is not None
+            and context.baseline_metadata.get("source_ids") != [source_id]
+        )
+        or context.candidate_metadata.get("source_ids") != [source_id]
+        or (
+            context.baseline is not None
+            and _text(context.baseline.get("endpoint_id"))
+            != context.endpoint_id
+        )
+        or _text(context.candidate.get("endpoint_id")) != context.endpoint_id
+        or is_single_root
+        and (
+            context.baseline is not None
+            or context.baseline_metadata is not None
+        )
     ):
         raise ReviewedSubsetActivationError("evidence")
+    return source_id, campaign_id, scope_sha256
+
+
+def _selection_from_roots(
+    context: _SelectionContext,
+) -> ReviewedSubsetActivationSelection:
+    """Build one private activation selection from validated root evidence."""
+
+    source_id, campaign_id, scope_sha256 = _validated_selection_identity(
+        context
+    )
     return ReviewedSubsetActivationSelection(
         source_id=source_id,
-        endpoint_id=endpoint_id,
+        endpoint_id=context.endpoint_id,
         campaign_id=campaign_id,
-        baseline_dataset_id=_text(baseline.get("dataset_id")) or "",
-        baseline_root_run_id=_text(baseline.get("acquisition_root_run_id")) or "",
-        candidate_dataset_id=_text(candidate.get("dataset_id")) or "",
-        candidate_root_run_id=_text(candidate.get("acquisition_root_run_id")) or "",
-        source_contract_sha256=source_contract_sha256,
+        baseline_dataset_id=(
+            _text(context.baseline.get("dataset_id")) or ""
+            if context.baseline is not None
+            else ""
+        ),
+        baseline_root_run_id=(
+            _text(context.baseline.get("acquisition_root_run_id")) or ""
+            if context.baseline is not None
+            else ""
+        ),
+        candidate_dataset_id=_text(context.candidate.get("dataset_id")) or "",
+        candidate_root_run_id=(
+            _text(context.candidate.get("acquisition_root_run_id")) or ""
+        ),
+        source_contract_sha256=context.source_contract_sha256,
         verification_source_scope_sha256=scope_sha256,
-        cutoff=evidence.cutoff,
-        completion_proof_sha256=evidence.completion_proof_sha256,
-        baseline_replay_evidence_sha256=_selection_digest(
-            baseline_metadata, "server_issued_subset_replay_evidence_sha256"
+        cutoff=context.evidence.cutoff,
+        completion_proof_sha256=context.evidence.completion_proof_sha256,
+        baseline_replay_evidence_sha256=(
+            _selection_digest(
+                context.baseline_metadata,
+                "server_issued_subset_replay_evidence_sha256",
+            )
+            if context.baseline_metadata is not None
+            else ""
         ),
         candidate_replay_evidence_sha256=_selection_digest(
-            candidate_metadata, "server_issued_subset_replay_evidence_sha256"
+            context.candidate_metadata,
+            "server_issued_subset_replay_evidence_sha256",
         ),
-        baseline_coverage_sha256=_selection_coverage_sha256(baseline_metadata),
-        candidate_coverage_sha256=_selection_coverage_sha256(candidate_metadata),
+        baseline_coverage_sha256=(
+            _selection_coverage_sha256(context.baseline_metadata)
+            if context.baseline_metadata is not None
+            else ""
+        ),
+        candidate_coverage_sha256=_selection_coverage_sha256(
+            context.candidate_metadata
+        ),
+        root_policy=context.root_policy,
     )
 
 
@@ -310,29 +459,39 @@ def validated_reviewed_subset_activation_selection(
 ) -> ReviewedSubsetActivationSelection:
     """Validate exact pending source and matching sealed twins for one sync."""
 
-    source_by_field, endpoint_id, source_contract_sha256 = _activation_source(
+    (
+        source_by_field,
+        endpoint_id,
+        source_contract_sha256,
+        root_policy,
+    ) = _activation_source(
         source_rows,
         expected_source_id,
         evidence,
     )
-    baseline, candidate = _activation_roots(dataset_rows)
+    baseline, candidate = _activation_roots(dataset_rows, root_policy)
     baseline_metadata, candidate_metadata = _validated_root_proofs(
         baseline,
         candidate,
         evidence,
+        root_policy,
     )
-    _validate_candidate_baseline_binding(
-        baseline,
-        baseline_metadata,
-        candidate_metadata,
-    )
+    if baseline is not None and baseline_metadata is not None:
+        validate_candidate_baseline_binding(
+            baseline,
+            baseline_metadata,
+            candidate_metadata,
+        )
     return _selection_from_roots(
-        source_by_field,
-        baseline,
-        candidate,
-        baseline_metadata,
-        candidate_metadata,
-        evidence,
-        endpoint_id,
-        source_contract_sha256,
+        _SelectionContext(
+            source_by_field=source_by_field,
+            baseline=baseline,
+            candidate=candidate,
+            baseline_metadata=baseline_metadata,
+            candidate_metadata=candidate_metadata,
+            evidence=evidence,
+            endpoint_id=endpoint_id,
+            source_contract_sha256=source_contract_sha256,
+            root_policy=root_policy,
+        )
     )

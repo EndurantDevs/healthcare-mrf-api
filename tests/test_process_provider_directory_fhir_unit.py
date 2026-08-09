@@ -81,8 +81,12 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 54
+    assert len(command_signature.parameters) == 55
     assert "resource_scan_concurrency" in command_signature.parameters
+    assert (
+        "provider_directory_reviewed_root_count"
+        in command_signature.parameters
+    )
     assert command_signature.parameters == options_signature.parameters
     assert command_signature.return_annotation == "dict[str, Any]"
     assert command.__annotations__ == expected_annotation_map
@@ -5985,6 +5989,10 @@ def test_provider_directory_source_seed_upsert_merges_metadata_json():
     assert merged in sql
     assert importer.REVIEWED_SUBSET_ACTIVATION_METADATA_KEY in sql
     assert importer.REVIEWED_SUBSET_VERIFIED_STATUS in sql
+    assert importer.REVIEWED_ROOT_POLICY_METADATA_KEY in sql
+    assert importer.PROVIDER_DIRECTORY_ROOT_POLICY_PENDING in sql
+    assert importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED in sql
+    assert f"- '{importer.REVIEWED_ROOT_POLICY_METADATA_KEY}'" in sql
     assert "pg_catalog.jsonb_typeof" in sql
 
 
@@ -6014,6 +6022,11 @@ def test_provider_directory_source_seed_upsert_preserves_sealed_activation():
 
     assert importer.REVIEWED_SUBSET_ACTIVATION_METADATA_KEY in expression_sql
     assert importer.REVIEWED_SUBSET_VERIFIED_STATUS in expression_sql
+    assert importer.REVIEWED_ROOT_POLICY_METADATA_KEY in expression_sql
+    assert importer.PROVIDER_DIRECTORY_ROOT_POLICY_PENDING in expression_sql
+    assert importer.PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED in expression_sql
+    assert importer.REVIEWED_ROOT_POLICY_METADATA_KEY in expression_sql
+    assert " - " in expression_sql
     assert "jsonb_typeof" in expression_sql
     assert "jsonb_build_object" in expression_sql
 
@@ -6352,6 +6365,7 @@ def test_provider_directory_cli_refresh_preset_leaves_defaults_unset_for_preset(
     assert calls[0]["full_refresh"] is None
     assert calls[0]["publish_after_acquisition"] is False
     assert calls[0]["defer_typed_materialization"] is False
+    assert calls[0]["provider_directory_reviewed_root_count"] == 2
     assert calls[0]["seed_only"] is True
     assert calls[0]["probe"] is False
 
@@ -6377,6 +6391,48 @@ def test_provider_directory_cli_forwards_deferred_materialization(monkeypatch):
 
     assert cli_result.exit_code == 0, cli_result.output
     assert calls[0]["defer_typed_materialization"] is True
+
+
+def test_provider_directory_cli_forwards_reviewed_root_count(monkeypatch):
+    calls = []
+
+    def fake_initiate_provider_directory_fhir(**kwargs):
+        calls.append(kwargs)
+        return "provider-directory-fhir-task"
+
+    monkeypatch.setattr(
+        process_cli,
+        "initiate_provider_directory_fhir",
+        fake_initiate_provider_directory_fhir,
+    )
+    monkeypatch.setattr(
+        process_cli,
+        "_run",
+        lambda task: calls.append({"run": task}),
+    )
+
+    cli_result = CliRunner().invoke(
+        process_cli.provider_directory_fhir,
+        [
+            "--acquisition-strategy",
+            "server-issued-traversal-subset",
+            "--reviewed-root-count",
+            "1",
+        ],
+    )
+
+    assert cli_result.exit_code == 0, cli_result.output
+    assert calls[0]["provider_directory_reviewed_root_count"] == 1
+
+
+def test_provider_directory_cli_rejects_invalid_reviewed_root_count():
+    cli_result = CliRunner().invoke(
+        process_cli.provider_directory_fhir,
+        ["--reviewed-root-count", "3"],
+    )
+
+    assert cli_result.exit_code == 2
+    assert "not in the range 1<=x<=2" in cli_result.output
 
 
 def test_provider_directory_cli_routes_uhc_through_normal_import(monkeypatch):

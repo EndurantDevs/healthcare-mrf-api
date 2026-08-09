@@ -6,6 +6,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from process.provider_directory_fhir_root_policy import (
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+    reviewed_root_policy_from_document,
+)
+
 CURRENT_VERSION_CENSUS_CONTRACT_FIELD = (
     "_provider_directory_current_version_census_contract"
 )
@@ -70,8 +75,14 @@ SERVER_ISSUED_SUBSET_RESOURCE_TYPES = (
 SERVER_ISSUED_SUBSET_SOURCE_SCOPE_VERSION = (
     "provider-directory-fhir-server-issued-subset-source-scope-v1"
 )
+SERVER_ISSUED_SUBSET_SOURCE_SCOPE_VERSION_V2 = (
+    "provider-directory-fhir-server-issued-subset-source-scope-v2"
+)
 SERVER_ISSUED_SUBSET_ACTIVATION_SOURCE_CONTRACT_VERSION = (
     "provider-directory-fhir-reviewed-subset-source-contract-v1"
+)
+SERVER_ISSUED_SUBSET_ACTIVATION_SOURCE_CONTRACT_VERSION_V2 = (
+    "provider-directory-fhir-reviewed-subset-source-contract-v2"
 )
 CONFIGURED_ENDPOINT_ID_METADATA_FIELD = (
     "provider_directory_configured_endpoint_id"
@@ -97,6 +108,31 @@ SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS = (
     SERVER_ISSUED_SUBSET_CAMPAIGN_FIELD,
     CONFIGURED_ENDPOINT_ID_METADATA_FIELD,
 )
+SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS_V2 = (
+    *SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS,
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
+)
+
+
+def _source_identity_contract(
+    metadata: Mapping[str, Any],
+) -> tuple[str, str, tuple[str, ...]]:
+    """Select the legacy or explicit-policy identity without hash drift."""
+
+    if REVIEWED_ROOT_POLICY_METADATA_KEY not in metadata:
+        return (
+            SERVER_ISSUED_SUBSET_ACTIVATION_SOURCE_CONTRACT_VERSION,
+            SERVER_ISSUED_SUBSET_SOURCE_SCOPE_VERSION,
+            SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS,
+        )
+    reviewed_root_policy_from_document(
+        metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
+    )
+    return (
+        SERVER_ISSUED_SUBSET_ACTIVATION_SOURCE_CONTRACT_VERSION_V2,
+        SERVER_ISSUED_SUBSET_SOURCE_SCOPE_VERSION_V2,
+        SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS_V2,
+    )
 
 
 def subset_source_endpoint_identity(
@@ -147,10 +183,16 @@ def subset_activation_source_contract_payload(
         or not canonical_api_base
     ):
         raise ValueError("provider_directory_subset_activation_source_invalid")
+    try:
+        activation_version, _, metadata_fields = _source_identity_contract(
+            metadata
+        )
+    except ValueError:
+        raise ValueError(
+            "provider_directory_subset_activation_source_invalid"
+        ) from None
     return {
-        "identity_version": (
-            SERVER_ISSUED_SUBSET_ACTIVATION_SOURCE_CONTRACT_VERSION
-        ),
+        "identity_version": activation_version,
         "source": {
             "source_id": source_id,
             "endpoint_id": configured_endpoint_id,
@@ -163,7 +205,7 @@ def subset_activation_source_contract_payload(
         },
         "metadata_identity": [
             [field_name, field_name in metadata, metadata.get(field_name)]
-            for field_name in SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS
+            for field_name in metadata_fields
         ],
     }
 
@@ -196,8 +238,16 @@ def server_issued_subset_source_scope_payload(
         or not canonical_api_base
     ):
         raise ValueError("provider_directory_subset_source_scope_invalid")
+    try:
+        _, scope_version, metadata_fields = _source_identity_contract(
+            metadata
+        )
+    except ValueError:
+        raise ValueError(
+            "provider_directory_subset_source_scope_invalid"
+        ) from None
     return {
-        "identity_version": SERVER_ISSUED_SUBSET_SOURCE_SCOPE_VERSION,
+        "identity_version": scope_version,
         "source_ids": list(source_ids),
         "cutoff": cutoff,
         "source": {
@@ -212,7 +262,7 @@ def server_issued_subset_source_scope_payload(
         },
         "metadata_identity": [
             [field_name, field_name in metadata, metadata.get(field_name)]
-            for field_name in SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS
+            for field_name in metadata_fields
         ],
     }
 
