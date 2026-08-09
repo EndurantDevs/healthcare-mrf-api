@@ -1082,7 +1082,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260808200000_provider_directory_reviewed_subset_activation"
+        "20260808210000_provider_directory_subset_payload_guard_repair"
     ]
 
 

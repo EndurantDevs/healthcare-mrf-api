@@ -62675,6 +62675,7 @@ async def _import_resources(
 
     async def import_one_group(
         source_group: list[dict[str, Any]],
+        resume_required_entries: set[str] | None,
     ) -> ResourceImportGroupResult:
         """Import, validate, and finalize one provider-directory source group."""
         await _raise_if_resource_import_cancelled(cancel_ctx, cancel_task)
@@ -62795,7 +62796,7 @@ async def _import_resources(
                     stale_cleanup=stale_cleanup,
                     seen_table=seen_stage_table,
                     checkpoint_context=partition_source.get("_pagination_checkpoint_context"),
-                    resume_required_entries=pagination_resume_required,
+                    resume_required_entries=resume_required_entries,
                     dataset_id=partition_source.get("_endpoint_dataset_id"),
                 ),
             )
@@ -62850,7 +62851,7 @@ async def _import_resources(
             await _finalize_source_pagination_checkpoints(
                 partition_source,
                 import_summary[1],
-                pagination_resume_required,
+                resume_required_entries,
                 require_complete_resources=require_complete_resources,
                 retain_complete_checkpoint=bool(
                     partition_source.get("_endpoint_dataset_id")
@@ -63099,7 +63100,7 @@ async def _import_resources(
         await _finalize_source_pagination_checkpoints(
             partition_source,
             resource_diagnostic_by_type,
-            pagination_resume_required,
+            resume_required_entries,
             require_complete_resources=require_complete_resources,
             retain_complete_checkpoint=bool(
                 partition_source.get("_endpoint_dataset_id")
@@ -63127,8 +63128,14 @@ async def _import_resources(
         prepared_source_lists: list[list[dict[str, Any]]],
     ) -> ResourceImportGroupResult:
         """Prepare, validate, and finalize one checkpoint-owned source group."""
+        group_resume_required = (
+            set() if pagination_resume_required is not None else None
+        )
         if _is_validated_uhc_official_source_group(source_records):
-            return await import_one_group(source_records)
+            return await import_one_group(
+                source_records,
+                group_resume_required,
+            )
         prepared_source_records, candidate = (
             await _prepare_resource_import_source_group(
                 source_records,
@@ -63150,8 +63157,16 @@ async def _import_resources(
             )
         diagnostics_by_resource: dict[str, dict[str, Any]] = {}
         try:
-            import_summary = await import_one_group(prepared_source_records)
+            import_summary = await import_one_group(
+                prepared_source_records,
+                group_resume_required,
+            )
             diagnostics_by_resource = import_summary[1]
+            if group_resume_required:
+                await resource_import_cancellation.check()
+                assert pagination_resume_required is not None
+                pagination_resume_required.update(group_resume_required)
+                return import_summary
             await _validate_and_finalize_import_candidate(
                 candidate,
                 prepared_source_records,

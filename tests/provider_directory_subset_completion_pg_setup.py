@@ -26,6 +26,10 @@ MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "alembic/versions/20260808190000_provider_directory_subset_completion_proof.py"
 )
+PAYLOAD_GUARD_REPAIR_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions/20260808210000_provider_directory_subset_payload_guard_repair.py"
+)
 
 
 class MigrationSqlCapture(SqlCapture):
@@ -166,6 +170,17 @@ def load_migration():
     module_spec = importlib.util.spec_from_file_location(
         "provider_directory_subset_completion_postgres_migration",
         MIGRATION_PATH,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
+
+
+def load_payload_guard_repair_migration():
+    module_spec = importlib.util.spec_from_file_location(
+        "provider_directory_subset_payload_guard_repair_postgres_migration",
+        PAYLOAD_GUARD_REPAIR_MIGRATION_PATH,
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
