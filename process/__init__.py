@@ -50,8 +50,6 @@ from process.initial import shutdown as shutdown_mrf
 from process.initial import mrf_worker_shutdown
 from process.initial import startup as initial_startup
 from process.npi import main as initiate_npi
-from process.npi import process_data as process_npi_data
-from process.npi import process_npi_chunk, save_npi_data
 from process.npi import shutdown as npi_shutdown
 from process.npi import startup as npi_startup
 from process.nucc import main as initiate_nucc
@@ -181,6 +179,12 @@ def _worker_int_env(name: str, default: int) -> int:
         return int(os.environ.get(name, "").strip() or default)
     except ValueError:
         return default
+
+
+def _npi_job_timeout() -> int:
+    """Return the bounded NPI worker timeout for full evidence replay."""
+
+    return max(_worker_int_env("HLTHPRT_NPI_JOB_TIMEOUT", 86400), 1)
 
 
 def _ptg_max_jobs(name: str, default: int) -> int:
@@ -432,34 +436,17 @@ class GeoCensus:
 
 
 class NPI:
-    functions = [process_npi_data, save_npi_data, process_npi_chunk, control_single_job_start]
+    functions = [control_single_job_start]
     on_startup = npi_startup
     on_shutdown = npi_shutdown
-    max_jobs = int(os.environ.get("HLTHPRT_MAX_NPI_JOBS")) if os.environ.get("HLTHPRT_MAX_NPI_JOBS") else 20
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_NPI_JOBS")) if os.environ.get("HLTHPRT_MAX_NPI_JOBS") else 1
     queue_read_limit = (
         int(os.environ.get("HLTHPRT_NPI_QUEUE_READ_LIMIT"))
         if os.environ.get("HLTHPRT_NPI_QUEUE_READ_LIMIT")
         else 2 * max_jobs
     )
     queue_name = 'arq:NPI'
-    job_timeout = 86400
-    redis_settings = build_redis_settings()
-    job_serializer = serialize_job
-    job_deserializer = deserialize_job
-
-
-class NPI_finish:
-    functions = [npi_shutdown]
-    on_startup = db_startup
-    max_jobs = (
-        int(os.environ.get("HLTHPRT_MAX_NPI_FINISH_JOBS"))
-        if os.environ.get("HLTHPRT_MAX_NPI_FINISH_JOBS")
-        else 1
-    )
-    queue_read_limit = max_jobs
-    job_timeout = 3600
-    burst = True
-    queue_name = 'arq:NPI_finish'
+    job_timeout = _npi_job_timeout()
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -967,10 +954,9 @@ def plan_attributes(test: bool):
     _run(initiate_plan_attributes(test_mode=test))
 
 @click.command(help="Run NPPES Import with Weekly updates")
-@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
-def npi(test: bool):
+def npi():
     """Run the weekly NPPES provider import."""
-    _run(initiate_npi(test_mode=test))
+    _run(initiate_npi())
 
 @click.command(help="Run Transparency in Coverage (PTG) Import")
 @click.option("--toc-url", multiple=True, help="URL of a table-of-contents file to seed jobs (repeatable).")

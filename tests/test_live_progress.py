@@ -3,6 +3,30 @@ import datetime as dt
 from process import live_progress
 
 
+def test_terminal_status_event_preserves_database_heartbeat():
+    database_heartbeat = "2026-08-09T02:03:04.000000+00:00"
+
+    event_by_field = live_progress._status_event_for_accepted_progress(
+        {
+            "run_id": "run_terminal",
+            "status": "succeeded",
+            "heartbeat_at": database_heartbeat,
+            "progress": {"message": "succeeded"},
+        },
+        {
+            "attempt_id": "run_terminal:attempt",
+            "attempt_started_at": "2026-08-09T01:00:00.000000+00:00",
+            "event_seq": 4,
+            "progress_seq": 3,
+            "observed_at": "2026-08-09T02:04:05.000000+00:00",
+        },
+    )
+
+    assert event_by_field["heartbeat_at"] == database_heartbeat
+    assert event_by_field["progress"]["event_seq"] == 4
+    assert event_by_field["progress"]["progress_seq"] == 3
+
+
 def test_heartbeat_preserves_old_importer_progress():
     merged_by_field = {
         "source": "engine-heartbeat",

@@ -38,13 +38,17 @@ Run the regular suite with:
 pytest tests -x
 ```
 
-Before merging importer changes, run a smoke import with `--test`, for example:
+Before merging importer changes that support bounded test mode, run a smoke
+import with `--test`, for example:
 
 ```bash
 python main.py start claims-pricing --test
 python main.py start drug-claims --test
-python main.py start npi --test
 ```
+
+The NPI importer deliberately has no live `--test` mode because its evidence
+and publication rows are immutable. Use the disposable PostgreSQL suites
+described in [the NPI import guide](docs/imports/npi.md) instead.
 
 ## Import Safety Rules
 

@@ -2052,6 +2052,35 @@ def _cross_source_fhir_profile(name_value_by_key):
     }
 
 
+def _cross_source_profile_evidence(name_value_by_key, profile_by_key):
+    return compose_provider_profile_evidence(
+        state_projection={
+            "evidence": {
+                "records": [
+                    {
+                        "source_record_id": "state-name-record",
+                        "artifact_id": "state-artifact",
+                    }
+                ]
+            }
+        },
+        fhir_evidence={
+            "facts": {
+                "name": {
+                    "items": [
+                        {
+                            "value": name_value_by_key,
+                            "source_ids": ["directory-source"],
+                        }
+                    ],
+                    "total": 1,
+                }
+            }
+        },
+        provider_profile=profile_by_key,
+    )
+
+
 def test_composer_deduplicates_equal_cross_source_fact_and_keeps_both_evidence_paths():
     """Verify composer deduplicates equal cross source fact and keeps both evidence paths."""
     name_value_by_key = {
@@ -2086,32 +2115,7 @@ def test_composer_deduplicates_equal_cross_source_fact_and_keeps_both_evidence_p
     assert profile_items[0]["assertion_count"] == 4
     assert len(profile_items[0]["assertions"]) == 2
 
-    evidence = compose_provider_profile_evidence(
-        state_projection={
-            "evidence": {
-                "records": [
-                    {
-                        "source_record_id": "state-name-record",
-                        "artifact_id": "state-artifact",
-                    }
-                ]
-            }
-        },
-        fhir_evidence={
-            "facts": {
-                "name": {
-                    "items": [
-                        {
-                            "value": name_value_by_key,
-                            "source_ids": ["directory-source"],
-                        }
-                    ],
-                    "total": 1,
-                }
-            }
-        },
-        provider_profile=profile,
-    )
+    evidence = _cross_source_profile_evidence(name_value_by_key, profile)
     assert len(evidence["sources"]["state_regulator"]["records"]) == 1
     assert len(
         evidence["sources"]["provider_directory_fhir"]["facts"]["name"]["items"]

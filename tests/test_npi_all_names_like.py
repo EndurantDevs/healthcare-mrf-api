@@ -1101,6 +1101,8 @@ async def test_get_all_handles_sparse_positional_rows_without_crashing(monkeypat
     assert len(response_body["rows"]) == 1
     assert response_body["rows"][0]["npi"] == 1234567890
     assert isinstance(response_body["rows"][0].get("taxonomy_list"), list)
+    assert "employer_identification_number" not in response_body["rows"][0]
+    assert "00-0000000" not in json.dumps(response_body)
 
 
 class _MappedProviderDirectoryRow:
@@ -1124,6 +1126,8 @@ def _provider_directory_row_mapping():
         "npi": 1033213624,
         "entity_type_code": 2,
         "provider_organization_name": "MARY S HARPER GERIATRIC PSY CTR",
+        "employer_identification_number": "private-ein-sentinel",
+        "parent_organization_tin": "private-tin-sentinel",
         "type": "practice",
         "first_line": "115 Harper Ct",
         "city_name": "Tuscaloosa",
@@ -1191,6 +1195,11 @@ async def test_npi_all_includes_fhir_sources(monkeypatch):
     )
     response = await get_all(request)
     provider_match = json.loads(response.body)["rows"][0]
+
+    assert "employer_identification_number" not in provider_match
+    assert "parent_organization_tin" not in provider_match
+    assert "private-ein-sentinel" not in json.dumps(provider_match)
+    assert "private-tin-sentinel" not in json.dumps(provider_match)
 
     assert provider_match["provider_directory_sources"] == [
             {

@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -306,13 +307,111 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
     )
 
     assert run_response["status"] == "succeeded"
-    assert calls == [
-        ("target", {"control_run_id": "run_1"}, {"run_id": "run_1"}),
-        ("shutdown", {"control_run_id": "run_1", "run": 1}, None),
+    target_context = calls[0][1]
+    shutdown_context = calls[1][1]
+    assert calls[0][0::2] == ("target", {"run_id": "run_1"})
+    assert calls[1][0::2] == ("shutdown", None)
+    assert target_context["control_run_id"] == "run_1"
+    assert shutdown_context["control_run_id"] == "run_1"
+    assert shutdown_context["run"] == 1
+    assert target_context["_control_attempt_id"].startswith("run_1:")
+    assert len(target_context["_control_attempt_id"]) == len("run_1:") + 32
+    assert shutdown_context["_control_attempt_id"] == target_context[
+        "_control_attempt_id"
+    ]
+    assert shutdown_context["_control_attempt_started_at"] == target_context[
+        "_control_attempt_started_at"
     ]
     assert run_response["run_id"] == "run_1"
     assert [mark_entry[1]["status"] for mark_entry in marks] == ["running", "succeeded"]
     _assert_shutdown_terminal_metrics(marks[-1][1])
+
+
+def _durable_npi_success_module(publication_ref: str, committed_at: str):
+    """Build a fake NPI module that commits before raising from shutdown."""
+
+    async def fake_target(ctx, _task):
+        ctx.setdefault("context", {})["run"] = 1
+
+    async def fake_shutdown(ctx):
+        context = ctx.setdefault("context", {})
+        context.update(
+            {
+                "control_run_terminal_committed": True,
+                "_control_committed_heartbeat_at": committed_at,
+                "_control_committed_finished_at": committed_at,
+                "_control_committed_result": {
+                    "npi_canonical_publication": {
+                        "publication_ref": publication_ref,
+                    },
+                    "terminal_progress": {
+                        "unit": "rows",
+                        "done": 1,
+                        "total": 1,
+                        "pct": 100,
+                        "message": "succeeded",
+                        "phase": "npi published",
+                    },
+                },
+            }
+        )
+        raise RuntimeError("synthetic postcommit error")
+
+    class FakeNpiModule:
+        process_data = staticmethod(fake_target)
+        shutdown = staticmethod(fake_shutdown)
+
+    return FakeNpiModule
+
+
+@pytest.mark.asyncio
+async def test_control_wrapper_preserves_durable_npi_success_after_shutdown_error(
+    monkeypatch,
+):
+    """Keep an exact durable NPI success despite a post-commit shutdown error."""
+
+    marks = []
+    publication_ref = "nppub1_" + "a" * 43
+    committed_at = "2026-08-09T02:03:04.000000+00:00"
+
+    async def is_control_mark_recorded(run_id, **kwargs):
+        marks.append((run_id, kwargs))
+        return True
+
+    monkeypatch.setattr(
+        control_lifecycle,
+        "mark_control_run",
+        is_control_mark_recorded,
+    )
+    monkeypatch.setattr(
+        control_lifecycle,
+        "_flush_terminal_status_events",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        control_lifecycle,
+        "import_module",
+        lambda name: (
+            _durable_npi_success_module(publication_ref, committed_at)
+            if name == "process.npi"
+            else None
+        ),
+    )
+
+    outcome = await control_single_job_start(
+        {"redis": object()},
+        {
+            "run_id": "run_committed_npi",
+            "target_module": "process.npi",
+            "target_function": "process_data",
+            "run_shutdown": True,
+        },
+    )
+
+    assert outcome["status"] == "succeeded"
+    assert [mark[1]["status"] for mark in marks] == ["running", "succeeded"]
+    assert marks[-1][1]["database_state_committed"] is True
+    assert marks[-1][1]["snapshot_id"] == publication_ref
 
 
 @pytest.mark.asyncio

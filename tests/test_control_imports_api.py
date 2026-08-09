@@ -286,7 +286,7 @@ def test_control_wrapped_publish_importers_request_shutdown():
         provider_directory_payload["task"]["retest_results_url"]
         == "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json"
     )
-    assert npi_payload["run_shutdown"] is False
+    assert npi_payload["run_shutdown"] is True
 
 
 def test_provider_directory_adapter_scopes_retry_lineage():
@@ -1113,6 +1113,40 @@ async def test_enqueue_import_start_wraps_ms_drg_importer(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_enqueue_import_start_targets_exact_npi_job(monkeypatch):
+    calls = []
+
+    class FakeJob:
+        job_id = "npi_start_run_npi"
+
+    class FakeRedis:
+        async def enqueue_job(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeJob()
+
+    async def fake_create_pool(*_args, **_kwargs):
+        return FakeRedis()
+
+    monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
+
+    enqueue_result_map = await _enqueue_import_start(
+        {"run_id": "run_npi", "importer": "npi", "params": {}}
+    )
+
+    assert enqueue_result_map["status"] == "queued"
+    args, kwargs = calls[0]
+    assert args[0] == "control_single_job_start"
+    assert args[1]["run_id"] == "run_npi"
+    assert args[1]["target_module"] == "process.npi"
+    assert args[1]["target_function"] == "process_data"
+    assert args[1]["run_shutdown"] is True
+    assert kwargs == {
+        "_queue_name": "arq:NPI",
+        "_job_id": "npi_start_run_npi",
+    }
+
+
+@pytest.mark.asyncio
 async def test_enqueue_import_start_marks_failed_on_enqueue_error(monkeypatch):
     async def fake_create_pool(*_args, **_kwargs):
         raise RuntimeError("redis unavailable")
@@ -1453,6 +1487,15 @@ async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
             return None
 
     class FakeDb:
+        @asynccontextmanager
+        async def acquire(self):
+            connection = types.SimpleNamespace(
+                scalar=AsyncMock(return_value=None),
+                all=AsyncMock(return_value=[]),
+                status=AsyncMock(return_value=None),
+            )
+            yield connection
+
         async def execute(self, _statement):
             return FakeResult()
 
@@ -1556,6 +1599,17 @@ async def test_list_import_runs_page_filters_retry_parent(monkeypatch):
             return FakeScalars()
 
     class FakeDb:
+        @asynccontextmanager
+        async def acquire(self):
+            connection = types.SimpleNamespace(
+                scalar=AsyncMock(return_value=None),
+                all=AsyncMock(return_value=[]),
+                status=AsyncMock(
+                    side_effect=lambda statement: statements.append(statement)
+                ),
+            )
+            yield connection
+
         async def execute(self, statement):
             statements.append(statement)
             return FakeResult()
@@ -1579,6 +1633,17 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
     statements = []
 
     class FakeDb:
+        @asynccontextmanager
+        async def acquire(self):
+            connection = types.SimpleNamespace(
+                scalar=AsyncMock(return_value=None),
+                all=AsyncMock(return_value=[]),
+                status=AsyncMock(
+                    side_effect=lambda statement: statements.append(statement)
+                ),
+            )
+            yield connection
+
         async def execute(self, statement):
             statements.append(statement)
 
@@ -1607,7 +1672,7 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
         {
             "run_id": "run_create",
             "importer": "npi",
-            "params": {"test_mode": True},
+            "params": {},
             "idempotency_key": "idem-1",
         }
     )
@@ -1625,6 +1690,21 @@ async def test_create_import_run_returns_active_run_after_integrity_race(monkeyp
     active_run_map = {"run_id": "run_existing", "status": "queued"}
 
     class FakeDb:
+        @asynccontextmanager
+        async def acquire(self):
+            connection = types.SimpleNamespace(
+                scalar=AsyncMock(return_value=None),
+                all=AsyncMock(return_value=[]),
+                status=AsyncMock(
+                    side_effect=IntegrityError(
+                        "insert",
+                        {},
+                        Exception("duplicate"),
+                    )
+                ),
+            )
+            yield connection
+
         async def execute(self, _statement):
             raise IntegrityError("insert", {}, Exception("duplicate"))
 
@@ -1678,6 +1758,19 @@ async def test_create_import_run_returns_active_same_importer_run(monkeypatch):
 
     assert created is False
     assert created_run_map == active_run_map
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_parameter", ["test", "test_mode"])
+async def test_create_npi_import_rejects_live_queue_test_mode(test_parameter):
+    with pytest.raises(ValueError, match="isolated database"):
+        await create_import_run(
+            {
+                "run_id": "run_npi_test_rejected",
+                "importer": "npi",
+                "params": {test_parameter: True},
+            }
+        )
 
 
 class _ParallelPTGConnection:
@@ -1957,6 +2050,21 @@ class _ConcurrentProviderAdmissionDb(_ProviderAdmissionDb):
         return await super().status(statement)
 
 
+class _ConcurrentNpiAdmissionDb(_ProviderAdmissionDb):
+    def __init__(self):
+        super().__init__()
+        self.admission_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def acquire(self):
+        async with self.admission_lock:
+            self.events.append(("acquire",))
+            try:
+                yield self
+            finally:
+                self.events.append(("commit",))
+
+
 class _BlockingProviderEnqueue:
     def __init__(self):
         self.started = asyncio.Event()
@@ -2001,6 +2109,65 @@ def _install_provider_admission_stubs(monkeypatch, active_runs, *, idempotency_r
     monkeypatch.setattr(control_imports, "_active_idempotency_run", active_idempotency)
     monkeypatch.setattr(control_imports, "_active_importer_runs", active_importers)
     return database
+
+
+@pytest.mark.asyncio
+async def test_concurrent_npi_admission_converges_on_one_active_run(monkeypatch):
+    """Converge concurrent NPI requests on the first admitted active run."""
+
+    database = _ConcurrentNpiAdmissionDb()
+    admitted_runs_by_id: dict[str, dict] = {}
+
+    async def no_idempotency_run(_connection, _idempotency_key):
+        return None
+
+    async def active_npi_runs(connection, importer):
+        assert connection is database
+        assert importer == "npi"
+        return list(admitted_runs_by_id.values())
+
+    original_status = database.status
+
+    async def insert_run(statement):
+        values_by_name = dict(statement.compile().params)
+        admitted_runs_by_id[str(values_by_name["run_id"])] = values_by_name
+        return await original_status(statement)
+
+    monkeypatch.setattr(database, "status", insert_run)
+    monkeypatch.setattr(control_imports, "db", database)
+    monkeypatch.setattr(
+        control_imports,
+        "_active_idempotency_run",
+        no_idempotency_run,
+    )
+    monkeypatch.setattr(control_imports, "_active_importer_runs", active_npi_runs)
+    first_run_by_name = {
+        "run_id": "run_npi_one",
+        "importer": "npi",
+        "status": "queued",
+    }
+    second_run_by_name = {
+        "run_id": "run_npi_two",
+        "importer": "npi",
+        "status": "queued",
+    }
+
+    first_result, second_result = await asyncio.gather(
+        control_imports._admit_npi_import_run(first_run_by_name),
+        control_imports._admit_npi_import_run(second_run_by_name),
+    )
+
+    assert first_result is None
+    assert second_result is not None
+    assert second_result["run_id"] == "run_npi_one"
+    assert [event[0] for event in database.events].count("status") == 1
+    lock_events = [event for event in database.events if event[0] == "scalar"]
+    assert len(lock_events) == 2
+    assert all("pg_advisory_xact_lock" in str(event[1]) for event in lock_events)
+    assert all(
+        event[2] == {"lock_key": control_imports._NPI_ADMISSION_LOCK_KEY}
+        for event in lock_events
+    )
 
 
 @pytest.mark.parametrize(
@@ -3204,6 +3371,46 @@ async def test_queued_arq_cancel_sets_fence_before_cleanup(monkeypatch):
 
     assert call_order_list == ["cancel_flag", "queue", "kubernetes"]
     assert signal_by_name["cancel_flag"] == {"redis": True}
+
+
+def test_cancel_progress_preserves_exact_worker_attempt_ownership():
+    progress_by_name = control_imports._cancel_progress_by_name(
+        canceled_now=False,
+        current_progress={
+            "pct": 25,
+            "attempt_id": "run_running:0123456789abcdef",
+            "attempt_started_at": "2026-08-09T01:02:03.000000+00:00",
+        },
+    )
+
+    assert progress_by_name["attempt_id"] == "run_running:0123456789abcdef"
+    assert progress_by_name["attempt_started_at"] == (
+        "2026-08-09T01:02:03.000000+00:00"
+    )
+
+
+@pytest.mark.parametrize(
+    "current_progress",
+    [
+        {"pct": 25, "attempt_id": "run_running:attempt"},
+        {"pct": 25, "attempt_started_at": "2026-08-09T01:02:03+00:00"},
+        {
+            "pct": 25,
+            "attempt_id": " run_running:attempt",
+            "attempt_started_at": "2026-08-09T01:02:03+00:00",
+        },
+    ],
+)
+def test_cancel_progress_never_persists_partial_attempt_ownership(
+    current_progress,
+):
+    progress_by_name = control_imports._cancel_progress_by_name(
+        canceled_now=False,
+        current_progress=current_progress,
+    )
+
+    assert "attempt_id" not in progress_by_name
+    assert "attempt_started_at" not in progress_by_name
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import importlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ import uuid
 from contextlib import asynccontextmanager
 
 import pytest
+
+from process.nppes_public_evidence_import import NPPES_RIGHTS_PROOF_SHA256
 
 os.environ.setdefault("HLTHPRT_REDIS_ADDRESS", "redis://localhost")
 
@@ -366,6 +369,12 @@ async def test_process_data_rejects_missing_nucc_before_download(monkeypatch, np
     monkeypatch.setattr(npi_module, "download_it", download_mock)
     monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
     monkeypatch.setattr(npi_module.db, "status", AsyncMock())
+    acquire_lease = AsyncMock()
+    assert_lease = AsyncMock()
+    release_lease = AsyncMock()
+    monkeypatch.setattr(npi_module, "_acquire_npi_import_lease", acquire_lease)
+    monkeypatch.setattr(npi_module, "_assert_npi_import_lease", assert_lease)
+    monkeypatch.setattr(npi_module, "_release_npi_import_lease", release_lease)
 
     async def fake_scalar(_sql):
         return None
@@ -381,6 +390,9 @@ async def test_process_data_rejects_missing_nucc_before_download(monkeypatch, np
     with pytest.raises(npi_module.NPIPrerequisiteError, match="nucc_taxonomy"):
         await npi_module.process_data(worker_context_map)
 
+    acquire_lease.assert_awaited_once()
+    assert_lease.assert_awaited_once()
+    release_lease.assert_awaited_once()
     download_mock.assert_not_awaited()
 
 
@@ -395,6 +407,8 @@ async def test_process_npi_chunk_enqueues_basic_payload(monkeypatch, npi_module)
         "NPI": "npi",
         "Entity Type Code": "entity_type_code",
         "Provider Organization Name (Legal Business Name)": "provider_organization_name",
+        "Employer Identification Number (EIN)": "employer_identification_number",
+        "Parent Organization TIN": "parent_organization_tin",
     }
     npi_csv_map_reverse = {
         column_name: source_name
@@ -402,6 +416,8 @@ async def test_process_npi_chunk_enqueues_basic_payload(monkeypatch, npi_module)
     }
 
     npi_row_map = _build_minimal_row("1215387113")
+    npi_row_map["Employer Identification Number (EIN)"] = "private-ein-sentinel"
+    npi_row_map["Parent Organization TIN"] = "private-tin-sentinel"
 
     chunk_task_map = {
         "npi_csv_map": npi_csv_map,
@@ -416,6 +432,8 @@ async def test_process_npi_chunk_enqueues_basic_payload(monkeypatch, npi_module)
     enqueue_payload_map = fake_redis.enqueue_job.await_args.args[1]
 
     assert enqueue_payload_map["npi_obj_list"][0]["npi"] == 1215387113
+    assert enqueue_payload_map["npi_obj_list"][0]["employer_identification_number"] is None
+    assert enqueue_payload_map["npi_obj_list"][0]["parent_organization_tin"] is None
     address_by_type = {
         entry["type"]: entry
         for entry in enqueue_payload_map["npi_address_list"]
@@ -687,14 +705,31 @@ async def test_process_data_no_remote_files(monkeypatch, npi_module):
     monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_DIR", "https://example.com/")
     monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_FILE", "feed.html")
 
-    download_mock = AsyncMock(return_value="")
+    call_order_events: list[str] = []
+
+    async def empty_listing(*_args, **_kwargs):
+        call_order_events.append("listing")
+        return ""
+
+    download_mock = AsyncMock(side_effect=empty_listing)
     monkeypatch.setattr(npi_module, "download_it", download_mock)
     monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
     monkeypatch.setattr(npi_module, "_ensure_required_extensions", AsyncMock())
     monkeypatch.setattr(npi_module, "_assert_nucc_ready", AsyncMock())
     monkeypatch.setattr(npi_module, "_assert_nppes_canonical_ready", AsyncMock())
     monkeypatch.setattr(npi_module, "_load_nucc_taxonomy_int_code_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(npi_module, "_prepare_npi_staging", AsyncMock())
     monkeypatch.setattr(npi_module.db, "status", AsyncMock())
+    acquire_lease = AsyncMock(
+        side_effect=lambda _context: call_order_events.append("lease")
+    )
+    assert_lease = AsyncMock(
+        side_effect=lambda _context: call_order_events.append("assert")
+    )
+    release_lease = AsyncMock()
+    monkeypatch.setattr(npi_module, "_acquire_npi_import_lease", acquire_lease)
+    monkeypatch.setattr(npi_module, "_assert_npi_import_lease", assert_lease)
+    monkeypatch.setattr(npi_module, "_release_npi_import_lease", release_lease)
 
     worker_context_map = {
         "context": {},
@@ -702,10 +737,325 @@ async def test_process_data_no_remote_files(monkeypatch, npi_module):
         "import_date": "20251107",
     }
 
-    await npi_module.process_data(worker_context_map)
+    with pytest.raises(
+        npi_module.NPIPrerequisiteError,
+        match="No NPPES source archives",
+    ):
+        await npi_module.process_data(worker_context_map)
 
-    assert worker_context_map["context"]["run"] == 1
+    assert worker_context_map["context"]["run"] == 0
     download_mock.assert_awaited()
+    npi_module._prepare_npi_staging.assert_not_awaited()
+    assert call_order_events[:3] == ["lease", "assert", "listing"]
+    release_lease.assert_awaited_once_with(
+        worker_context_map["context"],
+        suppress_errors=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_data_required_test_mode_cannot_write_immutable_evidence(
+    monkeypatch,
+    npi_module,
+):
+    monkeypatch.setenv("HLTHPRT_NPPES_PUBLIC_EVIDENCE_MODE", "required")
+    monkeypatch.setenv(
+        "HLTHPRT_NPPES_RIGHTS_PROOF_SHA256",
+        NPPES_RIGHTS_PROOF_SHA256,
+    )
+    prepare_chain = AsyncMock()
+    import_chain = AsyncMock()
+    ensure_database = AsyncMock()
+    monkeypatch.setattr(npi_module, "prepare_nppes_release_chain", prepare_chain)
+    monkeypatch.setattr(
+        npi_module,
+        "import_nppes_public_evidence_chain",
+        import_chain,
+    )
+    monkeypatch.setattr(npi_module, "ensure_database", ensure_database)
+    worker_context_map = {
+        "context": {},
+        "redis": SimpleNamespace(enqueue_job=AsyncMock()),
+        "import_date": "20260809",
+    }
+
+    with pytest.raises(
+        npi_module.NPIPrerequisiteError,
+        match="cannot admit immutable public evidence",
+    ):
+        await npi_module.process_data(worker_context_map, {"test_mode": True})
+
+    assert worker_context_map["context"]["run"] == 0
+    prepare_chain.assert_not_awaited()
+    import_chain.assert_not_awaited()
+    ensure_database.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_npi_import_lease_is_session_owned_and_released(
+    monkeypatch,
+    npi_module,
+):
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(side_effect=[True, 731, 731, True, True])
+    )
+    exit_events: list[tuple[object, object, object]] = []
+
+    @asynccontextmanager
+    async def lease_manager():
+        try:
+            yield connection
+        finally:
+            exit_events.append((None, None, None))
+
+    manager = lease_manager()
+    monkeypatch.setattr(npi_module.db, "acquire_driver", lambda: manager)
+    worker_context_by_key: dict[str, object] = {}
+    await npi_module._acquire_npi_import_lease(worker_context_by_key)
+    await npi_module._assert_npi_import_lease(worker_context_by_key)
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="already held"):
+        await npi_module._acquire_npi_import_lease(worker_context_by_key)
+    await npi_module._release_npi_import_lease(
+        worker_context_by_key,
+        suppress_errors=False,
+    )
+    assert npi_module._NPI_IMPORT_LEASE_KEY not in worker_context_by_key
+    assert connection.fetchval.await_count == 5
+    assert len(exit_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_npi_import_lease_rejects_a_missing_advisory_lock(npi_module):
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(side_effect=[941, False])
+    )
+    worker_context_by_key = {
+        npi_module._NPI_IMPORT_LEASE_KEY: npi_module._NpiImportLease(
+            manager=object(),
+            connection=connection,
+            backend_pid=941,
+        )
+    }
+
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="lease was lost"):
+        await npi_module._assert_npi_import_lease(worker_context_by_key)
+
+    lock_query = connection.fetchval.await_args_list[1].args[0]
+    assert "pg_catalog.pg_locks" in lock_query
+    for required_fragment in (
+        "held_lock.granted",
+        "held_lock.mode = 'ExclusiveLock'",
+        "held_lock.database",
+        "current_database()",
+        "held_lock.classid",
+        "held_lock.objid",
+        "held_lock.objsubid = 1",
+        "held_lock.pid = pg_backend_pid()",
+    ):
+        assert required_fragment in lock_query
+
+
+@pytest.mark.asyncio
+async def test_nppes_runtime_accepts_the_proved_postgres_configuration(npi_module):
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(return_value=(180002, "on", "on", "on", "pglz"))
+    )
+    worker_context_by_key = {
+        npi_module._NPI_IMPORT_LEASE_KEY: npi_module._NpiImportLease(
+            manager=object(),
+            connection=connection,
+            backend_pid=941,
+        )
+    }
+
+    await npi_module._assert_nppes_postgres_runtime(worker_context_by_key)
+
+    assert "current_setting('wal_compression')" in connection.fetchrow.await_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "settings",
+    (
+        (170999, "on", "on", "on", "pglz"),
+        (180002, "off", "on", "on", "pglz"),
+        (180002, "on", "off", "on", "pglz"),
+        (180002, "on", "on", "off", "pglz"),
+        (180002, "on", "on", "on", "off"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_nppes_runtime_rejects_unproved_postgres_settings(
+    npi_module,
+    settings,
+):
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=settings))
+    worker_context_by_key = {
+        npi_module._NPI_IMPORT_LEASE_KEY: npi_module._NpiImportLease(
+            manager=object(),
+            connection=connection,
+            backend_pid=941,
+        )
+    }
+
+    with pytest.raises(
+        npi_module.NPIPrerequisiteError,
+        match="durability configuration is invalid",
+    ):
+        await npi_module._assert_nppes_postgres_runtime(worker_context_by_key)
+
+
+@pytest.mark.asyncio
+async def test_nppes_catalog_preflight_uses_the_lease_connection(
+    monkeypatch,
+    npi_module,
+):
+    connection = object()
+    worker_context_by_key = {
+        npi_module._NPI_IMPORT_LEASE_KEY: npi_module._NpiImportLease(
+            manager=object(),
+            connection=connection,
+            backend_pid=941,
+        )
+    }
+    assert_catalog = AsyncMock()
+    monkeypatch.setattr(npi_module, "assert_nppes_admission_catalog", assert_catalog)
+
+    await npi_module._assert_nppes_storage_catalog(
+        worker_context_by_key,
+        "mrf",
+    )
+
+    assert_catalog.assert_awaited_once_with(connection, "mrf")
+
+
+@pytest.mark.asyncio
+async def test_npi_import_lease_rejects_a_parallel_attempt_and_closes_connection(
+    monkeypatch,
+    npi_module,
+):
+    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=[False, 811]))
+    exit_events: list[None] = []
+
+    @asynccontextmanager
+    async def lease_manager():
+        try:
+            yield connection
+        finally:
+            exit_events.append(None)
+
+    monkeypatch.setattr(npi_module.db, "acquire_driver", lease_manager)
+    worker_context_by_key: dict[str, object] = {}
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="already active"):
+        await npi_module._acquire_npi_import_lease(worker_context_by_key)
+    assert npi_module._NPI_IMPORT_LEASE_KEY not in worker_context_by_key
+    assert exit_events == [None]
+
+
+@pytest.mark.asyncio
+async def test_staged_write_failure_cancels_and_drains_its_sibling(npi_module):
+    sibling_started = asyncio.Event()
+
+    async def waiting_write() -> None:
+        sibling_started.set()
+        await asyncio.Event().wait()
+
+    async def failing_write() -> None:
+        await sibling_started.wait()
+        raise RuntimeError("synthetic write failure")
+
+    waiting_task = asyncio.create_task(waiting_write())
+    failing_task = asyncio.create_task(failing_write())
+    owned_tasks = [waiting_task, failing_task]
+    with pytest.raises(RuntimeError, match="synthetic write failure"):
+        await npi_module._drain_npi_save_tasks(owned_tasks)
+    assert waiting_task.cancelled()
+    assert failing_task.done()
+    assert owned_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_controlled_test_mode_fails_before_database_or_staging(
+    monkeypatch,
+    npi_module,
+):
+    ensure_database = AsyncMock()
+    staging_reset = AsyncMock()
+    release_lease = AsyncMock()
+    monkeypatch.setattr(npi_module, "ensure_database", ensure_database)
+    monkeypatch.setattr(npi_module, "_prepare_npi_staging", staging_reset)
+    monkeypatch.setattr(npi_module, "_release_npi_import_lease", release_lease)
+    worker_context_by_key = {
+        "context": {"control_run_id": "run_synthetic"},
+        "import_date": "20260809",
+    }
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="isolated publication"):
+        await npi_module.process_data(
+            worker_context_by_key,
+            {"test_mode": True, "run_id": "run_synthetic"},
+        )
+    ensure_database.assert_not_awaited()
+    staging_reset.assert_not_awaited()
+    assert worker_context_by_key["context"]["run"] == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_rejects_test_mode_before_database_or_publication(
+    monkeypatch,
+    npi_module,
+):
+    assert_lease = AsyncMock()
+    release_lease = AsyncMock()
+    ensure_database = AsyncMock()
+    monkeypatch.setattr(npi_module, "_assert_npi_import_lease", assert_lease)
+    monkeypatch.setattr(npi_module, "_release_npi_import_lease", release_lease)
+    monkeypatch.setattr(npi_module, "ensure_database", ensure_database)
+    worker_context_map = {
+        "context": {
+            "run": 1,
+            "test_mode": True,
+            "control_run_id": "run_test_mode",
+            "_control_attempt_id": "run_test_mode:" + "a" * 32,
+            "_control_attempt_started_at": "2026-08-09T00:00:00.000000+00:00",
+        },
+        "import_date": "20260809",
+    }
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="cannot publish"):
+        await npi_module.shutdown(worker_context_map)
+    assert_lease.assert_awaited_once()
+    ensure_database.assert_not_awaited()
+    release_lease.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_normalizes_missing_required_evidence_receipt(
+    monkeypatch,
+    npi_module,
+):
+    monkeypatch.setenv("HLTHPRT_NPPES_PUBLIC_EVIDENCE_MODE", "required")
+    monkeypatch.setenv(
+        "HLTHPRT_NPPES_RIGHTS_PROOF_SHA256",
+        NPPES_RIGHTS_PROOF_SHA256,
+    )
+    monkeypatch.setattr(npi_module, "_assert_npi_import_lease", AsyncMock())
+    monkeypatch.setattr(npi_module, "_release_npi_import_lease", AsyncMock())
+    ensure_database = AsyncMock()
+    monkeypatch.setattr(npi_module, "ensure_database", ensure_database)
+    worker_context_map = {
+        "context": {
+            "run": 1,
+            "test_mode": False,
+            "control_run_id": "run_missing_receipt",
+            "_control_attempt_id": "run_missing_receipt:" + "b" * 32,
+            "_control_attempt_started_at": "2026-08-09T00:00:00.000000+00:00",
+        },
+        "import_date": "20260809",
+    }
+    with pytest.raises(npi_module.NPIPrerequisiteError) as caught:
+        await npi_module.shutdown(worker_context_map)
+    assert str(caught.value) == "NPPES public-evidence admission receipt is invalid"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    ensure_database.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -721,6 +1071,9 @@ async def test_process_data_failure_does_not_mark_run(monkeypatch, npi_module):
     monkeypatch.setattr(npi_module, "_assert_nppes_canonical_ready", AsyncMock())
     monkeypatch.setattr(npi_module, "_load_nucc_taxonomy_int_code_map", AsyncMock(return_value={}))
     monkeypatch.setattr(npi_module.db, "status", AsyncMock())
+    monkeypatch.setattr(npi_module, "_acquire_npi_import_lease", AsyncMock())
+    monkeypatch.setattr(npi_module, "_assert_npi_import_lease", AsyncMock())
+    monkeypatch.setattr(npi_module, "_release_npi_import_lease", AsyncMock())
 
     worker_context_map = {
         "context": {},
@@ -760,6 +1113,8 @@ async def test_startup_initializes_tables(monkeypatch, npi_module):
     status_mock = AsyncMock()
     monkeypatch.setattr(npi_module.db, "create_table", create_mock)
     monkeypatch.setattr(npi_module.db, "status", status_mock)
+    staging_reset = AsyncMock()
+    monkeypatch.setattr(npi_module, "_prepare_npi_staging", staging_reset)
 
     startup_context_map: dict[str, object] = {}
     await npi_module.startup(startup_context_map)
@@ -769,6 +1124,7 @@ async def test_startup_initializes_tables(monkeypatch, npi_module):
     my_init_mock.assert_awaited_once()
     assert create_mock.await_count >= 1
     assert status_mock.await_count >= 1
+    staging_reset.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -789,110 +1145,199 @@ async def test_startup_honors_import_id_override(monkeypatch, npi_module):
     assert startup_context_map["import_date"] == "addrcanon_npi_timing"
 
 
-class _ShutdownDummyInsert:
-    def values(self, *_args, **_kwargs):
-        return self
-
-    def on_conflict_do_update(self, **_kwargs):
-        return self
-
-    async def status(self):
-        return None
-
-
-def _patch_npi_shutdown(monkeypatch, npi_module):
-    """Install deterministic database and archive collaborators for shutdown."""
-    monkeypatch.setenv("DB_SCHEMA", "testschema")
-    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_SOURCES", "nppes")
-    monkeypatch.setattr(npi_module, "make_class", _fake_make_class_factory("testschema"))
-    monkeypatch.setattr(npi_module, "print_time_info", lambda start: None)
-    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
-
-    scalar_mock = AsyncMock(return_value=6_000_000)
-    status_mock = AsyncMock()
-    execute_mock = AsyncMock()
-    monkeypatch.setattr(npi_module.db, "scalar", scalar_mock)
-    monkeypatch.setattr(npi_module.db, "status", status_mock)
-    monkeypatch.setattr(npi_module.db, "execute_ddl", execute_mock)
+class _ShutdownRawConnection:
+    def __init__(self, count_by_stage: dict[str, int]):
+        self.count_by_stage = count_by_stage
+        self.events: list[str] = []
 
     @asynccontextmanager
-    async def dummy_tx():
-        yield SimpleNamespace()
+    async def transaction(self):
+        self.events.append("transaction:begin")
+        try:
+            yield self
+        except BaseException:
+            self.events.append("transaction:rollback")
+            raise
+        self.events.append("transaction:commit")
 
-    monkeypatch.setattr(npi_module.db, "transaction", lambda: dummy_tx())
+    async def execute(self, statement: str, *_args):
+        self.events.append(statement)
+        return "OK"
 
-    monkeypatch.setattr(
-        npi_module.db,
-        "insert",
-        lambda *_args, **_kwargs: _ShutdownDummyInsert(),
+    async def fetchval(self, statement: str, *_args):
+        self.events.append(statement)
+        if "count(*)::bigint" in statement:
+            return next(
+                count
+                for stage_name, count in self.count_by_stage.items()
+                if stage_name in statement
+            )
+        return 1
+
+
+class _AmbiguousPublicationConnection:
+    @asynccontextmanager
+    async def transaction(self):
+        yield self
+        raise RuntimeError("synthetic ambiguous commit")
+
+
+def _shutdown_stage_classes(npi_module):
+    return tuple(
+        SimpleNamespace(__main_table__=table_name, __tablename__=table_name)
+        for table_name in npi_module.NPI_CANONICAL_TABLES
     )
-    monkeypatch.setattr(npi_module.db, "func", SimpleNamespace(now=lambda: "NOW"))
-    stamp_address_keys = AsyncMock()
-    monkeypatch.setattr(npi_module, "stamp_address_keys", stamp_address_keys)
+
+
+def _install_shutdown_success_collaborators(monkeypatch, npi_module, raw_connection):
+    monkeypatch.setenv("DB_SCHEMA", "testschema")
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "testschema")
+    monkeypatch.setattr(npi_module, "_NPI_STAGING_CLASSES", _shutdown_stage_classes(npi_module))
+    monkeypatch.setattr(npi_module, "make_class", _fake_make_class_factory("testschema"))
+    monkeypatch.setattr(npi_module, "source_enabled", lambda _source: False)
+    monkeypatch.setattr(npi_module, "_npi_requires_nucc", lambda _context: False)
+    monkeypatch.setattr(npi_module, "_nppes_evidence_runtime_config", lambda _context: SimpleNamespace(required=True))
+    monkeypatch.setattr(npi_module, "_required_nppes_evidence_receipt", lambda _context: SimpleNamespace(chain_ref="penpc1_" + "a" * 43))
+    monkeypatch.setattr(npi_module, "_nppes_evidence_metrics", lambda _receipt: {"status": "complete"})
+    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(npi_module, "_assert_npi_import_lease", AsyncMock())
+    monkeypatch.setattr(npi_module, "_release_npi_import_lease", AsyncMock())
+    monkeypatch.setattr(npi_module, "raise_if_cancelled", AsyncMock())
+    monkeypatch.setattr(npi_module, "lock_npi_publication_attempt", AsyncMock())
+    monkeypatch.setattr(npi_module, "canonical_relation_oids", AsyncMock(return_value=(11, 12, 13, 14, 15, 16)))
+    publication_receipt = SimpleNamespace(publication_ref="nppub1_" + "b" * 43)
+    monkeypatch.setattr(npi_module, "insert_npi_publication_receipt", AsyncMock(return_value=publication_receipt))
+    monkeypatch.setattr(npi_module, "npi_publication_metrics", lambda receipt: {"publication_ref": receipt.publication_ref})
+    publication_commit = npi_module.NpiCanonicalPublicationCommit(
+        publication_receipt,
+        "2026-08-09T02:03:04.000000+00:00",
+        "2026-08-09T02:03:04.000000+00:00",
+    )
     monkeypatch.setattr(
         npi_module,
-        "resolve_into_archive",
-        AsyncMock(return_value=SimpleNamespace(staged=1, distinct_keys=1, inserted=1, elapsed_seconds=0.1)),
+        "mark_npi_publication_succeeded",
+        AsyncMock(return_value=publication_commit),
     )
-    openaddresses_backfill = AsyncMock()
-    monkeypatch.delenv("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", raising=False)
-    monkeypatch.setattr(npi_module, "refresh_archive_geocodes_from_openaddresses_sharded", openaddresses_backfill)
-    progress_events: list[dict[str, object]] = []
-    control_updates: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(npi_module, "print_time_info", lambda _start: None)
+    monkeypatch.setattr(npi_module.db, "scalar", AsyncMock(return_value=6_000_000))
+    monkeypatch.setattr(npi_module.db, "status", AsyncMock())
+    monkeypatch.setattr(npi_module.db, "execute_ddl", AsyncMock())
+    monkeypatch.setattr(npi_module.func, "count", lambda _value: "count")
+    monkeypatch.setattr(npi_module, "select", lambda *_values: "count query")
 
-    monkeypatch.setattr(npi_module, "enqueue_live_progress", lambda **payload: progress_events.append(payload))
+    @asynccontextmanager
+    async def database_transaction():
+        yield SimpleNamespace()
 
-    async def fake_mark_control_run(run_id, **kwargs):
-        control_updates.append((run_id, kwargs))
+    monkeypatch.setattr(npi_module.db, "transaction", database_transaction)
+    return publication_receipt
 
-    monkeypatch.setattr(npi_module, "mark_control_run", fake_mark_control_run)
-    return (
-        scalar_mock,
-        status_mock,
-        execute_mock,
-        stamp_address_keys,
-        openaddresses_backfill,
-        progress_events,
-        control_updates,
+
+@pytest.mark.asyncio
+async def test_publication_transaction_reconciles_only_an_exact_commit(
+    monkeypatch,
+    npi_module,
+):
+    receipt = SimpleNamespace(publication_ref="nppub1_" + "d" * 43)
+    commit = npi_module.NpiCanonicalPublicationCommit(
+        receipt,
+        "2026-08-09T02:03:04.000000+00:00",
+        "2026-08-09T02:03:04.000000+00:00",
     )
+    lease = npi_module._NpiImportLease(
+        object(),
+        _AmbiguousPublicationConnection(),
+        731,
+    )
+    state_by_name = {
+        "commit": commit,
+        "progress": {"phase": "npi published"},
+        "metrics": {"npi_canonical_publication": {"publication_ref": receipt.publication_ref}},
+    }
+    reconcile = AsyncMock(return_value=commit)
+    monkeypatch.setattr(
+        npi_module,
+        "_reconcile_npi_commit_after_error",
+        reconcile,
+    )
+    committed_context_by_name = {}
+
+    async with npi_module._npi_publication_transaction(
+        lease=lease,
+        schema="testschema",
+        context=committed_context_by_name,
+        publication_state_by_name=state_by_name,
+    ):
+        state_by_name["first_body_entered"] = True
+    assert state_by_name["commit"] == commit
+    assert committed_context_by_name["control_run_terminal_committed"] is True
+    reconcile.assert_awaited_once()
+
+    reconcile.return_value = None
+    with pytest.raises(RuntimeError, match="npi_canonical_publication_invalid"):
+        async with npi_module._npi_publication_transaction(
+            lease=lease,
+            schema="testschema",
+            context={},
+            publication_state_by_name=state_by_name,
+        ):
+            state_by_name["second_body_entered"] = True
 
 
 @pytest.mark.asyncio
 async def test_shutdown_handles_rotation(monkeypatch, npi_module):
-    """Verify shutdown handles rotation."""
-    (
-        scalar_mock,
-        status_mock,
-        execute_mock,
-        stamp_address_keys,
-        openaddresses_backfill,
-        progress_events,
-        control_updates,
-    ) = _patch_npi_shutdown(monkeypatch, npi_module)
-
+    """Seal stage census, table rotation, receipt, and terminal state together."""
+    stage_count_by_table = {
+        f"{table_name}_20251108": ordinal
+        for ordinal, table_name in enumerate(npi_module.NPI_CANONICAL_TABLES, 1)
+    }
+    raw_connection = _ShutdownRawConnection(stage_count_by_table)
+    publication_receipt = _install_shutdown_success_collaborators(
+        monkeypatch,
+        npi_module,
+        raw_connection,
+    )
+    lease = npi_module._NpiImportLease(object(), raw_connection, 731)
     shutdown_context_map = {
-        "context": {"run": 1, "start": datetime.datetime.utcnow(), "control_run_id": "npi-run-1"},
+        "context": {
+            "run": 1,
+            "start": datetime.datetime.utcnow(),
+            "control_run_id": "npi-run-1",
+            "_control_attempt_id": "npi-run-1:" + "c" * 32,
+            "_control_attempt_started_at": "2026-08-09T00:00:00.000000+00:00",
+            npi_module._NPI_IMPORT_LEASE_KEY: lease,
+        },
         "import_date": "20251108",
     }
+    shutdown_result_by_name = await npi_module.shutdown(shutdown_context_map)
 
-    await npi_module.shutdown(shutdown_context_map)
-
-    scalar_mock.assert_awaited()
-    stamp_address_keys.assert_awaited()
-    assert stamp_address_keys.await_args.kwargs["update_existing"] is False
-    assert execute_mock.await_count >= 1
-    assert status_mock.await_count >= 1
-    assert control_updates[-1][0] == "npi-run-1"
-    metrics = control_updates[-1][1]["metrics"]
-    timings = metrics["npi_shutdown_phase_timings"]
-    openaddresses_backfill.assert_not_awaited()
-    assert metrics["openaddresses_backfill_enabled"] is False
-    assert any(phase_timing["phase"] == "canonical_address_resolve" for phase_timing in timings)
-    assert not any(phase_timing["phase"] == "openaddresses_archive_backfill" for phase_timing in timings)
-    assert any(str(phase_timing["phase"]).startswith("vacuum_analyze:") for phase_timing in timings)
-    assert any(str(phase_timing["phase"]).startswith("publish_swap:") for phase_timing in timings)
-    assert all("elapsed_seconds" in phase_timing for phase_timing in timings)
-    assert any(event.get("phase") == "npi shutdown canonical_address_resolve" for event in progress_events)
+    receipt_mock = npi_module.insert_npi_publication_receipt
+    publication_input = receipt_mock.await_args.kwargs["publication_input"]
+    assert publication_input.row_counts == (1, 2, 3, 4, 5, 6)
+    assert publication_input.relation_oids == (11, 12, 13, 14, 15, 16)
+    npi_module.mark_npi_publication_succeeded.assert_awaited_once()
+    npi_module.raise_if_cancelled.assert_awaited()
+    first_swap = next(
+        index for index, event in enumerate(raw_connection.events)
+        if "DROP TABLE IF EXISTS testschema.npi_old" in event
+    )
+    final_count = max(
+        index for index, event in enumerate(raw_connection.events)
+        if "count(*)::bigint" in event
+    )
+    assert final_count < first_swap
+    assert raw_connection.events[-1] == "transaction:commit"
+    assert shutdown_context_map["context"][npi_module._NPI_CONTROL_TERMINAL_COMMITTED_KEY] is True
+    assert shutdown_context_map["context"][
+        npi_module._NPI_CONTROL_COMMITTED_FINISHED_AT_KEY
+    ] == "2026-08-09T02:03:04.000000+00:00"
+    assert shutdown_result_by_name["npi_canonical_publication"][
+        "publication_ref"
+    ] == publication_receipt.publication_ref
+    npi_module._release_npi_import_lease.assert_awaited_once_with(
+        shutdown_context_map["context"],
+        suppress_errors=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -967,36 +1412,29 @@ async def test_resolve_npi_address_archive_repairs_only_on_mismatch(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_main_enqueues_process_job(monkeypatch, npi_module):
-
-    fake_pool = SimpleNamespace(enqueue_job=AsyncMock())
-
-    monkeypatch.setattr(
-        npi_module,
-        "create_pool",
-        AsyncMock(return_value=fake_pool),
+async def test_main_creates_one_controlled_import_run(monkeypatch, npi_module):
+    control_imports = importlib.import_module("api.control_imports")
+    create_run = AsyncMock(
+        return_value=({"run_id": "run_npi", "status": "queued"}, True)
     )
+    ensure_table = AsyncMock()
+    monkeypatch.setattr(control_imports, "create_import_run", create_run)
+    monkeypatch.setattr(control_imports, "ensure_import_run_table", ensure_table)
 
-    monkeypatch.setattr(npi_module, "build_redis_settings", lambda: ("settings", "redis://localhost"))
+    result = await npi_module.main()
 
-    await npi_module.main()
-
-    fake_pool.enqueue_job.assert_awaited_once_with("process_data", {"test_mode": False}, _queue_name="arq:NPI")
+    assert result == {"run_id": "run_npi", "status": "queued"}
+    ensure_table.assert_awaited_once_with()
+    create_run.assert_awaited_once_with(
+        {
+            "importer": "npi",
+            "params": {},
+            "triggered_by": "manual",
+        }
+    )
 
 
 @pytest.mark.asyncio
-async def test_main_enqueues_process_job_test_mode(monkeypatch, npi_module):
-
-    fake_pool = SimpleNamespace(enqueue_job=AsyncMock())
-
-    monkeypatch.setattr(
-        npi_module,
-        "create_pool",
-        AsyncMock(return_value=fake_pool),
-    )
-
-    monkeypatch.setattr(npi_module, "build_redis_settings", lambda: ("settings", "redis://localhost"))
-
-    await npi_module.main(test_mode=True)
-
-    fake_pool.enqueue_job.assert_awaited_once_with("process_data", {"test_mode": True}, _queue_name="arq:NPI")
+async def test_main_rejects_live_queue_test_mode(monkeypatch, npi_module):
+    with pytest.raises(ValueError, match="isolated database"):
+        await npi_module.main(test_mode=True)

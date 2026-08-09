@@ -457,11 +457,19 @@ def _status_event_for_accepted_progress(
     progress_by_field["event_seq"] = merged.get("event_seq")
     progress_by_field["progress_seq"] = merged.get("progress_seq")
     event_by_field["progress"] = progress_by_field
-    event_by_field["heartbeat_at"] = (
-        merged.get("observed_at")
-        or merged.get("updated_at")
-        or event_by_field.get("heartbeat_at")
-    )
+    supplied_heartbeat_at = event_by_field.get("heartbeat_at")
+    if (
+        event_by_field.get("status")
+        in {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
+        and supplied_heartbeat_at is not None
+    ):
+        event_by_field["heartbeat_at"] = supplied_heartbeat_at
+    else:
+        event_by_field["heartbeat_at"] = (
+            merged.get("observed_at")
+            or merged.get("updated_at")
+            or supplied_heartbeat_at
+        )
     return event_by_field
 
 

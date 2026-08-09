@@ -354,17 +354,22 @@ def test_public_evidence_contract_has_only_stdlib_or_local_imports() -> None:
 
 def test_runtime_and_container_do_not_wire_the_dormant_package() -> None:
     repository_root = Path(__file__).resolve().parents[1]
-    explicit_replay_executor = (
-        repository_root / "process" / "public_evidence_fhir_organization_replay.py"
-    )
+    authorized_runtime_adapters = {
+        "process/npi_canonical_publication.py",
+        "process/nppes_public_evidence_chain.py",
+        "process/nppes_public_evidence_chain_rows.py",
+        "process/nppes_public_evidence_members.py",
+        "process/nppes_public_evidence_replay.py",
+        "process/nppes_public_evidence_rows.py",
+        "process/nppes_public_evidence_writer.py",
+        "process/public_evidence_fhir_organization_replay.py",
+    }
     runtime_sources = [repository_root / "main.py"]
     for package_name in ("api", "db", "process", "service"):
         runtime_sources.extend((repository_root / package_name).rglob("*.py"))
 
     importing_paths = []
     for source_path in runtime_sources:
-        if source_path == explicit_replay_executor:
-            continue
         tree = ast.parse(
             source_path.read_text(encoding="utf-8"),
             filename=str(source_path),
@@ -385,6 +390,6 @@ def test_runtime_and_container_do_not_wire_the_dormant_package() -> None:
         if imports:
             importing_paths.append(source_path.relative_to(repository_root).as_posix())
 
-    assert not importing_paths
+    assert set(importing_paths) == authorized_runtime_adapters
     dockerfile = (repository_root / "Dockerfile").read_text(encoding="utf-8")
     assert "public_evidence" not in dockerfile

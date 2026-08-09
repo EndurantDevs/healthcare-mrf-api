@@ -178,7 +178,7 @@ Run from repo root in an activated virtualenv.
 | --- | --- | --- | --- |
 | `mrf` | `python main.py start mrf` | `python main.py worker process.MRF --burst` | `python main.py worker process.MRF_finish --burst` or `python main.py finish mrf` |
 | `plan-attributes` | `python main.py start plan-attributes` | `python main.py worker process.Attributes --burst` | publish handled in worker shutdown |
-| `npi` | `python main.py start npi` | `python main.py worker process.NPI --burst` | `python main.py worker process.NPI_finish --burst` |
+| `npi` | `python main.py start npi` | `python main.py worker process.NPI --burst` | publish handled atomically in worker shutdown |
 | `nucc` | `python main.py start nucc` | `python main.py worker process.NUCC --burst` | publish handled in worker shutdown |
 | `claims-pricing` | `python main.py start claims-pricing [--import-id YYYYMMDD] [--test]` | `python main.py worker process.ClaimsPricing --burst` | `python main.py worker process.ClaimsPricing_finish --burst` or `python main.py finish claims-pricing --import-id <import_id> --run-id <run_id> [--test]` |
 | `claims-procedures` | `python main.py start claims-procedures [--import-id YYYYMMDD] [--test]` | `python main.py worker process.ClaimsPricing --burst` | `python main.py worker process.ClaimsPricing_finish --burst` or `python main.py finish claims-procedures --import-id <import_id> --run-id <run_id> [--test]` |

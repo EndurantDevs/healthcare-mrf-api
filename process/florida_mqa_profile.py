@@ -2007,6 +2007,23 @@ def _indicator_value(source_value: str) -> dict[str, Any]:
     return {"status": "source_reported", "source_value": value}
 
 
+def _mapped_profile_display(
+    profile_source: FloridaSource,
+    field_value_by_key: Mapping[str, Any],
+) -> str:
+    """Return the stable display label for one mapped profile fact."""
+
+    display_values = [
+        str(field_value_by_key[field])
+        for field in _PROFILE_DISPLAY_VALUE_FIELDS.get(profile_source.key, ())
+        if field_value_by_key.get(field)
+    ]
+    unique_display_values = tuple(dict.fromkeys(display_values))
+    if not unique_display_values:
+        return profile_source.title
+    return f"{profile_source.title}: {' — '.join(unique_display_values)}"
+
+
 def _mapped_profile_data_fact(
     profile_source: FloridaSource,
     source_row: Mapping[str, str],
@@ -2035,17 +2052,6 @@ def _mapped_profile_data_fact(
         else:
             field_value_by_key[output_field] = source_value
     field_value_by_key = _without_empty(field_value_by_key)
-    display_values = [
-        str(field_value_by_key[field])
-        for field in _PROFILE_DISPLAY_VALUE_FIELDS.get(profile_source.key, ())
-        if field_value_by_key.get(field)
-    ]
-    display_values = list(dict.fromkeys(display_values))
-    display = (
-        f"{profile_source.title}: {' — '.join(display_values)}"
-        if display_values
-        else profile_source.title
-    )
     start_field, end_field = _PROFILE_EFFECTIVE_FIELDS.get(
         profile_source.key,
         (None, None),
@@ -2057,7 +2063,7 @@ def _mapped_profile_data_fact(
         record_id=record_id,
         npi=npi,
         artifact=artifact,
-        display=display,
+        display=_mapped_profile_display(profile_source, field_value_by_key),
         value_json=field_value_by_key,
         effective_start=(
             str(field_value_by_key.get(start_field) or "")

@@ -91,6 +91,10 @@ CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
 PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"premise_key"}
+PUBLIC_NPI_EXCLUDED_COLUMNS = {
+    "employer_identification_number",
+    "parent_organization_tin",
+}
 PUBLIC_ADDRESS_SITE_KEY = "address_site_key"
 PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS = {
     "location_key",
@@ -399,7 +403,9 @@ _TABLE_COLUMNS_CACHE: dict[str, tuple[float, set[str]]] = {}
 _NPI_FILTER_CAPABILITIES_CACHE_STATE: dict[
     str, Optional[tuple[float, str, dict[str, bool]]]
 ] = {"entry": None}
-_NPI_PRIMARY_TOTAL_CACHE_STATE: dict[str, Optional[tuple[float, int]]] = {
+_NPI_PRIMARY_TOTAL_CACHE_STATE: dict[
+    str, Optional[tuple[float, str, int]]
+] = {
     "entry": None
 }
 _NPI_HAS_INSURANCE_TOTAL_CACHE: dict[str, tuple[float, int]] = {}
@@ -571,12 +577,58 @@ async def _get_taxonomy_codes_for_classification(classification: str, *, session
     return list(values)
 
 
+async def _classification_npi_rows(query, taxonomy_codes, session):
+    """Read taxonomy-matched NPI rows through either supported DB seam."""
+
+    if session is not None:
+        query_result = await session.execute(
+            query,
+            {"taxonomy_codes": taxonomy_codes},
+        )
+        return query_result.all()
+    async with db.acquire() as connection:
+        return await connection.all(
+            query,
+            taxonomy_codes=taxonomy_codes,
+        )
+
+
+def _classification_npi_values(taxonomy_npi_rows) -> list[int]:
+    """Normalize mapping and positional query rows into integer NPIs."""
+
+    npi_values: list[int] = []
+    for taxonomy_npi_row in taxonomy_npi_rows:
+        mapping = getattr(taxonomy_npi_row, "_mapping", None)
+        npi_value = (
+            mapping.get("npi")
+            if mapping is not None
+            else (taxonomy_npi_row[0] if taxonomy_npi_row else None)
+        )
+        if npi_value is None:
+            continue
+        try:
+            npi_values.append(int(npi_value))
+        except (TypeError, ValueError):
+            continue
+    return npi_values
+
+
 async def _get_classification_npi_list(classification: str, *, session=None) -> list[int]:
-    key = str(classification or "").strip().lower()
-    if not key:
+    """Return the publication-scoped NPI list for one taxonomy classification."""
+
+    classification_key = str(classification or "").strip().lower()
+    if not classification_key:
         return []
+    publication_identity = await _npi_canonical_publication_identity(
+        session=session
+    )
+    cache_key = (
+        f"{publication_identity}|{classification_key}"
+        if publication_identity is not None
+        else None
+    )
     now = time.time()
-    cached = _CLASSIFICATION_NPI_CACHE.get(key)
+    cached = _CLASSIFICATION_NPI_CACHE.get(cache_key) if cache_key else None
     if cached and (now - cached[0]) < _CLASSIFICATION_NPI_CACHE_TTL_SECONDS:
         return list(cached[1])
 
@@ -584,47 +636,29 @@ async def _get_classification_npi_list(classification: str, *, session=None) -> 
     if not taxonomy_codes:
         return []
 
+    schema = _runtime_db_schema()
     query = text(
-        """
+        f"""
         SELECT DISTINCT t.npi
-          FROM mrf.npi_taxonomy AS t
+          FROM {schema}.npi_taxonomy AS t
          WHERE t.healthcare_provider_taxonomy_code = ANY(:taxonomy_codes)
          ORDER BY t.npi
         """
     )
-    if session is not None:
-        query_result = await session.execute(
-            query,
-            {"taxonomy_codes": taxonomy_codes},
-        )
-        taxonomy_npi_rows = query_result.all()
-    else:
-        async with db.acquire() as conn:
-            taxonomy_npi_rows = await conn.all(
-                query,
-                taxonomy_codes=taxonomy_codes,
-            )
-
-    npi_list: list[int] = []
-    for taxonomy_npi_row in taxonomy_npi_rows:
-        mapping = getattr(taxonomy_npi_row, "_mapping", None)
-        if mapping is not None:
-            npi_value = mapping.get("npi")
-        else:
-            npi_value = taxonomy_npi_row[0] if taxonomy_npi_row else None
-        if npi_value is None:
-            continue
-        try:
-            npi_list.append(int(npi_value))
-        except (TypeError, ValueError):
-            continue
-
-    _set_limited_classification_cache(
-        _CLASSIFICATION_NPI_CACHE,
-        key,
-        npi_list,
-        now,
+    taxonomy_npi_rows = await _classification_npi_rows(
+        query,
+        taxonomy_codes,
+        session,
     )
+    npi_list = _classification_npi_values(taxonomy_npi_rows)
+
+    if cache_key is not None:
+        _set_limited_classification_cache(
+            _CLASSIFICATION_NPI_CACHE,
+            cache_key,
+            npi_list,
+            now,
+        )
     return list(npi_list)
 
 
@@ -670,9 +704,24 @@ def _model_table_columns(model: Any) -> set[str]:
     return {str(column.key) for column in table.columns if getattr(column, "key", None)}
 
 
+_DB_SCHEMA_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}", flags=re.ASCII)
+
+
+def _runtime_db_schema() -> str:
+    """Resolve the schema shared by runtime queries and Alembic."""
+
+    runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
+    legacy_schema = os.getenv("DB_SCHEMA")
+    if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
+        raise RuntimeError("npi_database_schema_configuration_conflicts")
+    schema = runtime_schema or legacy_schema or "mrf"
+    if _DB_SCHEMA_RE.fullmatch(schema) is None:
+        raise RuntimeError("npi_database_schema_invalid")
+    return schema
+
+
 def _schema_cache_key(table_name: str) -> str:
-    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    return f"{schema}.{table_name}"
+    return f"{_runtime_db_schema()}.{table_name}"
 
 
 def _cache_get(cache: dict[str, tuple[float, Any]], key: str) -> Any:
@@ -704,7 +753,7 @@ def _filter_cache_get() -> Optional[dict[str, bool]]:
     if (time.monotonic() - cached_at) > _NPI_SCHEMA_CACHE_TTL_SECONDS:
         _NPI_FILTER_CAPABILITIES_CACHE_STATE["entry"] = None
         return None
-    if schema_key != (os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"):
+    if schema_key != _runtime_db_schema():
         _NPI_FILTER_CAPABILITIES_CACHE_STATE["entry"] = None
         return None
     return dict(value)
@@ -714,28 +763,35 @@ def _filter_cache_set(value: dict[str, bool]) -> dict[str, bool]:
     if ENABLE_NPI_SCHEMA_CACHE:
         _NPI_FILTER_CAPABILITIES_CACHE_STATE["entry"] = (
             time.monotonic(),
-            os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            _runtime_db_schema(),
             dict(value),
         )
     return value
 
 
-def _primary_total_cache_get() -> Optional[int]:
+def _primary_total_cache_get(publication_identity: str) -> Optional[int]:
     if not ENABLE_NPI_SCHEMA_CACHE:
         return None
     cache_entry = _NPI_PRIMARY_TOTAL_CACHE_STATE["entry"]
     if cache_entry is None:
         return None
-    cached_at, value = cache_entry
+    cached_at, cached_identity, value = cache_entry
     if (time.monotonic() - cached_at) > _NPI_SCHEMA_CACHE_TTL_SECONDS:
+        _NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] = None
+        return None
+    if cached_identity != publication_identity:
         _NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] = None
         return None
     return int(value)
 
 
-def _primary_total_cache_set(value: int) -> int:
+def _primary_total_cache_set(publication_identity: str, value: int) -> int:
     if ENABLE_NPI_SCHEMA_CACHE:
-        _NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] = (time.monotonic(), int(value))
+        _NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] = (
+            time.monotonic(),
+            publication_identity,
+            int(value),
+        )
     return int(value)
 
 
@@ -748,24 +804,40 @@ MAX_PROVIDER_DIRECTORY_FHIR_PROVENANCE_TEXT_LENGTH = 2048
 _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR = "_healthporta_provider_directory_role_jit_disabled"
 
 
-def _has_insurance_total_cache_key(city: Optional[str], state: Optional[str]) -> str:
+def _has_insurance_total_cache_key(
+    publication_identity: str,
+    city: Optional[str],
+    state: Optional[str],
+) -> str:
     city_key = (city or "").strip().upper()
     state_key = (state or "").strip().upper()
-    return f"{city_key}|{state_key}"
+    return f"{publication_identity}|{city_key}|{state_key}"
 
 
-def _has_insurance_total_cache_get(city: Optional[str], state: Optional[str]) -> Optional[int]:
-    cached = _cache_get(_NPI_HAS_INSURANCE_TOTAL_CACHE, _has_insurance_total_cache_key(city, state))
+def _has_insurance_total_cache_get(
+    publication_identity: str,
+    city: Optional[str],
+    state: Optional[str],
+) -> Optional[int]:
+    cached = _cache_get(
+        _NPI_HAS_INSURANCE_TOTAL_CACHE,
+        _has_insurance_total_cache_key(publication_identity, city, state),
+    )
     if cached is None:
         return None
     return int(cached)
 
 
-def _has_insurance_total_cache_set(city: Optional[str], state: Optional[str], value: int) -> int:
+def _has_insurance_total_cache_set(
+    publication_identity: str,
+    city: Optional[str],
+    state: Optional[str],
+    value: int,
+) -> int:
     return int(
         _cache_set(
             _NPI_HAS_INSURANCE_TOTAL_CACHE,
-            _has_insurance_total_cache_key(city, state),
+            _has_insurance_total_cache_key(publication_identity, city, state),
             int(value),
         )
     )
@@ -847,35 +919,28 @@ def _npi_detail_cache_key(
     profile_generation: str | None = None,
     profile_serving_identity: str | None = None,
     address_overlay_serving_identity: str | None = None,
+    canonical_publication_identity: str | None = None,
     address_limit: int | None = None,
     address_offset: int = 0,
     include_address_total: bool = True,
     address_key: str | None = None,
 ) -> str:
-    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema = _runtime_db_schema()
     address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
-    geocode_mode = "sync_geo" if sync_geocode else "stored_geo"
-    archive_mode = "archive_geo" if lookup_stored_geocode else "no_archive_geo"
-    debug_mode = f"sources:{int(include_sources)}|evidence:{int(include_evidence)}"
-    profile_mode = (
-        f"profile:{int(include_profile)}|"
-        f"pgen:{profile_generation or 'none'}|"
-        f"pserve:{profile_serving_identity or 'unknown'}"
-    )
-    address_overlay_mode = (
-        "pdaddr:"
-        f"{address_overlay_serving_identity or 'unknown'}"
-    )
-    page_mode = (
-        f"alim:{address_limit if address_limit is not None else 'all'}|"
-        f"aoff:{int(address_offset or 0)}|atotal:{int(include_address_total)}|"
-        f"akey:{address_key or 'none'}"
-    )
     return (
         f"{schema}|{address_source}|{int(npi)}|{view}|"
         f"{'chain' if include_chain else 'default'}|"
-        f"extra:{int(extra_info)}|{geocode_mode}|{archive_mode}|{debug_mode}|"
-        f"{profile_mode}|{address_overlay_mode}|{page_mode}"
+        f"extra:{int(extra_info)}|"
+        f"{'sync_geo' if sync_geocode else 'stored_geo'}|"
+        f"{'archive_geo' if lookup_stored_geocode else 'no_archive_geo'}|"
+        f"sources:{int(include_sources)}|evidence:{int(include_evidence)}|"
+        f"profile:{int(include_profile)}|pgen:{profile_generation or 'none'}|"
+        f"pserve:{profile_serving_identity or 'unknown'}|"
+        f"pdaddr:{address_overlay_serving_identity or 'unknown'}|"
+        f"npipub:{canonical_publication_identity or 'untracked'}|"
+        f"alim:{address_limit if address_limit is not None else 'all'}|"
+        f"aoff:{int(address_offset or 0)}|atotal:{int(include_address_total)}|"
+        f"akey:{address_key or 'none'}"
     )
 
 
@@ -2933,7 +2998,7 @@ async def _fetch_provider_directory_role_evidence_map(
     )
     if table_flags is None:
         return {}
-    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema = _runtime_db_schema()
     await _disable_provider_directory_evidence_jit(session)
     evidence_result = await _execute_stmt(
         text(
@@ -2970,7 +3035,7 @@ async def _provider_directory_evidence_tables(
             text(PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL),
             session=session,
             params={
-                "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                "schema": _runtime_db_schema(),
                 "table_names": table_names,
                 "column_table_names": [
                     table_name for table_name, _column_name in optional_columns
@@ -3432,7 +3497,7 @@ async def _fetch_provider_directory_affiliation_evidence_map(
     )
     if table_flags is None:
         return {}
-    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema = _runtime_db_schema()
     await _disable_provider_directory_evidence_jit(session)
     evidence_result = await _execute_stmt(
         text(
@@ -4182,16 +4247,20 @@ async def _fetch_ffs_summary_overrides(
 
 
 async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -> int:
-    has_cached_insurance_count = _has_insurance_total_cache_get(city, state)
-    if has_cached_insurance_count is not None:
-        return has_cached_insurance_count
-
     required_columns = {"npi", "type", "plans_network_array"}
     if city:
         required_columns.add("city_name")
     if state:
         required_columns.add("state_name")
     address_model = await _address_serving_model(required_columns)
+    publication_identity = await _npi_count_cache_identity(address_model)
+    has_cached_insurance_count = (
+        _has_insurance_total_cache_get(publication_identity, city, state)
+        if publication_identity is not None
+        else None
+    )
+    if has_cached_insurance_count is not None:
+        return has_cached_insurance_count
     table = address_model.__table__
     conditions = [
         table.c.type == "primary",
@@ -4210,18 +4279,27 @@ async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -
         stmt = select(func.count(func.distinct(table.c.npi))).where(*conditions)
     async with db.session() as session:
         count_result = await session.execute(stmt)
+        count = int(count_result.scalar() or 0)
+        if publication_identity is None:
+            return count
         return _has_insurance_total_cache_set(
+            publication_identity,
             city,
             state,
-            int(count_result.scalar() or 0),
+            count,
         )
 
 
 async def _fast_primary_npi_count() -> int:
-    cached = _primary_total_cache_get()
+    address_model = await _address_serving_model({"type"})
+    publication_identity = await _npi_count_cache_identity(address_model)
+    cached = (
+        _primary_total_cache_get(publication_identity)
+        if publication_identity is not None
+        else None
+    )
     if cached is not None:
         return cached
-    address_model = await _address_serving_model({"type"})
     table = address_model.__table__
     if address_model is EntityAddressUnified:
         stmt = select(func.count(func.distinct(table.c.npi))).where(table.c.type == "primary")
@@ -4230,14 +4308,23 @@ async def _fast_primary_npi_count() -> int:
     scalar_fn = getattr(db, "scalar", None)
     if scalar_fn is not None:
         try:
-            value = await scalar_fn(stmt)
-            return _primary_total_cache_set(int(value or 0))
+            scalar_value = await scalar_fn(stmt)
+            count = int(scalar_value or 0)
+            if publication_identity is None:
+                return count
+            return _primary_total_cache_set(publication_identity, count)
         except Exception as exc:  # pragma: no cover - fallback for lightweight test doubles
-            logger.debug("primary NPI count scalar path failed; falling back to acquire path: %s", exc)
+            logger.debug(
+                "Primary NPI count scalar path failed; using acquire path (%s)",
+                type(exc).__name__,
+            )
     async with db.acquire() as conn:
-        rows = await conn.all(stmt)
-    value = rows[0][0] if rows else 0
-    return _primary_total_cache_set(int(value or 0))
+        count_rows = await conn.all(stmt)
+    fallback_value = count_rows[0][0] if count_rows else 0
+    count = int(fallback_value or 0)
+    if publication_identity is None:
+        return count
+    return _primary_total_cache_set(publication_identity, count)
 
 
 def _nearby_geo_type_clause(address_table_sql: str) -> str:
@@ -6374,8 +6461,9 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
     args = request.args
     unknown_params = sorted(set(args.keys()) - MATCH_CANDIDATE_QUERY_PARAMS)
     if unknown_params:
-        joined = ", ".join(unknown_params)
-        raise sanic.exceptions.InvalidUsage(f"unknown query parameter(s): {joined}")
+        raise sanic.exceptions.InvalidUsage(
+            f"unknown query parameter(s): {', '.join(unknown_params)}"
+        )
 
     args.get("address_site_key")
     args.get("address_key")
@@ -8667,6 +8755,8 @@ async def list_providers(request):
                     if provider_by_field is None:
                         provider_by_field = {"taxonomy_list": []}
                         for column in NPIData.__table__.columns:
+                            if column.key in PUBLIC_NPI_EXCLUDED_COLUMNS:
+                                continue
                             if column.key in row_mapping:
                                 provider_by_field[column.key] = row_mapping.get(column.key)
                         for column in NPIAddress.__table__.columns:
@@ -8711,6 +8801,8 @@ async def list_providers(request):
                     count += 1
                     if count >= row_len:
                         break
+                    if column.key in PUBLIC_NPI_EXCLUDED_COLUMNS:
+                        continue
                     provider_by_field[column.key] = provider_record[count]
                 for column in NPIAddress.__table__.columns:
                     count += 1
@@ -9749,7 +9841,12 @@ async def get_near_npi(request):
                         if key in row_dict and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                             provider_by_field[key] = row_dict[key]
                 for column in NPIData.__table__.columns:
-                    if column.key in ("npi", "checksum", "do_business_as_text"):
+                    if column.key in {
+                        "npi",
+                        "checksum",
+                        "do_business_as_text",
+                        *PUBLIC_NPI_EXCLUDED_COLUMNS,
+                    }:
                         continue
                     if column.key in row_dict:
                         provider_by_field[column.key] = row_dict[column.key]
@@ -9787,7 +9884,12 @@ async def get_near_npi(request):
             count += 1
             if count >= row_len:
                 break
-            if column.key in ("npi", "checksum", "do_business_as_text"):
+            if column.key in {
+                "npi",
+                "checksum",
+                "do_business_as_text",
+                *PUBLIC_NPI_EXCLUDED_COLUMNS,
+            }:
                 continue
             provider_by_field[column.key] = provider_record[count]
 
@@ -10287,8 +10389,16 @@ async def get_npi(request, npi):
         and _NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS > 0
     )
     address_overlay_serving_identity: str | None = None
+    canonical_publication_identity: str | None = None
     if is_response_cache_enabled:
         try:
+            canonical_publication_identity = (
+                await _npi_canonical_publication_identity(
+                    session=request_session,
+                )
+            )
+            if canonical_publication_identity is None:
+                raise RuntimeError("npi_canonical_publication_identity_missing")
             address_overlay_serving_identity = (
                 await _provider_directory_address_overlay_serving_identity(
                     session=request_session,
@@ -10297,7 +10407,7 @@ async def get_npi(request, npi):
         except Exception as exc:
             is_response_cache_enabled = False
             logger.debug(
-                "Provider Directory address-overlay identity fetch failed "
+                "NPI response cache identity fetch failed "
                 "for npi=%s; bypassing response cache: %s",
                 npi,
                 exc,
@@ -10325,6 +10435,7 @@ async def get_npi(request, npi):
         address_overlay_serving_identity=(
             address_overlay_serving_identity
         ),
+        canonical_publication_identity=canonical_publication_identity,
         address_limit=address_limit,
         address_offset=address_offset,
         include_address_total=include_address_total,
@@ -10334,7 +10445,7 @@ async def get_npi(request, npi):
         cached_body = _npi_detail_response_cache_get(cache_key)
         if cached_body is not None:
             return response.raw(cached_body, content_type="application/json")
-    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    db_schema = _runtime_db_schema()
     is_address_archive_cutover = _is_environment_flag_enabled(
         "HLTHPRT_ADDRESS_ARCHIVE_CUTOVER"
     )
@@ -10710,10 +10821,10 @@ async def get_npi(request, npi):
                     if geo_data.get("features", []):
                         address_by_field["long"] = geo_data["features"][0]["geometry"]["coordinates"][0]
                         address_by_field["lat"] = geo_data["features"][0]["geometry"]["coordinates"][1]
-                        if t2 := geo_data["features"][0].get("matching_place_name"):
-                            address_by_field["formatted_address"] = t2
-                        else:
-                            address_by_field["formatted_address"] = geo_data["features"][0]["place_name"]
+                        address_by_field["formatted_address"] = (
+                            geo_data["features"][0].get("matching_place_name")
+                            or geo_data["features"][0]["place_name"]
+                        )
                         address_by_field["place_id"] = None
                         address_by_field["geo_source"] = "mapbox"
                 except Exception as exc:
@@ -11180,7 +11291,10 @@ async def _build_npi_details(
     for column in NPIData.__table__.columns:
         column_value = result_row[idx]
         idx += 1
-        if column.key == "do_business_as_text":
+        if (
+            column.key == "do_business_as_text"
+            or column.key in PUBLIC_NPI_EXCLUDED_COLUMNS
+        ):
             continue
         provider_detail_map[column.key] = column_value
 
@@ -11215,6 +11329,87 @@ async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str,
 
 
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
+
+
+async def _npi_canonical_publication_identity(
+    *,
+    session: Any = None,
+) -> str | None:
+    """Return the uncached receipt identity for the six current NPI tables."""
+
+    schema = _runtime_db_schema()
+    receipt_table = _schema_cache_key("npi_canonical_publication_receipt")
+    seal_table = _schema_cache_key("npi_canonical_publication_receipt_seal")
+    live_table_by_oid_column = (
+        ("npi_table_oid", "npi"),
+        ("npi_address_table_oid", "npi_address"),
+        ("npi_taxonomy_table_oid", "npi_taxonomy"),
+        ("npi_taxonomy_group_table_oid", "npi_taxonomy_group"),
+        ("npi_other_identifier_table_oid", "npi_other_identifier"),
+        ("npi_phone_staffing_table_oid", "npi_phone_staffing"),
+    )
+    relation_predicates = " AND ".join(
+        f"receipt.{oid_column}=to_regclass(:{table_name}_ref)::oid"
+        for oid_column, table_name in live_table_by_oid_column
+    )
+    parameters_by_name = {
+        f"{table_name}_ref": f"{schema}.{table_name}"
+        for _, table_name in live_table_by_oid_column
+    }
+    try:
+        identity_result = await _execute_stmt(
+            text(
+                f"SELECT receipt.publication_generation, receipt.publication_ref "
+                f"FROM {receipt_table} AS receipt "
+                f"JOIN {seal_table} AS sealed USING (publication_ref) "
+                f"WHERE {relation_predicates} "
+                "ORDER BY receipt.publication_generation DESC LIMIT 2"
+            ),
+            session=session,
+            params=parameters_by_name,
+        )
+        identity_rows = identity_result.all()
+    except Exception as exc:
+        logger.debug(
+            "Canonical NPI publication identity unavailable; bypassing cache (%s)",
+            type(exc).__name__,
+        )
+        return None
+    if len(identity_rows) != 1:
+        return None
+    publication_generation, publication_ref = identity_rows[0]
+    if (
+        type(publication_generation) is not int
+        or publication_generation < 1
+        or type(publication_ref) is not str
+        or len(publication_ref) != 50
+        or not publication_ref.startswith("nppub1_")
+    ):
+        return None
+    return f"{publication_generation}:{publication_ref}"
+
+
+async def _npi_count_cache_identity(address_model: Any) -> str | None:
+    """Bind count caches to both canonical NPI and address-serving generations."""
+
+    publication_identity = await _npi_canonical_publication_identity()
+    if publication_identity is None:
+        return None
+    if address_model is NPIAddress:
+        return f"{publication_identity}|address:npi-publication"
+    if address_model is not EntityAddressUnified:
+        return None
+    try:
+        relation_result = await _execute_stmt(
+            text("SELECT to_regclass(:table_ref)::oid::bigint"),
+            params={"table_ref": _schema_cache_key(address_model.__tablename__)},
+        )
+        relation_oid = relation_result.scalar()
+    except Exception:
+        return None
+    if type(relation_oid) is not int or relation_oid < 1:
+        return None
+    return f"{publication_identity}|address:oid:{relation_oid}"
 
 
 async def _provider_directory_address_overlay_serving_identity(
@@ -11260,7 +11455,7 @@ def _provider_directory_overlay_query_sql(
     long_select = "long" if "long" in overlay_columns else "NULL::numeric AS long"
     coordinate_group_by = ", lat, long" if {"lat", "long"}.issubset(overlay_columns) else ""
     overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
-    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    schema = _runtime_db_schema()
     current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(schema)
     return f"""
         WITH {current_resource_ctes_sql}, visible_overlay AS MATERIALIZED (

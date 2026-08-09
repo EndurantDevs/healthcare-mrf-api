@@ -57,12 +57,6 @@ def _assert_cli_forwards(
             {"test_mode": True},
         ),
         (
-            process_cli.npi,
-            "initiate_npi",
-            ["--test"],
-            {"test_mode": True},
-        ),
-        (
             process_cli.nucc,
             "initiate_nucc",
             ["--test"],
@@ -168,6 +162,26 @@ def test_simple_start_commands_preserve_importer_arguments(
         args=args,
         expected=expected,
     )
+
+
+def test_npi_cli_has_no_live_test_mode_and_dispatches_without_parameters(
+    monkeypatch,
+) -> None:
+    _assert_cli_forwards(
+        monkeypatch,
+        command=process_cli.npi,
+        target_name="initiate_npi",
+        args=[],
+        expected={},
+    )
+    rejected = CliRunner().invoke(process_cli.npi, ["--test"])
+    assert rejected.exit_code == 2
+    assert "No such option '--test'" in rejected.output
+
+
+def test_npi_worker_registers_only_the_control_wrapper():
+    assert process_cli.NPI.functions == [process_cli.control_single_job_start]
+    assert not hasattr(process_cli, "NPI_finish")
 
 
 @pytest.mark.parametrize(
@@ -331,6 +345,28 @@ def test_worker_integer_environment_has_safe_fallbacks(
         monkeypatch.setenv(name, raw)
 
     assert process_cli._worker_int_env(name, default) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 86400),
+        ("518400", 518400),
+        ("invalid", 86400),
+        ("0", 1),
+    ],
+)
+def test_npi_job_timeout_is_configurable_and_positive(
+    monkeypatch,
+    raw: str | None,
+    expected: int,
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("HLTHPRT_NPI_JOB_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("HLTHPRT_NPI_JOB_TIMEOUT", raw)
+
+    assert process_cli._npi_job_timeout() == expected
 
 
 @pytest.mark.parametrize(

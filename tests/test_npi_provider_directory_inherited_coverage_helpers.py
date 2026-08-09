@@ -68,10 +68,16 @@ def test_affiliation_mapping_updates_single_plan_metadata(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_classification_npi_cache_hit():
+async def test_classification_npi_cache_hit(monkeypatch):
     cache = npi_module._CLASSIFICATION_NPI_CACHE
     cache.clear()
-    cache["hospital"] = (time.time(), [123])
+    publication_identity = "1:nppub1_" + "a" * 43
+    monkeypatch.setattr(
+        npi_module,
+        "_npi_canonical_publication_identity",
+        AsyncMock(return_value=publication_identity),
+    )
+    cache[f"{publication_identity}|hospital"] = (time.time(), [123])
 
     assert await npi_module._get_classification_npi_list("Hospital") == [123]
 

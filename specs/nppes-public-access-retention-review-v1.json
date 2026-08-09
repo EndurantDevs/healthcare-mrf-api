@@ -1,0 +1,40 @@
+{
+  "contract": "healthporta.nppes-public-access-retention-review.v1",
+  "reviewed_at": "2026-08-09T00:00:00Z",
+  "source_authority": "United States Centers for Medicare and Medicaid Services",
+  "source_kind": "nppes_entity_address",
+  "reviewed_sources": [
+    {
+      "claim": "CMS publishes FOIA-disclosable NPPES provider data on the Internet without a download charge.",
+      "url": "https://www.cms.gov/medicare/regulations-guidance/administrative-simplification/data-dissemination"
+    },
+    {
+      "claim": "CMS states that the downloadable CSV is intended for import into a relational database or other technical manipulation.",
+      "url": "https://www.cms.gov/medicare/regulations-guidance/administrative-simplification/data-dissemination"
+    },
+    {
+      "claim": "CMS publishes the current monthly replacement and weekly incremental Version 2 archive links.",
+      "url": "https://download.cms.gov/nppes/NPI_Files.html"
+    }
+  ],
+  "approved_processing": [
+    "download_official_archive_bytes",
+    "retain_content_addressed_archive_bytes",
+    "verify_archive_and_primary_csv_integrity",
+    "import_foia_disclosable_fields_into_relational_storage",
+    "retain_nonserving_integrity_and_exclusion_evidence"
+  ],
+  "limits": [
+    "This review is an internal technical provenance artifact, not a CMS signature or legal opinion.",
+    "Artifact hashes prove byte identity, not CMS authorship or authenticity.",
+    "The phase-one evidence replay covers the primary NPI CSV member, not every auxiliary ZIP member semantic.",
+    "For sparse deactivated rows, only the NPI and deactivation date may be source-supported; no entity type may be inferred.",
+    "Issuance of an NPI does not establish licensure or credentialing.",
+    "Serving, publication, redistribution, and export authority remain disabled."
+  ],
+  "processing_retention_reviewed": true,
+  "public_access_reviewed": true,
+  "redistribution_enabled": false,
+  "export_enabled": false,
+  "publication_enabled": false
+}

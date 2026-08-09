@@ -1208,7 +1208,11 @@ def _uses_single_job_worker(spec: WorkerSpec) -> bool:
     return spec.role == "start" and (
         spec.worker_class.startswith("process.PTG")
         or spec.worker_class
-        in {"process.MRFSourceDiscovery", "process.ProviderDirectoryFHIR"}
+        in {
+            "process.MRFSourceDiscovery",
+            "process.NPI",
+            "process.ProviderDirectoryFHIR",
+        }
     )
 
 
@@ -1224,6 +1228,8 @@ def _single_job_worker_target(
     run_id = str(payload.get("run_id") or "").strip()
     if spec.worker_class.startswith("process.PTG") and run_id:
         return f"ptg_start_{run_id}"
+    if spec.worker_class == "process.NPI" and run_id:
+        return f"npi_start_{run_id}"
     return None
 
 

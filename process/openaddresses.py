@@ -2868,6 +2868,9 @@ async def process_data(ctx, task=None):  # pragma: no cover
     )
 
 
+execute_openaddresses_import_task = process_data
+
+
 async def startup(ctx):  # pragma: no cover
     """Initialize OpenAddresses worker state and schema."""
     await my_init_db(db)
@@ -2979,6 +2982,9 @@ async def shutdown(ctx):  # pragma: no cover
         f"relaxed={stats.relaxed_updates:,} zip_restored={zip_restore_stats.restored:,}"
     )
     print_time_info(context.get("start"))
+
+
+publish_openaddresses_generation = shutdown
 
 
 async def main(
