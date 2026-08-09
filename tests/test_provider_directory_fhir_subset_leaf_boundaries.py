@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import copy
+import importlib
+import urllib.parse
 
 import pytest
 
@@ -17,6 +19,7 @@ from process import provider_directory_fhir_subset_execution as subset_execution
 from process import provider_directory_fhir_subset_identity as subset_identity
 from process import provider_directory_fhir_subset_replay as replay
 from process.provider_directory_fhir_census_contract import (
+    CURRENT_VERSION_CENSUS_CONTRACT_FIELD,
     SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
     SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_SEMANTICS,
@@ -32,6 +35,9 @@ from tests.provider_directory_fhir_subset_completion_support import (
 )
 
 
+importer = importlib.import_module("process.provider_directory_fhir")
+
+
 def test_contract_url_and_resume_require_bound_v3_page_geometry():
     contract = build_subset_contract()
 
@@ -39,6 +45,29 @@ def test_contract_url_and_resume_require_bound_v3_page_geometry():
         contract.start_url("Organization", PAGE_COUNT - 1)
     with pytest.raises(ValueError, match="resume_identity_invalid"):
         census_resume.resume_prior_page_entry_count(contract, {})
+
+
+def test_resource_access_probe_uses_bound_v3_page_geometry():
+    """Preserve the reviewed page count when building the access probe URL."""
+
+    contract = build_subset_contract()
+    source_record_by_field = {CURRENT_VERSION_CENSUS_CONTRACT_FIELD: contract}
+
+    probe_source, probe_url = importer._resource_access_probe_url(
+        source_record_by_field,
+        "https://directory.example.test/fhir",
+        "Practitioner",
+    )
+
+    assert probe_source["canonical_api_base"] == (
+        "https://directory.example.test/fhir"
+    )
+    assert probe_url is not None
+    query_value_by_name = dict(
+        urllib.parse.parse_qsl(urllib.parse.urlsplit(probe_url).query)
+    )
+    assert query_value_by_name["_count"] == str(PAGE_COUNT)
+    assert query_value_by_name["_lastUpdated"] == f"lt{contract.cutoff}"
 
 
 def test_initial_and_terminal_counts_reject_each_v3_drift_class():

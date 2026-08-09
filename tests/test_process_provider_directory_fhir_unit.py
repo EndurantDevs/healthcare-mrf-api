@@ -5976,12 +5976,42 @@ def test_provider_directory_source_seed_upsert_merges_metadata_json():
         'COALESCE(target_row."metadata_json"::jsonb, \'{}\'::jsonb) '
         '|| COALESCE(stage_row."metadata_json"::jsonb, \'{}\'::jsonb)'
     )
-    assert sql == (
-        'CASE WHEN COALESCE(stage_row."metadata_json"::jsonb ->> '
-        "'provider_directory_acquisition_enabled', 'false') = 'true' "
-        f"THEN ({merged}) - 'provider_directory_acquisition_blocked_reason' "
-        f"ELSE {merged} END"
+    assert "provider_directory_acquisition_enabled" in sql
+    assert "provider_directory_acquisition_blocked_reason" in sql
+    assert merged in sql
+    assert importer.REVIEWED_SUBSET_ACTIVATION_METADATA_KEY in sql
+    assert importer.REVIEWED_SUBSET_VERIFIED_STATUS in sql
+    assert "pg_catalog.jsonb_typeof" in sql
+
+
+def test_provider_directory_source_seed_upsert_preserves_sealed_activation():
+    table = ProviderDirectorySource.__table__
+    statement = importer.pg_insert(table).values(
+        source_id="synthetic-source",
+        org_name="Synthetic Directory",
+        metadata_json={
+            "provider_directory_candidate_status": (
+                importer.PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING
+            )
+        },
     )
+
+    expression = importer._effective_update_expression(
+        table,
+        statement,
+        "metadata_json",
+    )
+    expression_sql = str(
+        expression.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert importer.REVIEWED_SUBSET_ACTIVATION_METADATA_KEY in expression_sql
+    assert importer.REVIEWED_SUBSET_VERIFIED_STATUS in expression_sql
+    assert "jsonb_typeof" in expression_sql
+    assert "jsonb_build_object" in expression_sql
 
 
 def test_provider_directory_source_seed_upsert_clears_obsolete_block_reason():
@@ -11245,9 +11275,11 @@ async def test_artifact_cutover_locks_endpoint_and_rejects_alias_repoint(monkeyp
 
     endpoint_lock_sql = lookup.await_args_list[0].args[0]
     alias_lock_sql = lookup.await_args_list[1].args[0]
+    advisory_sql = status.await_args_list[0].args[0]
+    assert "pg_advisory_xact_lock" in advisory_sql
+    assert status.await_args_list[0].kwargs == {"endpoint_id": "endpoint_1"}
     assert "FOR UPDATE" in endpoint_lock_sql
     assert "provider_directory_api_endpoint" in endpoint_lock_sql
-    status.assert_not_awaited()
     assert "FOR SHARE OF source" in alias_lock_sql
     assert "source.source_id = ANY" in alias_lock_sql
     assert lookup.await_args_list[1].kwargs["source_ids"] == ["source_a"]

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-
 CURRENT_VERSION_CENSUS_CONTRACT_FIELD = (
     "_provider_directory_current_version_census_contract"
 )
@@ -71,6 +70,9 @@ SERVER_ISSUED_SUBSET_RESOURCE_TYPES = (
 SERVER_ISSUED_SUBSET_SOURCE_SCOPE_VERSION = (
     "provider-directory-fhir-server-issued-subset-source-scope-v1"
 )
+SERVER_ISSUED_SUBSET_ACTIVATION_SOURCE_CONTRACT_VERSION = (
+    "provider-directory-fhir-reviewed-subset-source-contract-v1"
+)
 SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS = (
     "provider_directory_supported_resources",
     "provider_directory_fully_enumerable_resources",
@@ -92,6 +94,46 @@ SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS = (
     SERVER_ISSUED_SUBSET_CAMPAIGN_FIELD,
     "provider_directory_configured_endpoint_id",
 )
+
+
+def subset_activation_source_contract_payload(
+    source_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the cutoff-neutral source identity used by activation evidence."""
+
+    metadata = source_record.get("metadata_json")
+    source_id = source_record.get("source_id")
+    endpoint_id = source_record.get("endpoint_id")
+    canonical_api_base = source_record.get("canonical_api_base")
+    if (
+        not isinstance(metadata, Mapping)
+        or type(source_id) is not str
+        or not source_id
+        or type(endpoint_id) is not str
+        or not endpoint_id
+        or type(canonical_api_base) is not str
+        or not canonical_api_base
+    ):
+        raise ValueError("provider_directory_subset_activation_source_invalid")
+    return {
+        "identity_version": (
+            SERVER_ISSUED_SUBSET_ACTIVATION_SOURCE_CONTRACT_VERSION
+        ),
+        "source": {
+            "source_id": source_id,
+            "endpoint_id": endpoint_id,
+            "canonical_api_base": canonical_api_base,
+            "requires_registration": source_record.get(
+                "requires_registration"
+            ),
+            "requires_api_key": source_record.get("requires_api_key"),
+            "auth_type": source_record.get("auth_type"),
+        },
+        "metadata_identity": [
+            [field_name, field_name in metadata, metadata.get(field_name)]
+            for field_name in SERVER_ISSUED_SUBSET_SOURCE_SCOPE_METADATA_FIELDS
+        ],
+    }
 
 
 def server_issued_subset_source_scope_payload(

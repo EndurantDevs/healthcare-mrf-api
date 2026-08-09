@@ -79,6 +79,12 @@ REQUIRED_SERVING_READINESS_CHECKS = (
     "ptg_corroboration_table",
     "ptg_network_name_overlap",
 )
+REVIEWED_SUBSET_OPERATOR = (
+    ROOT / "scripts/smoke/provider_directory_fhir_reviewed_subset_state.py"
+)
+REVIEWED_SUBSET_MANIFEST = (
+    ROOT / "specs/provider_directory_reviewed_subset_activation.json"
+)
 
 
 def _command_text(args: list[str]) -> str:
@@ -233,6 +239,65 @@ def _serving_readiness_contract_report() -> dict[str, Any]:
     }
 
 
+def _reviewed_subset_state_sync_report() -> dict[str, Any]:
+    """Prove the selector-free operator is packaged and default-off."""
+
+    from process.provider_directory_fhir_subset_activation_contract import (
+        PENDING_STATUS,
+        STATE_SYNC_ENABLED_ENV,
+        VERIFIED_STATUS,
+        reviewed_subset_activation_manifest,
+    )
+
+    missing_paths = [
+        str(path.relative_to(ROOT))
+        for path in (REVIEWED_SUBSET_OPERATOR, REVIEWED_SUBSET_MANIFEST)
+        if not path.is_file()
+    ]
+    manifest = reviewed_subset_activation_manifest(REVIEWED_SUBSET_MANIFEST)
+    environment_by_name = dict(os.environ)
+    environment_by_name.pop(STATE_SYNC_ENABLED_ENV, None)
+    operator_result = subprocess.run(
+        [sys.executable, "-B", str(REVIEWED_SUBSET_OPERATOR), "sync-verified-state"],
+        cwd=ROOT,
+        env=environment_by_name,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    output_lines = operator_result.stdout.splitlines()
+    observed_output = output_lines[-1] if output_lines else ""
+    expected_output = '{"code":"disabled","status":"error"}'
+    is_manifest_valid = (
+        (
+            manifest.desired_candidate_status == PENDING_STATUS
+            and manifest.evidence is None
+        )
+        or (
+            manifest.desired_candidate_status == VERIFIED_STATUS
+            and manifest.evidence is not None
+        )
+    )
+    return {
+        "ok": (
+            not missing_paths
+            and is_manifest_valid
+            and operator_result.returncode == 1
+            and observed_output == expected_output
+        ),
+        "missing": missing_paths,
+        "default_off": (
+            operator_result.returncode == 1
+            and observed_output == expected_output
+        ),
+        "desired_state": manifest.desired_candidate_status,
+        "evidence_present": manifest.evidence is not None,
+        "operator_exit_code": operator_result.returncode,
+        "operator_output_matches": observed_output == expected_output,
+    }
+
+
 def build_report() -> dict[str, Any]:
     """Evaluate the database-free Provider Directory runtime contract."""
     checks_by_name = {
@@ -242,6 +307,7 @@ def build_report() -> dict[str, Any]:
         "importer_schema": _importer_schema_report(),
         "monthly_preset": _monthly_preset_report(),
         "serving_readiness_contract": _serving_readiness_contract_report(),
+        "reviewed_subset_state_sync": _reviewed_subset_state_sync_report(),
     }
     failures_by_name = {
         name: check

@@ -341,6 +341,30 @@ def _resource_coverage(cutoff, resource_proof):
     }
 
 
+def _resource_diagnostics_from_proof(proof_by_field):
+    """Build the production-shaped diagnostics required at publication."""
+
+    return {
+        resource_type: {
+            "server_issued_subset_completeness": {
+                "cutoff": proof_by_field["cutoff"],
+                "page_count": proof_by_field["page_count"],
+                "campaign_id": proof_by_field["campaign_id"],
+                **{
+                    field_name: resource_proof[field_name]
+                    for field_name in (
+                        "advertised_pre",
+                        "advertised_post",
+                        "returned_unique",
+                        "deficit",
+                    )
+                },
+            }
+        }
+        for resource_type, resource_proof in proof_by_field["resources"].items()
+    }
+
+
 def terminal_metadata(
     proof_by_field,
     proof_sha256,
@@ -389,6 +413,9 @@ def terminal_metadata(
             proof_by_field,
             proof_sha256,
             verification_by_field["result"],
+        ),
+        "resource_diagnostics": _resource_diagnostics_from_proof(
+            proof_by_field
         ),
     }
 

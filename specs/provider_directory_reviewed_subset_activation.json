@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "importer": "provider-directory-fhir",
+  "operation": "reviewed-subset-source-state-sync",
+  "desired_candidate_status": "pending_two_matching_reviewed_subset_acquisitions",
+  "evidence": null
+}
