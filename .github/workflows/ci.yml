@@ -676,6 +676,7 @@ jobs:
           tests/test_public_evidence_npi_enumeration_adversarial_postgres.py
           tests/test_public_evidence_nppes_registry_admission_postgres.py
           tests/test_public_evidence_nppes_registry_admission_adversarial_postgres.py
+          tests/test_public_evidence_nppes_lifecycle_postgres.py
           tests/test_npi_canonical_publication_postgres.py
           tests/test_npi_canonical_publication_rotation_postgres.py
           tests/test_formulary_fhir_storage_postgres.py

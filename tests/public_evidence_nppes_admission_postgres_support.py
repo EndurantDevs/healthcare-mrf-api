@@ -61,6 +61,12 @@ MIGRATION_PATH = (
     / "versions"
     / "20260808220000_public_evidence_nppes_registry_admission.py"
 )
+LIFECYCLE_MIGRATION_PATH = (
+    ROOT
+    / "alembic"
+    / "versions"
+    / "20260809020000_nppes_lifecycle_date_tolerance.py"
+)
 ARCHIVE_NAME = "NPPES_Data_Dissemination_July_2026_V2.zip"
 PRIMARY_SNAPSHOT = "20260712"
 NEW_TABLES = (
@@ -168,11 +174,49 @@ def load_admission_migration() -> Any:
     return migration
 
 
+def load_lifecycle_migration() -> Any:
+    """Load the lifecycle follow-on without importing package state."""
+
+    module_spec = importlib.util.spec_from_file_location(
+        "public_evidence_nppes_lifecycle_postgres_proof",
+        LIFECYCLE_MIGRATION_PATH,
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    migration = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(migration)
+    return migration
+
+
+class _NppesAdmissionMigrationStack:
+    """Expose the base admission and lifecycle revisions as one test stack."""
+
+    def __init__(self, admission: Any, lifecycle: Any) -> None:
+        self.admission = admission
+        self.lifecycle = lifecycle
+        self.op: object | None = None
+
+    def _bind_operation(self) -> None:
+        if self.op is None:
+            raise RuntimeError("migration operation is unavailable")
+        self.admission.op = self.op
+        self.lifecycle.op = self.op
+
+    def upgrade(self) -> None:
+        self._bind_operation()
+        self.admission.upgrade()
+        self.lifecycle.upgrade()
+
+    def downgrade(self) -> None:
+        self._bind_operation()
+        self.lifecycle.downgrade()
+        self.admission.downgrade()
+
+
 @asynccontextmanager
 async def nppes_admission_schema() -> (
     AsyncIterator[tuple[AsyncEngine, Any, str, Any]]
 ):
-    """Install the released NPI schema and the prospective admission revision."""
+    """Install the NPI, admission, and lifecycle revisions."""
 
     async with npi_enumeration_schema() as (
         engine,
@@ -180,10 +224,13 @@ async def nppes_admission_schema() -> (
         schema_name,
         _npi_migration,
     ):
-        migration = load_admission_migration()
-        migration._schema = lambda: schema_name
-        await run_migration_action(engine, migration, "upgrade")
-        yield engine, database_url, schema_name, migration
+        admission = load_admission_migration()
+        lifecycle = load_lifecycle_migration()
+        admission._schema = lambda: schema_name
+        lifecycle._schema = lambda: schema_name
+        migration_stack = _NppesAdmissionMigrationStack(admission, lifecycle)
+        await run_migration_action(engine, migration_stack, "upgrade")
+        yield engine, database_url, schema_name, migration_stack
 
 
 def required_config() -> NppesEvidenceRuntimeConfig:
