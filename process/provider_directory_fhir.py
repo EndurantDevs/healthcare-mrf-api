@@ -1264,6 +1264,9 @@ SOURCE_HTTP_PAGE_PREFETCH_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH"
 SOURCE_HTTP_DETERMINISTIC_PAGE_PREFETCH_ENV = (
     "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_DETERMINISTIC"
 )
+SOURCE_HTTP_SUBSET_PAGE_PREFETCH_ENV = (
+    "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_SERVER_ISSUED_SUBSET"
+)
 SOURCE_RESOURCE_SCAN_CONCURRENCY_ENV = (
     "HLTHPRT_PROVIDER_DIRECTORY_RESOURCE_SCAN_CONCURRENCY"
 )
@@ -1338,6 +1341,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
 )
 PAGINATION_CHECKPOINT_ACTIVE = "active"
 PAGINATION_CHECKPOINT_COMPLETE = "complete"
+PAGINATION_CHECKPOINT_ACQUISITION_ABANDONED = "acquisition_abandoned"
 PAGINATION_CHECKPOINT_RECENT_URL_LIMIT = 64
 PAGINATION_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-search-v2"
 SYNTHETIC_POSITION_PAGE_GUARD_VERSION = "synthetic-position-page-v1"
@@ -1412,6 +1416,7 @@ REQUESTED_SOURCE_IMPORT_EMPTY_ERROR = (
 ENDPOINT_DATASET_ACQUIRING = "acquiring"
 ENDPOINT_DATASET_INCOMPLETE = "incomplete"
 ENDPOINT_DATASET_FAILED = "failed"
+ENDPOINT_DATASET_ACQUISITION_ABANDONED = "acquisition_abandoned"
 ENDPOINT_DATASET_VALIDATED = "validated"
 ENDPOINT_DATASET_PUBLISHED = "published"
 ENDPOINT_DATASET_SUPERSEDED = "superseded"
@@ -1529,6 +1534,7 @@ SERVER_ISSUED_SUBSET_ARTIFACT_METADATA_KEYS = (
     CURRENT_VERSION_CENSUS_START_URLS_FIELD,
 )
 IMMUTABLE_ENDPOINT_DATASET_STATUSES = (
+    ENDPOINT_DATASET_ACQUISITION_ABANDONED,
     ENDPOINT_DATASET_VALIDATED,
     ENDPOINT_DATASET_PUBLISHED,
     ENDPOINT_DATASET_SUPERSEDED,
@@ -1621,6 +1627,20 @@ class RestPagePrefetchEligibility:
     retain_rows: bool
     per_resource_limit: int
     page_limit: int
+
+
+class ProviderDirectoryPaginationTerminalFailure(RuntimeError):
+    """Carry only sanitized diagnostics for one non-resumable traversal."""
+
+    def __init__(
+        self,
+        details: str,
+        diagnostics_by_resource: Mapping[str, Any],
+    ) -> None:
+        super().__init__(details)
+        self.diagnostics_by_resource = _sanitized_resource_diagnostics(
+            diagnostics_by_resource
+        )
 
 
 @dataclass(frozen=True)
@@ -1828,6 +1848,28 @@ class PaginationCheckpointContext:
     def __post_init__(self) -> None:
         if not self.acquisition_root_run_id.strip():
             raise ValueError("provider_directory_pagination_root_missing")
+
+
+@dataclass
+class _PaginationCheckpointGuardLease:
+    context: PaginationCheckpointContext
+    database: Any
+    is_held: bool = True
+
+    @property
+    def lock_key(self) -> str:
+        """Return the endpoint-scoped advisory-lock identity."""
+
+        return _pagination_checkpoint_guard_key(self.context)
+
+
+class _PaginationCheckpointGuardDatabase(ConnectionProxy):
+    @contextlib.asynccontextmanager
+    async def transaction(self) -> AsyncIterator[ConnectionProxy]:
+        """Commit one store transaction while retaining the session lock."""
+
+        async with self._connection.begin():
+            yield self
 
 
 @dataclass(frozen=True)
@@ -49716,17 +49758,37 @@ def _is_rest_page_prefetch_eligible(
     options: RestPagePrefetchEligibility,
 ) -> bool:
     """Fail closed unless the request matches the narrow REST pilot shape."""
-    if current_version_census_contract(source_record) is not None:
-        return False
+    census_contract = current_version_census_contract(source_record)
     source_api_base = _canonical_base(
         source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    checkpoint_context = options.checkpoint_context
+    is_reviewed_subset_prefetch = bool(
+        census_contract is not None
+        and census_contract.is_server_issued_subset_v3
+        and os.getenv(SOURCE_HTTP_SUBSET_PAGE_PREFETCH_ENV, "false").lower()
+        in {"1", "true", "yes"}
+        and checkpoint_context is not None
+        and checkpoint_context.dataset_id
+        and checkpoint_context.endpoint_id
+        and checkpoint_context.lineage_verified is True
+        and checkpoint_context.source_ids == (census_contract.source_id,)
+        and checkpoint_context.canonical_api_base == source_api_base
+        and checkpoint_context.owner_run_id
+        and checkpoint_context.acquisition_root_run_id
+        and checkpoint_context.retry_of_run_id is None
+        and checkpoint_context.owner_run_id
+        == checkpoint_context.acquisition_root_run_id
+    )
+    is_generic_prefetch = bool(
+        census_contract is None and _is_prefetch_base_enabled(source_api_base)
     )
     return bool(
         os.getenv(SOURCE_HTTP_PAGE_PREFETCH_ENV, "false").lower()
         in {"1", "true", "yes"}
-        and _is_prefetch_base_enabled(source_api_base)
-        and options.checkpoint_context is not None
-        and options.checkpoint_context.canonical_api_base == source_api_base
+        and (is_generic_prefetch or is_reviewed_subset_prefetch)
+        and checkpoint_context is not None
+        and checkpoint_context.canonical_api_base == source_api_base
         and options.start_url_count == 1
         and not options.is_partitioned_fetch
         and options.row_batch_handler is not None
@@ -50455,7 +50517,24 @@ async def _fetch_resource_rows(
                     error_message = f"partition_errors_{partition_error_count}_last_{current_error}"
                     url = None
                     break
-                error_message = current_error
+                if is_current_version_census_enabled:
+                    is_retryable_current_version_error = (
+                        _is_transient_source_fetch_failure(
+                            status_code,
+                            error,
+                        )
+                    )
+                    error_prefix = (
+                        CURRENT_VERSION_CENSUS_RETRYABLE_ERROR
+                        if is_retryable_current_version_error
+                        else CURRENT_VERSION_CENSUS_BLOCKED_ERROR
+                    )
+                    error_message = f"{error_prefix}:{current_error}"
+                    has_next_url = is_retryable_current_version_error
+                    if not is_retryable_current_version_error:
+                        url = None
+                else:
+                    error_message = current_error
                 break
             if not _is_bundle_payload(response_payload):
                 retry_not_before = checkpoint_non_bundle_retry_at
@@ -50814,6 +50893,19 @@ async def _fetch_resource_rows(
             or not _can_limit_accept_more(rows_fetched, per_resource_limit)
         ):
             break
+    if (
+        is_current_version_census_enabled
+        and error_message
+        and not error_message.startswith(
+            (
+                CURRENT_VERSION_CENSUS_BLOCKED_ERROR,
+                CURRENT_VERSION_CENSUS_RETRYABLE_ERROR,
+            )
+        )
+    ):
+        error_message = f"{CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:{error_message}"
+        has_next_url = False
+        url = None
     if is_current_version_census_enabled:
         if error_message:
             pending_rows.clear()
@@ -54598,56 +54690,75 @@ async def _open_pagination_checkpoint_guard_connection() -> Any:
     if db.engine is None:
         await db.connect()
     assert db.engine is not None
-    guard_dsn = db.engine.url.set(drivername="postgresql").render_as_string(
-        hide_password=False
-    )
-    return await asyncpg.connect(dsn=guard_dsn)
+    return await db.engine.connect()
+
+
+async def _discard_pagination_guard_connection(guard_connection: Any) -> None:
+    """Invalidate one uncertain guard backend before returning it to the pool."""
+
+    with contextlib.suppress(BaseException):
+        await guard_connection.invalidate()
+    with contextlib.suppress(BaseException):
+        await guard_connection.close()
 
 
 @contextlib.asynccontextmanager
 async def _pagination_checkpoint_worker_guard(
     context: PaginationCheckpointContext | None,
-) -> AsyncIterator[None]:
+) -> AsyncIterator[_PaginationCheckpointGuardLease | None]:
     """Serialize all writes and checkpoint changes for one FHIR endpoint."""
     if context is None:
-        yield
+        yield None
         return
     lock_key = _pagination_checkpoint_guard_key(context)
     guard_connection = await _open_pagination_checkpoint_guard_connection()
+    guard_database = _PaginationCheckpointGuardDatabase(
+        db,
+        guard_connection,
+        None,
+    )
     try:
-        await guard_connection.fetchval(
-            "SELECT pg_advisory_lock(hashtextextended($1, 0));",
-            lock_key,
+        await guard_database.scalar(
+            "SELECT pg_advisory_lock(hashtextextended(:lock_key, 0));",
+            lock_key=lock_key,
         )
+        await guard_connection.commit()
     except asyncio.CancelledError:
-        guard_connection.terminate()
+        await _discard_pagination_guard_connection(guard_connection)
         raise
     except Exception as exc:
-        guard_connection.terminate()
+        await _discard_pagination_guard_connection(guard_connection)
         raise RuntimeError(
             "provider_directory_pagination_checkpoint_guard_unavailable"
         ) from exc
+    guard_lease = _PaginationCheckpointGuardLease(
+        context=context,
+        database=guard_database,
+    )
     try:
-        yield
+        yield guard_lease
     finally:
         try:
-            await guard_connection.fetchval(
-                "SELECT pg_advisory_unlock(hashtextextended($1, 0));",
-                lock_key,
+            await guard_database.scalar(
+                "SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0));",
+                lock_key=lock_key,
             )
+            await guard_connection.commit()
         except asyncio.CancelledError:
-            guard_connection.terminate()
+            await _discard_pagination_guard_connection(guard_connection)
             raise
         except Exception:
-            guard_connection.terminate()
+            await _discard_pagination_guard_connection(guard_connection)
         else:
             try:
                 await guard_connection.close()
             except asyncio.CancelledError:
-                guard_connection.terminate()
+                await _discard_pagination_guard_connection(guard_connection)
                 raise
             except Exception:
-                guard_connection.terminate()
+                await _discard_pagination_guard_connection(guard_connection)
+        finally:
+            guard_lease.is_held = False
 
 
 def _pagination_url_hash(url: str) -> str:
@@ -56947,7 +57058,13 @@ def _compatible_pagination_resume_state(
 ) -> PaginationResumeState | None:
     if not _has_matching_pagination_checkpoint_identity(checkpoint, context):
         return None
-    is_complete = checkpoint.get("state") == PAGINATION_CHECKPOINT_COMPLETE
+    checkpoint_state = _clean_text(checkpoint.get("state"))
+    if checkpoint_state not in {
+        PAGINATION_CHECKPOINT_ACTIVE,
+        PAGINATION_CHECKPOINT_COMPLETE,
+    }:
+        return None
+    is_complete = checkpoint_state == PAGINATION_CHECKPOINT_COMPLETE
     if (
         not is_complete
         and _clean_text(checkpoint.get("start_url_hash")) != start_url_hash
@@ -57539,7 +57656,10 @@ def _handle_incomplete_source_pagination(
         incomplete_resource_types,
     )
     if terminal_failure_details:
-        raise RuntimeError(terminal_failure_details)
+        raise ProviderDirectoryPaginationTerminalFailure(
+            terminal_failure_details,
+            diagnostics_by_resource,
+        )
     graph_failures = [
         resource_type
         for resource_type in incomplete_resource_types
@@ -62090,6 +62210,108 @@ async def _mark_failed_endpoint_dataset_without_masking(
         )
 
 
+async def _retain_terminal_import_failure(
+    candidate: EndpointDatasetCandidate | None,
+    source_records: list[dict[str, Any]],
+    run_id: str | None,
+    failure: ProviderDirectoryPaginationTerminalFailure,
+) -> None:
+    """Retain terminal diagnostics and fail the candidate without masking."""
+
+    source_ids = sorted(
+        {
+            source_id
+            for source_record in source_records
+            if (source_id := _clean_text(source_record.get("source_id")))
+        }
+    )
+    try:
+        await _update_source_resource_import_metadata(
+            source_ids,
+            run_id=run_id,
+            diagnostics=failure.diagnostics_by_resource,
+        )
+    except Exception:
+        LOGGER.exception(
+            "Failed to retain terminal Provider Directory source diagnostics"
+        )
+    await _mark_failed_endpoint_dataset_without_masking(
+        candidate,
+        failure.diagnostics_by_resource,
+        failure,
+    )
+
+
+async def _abandon_terminal_reviewed_subset_without_masking(
+    source_records: list[dict[str, Any]],
+    failure: ProviderDirectoryPaginationTerminalFailure,
+    guard_lease: _PaginationCheckpointGuardLease | None,
+) -> None:
+    """Seal only the checked-in reviewed v3 root under its worker lock."""
+
+    if len(source_records) != 1:
+        return
+    source_record = source_records[0]
+    census_contract = current_version_census_contract(source_record)
+    canonical_api_base = _canonical_base(
+        source_record.get("canonical_api_base") or source_record.get("api_base")
+    )
+    if (
+        census_contract is None
+        or not census_contract.is_server_issued_subset_v3
+        or set(failure.diagnostics_by_resource) != set(census_contract.resources)
+        or guard_lease is None
+        or not guard_lease.is_held
+        or guard_lease.context.canonical_api_base != canonical_api_base
+    ):
+        return
+    try:
+        from process.provider_directory_fhir_manual_catalog import (
+            reviewed_manual_census_source_id,
+        )
+        from process.provider_directory_fhir_subset_abandonment_store import (
+            sync_reviewed_subset_abandonment_transaction,
+        )
+
+        expected_source_id = reviewed_manual_census_source_id()
+        if _clean_text(source_record.get("source_id")) != expected_source_id:
+            return
+        await sync_reviewed_subset_abandonment_transaction(
+            guard_lease.database,
+            expected_source_id,
+            tuple(sorted(census_contract.resources)),
+            held_pagination_guard_key=guard_lease.lock_key,
+        )
+    except (asyncio.CancelledError, ImportCancelledError):
+        raise
+    except Exception:
+        LOGGER.exception(
+            "Failed to seal terminal reviewed Provider Directory subset evidence"
+        )
+
+
+async def _retain_and_abandon_terminal_failure(
+    candidate: EndpointDatasetCandidate | None,
+    source_records: list[dict[str, Any]],
+    run_id: str | None,
+    failure: ProviderDirectoryPaginationTerminalFailure,
+    guard_lease: _PaginationCheckpointGuardLease | None,
+) -> None:
+    """Persist terminal diagnostics and seal before releasing the guard."""
+
+    await _retain_terminal_import_failure(
+        candidate,
+        source_records,
+        run_id,
+        failure,
+    )
+    await _abandon_terminal_reviewed_subset_without_masking(
+        source_records,
+        failure,
+        guard_lease,
+    )
+
+
 def _is_validated_uhc_official_source_group(
     source_records: list[dict[str, Any]],
 ) -> bool:
@@ -63123,19 +63345,28 @@ async def _import_resources(
     )
     stale_ready_source_ids_by_resource: dict[str, set[str]] = {}
 
+    async def replay_finalized_candidate(
+        candidate: EndpointDatasetCandidate,
+        prepared_source_records: list[dict[str, Any]],
+    ) -> ResourceImportGroupResult:
+        """Replay one immutable candidate after the cancellation fence."""
+
+        return await _replay_finalized_candidate_after_cancellation(
+            candidate,
+            resource_completion,
+            prepared_source_records,
+            resource_import_cancellation,
+        )
+
     async def run_guarded_group(
         source_records: list[dict[str, Any]],
         prepared_source_lists: list[list[dict[str, Any]]],
+        guard_lease: _PaginationCheckpointGuardLease | None,
     ) -> ResourceImportGroupResult:
         """Prepare, validate, and finalize one checkpoint-owned source group."""
-        group_resume_required = (
-            set() if pagination_resume_required is not None else None
-        )
+        group_resume_required = set() if pagination_resume_required is not None else None
         if _is_validated_uhc_official_source_group(source_records):
-            return await import_one_group(
-                source_records,
-                group_resume_required,
-            )
+            return await import_one_group(source_records, group_resume_required)
         prepared_source_records, candidate = (
             await _prepare_resource_import_source_group(
                 source_records,
@@ -63149,11 +63380,8 @@ async def _import_resources(
         prepared_source_lists[0] = prepared_source_records
         if _is_finalized_endpoint_dataset_candidate(candidate):
             assert candidate is not None
-            return await _replay_finalized_candidate_after_cancellation(
-                candidate,
-                resource_completion,
-                prepared_source_records,
-                resource_import_cancellation,
+            return await replay_finalized_candidate(
+                candidate, prepared_source_records
             )
         diagnostics_by_resource: dict[str, dict[str, Any]] = {}
         try:
@@ -63174,6 +63402,15 @@ async def _import_resources(
                 resource_import_cancellation,
             )
             return import_summary
+        except ProviderDirectoryPaginationTerminalFailure as failure:
+            await _retain_and_abandon_terminal_failure(
+                candidate,
+                prepared_source_records,
+                run_id,
+                failure,
+                guard_lease,
+            )
+            raise
         except BaseException as failure:
             await _mark_failed_endpoint_dataset_without_masking(
                 candidate,
@@ -63201,10 +63438,11 @@ async def _import_resources(
                 )
                 async with _pagination_checkpoint_worker_guard(
                     checkpoint_guard_context
-                ):
+                ) as guard_lease:
                     return await run_guarded_group(
                         source_records,
                         prepared_source_lists,
+                        guard_lease,
                     )
 
     async def run_isolated_group(
@@ -63215,6 +63453,10 @@ async def _import_resources(
             for source_record in source_records:
                 _assert_resource_acquisition_allowed(source_record, resources)
             return await run_with_limit(source_records)
+        except ProviderDirectoryPaginationTerminalFailure as failure:
+            if total_groups == 1:
+                raise
+            return _resource_import_group_failure(source_records, failure)
         except (
             asyncio.CancelledError,
             ImportCancelledError,

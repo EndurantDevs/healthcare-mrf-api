@@ -12,6 +12,7 @@ from process.provider_directory_fhir_census_binding import (
 )
 from process.provider_directory_fhir_census_execution import (
     CURRENT_VERSION_CENSUS_FETCH_MODE,
+    CURRENT_VERSION_CENSUS_RETRYABLE_ERROR,
     current_version_census_proof_identity,
 )
 from tests.provider_directory_current_census_postgres_support import (
@@ -67,26 +68,19 @@ def assert_initial_checkpoint(checkpoint: dict[str, Any], contract: Any) -> None
     }
 
 
-def assert_retry_checkpoint(
+def assert_completed_checkpoint(
     checkpoint: dict[str, Any],
-    initial_proof: dict[str, Any],
+    contract: Any,
+    *,
+    owner_run_id: str,
+    retry_of_run_id: str,
 ) -> None:
-    assert checkpoint["next_url"] == NEXT_URL
-    assert checkpoint["state"] == importer.PAGINATION_CHECKPOINT_ACTIVE
-    assert checkpoint["pages_processed"] == 1
-    assert checkpoint["rows_processed"] == 1
-    assert checkpoint["owner_run_id"] == "run-current-census-retry-1"
-    assert checkpoint["retry_of_run_id"] == ROOT_RUN_ID
-    assert checkpoint["completeness_json"] == initial_proof
-
-
-def assert_completed_checkpoint(checkpoint: dict[str, Any], contract: Any) -> None:
     assert checkpoint["next_url"] is None
     assert checkpoint["state"] == importer.PAGINATION_CHECKPOINT_COMPLETE
     assert checkpoint["pages_processed"] == 2
     assert checkpoint["rows_processed"] == 2
-    assert checkpoint["owner_run_id"] == "run-current-census-retry-2"
-    assert checkpoint["retry_of_run_id"] == "run-current-census-retry-1"
+    assert checkpoint["owner_run_id"] == owner_run_id
+    assert checkpoint["retry_of_run_id"] == retry_of_run_id
     assert checkpoint["completed_at"] is not None
     assert checkpoint["completeness_json"] == {
         "strategy_version": contract.strategy_version,
@@ -159,7 +153,9 @@ async def _run_initial_interrupted_phase(
     assert requested_urls == [count_url, start_url, NEXT_URL]
     assert fetch_result.fetch_mode == CURRENT_VERSION_CENSUS_FETCH_MODE
     assert fetch_result.complete is False
-    assert fetch_result.error == "http_500"
+    assert fetch_result.error == (
+        f"{CURRENT_VERSION_CENSUS_RETRYABLE_ERROR}:http_500"
+    )
     assert fetch_result.next_url_remaining is True
     assert_initial_checkpoint(checkpoint, contract)
     assert await candidate_resource_ids(database, schema) == [
@@ -167,46 +163,6 @@ async def _run_initial_interrupted_phase(
     ]
     assert await proof_shard_counts(database, schema) == (1, 1)
     return checkpoint
-
-
-async def _run_expired_cursor_phase(
-    monkeypatch: pytest.MonkeyPatch,
-    source_record: dict[str, Any],
-    database: Any,
-    schema: str,
-    initial_proof: dict[str, Any],
-) -> None:
-    """Prove an expired exact cursor is retained rather than restarted."""
-
-    requested_urls: list[str] = []
-    monkeypatch.setattr(
-        importer,
-        "_fetch_source_json",
-        fetch_sequence(
-            [(410, None, None, 1)],
-            requested_urls,
-        ),
-    )
-    fetch_result = await fetch_practitioners(
-        source_record,
-        checkpoint_context(
-            source_record,
-            owner_run_id="run-current-census-retry-1",
-            retry_of_run_id=ROOT_RUN_ID,
-        ),
-    )
-    checkpoint = await checkpoint_record(database, schema)
-
-    assert requested_urls == [NEXT_URL]
-    assert fetch_result.fetch_mode == CURRENT_VERSION_CENSUS_FETCH_MODE
-    assert fetch_result.complete is False
-    assert fetch_result.error == "http_410"
-    assert fetch_result.next_url_remaining is True
-    assert_retry_checkpoint(checkpoint, initial_proof)
-    assert await candidate_resource_ids(database, schema) == [
-        "practitioner-1"
-    ]
-    assert await proof_shard_counts(database, schema) == (1, 1)
 
 
 async def _run_completed_phase(
@@ -217,7 +173,7 @@ async def _run_completed_phase(
     count_url: str,
     contract: Any,
 ) -> None:
-    """Resume the raw cursor and persist the verified terminal proof."""
+    """Resume one transient failure and persist the verified terminal proof."""
 
     requested_urls: list[str] = []
     monkeypatch.setattr(
@@ -240,8 +196,8 @@ async def _run_completed_phase(
         source_record,
         checkpoint_context(
             source_record,
-            owner_run_id="run-current-census-retry-2",
-            retry_of_run_id="run-current-census-retry-1",
+            owner_run_id="run-current-census-retry-1",
+            retry_of_run_id=ROOT_RUN_ID,
         ),
     )
     checkpoint = await checkpoint_record(database, schema)
@@ -251,7 +207,12 @@ async def _run_completed_phase(
     assert fetch_result.complete is True
     assert fetch_result.error is None
     assert fetch_result.next_url_remaining is False
-    assert_completed_checkpoint(checkpoint, contract)
+    assert_completed_checkpoint(
+        checkpoint,
+        contract,
+        owner_run_id="run-current-census-retry-1",
+        retry_of_run_id=ROOT_RUN_ID,
+    )
     assert await candidate_resource_ids(database, schema) == [
         "practitioner-1",
         "practitioner-2",
@@ -260,10 +221,10 @@ async def _run_completed_phase(
 
 
 @pytest.mark.asyncio
-async def test_postgres_resumes_exact_census_without_restarting_expired_cursor(
+async def test_postgres_resumes_transient_exact_census_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify exact-count proof, retry ownership, and opaque-cursor retention."""
+    """Verify retry ownership and completion after a transient status."""
 
     contract = census_contract()
     source_record = census_source_record(contract)
@@ -276,7 +237,7 @@ async def test_postgres_resumes_exact_census_without_restarting_expired_cursor(
     count_url = current_version_census_count_url(start_url)
 
     async with census_database(monkeypatch) as (database, schema):
-        initial_checkpoint = await _run_initial_interrupted_phase(
+        await _run_initial_interrupted_phase(
             monkeypatch,
             source_record,
             database,
@@ -284,13 +245,6 @@ async def test_postgres_resumes_exact_census_without_restarting_expired_cursor(
             start_url,
             count_url,
             contract,
-        )
-        await _run_expired_cursor_phase(
-            monkeypatch,
-            source_record,
-            database,
-            schema,
-            initial_checkpoint["completeness_json"],
         )
         await _run_completed_phase(
             monkeypatch,

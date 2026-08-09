@@ -22,6 +22,7 @@ os.environ.setdefault("HLTHPRT_LOG_CFG", str(ROOT / "logging.yaml"))
 
 COMMAND = "sync-verified-state"
 EVIDENCE_COMMAND = "render-neutral-evidence"
+ABANDON_COMMAND = "abandon-expired-root"
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
 SAFE_ERROR_CODES = frozenset(
     {
@@ -61,7 +62,10 @@ def _parser() -> argparse.ArgumentParser:
             "Provider Directory subset state. No selector is accepted."
         ),
     )
-    parser.add_argument("command", choices=(COMMAND, EVIDENCE_COMMAND))
+    parser.add_argument(
+        "command",
+        choices=(COMMAND, EVIDENCE_COMMAND, ABANDON_COMMAND),
+    )
     return parser
 
 
@@ -162,11 +166,23 @@ async def _execute_evidence_render(database: Any) -> str:
     return reviewed_subset_activation_verified_manifest_json(evidence)
 
 
+async def _execute_abandonment(database: Any) -> str:
+    from process.provider_directory_fhir_subset_abandonment import (
+        abandon_reviewed_subset_expired_root,
+        abandonment_result_json,
+    )
+
+    result = await abandon_reviewed_subset_expired_root(database=database)
+    return abandonment_result_json(result)
+
+
 async def _execute_operation(database: Any, command: str) -> str:
     if command == COMMAND:
         return await _execute_state_sync(database)
     if command == EVIDENCE_COMMAND:
         return await _execute_evidence_render(database)
+    if command == ABANDON_COMMAND:
+        return await _execute_abandonment(database)
     raise RuntimeError("reviewed subset operator command is invalid")
 
 

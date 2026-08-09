@@ -17,6 +17,9 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from db import migration_index_adoption
+from tests.provider_directory_subset_abandonment_adoption_support import (
+    assert_abandonment_object_shapes,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,7 +91,6 @@ _EXPECTED_ACTIVATION_TRIGGERS = {
     "provider_directory_reviewed_subset_activation_dataset_guard",
     "provider_directory_reviewed_subset_dataset_truncate_guard",
 }
-
 RUNTIME_SCHEMA_SEED = r"""
 import asyncio
 
@@ -357,6 +359,7 @@ async def _assert_adopted_schema(database_url, schema_name: str) -> None:
     await _assert_active_index_shape(database_url, schema_name)
     await _assert_subset_completion_column_shapes(database_url, schema_name)
     await _assert_activation_object_shapes(database_url, schema_name)
+    await assert_abandonment_object_shapes(database_url, schema_name)
 
 
 def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():

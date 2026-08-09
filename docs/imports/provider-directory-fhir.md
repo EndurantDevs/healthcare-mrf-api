@@ -180,6 +180,10 @@ After two roots match, use the separate
 [reviewed subset state-sync runbook](provider-directory-reviewed-subset-activation.md)
 to review the neutral desired-state evidence and activate the source. The
 selector-free state sync is default-off and does not publish a dataset.
+If every retained reviewed continuation returns HTTP 410, stop retrying that
+root and follow the runbook's selector-free abandonment procedure. The sealed
+`acquisition_abandoned` root remains immutable evidence and is never reset or
+adopted by a later run; recovery starts from a new root.
 
 Resolve the single reviewed manual entry from the manifest and freeze one
 timezone-aware cutoff for the acquisition pair:
@@ -236,11 +240,12 @@ globally unique root ID while preserving the identical cutoff. Do not pass
 retry or pagination-root arguments for either fresh root. Root B must have a
 distinct acquisition root, separately valid replay evidence, and the same
 advertised/returned/deficit vector, neutral geometry, and content proof as
-Root A. A retry must use a new `--run-id` plus
+Root A. A transient retry must use a new `--run-id` plus
 `--retry-of-run-id <previous-run-id>` and
 `--pagination-root-run-id <original-root-run-id>`; it resumes the original root
-and is not a second root. Publication, Profile admission, and API verification
-remain separate reviewed operations after the twin-root gate passes.
+and is not a second root. A terminal HTTP 410 root is abandoned and never
+retried. Publication, Profile admission, and API verification remain separate
+reviewed operations after the twin-root gate passes.
 
 ## Source
 
@@ -1028,13 +1033,28 @@ The REST page-prefetch pilot is default-off. Enable it only with both
 `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH=true`. It is fail-closed to the
 pilot source allowlist and only a generic, single-start, checkpointed, unbounded
 streaming scan that does not retain rows. Any declared or configured credential,
-partitions, bounded scans, and specialized acquisition paths stay sequential. The
-pilot starts at most one trusted continuation while the current page is written and
+partitions, bounded scans, and specialized acquisition paths stay sequential
+unless the reviewed v3 exception below is independently enabled. The pilot
+starts at most one trusted continuation while the current page is written and
 checkpointed; it does not consume that result until the current checkpoint
 succeeds. A configured resource deadline bounds the speculative request to its
-remaining time, and an expired result is discarded before parsing or persistence.
-Resource diagnostics report prefetch eligibility, started/consumed/discarded page
-counts, and residual wait time without exposing cursor URLs or payloads.
+remaining time, and an expired result is discarded before parsing or
+persistence. Resource diagnostics report prefetch eligibility,
+started/consumed/discarded page counts, and residual wait time without exposing
+cursor URLs or payloads.
+
+Reviewed server-issued subset v3 scans remain excluded unless a second,
+dedicated switch is also set:
+`HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_SERVER_ISSUED_SUBSET=true`.
+This admits only a fresh, candidate-bound, exact-source lineage with no retry
+parent, one anonymous pinned session, one reviewed start URL, unbounded
+streaming, and no retained in-memory rows. It does not add a source-base
+allowlist and does not enable current-version v2 scans. Use the same setting
+for fresh Root A and Root B. The overlap changes only request timing: the next
+validated source-issued GET may run while the current page's rows, proof shard,
+and checkpoint are committed, but it is never parsed or consumed before that
+commit succeeds. Unset either prefetch switch to restore sequential transport;
+no proof, checkpoint, or campaign identity changes.
 
 After the pilot is verified, set
 `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_DETERMINISTIC=true` to extend the

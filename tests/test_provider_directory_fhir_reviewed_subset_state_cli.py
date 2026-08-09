@@ -16,6 +16,10 @@ import pytest
 from process.provider_directory_fhir_subset_activation import (
     ReviewedSubsetActivationError,
 )
+from process.provider_directory_fhir_subset_abandonment_contract import (
+    ReviewedSubsetAbandonmentError,
+    ReviewedSubsetAbandonmentResult,
+)
 from process import provider_directory_fhir_subset_activation_evidence as evidence_api
 from tests.provider_directory_fhir_subset_activation_support import activation_inputs
 
@@ -44,8 +48,10 @@ def test_operator_is_packaged_and_absent_from_ordinary_runtime_paths():
     runtime_paths.extend((ROOT / "api" / "endpoint").glob("*.py"))
     forbidden_runtime_names = (
         "sync_reviewed_subset_verified_state",
+        "abandon_reviewed_subset_expired_root",
         "provider_directory_fhir_reviewed_subset_state",
         "HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED",
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED",
     )
     for runtime_path in runtime_paths:
         runtime_source = runtime_path.read_text(encoding="utf-8")
@@ -79,9 +85,18 @@ def test_runbook_binds_neutral_review_and_separate_publication():
         "does not publish",
         "already_applied",
         "READ COMMITTED",
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED=true",
+        "abandon-expired-root",
+        "acquisition_abandoned",
+        "seal commits before that guard is released",
+        "does not publish, delete, reset, or reuse",
     ):
         assert required_text in runbook
     assert "provider-directory-reviewed-subset-activation.md" in provider_guide
+    assert (
+        "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_SERVER_ISSUED_SUBSET=true"
+        in provider_guide
+    )
 
 
 def _script_module():
@@ -115,12 +130,25 @@ def test_parser_accepts_only_fixed_command_and_no_selectors(capsys):
     assert vars(evidence_arguments) == {
         "command": script_module.EVIDENCE_COMMAND
     }
+    abandonment_arguments = script_module._parser().parse_args(
+        [script_module.ABANDON_COMMAND]
+    )
+    assert vars(abandonment_arguments) == {
+        "command": script_module.ABANDON_COMMAND
+    }
     with pytest.raises(SystemExit) as error:
         script_module._parser().parse_args(
             [script_module.COMMAND, "--source-id", "private"]
         )
-
     assert error.value.code == 2
+    assert capsys.readouterr().err == (
+        '{"code":"invalid_arguments","status":"error"}\n'
+    )
+    with pytest.raises(SystemExit) as abandonment_error:
+        script_module._parser().parse_args(
+            [script_module.ABANDON_COMMAND, "--dataset-id", "private"]
+        )
+    assert abandonment_error.value.code == 2
     assert capsys.readouterr().err == (
         '{"code":"invalid_arguments","status":"error"}\n'
     )
@@ -186,11 +214,47 @@ async def test_evidence_command_renders_only_the_neutral_manifest(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_abandonment_command_renders_only_closed_disposition(monkeypatch):
+    script_module = _script_module()
+    database = _Database()
+    abandonment_call = AsyncMock(
+        return_value=ReviewedSubsetAbandonmentResult(abandoned=True)
+    )
+    monkeypatch.setattr(
+        "process.provider_directory_fhir_subset_abandonment."
+        "abandon_reviewed_subset_expired_root",
+        abandonment_call,
+    )
+
+    rendered_result = await script_module._execute_operation(
+        database,
+        script_module.ABANDON_COMMAND,
+    )
+
+    abandonment_call.assert_awaited_once_with(database=database)
+    assert rendered_result == (
+        '{"abandoned":true,"already_applied":false,"status":"ok"}'
+    )
+
+    abandonment_call.return_value = ReviewedSubsetAbandonmentResult(
+        abandoned=False
+    )
+    replay_result = await script_module._execute_operation(
+        database,
+        script_module.ABANDON_COMMAND,
+    )
+    assert replay_result == (
+        '{"abandoned":false,"already_applied":true,"status":"ok"}'
+    )
+
+
 @pytest.mark.parametrize(
     ("error", "expected_code"),
     (
         (ReviewedSubsetActivationError("disabled"), "disabled"),
         (ReviewedSubsetActivationError("evidence"), "evidence"),
+        (ReviewedSubsetAbandonmentError("busy"), "busy"),
         (RuntimeError("private"), "failed"),
     ),
 )
