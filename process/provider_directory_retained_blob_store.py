@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
+from contextlib import contextmanager
+import hashlib
 from pathlib import Path
 
 from process.provider_directory_retained_artifact_base import (
@@ -282,6 +284,67 @@ class _OpenedArtifactBlob:
             self._directory_descriptors = []
 
 
+class _RetainedArtifactBlobReader:
+    """Sequential reader that proves the complete retained bytes on close."""
+
+    __slots__ = (
+        "_artifact_sha256",
+        "_byte_count",
+        "_digest",
+        "_offset",
+        "_opened_blob",
+    )
+
+    def __init__(
+        self,
+        opened_blob: _OpenedArtifactBlob,
+        artifact_sha256: str,
+        byte_count: int,
+    ) -> None:
+        self._opened_blob = opened_blob
+        self._artifact_sha256 = artifact_sha256
+        self._byte_count = byte_count
+        self._digest = hashlib.sha256()
+        self._offset = 0
+
+    def read(self, byte_count: int = -1) -> bytes:
+        """Read the next bytes while extending the exact content digest."""
+
+        if type(byte_count) is not int or byte_count < -1:
+            raise ValueError("retained artifact read size is invalid")
+        if byte_count == 0:
+            return b""
+        remaining = self._byte_count - self._offset
+        requested = remaining if byte_count < 0 else min(byte_count, remaining)
+        if requested == 0:
+            return b""
+        chunk = self._opened_blob.read_at(requested, self._offset)
+        if not chunk or len(chunk) > requested:
+            raise RetainedArtifactError("retained_blob_read_incomplete")
+        self._offset += len(chunk)
+        self._digest.update(chunk)
+        return chunk
+
+    def _verify_and_close(self) -> None:
+        """Require a full sequential read and its bound SHA-256 identity."""
+
+        try:
+            if (
+                self._offset != self._byte_count
+                or self._digest.hexdigest() != self._artifact_sha256
+            ):
+                raise RetainedArtifactError("retained_blob_digest_mismatch")
+            self._opened_blob.verify_and_close()
+        except BaseException:
+            self._opened_blob.abort()
+            raise
+
+    def _abort(self) -> None:
+        """Close an incomplete read without treating it as verified."""
+
+        self._opened_blob.abort()
+
+
 def _open_retained_artifact_blob(
     artifact_sha256: str,
     artifact_byte_count: int,
@@ -315,4 +378,37 @@ def _open_retained_artifact_blob(
     )
 
 
-__all__ = ("ARTIFACT_ROOT_ENV", "retained_artifact_blob_components")
+@contextmanager
+def open_retained_artifact_blob(
+    artifact_sha256: str,
+    artifact_byte_count: int,
+):
+    """Open one retained blob for a complete, digest-verifying read."""
+
+    artifact_digest = require_digest(artifact_sha256, "artifact_sha256")
+    expected_byte_count = require_positive_int(
+        artifact_byte_count,
+        "artifact_byte_count",
+    )
+    reader = _RetainedArtifactBlobReader(
+        _open_retained_artifact_blob(
+            artifact_digest,
+            expected_byte_count,
+        ),
+        artifact_digest,
+        expected_byte_count,
+    )
+    try:
+        yield reader
+    except BaseException:
+        reader._abort()
+        raise
+    else:
+        reader._verify_and_close()
+
+
+__all__ = (
+    "ARTIFACT_ROOT_ENV",
+    "open_retained_artifact_blob",
+    "retained_artifact_blob_components",
+)

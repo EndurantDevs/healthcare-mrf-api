@@ -398,6 +398,15 @@ def validate_retained_catalog_proof(
     return normalized_proof, observed_catalog_from_payloads(payloads_by_family)
 
 
+def validate_retained_catalog_payloads(
+    raw_proof: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Rehash and decode both retained listings for sibling source contracts."""
+
+    normalized_proof, payloads_by_family = _validated_catalog_proof(raw_proof)
+    return normalized_proof, payloads_by_family
+
+
 def validate_retained_raw_proof(raw_proof: Any) -> dict[str, Any]:
     """Rehash the two retained listings and return their immutable proof."""
 

@@ -259,3 +259,89 @@ def test_reviewed_operator_library_and_script_paths_are_packaged():
     assert "tests/test_formulary_fhir_reviewed_operator_postgres.py" in (
         workflow_source
     )
+
+
+def test_uhc_operator_phases_are_separated_and_runtime_dormant():
+    """UHC network acquisition and receipt-only publication cannot cross."""
+
+    acquire_source = (
+        ROOT / "process" / "formulary_fhir" / "uhc_drug_acquire_operation.py"
+    ).read_text(encoding="utf-8")
+    publish_source = (
+        ROOT / "process" / "formulary_fhir" / "uhc_drug_publish_operation.py"
+    ).read_text(encoding="utf-8")
+    common_source = (
+        ROOT / "process" / "formulary_fhir" / "uhc_drug_operation.py"
+    ).read_text(encoding="utf-8")
+
+    for forbidden_publish_name in (
+        "publish_dataset",
+        "publish_admitted_uhc_drug_candidate",
+        "publish_uhc_drug_receipt",
+    ):
+        assert forbidden_publish_name not in acquire_source
+    for forbidden_acquisition_name in (
+        "acquire_current_uhc_drug_artifacts",
+        "uhc_drug_acquisition",
+        "uhc_drug_transport",
+        "aiohttp",
+        "socket",
+        "materialize_uhc_drug_spool",
+    ):
+        assert forbidden_acquisition_name not in publish_source
+    assert "uhc_drug_acquire_operation" not in common_source
+    assert "uhc_drug_publish_operation" not in common_source
+
+    runtime_paths = [
+        ROOT / "main.py",
+        ROOT / "process" / "__init__.py",
+        ROOT / "process" / "formulary_fhir" / "__init__.py",
+        ROOT / "api" / "control_imports.py",
+        ROOT / "api" / "control_workers.py",
+    ]
+    runtime_paths.extend((ROOT / "api" / "endpoint").glob("*.py"))
+    forbidden_runtime_names = (
+        "acquire_and_admit_uhc_drugs",
+        "publish_uhc_drug_receipt",
+        "HLTHPRT_UHC_FORMULARY_ACQUISITION_ENABLED",
+        "HLTHPRT_UHC_FORMULARY_PUBLICATION_ENABLED",
+        "uhc_formulary_operator",
+    )
+    for runtime_path in runtime_paths:
+        runtime_source = runtime_path.read_text(encoding="utf-8")
+        for forbidden_runtime_name in forbidden_runtime_names:
+            assert forbidden_runtime_name not in runtime_source
+
+
+def test_uhc_operator_never_imports_the_legacy_formulary_writer():
+    """The UHC lane writes only the immutable formulary FHIR repository."""
+
+    uhc_sources = (
+        ROOT / "process" / "formulary_fhir"
+    ).glob("uhc_*.py")
+    for uhc_source_path in uhc_sources:
+        source_text = uhc_source_path.read_text(encoding="utf-8")
+        for forbidden_legacy_name in (
+            "PlanDrugRaw",
+            "PlanFormulary",
+            "process.initial",
+            "api.endpoint.formulary",
+        ):
+            assert forbidden_legacy_name not in source_text
+
+
+def test_uhc_operator_library_and_script_are_packaged_and_gated_in_ci():
+    """The image contains the one-shot operator and proves it disabled."""
+
+    dockerfile_source = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    workflow_source = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    operator_script = ROOT / "scripts" / "smoke" / "uhc_formulary_operator.py"
+
+    assert operator_script.is_file()
+    assert "COPY process/ /opt/process/" in dockerfile_source
+    assert "COPY scripts/ /opt/scripts/" in dockerfile_source
+    assert str(operator_script.relative_to(ROOT)) in workflow_source
+    assert "HLTHPRT_UHC_FORMULARY_ACQUISITION_ENABLED" in workflow_source
+    assert "HLTHPRT_UHC_FORMULARY_PUBLICATION_ENABLED" in workflow_source

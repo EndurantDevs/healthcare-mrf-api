@@ -9,7 +9,6 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Callable
 
-import asyncpg
 from db.models import db
 from process.formulary_fhir.client import FHIRFormularyClient
 from process.formulary_fhir.continuation import FHIRTransportError
@@ -35,9 +34,17 @@ from process.formulary_fhir.source import EnabledSourceBinding
 from process.formulary_fhir.source import LIBRARY_ONLY_LAUNCH_MODE
 from process.formulary_fhir.source import load_enabled_source
 from process.formulary_fhir.source import require_source_unchanged
+from process.formulary_fhir.sync_lifecycle import (
+    is_resumable_synchronization_error as _is_resumable,
+)
+from process.formulary_fhir.sync_lifecycle import (
+    record_synchronization_failure as _record_failure,
+)
+from process.formulary_fhir.sync_lifecycle import (
+    shield_synchronization_lifecycle as _shield_lifecycle,
+)
 from process.formulary_fhir.types import AlternativeCorrection
 from process.formulary_fhir.types import FHIRSourceConfigurationError
-from sqlalchemy import exc as sqlalchemy_error
 
 
 ClientFactory = Callable[[Any], Any]
@@ -289,65 +296,6 @@ def _result(
         transient_retry_count=_metric(client, "transient_retry_count"),
         throttle_count=_metric(client, "throttle_count"),
     )
-
-
-def _is_resumable(error: BaseException) -> bool:
-    if isinstance(error, (asyncio.CancelledError, TimeoutError)):
-        return True
-    if isinstance(error, FHIRTransportError):
-        return error.is_transient is True
-    transient_database_errors = (
-        asyncpg.CannotConnectNowError,
-        asyncpg.DeadlockDetectedError,
-        asyncpg.PostgresConnectionError,
-        asyncpg.SerializationError,
-        asyncpg.TooManyConnectionsError,
-    )
-    if isinstance(error, transient_database_errors):
-        return True
-    if isinstance(
-        error,
-        (
-            sqlalchemy_error.DisconnectionError,
-            sqlalchemy_error.InterfaceError,
-            sqlalchemy_error.OperationalError,
-            sqlalchemy_error.TimeoutError,
-        ),
-    ):
-        return True
-    return isinstance(
-        getattr(error, "orig", None),
-        transient_database_errors,
-    )
-
-
-async def _shield_lifecycle(update: Any) -> None:
-    lifecycle_task = asyncio.create_task(update)
-    while not lifecycle_task.done():
-        try:
-            await asyncio.shield(lifecycle_task)
-        except asyncio.CancelledError:
-            continue
-        except BaseException:
-            break
-    if lifecycle_task.done():
-        try:
-            lifecycle_task.result()
-        except BaseException:
-            return
-
-
-async def _record_failure(
-    repository: FHIRFormularyRepository,
-    dataset: DatasetRef,
-    error: BaseException,
-) -> None:
-    update = (
-        repository.interrupt_dataset(dataset, error)
-        if _is_resumable(error)
-        else repository.fail_dataset(dataset, error)
-    )
-    await _shield_lifecycle(update)
 
 
 async def _verified_replay_result(
