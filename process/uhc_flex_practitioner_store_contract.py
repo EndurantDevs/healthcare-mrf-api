@@ -292,7 +292,6 @@ def terminal_record_sha256(
 
     fields = (
         UHC_FLEX_PRACTITIONER_TERMINAL_RECORD_CONTRACT_ID,
-        claim.acquisition_id,
         str(claim.requested_npi),
         status,
         result_sha256 or "",

@@ -107,7 +107,6 @@ def _terminal_set_function_sql(schema: str) -> str:
         )
         SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
             '{_TERMINAL_SET_CONTRACT}' || pg_catalog.chr(31)
-            || candidate_acquisition_id || pg_catalog.chr(31)
             || COALESCE(pg_catalog.string_agg(
                 middle.bucket_id::text || pg_catalog.chr(31)
                 || middle.row_count::text || pg_catalog.chr(31)
@@ -430,7 +429,6 @@ def _work_guard_function_sql(schema: str) -> str:
         expected_terminal_record_sha256 := pg_catalog.encode(
             pg_catalog.sha256(pg_catalog.convert_to(
                 '{_TERMINAL_RECORD_CONTRACT}' || pg_catalog.chr(31)
-                || NEW.acquisition_id || pg_catalog.chr(31)
                 || NEW.npi::text || pg_catalog.chr(31)
                 || NEW.status || pg_catalog.chr(31)
                 || COALESCE(NEW.result_sha256, '') || pg_catalog.chr(31)

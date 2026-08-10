@@ -60,6 +60,25 @@ def _identity(role: str = "baseline") -> UHCFlexPractitionerAcquisitionIdentity:
     )
 
 
+def _terminal_claim(
+    role: str,
+    requested_npi: int = NPI,
+) -> UHCFlexPractitionerWorkClaim:
+    identity = build_uhc_flex_practitioner_acquisition_identity(
+        cohort_fixture(),
+        acquisition_role=role,
+        run_id=RUN_ID if role == "baseline" else "pdufpr_" + "3" * 48,
+        dataset_intent_id=INTENT_ID,
+    )
+    return UHCFlexPractitionerWorkClaim(
+        acquisition_id=identity.acquisition_id,
+        cohort_id=identity.cohort_id,
+        requested_npi=requested_npi,
+        attempt=1,
+        lease_token=("4" if role == "baseline" else "5") * 64,
+    )
+
+
 def _matched_result():
     return validate_uhc_flex_practitioner_search_bundle(
         NPI,
@@ -134,7 +153,6 @@ def test_terminal_record_hash_and_payload_rows_match_query_result() -> None:
             (
                 "healthporta.provider-directory.uhc-flex-practitioner-"
                 "terminal-record.v1",
-                claim.acquisition_id,
                 str(NPI),
                 "matched",
                 query_result.result_sha256,
@@ -150,6 +168,63 @@ def test_terminal_record_hash_and_payload_rows_match_query_result() -> None:
         resource_count=1,
         error_code=None,
     ) == expected
+
+
+def test_terminal_record_root_is_acquisition_neutral_but_outcome_exact() -> None:
+    comparable_by_field = {
+        "status": "matched",
+        "result_sha256": "6" * 64,
+        "resource_count": 1,
+        "error_code": None,
+    }
+    baseline_root = _terminal_record_sha256(
+        _terminal_claim("baseline"),
+        **comparable_by_field,
+    )
+    assert baseline_root == _terminal_record_sha256(
+        _terminal_claim("candidate"),
+        **comparable_by_field,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "requested_npi",
+        "status",
+        "result_sha256",
+        "resource_count",
+        "error_code",
+    ),
+    (
+        (1518379601, "matched", "6" * 64, 1, None),
+        (NPI, "unmatched", "6" * 64, 1, None),
+        (NPI, "matched", "8" * 64, 1, None),
+        (NPI, "matched", "6" * 64, 2, None),
+        (NPI, "error", None, 0, "response_invalid"),
+    ),
+)
+def test_terminal_record_root_binds_each_comparable_outcome_field(
+    requested_npi: int,
+    status: str,
+    result_sha256: str | None,
+    resource_count: int,
+    error_code: str | None,
+) -> None:
+    baseline_root = _terminal_record_sha256(
+        _terminal_claim("baseline"),
+        status="matched",
+        result_sha256="6" * 64,
+        resource_count=1,
+        error_code=None,
+    )
+    drifted_root = _terminal_record_sha256(
+        _terminal_claim("candidate", requested_npi),
+        status=status,
+        result_sha256=result_sha256,
+        resource_count=resource_count,
+        error_code=error_code,
+    )
+    assert drifted_root != baseline_root
 
 
 def test_manifest_row_and_terminal_summary_fail_closed() -> None:
