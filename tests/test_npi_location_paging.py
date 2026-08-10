@@ -316,7 +316,7 @@ def test_dedupe_merges_unsited_alias_into_only_concrete_site(
     ]
 
 
-def test_dedupe_keeps_bare_overlay_when_site_match_is_ambiguous():
+def test_dedupe_merges_bare_overlay_and_conflicting_sites_by_exact_key(caplog):
     rows = [
         _address(ADDRESS_A, "100 Example Avenue", source_id="nppes", premise_key=SITE_A),
         _address(
@@ -330,8 +330,10 @@ def test_dedupe_keeps_bare_overlay_when_site_match_is_ambiguous():
 
     deduped = npi_module._dedupe_addresses_by_key(rows)
 
-    assert len(deduped) == 3
-    assert sum("premise_key" not in row for row in deduped) == 1
+    assert len(deduped) == 1
+    assert deduped[0]["premise_key"] == SITE_A
+    assert deduped[0]["address_sources"] == ["nppes", "provider_directory_fhir"]
+    assert "maps to 2 conflicting non-null site keys" in caplog.text
 
 
 def test_merge_preserves_endpoint_aware_confirmation():

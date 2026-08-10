@@ -63,12 +63,6 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        ProviderDirectoryPractitionerRole,
                        ProviderDirectorySource, db)
 from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
-from process.ext.address_canon import (
-    city_norm as canonical_city_norm,
-    state_code as canonical_state_code,
-    street_norm as canonical_street_norm,
-    zip5_norm as canonical_zip5_norm,
-)
 from process.ext.utils import download_it
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 from process import provider_directory_profile as profile_artifact
@@ -1212,92 +1206,35 @@ def _merge_address_bucket(addresses: Sequence[dict[str, Any]]) -> dict[str, Any]
     return base
 
 
-def _address_display_site_signature(address: Mapping[str, Any]) -> tuple[str, ...]:
-    return (
-        canonical_street_norm(
-            str(address.get("first_line") or ""),
-            str(address.get("second_line") or ""),
-        )
-        or "",
-        canonical_city_norm(str(address.get("city_name") or "")) or "",
-        canonical_state_code(
-            str(address.get("state_code") or address.get("state_name") or "")
-        )
-        or "",
-        canonical_zip5_norm(str(address.get("postal_code") or "")) or "",
-    )
-
-
-def _has_shared_display_site(first: Mapping[str, Any], second: Mapping[str, Any]) -> bool:
-    first_signature = _address_display_site_signature(first)
-    second_signature = _address_display_site_signature(second)
-    if not first_signature[0] or not second_signature[0]:
-        return False
-    return all(
-        not first_value or not second_value or first_value == second_value
-        for first_value, second_value in zip(first_signature, second_signature)
-    )
-
-
-def _is_unhydrated_directory_overlay(address: Mapping[str, Any]) -> bool:
-    """Identify an address-only FHIR overlay before base-row hydration."""
-    raw_sources = address.get("address_sources") or []
-    address_sources = (
-        raw_sources
-        if isinstance(raw_sources, (list, tuple, set))
-        else [raw_sources]
-    )
-    normalized_sources = {
-        str(source_id or "").strip().lower()
-        for source_id in address_sources
-        if str(source_id or "").strip()
-    }
-    return (
-        normalized_sources == {"provider_directory_fhir"}
-        and not _base_address_row_identity(address)
-    )
-
-
 def _merge_address_key_group(
     address_group: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    site_buckets_by_key: dict[str, list[dict[str, Any]]] = {}
-    unsited_addresses: list[dict[str, Any]] = []
+    """Return one public member for one canonical delivery-point key."""
+    address_key = ""
+    site_keys: set[str] = set()
     for address in address_group:
-        _group_address_key, site_key = _address_key_and_site_key(address)
+        address_key, site_key = _address_key_and_site_key(address)
         if site_key:
-            site_buckets_by_key.setdefault(site_key, []).append(address)
-        else:
-            unsited_addresses.append(address)
-    merged_site_addresses = [
-        _merge_address_bucket(site_bucket)
-        for site_bucket in site_buckets_by_key.values()
-    ]
-    unresolved_unsited_addresses: list[dict[str, Any]] = []
-    for unsited_address in unsited_addresses:
-        matching_site_addresses = [
-            site_address
-            for site_address in merged_site_addresses
-            if _has_shared_display_site(site_address, unsited_address)
-        ]
-        if (
-            not matching_site_addresses
-            and len(merged_site_addresses) == 1
-            and _is_unhydrated_directory_overlay(unsited_address)
-        ):
-            matching_site_addresses = merged_site_addresses
-        if len(matching_site_addresses) == 1:
-            _merge_duplicate_address(matching_site_addresses[0], unsited_address)
-        else:
-            unresolved_unsited_addresses.append(unsited_address)
-    group_addresses = list(merged_site_addresses)
-    if unresolved_unsited_addresses:
-        group_addresses.append(_merge_address_bucket(unresolved_unsited_addresses))
-    return sorted(group_addresses, key=_provider_location_sort_key)
+            site_keys.add(site_key)
+    if len(site_keys) > 1:
+        logger.warning(
+            "Canonical address_key %s maps to %d conflicting non-null site keys",
+            address_key,
+            len(site_keys),
+        )
+    ordered_group = sorted(
+        address_group,
+        key=lambda address: (
+            _address_type_rank(address),
+            not bool(_address_key_and_site_key(address)[1]),
+            _provider_location_sort_key(address),
+        ),
+    )
+    return [_merge_address_bucket(ordered_group)]
 
 
 def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
-    """Merge equivalent address rows while preserving distinct premises."""
+    """Merge every nonempty canonical address key into one public member."""
     addresses_by_key: dict[str, list[dict[str, Any]]] = {}
     unkeyed_addresses: list[dict[str, Any]] = []
     for address in sorted(
