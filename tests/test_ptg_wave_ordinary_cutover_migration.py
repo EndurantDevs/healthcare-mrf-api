@@ -73,7 +73,7 @@ def test_migration_reuses_exact_guard_and_has_one_head_link(monkeypatch):
     sql = "\n".join(statements)
 
     assert migration.down_revision == (
-        "20260810040000_fhir_formulary_uhc_admission_receipt"
+        "20260810090000_provider_directory_terminal_root_retirement"
     )
     assert "ADD COLUMN successor_wave_id varchar(64)" in sql
     assert "ADD COLUMN recovery_evidence jsonb" in sql
