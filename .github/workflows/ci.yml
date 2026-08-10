@@ -524,6 +524,23 @@ jobs:
                 test "$operation_output" = '\''{"code":"disabled","status":"error"}'\''
               done
             '
+      - name: Prove terminal-root retirement operator is packaged and dormant
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/sh \
+            healthcare-mrf-api:ptg-v4-gate \
+            -ec '
+              set +e
+              operation_output=$(env \
+                -u HLTHPRT_PROVIDER_DIRECTORY_TERMINAL_ROOT_RETIREMENT_ENABLED \
+                /opt/venv/bin/python -B \
+                /opt/scripts/smoke/provider_directory_terminal_root_retirement.py \
+                2>&1)
+              operation_status=$?
+              set -e
+              test "$operation_status" -eq 1
+              test "$operation_output" = '\''{"code":"disabled","status":"error"}'\''
+            '
 
   security:
     name: dependency and semgrep security
@@ -946,6 +963,7 @@ jobs:
           tests/test_provider_directory_fhir_terminal_atomicity_postgres.py
           tests/test_provider_directory_reviewed_subset_bounded_drift_postgres.py
           tests/test_provider_directory_reviewed_subset_terminal_disposition_postgres.py
+          tests/test_provider_directory_terminal_root_retirement_postgres.py
       - name: Run exact Provider Directory enrichment PostgreSQL lifecycle gate
         if: matrix.shard == 'provider-directory'
         env:

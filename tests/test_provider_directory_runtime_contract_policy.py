@@ -37,3 +37,20 @@ def test_runtime_contract_accepts_policy_pending_manifest(monkeypatch):
     assert report["ok"] is True
     assert report["desired_state"] == POLICY_PENDING_STATUS
     assert report["evidence_present"] is False
+
+
+def test_terminal_root_retirement_operator_is_default_off(monkeypatch) -> None:
+    from process.provider_directory_terminal_root_retirement_contract import (
+        RETIREMENT_ENABLED_ENV,
+    )
+
+    monkeypatch.delenv(RETIREMENT_ENABLED_ENV, raising=False)
+
+    report = runtime_contract._terminal_root_retirement_gate_report()
+
+    assert report == {
+        "default_off": True,
+        "ok": True,
+        "stderr_matches": True,
+        "stdout_empty": True,
+    }

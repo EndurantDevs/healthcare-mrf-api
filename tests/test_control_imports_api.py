@@ -258,6 +258,13 @@ def test_provider_directory_runtime_contract_preflight_passes():
             "output_matches": True,
         },
     }
+    retirement = report["checks"]["terminal_root_retirement"]
+    assert retirement == {
+        "default_off": True,
+        "ok": True,
+        "stderr_matches": True,
+        "stdout_empty": True,
+    }
 
 
 def test_control_wrapped_publish_importers_request_shutdown():
