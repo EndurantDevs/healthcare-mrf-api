@@ -150,6 +150,7 @@ from process.provider_directory_fhir_subset_completion import (
 from process.provider_directory_fhir_subset_identity import (
     is_reviewed_subset_profile,
     server_issued_subset_source_scope_payload,
+    subset_activation_source_contract_payload,
 )
 from process.provider_directory_fhir_root_policy import (
     DEFAULT_REQUIRED_ROOT_COUNT,
@@ -58266,12 +58267,25 @@ def _attach_provider_directory_endpoint_ids(
 
 async def _upsert_provider_directory_source_rows(
     source_rows: list[dict[str, Any]],
+    *,
+    require_reviewed_subset_generation: bool = False,
 ) -> int:
     endpoint_rows = _attach_provider_directory_endpoint_ids(source_rows)
-    if endpoint_rows:
-        await _upsert_rows(ProviderDirectoryAPIEndpoint, endpoint_rows)
-    await _upsert_rows(ProviderDirectorySource, source_rows)
-    return len(endpoint_rows)
+
+    async def upsert_and_require_generation() -> int:
+        """Persist one source generation inside the selected boundary."""
+
+        if endpoint_rows:
+            await _upsert_rows(ProviderDirectoryAPIEndpoint, endpoint_rows)
+        await _upsert_rows(ProviderDirectorySource, source_rows)
+        if require_reviewed_subset_generation:
+            await _assert_persisted_reviewed_subset_generations(source_rows)
+        return len(endpoint_rows)
+
+    if not require_reviewed_subset_generation:
+        return await upsert_and_require_generation()
+    async with db.transaction():
+        return await upsert_and_require_generation()
 
 
 _REVIEWED_PARTITION_GENERATION_METADATA_KEYS = tuple(
@@ -58287,6 +58301,100 @@ _REVIEWED_PARTITION_GENERATION_METADATA_KEYS = tuple(
         )
     )
 )
+
+_REVIEWED_SUBSET_GENERATION_METADATA_KEYS = (
+    "provider_directory_candidate_status",
+    REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+    REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
+)
+
+
+def _is_reviewed_subset_generation_exact(
+    expected_source: Mapping[str, Any],
+    persisted_source: Mapping[str, Any],
+) -> bool:
+    """Compare one pending reviewed subset generation fail closed."""
+
+    expected_metadata = _source_metadata(dict(expected_source))
+    persisted_metadata = _json_object(persisted_source.get("metadata_json"))
+    expected_pending_status = (
+        PROVIDER_DIRECTORY_ROOT_POLICY_PENDING
+        if REVIEWED_ROOT_POLICY_METADATA_KEY in expected_metadata
+        else PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_PENDING
+    )
+    if (
+        expected_metadata.get("provider_directory_candidate_status")
+        != expected_pending_status
+        or any(
+            key in expected_metadata
+            for key in (
+                REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+                REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
+            )
+        )
+        or any(
+            (key in expected_metadata) != (key in persisted_metadata)
+            or expected_metadata.get(key) != persisted_metadata.get(key)
+            for key in _REVIEWED_SUBSET_GENERATION_METADATA_KEYS
+        )
+    ):
+        return False
+    try:
+        return subset_activation_source_contract_payload(
+            expected_source
+        ) == subset_activation_source_contract_payload(persisted_source)
+    except ValueError:
+        return False
+
+
+async def _assert_persisted_reviewed_subset_generations(
+    source_rows: list[dict[str, Any]],
+) -> None:
+    """Require the bound reviewed generation before any source request."""
+
+    expected_sources = [
+        source_record
+        for source_record in source_rows
+        if (
+            contract := current_version_census_contract(source_record)
+        ) is not None
+        and contract.is_server_issued_subset_v3
+    ]
+    if len(expected_sources) != 1:
+        raise RuntimeError(
+            "provider_directory_reviewed_subset_generation_persistence_mismatch"
+        )
+    expected_source = expected_sources[0]
+    persisted_rows = await db.all(
+        f"""
+        SELECT source_id, endpoint_id, canonical_api_base,
+               requires_registration, requires_api_key, auth_type,
+               metadata_json
+          FROM {_qt(_schema(), ProviderDirectorySource.__tablename__)}
+         WHERE source_id = :source_id
+         ORDER BY endpoint_id
+         LIMIT 2
+        """,
+        source_id=expected_source.get("source_id"),
+    )
+    persisted_sources = [
+        dict(
+            persisted_source_record._mapping
+            if hasattr(persisted_source_record, "_mapping")
+            else persisted_source_record
+        )
+        for persisted_source_record in persisted_rows
+    ]
+    if (
+        len(persisted_sources) != 1
+        or not _is_reviewed_subset_generation_exact(
+            expected_source,
+            persisted_sources[0],
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_reviewed_subset_generation_persistence_mismatch"
+        )
 
 
 def _is_reviewed_partition_generation_exact(
@@ -70665,7 +70773,13 @@ async def process_provider_directory_fhir_data(
         )
         for source_record in source_rows:
             _validate_current_version_census_source_transport(source_record)
-        endpoint_rows_seeded = await _upsert_provider_directory_source_rows(source_rows)
+        endpoint_rows_seeded = await _upsert_provider_directory_source_rows(
+            source_rows,
+            require_reviewed_subset_generation=bool(
+                census_contract is not None
+                and census_contract.is_server_issued_subset_v3
+            ),
+        )
         await _assert_persisted_reviewed_partition_generations(source_rows)
         stale_source_deletion_by_type = {}
         protected_source_ids: list[str] = []
