@@ -28480,11 +28480,16 @@ async def test_last_updated_partition_rejects_non_searchset_bundles(monkeypatch)
         "total": 1,
         "entry": [],
     }
+    fetch_source_json = AsyncMock(
+        return_value=(200, non_searchset_bundle_by_field, None, 1)
+    )
+    sleep = AsyncMock()
     monkeypatch.setattr(
         importer,
         "_fetch_source_json",
-        AsyncMock(return_value=(200, non_searchset_bundle_by_field, None, 1)),
+        fetch_source_json,
     )
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep)
 
     count_fetch = await importer._fetch_last_updated_partition_count(
         directory_source,
@@ -28501,8 +28506,11 @@ async def test_last_updated_partition_rejects_non_searchset_bundles(monkeypatch)
 
     assert count_fetch.observation is not None
     assert count_fetch.observation.kind.value == "unknown"
-    assert count_fetch.error == "non_searchset_count_bundle"
+    assert count_fetch.pages_fetched == 3
+    assert count_fetch.error == "non_searchset_count_bundle_retry_exhausted"
     assert page_fetch.error == "non_searchset_bundle"
+    assert fetch_source_json.await_count == 4
+    assert [call.args[0] for call in sleep.await_args_list] == [0.25, 0.5]
 
 
 @pytest.mark.asyncio
@@ -29071,6 +29079,16 @@ class _CensusSequenceResponder:
         )
 
 
+class _CensusEnvelopeSequenceResponder:
+    def __init__(self, payloads):
+        self.payloads = iter(payloads)
+        self.requested_urls = []
+
+    async def _fetch_source_json(self, _source, request_url, *, timeout):
+        self.requested_urls.append(request_url)
+        return 200, next(self.payloads), None, 1
+
+
 @pytest.mark.asyncio
 async def test_last_updated_partition_blocks_pre_census_mismatch(monkeypatch):
     directory_source = _last_updated_partition_test_source()
@@ -29089,6 +29107,80 @@ async def test_last_updated_partition_blocks_pre_census_mismatch(monkeypatch):
     assert "census_ranged_root_pre_mismatch:2!=1" in fetch_outcome.error
     assert fetch_outcome.fetch_diagnostic["unfiltered_pre"] == 2
     assert fetch_outcome.fetch_diagnostic["ranged_root_pre"] == 1
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_retry_recovery_preserves_census_mismatch(
+    monkeypatch,
+):
+    directory_source = _last_updated_partition_test_source()
+    responder = _CensusEnvelopeSequenceResponder(
+        [
+            _last_updated_partition_test_bundle([], total=2),
+            None,
+            _last_updated_partition_test_bundle([], total=1),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep)
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            responder._fetch_source_json,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert fetch_outcome.next_url_remaining is False
+    assert fetch_outcome.pages_fetched == 3
+    assert "census_ranged_root_pre_mismatch:2!=1" in fetch_outcome.error
+    assert fetch_outcome.fetch_diagnostic["unfiltered_pre"] == 2
+    assert fetch_outcome.fetch_diagnostic["ranged_root_pre"] == 1
+    assert responder.requested_urls[1] == responder.requested_urls[2]
+    sleep.assert_awaited_once_with(0.25)
+    assert staged_resources_by_id == {}
+    assert written_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_last_updated_partition_count_envelope_exhaustion_is_terminal(
+    monkeypatch,
+):
+    directory_source = _last_updated_partition_test_source()
+    responder = _CensusEnvelopeSequenceResponder(
+        [
+            _last_updated_partition_test_bundle([], total=2),
+            None,
+            None,
+            None,
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep)
+
+    fetch_outcome, staged_resources_by_id, written_resource_ids = (
+        await _run_last_updated_partition_test_fetch(
+            monkeypatch,
+            directory_source,
+            responder._fetch_source_json,
+        )
+    )
+
+    assert fetch_outcome.complete is False
+    assert fetch_outcome.next_url_remaining is False
+    assert fetch_outcome.pages_fetched == 4
+    assert (
+        "census_ranged_root_pre_invalid:"
+        "non_searchset_count_bundle_retry_exhausted"
+    ) in fetch_outcome.error
+    assert fetch_outcome.fetch_diagnostic["unfiltered_pre"] == 2
+    assert fetch_outcome.fetch_diagnostic["ranged_root_pre"] is None
+    assert len(set(responder.requested_urls[1:])) == 1
+    assert sleep.await_args_list == [call(0.25), call(0.5)]
     assert staged_resources_by_id == {}
     assert written_resource_ids == []
 

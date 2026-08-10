@@ -1457,6 +1457,7 @@ LAST_UPDATED_PARTITION_BLOCKED_ERROR = (
 LAST_UPDATED_PARTITION_RETRYABLE_ERROR = (
     "provider_directory_last_updated_partition_acquisition_retryable"
 )
+LAST_UPDATED_PARTITION_COUNT_ENVELOPE_RETRY_DELAYS_SECONDS = (0.25, 0.5)
 PAGINATION_RESUME_REQUIRED_ERROR = "provider_directory_pagination_resume_required"
 RESOURCE_FETCH_INCOMPLETE_ERROR = "provider_directory_resource_fetch_incomplete"
 BULK_EXPORT_CHECKPOINT_STRATEGY_VERSION = "provider-directory-fhir-bulk-v1"
@@ -49019,35 +49020,52 @@ async def _fetch_last_updated_partition_count(
     timeout: int,
 ) -> LastUpdatedCountFetch:
     """Fetch one exact, non-paginated partition count observation."""
-    status_code, response_payload, error, _elapsed = await _fetch_source_json(
-        source_record,
-        request_url,
-        timeout=timeout,
-    )
-    if status_code != 200 or error:
-        failure_error = error or f"http_{status_code}"
-        is_transient = _is_transient_source_fetch_failure(status_code, error)
-        return LastUpdatedCountFetch(
-            observation=(
-                None
-                if is_transient
-                else CountObservation.error(failure_error)
-            ),
-            error=failure_error,
-            transient=is_transient,
-            retry_not_before=(
-                _last_updated_partition_retry_not_before(
-                    source_record,
-                    request_url,
-                    status_code,
-                    response_payload,
-                    error,
-                )
-                if is_transient
-                else None
-            ),
+    retry_delays = LAST_UPDATED_PARTITION_COUNT_ENVELOPE_RETRY_DELAYS_SECONDS
+    attempt_index = 0
+    while True:
+        status_code, response_payload, error, _elapsed = await _fetch_source_json(
+            source_record,
+            request_url,
+            timeout=timeout,
         )
-    return _validate_last_updated_partition_count_payload(response_payload)
+        pages_fetched = attempt_index + 1
+        if status_code != 200 or error:
+            failure_error = error or f"http_{status_code}"
+            is_transient = _is_transient_source_fetch_failure(status_code, error)
+            return LastUpdatedCountFetch(
+                observation=(
+                    None
+                    if is_transient
+                    else CountObservation.error(failure_error)
+                ),
+                pages_fetched=pages_fetched,
+                error=failure_error,
+                transient=is_transient,
+                retry_not_before=(
+                    _last_updated_partition_retry_not_before(
+                        source_record,
+                        request_url,
+                        status_code,
+                        response_payload,
+                        error,
+                    )
+                    if is_transient
+                    else None
+                ),
+            )
+        count_fetch = _validate_last_updated_partition_count_payload(
+            response_payload
+        )
+        if count_fetch.error != "non_searchset_count_bundle":
+            return replace(count_fetch, pages_fetched=pages_fetched)
+        if attempt_index == len(retry_delays):
+            return replace(
+                count_fetch,
+                pages_fetched=pages_fetched,
+                error="non_searchset_count_bundle_retry_exhausted",
+            )
+        await asyncio.sleep(retry_delays[attempt_index])
+        attempt_index += 1
 
 
 def _validate_last_updated_partition_count_payload(
