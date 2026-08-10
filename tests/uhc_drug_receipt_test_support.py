@@ -24,7 +24,6 @@ from process.formulary_fhir.uhc_drug_twin import UHCDrugTwinResult
 from process.formulary_fhir.uhc_source import uhc_formulary_source_manifest
 from tests.uhc_drug_parser_test_support import artifact_set
 
-
 CUTOFF = dt.datetime(2026, 8, 10, 13, 0, tzinfo=dt.UTC)
 ADMITTED_AT = CUTOFF + dt.timedelta(minutes=3)
 OBSERVATION_SHA256 = "f" * 64
@@ -179,7 +178,7 @@ def admission_receipt(
         artifact_set_sha256=evidence.artifact_set_sha256,
         admission=admission,
         evidence=evidence,
-        recorded_at=ADMITTED_AT + dt.timedelta(seconds=1),
+        recorded_at=max(ADMITTED_AT, admission.admitted_at) + dt.timedelta(seconds=1),
     )
 
 
