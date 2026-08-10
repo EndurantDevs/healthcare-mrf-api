@@ -281,7 +281,8 @@ def _evidence_ctes_sql(schema: str) -> str:
                {lineage_digest} AS row_sha256
           FROM lineage
     ), resource_summary AS (
-        SELECT pg_catalog.count(*)::bigint AS actual_count,
+        SELECT COALESCE(pg_catalog.sum(grouped.row_count), 0)::bigint
+                   AS actual_count,
                COALESCE(
                    pg_catalog.jsonb_object_agg(
                        grouped.resource_type,

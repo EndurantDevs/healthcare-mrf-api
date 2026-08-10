@@ -7,7 +7,11 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-from db import migration_provider_directory_terminal_root_retirement_evidence as evidence
+import pytest
+
+from db import (
+    migration_provider_directory_terminal_root_retirement_evidence as evidence,
+)
 from db import migration_provider_directory_terminal_root_retirement_guards as guards
 from process.provider_directory_terminal_root_retirement_contract import (
     REQUIRED_CHILD_RELATIONS,
@@ -15,8 +19,17 @@ from process.provider_directory_terminal_root_retirement_contract import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = ROOT / "alembic/versions" / (
-    "20260810090000_provider_directory_terminal_root_retirement.py"
+MIGRATION_PATH = (
+    ROOT
+    / "alembic/versions"
+    / ("20260810090000_provider_directory_terminal_root_retirement.py")
+)
+REPAIR_MIGRATION_PATH = (
+    ROOT
+    / "alembic/versions"
+    / (
+        "20260810100000_provider_directory_terminal_root_retirement_resource_count_repair.py"
+    )
 )
 
 
@@ -39,17 +52,35 @@ def _migration():
     return migration
 
 
+def _repair_migration():
+    spec = importlib.util.spec_from_file_location(
+        "provider_directory_terminal_root_retirement_resource_count_repair",
+        REPAIR_MIGRATION_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
+
+
 def _normalized(value: str) -> str:
     return " ".join(value.split())
 
 
-def test_revision_is_additive_unique_head_child() -> None:
+def test_revision_and_resource_count_repair_form_additive_chain() -> None:
     migration = _migration()
+    repair = _repair_migration()
     assert migration.revision == (
         "20260810090000_provider_directory_terminal_root_retirement"
     )
     assert migration.down_revision == (
         "20260810080000_provider_directory_uhc_flex_practitioner_publication"
+    )
+    assert repair.revision == (
+        "20260810100000_provider_directory_terminal_root_retirement_resource_count_repair"
+    )
+    assert repair.down_revision == (
+        "20260809040000_ptg_import_wave_ordinary_cutover"
     )
 
 
@@ -59,12 +90,17 @@ def test_evidence_inventory_is_closed_and_hashes_indirect_outputs() -> None:
     assert set(evidence._relation_specs("terminal_test")) == set(
         REQUIRED_CHILD_RELATIONS
     )
-    assert "JOIN \"terminal_test\".\"provider_directory_bulk_acquisition_checkpoint\" AS bulk" in relation_sql
+    assert (
+        'JOIN "terminal_test"."provider_directory_bulk_acquisition_checkpoint" AS bulk'
+        in relation_sql
+    )
     assert "bulk.dataset_id = candidate_dataset_id" in relation_sql
     assert "pg_catalog.to_jsonb(row) - 'payload_bytes'" in relation_sql
     assert "pg_catalog.sha256(row.payload_bytes)" in relation_sql
     assert "SET TimeZone = 'UTC'" in relation_sql
     assert "SET TimeZone = 'UTC'" in evidence_sql
+    assert "pg_catalog.sum(grouped.row_count)" in evidence_sql
+    assert "SELECT pg_catalog.count(*)::bigint AS actual_count" not in evidence_sql
     assert "pg_catalog.max(finished_at) AT TIME ZONE 'UTC'" in evidence_sql
     assert "ancestor.depth < 128" in evidence_sql
     assert "NOT child.run_id = ANY(ancestor.path)" in evidence_sql
@@ -119,7 +155,7 @@ def test_marker_validation_separates_transition_snapshot_from_replay() -> None:
         assert driftable_field in marker_sql
     assert "provider_directory_endpoint_dataset_previous_reference" in marker_sql
     assert "-> 'row_count' = '0'::jsonb" in marker_sql
-    assert f"{guards.MARKER_FUNCTION}\"(NULL, marker)" in parent_sql
+    assert f'{guards.MARKER_FUNCTION}"(NULL, marker)' in parent_sql
     assert "(marker -> 'evidence') IS DISTINCT FROM" in parent_sql
     assert parent_sql.count(evidence.EVIDENCE_FUNCTION) == 1
     assert guards.VALID_FUNCTION not in parent_sql
@@ -187,3 +223,97 @@ def test_downgrade_refuses_used_status_or_marker(monkeypatch) -> None:
     assert guards.MARKER in sql
     assert "DROP TRIGGER IF EXISTS" in sql
     assert "DROP FUNCTION IF EXISTS" in sql
+
+
+def test_resource_count_repair_is_fenced_replacement(monkeypatch) -> None:
+    migration = _repair_migration()
+    recorder = _OperationsRecorder()
+    monkeypatch.setattr(migration, "op", recorder)
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "terminal_test")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+
+    migration.upgrade()
+
+    sql = "\n".join(recorder.statements)
+    normalized_sql = _normalized(sql)
+    assert recorder.statements[0] == (
+        'LOCK TABLE "terminal_test"."provider_directory_endpoint_dataset" '
+        "IN SHARE ROW EXCLUSIVE MODE;"
+    )
+    assert (
+        "provider_directory_terminal_root_retirement_resource_count_repair_used" in sql
+    )
+    assert normalized_sql.count("CREATE OR REPLACE FUNCTION") == 1
+    assert "pg_catalog.sum(grouped.row_count)" in sql
+    assert "SELECT pg_catalog.count(*)::bigint AS actual_count" not in sql
+    assert (
+        normalized_sql.count(
+            "provider_directory_terminal_root_retirement_evidence_function_changed"
+        )
+        == 2
+    )
+    assert "pg_catalog.to_regprocedure" in sql
+    assert "TimeZone=UTC" in sql
+    assert "pg_catalog.sha256" in sql
+    assert "pg_catalog.btrim(" in sql
+    assert "function_row.prosrc" in sql
+    assert "'[[:space:]]+'" in sql
+    assert normalized_sql.count("REVOKE ALL ON FUNCTION") == 1
+
+
+def test_resource_count_repair_downgrade_preserves_corrected_body(
+    monkeypatch,
+) -> None:
+    migration = _repair_migration()
+    recorder = _OperationsRecorder()
+    monkeypatch.setattr(migration, "op", recorder)
+
+    migration.downgrade()
+
+    assert recorder.statements == []
+
+
+def test_resource_count_repair_rejects_conflicting_schema_env(monkeypatch) -> None:
+    migration = _repair_migration()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "runtime_schema")
+    monkeypatch.setenv("DB_SCHEMA", "legacy_schema")
+
+    with pytest.raises(RuntimeError, match="must match"):
+        migration._schema()
+
+
+@pytest.mark.parametrize(
+    "function_sql",
+    (
+        "SELECT 1\n    $function$;",
+        "AS $function$\nSELECT 1",
+    ),
+)
+def test_resource_count_repair_rejects_unknown_body_delimiters(
+    monkeypatch,
+    function_sql: str,
+) -> None:
+    migration = _repair_migration()
+    monkeypatch.setattr(
+        migration.evidence,
+        "evidence_function_sql",
+        lambda _schema: function_sql,
+    )
+
+    with pytest.raises(RuntimeError, match="function body changed"):
+        migration._function_body_sha256("terminal_test", corrected=True)
+
+
+def test_resource_count_repair_rejects_unknown_body_and_ddl(monkeypatch) -> None:
+    migration = _repair_migration()
+    unknown_body = "AS $function$\nSELECT 1\n    $function$;"
+    monkeypatch.setattr(
+        migration.evidence,
+        "evidence_function_sql",
+        lambda _schema: unknown_body,
+    )
+
+    with pytest.raises(RuntimeError, match="count SQL changed"):
+        migration._function_body_sha256("terminal_test", corrected=True)
+    with pytest.raises(RuntimeError, match="function DDL changed"):
+        migration._replacement_sql("terminal_test")
