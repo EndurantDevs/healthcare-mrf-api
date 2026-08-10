@@ -81,6 +81,9 @@ REQUIRED_SERVING_READINESS_CHECKS = (
 REVIEWED_SUBSET_OPERATOR = (
     ROOT / "scripts/smoke/provider_directory_fhir_reviewed_subset_state.py"
 )
+TERMINAL_ROOT_RETIREMENT_OPERATOR = (
+    ROOT / "scripts/smoke/provider_directory_terminal_root_retirement.py"
+)
 REVIEWED_SUBSET_MANIFEST = (
     ROOT / "specs/provider_directory_reviewed_subset_activation.json"
 )
@@ -363,6 +366,38 @@ def _reviewed_subset_state_sync_report() -> dict[str, Any]:
     }
 
 
+def _terminal_root_retirement_gate_report() -> dict[str, Any]:
+    """Prove the packaged terminal-root operator is default-off."""
+
+    from process.provider_directory_terminal_root_retirement_contract import (
+        RETIREMENT_ENABLED_ENV,
+    )
+
+    environment_by_name = dict(os.environ)
+    environment_by_name.pop(RETIREMENT_ENABLED_ENV, None)
+    operator_result = subprocess.run(
+        [sys.executable, "-B", str(TERMINAL_ROOT_RETIREMENT_OPERATOR)],
+        cwd=ROOT,
+        env=environment_by_name,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    expected_error = '{"code":"disabled","status":"error"}'
+    return {
+        "ok": (
+            TERMINAL_ROOT_RETIREMENT_OPERATOR.is_file()
+            and operator_result.returncode == 1
+            and operator_result.stdout == ""
+            and operator_result.stderr.strip() == expected_error
+        ),
+        "default_off": operator_result.returncode == 1,
+        "stderr_matches": operator_result.stderr.strip() == expected_error,
+        "stdout_empty": operator_result.stdout == "",
+    }
+
+
 def build_report() -> dict[str, Any]:
     """Evaluate the database-free Provider Directory runtime contract."""
     checks_by_name = {
@@ -373,6 +408,7 @@ def build_report() -> dict[str, Any]:
         "monthly_preset": _monthly_preset_report(),
         "serving_readiness_contract": _serving_readiness_contract_report(),
         "reviewed_subset_state_sync": _reviewed_subset_state_sync_report(),
+        "terminal_root_retirement": _terminal_root_retirement_gate_report(),
     }
     failures_by_name = {
         name: check for name, check in checks_by_name.items() if not check.get("ok")
