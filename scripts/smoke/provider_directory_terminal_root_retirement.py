@@ -21,6 +21,9 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("HLTHPRT_LOG_CFG", str(ROOT / "logging.yaml"))
 
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
+_RETIREMENT_ENABLED_ENV = (
+    "HLTHPRT_PROVIDER_DIRECTORY_TERMINAL_ROOT_RETIREMENT_ENABLED"
+)
 SAFE_ERROR_CODES = frozenset(
     {
         "busy",
@@ -206,11 +209,7 @@ async def _run_operator(
 
 
 def _is_gate_enabled() -> bool:
-    from process.provider_directory_terminal_root_retirement_contract import (
-        RETIREMENT_ENABLED_ENV,
-    )
-
-    return os.getenv(RETIREMENT_ENABLED_ENV) == "true"
+    return os.getenv(_RETIREMENT_ENABLED_ENV) == "true"
 
 
 def _operation_error_code(error: Exception) -> str:

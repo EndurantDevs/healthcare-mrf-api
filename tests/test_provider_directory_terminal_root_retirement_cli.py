@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
 from typing import Any
 
@@ -34,12 +35,21 @@ def test_dormant_gate_runs_before_parser_or_selectors(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    assert cli._RETIREMENT_ENABLED_ENV == contract.RETIREMENT_ENABLED_ENV
     monkeypatch.delenv(contract.RETIREMENT_ENABLED_ENV, raising=False)
     monkeypatch.setattr(
         cli,
         "_parser",
         lambda: pytest.fail("dormant command reached argparse"),
     )
+    original_import = builtins.__import__
+
+    def reject_process_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "process" or name.startswith("process."):
+            pytest.fail("dormant command imported process package")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_process_import)
 
     exit_code = cli.run_command(["preview", *SELECTOR_ARGUMENTS])
 
