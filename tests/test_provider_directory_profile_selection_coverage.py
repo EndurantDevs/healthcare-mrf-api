@@ -389,7 +389,7 @@ def test_snapshot_mapping_identifiers_and_catalog_validation(monkeypatch):
     assert snapshot._catalog_source_groups({
         "catalog_digest": "a" * 64,
         "items": [{"runnable": False, "profile_enabled": True, "source_ids": ["a"]}],
-    }) == ()
+    }) == (("pdfhir_1ceb7c0986c320b7eb924881",),)
 
 
 @pytest.mark.parametrize(
@@ -454,7 +454,12 @@ async def test_snapshot_database_queries_and_optional_lock(monkeypatch):
     await snapshot._lock_profile_selection_tables()
     assert await snapshot._selection_source_rows() == [{"source_id": "a"}]
     assert await snapshot._selection_dataset_rows() == [{"dataset_id": "d"}]
-    assert status.await_count == 3
+    assert status.await_count == 4
+    advisory_call = status.await_args_list[0]
+    assert "pg_advisory_xact_lock" in advisory_call.args[0]
+    assert advisory_call.kwargs["lock_identity"].endswith(
+        "pdfhir_1ceb7c0986c320b7eb924881"
+    )
     assert all_rows.await_count == 2
 
     lock = AsyncMock()

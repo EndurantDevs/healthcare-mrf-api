@@ -62,6 +62,8 @@ async def _create_selection_source_tables(
     database: Database,
     schema: str,
 ) -> None:
+    """Create the generic source and immutable dataset parents."""
+
     await database.status(
         f"""
         CREATE TABLE {schema}.provider_directory_api_endpoint (
@@ -69,6 +71,7 @@ async def _create_selection_source_tables(
         );
         """
     )
+    await _create_flex_selection_tables(database, schema)
     await database.status(
         f"""
         CREATE TABLE {schema}.provider_directory_source (
@@ -95,6 +98,42 @@ async def _create_selection_source_tables(
             superseded_at timestamp,
             publication_metadata_json jsonb
         );
+        """
+    )
+
+
+async def _create_flex_selection_tables(
+    database: Database,
+    schema: str,
+) -> None:
+    """Create narrow Flex readiness dependencies locked by selection."""
+
+    for relation_name in (
+        "provider_directory_dataset_resource",
+        "provider_directory_uhc_flex_practitioner_acquisition",
+        "provider_directory_uhc_flex_practitioner_dataset_resource",
+        "provider_directory_uhc_flex_practitioner_resource",
+        "provider_directory_uhc_flex_practitioner_twin_admission",
+        "provider_directory_uhc_flex_practitioner_work",
+    ):
+        await database.status(
+            f"CREATE TABLE {schema}.{relation_name} (id bigint);"
+        )
+    await database.status(
+        f"""
+        CREATE TABLE {schema}.provider_directory_uhc_flex_practitioner_dataset (
+            dataset_id varchar(96) PRIMARY KEY,
+            admission_id varchar(96),
+            semantic_projection_as_of date,
+            source_authority_id varchar(96),
+            operation_key varchar(64)
+        );
+        """
+    )
+    await database.status(
+        f"""
+        CREATE FUNCTION {schema}.provider_directory_uhc_flex_practitioner_dataset_ready(text)
+        RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT false; $$;
         """
     )
 

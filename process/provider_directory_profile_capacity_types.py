@@ -10,7 +10,9 @@ from typing import Any, Mapping
 
 CAPACITY_GEOMETRY_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-geometry.v5"
 PROFILE_MATERIALIZATION_MODE = "source_delta"
-PROFILE_STRATEGY_VERSION = "source-fact-role32-org32-membership32-npi5m-v4"
+PROFILE_STRATEGY_VERSION = (
+    "source-fact-role32-org32-membership32-dataset-practitioner-authority-npi5m-v5"
+)
 
 _GEOMETRY_HASH_DOMAIN = "provider_directory_profile_capacity_geometry.v5"
 _CONTROL_WAL_PLAN_INPUT_HASH_DOMAIN = (

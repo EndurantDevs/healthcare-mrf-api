@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "release": "current-insurer-directories-v3",
-  "description": "All reviewed acquisition-capable insurer Provider Directory endpoints enabled for unified doctor profiles, plus the official-file source when published from one complete admitted retained semantic dataset. Endpoint sibling aliases are included automatically and remain evidence aliases, not inferred product membership. Probe-only endpoints remain excluded.",
+  "release": "current-insurer-directories-v4",
+  "description": "All reviewed acquisition-capable insurer Provider Directory endpoints enabled for unified doctor profiles, plus the official-file source when published from one complete admitted retained semantic dataset and its dedicated exact-cohort Practitioner enrichment when the independently admitted dataset is current and ready. Endpoint sibling aliases are included automatically and remain evidence aliases, not inferred product membership. Generic probe-only endpoints remain excluded.",
   "entry_ids": [
     "aetna-commercial-medicare",
     "alohr",
@@ -25,11 +25,15 @@
     "san-mateo-county-bhrs",
     "simpra-advantage",
     "texas-tmhp",
+    "uhc-flex-practitioner-enrichment",
     "uhc-provider-files",
     "wyoming"
   ],
   "retained_entry_ids": [
     "uhc-provider-files"
+  ],
+  "dataset_scoped_entry_ids": [
+    "uhc-flex-practitioner-enrichment"
   ],
   "source_ids": [
     "pdfhir_d68a896335981928bdbbb80e",
@@ -54,9 +58,14 @@
     "pdfhir_0c52480afd14b4c89386df94",
     "pdfhir_e3d82f2cd0a10ab4463dbdda",
     "pdfhir_569c8c60329e96aefd3e5983",
+    "pdfhir_1ceb7c0986c320b7eb924881",
     "pdfhir_2754e999dd691175821ec26e",
     "pdfhir_72257bf04f7fb816c0ad6fb9"
   ],
+  "authority_ids_by_source_id": {
+    "pdfhir_1ceb7c0986c320b7eb924881": "unitedhealthcare",
+    "pdfhir_2754e999dd691175821ec26e": "unitedhealthcare"
+  },
   "verification_matrix": {
     "check_codes": ["A", "P", "G", "F", "V"],
     "resource_profiles": {
@@ -66,6 +75,7 @@
       "I6": {"resources": ["HealthcareService", "InsurancePlan", "Location", "Organization", "Practitioner", "PractitionerRole"]},
       "A6": {"resources": ["InsurancePlan", "Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]},
       "M5": {"resources": ["Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]},
+      "P1_DATASET": {"transport": "fhir_rest_exact_identifier", "resources": ["Practitioner"], "endpoint_collection_complete": false},
       "ALOHR_GRAPHQL_R4": {
         "transport": "graphql",
         "tenant": "alohr",
@@ -96,6 +106,7 @@
       {"entry_id": "san-mateo-county-bhrs", "source_id": "pdfhir_0c52480afd14b4c89386df94", "resource_profile": "R8"},
       {"entry_id": "simpra-advantage", "source_id": "pdfhir_e3d82f2cd0a10ab4463dbdda", "resource_profile": "A6"},
       {"entry_id": "texas-tmhp", "source_id": "pdfhir_569c8c60329e96aefd3e5983", "resource_profile": "A7"},
+      {"entry_id": "uhc-flex-practitioner-enrichment", "source_id": "pdfhir_1ceb7c0986c320b7eb924881", "resource_profile": "P1_DATASET"},
       {"entry_id": "uhc-provider-files", "source_id": "pdfhir_2754e999dd691175821ec26e", "resource_profile": "A6"},
       {"entry_id": "wyoming", "source_id": "pdfhir_72257bf04f7fb816c0ad6fb9", "resource_profile": "R8"}
     ]

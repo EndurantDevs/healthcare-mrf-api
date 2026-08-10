@@ -71,7 +71,7 @@ def test_profile_evidence_sql_preserves_uhc_facility_semantics():
     sql = _render_profile_evidence_sql()
 
     assert "'plan_membership'" in sql
-    assert "affiliation_edge.dataset_id = source_context.dataset_id" in sql
+    assert "affiliation_edge.dataset_id = typed_source_context.dataset_id" in sql
     assert (
         "affiliation.relationship_type =\n"
         "                   'payer_reported_provider_plan_membership'"

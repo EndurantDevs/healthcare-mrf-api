@@ -225,12 +225,17 @@ def test_profile_source_spec_matches_reviewed_and_retained_entries():
         entry["entry_id"]: entry for entry in retained_registry["entries"]
     }
     retained_entry_ids = set(source_spec.get("retained_entry_ids", ()))
+    dataset_scoped_entry_ids = set(
+        source_spec.get("dataset_scoped_entry_ids", ())
+    )
     importable_entry_ids = {
         entry_id
         for entry_id, entry in entries_by_id.items()
         if entry["classification"] in PROFILE_SOURCE_CLASSIFICATIONS
     }
-    expected_profile_entry_ids = retained_entry_ids | importable_entry_ids
+    expected_profile_entry_ids = (
+        retained_entry_ids | dataset_scoped_entry_ids | importable_entry_ids
+    )
     expected_source_ids = {
         source_id
         for entry_id in importable_entry_ids
@@ -238,6 +243,10 @@ def test_profile_source_spec_matches_reviewed_and_retained_entries():
     } | {
         retained_entries_by_id[entry_id]["registered_source_id"]
         for entry_id in retained_entry_ids
+    } | {
+        source_row["source_id"]
+        for source_row in source_spec["verification_matrix"]["sources"]
+        if source_row["entry_id"] in dataset_scoped_entry_ids
     }
 
     assert set(source_spec["entry_ids"]) == expected_profile_entry_ids

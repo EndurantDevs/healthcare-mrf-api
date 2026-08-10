@@ -734,7 +734,8 @@ artifact and do not traverse the FHIR graph at request time.
 
 ### Profile publication batching and recovery
 
-The `source-fact-role32-org32-membership32-npi5m-v4` build strategy is an
+The `source-fact-role32-org32-membership32-dataset-practitioner-authority-npi5m-v5`
+build strategy is an
 executable resource bound, not only a label. Evidence publication uses 22
 fact branches per source. The high-fanout `affiliation` branch is split into
 32 deterministic PractitionerRole-resource buckets; `plan_membership` uses 32
@@ -742,7 +743,7 @@ OrganizationAffiliation-resource buckets; and `organization` executes both
 resource-keyed branches under the matching bucket coordinate. This produces
 115 bounded evidence statements per source. The executable-plan fingerprint
 binds the exact per-fact resource-key scheme, so a v3 checkpoint or a
-same-cardinality plan using a different bucket key cannot resume under v4.
+same-cardinality plan using a different bucket key cannot resume under v5.
 Compact profile publication covers the full 10-digit NPI space in 400
 half-open ranges of 5,000,000 values. A partial refresh with retained sources
 outside the selected source set prepends one copy batch to each phase. A
