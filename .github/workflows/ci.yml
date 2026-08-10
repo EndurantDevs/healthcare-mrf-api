@@ -965,6 +965,7 @@ jobs:
           tests/test_provider_directory_fhir_terminal_atomicity_postgres.py
           tests/test_provider_directory_reviewed_subset_bounded_drift_postgres.py
           tests/test_provider_directory_reviewed_subset_terminal_window_postgres.py
+          tests/test_provider_directory_reviewed_subset_terminal_window_lock_postgres.py
           tests/test_provider_directory_reviewed_subset_terminal_disposition_postgres.py
           tests/test_provider_directory_reviewed_subset_direct_v4_disposition_postgres.py
           tests/test_provider_directory_terminal_root_retirement_postgres.py
