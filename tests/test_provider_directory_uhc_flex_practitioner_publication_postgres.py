@@ -49,6 +49,7 @@ from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
     insert_valid_cohort,
 )
+from tests.provider_directory_uhc_flex_npi_cohort_pg_support import DATASET_ID
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import MEMBER_NPIS
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
     seed_official_dataset,
@@ -403,6 +404,30 @@ async def _assert_exact_removal(connection, schema: str, first, empty) -> None:
     assert old_resource_count == 1
 
 
+async def _assert_official_dataset_rotation_revokes_readiness(
+    connection,
+    schema: str,
+    dataset_id: str,
+) -> None:
+    ready_function = (
+        f"{schema}.provider_directory_uhc_flex_practitioner_dataset_ready"
+    )
+    assert await connection.fetchval(
+        f"SELECT {ready_function}($1)",
+        dataset_id,
+    ) is True
+    await connection.execute(
+        f"UPDATE {schema}.provider_directory_endpoint_dataset "
+        "SET status = 'superseded', is_current = false, "
+        "superseded_at = transaction_timestamp() WHERE dataset_id = $1",
+        DATASET_ID,
+    )
+    assert await connection.fetchval(
+        f"SELECT {ready_function}($1)",
+        dataset_id,
+    ) is False
+
+
 async def _assert_mutation_guards(connection, schema: str) -> None:
     guarded_statements = (
         f"UPDATE {schema}.provider_directory_uhc_flex_practitioner_dataset "
@@ -443,6 +468,11 @@ async def test_flex_practitioner_publication_lifecycle_replay_and_removal(
         try:
             await _assert_exact_removal(connection, schema, first, empty)
             await _assert_mutation_guards(connection, schema)
+            await _assert_official_dataset_rotation_revokes_readiness(
+                connection,
+                schema,
+                empty.readiness.dataset_id,
+            )
         finally:
             await connection.close()
         with pytest.raises(DBAPIError, match="downgrade_blocked"):

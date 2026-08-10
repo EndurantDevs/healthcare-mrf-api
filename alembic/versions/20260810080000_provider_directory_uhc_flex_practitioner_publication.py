@@ -37,6 +37,7 @@ _ADMISSION = "provider_directory_uhc_flex_practitioner_twin_admission"
 _ACQUISITION = "provider_directory_uhc_flex_practitioner_acquisition"
 _WORK = "provider_directory_uhc_flex_practitioner_work"
 _RAW_RESOURCE = "provider_directory_uhc_flex_practitioner_resource"
+_COHORT = "provider_directory_uhc_flex_npi_cohort"
 _SOURCE = "provider_directory_source"
 _ENDPOINT = "provider_directory_api_endpoint"
 
@@ -63,6 +64,11 @@ _STORAGE_CONTRACT = (
     "healthporta.provider-directory.uhc-flex-practitioner-acquisition.v1"
 )
 _SOURCE_AUTHORITY = "unitedhealthcare"
+_OFFICIAL_SOURCE_ID = "pdfhir_2754e999dd691175821ec26e"
+_COHORT_CONTRACT = (
+    "healthporta.provider-directory.uhc-flex-official-practitioner-"
+    "npi-cohort.v1"
+)
 _API_BASE = "https://flex.optum.com/fhirpublic/R4"
 _RESOURCE_TYPE = "Practitioner"
 _HASH_CONTRACT = "semantic_content_v3"
@@ -226,6 +232,7 @@ def _valid_function_sql(schema: str) -> str:
     acquisition_ref = _qf(schema, _ACQUISITION)
     work_ref = _qf(schema, _WORK)
     raw_resource_ref = _qf(schema, _RAW_RESOURCE)
+    cohort_ref = _qf(schema, _COHORT)
     source_ref = _qf(schema, _SOURCE)
     endpoint_ref = _qf(schema, _ENDPOINT)
     valid_ref = _qf(schema, _VALID_FUNCTION)
@@ -254,6 +261,10 @@ def _valid_function_sql(schema: str) -> str:
                header.candidate_acquisition_id
           JOIN {acquisition_ref} AS candidate
             ON candidate.acquisition_id = header.candidate_acquisition_id
+          JOIN {cohort_ref} AS cohort
+            ON cohort.cohort_id = header.cohort_id
+          JOIN {endpoint_dataset_ref} AS official_dataset
+            ON official_dataset.dataset_id = cohort.official_dataset_id
           JOIN {source_ref} AS source
             ON source.source_id = header.source_id
           JOIN {endpoint_ref} AS endpoint
@@ -271,6 +282,17 @@ def _valid_function_sql(schema: str) -> str:
            AND header.cohort_complete IS TRUE
            AND header.endpoint_collection_complete IS FALSE
            AND header.endpoint_complete IS FALSE
+           AND cohort.contract_id = {_ql(_COHORT_CONTRACT)}
+           AND cohort.authority_id = header.source_authority_id
+           AND cohort.official_source_id = {_ql(_OFFICIAL_SOURCE_ID)}
+           AND cohort.official_endpoint_id = official_dataset.endpoint_id
+           AND cohort.resource_type = {_ql(_RESOURCE_TYPE)}
+           AND cohort.cohort_complete IS TRUE
+           AND cohort.endpoint_collection_complete IS FALSE
+           AND cohort.endpoint_complete IS FALSE
+           AND official_dataset.acquisition_root_run_id =
+               cohort.official_acquisition_root_run_id
+           AND official_dataset.dataset_hash = cohort.official_dataset_hash
            AND admission.admission_contract_id = {_ql(_ADMISSION_CONTRACT)}
            AND admission.publication_authority IS TRUE
            AND admission.source_id = header.source_id
@@ -436,6 +458,8 @@ def _valid_function_sql(schema: str) -> str:
 
 def _ready_function_sql(schema: str) -> str:
     header_ref = _qf(schema, _HEADER)
+    cohort_ref = _qf(schema, _COHORT)
+    endpoint_dataset_ref = _qf(schema, _ENDPOINT_DATASET)
     valid_ref = _qf(schema, _VALID_FUNCTION)
     ready_ref = _qf(schema, _READY_FUNCTION)
     return f"""
@@ -449,9 +473,20 @@ def _ready_function_sql(schema: str) -> str:
         SELECT EXISTS (
             SELECT 1
               FROM {header_ref} AS header
+              JOIN {cohort_ref} AS cohort
+                ON cohort.cohort_id = header.cohort_id
+              JOIN {endpoint_dataset_ref} AS official_dataset
+                ON official_dataset.dataset_id = cohort.official_dataset_id
              WHERE header.dataset_id = candidate_dataset_id
                AND header.status = 'published'
                AND header.is_current IS TRUE
+               AND official_dataset.endpoint_id = cohort.official_endpoint_id
+               AND official_dataset.acquisition_root_run_id =
+                   cohort.official_acquisition_root_run_id
+               AND official_dataset.dataset_hash =
+                   cohort.official_dataset_hash
+               AND official_dataset.status = 'published'
+               AND official_dataset.is_current IS TRUE
                AND {valid_ref}(header.dataset_id)
         );
     $function$;
@@ -460,6 +495,7 @@ def _ready_function_sql(schema: str) -> str:
 
 def _header_guard_sql(schema: str) -> str:
     valid_ref = _qf(schema, _VALID_FUNCTION)
+    ready_ref = _qf(schema, _READY_FUNCTION)
     guard_ref = _qf(schema, _HEADER_GUARD)
     immutable = (
         "ROW(NEW.dataset_id, NEW.publication_contract_id, NEW.admission_id, "
@@ -496,7 +532,9 @@ def _header_guard_sql(schema: str) -> str:
                 'provider_directory_uhc_flex_practitioner_dataset_truncate_forbidden'
                 USING ERRCODE = '55000';
         ELSIF TG_WHEN = 'AFTER' THEN
-            IF {valid_ref}(NEW.dataset_id) IS DISTINCT FROM TRUE THEN
+            IF {valid_ref}(NEW.dataset_id) IS DISTINCT FROM TRUE
+               OR (NEW.status = 'published' AND
+                   {ready_ref}(NEW.dataset_id) IS DISTINCT FROM TRUE) THEN
                 RAISE EXCEPTION
                     'provider_directory_uhc_flex_practitioner_dataset_invalid'
                     USING ERRCODE = '55000';

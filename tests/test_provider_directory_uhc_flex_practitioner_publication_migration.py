@@ -86,6 +86,8 @@ def test_readiness_binds_admission_source_content_and_subset_semantics() -> None
         "admission.operation_key = header.operation_key",
         "candidate.error_count = 0",
         "candidate.status = 'sealed'",
+        "official_dataset.dataset_id = cohort.official_dataset_id",
+        "official_dataset.acquisition_root_run_id = cohort.official_acquisition_root_run_id",
         "source.metadata_json::jsonb -> 'provider_directory_acquisition_enabled' = 'false'::jsonb",
         "resource.acquired_resource_sha256 IS NOT NULL",
         "provenance.candidate_acquisition_id",
@@ -94,6 +96,14 @@ def test_readiness_binds_admission_source_content_and_subset_semantics() -> None
         "pg_catalog.string_agg",
     ):
         assert required_fragment in sql
+    readiness_sql = " ".join(
+        migration._ready_function_sql("fhir_twin_test_static").split()
+    )
+    assert "official_dataset.status = 'published'" in readiness_sql
+    assert "official_dataset.is_current IS TRUE" in readiness_sql
+    assert "NEW.status = 'published'" in " ".join(
+        migration._header_guard_sql("fhir_twin_test_static").split()
+    )
     metadata_sql = migration._metadata_sql("header", "admission")
     assert "'selected_resources'" in metadata_sql
     assert "'expected_resources'" in metadata_sql
