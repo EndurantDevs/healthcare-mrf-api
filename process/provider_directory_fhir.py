@@ -28340,6 +28340,7 @@ _PROVIDER_DIRECTORY_PROFILE_DELTA_COMPATIBLE_STRATEGIES = frozenset(
     {
         "source-fact-role32-npi5m-v1",
         "source-fact-role32-org32-npi5m-v3",
+        "source-fact-role32-org32-membership32-npi5m-v4",
         profile_artifact.PROFILE_BUILD_STRATEGY_VERSION,
     }
 )
