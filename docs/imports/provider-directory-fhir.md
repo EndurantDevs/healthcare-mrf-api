@@ -157,13 +157,21 @@ resource family. It follows only a validated source-issued next link and treats
 page count. Sparse and empty pages remain valid while a next link exists. A
 resource terminates successfully only when the source returns no next link.
 The legacy stability profile requires equal cutoff-filtered advertised counts.
-The bounded-drift profile permits only equality or a monotone decrease of one;
-an increase or a decrease of two or more remains terminal.
+The historical bounded-drift profile permits only equality or a monotone
+decrease of one. The current terminal-window profile permits a monotone
+decrease no larger than the smaller of twenty logical pages or one percent of
+the pre-count rounded up to a whole resource. It additionally requires the
+original pre-count to fall inside the inclusive terminal logical window, so an
+early `source_no_next` remains a
+terminal failure even when its count change is numerically small. Any increase
+or an over-bound decrease remains terminal.
 The proof records advertised, returned unique, and exact deficit counts; it has
-no percentage threshold and requires returned unique to be no greater than
-advertised. Even a zero final deficit remains subset evidence under this
-reviewed campaign. Absence from the returned subset is unknown, not evidence
-that a provider-directory resource does not exist.
+a profile-bound threshold and requires returned unique to be no greater than
+advertised. Existing v3 and v4 proofs retain their original byte identity and
+rules; they are never reinterpreted under the terminal-window profile. Even a
+zero final deficit remains subset evidence under this reviewed campaign.
+Absence from the returned subset is unknown, not evidence that a
+provider-directory resource does not exist.
 
 Each reviewed current-version request has one fixed transport policy: at most
 three attempts against the identical URL, with redirects disabled and encoded

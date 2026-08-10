@@ -12,12 +12,14 @@ from process.provider_directory_fhir_census_binding import (
 )
 from process.provider_directory_fhir_census_contract import (
     SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
-    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_RESOURCE_TYPES,
     SERVER_ISSUED_SUBSET_SEMANTICS,
     SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY,
-    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
+)
+from process.provider_directory_fhir_subset_identity import (
+    SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION,
 )
 from process.provider_directory_fhir_census_execution import (
     SERVER_ISSUED_SUBSET_FETCH_MODE,
@@ -54,7 +56,7 @@ def build_subset_contract(**overrides: Any) -> CurrentVersionCensusContract:
         "continuation_strategy": (
             SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY
         ),
-        "strategy_version": SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+        "strategy_version": SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION,
         "contract_version": 3,
         "semantics": SERVER_ISSUED_SUBSET_SEMANTICS,
         "page_count": PAGE_COUNT,
@@ -62,7 +64,7 @@ def build_subset_contract(**overrides: Any) -> CurrentVersionCensusContract:
         "canonicalization_version": (
             SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION
         ),
-        "completion_scopes": SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+        "completion_scopes": SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES,
         "campaign_id": "synthetic-reviewed-subset-v3",
     }
     contract_value_by_field.update(overrides)
@@ -73,16 +75,18 @@ def build_execution_proof(
     *,
     hop_prefix: str = "1",
     shape_prefixes: tuple[str, str] = ("a", "b"),
+    terminal_window_compatible: bool = False,
 ) -> dict[str, Any]:
     alternate_hop_prefix = "2" if hop_prefix != "2" else "3"
     hop_hashes = [hop_prefix * 64, alternate_hop_prefix * 64]
     shape_hashes = [prefix * 64 for prefix in shape_prefixes]
+    advertised_pre = 502 if terminal_window_compatible else 2
     return {
         "verified": True,
-        "advertised_pre": 2,
-        "advertised_post": 2,
+        "advertised_pre": advertised_pre,
+        "advertised_post": advertised_pre,
         "returned_unique": 1,
-        "deficit": 1,
+        "deficit": advertised_pre - 1,
         "terminal_reason": "source_no_next",
         "page_entry_counts": [1, 0, 0],
         "continuation_hop_sha256": hop_hashes,
@@ -108,7 +112,12 @@ def build_proof_pair(
 ) -> tuple[dict[str, Any], str, dict[str, dict[str, Any]]]:
     selected_contract = contract or build_subset_contract()
     execution_proof_by_type = {
-        resource_type: build_execution_proof(hop_prefix=hop_prefix)
+        resource_type: build_execution_proof(
+            hop_prefix=hop_prefix,
+            terminal_window_compatible=(
+                selected_contract.is_terminal_count_window_required
+            ),
+        )
         for resource_type in SERVER_ISSUED_SUBSET_RESOURCE_TYPES
     }
     resource_hash_by_type = dict.fromkeys(

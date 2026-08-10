@@ -30,6 +30,9 @@ from process.provider_directory_fhir_subset_replay import (
     build_subset_replay_evidence,
     validate_subset_replay_evidence_pair,
 )
+from process.provider_directory_fhir_subset_profiles import (
+    is_advertised_pre_in_terminal_window,
+)
 
 
 __all__ = (
@@ -99,18 +102,17 @@ def _validated_resource_metrics(
     content_sha256: str,
     acquired_content_sha256: str,
     max_advertised_count_decrease: int,
+    is_terminal_count_window_required: bool,
 ) -> tuple[int, int, int, int, list[str]]:
+    """Validate one resource's counts, hashes, and terminal window."""
     advertised_pre = resource_proof.get("advertised_pre")
     advertised_post = resource_proof.get("advertised_post")
     returned_unique = resource_proof.get("returned_unique")
     deficit = resource_proof.get("deficit")
-    continuation_shape_hashes = resource_proof.get(
-        "continuation_shape_sha256"
-    )
+    continuation_shape_hashes = resource_proof.get("continuation_shape_sha256")
     advertised_count_decrease = (
         advertised_pre - advertised_post
-        if _is_nonnegative_int(advertised_pre)
-        and _is_nonnegative_int(advertised_post)
+        if _is_nonnegative_int(advertised_pre) and _is_nonnegative_int(advertised_post)
         else None
     )
     if (
@@ -125,6 +127,13 @@ def _validated_resource_metrics(
         )
         or advertised_count_decrease is None
         or not 0 <= advertised_count_decrease <= max_advertised_count_decrease
+        or (
+            is_terminal_count_window_required
+            and not is_advertised_pre_in_terminal_window(
+                advertised_pre,
+                geometry_by_field,
+            )
+        )
         or returned_unique > advertised_post
         or deficit != advertised_pre - returned_unique
         or resource_proof.get("terminal_reason")
@@ -133,8 +142,7 @@ def _validated_resource_metrics(
         or not _is_sha256(content_sha256)
         or not _is_sha256(acquired_content_sha256)
         or type(continuation_shape_hashes) is not list
-        or len(continuation_shape_hashes)
-        != geometry_by_field["pages_processed"] - 1
+        or len(continuation_shape_hashes) != geometry_by_field["pages_processed"] - 1
         or any(
             not _is_sha256(shape_digest)
             for shape_digest in continuation_shape_hashes
@@ -156,6 +164,7 @@ def _canonical_resource_proof(
     content_sha256: str,
     acquired_content_sha256: str,
     max_advertised_count_decrease: int,
+    is_terminal_count_window_required: bool,
 ) -> dict[str, Any]:
     geometry_by_field = _geometry_from_execution_proof(resource_proof)
     (
@@ -170,6 +179,7 @@ def _canonical_resource_proof(
         content_sha256,
         acquired_content_sha256,
         max_advertised_count_decrease,
+        is_terminal_count_window_required,
     )
     return {
         "advertised_pre": advertised_pre,
@@ -280,13 +290,21 @@ def build_subset_completion_proof(
         acquired_resource_hash_by_type,
         resource_count_by_type,
     )
-    max_advertised_count_decrease = contract.max_advertised_count_decrease
     canonical_resource_by_type = {
         resource_type: _canonical_resource_proof(
             resource_proof_by_type[resource_type],
             content_sha256=resource_hash_by_type[resource_type],
             acquired_content_sha256=acquired_resource_hash_by_type[resource_type],
-            max_advertised_count_decrease=max_advertised_count_decrease,
+            max_advertised_count_decrease=(
+                contract.advertised_count_decrease_limit(
+                    resource_proof_by_type[resource_type].get(
+                        "advertised_pre"
+                    )
+                )
+            ),
+            is_terminal_count_window_required=(
+                contract.is_terminal_count_window_required
+            ),
         )
         for resource_type in sorted(resource_types)
     }

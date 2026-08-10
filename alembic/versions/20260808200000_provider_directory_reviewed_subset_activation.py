@@ -375,6 +375,7 @@ def _activation_valid_function_sql(
     replace_existing: bool = False,
     reviewed_root_policy_aware: bool = False,
     reviewed_subset_profile_aware: bool = False,
+    reviewed_subset_terminal_window_profile_aware: bool = False,
 ) -> str:
     previous = _predecessor()
     source_ref = _qf(schema, _SOURCE)
@@ -396,6 +397,9 @@ def _activation_valid_function_sql(
         require_physical_match=not use_configured_endpoint_identity,
         reviewed_root_policy_aware=reviewed_root_policy_aware,
         reviewed_subset_profile_aware=reviewed_subset_profile_aware,
+        reviewed_subset_terminal_window_profile_aware=(
+            reviewed_subset_terminal_window_profile_aware
+        ),
     )
     source_contract_payload = _source_contract_payload_sql(
         use_configured_endpoint_identity=use_configured_endpoint_identity,
@@ -421,6 +425,9 @@ def _activation_valid_function_sql(
         require_physical_match=not use_configured_endpoint_identity,
         reviewed_root_policy_aware=True,
         reviewed_subset_profile_aware=reviewed_subset_profile_aware,
+        reviewed_subset_terminal_window_profile_aware=(
+            reviewed_subset_terminal_window_profile_aware
+        ),
     )
     policy_matched_twin_sql = _activation_matched_twin_sql(
         schema,

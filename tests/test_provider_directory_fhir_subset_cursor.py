@@ -13,12 +13,14 @@ from process.provider_directory_fhir_census_binding import (
 )
 from process.provider_directory_fhir_census_contract import (
     SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
-    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_RESOURCE_TYPES,
     SERVER_ISSUED_SUBSET_SEMANTICS,
     SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY,
-    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
+)
+from process.provider_directory_fhir_subset_identity import (
+    SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION,
 )
 from process.provider_directory_fhir_census_execution import (
     current_version_census_checkpoint_proof,
@@ -50,7 +52,7 @@ def _contract() -> CurrentVersionCensusContract:
         continuation_strategy=(
             SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY
         ),
-        strategy_version=SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+        strategy_version=SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION,
         contract_version=3,
         semantics=SERVER_ISSUED_SUBSET_SEMANTICS,
         page_count=PAGE_COUNT,
@@ -58,7 +60,7 @@ def _contract() -> CurrentVersionCensusContract:
         canonicalization_version=(
             SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION
         ),
-        completion_scopes=SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+        completion_scopes=SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES,
         campaign_id="synthetic-reviewed-subset-v3",
     )
 
