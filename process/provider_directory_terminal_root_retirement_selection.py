@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Locked selection for one exact legacy Provider Directory root retirement."""
+"""Locked selection for one exact Provider Directory root retirement."""
 
 from __future__ import annotations
 
@@ -9,21 +9,23 @@ from typing import Any, Mapping
 
 from process.provider_directory_terminal_root_retirement_contract import (
     REQUIRED_CHILD_RELATIONS,
-    RETIREMENT_EVIDENCE_FUNCTION,
-    RETIREMENT_METADATA_KEY,
     RETIREMENT_STATUS,
     TERMINAL_FAILURE_STATUSES,
     TerminalRootRetirementError,
+    TerminalRootRetirementProfile,
     TerminalRootRetirementRequest,
     TerminalRootRetirementSelection,
     canonical_json_sha256,
     json_object,
     quoted_relation,
     retirement_marker,
-    retirement_resource_hash_contract,
     row_mapping,
+    terminal_root_retirement_profile,
     validated_retirement_evidence,
     validated_retirement_marker,
+)
+from process.provider_directory_terminal_root_retirement_profile import (
+    RETIREMENT_METADATA_KEYS,
 )
 
 _INCOMPLETE_STATUSES = ("acquiring", "incomplete")
@@ -133,12 +135,12 @@ async def _locked_target(
 def _target_metadata(
     target: Mapping[str, Any],
     request: TerminalRootRetirementRequest,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], TerminalRootRetirementProfile]:
     metadata = json_object(target.get("publication_metadata_json"))
-    retirement_resource_hash_contract(metadata)
+    profile = terminal_root_retirement_profile(metadata)
     if metadata.get("source_ids") != [request.source_id]:
         raise TerminalRootRetirementError("evidence_invalid")
-    return metadata
+    return metadata, profile
 
 
 def _validate_new_target(
@@ -158,7 +160,7 @@ def _validate_new_target(
         or target.get("completion_proof_sha256") is not None
         or type(target.get("resource_count")) is not int
         or int(target["resource_count"]) < 0
-        or RETIREMENT_METADATA_KEY in metadata
+        or not RETIREMENT_METADATA_KEYS.isdisjoint(metadata)
         or target.get("dataset_id") != request.dataset_id
     ):
         raise TerminalRootRetirementError("evidence_invalid")
@@ -271,9 +273,7 @@ async def _locked_lineage(
         root_run_id=request.acquisition_root_run_id,
         minimum_age=request.minimum_terminal_age_seconds,
     )
-    lineage_records = tuple(
-        row_mapping(run_record) for run_record in run_rows
-    )
+    lineage_records = tuple(row_mapping(run_record) for run_record in run_rows)
     _validate_lineage(lineage_records, request)
     return lineage_records
 
@@ -300,9 +300,13 @@ def _validate_lineage(
         raise TerminalRootRetirementError("evidence_invalid")
 
 
-async def _locked_evidence(database: Any, dataset_id: str) -> dict[str, Any]:
+async def _locked_evidence(
+    database: Any,
+    dataset_id: str,
+    profile: TerminalRootRetirementProfile,
+) -> dict[str, Any]:
     evidence = await database.scalar(
-        f"SELECT {quoted_relation(RETIREMENT_EVIDENCE_FUNCTION)}(:dataset_id);",
+        f"SELECT {quoted_relation(profile.evidence_function)}(:dataset_id);",
         dataset_id=dataset_id,
     )
     return validated_retirement_evidence(evidence)
@@ -323,9 +327,9 @@ def _validate_evidence_counts(
         != evidence["actual_resource_count"]
         or relation_evidence["provider_directory_dataset_proof_shard"]["row_count"]
         != evidence["proof_shard_count"]
-        or relation_evidence[
-            "provider_directory_endpoint_dataset_previous_reference"
-        ]["row_count"]
+        or relation_evidence["provider_directory_endpoint_dataset_previous_reference"][
+            "row_count"
+        ]
         != 0
     ):
         raise TerminalRootRetirementError("evidence_invalid")
@@ -337,13 +341,14 @@ async def _new_selection(
     canonical_api_base: str,
     target_by_field: Mapping[str, Any],
     metadata: dict[str, Any],
+    profile: TerminalRootRetirementProfile,
 ) -> TerminalRootRetirementSelection:
     _validate_new_target(target_by_field, request, metadata)
     await _locked_source(database, request, canonical_api_base)
     await _locked_predecessor(database, request)
     await _require_no_competing_candidate(database, request)
     lineage = await _locked_lineage(database, request)
-    evidence = await _locked_evidence(database, request.dataset_id)
+    evidence = await _locked_evidence(database, request.dataset_id, profile)
     _validate_evidence_counts(evidence, target_by_field, len(lineage))
     evidence_sha256 = canonical_json_sha256(evidence)
     if (
@@ -363,6 +368,7 @@ async def _new_selection(
         evidence,
         minimum_terminal_age_seconds=request.minimum_terminal_age_seconds,
         retired_at=retired_at,
+        profile=profile,
     )
     return TerminalRootRetirementSelection(
         request=request,
@@ -370,6 +376,7 @@ async def _new_selection(
         prior_status="acquiring",
         observed_metadata=metadata,
         marker_by_field=marker,
+        profile=profile,
     )
 
 
@@ -379,13 +386,16 @@ async def _replay_selection(
     canonical_api_base: str,
     target: Mapping[str, Any],
     metadata: dict[str, Any],
+    profile: TerminalRootRetirementProfile,
 ) -> TerminalRootRetirementSelection:
-    marker = validated_retirement_marker(metadata.get(RETIREMENT_METADATA_KEY))
+    marker = validated_retirement_marker(
+        metadata.get(profile.metadata_key),
+        profile=profile,
+    )
     evidence_sha256 = canonical_json_sha256(marker["evidence"])
-    if (
-        target.get("is_current") is not False
-        or request.expected_evidence_sha256 not in (None, evidence_sha256)
-    ):
+    if target.get(
+        "is_current"
+    ) is not False or request.expected_evidence_sha256 not in (None, evidence_sha256):
         raise TerminalRootRetirementError("evidence_changed")
     return TerminalRootRetirementSelection(
         request=request,
@@ -393,6 +403,7 @@ async def _replay_selection(
         prior_status=RETIREMENT_STATUS,
         observed_metadata=metadata,
         marker_by_field=marker,
+        profile=profile,
     )
 
 
@@ -405,21 +416,27 @@ async def selected_terminal_root_retirement(
     if type(request) is not TerminalRootRetirementRequest:
         raise TerminalRootRetirementError("request_invalid")
     initial_endpoint = await _initial_endpoint(database, request.endpoint_id)
-    canonical_api_base = await _lock_endpoint_scope(
-        database, request, initial_endpoint
-    )
+    canonical_api_base = await _lock_endpoint_scope(database, request, initial_endpoint)
     await _share_evidence_relations(database)
-    target = await _locked_target(database, request)
-    metadata = _target_metadata(target, request)
-    if target.get("status") == RETIREMENT_STATUS:
+    target_by_field = await _locked_target(database, request)
+    metadata, profile = _target_metadata(target_by_field, request)
+    if target_by_field.get("status") == RETIREMENT_STATUS:
         return await _replay_selection(
-            database, request, canonical_api_base, target, metadata
+            database,
+            request,
+            canonical_api_base,
+            target_by_field,
+            metadata,
+            profile,
         )
     return await _new_selection(
-        database, request, canonical_api_base, target, metadata
+        database,
+        request,
+        canonical_api_base,
+        target_by_field,
+        metadata,
+        profile,
     )
 
 
-__all__ = (
-    "selected_terminal_root_retirement",
-)
+__all__ = ("selected_terminal_root_retirement",)

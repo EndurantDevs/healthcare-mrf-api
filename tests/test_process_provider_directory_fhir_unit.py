@@ -3068,8 +3068,8 @@ def test_reviewed_candidate_seeds_have_stable_ids_and_acquisition_controls():
     )[0]["api_base"] == importer.DEVOTED_PROVIDER_DIRECTORY_BASE
 
 
-def test_reviewed_candidate_statuses_match_completed_twin_campaigns():
-    """Admit only sources whose two exhaustive roots matched exactly."""
+def test_reviewed_candidate_statuses_match_current_acquisition_state():
+    """Track reviewed status against each candidate's current evidence."""
     source_rows = [
         importer._source_row_from_seed(seed_row)
         for seed_row in importer._reviewed_provider_directory_candidate_seed_rows()
@@ -3082,7 +3082,8 @@ def test_reviewed_candidate_statuses_match_completed_twin_campaigns():
     }
 
     verified_status = importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED
-    assert status_by_base[importer.DEVOTED_PROVIDER_DIRECTORY_BASE] == verified_status
+    pending_status = importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+    assert status_by_base[importer.DEVOTED_PROVIDER_DIRECTORY_BASE] == pending_status
     assert status_by_base[importer.SIMPRA_PROVIDER_DIRECTORY_BASE] == verified_status
     assert (
         status_by_base[importer.SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE]
@@ -3092,7 +3093,6 @@ def test_reviewed_candidate_statuses_match_completed_twin_campaigns():
         status_by_base[importer.SAN_MATEO_COUNTY_PROVIDER_DIRECTORY_BASE]
         == verified_status
     )
-    pending_status = importer.PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
     assert (
         status_by_base[importer.IOWA_MEDICAID_PROVIDER_DIRECTORY_BASE]
         == verified_status
@@ -14966,6 +14966,11 @@ async def test_process_data_merges_supplemental_retest_sources(monkeypatch, tmp_
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+    monkeypatch.setattr(
+        importer,
+        "_assert_persisted_reviewed_partition_generations",
+        AsyncMock(),
+    )
 
     metrics = await importer.process_data(
         {"context": {}},
@@ -15080,6 +15085,11 @@ async def test_process_data_merges_supplemental_catalog_sources(monkeypatch, tmp
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+    monkeypatch.setattr(
+        importer,
+        "_assert_persisted_reviewed_partition_generations",
+        AsyncMock(),
+    )
 
     metrics = await importer.process_data(
         {"context": {}},

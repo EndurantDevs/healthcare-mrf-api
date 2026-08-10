@@ -1763,7 +1763,7 @@ endpoint-discovery work instead of disappearing during dedupe.
 
 ## Runtime Contract Preflight
 
-For the default-off stale legacy-root operator, use the dedicated
+For the default-off versioned stale-root operator, use the dedicated
 [terminal root retirement runbook](provider-directory-terminal-root-retirement.md).
 
 Before building or accepting a dev image for the monthly Provider Directory

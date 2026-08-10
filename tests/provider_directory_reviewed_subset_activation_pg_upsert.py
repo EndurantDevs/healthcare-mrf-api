@@ -55,6 +55,8 @@ def _values_upsert_sql(
     scenario,
     *,
     note: str,
+    source_id: str = "synthetic-source",
+    endpoint_id: str = "endpoint-a",
     canonical_api_base: str = "https://directory.example.test/fhir",
     incoming_metadata: dict[str, object] | None = None,
 ) -> tuple[str, tuple[object, ...]]:
@@ -63,8 +65,8 @@ def _values_upsert_sql(
     importer = importlib.import_module("process.provider_directory_fhir")
     source_table = _source_table(scenario.schema)
     statement = pg_insert(source_table).values(
-        source_id="synthetic-source",
-        endpoint_id="endpoint-a",
+        source_id=source_id,
+        endpoint_id=endpoint_id,
         canonical_api_base=canonical_api_base,
         metadata_json=cast(
             literal(
@@ -100,7 +102,12 @@ def _values_upsert_sql(
     return str(compiled), parameters
 
 
-def _copy_upsert_sql(scenario) -> str:
+def _copy_upsert_sql(
+    scenario,
+    *,
+    source_id: str = "synthetic-source",
+    endpoint_id: str = "endpoint-a",
+) -> str:
     """Render the production COPY-conflict metadata expression."""
 
     importer = importlib.import_module("process.provider_directory_fhir")
@@ -115,7 +122,7 @@ def _copy_upsert_sql(scenario) -> str:
             source_id, endpoint_id, canonical_api_base,
             metadata_json, updated_at
         ) VALUES (
-            'synthetic-source', 'endpoint-a',
+            '{source_id}', '{endpoint_id}',
             'https://directory.example.test/fhir',
             $1::jsonb, pg_catalog.transaction_timestamp()
         )
@@ -123,6 +130,123 @@ def _copy_upsert_sql(scenario) -> str:
             SET metadata_json = {metadata_expression},
                 updated_at = pg_catalog.transaction_timestamp()
     """
+
+
+def _legacy_exhaustive_generation(note: str) -> dict[str, object]:
+    return {
+        "provider_directory_candidate_status": (
+            "verified_two_matching_exhaustive_acquisitions"
+        ),
+        "provider_directory_verification_campaign_id": "reviewed-campaign-v1",
+        "ordinary_catalog_note": note,
+    }
+
+
+def _partition_generation(note: str) -> dict[str, object]:
+    return {
+        "provider_directory_candidate_status": (
+            "pending_two_matching_exhaustive_acquisitions"
+        ),
+        "provider_directory_verification_campaign_id": "reviewed-campaign-v2",
+        "provider_directory_last_updated_partition_acquisition": {
+            "enabled": True,
+            "resources": {
+                "PractitionerRole": {
+                    "start": "1900-01-01T00:00:00Z",
+                    "end": "2026-08-11T00:00:00Z",
+                    "ceiling": 3000,
+                    "minimum_width_seconds": 1,
+                    "boundary_precision_seconds": 1,
+                    "page_count": 1000,
+                    "maximum_pages_per_window": 3,
+                    "volatile_metadata_paths": [],
+                }
+            },
+        },
+        "ordinary_catalog_note": note,
+    }
+
+
+async def _insert_legacy_generation(
+    scenario,
+    source_id: str,
+    endpoint_id: str,
+) -> None:
+    await scenario.connection.execute(
+        f"""
+        INSERT INTO {scenario.quoted_schema}.provider_directory_source (
+            source_id, endpoint_id, canonical_api_base,
+            metadata_json, updated_at
+        ) VALUES ($1, $2, 'https://directory.example.test/fhir',
+                  $3::jsonb, pg_catalog.transaction_timestamp())
+        """,
+        source_id,
+        endpoint_id,
+        json.dumps(_legacy_exhaustive_generation("legacy"), sort_keys=True),
+    )
+
+
+async def _assert_partition_generation(
+    scenario,
+    source_id: str,
+    expected_note: str,
+) -> None:
+    raw_metadata = await scenario.connection.fetchval(
+        f"""
+        SELECT metadata_json::text
+          FROM {scenario.quoted_schema}.provider_directory_source
+         WHERE source_id = $1
+        """,
+        source_id,
+    )
+    metadata = json.loads(raw_metadata)
+    assert metadata == _partition_generation(expected_note)
+    assert REVIEWED_ROOT_POLICY_METADATA_KEY not in metadata
+    assert ACTIVATION_METADATA_KEY not in metadata
+    assert ACTIVATION_METADATA_KEY_V2 not in metadata
+
+
+async def prove_unprotected_generation_replacement(scenario) -> None:
+    """Replace one legacy exhaustive campaign through both upsert paths."""
+
+    values_source = "legacy-values-source"
+    copy_source = "legacy-copy-source"
+    await _insert_legacy_generation(
+        scenario,
+        values_source,
+        "endpoint-generation-values",
+    )
+    await _insert_legacy_generation(
+        scenario,
+        copy_source,
+        "endpoint-generation-copy",
+    )
+    values_sql, values_parameters = _values_upsert_sql(
+        scenario,
+        note="values-path",
+        source_id=values_source,
+        endpoint_id="endpoint-generation-values",
+        incoming_metadata=_partition_generation("values-path"),
+    )
+    await scenario.connection.execute(values_sql, *values_parameters)
+    await scenario.connection.execute(
+        _copy_upsert_sql(
+            scenario,
+            source_id=copy_source,
+            endpoint_id="endpoint-generation-copy",
+        ),
+        json.dumps(_partition_generation("copy-path"), sort_keys=True),
+    )
+    await _assert_partition_generation(
+        scenario,
+        values_source,
+        "values-path",
+    )
+    await _assert_partition_generation(
+        scenario,
+        copy_source,
+        "copy-path",
+    )
 
 
 async def _assert_marker_and_note(
@@ -151,9 +275,7 @@ async def prove_catalog_upserts_preserve_activation(
 ) -> None:
     """Execute both normal upsert expressions and reject contract drift."""
 
-    values_sql, values_parameters = _values_upsert_sql(
-        scenario, note="values-path"
-    )
+    values_sql, values_parameters = _values_upsert_sql(scenario, note="values-path")
     await scenario.connection.execute(values_sql, *values_parameters)
     await _assert_marker_and_note(scenario, marker_by_field, "values-path")
     await scenario.connection.execute(
@@ -198,9 +320,7 @@ async def _assert_policy_marker_and_note(
         """
     )
     metadata = json.loads(raw_metadata)
-    assert metadata["provider_directory_candidate_status"] == (
-        POLICY_VERIFIED_STATUS
-    )
+    assert metadata["provider_directory_candidate_status"] == (POLICY_VERIFIED_STATUS)
     assert metadata[ACTIVATION_METADATA_KEY_V2] == marker_by_field
     assert ACTIVATION_METADATA_KEY not in metadata
     assert metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] == (
@@ -222,9 +342,7 @@ async def prove_policy_catalog_upserts_preserve_activation(
         incoming_metadata=values_metadata,
     )
     await scenario.connection.execute(values_sql, *values_parameters)
-    await _assert_policy_marker_and_note(
-        scenario, marker_by_field, "values-path"
-    )
+    await _assert_policy_marker_and_note(scenario, marker_by_field, "values-path")
     await scenario.connection.execute(
         _copy_upsert_sql(scenario),
         json.dumps(_policy_incoming_metadata("copy-path"), sort_keys=True),

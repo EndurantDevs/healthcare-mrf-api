@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import contextvars
+import copy
 import csv
 import datetime
 import email.utils
@@ -1173,6 +1174,18 @@ NETSMART_PROVIDER_DIRECTORY_BASES = frozenset(
 DEVOTED_PROVIDER_DIRECTORY_BASE = "https://fhir.devoted.com/fhir"
 REVIEWED_PRACTITIONER_ROLE_TIMEOUT_BASE = DEVOTED_PROVIDER_DIRECTORY_BASE
 REVIEWED_PRACTITIONER_ROLE_TIMEOUT_MIN_SECONDS = 300
+REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES = {
+    "PractitionerRole": {
+        "start": "1900-01-01T00:00:00Z",
+        "end": "2026-08-11T00:00:00Z",
+        "ceiling": 3000,
+        "minimum_width_seconds": 1,
+        "boundary_precision_seconds": 1,
+        "page_count": 1000,
+        "maximum_pages_per_window": 3,
+        "volatile_metadata_paths": [],
+    }
+}
 SIMPRA_PROVIDER_DIRECTORY_BASE = "https://data.healthlx.com:8004/SIMPRA"
 CAPITAL_BLUE_CROSS_PROVIDER_DIRECTORY_BASE = (
     "https://providerdirectory-api.capbluecross.com/r4"
@@ -1531,12 +1544,17 @@ REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID = {
         "provider-directory-san-mateo-2026-07-19-v1"
     ),
     "devoted-health-reviewed-candidate": (
-        "provider-directory-devoted-2026-07-19-v1"
+        "provider-directory-reviewed-practitioner-role-partition-2026-08-11-v2"
     ),
     "simpra-advantage-reviewed-candidate": (
         "provider-directory-simpra-2026-07-19-v1"
     ),
 }
+REVIEWED_PRACTITIONER_ROLE_PARTITION_CAMPAIGN_ID = (
+    REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID[
+        "devoted-health-reviewed-candidate"
+    ]
+)
 TWIN_ROOT_VERIFICATION_METADATA_KEY = "twin_root_verification_v1"
 SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY = (
     "server_issued_subset_replay_evidence"
@@ -1780,10 +1798,11 @@ class LastUpdatedPartitionConfig:
     boundary_precision: datetime.timedelta
     page_count: int
     volatile_metadata_paths: tuple[str, ...]
+    maximum_pages_per_window: int | None = None
 
     def identity(self) -> dict[str, Any]:
         """Return stable metadata identity without a moving resolved cutoff."""
-        return {
+        identity_by_field = {
             "start": self.start.isoformat(timespec="microseconds"),
             "end": (
                 self.end.isoformat(timespec="microseconds")
@@ -1801,6 +1820,11 @@ class LastUpdatedPartitionConfig:
             "volatile_metadata_paths": list(self.volatile_metadata_paths),
             "strategy_version": LAST_UPDATED_PARTITION_STRATEGY_VERSION,
         }
+        if self.maximum_pages_per_window is not None:
+            identity_by_field["maximum_pages_per_window"] = (
+                self.maximum_pages_per_window
+            )
+        return identity_by_field
 
     def root_end(self) -> datetime.datetime:
         """Resolve a fixed UTC root cutoff for a newly created acquisition."""
@@ -3734,6 +3758,22 @@ def _partition_page_count(raw_page_count: Any, ceiling: int) -> int:
     return raw_page_count
 
 
+def _partition_maximum_pages(
+    raw_maximum_pages: Any,
+    ceiling: int,
+) -> int | None:
+    if raw_maximum_pages is None:
+        return None
+    if (
+        isinstance(raw_maximum_pages, bool)
+        or not isinstance(raw_maximum_pages, int)
+        or raw_maximum_pages <= 0
+        or raw_maximum_pages > ceiling
+    ):
+        raise ValueError("maximum_pages_per_window_invalid")
+    return raw_maximum_pages
+
+
 def _partition_volatile_paths(raw_paths: Any) -> tuple[str, ...]:
     if not isinstance(raw_paths, list) or not all(
         isinstance(path, str) for path in raw_paths
@@ -3761,6 +3801,10 @@ def _build_partition_config(
     volatile_paths = _partition_volatile_paths(
         resource_settings.get("volatile_metadata_paths", [])
     )
+    maximum_pages = _partition_maximum_pages(
+        resource_settings.get("maximum_pages_per_window"),
+        ceiling,
+    )
     if partition_end is not None and partition_start >= partition_end:
         raise ValueError("start_must_precede_end")
     partition_config = LastUpdatedPartitionConfig(
@@ -3772,6 +3816,7 @@ def _build_partition_config(
         boundary_precision=boundary_precision,
         page_count=page_count,
         volatile_metadata_paths=volatile_paths,
+        maximum_pages_per_window=maximum_pages,
     )
     validation_end = partition_end or (partition_start + minimum_width)
     PartitionPlan.create(
@@ -38882,6 +38927,7 @@ class _ReviewedCandidateSeed:
     acquisition_enabled: bool = True
     acquisition_blocked_reason: str | None = None
     candidate_status: str = PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+    last_updated_partition_resources: dict[str, Any] | None = None
 
 
 def _reviewed_candidate_metadata(candidate: _ReviewedCandidateSeed) -> dict[str, Any]:
@@ -38898,6 +38944,13 @@ def _reviewed_candidate_metadata(candidate: _ReviewedCandidateSeed) -> dict[str,
             candidate.expected_nonempty_resources
         ),
     }
+    if candidate.last_updated_partition_resources is not None:
+        metadata[LAST_UPDATED_PARTITION_METADATA_KEY] = {
+            "enabled": True,
+            "resources": copy.deepcopy(
+                candidate.last_updated_partition_resources
+            ),
+        }
     if candidate.acquisition_enabled:
         campaign_id = REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID.get(
             candidate.row_id
@@ -39052,7 +39105,10 @@ def _reviewed_provider_directory_candidate_seed_rows(
             source_url="https://www.devoted.com/developers/",
             resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
             expected_nonempty_resources=PUBLIC_DIRECTORY_SEVEN_RESOURCES,
-            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+            candidate_status=PROVIDER_DIRECTORY_TWIN_ROOT_PENDING,
+            last_updated_partition_resources=(
+                REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES
+            ),
         )),
         _reviewed_candidate_row(_ReviewedCandidateSeed(
             row_id="simpra-advantage-reviewed-candidate",
@@ -49244,6 +49300,27 @@ def _last_updated_window_page_failure_result(
     )
 
 
+def _last_updated_window_hard_page_limit(
+    source_record: Mapping[str, Any],
+    resource_type: str,
+    expected_count: int,
+) -> int:
+    default_limit = min(_max_page_count(), max(1, expected_count))
+    partition_config, _partition_error = _last_updated_partition_config(
+        dict(source_record),
+        resource_type,
+    )
+    if (
+        partition_config is not None
+        and partition_config.maximum_pages_per_window is not None
+    ):
+        return min(
+            default_limit,
+            partition_config.maximum_pages_per_window,
+        )
+    return default_limit
+
+
 async def _fetch_last_updated_partition_window(
     source_record: dict[str, Any],
     resource_type: str,
@@ -49266,7 +49343,9 @@ async def _fetch_last_updated_partition_window(
             pages_fetched,
             "window_count_missing",
         )
-    hard_page_limit = min(_max_page_count(), max(1, expected_count))
+    hard_page_limit = _last_updated_window_hard_page_limit(
+        source_record, resource_type, expected_count
+    )
     current_url: str | None = request_url
     while current_url:
         if cancel_ctx is not None:
@@ -49298,11 +49377,7 @@ async def _fetch_last_updated_partition_window(
         if page_failure is not None:
             return page_failure
         current_url = page.next_url
-    return LastUpdatedWindowFetch(
-        resources=tuple(collected_resources),
-        pages_fetched=pages_fetched,
-        complete=True,
-    )
+    return LastUpdatedWindowFetch(tuple(collected_resources), pages_fetched, True)
 
 
 def _last_updated_partition_fingerprint_resource_type(
@@ -52791,6 +52866,7 @@ async def _fetch_resource_rows(
         and resource_type not in supported_resource_types
     ):
         return None
+    resource_timeout = _source_resource_timeout(source_record, resource_type, timeout)
     raw_partition_config = _source_metadata(source_record).get(
         LAST_UPDATED_PARTITION_METADATA_KEY
     )
@@ -52811,7 +52887,7 @@ async def _fetch_resource_rows(
                 LastUpdatedPartitionFetchOptions(
                     per_resource_limit=per_resource_limit,
                     page_limit=page_limit,
-                    timeout=timeout,
+                    timeout=resource_timeout,
                     run_id=run_id,
                     row_batch_handler=row_batch_handler,
                     row_batch_size=row_batch_size,
@@ -52828,7 +52904,6 @@ async def _fetch_resource_rows(
                 None,
                 partition_config_error or "resource_not_opted_in",
             )
-    resource_timeout = _source_resource_timeout(source_record, resource_type, timeout)
     start_urls: list[str] | None = None
     bulk_checkpoint_context = (
         pagination_checkpoint
@@ -58180,6 +58255,106 @@ async def _upsert_provider_directory_source_rows(
         await _upsert_rows(ProviderDirectoryAPIEndpoint, endpoint_rows)
     await _upsert_rows(ProviderDirectorySource, source_rows)
     return len(endpoint_rows)
+
+
+_REVIEWED_PARTITION_GENERATION_METADATA_KEYS = tuple(
+    dict.fromkeys(
+        (
+            "provider_directory_candidate_status",
+            PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY,
+            *TWIN_ROOT_ACQUISITION_METADATA_KEYS,
+            PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY,
+            REVIEWED_ROOT_POLICY_METADATA_KEY,
+            REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+            REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
+        )
+    )
+)
+
+
+def _is_reviewed_partition_generation_exact(
+    expected_source: Mapping[str, Any],
+    persisted_source: Mapping[str, Any],
+) -> bool:
+    """Compare one persisted reviewed partition generation fail closed."""
+
+    expected_metadata = _source_metadata(dict(expected_source))
+    persisted_metadata = _json_object(persisted_source.get("metadata_json"))
+    expected_partition_by_field = {
+        "enabled": True,
+        "resources": REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES,
+    }
+    if (
+        expected_metadata.get("provider_directory_candidate_status")
+        != PROVIDER_DIRECTORY_TWIN_ROOT_PENDING
+        or expected_metadata.get(LAST_UPDATED_PARTITION_METADATA_KEY)
+        != expected_partition_by_field
+        or any(
+            key in expected_metadata
+            for key in (
+                REVIEWED_ROOT_POLICY_METADATA_KEY,
+                REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+                REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
+            )
+        )
+    ):
+        return False
+    if any(
+        (key in expected_metadata) != (key in persisted_metadata)
+        or expected_metadata.get(key) != persisted_metadata.get(key)
+        for key in _REVIEWED_PARTITION_GENERATION_METADATA_KEYS
+    ):
+        return False
+    return bool(
+        persisted_source.get("source_id") == expected_source.get("source_id")
+        and persisted_source.get("endpoint_id") == expected_source.get("endpoint_id")
+        and _canonical_base(persisted_source.get("canonical_api_base"))
+        == _canonical_base(expected_source.get("canonical_api_base"))
+    )
+
+
+async def _assert_persisted_reviewed_partition_generations(
+    source_rows: list[dict[str, Any]],
+) -> None:
+    """Read back each new reviewed generation before probe or acquisition."""
+
+    expected_sources = [
+        source_record
+        for source_record in source_rows
+        if _source_metadata(source_record).get(
+            PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+        )
+        == REVIEWED_PRACTITIONER_ROLE_PARTITION_CAMPAIGN_ID
+    ]
+    for expected_source in expected_sources:
+        persisted_rows = await db.all(
+            f"""
+            SELECT source_id, endpoint_id, canonical_api_base, metadata_json
+              FROM {_qt(_schema(), ProviderDirectorySource.__tablename__)}
+             WHERE source_id = :source_id
+             ORDER BY endpoint_id
+             LIMIT 2
+            """,
+            source_id=expected_source.get("source_id"),
+        )
+        persisted_sources = [
+            dict(
+                persisted_source_record._mapping
+                if hasattr(persisted_source_record, "_mapping")
+                else persisted_source_record
+            )
+            for persisted_source_record in persisted_rows
+        ]
+        if (
+            len(persisted_sources) != 1
+            or not _is_reviewed_partition_generation_exact(
+                expected_source,
+                persisted_sources[0],
+            )
+        ):
+            raise RuntimeError(
+                "provider_directory_reviewed_partition_generation_persistence_mismatch"
+            )
 
 
 def _group_resource_import_sources(
@@ -70474,6 +70649,7 @@ async def process_provider_directory_fhir_data(
         for source_record in source_rows:
             _validate_current_version_census_source_transport(source_record)
         endpoint_rows_seeded = await _upsert_provider_directory_source_rows(source_rows)
+        await _assert_persisted_reviewed_partition_generations(source_rows)
         stale_source_deletion_by_type = {}
         protected_source_ids: list[str] = []
         missing_protected_source_ids: list[str] = []
