@@ -96,6 +96,16 @@ def _patch_npi_detail_dependencies(
     )
     monkeypatch.setattr(
         npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_directory_address_overlay",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
         "_fetch_other_names",
         AsyncMock(return_value=[]),
     )
@@ -304,9 +314,24 @@ async def test_npi_detail_returns_profile_only_provider(monkeypatch):
         "provider_directory_profile_evidence": profile_payload_by_kind[
             "evidence"
         ],
+        "address_list": [],
+        "address_pagination": {
+            "limit": npi_module.NPI_DETAIL_ADDRESS_DEFAULT_LIMIT,
+            "offset": 0,
+            "returned": 0,
+            "total": 0,
+            "has_more": False,
+        },
+        "other_name_list": [],
+        "do_business_as": [],
+        "provider_enrichment": {
+            "summary": None,
+            "enrollments": {},
+            "ffs_visibility": {},
+        },
     }
-    npi_module._fetch_other_names.assert_not_awaited()
-    npi_module._fetch_provider_enrichment_detail.assert_not_awaited()
+    npi_module._fetch_other_names.assert_awaited_once()
+    npi_module._fetch_provider_enrichment_detail.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 import json
 import types
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 import sanic.exceptions
@@ -24,7 +25,7 @@ class RecordingConnection:
         self.last_sql = sql_text
         self.last_params = params
         self.sql_calls.append((sql_text, dict(params)))
-        if "COUNT(DISTINCT c.npi)" in sql_text:
+        if "SELECT COUNT(DISTINCT" in sql_text:
             return [(5,)]
         return []
 
@@ -41,7 +42,7 @@ class CandidateLimitConnection(RecordingConnection):
         self.last_sql = sql_text
         self.last_params = params
         self.sql_calls.append((sql_text, dict(params)))
-        if "COUNT(DISTINCT c.npi)" in sql_text:
+        if "SELECT COUNT(DISTINCT" in sql_text:
             return [(5,)]
         return []
 
@@ -569,10 +570,14 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
     assert "FROM mrf.entity_address_unified as c" in page_sql
     assert "page_npis AS" in page_sql
-    assert "SELECT DISTINCT c.npi" in page_sql
+    assert "SELECT DISTINCT COALESCE(c.npi, c.inferred_npi) AS npi" in page_sql
     assert "JOIN LATERAL" in page_sql
-    assert "AND c.npi = pn.npi" in page_sql
-    assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in page_sql
+    assert "AND COALESCE(c.npi, c.inferred_npi) = pn.npi" in page_sql
+    assert "c.type IN" in page_sql
+    assert all(
+        f"'{location_type}'" in page_sql
+        for location_type in ("primary", "secondary", "practice", "site")
+    )
     assert "c.zip5 = :zip_code" in page_sql
     assert "phone_candidates AS MATERIALIZED" in page_sql
     assert "provider_directory_address_overlay AS overlay" in page_sql
@@ -584,9 +589,8 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     assert "c.type = 'primary'" not in page_sql
     assert "LEFT(c.postal_code, 5) = :zip_code" not in page_sql
 
-    fallback_sql = conn.last_sql
-    assert "SELECT c.*" in fallback_sql
-    assert "FROM mrf.entity_address_unified AS c" in fallback_sql
+    assert "fallback_npis AS" not in page_sql
+    assert "SELECT c.checksum" in page_sql
 
 
 @pytest.mark.asyncio
@@ -646,13 +650,14 @@ async def test_get_all_unified_phone_facet_counts_include_service_locations(monk
 
 def _provider_directory_fallback_record(*, premise_key=None):
     provider_record_map = {
-        "npi": 1033213624,
+        "npi_code": 1000000049,
+        "npi": 1000000049,
         "inferred_npi": None,
-        "entity_name": "MARY S HARPER GERIATRIC PSY CTR",
+        "entity_name": "SYNTHETIC PROVIDER ORGANIZATION",
         "type": "practice",
-        "first_line": "115 Harper Ct",
+        "first_line": "115 Example Court",
         "second_line": "Suite 100" if premise_key else None,
-        "city_name": "Tuscaloosa",
+        "city_name": "Example City",
         "state_name": "AL",
         "postal_code": "35401",
         "country_code": "US",
@@ -661,9 +666,10 @@ def _provider_directory_fallback_record(*, premise_key=None):
         "address_key": "00000000-0000-0000-0000-000000000001"
         if premise_key
         else "e4cd3105-5ce1-efd3-3f31-d48bfa864a13",
+        "location_key": "00000000-0000-0000-0000-000000000011",
         "address_sources": ["provider_directory_fhir"],
         "source_record_ids": [
-            "provider_directory_fhir:practitioner_role:pdfhir_alohr:role-1:loc-1"
+            "provider_directory_fhir:practitioner_role:synthetic_directory:role-1:loc-1"
         ],
         "source_count": 1,
         "taxonomy_array": [],
@@ -685,7 +691,7 @@ class _ProviderDirectoryFallbackConnection:
         sql_text = str(sql)
         self.sql_calls.append((sql_text, dict(params)))
         if "page_npis AS" in sql_text:
-            return []
+            return [_MappedProviderDirectoryRow(self.row)]
         return [self.row] if "SELECT c.*" in sql_text else []
 
     async def first(self, *_args, **_kwargs):
@@ -755,8 +761,8 @@ async def test_get_all_unified_phone_lookup_returns_provider_directory_only_row(
     assert response_body["total_source"] == "estimated_page_floor"
     assert len(response_body["rows"]) == 1
     provider_record_map = response_body["rows"][0]
-    assert provider_record_map["npi"] == 1033213624
-    assert provider_record_map["provider_organization_name"] == "MARY S HARPER GERIATRIC PSY CTR"
+    assert provider_record_map["npi"] == 1000000049
+    assert provider_record_map["provider_organization_name"] == "SYNTHETIC PROVIDER ORGANIZATION"
     assert provider_record_map["entity_type_code"] == 1
     assert provider_record_map["phone_number"] == "2053663010"
     assert provider_record_map["address_key"] == "e4cd3105-5ce1-efd3-3f31-d48bfa864a13"
@@ -806,16 +812,16 @@ async def test_get_all_unified_site_key_returns_provider_directory_row(monkeypat
     assert response_body["total_source"] == "estimated_page_floor"
     assert len(response_body["rows"]) == 1
     provider_record_map = response_body["rows"][0]
-    assert provider_record_map["npi"] == 1033213624
+    assert provider_record_map["npi"] == 1000000049
     assert provider_record_map["address_key"] == "00000000-0000-0000-0000-000000000001"
     assert provider_record_map["address_site_key"] == address_site_key
     assert "premise_key" not in provider_record_map
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
-    fallback_sql = next(sql for sql, _params in conn.sql_calls if "SELECT c.*" in sql)
+    hydration_sql = next(sql for sql, _params in conn.sql_calls if "SELECT c.*" in sql)
     assert "FROM mrf.entity_address_unified as c" in page_sql
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in page_sql
     assert "c.premise_key = CAST(:address_site_key AS uuid)" in page_sql
-    assert "c.premise_key = CAST(:address_site_key AS uuid)" in fallback_sql
+    assert "c.location_key = ANY(:location_keys)" in hydration_sql
     assert any(params.get("address_site_key") == address_site_key for _sql, params in conn.sql_calls)
 
 
@@ -826,7 +832,7 @@ async def test_get_all_unified_exact_npi_lookup_returns_provider_directory_only_
 
     request = types.SimpleNamespace(
         args={
-            "npi": "1033213624",
+            "npi": "1000000049",
             "limit": "5",
             "start": "0",
             "include_total": "0",
@@ -838,15 +844,15 @@ async def test_get_all_unified_exact_npi_lookup_returns_provider_directory_only_
     assert response_body["total"] == 1
     assert len(response_body["rows"]) == 1
     provider_record_map = response_body["rows"][0]
-    assert provider_record_map["npi"] == 1033213624
-    assert provider_record_map["provider_organization_name"] == "MARY S HARPER GERIATRIC PSY CTR"
+    assert provider_record_map["npi"] == 1000000049
+    assert provider_record_map["provider_organization_name"] == "SYNTHETIC PROVIDER ORGANIZATION"
     assert provider_record_map["address_sources"] == ["provider_directory_fhir"]
     assert "source_record_ids" not in provider_record_map
 
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
     assert "COALESCE(c.npi, c.inferred_npi) = :npi_filter" in page_sql
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in page_sql
-    assert any(params.get("npi_filter") == 1033213624 for _sql, params in conn.sql_calls)
+    assert any(params.get("npi_filter") == 1000000049 for _sql, params in conn.sql_calls)
 
 
 @pytest.mark.asyncio
@@ -863,14 +869,14 @@ async def test_get_all_rejects_invalid_npi_filter(monkeypatch):
 async def test_get_all_unified_exact_lookup_can_include_provider_directory_source_summary(monkeypatch):
     """Verify get all unified exact lookup can include provider directory source summary."""
     async def fake_source_detail_map(source_ids, **_kwargs):
-        assert source_ids == ["pdfhir_alohr"]
+        assert source_ids == ["synthetic_directory"]
         return {
-            "pdfhir_alohr": {
+            "synthetic_directory": {
                 "source": "provider_directory_fhir",
-                "source_id": "pdfhir_alohr",
-                "endpoint_id": "pd_endpoint_alohr",
-                "canonical_api_base": "https://fhir.alohr.example/provider-directory",
-                "org_name": "Blue Cross and Blue Shield of Alabama",
+                "source_id": "synthetic_directory",
+                "endpoint_id": "synthetic_endpoint",
+                "canonical_api_base": "https://fhir.example.invalid/provider-directory",
+                "org_name": "Synthetic Health Plan",
                 "plan_name": "Provider Directory",
             }
         }
@@ -895,13 +901,13 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
     assert provider_record_map["provider_directory_sources"] == [
             {
                 "source": "provider_directory_fhir",
-                "source_ids": ["pdfhir_alohr"],
-                "endpoint_id": "pd_endpoint_alohr",
+                "source_ids": ["synthetic_directory"],
+                "endpoint_id": "synthetic_endpoint",
                 "catalog_aliases_verified": False,
             "catalog_aliases": [
                 {
-                    "source_id": "pdfhir_alohr",
-                    "org_name": "Blue Cross and Blue Shield of Alabama",
+                    "source_id": "synthetic_directory",
+                    "org_name": "Synthetic Health Plan",
                     "plan_name": "Provider Directory",
                 }
             ],
@@ -1105,6 +1111,64 @@ async def test_get_all_handles_sparse_positional_rows_without_crashing(monkeypat
     assert "00-0000000" not in json.dumps(response_body)
 
 
+@pytest.mark.asyncio
+async def test_get_all_keeps_each_positional_rows_own_address(monkeypatch):
+    class PositionalResultConnection:
+        async def all(self, _sql, **_kwargs):
+            def provider_row(street: str, address_key: str):
+                row = [None] * 73
+                row[0] = 1234567890  # npi_code
+                row[1] = 1234567890  # b.npi
+                row[3] = 1  # entity_type_code
+                row[7] = "Sample"  # provider_first_name
+                row[6] = "Clinician"  # provider_last_name
+                row[42] = 1234567890  # address npi
+                row[43] = "practice"  # address type
+                row[53] = street  # first_line
+                row[55] = "Example City"
+                row[56] = "UT"
+                row[57] = "84001"
+                row[58] = "US"
+                row[66] = address_key
+                row[69] = "207Q00000X"
+                row[72] = "Y"
+                return tuple(row)
+
+            return [
+                provider_row(
+                    "100 First Avenue",
+                    "00000000-0000-0000-0000-000000000101",
+                ),
+                provider_row(
+                    "200 Second Avenue",
+                    "00000000-0000-0000-0000-000000000102",
+                ),
+            ]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        npi_module.db,
+        "acquire",
+        lambda: FakeAcquire(PositionalResultConnection()),
+    )
+    response = await get_all(
+        types.SimpleNamespace(
+            args={
+                "name_like": "sample",
+                "limit": "3",
+                "include_total": "0",
+            }
+        )
+    )
+    provider_match = json.loads(response.body)["rows"][0]
+
+    assert [
+        location["first_line"] for location in provider_match["address_list"]
+    ] == ["100 First Avenue", "200 Second Avenue"]
+
+
 class _MappedProviderDirectoryRow:
     def __init__(self, mapping):
         self._mapping = mapping
@@ -1120,17 +1184,85 @@ class _ProviderDirectoryMappedConnection:
         return None
 
 
+class _MultiLocationMappedConnection:
+    def __init__(self, rows, *, taxonomy_rows=None):
+        self.rows = rows
+        self.taxonomy_rows = taxonomy_rows or []
+        self.sql_calls = []
+
+    async def all(self, sql, **params):
+        sql_text = str(sql)
+        self.sql_calls.append((sql_text, dict(params)))
+        if "FROM mrf.npi_taxonomy AS taxonomy" in sql_text:
+            return [
+                _MappedProviderDirectoryRow(row)
+                for row in self.taxonomy_rows
+            ]
+        if "page_npis AS" not in sql_text:
+            return []
+        return [_MappedProviderDirectoryRow(row) for row in self.rows]
+
+    async def first(self, *_args, **_kwargs):
+        return None
+
+
+class _HydratingMultiLocationConnection(_MultiLocationMappedConnection):
+    def __init__(self, rows, hydrated_rows, *, taxonomy_rows=None):
+        super().__init__(rows, taxonomy_rows=taxonomy_rows)
+        self.hydrated_rows = hydrated_rows
+
+    async def all(self, sql, **params):
+        sql_text = str(sql)
+        self.sql_calls.append((sql_text, dict(params)))
+        if "FROM mrf.npi_taxonomy AS taxonomy" in sql_text:
+            return [
+                _MappedProviderDirectoryRow(row)
+                for row in self.taxonomy_rows
+            ]
+        if "SELECT c.*" in sql_text:
+            selected_keys = {
+                str(value) for value in (params.get("location_keys") or [])
+            }
+            return [
+                row
+                for row in self.hydrated_rows
+                if str(row.get("location_key") or "") in selected_keys
+            ]
+        if "page_npis AS" in sql_text:
+            return [_MappedProviderDirectoryRow(row) for row in self.rows]
+        return []
+
+
+class _FallbackMultiLocationConnection(_MultiLocationMappedConnection):
+    async def all(self, sql, **params):
+        sql_text = str(sql)
+        self.sql_calls.append((sql_text, dict(params)))
+        if "page_npis AS" in sql_text:
+            return [
+                _MappedProviderDirectoryRow(
+                    {
+                        **row,
+                        "npi_code": row.get("npi") or row.get("inferred_npi"),
+                    }
+                )
+                for row in self.rows
+            ]
+        if "SELECT c.*" in sql_text:
+            return self.rows
+        return []
+
+
 def _provider_directory_row_mapping():
     return {
-        "npi_code": 1033213624,
-        "npi": 1033213624,
+        "npi_code": 1000000049,
+        "npi": 1000000049,
         "entity_type_code": 2,
-        "provider_organization_name": "MARY S HARPER GERIATRIC PSY CTR",
+        "provider_organization_name": "SYNTHETIC PROVIDER ORGANIZATION",
         "employer_identification_number": "private-ein-sentinel",
         "parent_organization_tin": "private-tin-sentinel",
         "type": "practice",
-        "first_line": "115 Harper Ct",
-        "city_name": "Tuscaloosa",
+        "first_line": "115 Example Court",
+        "city_name": "Example City",
         "state_name": "AL",
         "postal_code": "35401",
         "country_code": "US",
@@ -1138,7 +1270,7 @@ def _provider_directory_row_mapping():
         "phone_number": "2053663010",
         "address_key": "e4cd3105-5ce1-efd3-3f31-d48bfa864a13",
         "address_sources": ["provider_directory_fhir"],
-        "source_record_ids": ["provider_directory_fhir:practitioner_role:pdfhir_alohr:role-1:loc-1"],
+        "source_record_ids": ["provider_directory_fhir:practitioner_role:synthetic_directory:role-1:loc-1"],
         "source_count": 1,
     }
 
@@ -1163,14 +1295,14 @@ async def _empty_provider_enrichment_summary(*_args, **_kwargs):
 
 
 async def _provider_directory_source_detail_map(source_ids, **_kwargs):
-    assert source_ids == ["pdfhir_alohr"]
+    assert source_ids == ["synthetic_directory"]
     return {
-        "pdfhir_alohr": {
+        "synthetic_directory": {
             "source": "provider_directory_fhir",
-            "source_id": "pdfhir_alohr",
-            "endpoint_id": "pd_endpoint_alohr",
-            "canonical_api_base": "https://fhir.alohr.example/provider-directory",
-            "org_name": "Blue Cross and Blue Shield of Alabama",
+            "source_id": "synthetic_directory",
+            "endpoint_id": "synthetic_endpoint",
+            "canonical_api_base": "https://fhir.example.invalid/provider-directory",
+            "org_name": "Synthetic Health Plan",
             "plan_name": "Provider Directory",
         }
     }
@@ -1182,11 +1314,16 @@ async def test_npi_all_includes_fhir_sources(monkeypatch):
     monkeypatch.setattr(npi_module, "_table_columns", _provider_directory_test_columns)
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", _empty_provider_enrichment_summary)
     monkeypatch.setattr(npi_module, "_fetch_provider_directory_source_detail_map", _provider_directory_source_detail_map)
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_location_status_by_record_id",
+        AsyncMock(return_value={}),
+    )
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(_ProviderDirectoryMappedConnection()))
 
     request = types.SimpleNamespace(
         args={
-            "name_like": "harper",
+            "name_like": "synthetic",
             "include_sources": "true",
             "limit": "5",
             "start": "0",
@@ -1204,19 +1341,547 @@ async def test_npi_all_includes_fhir_sources(monkeypatch):
     assert provider_match["provider_directory_sources"] == [
             {
                 "source": "provider_directory_fhir",
-                "source_ids": ["pdfhir_alohr"],
-                "endpoint_id": "pd_endpoint_alohr",
+                "source_ids": ["synthetic_directory"],
+                "endpoint_id": "synthetic_endpoint",
                 "catalog_aliases_verified": False,
             "catalog_aliases": [
                 {
-                    "source_id": "pdfhir_alohr",
-                    "org_name": "Blue Cross and Blue Shield of Alabama",
+                    "source_id": "synthetic_directory",
+                    "org_name": "Synthetic Health Plan",
                     "plan_name": "Provider Directory",
                 }
             ],
         }
     ]
     assert "source_record_ids" not in provider_match
+
+
+def _ranked_location_maps():
+    return [
+        {
+            "npi_code": 1000000007,
+            "npi": 1000000007,
+            "entity_type_code": 1,
+            "provider_first_name": "Sample",
+            "provider_last_name_legal_name": "Clinician",
+            "type": "practice",
+            "first_line": street,
+            "city_name": "Example City",
+            "state_name": "UT",
+            "postal_code": f"8400{index}",
+            "country_code": "US",
+            "telephone_number": f"+1801555010{index}",
+            "address_key": f"00000000-0000-0000-0000-00000000010{index}",
+            "premise_key": f"00000000-0000-0000-0000-00000000020{index}",
+            "address_sources": ["provider_directory_fhir"],
+            "source_record_ids": [
+                f"provider_directory_fhir:practitioner_role:synthetic:role-1:loc-{index}"
+            ],
+            "source_count": 1,
+            "provider_address_total": 4,
+        }
+        for index, street in enumerate(
+            (
+                "100 Example Ave",
+                "200 Example Ave",
+                "300 Example Ave",
+                "400 Example Ave",
+            ),
+            start=1,
+        )
+    ]
+
+
+def _install_multi_location_dependencies(
+    monkeypatch,
+    connection,
+    *,
+    status_by_record_id=None,
+):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(
+        npi_module,
+        "_address_serving_table_sql",
+        AsyncMock(return_value="mrf.entity_address_unified"),
+    )
+    monkeypatch.setattr(npi_module, "_table_columns", _provider_directory_test_columns)
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_summary_map",
+        _empty_provider_enrichment_summary,
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_location_status_by_record_id",
+        AsyncMock(return_value=status_by_record_id or {}),
+    )
+    monkeypatch.setattr(
+        npi_module.db,
+        "acquire",
+        lambda: FakeAcquire(connection),
+    )
+
+
+async def _first_provider_match(request_args):
+    operation_response = await get_all(types.SimpleNamespace(args=request_args))
+    return json.loads(operation_response.body)["rows"][0]
+
+
+def _provider_page_sql(connection):
+    return next(
+        (statement_sql, statement_params)
+        for statement_sql, statement_params in connection.sql_calls
+        if "page_npis AS" in statement_sql
+    )
+
+
+def _assert_ranked_location_query_contract(connection):
+    page_sql, page_params = _provider_page_sql(connection)
+    assert "COUNT(*) OVER () AS provider_address_total" in page_sql
+    assert "json_agg(taxonomy ORDER BY taxonomy.checksum)" not in page_sql
+    assert any(
+        "FROM mrf.npi_taxonomy AS taxonomy" in statement_sql
+        for statement_sql, _statement_params in connection.sql_calls
+    )
+    assert "select sub_s.*, t.*" not in page_sql.lower()
+    assert "c.type IN" in page_sql
+    assert all(
+        f"'{location_type}'" in page_sql
+        for location_type in ("primary", "secondary", "practice", "site")
+    )
+    assert "LIMIT :locations_per_provider" not in page_sql
+    assert "locations_per_provider" not in page_params
+
+
+@pytest.mark.asyncio
+async def test_npi_all_returns_three_ranked_locations_with_honest_total(monkeypatch):
+    location_maps = _ranked_location_maps()
+    nested_taxonomy_map = {
+        "npi": 1000000007,
+        "checksum": 1,
+        "healthcare_provider_taxonomy_code": "207Q00000X",
+    }
+    location_maps[0]["taxonomy_rows"] = [nested_taxonomy_map]
+    location_maps[1]["taxonomy_rows"] = [nested_taxonomy_map]
+    location_maps[2]["healthcare_provider_taxonomy_code"] = "207Q00000X"
+    connection = _MultiLocationMappedConnection(
+        location_maps,
+        taxonomy_rows=[nested_taxonomy_map],
+    )
+    status_by_record_id = {
+        location_maps[index]["source_record_ids"][0]: location_status
+        for index, location_status in enumerate(
+            ("active", "unknown", "unknown", "active")
+        )
+    }
+    _install_multi_location_dependencies(
+        monkeypatch,
+        connection,
+        status_by_record_id=status_by_record_id,
+    )
+    provider_match = await _first_provider_match(
+        {"name_like": "sample", "limit": "5", "start": "0", "include_total": "0"}
+    )
+
+    assert [
+        location["first_line"] for location in provider_match["address_list"]
+    ] == ["100 Example Ave", "400 Example Ave", "200 Example Ave"]
+    assert provider_match["address_pagination"] == {
+        "limit": 3,
+        "offset": 0,
+        "returned": 3,
+        "total": 4,
+        "has_more": True,
+    }
+    assert provider_match["location_status"] == "active"
+    assert provider_match["taxonomy_list"] == [
+        {"healthcare_provider_taxonomy_code": "207Q00000X"}
+    ]
+    assert all(
+        "source_record_ids" not in location
+        for location in provider_match["address_list"]
+    )
+    _assert_ranked_location_query_contract(connection)
+
+
+def _fallback_location_maps():
+    return [
+        {
+            "npi": None,
+            "inferred_npi": 1000000015,
+            "entity_name": "Synthetic clinic",
+            "type": "practice",
+            "first_line": f"{index} Fallback Avenue",
+            "city_name": "Example City",
+            "state_name": "UT",
+            "postal_code": f"8410{index}",
+            "address_key": f"00000000-0000-0000-0000-00000000030{index}",
+            "location_key": f"00000000-0000-0000-0000-00000000035{index}",
+            "premise_key": f"00000000-0000-0000-0000-00000000040{index}",
+            "source_record_ids": [
+                f"provider_directory_fhir:practitioner_role:synthetic:role-2:loc-{index}"
+            ],
+            "provider_address_total": 4,
+        }
+        for index in range(1, 5)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_npi_all_profile_only_fallback_groups_three_locations(monkeypatch):
+    fallback_locations = _fallback_location_maps()
+    connection = _FallbackMultiLocationConnection(fallback_locations)
+    status_by_record_id = {
+        location["source_record_ids"][0]: "active"
+        for location in fallback_locations
+    }
+    _install_multi_location_dependencies(
+        monkeypatch,
+        connection,
+        status_by_record_id=status_by_record_id,
+    )
+    provider_match = await _first_provider_match(
+        {"npi": "1000000015", "limit": "5", "start": "0", "include_total": "0"}
+    )
+
+    assert provider_match["npi"] == 1000000015
+    assert all(
+        location["npi"] == 1000000015
+        for location in provider_match["address_list"]
+    )
+
+    assert [
+        location["first_line"] for location in provider_match["address_list"]
+    ] == [
+        "1 Fallback Avenue",
+        "2 Fallback Avenue",
+        "3 Fallback Avenue",
+    ]
+    assert provider_match["address_pagination"] == {
+        "limit": 3,
+        "offset": 0,
+        "returned": 3,
+        "total": 4,
+        "has_more": True,
+    }
+    page_sql, page_params = _provider_page_sql(connection)
+    assert "ROW_NUMBER() OVER" not in page_sql
+    assert "COUNT(*) OVER" in page_sql
+    assert "COALESCE(c.npi, c.inferred_npi)" in page_sql
+    assert page_params["limit"] == 5
+
+
+def _exact_provider_location_maps(provider_npi):
+    return [
+        {
+            "npi_code": provider_npi,
+            "npi": None,
+            "inferred_npi": None if index == 1 else provider_npi,
+            "entity_name": "Synthetic provider",
+            "type": "practice",
+            "first_line": street,
+            "city_name": "Example City",
+            "state_name": "UT",
+            "postal_code": f"8410{index}",
+            "address_key": f"00000000-0000-0000-0000-0000000005{index:02d}",
+            "provider_address_total": 3,
+        }
+        for index, street in enumerate(
+            ("100 Example Ave", "200 Example Ave", "300 Example Ave"),
+            start=1,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_npi_all_exact_provider_page_collects_direct_and_inferred_locations(
+    monkeypatch,
+):
+    provider_npi = 1000000015
+    location_maps = _exact_provider_location_maps(provider_npi)
+    connection = _MultiLocationMappedConnection(location_maps)
+    _install_multi_location_dependencies(monkeypatch, connection)
+    provider_match = await _first_provider_match(
+        {"npi": str(provider_npi), "limit": "1", "start": "0", "include_total": "0"}
+    )
+
+    assert provider_match["npi"] == provider_npi
+    assert [
+        location["first_line"]
+        for location in provider_match["address_list"]
+    ] == ["100 Example Ave", "200 Example Ave", "300 Example Ave"]
+    assert all(
+        location["npi"] == provider_npi
+        for location in provider_match["address_list"]
+    )
+    assert provider_match["address_pagination"] == {
+        "limit": 3,
+        "offset": 0,
+        "returned": 3,
+        "total": 3,
+        "has_more": False,
+    }
+    page_sql, page_params = _provider_page_sql(connection)
+    assert "COALESCE(c.npi, c.inferred_npi) = :npi_filter" in page_sql
+    assert page_params["limit"] == 1
+
+
+def _duplicate_search_location_maps(provider_npi, address_key, site_key):
+    return [
+        {
+            "npi_code": provider_npi,
+            "npi": provider_npi,
+            "entity_type_code": 1,
+            "provider_first_name": "Synthetic",
+            "provider_last_name_legal_name": "Clinician",
+            "type": "practice",
+            "first_line": "100 Example Ave",
+            "city_name": "Example City",
+            "state_name": "UT",
+            "postal_code": "84101",
+            "telephone_number": "2025550101",
+            "address_key": address_key,
+            "premise_key": site_key,
+            "location_key": "synthetic-location-a",
+            "address_sources": ["synthetic_source_a"],
+            "source_record_ids": ["synthetic:role:active-a"],
+            "provider_address_total": 5,
+        },
+        {
+            "npi_code": provider_npi,
+            "npi": None,
+            "inferred_npi": provider_npi,
+            "type": "practice",
+            "first_line": "100 Example Ave",
+            "city_name": "Example City",
+            "state_name": "UT",
+            "postal_code": "84101",
+            "telephone_number": "2025550199",
+            "address_key": address_key,
+            "premise_key": site_key,
+            "location_key": "synthetic-location-b",
+            "address_sources": ["synthetic_source_b"],
+            "source_record_ids": ["synthetic:role:unknown-b"],
+            "provider_address_total": 5,
+        },
+    ]
+
+
+def _search_hydration_location_maps(provider_npi):
+    location_maps = _duplicate_search_location_maps(
+        provider_npi,
+        "00000000-0000-0000-0000-000000000601",
+        "00000000-0000-0000-0000-000000000701",
+    )
+    location_maps.extend(
+        {
+            "npi_code": provider_npi,
+            "npi": provider_npi,
+            "type": "practice",
+            "first_line": f"{index}00 Example Ave",
+            "city_name": "Example City",
+            "state_name": "UT",
+            "postal_code": f"8410{index}",
+            "address_key": f"00000000-0000-0000-0000-00000000060{index}",
+            "location_key": f"synthetic-location-{index}",
+            "source_record_ids": [f"synthetic:role:active-{index}"],
+            "provider_address_total": 5,
+        }
+        for index in range(2, 5)
+    )
+    return location_maps
+
+
+def _hydrated_location_maps(location_maps):
+    return [
+        {
+            **location_map,
+            "taxonomy_array": [100 + index],
+            "plans_network_array": [200 + index],
+            "procedures_array": [300 + index],
+            "medications_array": [400 + index],
+            "aca_plan_array": [f"synthetic-aca-{index}"],
+            "ptg_plan_array": [f"synthetic-ptg-{index}"],
+            "group_plan_array": [f"synthetic-group-{index}"],
+            "fax_number": f"20255502{index:02d}",
+        }
+        for index, location_map in enumerate(location_maps, start=1)
+    ]
+
+
+def _search_location_status_map():
+    return {
+        "synthetic:role:active-a": "active",
+        "synthetic:role:unknown-b": "unknown",
+        **{
+            f"synthetic:role:active-{index}": "active"
+            for index in range(2, 5)
+        },
+    }
+
+
+def _assert_hydrated_primary_location(provider_match):
+    primary_location = provider_match["address_list"][0]
+    assert primary_location["telephone_number"] == "2025550101"
+    assert primary_location["address_sources"] == [
+        "synthetic_source_a",
+        "synthetic_source_b",
+    ]
+    assert primary_location["aca_plan_array"] == [
+        "synthetic-aca-1",
+        "synthetic-aca-2",
+    ]
+    assert primary_location["ptg_plan_array"] == [
+        "synthetic-ptg-1",
+        "synthetic-ptg-2",
+    ]
+    assert primary_location["procedures_array"] == [301, 302]
+    assert primary_location["medications_array"] == [401, 402]
+    assert primary_location["location_status"] == "active"
+    for internal_key in (
+        "location_key",
+        "inferred_npi",
+        "source_record_ids",
+        "_base_row_identities",
+    ):
+        assert internal_key not in primary_location
+
+
+def _hydration_query_details(connection):
+    page_sql = next(
+        statement_sql
+        for statement_sql, _statement_params in connection.sql_calls
+        if "page_npis AS" in statement_sql
+    )
+    hydration_sql, hydration_params = next(
+        (statement_sql, statement_params)
+        for statement_sql, statement_params in connection.sql_calls
+        if "SELECT c.*" in statement_sql
+    )
+    return page_sql, hydration_sql, hydration_params
+
+
+@pytest.mark.asyncio
+async def test_npi_all_search_hydrates_selected_locations_and_merges_base_evidence(
+    monkeypatch,
+):
+    location_maps = _search_hydration_location_maps(1000000023)
+    connection = _HydratingMultiLocationConnection(
+        location_maps,
+        _hydrated_location_maps(location_maps),
+    )
+    _install_multi_location_dependencies(
+        monkeypatch,
+        connection,
+        status_by_record_id=_search_location_status_map(),
+    )
+    provider_match = await _first_provider_match(
+        {"name_like": "synthetic", "limit": "5", "start": "0", "include_total": "0"}
+    )
+
+    assert len(provider_match["address_list"]) == 3
+    assert provider_match["address_pagination"] == {
+        "limit": 3,
+        "offset": 0,
+        "returned": 3,
+        "total": 4,
+        "has_more": True,
+    }
+    _assert_hydrated_primary_location(provider_match)
+    page_sql, hydration_sql, hydration_params = _hydration_query_details(connection)
+    assert "c.aca_plan_array" not in page_sql
+    assert "c.procedures_array" not in page_sql
+    assert "c.location_key = ANY(:location_keys)" in hydration_sql
+    assert {"synthetic-location-a", "synthetic-location-b"}.issubset(
+        set(hydration_params["location_keys"])
+    )
+    assert "synthetic-location-4" not in hydration_params["location_keys"]
+
+
+@pytest.mark.asyncio
+async def test_npi_all_search_degrades_when_selected_hydration_fails(monkeypatch):
+    class FailingHydrationConnection(_HydratingMultiLocationConnection):
+        async def all(self, sql, **params):
+            if "SELECT c.*" in str(sql):
+                raise RuntimeError("synthetic selected hydration failure")
+            return await super().all(sql, **params)
+
+    location_maps = _search_hydration_location_maps(1000000023)
+    connection = FailingHydrationConnection(
+        location_maps,
+        _hydrated_location_maps(location_maps),
+    )
+    _install_multi_location_dependencies(
+        monkeypatch,
+        connection,
+        status_by_record_id=_search_location_status_map(),
+    )
+
+    provider_match = await _first_provider_match(
+        {"name_like": "synthetic", "limit": "5", "start": "0", "include_total": "0"}
+    )
+
+    assert len(provider_match["address_list"]) == 3
+    assert provider_match["address_pagination"]["total"] == 4
+    assert provider_match["address_pagination"]["has_more"] is True
+    assert all(
+        "procedures_array" not in location
+        for location in provider_match["address_list"]
+    )
+
+
+def _large_system_location_maps(provider_npi):
+    return [
+        {
+            "npi_code": provider_npi,
+            "npi": provider_npi,
+            "entity_type_code": 2,
+            "provider_organization_name": "Synthetic medical system",
+            "type": "practice",
+            "first_line": f"{index:04d} Example Ave",
+            "city_name": "Example City",
+            "state_name": "UT",
+            "postal_code": "84101",
+            "address_key": (
+                f"00000000-0000-0000-0001-{index:012d}"
+            ),
+            "location_key": f"synthetic-large-{index:04d}",
+            "provider_address_total": 1000,
+        }
+        for index in range(1000)
+    ]
+
+
+def _large_system_hydrated_locations(location_maps):
+    return [
+        {
+            **location_map,
+            "procedures_array": [index],
+            "medications_array": [index + 1000],
+        }
+        for index, location_map in enumerate(location_maps)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_npi_all_large_system_hydrates_only_three_selected_locations(
+    monkeypatch,
+):
+    location_maps = _large_system_location_maps(1000000031)
+    connection = _HydratingMultiLocationConnection(
+        location_maps,
+        _large_system_hydrated_locations(location_maps),
+    )
+    _install_multi_location_dependencies(monkeypatch, connection)
+    provider_match = await _first_provider_match(
+        {"name_like": "synthetic", "limit": "5", "start": "0", "include_total": "0"}
+    )
+    _page_sql, _hydration_sql, hydration_params = _hydration_query_details(connection)
+
+    assert len(provider_match["address_list"]) == 3
+    assert provider_match["address_pagination"]["total"] == 1000
+    assert provider_match["address_pagination"]["has_more"] is True
+    assert len(hydration_params["location_keys"]) == 3
 
 
 def test_overlay_row_merges_by_key():
