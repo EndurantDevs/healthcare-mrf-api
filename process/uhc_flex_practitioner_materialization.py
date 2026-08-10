@@ -30,6 +30,10 @@ from process.uhc_flex_practitioner_contract import (
 from process.uhc_flex_practitioner_query import (
     UHCFlexPractitionerQueryResult,
     uhc_flex_practitioner_query_url,
+    validate_uhc_flex_practitioner_search_bundle,
+)
+from process.uhc_flex_practitioner_store_contract import (
+    UHCFlexPractitionerResourceRow,
 )
 
 
@@ -385,8 +389,57 @@ def materialize_uhc_flex_practitioner_result(
     )
 
 
+def materialize_uhc_flex_practitioner_stored_resource(
+    stored_resource: UHCFlexPractitionerResourceRow,
+    *,
+    dataset_id: str,
+    source_id: str,
+    run_id: str,
+    semantic_projection_as_of: str,
+) -> UHCFlexPractitionerMaterializedRow:
+    """Normalize one sealed-store row through the reviewed result validator."""
+
+    if type(stored_resource) is not UHCFlexPractitionerResourceRow:
+        raise UHCFlexPractitionerMaterializationError("result_invalid")
+    try:
+        resource_by_field = json.loads(stored_resource.payload_json_text)
+        reconstructed_result = validate_uhc_flex_practitioner_search_bundle(
+            stored_resource.requested_npi,
+            {
+                "resourceType": "Bundle",
+                "type": "searchset",
+                "total": 1,
+                "entry": [{"resource": resource_by_field}],
+            },
+        )
+    except (MemoryError, RecursionError, TypeError, UnicodeError, ValueError):
+        raise UHCFlexPractitionerMaterializationError(
+            "result_invalid"
+        ) from None
+    if (
+        reconstructed_result.resource_count != 1
+        or reconstructed_result.resource_ids != (stored_resource.resource_id,)
+        or dict(reconstructed_result.resource_sha256_by_id).get(
+            stored_resource.resource_id
+        )
+        != stored_resource.payload_sha256
+    ):
+        raise UHCFlexPractitionerMaterializationError("raw_content_drift")
+    materialized_rows = materialize_uhc_flex_practitioner_result(
+        reconstructed_result,
+        dataset_id=dataset_id,
+        source_id=source_id,
+        run_id=run_id,
+        semantic_projection_as_of=semantic_projection_as_of,
+    )
+    if len(materialized_rows) != 1:
+        raise UHCFlexPractitionerMaterializationError("result_invalid")
+    return materialized_rows[0]
+
+
 __all__ = (
     "materialize_uhc_flex_practitioner_result",
+    "materialize_uhc_flex_practitioner_stored_resource",
     "UHCFlexPractitionerMaterializationError",
     "UHCFlexPractitionerMaterializedRow",
 )

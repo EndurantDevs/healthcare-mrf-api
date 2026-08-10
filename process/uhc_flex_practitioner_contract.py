@@ -102,6 +102,10 @@ UHC_FLEX_PRACTITIONER_SOURCE_ID = _derived_identity(
     uhc_flex_practitioner_source_identity_payload(),
     24,
 )
+UHC_FLEX_PRACTITIONER_PUBLICATION_LOCK_IDENTITY = (
+    "provider-directory-uhc-flex-practitioner-publication:"
+    + UHC_FLEX_PRACTITIONER_SOURCE_ID
+)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -183,6 +187,7 @@ __all__ = (
     "UHC_FLEX_PRACTITIONER_COHORT_SCOPE",
     "UHC_FLEX_PRACTITIONER_CONNECTOR_ID",
     "UHC_FLEX_PRACTITIONER_PAGINATION",
+    "UHC_FLEX_PRACTITIONER_PUBLICATION_LOCK_IDENTITY",
     "UHC_FLEX_PRACTITIONER_QUERY_CONTRACT",
     "UHC_FLEX_PRACTITIONER_QUERY_CONTRACT_ID",
     "UHC_FLEX_PRACTITIONER_QUERY_COUNT",
