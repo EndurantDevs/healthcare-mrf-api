@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import datetime
 import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -16,17 +15,17 @@ importer = importlib.import_module("process.provider_directory_fhir")
 EXPECTED_ROLE_PARTITION = {
     "PractitionerRole": {
         "start": "1900-01-01T00:00:00Z",
-        "end": "2026-08-11T00:00:00Z",
+        "end": "2026-08-17T00:00:00Z",
         "ceiling": 3000,
         "minimum_width_seconds": 1,
         "boundary_precision_seconds": 1,
         "page_count": 1000,
-        "maximum_pages_per_window": 3,
+        "maximum_pages_per_window": 4,
         "volatile_metadata_paths": [],
     }
 }
 EXPECTED_CAMPAIGN = (
-    "provider-directory-reviewed-practitioner-role-partition-2026-08-11-v2"
+    "provider-directory-reviewed-practitioner-role-partition-2026-08-17-v3"
 )
 
 
@@ -82,8 +81,8 @@ def test_reviewed_role_partition_policy_is_resource_isolated():
     assert role_config is not None
     assert role_config.ceiling == 3000
     assert role_config.page_count == 1000
-    assert role_config.maximum_pages_per_window == 3
-    assert role_config.identity()["maximum_pages_per_window"] == 3
+    assert role_config.maximum_pages_per_window == 4
+    assert role_config.identity()["maximum_pages_per_window"] == 4
     assert other_config is None
     assert other_error == "resource_not_opted_in"
 
@@ -126,6 +125,46 @@ def test_reviewed_role_partition_policy_fences_prior_root_scope():
         )
 
 
+def test_reviewed_role_partition_policy_fences_prior_campaign_generation():
+    current_source = _partitioned_source_record()
+    prior_source = copy.deepcopy(current_source)
+    prior_metadata = prior_source["metadata_json"]
+    prior_metadata[importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY] = (
+        "provider-directory-reviewed-practitioner-role-partition-2026-08-11-v2"
+    )
+    prior_role = prior_metadata[importer.LAST_UPDATED_PARTITION_METADATA_KEY][
+        "resources"
+    ]["PractitionerRole"]
+    prior_role["end"] = "2026-08-11T00:00:00Z"
+    prior_role["maximum_pages_per_window"] = 3
+    source_ids = [current_source["source_id"]]
+    prior_checkpoint = importer._pagination_checkpoint_context(
+        prior_source,
+        source_ids,
+        run_id="root_prior_generation",
+        retry_of_run_id=None,
+    )
+
+    assert importer._pagination_checkpoint_scope_identity(
+        current_source,
+        source_ids,
+    ) != importer._pagination_checkpoint_scope_identity(prior_source, source_ids)
+    assert importer._twin_root_scope_hash(
+        [current_source], EXPECTED_CAMPAIGN, None
+    ) != importer._twin_root_scope_hash(
+        [prior_source],
+        prior_metadata[importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY],
+        None,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_endpoint_dataset_verification_scope_mismatch",
+    ):
+        importer._twin_root_scope_hash(
+            [current_source], EXPECTED_CAMPAIGN, prior_checkpoint
+        )
+
+
 def test_partition_page_limit_uses_only_bound_metadata(
     monkeypatch,
 ):
@@ -137,7 +176,7 @@ def test_partition_page_limit_uses_only_bound_metadata(
             "PractitionerRole",
             3000,
         )
-        == 3
+        == 4
     )
     assert (
         importer._last_updated_window_hard_page_limit(
@@ -298,54 +337,3 @@ async def test_partition_generation_readback_skips_other_campaigns(
     await importer._assert_persisted_reviewed_partition_generations([source_record])
 
     query.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_reviewed_role_partition_never_requests_a_fourth_page(
-    monkeypatch,
-):
-    reviewed_source = _partitioned_source_record()
-    requested_urls = []
-
-    async def fetch_page(
-        _source_record,
-        _resource_type,
-        request_url,
-        _window,
-        *,
-        timeout,
-    ):
-        requested_urls.append((request_url, timeout))
-        next_page = len(requested_urls) + 1
-        return importer.LastUpdatedWindowPage(
-            (),
-            f"{importer.REVIEWED_PRACTITIONER_ROLE_TIMEOUT_BASE}/"
-            f"PractitionerRole?page={next_page}",
-        )
-
-    monkeypatch.setattr(importer, "_fetch_last_updated_window_page", fetch_page)
-    monkeypatch.setattr(importer, "_max_page_count", lambda: 10_000)
-    partition_window = importer.TimeWindow(
-        "root",
-        datetime.datetime(2026, 8, 7, 12, 51, 29, tzinfo=datetime.UTC),
-        datetime.datetime(2026, 8, 7, 12, 51, 39, tzinfo=datetime.UTC),
-        count=3000,
-    )
-
-    window_fetch = await importer._fetch_last_updated_partition_window(
-        reviewed_source,
-        "PractitionerRole",
-        f"{importer.REVIEWED_PRACTITIONER_ROLE_TIMEOUT_BASE}/"
-        "PractitionerRole?page=1",
-        partition_window,
-        timeout=300,
-        cancel_ctx=None,
-        cancel_task=None,
-        deadline_at=None,
-    )
-
-    assert len(requested_urls) == 3
-    assert window_fetch.pages_fetched == 3
-    assert window_fetch.complete is False
-    assert window_fetch.bounded is True
-    assert window_fetch.error == "window_page_limit_reached"

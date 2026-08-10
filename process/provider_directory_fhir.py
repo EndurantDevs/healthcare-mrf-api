@@ -1177,12 +1177,12 @@ REVIEWED_PRACTITIONER_ROLE_TIMEOUT_MIN_SECONDS = 300
 REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES = {
     "PractitionerRole": {
         "start": "1900-01-01T00:00:00Z",
-        "end": "2026-08-11T00:00:00Z",
+        "end": "2026-08-17T00:00:00Z",
         "ceiling": 3000,
         "minimum_width_seconds": 1,
         "boundary_precision_seconds": 1,
         "page_count": 1000,
-        "maximum_pages_per_window": 3,
+        "maximum_pages_per_window": 4,
         "volatile_metadata_paths": [],
     }
 }
@@ -1544,7 +1544,7 @@ REVIEWED_PROVIDER_DIRECTORY_CAMPAIGN_BY_SEED_ID = {
         "provider-directory-san-mateo-2026-07-19-v1"
     ),
     "devoted-health-reviewed-candidate": (
-        "provider-directory-reviewed-practitioner-role-partition-2026-08-11-v2"
+        "provider-directory-reviewed-practitioner-role-partition-2026-08-17-v3"
     ),
     "simpra-advantage-reviewed-candidate": (
         "provider-directory-simpra-2026-07-19-v1"
