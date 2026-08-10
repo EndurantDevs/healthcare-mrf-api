@@ -1056,8 +1056,7 @@ async def _prepare_npi_staging(import_date: str, db_schema: str) -> None:
 
 
 
-@_release_lease_after_process_failure
-async def process_data(ctx, task=None):  # pragma: no cover
+async def _run_npi_import(ctx, task=None):  # pragma: no cover
     """Download and process the configured NPPES dissemination files."""
     # Track whether any work actually ran so shutdown can distinguish "no jobs" from a bad import
     task = task or {}
@@ -1611,6 +1610,13 @@ async def process_data(ctx, task=None):  # pragma: no cover
     context['run'] = context.get('run', 0) + 1
 
 
+@_release_lease_after_process_failure
+async def process_data(ctx, task=None):  # pragma: no cover
+    """Compatibility worker hook for the NPPES import attempt."""
+
+    return await _run_npi_import(ctx, task)
+
+
 execute_npi_import_attempt = process_data
 
 
@@ -2129,8 +2135,7 @@ def _print_time_info_best_effort(started_at: object) -> None:
         return
 
 
-@_release_lease_after_shutdown
-async def shutdown(ctx):  # pragma: no cover
+async def _finalize_npi_import(ctx):  # pragma: no cover
     """Finalize, index, validate, and atomically publish an NPI import."""
     import_date = ctx['import_date']
     context = ctx.get('context') or {}
@@ -2666,6 +2671,13 @@ WHERE
         raise NPIPrerequisiteError("NPI publication result is invalid")
     _print_time_info_best_effort(ctx['context']['start'])
     return committed_result_by_name
+
+
+@_release_lease_after_shutdown
+async def shutdown(ctx):  # pragma: no cover
+    """Compatibility worker hook for NPI publication finalization."""
+
+    return await _finalize_npi_import(ctx)
 
 
 finalize_npi_import_attempt = shutdown

@@ -2743,7 +2743,7 @@ async def refresh_archive_geocodes_from_openaddresses(
     )
 
 
-async def process_data(ctx, task=None):  # pragma: no cover
+async def run_openaddresses_import_task(ctx, task=None):  # pragma: no cover
     """Run the OpenAddresses load or backfill task."""
     task = task or {}
     await _maybe_raise_if_cancelled(ctx, task)
@@ -2868,6 +2868,12 @@ async def process_data(ctx, task=None):  # pragma: no cover
     )
 
 
+async def process_data(ctx, task=None):  # pragma: no cover
+    """Compatibility worker hook for an OpenAddresses import task."""
+
+    return await run_openaddresses_import_task(ctx, task)
+
+
 execute_openaddresses_import_task = process_data
 
 
@@ -2888,7 +2894,7 @@ async def startup(ctx):  # pragma: no cover
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)};")
 
 
-async def shutdown(ctx):  # pragma: no cover
+async def publish_openaddresses_import(ctx):  # pragma: no cover
     """Publish staged OpenAddresses data after a completed load."""
     context = ctx.get("context") or {}
     if not context.get("run") or context.get("backfill_only"):
@@ -2982,6 +2988,12 @@ async def shutdown(ctx):  # pragma: no cover
         f"relaxed={stats.relaxed_updates:,} zip_restored={zip_restore_stats.restored:,}"
     )
     print_time_info(context.get("start"))
+
+
+async def shutdown(ctx):  # pragma: no cover
+    """Compatibility worker hook for staged OpenAddresses publication."""
+
+    return await publish_openaddresses_import(ctx)
 
 
 publish_openaddresses_generation = shutdown
