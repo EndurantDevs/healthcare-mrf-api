@@ -81,7 +81,20 @@ def test_cli_collects_and_assigns_each_temporary_test_once(tmp_path: Path) -> No
     ]
 
 
+def _assert_single_lifecycle_test(
+    workflow: str,
+    lifecycle_step: str,
+    test_path: str,
+) -> None:
+    """Require one owned PostgreSQL test path in the lifecycle command."""
+
+    assert test_path in lifecycle_step
+    assert workflow.count(test_path) == 1
+
+
 def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> None:
+    """Keep coverage artifacts, lifecycle proofs, and command deadlines closed."""
+
     workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
@@ -115,19 +128,15 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     assert "timeout --foreground 295s python -m pytest -q" in lifecycle_step
     assert "tests/test_tin_npi_connector_postgres.py" in lifecycle_step
     assert (
-        "tests/test_provider_directory_subset_completion_postgres.py"
-        in lifecycle_step
+        "tests/test_provider_directory_subset_completion_postgres.py" in lifecycle_step
     )
-    retirement_test = (
-        "tests/test_provider_directory_terminal_root_retirement_postgres.py"
-    )
-    assert retirement_test in lifecycle_step
-    assert workflow.count(retirement_test) == 1
-    retirement_repair_test = (
-        "tests/test_provider_directory_terminal_root_retirement_repair_postgres.py"
-    )
-    assert retirement_repair_test in lifecycle_step
-    assert workflow.count(retirement_repair_test) == 1
+    for test_path in (
+        "tests/test_provider_directory_terminal_root_retirement_postgres.py",
+        "tests/test_provider_directory_terminal_root_retirement_repair_postgres.py",
+        "tests/test_provider_directory_terminal_root_retirement_v2_postgres.py",
+        "tests/test_provider_directory_terminal_root_retirement_v2_topology_postgres.py",
+    ):
+        _assert_single_lifecycle_test(workflow, lifecycle_step, test_path)
     for workflow_line in workflow.splitlines():
         if (
             "python -m pytest" in workflow_line

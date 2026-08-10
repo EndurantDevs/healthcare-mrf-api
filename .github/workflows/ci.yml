@@ -968,6 +968,8 @@ jobs:
           tests/test_provider_directory_reviewed_subset_direct_v4_disposition_postgres.py
           tests/test_provider_directory_terminal_root_retirement_postgres.py
           tests/test_provider_directory_terminal_root_retirement_repair_postgres.py
+          tests/test_provider_directory_terminal_root_retirement_v2_postgres.py
+          tests/test_provider_directory_terminal_root_retirement_v2_topology_postgres.py
       - name: Run exact Provider Directory enrichment PostgreSQL lifecycle gate
         if: matrix.shard == 'provider-directory'
         env:
