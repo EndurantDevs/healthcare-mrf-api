@@ -3686,7 +3686,7 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (39, 24, 24)
+    ) == (39, 24, 25)
     assert len(catalog["catalog_digest"]) == 64
     assert len(runnable_items) == 24
     assert all(entry["profile_enabled"] for entry in runnable_items)
