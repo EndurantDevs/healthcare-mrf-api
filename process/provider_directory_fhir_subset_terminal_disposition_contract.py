@@ -16,6 +16,7 @@ from process.provider_directory_fhir_subset_completion import (
 from process.provider_directory_fhir_subset_terminal_disposition_profile import (
     COUNT_DRIFT_DISPOSITION,
     COUNT_DRIFT_RESOURCE_TYPES,
+    DIRECT_V4_CONTRACT_VERSION,
     EXPECTED_DISPOSITION_BY_RESOURCE_TYPE,
     EXPECTED_RESOURCE_TYPES,
     RESOURCE_DISPOSITION_FIELDS,
@@ -423,7 +424,7 @@ def _has_valid_marker_totals_and_hashes(
     )
 
 
-def validated_terminal_disposition_marker(
+def _validated_legacy_terminal_disposition_marker(
     marker_by_field: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Validate exact marker fields, disposition partition, and totals."""
@@ -450,6 +451,23 @@ def validated_terminal_disposition_marker(
     ):
         raise ReviewedSubsetTerminalDispositionError("evidence")
     return dict(marker_by_field)
+
+
+def validated_terminal_disposition_marker(
+    marker_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate either supported contract in the terminal marker envelope."""
+
+    if (
+        isinstance(marker_by_field, Mapping)
+        and marker_by_field.get("contract_version") == DIRECT_V4_CONTRACT_VERSION
+    ):
+        from process.provider_directory_fhir_subset_terminal_disposition_v4_contract import (
+            validated_direct_v4_terminal_marker,
+        )
+
+        return validated_direct_v4_terminal_marker(marker_by_field)
+    return _validated_legacy_terminal_disposition_marker(marker_by_field)
 
 
 __all__ = (

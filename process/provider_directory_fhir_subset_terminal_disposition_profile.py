@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Closed resource profile for the reviewed mixed-terminal seal."""
+"""Closed resource profiles for reviewed terminal-root seals."""
 
 from process.provider_directory_fhir_manual_catalog import (
     MANUAL_CURRENT_VERSION_CENSUS_RESOURCES,
@@ -10,6 +10,39 @@ from process.provider_directory_fhir_manual_catalog import (
 STABLE_COMPLETE_DISPOSITION = "stable_complete"
 COUNT_DRIFT_DISPOSITION = "terminal_count_drift"
 RETRYABLE_HTTP_500_DISPOSITION = "retryable_http_500"
+VERIFIED_COMPLETE_DISPOSITION = "verified_complete"
+TERMINAL_CENSUS_DRIFT_DISPOSITION = "terminal_census_drift"
+DIRECT_V4_TERMINAL_DISPOSITION_ENABLED_ENV = (
+    "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_"
+    "TERMINAL_DISPOSITION_ENABLED"
+)
+DIRECT_V4_CONTRACT_VERSION = (
+    "healthporta.provider-directory.reviewed-subset-terminal-disposition.v2"
+)
+DIRECT_V4_REASON_CODE = "reviewed_current_version_census_drift"
+DIRECT_V4_STRATEGY_VERSION = (
+    "provider-directory-fhir-server-issued-traversal-subset-v4"
+)
+DIRECT_V4_TRAVERSAL_VERSION = (
+    "provider-directory-fhir-smile-logical-offset-v3"
+)
+DIRECT_V4_CANONICALIZATION_VERSION = (
+    "provider-directory-fhir-returned-resource-json-v2"
+)
+DIRECT_V4_CONTINUATION_STRATEGY = "smile-opaque-logical-offset-v3"
+DIRECT_V4_SEMANTICS = "server-issued-traversal-subset"
+DIRECT_V4_PROOF_CONTRACT_VERSION = 3
+DIRECT_V4_COMPLETION_SCOPES = (
+    "advertised-count-monotone-decrease-at-most-one",
+    "source-issued-continuation",
+    "returned-resource-content",
+)
+DIRECT_V4_CAMPAIGN_ID = "provider-directory-reviewed-subset-2026-08-10-v4"
+DIRECT_V4_PAGE_COUNT = 250
+DIRECT_V4_MAX_VERIFIED_DECREASE = 1
+DIRECT_V4_TERMINAL_MARKER_SHA256 = (
+    "e6f19eb70f8b5a84c76e61c19c379541bb6865b7de3114de01dd2a32181cb299"
+)
 SOURCE_PROFILE_RESOURCE_TYPES = MANUAL_CURRENT_VERSION_CENSUS_RESOURCES
 EXPECTED_RESOURCE_TYPES = tuple(sorted(SOURCE_PROFILE_RESOURCE_TYPES))
 STABLE_COMPLETE_RESOURCE_TYPES = ("Organization", "Practitioner")
@@ -32,6 +65,26 @@ EXPECTED_DISPOSITION_BY_RESOURCE_TYPE = {
     **{
         resource_type: RETRYABLE_HTTP_500_DISPOSITION
         for resource_type in RETRYABLE_HTTP_500_RESOURCE_TYPES
+    },
+}
+DIRECT_V4_DRIFT_RESOURCE_TYPES = (
+    "HealthcareService",
+    "OrganizationAffiliation",
+    "PractitionerRole",
+)
+DIRECT_V4_VERIFIED_RESOURCE_TYPES = tuple(
+    resource_type
+    for resource_type in EXPECTED_RESOURCE_TYPES
+    if resource_type not in DIRECT_V4_DRIFT_RESOURCE_TYPES
+)
+DIRECT_V4_DISPOSITION_BY_RESOURCE_TYPE = {
+    **{
+        resource_type: VERIFIED_COMPLETE_DISPOSITION
+        for resource_type in DIRECT_V4_VERIFIED_RESOURCE_TYPES
+    },
+    **{
+        resource_type: TERMINAL_CENSUS_DRIFT_DISPOSITION
+        for resource_type in DIRECT_V4_DRIFT_RESOURCE_TYPES
     },
 }
 DIAGNOSTIC_FIELDS = frozenset(
@@ -151,6 +204,21 @@ RESOURCE_DISPOSITION_FIELDS = frozenset(
         "recent_cursor_hashes_sha256",
     }
 )
+DIRECT_V4_RESOURCE_DISPOSITION_FIELDS = RESOURCE_DISPOSITION_FIELDS | {
+    "terminal_page_entry_count"
+}
+DIRECT_V4_LINEAGE_FIELDS = frozenset(
+    {
+        "checkpoint_retry_count",
+        "competing_candidate_count",
+        "current_dataset_count",
+        "import_run_row_count",
+        "owner_equals_root",
+        "previous_dataset_present",
+        "previous_reference_count",
+    }
+)
+DIRECT_V4_TERMINAL_MARKER_FIELDS = TERMINAL_MARKER_FIELDS | {"direct_lineage"}
 
 
 __all__ = (
@@ -158,6 +226,26 @@ __all__ = (
     "COUNT_DRIFT_DISPOSITION",
     "COUNT_DRIFT_PROOF_FIELDS",
     "COUNT_DRIFT_RESOURCE_TYPES",
+    "DIRECT_V4_CAMPAIGN_ID",
+    "DIRECT_V4_CANONICALIZATION_VERSION",
+    "DIRECT_V4_COMPLETION_SCOPES",
+    "DIRECT_V4_CONTINUATION_STRATEGY",
+    "DIRECT_V4_CONTRACT_VERSION",
+    "DIRECT_V4_DISPOSITION_BY_RESOURCE_TYPE",
+    "DIRECT_V4_DRIFT_RESOURCE_TYPES",
+    "DIRECT_V4_MAX_VERIFIED_DECREASE",
+    "DIRECT_V4_PAGE_COUNT",
+    "DIRECT_V4_PROOF_CONTRACT_VERSION",
+    "DIRECT_V4_REASON_CODE",
+    "DIRECT_V4_STRATEGY_VERSION",
+    "DIRECT_V4_SEMANTICS",
+    "DIRECT_V4_LINEAGE_FIELDS",
+    "DIRECT_V4_RESOURCE_DISPOSITION_FIELDS",
+    "DIRECT_V4_TERMINAL_MARKER_FIELDS",
+    "DIRECT_V4_TERMINAL_DISPOSITION_ENABLED_ENV",
+    "DIRECT_V4_TERMINAL_MARKER_SHA256",
+    "DIRECT_V4_VERIFIED_RESOURCE_TYPES",
+    "DIRECT_V4_TRAVERSAL_VERSION",
     "DIAGNOSTIC_FIELDS",
     "EXPECTED_DISPOSITION_BY_RESOURCE_TYPE",
     "EXPECTED_RESOURCE_TYPES",
@@ -169,4 +257,6 @@ __all__ = (
     "STABLE_COMPLETE_RESOURCE_TYPES",
     "SOURCE_PROFILE_RESOURCE_TYPES",
     "TERMINAL_MARKER_FIELDS",
+    "TERMINAL_CENSUS_DRIFT_DISPOSITION",
+    "VERIFIED_COMPLETE_DISPOSITION",
 )

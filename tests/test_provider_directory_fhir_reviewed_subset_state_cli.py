@@ -28,6 +28,9 @@ from process.provider_directory_fhir_subset_terminal_disposition_contract import
     TERMINAL_DISPOSITION_ENABLED_ENV,
     ReviewedSubsetTerminalDispositionResult,
 )
+from process.provider_directory_fhir_subset_terminal_disposition_profile import (
+    DIRECT_V4_TERMINAL_DISPOSITION_ENABLED_ENV,
+)
 from process import provider_directory_fhir_subset_activation_evidence as evidence_api
 from tests.provider_directory_fhir_subset_activation_support import activation_inputs
 
@@ -62,6 +65,9 @@ def test_operator_is_packaged_and_absent_from_ordinary_runtime_paths():
         "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED",
         "dispose_reviewed_subset_census_drift_root",
         "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_"
+        "TERMINAL_DISPOSITION_ENABLED",
+        "dispose_v4_census_drift_root",
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_"
         "TERMINAL_DISPOSITION_ENABLED",
     )
     for runtime_path in runtime_paths:
@@ -153,6 +159,12 @@ def test_parser_accepts_only_fixed_command_and_no_selectors(capsys):
     assert vars(terminal_arguments) == {
         "command": script_module.TERMINAL_DISPOSITION_COMMAND
     }
+    direct_v4_arguments = script_module._parser().parse_args(
+        [script_module.DIRECT_V4_TERMINAL_DISPOSITION_COMMAND]
+    )
+    assert vars(direct_v4_arguments) == {
+        "command": script_module.DIRECT_V4_TERMINAL_DISPOSITION_COMMAND
+    }
     with pytest.raises(SystemExit) as error:
         script_module._parser().parse_args(
             [script_module.COMMAND, "--source-id", "private"]
@@ -179,6 +191,10 @@ def test_parser_accepts_only_fixed_command_and_no_selectors(capsys):
         (
             "TERMINAL_DISPOSITION_COMMAND",
             TERMINAL_DISPOSITION_ENABLED_ENV,
+        ),
+        (
+            "DIRECT_V4_TERMINAL_DISPOSITION_COMMAND",
+            DIRECT_V4_TERMINAL_DISPOSITION_ENABLED_ENV,
         ),
     ),
 )
@@ -317,6 +333,32 @@ async def test_terminal_command_renders_only_closed_disposition(monkeypatch):
     rendered_result = await script_module._execute_operation(
         database,
         script_module.TERMINAL_DISPOSITION_COMMAND,
+    )
+
+    disposition_call.assert_awaited_once_with(database=database)
+    assert rendered_result == (
+        '{"already_applied":false,"disposed":true,"status":"ok"}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_v4_terminal_command_reuses_closed_disposition(monkeypatch):
+    """Keep the direct-root profile on the existing identifier-free CLI."""
+
+    script_module = _script_module()
+    database = _Database()
+    disposition_call = AsyncMock(
+        return_value=ReviewedSubsetTerminalDispositionResult(disposed=True)
+    )
+    monkeypatch.setattr(
+        "process.provider_directory_fhir_subset_terminal_disposition."
+        "dispose_v4_census_drift_root",
+        disposition_call,
+    )
+
+    rendered_result = await script_module._execute_operation(
+        database,
+        script_module.DIRECT_V4_TERMINAL_DISPOSITION_COMMAND,
     )
 
     disposition_call.assert_awaited_once_with(database=database)
