@@ -13,12 +13,7 @@ from process.provider_directory_fhir_census_execution import (
     SERVER_ISSUED_SUBSET_FETCH_MODE,
 )
 from process.provider_directory_fhir_census_page_geometry import (
-    current_version_census_terminal_page_geometry,
     validate_current_version_census_checkpoint_geometry,
-)
-from process.provider_directory_fhir_subset_execution import (
-    has_valid_reviewed_subset_counts,
-    has_valid_subset_completed_fields,
 )
 from process.provider_directory_fhir_subset_identity import (
     SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
@@ -35,9 +30,19 @@ from process.provider_directory_fhir_subset_terminal_disposition_contract import
     ReviewedSubsetTerminalDispositionError,
     canonical_evidence_sha256,
 )
+from process.provider_directory_fhir_subset_terminal_disposition_profile import (
+    DIRECT_V4_CAMPAIGN_ID,
+    DIRECT_V4_COMPLETION_SCOPES,
+    DIRECT_V4_DISPOSITION_BY_RESOURCE_TYPE,
+    DIRECT_V4_PAGE_COUNT,
+    DIRECT_V4_STRATEGY_VERSION,
+)
 from process.provider_directory_fhir_subset_terminal_disposition_shapes import (
+    completed_or_drift_disposition as _completed_or_drift_disposition,
+    expected_subset_coverage,
     validate_disposition_diagnostic_shape,
     validate_disposition_proof_shapes,
+    validate_terminal_sequence as _validate_terminal_sequence,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_util import (
     clean_text,
@@ -57,6 +62,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 def _proof_identity(
     proof: Mapping[str, Any],
     resource_type: str,
+    *,
+    direct_v4: bool = False,
 ) -> tuple[Any, ...]:
     page_count = proof.get("page_count")
     identity = (
@@ -68,20 +75,30 @@ def _proof_identity(
     if (
         proof.get("contract_version") != 3
         or proof.get("strategy_version")
-        != SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION
+        != (
+            DIRECT_V4_STRATEGY_VERSION
+            if direct_v4
+            else SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION
+        )
         or proof.get("semantics") != SERVER_ISSUED_SUBSET_SEMANTICS
         or proof.get("traversal_version")
         != SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION
         or proof.get("canonicalization_version")
         != SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION
         or proof.get("completion_scopes")
-        != list(SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES)
+        != list(
+            DIRECT_V4_COMPLETION_SCOPES
+            if direct_v4
+            else SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES
+        )
         or proof.get("resource_type") != resource_type
         or clean_text(identity[0]) is None
         or clean_text(identity[1]) is None
         or _SHA256.fullmatch(identity[1]) is None
         or type(page_count) is not int
         or not 1 <= page_count <= 1000
+        or (direct_v4 and page_count != DIRECT_V4_PAGE_COUNT)
+        or (direct_v4 and proof.get("campaign_id") != DIRECT_V4_CAMPAIGN_ID)
         or clean_text(identity[3]) is None
         or type(proof.get("pre_count")) is not int
         or proof["pre_count"] < 0
@@ -95,64 +112,6 @@ def _safe_checkpoint_proof(checkpoint_proof: Mapping[str, Any]) -> dict[str, Any
         field_name: field_value
         for field_name, field_value in checkpoint_proof.items()
         if field_name != "continuation_hop_sha256"
-    }
-
-
-def expected_subset_coverage(proof_by_field: Mapping[str, Any]) -> dict[str, Any]:
-    """Rebuild the exact safe coverage projection stored by the importer."""
-
-    geometry = proof_by_field.get("terminal_page_geometry")
-    continuation_shape_sha256 = proof_by_field.get(
-        "continuation_shape_sha256"
-    )
-    return {
-        "cutoff": proof_by_field.get("cutoff"),
-        "scope": "server_issued_traversal_subset",
-        "advertised_pre": proof_by_field.get("advertised_pre"),
-        "advertised_post": proof_by_field.get("advertised_post"),
-        "returned_unique": proof_by_field.get("returned_unique"),
-        "deficit": proof_by_field.get("deficit"),
-        "geometry": (
-            {
-                "pages": geometry.get("pages_processed"),
-                "logical_terminal_offset": geometry.get(
-                    "terminal_page_start_offset"
-                ),
-                "sparse_pages": geometry.get("sparse_pages"),
-                "empty_pages": geometry.get("empty_pages"),
-                "page_entry_counts_sha256": canonical_evidence_sha256(
-                    proof_by_field.get("page_entry_counts")
-                ),
-                "geometry_sha256": canonical_evidence_sha256(
-                    {
-                        **dict(geometry),
-                        "page_entry_counts": proof_by_field.get(
-                            "page_entry_counts"
-                        ),
-                    }
-                ),
-            }
-            if isinstance(geometry, Mapping)
-            else None
-        ),
-        "continuation": (
-            {
-                "validated_hops": len(continuation_shape_sha256),
-                "chain_sha256": canonical_evidence_sha256(
-                    continuation_shape_sha256
-                ),
-            }
-            if type(continuation_shape_sha256) is list
-            else None
-        ),
-        "twin_state": "pending_matching_reviewed_root",
-        "proof_state": (
-            "resource_terminal_verified"
-            if proof_by_field.get("verified") is True
-            else "not_verified"
-        ),
-        "unresolved_reference_count": None,
-        "absence_semantics": "unknown_under_subset",
     }
 
 
@@ -194,120 +153,6 @@ def _checkpoint_hash_commitments(
         start_url_sha256,
         canonical_evidence_sha256(recent_cursor_hashes),
     )
-
-
-def _completed_counts(proof: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        field_name: proof.get(field_name)
-        for field_name in _COMPLETED_COUNT_FIELDS
-    }
-
-
-def _validate_terminal_sequence(
-    proof: Mapping[str, Any],
-    checkpoint_pages: int,
-    checkpoint_rows: int,
-    *,
-    terminal_checkpointed: bool,
-) -> None:
-    terminal_geometry = proof.get("terminal_page_geometry")
-    page_entry_counts = proof.get("page_entry_counts")
-    expected_terminal_pages = checkpoint_pages + int(not terminal_checkpointed)
-    if (
-        not isinstance(terminal_geometry, Mapping)
-        or terminal_geometry.get("pages_processed") != expected_terminal_pages
-        or type(page_entry_counts) is not list
-        or not page_entry_counts
-    ):
-        raise ReviewedSubsetTerminalDispositionError("evidence")
-    terminal_pages = terminal_geometry["pages_processed"]
-    terminal_page_entries = page_entry_counts[-1]
-    prior_rows = sum(page_entry_counts[:-1])
-    expected_prior_rows = (
-        checkpoint_rows - page_entry_counts[-1]
-        if terminal_checkpointed
-        else checkpoint_rows
-    )
-    if prior_rows != expected_prior_rows:
-        raise ReviewedSubsetTerminalDispositionError("evidence")
-    try:
-        expected_terminal_geometry = current_version_census_terminal_page_geometry(
-            proof,
-            pages_processed=terminal_pages,
-            processed_rows=proof["processed_rows"],
-            expected_page_count=proof["page_count"],
-            terminal_page_entry_count=terminal_page_entries,
-        )
-        validate_current_version_census_checkpoint_geometry(
-            proof,
-            pages_processed=terminal_pages - 1,
-            rows_processed=prior_rows,
-            expected_page_count=proof["page_count"],
-        )
-    except ValueError:
-        raise ReviewedSubsetTerminalDispositionError("evidence") from None
-    if expected_terminal_geometry != dict(terminal_geometry):
-        raise ReviewedSubsetTerminalDispositionError("evidence")
-
-
-def _completed_or_drift_disposition(
-    diagnostic: Mapping[str, Any],
-    checkpoint: Mapping[str, Any],
-    proof: Mapping[str, Any],
-) -> str:
-    counts = _completed_counts(proof)
-    is_complete = diagnostic.get("complete") is True
-    maximum_decrease = 0 if is_complete else 1
-    if (
-        not has_valid_reviewed_subset_counts(counts, maximum_decrease)
-        or not has_valid_subset_completed_fields(
-            proof,
-            counts,
-            proof["page_count"],
-        )
-        or proof.get("processed_rows") != checkpoint.get("rows_processed")
-    ):
-        raise ReviewedSubsetTerminalDispositionError("evidence")
-    if is_complete:
-        is_valid = bool(
-            diagnostic.get("error") is None
-            and diagnostic.get("traversal_complete") is True
-            and diagnostic.get("source_continuation_exhausted") is True
-            and diagnostic.get("next_url_remaining") is False
-            and checkpoint.get("state") == "complete"
-            and checkpoint.get("next_url") is None
-            and proof.get("verified") is True
-            and proof.get("failure") is None
-            and proof["pre_count"] == proof["post_count"]
-            and diagnostic["pages_fetched"]
-            == checkpoint.get("pages_processed")
-        )
-        disposition = STABLE_COMPLETE_DISPOSITION
-    else:
-        is_valid = bool(
-            diagnostic.get("error")
-            == f"{CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:census_drift"
-            and diagnostic.get("traversal_complete") is False
-            and diagnostic.get("source_continuation_exhausted") is False
-            and diagnostic.get("next_url_remaining") is False
-            and checkpoint.get("state") == "active"
-            and clean_text(checkpoint.get("next_url")) is not None
-            and proof.get("verified") is False
-            and proof.get("failure") == "census_drift"
-            and proof["pre_count"] - proof["post_count"] == 1
-            and diagnostic["pages_fetched"]
-            == checkpoint.get("pages_processed") + 1
-        )
-        disposition = COUNT_DRIFT_DISPOSITION
-    if not is_valid:
-        raise ReviewedSubsetTerminalDispositionError("evidence")
-    _validate_terminal_sequence(
-        proof,
-        checkpoint["pages_processed"],
-        checkpoint["rows_processed"],
-        terminal_checkpointed=is_complete,
-    )
-    return disposition
 
 
 def _retryable_disposition(
@@ -354,12 +199,11 @@ def _retryable_disposition(
     return RETRYABLE_HTTP_500_DISPOSITION
 
 
-def _resource_disposition(
-    resource_type: str,
+def _validated_resource_proof(
     diagnostic: Mapping[str, Any],
     checkpoint: Mapping[str, Any],
     expected_start_url_sha256: str,
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
+) -> tuple[dict[str, Any], str, str]:
     validate_disposition_diagnostic_shape(diagnostic)
     checkpoint_proof = json_object(checkpoint.get("completeness_json"))
     diagnostic_proof = json_object(
@@ -370,8 +214,10 @@ def _resource_disposition(
         checkpoint_proof,
         diagnostic_proof,
     )
-    if diagnostic.get("server_issued_subset_coverage") != (
-        expected_subset_coverage(diagnostic_proof)
+    if (
+        diagnostic.get("server_issued_subset_coverage")
+        != expected_subset_coverage(diagnostic_proof)
+        or _safe_checkpoint_proof(checkpoint_proof) != diagnostic_proof
     ):
         raise ReviewedSubsetTerminalDispositionError("evidence")
     start_url_sha256, recent_cursor_hashes_sha256 = (
@@ -381,20 +227,56 @@ def _resource_disposition(
             expected_start_url_sha256,
         )
     )
-    if (
-        _safe_checkpoint_proof(checkpoint_proof) != diagnostic_proof
-        or diagnostic.get("rows_fetched") != checkpoint.get("rows_processed")
-    ):
-        raise ReviewedSubsetTerminalDispositionError("evidence")
-    identity = _proof_identity(checkpoint_proof, resource_type)
+    return (
+        checkpoint_proof,
+        start_url_sha256,
+        recent_cursor_hashes_sha256,
+    )
+
+
+def _resource_disposition(
+    resource_type: str,
+    diagnostic: Mapping[str, Any],
+    checkpoint: Mapping[str, Any],
+    expected_start_url_sha256: str,
+    *,
+    direct_v4: bool = False,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    (
+        checkpoint_proof,
+        start_url_sha256,
+        recent_cursor_hashes_sha256,
+    ) = _validated_resource_proof(
+        diagnostic,
+        checkpoint,
+        expected_start_url_sha256,
+    )
+    identity = _proof_identity(
+        checkpoint_proof,
+        resource_type,
+        direct_v4=direct_v4,
+    )
+    expected_disposition = (
+        DIRECT_V4_DISPOSITION_BY_RESOURCE_TYPE[resource_type]
+        if direct_v4
+        else None
+    )
     disposition = (
         _retryable_disposition(diagnostic, checkpoint, checkpoint_proof)
-        if diagnostic.get("error")
+        if not direct_v4
+        and diagnostic.get("error")
         == f"{CURRENT_VERSION_CENSUS_RETRYABLE_ERROR}:http_500"
         else _completed_or_drift_disposition(
             diagnostic,
             checkpoint,
             checkpoint_proof,
+            expected_disposition
+            or (
+                STABLE_COMPLETE_DISPOSITION
+                if diagnostic.get("complete") is True
+                else COUNT_DRIFT_DISPOSITION
+            ),
+            is_direct_v4=direct_v4,
         )
     )
     return identity, _resource_marker(
@@ -404,6 +286,7 @@ def _resource_disposition(
         disposition,
         start_url_sha256,
         recent_cursor_hashes_sha256,
+        direct_v4=direct_v4,
     )
 
 
@@ -414,8 +297,10 @@ def _resource_marker(
     disposition: str,
     start_url_sha256: str,
     recent_cursor_hashes_sha256: str,
+    *,
+    direct_v4: bool,
 ) -> dict[str, Any]:
-    return {
+    marker_by_field = {
         "disposition": disposition,
         "checkpoint_state": checkpoint["state"],
         "checkpoint_pages": checkpoint["pages_processed"],
@@ -433,6 +318,11 @@ def _resource_marker(
         "start_url_sha256": start_url_sha256,
         "recent_cursor_hashes_sha256": recent_cursor_hashes_sha256,
     }
+    if direct_v4:
+        marker_by_field["terminal_page_entry_count"] = checkpoint_proof[
+            "page_entry_counts"
+        ][-1]
+    return marker_by_field
 
 
 def validated_resource_dispositions(
@@ -441,6 +331,7 @@ def validated_resource_dispositions(
     candidate_metadata: Mapping[str, Any],
     *,
     expected_start_hash_by_type: Mapping[str, str],
+    direct_v4: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Validate the 2/1/4 resource partition and return marker evidence."""
 
@@ -461,13 +352,18 @@ def validated_resource_dispositions(
             json_object(diagnostics[resource_type]),
             checkpoint_by_resource_type[resource_type],
             expected_start_hash_by_type[resource_type],
+            direct_v4=direct_v4,
         )
         identities.add(identity)
         resource_by_type[resource_type] = resource
     if (
         len(identities) != 1
         or next(iter(identities))[3]
-        != candidate_metadata.get("verification_campaign_id")
+        != (
+            DIRECT_V4_CAMPAIGN_ID
+            if direct_v4
+            else candidate_metadata.get("verification_campaign_id")
+        )
     ):
         raise ReviewedSubsetTerminalDispositionError("evidence")
     return resource_by_type

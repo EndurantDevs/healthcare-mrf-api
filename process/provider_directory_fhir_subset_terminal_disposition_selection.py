@@ -8,9 +8,7 @@ import datetime
 import json
 from typing import Any, Mapping
 
-from process.provider_directory_fhir_root_policy import (
-    REVIEWED_ROOT_POLICY_METADATA_KEY,
-)
+from process.provider_directory_fhir_root_policy import REVIEWED_ROOT_POLICY_METADATA_KEY
 from process.provider_directory_fhir_subset_abandonment_contract import (
     ABANDONMENT_METADATA_KEY,
     ReviewedSubsetAbandonmentError,
@@ -19,6 +17,9 @@ from process.provider_directory_fhir_subset_abandonment_evidence import (
     require_distinct_scope_domains,
     retained_evidence_counts,
     validated_checkpoint_summary,
+)
+from process.provider_directory_fhir_subset_terminal_disposition_evidence import (
+    validated_resource_dispositions,
 )
 from process.provider_directory_fhir_subset_abandonment_selection import (
     _configured_endpoint_id,
@@ -30,6 +31,7 @@ from process.provider_directory_fhir_subset_abandonment_selection import (
 )
 from process.provider_directory_fhir_subset_terminal_disposition_contract import (
     EXPECTED_RESOURCE_TYPES,
+    TERMINAL_DISPOSITION_CONTRACT_VERSION,
     TERMINAL_DISPOSITION_METADATA_KEY,
     TERMINAL_DISPOSITION_PRIOR_STATUS,
     TERMINAL_DISPOSITION_STATUS,
@@ -51,25 +53,14 @@ from process.provider_directory_fhir_subset_terminal_disposition_util import (
     quoted_relation,
     row_mapping,
 )
-from process.provider_directory_fhir_subset_terminal_disposition_evidence import (
-    validated_resource_dispositions,
-)
-from process.provider_directory_resource_hash import (
-    TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
-)
+from process.provider_directory_resource_hash import TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
 
 
-_COMPLETION_PROOF_FIELDS = frozenset(
-    {
-        "acquisition_root_run_id",
-        "terminal_run_id",
-        "source_ids",
-        "selected_resources",
-        "resource_diagnostics",
-        "verification_campaign_id",
-        "verification_source_scope_hash",
-    }
-)
+_COMPLETION_PROOF_FIELDS = frozenset({
+    "acquisition_root_run_id", "terminal_run_id", "source_ids",
+    "selected_resources", "resource_diagnostics", "verification_campaign_id",
+    "verification_source_scope_hash",
+})
 _SOURCE_IMPORT_FIELDS = frozenset({"run_id", "observed_at", "resources"})
 
 
@@ -89,11 +80,10 @@ def _translate_evidence_error(error: Exception) -> None:
     raise error
 
 
-async def _locked_candidate_row(
+async def _locked_legacy_disposed_row(
     database: Any,
     source_id: str,
-    endpoint_id: str,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     disposed_rows = await database.all(
         f"""
         SELECT dataset.*
@@ -107,18 +97,28 @@ async def _locked_candidate_row(
            AND dataset.publication_metadata_json::jsonb -> 'source_ids'
                    = CAST(:source_ids AS jsonb)
            AND dataset.publication_metadata_json::jsonb
-                   ? :disposition_key
+                   #>> ARRAY[
+                       :disposition_key,
+                       'contract_version'
+                   ]::text[] = :contract_version
          ORDER BY dataset.dataset_id
          FOR UPDATE OF dataset;
         """,
         disposed_status=TERMINAL_DISPOSITION_STATUS,
         source_ids=json.dumps([source_id]),
         disposition_key=TERMINAL_DISPOSITION_METADATA_KEY,
+        contract_version=TERMINAL_DISPOSITION_CONTRACT_VERSION,
     )
     if len(disposed_rows) > 1:
         raise ReviewedSubsetTerminalDispositionError("evidence")
-    if disposed_rows:
-        return row_mapping(disposed_rows[0])
+    return row_mapping(disposed_rows[0]) if disposed_rows else None
+
+
+async def _locked_legacy_failed_row(
+    database: Any,
+    source_id: str,
+    endpoint_id: str,
+) -> dict[str, Any]:
     failed_rows = await database.all(
         f"""
         SELECT dataset.*
@@ -145,6 +145,19 @@ async def _locked_candidate_row(
     if len(failed_rows) != 1:
         raise ReviewedSubsetTerminalDispositionError("evidence")
     return row_mapping(failed_rows[0])
+
+
+async def _locked_candidate_row(
+    database: Any,
+    source_id: str,
+    endpoint_id: str,
+) -> dict[str, Any]:
+    """Select only the exact legacy-v1 disposed or failed candidate."""
+
+    disposed_row = await _locked_legacy_disposed_row(database, source_id)
+    if disposed_row is not None:
+        return disposed_row
+    return await _locked_legacy_failed_row(database, source_id, endpoint_id)
 
 
 def _candidate_diagnostic_copies(

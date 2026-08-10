@@ -151,6 +151,28 @@ never validates or publishes the dataset, and cannot turn the old v3 failure
 into evidence for the bounded-drift profile. A fresh campaign, root, cutoff,
 and versioned transport profile are required after the seal.
 
+## Seal the exact direct-v4 terminal root
+
+The mixed v1 disposition above remains frozen to its original 2/1/4 outcome.
+For the separately reviewed direct-v4 root, use its distinct selector-free
+command only after the acquisition Job is terminal and all ownership is quiet:
+
+```console
+HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_TERMINAL_DISPOSITION_ENABLED=true \
+  /opt/venv/bin/python -B \
+  /opt/scripts/smoke/provider_directory_fhir_reviewed_subset_state.py \
+  seal-direct-v4-terminal-root
+```
+
+This profile is closed to four verified-complete resources and the three
+terminal census-drift resources observed by that one root. The transaction
+reuses the existing terminal-disposition locks, compare-and-swap update,
+checkpoint sealing, durable validator, and replay path. Its exact neutral
+marker digest is checked by the database migration. It does not add a second
+disposition service, reinterpret the failed proof, validate, publish, retry,
+or reuse the root. A later acquisition must use a fresh root and the next
+versioned census policy.
+
 ## Publication and rollback boundary
 
 State sync does not run artifact publication, address materialization, Profile

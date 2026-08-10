@@ -188,6 +188,99 @@ async def _proof_totals(
     )
 
 
+_INVALID_PROOF_SHARD_COUNT_SQL = """
+        SELECT count(*)
+          FROM {proof_shard} AS shard
+         WHERE shard.dataset_id = :dataset_id
+           AND (
+                shard.endpoint_id IS DISTINCT FROM :endpoint_id
+                OR shard.acquisition_root_run_id IS DISTINCT FROM :root_run_id
+                OR shard.resource_count <= 0
+                OR (
+                    SELECT pg_catalog.count(*) <> 1
+                      FROM pg_catalog.jsonb_object_keys(
+                               CASE
+                                   WHEN pg_catalog.jsonb_typeof(
+                                            shard.resource_counts_json
+                                        ) = 'object'
+                                   THEN shard.resource_counts_json
+                                   ELSE '{{}}'::jsonb
+                               END
+                           ) AS resource_key
+                )
+                OR CAST(shard.resource_count AS numeric) IS DISTINCT FROM (
+                    SELECT COALESCE(
+                               sum(
+                                   CASE
+                                       WHEN pg_catalog.jsonb_typeof(
+                                                resource.value
+                                            ) = 'number'
+                                        AND resource.value #>> '{{}}'
+                                                ~ '^[1-9][0-9]*$'
+                                       THEN CAST(
+                                                resource.value #>> '{{}}'
+                                                AS numeric
+                                            )
+                                       ELSE NULL
+                                   END
+                               ),
+                               0
+                           )
+                      FROM pg_catalog.jsonb_each(
+                               CASE
+                                   WHEN pg_catalog.jsonb_typeof(
+                                            shard.resource_counts_json
+                                        ) = 'object'
+                                   THEN shard.resource_counts_json
+                                   ELSE '{{}}'::jsonb
+                               END
+                           ) AS resource(key, value)
+                )
+                OR EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.jsonb_each(
+                               CASE
+                                   WHEN pg_catalog.jsonb_typeof(
+                                            shard.resource_counts_json
+                                        ) = 'object'
+                                   THEN shard.resource_counts_json
+                                   ELSE '{{}}'::jsonb
+                               END
+                           ) AS resource(key, value)
+                     WHERE resource.key <> ALL(CAST(:resource_types AS text[]))
+                        OR pg_catalog.jsonb_typeof(resource.value) <> 'number'
+                        OR resource.value #>> '{{}}' !~ '^[1-9][0-9]*$'
+                )
+           );
+        """
+
+
+def _invalid_proof_shard_count_sql() -> str:
+    """Render the proof-shard check against the active runtime schema."""
+
+    return _INVALID_PROOF_SHARD_COUNT_SQL.format(
+        proof_shard=_quoted_relation("provider_directory_dataset_proof_shard")
+    )
+
+
+async def require_valid_proof_shards(
+    database: Any,
+    candidate_by_field: Mapping[str, Any],
+    resource_types: tuple[str, ...],
+) -> None:
+    """Reject malformed, foreign, empty, or out-of-profile proof shards."""
+
+    invalid_count = await database.scalar(
+        _invalid_proof_shard_count_sql(),
+        dataset_id=candidate_by_field["dataset_id"],
+        endpoint_id=candidate_by_field["endpoint_id"],
+        root_run_id=candidate_by_field["acquisition_root_run_id"],
+        resource_types=list(resource_types),
+    )
+    if int(invalid_count or 0) != 0:
+        raise ReviewedSubsetAbandonmentError("evidence")
+
+
 async def _proof_counts_by_type(
     database: Any,
     dataset_id: str,

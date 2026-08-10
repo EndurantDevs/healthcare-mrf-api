@@ -257,6 +257,10 @@ def test_provider_directory_runtime_contract_preflight_passes():
             "exit_code": 1,
             "output_matches": True,
         },
+        "seal-direct-v4-terminal-root": {
+            "exit_code": 1,
+            "output_matches": True,
+        },
     }
     retirement = report["checks"]["terminal_root_retirement"]
     assert retirement == {

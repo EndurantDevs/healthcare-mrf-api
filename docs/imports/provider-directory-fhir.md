@@ -207,8 +207,11 @@ root and follow the runbook's selector-free abandonment procedure. The sealed
 adopted by a later run; recovery starts from a new root.
 If a failed policy-one root instead matches the runbook's exact mixed terminal
 shape, use the separate `seal-terminal-root` operation. Do not reinterpret its
-legacy proof under the bounded-drift profile; seal it first, then start a fresh
-campaign with a new cutoff and root.
+frozen outcome. The exact direct-v4 4/3 terminal outcome uses the separate
+`seal-direct-v4-terminal-root` operation under its own default-off gate; it
+reuses the existing terminal-disposition transaction and does not publish.
+Do not reinterpret either failed root as proof under the bounded-drift profile;
+seal it first, then start a fresh campaign with a new cutoff and root.
 
 Resolve the single reviewed manual entry from the manifest and freeze one
 timezone-aware cutoff for the acquisition pair:

@@ -35,12 +35,15 @@ from process.provider_directory_fhir_subset_terminal_disposition_contract import
     ReviewedSubsetTerminalDispositionError,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_profile import (
+    DIRECT_V4_CAMPAIGN_ID,
+    DIRECT_V4_LINEAGE_FIELDS,
     SOURCE_PROFILE_RESOURCE_TYPES,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_util import (
     clean_text,
     json_object,
     json_text_tuple,
+    quoted_relation,
 )
 
 
@@ -87,6 +90,88 @@ def is_candidate_policy_one(metadata: Mapping[str, Any]) -> bool:
         and metadata.get("requires_twin_root_verification") is False
         and metadata.get("completion_proof_required_version") == 3
     )
+
+
+async def _direct_v4_lineage_counts(
+    database: Any,
+    candidate_by_field: Mapping[str, Any],
+) -> dict[str, int]:
+    root_run_id = str(candidate_by_field["acquisition_root_run_id"])
+    owner_run_id = str(candidate_by_field["import_run_id"])
+    query_by_name = {
+        "import_run_row_count": f"""
+            SELECT count(*) FROM {quoted_relation('import_run')}
+             WHERE run_id IN (:root_run_id, :owner_run_id)
+                OR retry_of_run_id IN (:root_run_id, :owner_run_id);
+        """,
+        "current_dataset_count": f"""
+            SELECT count(*)
+              FROM {quoted_relation('provider_directory_endpoint_dataset')}
+             WHERE endpoint_id = :endpoint_id AND is_current = true;
+        """,
+        "competing_candidate_count": f"""
+            SELECT count(*)
+              FROM {quoted_relation('provider_directory_endpoint_dataset')}
+             WHERE endpoint_id = :endpoint_id
+               AND dataset_id <> :dataset_id
+               AND status IN ('acquiring', 'failed')
+               AND publication_metadata_json::jsonb
+                       ->> 'verification_campaign_id' = :campaign_id;
+        """,
+        "previous_reference_count": f"""
+            SELECT count(*)
+              FROM {quoted_relation('provider_directory_endpoint_dataset')}
+             WHERE previous_dataset_id = :dataset_id;
+        """,
+    }
+    parameters_by_field = {
+        "root_run_id": root_run_id,
+        "owner_run_id": owner_run_id,
+        "endpoint_id": candidate_by_field["endpoint_id"],
+        "dataset_id": candidate_by_field["dataset_id"],
+        "campaign_id": DIRECT_V4_CAMPAIGN_ID,
+    }
+    return {
+        count_name: int(
+            await database.scalar(query, **parameters_by_field) or 0
+        )
+        for count_name, query in query_by_name.items()
+    }
+
+
+async def direct_v4_lineage_evidence(
+    database: Any,
+    candidate_by_field: Mapping[str, Any],
+    checkpoint_rows: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Require the fresh direct root to have no retry or predecessor lineage."""
+
+    count_by_name = await _direct_v4_lineage_counts(
+        database,
+        candidate_by_field,
+    )
+    owner_run_id = clean_text(candidate_by_field.get("import_run_id"))
+    root_run_id = clean_text(candidate_by_field.get("acquisition_root_run_id"))
+    lineage_by_field = {
+        **count_by_name,
+        "checkpoint_retry_count": sum(
+            int(checkpoint.get("retry_of_run_id") is not None)
+            for checkpoint in checkpoint_rows
+        ),
+        "owner_equals_root": owner_run_id == root_run_id,
+        "previous_dataset_present": (
+            candidate_by_field.get("previous_dataset_id") is not None
+        ),
+    }
+    if (
+        set(lineage_by_field) != DIRECT_V4_LINEAGE_FIELDS
+        or any(lineage_by_field[name] != 0 for name in count_by_name)
+        or lineage_by_field["checkpoint_retry_count"] != 0
+        or lineage_by_field["owner_equals_root"] is not True
+        or lineage_by_field["previous_dataset_present"] is not False
+    ):
+        raise ReviewedSubsetTerminalDispositionError("evidence")
+    return lineage_by_field
 
 
 def _source_contract(
@@ -252,6 +337,7 @@ def expected_terminal_start_hashes(
 
 
 __all__ = (
+    "direct_v4_lineage_evidence",
     "expected_terminal_start_hashes",
     "is_candidate_policy_one",
     "is_policy_one_pending",

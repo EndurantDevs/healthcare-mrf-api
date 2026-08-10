@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from process.provider_directory_fhir_subset_abandonment_contract import (
     ABANDONMENT_METADATA_KEY,
@@ -161,23 +161,31 @@ async def _seal_candidate(
     await _force_terminal_disposition_guards(database, selection.dataset_id)
 
 
-async def sync_reviewed_subset_terminal_disposition_transaction(
+_SelectionFunction = Callable[
+    [Any, str],
+    Awaitable[
+        tuple[
+            ReviewedSubsetTerminalDispositionSelection,
+            tuple[dict[str, Any], ...],
+        ]
+    ],
+]
+
+
+async def _sync_terminal_disposition_transaction(
     database: Any,
     expected_source_id: str,
+    selection_function: _SelectionFunction,
 ) -> ReviewedSubsetTerminalDispositionResult:
-    """Lock and seal the sole reviewed mixed-terminal retained root."""
-
     async with database.transaction():
         isolation = await database.scalar(
             "SELECT pg_catalog.current_setting('transaction_isolation');"
         )
         if isolation != "read committed":
             raise ReviewedSubsetTerminalDispositionError("state")
-        selection, checkpoint_rows = (
-            await selected_reviewed_subset_terminal_disposition(
-                database,
-                expected_source_id,
-            )
+        selection, checkpoint_rows = await selection_function(
+            database,
+            expected_source_id,
         )
         if not checkpoint_rows:
             is_valid = await database.scalar(
@@ -192,4 +200,37 @@ async def sync_reviewed_subset_terminal_disposition_transaction(
         return ReviewedSubsetTerminalDispositionResult(disposed=True)
 
 
-__all__ = ("sync_reviewed_subset_terminal_disposition_transaction",)
+async def sync_reviewed_subset_terminal_disposition_transaction(
+    database: Any,
+    expected_source_id: str,
+) -> ReviewedSubsetTerminalDispositionResult:
+    """Lock and seal the sole reviewed mixed-terminal retained root."""
+
+    return await _sync_terminal_disposition_transaction(
+        database,
+        expected_source_id,
+        selected_reviewed_subset_terminal_disposition,
+    )
+
+
+async def sync_v4_terminal_disposition(
+    database: Any,
+    expected_source_id: str,
+) -> ReviewedSubsetTerminalDispositionResult:
+    """Lock and seal the sole reviewed direct-v4 retained root."""
+
+    from process.provider_directory_fhir_subset_terminal_disposition_v4_selection import (
+        selected_direct_v4_terminal_disposition,
+    )
+
+    return await _sync_terminal_disposition_transaction(
+        database,
+        expected_source_id,
+        selected_direct_v4_terminal_disposition,
+    )
+
+
+__all__ = (
+    "sync_v4_terminal_disposition",
+    "sync_reviewed_subset_terminal_disposition_transaction",
+)
