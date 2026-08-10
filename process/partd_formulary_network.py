@@ -2570,10 +2570,7 @@ async def partd_formulary_network_finalize(_ctx, task=None):  # pragma: no cover
     )
 
 
-async def queue_partd_formulary_import(
-    test_mode: bool = False,
-    import_id: str | None = None,
-):  # pragma: no cover
+async def main(test_mode: bool = False, import_id: str | None = None):  # pragma: no cover
     """Queue a Part D formulary import."""
     run_id = _normalize_run_id(None)
     normalized_import_id = _normalize_import_id(import_id)
@@ -2606,10 +2603,7 @@ async def queue_partd_formulary_import(
     return run_id
 
 
-async def main(test_mode: bool = False, import_id: str | None = None):  # pragma: no cover
-    """Compatibility CLI entry point for the Part D import queue."""
-
-    return await queue_partd_formulary_import(test_mode, import_id)
+queue_partd_formulary_import = main
 
 
 async def finish_main(

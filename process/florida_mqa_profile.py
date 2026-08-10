@@ -1522,33 +1522,15 @@ def _license_status_continuation_values(
     }
 
 
-def _normalized_pipe_values(
+def _repair_pipe_value_alignment(
     profile_source: FloridaSource,
     header: list[str],
     field_values: list[str],
     *,
-    row_number: int,
-    artifact_member: str,
+    physical_field_count: int,
     parser_metrics: dict[str, Any] | None,
-) -> tuple[list[str] | None, dict[str, Any] | None]:
-    """Normalize only explicit source quirks; otherwise quarantine the row."""
-    physical_field_count = len(field_values)
-    physical_row_sha256 = _physical_row_sha256(field_values)
-    trailing_empty_count = 0
-    if len(field_values) > len(header) and field_values[-1] == "":
-        field_values = field_values[:-1]
-        trailing_empty_count = 1
-    if trailing_empty_count:
-        _increment_parser_metric(
-            parser_metrics,
-            "trailing_empty_rows",
-        )
-        _increment_parser_metric(
-            parser_metrics,
-            "trailing_empty_fields",
-            trailing_empty_count,
-        )
-
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Repair the two reviewed source-specific field alignment quirks."""
     repair_metadata_by_key: dict[str, Any] | None = None
     if (
         len(field_values) == len(header) + 1
@@ -1590,6 +1572,43 @@ def _normalized_pipe_values(
                 "physical_field_count": physical_field_count,
             }
             _increment_parser_metric(parser_metrics, "recovered_rows")
+    return field_values, repair_metadata_by_key
+
+
+def _normalized_pipe_values(
+    profile_source: FloridaSource,
+    header: list[str],
+    field_values: list[str],
+    *,
+    row_number: int,
+    artifact_member: str,
+    parser_metrics: dict[str, Any] | None,
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    """Normalize only explicit source quirks; otherwise quarantine the row."""
+    physical_field_count = len(field_values)
+    physical_row_sha256 = _physical_row_sha256(field_values)
+    trailing_empty_count = 0
+    if len(field_values) > len(header) and field_values[-1] == "":
+        field_values = field_values[:-1]
+        trailing_empty_count = 1
+    if trailing_empty_count:
+        _increment_parser_metric(
+            parser_metrics,
+            "trailing_empty_rows",
+        )
+        _increment_parser_metric(
+            parser_metrics,
+            "trailing_empty_fields",
+            trailing_empty_count,
+        )
+
+    field_values, repair_metadata_by_key = _repair_pipe_value_alignment(
+        profile_source,
+        header,
+        field_values,
+        physical_field_count=physical_field_count,
+        parser_metrics=parser_metrics,
+    )
 
     if len(field_values) == len(header):
         return field_values, repair_metadata_by_key
@@ -2734,20 +2753,12 @@ def _administrative_complaint_fact(
     )
 
 
-def _pain_management_fact(
-    profile_source: FloridaSource,
+def _pain_management_value(
     source_row: Mapping[str, str],
-    *,
-    run_id: str,
-    record_id: str,
-    npi: int | None,
-    artifact: Mapping[str, Any],
+    report_period: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Build one reviewed pain-management report fact."""
-    report_period = _without_empty(
-        {"year": source_row.get("year", ""), "quarter": source_row.get("qtr", "")}
-    )
-    field_value = _without_empty(
+    """Build the reviewed value carried by one pain-management fact."""
+    return _without_empty(
         {
             "jurisdiction": "FL",
             "clinic": _without_empty(
@@ -2776,6 +2787,22 @@ def _pain_management_fact(
             ),
         }
     )
+
+
+def _pain_management_fact(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one reviewed pain-management report fact."""
+    report_period = _without_empty(
+        {"year": source_row.get("year", ""), "quarter": source_row.get("qtr", "")}
+    )
+    field_value = _pain_management_value(source_row, report_period)
     period_display = " ".join(
         profile_item
         for profile_item in (
@@ -2810,21 +2837,14 @@ def _pain_management_fact(
     )
 
 
-def _pharmacy_relationship_fact(
-    profile_source: FloridaSource,
+def _pharmacy_relationship_value(
     source_row: Mapping[str, str],
     *,
-    run_id: str,
-    record_id: str,
-    npi: int | None,
-    artifact: Mapping[str, Any],
+    original_date: str,
+    expiration_date: str,
+    status_effective_date: str,
 ) -> dict[str, Any]:
-    """Build one reviewed pharmacy relationship fact."""
-    original_date, _ = _normalize_source_date(source_row.get("pharm_orig_dte", ""))
-    expiration_date, _ = _normalize_source_date(source_row.get("pharm_expr_dte", ""))
-    status_effective_date, _ = _normalize_source_date(
-        source_row.get("pharm_stat_efctv_dte", "")
-    )
+    """Build the reviewed value carried by one pharmacy relationship."""
     pharmacy_location = _without_empty(
         {
             "address_line_1": source_row.get("pharm_pl_addr_l1", ""),
@@ -2835,7 +2855,7 @@ def _pharmacy_relationship_fact(
             "postal_code": source_row.get("pharm_pl_zip", ""),
         }
     )
-    field_value = _without_empty(
+    return _without_empty(
         {
             "jurisdiction": "FL",
             "relationship_profession": source_row.get("rltn_prof_nme", ""),
@@ -2870,6 +2890,29 @@ def _pharmacy_relationship_fact(
                 }
             ),
         }
+    )
+
+
+def _pharmacy_relationship_fact(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one reviewed pharmacy relationship fact."""
+    original_date, _ = _normalize_source_date(source_row.get("pharm_orig_dte", ""))
+    expiration_date, _ = _normalize_source_date(source_row.get("pharm_expr_dte", ""))
+    status_effective_date, _ = _normalize_source_date(
+        source_row.get("pharm_stat_efctv_dte", "")
+    )
+    field_value = _pharmacy_relationship_value(
+        source_row,
+        original_date=original_date,
+        expiration_date=expiration_date,
+        status_effective_date=status_effective_date,
     )
     relationship = source_row.get("rltn_prof_nme", "")
     pharmacy_name = source_row.get("pharm_key_name", "")
@@ -2975,6 +3018,35 @@ def _medical_cannabis_fact(
     )
 
 
+def _specialized_fact_for_row(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Map source-specific supplemental rows through their reviewed builder."""
+    builder_by_source_key = {
+        "medical_cannabis_authorization": _medical_cannabis_fact,
+        "administrative_complaints": _administrative_complaint_fact,
+        "pain_management_report": _pain_management_fact,
+        "pharmacy_pharmacist": _pharmacy_relationship_fact,
+    }
+    fact_builder = builder_by_source_key.get(profile_source.key)
+    if fact_builder is None:
+        return None
+    return fact_builder(
+        profile_source,
+        source_row,
+        run_id=run_id,
+        record_id=record_id,
+        npi=npi,
+        artifact=artifact,
+    )
+
+
 def _facts_for_row(
     profile_source: FloridaSource,
     source_row: Mapping[str, str],
@@ -3014,46 +3086,16 @@ def _facts_for_row(
             npi=npi,
             artifact=artifact,
         )
-    if profile_source.key == "medical_cannabis_authorization":
-        return [
-            _medical_cannabis_fact(
-                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-                artifact=artifact,
-            )
-        ]
-    if profile_source.key == "administrative_complaints":
-        return [
-            _administrative_complaint_fact(
-                profile_source,
-                source_row,
-                run_id=run_id,
-                record_id=record_id,
-                npi=npi,
-                artifact=artifact,
-            )
-        ]
-    if profile_source.key == "pain_management_report":
-        return [
-            _pain_management_fact(
-                profile_source,
-                source_row,
-                run_id=run_id,
-                record_id=record_id,
-                npi=npi,
-                artifact=artifact,
-            )
-        ]
-    if profile_source.key == "pharmacy_pharmacist":
-        return [
-            _pharmacy_relationship_fact(
-                profile_source,
-                source_row,
-                run_id=run_id,
-                record_id=record_id,
-                npi=npi,
-                artifact=artifact,
-            )
-        ]
+    specialized_fact = _specialized_fact_for_row(
+        profile_source,
+        source_row,
+        run_id=run_id,
+        record_id=record_id,
+        npi=npi,
+        artifact=artifact,
+    )
+    if specialized_fact is not None:
+        return [specialized_fact]
     return [
         _fact_payload(
             profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
@@ -3986,6 +4028,50 @@ async def _publish_projection_swap(
     return publication_by_key, final_metrics_by_key
 
 
+def _source_quarantine_guard_reasons(
+    source_key: str,
+    metric: Mapping[str, Any],
+    source_rows: object,
+) -> list[str]:
+    """Validate one source's bounded parse-quarantine policy."""
+    reasons: list[str] = []
+    quarantined_rows = metric.get("quarantined_rows", 0)
+    if not isinstance(quarantined_rows, int) or quarantined_rows < 0:
+        return [f"source_quarantine_metric_invalid:{source_key}"]
+
+    max_quarantined_rows = metric.get(
+        "max_quarantined_rows",
+        DEFAULT_MAX_QUARANTINED_ROWS_PER_SOURCE,
+    )
+    max_quarantined_ratio = metric.get(
+        "max_quarantined_ratio",
+        DEFAULT_MAX_QUARANTINED_ROW_RATIO,
+    )
+    if not isinstance(max_quarantined_rows, int) or max_quarantined_rows < 0:
+        reasons.append(f"source_quarantine_count_limit_invalid:{source_key}")
+    elif quarantined_rows > max_quarantined_rows:
+        reasons.append(
+            f"source_quarantine_count_exceeded:{source_key}:"
+            f"{quarantined_rows}>{max_quarantined_rows}"
+        )
+    if (
+        not isinstance(max_quarantined_ratio, (int, float))
+        or isinstance(max_quarantined_ratio, bool)
+        or not 0 <= max_quarantined_ratio <= 1
+    ):
+        reasons.append(f"source_quarantine_ratio_limit_invalid:{source_key}")
+    elif (
+        isinstance(source_rows, int)
+        and source_rows > 0
+        and quarantined_rows / source_rows > max_quarantined_ratio
+    ):
+        reasons.append(
+            f"source_quarantine_ratio_exceeded:{source_key}:"
+            f"{quarantined_rows}/{source_rows}>{max_quarantined_ratio:g}"
+        )
+    return reasons
+
+
 def _source_validation_guard_reasons(
     source_metrics: Mapping[str, Any],
     *,
@@ -4009,52 +4095,13 @@ def _source_validation_guard_reasons(
         source_rows = metric.get("rows")
         if not isinstance(source_rows, int) or source_rows <= 0:
             reasons.append(f"source_rows_empty:{source_key}")
-        quarantined_rows = metric.get("quarantined_rows", 0)
-        if (
-            not isinstance(quarantined_rows, int)
-            or quarantined_rows < 0
-        ):
-            reasons.append(
-                f"source_quarantine_metric_invalid:{source_key}"
+        reasons.extend(
+            _source_quarantine_guard_reasons(
+                source_key,
+                metric,
+                source_rows,
             )
-        else:
-            max_quarantined_rows = metric.get(
-                "max_quarantined_rows",
-                DEFAULT_MAX_QUARANTINED_ROWS_PER_SOURCE,
-            )
-            max_quarantined_ratio = metric.get(
-                "max_quarantined_ratio",
-                DEFAULT_MAX_QUARANTINED_ROW_RATIO,
-            )
-            if (
-                not isinstance(max_quarantined_rows, int)
-                or max_quarantined_rows < 0
-            ):
-                reasons.append(
-                    f"source_quarantine_count_limit_invalid:{source_key}"
-                )
-            elif quarantined_rows > max_quarantined_rows:
-                reasons.append(
-                    f"source_quarantine_count_exceeded:{source_key}:"
-                    f"{quarantined_rows}>{max_quarantined_rows}"
-                )
-            if (
-                not isinstance(max_quarantined_ratio, (int, float))
-                or isinstance(max_quarantined_ratio, bool)
-                or not 0 <= max_quarantined_ratio <= 1
-            ):
-                reasons.append(
-                    f"source_quarantine_ratio_limit_invalid:{source_key}"
-                )
-            elif (
-                isinstance(source_rows, int)
-                and source_rows > 0
-                and quarantined_rows / source_rows > max_quarantined_ratio
-            ):
-                reasons.append(
-                    f"source_quarantine_ratio_exceeded:{source_key}:"
-                    f"{quarantined_rows}/{source_rows}>{max_quarantined_ratio:g}"
-                )
+        )
         header_sha256 = metric.get("header_sha256")
         if not isinstance(header_sha256, str) or not re.fullmatch(
             r"[a-f0-9]{64}",
