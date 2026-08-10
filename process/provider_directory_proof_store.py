@@ -1798,8 +1798,6 @@ def _validated_resource_maps(
                 resource_count_by_type
             )
         )
-        or list(resource_count_by_type) != sorted(resource_count_by_type)
-        or list(resource_hash_by_type) != sorted(resource_hash_by_type)
     ):
         raise ProviderDirectoryProofStoreError(
             "provider directory proof resource scope is invalid"

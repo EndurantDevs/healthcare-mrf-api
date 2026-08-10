@@ -238,7 +238,7 @@ def _retained_resource_types(
             expected_semantic_projection_as_of=semantic_projection_as_of,
         ),
     )
-    return tuple(stored_proof["resource_counts"])
+    return tuple(sorted(stored_proof["resource_counts"]))
 
 
 def _semantic_projection_as_of(

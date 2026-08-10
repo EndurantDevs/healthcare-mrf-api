@@ -298,19 +298,21 @@ def test_scope_decodes_exact_persisted_hash_contract_and_projection_date(
     v3_scope_record["publication_metadata_json"].update(
         resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
         semantic_projection_as_of="2026-08-09",
-        proof_resource_scope=["Location"],
+        proof_resource_scope=["Location", "Organization"],
         provider_directory_content_proof_v1={"sealed": True},
     )
-    validate_proof = Mock(return_value={"resource_counts": {"Location": 1}})
+    validate_proof = Mock(
+        return_value={"resource_counts": {"Organization": 1, "Location": 1}}
+    )
     monkeypatch.setattr(
         rehydrate_scope, "validate_stored_dataset_proof_metadata", validate_proof
     )
     v3_scope = rehydrate_scope._decode_dataset_scope(_scope_request(), v3_scope_record)
     assert v3_scope.resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
     assert v3_scope.semantic_projection_as_of == "2026-08-09"
-    assert v3_scope.resource_types == ("Location",)
+    assert v3_scope.resource_types == ("Location", "Organization")
     proof_options = validate_proof.call_args.kwargs["options"]
-    assert proof_options.proof_resource_scope == ("Location",)
+    assert proof_options.proof_resource_scope == ("Location", "Organization")
 
     v2_scope_record = _scope_record()
     v2_scope_record["publication_metadata_json"]["resource_hash_contract"] = (

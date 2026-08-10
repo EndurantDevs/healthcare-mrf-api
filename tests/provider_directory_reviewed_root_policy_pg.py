@@ -18,7 +18,6 @@ from tests.provider_directory_fhir_subset_abandonment_pg_support import (
     create_abandonment_relations,
 )
 from tests.provider_directory_fhir_subset_activation_support import (
-    _single_root_content_proof,
     single_root_activation_inputs,
 )
 from tests.provider_directory_reviewed_subset_activation_pg_support import (
@@ -40,6 +39,10 @@ from tests.provider_directory_subset_completion_pg_setup import (
 )
 from tests.provider_directory_subset_completion_pg_support import (
     RESOURCE_TYPES,
+    VALID_RESOURCE_ROWS,
+)
+from tests.provider_directory_stored_content_proof_support import (
+    stored_content_proof,
 )
 from tests.tin_npi_connector_postgres_support import (
     TransactionalSchema,
@@ -263,8 +266,10 @@ async def _prove_malformed_content_proof_rejected(scenario, dataset_row) -> None
     malformed_metadata["acquisition_root_run_id"] = (
         "root-malformed-policy-root"
     )
-    malformed_proof = _single_root_content_proof(
+    malformed_proof = stored_content_proof(
         malformed_row["completion_proof_json"],
+        RESOURCE_TYPES,
+        VALID_RESOURCE_ROWS,
         dataset_id="dataset-malformed-policy-root",
         root_run_id="root-malformed-policy-root",
     )
@@ -300,8 +305,10 @@ async def _prove_extra_policy_root_rejected(scenario, dataset_row) -> None:
     extra_metadata = extra_row["publication_metadata_json"]
     extra_metadata["acquisition_root_run_id"] = "root-extra-policy-root"
     extra_metadata["provider_directory_content_proof_v1"] = (
-        _single_root_content_proof(
+        stored_content_proof(
             extra_row["completion_proof_json"],
+            RESOURCE_TYPES,
+            VALID_RESOURCE_ROWS,
             dataset_id="dataset-extra-policy-root",
             root_run_id="root-extra-policy-root",
         )

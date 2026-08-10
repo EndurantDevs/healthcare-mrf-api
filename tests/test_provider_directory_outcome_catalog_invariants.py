@@ -35,6 +35,7 @@ def _candidate(**overrides) -> importer.EndpointDatasetCandidate:
         "expected_resources": ("Organization", "Practitioner"),
         "import_run_id": "run-1",
         "previous_dataset_id": "dataset-current",
+        "resource_hash_contract": importer.LEGACY_RESOURCE_HASH_CONTRACT,
     }
     candidate_by_field.update(overrides)
     return importer.EndpointDatasetCandidate(**candidate_by_field)

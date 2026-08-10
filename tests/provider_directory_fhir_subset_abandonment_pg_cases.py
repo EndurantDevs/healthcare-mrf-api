@@ -174,6 +174,9 @@ async def _admit_fresh_candidate_after_guard(importer, database):
         selected_resources=tuple(RESOURCE_TYPES),
         import_run_id="owner-fresh-admission",
         previous_dataset_id=None,
+        resource_hash_contract=(
+            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+        ),
     )
     async with database.acquire() as connection:
         return await importer._assert_no_conflicting_endpoint_candidate(

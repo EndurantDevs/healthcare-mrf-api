@@ -287,6 +287,7 @@ async def _seed_direct_fetch_dataset(
         metadata_json=json.dumps(
             {
                 "source_ids": [SOURCE_ID],
+                "selected_resources": [RESOURCE_TYPE],
                 "resource_hash_contract": (
                     importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
                 ),
