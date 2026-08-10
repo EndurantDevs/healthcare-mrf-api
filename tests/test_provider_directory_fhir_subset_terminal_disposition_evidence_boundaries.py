@@ -25,7 +25,7 @@ from process.provider_directory_fhir_subset_terminal_disposition_store import (
     sync_reviewed_subset_terminal_disposition_transaction,
 )
 from tests.provider_directory_fhir_subset_terminal_disposition_support import (
-    SOURCE_SCOPE_SHA256,
+    CHECKPOINT_SCOPE_SHA256,
     TerminalDispositionDatabase,
     terminal_disposition_inputs,
 )
@@ -121,7 +121,6 @@ def test_resource_partition_rejects_missing_checkpoint_and_campaign():
         source_row,
         candidate_metadata,
         diagnostics,
-        SOURCE_SCOPE_SHA256,
     )
     with pytest.raises(ReviewedSubsetTerminalDispositionError):
         evidence.validated_resource_dispositions(
@@ -231,7 +230,7 @@ async def test_new_selection_rejects_retained_count_mismatch(monkeypatch):
 
     async def inconsistent_evidence(_database, _candidate_row, _source_row):
         resource_count = database.candidate_row["resource_count"] + 1
-        return database.checkpoint_rows, SOURCE_SCOPE_SHA256, (
+        return database.checkpoint_rows, CHECKPOINT_SCOPE_SHA256, (
             resource_count,
             3,
             resource_count,
@@ -282,7 +281,6 @@ def test_source_contract_rejects_invalid_profile_inputs(mutation):
             source_row,
             candidate_row["publication_metadata_json"],
             diagnostics,
-            SOURCE_SCOPE_SHA256,
         )
 
 
@@ -298,7 +296,6 @@ def test_source_contract_translates_start_url_failure(monkeypatch):
             source_row,
             candidate_row["publication_metadata_json"],
             diagnostics,
-            SOURCE_SCOPE_SHA256,
         )
 
 

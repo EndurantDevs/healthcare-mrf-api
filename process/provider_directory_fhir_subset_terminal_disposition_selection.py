@@ -403,7 +403,6 @@ async def _new_terminal_selection(
         source_row,
         candidate_metadata,
         diagnostics,
-        source_scope,
     )
     resource_dispositions_by_type = validated_resource_dispositions(
         diagnostics,

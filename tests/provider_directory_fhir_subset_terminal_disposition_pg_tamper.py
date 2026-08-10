@@ -331,9 +331,137 @@ async def assert_source_import_envelope_rejected(
         )
 
 
+def _serial_candidate_metadata(selection, field_name, mutation):
+    candidate_metadata = deepcopy(selection.observed_candidate_metadata)
+    diagnostic = candidate_metadata["resource_diagnostics"][
+        "HealthcareService"
+    ]
+    if mutation == "missing":
+        diagnostic.pop(field_name)
+    elif mutation == "non_one":
+        diagnostic[field_name] = 2
+    else:
+        diagnostic[field_name] = 1.0
+    candidate_metadata["completion_proof_v1"]["resource_diagnostics"] = (
+        deepcopy(candidate_metadata["resource_diagnostics"])
+    )
+    return candidate_metadata, diagnostic
+
+
+def _serial_marker(selection, candidate_metadata, diagnostic, source_import):
+    marker = deepcopy(selection.marker_by_field)
+    marker["resource_dispositions"]["HealthcareService"][
+        "diagnostic_sha256"
+    ] = canonical_evidence_sha256(diagnostic)
+    marker["source_diagnostics_sha256"] = canonical_evidence_sha256(
+        candidate_metadata["resource_diagnostics"]
+    )
+    marker["source_import_sha256"] = canonical_evidence_sha256(source_import)
+    marker["candidate_metadata_sha256"] = canonical_evidence_sha256(
+        candidate_metadata
+    )
+    return marker
+
+
+async def _persist_serial_documents(
+    scenario,
+    selection,
+    candidate_metadata,
+    source_metadata,
+) -> None:
+    await scenario.connection.execute(
+        f"""
+        UPDATE {scenario.quoted_schema}.provider_directory_source
+           SET metadata_json = $1::jsonb
+         WHERE source_id = 'source-a'
+        """,
+        json.dumps(source_metadata),
+    )
+    await scenario.connection.execute(
+        f"""
+        UPDATE {scenario.quoted_schema}.provider_directory_endpoint_dataset
+           SET publication_metadata_json = $1::jsonb
+         WHERE dataset_id = $2
+        """,
+        json.dumps(candidate_metadata),
+        selection.dataset_id,
+    )
+
+
+async def _write_serial_concurrency_tamper(
+    scenario,
+    migration,
+    selection,
+    field_name: str,
+    mutation: str,
+) -> None:
+    """Write synchronized diagnostic copies with one invalid serial field."""
+
+    candidate_metadata, diagnostic = _serial_candidate_metadata(
+        selection,
+        field_name,
+        mutation,
+    )
+    source_metadata_text = await scenario.connection.fetchval(
+        f"""
+        SELECT metadata_json::text
+          FROM {scenario.quoted_schema}.provider_directory_source
+         WHERE source_id = 'source-a'
+        """
+    )
+    source_metadata = json.loads(source_metadata_text)
+    source_import = source_metadata["last_resource_import"]
+    source_import["resources"] = deepcopy(
+        candidate_metadata["resource_diagnostics"]
+    )
+    marker = _serial_marker(
+        selection,
+        candidate_metadata,
+        diagnostic,
+        source_import,
+    )
+    await _persist_serial_documents(
+        scenario,
+        selection,
+        candidate_metadata,
+        source_metadata,
+    )
+    await _write_terminal_state(scenario, migration, selection, marker)
+
+
+async def assert_serial_concurrency_rejected(
+    scenario,
+    migration,
+    database,
+) -> None:
+    """Reject missing, non-one, and decimal-one serial diagnostics."""
+
+    selection, _checkpoint_records = await _selected_terminal_evidence(database)
+    fields = (
+        "resource_scan_concurrency_requested",
+        "resource_scan_concurrency_effective",
+    )
+    for field_name in fields:
+        for mutation in ("missing", "non_one", "float_one"):
+            await _assert_postgres_error(
+                scenario.connection,
+                "provider_directory_subset_terminal_disposition_transition_invalid",
+                lambda field=field_name, case=mutation: (
+                    _write_serial_concurrency_tamper(
+                        scenario,
+                        migration,
+                        selection,
+                        field,
+                        case,
+                    )
+                ),
+            )
+
+
 __all__ = (
     "assert_completion_envelope_rejected",
     "assert_retryable_precount_rejected",
+    "assert_serial_concurrency_rejected",
     "assert_shared_proof_identity_rejected",
     "assert_source_import_envelope_rejected",
     "assert_terminal_geometry_tamper_rejected",

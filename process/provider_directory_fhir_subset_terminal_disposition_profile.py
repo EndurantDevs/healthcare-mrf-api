@@ -48,6 +48,8 @@ DIAGNOSTIC_FIELDS = frozenset(
         "pages_fetched",
         "rows_fetched",
         "rows_written",
+        "resource_scan_concurrency_effective",
+        "resource_scan_concurrency_requested",
         "source_fetch_elapsed_ms",
         "stream_write_elapsed_seconds",
         "checkpoint_persist_elapsed_seconds",
