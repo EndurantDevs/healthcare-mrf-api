@@ -114,8 +114,9 @@ async def _selected_observation(
     catalog_set_sha256: str | None,
     raw_set_sha256: str | None,
     *,
-    database: Any = db,
+    database: Any | None = None,
 ) -> dict[str, Any]:
+    selected_database = database if database is not None else db
     catalog_hash = _validate_selector(catalog_set_sha256, "catalog_set_sha256")
     raw_hash = _validate_selector(raw_set_sha256, "raw_set_sha256")
     if catalog_hash and raw_hash:
@@ -129,7 +130,7 @@ async def _selected_observation(
         where_clause = "WHERE raw.raw_set_sha256=:raw_set_sha256"
         selection_parameters_by_name["raw_set_sha256"] = raw_hash
     observation_fields = _row_fields(
-        await database.first(
+        await selected_database.first(
             f"""SELECT semantic.catalog_set_sha256, semantic.schema_version,
                        semantic.families_json, semantic.collection_summary_json,
                        semantic.file_count, semantic.provider_file_count,
@@ -254,9 +255,10 @@ def _public_raw_observation(
 async def _catalog_file_records(
     selected_catalog_hash: str,
     *,
-    database: Any = db,
+    database: Any | None = None,
 ) -> list[dict[str, Any]]:
-    database_records = await database.all(
+    selected_database = database if database is not None else db
+    database_records = await selected_database.all(
         f"""SELECT catalog_set_sha256, file_id, family, collection_kind,
                    file_name, source_url, catalog_modified_at,
                    catalog_entry_sha256, size_bytes, availability,
@@ -564,7 +566,7 @@ async def uhc_provider_file_catalog(
 async def load_retained_uhc_catalog_proof(
     *,
     raw_set_sha256: str | None = None,
-    database: Any = db,
+    database: Any | None = None,
 ) -> dict[str, Any]:
     """Load one exact retained two-listing proof for downstream adapters."""
 
