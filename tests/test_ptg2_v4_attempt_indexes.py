@@ -104,3 +104,17 @@ def test_ci_runs_attempt_and_legacy_guard_postgres_tests() -> None:
         "tests/test_ptg_source_attempt_action_postgres.py",
     ):
         assert legacy_guard_test in packed_v4_gate
+
+
+def test_ci_runs_split_shared_gc_postgres_tests() -> None:
+    workflow_text = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    ).read_text()
+    shared_gc_gate = workflow_text.split(
+        "- name: Run strict shared PTG PostgreSQL GC and removal tests",
+        maxsplit=1,
+    )[1].split(
+        "- name: Run strict shared PTG PostgreSQL cross-plan reuse tests",
+        maxsplit=1,
+    )[0]
+    assert "tests/test_ptg2_shared_gc_postgres.py" in shared_gc_gate
