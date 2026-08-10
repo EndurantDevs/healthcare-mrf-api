@@ -22,3 +22,6 @@ CoveragePlan content, aliases, and deterministic FHIR search contracts. Source
 configuration is rechecked before each alias census and immediately before
 verification. Only hashes and bounded counts are returned; source locations,
 continuations, and raw configuration are not retained in checkpoints.
+
+The separate official-file adapter and its two-phase release boundary are
+documented in [Official-file FHIR formulary operator](formulary-fhir-official-mrf-operator.md).

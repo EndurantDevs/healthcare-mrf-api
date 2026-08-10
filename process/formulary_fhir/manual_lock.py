@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
+from process.formulary_fhir.async_safety import drain_operation
+
 
 LOCK_DOMAIN = "fhir-formulary-manual-sync-v1"
 TRY_LOCK_SQL = (
@@ -40,37 +42,7 @@ def _lock_identity(source_id: str) -> str:
     return f"{LOCK_DOMAIN}:{source_id}"
 
 
-async def _drain(
-    operation: Any,
-    *,
-    preserve_cancellation: bool,
-    should_prefer_operation_error: bool = False,
-) -> Any:
-    """Drain one cleanup task through repeated outer cancellation."""
-
-    cleanup_task = asyncio.create_task(operation)
-    cancellation_error: asyncio.CancelledError | None = None
-    while not cleanup_task.done():
-        try:
-            await asyncio.shield(cleanup_task)
-        except asyncio.CancelledError as error:
-            if cancellation_error is None:
-                cancellation_error = error
-        except BaseException:
-            break
-    try:
-        cleanup_result = cleanup_task.result()
-    except BaseException:
-        if (
-            cancellation_error is not None
-            and preserve_cancellation
-            and not should_prefer_operation_error
-        ):
-            raise cancellation_error
-        raise
-    if cancellation_error is not None and preserve_cancellation:
-        raise cancellation_error
-    return cleanup_result
+_drain = drain_operation
 
 
 async def _exit_lease(

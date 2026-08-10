@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "importer": "formulary-fhir",
+  "reviewed_at": "2026-08-10",
+  "source": {
+    "source_id": "uhc-official-formulary-mrf",
+    "canonical_base": "https://providermrf.uhc.com",
+    "display_name": "UnitedHealthcare official formulary machine-readable files",
+    "enabled": true,
+    "runtime_config_json": {
+      "timeout_seconds": 120,
+      "max_attempts": 3,
+      "page_size": 100,
+      "max_pages": 100000,
+      "max_total_resources": 10000000,
+      "max_response_bytes": 20971520
+    },
+    "metadata_json": {
+      "access_requirement": "none",
+      "launch_mode": "manual-library",
+      "publication_intent": "none",
+      "source_families": [
+        "cs",
+        "ifp"
+      ],
+      "source_kind": "cms-mrf-drug-catalog",
+      "verification_state": "pending-first-reviewed-artifact-twin"
+    }
+  }
+}

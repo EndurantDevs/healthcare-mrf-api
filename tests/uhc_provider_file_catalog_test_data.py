@@ -10,7 +10,12 @@ from process import uhc_provider_file_catalog_types as catalog_types
 
 
 def catalog_entry(family: str, section: str, index: int) -> dict:
-    prefix = "Providers" if section == "providers" else "Plans"
+    prefix_by_section = {
+        "drugs": "Drugs",
+        "plans": "Plans",
+        "providers": "Providers",
+    }
+    prefix = prefix_by_section[section]
     name = f"JSON_{prefix}_{family.upper()}_{index:03d}.json"
     return {
         "name": name,
@@ -24,12 +29,14 @@ def live_catalog_payloads() -> dict:
     return {
         "cs": {
             "providers": [catalog_entry("cs", "providers", index) for index in range(53)],
+            "drugs": [catalog_entry("cs", "drugs", index) for index in range(24)],
         },
         "ifp": {
             "providers": [
                 catalog_entry("ifp", "providers", index) for index in range(25)
             ],
             "plans": [catalog_entry("ifp", "plans", index) for index in range(24)],
+            "drugs": [catalog_entry("ifp", "drugs", index) for index in range(24)],
         },
     }
 

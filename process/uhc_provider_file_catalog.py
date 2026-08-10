@@ -113,6 +113,8 @@ def _validate_selector(value: str | None, selector_name: str) -> str | None:
 async def _selected_observation(
     catalog_set_sha256: str | None,
     raw_set_sha256: str | None,
+    *,
+    database: Any = db,
 ) -> dict[str, Any]:
     catalog_hash = _validate_selector(catalog_set_sha256, "catalog_set_sha256")
     raw_hash = _validate_selector(raw_set_sha256, "raw_set_sha256")
@@ -127,7 +129,7 @@ async def _selected_observation(
         where_clause = "WHERE raw.raw_set_sha256=:raw_set_sha256"
         selection_parameters_by_name["raw_set_sha256"] = raw_hash
     observation_fields = _row_fields(
-        await db.first(
+        await database.first(
             f"""SELECT semantic.catalog_set_sha256, semantic.schema_version,
                        semantic.families_json, semantic.collection_summary_json,
                        semantic.file_count, semantic.provider_file_count,
@@ -251,8 +253,10 @@ def _public_raw_observation(
 
 async def _catalog_file_records(
     selected_catalog_hash: str,
+    *,
+    database: Any = db,
 ) -> list[dict[str, Any]]:
-    database_records = await db.all(
+    database_records = await database.all(
         f"""SELECT catalog_set_sha256, file_id, family, collection_kind,
                    file_name, source_url, catalog_modified_at,
                    catalog_entry_sha256, size_bytes, availability,
@@ -555,6 +559,38 @@ async def uhc_provider_file_catalog(
         public_files,
         publication_state,
     )
+
+
+async def load_retained_uhc_catalog_proof(
+    *,
+    raw_set_sha256: str | None = None,
+    database: Any = db,
+) -> dict[str, Any]:
+    """Load one exact retained two-listing proof for downstream adapters."""
+
+    observation = await _selected_observation(
+        None,
+        raw_set_sha256,
+        database=database,
+    )
+    if not observation:
+        raise UHCFileCatalogError("UHC retained raw catalog was not found")
+    file_records = await _catalog_file_records(
+        str(observation["catalog_set_sha256"]),
+        database=database,
+    )
+    persisted_catalog, _catalog_counts = _validated_persisted_catalog(
+        observation,
+        file_records,
+    )
+    raw_proof, retained_catalog = await _validated_persisted_raw_proof(
+        observation
+    )
+    if retained_catalog != persisted_catalog:
+        raise UHCFileCatalogError(
+            "UHC retained raw catalog does not match persisted semantics"
+        )
+    return raw_proof
 
 
 async def refresh_uhc_provider_file_catalog() -> dict[str, Any]:
