@@ -204,6 +204,16 @@ async def test_get_npi_filters_non_street_addresses_unless_extra_info(monkeypatc
         "_build_npi_details",
         _build_npi_street_city_details,
     )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_address_rows",
+        AsyncMock(return_value=[]),
+    )
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         npi_module,

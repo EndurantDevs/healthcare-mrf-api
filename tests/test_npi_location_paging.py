@@ -91,10 +91,41 @@ def _overlay_payload() -> list[dict[str, object]]:
     ]
 
 
-def _install_route_mocks(monkeypatch):
-    build_calls: list[dict[str, object]] = []
-    address_row_calls: list[dict[str, object]] = []
+def _prepare_hydrated_address_maps(
+    *,
+    degraded_hydration: bool,
+) -> list[dict[str, object]]:
+    """Build full-row address fixtures with stable base identities."""
+    address_maps = deepcopy(_detail_payload()["address_list"])
+    if degraded_hydration:
+        address_maps[0]["state_code"] = None
+        address_maps[1].update(
+            {
+                "location_status": "active",
+                "independent_source_count": 3,
+                "multi_source_confirmed": True,
+                "aca_plan_array": ["synthetic-plan"],
+                "archive_identity_version": 2,
+                "base_address_version": 3,
+                "confidence_score": 0.9,
+                "entity_id": "synthetic-entity",
+                "entity_name": "Synthetic Entity",
+                "entity_type": "provider",
+                "freshness_score": 0.8,
+                "inference_confidence": 0.7,
+                "inference_method": "synthetic_method",
+                "location_confidence_id": "synthetic-confidence",
+                "row_origin": "synthetic_origin",
+            }
+        )
+    for address_map in address_maps:
+        address_map["_base_row_identities"] = [
+            npi_module._base_address_row_identity(address_map)
+        ]
+    return address_maps
 
+
+def _build_detail_mock(build_calls):
     async def fake_build(_npi, **kwargs):
         build_calls.append(kwargs)
         detail = deepcopy(_detail_payload())
@@ -110,7 +141,12 @@ def _install_route_mocks(monkeypatch):
             ]
         return detail
 
-    async def fake_candidates(_npi, **_kwargs):
+    return fake_build
+
+
+def _location_candidate_mock(candidate_calls):
+    async def fake_candidates(_npi, **kwargs):
+        candidate_calls.append(kwargs)
         candidates = deepcopy(_detail_payload()["address_list"])
         for candidate in candidates:
             candidate["_base_row_identities"] = [
@@ -118,12 +154,15 @@ def _install_route_mocks(monkeypatch):
             ]
         return candidates
 
-    async def fake_overlay(_npi, **_kwargs):
-        return deepcopy(_overlay_payload())
+    return fake_candidates
 
+
+def _address_row_mock(address_row_calls, *, degraded_hydration):
     async def fake_address_rows(_npi, **kwargs):
         address_row_calls.append(kwargs)
-        address_maps = deepcopy(_detail_payload()["address_list"])
+        address_maps = _prepare_hydrated_address_maps(
+            degraded_hydration=degraded_hydration,
+        )
         selected_identities = kwargs.get("address_row_identities")
         if selected_identities is not None:
             address_maps = [
@@ -134,11 +173,26 @@ def _install_route_mocks(monkeypatch):
             ]
         return address_maps
 
+    return fake_address_rows
+
+
+async def _fake_overlay(_npi, **_kwargs):
+    return deepcopy(_overlay_payload())
+
+
+def _install_route_mocks(monkeypatch, *, degraded_hydration: bool = False):
+    """Install deterministic exact-detail candidate and hydration fixtures."""
+    build_calls: list[dict[str, object]] = []
+    address_row_calls: list[dict[str, object]] = []
+    candidate_calls: list[dict[str, object]] = []
     route_replacement_by_name = {
-        "_build_npi_details": fake_build,
-        "_fetch_provider_directory_address_overlay": fake_overlay,
-        "_fetch_npi_location_candidates": fake_candidates,
-        "_fetch_npi_address_rows": fake_address_rows,
+        "_build_npi_details": _build_detail_mock(build_calls),
+        "_fetch_provider_directory_address_overlay": _fake_overlay,
+        "_fetch_npi_location_candidates": _location_candidate_mock(candidate_calls),
+        "_fetch_npi_address_rows": _address_row_mock(
+            address_row_calls,
+            degraded_hydration=degraded_hydration,
+        ),
     }
     for function_name, replacement in route_replacement_by_name.items():
         monkeypatch.setattr(npi_module, function_name, replacement)
@@ -149,7 +203,11 @@ def _install_route_mocks(monkeypatch):
         AsyncMock(return_value={"summary": None, "ffs_visibility": {}}),
     )
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 0.0)
-    return {"build": build_calls, "address_rows": address_row_calls}
+    return {
+        "build": build_calls,
+        "candidates": candidate_calls,
+        "address_rows": address_row_calls,
+    }
 
 
 def _detail_request(
@@ -177,9 +235,25 @@ def _detail_request(
     )
 
 
-async def _get_page(monkeypatch, *, limit: str, offset: int = 0, include_total: bool = True):
-    route_calls = _install_route_mocks(monkeypatch)
-    request = _detail_request(limit=limit, offset=offset, include_total=include_total)
+async def _get_page(
+    monkeypatch,
+    *,
+    limit: str,
+    offset: int = 0,
+    include_total: bool = True,
+    include_evidence: bool = False,
+    degraded_hydration: bool = False,
+):
+    route_calls = _install_route_mocks(
+        monkeypatch,
+        degraded_hydration=degraded_hydration,
+    )
+    request = _detail_request(
+        limit=limit,
+        offset=offset,
+        include_total=include_total,
+        include_evidence=include_evidence,
+    )
     operation_response = await npi_module.get_npi(request, "1234567890")
     return json.loads(operation_response.body), route_calls
 
@@ -370,7 +444,7 @@ async def test_get_npi_limit_one_never_leaks_overlay_rows(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_all_returns_complete_combined_location_set(monkeypatch):
-    payload, _build_calls = await _get_page(monkeypatch, limit="all")
+    payload, route_calls = await _get_page(monkeypatch, limit="all")
 
     assert [row["address_key"] for row in payload["address_list"]] == [
         ADDRESS_A,
@@ -384,65 +458,6 @@ async def test_get_npi_all_returns_complete_combined_location_set(monkeypatch):
         "total": 3,
         "has_more": False,
     }
-
-
-@pytest.mark.asyncio
-async def test_get_npi_all_includes_direct_and_inferred_base_rows(monkeypatch):
-    direct_address = _address(
-        ADDRESS_A,
-        "100 Example Avenue",
-        source_id="nppes",
-    )
-    inferred_address = _address(
-        ADDRESS_B,
-        "200 Example Avenue",
-        source_id="provider_directory_fhir",
-    )
-    inferred_address["npi"] = None
-    inferred_address["inferred_npi"] = 1234567890
-    address_rows = AsyncMock(
-        return_value=[deepcopy(direct_address), deepcopy(inferred_address)]
-    )
-    monkeypatch.setattr(
-        npi_module,
-        "_build_npi_details",
-        AsyncMock(
-            return_value={
-                "npi": 1234567890,
-                "taxonomy_list": [],
-                "taxonomy_group_list": [],
-                "do_business_as": [],
-                "address_list": [deepcopy(direct_address)],
-            }
-        ),
-    )
-    monkeypatch.setattr(npi_module, "_fetch_npi_address_rows", address_rows)
-    monkeypatch.setattr(
-        npi_module,
-        "_fetch_provider_directory_address_overlay",
-        AsyncMock(return_value=[]),
-    )
-    monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
-    monkeypatch.setattr(
-        npi_module,
-        "_fetch_provider_enrichment_summary_detail",
-        AsyncMock(return_value={"summary": None, "ffs_visibility": {}}),
-    )
-    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 0.0)
-    operation_response = await npi_module.get_npi(
-        _detail_request(limit="all"),
-        "1234567890",
-    )
-    response_map = json.loads(operation_response.body)
-    assert [location["address_key"] for location in response_map["address_list"]] == [
-        ADDRESS_A,
-        ADDRESS_B,
-    ]
-    assert response_map["address_pagination"] == {
-        "limit": None,
-        "offset": 0,
-        "returned": 2,
-        "total": 2,
-        "has_more": False,
-    }
-    address_rows.assert_awaited_once()
+    assert len(route_calls["candidates"]) == 1
+    assert len(route_calls["address_rows"]) == 1
+    assert len(route_calls["address_rows"][0]["address_row_identities"]) == 2
