@@ -923,6 +923,14 @@ def downgrade() -> None:
     schema = _schema()
     header_ref = _qf(schema, _HEADER)
     op.execute(
+        "LOCK TABLE "
+        + ", ".join(
+            _qf(schema, relation)
+            for relation in (_ENDPOINT_DATASET, _HEADER, _PROVENANCE)
+        )
+        + " IN ACCESS EXCLUSIVE MODE;"
+    )
+    op.execute(
         f"""
         DO $migration$
         BEGIN
@@ -950,6 +958,17 @@ def downgrade() -> None:
     op.execute(
         f"DROP TRIGGER IF EXISTS pd_uhc_flex_dataset_parent_guard ON {_qf(schema, _ENDPOINT_DATASET)};"
     )
+    for trigger_name, relation_name in (
+        ("pd_uhc_flex_dataset_resource_row_guard", _PROVENANCE),
+        ("pd_uhc_flex_dataset_resource_truncate_guard", _PROVENANCE),
+        ("pd_uhc_flex_dataset_row_guard", _HEADER),
+        ("pd_uhc_flex_dataset_valid_guard", _HEADER),
+        ("pd_uhc_flex_dataset_truncate_guard", _HEADER),
+    ):
+        op.execute(
+            f"DROP TRIGGER IF EXISTS {trigger_name} "
+            f"ON {_qf(schema, relation_name)};"
+        )
     for function_name in (
         _SOURCE_GUARD,
         _ENDPOINT_GUARD,

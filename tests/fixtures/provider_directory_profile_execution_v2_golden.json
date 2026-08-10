@@ -3,7 +3,7 @@
   "probe": false,
   "provider_directory_profile_capacity_attestation": {
     "lease": {
-      "attestation_id": "4d4f0652363d504b7f62af2aa2c6d842e872d81c9b9d1c202bd563c69ab2e677",
+      "attestation_id": "98af1e6bde11df82027a9ea99f22f9c9ceed02cdfcc38f8fc7b6a06189f2e1e3",
       "attestor_id": "capacity-authority-dev",
       "attestor_release_digest": "1111111111111111111111111111111111111111111111111111111111111111",
       "capacity_geometry_hash": "5555555555555555555555555555555555555555555555555555555555555555",
@@ -26,10 +26,10 @@
         "import\u005fcontrol_image_digest": "sha256:1515151515151515151515151515151515151515151515151515151515151515",
         "profile_migration_revision": "20260801130000_provider_directory_capacity_lease_v2",
         "profile_schema_version": 1,
-        "profile_strategy_version": "source-fact-role32-org32-membership32-dataset-practitioner-authority-npi5m-v5",
+        "profile_strategy_version": "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5",
         "postgres_server_version_num": 180002
       },
-      "runtime_witness_sha256": "a018360debb204d75df9640d89304f31d37c13edee7471ef2b648e3d78ceb52e",
+      "runtime_witness_sha256": "91be002a5ba3464ab0b5b3bfb8d6baebc762df94dd96d3e2254753fc0822a7ea",
       "deployment_witness": {
         "flux_revision": "main@sha1:1616161616161616161616161616161616161616",
         "bootstrap_config_sha256": "1717171717171717171717171717171717171717171717171717171717171717",
@@ -77,7 +77,7 @@
         }
       ]
     },
-    "signature": "UtGjwVckTwdXsRxC_R0gR_PM_yrjDiAH56EVV-5rayHpFMNahjLdVVGs2cVkfl2_OJXQBzMauF20s2NBmgV7Bg"
+    "signature": "SLzZrUeYtxvUIJrfFBPo5ngN4zk_R5pG4j33-3ZYI5lukT6SexXVqrP4sK_sKyVwGabeqFs6ydt29dZg7ZfRBA"
   },
   "provider_directory_profile_contract_id": "healthporta.provider-directory-profile-execution.v2",
   "provider_directory_profile_generation": 11,
@@ -99,12 +99,12 @@
         "source_id": "pdfhir_payer"
       }
     ],
-    "profile_input_digest": "4eca0836dcd319cb8ce9a31e464a6f883916d9b7a371c7faa90313676612204d",
+    "profile_input_digest": "ce56caced6e2a9efbc0e9f11cd531e6212ba4293900372eab2e8a3d26dd49d30",
     "profile_schema_version": 1,
-    "profile_strategy_version": "source-fact-role32-org32-membership32-dataset-practitioner-authority-npi5m-v5",
-    "proof_id": "9e0a992d2452fdc295918255ddfcaef3a44d334e10d4094195b4fb68943669ff",
+    "profile_strategy_version": "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5",
+    "proof_id": "9c1f5f05299769d9d87dee7f35e88019daedf7bb47c87534803bb84b437daf29",
     "selection_fingerprint": "bdee59431fa659e4199426063b943bcbbc478c5b788bb543aa26471d13604a4a",
-    "source_context_digest": "9d71bd59d73b176080a32bf43c802b30dbe129d78c4e6f8af5d4c8fc465c5a15"
+    "source_context_digest": "3528caf315a2f3a5b2b3d8c56539aa12ab797fe050a5ccfeeec9989434e8d52f"
   },
   "publish_artifacts_only": true,
   "publish_artifacts_targets": [

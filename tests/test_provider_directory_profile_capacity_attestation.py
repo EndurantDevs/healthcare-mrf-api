@@ -26,16 +26,16 @@ UTC = datetime.timezone.utc
 VALIDATION_TIME = datetime.datetime(2026, 7, 30, 12, 0, 2, tzinfo=UTC)
 PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
 GOLDEN_ATTESTATION_ID = (
-    "4d4f0652363d504b7f62af2aa2c6d842"
-    "e872d81c9b9d1c202bd563c69ab2e677"
+    "98af1e6bde11df82027a9ea99f22f9c9"
+    "ceed02cdfcc38f8fc7b6a06189f2e1e3"
 )
 GOLDEN_SIGNATURE = (
-    "UtGjwVckTwdXsRxC_R0gR_PM_yrjDiAH56EVV-5rayHpFMNahjLdVVGs2"
-    "cVkfl2_OJXQBzMauF20s2NBmgV7Bg"
+    "SLzZrUeYtxvUIJrfFBPo5ngN4zk_R5pG4j33-3ZYI5lukT6SexXVqrP4s"
+    "K_sKyVwGabeqFs6ydt29dZg7ZfRBA"
 )
 GOLDEN_CANONICAL_BODY_SHA256 = (
-    "bf880e3ca0618bd4d6de0f687246cc98"
-    "1cea4500de997a9eb8fb31cbe9b4632f"
+    "b49e41dbc8df00ae874d2ef5f5be034b"
+    "d32c967be331815a7d434ca4ca71b7bc"
 )
 
 
@@ -130,8 +130,8 @@ def test_golden_vector_verifies_exact_canonical_schema_and_signature():
     assert verified.database_system_identifier == "7527713908662902214"
     assert verified.runtime_witness.healthcare_source_commit == "12" * 20
     assert verified.runtime_witness_sha256 == (
-        "a018360debb204d75df9640d89304f31"
-        "d37c13edee7471ef2b648e3d78ceb52e"
+        "91be002a5ba3464ab0b5b3bfb8d6bae"
+        "bc762df94dd96d3e2254753fc0822a7ea"
     )
     assert verified.deployment_witness.preflight_transport == (
         "kubectl_exec_loopback_8080"
@@ -142,8 +142,8 @@ def test_golden_vector_verifies_exact_canonical_schema_and_signature():
         "wal": 150_000_000_000,
     }
     assert verified.lease_digest == (
-        "e8aee33cf851a8768ca42481f04acd1a"
-        "9a0aba07170f8ec657ffa9d58579a920"
+        "f569a08487acbf7c47a87a659d4a852c"
+        "51b1c0c051cf3c8d5732da33dcd068e8"
     )
     assert verified.public_key_fingerprint == (
         "05549452c2988321a6d9e7daa9a7704b"

@@ -50,19 +50,6 @@ async def _seed_sources_and_rows(database, schema: str) -> None:
 
 async def _seed_profile_source_rows(database, schema: str) -> None:
     """Seed source identities and typed rows used to detect stale evidence."""
-
-    await database.status(
-        f"""
-        CREATE TABLE {_ref(schema, 'provider_directory_dataset_resource')} (
-            dataset_id varchar(96) NOT NULL,
-            resource_type varchar(64) NOT NULL,
-            resource_id varchar(256) NOT NULL,
-            payload_hash varchar(64) NOT NULL,
-            payload_json jsonb NOT NULL,
-            PRIMARY KEY (dataset_id, resource_type, resource_id)
-        );
-        """
-    )
     await database.status(
         f"""
         INSERT INTO {_ref(schema, 'provider_directory_source')} (

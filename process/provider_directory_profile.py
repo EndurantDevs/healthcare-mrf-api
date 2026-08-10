@@ -32,7 +32,7 @@ PROFILE_SPEC_PATH = (
 PROFILE_SQL_PATH = Path(__file__).resolve().parent / "sql"
 PROFILE_SCHEMA_VERSION = 1
 PROFILE_BUILD_STRATEGY_VERSION = (
-    "source-fact-role32-org32-membership32-dataset-practitioner-authority-npi5m-v5"
+    "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5"
 )
 PROFILE_FACT_LIMIT = 100
 PROFILE_FACT_EVIDENCE_LIMIT = 25

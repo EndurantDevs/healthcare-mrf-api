@@ -674,18 +674,6 @@ async def _archive_profile_dataset_a(database: Database, schema: str) -> None:
     )
     await database.status(
         f"""
-        CREATE TABLE {schema}.provider_directory_dataset_resource (
-            dataset_id varchar(96) NOT NULL,
-            resource_type varchar(64) NOT NULL,
-            resource_id varchar(256) NOT NULL,
-            payload_hash varchar(64) NOT NULL,
-            payload_json jsonb NOT NULL,
-            PRIMARY KEY (dataset_id, resource_type, resource_id)
-        );
-        """
-    )
-    await database.status(
-        f"""
         INSERT INTO {schema}.provider_directory_endpoint_dataset
             (dataset_id, created_at, validated_at, published_at)
         VALUES ('profile-dataset-a', now(), now(), now());
@@ -1754,6 +1742,7 @@ def _assert_uhc_facility_profile_rows(
         {
             "source_id": "profile-source-uhc",
             "endpoint_id": "profile-endpoint-uhc",
+            "authority_id": "profile-endpoint-uhc",
             "dataset_id": "profile-dataset-uhc",
             "api_base": "https://providermrf.uhc.com",
             "org_name": "UnitedHealthcare",

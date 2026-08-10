@@ -734,7 +734,7 @@ artifact and do not traverse the FHIR graph at request time.
 
 ### Profile publication batching and recovery
 
-The `source-fact-role32-org32-membership32-dataset-practitioner-authority-npi5m-v5`
+The `source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5`
 build strategy is an
 executable resource bound, not only a label. Evidence publication uses 22
 fact branches per source. The high-fanout `affiliation` branch is split into

@@ -7,6 +7,15 @@ CREATE TABLE "{{SCHEMA}}"."provider_directory_source" (
     plan_name varchar(512)
 );
 -- statement
+CREATE TABLE "{{SCHEMA}}"."provider_directory_dataset_resource" (
+    dataset_id varchar(96) NOT NULL,
+    resource_type varchar(64) NOT NULL,
+    resource_id varchar(256) NOT NULL,
+    payload_hash varchar(64) NOT NULL,
+    payload_json jsonb NOT NULL,
+    PRIMARY KEY (dataset_id, resource_type, resource_id)
+);
+-- statement
 CREATE TABLE "{{SCHEMA}}"."provider_directory_practitioner" (
     source_id varchar(64) NOT NULL,
     resource_id varchar(256) NOT NULL,
