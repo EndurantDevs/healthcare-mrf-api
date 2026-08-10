@@ -123,6 +123,11 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
     )
     assert retirement_test in lifecycle_step
     assert workflow.count(retirement_test) == 1
+    retirement_repair_test = (
+        "tests/test_provider_directory_terminal_root_retirement_repair_postgres.py"
+    )
+    assert retirement_repair_test in lifecycle_step
+    assert workflow.count(retirement_repair_test) == 1
     for workflow_line in workflow.splitlines():
         if (
             "python -m pytest" in workflow_line

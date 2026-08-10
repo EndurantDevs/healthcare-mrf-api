@@ -228,10 +228,10 @@ async def test_exact_retirement_preview_apply_and_drifted_replay(monkeypatch) ->
         applied = await scenario.snapshot()
         marker = assert_only_parent_seal_changed(seeded, applied)
         evidence = marker["evidence"]
-        assert evidence["actual_resource_count"] == 2
-        assert evidence["parent_resource_count"] == 2
-        assert evidence["proof_row_count"] == 3
-        assert evidence["proof_row_count"] != evidence["actual_resource_count"]
+        assert evidence["actual_resource_count"] == 3
+        assert evidence["resource_counts"] == {"Organization": 2, "Practitioner": 1}
+        assert evidence["parent_resource_count"] == 3
+        assert evidence["proof_row_count"] == 4
         assert evidence["terminal_run_count"] == 4
         assert set(evidence["child_relations"]) == REQUIRED_CHILD_RELATIONS
         assert (

@@ -298,7 +298,7 @@ async def _seed_datasets(scenario: RetirementPostgres) -> None:
             (dataset_id, endpoint_id, import_run_id, acquisition_root_run_id,
              previous_dataset_id, status, is_current, resource_count, dataset_hash,
              validated_at, published_at, publication_metadata_json) VALUES
-            ($3, $2, $4, $5, $1, 'acquiring', false, 2, NULL, NULL, NULL, $6),
+            ($3, $2, $4, $5, $1, 'acquiring', false, 3, NULL, NULL, NULL, $6),
             ($7, 'endpoint-predecessorless', 'run-predecessorless',
              'run-predecessorless', NULL, 'acquiring', false, 0, NULL, NULL,
              NULL, '{{"source_ids":["source-predecessorless"]}}')""",
@@ -317,6 +317,8 @@ async def _seed_target_evidence(scenario: RetirementPostgres) -> None:
     await scenario.connection.execute(
         f"""INSERT INTO {schema}.provider_directory_dataset_resource VALUES
             ($1, 'Organization', 'org-1', $2, '{{"resourceType":"Organization"}}'),
+            ($1, 'Organization', 'org-2', $2,
+             '{{"resourceType":"Organization","active":true}}'),
             ($1, 'Practitioner', 'practitioner-1', $3,
              '{{"resourceType":"Practitioner"}}'),
             ($4, 'Organization', 'current-org', $2,
@@ -328,7 +330,7 @@ async def _seed_target_evidence(scenario: RetirementPostgres) -> None:
     )
     await scenario.connection.execute(
         f"""INSERT INTO {schema}.provider_directory_dataset_proof_shard
-            VALUES ('{TARGET_DATASET_ID}', 0, decode('abcd', 'hex'), 3);
+            VALUES ('{TARGET_DATASET_ID}', 0, decode('abcd', 'hex'), 4);
         INSERT INTO {schema}.provider_directory_pagination_checkpoint
             VALUES ('{TARGET_DATASET_ID}', 'https://terminal.example.invalid/fhir',
                     'Practitioner', '{'d' * 64}', 'complete');
