@@ -1070,6 +1070,43 @@ def _fill_address_scalars(base: dict[str, Any], duplicate: Mapping[str, Any]) ->
             base[key] = duplicate.get(key)
 
 
+HYDRATED_IDENTITY_SCALAR_FIELDS = (
+    "archive_identity_version",
+    "base_address_version",
+    "confidence_score",
+    "entity_id",
+    "entity_name",
+    "entity_subtype",
+    "entity_type",
+    "freshness_score",
+    "inference_confidence",
+    "inference_method",
+    "location_confidence_id",
+    "location_key",
+    "row_origin",
+    "source_mask",
+    "address_source_mask",
+    "city_norm",
+    "county_fips",
+    "state_code",
+    "zip5",
+    "inferred_npi",
+)
+
+
+def _fill_hydrated_identity_scalars(
+    location_map: dict[str, Any],
+    hydrated_identity_map: Mapping[str, Any],
+) -> None:
+    """Fill row-specific evidence only from the selected base identity."""
+    for field_name in HYDRATED_IDENTITY_SCALAR_FIELDS:
+        if (
+            location_map.get(field_name) in (None, "")
+            and hydrated_identity_map.get(field_name) not in (None, "")
+        ):
+            location_map[field_name] = hydrated_identity_map.get(field_name)
+
+
 def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any]) -> None:
     """Merge corroborating rows without crossing canonical location identities."""
     _merge_address_lists(base, duplicate)
@@ -1202,6 +1239,25 @@ def _has_shared_display_site(first: Mapping[str, Any], second: Mapping[str, Any]
     )
 
 
+def _is_unhydrated_directory_overlay(address: Mapping[str, Any]) -> bool:
+    """Identify an address-only FHIR overlay before base-row hydration."""
+    raw_sources = address.get("address_sources") or []
+    address_sources = (
+        raw_sources
+        if isinstance(raw_sources, (list, tuple, set))
+        else [raw_sources]
+    )
+    normalized_sources = {
+        str(source_id or "").strip().lower()
+        for source_id in address_sources
+        if str(source_id or "").strip()
+    }
+    return (
+        normalized_sources == {"provider_directory_fhir"}
+        and not _base_address_row_identity(address)
+    )
+
+
 def _merge_address_key_group(
     address_group: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1224,6 +1280,12 @@ def _merge_address_key_group(
             for site_address in merged_site_addresses
             if _has_shared_display_site(site_address, unsited_address)
         ]
+        if (
+            not matching_site_addresses
+            and len(merged_site_addresses) == 1
+            and _is_unhydrated_directory_overlay(unsited_address)
+        ):
+            matching_site_addresses = merged_site_addresses
         if len(matching_site_addresses) == 1:
             _merge_duplicate_address(matching_site_addresses[0], unsited_address)
         else:
@@ -11436,41 +11498,21 @@ async def get_npi(request, npi):
     initial_base_addresses = list(
         provider_detail_by_field.get("address_list") or []
     )
-    has_hydrated_base_candidates = False
-    if address_limit is None:
-        # The detail builder is anchored on mrf.npi and can only aggregate rows
-        # whose direct npi column matches. An explicit exhaustive request must
-        # also include unified rows resolved through inferred_npi, so hydrate
-        # the complete address relation independently of provider identity.
-        base_addresses = await _fetch_npi_address_rows(
+    base_candidates = list(
+        await _fetch_npi_location_candidates(
             npi,
-            include_sources=include_sources,
-            include_evidence=include_evidence,
             address_key=address_key,
             session=request_session,
         )
-        await _apply_location_statuses(
-            base_addresses,
-            session=request_session,
-        )
-        addresses = base_addresses + overlay_addresses
-    else:
-        if initial_base_addresses:
-            # A detail builder may retain hydrated address rows even when its
-            # requested page size is zero. Reuse them instead of querying twice.
-            base_candidates = initial_base_addresses
-            has_hydrated_base_candidates = True
-        else:
-            base_candidates = await _fetch_npi_location_candidates(
-                npi,
-                address_key=address_key,
-                session=request_session,
-            )
-        await _apply_location_statuses(
-            base_candidates,
-            session=request_session,
-        )
-        addresses = base_candidates + overlay_addresses
+    )
+    # A compatibility builder may retain direct rows despite its empty address
+    # window. Keep that evidence without replacing the complete candidate set.
+    base_candidates.extend(initial_base_addresses)
+    await _apply_location_statuses(
+        base_candidates,
+        session=request_session,
+    )
+    addresses = base_candidates + overlay_addresses
     if address_key is not None:
         addresses = [
             address
@@ -11484,19 +11526,20 @@ async def get_npi(request, npi):
     if not has_provider_detail and not profile_record and not addresses:
         raise sanic.exceptions.NotFound
     address_total = len(addresses)
+    selected_candidates = addresses
     if address_limit is not None:
-        selected_candidates = addresses[
+        selected_candidates = selected_candidates[
             address_offset : address_offset + address_limit
         ]
-        addresses = await _hydrate_selected_provider_locations(
-            npi,
-            selected_candidates,
-            already_hydrated=has_hydrated_base_candidates,
-            include_sources=include_sources,
-            include_evidence=include_evidence,
-            address_key=address_key,
-            session=request_session,
-        )
+    addresses = await _hydrate_selected_provider_locations(
+        npi,
+        selected_candidates,
+        already_hydrated=False,
+        include_sources=include_sources,
+        include_evidence=include_evidence,
+        address_key=address_key,
+        session=request_session,
+    )
     if addresses:
         if include_sources or include_evidence:
             await _attach_provider_directory_source_details(
@@ -11865,8 +11908,17 @@ def _merge_hydrated_location_candidates(
             hydrated_location = hydrated_by_identity.get(identity_value)
             if hydrated_location is not None:
                 _merge_duplicate_address(merged_location_map, hydrated_location)
+        primary_identity = _base_address_row_identity(selected_location)
+        if not primary_identity and len(identity_list) == 1:
+            primary_identity = identity_list[0]
+        primary_hydrated_location = hydrated_by_identity.get(primary_identity)
+        if primary_hydrated_location is not None:
+            _fill_hydrated_identity_scalars(
+                merged_location_map,
+                primary_hydrated_location,
+            )
         merged_locations.append(merged_location_map)
-    return _rank_provider_locations(merged_locations)
+    return merged_locations
 
 
 async def _hydrate_selected_provider_locations(

@@ -439,10 +439,10 @@ def _patch_detail_endpoint(monkeypatch, fixture, role_evidence_mock):
 
     replacement_map = {
         "_build_npi_details": fake_build,
+        "_fetch_npi_location_candidates": AsyncMock(return_value=[]),
+        "_fetch_npi_address_rows": AsyncMock(return_value=[]),
         "_fetch_provider_directory_address_overlay": AsyncMock(return_value=[]),
-        "_fetch_provider_directory_source_detail_map": AsyncMock(
-            return_value=fixture["source_detail_map"]
-        ),
+        "_fetch_provider_directory_source_detail_map": AsyncMock(return_value=fixture["source_detail_map"]),
         "_fetch_provider_directory_role_evidence_map": role_evidence_mock,
         "_fetch_other_names": AsyncMock(return_value=[]),
         "_fetch_provider_enrichment_detail": AsyncMock(return_value=None),

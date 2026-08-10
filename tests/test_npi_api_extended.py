@@ -13,6 +13,21 @@ from db.models import NPIAddress, NPIData, NPIDataOtherIdentifier, NPIDataTaxono
 from db.models import AddressArchive
 
 
+@pytest.fixture(autouse=True)
+def _stub_detail_location_materialization(monkeypatch):
+    """Keep endpoint fixtures focused on their explicitly supplied addresses."""
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_address_rows",
+        AsyncMock(return_value=[]),
+    )
+
+
 class FakeConnection:
     def __init__(self, responses):
         self._responses = list(responses)
