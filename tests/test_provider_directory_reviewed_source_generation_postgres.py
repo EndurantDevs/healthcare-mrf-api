@@ -70,11 +70,13 @@ async def _reviewed_source_database(monkeypatch):
     schema = f"provider_reviewed_source_{uuid.uuid4().hex[:12]}"
     database = Database()
     observer = Database()
+    is_disposable_database_ready = False
     endpoint_table = importer.ProviderDirectoryAPIEndpoint.__table__
     source_table = importer.ProviderDirectorySource.__table__
     try:
         await database.connect()
         await _require_disposable_postgres(database)
+        is_disposable_database_ready = True
         await observer.connect()
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
         monkeypatch.setattr(endpoint_table, "schema", schema)
@@ -84,7 +86,7 @@ async def _reviewed_source_database(monkeypatch):
         await database.create_table(source_table)
         yield database, observer, schema
     finally:
-        if database.engine is not None:
+        if is_disposable_database_ready:
             await database.status(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
         await observer.disconnect()
         await database.disconnect()
