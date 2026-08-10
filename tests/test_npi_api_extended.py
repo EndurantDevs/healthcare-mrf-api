@@ -175,11 +175,13 @@ def _install_profile_transition_cache_dependencies(
         profile_fetch,
     )
     monkeypatch.setattr(npi_module, "_build_npi_details", build_details)
-    monkeypatch.setattr(
-        npi_module,
+    for function_name in (
+        "_fetch_npi_location_candidates",
+        "_fetch_npi_address_rows",
+        "_fetch_provider_directory_address_overlay",
         "_fetch_other_names",
-        AsyncMock(return_value=[]),
-    )
+    ):
+        monkeypatch.setattr(npi_module, function_name, AsyncMock(return_value=[]))
     monkeypatch.setattr(
         npi_module,
         "_provider_directory_address_overlay_serving_identity",
@@ -390,11 +392,7 @@ def _build_result_row(npi_value: int) -> list:
             result_values.append(1)
         else:
             result_values.append(f"addr_{column.key}")
-    for column in NPIDataTaxonomy.__table__.columns:
-        if column.key in {"npi", "checksum"}:
-            result_values.append(None)
-        else:
-            result_values.append(f"tax_{column.key}")
+    result_values.append(1)
     return result_values
 
 
@@ -466,8 +464,19 @@ async def test_get_all_returns_rows(monkeypatch):
     _set_result_address_column(result_row, "country_code", "US")
     class QueryAwareConnection:
         async def all(self, statement, **_params):
-            if "COUNT(DISTINCT" in str(statement):
+            sql_text = str(statement)
+            if "COUNT(DISTINCT" in sql_text:
                 return [(2,)]
+            if "FROM mrf.npi_taxonomy AS taxonomy" in sql_text:
+                return [
+                    types.SimpleNamespace(
+                        _mapping={
+                            "npi": 1234567890,
+                            "checksum": 1,
+                            "healthcare_provider_taxonomy_code": "207Q00000X",
+                        }
+                    )
+                ]
             return [result_row]
 
     class FakeDB:
@@ -1855,6 +1864,16 @@ async def test_get_npi_force_address_update_bypasses_response_cache(monkeypatch)
 @pytest.mark.asyncio
 async def test_get_npi_not_found(monkeypatch):
     monkeypatch.setattr(npi_module, "_build_npi_details", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_directory_address_overlay",
+        AsyncMock(return_value=[]),
+    )
     request = types.SimpleNamespace(args={})
     with pytest.raises(sanic.exceptions.NotFound):
         await npi_module.get_npi(request, "123")
@@ -1961,7 +1980,9 @@ async def test_get_all_format_all_returns_classification_map(monkeypatch):
 async def test_get_all_deduplicates_rows(monkeypatch):
     connections = [
         FakeConnection([[(1,)]]),
-        FakeConnection([[ _build_result_row(999), _build_result_row(999) ]]),
+        FakeConnection(
+            [[_build_result_row(999), _build_result_row(999)], []]
+        ),
     ]
 
     class FakeDB:
@@ -2099,6 +2120,16 @@ async def test_get_npi_not_found(monkeypatch):
         return {}
 
     monkeypatch.setattr(npi_module, '_build_npi_details', AsyncMock(side_effect=fake_build))
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_directory_address_overlay",
+        AsyncMock(return_value=[]),
+    )
 
     request = types.SimpleNamespace(args={}, app=types.SimpleNamespace())
     with pytest.raises(sanic.exceptions.NotFound):

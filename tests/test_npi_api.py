@@ -76,6 +76,11 @@ async def test_get_npi_includes_other_names(monkeypatch):
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
     monkeypatch.setattr(
         npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
         "_fetch_other_names",
         AsyncMock(
             return_value=[
@@ -132,6 +137,11 @@ async def test_get_npi_uses_other_names_for_dba(monkeypatch):
     ]
 
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=other_names))
 
     request = types.SimpleNamespace(args={})

@@ -24,7 +24,7 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Sequen
 import sanic.exceptions
 from sanic import Blueprint, response
 from sqlalchemy import JSON as SQLAlchemyJSON
-from sqlalchemy import func, or_, select
+from sqlalchemy import false, func, or_, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql import literal_column, text, tuple_
 
@@ -63,6 +63,12 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        ProviderDirectoryPractitionerRole,
                        ProviderDirectorySource, db)
 from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
+from process.ext.address_canon import (
+    city_norm as canonical_city_norm,
+    state_code as canonical_state_code,
+    street_norm as canonical_street_norm,
+    zip5_norm as canonical_zip5_norm,
+)
 from process.ext.utils import download_it
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 from process import provider_directory_profile as profile_artifact
@@ -468,6 +474,7 @@ def _provider_taxonomy_lateral_join(
     address_alias: str = "c",
     taxonomy_alias: str = "q",
     code_placeholders: Sequence[str] = (),
+    provider_npi_sql: str | None = None,
 ) -> str:
     """Return an NPI-first taxonomy probe for selective provider searches."""
 
@@ -478,11 +485,12 @@ def _provider_taxonomy_lateral_join(
         else "provider_taxonomy.healthcare_provider_taxonomy_code "
         f"= ANY({taxonomy_alias}.codes)"
     )
+    provider_npi = provider_npi_sql or f"{address_alias}.npi"
     return f"""
     JOIN LATERAL (
         SELECT 1
           FROM mrf.npi_taxonomy AS provider_taxonomy
-         WHERE provider_taxonomy.npi = {address_alias}.npi
+         WHERE provider_taxonomy.npi = {provider_npi}
            AND {taxonomy_code_predicate}
          LIMIT 1
     ) AS provider_taxonomy_match ON TRUE
@@ -903,6 +911,7 @@ PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL = """
 # callers walk every address via address_offset, or opt out with address_limit=all.
 NPI_DETAIL_ADDRESS_DEFAULT_LIMIT = 200
 NPI_DETAIL_ADDRESS_MAX_LIMIT = 1000
+NPI_SEARCH_ADDRESS_DEFAULT_LIMIT = 3
 
 
 def _npi_detail_cache_key(
@@ -1021,11 +1030,12 @@ def _merge_unique_list_values(first: Any, second: Any) -> list[Any]:
     return merged_values
 
 
-def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any]) -> None:
+def _merge_address_lists(base: dict[str, Any], duplicate: Mapping[str, Any]) -> None:
     for key in (
         "address_sources",
         "source_record_ids",
         PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY,
+        "_base_row_identities",
         "aca_plan_array",
         "aca_network_array",
         "ptg_plan_array",
@@ -1040,6 +1050,8 @@ def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any])
         if merged:
             base[key] = merged
 
+
+def _fill_address_scalars(base: dict[str, Any], duplicate: Mapping[str, Any]) -> None:
     for key in (
         "telephone_number",
         "phone_number",
@@ -1057,11 +1069,28 @@ def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any])
         if base.get(key) in (None, "") and duplicate.get(key) not in (None, ""):
             base[key] = duplicate.get(key)
 
+
+def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any]) -> None:
+    """Merge corroborating rows without crossing canonical location identities."""
+    _merge_address_lists(base, duplicate)
+    _fill_address_scalars(base, duplicate)
     if (
         duplicate.get("address_status")
         == UHC_PROVIDER_FILE_ADDRESS_STATUS
     ):
         base["address_status"] = UHC_PROVIDER_FILE_ADDRESS_STATUS
+
+    merged_statuses = {
+        str(status).strip().lower()
+        for status in (base.get("location_status"), duplicate.get("location_status"))
+        if status not in (None, "")
+    }
+    if "active" in merged_statuses:
+        base["location_status"] = "active"
+    elif "unknown" in merged_statuses:
+        base["location_status"] = "unknown"
+    elif "inactive" in merged_statuses:
+        base["location_status"] = "inactive"
 
     merged_sources = base.get("address_sources") or []
     if isinstance(merged_sources, list):
@@ -1075,7 +1104,12 @@ def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any])
             int(duplicate.get("independent_source_count") or 0),
             len(merged_sources),
         )
-        base["multi_source_confirmed"] = len(merged_sources) > 1
+        base["multi_source_confirmed"] = bool(
+            base.get("multi_source_confirmed")
+            or duplicate.get("multi_source_confirmed")
+            or base["independent_source_count"] > 1
+            or len(merged_sources) > 1
+        )
 
 
 def _has_contact_value(value: Any) -> bool:
@@ -1108,38 +1142,206 @@ def _add_canonical_contact_fields_to_address(address: dict[str, Any]) -> dict[st
     return address
 
 
-def _address_dedupe_key(address: Mapping[str, Any]) -> str:
-    raw_address_key = address.get("address_key")
-    address_key = str(raw_address_key).strip().lower() if raw_address_key not in (None, "") else ""
-    if not address_key:
+def _normalized_address_identity(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _address_key_and_site_key(address: Mapping[str, Any]) -> tuple[str, str]:
+    address_key = _normalized_address_identity(address.get("address_key"))
+    site_key = _normalized_address_identity(
+        address.get(PUBLIC_ADDRESS_SITE_KEY) or address.get("premise_key")
+    )
+    if site_key == address_key:
+        site_key = ""
+    return address_key, site_key
+
+
+def _base_address_row_identity(address: Mapping[str, Any]) -> str:
+    location_key = _normalized_address_identity(address.get("location_key"))
+    if location_key:
+        return f"location:{location_key}"
+    checksum = address.get("checksum")
+    if checksum in (None, ""):
         return ""
-    raw_site_key = address.get(PUBLIC_ADDRESS_SITE_KEY) or address.get("premise_key")
-    site_key = str(raw_site_key).strip().lower() if raw_site_key not in (None, "") else ""
-    if site_key and site_key != address_key:
-        return f"{address_key}:{site_key}"
-    return address_key
+    npi = address.get("npi")
+    address_type = str(address.get("type") or "").strip().lower()
+    return f"legacy:{npi}:{address_type}:{checksum}"
+
+
+def _merge_address_bucket(addresses: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    base = addresses[0]
+    for duplicate in addresses[1:]:
+        _merge_duplicate_address(base, duplicate)
+    return base
+
+
+def _address_display_site_signature(address: Mapping[str, Any]) -> tuple[str, ...]:
+    return (
+        canonical_street_norm(
+            str(address.get("first_line") or ""),
+            str(address.get("second_line") or ""),
+        )
+        or "",
+        canonical_city_norm(str(address.get("city_name") or "")) or "",
+        canonical_state_code(
+            str(address.get("state_code") or address.get("state_name") or "")
+        )
+        or "",
+        canonical_zip5_norm(str(address.get("postal_code") or "")) or "",
+    )
+
+
+def _has_shared_display_site(first: Mapping[str, Any], second: Mapping[str, Any]) -> bool:
+    first_signature = _address_display_site_signature(first)
+    second_signature = _address_display_site_signature(second)
+    if not first_signature[0] or not second_signature[0]:
+        return False
+    return all(
+        not first_value or not second_value or first_value == second_value
+        for first_value, second_value in zip(first_signature, second_signature)
+    )
+
+
+def _merge_address_key_group(
+    address_group: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    site_buckets_by_key: dict[str, list[dict[str, Any]]] = {}
+    unsited_addresses: list[dict[str, Any]] = []
+    for address in address_group:
+        _group_address_key, site_key = _address_key_and_site_key(address)
+        if site_key:
+            site_buckets_by_key.setdefault(site_key, []).append(address)
+        else:
+            unsited_addresses.append(address)
+    merged_site_addresses = [
+        _merge_address_bucket(site_bucket)
+        for site_bucket in site_buckets_by_key.values()
+    ]
+    unresolved_unsited_addresses: list[dict[str, Any]] = []
+    for unsited_address in unsited_addresses:
+        matching_site_addresses = [
+            site_address
+            for site_address in merged_site_addresses
+            if _has_shared_display_site(site_address, unsited_address)
+        ]
+        if len(matching_site_addresses) == 1:
+            _merge_duplicate_address(matching_site_addresses[0], unsited_address)
+        else:
+            unresolved_unsited_addresses.append(unsited_address)
+    group_addresses = list(merged_site_addresses)
+    if unresolved_unsited_addresses:
+        group_addresses.append(_merge_address_bucket(unresolved_unsited_addresses))
+    return sorted(group_addresses, key=_provider_location_sort_key)
 
 
 def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
-    addresses_by_key: dict[str, dict[str, Any]] = {}
+    """Merge equivalent address rows while preserving distinct premises."""
+    addresses_by_key: dict[str, list[dict[str, Any]]] = {}
     unkeyed_addresses: list[dict[str, Any]] = []
     for address in sorted(
         (entry for entry in addresses if isinstance(entry, dict)),
-        key=lambda entry: (_address_type_rank(entry), str(entry.get("first_line") or "")),
+        key=_provider_location_sort_key,
     ):
-        key = _address_dedupe_key(address)
-        if not key:
+        address_key, _site_key = _address_key_and_site_key(address)
+        base_row_identities = address.get("_base_row_identities") or []
+        if not address_key and base_row_identities:
+            address_key = f"base:{base_row_identities[0]}"
+        if not address_key:
             unkeyed_addresses.append(address)
             continue
-        existing = addresses_by_key.get(key)
-        if existing is None:
-            addresses_by_key[key] = address
-            continue
-        _merge_duplicate_address(existing, address)
+        addresses_by_key.setdefault(address_key, []).append(address)
+    deduped_addresses = [
+        merged_address
+        for address_group in addresses_by_key.values()
+        for merged_address in _merge_address_key_group(address_group)
+    ]
+
     return [
         _add_canonical_contact_fields_to_address(address)
-        for address in (list(addresses_by_key.values()) + unkeyed_addresses)
+        for address in (deduped_addresses + unkeyed_addresses)
     ]
+
+
+def _address_number(address: Mapping[str, Any], key: str) -> float | None:
+    try:
+        value = float(address.get(key))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _parse_address_datetime(raw_value: Any) -> datetime | None:
+    if isinstance(raw_value, datetime):
+        return raw_value
+    if isinstance(raw_value, date):
+        return datetime.combine(raw_value, datetime.min.time(), tzinfo=UTC)
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(raw_value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _address_freshness_timestamp(address: Mapping[str, Any]) -> float:
+    for key in ("updated_at", "last_seen_at", "date_added"):
+        parsed_value = _parse_address_datetime(address.get(key))
+        if parsed_value is None:
+            continue
+        if parsed_value.tzinfo is None:
+            parsed_value = parsed_value.replace(tzinfo=UTC)
+        return parsed_value.timestamp()
+    return 0.0
+
+
+def _provider_location_sort_key(address: Mapping[str, Any]) -> tuple[Any, ...]:
+    distance = _address_number(address, "distance_miles")
+    status_rank = {"active": 0, "unknown": 1, "inactive": 2}.get(
+        str(address.get("location_status") or "unknown").strip().lower(),
+        1,
+    )
+    independent_source_count = int(address.get("independent_source_count") or 0)
+    is_multi_source = bool(
+        address.get("multi_source_confirmed") or independent_source_count > 1
+    )
+    has_complete_street = bool(
+        address.get("first_line")
+        and address.get("city_name")
+        and (address.get("state_code") or address.get("state_name"))
+    )
+    has_coordinates = _address_number(address, "lat") is not None and _address_number(address, "long") is not None
+    has_contact = _has_contact_value(address.get("telephone_number") or address.get("phone_number"))
+    address_key, site_key = _address_key_and_site_key(address)
+    return (
+        distance is None,
+        distance if distance is not None else 0.0,
+        status_rank,
+        not is_multi_source,
+        not has_complete_street,
+        not has_coordinates,
+        not has_contact,
+        _address_type_rank(address),
+        -independent_source_count,
+        -_address_freshness_timestamp(address),
+        address_key,
+        site_key,
+        str(address.get("first_line") or ""),
+        str(address.get("city_name") or ""),
+        str(address.get("state_code") or address.get("state_name") or ""),
+        str(address.get("postal_code") or ""),
+        tuple(
+            sorted(
+                str(identity_value)
+                for identity_value in (
+                    address.get("_base_row_identities") or []
+                )
+            )
+        ),
+    )
+
+
+def _rank_provider_locations(addresses: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(addresses, key=_provider_location_sort_key)
 
 
 def _directory_source_ids(record_ids: Any) -> list[str]:
@@ -4262,8 +4464,15 @@ async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -
     if has_cached_insurance_count is not None:
         return has_cached_insurance_count
     table = address_model.__table__
+    provider_npi = table.c.npi
+    if address_model is EntityAddressUnified:
+        provider_npi = func.coalesce(table.c.npi, table.c.inferred_npi)
+        is_serving_type = table.c.type.in_(GEO_SERVICE_LOCATION_TYPES)
+    else:
+        is_serving_type = table.c.type == "primary"
     conditions = [
-        table.c.type == "primary",
+        is_serving_type,
+        provider_npi.is_not(None),
         literal_column("NOT (plans_network_array @@ '0'::query_int)"),
     ]
     if city:
@@ -4276,7 +4485,7 @@ async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -
     if city is None and state is None and address_model is NPIAddress:
         stmt = select(func.count()).select_from(table).where(*conditions)
     else:
-        stmt = select(func.count(func.distinct(table.c.npi))).where(*conditions)
+        stmt = select(func.count(func.distinct(provider_npi))).where(*conditions)
     async with db.session() as session:
         count_result = await session.execute(stmt)
         count = int(count_result.scalar() or 0)
@@ -4302,7 +4511,11 @@ async def _fast_primary_npi_count() -> int:
         return cached
     table = address_model.__table__
     if address_model is EntityAddressUnified:
-        stmt = select(func.count(func.distinct(table.c.npi))).where(table.c.type == "primary")
+        provider_npi = func.coalesce(table.c.npi, table.c.inferred_npi)
+        stmt = select(func.count(func.distinct(provider_npi))).where(
+            table.c.type.in_(GEO_SERVICE_LOCATION_TYPES),
+            provider_npi.is_not(None),
+        )
     else:
         stmt = select(func.count()).select_from(table).where(table.c.type == "primary")
     scalar_fn = getattr(db, "scalar", None)
@@ -7984,11 +8197,34 @@ async def list_providers(request):
         ]
     )
 
+    def _append_available_filter(
+        address_clauses: list[str],
+        array_clause: str,
+        exists_clause: str,
+        *,
+        is_array_available: bool,
+        is_table_available: bool,
+    ) -> None:
+        if is_array_available and is_table_available:
+            address_clauses.append(f"({array_clause} OR {exists_clause})")
+        elif is_array_available:
+            address_clauses.append(array_clause)
+        elif is_table_available:
+            address_clauses.append(exists_clause)
+        else:
+            address_clauses.append("1=0")
+
     def _append_array_filters(
         address_clauses: list[str],
         filters_by_name: dict[str, Any],
     ) -> dict[str, int]:
+        """Append supported procedure and medication predicates and parameters."""
         parameters_by_name: dict[str, int] = {}
+        provider_npi_sql = (
+            "COALESCE(c.npi, c.inferred_npi)"
+            if _is_unified_address_table(address_table_sql)
+            else "c.npi"
+        )
         filter_year = filters_by_name.get("filter_year")
         procedure_internal_codes = filters_by_name.get("procedure_internal_codes") or []
         medication_internal_codes = filters_by_name.get("medication_internal_codes") or []
@@ -7996,10 +8232,8 @@ async def list_providers(request):
         medications_array_available = bool(filters_by_name.get("npi_medications_array_available", True))
         procedure_table_available = bool(filters_by_name.get("pricing_provider_procedure_available", False))
         medication_table_available = bool(filters_by_name.get("pricing_provider_prescription_available", False))
-
         if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
             parameters_by_name["filter_year"] = int(filter_year)
-
         for idx, code in enumerate(procedure_internal_codes):
             parameter_name = f"procedure_code_{idx}"
             parameters_by_name[parameter_name] = int(code)
@@ -8007,19 +8241,17 @@ async def list_providers(request):
             exists_clause = (
                 "EXISTS ("
                 "SELECT 1 FROM mrf.pricing_provider_procedure AS pp "
-                f"WHERE pp.npi = c.npi AND pp.procedure_code = :{parameter_name}"
+                f"WHERE pp.npi = {provider_npi_sql} AND pp.procedure_code = :{parameter_name}"
                 + (" AND pp.year = :filter_year" if filter_year is not None else "")
                 + ")"
             )
-            if procedures_array_available and procedure_table_available:
-                address_clauses.append(f"({array_clause} OR {exists_clause})")
-            elif procedures_array_available:
-                address_clauses.append(array_clause)
-            elif procedure_table_available:
-                address_clauses.append(exists_clause)
-            else:
-                address_clauses.append("1=0")
-
+            _append_available_filter(
+                address_clauses,
+                array_clause,
+                exists_clause,
+                is_array_available=procedures_array_available,
+                is_table_available=procedure_table_available,
+            )
         for idx, code in enumerate(medication_internal_codes):
             parameter_name = f"medication_code_{idx}"
             parameters_by_name[parameter_name] = int(code)
@@ -8027,21 +8259,19 @@ async def list_providers(request):
             exists_clause = (
                 "EXISTS ("
                 "SELECT 1 FROM mrf.pricing_provider_prescription AS pr "
-                "WHERE pr.npi = c.npi "
+                f"WHERE pr.npi = {provider_npi_sql} "
                 "AND pr.rx_code_system = 'HP_RX_CODE' "
                 + ("AND pr.year = :filter_year " if filter_year is not None else "")
                 + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{parameter_name} "
                 ")"
             )
-            if medications_array_available and medication_table_available:
-                address_clauses.append(f"({array_clause} OR {exists_clause})")
-            elif medications_array_available:
-                address_clauses.append(array_clause)
-            elif medication_table_available:
-                address_clauses.append(exists_clause)
-            else:
-                address_clauses.append("1=0")
-
+            _append_available_filter(
+                address_clauses,
+                array_clause,
+                exists_clause,
+                is_array_available=medications_array_available,
+                is_table_available=medication_table_available,
+            )
         return parameters_by_name
 
     address_required_columns = _public_address_serving_column_keys()
@@ -8072,6 +8302,10 @@ async def list_providers(request):
         address_key = filters_by_name.get("address_key")
         address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
         exact_npi = filters_by_name.get("npi")
+        is_unified_search = _is_unified_address_table(address_table_sql)
+        provider_npi_sql = (
+            "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
+        )
 
         taxonomy_filters = []
         if classification:
@@ -8093,7 +8327,6 @@ async def list_providers(request):
             organization_name,
             entity_type_code,
         )
-
         use_taxonomy_filter = bool(taxonomy_filters)
         use_location_first_taxonomy = _is_location_first_taxonomy_filter(
             use_taxonomy_filter,
@@ -8108,7 +8341,9 @@ async def list_providers(request):
                 exact_npi,
             ),
         )
-        include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
+        # Unified rows represent independently usable service locations. Search
+        # providers across that complete set, then rank at most three per NPI.
+        include_service_locations = _is_unified_address_table(address_table_sql)
         address_clauses = [
             _provider_list_address_type_clause(
                 "c",
@@ -8133,7 +8368,7 @@ async def list_providers(request):
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
             if phone_candidates_cte:
-                phone_candidates_join = _address_phone_candidates_join("c", "c.npi")
+                phone_candidates_join = _address_phone_candidates_join("c")
             else:
                 address_clauses.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
@@ -8146,7 +8381,7 @@ async def list_providers(request):
             address_clauses.append(
                 "EXISTS ("
                 "SELECT 1 FROM mrf.npi AS sex_provider "
-                "WHERE sex_provider.npi = c.npi "
+                f"WHERE sex_provider.npi = {provider_npi_sql} "
                 "AND sex_provider.provider_sex_code = :provider_sex_code"
                 ")"
             )
@@ -8166,9 +8401,12 @@ async def list_providers(request):
                 )
                 taxonomy_join = _provider_taxonomy_lateral_join(
                     code_placeholders=taxonomy_code_placeholders,
+                    provider_npi_sql=provider_npi_sql,
                 )
             else:
-                taxonomy_join += _provider_taxonomy_lateral_join()
+                taxonomy_join += _provider_taxonomy_lateral_join(
+                    provider_npi_sql=provider_npi_sql,
+                )
 
         if npi_where and use_taxonomy_filter:
             query = text(
@@ -8178,9 +8416,10 @@ async def list_providers(request):
                       FROM mrf.npi AS b
                      WHERE {npi_where}
                 )
-                SELECT COUNT(DISTINCT c.npi)
+                SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM filtered_npi AS fn
-                  JOIN {address_table_sql} AS c ON c.npi = fn.npi
+                  JOIN {address_table_sql} AS c
+                    ON {provider_npi_sql} = fn.npi
                   {phone_candidates_join}
                   {taxonomy_join}
                  WHERE {' AND '.join(address_clauses)}
@@ -8194,9 +8433,10 @@ async def list_providers(request):
                       FROM mrf.npi AS b
                      WHERE {npi_where}
                 )
-                SELECT COUNT(DISTINCT c.npi)
+                SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM filtered_npi AS fn
-                  JOIN {address_table_sql} AS c ON c.npi = fn.npi
+                  JOIN {address_table_sql} AS c
+                    ON {provider_npi_sql} = fn.npi
                   {phone_candidates_join}
                  WHERE {' AND '.join(address_clauses)}
                 """
@@ -8205,7 +8445,7 @@ async def list_providers(request):
             query = text(
                 f"""
                 {_sql_with_ctes(phone_candidates_cte)}
-                SELECT COUNT(DISTINCT c.npi)
+                SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                   {taxonomy_join}
@@ -8216,7 +8456,7 @@ async def list_providers(request):
             query = text(
                 f"""
                 {_sql_with_ctes(phone_candidates_cte)}
-                SELECT COUNT(DISTINCT c.npi)
+                SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                  WHERE {' AND '.join(address_clauses)}
@@ -8300,6 +8540,12 @@ async def list_providers(request):
         address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
         exact_npi = filters_by_name.get("npi")
 
+        provider_npi_sql = (
+            "COALESCE(c.npi, c.inferred_npi)"
+            if _is_unified_address_table(address_table_sql)
+            else "c.npi"
+        )
+
         taxonomy_filters = []
         if classification:
             taxonomy_filters.append("classification = :classification")
@@ -8321,7 +8567,7 @@ async def list_providers(request):
             entity_type_code,
         )
 
-        include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
+        include_service_locations = _is_unified_address_table(address_table_sql)
         address_clauses = [
             _provider_list_address_type_clause(
                 "c",
@@ -8344,7 +8590,7 @@ async def list_providers(request):
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
             if phone_candidates_cte:
-                phone_candidates_join = _address_phone_candidates_join("c", "c.npi")
+                phone_candidates_join = _address_phone_candidates_join("c")
             else:
                 address_clauses.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
@@ -8357,14 +8603,15 @@ async def list_providers(request):
             address_clauses.append(
                 "EXISTS ("
                 "SELECT 1 FROM mrf.npi AS sex_provider "
-                "WHERE sex_provider.npi = c.npi "
+                f"WHERE sex_provider.npi = {provider_npi_sql} "
                 "AND sex_provider.provider_sex_code = :provider_sex_code"
                 ")"
             )
         dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
         if npi_where:
             address_clauses.append(
-                f"EXISTS (SELECT 1 FROM mrf.npi AS b WHERE b.npi = c.npi AND {npi_where})"
+                "EXISTS (SELECT 1 FROM mrf.npi AS b "
+                f"WHERE b.npi = {provider_npi_sql} AND {npi_where})"
             )
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
@@ -8372,7 +8619,7 @@ async def list_providers(request):
         query = text(
             f"""
             {_sql_with_prefix_ctes(phone_candidates_cte)}filtered_taxonomy AS (
-                SELECT DISTINCT c.npi, code.int_code
+                SELECT DISTINCT {provider_npi_sql} AS npi, code.int_code
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                   CROSS JOIN LATERAL unnest(COALESCE(c.taxonomy_array, ARRAY[]::INTEGER[])) AS code(int_code)
@@ -8545,8 +8792,12 @@ async def list_providers(request):
         address_key = filters_by_name.get("address_key")
         address_site_key = filters_by_name.get(PUBLIC_ADDRESS_SITE_KEY)
         exact_npi = filters_by_name.get("npi")
+        is_unified_search = _is_unified_address_table(address_table_sql)
+        provider_npi_sql = (
+            "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
+        )
         taxonomy_clauses = []
-        include_service_locations = bool(address_key or address_site_key or phone_digits or exact_npi)
+        include_service_locations = _is_unified_address_table(address_table_sql)
         address_clauses = [
             _provider_list_address_type_clause(
                 "c",
@@ -8594,7 +8845,7 @@ async def list_providers(request):
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
             if phone_candidates_cte:
-                phone_candidates_join = _address_phone_candidates_join("c", "c.npi")
+                phone_candidates_join = _address_phone_candidates_join("c")
             else:
                 address_clauses.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
@@ -8607,7 +8858,7 @@ async def list_providers(request):
             address_clauses.append(
                 "EXISTS ("
                 "SELECT 1 FROM mrf.npi AS sex_provider "
-                "WHERE sex_provider.npi = c.npi "
+                f"WHERE sex_provider.npi = {provider_npi_sql} "
                 "AND sex_provider.provider_sex_code = :provider_sex_code"
                 ")"
             )
@@ -8619,6 +8870,40 @@ async def list_providers(request):
             last_name,
             organization_name,
             entity_type_code,
+        )
+        lightweight_candidate_columns = tuple(
+            dict.fromkeys(
+                NPI_LOCATION_CANDIDATE_COLUMNS
+                + (
+                    "entity_name",
+                    "source_record_ids",
+                    "address_sources",
+                )
+            )
+        )
+        candidate_projection = (
+            ", ".join(
+                f"c.{column_name}"
+                for column_name in lightweight_candidate_columns
+                if column_name != "npi"
+            )
+            if is_unified_search
+            else "c.*"
+        )
+        projected_candidate_names = (
+            tuple(
+                column_name
+                for column_name in lightweight_candidate_columns
+                if column_name != "npi"
+            )
+            if is_unified_search
+            else tuple(column.key for column in NPIAddress.__table__.columns)
+        )
+        search_row_column_names = (
+            ("npi_code",)
+            + tuple(column.key for column in NPIData.__table__.columns)
+            + projected_candidate_names
+            + ("provider_address_total",)
         )
 
         taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
@@ -8650,21 +8935,24 @@ async def list_providers(request):
                 )
                 taxonomy_source = _provider_taxonomy_lateral_join(
                     code_placeholders=taxonomy_code_placeholders,
+                    provider_npi_sql=provider_npi_sql,
                 )
             else:
-                taxonomy_source += _provider_taxonomy_lateral_join()
+                taxonomy_source += _provider_taxonomy_lateral_join(
+                    provider_npi_sql=provider_npi_sql,
+                )
 
         if npi_where and use_taxonomy_filter:
             address_source = (
                 "filtered_npi as fn\n"
-                f"    JOIN {address_table_sql} as c ON c.npi = fn.npi\n"
+                f"    JOIN {address_table_sql} as c ON {provider_npi_sql} = fn.npi\n"
                 f"    {phone_candidates_join}\n"
                 f"    {taxonomy_source}"
             )
         elif npi_where:
             address_source = (
                 "filtered_npi as fn\n"
-                f"    JOIN {address_table_sql} as c ON c.npi = fn.npi\n"
+                f"    JOIN {address_table_sql} as c ON {provider_npi_sql} = fn.npi\n"
                 f"    {phone_candidates_join}"
             )
         elif use_taxonomy_filter:
@@ -8679,30 +8967,63 @@ async def list_providers(request):
         provider_page_query = text(
             f"""
         {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte)}page_npis AS (
-            SELECT DISTINCT c.npi
+            SELECT DISTINCT {provider_npi_sql} AS npi
               FROM {address_source}
              WHERE {' and '.join(address_clauses)}
-             ORDER BY c.npi
+             ORDER BY npi
              LIMIT :limit OFFSET :start
         ),
         sub_s AS (
-            SELECT b.npi AS npi_code, b.*, g.*
+            SELECT pn.npi AS npi_code, b.*, g.*
               FROM page_npis AS pn
-              JOIN mrf.npi AS b ON b.npi = pn.npi
+         LEFT JOIN mrf.npi AS b ON b.npi = pn.npi
               JOIN LATERAL (
-                  SELECT c.*
+                  SELECT {candidate_projection},
+                         COUNT(*) OVER () AS provider_address_total
                     FROM {address_source}
                    WHERE {' and '.join(address_clauses)}
-                     AND c.npi = pn.npi
+                     AND {provider_npi_sql} = pn.npi
                    ORDER BY {address_order}
-                   LIMIT 1
               ) AS g ON TRUE
-    )
+        )
 
-    select sub_s.*, t.* from sub_s, mrf.npi_taxonomy as t
-            where sub_s.npi_code = t.npi;
+    SELECT sub_s.* FROM sub_s;
     """
         )
+
+        def _search_location_from_mapping(
+            row_mapping: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            location_by_field: dict[str, Any] = {}
+            for column in NPIAddress.__table__.columns:
+                if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                    continue
+                if column.key in row_mapping:
+                    location_by_field[column.key] = row_mapping.get(column.key)
+            if location_by_field.get("npi") is None and row_mapping.get(
+                "inferred_npi"
+            ) is not None:
+                location_by_field["npi"] = row_mapping.get("inferred_npi")
+            if location_by_field.get("npi") is None:
+                location_by_field["npi"] = row_mapping.get("npi_code")
+            if row_mapping.get("location_key") not in (None, ""):
+                location_by_field["location_key"] = row_mapping.get(
+                    "location_key"
+                )
+            _attach_public_address_site_key(location_by_field, row_mapping)
+            if address_table_sql.endswith(".entity_address_unified"):
+                for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
+                    if key in row_mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                        location_by_field[key] = row_mapping.get(key)
+                if "source_record_ids" in row_mapping:
+                    location_by_field["source_record_ids"] = row_mapping.get(
+                        "source_record_ids"
+                    )
+            base_identity = _base_address_row_identity(location_by_field)
+            if base_identity:
+                location_by_field["_base_row_identities"] = [base_identity]
+            location_by_field["location_status"] = "unknown"
+            return _add_canonical_contact_fields_to_address(location_by_field)
 
         providers_by_npi = {}
         async with db.acquire() as conn:
@@ -8741,6 +9062,14 @@ async def list_providers(request):
                 # (for example missing optional array columns) does not break
                 # positional offsets and crash /npi/all.
                 row_mapping = getattr(provider_record, "_mapping", None)
+                if row_mapping is None:
+                    row_mapping = {
+                        column_name: provider_record[index]
+                        for index, column_name in enumerate(
+                            search_row_column_names
+                        )
+                        if index < len(provider_record)
+                    }
                 if row_mapping is not None:
                     npi_value = (
                         row_mapping.get("npi_code")
@@ -8753,12 +9082,33 @@ async def list_providers(request):
 
                     provider_by_field = providers_by_npi.get(npi_value)
                     if provider_by_field is None:
-                        provider_by_field = {"taxonomy_list": []}
+                        provider_by_field = {
+                            "taxonomy_list": [],
+                            "_taxonomy_identities": set(),
+                            "_address_candidates_complete": True,
+                        }
                         for column in NPIData.__table__.columns:
                             if column.key in PUBLIC_NPI_EXCLUDED_COLUMNS:
                                 continue
                             if column.key in row_mapping:
                                 provider_by_field[column.key] = row_mapping.get(column.key)
+                        provider_by_field["npi"] = npi_value
+                        if not provider_by_field.get("provider_organization_name"):
+                            provider_by_field["provider_organization_name"] = (
+                                row_mapping.get("entity_name")
+                            )
+                        if provider_by_field.get("entity_type_code") is None:
+                            provider_by_field["entity_type_code"] = (
+                                1
+                                if any(
+                                    ":practitioner_role:"
+                                    in str(record_id or "").lower()
+                                    for record_id in (
+                                        row_mapping.get("source_record_ids") or []
+                                    )
+                                )
+                                else 2
+                            )
                         for column in NPIAddress.__table__.columns:
                             if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                                 continue
@@ -8778,139 +9128,278 @@ async def list_providers(request):
                         provider_by_field.setdefault("procedures_array", [])
                         provider_by_field.setdefault("medications_array", [])
 
-                    taxonomy_by_field = {}
-                    for column in NPIDataTaxonomy.__table__.columns:
-                        if column.key in ("npi", "checksum"):
-                            continue
-                        if column.key in row_mapping:
-                            taxonomy_by_field[column.key] = row_mapping.get(column.key)
-                    if taxonomy_by_field:
-                        provider_by_field["taxonomy_list"].append(taxonomy_by_field)
-
-                    providers_by_npi[npi_value] = provider_by_field
-                    continue
-
-                # Fallback for positional row types.
-                row_len = len(provider_record)
-                if row_len <= 1:
-                    continue
-
-                provider_by_field = {"taxonomy_list": []}
-                count = 0
-                for column in NPIData.__table__.columns:
-                    count += 1
-                    if count >= row_len:
-                        break
-                    if column.key in PUBLIC_NPI_EXCLUDED_COLUMNS:
-                        continue
-                    provider_by_field[column.key] = provider_record[count]
-                for column in NPIAddress.__table__.columns:
-                    count += 1
-                    if count >= row_len:
-                        break
-                    if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                        continue
-                    provider_by_field[column.key] = provider_record[count]
-
-                npi_value = provider_by_field.get("npi")
-                if npi_value is None:
-                    continue
-
-                if npi_value in providers_by_npi:
-                    provider_by_field = providers_by_npi[npi_value]
-                else:
-                    provider_by_field["do_business_as"] = provider_by_field.get("do_business_as") or []
-                    provider_by_field.setdefault("procedures_array", [])
-                    provider_by_field.setdefault("medications_array", [])
-
-                taxonomy_by_field = {}
-                for column in NPIDataTaxonomy.__table__.columns:
-                    count += 1
-                    if count >= row_len:
-                        break
-                    if column.key in ("npi", "checksum"):
-                        continue
-                    taxonomy_by_field[column.key] = provider_record[count]
-                if taxonomy_by_field:
-                    provider_by_field["taxonomy_list"].append(taxonomy_by_field)
-                providers_by_npi[npi_value] = provider_by_field
-
-            if (
-                _is_unified_address_table(address_table_sql)
-                and (address_key or address_site_key or phone_digits or exact_npi is not None)
-                and len(providers_by_npi) < limit
-                and not npi_where
-                and not use_taxonomy_filter
-                and provider_sex_code is None
-            ):
-                fallback_clauses = list(address_clauses)
-                if fallback_clauses:
-                    fallback_clauses[0] = _provider_list_address_type_clause(
-                        "c",
-                        address_table_sql,
-                        include_service_locations=True,
+                    address_candidate = _search_location_from_mapping(row_mapping)
+                    provider_by_field.setdefault("_address_candidates", []).append(
+                        address_candidate
                     )
-                fallback_parameters_by_name = {
-                    "plan_network_array": plan_network_ids,
-                    "city": city,
-                    "state": state,
-                    "zip_code": zip_code,
-                    "phone_digits": phone_digits,
-                    "address_key": address_key,
-                    "address_site_key": address_site_key,
-                    "npi_filter": exact_npi,
-                    **dynamic_code_parameters,
-                }
-                fallback_rows = await conn.all(
-                    text(
-                        f"""
-                        SELECT c.*
-                          FROM {address_table_sql} AS c
-                         WHERE {' AND '.join(fallback_clauses)}
-                         ORDER BY {_primary_address_order_clause("c", address_table_sql)}
-                         LIMIT :fallback_limit
-                        """
-                    ),
-                    fallback_limit=limit,
-                    **fallback_parameters_by_name,
-                )
-                for fallback_record in fallback_rows:
-                    mapping = getattr(fallback_record, "_mapping", fallback_record)
-                    if not isinstance(mapping, Mapping):
-                        continue
-                    npi_value = mapping.get("npi") or mapping.get("inferred_npi")
-                    if npi_value is None or npi_value in providers_by_npi:
-                        continue
-                    provider_by_field = {
-                        "npi": npi_value,
-                        "entity_type_code": 1
-                        if any(
-                            ":practitioner_role:" in str(record_id or "")
-                            for record_id in (mapping.get("source_record_ids") or [])
+                    provider_by_field["_address_total"] = max(
+                        int(provider_by_field.get("_address_total") or 0),
+                        int(row_mapping.get("provider_address_total") or 0),
+                    )
+
+                    taxonomy_rows = row_mapping.get("taxonomy_rows")
+                    if isinstance(taxonomy_rows, list):
+                        taxonomy_payloads = _public_nested_taxonomy_rows(
+                            taxonomy_rows
                         )
-                        else 2,
-                        "provider_organization_name": mapping.get("entity_name"),
-                        "do_business_as": [],
-                        "taxonomy_list": [],
-                        "procedures_array": [],
-                        "medications_array": [],
-                    }
-                    for column in NPIAddress.__table__.columns:
-                        if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                            continue
-                        if column.key in mapping:
-                            provider_by_field[column.key] = mapping.get(column.key)
-                    _attach_public_address_site_key(provider_by_field, mapping)
-                    for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
-                        if key in mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                            provider_by_field[key] = mapping.get(key)
-                    if "source_record_ids" in mapping:
-                        provider_by_field["source_record_ids"] = mapping.get("source_record_ids")
+                    else:
+                        taxonomy_by_field = {}
+                        for column in NPIDataTaxonomy.__table__.columns:
+                            if column.key in ("npi", "checksum"):
+                                continue
+                            if column.key in row_mapping:
+                                taxonomy_by_field[column.key] = row_mapping.get(
+                                    column.key
+                                )
+                        taxonomy_payloads = (
+                            [taxonomy_by_field] if taxonomy_by_field else []
+                        )
+                    for taxonomy_by_field in taxonomy_payloads:
+                        taxonomy_identity_parts = tuple(
+                            sorted(
+                                (
+                                    key,
+                                    json.dumps(
+                                        field_value,
+                                        sort_keys=True,
+                                        default=str,
+                                    ),
+                                )
+                                for key, field_value in taxonomy_by_field.items()
+                            )
+                        )
+                        taxonomy_identities = provider_by_field.setdefault(
+                            "_taxonomy_identities", set()
+                        )
+                        if taxonomy_identity_parts not in taxonomy_identities:
+                            taxonomy_identities.add(taxonomy_identity_parts)
+                            provider_by_field["taxonomy_list"].append(
+                                taxonomy_by_field
+                            )
+
                     providers_by_npi[npi_value] = provider_by_field
+                    continue
+
+            if providers_by_npi:
+                taxonomy_records = await conn.all(
+                    text(
+                        "SELECT taxonomy.* FROM mrf.npi_taxonomy AS taxonomy "
+                        "WHERE taxonomy.npi = ANY(:provider_npis) "
+                        "ORDER BY taxonomy.npi, taxonomy.checksum"
+                    ),
+                    provider_npis=sorted(providers_by_npi),
+                )
+                for taxonomy_record in taxonomy_records:
+                    taxonomy_mapping = getattr(
+                        taxonomy_record,
+                        "_mapping",
+                        None,
+                    )
+                    if taxonomy_mapping is None:
+                        taxonomy_mapping = {
+                            column.key: taxonomy_record[index]
+                            for index, column in enumerate(
+                                NPIDataTaxonomy.__table__.columns
+                            )
+                            if index < len(taxonomy_record)
+                        }
+                    taxonomy_npi = taxonomy_mapping.get("npi")
+                    provider_by_field = providers_by_npi.get(taxonomy_npi)
+                    if provider_by_field is None:
+                        continue
+                    taxonomy_by_field = {
+                        column.key: taxonomy_mapping.get(column.key)
+                        for column in NPIDataTaxonomy.__table__.columns
+                        if column.key not in ("npi", "checksum")
+                        and taxonomy_mapping.get(column.key) is not None
+                    }
+                    if not taxonomy_by_field:
+                        continue
+                    taxonomy_identity_parts = tuple(
+                        sorted(
+                            (
+                                key,
+                                json.dumps(
+                                    field_value,
+                                    sort_keys=True,
+                                    default=str,
+                                ),
+                            )
+                            for key, field_value in taxonomy_by_field.items()
+                        )
+                    )
+                    taxonomy_identities = provider_by_field.setdefault(
+                        "_taxonomy_identities",
+                        set(),
+                    )
+                    if taxonomy_identity_parts not in taxonomy_identities:
+                        taxonomy_identities.add(taxonomy_identity_parts)
+                        provider_by_field["taxonomy_list"].append(
+                            taxonomy_by_field
+                        )
 
         provider_results = list(providers_by_npi.values())
+        await _apply_location_statuses(
+            [
+                address_candidate
+                for provider_result in provider_results
+                for address_candidate in provider_result.get(
+                    "_address_candidates",
+                    [],
+                )
+            ],
+            session=request_session,
+        )
         for provider_result in provider_results:
             provider_result["do_business_as"] = provider_result.get("do_business_as") or []
+            address_candidates = provider_result.pop("_address_candidates", [])
+            ranked_locations = _rank_provider_locations(
+                _dedupe_addresses_by_key(address_candidates)
+            )
+            candidates_are_complete = bool(
+                provider_result.pop("_address_candidates_complete", False)
+            )
+            raw_address_total = int(
+                provider_result.pop("_address_total", 0) or 0
+            )
+            address_total = (
+                len(ranked_locations)
+                if candidates_are_complete
+                else max(raw_address_total, len(ranked_locations))
+            )
+            provider_result["_selected_locations"] = ranked_locations[
+                :NPI_SEARCH_ADDRESS_DEFAULT_LIMIT
+            ]
+            provider_result["_selected_location_total"] = address_total
+
+        selected_location_keys = sorted(
+            {
+                identity.removeprefix("location:")
+                for provider_result in provider_results
+                for location in provider_result.get("_selected_locations", [])
+                for identity in (
+                    list(location.get("_base_row_identities") or [])
+                    + (
+                        [f"location:{location.get('location_key')}" ]
+                        if location.get("location_key") not in (None, "")
+                        else []
+                    )
+                )
+                if str(identity).startswith("location:")
+                and identity.removeprefix("location:")
+            }
+        )
+        hydrated_by_location_key: dict[str, dict[str, Any]] = {}
+        if is_unified_search and selected_location_keys:
+            try:
+                async with db.acquire() as hydration_conn:
+                    hydrated_rows = await hydration_conn.all(
+                        text(
+                            f"SELECT c.* FROM {address_table_sql} AS c "
+                            "WHERE c.location_key = ANY(:location_keys)"
+                        ),
+                        location_keys=selected_location_keys,
+                    )
+                allowed_hydrated_fields = {
+                    column.key for column in NPIAddress.__table__.columns
+                } | PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS | {
+                    "inferred_npi",
+                    "location_key",
+                    "premise_key",
+                    "source_record_ids",
+                }
+                for hydrated_row in hydrated_rows:
+                    hydrated_mapping = getattr(
+                        hydrated_row,
+                        "_mapping",
+                        hydrated_row,
+                    )
+                    if not isinstance(hydrated_mapping, Mapping):
+                        continue
+                    location_key = str(
+                        hydrated_mapping.get("location_key") or ""
+                    )
+                    if not location_key:
+                        continue
+                    hydrated_address_map = {
+                        field_name: hydrated_mapping.get(field_name)
+                        for field_name in allowed_hydrated_fields
+                        if field_name in hydrated_mapping
+                    }
+                    if hydrated_address_map.get("npi") is None:
+                        hydrated_address_map["npi"] = hydrated_mapping.get(
+                            "inferred_npi"
+                        )
+                    _attach_public_address_site_key(
+                        hydrated_address_map,
+                        hydrated_mapping,
+                    )
+                    hydrated_by_location_key[location_key] = (
+                        _add_canonical_contact_fields_to_address(
+                            hydrated_address_map
+                        )
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "NPI search location hydration failed; returning ranked candidates (%s)",
+                    exc,
+                )
+
+        for provider_result in provider_results:
+            selected_locations = provider_result.pop(
+                "_selected_locations",
+                [],
+            )
+            locations: list[dict[str, Any]] = []
+            for selected_location in selected_locations:
+                selected_identity_keys = {
+                    str(identity).removeprefix("location:")
+                    for identity in (
+                        list(selected_location.get("_base_row_identities") or [])
+                        + (
+                            [f"location:{selected_location.get('location_key')}" ]
+                            if selected_location.get("location_key") not in (None, "")
+                            else []
+                        )
+                    )
+                    if str(identity).startswith("location:")
+                }
+                hydrated_locations = [
+                    hydrated_by_location_key[location_key]
+                    for location_key in sorted(selected_identity_keys)
+                    if location_key in hydrated_by_location_key
+                ]
+                if not hydrated_locations:
+                    locations.append(selected_location)
+                    continue
+                merged_location_map = dict(selected_location)
+                for hydrated_location in hydrated_locations:
+                    _merge_duplicate_address(
+                        merged_location_map,
+                        hydrated_location,
+                    )
+                merged_location_map["location_status"] = selected_location.get(
+                    "location_status",
+                    "unknown",
+                )
+                locations.append(merged_location_map)
+            address_total = int(
+                provider_result.pop("_selected_location_total", len(locations))
+            )
+            provider_result["address_list"] = locations
+            provider_result["address_pagination"] = {
+                "limit": NPI_SEARCH_ADDRESS_DEFAULT_LIMIT,
+                "offset": 0,
+                "returned": len(locations),
+                "total": address_total,
+                "has_more": address_total > len(locations),
+            }
+            provider_result.pop("_taxonomy_identities", None)
+            if locations:
+                provider_result.update(locations[0])
+            provider_result["location_status"] = locations[0].get(
+                "location_status", "unknown"
+            ) if locations else "unknown"
             _add_canonical_contact_fields_to_address(provider_result)
             _redact_internal_address_fields(provider_result)
         return provider_results
@@ -9026,15 +9515,42 @@ async def list_providers(request):
             if summary:
                 provider_result["provider_enrichment_summary"] = summary
     if include_sources or include_evidence:
+        source_detail_targets = list(result_rows)
+        source_detail_targets.extend(
+            location
+            for provider_result in result_rows
+            if isinstance(provider_result, dict)
+            for location in (provider_result.get("address_list") or [])
+            if isinstance(location, dict)
+        )
         await _attach_provider_directory_source_details(
-            result_rows,
+            source_detail_targets,
             include_role_evidence=include_evidence,
             session=request_session,
         )
     if not include_evidence:
         for provider_result in result_rows:
-            if isinstance(provider_result, dict):
-                provider_result.pop("source_record_ids", None)
+            if not isinstance(provider_result, dict):
+                continue
+            provider_result.pop("source_record_ids", None)
+            for location in provider_result.get("address_list") or []:
+                if isinstance(location, dict):
+                    location.pop("source_record_ids", None)
+    for provider_result in result_rows:
+        if not isinstance(provider_result, dict):
+            continue
+        public_locations = [provider_result]
+        public_locations.extend(
+            location
+            for location in (provider_result.get("address_list") or [])
+            if isinstance(location, dict)
+        )
+        for location in public_locations:
+            location.pop("_base_row_identities", None)
+            if not (include_sources or include_evidence):
+                location.pop("location_key", None)
+            if not include_evidence:
+                location.pop("inferred_npi", None)
 
     response_map: dict[str, Any] = {
         "total": total,
@@ -10880,9 +11396,11 @@ async def get_npi(request, npi):
         return address_by_field
 
     detail_build_map: dict[str, Any] = {
-        "address_limit": address_limit,
-        "address_offset": address_offset,
-        "include_address_total": include_address_total,
+        # Bounded requests assemble provider identity without full address rows.
+        # A lightweight complete candidate query ranks the combined set below,
+        # then a second bounded query hydrates only the selected base rows.
+        "address_limit": 0,
+        "include_address_total": False,
         "address_key": address_key,
     }
     if request_session is not None:
@@ -10891,41 +11409,68 @@ async def get_npi(request, npi):
         detail_build_map["include_sources"] = include_sources
         detail_build_map["include_evidence"] = include_evidence
     provider_detail_by_field = await _build_npi_details(npi, **detail_build_map)
+    has_provider_detail = bool(provider_detail_by_field)
 
-    if not provider_detail_by_field:
-        if not profile_record:
-            raise sanic.exceptions.NotFound
-        provider_detail_by_field = {
-            "npi": npi,
-            "provider_directory_profile": profile_record["profile"],
-        }
-        if include_evidence and profile_record.get("evidence") is not None:
+    if not has_provider_detail:
+        provider_detail_by_field = {"npi": npi}
+        if profile_record:
+            provider_detail_by_field["provider_directory_profile"] = (
+                profile_record["profile"]
+            )
+        if (
+            include_evidence
+            and profile_record
+            and profile_record.get("evidence") is not None
+        ):
             provider_detail_by_field["provider_directory_profile_evidence"] = (
                 profile_record["evidence"]
             )
-        response_body = json.dumps(
-            provider_detail_by_field,
-            default=str,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if is_response_cache_enabled and _is_npi_detail_response_cacheable(
-            provider_detail_by_field,
-            force_address_update=should_force_address_update,
-            sync_geocode=should_sync_geocode,
-        ):
-            _npi_detail_response_cache_set(cache_key, response_body)
-        return response.raw(response_body, content_type="application/json")
 
-    address_total = provider_detail_by_field.pop("address_total", None)
+    provider_detail_by_field.pop("address_total", None)
 
-    addresses = provider_detail_by_field.get("address_list") or []
-    addresses.extend(
-        await _fetch_provider_directory_address_overlay(
+    overlay_addresses = await _fetch_provider_directory_address_overlay(
+        npi,
+        address_key=address_key,
+        session=request_session,
+    )
+    initial_base_addresses = list(
+        provider_detail_by_field.get("address_list") or []
+    )
+    has_hydrated_base_candidates = False
+    if address_limit is None:
+        # The detail builder is anchored on mrf.npi and can only aggregate rows
+        # whose direct npi column matches. An explicit exhaustive request must
+        # also include unified rows resolved through inferred_npi, so hydrate
+        # the complete address relation independently of provider identity.
+        base_addresses = await _fetch_npi_address_rows(
             npi,
+            include_sources=include_sources,
+            include_evidence=include_evidence,
             address_key=address_key,
             session=request_session,
         )
-    )
+        await _apply_location_statuses(
+            base_addresses,
+            session=request_session,
+        )
+        addresses = base_addresses + overlay_addresses
+    else:
+        if initial_base_addresses:
+            # A detail builder may retain hydrated address rows even when its
+            # requested page size is zero. Reuse them instead of querying twice.
+            base_candidates = initial_base_addresses
+            has_hydrated_base_candidates = True
+        else:
+            base_candidates = await _fetch_npi_location_candidates(
+                npi,
+                address_key=address_key,
+                session=request_session,
+            )
+        await _apply_location_statuses(
+            base_candidates,
+            session=request_session,
+        )
+        addresses = base_candidates + overlay_addresses
     if address_key is not None:
         addresses = [
             address
@@ -10935,7 +11480,23 @@ async def get_npi(request, npi):
         ]
     if not include_extra_info:
         addresses = [address for address in addresses if _is_public_street_level_address(address)]
-    addresses = _dedupe_addresses_by_key(addresses)
+    addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
+    if not has_provider_detail and not profile_record and not addresses:
+        raise sanic.exceptions.NotFound
+    address_total = len(addresses)
+    if address_limit is not None:
+        selected_candidates = addresses[
+            address_offset : address_offset + address_limit
+        ]
+        addresses = await _hydrate_selected_provider_locations(
+            npi,
+            selected_candidates,
+            already_hydrated=has_hydrated_base_candidates,
+            include_sources=include_sources,
+            include_evidence=include_evidence,
+            address_key=address_key,
+            session=request_session,
+        )
     if addresses:
         if include_sources or include_evidence:
             await _attach_provider_directory_source_details(
@@ -10961,18 +11522,24 @@ async def get_npi(request, npi):
             _attach_public_address_site_key(address, address)
             for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                 address.pop(key, None)
+            address.pop("_base_row_identities", None)
+            if not (include_sources or include_evidence):
+                address.pop("location_key", None)
             if not include_evidence:
                 address.pop("source_record_ids", None)
-    if address_limit is not None:
-        # Never silently truncate: tell the caller the full count and how to page.
-        returned = len(provider_detail_by_field["address_list"])
-        provider_detail_by_field["address_pagination"] = {
-            "limit": address_limit,
-            "offset": address_offset,
-            "returned": returned,
-            "total": address_total,
-            "has_more": bool(address_total is not None and address_offset + address_limit < address_total),
-        }
+    # Never silently truncate: describe the combined, deduplicated result set.
+    returned = len(provider_detail_by_field["address_list"])
+    effective_offset = address_offset if address_limit is not None else 0
+    provider_detail_by_field["address_pagination"] = {
+        "limit": address_limit,
+        "offset": effective_offset,
+        "returned": returned,
+        "total": address_total if include_address_total else None,
+        "has_more": bool(
+            address_limit is not None
+            and effective_offset + returned < address_total
+        ),
+    }
 
     if provider_enrichment_view == "summary":
         fetch_provider_enrichment = _fetch_provider_enrichment_summary_detail
@@ -11077,15 +11644,331 @@ async def get_npi(request, npi):
         _npi_detail_response_cache_set(cache_key, response_body)
     return response.raw(response_body, content_type="application/json")
 
+NPI_LOCATION_CANDIDATE_COLUMNS = (
+    "checksum",
+    "npi",
+    "inferred_npi",
+    "type",
+    "first_line",
+    "second_line",
+    "city_name",
+    "state_name",
+    "state_code",
+    "postal_code",
+    "country_code",
+    "telephone_number",
+    "phone_number",
+    "formatted_address",
+    "location_key",
+    "address_key",
+    "premise_key",
+    "address_precision",
+    "lat",
+    "long",
+    "source_count",
+    "independent_source_count",
+    "multi_source_confirmed",
+    "address_sources",
+    "source_record_ids",
+    "updated_at",
+    "last_seen_at",
+    "date_added",
+)
+
+
+def _provider_detail_address_type_clause(address_model: Any, table: Any) -> Any:
+    if address_model is EntityAddressUnified:
+        return table.c.type.in_(("primary", "secondary", "practice", "site"))
+    return or_(table.c.type == "primary", table.c.type == "secondary")
+
+
+async def _fetch_npi_location_candidates(
+    npi: int,
+    *,
+    address_key: str | None = None,
+    session: Any = None,
+) -> list[dict[str, Any]]:
+    """Read only the fields needed to rank the complete base location set."""
+    address_model = await _address_serving_model(
+        _public_address_serving_column_keys()
+        - {"procedures_array", "medications_array"},
+        session=session,
+    )
+    address_table = address_model.__table__
+    existing_columns = await _table_columns(
+        address_model.__tablename__, session=session
+    )
+    if not existing_columns:
+        existing_columns = _model_table_columns(address_model)
+    candidate_columns = [
+        address_table.c[column_name]
+        for column_name in NPI_LOCATION_CANDIDATE_COLUMNS
+        if column_name in existing_columns
+    ]
+    filters = [address_table.c.npi == npi]
+    if address_model is EntityAddressUnified:
+        filters[0] = func.coalesce(
+            address_table.c.npi,
+            address_table.c.inferred_npi,
+        ) == npi
+    if address_key is not None:
+        filters.append(address_table.c.address_key == address_key)
+    statement = (
+        select(*candidate_columns)
+        .where(*filters)
+        .where(_provider_detail_address_type_clause(address_model, address_table))
+    )
+    query_result = await _execute_stmt(statement, session=session)
+    candidates: list[dict[str, Any]] = []
+    for address_record in query_result.all():
+        row_mapping = getattr(address_record, "_mapping", address_record)
+        candidate_map = {
+            column.key: row_mapping[column.key]
+            for column in candidate_columns
+        }
+        if candidate_map.get("npi") is None:
+            candidate_map["npi"] = npi
+        base_identity = _base_address_row_identity(candidate_map)
+        if base_identity:
+            candidate_map["_base_row_identities"] = [base_identity]
+        candidates.append(candidate_map)
+    return candidates
+
+
+def _address_hydration_columns(
+    address_model: Any,
+    address_table: Any,
+    existing_columns: set[str],
+    *,
+    include_sources: bool,
+    include_evidence: bool,
+    include_location_key: bool,
+) -> list[Any]:
+    allowed_columns = set(_model_table_columns(NPIAddress))
+    if address_model is EntityAddressUnified:
+        allowed_columns.update(PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS)
+        allowed_columns.update({"premise_key", "source_record_ids", "location_key"})
+    if include_sources or include_evidence:
+        allowed_columns.update(PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS)
+    if include_evidence:
+        allowed_columns.update(PUBLIC_ADDRESS_EVIDENCE_DEBUG_COLUMNS)
+    if include_location_key:
+        allowed_columns.add("location_key")
+    return [
+        address_table.c[column.key]
+        for column in address_table.columns
+        if column.key in allowed_columns and column.key in existing_columns
+    ]
+
+
+def _address_identity_filter(
+    address_model: Any,
+    address_table: Any,
+    address_row_identities: Sequence[str] | None,
+) -> tuple[set[str], Any | None]:
+    selected_identity_set = {
+        str(identity)
+        for identity in (address_row_identities or [])
+        if str(identity or "").strip()
+    }
+    if address_row_identities is None:
+        return selected_identity_set, None
+    if address_model is EntityAddressUnified:
+        selected_keys = sorted(
+            identity.split(":", 1)[1]
+            for identity in selected_identity_set
+            if identity.startswith("location:")
+        )
+        return selected_identity_set, (
+            address_table.c.location_key.in_(selected_keys)
+            if selected_keys
+            else false()
+        )
+    selected_checksums = sorted(
+        int(identity.rsplit(":", 1)[1])
+        for identity in selected_identity_set
+        if identity.startswith("legacy:")
+        and identity.rsplit(":", 1)[1].lstrip("-").isdigit()
+    )
+    return selected_identity_set, (
+        address_table.c.checksum.in_(selected_checksums)
+        if selected_checksums
+        else false()
+    )
+
+
+def _hydrate_address_query_rows(
+    query_result: Any,
+    selected_columns: Sequence[Any],
+    npi: int,
+    selected_identity_set: set[str],
+) -> list[dict[str, Any]]:
+    hydrated_addresses: list[dict[str, Any]] = []
+    for address_record in query_result.all():
+        mapping = getattr(address_record, "_mapping", address_record)
+        address_by_field = {
+            column.key: mapping[column.key]
+            for column in selected_columns
+        }
+        if address_by_field.get("npi") is None:
+            address_by_field["npi"] = npi
+        identity = _base_address_row_identity(address_by_field)
+        if selected_identity_set and identity not in selected_identity_set:
+            continue
+        if identity:
+            address_by_field["_base_row_identities"] = [identity]
+        _attach_public_address_site_key(address_by_field, address_by_field)
+        hydrated_addresses.append(
+            _add_canonical_contact_fields_to_address(address_by_field)
+        )
+    return hydrated_addresses
+
+
+def _selected_base_identity_list(
+    selected_locations: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Return stable base-row identities for a selected location page."""
+    return sorted(
+        {
+            str(identity_value)
+            for location_map in selected_locations
+            for identity_value in (location_map.get("_base_row_identities") or [])
+            if identity_value not in (None, "")
+        }
+    )
+
+
+def _merge_hydrated_location_candidates(
+    selected_locations: Sequence[Mapping[str, Any]],
+    hydrated_locations: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge hydrated evidence into ranked candidate scalars deterministically."""
+    hydrated_by_identity = {
+        str(identity_value): hydrated_location
+        for hydrated_location in hydrated_locations
+        for identity_value in (
+            hydrated_location.get("_base_row_identities") or []
+        )
+        if identity_value not in (None, "")
+    }
+    merged_locations: list[dict[str, Any]] = []
+    for selected_location in selected_locations:
+        merged_location_map = dict(selected_location)
+        identity_list = sorted(
+            str(identity_value)
+            for identity_value in (
+                selected_location.get("_base_row_identities") or []
+            )
+            if identity_value not in (None, "")
+        )
+        for identity_value in identity_list:
+            hydrated_location = hydrated_by_identity.get(identity_value)
+            if hydrated_location is not None:
+                _merge_duplicate_address(merged_location_map, hydrated_location)
+        merged_locations.append(merged_location_map)
+    return _rank_provider_locations(merged_locations)
+
+
+async def _hydrate_selected_provider_locations(
+    npi: int,
+    selected_locations: Sequence[Mapping[str, Any]],
+    *,
+    already_hydrated: bool,
+    include_sources: bool,
+    include_evidence: bool,
+    address_key: str | None,
+    session: Any,
+) -> list[dict[str, Any]]:
+    """Hydrate only the base rows represented by a bounded location page."""
+    if already_hydrated:
+        return [dict(location_map) for location_map in selected_locations]
+    identity_list = _selected_base_identity_list(selected_locations)
+    hydrated_locations: list[dict[str, Any]] = []
+    if identity_list:
+        hydrated_locations = await _fetch_npi_address_rows(
+            npi,
+            include_sources=include_sources,
+            include_evidence=include_evidence,
+            address_key=address_key,
+            address_row_identities=identity_list,
+            session=session,
+        )
+    return _merge_hydrated_location_candidates(
+        selected_locations,
+        hydrated_locations,
+    )
+
+
+async def _fetch_npi_address_rows(
+    npi: int,
+    *,
+    include_sources: bool = False,
+    include_evidence: bool = False,
+    address_key: str | None = None,
+    address_row_identities: Sequence[str] | None = None,
+    session: Any = None,
+) -> list[dict[str, Any]]:
+    """Hydrate address rows without requiring a matching NPIData identity row."""
+    address_model = await _address_serving_model(
+        _public_address_serving_column_keys()
+        - {"procedures_array", "medications_array"},
+        session=session,
+    )
+    address_table = address_model.__table__
+    existing_columns = await _table_columns(
+        address_model.__tablename__,
+        session=session,
+    )
+    if not existing_columns:
+        existing_columns = _model_table_columns(address_model)
+    selected_columns = _address_hydration_columns(
+        address_model,
+        address_table,
+        existing_columns,
+        include_sources=include_sources,
+        include_evidence=include_evidence,
+        include_location_key=address_row_identities is not None,
+    )
+    filters = [address_table.c.npi == npi]
+    if address_model is EntityAddressUnified:
+        filters[0] = func.coalesce(
+            address_table.c.npi,
+            address_table.c.inferred_npi,
+        ) == npi
+    if address_key is not None:
+        filters.append(address_table.c.address_key == address_key)
+    selected_identity_set, identity_filter = _address_identity_filter(
+        address_model,
+        address_table,
+        address_row_identities,
+    )
+    if identity_filter is not None:
+        filters.append(identity_filter)
+    statement = (
+        select(*selected_columns)
+        .where(*filters)
+        .where(_provider_detail_address_type_clause(address_model, address_table))
+        .order_by(
+            address_table.c.type,
+            address_table.c.first_line,
+            address_table.c.city_name,
+        )
+    )
+    query_result = await _execute_stmt(statement, session=session)
+    return _hydrate_address_query_rows(
+        query_result, selected_columns, npi, selected_identity_set
+    )
+
+
 async def _build_npi_details(
     npi: int,
     *,
     include_sources: bool = False,
     include_evidence: bool = False,
     address_limit: int | None = None,
-    address_offset: int = 0,
     include_address_total: bool = True,
     address_key: str | None = None,
+    address_row_identities: Sequence[str] | None = None,
     session: Any = None,
 ) -> dict:
     """Assemble one provider identity, taxonomy, and address detail payload."""
@@ -11121,6 +12004,8 @@ async def _build_npi_details(
         allowed_address_columns.update(PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS)
     if include_evidence:
         allowed_address_columns.update(PUBLIC_ADDRESS_EVIDENCE_DEBUG_COLUMNS)
+    if address_row_identities is not None and address_model is EntityAddressUnified:
+        allowed_address_columns.add("location_key")
 
     address_columns = []
     for column in address_table.columns:
@@ -11142,31 +12027,36 @@ async def _build_npi_details(
             continue
         address_columns.append(address_table.c[column.key])
 
-    # Expose every known service location, not just the NPPES primary/secondary.
-    # The unified builder stores TiC/PTG and ACA practice locations as type
-    # 'practice'/'site', so the legacy primary/secondary-only filter silently
-    # dropped all TiC addresses. Widen the filter for the unified model only;
-    # legacy NPIAddress behaviour is unchanged.
-    def _address_type_clause(table: Any) -> Any:
-        if address_model is EntityAddressUnified:
-            return table.c.type.in_(
-                ("primary", "secondary", "practice", "site")
-            )
-        return or_(
-            table.c.type == "primary",
-            table.c.type == "secondary",
-        )
-
     # Keep the serving-type predicate outside this optimization barrier. On
     # PostgreSQL 18, combining it with NPI can otherwise select a ZIP-first
     # partial-index skip scan instead of the direct NPI index.
     base_address_filters = [address_table.c.npi == npi]
-    if address_key is not None and address_model is EntityAddressUnified:
+    if address_model is EntityAddressUnified:
         base_address_filters[0] = func.coalesce(
             address_table.c.npi, address_table.c.inferred_npi
         ) == npi
     if address_key is not None:
         base_address_filters.append(address_table.c.address_key == address_key)
+    if address_row_identities is not None:
+        if address_model is EntityAddressUnified:
+            selected_location_keys = sorted(
+                str(identity).split(":", 1)[1]
+                for identity in address_row_identities
+                if str(identity).startswith("location:")
+            )
+            base_address_filters.append(
+                address_table.c.location_key.in_(selected_location_keys)
+            )
+        else:
+            selected_checksums = sorted(
+                int(str(identity).rsplit(":", 1)[1])
+                for identity in address_row_identities
+                if str(identity).startswith("legacy:")
+                and str(identity).rsplit(":", 1)[1].lstrip("-").isdigit()
+            )
+            base_address_filters.append(
+                address_table.c.checksum.in_(selected_checksums)
+            )
     npi_address_rows = (
         select(*address_columns)
         .where(*base_address_filters)
@@ -11175,8 +12065,8 @@ async def _build_npi_details(
     )
     address_subquery_base = (
         select(*npi_address_rows.c)
-        .where(_address_type_clause(npi_address_rows))
-        # Deterministic order so address_offset paging is stable across requests.
+        .where(_provider_detail_address_type_clause(address_model, npi_address_rows))
+        # Deterministic order keeps bounded identity hydration stable.
         .order_by(
             npi_address_rows.c.type,
             npi_address_rows.c.first_line,
@@ -11192,7 +12082,7 @@ async def _build_npi_details(
             .subquery("count_npi_address_rows")
         )
         count_stmt = select(func.count()).select_from(count_npi_rows).where(
-            _address_type_clause(count_npi_rows)
+            _provider_detail_address_type_clause(address_model, count_npi_rows)
         )
         if session is not None:
             total_res = await session.execute(count_stmt)
@@ -11203,7 +12093,7 @@ async def _build_npi_details(
             except Exception:  # pragma: no cover - gino fallback when no session bound
                 address_total = None
     if address_limit is not None:
-        address_subquery_base = address_subquery_base.limit(address_limit).offset(max(address_offset or 0, 0))
+        address_subquery_base = address_subquery_base.limit(address_limit)
     try:
         address_subquery = address_subquery_base.alias("address_list")
     except NameError:
@@ -11448,18 +12338,63 @@ async def _provider_directory_address_overlay_serving_identity(
     return f"oid:{normalized_oid}"
 
 
-def _provider_directory_overlay_query_sql(
-    overlay_columns: set[str],
-) -> str:
+def _directory_overlay_resource_ctes_sql(schema: str) -> str:
+    """Resolve current overlay resources without parsing unrelated graph metadata."""
+    return f"""
+    current_endpoint_counts AS MATERIALIZED (
+        SELECT dataset.endpoint_id
+          FROM {schema}.provider_directory_endpoint_dataset AS dataset
+         WHERE dataset.is_current IS TRUE
+      GROUP BY dataset.endpoint_id
+        HAVING COUNT(*) = 1
+    ), current_datasets AS MATERIALIZED (
+        SELECT dataset.endpoint_id, dataset.dataset_id,
+               COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
+          FROM {schema}.provider_directory_endpoint_dataset AS dataset
+          JOIN current_endpoint_counts AS current_endpoint
+            ON current_endpoint.endpoint_id = dataset.endpoint_id
+         WHERE dataset.is_current IS TRUE
+           AND dataset.status = 'published'
+           AND dataset.published_at IS NOT NULL
+           AND dataset.superseded_at IS NULL
+           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
+    ), current_resources AS NOT MATERIALIZED (
+        SELECT source.source_id, source.canonical_api_base,
+               dataset.dataset_id, dataset.run_id,
+               resource.resource_type, resource.resource_id,
+               resource.payload_json::jsonb AS payload_json
+          FROM {schema}.provider_directory_source AS source
+          JOIN current_datasets AS dataset
+            ON dataset.endpoint_id = source.endpoint_id
+          JOIN {schema}.provider_directory_dataset_resource AS resource
+            ON resource.dataset_id = dataset.dataset_id
+    )
+    """
+
+
+def _overlay_coordinate_sql(overlay_columns: set[str]) -> tuple[str, str, str]:
     lat_select = "lat" if "lat" in overlay_columns else "NULL::numeric AS lat"
     long_select = "long" if "long" in overlay_columns else "NULL::numeric AS long"
     coordinate_group_by = ", lat, long" if {"lat", "long"}.issubset(overlay_columns) else ""
+    return lat_select, long_select, coordinate_group_by
+
+
+def _provider_directory_overlay_query_sql(
+    overlay_columns: set[str],
+) -> str:
+    """Build the current-resource provider-directory address overlay query."""
+    lat_select, long_select, coordinate_group_by = _overlay_coordinate_sql(overlay_columns)
     overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
     schema = _runtime_db_schema()
-    current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(schema)
+    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(schema)
+    location_status_sql = _provider_directory_location_status_sql(
+        "overlay.payload_json",
+        resource_type_sql="overlay.resource_type",
+    )
     return f"""
         WITH {current_resource_ctes_sql}, visible_overlay AS MATERIALIZED (
-            SELECT overlay.*, current_resource.canonical_api_base
+            SELECT overlay.*, current_resource.canonical_api_base,
+                   current_resource.payload_json
               FROM {overlay_table_sql} AS overlay
               JOIN current_resources AS current_resource
                 ON current_resource.source_id = overlay.source_id
@@ -11495,6 +12430,7 @@ def _provider_directory_overlay_query_sql(
             COUNT(DISTINCT overlay.source_id)::integer AS source_count,
             COUNT(DISTINCT COALESCE(NULLIF(overlay.canonical_api_base, ''), overlay.source_id))::integer AS independent_source_count,
             (COUNT(DISTINCT COALESCE(NULLIF(overlay.canonical_api_base, ''), overlay.source_id)) > 1)::boolean AS multi_source_confirmed,
+            {location_status_sql} AS location_status,
             MAX(source_updated_at) AS updated_at
           FROM visible_overlay AS overlay
       GROUP BY
@@ -11502,6 +12438,60 @@ def _provider_directory_overlay_query_sql(
             postal_code, country_code, telephone_number, fax_number, phone_number,
             fax_number_digits, address_key, address_precision{coordinate_group_by}
       ORDER BY first_line NULLS LAST, city_name NULLS LAST, address_key;
+    """
+
+
+def _provider_directory_location_status_sql(
+    payload_sql: str,
+    *,
+    resource_type_sql: str,
+) -> str:
+    role_start = f"{payload_sql} -> 'period' ->> 'start'"
+    role_end = f"{payload_sql} -> 'period' ->> 'end'"
+    role_start_date = f"""
+        CASE
+            WHEN pg_input_is_valid(LEFT(COALESCE({role_start}, ''), 10), 'date')
+            THEN LEFT({role_start}, 10)::date
+            ELSE NULL::date
+        END
+    """
+    role_end_date = f"""
+        CASE
+            WHEN pg_input_is_valid(LEFT(COALESCE({role_end}, ''), 10), 'date')
+            THEN LEFT({role_end}, 10)::date
+            ELSE NULL::date
+        END
+    """
+    role_active = f"""
+        LOWER(COALESCE({payload_sql} ->> 'active', '')) = 'true'
+        AND (
+            COALESCE({role_start}, '') = ''
+            OR ({role_start_date}) <= CURRENT_DATE
+        )
+        AND (
+            COALESCE({role_end}, '') = ''
+            OR ({role_end_date}) >= CURRENT_DATE
+        )
+    """
+    role_inactive = f"""
+        LOWER(COALESCE({payload_sql} ->> 'active', '')) = 'false'
+        OR ({role_start_date}) > CURRENT_DATE
+        OR ({role_end_date}) < CURRENT_DATE
+    """
+    return f"""
+        CASE
+            WHEN BOOL_OR(
+                {resource_type_sql} = 'PractitionerRole'
+                AND ({role_active})
+            ) THEN 'active'
+            WHEN COUNT(*) FILTER (
+                WHERE {resource_type_sql} = 'PractitionerRole'
+            ) > 0
+            AND BOOL_AND(COALESCE(({role_inactive}), FALSE)) FILTER (
+                WHERE {resource_type_sql} = 'PractitionerRole'
+            ) THEN 'inactive'
+            ELSE 'unknown'
+        END::varchar
     """
 
 
@@ -11543,6 +12533,167 @@ async def _fetch_provider_directory_address_overlay(
             )
         overlay_addresses.append(overlay_address_by_field)
     return overlay_addresses
+
+
+def _location_status_query(schema: str, overlay_table_sql: str) -> Any:
+    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(schema)
+    location_status_sql = _provider_directory_location_status_sql(
+        "overlay.payload_json",
+        resource_type_sql="overlay.resource_type",
+    )
+    return text(
+        f"""
+        WITH {current_resource_ctes_sql}, visible_roles AS MATERIALIZED (
+            SELECT overlay.source_record_id,
+                   overlay.resource_type,
+                   current_resource.payload_json
+              FROM {overlay_table_sql} AS overlay
+              JOIN current_resources AS current_resource
+                ON current_resource.source_id = overlay.source_id
+               AND current_resource.resource_type = overlay.resource_type
+               AND current_resource.resource_id = overlay.resource_id
+               AND overlay.last_seen_run_id = current_resource.run_id
+             WHERE overlay.source_record_id = ANY(:source_record_ids)
+        )
+        SELECT overlay.source_record_id,
+               {location_status_sql} AS location_status
+          FROM visible_roles AS overlay
+      GROUP BY overlay.source_record_id;
+        """
+    )
+
+
+def _status_map_from_result(query_result: Any) -> dict[str, str]:
+    status_by_record_id: dict[str, str] = {}
+    for status_record in query_result.all():
+        mapping = getattr(status_record, "_mapping", status_record)
+        record_id = str(mapping["source_record_id"] or "").strip()
+        if record_id:
+            status_by_record_id[record_id] = str(
+                mapping["location_status"] or "unknown"
+            ).lower()
+    return status_by_record_id
+
+
+async def _fetch_location_status_by_record_id(
+    source_record_ids: Sequence[Any],
+    *,
+    session: Any = None,
+) -> dict[str, str]:
+    """Resolve active/inactive/unknown for current PractitionerRole evidence."""
+    normalized_record_ids = sorted(
+        {
+            str(record_id).strip()
+            for record_id in source_record_ids
+            if str(record_id or "").strip()
+        }
+    )
+    if not normalized_record_ids:
+        return {}
+    try:
+        required_tables = (
+            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+            *PROVIDER_DIRECTORY_VISIBILITY_TABLES,
+        )
+        if not all(
+            [
+                await _is_table_available(table_name, session=session)
+                for table_name in required_tables
+            ]
+        ):
+            return {}
+        overlay_table_sql = _schema_cache_key(
+            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+        )
+        status_query = _location_status_query(
+            _runtime_db_schema(),
+            overlay_table_sql,
+        )
+        query_result = await _execute_stmt(
+            status_query,
+            session=session,
+            params={"source_record_ids": normalized_record_ids},
+        )
+    except Exception as exc:
+        logger.debug("Provider location status lookup failed: %s", exc)
+        return {}
+    return _status_map_from_result(query_result)
+
+
+def _location_status_from_source_records(
+    source_record_ids: Any,
+    status_by_record_id: Mapping[str, str],
+) -> str:
+    candidates = (
+        source_record_ids
+        if isinstance(source_record_ids, (list, tuple, set))
+        else [source_record_ids]
+    )
+    statuses = []
+    for record_id in candidates:
+        normalized_record_id = str(record_id or "").strip()
+        if not normalized_record_id:
+            continue
+        status = str(
+            status_by_record_id.get(normalized_record_id) or "unknown"
+        ).strip().lower()
+        statuses.append(
+            status if status in {"active", "inactive"} else "unknown"
+        )
+    if "active" in statuses:
+        return "active"
+    if statuses and all(status == "inactive" for status in statuses):
+        return "inactive"
+    return "unknown"
+
+
+async def _apply_location_statuses(
+    addresses: Sequence[Any],
+    *,
+    session: Any = None,
+) -> None:
+    """Attach conservative per-location status without overriding unknown evidence."""
+    source_record_ids = [
+        record_id
+        for address in addresses
+        if isinstance(address, dict)
+        for record_id in _merge_unique_list_values(
+            address.get("source_record_ids"),
+            None,
+        )
+        if str(record_id or "").strip()
+    ]
+    status_by_record_id = (
+        await _fetch_location_status_by_record_id(
+            source_record_ids,
+            session=session,
+        )
+        if source_record_ids
+        else {}
+    )
+    for address in addresses:
+        if not isinstance(address, dict):
+            continue
+        directory_status = _location_status_from_source_records(
+            address.get("source_record_ids"),
+            status_by_record_id,
+        )
+        raw_sources = address.get("address_sources") or []
+        address_sources = (
+            raw_sources
+            if isinstance(raw_sources, (list, tuple, set))
+            else [raw_sources]
+        )
+        has_non_directory_source = any(
+            str(source_id or "").strip().lower()
+            not in {"", "provider_directory_fhir"}
+            for source_id in address_sources
+        )
+        address["location_status"] = (
+            "unknown"
+            if directory_status == "inactive" and has_non_directory_source
+            else directory_status
+        )
 
 
 def _should_include_npi_all_total(args: object, count_only: bool) -> bool:
