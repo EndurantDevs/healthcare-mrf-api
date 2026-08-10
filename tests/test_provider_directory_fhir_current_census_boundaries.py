@@ -276,10 +276,12 @@ def test_exact_pagination_helper_boundaries_fail_closed():
 
 
 @pytest.mark.asyncio
-async def test_exact_one_shot_fetch_records_its_terminal_diagnostic(monkeypatch):
+async def test_reviewed_fetch_records_its_final_terminal_diagnostic(monkeypatch):
     source_record = _source_record()
     fetch_once = AsyncMock(return_value=(429, {}, None, 7))
+    sleep_mock = AsyncMock()
     monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_once)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
     result = await importer._fetch_source_json(
         source_record,
         _contract().start_url(RESOURCE_TYPE, 250),
@@ -289,7 +291,9 @@ async def test_exact_one_shot_fetch_records_its_terminal_diagnostic(monkeypatch)
     assert source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD][
         "response_class"
     ] == "transient_rate_limited"
+    assert source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD]["retry_count"] == 0
     fetch_once.assert_awaited_once()
+    sleep_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

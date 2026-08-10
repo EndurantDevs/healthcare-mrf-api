@@ -433,7 +433,7 @@ async def test_credential_environment_is_rejected_before_database(
 
 
 @pytest.mark.asyncio
-async def test_exact_candidate_is_attempted_once_without_retry(monkeypatch):
+async def test_exact_candidate_defers_rate_limit_without_inline_retry(monkeypatch):
     retry_payload_by_field = {importer.SOURCE_RETRY_AFTER_FIELD: "600"}
     exact_attempt_mock = AsyncMock(
         return_value=(429, retry_payload_by_field, None, 1)

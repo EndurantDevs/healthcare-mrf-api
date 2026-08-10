@@ -1325,6 +1325,10 @@ MAX_RESOURCE_SCAN_CONCURRENCY = 3
 SOURCE_HTTP_KEEPALIVE_SECONDS = 60.0
 SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
 SOURCE_TRANSIENT_HTTP_STATUSES = frozenset({423, 429, 500, 502, 503, 504})
+CURRENT_VERSION_CENSUS_RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+CURRENT_VERSION_CENSUS_RETRY_WAIT_TARGETS_SECONDS = (300.0, 899.0)
+CURRENT_VERSION_CENSUS_RETRY_WAIT_BUDGET_SECONDS = 900.0
+CURRENT_VERSION_CENSUS_RETRY_AFTER_MAX_SECONDS = 600.0
 REST_PAGINATION_COOLDOWN_RETRY_CAP = 2
 MOLINA_QUOTA_RESET_GRACE_SECONDS = 60
 MOLINA_QUOTA_DURATION_PATTERN = re.compile(
@@ -39789,13 +39793,20 @@ def _source_retry_after_seconds(
         numeric_delay = float(retry_after)
     except ValueError:
         numeric_delay = None
-    if numeric_delay is not None and math.isfinite(numeric_delay):
-        delay_seconds = max(0.0, numeric_delay)
-        return (
-            min(max_delay_seconds, delay_seconds)
-            if max_delay_seconds is not None
-            else delay_seconds
-        )
+    if numeric_delay is not None:
+        if math.isfinite(numeric_delay):
+            delay_seconds = max(0.0, numeric_delay)
+            return (
+                min(max_delay_seconds, delay_seconds)
+                if max_delay_seconds is not None
+                else delay_seconds
+            )
+        if (
+            numeric_delay > 0
+            and retry_after.isascii()
+            and retry_after.isdigit()
+        ):
+            return max_delay_seconds if max_delay_seconds is not None else math.inf
     try:
         retry_at = email.utils.parsedate_to_datetime(retry_after)
     except (TypeError, ValueError, OverflowError):
@@ -39817,13 +39828,18 @@ def _transient_source_retry_not_before(
     fetch_error: str | None,
     *,
     retry_count: int,
+    max_delay_seconds: float | None = 600.0,
     now_utc: datetime.datetime | None = None,
 ) -> str | None:
-    """Return a bounded, generic defer time after a terminal transient fetch."""
+    """Return a generic defer time after a terminal transient fetch."""
     if not _is_transient_source_fetch_failure(status_code, fetch_error):
         return None
     retry_after_seconds = (
-        _source_retry_after_seconds(fhir_payload, now_utc=now_utc)
+        _source_retry_after_seconds(
+            fhir_payload,
+            max_delay_seconds=max_delay_seconds,
+            now_utc=now_utc,
+        )
         if status_code in SOURCE_TRANSIENT_HTTP_STATUSES
         else None
     )
@@ -39836,7 +39852,23 @@ def _transient_source_retry_not_before(
         )
     )
     current_time = now_utc or datetime.datetime.now(datetime.UTC)
-    retry_at = current_time + datetime.timedelta(seconds=math.ceil(delay_seconds))
+    return _retry_not_before_timestamp(current_time, delay_seconds)
+
+
+def _retry_not_before_timestamp(
+    current_time: datetime.datetime,
+    delay_seconds: float,
+) -> str:
+    """Return one representable UTC boundary for an arbitrary safe delay."""
+    try:
+        retry_at = current_time + datetime.timedelta(
+            seconds=math.ceil(delay_seconds)
+        )
+    except (OverflowError, ValueError):
+        retry_at = datetime.datetime.max.replace(
+            tzinfo=datetime.UTC,
+            microsecond=0,
+        )
     return retry_at.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
@@ -39900,10 +39932,10 @@ def _molina_quota_retry_not_before(
     if not valid_delays:
         return None
     current_time = now_utc or datetime.datetime.now(datetime.UTC)
-    retry_at = current_time + datetime.timedelta(
-        seconds=math.ceil(max(valid_delays) + MOLINA_QUOTA_RESET_GRACE_SECONDS)
+    return _retry_not_before_timestamp(
+        current_time,
+        max(valid_delays) + MOLINA_QUOTA_RESET_GRACE_SECONDS,
     )
-    return retry_at.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 async def _fetch_source_json_once(
@@ -40063,12 +40095,12 @@ async def _fetch_source_json_candidate(
 ) -> tuple[tuple[int | None, dict[str, Any] | None, str | None, int], bool, int]:
     """Fetch one page-size candidate and report whether to try a smaller page."""
     if current_version_census_contract(source_record) is not None:
-        fetch_result = await _fetch_current_version_census_json_once(
+        fetch_result, retry_count = await _fetch_current_version_census_json(
             source_record,
             candidate_url,
             timeout=timeout,
         )
-        return fetch_result, False, 0
+        return fetch_result, False, retry_count
     empty_collection_retry_delays = _cigna_empty_collection_retry_delays(
         source_record,
         candidate_url,
@@ -40159,7 +40191,7 @@ async def _fetch_current_version_census_json_once(
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     """Fetch one reviewed traversal request without retries or substitution."""
-    fetch_result = _source_fetch_result_with_payload_error(
+    return _source_fetch_result_with_payload_error(
         source_record,
         request_url,
         await _fetch_source_json_once(
@@ -40168,13 +40200,118 @@ async def _fetch_current_version_census_json_once(
             timeout=timeout,
         ),
     )
+
+
+def _is_current_version_census_fetch_retryable(
+    status_code: int | None,
+    fetch_error: str | None,
+) -> bool:
+    """Limit reviewed traversal retries to transport and transient HTTP failures."""
+    if status_code is None:
+        return bool(fetch_error) and _is_transient_source_fetch_failure(
+            status_code,
+            fetch_error,
+        )
+    return (
+        fetch_error is None
+        and status_code in CURRENT_VERSION_CENSUS_RETRYABLE_HTTP_STATUSES
+    )
+
+
+def _current_version_census_retry_delay_seconds(
+    fhir_payload: dict[str, Any] | None,
+    *,
+    retry_index: int,
+    retry_started_at: float,
+    now_monotonic: float,
+    now_utc: datetime.datetime | None = None,
+) -> float | None:
+    """Return the next fixed-schedule delay, or defer beyond the wait budget."""
+    retry_target_at = (
+        retry_started_at
+        + CURRENT_VERSION_CENSUS_RETRY_WAIT_TARGETS_SECONDS[retry_index]
+    )
+    retry_deadline_at = (
+        retry_started_at + CURRENT_VERSION_CENSUS_RETRY_WAIT_BUDGET_SECONDS
+    )
+    nominal_delay_seconds = max(
+        0.0,
+        retry_target_at - now_monotonic,
+    )
+    retry_after_seconds = _source_retry_after_seconds(
+        fhir_payload,
+        max_delay_seconds=None,
+        now_utc=now_utc,
+    )
+    if (
+        retry_after_seconds is not None
+        and retry_after_seconds > CURRENT_VERSION_CENSUS_RETRY_AFTER_MAX_SECONDS
+    ):
+        return None
+    delay_seconds = max(
+        nominal_delay_seconds,
+        retry_after_seconds if retry_after_seconds is not None else 0.0,
+    )
+    if now_monotonic + delay_seconds >= retry_deadline_at:
+        return None
+    return delay_seconds
+
+
+async def _fetch_current_version_census_json(
+    source_record: dict[str, Any],
+    request_url: str,
+    *,
+    timeout: int,
+) -> tuple[
+    tuple[int | None, dict[str, Any] | None, str | None, int],
+    int,
+]:
+    """Fetch one reviewed URL on a fixed, bounded transient-retry schedule."""
+    retry_started_at = time.monotonic()
+    retry_deadline_at = (
+        retry_started_at + CURRENT_VERSION_CENSUS_RETRY_WAIT_BUDGET_SECONDS
+    )
+    total_elapsed_ms = 0
+    retry_count = 0
+    fetch_result = (None, None, "request_not_attempted", 0)
+    for attempt_index in range(
+        len(CURRENT_VERSION_CENSUS_RETRY_WAIT_TARGETS_SECONDS) + 1
+    ):
+        fetch_result = await _fetch_current_version_census_json_once(
+            source_record,
+            request_url,
+            timeout=timeout,
+        )
+        total_elapsed_ms += fetch_result[3]
+        fetch_result = _source_fetch_result_with_elapsed(
+            fetch_result,
+            total_elapsed_ms,
+        )
+        if not _is_current_version_census_fetch_retryable(
+            fetch_result[0],
+            fetch_result[2],
+        ):
+            break
+        if attempt_index < len(CURRENT_VERSION_CENSUS_RETRY_WAIT_TARGETS_SECONDS):
+            delay_seconds = _current_version_census_retry_delay_seconds(
+                fetch_result[1],
+                retry_index=attempt_index,
+                retry_started_at=retry_started_at,
+                now_monotonic=time.monotonic(),
+            )
+            if delay_seconds is None:
+                break
+            await asyncio.sleep(delay_seconds)
+            if time.monotonic() >= retry_deadline_at:
+                break
+            retry_count += 1
     _record_terminal_source_fetch_diagnostic(
         source_record,
         request_url,
         fetch_result,
-        retry_count=0,
+        retry_count=retry_count,
     )
-    return fetch_result
+    return fetch_result, retry_count
 
 
 async def _fetch_source_json(
@@ -40185,11 +40322,12 @@ async def _fetch_source_json(
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     """Fetch FHIR JSON with source retries and page-size fallback."""
     if current_version_census_contract(source_record) is not None:
-        return await _fetch_current_version_census_json_once(
+        fetch_result, _retry_count = await _fetch_current_version_census_json(
             source_record,
             url,
             timeout=timeout,
         )
+        return fetch_result
     total_elapsed_ms = 0
     fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int] = (
         None,
@@ -48575,6 +48713,8 @@ def _last_updated_partition_retry_not_before(
     status_code: int | None,
     response_payload: dict[str, Any] | None,
     fetch_error: str | None,
+    *,
+    max_delay_seconds: float | None = 600.0,
 ) -> str | None:
     diagnostic = _terminal_source_fetch_diagnostic(
         source_record,
@@ -48589,6 +48729,7 @@ def _last_updated_partition_retry_not_before(
         response_payload,
         fetch_error,
         retry_count=int(diagnostic.get("retry_count") or 0),
+        max_delay_seconds=max_delay_seconds,
     )
 
 
@@ -51905,6 +52046,7 @@ async def _fetch_current_version_census_count(
                     status_code,
                     response_payload,
                     fetch_error,
+                    max_delay_seconds=None,
                 )
                 if is_transient
                 else None
@@ -53101,6 +53243,9 @@ async def _fetch_resource_rows(
                     response_payload,
                     error,
                     retry_count=int((fetch_diagnostic or {}).get("retry_count") or 0),
+                    max_delay_seconds=(
+                        None if is_current_version_census_enabled else 600.0
+                    ),
                 ) or checkpoint_non_bundle_retry_at
                 current_error = error or f"http_{status_code}"
                 if is_partitioned_fetch:
