@@ -60,7 +60,15 @@ def test_upgrade_replaces_only_profile_objects_without_evidence_dml(
     assert migration.down_revision == (
         "20260810120000_provider_directory_terminal_root_retirement_v2"
     )
-    assert statements[0].startswith("LOCK TABLE")
+    assert statements[0].startswith("DO $migration$")
+    assert "LOCK TABLE" in statements[0]
+    assert "IN ACCESS EXCLUSIVE MODE NOWAIT" in statements[0]
+    assert "FOR attempt IN 1..150 LOOP" in statements[0]
+    assert "pg_catalog.pg_sleep(0.2)" in statements[0]
+    assert (
+        "provider_directory_reviewed_subset_terminal_window_lock_unavailable"
+        in statements[0]
+    )
     replacements = [
         statement
         for statement in statements

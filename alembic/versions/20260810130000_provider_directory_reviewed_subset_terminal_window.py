@@ -112,13 +112,33 @@ def _lock_relations(schema: str) -> None:
         abandonment._CHECKPOINT,
         abandonment._BULK_CHECKPOINT,
     )
+    relation_list = ", ".join(
+        subset._qf(schema, relation_name)
+        for relation_name in relation_names
+    )
     op.execute(
-        "LOCK TABLE "
-        + ", ".join(
-            subset._qf(schema, relation_name)
-            for relation_name in relation_names
-        )
-        + " IN ACCESS EXCLUSIVE MODE;"
+        f"""
+        DO $migration$
+        DECLARE
+            attempt integer;
+        BEGIN
+            FOR attempt IN 1..150 LOOP
+                BEGIN
+                    LOCK TABLE {relation_list}
+                        IN ACCESS EXCLUSIVE MODE NOWAIT;
+                    RETURN;
+                EXCEPTION WHEN lock_not_available THEN
+                    IF attempt = 150 THEN
+                        RAISE EXCEPTION
+                            'provider_directory_reviewed_subset_terminal_window_lock_unavailable'
+                            USING ERRCODE = '55P03';
+                    END IF;
+                    PERFORM pg_catalog.pg_sleep(0.2);
+                END;
+            END LOOP;
+        END;
+        $migration$;
+        """
     )
 
 
