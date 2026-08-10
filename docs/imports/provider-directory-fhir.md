@@ -745,7 +745,7 @@ artifact and do not traverse the FHIR graph at request time.
 
 ### Profile publication batching and recovery
 
-The `source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5`
+The `source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6`
 build strategy is an
 executable resource bound, not only a label. Evidence publication uses 22
 fact branches per source. The high-fanout `affiliation` branch is split into
@@ -754,7 +754,7 @@ OrganizationAffiliation-resource buckets; and `organization` executes both
 resource-keyed branches under the matching bucket coordinate. This produces
 115 bounded evidence statements per source. The executable-plan fingerprint
 binds the exact per-fact resource-key scheme, so a v3 checkpoint or a
-same-cardinality plan using a different bucket key cannot resume under v5.
+same-cardinality plan using a different bucket key cannot resume under v6.
 Compact profile publication covers the full 10-digit NPI space in 400
 half-open ranges of 5,000,000 values. A partial refresh with retained sources
 outside the selected source set prepends one copy batch to each phase. A
@@ -831,11 +831,56 @@ capacity signing key.
 The worker derives the exact source-delta execution geometry, typed
 artifact-scope row/byte projection, ordered batch-plan fingerprint, PostgreSQL
 storage identity, worker/pool geometry, and required data/temp/WAL reservation.
-It selects the public verification key by the assigned envelope's exact
-`lease.key_id`, then verifies and consumes the signed lease before creating
-scratch payloads. A missing variable, malformed document, stale signature,
-identity mismatch, insufficient reservation, expired deadline, or changed
-projection fails closed; it cannot fall back to the legacy full rebuild.
+Before signing, control-plane holds the exact queued follow-up and issues its
+closed quiescence receipt. The authenticated healthcare endpoint
+`POST /control/provider-directory/profile-capacity-preflight` accepts the
+closed limits document and the exact v6/source-delta execution with an empty
+capacity attestation. It serializes Profile state, proves that no competing
+run, checkpoint claim, unexpired capacity consumption, or other open receipt
+exists, and persists one immutable, replay-fenced preflight receipt. Replaying
+the byte-identical unconsumed request returns the byte-identical receipt;
+reusing its nonce with different input, replaying it after expiry or
+consumption, or observing database/serving-state drift fails closed.
+
+First-generation Profile execution requires
+`provider-directory-database-capacity-lease-v3`. Its Ed25519-signed body
+contains `signing_preflight_guard` and
+`signing_preflight_guard_sha256`. The closed guard carries the full canonical
+control-plane and healthcare replay requests, both expected full receipts and
+their hashes, the exact limits and external-storage-observation digests, the
+held-follow-up preimage hash, fixed validation paths, and the replay fence.
+The lease nonce is the healthcare receipt hash, and its expiry and database
+geometry are exact-bound to the same chain. Lease v2 is recognized only as a
+legacy contract and is rejected for this admission path.
+
+The trust artifact's byte digest is checked by the authenticated
+control-plane/GitOps bundle validator before installation; guard v1 does not
+carry that digest. Healthcare instead performs the stronger local semantic
+boundary at admission: it verifies the v3 signature against its independently
+configured closed trust-v2 document and its exact authority, key, database,
+tablespace, and volume pins, then records the selected public-key fingerprint
+and key identity in the immutable consumption row. Thus a valid bundle digest
+cannot substitute for healthcare trust verification, and a locally changed or
+unauthorized trust assignment fails closed.
+
+The worker selects the public verification key by the assigned envelope's
+exact `lease.key_id`, verifies the v3 signature and complete guard, rechecks
+the durable receipt and live runtime/storage/serving identities, and atomically
+consumes the receipt and lease before creating scratch payloads. Receipt replay
+for deployment validation is non-consuming; only actual admission performs
+the single-use transition. A missing variable, malformed document, stale
+signature, identity mismatch, insufficient reservation, expired deadline, or
+changed projection fails closed; it cannot fall back to the legacy full
+rebuild.
+
+When a successful legacy Profile exists but the serving-generation singleton
+does not, preflight validates a read-only virtual adoption candidate and signs
+that exact state as `resolution=legacy_adoption`. No row is inserted before
+lease verification. Admission recomputes and inserts the candidate only inside
+the same serialized transaction that consumes the receipt and lease; any
+failure rolls the insert back. The worst-case admission control-WAL projection
+reserves three bounded metadata mutations for the receipt transition, lease
+consumption, and possible serving-generation adoption.
 
 All scratch tables and their required indexes are created empty before payload
 DML. The worker projects aggregate physical growth and WAL across the complete
@@ -923,6 +968,37 @@ to the same source IDs, then uses only resources in that source's current,
 published endpoint dataset. Direct plan references and Plan-Net/network-derived
 plans therefore cannot pull a historical plan row or a plan belonging to a
 different source alias into the evidence response.
+
+The dormant rooted-graph acquisition path treats the published Practitioner
+cohort as an immutable database root. Initialization creates every
+PractitionerRole search with one `INSERT ... SELECT`; query JSON, SHA-256, and
+query IDs are derived in SQL and checked against the same canonical contract as
+the Python builders. It does not load the root ID census into application
+memory, and it does not create the InsurancePlan census at initialization.
+
+Each successful query terminalizes its retained witnesses and inserts the
+deduplicated direct-read and OrganizationAffiliation frontier in the same
+transaction. The database trigger requires the discovery parent to have become
+terminal in that transaction, so a later registration pass cannot leave the
+stored graph ahead of its work queue. Exact direct-read HTTP 404 and 410
+responses use completed `missing_http_status` witnesses: they participate in
+terminal and rooted-graph hashes and satisfy reference closure, while transport,
+validation, and other real failures remain `error` rows that prevent sealing.
+
+The full InsurancePlan census has a dedicated claim. Generic claims exclude it,
+and the database admits it only after the exact Practitioner root set is
+complete, every retained root reference has a completed direct-read witness,
+and every retained root Organization has a completed affiliation search. That
+transition freezes root work and returns the sorted, database-derived root
+network anchors used for the local plan intersection. Plan-only closure can then
+expand, and sealing repeats the fixed-point checks before recording comparison
+roots. None of these dormant persistence contracts activate acquisition or
+publication by themselves.
+
+The packaged default-off register, acquire/admit, and publish phases are
+documented in [Rooted Provider Directory graph operator](provider-directory-rooted-graph-operator.md).
+They use separate lowercase-true gates and never dispatch the global Profile
+build from a source-local publication receipt.
 
 Inline evidence returns at most 100 plans per role. Exact `returned`, `total`,
 and `truncated` metadata tells consumers when the complete plan set must be
@@ -1520,21 +1596,62 @@ instead of converting a landing page into a resource import.
 
 Optum caps broad PractitionerRole, Practitioner, Organization,
 OrganizationAffiliation, and Location searches at 10,000 rows and does not
-publish Bulk or an exhaustive residual search. Full-refresh imports therefore
-use an InsurancePlan-anchored graph contract: enumerate every plan network,
-page PractitionerRole and OrganizationAffiliation for each network, validate
-the returned network predicate, and resolve every referenced Practitioner,
-Organization, and Location exactly. The graph must produce the same content
-fingerprint twice before publication. Metrics report `plan_graph_complete`
-separately from `collection_complete`; the latter remains false so clients and
-operators cannot mistake the curated plan graph for exhaustive raw collections.
+publish Bulk or an exhaustive residual search. The reviewed rooted connector
+therefore starts from one immutable, published Practitioner cohort, enumerates
+PractitionerRole only with exact `practitioner` searches, enumerates
+OrganizationAffiliation only with exact `participating-organization` searches
+for reached Organizations, and resolves reviewed references with exact direct
+reads. InsurancePlan is covered by one finite bounded census whose complete
+payload remains an admission witness; only plans tied to the rooted
+Organization network anchors enter the published graph. Two separate sealed
+acquisitions must produce the same terminal, resource, edge, census, and budget
+proof before publication. Metrics keep rooted-graph completion separate from
+`collection_complete`; the latter remains false so clients and operators
+cannot mistake the curated graph for an exhaustive raw endpoint crawl.
+
+The rooted graph is registered as a distinct reviewed, manual/default-off
+source and endpoint under the same explicit authority as the Practitioner
+root. Operators must register this dormant pair before deploying the source
+spec that names it; Profile selection fails closed even while the legacy
+Practitioner variant remains the sole current dataset if either reviewed
+registry coordinate is absent or changed. Its ready publication is one
+immutable eight-family dataset: the exact
+copied Practitioner root plus PractitionerRole, Organization,
+OrganizationAffiliation, Location, HealthcareService, InsurancePlan, and
+Endpoint rows. Profile selection treats the legacy Practitioner-only dataset
+and the rooted combined dataset as alternative generations of one logical
+input. Exactly one may be current: two current variants, or an unsupported
+generic current row on either reviewed endpoint, fails selection before any
+evidence SQL runs. A ready rooted generation replaces rather than unions with
+the legacy source, so source-delta removal covers all evidence and NPIs that
+belonged only to the prior generation.
+
+Readiness also follows every rooted successor recursively to the exact legacy
+cohort and corporate official-file dataset that supplied its Practitioner set.
+Rotating that official dataset makes the old legacy or rooted current row
+unready immediately, even though its immutable publication remains valid
+historical evidence. Profile selects no stale variant. The shared publication
+lock permits only an identity-valid known stale row to be superseded by a new
+legacy generation derived from the current official cohort; rooted acquisition
+and publication can then continue from that ready generation. Missing,
+ambiguous, cyclic, or foreign lineage fails closed.
+
+All normalized role, organization, affiliation, service, and endpoint rows
+for either dataset-scoped source are read only from the selected
+`provider_directory_dataset_resource.dataset_id`. Profile never falls back to
+source-wide typed tables for those sources. Location and InsurancePlan remain
+retained dataset resources and exact reference/serving-relation inputs; the
+current Profile schema has no standalone Location or InsurancePlan fact type,
+so this publication deliberately does not invent one. Their references can
+still appear in role, affiliation, membership, and service context, and a row
+from another dataset cannot satisfy those joins.
 
 The corporate UnitedHealthcare official-file source is a distinct
 acquisition-configured source at `https://providermrf.uhc.com`, with source ID
 `pdfhir_2754e999dd691175821ec26e`. It enters the same source resolution, probe,
 grouping, progress, completion, artifact, Profile-follow-up, and cleanup
 lifecycle as FHIR REST and connector-backed sources. Its source-group adapter
-refreshes and optionally pins the official catalog, downloads missing objects
+requires the exact reviewed catalog SHA-256, downloads missing objects
 with bounded parallelism, verifies retained bytes, builds semantic facts with
 bounded file-level and native range-level parallelism, and atomically
 materializes InsurancePlan, Location, Organization,
@@ -1567,7 +1684,7 @@ UHC readiness is proved in two stages. Publishing the current endpoint dataset
 and typed resources is an intermediate checkpoint: it can support catalog
 evidence and raw Provider Directory-backed role, candidate-address, and plan
 overlays, but it is not full consumer readiness. Full acceptance additionally
-requires the bounded v4 source-delta Profile cutover for that exact dataset
+requires the bounded v6 source-delta Profile cutover for that exact dataset
 vector and public `/v1/npi/id/{npi}/profile` evidence for the facility
 Organization, `tin_status: unavailable_from_uhc_source`, and
 `relationship_type: payer_reported_provider_plan_membership`. Operators must

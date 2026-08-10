@@ -9,6 +9,11 @@ import json
 import os
 from typing import Any
 
+from process.provider_directory_global_profile_followup_contract import (
+    build_provider_directory_global_profile_followup,
+    profile_followup_receipt_metadata,
+)
+
 
 COHORT_ENABLED_ENV = "HLTHPRT_UHC_FLEX_PRACTITIONER_COHORT_ENABLED"
 ACQUISITION_ENABLED_ENV = "HLTHPRT_UHC_FLEX_PRACTITIONER_ACQUISITION_ENABLED"
@@ -156,29 +161,39 @@ def _acquisition_result_json(receipt: Any) -> str:
     )
 
 
-def _publication_result_json(result: Any) -> str:
-    readiness = result.readiness
+def _publication_result_json(publication_result: Any) -> str:
+    dataset_readiness = publication_result.readiness
     return _json_text(
         {
-            "admission_id": readiness.admission_id,
-            "candidate_acquisition_id": readiness.candidate_acquisition_id,
-            "cohort_complete": readiness.cohort_complete,
-            "cohort_id": readiness.cohort_id,
-            "dataset_hash": readiness.dataset_hash,
-            "dataset_id": readiness.dataset_id,
-            "dataset_intent_id": readiness.dataset_intent_id,
-            "endpoint_collection_complete": (readiness.endpoint_collection_complete),
-            "endpoint_complete": readiness.endpoint_complete,
-            "operation_key": readiness.operation_key,
-            "previous_dataset_id": readiness.previous_dataset_id,
+            "admission_id": dataset_readiness.admission_id,
+            "candidate_acquisition_id": dataset_readiness.candidate_acquisition_id,
+            "cohort_complete": dataset_readiness.cohort_complete,
+            "cohort_id": dataset_readiness.cohort_id,
+            "dataset_hash": dataset_readiness.dataset_hash,
+            "dataset_id": dataset_readiness.dataset_id,
+            "dataset_intent_id": dataset_readiness.dataset_intent_id,
+            "endpoint_collection_complete": (
+                dataset_readiness.endpoint_collection_complete
+            ),
+            "endpoint_complete": dataset_readiness.endpoint_complete,
+            "operation_key": dataset_readiness.operation_key,
+            "previous_dataset_id": dataset_readiness.previous_dataset_id,
             "profile_delta_dispatch": {
+                **profile_followup_receipt_metadata(),
+                "external_followup": (
+                    build_provider_directory_global_profile_followup(
+                        source_id=dataset_readiness.source_id,
+                        dataset_id=dataset_readiness.dataset_id,
+                        parent_run_id=dataset_readiness.acquisition_root_run_id,
+                    )
+                ),
                 "operator_command_available": False,
                 "required_external_global_dispatch": True,
                 "status": "not_dispatched",
             },
-            "replayed": result.replayed,
-            "resource_count": readiness.resource_count,
-            "semantic_projection_as_of": readiness.semantic_projection_as_of,
+            "replayed": publication_result.replayed,
+            "resource_count": dataset_readiness.resource_count,
+            "semantic_projection_as_of": (dataset_readiness.semantic_projection_as_of),
             "status": "published",
         }
     )

@@ -39,6 +39,7 @@ __all__ = (
     "FHIRFormularyDatasetCoveragePlan",
     "FHIRFormularyMedication",
     "FHIRFormularySource",
+    "FHIRFormularySourceAcquisitionLease",
     "FHIRFormularySourceArtifact",
     "FHIRFormularySourceArtifactObservation",
     "FHIRFormularySourceArtifactSet",
@@ -337,6 +338,7 @@ from db.models.formulary_fhir_alias import (
     FHIRFormularyDatasetAlias,
 )
 from db.models.formulary_fhir_artifact import (
+    FHIRFormularySourceAcquisitionLease,
     FHIRFormularySourceArtifact,
     FHIRFormularySourceArtifactObservation,
     FHIRFormularySourceArtifactSet,

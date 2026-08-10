@@ -175,6 +175,7 @@ def test_control_wal_projection_binds_fixed_catalog_statement_envelopes():
     )
     assert operations["artifact_scope_analyze"].operation_count == 9
     assert operations["admission_row_lock"].operation_count == 2
+    assert operations["capacity_consumption_insert"].operation_count == 3
     assert operations["cutover_row_lock"].operation_count == 12
     assert operations["admission_row_lock"].wal_bytes_per_operation == (
         capacity.CONTROL_WAL_ROW_LOCK_UPPER_BOUND_BYTES_PER_TUPLE

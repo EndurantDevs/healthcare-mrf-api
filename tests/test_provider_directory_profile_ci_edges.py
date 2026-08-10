@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -100,9 +100,7 @@ async def test_profile_scope_blank_and_duplicate_rows(monkeypatch):
         "org_name": "Example Health",
         "plan_name": None,
     }
-    source_query = AsyncMock(
-        return_value=[{"source_id": None}, valid_source_by_field]
-    )
+    source_query = AsyncMock(return_value=[{"source_id": None}, valid_source_by_field])
     monkeypatch.setattr(importer.db, "all", source_query)
     monkeypatch.setattr(
         profile,
@@ -233,24 +231,50 @@ async def test_profile_cutover_deletes_exact_checkpoint(monkeypatch):
     )
 
     metrics_by_name = {"profile_rows": 2}
-    assert await importer._finalize_provider_directory_profile_stages(
-        metrics_by_name,
-        stages,
-        defer_cutover=False,
-    ) == metrics_by_name
+    assert (
+        await importer._finalize_provider_directory_profile_stages(
+            metrics_by_name,
+            stages,
+            defer_cutover=False,
+        )
+        == metrics_by_name
+    )
     delete_checkpoint.assert_awaited_once_with(*checkpoint)
     assert remove_stage.await_count == 2
 
 
-@pytest.mark.asyncio
-async def test_profile_publish_returns_finalized_metrics(monkeypatch):
-    dataset_fence = importer.ProviderDirectoryArtifactDatasetFence((_dataset(),))
-    build = _build()
-    metrics_by_name = {"profile_rows": 2}
-    stages = (
+def _patch_profile_capacity_admission(monkeypatch):
+    """Install an admitted capacity and return its binding assertion spy."""
+    capacity_binding = Mock()
+    capacity_admission = object()
+    monkeypatch.setattr(
+        importer,
+        "_assert_provider_directory_profile_capacity_build",
+        capacity_binding,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_capacity_admission",
+        lambda: capacity_admission,
+    )
+    return capacity_admission, capacity_binding
+
+
+def _profile_publish_stages():
+    """Return the two synthetic stages used by Profile publish tests."""
+    return (
         SimpleNamespace(stage_table="evidence-stage"),
         SimpleNamespace(stage_table="profile-stage"),
     )
+
+
+@pytest.mark.asyncio
+async def test_profile_publish_returns_finalized_metrics(monkeypatch):
+    """Return finalized metrics after binding the admitted Profile capacity."""
+    dataset_fence = importer.ProviderDirectoryArtifactDatasetFence((_dataset(),))
+    build = _build()
+    metrics_by_name = {"profile_rows": 2}
+    stages = _profile_publish_stages()
 
     @contextlib.asynccontextmanager
     async def build_guard(_schema, _target):
@@ -287,15 +311,18 @@ async def test_profile_publish_returns_finalized_metrics(monkeypatch):
         "_finalize_provider_directory_profile_stages",
         finalize,
     )
-    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(
-        dataset_fence
+    capacity_admission, capacity_binding = _patch_profile_capacity_admission(
+        monkeypatch
     )
+    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(dataset_fence)
     try:
-        assert await importer.publish_provider_directory_profile(
-            run_id="run-a"
-        ) == metrics_by_name
+        assert (
+            await importer.publish_provider_directory_profile(run_id="run-a")
+            == metrics_by_name
+        )
     finally:
         importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
+    assert capacity_binding.call_args.args[0] is capacity_admission
     finalize.assert_awaited_once_with(
         metrics_by_name,
         stages,
@@ -362,11 +389,14 @@ async def test_artifact_scope_helpers_cover_empty_and_guarded_paths(monkeypatch)
             primary_key=SimpleNamespace(columns=()),
         )
     )
-    assert importer._artifact_scope_pk_sql(
-        model_without_pk,
-        "mrf",
-        "artifact-stage",
-    ) == ()
+    assert (
+        importer._artifact_scope_pk_sql(
+            model_without_pk,
+            "mrf",
+            "artifact-stage",
+        )
+        == ()
+    )
 
     empty_fence = importer.ProviderDirectoryArtifactDatasetFence(())
     await importer._lock_and_verify_artifact_dataset_fence(empty_fence)

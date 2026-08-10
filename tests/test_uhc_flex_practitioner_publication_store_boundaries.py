@@ -12,6 +12,12 @@ import pytest
 
 from process import uhc_flex_practitioner_publication as publication
 from process import uhc_flex_practitioner_publication_store as store
+from process.provider_directory_dataset_scoped_publication import (
+    ProviderDirectoryDatasetScopedPublicationError,
+)
+from tests.test_provider_directory_dataset_scoped_publication_contract import (
+    _legacy_current,
+)
 from tests.test_uhc_flex_practitioner_publication import _admission
 from tests.test_uhc_flex_practitioner_publication_contract_boundaries import (
     _readiness,
@@ -20,9 +26,7 @@ from tests.test_uhc_flex_practitioner_publication_contract_boundaries import (
 
 def _identity_and_admission(resource_count: int = 1):
     admission = _admission(resource_count=resource_count)
-    identity = publication.build_uhc_flex_practitioner_dataset_identity(
-        admission
-    )
+    identity = publication.build_uhc_flex_practitioner_dataset_identity(admission)
     return identity, admission
 
 
@@ -48,14 +52,15 @@ async def test_readiness_rows_and_loaders_are_bounded() -> None:
     assert "dataset_ready" in sql
 
     database = SimpleNamespace(
-        first=AsyncMock(
-            side_effect=[None, _readiness_row(), None, _readiness_row()]
-        )
+        first=AsyncMock(side_effect=[None, _readiness_row(), None, _readiness_row()])
     )
-    assert await store.load_dataset_readiness(
-        readiness.dataset_id,
-        database=database,
-    ) is None
+    assert (
+        await store.load_dataset_readiness(
+            readiness.dataset_id,
+            database=database,
+        )
+        is None
+    )
     assert (
         await store.load_dataset_readiness(
             readiness.dataset_id,
@@ -79,9 +84,7 @@ async def test_existing_and_orphan_parent_locks_fail_closed() -> None:
     }
 
     for parent_count, expected_code in ((2, "state"), (1, "source_drift")):
-        count_database = SimpleNamespace(
-            scalar=AsyncMock(return_value=parent_count)
-        )
+        count_database = SimpleNamespace(scalar=AsyncMock(return_value=parent_count))
         with pytest.raises(
             publication.UHCFlexPractitionerPublicationError
         ) as error_info:
@@ -94,73 +97,62 @@ async def test_existing_and_orphan_parent_locks_fail_closed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_current_lock_rejects_orphan_dedicated_header() -> None:
+async def test_current_lock_rejects_orphan_dedicated_header(monkeypatch) -> None:
     identity, _admitted = _identity_and_admission()
-    empty_database = SimpleNamespace(
-        first=AsyncMock(side_effect=[None, None]),
-        scalar=AsyncMock(),
+    current_loader = AsyncMock(return_value=None)
+    monkeypatch.setattr(store, "lock_exact_current_dataset", current_loader)
+    empty_database = object()
+    assert (
+        await store._locked_current_dataset(
+            empty_database,
+            identity,
+        )
+        is None
     )
-    assert await store._locked_current_dataset(
+    current_loader.assert_awaited_once_with(
         empty_database,
-        identity,
-    ) is None
+        pair=store.exact_uhc_dataset_pair(),
+        require_ready=False,
+    )
 
-    orphan_header_database = SimpleNamespace(
-        first=AsyncMock(
-            side_effect=[None, {"dataset_id": "orphan"}]
-        ),
-        scalar=AsyncMock(),
+    current_loader.side_effect = ProviderDirectoryDatasetScopedPublicationError(
+        "both_current"
     )
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
         match="state is invalid",
     ):
         await store._locked_current_dataset(
-            orphan_header_database,
+            object(),
             identity,
         )
 
 
 @pytest.mark.asyncio
-async def test_current_lock_rejects_foreign_and_returns_ready_parent() -> None:
+async def test_current_lock_rejects_foreign_and_returns_ready_parent(
+    monkeypatch,
+) -> None:
     identity, _admitted = _identity_and_admission()
-    previous_dataset_id = "pdufpd_" + "9" * 48
-    foreign_database = SimpleNamespace(
-        first=AsyncMock(
-            side_effect=[
-                {"dataset_id": previous_dataset_id},
-                {
-                    "dataset_id": "different",
-                    "status": "published",
-                    "is_current": True,
-                },
-            ]
-        ),
-        scalar=AsyncMock(return_value=True),
+    current_loader = AsyncMock(
+        side_effect=ProviderDirectoryDatasetScopedPublicationError("foreign_current")
     )
+    monkeypatch.setattr(store, "lock_exact_current_dataset", current_loader)
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
         match="unrelated current dataset",
     ):
-        await store._locked_current_dataset(foreign_database, identity)
+        await store._locked_current_dataset(object(), identity)
 
-    current_database = SimpleNamespace(
-        first=AsyncMock(
-            side_effect=[
-                {"dataset_id": previous_dataset_id},
-                {
-                    "dataset_id": previous_dataset_id,
-                    "status": "published",
-                    "is_current": True,
-                },
-            ]
-        ),
-        scalar=AsyncMock(return_value=True),
+    previous = _legacy_current()
+    current_loader.side_effect = None
+    current_loader.return_value = previous
+    assert (
+        await store._locked_current_dataset(
+            object(),
+            identity,
+        )
+        == previous
     )
-    assert await store._locked_current_dataset(
-        current_database,
-        identity,
-    ) == previous_dataset_id
 
 
 @pytest.mark.asyncio
@@ -215,56 +207,39 @@ async def test_header_inserts_require_one_row_and_compose_metadata(
 
 
 @pytest.mark.asyncio
-async def test_supersede_and_publish_require_exact_atomic_updates() -> None:
-    previous_dataset_id = "pdufpd_" + "8" * 48
-    unused_database = SimpleNamespace(scalar=AsyncMock(), status=AsyncMock())
-    await store._supersede_previous(unused_database, None)
-    unused_database.scalar.assert_not_awaited()
-
-    not_ready_database = SimpleNamespace(
-        scalar=AsyncMock(return_value=False),
-        status=AsyncMock(),
+async def test_supersede_and_publish_require_exact_atomic_updates(
+    monkeypatch,
+) -> None:
+    previous = _legacy_current()
+    superseder = AsyncMock(
+        side_effect=ProviderDirectoryDatasetScopedPublicationError("foreign_current")
     )
+    monkeypatch.setattr(store, "supersede_exact_current_dataset", superseder)
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
         match="unrelated current dataset",
     ):
-        await store._supersede_previous(
-            not_ready_database,
-            previous_dataset_id,
-        )
+        await store._supersede_previous(object(), previous)
 
     for update_counts in ((0, 1), (1, 0)):
-        supersede_database = SimpleNamespace(
-            scalar=AsyncMock(return_value=True),
-            status=AsyncMock(side_effect=update_counts),
-        )
-        with pytest.raises(publication.UHCFlexPractitionerPublicationError):
-            await store._supersede_previous(
-                supersede_database,
-                previous_dataset_id,
-            )
-        publish_database = SimpleNamespace(
-            status=AsyncMock(side_effect=update_counts)
-        )
+        publish_database = SimpleNamespace(status=AsyncMock(side_effect=update_counts))
         with pytest.raises(publication.UHCFlexPractitionerPublicationError):
             await store._publish_candidate(
                 publish_database,
-                previous_dataset_id,
+                previous.dataset_id,
             )
 
+    superseder.side_effect = None
+    superseder.return_value = None
+    supersede_database = object()
+    await store._supersede_previous(supersede_database, previous)
+    superseder.assert_awaited_with(supersede_database, previous)
     complete_database = SimpleNamespace(
-        scalar=AsyncMock(return_value=True),
         status=AsyncMock(side_effect=[1, 1]),
     )
-    await store._supersede_previous(
-        complete_database,
-        previous_dataset_id,
-    )
-    complete_database.status = AsyncMock(side_effect=[1, 1])
     await store._publish_candidate(
         complete_database,
-        previous_dataset_id,
+        previous.dataset_id,
     )
 
 
@@ -318,11 +293,14 @@ async def test_admission_lock_requires_registered_source_and_exact_authority(
         )
 
     admission_loader.return_value = admission
-    assert await store._lock_admission(
-        source_database,
-        admission.candidate_acquisition_id,
-        identity.endpoint_id,
-    ) is admission
+    assert (
+        await store._lock_admission(
+            source_database,
+            admission.candidate_acquisition_id,
+            identity.endpoint_id,
+        )
+        is admission
+    )
 
 
 @pytest.mark.asyncio
@@ -362,7 +340,7 @@ async def test_new_publication_runs_full_sequence_before_readiness(
     monkeypatch,
 ) -> None:
     identity, admission = _identity_and_admission()
-    previous_dataset_id = "pdufpd_" + "8" * 48
+    previous_dataset = _legacy_current()
     database = object()
     monkeypatch.setattr(
         store,
@@ -373,7 +351,7 @@ async def test_new_publication_runs_full_sequence_before_readiness(
     monkeypatch.setattr(
         store,
         "_locked_current_dataset",
-        AsyncMock(return_value=previous_dataset_id),
+        AsyncMock(return_value=previous_dataset),
     )
     for function_name in (
         "_insert_building_headers",
@@ -407,7 +385,7 @@ async def test_new_publication_runs_full_sequence_before_readiness(
     assert publication_result.replayed is False
     store._supersede_previous.assert_awaited_with(
         database,
-        previous_dataset_id,
+        previous_dataset,
     )
     store._publish_candidate.assert_awaited_with(
         database,

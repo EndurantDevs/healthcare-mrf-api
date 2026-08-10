@@ -52,13 +52,16 @@ def test_control_data_revalidation_rejects_formula_tamper():
         metadata_data_bytes_per_operation=(
             operation.metadata_data_bytes_per_operation + 1
         ),
-        metadata_data_bytes=operation.metadata_data_bytes + 1,
+        metadata_data_bytes=(
+            operation.metadata_data_bytes + operation.operation_count
+        ),
     )
     tampered = dataclasses.replace(
         projection,
         operations=tuple(operations),
         total_control_metadata_data_bytes=(
-            projection.total_control_metadata_data_bytes + 1
+            projection.total_control_metadata_data_bytes
+            + operation.operation_count
         ),
     )
     tampered_geometry = capacity.revalidate_capacity_geometry(
@@ -91,15 +94,21 @@ def test_control_wal_revalidation_rejects_self_consistent_formula_tamper():
     operation = operations[operation_index]
     operations[operation_index] = dataclasses.replace(
         operation,
-        metadata_wal_bytes=operation.metadata_wal_bytes + 1,
+        metadata_wal_bytes=(
+            operation.metadata_wal_bytes + operation.operation_count
+        ),
         wal_bytes_per_operation=operation.wal_bytes_per_operation + 1,
-        wal_bytes=operation.wal_bytes + 1,
+        wal_bytes=operation.wal_bytes + operation.operation_count,
     )
     tampered = dataclasses.replace(
         projection,
         operations=tuple(operations),
-        pre_cutover_wal_bytes=projection.pre_cutover_wal_bytes + 1,
-        total_control_wal_bytes=projection.total_control_wal_bytes + 1,
+        pre_cutover_wal_bytes=(
+            projection.pre_cutover_wal_bytes + operation.operation_count
+        ),
+        total_control_wal_bytes=(
+            projection.total_control_wal_bytes + operation.operation_count
+        ),
     )
     tampered_geometry = capacity.revalidate_capacity_geometry(
         dataclasses.replace(

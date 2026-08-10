@@ -38,6 +38,9 @@ from tests.test_provider_directory_profile_capacity_attestation import (
     _trust,
 )
 from tests.provider_directory_profile_delta_test_support import _delta_database
+from tests.provider_directory_profile_capacity_signing_guard_test_support import (
+    capacity_signing_guard,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -244,20 +247,23 @@ def _capacity_envelope(
     database_identity,
     accepted_at: datetime.datetime,
 ):
+    """Build a replay lease bound to the disposable database identity."""
     observed_at = accepted_at - datetime.timedelta(seconds=2)
     issued_at = accepted_at - datetime.timedelta(seconds=1)
     deadline = accepted_at + datetime.timedelta(hours=7)
     expires_at = accepted_at + datetime.timedelta(hours=8)
-    data_digest = "31" * 32
-    temp_digest = (
-        data_digest
-        if database_identity.temp_tablespace_oid
-        == database_identity.tablespace_oid
-        else "32" * 32
-    )
-    wal_digest = "33" * 32
+    tablespace_rows, volume_rows = _capacity_storage_rows(database_identity)
 
     def mutate(body):
+        signing_guard, signing_guard_sha256, receipt_sha256 = (
+            capacity_signing_guard(
+                capacity_geometry_hash=geometry_hash,
+                observed_at=observed_at,
+                issued_at=issued_at,
+                expires_at=expires_at,
+                max_build_deadline=deadline,
+            )
+        )
         body.update(
             {
                 "capacity_geometry_hash": geometry_hash,
@@ -271,31 +277,46 @@ def _capacity_envelope(
                 "max_build_deadline": _utc_text(deadline),
                 "expires_at": _utc_text(expires_at),
                 "reservation_id": "pd-capacity-replay-postgres",
+                "signing_preflight_guard": signing_guard,
+                "signing_preflight_guard_sha256": signing_guard_sha256,
+                "nonce": receipt_sha256,
             }
         )
-        body["tablespaces"] = [
-            {
-                "tablespace_name": database_identity.tablespace_name,
-                "tablespace_oid": database_identity.tablespace_oid,
-                "usage": "data",
-                "volume_digest": data_digest,
-            },
-            {
-                "tablespace_name": (
-                    database_identity.temp_tablespace_name
-                ),
-                "tablespace_oid": database_identity.temp_tablespace_oid,
-                "usage": "temp",
-                "volume_digest": temp_digest,
-            },
-        ]
-        body["volumes"] = [
-            _volume("data", data_digest, 200_000_000_000),
-            _volume("temp", temp_digest, 20_000_000_000),
-            _volume("wal", wal_digest, 150_000_000_000),
-        ]
+        body["tablespaces"] = tablespace_rows
+        body["volumes"] = volume_rows
 
     return _signed_envelope(body_mutator=mutate)
+
+
+def _capacity_storage_rows(database_identity):
+    """Return exact tablespace and volume rows for the replay lease."""
+    data_digest = "31" * 32
+    temp_digest = (
+        data_digest
+        if database_identity.temp_tablespace_oid
+        == database_identity.tablespace_oid
+        else "32" * 32
+    )
+    tablespace_rows = [
+        {
+            "tablespace_name": database_identity.tablespace_name,
+            "tablespace_oid": database_identity.tablespace_oid,
+            "usage": "data",
+            "volume_digest": data_digest,
+        },
+        {
+            "tablespace_name": database_identity.temp_tablespace_name,
+            "tablespace_oid": database_identity.temp_tablespace_oid,
+            "usage": "temp",
+            "volume_digest": temp_digest,
+        },
+    ]
+    volume_rows = [
+        _volume("data", data_digest, 200_000_000_000),
+        _volume("temp", temp_digest, 20_000_000_000),
+        _volume("wal", "33" * 32, 150_000_000_000),
+    ]
+    return tablespace_rows, volume_rows
 
 
 def _volume(volume_class: str, digest: str, reserved_bytes: int):
@@ -322,7 +343,7 @@ def _execution(
 ) -> ProviderDirectoryProfileExecution:
     attestation = ProviderDirectoryProfileSelectionAttestation(
         proof_id=proof_id,
-        node_id="node-test",
+        node_id="dev-node",
         catalog_digest="8" * 64,
         selection_fingerprint="9" * 64,
         authority_revision=7,

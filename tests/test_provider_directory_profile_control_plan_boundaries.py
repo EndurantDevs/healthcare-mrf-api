@@ -81,13 +81,15 @@ def _control_layout(
 
 
 def _control_layout_by_oid() -> dict[int, object]:
-    """Return checkpoint, import-run, and consumption storage layouts."""
+    """Return every admission-control storage layout."""
     return {
         11: _control_layout(11, "1" * 64, "a" * 64, 101, "payload"),
         12: _control_layout(12, "2" * 64, "b" * 64, 102, "progress"),
         13: _control_layout(
             13, "3" * 64, "c" * 64, 103, "canonical_lease_json"
         ),
+        14: _control_layout(14, "4" * 64, "d" * 64, 104, "source_vector_json"),
+        15: _control_layout(15, "5" * 64, "e" * 64, 105, "receipt_json"),
     }
 
 
@@ -97,9 +99,12 @@ def _control_plan_context():
         build_checkpoint_oid=11,
         import_run_oid=12,
         capacity_consumption_oid=13,
+        serving_generation_oid=14,
         build_checkpoint_storage_fingerprint="1" * 64,
         import_run_storage_fingerprint="2" * 64,
         capacity_consumption_storage_fingerprint="3" * 64,
+        serving_generation_storage_fingerprint="4" * 64,
+        tablespace_oid=1663,
         postgres_default_toast_compression="pglz",
     )
     batch_plan = SimpleNamespace(
@@ -137,6 +142,11 @@ async def test_control_plan_excludes_signed_terminal_zero_probe(
         "_provider_directory_profile_relation_storage_fingerprint",
         AsyncMock(side_effect=lambda relation_oid, **_: layout_by_oid[relation_oid]),
     )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_relation_oid",
+        AsyncMock(return_value=15),
+    )
     toast_counter = AsyncMock(return_value=0)
     monkeypatch.setattr(
         importer,
@@ -164,7 +174,7 @@ async def test_control_plan_excludes_signed_terminal_zero_probe(
     assert plan_input.evidence_batch_count == 3
     assert plan_input.compact_batch_count == 2
     assert plan_input.affected_source_count == 2
-    assert plan_input.admission_row_lock_count == 2
+    assert plan_input.admission_row_lock_count == 3
     assert plan_input.cutover_row_lock_count == 27
     assert toast_counter.await_count == 1
     assert "build_id" in toast_counter.await_args.kwargs["params"]

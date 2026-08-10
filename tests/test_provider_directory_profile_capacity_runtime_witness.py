@@ -10,8 +10,8 @@ import pytest
 
 from process import provider_directory_profile_capacity_attestation as lease
 from process.provider_directory_profile_capacity_runtime_witness import (
-    CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD,
-    CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD,
+    CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD,
+    CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD,
 )
 from tests.test_provider_directory_profile_capacity_attestation import (
     _signed_envelope,
@@ -24,22 +24,20 @@ def test_coordinator_fields_preserve_exact_typed_and_wire_schema():
     runtime_witness_by_field = envelope["lease"]["runtime_witness"]
     verified_witness = _verify(envelope).runtime_witness
     expected_fields = {
-        CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD,
-        CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD,
+        CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD,
+        CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD,
     }
 
     assert expected_fields <= set(runtime_witness_by_field)
-    assert tuple(
-        field.name for field in dataclasses.fields(verified_witness)
-    ) == tuple(runtime_witness_by_field)
+    assert tuple(field.name for field in dataclasses.fields(verified_witness)) == tuple(
+        runtime_witness_by_field
+    )
     assert dataclasses.asdict(verified_witness) == runtime_witness_by_field
 
 
 def test_new_v1_lease_is_rejected_at_application_boundary():
     def v1_contract(body):
-        body["contract_id"] = (
-            "provider-directory-database-capacity-lease-v1"
-        )
+        body["contract_id"] = "provider-directory-database-capacity-lease-v1"
 
     with pytest.raises(
         lease.ProviderDirectoryCapacityLeaseError,
@@ -50,9 +48,7 @@ def test_new_v1_lease_is_rejected_at_application_boundary():
 
 def test_legacy_v1_shape_and_opaque_runtime_digest_replay_fail_closed():
     def legacy_body(body):
-        body["contract_id"] = (
-            "provider-directory-database-capacity-lease-v1"
-        )
+        body["contract_id"] = "provider-directory-database-capacity-lease-v1"
         body.pop("runtime_witness")
         body.pop("runtime_witness_sha256")
         body.pop("deployment_witness")

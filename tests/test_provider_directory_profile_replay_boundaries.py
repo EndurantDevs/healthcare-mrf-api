@@ -142,7 +142,7 @@ async def test_attested_profile_returns_committed_replay_before_build(
     )
 
     replay.assert_awaited_once()
-    serving_bootstrap.assert_awaited_once_with(importer._schema())
+    serving_bootstrap.assert_not_awaited()
     replay_publish.assert_awaited_once()
     build.assert_not_awaited()
     assert importer.PROFILE_SELECTION_RESULT_METRIC in publication_result

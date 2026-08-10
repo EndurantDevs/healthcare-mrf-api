@@ -108,7 +108,7 @@ async def _delta_capacity_admission(
         wal_tracker=importer._ProviderDirectoryProfileWalTracker(
             accounted_control_operation_counts={
                 "admission_row_lock": 2,
-                "capacity_consumption_insert": 1,
+                "capacity_consumption_insert": 3,
             }
         ),
     )

@@ -75,6 +75,8 @@ from process.uhc_provider_quarantine_contract import (
 from process.uhc_provider_quarantine_raw_verifier import (
     UhcProviderQuarantineRawSource,
 )
+from process.uhc_retained_range_manifest import load_verified_range_manifest
+from process.uhc_retained_types import UHCRetainedAdmissionError
 from process.uhc_semantic_build_store import (
     UHC_SEMANTIC_CONTRACT_ID,
     UHC_SEMANTIC_CONTRACT_VERSION,
@@ -164,6 +166,7 @@ class UhcAdmittedFile:
     record_count: int
     range_set_sha256: str
     manifest_sha256: str
+    manifest_byte_count: int
     raw_producer_build_id: str
     raw_path: Path
     manifest_path: Path
@@ -355,6 +358,7 @@ def _catalog_set_query() -> str:
                layout.record_count,
                layout.range_set_sha256,
                layout.manifest_sha256,
+               layout.manifest_byte_count,
                layout.producer_build_id AS raw_producer_build_id,
                layout.manifest_storage_uri,
                layout.status AS layout_status,
@@ -500,6 +504,10 @@ def _admitted_uhc_file(
         record_count=_positive_int(binding["record_count"], "record_count"),
         range_set_sha256=_require_sha256(binding["range_set_sha256"], "range_set_sha256"),
         manifest_sha256=_require_sha256(binding["manifest_sha256"], "manifest_sha256"),
+        manifest_byte_count=_positive_int(
+            binding["manifest_byte_count"],
+            "manifest_byte_count",
+        ),
         raw_producer_build_id=_required_printable_text(
             binding["raw_producer_build_id"],
             "raw_producer_build_id",
@@ -700,6 +708,23 @@ async def _reused_semantic_file(
         raise UhcRetainedDatasetError(
             "retained UHC SEALED semantic build disappeared"
         )
+    try:
+        await asyncio.to_thread(
+            load_verified_range_manifest,
+            raw_path=admitted.raw_path,
+            manifest_path=admitted.manifest_path,
+            expected_artifact_sha256=admitted.artifact_sha256,
+            expected_artifact_bytes=admitted.artifact_byte_count,
+            expected_manifest_sha256=admitted.manifest_sha256,
+            expected_manifest_bytes=admitted.manifest_byte_count,
+            expected_range_count=admitted.raw_range_count,
+            producer_build_id=admitted.raw_producer_build_id,
+            verify_raw_bytes=True,
+        )
+    except UHCRetainedAdmissionError as error:
+        raise UhcRetainedDatasetError(
+            "retained UHC SEALED semantic reuse source proof is invalid"
+        ) from error
     await verify_sealed_uhc_semantic_build(connection, identity, build_row)
     return UhcSealedSemanticFile(admitted, identity, build_row)
 

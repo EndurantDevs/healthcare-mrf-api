@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +85,21 @@ def _validate_artifact_content_claim(
         raise ValueError("FHIR formulary source artifact byte count is invalid")
 
 
+def _require_binding_request(
+    identity: object,
+    artifact_sha256: str,
+    artifact_byte_count: int,
+) -> SourceArtifactIdentity:
+    if type(identity) is not SourceArtifactIdentity:
+        raise ValueError("FHIR formulary source artifact identity is invalid")
+    _validate_artifact_content_claim(
+        identity,
+        artifact_sha256,
+        artifact_byte_count,
+    )
+    return identity
+
+
 def _matching_verified_artifact(
     database_row: dict[str, Any],
     artifact_sha256: str,
@@ -103,8 +119,11 @@ async def _fill_pending_source_artifact(
     identity: SourceArtifactIdentity,
     artifact_sha256: str,
     artifact_byte_count: int,
+    transaction_fence: Callable[[], Awaitable[None]] | None = None,
 ) -> VerifiedSourceArtifact:
     async with database.transaction():
+        if transaction_fence is not None:
+            await transaction_fence()
         database_row = await _artifact_record_for_identity(
             database,
             identity,
@@ -144,6 +163,7 @@ async def _install_and_fill_pending_source_artifact(
     source_path: Path,
     artifact_sha256: str,
     artifact_byte_count: int,
+    transaction_fence: Callable[[], Awaitable[None]] | None = None,
 ) -> VerifiedSourceArtifact:
     """Drain retained install and immutable ledger fill as one operation."""
 
@@ -158,7 +178,33 @@ async def _install_and_fill_pending_source_artifact(
         identity,
         artifact_sha256,
         artifact_byte_count,
+        transaction_fence,
     )
+
+
+async def _fenced_verified_source_artifact(
+    database: Any,
+    identity: SourceArtifactIdentity,
+    artifact_sha256: str,
+    artifact_byte_count: int,
+    transaction_fence: Callable[[], Awaitable[None]],
+) -> VerifiedSourceArtifact:
+    """Revalidate a replay while the exact source generation remains locked."""
+
+    async with database.transaction():
+        await transaction_fence()
+        database_row = await _artifact_record_for_identity(
+            database,
+            identity,
+            for_update=True,
+        )
+        if database_row.get("status") != "verified":
+            raise RuntimeError("FHIR formulary source artifact state is invalid")
+        return _matching_verified_artifact(
+            database_row,
+            artifact_sha256,
+            artifact_byte_count,
+        )
 
 
 async def bind_verified_source_artifact(
@@ -168,12 +214,11 @@ async def bind_verified_source_artifact(
     artifact_sha256: str,
     artifact_byte_count: int,
     database: Any = db,
+    transaction_fence: Callable[[], Awaitable[None]] | None = None,
 ) -> VerifiedSourceArtifact:
     """Install, rehash, and CAS-bind one source file to retained content."""
 
-    if type(identity) is not SourceArtifactIdentity:
-        raise ValueError("FHIR formulary source artifact identity is invalid")
-    _validate_artifact_content_claim(
+    identity = _require_binding_request(
         identity,
         artifact_sha256,
         artifact_byte_count,
@@ -194,6 +239,17 @@ async def bind_verified_source_artifact(
             verifier = install_and_verify_source_artifact
             verifier_args = (Path(source_path), *verifier_args)
         await _shielded_to_thread(verifier, *verifier_args)
+        if transaction_fence is not None:
+            return await drain_operation(
+                _fenced_verified_source_artifact(
+                    database,
+                    identity,
+                    artifact_sha256,
+                    artifact_byte_count,
+                    transaction_fence,
+                ),
+                preserve_cancellation=True,
+            )
         return stored_artifact
     if existing_row.get("status") != "pending":
         raise RuntimeError("FHIR formulary source artifact state is invalid")
@@ -206,6 +262,7 @@ async def bind_verified_source_artifact(
             Path(source_path),
             artifact_sha256,
             artifact_byte_count,
+            transaction_fence,
         ),
         preserve_cancellation=True,
     )

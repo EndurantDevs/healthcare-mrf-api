@@ -1,19 +1,29 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Prove the canonical Provider Directory Profile v4-to-v5 delta upgrade."""
+"""Prove canonical legacy-to-v6 Provider Directory Profile deltas."""
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 from unittest.mock import AsyncMock
 
 import pytest
+
+from process import provider_directory_profile as profile_artifact
+from process.provider_directory_rooted_graph_source_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+)
+from process.uhc_flex_practitioner_contract import (
+    UHC_FLEX_PRACTITIONER_SOURCE_ID,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
 LEGACY_V4_STRATEGY = "source-fact-role32-org32-membership32-npi5m-v4"
+LEGACY_V5_STRATEGY = "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5"
 
 
 def _legacy_source_context_digest(source_id: str) -> str:
@@ -35,26 +45,24 @@ def _desired_identity():
         ("source-a", "dataset-a"),
         ("source-b", "dataset-b"),
     )
-    source_context_vector = (
-        importer._provider_directory_profile_source_context_vector(
-            (
-                importer._ProviderDirectoryProfileSourceContext(
-                    source_id="source-a",
-                    endpoint_id="endpoint-a",
-                    canonical_api_base="https://directory.example.test/R4",
-                    org_name="Synthetic directory",
-                    plan_name=None,
-                    authority_id="shared-authority",
-                ),
-                importer._ProviderDirectoryProfileSourceContext(
-                    source_id="source-b",
-                    endpoint_id="endpoint-b",
-                    canonical_api_base="https://enrichment.example.test/R4",
-                    org_name="Synthetic enrichment",
-                    plan_name=None,
-                    authority_id="shared-authority",
-                ),
-            )
+    source_context_vector = importer._provider_directory_profile_source_context_vector(
+        (
+            importer._ProviderDirectoryProfileSourceContext(
+                source_id="source-a",
+                endpoint_id="endpoint-a",
+                canonical_api_base="https://directory.example.test/R4",
+                org_name="Synthetic directory",
+                plan_name=None,
+                authority_id="shared-authority",
+            ),
+            importer._ProviderDirectoryProfileSourceContext(
+                source_id="source-b",
+                endpoint_id="endpoint-b",
+                canonical_api_base="https://enrichment.example.test/R4",
+                org_name="Synthetic enrichment",
+                plan_name=None,
+                authority_id="shared-authority",
+            ),
         )
     )
     return importer._ProviderDirectoryProfileDesiredIdentity(
@@ -62,9 +70,7 @@ def _desired_identity():
         dataset_ids=[dataset_id for _source_id, dataset_id in source_vector],
         source_vector=source_vector,
         source_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(
-                source_vector
-            )
+            importer._provider_directory_profile_source_vector_hash(source_vector)
         ),
         source_context_vector=source_context_vector,
         source_context_vector_hash=(
@@ -95,9 +101,7 @@ def _legacy_serving_state():
         profile_strategy_version=LEGACY_V4_STRATEGY,
         source_vector=source_vector,
         source_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(
-                source_vector
-            )
+            importer._provider_directory_profile_source_vector_hash(source_vector)
         ),
         source_context_vector=source_context_vector,
         source_context_vector_hash=(
@@ -115,7 +119,7 @@ def _legacy_serving_state():
     )
 
 
-def test_v4_contexts_refresh_every_v5_source() -> None:
+def test_v4_contexts_refresh_every_v6_source() -> None:
     serving_state = _legacy_serving_state()
     desired = _desired_identity()
 
@@ -130,8 +134,87 @@ def test_v4_contexts_refresh_every_v5_source() -> None:
     ) == (("source-a", "source-b"), ("source-z",))
 
 
+def _canonical_dataset_context(source_id: str):
+    endpoint_id = dict(profile_artifact.configured_dataset_scoped_profile_endpoints())[
+        source_id
+    ]
+    return importer._provider_directory_profile_source_context_vector(
+        (
+            importer._ProviderDirectoryProfileSourceContext(
+                source_id=source_id,
+                endpoint_id=endpoint_id,
+                canonical_api_base="https://synthetic.invalid/R4",
+                org_name="Synthetic dataset variant",
+                plan_name=None,
+                authority_id=(
+                    profile_artifact.profile_reviewed_source_authority_id(source_id)
+                ),
+            ),
+        )
+    )
+
+
+def _v5_dataset_serving_state(source_id: str, dataset_id: str):
+    source_vector = ((source_id, dataset_id),)
+    source_context_vector = _canonical_dataset_context(source_id)
+    return dataclasses.replace(
+        _legacy_serving_state(),
+        profile_strategy_version=LEGACY_V5_STRATEGY,
+        source_vector=source_vector,
+        source_vector_hash=(
+            importer._provider_directory_profile_source_vector_hash(source_vector)
+        ),
+        source_context_vector=source_context_vector,
+        source_context_vector_hash=(
+            importer._provider_directory_profile_source_context_vector_hash(
+                source_context_vector
+            )
+        ),
+    )
+
+
+def test_v5_to_v6_variants_refresh_and_remove_old_generation() -> None:
+    legacy_dataset = "pdufpd_" + "1" * 48
+    rooted_dataset = "pdrgpd_" + "2" * 48
+    legacy_context = _canonical_dataset_context(UHC_FLEX_PRACTITIONER_SOURCE_ID)
+    rooted_context = _canonical_dataset_context(
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
+    )
+
+    legacy_serving = _v5_dataset_serving_state(
+        UHC_FLEX_PRACTITIONER_SOURCE_ID,
+        legacy_dataset,
+    )
+    assert importer._provider_directory_profile_delta_sources(
+        legacy_serving,
+        ((UHC_FLEX_PRACTITIONER_SOURCE_ID, legacy_dataset),),
+        legacy_context,
+    ) == ((UHC_FLEX_PRACTITIONER_SOURCE_ID,), ())
+    assert importer._provider_directory_profile_delta_sources(
+        legacy_serving,
+        ((PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID, rooted_dataset),),
+        rooted_context,
+    ) == (
+        (PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,),
+        (UHC_FLEX_PRACTITIONER_SOURCE_ID,),
+    )
+
+    rooted_serving = _v5_dataset_serving_state(
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+        rooted_dataset,
+    )
+    assert importer._provider_directory_profile_delta_sources(
+        rooted_serving,
+        ((UHC_FLEX_PRACTITIONER_SOURCE_ID, legacy_dataset),),
+        legacy_context,
+    ) == (
+        (UHC_FLEX_PRACTITIONER_SOURCE_ID,),
+        (PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,),
+    )
+
+
 @pytest.mark.asyncio
-async def test_v4_serving_generation_uses_v5_source_delta(monkeypatch) -> None:
+async def test_v4_serving_generation_uses_v6_source_delta(monkeypatch) -> None:
     serving_state = _legacy_serving_state()
     desired = _desired_identity()
     monkeypatch.setattr(
@@ -139,10 +222,8 @@ async def test_v4_serving_generation_uses_v5_source_delta(monkeypatch) -> None:
         "_provider_directory_profile_delta_serving_state",
         AsyncMock(return_value=serving_state),
     )
-    execution_token = (
-        importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-            object()
-        )
+    execution_token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
+        object()
     )
     try:
         materialization = await importer._profile_materialization_identity(
@@ -152,9 +233,7 @@ async def test_v4_serving_generation_uses_v5_source_delta(monkeypatch) -> None:
             allow_serving_generation_adoption=False,
         )
     finally:
-        importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(
-            execution_token
-        )
+        importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.reset(execution_token)
 
     assert materialization.materialization_mode == "source_delta"
     assert materialization.source_ids == ["source-a", "source-b"]

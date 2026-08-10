@@ -15,6 +15,7 @@ from sqlalchemy import (
     PrimaryKeyConstraint,
     String,
     UniqueConstraint,
+    text,
 )
 
 from db.connection import Base
@@ -23,10 +24,61 @@ from db.models.formulary_fhir import _reference, _table_args
 
 
 __all__ = (
+    "FHIRFormularySourceAcquisitionLease",
     "FHIRFormularySourceArtifact",
     "FHIRFormularySourceArtifactObservation",
     "FHIRFormularySourceArtifactSet",
 )
+
+
+class FHIRFormularySourceAcquisitionLease(Base, JSONOutputMixin):
+    """Reusable source-scoped acquisition generation and expiry fence."""
+
+    __tablename__ = "fhir_formulary_source_acquisition_lease"
+    __main_table__ = __tablename__
+    EXCLUDE_FIELDS = ("lease_token",)
+    __table_args__ = _table_args(
+        PrimaryKeyConstraint("source_id"),
+        ForeignKeyConstraint(
+            ["source_id"],
+            [_reference("fhir_formulary_source", "source_id")],
+            name="fhir_formulary_source_acquisition_lease_source_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "lease_generation >= 0 AND ((lease_token IS NULL AND "
+            "lease_expires_at IS NULL AND lease_heartbeat_at IS NULL AND "
+            "claimed_at IS NULL) OR (lease_generation > 0 AND "
+            "lease_token ~ '^[0-9a-f]{64}$' AND lease_expires_at IS NOT NULL "
+            "AND lease_heartbeat_at IS NOT NULL AND claimed_at IS NOT NULL "
+            "AND lease_expires_at > lease_heartbeat_at AND "
+            "lease_expires_at <= lease_heartbeat_at + INTERVAL '1 hour' AND "
+            "lease_heartbeat_at >= claimed_at))",
+            name="fhir_formulary_source_acquisition_lease_state_check",
+        ),
+    )
+    __my_index_elements__ = ["source_id"]
+
+    source_id = Column(String(64), nullable=False)
+    lease_generation = Column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    lease_token = Column(String(64))
+    lease_expires_at = Column(TIMESTAMP(timezone=True))
+    lease_heartbeat_at = Column(TIMESTAMP(timezone=True))
+    claimed_at = Column(TIMESTAMP(timezone=True))
+    created_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=text("transaction_timestamp()"),
+    )
+    updated_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=text("transaction_timestamp()"),
+    )
 
 
 class FHIRFormularySourceArtifactSet(Base, JSONOutputMixin):

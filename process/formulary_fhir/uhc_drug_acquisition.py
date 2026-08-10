@@ -18,6 +18,15 @@ from process.formulary_fhir.source_artifacts import (
     load_complete_source_artifact_set,
 )
 from process.formulary_fhir.source_artifacts import pending_source_files
+from process.formulary_fhir.uhc_drug_acquisition_lease import (
+    require_active_uhc_drug_source_acquisition,
+)
+from process.formulary_fhir.uhc_drug_acquisition_lease import (
+    run_with_uhc_drug_source_acquisition_lease,
+)
+from process.formulary_fhir.uhc_drug_acquisition_lease import (
+    UHCDrugSourceAcquisitionClaim,
+)
 from process.formulary_fhir.uhc_drug_transport import (
     acquire_pending_uhc_drug_artifacts,
 )
@@ -59,14 +68,11 @@ class UHCDrugArtifactAcquisitionResult:
         if (
             type(self.artifacts) is not VerifiedSourceArtifactSet
             or self.source_id != self.artifacts.source_id
-            or self.source_file_set_sha256
-            != self.artifacts.source_file_set_sha256
-            or self.artifact_set_sha256
-            != self.artifacts.artifact_set_sha256
+            or self.source_file_set_sha256 != self.artifacts.source_file_set_sha256
+            or self.artifact_set_sha256 != self.artifacts.artifact_set_sha256
             or self.file_count != 48
             or self.file_count != len(self.artifacts.artifacts)
-            or self.downloaded_file_count + self.reused_file_count
-            != self.file_count
+            or self.downloaded_file_count + self.reused_file_count != self.file_count
             or min(
                 self.file_count,
                 self.downloaded_file_count,
@@ -103,50 +109,21 @@ async def _invoke_cancel(cancel_check: CancelCheck | None) -> None:
         await cancellation_result
 
 
-async def acquire_uhc_drug_artifacts(
-    raw_proof: Any,
-    *,
-    database: Any = db,
-    session_factory: SessionFactory = default_uhc_drug_session_factory,
-    cancel_check: CancelCheck | None = None,
-    progress_callback: ProgressCallback | None = None,
-) -> UHCDrugArtifactAcquisitionResult:
-    """Register, download once, and reverify the exact 48-file drug set."""
-
-    await _invoke_cancel(cancel_check)
-    binding = await register_uhc_formulary_source(database=database)
-    registration = await register_uhc_source_file_set(
-        binding.source_id,
-        raw_proof,
-        database=database,
-    )
-    await require_source_unchanged(binding, database=database)
-    pending = await pending_source_files(
-        registration.identities,
-        database=database,
-        cancel_check=cancel_check,
-    )
-    await _invoke_cancel(cancel_check)
-    downloaded_bytes = await acquire_pending_uhc_drug_artifacts(
-        pending,
-        database=database,
-        session_factory=session_factory,
-        cancel_check=cancel_check,
-        progress_callback=progress_callback,
-    )
-    await _invoke_cancel(cancel_check)
-    artifacts = await load_complete_source_artifact_set(
-        registration.identities,
-        database=database,
-        cancel_check=cancel_check,
-    )
-    await _invoke_cancel(cancel_check)
-    await require_source_unchanged(binding, database=database)
+async def _require_postflight_binding(binding: Any, *, database: Any) -> None:
     postflight_binding = await register_uhc_formulary_source(database=database)
     if postflight_binding != binding:
         raise UHCDrugArtifactAcquisitionError(
             "UHC formulary source changed during artifact acquisition"
         )
+
+
+def _acquisition_result(
+    binding: Any,
+    registration: Any,
+    pending: tuple[Any, ...],
+    downloaded_bytes: int,
+    artifacts: VerifiedSourceArtifactSet,
+) -> UHCDrugArtifactAcquisitionResult:
     return UHCDrugArtifactAcquisitionResult(
         source_id=binding.source_id,
         source_observation_sha256=registration.source_observation_sha256,
@@ -160,6 +137,100 @@ async def acquire_uhc_drug_artifacts(
     )
 
 
+async def acquire_uhc_drug_artifacts(
+    raw_proof: Any,
+    *,
+    database: Any = db,
+    session_factory: SessionFactory = default_uhc_drug_session_factory,
+    cancel_check: CancelCheck | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> UHCDrugArtifactAcquisitionResult:
+    """Acquire one already-retained proof under a durable source claim."""
+
+    await _invoke_cancel(cancel_check)
+    binding = await register_uhc_formulary_source(database=database)
+
+    async def acquire_claimed(
+        claim: UHCDrugSourceAcquisitionClaim,
+    ) -> UHCDrugArtifactAcquisitionResult:
+        """Run the exact retained proof inside the granted generation."""
+
+        return await _acquire_registered_uhc_drug_artifacts(
+            raw_proof,
+            binding=binding,
+            claim=claim,
+            database=database,
+            session_factory=session_factory,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+
+    return await run_with_uhc_drug_source_acquisition_lease(
+        binding.source_id,
+        acquire_claimed,
+        database=database,
+    )
+
+
+async def _acquire_registered_uhc_drug_artifacts(
+    raw_proof: Any,
+    *,
+    binding: Any,
+    claim: UHCDrugSourceAcquisitionClaim,
+    database: Any,
+    session_factory: SessionFactory,
+    cancel_check: CancelCheck | None,
+    progress_callback: ProgressCallback | None,
+) -> UHCDrugArtifactAcquisitionResult:
+    """Register, download, and reverify inside one exact live generation."""
+
+    async def claim_check() -> None:
+        """Lock and recheck the exact generation at an action boundary."""
+
+        await require_active_uhc_drug_source_acquisition(
+            claim,
+            database=database,
+        )
+
+    await _invoke_cancel(cancel_check)
+    await claim_check()
+    registration = await register_uhc_source_file_set(
+        binding.source_id,
+        raw_proof,
+        database=database,
+    )
+    await require_source_unchanged(binding, database=database)
+    pending = await pending_source_files(
+        registration.identities,
+        database=database,
+        cancel_check=cancel_check,
+    )
+    await _invoke_cancel(cancel_check)
+    await claim_check()
+    downloaded_bytes = await acquire_pending_uhc_drug_artifacts(
+        pending,
+        database=database,
+        session_factory=session_factory,
+        cancel_check=cancel_check,
+        claim_check=claim_check,
+        progress_callback=progress_callback,
+    )
+    await _invoke_cancel(cancel_check)
+    await claim_check()
+    artifacts = await load_complete_source_artifact_set(
+        registration.identities,
+        database=database,
+        cancel_check=cancel_check,
+    )
+    await _invoke_cancel(cancel_check)
+    await claim_check()
+    await require_source_unchanged(binding, database=database)
+    await _require_postflight_binding(binding, database=database)
+    return _acquisition_result(
+        binding, registration, pending, downloaded_bytes, artifacts
+    )
+
+
 async def acquire_current_uhc_drug_artifacts(
     *,
     raw_set_sha256: str | None = None,
@@ -168,18 +239,42 @@ async def acquire_current_uhc_drug_artifacts(
     cancel_check: CancelCheck | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> UHCDrugArtifactAcquisitionResult:
-    """Use the current retained listings without fetching either listing again."""
+    """Snapshot retained listings and acquire every file under one claim."""
 
-    raw_proof = await load_retained_uhc_catalog_proof(
-        raw_set_sha256=raw_set_sha256,
+    await _invoke_cancel(cancel_check)
+    binding = await register_uhc_formulary_source(database=database)
+
+    async def acquire_current_claimed(
+        claim: UHCDrugSourceAcquisitionClaim,
+    ) -> UHCDrugArtifactAcquisitionResult:
+        """Snapshot retained listings and acquire them in one generation."""
+
+        await require_active_uhc_drug_source_acquisition(
+            claim,
+            database=database,
+        )
+        raw_proof = await load_retained_uhc_catalog_proof(
+            raw_set_sha256=raw_set_sha256,
+            database=database,
+        )
+        await require_active_uhc_drug_source_acquisition(
+            claim,
+            database=database,
+        )
+        return await _acquire_registered_uhc_drug_artifacts(
+            raw_proof,
+            binding=binding,
+            claim=claim,
+            database=database,
+            session_factory=session_factory,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+
+    return await run_with_uhc_drug_source_acquisition_lease(
+        binding.source_id,
+        acquire_current_claimed,
         database=database,
-    )
-    return await acquire_uhc_drug_artifacts(
-        raw_proof,
-        database=database,
-        session_factory=session_factory,
-        cancel_check=cancel_check,
-        progress_callback=progress_callback,
     )
 
 

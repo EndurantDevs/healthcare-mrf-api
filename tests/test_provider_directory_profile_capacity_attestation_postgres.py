@@ -357,6 +357,7 @@ def _second_v2_consumption_values() -> dict[str, object]:
             "lease_digest": "dc" * 32,
             "run_id": "run_" + "d" * 32,
             "build_id": "pdpb_" + "e" * 32,
+            "contract_id": "provider-directory-database-capacity-lease-v2",
         }
     )
     return values

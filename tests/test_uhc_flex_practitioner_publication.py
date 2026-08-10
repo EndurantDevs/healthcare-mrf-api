@@ -60,9 +60,7 @@ def _admission(resource_count: int = 1):
                 source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
                 connector_id=UHC_FLEX_PRACTITIONER_CONNECTOR_ID,
                 query_contract_id=UHC_FLEX_PRACTITIONER_QUERY_CONTRACT_ID,
-                storage_contract_id=(
-                    UHC_FLEX_PRACTITIONER_ACQUISITION_CONTRACT_ID
-                ),
+                storage_contract_id=(UHC_FLEX_PRACTITIONER_ACQUISITION_CONTRACT_ID),
                 run_id=build_uhc_flex_practitioner_run_id(intent_id, role),
                 dataset_intent_id=intent_id,
                 expected_npi_count=2,
@@ -96,9 +94,7 @@ def test_dataset_identity_and_metadata_bind_the_exact_admission() -> None:
         admission,
     )
     assert metadata["admission_id"] == admission.admission_id
-    assert metadata["candidate_acquisition_id"] == (
-        admission.candidate_acquisition_id
-    )
+    assert metadata["candidate_acquisition_id"] == (admission.candidate_acquisition_id)
     assert metadata["cohort_id"] == admission.cohort_id
     assert metadata["dataset_intent_id"] == admission.dataset_intent_id
     assert metadata["semantic_projection_as_of"] == PROJECTION_DATE
@@ -161,6 +157,7 @@ def test_readiness_never_promotes_exact_cohort_to_endpoint_complete() -> None:
         previous_dataset_id=None,
         admission_id=admission.admission_id,
         candidate_acquisition_id=admission.candidate_acquisition_id,
+        acquisition_root_run_id=identity.acquisition_root_run_id,
         cohort_id=admission.cohort_id,
         dataset_intent_id=admission.dataset_intent_id,
         endpoint_id=identity.endpoint_id,

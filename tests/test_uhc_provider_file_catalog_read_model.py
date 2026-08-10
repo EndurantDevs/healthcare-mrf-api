@@ -9,6 +9,9 @@ import pytest
 from process import uhc_provider_file_catalog as catalog_module
 from process import uhc_provider_file_catalog_store as catalog_store
 from process import uhc_provider_file_catalog_types as catalog_types
+from tests.uhc_final_publication_test_support import (
+    final_publication_fixture,
+)
 from tests.test_uhc_provider_file_catalog_store import _live_payloads
 
 
@@ -74,6 +77,61 @@ def _assert_catalog_only_inventory(catalog_document):
         "reference_aware_gc_ready",
     ):
         assert catalog_document[capability_flag] is False
+
+
+def test_current_publication_state_rejects_weak_summary_fragment():
+    catalog_hash = "a" * 64
+    source_file_id = "b" * 64
+    weak_dataset_by_field = {
+        "source_id": catalog_module.UHC_PROVIDER_FILE_SOURCE_ID,
+        "dataset_id": "synthetic-dataset",
+        "endpoint_id": "9" * 64,
+        "acquisition_root_run_id": "synthetic-root",
+        "status": "published",
+        "is_current": True,
+        "dataset_hash": "c" * 64,
+        "resource_count": 6,
+        "publication_metadata_json": {
+            "uhc_retained_summary_input_v1": {
+                "complete": True,
+                "catalog_set_sha256": catalog_hash,
+            }
+        },
+    }
+
+    publication_state = catalog_module._current_publication_state(
+        catalog_hash,
+        [{"file_id": source_file_id}],
+        {source_file_id: {"artifact_sha256": "d" * 64}},
+        weak_dataset_by_field,
+    )
+
+    assert publication_state == {
+        "binding_complete": True,
+        "dataset_current": False,
+        "provider_directory_current": False,
+        "dataset_id": None,
+        "resource_count": 0,
+        "published_at": None,
+    }
+
+
+def test_current_publication_state_accepts_exact_final_proof():
+    dataset_state, _expectation = final_publication_fixture()
+    source_file_id = "b" * 64
+
+    publication_state = catalog_module._current_publication_state(
+        "a" * 64,
+        [{"file_id": source_file_id}],
+        {source_file_id: {"artifact_sha256": "d" * 64}},
+        dataset_state,
+    )
+
+    assert publication_state["binding_complete"] is True
+    assert publication_state["dataset_current"] is True
+    assert publication_state["provider_directory_current"] is True
+    assert publication_state["dataset_id"] == dataset_state["dataset_id"]
+    assert publication_state["resource_count"] == 6
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,9 @@ import re
 from typing import Any, Mapping
 
 from db.connection import db
+from process.provider_directory_dataset_scoped_publication import (
+    exact_dataset_variant,
+)
 from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
 )
@@ -120,9 +123,7 @@ def _row_fields(database_row: Any) -> dict[str, Any]:
     if database_row is None:
         return {}
     mapping = (
-        database_row._mapping
-        if hasattr(database_row, "_mapping")
-        else database_row
+        database_row._mapping if hasattr(database_row, "_mapping") else database_row
     )
     if not isinstance(mapping, Mapping):
         raise UHCFlexPractitionerPublicationError("state")
@@ -145,9 +146,7 @@ class UHCFlexPractitionerDatasetIdentity:
     terminal_set_sha256: str
     resource_count: int
     source_id: str = UHC_FLEX_PRACTITIONER_SOURCE_ID
-    publication_contract_id: str = (
-        UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID
-    )
+    publication_contract_id: str = UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID
 
     def __post_init__(self) -> None:
         try:
@@ -159,21 +158,31 @@ class UHCFlexPractitionerDatasetIdentity:
         expected_dataset_id = _digest_identifier(
             "pdufpd_",
             (
-                self.publication_contract_id, self.admission_id,
-                self.candidate_acquisition_id, self.cohort_id,
-                self.dataset_intent_id, self.source_id, self.endpoint_id,
-                self.semantic_projection_as_of, self.operation_key,
-                self.terminal_set_sha256, self.resource_count,
+                self.publication_contract_id,
+                self.admission_id,
+                self.candidate_acquisition_id,
+                self.cohort_id,
+                self.dataset_intent_id,
+                self.source_id,
+                self.endpoint_id,
+                self.semantic_projection_as_of,
+                self.operation_key,
+                self.terminal_set_sha256,
+                self.resource_count,
             ),
         )
         expected_root_id = _digest_identifier(
             "pdufpar_",
             (
                 UHC_FLEX_PRACTITIONER_DATASET_ROOT_CONTRACT_ID,
-                self.admission_id, self.candidate_acquisition_id,
-                self.cohort_id, self.dataset_intent_id,
-                self.semantic_projection_as_of, self.operation_key,
-                self.terminal_set_sha256, self.resource_count,
+                self.admission_id,
+                self.candidate_acquisition_id,
+                self.cohort_id,
+                self.dataset_intent_id,
+                self.semantic_projection_as_of,
+                self.operation_key,
+                self.terminal_set_sha256,
+                self.resource_count,
             ),
         )
         if (
@@ -195,8 +204,7 @@ class UHCFlexPractitionerDatasetIdentity:
             or _HASH_PATTERN.fullmatch(self.terminal_set_sha256) is None
             or type(self.endpoint_id) is not str
             or _HASH_PATTERN.fullmatch(self.endpoint_id) is None
-            or self.endpoint_id
-            != uhc_flex_practitioner_endpoint_identity().endpoint_id
+            or self.endpoint_id != uhc_flex_practitioner_endpoint_identity().endpoint_id
         ):
             raise ValueError("Flex Practitioner dataset identity is invalid")
 
@@ -218,16 +226,22 @@ def build_uhc_flex_practitioner_dataset_identity(
     if selected_endpoint_id != uhc_flex_practitioner_endpoint_identity().endpoint_id:
         raise ValueError("Flex Practitioner endpoint ID is invalid")
     identity_tail = (
-        admission.admission_id, admission.candidate_acquisition_id,
-        admission.cohort_id, admission.dataset_intent_id,
-        admission.semantic_projection_as_of, admission.operation_key,
-        admission.terminal_set_sha256, admission.resource_count,
+        admission.admission_id,
+        admission.candidate_acquisition_id,
+        admission.cohort_id,
+        admission.dataset_intent_id,
+        admission.semantic_projection_as_of,
+        admission.operation_key,
+        admission.terminal_set_sha256,
+        admission.resource_count,
     )
     dataset_id = _digest_identifier(
         "pdufpd_",
         (
             UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID,
-            *identity_tail[:4], admission.source_id, selected_endpoint_id,
+            *identity_tail[:4],
+            admission.source_id,
+            selected_endpoint_id,
             *identity_tail[4:],
         ),
     )
@@ -292,9 +306,7 @@ def uhc_flex_practitioner_publication_metadata(
         "operation_key": admission.operation_key,
         "publication_contract_id": identity.publication_contract_id,
         "query_contract_id": admission.query_contract_id,
-        "resource_counts": {
-            UHC_FLEX_OFFICIAL_RESOURCE_TYPE: admission.resource_count
-        },
+        "resource_counts": {UHC_FLEX_OFFICIAL_RESOURCE_TYPE: admission.resource_count},
         "resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
         "selected_resources": [UHC_FLEX_OFFICIAL_RESOURCE_TYPE],
         "semantic_projection_as_of": admission.semantic_projection_as_of,
@@ -314,6 +326,7 @@ class UHCFlexPractitionerDatasetReadiness:
     previous_dataset_id: str | None
     admission_id: str
     candidate_acquisition_id: str
+    acquisition_root_run_id: str
     cohort_id: str
     dataset_intent_id: str
     endpoint_id: str
@@ -336,16 +349,18 @@ class UHCFlexPractitionerDatasetReadiness:
             projection_date = None
         if (
             _DATASET_PATTERN.fullmatch(self.dataset_id) is None
-            or (self.previous_dataset_id is not None
-                and _DATASET_PATTERN.fullmatch(self.previous_dataset_id) is None)
+            or (
+                self.previous_dataset_id is not None
+                and exact_dataset_variant(self.previous_dataset_id) is None
+            )
             or ADMISSION_PATTERN.fullmatch(self.admission_id) is None
             or ACQUISITION_PATTERN.fullmatch(self.candidate_acquisition_id) is None
+            or _ROOT_PATTERN.fullmatch(self.acquisition_root_run_id) is None
             or COHORT_PATTERN.fullmatch(self.cohort_id) is None
             or INTENT_PATTERN.fullmatch(self.dataset_intent_id) is None
             or projection_date != self.semantic_projection_as_of
             or _HASH_PATTERN.fullmatch(self.endpoint_id) is None
-            or self.endpoint_id
-            != uhc_flex_practitioner_endpoint_identity().endpoint_id
+            or self.endpoint_id != uhc_flex_practitioner_endpoint_identity().endpoint_id
             or _HASH_PATTERN.fullmatch(self.operation_key) is None
             or _HASH_PATTERN.fullmatch(self.dataset_hash) is None
             or type(self.resource_count) is not int

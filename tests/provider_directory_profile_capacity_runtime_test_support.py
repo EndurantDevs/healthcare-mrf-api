@@ -7,22 +7,25 @@ from __future__ import annotations
 import copy
 
 from process.provider_directory_profile_capacity_runtime_witness import (
-    CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD,
-    CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD,
+    CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD,
+    CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD,
 )
 
 
+# This revision is signed into the neutral cross-repository execution golden.
+# Any repository head change requires regenerating that fixture and its hashes.
+PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION = (
+    "20260811030000_fhir_formulary_source_acquisition_lease"
+)
 _RUNTIME_WITNESS_BY_FIELD = {
     "healthcare_source_commit": "12" * 20,
     "healthcare_image_digest": "sha256:" + "13" * 32,
-    CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD: "14" * 20,
-    CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD: "sha256:" + "15" * 32,
-    "profile_migration_revision": (
-        "20260801130000_provider_directory_capacity_lease_v2"
-    ),
+    CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD: "14" * 20,
+    CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD: "sha256:" + "15" * 32,
+    "profile_migration_revision": PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION,
     "profile_schema_version": 1,
     "profile_strategy_version": (
-        "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5"
+        "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
     ),
     "postgres_server_version_num": 180002,
 }

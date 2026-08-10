@@ -18,8 +18,8 @@ from process.provider_directory_profile_capacity_attestation_contract import (
     VerifiedDatabaseCapacityLease,
 )
 from process.provider_directory_profile_capacity_runtime_witness import (
-    CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD,
-    CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD,
+    CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD,
+    CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD,
 )
 from process.provider_directory_profile_capacity_types import (
     PROFILE_STRATEGY_VERSION,
@@ -57,8 +57,8 @@ CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS = (
 )
 CAPACITY_LEASE_AUDIT_ONLY_RUNTIME_FIELDS = (
     "healthcare_image_digest",
-    CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD,
-    CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD,
+    CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD,
+    CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD,
 )
 CAPACITY_LEASE_AUDIT_ONLY_DEPLOYMENT_FIELDS = (
     "flux_revision",
@@ -85,11 +85,7 @@ def _runtime_observation_error(
 def _database_schema() -> str:
     runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
     legacy_schema = os.getenv("DB_SCHEMA")
-    if (
-        runtime_schema
-        and legacy_schema
-        and runtime_schema != legacy_schema
-    ):
+    if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
         raise _runtime_observation_error("database_schema_mismatch")
     return runtime_schema or legacy_schema or "mrf"
 
@@ -118,9 +114,7 @@ def build_baked_healthcare_source_commit() -> str:
     try:
         path_stat = PROFILE_RUNTIME_SOURCE_COMMIT_FILE.lstat()
         _validate_build_identity_file_stat(path_stat)
-        descriptor = _open_build_identity_file(
-            PROFILE_RUNTIME_SOURCE_COMMIT_FILE
-        )
+        descriptor = _open_build_identity_file(PROFILE_RUNTIME_SOURCE_COMMIT_FILE)
         opened_stat = os.fstat(descriptor)
         _validate_build_identity_file_stat(opened_stat)
         _require_same_build_identity_file(path_stat, opened_stat)
@@ -131,9 +125,7 @@ def build_baked_healthcare_source_commit() -> str:
         _require_same_build_identity_file(path_stat, final_opened_stat)
         source_commit = raw_source_commit.decode("ascii").removesuffix("\n")
     except (OSError, UnicodeDecodeError) as exc:
-        raise _runtime_observation_error(
-            "healthcare_source_commit_invalid"
-        ) from exc
+        raise _runtime_observation_error("healthcare_source_commit_invalid") from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -143,9 +135,7 @@ def build_baked_healthcare_source_commit() -> str:
         or not _SOURCE_COMMIT_PATTERN.fullmatch(source_commit)
         or source_commit == "0" * 40
     ):
-        raise _runtime_observation_error(
-            "healthcare_source_commit_invalid"
-        )
+        raise _runtime_observation_error("healthcare_source_commit_invalid")
     return source_commit
 
 
@@ -158,15 +148,11 @@ def _validate_build_identity_file_stat(file_stat: os.stat_result) -> None:
         or file_stat.st_nlink != 1
         or file_stat.st_size != _BUILD_IDENTITY_SIZE
     ):
-        raise _runtime_observation_error(
-            "healthcare_source_commit_invalid"
-        )
+        raise _runtime_observation_error("healthcare_source_commit_invalid")
 
 
 def _open_build_identity_file(path: Path) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-        os, "O_NOFOLLOW", 0
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     return os.open(path, flags)
 
 
@@ -178,9 +164,7 @@ def _read_build_identity_file(descriptor: int) -> bytes:
             break
         chunks.extend(chunk)
     if os.read(descriptor, 1):
-        raise _runtime_observation_error(
-            "healthcare_source_commit_invalid"
-        )
+        raise _runtime_observation_error("healthcare_source_commit_invalid")
     return bytes(chunks)
 
 
@@ -203,9 +187,7 @@ def _require_same_build_identity_file(
         getattr(expected, field_name) != getattr(observed, field_name)
         for field_name in stable_fields
     ):
-        raise _runtime_observation_error(
-            "healthcare_source_commit_invalid"
-        )
+        raise _runtime_observation_error("healthcare_source_commit_invalid")
 
 
 def _runtime_observation_row_mapping(row: Any) -> Mapping[str, Any]:
@@ -222,25 +204,14 @@ def _runtime_observation_row_mapping(row: Any) -> Mapping[str, Any]:
 
 
 def _validated_migration_revision(value: Any) -> str:
-    if (
-        not isinstance(value, str)
-        or not _MIGRATION_REVISION_PATTERN.fullmatch(value)
-    ):
-        raise _runtime_observation_error(
-            "profile_migration_revision_invalid"
-        )
+    if not isinstance(value, str) or not _MIGRATION_REVISION_PATTERN.fullmatch(value):
+        raise _runtime_observation_error("profile_migration_revision_invalid")
     return value
 
 
 def _validated_postgres_server_version_num(value: Any) -> int:
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or value <= 0
-    ):
-        raise _runtime_observation_error(
-            "postgres_server_version_num_invalid"
-        )
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise _runtime_observation_error("postgres_server_version_num_invalid")
     return value
 
 
@@ -252,13 +223,9 @@ def _source_profile_identity() -> tuple[int, str]:
         or isinstance(schema_version, bool)
         or schema_version <= 0
     ):
-        raise _runtime_observation_error(
-            "profile_schema_version_invalid"
-        )
+        raise _runtime_observation_error("profile_schema_version_invalid")
     if strategy_version != PROFILE_STRATEGY_VERSION:
-        raise _runtime_observation_error(
-            "profile_strategy_version_invalid"
-        )
+        raise _runtime_observation_error("profile_strategy_version_invalid")
     return schema_version, strategy_version
 
 
@@ -267,16 +234,12 @@ async def observe_profile_runtime(database: Any = db) -> dict[str, Any]:
 
     source_commit = build_baked_healthcare_source_commit()
     try:
-        migration_rows = await database.all(
-            profile_runtime_observation_sql()
-        )
+        migration_rows = await database.all(profile_runtime_observation_sql())
     except SQLAlchemyError as exc:
         raise _runtime_observation_error(
             "profile_migration_revision_unavailable"
         ) from exc
-    if not isinstance(migration_rows, (list, tuple)) or len(
-        migration_rows
-    ) != 1:
+    if not isinstance(migration_rows, (list, tuple)) or len(migration_rows) != 1:
         raise _runtime_observation_error(
             "profile_migration_revision_cardinality_invalid"
         )
@@ -307,8 +270,7 @@ def assert_runtime_observation_matches_geometry(
     if (
         not isinstance(observation, Mapping)
         or set(observation) != _RUNTIME_OBSERVATION_FIELDS
-        or observation.get("contract_id")
-        != PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID
+        or observation.get("contract_id") != PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID
     ):
         raise _runtime_observation_error("fields_invalid")
     expected_by_field = {
@@ -330,9 +292,7 @@ def assert_runtime_observation_matches_geometry(
     }
     for field_name, expected_value in expected_by_field.items():
         if observation.get(field_name) != expected_value:
-            raise _runtime_observation_error(
-                f"{field_name}_geometry_mismatch"
-            )
+            raise _runtime_observation_error(f"{field_name}_geometry_mismatch")
 
 
 def assert_capacity_lease_matches_runtime_observation(
@@ -346,8 +306,7 @@ def assert_capacity_lease_matches_runtime_observation(
     if (
         not isinstance(observation, Mapping)
         or set(observation) != _RUNTIME_OBSERVATION_FIELDS
-        or observation.get("contract_id")
-        != PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID
+        or observation.get("contract_id") != PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID
     ):
         raise _runtime_observation_error("fields_invalid")
     witness = lease.runtime_witness

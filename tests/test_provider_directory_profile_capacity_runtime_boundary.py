@@ -99,11 +99,20 @@ async def test_cross_runtime_lease_fails_inside_transaction_before_consume(
         assert transaction_state_by_field["active"] is True
         raise runtime_failure
 
+    async def lock_preflight_state(_schema):
+        assert transaction_state_by_field["active"] is True
+
     _patch_admission_dependencies(
         monkeypatch,
         _tracked_transaction(transaction_state_by_field),
         serving_state,
         consume,
+    )
+    preflight_state_lock = AsyncMock(side_effect=lock_preflight_state)
+    monkeypatch.setattr(
+        importer,
+        "_lock_profile_capacity_preflight_state",
+        preflight_state_lock,
     )
     monkeypatch.setattr(
         importer,
@@ -128,4 +137,5 @@ async def test_cross_runtime_lease_fails_inside_transaction_before_consume(
             object(),
         )
 
+    preflight_state_lock.assert_awaited_once_with(importer._schema())
     consume.assert_not_awaited()

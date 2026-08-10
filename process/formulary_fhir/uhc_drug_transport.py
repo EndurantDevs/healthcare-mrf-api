@@ -11,14 +11,45 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from collections.abc import Awaitable, Callable
-from typing import Any, AsyncContextManager
+from collections.abc import Callable
+from typing import Any
 
 import aiohttp
 from process.formulary_fhir.async_safety import cancellable_to_thread
 from process.formulary_fhir.async_safety import drain_operation
 from process.formulary_fhir.source_artifact_contract import SourceArtifactIdentity
 from process.formulary_fhir.source_artifacts import bind_verified_source_artifact
+from process.formulary_fhir.uhc_drug_acquisition_lease import (
+    UHCDrugSourceAcquisitionLeaseError,
+)
+from process.formulary_fhir.uhc_drug_transport_contract import CancelCheck
+from process.formulary_fhir.uhc_drug_transport_contract import ClaimCheck
+from process.formulary_fhir.uhc_drug_transport_contract import (
+    DEFAULT_MAX_FILE_BYTES,
+)
+from process.formulary_fhir.uhc_drug_transport_contract import (
+    DEFAULT_MAX_TOTAL_BYTES,
+)
+from process.formulary_fhir.uhc_drug_transport_contract import (
+    DEFAULT_MIN_FREE_BYTES,
+)
+from process.formulary_fhir.uhc_drug_transport_contract import (
+    DEFAULT_TIMEOUT_SECONDS,
+)
+from process.formulary_fhir.uhc_drug_transport_contract import DOWNLOAD_CHUNK_BYTES
+from process.formulary_fhir.uhc_drug_transport_contract import MAX_CONCURRENCY
+from process.formulary_fhir.uhc_drug_transport_contract import ProgressCallback
+from process.formulary_fhir.uhc_drug_transport_contract import SessionFactory
+from process.formulary_fhir.uhc_drug_transport_contract import (
+    UHCDrugArtifactAcquisitionError,
+)
+from process.formulary_fhir.uhc_drug_transport_contract import USER_AGENT
+from process.formulary_fhir.uhc_drug_transport_contract import (
+    _positive_environment_integer,
+)
+from process.formulary_fhir.uhc_drug_transport_contract import (
+    uhc_drug_download_concurrency,
+)
 from process.formulary_fhir.uhc_drug_payload import UHCDrugPayloadError
 from process.formulary_fhir.uhc_drug_payload import (
     uhc_drug_object_array_item_count,
@@ -29,60 +60,6 @@ from process.provider_directory_retained_blob_staging import (
 )
 from process.uhc_provider_file_catalog_contract import UHCFileCatalogError
 from process.uhc_provider_file_catalog_contract import trusted_public_https_url
-
-
-DEFAULT_MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024
-DEFAULT_TIMEOUT_SECONDS = 30 * 60
-DEFAULT_CONCURRENCY = 4
-MAX_CONCURRENCY = 8
-DEFAULT_MAX_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
-DEFAULT_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
-DOWNLOAD_CHUNK_BYTES = 1024 * 1024
-USER_AGENT = "HealthPorta-UHC-Formulary-Artifacts/1.0"
-
-CancelCheck = Callable[[], Awaitable[None] | None]
-ProgressCallback = Callable[[int, int, str, str], Awaitable[None] | None]
-SessionFactory = Callable[[aiohttp.ClientTimeout], AsyncContextManager[Any]]
-
-
-class UHCDrugArtifactAcquisitionError(RuntimeError):
-    """Report one bounded artifact-acquisition failure without source values."""
-
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
-        self.retryable = retryable is True
-        self.is_retryable = self.retryable
-        super().__init__(message)
-
-
-def _positive_environment_integer(name: str, default: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value in (None, ""):
-        return default
-    try:
-        configured_value = int(raw_value)
-    except ValueError:
-        raise UHCDrugArtifactAcquisitionError(
-            f"{name} must be a positive integer"
-        ) from None
-    if not 0 < configured_value <= 2**63 - 1:
-        raise UHCDrugArtifactAcquisitionError(
-            f"{name} must be a positive integer"
-        )
-    return configured_value
-
-
-def uhc_drug_download_concurrency() -> int:
-    """Return the bounded number of simultaneous drug-file downloads."""
-
-    configured_concurrency = _positive_environment_integer(
-        "HLTHPRT_UHC_FORMULARY_DOWNLOAD_CONCURRENCY",
-        DEFAULT_CONCURRENCY,
-    )
-    if configured_concurrency > MAX_CONCURRENCY:
-        raise UHCDrugArtifactAcquisitionError(
-            "HLTHPRT_UHC_FORMULARY_DOWNLOAD_CONCURRENCY exceeds its bound"
-        )
-    return configured_concurrency
 
 
 def _download_directory() -> Path:
@@ -126,9 +103,7 @@ def _validated_source_url(identity: SourceArtifactIdentity) -> str:
             "UHC drug artifact URL is invalid"
         ) from None
     if source_url != identity.source_url:
-        raise UHCDrugArtifactAcquisitionError(
-            "UHC drug artifact URL is not canonical"
-        )
+        raise UHCDrugArtifactAcquisitionError("UHC drug artifact URL is not canonical")
     return source_url
 
 
@@ -328,10 +303,12 @@ async def _acquire_identity(
     *,
     database: Any,
     cancel_check: CancelCheck | None,
+    claim_check: ClaimCheck,
     max_bytes: int,
 ) -> tuple[int, str, str]:
     async with semaphore:
         await _invoke(cancel_check)
+        await claim_check()
         staged_path, artifact_sha256, artifact_byte_count = await _download_to_stage(
             session,
             identity,
@@ -340,12 +317,14 @@ async def _acquire_identity(
         )
         try:
             await _invoke(cancel_check)
+            await claim_check()
             await bind_verified_source_artifact(
                 identity,
                 source_path=staged_path,
                 artifact_sha256=artifact_sha256,
                 artifact_byte_count=artifact_byte_count,
                 database=database,
+                transaction_fence=claim_check,
             )
         finally:
             staged_path.unlink(missing_ok=True)
@@ -361,8 +340,7 @@ def _preflight_pending_artifacts(
     if not pending_artifacts:
         return
     effective_sizes = tuple(
-        artifact.expected_byte_count or max_file_bytes
-        for artifact in pending_artifacts
+        artifact.expected_byte_count or max_file_bytes for artifact in pending_artifacts
     )
     if any(byte_count > max_file_bytes for byte_count in effective_sizes):
         raise UHCDrugArtifactAcquisitionError(
@@ -394,16 +372,30 @@ async def _complete_pending_tasks(
     progress_callback: ProgressCallback | None,
 ) -> int:
     downloaded_byte_count = 0
+    failure_evidence_entries: list[str] = []
     try:
-        for completed_count, completed_task in enumerate(
+        for settled_count, completed_task in enumerate(
             asyncio.as_completed(tasks),
             start=1,
         ):
-            artifact_bytes, family, file_name = await completed_task
+            try:
+                artifact_bytes, family, file_name = await completed_task
+            except asyncio.CancelledError:
+                raise
+            except UHCDrugSourceAcquisitionLeaseError:
+                raise
+            except UHCDrugArtifactAcquisitionError as error:
+                failure_evidence_entries.append(
+                    "retryable_transport" if error.retryable else "artifact_rejected"
+                )
+                continue
+            except Exception:
+                failure_evidence_entries.append("artifact_processing")
+                continue
             downloaded_byte_count += artifact_bytes
             await _invoke(
                 progress_callback,
-                completed_count,
+                settled_count,
                 len(tasks),
                 family,
                 file_name,
@@ -416,6 +408,16 @@ async def _complete_pending_tasks(
             preserve_cancellation=False,
         )
         raise
+    if failure_evidence_entries:
+        immutable_evidence_entries = tuple(failure_evidence_entries)
+        raise UHCDrugArtifactAcquisitionError(
+            "UHC drug artifact set acquisition is incomplete",
+            retryable=all(
+                evidence == "retryable_transport"
+                for evidence in immutable_evidence_entries
+            ),
+            failure_evidence=immutable_evidence_entries,
+        )
     return downloaded_byte_count
 
 
@@ -431,6 +433,7 @@ async def acquire_pending_uhc_drug_artifacts(
     database: Any,
     session_factory: SessionFactory,
     cancel_check: CancelCheck | None,
+    claim_check: ClaimCheck,
     progress_callback: ProgressCallback | None,
 ) -> int:
     """Acquire, validate, and bind only unresolved exact source identities."""
@@ -466,6 +469,7 @@ async def acquire_pending_uhc_drug_artifacts(
                     semaphore,
                     database=database,
                     cancel_check=cancel_check,
+                    claim_check=claim_check,
                     max_bytes=max_file_bytes,
                 )
             )
@@ -479,6 +483,7 @@ async def acquire_pending_uhc_drug_artifacts(
 
 __all__ = (
     "CancelCheck",
+    "ClaimCheck",
     "ProgressCallback",
     "SessionFactory",
     "UHCDrugArtifactAcquisitionError",

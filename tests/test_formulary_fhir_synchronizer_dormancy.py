@@ -324,6 +324,7 @@ def test_uhc_operator_never_imports_the_legacy_formulary_writer():
         for forbidden_legacy_name in (
             "PlanDrugRaw",
             "PlanFormulary",
+            "plan_drug_raw",
             "process.initial",
             "api.endpoint.formulary",
         ):

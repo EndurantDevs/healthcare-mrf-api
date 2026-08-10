@@ -123,7 +123,7 @@ def _wal_tracker_admission():
         wal_tracker=importer._ProviderDirectoryProfileWalTracker(
             accounted_control_operation_counts={
                 "admission_row_lock": 2,
-                "capacity_consumption_insert": 1,
+                "capacity_consumption_insert": 3,
             }
         ),
     )
@@ -306,9 +306,7 @@ async def test_capacity_wal_tracker_refuses_unforecast_external_wal(
         "_provider_directory_profile_current_wal_bytes",
         AsyncMock(
             return_value=(
-                capacity_operation.wal_bytes_per_operation
-                + admission_lock_operation.wal_bytes
-                + 1
+                capacity_operation.wal_bytes + admission_lock_operation.wal_bytes + 1
             )
         ),
     )
