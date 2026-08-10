@@ -55,8 +55,10 @@ async def test_partition_stage_binds_v3_hash_identity(monkeypatch):
         "Practitioner",
         importer.ProviderDirectoryPractitioner,
         ({"resourceType": "Practitioner", "id": "p1"},),
-        run_id="run-1",
-        fetch_url="https://example.test/fhir/Practitioner",
+        importer.LastUpdatedPartitionStageOptions(
+            run_id="run-1",
+            fetch_url="https://example.test/fhir/Practitioner",
+        ),
     )
 
     assert acquisitions[0].semantic_projection_as_of.isoformat() == "2026-08-09"
@@ -97,6 +99,8 @@ async def test_partition_stage_rejects_invalid_hash_identity(
             "Practitioner",
             object,
             (),
-            run_id="run-1",
-            fetch_url="https://example.test/fhir/Practitioner",
+            importer.LastUpdatedPartitionStageOptions(
+                run_id="run-1",
+                fetch_url="https://example.test/fhir/Practitioner",
+            ),
         )

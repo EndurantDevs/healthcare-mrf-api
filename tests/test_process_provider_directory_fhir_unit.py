@@ -13655,8 +13655,9 @@ def _published_endpoint_dataset_metadata_by_field(
                     "Practitioner"
                 ],
             }
-            if resource_hash_contract
-            == importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            if importer.is_semantic_resource_hash_contract(
+                resource_hash_contract
+            )
             else {}
         ),
         "resource_diagnostics": {
@@ -28346,6 +28347,8 @@ def _last_updated_partition_test_source(**resource_config_overrides):
         "endpoint_id": "endpoint_scan_partition_test",
         "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
         "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        "_resource_hash_contract": importer.LEGACY_RESOURCE_HASH_CONTRACT,
+        "_semantic_projection_as_of": None,
         "last_validated_status": "valid",
         "metadata_json": {
             "provider_directory_coverage_mode": "probe_only",
@@ -28747,6 +28750,7 @@ class _LastUpdatedPartitionFetchHarness:
         _resource_type,
         _model,
         resources,
+        _options,
         **_kwargs,
     ):
         candidate_hashes_by_id = {
@@ -28814,6 +28818,7 @@ class _LastUpdatedPartitionFetchHarness:
         _context,
         _resource_type,
         partition_plan,
+        _resource_hash_contract=None,
     ):
         expected_count = sum(
             partition_window.count or 0

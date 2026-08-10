@@ -295,7 +295,11 @@ def test_v3_dataset_payload_requires_object_subset_absence_and_exact_hash() -> N
 
     for dataset_row in cases:
         with pytest.raises(RuntimeError, match="semantic_resource"):
-            importer._validated_v3_dataset_payload(dataset_row)
+            importer._validated_semantic_dataset_payload(
+                dataset_row,
+                "Organization",
+                SEMANTIC_CONTRACT,
+            )
 
 
 def test_endpoint_batch_identity_rejects_mixed_or_missing_scope() -> None:
@@ -317,6 +321,7 @@ def test_incoming_semantic_batch_rejects_invalid_or_duplicate_identity() -> None
         importer._incoming_semantic_dataset_rows_by_id(
             [_generic_dataset_row(resource_id=None)],
             "Organization",
+            SEMANTIC_CONTRACT,
             PROJECTION_DATE,
         )
 
@@ -325,6 +330,7 @@ def test_incoming_semantic_batch_rejects_invalid_or_duplicate_identity() -> None
         importer._incoming_semantic_dataset_rows_by_id(
             [row, dict(row)],
             "Organization",
+            SEMANTIC_CONTRACT,
             PROJECTION_DATE,
         )
 
@@ -489,12 +495,4 @@ def test_payload_hash_validator_covers_subset_and_explicit_contract_paths() -> N
                 "acquired_resource_sha256": None,
             },
             resource_hash_contract="unknown-contract",
-        )
-
-
-def test_locked_candidate_translates_invalid_persisted_identity() -> None:
-    with pytest.raises(RuntimeError, match="candidate_stale"):
-        importer._assert_locked_candidate_identity(
-            {"publication_metadata_json": "{"},
-            _candidate(),
         )

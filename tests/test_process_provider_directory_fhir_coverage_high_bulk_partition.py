@@ -399,6 +399,11 @@ async def test_partition_restore_and_candidate_proof_fail_closed(monkeypatch):
         AsyncMock(side_effect=RuntimeError("proof-corrupt")),
     )
     assert await importer._verified_partition_proof_counts(
+        {
+            "_resource_hash_contract": (
+                importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+            )
+        },
         "Practitioner",
         ProviderDirectoryPractitioner,
         partition_config,
@@ -424,6 +429,11 @@ async def test_partition_candidate_proof_counts_must_match_census(monkeypatch):
         census=importer.LastUpdatedCompletenessCensus(ranged_root_pre=2)
     )
     assert await importer._verified_partition_proof_counts(
+        {
+            "_resource_hash_contract": (
+                importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+            )
+        },
         "Practitioner",
         ProviderDirectoryPractitioner,
         last_updated_partition_config(),

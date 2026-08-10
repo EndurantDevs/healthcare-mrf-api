@@ -24,12 +24,19 @@ RESOURCE_HASH_CONTRACT_METADATA_KEY = "resource_hash_contract"
 LEGACY_RESOURCE_HASH_CONTRACT = "transport_bound_v1"
 TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT = "transport_neutral_v2"
 SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT = "semantic_content_v3"
-DEFAULT_RESOURCE_HASH_CONTRACT = SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT = "semantic_content_v4"
+DEFAULT_RESOURCE_HASH_CONTRACT = SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+SEMANTIC_RESOURCE_HASH_CONTRACTS = frozenset(
+    {
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+    }
+)
 RESOURCE_HASH_CONTRACTS = frozenset(
     {
         LEGACY_RESOURCE_HASH_CONTRACT,
         TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        *SEMANTIC_RESOURCE_HASH_CONTRACTS,
     }
 )
 
@@ -41,6 +48,12 @@ PRACTITIONER_NAME_PAYLOAD_FIELDS = frozenset(
         "full_name",
     }
 )
+
+
+def is_semantic_resource_hash_contract(value: Any) -> bool:
+    """Return whether one contract carries semantic scope and root date."""
+
+    return value in SEMANTIC_RESOURCE_HASH_CONTRACTS
 
 
 def _json_default(value: Any) -> Any:
@@ -383,6 +396,8 @@ def legacy_resource_payload_sha256(payload_by_field: Mapping[str, Any]) -> str:
 def resource_payload_sha256_for_contract(
     payload_by_field: Mapping[str, Any],
     resource_hash_contract: str,
+    *,
+    resource_type: str | None = None,
 ) -> str:
     """Hash one payload under its persisted dataset-root contract."""
 
@@ -391,6 +406,18 @@ def resource_payload_sha256_for_contract(
     if resource_hash_contract == TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT:
         return resource_payload_sha256(payload_by_field)
     if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        return semantic_resource_payload_sha256(payload_by_field)
+    if resource_hash_contract == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT:
+        if not resource_type:
+            raise ValueError(
+                "provider_directory_resource_hash_resource_type_required"
+            )
+        if resource_type == "Organization":
+            from process.provider_directory_organization_hash import (
+                organization_semantic_payload_sha256,
+            )
+
+            return organization_semantic_payload_sha256(payload_by_field)
         return semantic_resource_payload_sha256(payload_by_field)
     raise ValueError("provider_directory_resource_hash_contract_invalid")
 
@@ -411,8 +438,9 @@ def persisted_resource_hash_contract(
 def is_resource_payload_hash_match(
     payload_by_field: Mapping[str, Any],
     stored_hash: str,
+    resource_type: str | None = None,
 ) -> bool:
-    """Accept v3 semantic hashes and exact historical v1/v2 row hashes."""
+    """Accept exact historical v1/v2 rows and frozen v3 semantic rows."""
 
     accepted_hashes = {
         resource_payload_sha256(payload_by_field),

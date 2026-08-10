@@ -200,12 +200,19 @@ from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
     ProviderDirectoryProofStoreError,
     ProviderDirectoryStoredProofOptions,
+    build_dataset_proof_record,
     build_stored_dataset_proof,
+    decode_dataset_proof_record,
     delete_dataset_resource_proof_shards,
     delete_dataset_proof_shards,
     ensure_dataset_proof_shard_table,
     persist_dataset_proof_shard,
+    reduce_dataset_proof_records,
     validate_stored_dataset_proof_metadata,
+)
+from process.provider_directory_organization_hash import (
+    canonical_organization_payload,
+    merge_organization_semantic_payloads,
 )
 from process.provider_directory_resource_hash import (
     DEFAULT_RESOURCE_HASH_CONTRACT,
@@ -213,11 +220,13 @@ from process.provider_directory_resource_hash import (
     RESOURCE_HASH_CONTRACTS,
     RESOURCE_HASH_CONTRACT_METADATA_KEY,
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
     TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     canonical_practitioner_payload,
+    is_resource_payload_hash_match,
+    is_semantic_resource_hash_contract,
     persisted_resource_hash_contract,
     resource_content_hash_payload,
-    is_resource_payload_hash_match,
     merge_practitioner_semantic_payloads,
     merge_semantic_resource_payloads,
     resource_payload_sha256_for_contract,
@@ -279,6 +288,7 @@ from process.provider_directory_time_partition import (
     PlanStatus,
     TimeWindow,
     WindowPass,
+    fingerprint_resource,
     parse_utc_instant,
 )
 from process import provider_directory_profile as profile_artifact
@@ -1398,6 +1408,7 @@ NETSMART_PAGE_INDEX_PAGINATION_STRATEGY_VERSION = (
 LAST_UPDATED_PARTITION_STRATEGY_VERSION = (
     "provider-directory-fhir-last-updated-v4"
 )
+V4_ORGANIZATION_PARTITION_VOLATILE_PATHS = ("/meta/lastUpdated",)
 LAST_UPDATED_PARTITION_METADATA_KEY = (
     "provider_directory_last_updated_partition_acquisition"
 )
@@ -2143,8 +2154,8 @@ class EndpointDatasetWriteScope:
             raise ValueError(
                 "provider_directory_resource_hash_contract_required"
             )
-        if self.resource_hash_contract == (
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        if is_semantic_resource_hash_contract(
+            self.resource_hash_contract
         ):
             _validated_semantic_projection_as_of(
                 self.semantic_projection_as_of
@@ -2201,6 +2212,55 @@ class LastUpdatedPartitionStage:
     candidate_hashes_by_id: dict[str, str]
     resource_hash_contract: str
     semantic_projection_as_of: str | None
+    candidate_proof_records_by_id: dict[str, list[Any]] = field(
+        default_factory=dict
+    )
+    occurrence_source_fingerprints_by_id: dict[str, str] = field(
+        default_factory=dict
+    )
+
+
+@dataclass(frozen=True)
+class LastUpdatedPartitionStageOptions:
+    """Bind one staged window to its fetch and occurrence identities."""
+
+    run_id: str | None
+    fetch_url: str
+    occurrence_ids: tuple[str, ...] = ()
+    source_fingerprints_by_id: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LastUpdatedPartitionPassProof:
+    """Carry one immutable pass proof between storage and replay checks."""
+
+    resource_type: str
+    window_id: str
+    pass_number: int
+    fingerprints_by_id: dict[str, str]
+    candidate_hashes_by_id: dict[str, str] = field(default_factory=dict)
+    candidate_records_by_id: dict[str, list[Any]] = field(default_factory=dict)
+    source_fingerprints_by_id: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PartitionCandidateStageRequest:
+    """Carry one pass-two candidate staging request without loose identity."""
+
+    source_record: dict[str, Any]
+    resource_type: str
+    model: type
+    state: LastUpdatedPartitionState
+    fetch_options: LastUpdatedPartitionFetchOptions
+    config: LastUpdatedPartitionConfig
+    window: TimeWindow
+    window_fetch: LastUpdatedWindowFetch
+    pass_number: int
+    request_url: str
+    staged_resources: tuple[dict[str, Any], ...]
+    proof_resources: tuple[dict[str, Any], ...]
+    occurrence_ids: tuple[str, ...]
+    source_fingerprints_by_id: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -2211,6 +2271,7 @@ class LastUpdatedPartitionProofCounts:
     staged_candidate_count: int
     invalid_candidate_count: int
     orphan_proof_count: int
+    candidate_hashes_by_id: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -14410,7 +14471,8 @@ def _artifact_proof_hash_identity_sql(metadata: str, proof: str) -> str:
         ({resource_hash_contract}) IN (
             '{LEGACY_RESOURCE_HASH_CONTRACT}',
             '{TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT}',
-            '{SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT}'
+            '{SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT}',
+            '{SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT}'
         )
         AND ({proof} -> '{proof_scope_key}') IS NOT DISTINCT FROM
             ({metadata} -> '{proof_scope_key}')
@@ -14419,7 +14481,25 @@ def _artifact_proof_hash_identity_sql(metadata: str, proof: str) -> str:
         AND (
             (
                 ({resource_hash_contract}) =
+                    '{SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT}'
+                AND {proof} ->> '{RESOURCE_HASH_CONTRACT_METADATA_KEY}' =
+                    '{SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT}'
+            )
+            OR (
+                ({resource_hash_contract}) IN (
+                    '{LEGACY_RESOURCE_HASH_CONTRACT}',
+                    '{TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT}',
                     '{SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT}'
+                )
+                AND NOT ({proof} ? '{RESOURCE_HASH_CONTRACT_METADATA_KEY}')
+            )
+        )
+        AND (
+            (
+                ({resource_hash_contract}) IN (
+                    '{SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT}',
+                    '{SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT}'
+                )
                 AND jsonb_typeof({metadata} -> '{proof_scope_key}') = 'array'
                 AND jsonb_typeof({metadata} -> '{projection_date_key}') =
                     'string'
@@ -14516,6 +14596,7 @@ def _artifact_twin_proof_equality_sql(
         f"({candidate_proof} -> '{field}') IS NOT DISTINCT FROM "
         f"({baseline_proof} -> '{field}')"
         for field in (
+            RESOURCE_HASH_CONTRACT_METADATA_KEY,
             PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
             SEMANTIC_PROJECTION_AS_OF_METADATA_KEY,
         )
@@ -16131,8 +16212,9 @@ def _artifact_dataset_retained_resources(
     )
     if source_id == UHC_RETAINED_SOURCE_ID:
         if (
-            proof_identity.resource_hash_contract
-            == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            is_semantic_resource_hash_contract(
+                proof_identity.resource_hash_contract
+            )
             or proof_identity.proof_resource_scope is not None
         ):
             raise ProviderDirectoryArtifactBuildStale(
@@ -16145,8 +16227,9 @@ def _artifact_dataset_retained_resources(
     )
     if raw_content_proof is None:
         if (
-            proof_identity.resource_hash_contract
-            == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            is_semantic_resource_hash_contract(
+                proof_identity.resource_hash_contract
+            )
         ):
             raise ProviderDirectoryArtifactBuildStale(
                 "provider_directory_artifact_content_proof_invalid:"
@@ -36884,10 +36967,15 @@ def _resource_payload_for_contract(
     payload_by_field = _canonical_resource_payload(resource_row_by_field)
     if (
         model is ProviderDirectoryPractitioner
-        and resource_hash_contract
-        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and is_semantic_resource_hash_contract(resource_hash_contract)
     ):
         return canonical_practitioner_payload(payload_by_field)
+    if (
+        model is ProviderDirectoryOrganization
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    ):
+        return canonical_organization_payload(payload_by_field)
     return payload_by_field
 
 
@@ -36897,9 +36985,18 @@ def _merge_resource_payload_for_contract(
     second_payload: dict[str, Any],
     resource_hash_contract: str,
 ) -> dict[str, Any]:
-    if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if is_semantic_resource_hash_contract(resource_hash_contract):
         if model is ProviderDirectoryPractitioner:
             return merge_practitioner_semantic_payloads(
+                first_payload,
+                second_payload,
+            )
+        if (
+            model is ProviderDirectoryOrganization
+            and resource_hash_contract
+            == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+        ):
+            return merge_organization_semantic_payloads(
                 first_payload,
                 second_payload,
             )
@@ -36935,6 +37032,7 @@ def _canonical_compatibility_resource_row(
         "payload_hash": resource_payload_sha256_for_contract(
             payload_by_field,
             resource_hash_contract,
+            resource_type=resource_type,
         ),
         "payload_json": payload_by_field if store_payload else None,
         "first_seen_run_id": run_id,
@@ -37017,8 +37115,7 @@ def _validated_acquired_resource_sha256(
         )
     if (
         acquired_resource_sha256 is not None
-        and resource_hash_contract
-        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and is_semantic_resource_hash_contract(resource_hash_contract)
     ):
         raise ValueError(
             "provider_directory_subset_resource_hash_contract_invalid"
@@ -37087,6 +37184,7 @@ def _retained_dataset_resource_record(
         else resource_payload_sha256_for_contract(
             payload_by_field,
             resource_hash_contract,
+            resource_type=resource_type,
         )
     )
     return {
@@ -48849,6 +48947,124 @@ def _last_updated_partition_fingerprint_resource_type(
     return f"LU:{resource_type}:pass:{pass_number}"
 
 
+def _uses_v4_organization_partition(
+    source_record: Mapping[str, Any],
+    resource_type: str,
+) -> bool:
+    """Return whether repeated Organization observations are composable."""
+
+    return bool(
+        resource_type == "Organization"
+        and source_record.get("_resource_hash_contract")
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    )
+
+
+def _partition_occurrence_id(
+    window_id: str,
+    resource_id: str,
+    fingerprint: str,
+    ordinal: int,
+) -> str:
+    """Bind one raw occurrence to a stable window-scoped proof identity."""
+
+    return _identity_hash(
+        {
+            "contract": "semantic-content-v4-organization-occurrence-v1",
+            "window_id": window_id,
+            "resource_id": resource_id,
+            "fingerprint": fingerprint,
+            "ordinal": ordinal,
+        }
+    )
+
+
+def _v4_partition_resource_bindings(
+    resources: tuple[dict[str, Any], ...],
+    window_id: str,
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+    tuple[str, ...],
+    dict[str, str],
+]:
+    """Return raw, planner, and occurrence identities in stable order."""
+
+    resources_by_identity: dict[
+        tuple[str, str], list[dict[str, Any]]
+    ] = {}
+    for resource_by_field in resources:
+        resource_id = resource_by_field.get("id")
+        if not isinstance(resource_id, str) or not resource_id:
+            return resources, resources, tuple(), {}
+        fingerprint = fingerprint_resource(
+            resource_by_field,
+            V4_ORGANIZATION_PARTITION_VOLATILE_PATHS,
+        )
+        resources_by_identity.setdefault(
+            (resource_id, fingerprint), []
+        ).append(resource_by_field)
+    bindings: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    for (resource_id, fingerprint), grouped_observations in sorted(
+        resources_by_identity.items()
+    ):
+        for ordinal, resource_by_field in enumerate(
+            sorted(grouped_observations, key=_stable_identity_json)
+        ):
+            occurrence_id = _partition_occurrence_id(
+                window_id,
+                resource_id,
+                fingerprint,
+                ordinal,
+            )
+            proof_resource_by_field = dict(resource_by_field)
+            proof_resource_by_field["id"] = occurrence_id
+            bindings.append(
+                (occurrence_id, resource_by_field, proof_resource_by_field)
+            )
+    bindings.sort(key=lambda binding: binding[0])
+    occurrence_ids = tuple(binding[0] for binding in bindings)
+    return (
+        tuple(binding[1] for binding in bindings),
+        tuple(binding[2] for binding in bindings),
+        occurrence_ids,
+        {
+            binding[0]: fingerprint_resource(
+                binding[1],
+                V4_ORGANIZATION_PARTITION_VOLATILE_PATHS,
+            )
+            for binding in bindings
+        },
+    )
+
+
+def _partition_resource_bindings(
+    source_record: Mapping[str, Any],
+    resource_type: str,
+    plan: PartitionPlan,
+    window: TimeWindow,
+    resources: tuple[dict[str, Any], ...],
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+    tuple[str, ...],
+    dict[str, str],
+]:
+    """Select strict or composable resource identities for one pass."""
+
+    if _uses_v4_organization_partition(source_record, resource_type):
+        return _v4_partition_resource_bindings(
+            resources,
+            window.window_id,
+        )
+    return (
+        resources,
+        resources,
+        tuple(str(resource.get("id") or "") for resource in resources),
+        {},
+    )
+
+
 def _last_updated_partition_retry_resource_types() -> list[str]:
     """Return every valid immutable fingerprint marker resource type."""
     return [
@@ -48895,16 +49111,56 @@ def _last_updated_partition_fingerprint_row(
     return resource_id, window_id, fingerprint
 
 
-async def _load_last_updated_partition_window_proof(
+def _partition_proof_row_fields(
+    fingerprint_row: Any,
+    expected_window_id: str,
+) -> tuple[str, str, str | None, list[Any] | None, str | None]:
+    """Decode one durable pass row and its optional v4 commitments."""
+
+    fingerprint_row_map = _pagination_checkpoint_row_mapping(
+        fingerprint_row
+    )
+    resource_id, observed_window_id, fingerprint = (
+        _last_updated_partition_fingerprint_row(fingerprint_row)
+    )
+    if observed_window_id != expected_window_id:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_fingerprint_row_invalid"
+        )
+    proof_payload = fingerprint_row_map["payload_json"]
+    candidate_payload_hash = _clean_text(
+        proof_payload.get("candidate_payload_hash")
+    )
+    raw_proof_record = proof_payload.get("candidate_proof_record")
+    try:
+        proof_record = (
+            decode_dataset_proof_record(raw_proof_record)
+            if raw_proof_record is not None
+            else None
+        )
+    except ProviderDirectoryProofStoreError as exc:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_fingerprint_row_invalid"
+        ) from exc
+    return (
+        resource_id,
+        fingerprint,
+        candidate_payload_hash,
+        proof_record,
+        _clean_text(proof_payload.get("source_fingerprint")),
+    )
+
+
+async def _partition_pass_proof_rows(
     context: PaginationCheckpointContext,
     resource_type: str,
     window_id: str,
     pass_number: int,
-    *,
-    database_connection: Any | None = None,
-) -> tuple[dict[str, str], dict[str, str]]:
-    database_executor = database_connection or db
-    fingerprint_rows = await database_executor.all(
+    database_executor: Any,
+) -> list[Any]:
+    """Select one pass's exact retained proof rows in identity order."""
+
+    return await database_executor.all(
         f"""
         SELECT resource_id, payload_json
           FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
@@ -48926,27 +49182,78 @@ async def _load_last_updated_partition_window_proof(
             pass_number,
         ),
     )
+
+
+async def _load_partition_pass_proof(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    window_id: str,
+    pass_number: int,
+    *,
+    database_connection: Any | None = None,
+) -> LastUpdatedPartitionPassProof:
+    """Load one exact immutable pass proof from retained staging rows."""
+
+    database_executor = database_connection or db
+    fingerprint_rows = await _partition_pass_proof_rows(
+        context,
+        resource_type,
+        window_id,
+        pass_number,
+        database_executor,
+    )
     fingerprints_by_id: dict[str, str] = {}
     candidate_hashes_by_id: dict[str, str] = {}
+    proof_records_by_id: dict[str, list[Any]] = {}
+    source_fingerprints_by_id: dict[str, str] = {}
     for fingerprint_row in fingerprint_rows:
-        fingerprint_row_map = _pagination_checkpoint_row_mapping(
-            fingerprint_row
-        )
-        resource_id, observed_window_id, fingerprint = (
-            _last_updated_partition_fingerprint_row(fingerprint_row)
-        )
-        if observed_window_id != window_id or resource_id in fingerprints_by_id:
+        (
+            resource_id,
+            fingerprint,
+            candidate_payload_hash,
+            proof_record,
+            source_fingerprint,
+        ) = _partition_proof_row_fields(fingerprint_row, window_id)
+        if resource_id in fingerprints_by_id:
             raise RuntimeError(
                 "provider_directory_last_updated_partition_fingerprint_row_invalid"
             )
         fingerprints_by_id[resource_id] = fingerprint
-        proof_payload = fingerprint_row_map["payload_json"]
-        candidate_payload_hash = _clean_text(
-            proof_payload.get("candidate_payload_hash")
-        )
         if candidate_payload_hash:
             candidate_hashes_by_id[resource_id] = candidate_payload_hash
-    return fingerprints_by_id, candidate_hashes_by_id
+        if proof_record is not None:
+            proof_records_by_id[resource_id] = proof_record
+        if source_fingerprint:
+            source_fingerprints_by_id[resource_id] = source_fingerprint
+    return LastUpdatedPartitionPassProof(
+        resource_type=resource_type,
+        window_id=window_id,
+        pass_number=pass_number,
+        fingerprints_by_id=fingerprints_by_id,
+        candidate_hashes_by_id=candidate_hashes_by_id,
+        candidate_records_by_id=proof_records_by_id,
+        source_fingerprints_by_id=source_fingerprints_by_id,
+    )
+
+
+async def _load_last_updated_partition_window_proof(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    window_id: str,
+    pass_number: int,
+    *,
+    database_connection: Any | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Read historical fingerprint and candidate-hash proof fields."""
+
+    pass_proof = await _load_partition_pass_proof(
+        context,
+        resource_type,
+        window_id,
+        pass_number,
+        database_connection=database_connection,
+    )
+    return pass_proof.fingerprints_by_id, pass_proof.candidate_hashes_by_id
 
 
 async def _load_last_updated_partition_window_fingerprints(
@@ -48970,59 +49277,73 @@ async def _load_last_updated_partition_window_fingerprints(
     return fingerprints_by_id
 
 
+def _assert_partition_proof_keysets(
+    pass_proof: LastUpdatedPartitionPassProof,
+) -> None:
+    """Require every optional commitment to cover the exact pass identities."""
+
+    fingerprint_ids = set(pass_proof.fingerprints_by_id)
+    if pass_proof.candidate_hashes_by_id and set(
+        pass_proof.candidate_hashes_by_id
+    ) != fingerprint_ids:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_candidate_hash_mismatch"
+        )
+    if pass_proof.candidate_records_by_id and set(
+        pass_proof.candidate_records_by_id
+    ) != fingerprint_ids:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_candidate_proof_mismatch"
+        )
+    if pass_proof.source_fingerprints_by_id and set(
+        pass_proof.source_fingerprints_by_id
+    ) != fingerprint_ids:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_occurrence_identity_invalid"
+        )
+
+
 async def _store_last_updated_partition_window_fingerprints(
     context: PaginationCheckpointContext,
-    resource_type: str,
-    window_id: str,
-    pass_number: int,
-    fingerprints: dict[str, str],
-    candidate_hashes_by_id: dict[str, str] | None = None,
+    pass_proof: LastUpdatedPartitionPassProof,
     *,
     database_connection: Any | None = None,
 ) -> None:
     """Persist one immutable fingerprint proof for a partition pass."""
-    candidate_hashes_by_id = candidate_hashes_by_id or {}
-    if candidate_hashes_by_id and set(candidate_hashes_by_id) != set(
-        fingerprints
-    ):
-        raise RuntimeError(
-            "provider_directory_last_updated_partition_candidate_hash_mismatch"
-        )
+    _assert_partition_proof_keysets(pass_proof)
     if await _has_partition_fingerprint_replay(
         context,
-        resource_type,
-        window_id,
-        pass_number,
-        fingerprints,
-        candidate_hashes_by_id,
+        pass_proof,
         database_connection=database_connection,
     ):
         return
     fingerprint_resource_type = (
         _last_updated_partition_fingerprint_resource_type(
-            resource_type,
-            pass_number,
+            pass_proof.resource_type,
+            pass_proof.pass_number,
         )
     )
     await _assert_partition_resource_ids_unique(
         context,
         fingerprint_resource_type,
-        window_id,
-        fingerprints,
+        pass_proof.window_id,
+        pass_proof.fingerprints_by_id,
         database_connection=database_connection,
     )
     window_proof_hash = _last_updated_partition_window_proof_hash(
-        resource_type,
-        window_id,
-        pass_number,
+        pass_proof.resource_type,
+        pass_proof.window_id,
+        pass_proof.pass_number,
     )
     staged_fingerprint_rows = _partition_fingerprint_rows(
         context,
         fingerprint_resource_type,
-        window_id,
+        pass_proof.window_id,
         window_proof_hash,
-        fingerprints,
-        candidate_hashes_by_id,
+        pass_proof.fingerprints_by_id,
+        pass_proof.candidate_hashes_by_id,
+        pass_proof.candidate_records_by_id,
+        pass_proof.source_fingerprints_by_id,
     )
     if staged_fingerprint_rows:
         await _write_last_updated_partition_fingerprint_rows(
@@ -49050,28 +49371,27 @@ async def _write_last_updated_partition_fingerprint_rows(
 
 async def _has_partition_fingerprint_replay(
     context: PaginationCheckpointContext,
-    resource_type: str,
-    window_id: str,
-    pass_number: int,
-    fingerprints_by_id: dict[str, str],
-    candidate_hashes_by_id: dict[str, str],
+    pass_proof: LastUpdatedPartitionPassProof,
     *,
     database_connection: Any | None = None,
 ) -> bool:
-    existing_fingerprints, existing_candidate_hashes = (
-        await _load_last_updated_partition_window_proof(
-            context,
-            resource_type,
-            window_id,
-            pass_number,
-            database_connection=database_connection,
-        )
+    existing_proof = await _load_partition_pass_proof(
+        context,
+        pass_proof.resource_type,
+        pass_proof.window_id,
+        pass_proof.pass_number,
+        database_connection=database_connection,
     )
-    if not existing_fingerprints:
+    if not existing_proof.fingerprints_by_id:
         return False
     if (
-        existing_fingerprints != fingerprints_by_id
-        or existing_candidate_hashes != candidate_hashes_by_id
+        existing_proof.fingerprints_by_id != pass_proof.fingerprints_by_id
+        or existing_proof.candidate_hashes_by_id
+        != pass_proof.candidate_hashes_by_id
+        or existing_proof.candidate_records_by_id
+        != pass_proof.candidate_records_by_id
+        or existing_proof.source_fingerprints_by_id
+        != pass_proof.source_fingerprints_by_id
     ):
         raise RuntimeError(
             "provider_directory_last_updated_partition_fingerprint_replay_mismatch"
@@ -49122,7 +49442,13 @@ def _partition_fingerprint_rows(
     window_proof_hash: str,
     fingerprints_by_id: dict[str, str],
     candidate_hashes_by_id: dict[str, str],
+    candidate_proof_records_by_id: dict[str, list[Any]] | None = None,
+    occurrence_source_fingerprints_by_id: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
+    candidate_proof_records_by_id = candidate_proof_records_by_id or {}
+    occurrence_source_fingerprints_by_id = (
+        occurrence_source_fingerprints_by_id or {}
+    )
     fingerprint_rows: list[dict[str, Any]] = []
     for resource_id, fingerprint in sorted(fingerprints_by_id.items()):
         proof_payload_dict = {
@@ -49133,6 +49459,14 @@ def _partition_fingerprint_rows(
             proof_payload_dict["candidate_payload_hash"] = candidate_hashes_by_id[
                 resource_id
             ]
+        if resource_id in candidate_proof_records_by_id:
+            proof_record = candidate_proof_records_by_id[resource_id]
+            proof_payload_dict["candidate_resource_id"] = proof_record[1]
+            proof_payload_dict["candidate_proof_record"] = proof_record
+        if resource_id in occurrence_source_fingerprints_by_id:
+            proof_payload_dict["source_fingerprint"] = (
+                occurrence_source_fingerprints_by_id[resource_id]
+            )
         fingerprint_rows.append(
             {
                 "dataset_id": context.dataset_id,
@@ -49235,6 +49569,8 @@ async def _store_partition_pass_proof(
     window: TimeWindow,
     pass_number: int,
     candidate_hashes_by_id: dict[str, str] | None = None,
+    candidate_proof_records_by_id: dict[str, list[Any]] | None = None,
+    occurrence_source_fingerprints_by_id: dict[str, str] | None = None,
     *,
     database_connection: Any | None = None,
 ) -> None:
@@ -49255,11 +49591,17 @@ async def _store_partition_pass_proof(
             )
     await _store_last_updated_partition_window_fingerprints(
         context,
-        resource_type,
-        window.window_id,
-        pass_number,
-        fingerprints,
-        candidate_hashes_by_id,
+        LastUpdatedPartitionPassProof(
+            resource_type=resource_type,
+            window_id=window.window_id,
+            pass_number=pass_number,
+            fingerprints_by_id=fingerprints,
+            candidate_hashes_by_id=candidate_hashes_by_id or {},
+            candidate_records_by_id=candidate_proof_records_by_id or {},
+            source_fingerprints_by_id=(
+                occurrence_source_fingerprints_by_id or {}
+            ),
+        ),
         database_connection=database_connection,
     )
 
@@ -49277,7 +49619,7 @@ def _last_updated_partition_hash_identity(
     semantic_projection_as_of = source_record.get(
         "_semantic_projection_as_of"
     )
-    if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if is_semantic_resource_hash_contract(resource_hash_contract):
         semantic_projection_as_of = _validated_semantic_projection_as_of(
             semantic_projection_as_of
         )
@@ -49318,15 +49660,131 @@ def _last_updated_partition_parsed_rows(
     return parsed_rows
 
 
+def _v4_partition_candidate_proofs(
+    model: type,
+    parsed_rows: list[dict[str, Any]],
+    dataset_id: str,
+    resource_hash_contract: str,
+    occurrence_ids: tuple[str, ...],
+) -> tuple[dict[str, str], dict[str, list[Any]]]:
+    """Build one exact proof record for every raw Organization occurrence."""
+
+    if not (
+        model is ProviderDirectoryOrganization
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    ):
+        return {}, {}
+    if len(parsed_rows) != len(occurrence_ids) or len(set(occurrence_ids)) != len(
+        occurrence_ids
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_occurrence_identity_invalid"
+        )
+    candidate_hashes_by_id: dict[str, str] = {}
+    proof_records_by_id: dict[str, list[Any]] = {}
+    for occurrence_id, parsed_row_by_field in zip(occurrence_ids, parsed_rows):
+        retained_rows = _endpoint_dataset_resource_rows(
+            model,
+            [parsed_row_by_field],
+            dataset_id=dataset_id,
+            resource_hash_contract=resource_hash_contract,
+        )
+        if len(retained_rows) != 1:
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_occurrence_proof_invalid"
+            )
+        proof_record = build_dataset_proof_record(
+            retained_rows[0],
+            resource_hash_contract,
+        )
+        candidate_hashes_by_id[occurrence_id] = proof_record[2]
+        proof_records_by_id[occurrence_id] = proof_record
+    return candidate_hashes_by_id, proof_records_by_id
+
+
+def _assert_partition_stage_identity(
+    is_v4_organization: bool,
+    source_count: int,
+    parsed_rows: list[dict[str, Any]],
+    staged_rows: list[dict[str, Any]],
+    options: LastUpdatedPartitionStageOptions,
+) -> None:
+    """Require exact raw, parsed, retained, and occurrence identities."""
+
+    if is_v4_organization and set(
+        options.source_fingerprints_by_id
+    ) != set(options.occurrence_ids):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_occurrence_identity_invalid"
+        )
+    if not is_v4_organization and len(staged_rows) != source_count:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_stage_count_mismatch"
+        )
+    parsed_resource_ids = {
+        _clean_text(parsed_row_by_field.get("resource_id"))
+        for parsed_row_by_field in parsed_rows
+    }
+    staged_resource_ids = {
+        _clean_text(staged_row_by_field.get("resource_id"))
+        for staged_row_by_field in staged_rows
+    }
+    if is_v4_organization and (
+        None in parsed_resource_ids
+        or parsed_resource_ids != staged_resource_ids
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_stage_identity_mismatch"
+        )
+
+
+def _partition_stage_proof_fields(
+    context: PaginationCheckpointContext,
+    model: type,
+    parsed_rows: list[dict[str, Any]],
+    staged_rows: list[dict[str, Any]],
+    resource_hash_contract: str,
+    options: LastUpdatedPartitionStageOptions,
+) -> tuple[dict[str, str], dict[str, list[Any]]]:
+    """Validate stage identity and return its exact candidate commitments."""
+
+    is_v4_organization = bool(
+        model is ProviderDirectoryOrganization
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    )
+    _assert_partition_stage_identity(
+        is_v4_organization,
+        len(parsed_rows),
+        parsed_rows,
+        staged_rows,
+        options,
+    )
+    candidate_hashes_by_id, proof_records_by_id = (
+        _v4_partition_candidate_proofs(
+            model,
+            parsed_rows,
+            context.dataset_id,
+            resource_hash_contract,
+            options.occurrence_ids,
+        )
+    )
+    if not is_v4_organization:
+        candidate_hashes_by_id = {
+            staged_row["resource_id"]: staged_row["payload_hash"]
+            for staged_row in staged_rows
+        }
+    return candidate_hashes_by_id, proof_records_by_id
+
+
 async def _stage_last_updated_partition_window(
     context: PaginationCheckpointContext,
     source_record: dict[str, Any],
     resource_type: str,
     model: type,
     resources: tuple[dict[str, Any], ...],
-    *,
-    run_id: str | None,
-    fetch_url: str,
+    options: LastUpdatedPartitionStageOptions,
 ) -> LastUpdatedPartitionStage:
     """Parse and hash one partition window under the root contract."""
 
@@ -49334,8 +49792,8 @@ async def _stage_last_updated_partition_window(
         source_record,
         model,
         resources,
-        run_id=run_id,
-        fetch_url=fetch_url,
+        run_id=options.run_id,
+        fetch_url=options.fetch_url,
     )
     resource_hash_contract, semantic_projection_as_of = (
         _last_updated_partition_hash_identity(source_record)
@@ -49352,26 +49810,334 @@ async def _stage_last_updated_partition_window(
         dataset_id=context.dataset_id,
         resource_hash_contract=resource_hash_contract,
     )
-    if len(staged_rows) != len(resources):
-        raise RuntimeError(
-            "provider_directory_last_updated_partition_stage_count_mismatch"
+    candidate_hashes_by_id, proof_records_by_id = (
+        _partition_stage_proof_fields(
+            context,
+            model,
+            parsed_rows,
+            staged_rows,
+            resource_hash_contract,
+            options,
         )
+    )
     return LastUpdatedPartitionStage(
         rows=tuple(staged_rows),
-        candidate_hashes_by_id={
-            staged_row["resource_id"]: staged_row["payload_hash"]
-            for staged_row in staged_rows
-        },
+        candidate_hashes_by_id=candidate_hashes_by_id,
         resource_hash_contract=resource_hash_contract,
         semantic_projection_as_of=semantic_projection_as_of,
+        candidate_proof_records_by_id=proof_records_by_id,
+        occurrence_source_fingerprints_by_id=(
+            options.source_fingerprints_by_id
+        ),
     )
 
 
-async def _last_updated_partition_candidate_proof_counts(
+def _v4_partition_row_identity(
+    proof_row: Any,
+    pass_number: int,
+) -> tuple[str, str, str, str]:
+    """Decode one occurrence row's durable planner and source identity."""
+
+    proof_row_map = _pagination_checkpoint_row_mapping(proof_row)
+    resource_id, window_id, planner_fingerprint = (
+        _last_updated_partition_fingerprint_row(proof_row)
+    )
+    proof_payload = proof_row_map.get("payload_json")
+    source_fingerprint = (
+        _clean_text(proof_payload.get("source_fingerprint"))
+        if isinstance(proof_payload, Mapping)
+        else None
+    )
+    if not source_fingerprint:
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_fingerprint_row_invalid"
+        )
+    if not (
+        re.fullmatch(r"[0-9a-f]{64}", planner_fingerprint)
+        and re.fullmatch(r"[0-9a-f]{64}", source_fingerprint)
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_fingerprint_row_invalid"
+        )
+    if proof_row_map.get("payload_hash") != (
+        _last_updated_partition_window_proof_hash(
+            "Organization",
+            window_id,
+            pass_number,
+        )
+    ):
+        raise RuntimeError(
+            "provider_directory_last_updated_partition_fingerprint_row_invalid"
+        )
+    return resource_id, window_id, planner_fingerprint, source_fingerprint
+
+
+def _v4_partition_identity_set(
+    proof_rows: list[Any],
+    pass_number: int,
+) -> tuple[set[tuple[str, str, str, str]], int]:
+    """Return exact occurrence identities and an invalid-row count."""
+
+    identities: set[tuple[str, str, str, str]] = set()
+    invalid_count = 0
+    for proof_row in proof_rows:
+        try:
+            identity = _v4_partition_row_identity(proof_row, pass_number)
+        except RuntimeError:
+            invalid_count += 1
+            continue
+        if identity in identities:
+            invalid_count += 1
+        identities.add(identity)
+    return identities, invalid_count
+
+
+def _v4_partition_candidate_hashes(
+    candidate_rows: list[Any],
+) -> tuple[dict[str, str], dict[str, list[Any]], int]:
+    """Decode unique retained candidate hashes without overwriting drift."""
+
+    hashes_by_id: dict[str, str] = {}
+    proof_records_by_id: dict[str, list[Any]] = {}
+    invalid_count = 0
+    for candidate_row in candidate_rows:
+        candidate_row_map = _pagination_checkpoint_row_mapping(candidate_row)
+        resource_id = _clean_text(candidate_row_map.get("resource_id"))
+        payload_hash = _clean_text(candidate_row_map.get("payload_hash"))
+        payload_by_field = candidate_row_map.get("payload_json")
+        if isinstance(payload_by_field, str):
+            try:
+                payload_by_field = json.loads(payload_by_field)
+            except json.JSONDecodeError:
+                payload_by_field = None
+        if (
+            not resource_id
+            or not payload_hash
+            or resource_id in hashes_by_id
+            or not isinstance(payload_by_field, dict)
+        ):
+            invalid_count += 1
+            continue
+        try:
+            _validated_semantic_dataset_payload(
+                {
+                    **candidate_row_map,
+                    "payload_json": payload_by_field,
+                },
+                "Organization",
+                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+            )
+            proof_record = build_dataset_proof_record(
+                {
+                    **candidate_row_map,
+                    "payload_json": payload_by_field,
+                },
+                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+            )
+        except (
+            ProviderDirectoryProofStoreError,
+            RuntimeError,
+            ValueError,
+        ):
+            invalid_count += 1
+            continue
+        hashes_by_id[resource_id] = payload_hash
+        proof_records_by_id[resource_id] = proof_record
+    return hashes_by_id, proof_records_by_id, invalid_count
+
+
+def _v4_partition_occurrence_records(
+    proof_rows: list[Any],
+) -> tuple[
+    dict[str, list[list[Any]]],
+    dict[tuple[str, str, str], set[str]],
+    int,
+]:
+    """Decode candidate records and group their bound occurrence IDs."""
+
+    records_by_candidate_id: dict[str, list[list[Any]]] = {}
+    ids_by_occurrence_group: dict[tuple[str, str, str], set[str]] = {}
+    invalid_count = 0
+    for proof_row in proof_rows:
+        proof_row_map = _pagination_checkpoint_row_mapping(proof_row)
+        proof_payload = proof_row_map.get("payload_json")
+        if not isinstance(proof_payload, Mapping):
+            invalid_count += 1
+            continue
+        try:
+            occurrence_id, window_id, _planner_hash, source_hash = (
+                _v4_partition_row_identity(proof_row, 2)
+            )
+            proof_record = decode_dataset_proof_record(
+                proof_payload.get("candidate_proof_record")
+            )
+        except (ProviderDirectoryProofStoreError, RuntimeError):
+            invalid_count += 1
+            continue
+        candidate_id = _clean_text(
+            proof_payload.get("candidate_resource_id")
+        )
+        candidate_hash = _clean_text(
+            proof_payload.get("candidate_payload_hash")
+        )
+        if (
+            proof_record[0] != "Organization"
+            or not candidate_id
+            or proof_record[1] != candidate_id
+            or proof_record[2] != candidate_hash
+            or proof_record[7]
+            != SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+        ):
+            invalid_count += 1
+            continue
+        records_by_candidate_id.setdefault(candidate_id, []).append(
+            proof_record
+        )
+        ids_by_occurrence_group.setdefault(
+            (window_id, candidate_id, source_hash),
+            set(),
+        ).add(occurrence_id)
+    return records_by_candidate_id, ids_by_occurrence_group, invalid_count
+
+
+def _has_invalid_occurrence_ids(
+    ids_by_occurrence_group: Mapping[tuple[str, str, str], set[str]],
+) -> bool:
+    """Require each multiplicity group to contain exact ordinal identities."""
+
+    for (
+        window_id,
+        candidate_id,
+        source_fingerprint,
+    ), occurrence_ids in ids_by_occurrence_group.items():
+        expected_ids = {
+            _partition_occurrence_id(
+                window_id,
+                candidate_id,
+                source_fingerprint,
+                ordinal,
+            )
+            for ordinal in range(len(occurrence_ids))
+        }
+        if occurrence_ids != expected_ids:
+            return True
+    return False
+
+
+def _v4_partition_composition_errors(
+    candidate_records_by_id: Mapping[str, list[Any]],
+    records_by_candidate_id: Mapping[str, list[list[Any]]],
+) -> int:
+    """Count retained proof records that differ from occurrence reduction."""
+
+    invalid_count = 0
+    for candidate_id, candidate_record in candidate_records_by_id.items():
+        try:
+            merged_record, _diagnostics_by_name = reduce_dataset_proof_records(
+                records_by_candidate_id.get(candidate_id, [])
+            )
+        except ProviderDirectoryProofStoreError:
+            invalid_count += 1
+            continue
+        if merged_record != candidate_record:
+            invalid_count += 1
+    return invalid_count
+
+
+def _v4_partition_window_count_error(
+    proof_rows: list[Any],
+    expected_window_counts: Mapping[str, int] | None,
+) -> int:
+    """Bind raw pass-two multiplicity to the exact planner leaf windows."""
+
+    if expected_window_counts is None:
+        return 0
+    observed_count_by_window: dict[str, int] = {}
+    for proof_row in proof_rows:
+        try:
+            _resource_id, window_id, _planner_hash, _source_hash = (
+                _v4_partition_row_identity(proof_row, 2)
+            )
+        except RuntimeError:
+            continue
+        observed_count_by_window[window_id] = (
+            observed_count_by_window.get(window_id, 0) + 1
+        )
+    positive_expected_count_by_window = {
+        window_id: count
+        for window_id, count in expected_window_counts.items()
+        if count > 0
+    }
+    return int(
+        observed_count_by_window != positive_expected_count_by_window
+    )
+
+
+def _v4_partition_proof_counts(
+    candidate_rows: list[Any],
+    pass1_rows: list[Any],
+    proof_rows: list[Any],
+    expected_window_counts: Mapping[str, int] | None = None,
+) -> LastUpdatedPartitionProofCounts:
+    """Validate occurrence proofs against unique retained Organizations."""
+
+    (
+        candidate_hashes_by_id,
+        candidate_records_by_id,
+        invalid_candidate_count,
+    ) = (
+        _v4_partition_candidate_hashes(candidate_rows)
+    )
+    pass1_identities, invalid_pass1_count = _v4_partition_identity_set(
+        pass1_rows,
+        1,
+    )
+    pass2_identities, invalid_pass2_identity_count = (
+        _v4_partition_identity_set(proof_rows, 2)
+    )
+    records_by_candidate_id, occurrence_groups, invalid_record_count = (
+        _v4_partition_occurrence_records(proof_rows)
+    )
+    invalid_candidate_count += (
+        invalid_pass1_count
+        + invalid_pass2_identity_count
+        + invalid_record_count
+        + int(pass1_identities != pass2_identities)
+        + int(_has_invalid_occurrence_ids(occurrence_groups))
+        + _v4_partition_window_count_error(
+            proof_rows,
+            expected_window_counts,
+        )
+        + _v4_partition_composition_errors(
+            candidate_records_by_id,
+            records_by_candidate_id,
+        )
+    )
+    orphan_candidate_ids = set(records_by_candidate_id) - set(
+        candidate_hashes_by_id
+    )
+    return LastUpdatedPartitionProofCounts(
+        leaf_count_sum=0,
+        pass1_unique=len(pass1_rows),
+        pass2_unique=len(proof_rows),
+        staged_candidate_count=len(candidate_hashes_by_id),
+        invalid_candidate_count=invalid_candidate_count,
+        orphan_proof_count=len(orphan_candidate_ids),
+        candidate_hashes_by_id=dict(candidate_hashes_by_id),
+    )
+
+
+async def _v4_partition_candidate_proof_counts(
     context: PaginationCheckpointContext,
     resource_type: str,
+    expected_window_counts: Mapping[str, int] | None = None,
 ) -> LastUpdatedPartitionProofCounts:
-    """Count staged candidates and both immutable pass proofs."""
+    """Load raw occurrence proofs and unique retained Organizations."""
+
+    table_ref = _qt(
+        _schema(),
+        ProviderDirectoryDatasetResource.__tablename__,
+    )
     pass1_resource_type = _last_updated_partition_fingerprint_resource_type(
         resource_type,
         1,
@@ -49380,41 +50146,37 @@ async def _last_updated_partition_candidate_proof_counts(
         resource_type,
         2,
     )
-    count_row = await db.first(
-        f"""
-        SELECT
-          (SELECT COUNT(*) FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-            WHERE dataset_id = :dataset_id AND resource_type = :resource_type) AS candidate_count,
-          (SELECT COUNT(*) FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-            WHERE dataset_id = :dataset_id AND resource_type = :pass1_resource_type) AS pass1_count,
-          (SELECT COUNT(*) FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-            WHERE dataset_id = :dataset_id AND resource_type = :pass2_resource_type) AS pass2_count,
-          (SELECT COUNT(*)
-             FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} candidate
-             LEFT JOIN {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} proof
-               ON proof.dataset_id = candidate.dataset_id
-              AND proof.resource_type = :pass2_resource_type
-              AND proof.resource_id = candidate.resource_id
-            WHERE candidate.dataset_id = :dataset_id
-              AND candidate.resource_type = :resource_type
-              AND (proof.resource_id IS NULL OR
-                   proof.payload_json::jsonb ->> 'candidate_payload_hash'
-                   IS DISTINCT FROM candidate.payload_hash)) AS invalid_candidate_count,
-          (SELECT COUNT(*)
-             FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} proof
-             LEFT JOIN {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} candidate
-               ON candidate.dataset_id = proof.dataset_id
-              AND candidate.resource_type = :resource_type
-              AND candidate.resource_id = proof.resource_id
-            WHERE proof.dataset_id = :dataset_id
-              AND proof.resource_type = :pass2_resource_type
-              AND candidate.resource_id IS NULL) AS orphan_proof_count;
-        """,
+    retained_rows = await db.all(
+        f"SELECT resource_type, resource_id, payload_hash, payload_json, "
+        f"acquired_resource_sha256 "
+        f"FROM {table_ref} WHERE dataset_id=:dataset_id "
+        "AND resource_type=ANY(CAST(:resource_types AS varchar[])) "
+        "ORDER BY resource_type, resource_id;",
         dataset_id=context.dataset_id,
-        resource_type=resource_type,
-        pass1_resource_type=pass1_resource_type,
-        pass2_resource_type=pass2_resource_type,
+        resource_types=[
+            resource_type,
+            pass1_resource_type,
+            pass2_resource_type,
+        ],
     )
+    rows_by_resource_type: dict[str, list[Any]] = {}
+    for retained_row in retained_rows:
+        retained_row_map = _pagination_checkpoint_row_mapping(retained_row)
+        rows_by_resource_type.setdefault(
+            str(retained_row_map.get("resource_type") or ""),
+            [],
+        ).append(retained_row)
+    return _v4_partition_proof_counts(
+        rows_by_resource_type.get(resource_type, []),
+        rows_by_resource_type.get(pass1_resource_type, []),
+        rows_by_resource_type.get(pass2_resource_type, []),
+        expected_window_counts,
+    )
+
+
+def _partition_counts_from_row(count_row: Any) -> LastUpdatedPartitionProofCounts:
+    """Decode one aggregate pre-v4 candidate and twin-pass count row."""
+
     count_map = _pagination_checkpoint_row_mapping(count_row)
     return LastUpdatedPartitionProofCounts(
         leaf_count_sum=0,
@@ -49428,20 +50190,116 @@ async def _last_updated_partition_candidate_proof_counts(
     )
 
 
+async def _legacy_partition_candidate_proof_counts(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+) -> LastUpdatedPartitionProofCounts:
+    """Count pre-v4 staged candidates and exact twin-pass proof rows."""
+
+    pass1_resource_type = _last_updated_partition_fingerprint_resource_type(
+        resource_type,
+        1,
+    )
+    pass2_resource_type = _last_updated_partition_fingerprint_resource_type(
+        resource_type,
+        2,
+    )
+    table_ref = _qt(
+        _schema(), ProviderDirectoryDatasetResource.__tablename__
+    )
+    count_row = await db.first(
+        f"""
+        SELECT
+          (SELECT COUNT(*) FROM {table_ref}
+            WHERE dataset_id = :dataset_id AND resource_type = :resource_type) AS candidate_count,
+          (SELECT COUNT(*) FROM {table_ref}
+            WHERE dataset_id = :dataset_id AND resource_type = :pass1_resource_type) AS pass1_count,
+          (SELECT COUNT(*) FROM {table_ref}
+            WHERE dataset_id = :dataset_id AND resource_type = :pass2_resource_type) AS pass2_count,
+          (SELECT COUNT(*)
+             FROM {table_ref} candidate
+             LEFT JOIN {table_ref} proof
+               ON proof.dataset_id = candidate.dataset_id
+              AND proof.resource_type = :pass2_resource_type
+              AND proof.resource_id = candidate.resource_id
+            WHERE candidate.dataset_id = :dataset_id
+              AND candidate.resource_type = :resource_type
+              AND (proof.resource_id IS NULL OR
+                   proof.payload_json::jsonb ->> 'candidate_payload_hash'
+                   IS DISTINCT FROM candidate.payload_hash)) AS invalid_candidate_count,
+          (SELECT COUNT(*)
+             FROM {table_ref} proof
+             LEFT JOIN {table_ref} candidate
+               ON candidate.dataset_id = proof.dataset_id
+              AND candidate.resource_type = :resource_type
+              AND candidate.resource_id = proof.resource_id
+            WHERE proof.dataset_id = :dataset_id
+              AND proof.resource_type = :pass2_resource_type
+              AND candidate.resource_id IS NULL) AS orphan_proof_count;
+        """,
+        dataset_id=context.dataset_id,
+        resource_type=resource_type,
+        pass1_resource_type=pass1_resource_type,
+        pass2_resource_type=pass2_resource_type,
+    )
+    return _partition_counts_from_row(count_row)
+
+
+async def _last_updated_partition_candidate_proof_counts(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    resource_hash_contract: str | None = None,
+    partition_plan: PartitionPlan | None = None,
+) -> LastUpdatedPartitionProofCounts:
+    """Count staged candidates and both immutable pass proofs."""
+    if (
+        resource_type == "Organization"
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    ):
+        return await _v4_partition_candidate_proof_counts(
+            context,
+            resource_type,
+            (
+                {
+                    window.window_id: int(window.count or 0)
+                    for window in partition_plan.leaf_windows()
+                }
+                if partition_plan is not None
+                else None
+            ),
+        )
+    return await _legacy_partition_candidate_proof_counts(
+        context,
+        resource_type,
+    )
+
+
 async def _assert_last_updated_partition_candidate_proof(
     context: PaginationCheckpointContext,
     resource_type: str,
     plan: PartitionPlan,
+    resource_hash_contract: str | None = None,
 ) -> LastUpdatedPartitionProofCounts:
     """Require exact candidate/proof counts and immutable payload hashes."""
     expected_count = sum(window.count or 0 for window in plan.leaf_windows())
     observed_counts = await _last_updated_partition_candidate_proof_counts(
         context,
         resource_type,
+        resource_hash_contract,
+        plan,
     )
     proof_counts = replace(observed_counts, leaf_count_sum=expected_count)
+    is_v4_organization = bool(
+        resource_type == "Organization"
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    )
     if (
-        proof_counts.staged_candidate_count != expected_count
+        (
+            not is_v4_organization
+            and proof_counts.staged_candidate_count != expected_count
+        )
         or proof_counts.pass1_unique != expected_count
         or proof_counts.pass2_unique != expected_count
         or proof_counts.invalid_candidate_count
@@ -49481,6 +50339,94 @@ def _partition_output_rows(
     return output_rows
 
 
+async def _load_partition_output_batch(
+    context: PaginationCheckpointContext,
+    resource_type: str,
+    after_resource_id: str,
+    row_batch_size: int,
+) -> list[Any]:
+    """Load one stable keyset batch from the verified retained dataset."""
+
+    return await db.all(
+        f"""
+        SELECT resource_id, payload_hash, payload_json,
+               acquired_resource_sha256
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = :resource_type
+           AND resource_id > :after_resource_id
+         ORDER BY resource_id
+         LIMIT :batch_size;
+        """,
+        dataset_id=context.dataset_id,
+        resource_type=resource_type,
+        after_resource_id=after_resource_id,
+        batch_size=max(1, row_batch_size),
+    )
+
+
+def _assert_partition_stream_hashes(
+    staged_row_batch: list[Any],
+    expected_hash_by_id: Mapping[str, str],
+    resource_type: str,
+    resource_hash_contract: str,
+) -> None:
+    """Revalidate each retained row immediately before compatibility output."""
+
+    for staged_row in staged_row_batch:
+        staged_row_map = _pagination_checkpoint_row_mapping(staged_row)
+        resource_id = _clean_text(staged_row_map.get("resource_id"))
+        try:
+            _validated_semantic_dataset_payload(
+                staged_row_map,
+                resource_type,
+                resource_hash_contract,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_stream_payload_mismatch"
+            ) from exc
+        if (
+            not resource_id
+            or staged_row_map.get("payload_hash")
+            != expected_hash_by_id.get(resource_id)
+        ):
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_stream_payload_mismatch"
+            )
+
+
+async def _partition_stream_expectations(
+    context: PaginationCheckpointContext,
+    source_record: dict[str, Any],
+    resource_type: str,
+    plan: PartitionPlan,
+) -> tuple[str, dict[str, str] | None, int]:
+    """Return the verified hash contract, candidate hashes, and row count."""
+
+    resource_hash_contract, _semantic_projection_as_of = (
+        _last_updated_partition_hash_identity(source_record)
+    )
+    proof_counts = await _assert_last_updated_partition_candidate_proof(
+        context,
+        resource_type,
+        plan,
+        resource_hash_contract,
+    )
+    expected_count = (
+        proof_counts.staged_candidate_count
+        if resource_type == "Organization"
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+        else proof_counts.leaf_count_sum
+    )
+    return (
+        resource_hash_contract,
+        proof_counts.candidate_hashes_by_id,
+        expected_count,
+    )
+
+
 async def _stream_last_updated_partition_staged_rows(
     context: PaginationCheckpointContext,
     source_record: dict[str, Any],
@@ -49493,33 +50439,35 @@ async def _stream_last_updated_partition_staged_rows(
     row_batch_size: int,
 ) -> tuple[int, int]:
     """Verify proof, then keyset-stream staged rows to the normal writer."""
-    proof_counts = await _assert_last_updated_partition_candidate_proof(
+    (
+        resource_hash_contract,
+        candidate_hashes_by_id,
+        expected_count,
+    ) = await _partition_stream_expectations(
         context,
+        source_record,
         resource_type,
         plan,
     )
-    expected_count = proof_counts.leaf_count_sum
     written_count = 0
     streamed_count = 0
     after_resource_id = ""
     while True:
-        staged_row_batch = await db.all(
-            f"""
-            SELECT resource_id, payload_json
-              FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-             WHERE dataset_id = :dataset_id
-               AND resource_type = :resource_type
-               AND resource_id > :after_resource_id
-             ORDER BY resource_id
-             LIMIT :batch_size;
-            """,
-            dataset_id=context.dataset_id,
-            resource_type=resource_type,
-            after_resource_id=after_resource_id,
-            batch_size=max(1, row_batch_size),
+        staged_row_batch = await _load_partition_output_batch(
+            context,
+            resource_type,
+            after_resource_id,
+            row_batch_size,
         )
         if not staged_row_batch:
             break
+        if candidate_hashes_by_id is not None:
+            _assert_partition_stream_hashes(
+                staged_row_batch,
+                candidate_hashes_by_id,
+                resource_type,
+                resource_hash_contract,
+            )
         output_rows = _partition_output_rows(
             staged_row_batch,
             source_record,
@@ -50100,31 +51048,30 @@ async def _restore_pass_one_proof(
 
 
 async def _partition_candidate_hashes(
-    source_record: dict[str, Any],
-    resource_type: str,
-    model: type,
-    state: LastUpdatedPartitionState,
-    fetch_options: LastUpdatedPartitionFetchOptions,
-    window_fetch: LastUpdatedWindowFetch,
-    pass_number: int,
-    request_url: str,
+    request: PartitionCandidateStageRequest,
 ) -> LastUpdatedPartitionStage | None:
     if (
-        pass_number != 2
-        or not window_fetch.complete
-        or window_fetch.bounded
-        or state.plan.failure is not None
+        request.pass_number != 2
+        or not request.window_fetch.complete
+        or request.window_fetch.bounded
+        or request.state.plan.failure is not None
     ):
         return None
-    assert fetch_options.run_id is not None
+    assert request.fetch_options.run_id is not None
     return await _stage_last_updated_partition_window(
-        state.context,
-        source_record,
-        resource_type,
-        model,
-        window_fetch.resources,
-        run_id=fetch_options.run_id,
-        fetch_url=request_url,
+        request.state.context,
+        request.source_record,
+        request.resource_type,
+        request.model,
+        request.staged_resources,
+        LastUpdatedPartitionStageOptions(
+            run_id=request.fetch_options.run_id,
+            fetch_url=request.request_url,
+            occurrence_ids=request.occurrence_ids,
+            source_fingerprints_by_id=(
+                request.source_fingerprints_by_id
+            ),
+        ),
     )
 
 
@@ -50135,6 +51082,7 @@ async def _persist_partition_pass(
     window: TimeWindow,
     pass_number: int,
     candidate_stage: LastUpdatedPartitionStage | None,
+    occurrence_source_fingerprints_by_id: dict[str, str] | None = None,
 ) -> None:
     async with db.acquire() as connection:
         if state.plan.failure is None:
@@ -50160,6 +51108,14 @@ async def _persist_partition_pass(
                     if candidate_stage is not None
                     else None
                 ),
+                candidate_proof_records_by_id=(
+                    candidate_stage.candidate_proof_records_by_id
+                    if candidate_stage is not None
+                    else None
+                ),
+                occurrence_source_fingerprints_by_id=(
+                    occurrence_source_fingerprints_by_id
+                ),
                 database_connection=connection,
             )
             window.passes = {
@@ -50183,13 +51139,14 @@ def _record_partition_window(
     window: TimeWindow,
     pass_number: int,
     window_fetch: LastUpdatedWindowFetch,
+    proof_resources: tuple[dict[str, Any], ...],
 ) -> None:
     state.pages_fetched += window_fetch.pages_fetched
     state.rows_fetched += len(window_fetch.resources)
     state.plan.record_pass(
         window.window_id,
         pass_number,
-        window_fetch.resources,
+        proof_resources,
         complete=window_fetch.complete,
         bounded=window_fetch.bounded,
     )
@@ -50236,6 +51193,69 @@ def _is_partition_window_fetch_retryable(
     )
 
 
+async def _persist_completed_partition_fetch(
+    request: PartitionCandidateStageRequest,
+) -> None:
+    """Record and atomically persist one complete partition pass."""
+
+    _record_partition_window(
+        request.state,
+        request.window,
+        request.pass_number,
+        request.window_fetch,
+        request.proof_resources,
+    )
+    candidate_stage = await _partition_candidate_hashes(request)
+    await _persist_partition_pass(
+        request.resource_type,
+        request.config,
+        request.state,
+        request.window,
+        request.pass_number,
+        candidate_stage,
+        request.source_fingerprints_by_id,
+    )
+
+
+async def _partition_window_retry_result(
+    model: type,
+    resource_type: str,
+    config: LastUpdatedPartitionConfig,
+    state: LastUpdatedPartitionState,
+    window_fetch: LastUpdatedWindowFetch,
+) -> ResourceFetchResult:
+    """Persist retryable progress from one incomplete partition window."""
+
+    state.pages_fetched += window_fetch.pages_fetched
+    state.rows_fetched += len(window_fetch.resources)
+    return await _saved_partition_retry_result(
+        model,
+        resource_type,
+        config,
+        state,
+        window_fetch.error or "window_fetch_transient",
+        retry_not_before=window_fetch.retry_not_before,
+        deadline_reached=window_fetch.deadline_reached,
+    )
+
+
+def _partition_pass_failure(
+    model: type,
+    state: LastUpdatedPartitionState,
+    window_fetch: LastUpdatedWindowFetch,
+) -> ResourceFetchResult | None:
+    """Return a terminal pass failure after its durable proof write."""
+
+    if state.plan.status is not PlanStatus.FAILED:
+        return None
+    return _partition_failure_from_state(
+        model,
+        state,
+        window_fetch.error or "window_proof_failed",
+        bounded=window_fetch.bounded,
+    )
+
+
 async def _fetch_partition_pass(
     source_record: dict[str, Any],
     resource_type: str,
@@ -50258,44 +51278,42 @@ async def _fetch_partition_pass(
         window,
     )
     if _is_partition_window_fetch_retryable(window_fetch):
-        state.pages_fetched += window_fetch.pages_fetched
-        state.rows_fetched += len(window_fetch.resources)
-        return await _saved_partition_retry_result(
+        return await _partition_window_retry_result(
             model,
             resource_type,
             config,
             state,
-            window_fetch.error or "window_fetch_transient",
-            retry_not_before=window_fetch.retry_not_before,
-            deadline_reached=window_fetch.deadline_reached,
+            window_fetch,
         )
-    _record_partition_window(state, window, pass_number, window_fetch)
-    candidate_stage = await _partition_candidate_hashes(
+    partition_bindings = _partition_resource_bindings(
         source_record,
         resource_type,
-        model,
-        state,
-        fetch_options,
-        window_fetch,
-        pass_number,
-        request_url,
-    )
-    await _persist_partition_pass(
-        resource_type,
-        config,
-        state,
+        state.plan,
         window,
-        pass_number,
-        candidate_stage,
+        window_fetch.resources,
     )
-    if state.plan.status is PlanStatus.FAILED:
-        return _partition_failure_from_state(
-            model,
-            state,
-            window_fetch.error or "window_proof_failed",
-            bounded=window_fetch.bounded,
+    staged_resources, proof_resources, occurrence_ids, source_hashes_by_id = (
+        partition_bindings
+    )
+    await _persist_completed_partition_fetch(
+        PartitionCandidateStageRequest(
+            source_record=source_record,
+            resource_type=resource_type,
+            model=model,
+            state=state,
+            fetch_options=fetch_options,
+            config=config,
+            window=window,
+            window_fetch=window_fetch,
+            pass_number=pass_number,
+            request_url=request_url,
+            staged_resources=staged_resources,
+            proof_resources=proof_resources,
+            occurrence_ids=occurrence_ids,
+            source_fingerprints_by_id=source_hashes_by_id,
         )
-    return None
+    )
+    return _partition_pass_failure(model, state, window_fetch)
 
 
 async def _fetch_partition_plan_passes(
@@ -50370,16 +51388,21 @@ async def _observe_partition_post_census(
 
 
 async def _verified_partition_proof_counts(
+    source_record: dict[str, Any],
     resource_type: str,
     model: type,
     config: LastUpdatedPartitionConfig,
     state: LastUpdatedPartitionState,
 ) -> LastUpdatedPartitionProofCounts | ResourceFetchResult:
+    resource_hash_contract, _semantic_projection_as_of = (
+        _last_updated_partition_hash_identity(source_record)
+    )
     try:
         proof_counts = await _assert_last_updated_partition_candidate_proof(
             state.context,
             resource_type,
             state.plan,
+            resource_hash_contract,
         )
     except RuntimeError as exc:
         return await _saved_partition_terminal_result(
@@ -50390,12 +51413,17 @@ async def _verified_partition_proof_counts(
             str(exc),
         )
     expected_count = state.census.ranged_root_pre
-    observed_counts = (
+    observed_counts = [
         proof_counts.leaf_count_sum,
         proof_counts.pass1_unique,
         proof_counts.pass2_unique,
-        proof_counts.staged_candidate_count,
-    )
+    ]
+    if not (
+        resource_type == "Organization"
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    ):
+        observed_counts.append(proof_counts.staged_candidate_count)
     if expected_count is not None and all(
         observed_count == expected_count for observed_count in observed_counts
     ):
@@ -50420,7 +51448,8 @@ async def _completed_partition_fetch_result(
     row_batch_handler = fetch_options.row_batch_handler
     run_id = fetch_options.run_id
     assert row_batch_handler is not None and run_id is not None
-    streamed_count, rows_written = await _stream_last_updated_partition_staged_rows(
+    _streamed_count, rows_written = (
+        await _stream_last_updated_partition_staged_rows(
         state.context,
         source_record,
         resource_type,
@@ -50430,10 +51459,11 @@ async def _completed_partition_fetch_result(
         row_batch_handler=row_batch_handler,
         row_batch_size=fetch_options.row_batch_size,
     )
+    )
     return ResourceFetchResult(
         model=model,
         rows=[],
-        rows_fetched=streamed_count,
+        rows_fetched=proof_counts.leaf_count_sum,
         rows_written=rows_written,
         pages_fetched=state.pages_fetched,
         complete=True,
@@ -50462,6 +51492,7 @@ async def _finish_partition_fetch(
     if state.plan.status is not PlanStatus.SUCCEEDED:
         return _partition_failure_from_state(model, state, "proof_incomplete")
     proof_counts = await _verified_partition_proof_counts(
+        source_record,
         resource_type,
         model,
         config,
@@ -54900,8 +55931,7 @@ def _assert_practitioner_semantic_projection_as_of(
 
     if (
         model is not ProviderDirectoryPractitioner
-        or resource_hash_contract
-        != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        or not is_semantic_resource_hash_contract(resource_hash_contract)
     ):
         return
     expected_as_of = _validated_semantic_projection_as_of(
@@ -55076,7 +56106,7 @@ def _endpoint_dataset_parent_proof_resource_scope(
 ) -> tuple[str, ...] | None:
     """Return the exact v3 proof closure while preserving old contracts."""
 
-    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if not is_semantic_resource_hash_contract(resource_hash_contract):
         raw_metadata = parent_by_field.get("publication_metadata_json")
         if raw_metadata is None:
             return None
@@ -55165,10 +56195,12 @@ async def _existing_endpoint_dataset_resources(
     return resource_by_id
 
 
-def _validated_v3_dataset_payload(
+def _validated_semantic_dataset_payload(
     dataset_row_by_field: Mapping[str, Any],
+    resource_type: str,
+    resource_hash_contract: str,
 ) -> dict[str, Any]:
-    """Return one exact v3 payload only when its immutable hash is valid."""
+    """Return semantic payload only when its contract hash is valid."""
 
     payload_by_field = dataset_row_by_field.get("payload_json")
     if not isinstance(payload_by_field, dict):
@@ -55181,7 +56213,8 @@ def _validated_v3_dataset_payload(
         )
     expected_payload_hash = resource_payload_sha256_for_contract(
         payload_by_field,
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        resource_hash_contract,
+        resource_type=resource_type,
     )
     if dataset_row_by_field.get("payload_hash") != expected_payload_hash:
         raise RuntimeError(
@@ -55190,15 +56223,25 @@ def _validated_v3_dataset_payload(
     return payload_by_field
 
 
-def _merged_v3_dataset_payload(
+def _merged_semantic_dataset_payload(
     resource_type: str,
     first_payload: Mapping[str, Any],
     second_payload: Mapping[str, Any],
+    resource_hash_contract: str,
 ) -> dict[str, Any]:
     """Merge only the reviewed semantic shape for one repeated identity."""
 
     if resource_type == "Practitioner":
         return merge_practitioner_semantic_payloads(
+            first_payload,
+            second_payload,
+        )
+    if (
+        resource_type == "Organization"
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    ):
+        return merge_organization_semantic_payloads(
             first_payload,
             second_payload,
         )
@@ -55293,6 +56336,7 @@ async def _lock_endpoint_dataset_batch_identity(
 def _incoming_semantic_dataset_rows_by_id(
     incoming_dataset_rows: list[dict[str, Any]],
     resource_type: str,
+    resource_hash_contract: str,
     semantic_projection_as_of: str | None,
 ) -> dict[str, dict[str, Any]]:
     """Validate and index one duplicate-free v3 resource-family batch."""
@@ -55304,14 +56348,16 @@ def _incoming_semantic_dataset_rows_by_id(
             raise RuntimeError(
                 "provider_directory_semantic_resource_identity_invalid"
             )
-        incoming_payload = _validated_v3_dataset_payload(
-            incoming_dataset_row
+        incoming_payload = _validated_semantic_dataset_payload(
+            incoming_dataset_row,
+            resource_type,
+            resource_hash_contract,
         )
         if resource_type == "Practitioner":
             _assert_practitioner_semantic_projection_as_of(
                 ProviderDirectoryPractitioner,
                 [incoming_payload],
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                resource_hash_contract,
                 semantic_projection_as_of,
             )
         if resource_id in incoming_by_id:
@@ -55326,6 +56372,7 @@ async def _merged_semantic_dataset_rows(
     database_executor: Any,
     batch_identity: _EndpointDatasetBatchIdentity,
     incoming_by_id: dict[str, dict[str, Any]],
+    resource_hash_contract: str,
     semantic_projection_as_of: str | None,
 ) -> list[dict[str, Any]]:
     """Merge valid v3 observations with each locked retained identity."""
@@ -55342,29 +56389,35 @@ async def _merged_semantic_dataset_rows(
         accumulated_row_by_field = dict(incoming_dataset_row)
         existing_resource = existing_resource_by_id.get(resource_id)
         if existing_resource is not None:
-            existing_payload = _validated_v3_dataset_payload(
-                existing_resource
+            existing_payload = _validated_semantic_dataset_payload(
+                existing_resource,
+                batch_identity.resource_type,
+                resource_hash_contract,
             )
             if batch_identity.resource_type == "Practitioner":
                 _assert_practitioner_semantic_projection_as_of(
                     ProviderDirectoryPractitioner,
                     [existing_payload],
-                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                    resource_hash_contract,
                     semantic_projection_as_of,
                 )
-            incoming_payload = _validated_v3_dataset_payload(
-                incoming_dataset_row
+            incoming_payload = _validated_semantic_dataset_payload(
+                incoming_dataset_row,
+                batch_identity.resource_type,
+                resource_hash_contract,
             )
-            merged_payload = _merged_v3_dataset_payload(
+            merged_payload = _merged_semantic_dataset_payload(
                 batch_identity.resource_type,
                 existing_payload,
                 incoming_payload,
+                resource_hash_contract,
             )
             accumulated_row_by_field["payload_json"] = merged_payload
             accumulated_row_by_field["payload_hash"] = (
                 resource_payload_sha256_for_contract(
                     merged_payload,
-                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                    resource_hash_contract,
+                    resource_type=batch_identity.resource_type,
                 )
             )
         accumulated_rows.append(accumulated_row_by_field)
@@ -55397,17 +56450,19 @@ async def _accumulated_endpoint_dataset_rows(
         resource_hash_contract,
         semantic_projection_as_of,
     )
-    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if not is_semantic_resource_hash_contract(resource_hash_contract):
         return incoming_dataset_rows
     incoming_by_id = _incoming_semantic_dataset_rows_by_id(
         incoming_dataset_rows,
         batch_identity.resource_type,
+        resource_hash_contract,
         semantic_projection_as_of,
     )
     return await _merged_semantic_dataset_rows(
         database_executor,
         batch_identity,
         incoming_by_id,
+        resource_hash_contract,
         semantic_projection_as_of,
     )
 
@@ -55549,7 +56604,7 @@ def _resolved_resource_write_identity(
         raise ValueError(
             "provider_directory_resource_hash_contract_invalid"
         )
-    if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if is_semantic_resource_hash_contract(resource_hash_contract):
         projection_as_of = _validated_semantic_projection_as_of(
             projection_as_of
         )
@@ -55573,6 +56628,15 @@ def _prepared_resource_write_rows(
         if options.derive_location_contacts
         else resource_rows
     )
+    if (
+        model is ProviderDirectoryOrganization
+        and write_identity.resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    ):
+        prepared_rows = [
+            canonical_organization_payload(resource_row_by_field)
+            for resource_row_by_field in prepared_rows
+        ]
     _assert_practitioner_semantic_projection_as_of(
         model,
         prepared_rows,
@@ -55602,8 +56666,9 @@ async def _persist_compatible_resource_rows(
     )
     if (
         dataset_rows
-        and write_identity.resource_hash_contract
-        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and is_semantic_resource_hash_contract(
+            write_identity.resource_hash_contract
+        )
     ):
         materialized_resource_rows = (
             _materialized_resource_rows_from_dataset_rows(
@@ -57271,7 +58336,7 @@ def _dataset_semantic_projection_as_of(
 ) -> str | None:
     """Create or recover the immutable v3 derived-field date."""
 
-    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if not is_semantic_resource_hash_contract(resource_hash_contract):
         return None
     if not dataset_map:
         return _now().date().isoformat()
@@ -57287,7 +58352,7 @@ def _resource_hash_contract_proof_scope(
 ) -> tuple[str, ...] | None:
     """Derive the proof-bearing resource closure only for semantic v3."""
 
-    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if not is_semantic_resource_hash_contract(resource_hash_contract):
         return None
     return _provider_directory_proof_resource_scope(selected_resources)
 
@@ -57295,8 +58360,8 @@ def _resource_hash_contract_proof_scope(
 def _candidate_proof_resource_scope(
     candidate: EndpointDatasetCandidate,
 ) -> tuple[str, ...] | None:
-    if candidate.resource_hash_contract != (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    if not is_semantic_resource_hash_contract(
+        candidate.resource_hash_contract
     ):
         if candidate.proof_resource_scope is not None:
             raise RuntimeError(
@@ -57334,7 +58399,7 @@ def _dataset_proof_resource_scope(
         dataset_map,
         resource_hash_contract,
     )
-    if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT and (
+    if is_semantic_resource_hash_contract(resource_hash_contract) and (
         _endpoint_dataset_parent_selected_resources(dataset_map)
         != tuple(sorted(set(selected_resources)))
     ):
@@ -58028,6 +59093,10 @@ def _is_finalized_semantic_twin_proof_exact(
     embedded_proof = verification.get("proof")
     return bool(
         isinstance(embedded_proof, Mapping)
+        and _is_embedded_twin_hash_contract_exact(
+            embedded_proof,
+            stored_proof.get(RESOURCE_HASH_CONTRACT_METADATA_KEY),
+        )
         and _is_nonnegative_resource_count(
             embedded_proof.get("resource_count")
         )
@@ -58047,6 +59116,19 @@ def _is_finalized_semantic_twin_proof_exact(
         and embedded_proof.get("resource_counts")
         == stored_proof.get("resource_counts")
     )
+
+
+def _is_embedded_twin_hash_contract_exact(
+    embedded_proof: Mapping[str, Any],
+    resource_hash_contract: Any,
+) -> bool:
+    """Bind v4 twin proofs while preserving frozen v1-v3 proof shapes."""
+
+    if resource_hash_contract == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT:
+        return embedded_proof.get(RESOURCE_HASH_CONTRACT_METADATA_KEY) == (
+            SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+        )
+    return RESOURCE_HASH_CONTRACT_METADATA_KEY not in embedded_proof
 
 
 def _is_nonnegative_resource_count(value: Any) -> bool:
@@ -58075,8 +59157,8 @@ def _validate_finalized_content_proof(
     """Bind finalized subset or semantic proof to every replay path."""
 
     _validate_finalized_subset_completion_pair(dataset_map, metadata)
-    if _dataset_resource_hash_contract(dataset_map) != (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    if not is_semantic_resource_hash_contract(
+        _dataset_resource_hash_contract(dataset_map)
     ):
         return
     stored_proof = _validated_finalized_stored_proof(dataset_map, metadata)
@@ -58200,8 +59282,13 @@ def _is_twin_root_proof_hash_exact(
     proof = proof_state.proof
     if not isinstance(metadata, dict) or not isinstance(proof, dict):
         return False
+    resource_hash_contract = _dataset_resource_hash_contract(dataset_map)
     return bool(
-        metadata.get(PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY)
+        _is_embedded_twin_hash_contract_exact(
+            proof,
+            resource_hash_contract,
+        )
+        and metadata.get(PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY)
         == proof_state.stored_proof_resource_scope
         and proof.get(PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY)
         == proof_state.stored_proof_resource_scope
@@ -58300,6 +59387,8 @@ def _assert_compatible_twin_root_baseline(
     candidate: EndpointDatasetCandidate,
     dataset_map: dict[str, Any],
 ) -> None:
+    """Require one baseline to match every persisted twin-root identity."""
+
     proof = _twin_root_baseline_proof(dataset_map)
     if dataset_map.get("completion_proof_required_version") != (
         candidate.completion_proof_required_version
@@ -58317,6 +59406,7 @@ def _assert_compatible_twin_root_baseline(
         "endpoint_id": candidate.endpoint_id,
         "source_ids": list(candidate.source_ids),
         "selected_resources": list(candidate.selected_resources),
+        **_embedded_twin_hash_contract_fields(baseline_hash_contract),
         **(
             {
                 PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: list(
@@ -59526,8 +60616,9 @@ def _existing_endpoint_dataset_finalized_selection(
     if (
         existing_dataset_map.get("completion_proof_required_version")
         == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
-        and _dataset_resource_hash_contract(existing_dataset_map)
-        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and is_semantic_resource_hash_contract(
+            _dataset_resource_hash_contract(existing_dataset_map)
+        )
     ):
         raise RuntimeError(
             "provider_directory_subset_resource_hash_contract_invalid"
@@ -59906,7 +60997,7 @@ def _candidate_resource_hash_contract(
     if (
         completion_proof_required_version
         == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
-        and selected_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and is_semantic_resource_hash_contract(selected_contract)
     ):
         return TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
     return selected_contract
@@ -59917,8 +61008,8 @@ def _assert_candidate_hash_contract_supported(
 ) -> None:
     """Reject custom-proof roots falsely marked as semantic-union v3."""
 
-    if candidate.resource_hash_contract != (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    if not is_semantic_resource_hash_contract(
+        candidate.resource_hash_contract
     ):
         return
     if candidate.completion_proof_required_version == (
@@ -59973,7 +61064,7 @@ def _candidate_hash_fields(
 ) -> dict[str, Any]:
     """Bind only v3 candidates to the selected date and proof closure."""
 
-    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if not is_semantic_resource_hash_contract(resource_hash_contract):
         return {
             "semantic_projection_as_of": None,
             "proof_resource_scope": None,
@@ -62947,6 +64038,7 @@ def _assert_endpoint_dataset_resource_payload_hash(
     acquired_resource_sha256 = resource_map.get(
         "acquired_resource_sha256"
     )
+    resource_type = _clean_text(resource_map.get("resource_type"))
     stored_hash = _clean_text(resource_map.get("payload_hash"))
     if acquired_resource_sha256 is not None:
         is_payload_hash_match = (
@@ -62962,6 +64054,7 @@ def _assert_endpoint_dataset_resource_payload_hash(
             resource_payload_sha256_for_contract(
                 raw_payload,
                 resource_hash_contract,
+                resource_type=resource_type,
             )
             == stored_hash
         )
@@ -62969,6 +64062,7 @@ def _assert_endpoint_dataset_resource_payload_hash(
         is_payload_hash_match = is_resource_payload_hash_match(
             raw_payload,
             stored_hash,
+            resource_type,
         )
     if not is_payload_hash_match:
         raise ProviderDirectoryArtifactBuildStale(
@@ -63096,8 +64190,8 @@ async def _assert_candidate_semantic_content_proof(
 ) -> None:
     """Require v3 shard and retained-row proofs to match exactly."""
 
-    if candidate.resource_hash_contract != (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    if not is_semantic_resource_hash_contract(
+        candidate.resource_hash_contract
     ):
         return
     content_resource_scope = (
@@ -63791,6 +64885,20 @@ async def _endpoint_dataset_source_summary(
     )
 
 
+def _embedded_twin_hash_contract_fields(
+    resource_hash_contract: str,
+) -> dict[str, str]:
+    """Bind only v4 embedded twin proofs to an explicit hash contract."""
+
+    if resource_hash_contract != SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT:
+        return {}
+    return {
+        RESOURCE_HASH_CONTRACT_METADATA_KEY: (
+            SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+        )
+    }
+
+
 def _base_twin_root_content_proof(
     candidate: EndpointDatasetCandidate,
     content_proof: EndpointDatasetContentProof,
@@ -63803,6 +64911,9 @@ def _base_twin_root_content_proof(
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "source_ids": list(candidate.source_ids),
         "selected_resources": list(candidate.selected_resources),
+        **_embedded_twin_hash_contract_fields(
+            candidate.resource_hash_contract
+        ),
         **(
             {
                 PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: list(
@@ -63829,8 +64940,9 @@ def _base_twin_root_content_proof(
                     candidate.semantic_projection_as_of
                 )
             }
-            if candidate.resource_hash_contract
-            == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            if is_semantic_resource_hash_contract(
+                candidate.resource_hash_contract
+            )
             else {}
         ),
     }
@@ -63894,6 +65006,7 @@ def _twin_root_mismatch_fields(
             "endpoint_id",
             "source_ids",
             "selected_resources",
+            RESOURCE_HASH_CONTRACT_METADATA_KEY,
             PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
             "expected_resources",
             TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY,

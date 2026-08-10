@@ -1410,6 +1410,7 @@ class ProviderDirectoryOrganization(Base, JSONOutputMixin):
     active = Column(Boolean)
     identifiers = Column(JSON)
     name = Column(String(512))
+    name_variants = Column(JSON)
     aliases = Column(JSON)
     type_codes = Column(JSON)
     telecom = Column(JSON)

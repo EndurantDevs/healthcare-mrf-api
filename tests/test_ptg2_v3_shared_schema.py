@@ -1082,7 +1082,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260810020000_provider_directory_terminal_scope_binding"
+        "20260810030000_provider_directory_organization_name_variants"
     ]
 
 

@@ -87,7 +87,7 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260810020000_provider_directory_terminal_scope_binding"
+        "20260810030000_provider_directory_organization_name_variants"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (

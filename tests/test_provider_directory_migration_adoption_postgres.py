@@ -33,7 +33,7 @@ PRE_REPAIR_REVISION = "20260714120000_ptg2_v3_schema_gc_consistency"
 ADOPTION_SCHEMA = "mrf_provider_directory_adoption"
 PLAN_TABLE = "provider_directory_dataset_insurance_plan"
 ACTIVE_INDEX = "provider_directory_dataset_insurance_plan_active_lookup_idx"
-_SUBSET_COLUMN_SHAPE_SQL = """
+_ADOPTED_COLUMN_SHAPE_SQL = """
 SELECT relation.relname AS table_name,
        attribute.attname AS column_name,
        pg_catalog.format_type(
@@ -59,10 +59,12 @@ SELECT relation.relname AS table_name,
         ('provider_directory_endpoint_dataset',
          'completion_proof_sha256'),
         ('provider_directory_dataset_resource',
-         'acquired_resource_sha256')
+         'acquired_resource_sha256'),
+        ('provider_directory_organization',
+         'name_variants')
    )
 """
-_EXPECTED_SUBSET_COLUMN_SHAPES = {
+_EXPECTED_ADOPTED_COLUMN_SHAPES = {
     (
         "provider_directory_endpoint_dataset",
         "completion_proof_required_version",
@@ -79,6 +81,10 @@ _EXPECTED_SUBSET_COLUMN_SHAPES = {
         "provider_directory_dataset_resource",
         "acquired_resource_sha256",
     ): ("character varying(64)", False, False),
+    (
+        "provider_directory_organization",
+        "name_variants",
+    ): ("json", False, False),
 }
 _EXPECTED_ACTIVATION_FUNCTIONS = {
     "provider_directory_reviewed_subset_activation_valid",
@@ -240,16 +246,16 @@ async def _assert_active_index_shape(url, schema: str) -> None:
     assert shape.expression_keys is False
 
 
-async def _assert_subset_completion_column_shapes(
+async def _assert_adopted_column_shapes(
     database_url,
     schema_name: str,
 ) -> None:
-    """Require the exact nullable proof-column types after adoption."""
+    """Require exact runtime-created column types after adoption."""
 
     connection = await _connect(database_url)
     try:
         column_records = await connection.fetch(
-            _SUBSET_COLUMN_SHAPE_SQL,
+            _ADOPTED_COLUMN_SHAPE_SQL,
             schema_name,
         )
     finally:
@@ -262,7 +268,7 @@ async def _assert_subset_completion_column_shapes(
         )
         for column_record in column_records
     }
-    assert observed_shapes_by_column == _EXPECTED_SUBSET_COLUMN_SHAPES
+    assert observed_shapes_by_column == _EXPECTED_ADOPTED_COLUMN_SHAPES
 
 
 async def _activation_object_shape_records(
@@ -357,7 +363,7 @@ async def _assert_adopted_schema(database_url, schema_name: str) -> None:
     """Require the exact adopted index and subset-proof column shapes."""
 
     await _assert_active_index_shape(database_url, schema_name)
-    await _assert_subset_completion_column_shapes(database_url, schema_name)
+    await _assert_adopted_column_shapes(database_url, schema_name)
     await _assert_activation_object_shapes(database_url, schema_name)
     await assert_abandonment_object_shapes(database_url, schema_name)
 

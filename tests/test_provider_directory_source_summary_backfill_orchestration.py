@@ -114,9 +114,7 @@ async def test_missing_summary_is_backfilled_atomically_from_retained_rows(
             _dataset().selected_resources
         ),
         verify_payload_hashes=True,
-        resource_hash_contract=(
-            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        ),
+        resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
     )
     assert [call.args[1] for call in proof_recorder.await_args_list] == [
         importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY,
