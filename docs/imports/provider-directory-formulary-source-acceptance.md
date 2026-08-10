@@ -69,6 +69,21 @@ The Flex slice is acceptable only when all of the following are true:
 8. Official and Flex evidence remain separately attributable while their
    independent-authority count remains one.
 
+## PostgreSQL proof runbook
+
+CI runs Flex registration, exact-cohort sealing, acquisition storage, twin
+admission, and dataset publication once on the `provider-directory` PostgreSQL
+shard with `HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN`. The dataset-scoped
+Profile replacement proof runs once on the `provider-profile` shard with
+the shared test database also exposed as
+`HLTHPRT_PROVIDER_DIRECTORY_PROFILE_POSTGRES_DSN`. The lifecycle DSN must name
+an explicit disposable test database; each proof creates and removes its own
+schema.
+
+The workflow contract is covered by `tests/test_ci_test_sharding.py`. A skipped
+local database proof means its required database configuration was absent and
+is not successful evidence.
+
 ## Release proof ladder
 
 Do not collapse these gates into one completion statement:
