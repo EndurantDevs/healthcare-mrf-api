@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 from pathlib import Path
+
+import pytest
 
 from db.models.provider_directory_uhc_flex_practitioner_publication import (
     ProviderDirectoryUHCFlexPractitionerDataset,
@@ -11,14 +14,20 @@ from db.models.provider_directory_uhc_flex_practitioner_publication import (
 )
 
 
-MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions" / (
-    "20260810080000_provider_directory_uhc_flex_practitioner_publication.py"
+MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions"
+    / ("20260810080000_provider_directory_uhc_flex_practitioner_publication.py")
 )
-GENERIC_GUARD_PATH = Path(__file__).resolve().parents[1] / "alembic/versions" / (
-    "20260808190000_provider_directory_subset_completion_proof.py"
+GENERIC_GUARD_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic/versions"
+    / ("20260808190000_provider_directory_subset_completion_proof.py")
 )
-PUBLICATION_STORE_PATH = Path(__file__).resolve().parents[1] / "process" / (
-    "uhc_flex_practitioner_publication_store.py"
+PUBLICATION_STORE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "process"
+    / ("uhc_flex_practitioner_publication_store.py")
 )
 PUBLICATION_MATERIALIZATION_PATH = (
     Path(__file__).resolve().parents[1]
@@ -47,12 +56,12 @@ def test_publication_revision_follows_shifted_twin_admission() -> None:
     )
 
 
-def test_publication_uses_companion_provenance_without_replacing_generic_guards() -> None:
+def test_publication_uses_companion_provenance_without_replacing_generic_guards() -> (
+    None
+):
     migration = _migration()
     source = MIGRATION_PATH.read_text()
-    assert migration._HEADER == (
-        "provider_directory_uhc_flex_practitioner_dataset"
-    )
+    assert migration._HEADER == ("provider_directory_uhc_flex_practitioner_dataset")
     assert migration._PROVENANCE == (
         "provider_directory_uhc_flex_practitioner_dataset_resource"
     )
@@ -77,9 +86,7 @@ def test_generic_guard_markers_remain_compatible_with_exact_cohort_rows() -> Non
 
 def test_readiness_binds_admission_source_content_and_subset_semantics() -> None:
     migration = _migration()
-    sql = " ".join(
-        migration._valid_function_sql("fhir_twin_test_static").split()
-    )
+    sql = " ".join(migration._valid_function_sql("fhir_twin_test_static").split())
     for required_fragment in (
         "admission.publication_authority IS TRUE",
         "admission.semantic_projection_as_of = header.semantic_projection_as_of",
@@ -113,7 +120,9 @@ def test_readiness_binds_admission_source_content_and_subset_semantics() -> None
     assert "'endpoint_complete', false" in metadata_sql
 
 
-def test_publication_models_expose_current_header_and_exact_resource_provenance() -> None:
+def test_publication_models_expose_current_header_and_exact_resource_provenance() -> (
+    None
+):
     header = ProviderDirectoryUHCFlexPractitionerDataset.__table__
     provenance = ProviderDirectoryUHCFlexPractitionerDatasetResource.__table__
 
@@ -153,12 +162,8 @@ def test_publication_models_expose_current_header_and_exact_resource_provenance(
 def test_publication_guards_are_immutable_truncate_and_downgrade_closed() -> None:
     migration = _migration()
     header_guard = migration._header_guard_sql("fhir_twin_test_static")
-    resource_guard = migration._provenance_guard_sql(
-        "fhir_twin_test_static"
-    )
-    endpoint_guard = migration._endpoint_guard_sql(
-        "fhir_twin_test_static"
-    )
+    resource_guard = migration._provenance_guard_sql("fhir_twin_test_static")
+    endpoint_guard = migration._endpoint_guard_sql("fhir_twin_test_static")
     source = MIGRATION_PATH.read_text()
     assert "dataset_truncate_forbidden" in header_guard
     assert "dataset_delete_forbidden" in header_guard
@@ -167,3 +172,22 @@ def test_publication_guards_are_immutable_truncate_and_downgrade_closed() -> Non
     assert "endpoint_drift" in endpoint_guard
     assert "endpoint_truncate_forbidden" in endpoint_guard
     assert "publication_downgrade_blocked" in source
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    (
+        "db.models.provider_directory_uhc_flex_practitioner_publication",
+        "db.models.provider_directory_uhc_flex_practitioner_twin",
+    ),
+)
+def test_models_reject_conflicting_runtime_schemas(
+    monkeypatch,
+    module_name: str,
+) -> None:
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "runtime_schema")
+    monkeypatch.setenv("DB_SCHEMA", "legacy_schema")
+    model_module = importlib.import_module(module_name)
+
+    with pytest.raises(RuntimeError, match="DB_SCHEMA and HLTHPRT_DB_SCHEMA"):
+        model_module._schema()

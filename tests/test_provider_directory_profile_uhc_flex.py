@@ -125,14 +125,80 @@ def test_flex_profile_source_is_dataset_scoped_and_shares_authority():
     assert profile.configured_dataset_scoped_profile_source_ids() == (
         UHC_FLEX_PRACTITIONER_SOURCE_ID,
     )
-    assert profile.profile_source_authority_id(
-        OFFICIAL_SOURCE_ID,
-        OFFICIAL_ENDPOINT_ID,
-    ) == "unitedhealthcare"
-    assert profile.profile_source_authority_id(
-        UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        FLEX_ENDPOINT_ID,
-    ) == "unitedhealthcare"
+    assert (
+        profile.profile_source_authority_id(
+            OFFICIAL_SOURCE_ID,
+            OFFICIAL_ENDPOINT_ID,
+        )
+        == "unitedhealthcare"
+    )
+    assert (
+        profile.profile_source_authority_id(
+            UHC_FLEX_PRACTITIONER_SOURCE_ID,
+            FLEX_ENDPOINT_ID,
+        )
+        == "unitedhealthcare"
+    )
+
+
+def test_profile_source_helpers_fail_closed_and_render_empty_contracts(
+    monkeypatch,
+):
+    invalid_matrix_by_field = {
+        "dataset_scoped_entry_ids": (),
+        "source_ids": (),
+        "verification_matrix": {},
+    }
+    monkeypatch.setattr(
+        profile,
+        "load_profile_source_spec",
+        lambda _path=None: invalid_matrix_by_field,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_profile_source_spec_invalid",
+    ):
+        profile.configured_dataset_scoped_profile_source_ids()
+
+    missing_source_by_field = {
+        "dataset_scoped_entry_ids": ("dataset-entry",),
+        "source_ids": (),
+        "verification_matrix": {"sources": []},
+    }
+    monkeypatch.setattr(
+        profile,
+        "load_profile_source_spec",
+        lambda _path=None: missing_source_by_field,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_profile_source_spec_invalid",
+    ):
+        profile.configured_dataset_scoped_profile_source_ids()
+
+    empty_contract_by_field = {
+        "authority_ids_by_source_id": {},
+        "dataset_scoped_entry_ids": (),
+        "source_ids": ("source-a",),
+        "verification_matrix": {"sources": []},
+    }
+    monkeypatch.setattr(
+        profile,
+        "load_profile_source_spec",
+        lambda _path=None: empty_contract_by_field,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_profile_source_authority_invalid",
+    ):
+        profile.profile_source_authority_id("missing-source", "endpoint-a")
+    assert profile.profile_source_authority_sql("source_id", "endpoint_id") == (
+        "endpoint_id"
+    )
+    assert profile.profile_reviewed_source_authority_sql("source_id") == (
+        "NULL::varchar"
+    )
+    assert profile.dataset_scoped_profile_source_ids_sql() == ("ARRAY[]::varchar[]")
 
 
 def test_profile_sql_reads_flex_only_from_the_selected_dataset():
@@ -193,8 +259,7 @@ def test_selection_admits_only_ready_exact_cohort_and_never_generic_probe():
         dataset_rows=_dataset_rows(),
     )
     assert computed.request_projection == (
-        {"source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID,
-         "dataset_id": FLEX_DATASET_ID},
+        {"source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID, "dataset_id": FLEX_DATASET_ID},
     )
     assert computed.identity_payload["pairs"][0]["source_id"] == (
         UHC_FLEX_PRACTITIONER_SOURCE_ID
@@ -329,9 +394,7 @@ def test_dataset_scoped_marker_never_bypasses_ordinary_content_proof(
 
 @pytest.mark.asyncio
 async def test_artifact_fence_rechecks_exact_flex_readiness(monkeypatch):
-    publication = importlib.import_module(
-        "process.uhc_flex_practitioner_publication"
-    )
+    publication = importlib.import_module("process.uhc_flex_practitioner_publication")
     dataset = SimpleNamespace(
         source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
         dataset_id=FLEX_DATASET_ID,
@@ -368,9 +431,7 @@ async def test_artifact_fence_takes_publication_lock_before_row_locks(
 ):
     events: list[str] = []
     fence = SimpleNamespace(
-        datasets=(
-            SimpleNamespace(source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID),
-        )
+        datasets=(SimpleNamespace(source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID),)
     )
 
     def async_step(name: str, return_value: object = None) -> AsyncMock:
