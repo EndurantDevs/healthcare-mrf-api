@@ -171,7 +171,6 @@ def _has_exact_source_profile(
     evidence: _TransitionContractEvidence,
     source_row: Mapping[str, Any],
     candidate_metadata: Mapping[str, Any],
-    checkpoint_scope_sha256: str,
 ) -> bool:
     metadata = evidence.source_metadata
     contract = evidence.source_contract
@@ -204,7 +203,8 @@ def _has_exact_source_profile(
         == evidence.source_identity[-1]
         and current_version_census_proof_identity(contract)
         == evidence.proof_contract_identity
-        and evidence.scope_sha256 == checkpoint_scope_sha256
+        and evidence.scope_sha256
+        == candidate_metadata.get("verification_source_scope_hash")
         and metadata.get("provider_directory_fully_enumerable_resources") == []
         and metadata.get("provider_directory_resource_page_count_caps")
         == expected_page_cap_by_type
@@ -223,7 +223,6 @@ def expected_terminal_start_hashes(
     source_row: Mapping[str, Any],
     candidate_metadata: Mapping[str, Any],
     diagnostics: Mapping[str, Any],
-    checkpoint_scope_sha256: str,
 ) -> dict[str, str]:
     """Bind the transition to the exact reviewed source contract and starts."""
 
@@ -236,7 +235,6 @@ def expected_terminal_start_hashes(
         evidence,
         source_row,
         candidate_metadata,
-        checkpoint_scope_sha256,
     ):
         raise ReviewedSubsetTerminalDispositionError("evidence")
     try:

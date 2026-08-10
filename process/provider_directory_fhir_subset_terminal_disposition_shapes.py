@@ -51,6 +51,10 @@ _BOOLEAN_DIAGNOSTIC_FIELDS = (
     "pagination_cooldown_exhausted",
     "pagination_cooldown_deadline_blocked",
 )
+_SERIAL_CONCURRENCY_FIELDS = (
+    "resource_scan_concurrency_requested",
+    "resource_scan_concurrency_effective",
+)
 
 
 def _has_valid_diagnostic_metrics(diagnostic: Mapping[str, Any]) -> bool:
@@ -68,7 +72,17 @@ def _has_valid_diagnostic_metrics(diagnostic: Mapping[str, Any]) -> bool:
         type(diagnostic.get(field_name)) is bool
         for field_name in _BOOLEAN_DIAGNOSTIC_FIELDS
     )
-    return integers_are_valid and numbers_are_valid and booleans_are_exact
+    concurrency_is_serial = all(
+        type(diagnostic.get(field_name)) is int
+        and diagnostic[field_name] == 1
+        for field_name in _SERIAL_CONCURRENCY_FIELDS
+    )
+    return bool(
+        integers_are_valid
+        and numbers_are_valid
+        and booleans_are_exact
+        and concurrency_is_serial
+    )
 
 
 def validate_disposition_diagnostic_shape(

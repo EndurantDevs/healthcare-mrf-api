@@ -25,6 +25,9 @@ from tests.provider_directory_fhir_subset_abandonment_pg_support import (
     seed_expired_root,
 )
 from tests.provider_directory_fhir_subset_terminal_disposition_pg_lifecycle import (
+    _assert_postgres_error,
+    _selected_terminal_evidence,
+    _write_terminal_state,
     assert_candidate_root_mismatch_rejected,
     assert_numeric_digest_rejected,
     assert_post_seal_handoff,
@@ -34,6 +37,7 @@ from tests.provider_directory_fhir_subset_terminal_disposition_pg_lifecycle impo
     assert_terminal_parent,
 )
 from tests.provider_directory_fhir_subset_terminal_disposition_pg_tamper import (
+    assert_serial_concurrency_rejected,
     assert_completion_envelope_rejected,
     assert_retryable_precount_rejected,
     assert_shared_proof_identity_rejected,
@@ -42,6 +46,12 @@ from tests.provider_directory_fhir_subset_terminal_disposition_pg_tamper import 
 )
 from tests.provider_directory_fhir_subset_terminal_disposition_pg_support import (
     seed_mixed_terminal_root,
+)
+from tests.provider_directory_terminal_scope_binding_pg_assertions import (
+    assert_bound_scope_and_serial_evidence,
+)
+from tests.provider_directory_terminal_scope_binding_pg_concurrency import (
+    assert_upgrade_retries_held_dataset_write,
 )
 from tests.provider_directory_reviewed_root_policy_pg import (
     _install_policy_predecessors,
@@ -75,6 +85,11 @@ MIGRATION_PATH = (
     / "alembic/versions"
     / "20260810010000_provider_directory_reviewed_subset_terminal_disposition.py"
 )
+SCOPE_BINDING_MIGRATION_PATH = (
+    ROOT
+    / "alembic/versions"
+    / "20260810020000_provider_directory_terminal_scope_binding.py"
+)
 
 
 def _load(path: Path, name: str):
@@ -96,6 +111,13 @@ def _load_migration():
     return _load(
         MIGRATION_PATH,
         "provider_directory_terminal_disposition_postgres_migration",
+    )
+
+
+def _load_scope_binding_migration():
+    return _load(
+        SCOPE_BINDING_MIGRATION_PATH,
+        "provider_directory_terminal_scope_binding_postgres_migration",
     )
 
 
@@ -142,6 +164,7 @@ async def _guard_catalog(scenario, migration) -> dict:
     abandonment_migration = migration._abandonment()
     function_names = (
         abandonment_migration._VALID,
+        migration._VALID,
         abandonment_migration._DATASET_GUARD,
         abandonment_migration._CHECKPOINT_GUARD,
     )
@@ -192,16 +215,71 @@ async def _guard_catalog(scenario, migration) -> dict:
     }
 
 
-async def _assert_terminal_downgrade_blocked(scenario, migration) -> None:
+async def _assert_terminal_downgrade_blocked(
+    scenario,
+    migration,
+    expected_error: str,
+) -> None:
     """Assert retained terminal evidence blocks removing its validator."""
     with pytest.raises(AssertionError) as downgrade_error:
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "downgrade")
     cause = downgrade_error.value.__cause__
     assert isinstance(cause, asyncpg.PostgresError)
-    assert (
-        "provider_directory_subset_terminal_disposition_downgrade_blocked"
-        in str(cause)
+    assert expected_error in str(cause)
+
+
+async def _assert_predecessor_scope_domain_rejected(
+    scenario,
+    migration,
+    database,
+) -> None:
+    """Prove the installed predecessor rejects the corrected two domains."""
+
+    selection, _checkpoint_records = await _selected_terminal_evidence(database)
+    await _assert_postgres_error(
+        scenario.connection,
+        "provider_directory_subset_terminal_disposition_transition_invalid",
+        lambda: _write_terminal_state(
+            scenario,
+            migration,
+            selection,
+            selection.marker_by_field,
+        ),
+    )
+
+
+async def _upgrade_scope_binding_and_assert_identity(
+    scenario,
+    terminal_migration,
+    scope_binding_migration,
+) -> None:
+    """Upgrade an installed predecessor without replacing database objects."""
+
+    before = await _guard_catalog(scenario, terminal_migration)
+    async with scenario.connection.transaction():
+        await _run_migration(scenario, scope_binding_migration, "upgrade")
+    after = await _guard_catalog(scenario, terminal_migration)
+
+    assert after.keys() == before.keys()
+    assert after["triggers"] == before["triggers"]
+    for name, before_row in before["functions"].items():
+        after_row = after["functions"][name]
+        assert after_row["oid"] == before_row["oid"]
+        assert after_row["proacl"] == before_row["proacl"]
+        assert after_row["proowner"] == before_row["proowner"]
+        assert after_row["prosecdef"] == before_row["prosecdef"]
+        assert after_row["proconfig"] == before_row["proconfig"]
+    checkpoint_guard = terminal_migration._abandonment()._CHECKPOINT_GUARD
+    dataset_guard = terminal_migration._abandonment()._DATASET_GUARD
+    assert after["functions"][checkpoint_guard]["definition"] == (
+        before["functions"][checkpoint_guard]["definition"]
+    )
+    assert after["functions"][dataset_guard]["definition"] != (
+        before["functions"][dataset_guard]["definition"]
+    )
+    assert after["functions"][terminal_migration._VALID]["definition"] != (
+        before["functions"][terminal_migration._VALID]["definition"]
     )
 
 
@@ -224,6 +302,7 @@ async def _assert_direct_terminal_tamper_rejections(
     )
     await assert_completion_envelope_rejected(scenario, migration, database)
     await assert_source_import_envelope_rejected(scenario, migration, database)
+    await assert_serial_concurrency_rejected(scenario, migration, database)
 
 
 @pytest.mark.asyncio
@@ -231,6 +310,7 @@ async def test_clean_migration_preserves_oids_acl_and_restores_bodies(monkeypatc
     """Preserve old object identities and restore exact guard bodies."""
     scenario = await TransactionalSchema.create(monkeypatch)
     migration = _load_migration()
+    scope_binding_migration = _load_scope_binding_migration()
     try:
         await _install_bounded_predecessor(scenario)
         before = await _guard_catalog(scenario, migration)
@@ -252,11 +332,35 @@ async def test_clean_migration_preserves_oids_acl_and_restores_bodies(monkeypatc
             == before["functions"][abandonment_valid]["definition"]
         )
 
+        await _run_migration(scenario, scope_binding_migration, "upgrade")
+        await _run_migration(scenario, scope_binding_migration, "downgrade")
+        assert await _guard_catalog(scenario, migration) == upgraded
+
         await _run_migration(scenario, migration, "downgrade")
         restored = await _guard_catalog(scenario, migration)
         assert restored == before
     finally:
         await scenario.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_binding_upgrade_retries_a_dataset_writer(monkeypatch):
+    """Serialize the evidence fence behind an existing dataset writer."""
+
+    scenario = await create_committed_subset_schema(monkeypatch)
+    migration = _load_migration()
+    scope_binding_migration = _load_scope_binding_migration()
+    try:
+        await _install_committed_bounded_predecessor(scenario)
+        await seed_mixed_terminal_root(scenario)
+        async with scenario.connection.transaction():
+            await _run_migration(scenario, migration, "upgrade")
+        await assert_upgrade_retries_held_dataset_write(
+            scenario,
+            scope_binding_migration,
+        )
+    finally:
+        await close_abandonment_scenario(scenario)
 
 
 @pytest.mark.asyncio
@@ -266,12 +370,23 @@ async def test_terminal_disposition_lifecycle_tamper_idempotence_and_fence(
     """Exercise swapped-marker rejection, sealing, replay, and handoff."""
     scenario = await create_committed_subset_schema(monkeypatch)
     migration = _load_migration()
+    scope_binding_migration = _load_scope_binding_migration()
     database = runtime_database()
     try:
         await _install_committed_bounded_predecessor(scenario)
         await seed_mixed_terminal_root(scenario)
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "upgrade")
+        await _assert_predecessor_scope_domain_rejected(
+            scenario,
+            migration,
+            database,
+        )
+        await _upgrade_scope_binding_and_assert_identity(
+            scenario,
+            migration,
+            scope_binding_migration,
+        )
         await _assert_direct_terminal_tamper_rejections(
             scenario,
             migration,
@@ -293,10 +408,15 @@ async def test_terminal_disposition_lifecycle_tamper_idempotence_and_fence(
             f'"{migration._VALID}"($1)',
             "dataset-a",
         ) is True
+        await assert_bound_scope_and_serial_evidence(scenario, migration)
         await assert_terminal_parent(scenario, migration)
         await assert_terminal_evidence_is_immutable(scenario)
         await assert_post_seal_handoff(scenario, migration, database)
-        await _assert_terminal_downgrade_blocked(scenario, migration)
+        await _assert_terminal_downgrade_blocked(
+            scenario,
+            scope_binding_migration,
+            "provider_directory_terminal_scope_binding_evidence_blocked",
+        )
     finally:
         await database.engine.dispose()
         await close_abandonment_scenario(scenario)
@@ -307,12 +427,18 @@ async def test_expired_cursor_v1_remains_valid_and_downgradable(monkeypatch):
     """Keep the predecessor v1 seal valid before and after clean downgrade."""
     scenario = await create_committed_subset_schema(monkeypatch)
     migration = _load_migration()
+    scope_binding_migration = _load_scope_binding_migration()
     database = runtime_database()
     try:
         await _install_committed_bounded_predecessor(scenario)
         await seed_expired_root(scenario)
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "upgrade")
+            await _run_migration(
+                scenario,
+                scope_binding_migration,
+                "upgrade",
+            )
         authorize_operator(monkeypatch, ABANDONMENT_ENABLED_ENV)
 
         abandonment_result = await abandonment.abandon_reviewed_subset_expired_root(
@@ -330,6 +456,11 @@ async def test_expired_cursor_v1_remains_valid_and_downgradable(monkeypatch):
         ) is False
 
         async with scenario.connection.transaction():
+            await _run_migration(
+                scenario,
+                scope_binding_migration,
+                "downgrade",
+            )
             await _run_migration(scenario, migration, "downgrade")
         assert await scenario.connection.fetchval(
             f"SELECT {scenario.quoted_schema}.\"{old_valid}\"($1)",

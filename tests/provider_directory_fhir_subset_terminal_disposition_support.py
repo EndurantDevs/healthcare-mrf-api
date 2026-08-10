@@ -59,7 +59,7 @@ from tests.provider_directory_subset_completion_pg_support import (
 )
 
 
-VERIFICATION_SCOPE_SHA256 = "2" * 64
+CHECKPOINT_SCOPE_SHA256 = "4" * 64
 PAGE_COUNT = 2
 CUTOFF = "2026-08-09T12:00:00.000000Z"
 CAMPAIGN_ID = "reviewed-subset-synthetic-v3"
@@ -131,7 +131,7 @@ def _source_profile() -> dict:
     }
 
 
-SOURCE_SCOPE_SHA256 = canonical_sha256(
+VERIFICATION_SCOPE_SHA256 = canonical_sha256(
     server_issued_subset_source_scope_payload(
         _source_profile(),
         ("source-a",),
@@ -191,7 +191,7 @@ def _checkpoint_by_field(
     return {
         "canonical_api_base": "https://directory.example.test/fhir",
         "resource_type": resource_type,
-        "source_scope_hash": SOURCE_SCOPE_SHA256,
+        "source_scope_hash": CHECKPOINT_SCOPE_SHA256,
         "dataset_id": "dataset-a",
         "source_ids": ["source-a"],
         "acquisition_root_run_id": "root-a",
@@ -277,6 +277,8 @@ def _diagnostic_by_field(
         "pages_fetched": page_count,
         "rows_fetched": row_count,
         "rows_written": 0,
+        "resource_scan_concurrency_requested": 1,
+        "resource_scan_concurrency_effective": 1,
         "source_fetch_elapsed_ms": 1,
         "stream_write_elapsed_seconds": 0.01,
         "checkpoint_persist_elapsed_seconds": 0.01,

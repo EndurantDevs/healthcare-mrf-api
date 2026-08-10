@@ -350,8 +350,12 @@ def _mutate_coherent_source_start_url(database):
             database.source_row["canonical_api_base"],
         )
     )
+    candidate_metadata = database.candidate_row["publication_metadata_json"]
+    candidate_metadata["verification_source_scope_hash"] = source_scope_sha256
+    candidate_metadata["completion_proof_v1"][
+        "verification_source_scope_hash"
+    ] = source_scope_sha256
     for checkpoint in database.checkpoint_rows:
-        checkpoint["source_scope_hash"] = source_scope_sha256
         checkpoint["completeness_json"][
             "contract_identity"
         ] = contract_identity
