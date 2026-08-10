@@ -124,3 +124,37 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
             or "cargo llvm-cov --manifest-path" in workflow_line
         ):
             assert "timeout --foreground 295s" in workflow_line
+
+
+def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> None:
+    """Keep the lifecycle and Profile database proofs in their owned shards."""
+
+    workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    lifecycle_tests = (
+        "tests/test_uhc_flex_practitioner_registration_postgres.py",
+        "tests/test_provider_directory_uhc_flex_npi_cohort_postgres.py",
+        "tests/test_provider_directory_uhc_flex_practitioner_acquisition_postgres.py",
+        "tests/test_provider_directory_uhc_flex_practitioner_twin_postgres.py",
+        "tests/test_provider_directory_uhc_flex_practitioner_publication_postgres.py",
+    )
+    profile_test = "tests/test_provider_directory_profile_uhc_flex_postgres.py"
+    lifecycle_step = workflow.split(
+        "      - name: Run exact Provider Directory enrichment PostgreSQL "
+        "lifecycle gate\n",
+        1,
+    )[1].split("      - name:", 1)[0]
+    profile_step = workflow.split(
+        "      - name: Run bounded Provider Directory Profile PostgreSQL gates\n",
+        1,
+    )[1].split("      - name:", 1)[0]
+
+    assert "if: matrix.shard == 'provider-directory'" in lifecycle_step
+    assert "HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN:" in lifecycle_step
+    assert "if: matrix.shard == 'provider-profile'" in profile_step
+    for test_path in (*lifecycle_tests, profile_test):
+        assert workflow.count(test_path) == 1
+    for test_path in lifecycle_tests:
+        assert test_path in lifecycle_step
+    assert profile_test in profile_step

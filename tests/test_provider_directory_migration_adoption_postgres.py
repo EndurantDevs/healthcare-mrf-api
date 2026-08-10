@@ -125,6 +125,15 @@ async def main():
                 "provider_directory_profile_capacity_lease_consumption",
                 "provider_directory_profile_delta_receipt",
                 "provider_directory_profile_serving_generation",
+                "provider_directory_uhc_flex_npi_cohort",
+                "provider_directory_uhc_flex_npi_member",
+                "provider_directory_uhc_flex_practitioner_acquisition",
+                "provider_directory_uhc_flex_practitioner_work",
+                "provider_directory_uhc_flex_practitioner_resource",
+                "provider_directory_uhc_flex_practitioner_twin_attempt",
+                "provider_directory_uhc_flex_practitioner_twin_admission",
+                "provider_directory_uhc_flex_practitioner_dataset",
+                "provider_directory_uhc_flex_practitioner_dataset_resource",
             }
             target_tables = [
                 table

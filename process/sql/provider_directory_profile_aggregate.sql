@@ -26,13 +26,14 @@
                    ))[1] AS value_json,
                    array_agg(DISTINCT source_id ORDER BY source_id) AS source_ids,
                    count(DISTINCT source_id)::integer AS source_count,
-                   count(DISTINCT endpoint_id)::integer AS independent_source_count,
+                   count(DISTINCT {{FACT_AUTHORITY_ID_SQL}})::integer AS independent_source_count,
                    max(evidence_count)::integer AS evidence_count,
                    jsonb_agg(
                        jsonb_strip_nulls(
                            jsonb_build_object(
                                'source_id', source_id,
                                'endpoint_id', endpoint_id,
+                               'authority_id', {{FACT_AUTHORITY_ID_SQL}},
                                'dataset_id', dataset_id,
                                'api_base', regexp_replace(
                                    regexp_replace(canonical_api_base, '[?#].*$', ''),
@@ -120,6 +121,7 @@
         ), profile_source_rows AS MATERIALIZED (
             SELECT DISTINCT evidence.npi, evidence.source_id,
                    evidence.endpoint_id, evidence.dataset_id,
+                   {{PROFILE_SOURCE_AUTHORITY_ID_SQL}} AS authority_id,
                    evidence.canonical_api_base, evidence.source_org_name,
                    evidence.source_plan_name
               FROM scoped_evidence AS evidence
@@ -129,10 +131,11 @@
                    array_agg(DISTINCT evidence.endpoint_id ORDER BY evidence.endpoint_id) AS endpoint_ids,
                    array_agg(DISTINCT evidence.dataset_id ORDER BY evidence.dataset_id) AS dataset_ids,
                    count(DISTINCT evidence.source_id)::integer AS source_count,
-                   count(DISTINCT evidence.endpoint_id)::integer AS independent_source_count,
+                   count(DISTINCT evidence.authority_id)::integer AS independent_source_count,
                    jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
                        'source_id', evidence.source_id,
                        'endpoint_id', evidence.endpoint_id,
+                       'authority_id', evidence.authority_id,
                        'dataset_id', evidence.dataset_id,
                        'api_base', regexp_replace(
                            regexp_replace(

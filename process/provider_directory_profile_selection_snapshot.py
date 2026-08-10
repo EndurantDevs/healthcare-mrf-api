@@ -25,6 +25,15 @@ from process.provider_directory_profile_selection_contract import (
     _required_text,
     stable_hash,
 )
+from process.provider_directory_profile_uhc_flex import (
+    is_uhc_flex_dataset_row_ready,
+    load_profile_selection_dataset_rows,
+    lock_uhc_flex_profile_publication,
+    UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS,
+)
+from process.uhc_flex_practitioner_contract import (
+    UHC_FLEX_PRACTITIONER_SOURCE_ID,
+)
 
 
 @dataclass(frozen=True)
@@ -97,16 +106,31 @@ def _catalog_source_groups(
             raise RuntimeError("provider_directory_profile_selection_catalog_invalid")
         seen_source_ids.update(source_ids)
         source_groups.append(source_ids)
+    dataset_scoped_source_ids = (
+        profile_artifact.configured_dataset_scoped_profile_source_ids()
+    )
+    if seen_source_ids.intersection(dataset_scoped_source_ids):
+        raise RuntimeError("provider_directory_profile_selection_catalog_invalid")
+    source_groups.extend((source_id,) for source_id in dataset_scoped_source_ids)
     return tuple(sorted(source_groups))
 
 
 async def _lock_profile_selection_tables() -> None:
     """Freeze every table that can alter the global current selection."""
 
+    await lock_uhc_flex_profile_publication(db)
     await db.status(f"LOCK TABLE {_table_ref(ProviderDirectoryAPIEndpoint)} IN SHARE MODE;")
     await db.status(f"LOCK TABLE {_table_ref(ProviderDirectorySource)} IN SHARE MODE;")
+    dependent_relation_refs = [
+        _table_ref(ProviderDirectoryEndpointDataset),
+        *(
+            f"{_quote_identifier(_schema())}."
+            f"{_quote_identifier(relation_name)}"
+            for relation_name in UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS
+        ),
+    ]
     await db.status(
-        f"LOCK TABLE {_table_ref(ProviderDirectoryEndpointDataset)} IN SHARE MODE;"
+        "LOCK TABLE " + ", ".join(dependent_relation_refs) + " IN SHARE MODE;"
     )
 
 
@@ -122,20 +146,12 @@ async def _selection_source_rows() -> list[Mapping[str, Any]]:
 
 
 async def _selection_dataset_rows() -> list[Mapping[str, Any]]:
-    database_rows = await db.all(
-        f"""
-        SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash,
-               status, is_current, resource_count, validated_at, published_at,
-               superseded_at, publication_metadata_json
-          FROM {_table_ref(ProviderDirectoryEndpointDataset)}
-         WHERE status = 'published'
-           AND is_current = true
-           AND published_at IS NOT NULL
-           AND superseded_at IS NULL
-         ORDER BY published_at DESC, dataset_id DESC, endpoint_id DESC;
-        """
+    return await load_profile_selection_dataset_rows(
+        database=db,
+        endpoint_dataset_ref=_table_ref(ProviderDirectoryEndpointDataset),
+        schema_ref=_quote_identifier(_schema()),
+        row_mapping=_row_mapping,
     )
-    return [_row_mapping(database_row) for database_row in database_rows]
 
 
 def _metadata_source_ids(metadata_map: Any) -> tuple[str, ...] | None:
@@ -181,11 +197,16 @@ def _dataset_selection_by_group(
             dataset_row.get("publication_metadata_json")
         )
         endpoint_id = _clean_text(dataset_row.get("endpoint_id"))
+        is_dataset_scoped = source_group == (UHC_FLEX_PRACTITIONER_SOURCE_ID,)
         if (
             source_group in source_groups
             and endpoint_id is not None
             and set(source_group).issubset(
                 source_ids_by_endpoint.get(endpoint_id, set())
+            )
+            and (
+                not is_dataset_scoped
+                or is_uhc_flex_dataset_row_ready(dataset_row)
             )
         ):
             dataset_by_group.setdefault(source_group, dataset_row)
@@ -267,6 +288,9 @@ def _source_context(
         "canonical_api_base": source_row.get("canonical_api_base"),
         "org_name": source_row.get("org_name"),
         "plan_name": source_row.get("plan_name"),
+        "authority_id": profile_artifact.profile_reviewed_source_authority_id(
+            source_id
+        ),
     }
 
 
@@ -275,8 +299,28 @@ def _profile_input(
     dataset_row: Mapping[str, Any],
     publication_metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
+    scoped_fields = (
+        {
+            "dataset_scoped_admission_id": dataset_row.get(
+                "dataset_scoped_admission_id"
+            ),
+            "dataset_scoped_authority_id": dataset_row.get(
+                "dataset_scoped_authority_id"
+            ),
+            "dataset_scoped_operation_key": dataset_row.get(
+                "dataset_scoped_operation_key"
+            ),
+            "dataset_scoped_projection_as_of": _canonical_scalar(
+                dataset_row.get("dataset_scoped_projection_as_of")
+            ),
+            "dataset_scoped_ready": True,
+        }
+        if pair_map["source_id"] == UHC_FLEX_PRACTITIONER_SOURCE_ID
+        else {}
+    )
     return {
         **pair_map,
+        **scoped_fields,
         "resource_count": int(dataset_row.get("resource_count") or 0),
         "validated_at": _canonical_scalar(dataset_row.get("validated_at")),
         "published_at": _canonical_scalar(dataset_row.get("published_at")),

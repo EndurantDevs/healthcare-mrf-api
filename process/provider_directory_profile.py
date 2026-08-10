@@ -32,7 +32,7 @@ PROFILE_SPEC_PATH = (
 PROFILE_SQL_PATH = Path(__file__).resolve().parent / "sql"
 PROFILE_SCHEMA_VERSION = 1
 PROFILE_BUILD_STRATEGY_VERSION = (
-    "source-fact-role32-org32-membership32-npi5m-v4"
+    "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5"
 )
 PROFILE_FACT_LIMIT = 100
 PROFILE_FACT_EVIDENCE_LIMIT = 25
@@ -208,6 +208,12 @@ def load_profile_source_spec(path: Path | None = None) -> dict[str, Any]:
     source_ids = source_spec_map.get("source_ids")
     entry_ids = source_spec_map.get("entry_ids")
     retained_entry_ids = source_spec_map.get("retained_entry_ids", [])
+    dataset_scoped_entry_ids = source_spec_map.get(
+        "dataset_scoped_entry_ids", []
+    )
+    authority_ids_by_source_id = source_spec_map.get(
+        "authority_ids_by_source_id", {}
+    )
     if (
         not isinstance(source_ids, list)
         or not source_ids
@@ -227,6 +233,22 @@ def load_profile_source_spec(path: Path | None = None) -> dict[str, Any]:
         or not all(
             isinstance(entry_id, str) and entry_id in entry_ids
             for entry_id in retained_entry_ids
+        )
+        or not isinstance(dataset_scoped_entry_ids, list)
+        or len(dataset_scoped_entry_ids) != len(set(dataset_scoped_entry_ids))
+        or not all(
+            isinstance(entry_id, str) and entry_id in entry_ids
+            for entry_id in dataset_scoped_entry_ids
+        )
+        or not isinstance(authority_ids_by_source_id, dict)
+        or not all(
+            isinstance(source_id, str)
+            and source_id in source_ids
+            and isinstance(authority_id, str)
+            and authority_id
+            and authority_id == authority_id.strip()
+            and len(authority_id) <= 96
+            for source_id, authority_id in authority_ids_by_source_id.items()
         )
     ):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
@@ -266,6 +288,125 @@ def configured_retained_profile_source_ids(
     ):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
     return tuple(sorted(retained_source_ids))
+
+
+def configured_dataset_scoped_profile_source_ids(
+    path: Path | None = None,
+) -> tuple[str, ...]:
+    """Return reviewed sources read only from their selected dataset rows."""
+
+    source_spec = load_profile_source_spec(path)
+    dataset_scoped_entry_ids = set(source_spec["dataset_scoped_entry_ids"])
+    matrix = source_spec.get("verification_matrix")
+    source_rows = matrix.get("sources") if isinstance(matrix, dict) else None
+    if not isinstance(source_rows, list) or any(
+        not isinstance(source_row, dict) for source_row in source_rows
+    ):
+        raise RuntimeError("provider_directory_profile_source_spec_invalid")
+    source_ids = [
+        source_row.get("source_id")
+        for source_row in source_rows
+        if source_row.get("entry_id") in dataset_scoped_entry_ids
+    ]
+    if (
+        len(source_ids) != len(dataset_scoped_entry_ids)
+        or not all(
+            isinstance(source_id, str)
+            and source_id in source_spec["source_ids"]
+            for source_id in source_ids
+        )
+    ):
+        raise RuntimeError("provider_directory_profile_source_spec_invalid")
+    return tuple(sorted(source_ids))
+
+
+def profile_source_authority_id(
+    source_id: str,
+    endpoint_id: str,
+    path: Path | None = None,
+) -> str:
+    """Return reviewed authority identity, defaulting to endpoint identity."""
+
+    source_spec = load_profile_source_spec(path)
+    if source_id not in source_spec["source_ids"] or not endpoint_id:
+        raise RuntimeError("provider_directory_profile_source_authority_invalid")
+    return source_spec["authority_ids_by_source_id"].get(
+        source_id,
+        endpoint_id,
+    )
+
+
+def profile_reviewed_source_authority_id(
+    source_id: str,
+    path: Path | None = None,
+) -> str | None:
+    """Return only an explicit cross-endpoint authority review."""
+
+    source_spec = load_profile_source_spec(path)
+    return source_spec["authority_ids_by_source_id"].get(source_id)
+
+
+def profile_source_authority_sql(
+    source_id_sql: str,
+    endpoint_id_sql: str,
+    path: Path | None = None,
+) -> str:
+    """Return the SQL expression matching ``profile_source_authority_id``."""
+
+    authority_ids = load_profile_source_spec(path)[
+        "authority_ids_by_source_id"
+    ]
+    if not authority_ids:
+        return endpoint_id_sql
+    branches = " ".join(
+        "WHEN "
+        + source_id_sql
+        + " = '"
+        + source_id.replace("'", "''")
+        + "' THEN '"
+        + authority_id.replace("'", "''")
+        + "'"
+        for source_id, authority_id in sorted(authority_ids.items())
+    )
+    return f"CASE {branches} ELSE {endpoint_id_sql} END"
+
+
+def profile_reviewed_source_authority_sql(
+    source_id_sql: str,
+    path: Path | None = None,
+) -> str:
+    """Return explicit reviewed authority SQL, otherwise NULL."""
+
+    authority_ids = load_profile_source_spec(path)[
+        "authority_ids_by_source_id"
+    ]
+    if not authority_ids:
+        return "NULL::varchar"
+    branches = " ".join(
+        "WHEN "
+        + source_id_sql
+        + " = '"
+        + source_id.replace("'", "''")
+        + "' THEN '"
+        + authority_id.replace("'", "''")
+        + "'"
+        for source_id, authority_id in sorted(authority_ids.items())
+    )
+    return f"CASE {branches} ELSE NULL::varchar END"
+
+
+def dataset_scoped_profile_source_ids_sql(
+    path: Path | None = None,
+) -> str:
+    """Return one closed PostgreSQL varchar array for dataset-only sources."""
+
+    source_ids = configured_dataset_scoped_profile_source_ids(path)
+    if not source_ids:
+        return "ARRAY[]::varchar[]"
+    values = ", ".join(
+        "'" + source_id.replace("'", "''") + "'" for source_id in source_ids
+    )
+    return f"ARRAY[{values}]::varchar[]"
 
 
 def profile_table_sql(
@@ -393,7 +534,8 @@ def profile_scope_source_ids_sql(source_ref: str) -> str:
                source.endpoint_id,
                source.canonical_api_base,
                source.org_name,
-               source.plan_name
+               source.plan_name,
+               {profile_reviewed_source_authority_sql('source.source_id')} AS authority_id
           FROM {source_ref} AS source
          WHERE source.endpoint_id IN (
                 SELECT configured.endpoint_id
@@ -537,6 +679,7 @@ class _ProfileEvidenceSqlRequest:
     organization_ref: str
     service_ref: str
     endpoint_ref: str | None = None
+    dataset_resource_ref: str | None = None
     affiliation_ref: str | None = None
     affiliation_organization_ref: str | None = None
     fact_type: str | None = None
@@ -640,6 +783,10 @@ def _profile_evidence_reference_bindings(
             "provider_directory_dataset_affiliation_organization",
         )
     )
+    dataset_resource_ref = request.dataset_resource_ref or sibling_table_ref(
+        request.practitioner_ref,
+        "provider_directory_dataset_resource",
+    )
     return {
         "SOURCE_REF": request.source_ref,
         "PRACTITIONER_REF": request.practitioner_ref,
@@ -649,6 +796,10 @@ def _profile_evidence_reference_bindings(
         "AFFILIATION_ORGANIZATION_REF": affiliation_organization_ref,
         "SERVICE_REF": request.service_ref,
         "ENDPOINT_REF": endpoint_ref,
+        "DATASET_RESOURCE_REF": dataset_resource_ref,
+        "DATASET_SCOPED_SOURCE_IDS_SQL": (
+            dataset_scoped_profile_source_ids_sql()
+        ),
         "ROLE_PRACTITIONER_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
             "role.practitioner_ref", "Practitioner"
         ),
@@ -883,6 +1034,14 @@ def _profile_aggregate_sql(
             "PROFILE_FACT_EVIDENCE_LIMIT": PROFILE_FACT_EVIDENCE_LIMIT,
             "PROFILE_FACT_LIMIT": PROFILE_FACT_LIMIT,
             "PROFILE_SCHEMA_VERSION": PROFILE_SCHEMA_VERSION,
+            "FACT_AUTHORITY_ID_SQL": profile_source_authority_sql(
+                "source_id",
+                "endpoint_id",
+            ),
+            "PROFILE_SOURCE_AUTHORITY_ID_SQL": profile_source_authority_sql(
+                "evidence.source_id",
+                "evidence.endpoint_id",
+            ),
             "RESULT_SQL": result_sql,
             "CONFLICT_SQL": (
                 ";" if count_only else "ON CONFLICT (npi) DO NOTHING;"

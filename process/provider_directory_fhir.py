@@ -325,6 +325,18 @@ from process.provider_directory_profile_runtime_observation import (
     assert_runtime_observation_matches_geometry,
     observe_profile_runtime,
 )
+from process.provider_directory_profile_uhc_flex import (
+    annotate_uhc_flex_profile_dataset_readiness,
+    is_uhc_flex_fence_dataset_ready,
+    is_uhc_flex_publication_metadata_valid,
+    lock_uhc_flex_profile_publication,
+)
+from process.uhc_flex_official_cohort_contract import (
+    UHC_FLEX_OFFICIAL_RESOURCE_TYPE,
+)
+from process.uhc_flex_practitioner_contract import (
+    UHC_FLEX_PRACTITIONER_SOURCE_ID,
+)
 from process.provider_directory_refresh_preset import (
     PROVIDER_DIRECTORY_REFRESH_PRESETS,
     apply_provider_directory_refresh_preset as _apply_provider_directory_refresh_preset,
@@ -14136,6 +14148,11 @@ class ProviderDirectoryArtifactDataset:
     reviewed_root_policy: ReviewedRootPolicy | None = None
     source_verification_contract: tuple[Any, ...] = ()
     source_verification_contract_hash: str | None = None
+    dataset_scoped_ready: bool = False
+    semantic_projection_as_of: str | None = None
+    source_authority_id: str | None = None
+    admission_id: str | None = None
+    operation_key: str | None = None
 
     @property
     def artifact_resources(self) -> tuple[str, ...]:
@@ -16198,6 +16215,34 @@ def _artifact_content_proof_resources(
     return tuple(sorted(stored_proof["resource_counts"]))
 
 
+def _artifact_flex_retained_resources(
+    *,
+    endpoint_id: str,
+    dataset_id: str,
+    evidence_run_id: str,
+    selected_resources: tuple[str, ...],
+    publication_metadata: Mapping[str, Any],
+    dataset_scoped_ready: bool,
+) -> tuple[str, ...]:
+    """Return exact-cohort resources only under dedicated readiness metadata."""
+
+    if not (
+        dataset_scoped_ready
+        and selected_resources == (UHC_FLEX_OFFICIAL_RESOURCE_TYPE,)
+        and is_uhc_flex_publication_metadata_valid(
+            publication_metadata,
+            dataset_id=dataset_id,
+            endpoint_id=endpoint_id,
+            evidence_run_id=evidence_run_id,
+        )
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_dataset_scoped_proof_invalid:"
+            + dataset_id
+        )
+    return selected_resources
+
+
 def _artifact_dataset_retained_resources(
     *,
     source_id: str,
@@ -16206,8 +16251,39 @@ def _artifact_dataset_retained_resources(
     evidence_run_id: str,
     selected_resources: tuple[str, ...],
     publication_metadata: dict[str, Any],
+    dataset_scoped_ready: bool = False,
 ) -> tuple[str, ...]:
     """Return the exact proof-bearing families available to artifacts."""
+
+    if source_id == UHC_FLEX_PRACTITIONER_SOURCE_ID:
+        return _artifact_flex_retained_resources(
+            endpoint_id=endpoint_id,
+            dataset_id=dataset_id,
+            evidence_run_id=evidence_run_id,
+            selected_resources=selected_resources,
+            publication_metadata=publication_metadata,
+            dataset_scoped_ready=dataset_scoped_ready,
+        )
+    return _artifact_standard_retained_resources(
+        source_id=source_id,
+        endpoint_id=endpoint_id,
+        dataset_id=dataset_id,
+        evidence_run_id=evidence_run_id,
+        selected_resources=selected_resources,
+        publication_metadata=publication_metadata,
+    )
+
+
+def _artifact_standard_retained_resources(
+    *,
+    source_id: str,
+    endpoint_id: str,
+    dataset_id: str,
+    evidence_run_id: str,
+    selected_resources: tuple[str, ...],
+    publication_metadata: dict[str, Any],
+) -> tuple[str, ...]:
+    """Return proof-bearing resources for ordinary or retained-file datasets."""
 
     proof_identity = _artifact_content_proof_identity(
         publication_metadata,
@@ -16290,9 +16366,17 @@ def _validate_artifact_finalized_content_proof(
     publication_metadata: Mapping[str, Any],
     evidence_run_id: str,
     dataset_id: str,
+    *,
+    source_id: str,
+    dataset_scoped_ready: bool = False,
 ) -> None:
     """Bind an artifact row to the same finalized proof used by replay."""
 
+    if (
+        source_id == UHC_FLEX_PRACTITIONER_SOURCE_ID
+        and dataset_scoped_ready
+    ):
+        return
     finalized_dataset_by_field = dict(dataset_row_map)
     finalized_dataset_by_field["acquisition_root_run_id"] = evidence_run_id
     try:
@@ -16305,6 +16389,40 @@ def _validate_artifact_finalized_content_proof(
             "provider_directory_artifact_content_proof_invalid:"
             + dataset_id
         ) from error
+
+
+def _artifact_retained_resources_from_row(
+    dataset_row_map: Mapping[str, Any],
+    value_by_name: Mapping[str, str | None],
+    dataset_id: str,
+    selected_resources: tuple[str, ...],
+    publication_metadata: dict[str, Any],
+) -> tuple[str, ...]:
+    """Validate one selected row and return its exact retained resource set."""
+
+    source_id = value_by_name["source_id"] or ""
+    evidence_run_id = value_by_name["evidence_run_id"] or ""
+    is_dataset_scoped_ready = (
+        dataset_row_map.get("dataset_scoped_ready") is True
+    )
+    retained_resources = _artifact_dataset_retained_resources(
+        source_id=source_id,
+        endpoint_id=value_by_name["endpoint_id"] or "",
+        dataset_id=dataset_id,
+        evidence_run_id=evidence_run_id,
+        selected_resources=selected_resources,
+        publication_metadata=publication_metadata,
+        dataset_scoped_ready=is_dataset_scoped_ready,
+    )
+    _validate_artifact_finalized_content_proof(
+        dataset_row_map,
+        publication_metadata,
+        evidence_run_id,
+        dataset_id,
+        source_id=source_id,
+        dataset_scoped_ready=is_dataset_scoped_ready,
+    )
+    return retained_resources
 
 
 def _provider_directory_artifact_dataset_from_row(
@@ -16329,19 +16447,12 @@ def _provider_directory_artifact_dataset_from_row(
     publication_metadata = _json_object(
         dataset_row_map.get("publication_metadata_json")
     )
-    retained_resources = _artifact_dataset_retained_resources(
-        source_id=value_by_name["source_id"] or "",
-        endpoint_id=value_by_name["endpoint_id"] or "",
+    retained_resources = _artifact_retained_resources_from_row(
+        dataset_row_map,
+        value_by_name,
         dataset_id=dataset_id,
-        evidence_run_id=value_by_name["evidence_run_id"] or "",
         selected_resources=selected_resources,
         publication_metadata=publication_metadata,
-    )
-    _validate_artifact_finalized_content_proof(
-        dataset_row_map,
-        publication_metadata,
-        value_by_name["evidence_run_id"] or "",
-        dataset_id,
     )
     verification_fields_by_name = _artifact_dataset_row_verification_fields(
         dataset_row_map,
@@ -17084,6 +17195,30 @@ def _artifact_completion_state_from_row(
     }
 
 
+def _artifact_dataset_scoped_state_from_row(
+    dataset_row_map: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return exact dataset admission identity fields used only by Profile."""
+
+    return {
+        "dataset_scoped_ready": (
+            dataset_row_map.get("dataset_scoped_ready") is True
+        ),
+        "semantic_projection_as_of": _clean_text(
+            dataset_row_map.get("dataset_scoped_projection_as_of")
+        ),
+        "source_authority_id": _clean_text(
+            dataset_row_map.get("dataset_scoped_authority_id")
+        ),
+        "admission_id": _clean_text(
+            dataset_row_map.get("dataset_scoped_admission_id")
+        ),
+        "operation_key": _clean_text(
+            dataset_row_map.get("dataset_scoped_operation_key")
+        ),
+    }
+
+
 def _artifact_dataset_state_from_row(
     dataset_row_map: dict[str, Any],
     dataset_id: str,
@@ -17130,6 +17265,7 @@ def _artifact_dataset_state_from_row(
         ),
         "validated_at": validated_at,
         "publication_metadata_hash": _identity_hash(publication_metadata),
+        **_artifact_dataset_scoped_state_from_row(dataset_row_map),
         **_artifact_completion_state_from_row(dataset_row_map),
     }
 
@@ -17378,6 +17514,11 @@ def _artifact_endpoint_selection_identity(
         dataset.completion_proof_sha256,
         dataset.completion_proof_cutoff,
         dataset.source_verification_contract_hash,
+        dataset.dataset_scoped_ready,
+        dataset.semantic_projection_as_of,
+        dataset.source_authority_id,
+        dataset.admission_id,
+        dataset.operation_key,
     )
 
 
@@ -17398,6 +17539,11 @@ async def _resolve_provider_directory_artifact_datasets(
         validated_status=ENDPOINT_DATASET_VALIDATED,
         select_validated_candidates=should_select_validated_candidates,
         **({"source_ids": cleaned_source_ids} if cleaned_source_ids else {}),
+    )
+    dataset_rows = await annotate_uhc_flex_profile_dataset_readiness(
+        dataset_rows,
+        database=db,
+        row_mapping=_pagination_checkpoint_row_mapping,
     )
     fence = _validate_provider_directory_artifact_datasets(
         dataset_rows,
@@ -19574,6 +19720,7 @@ async def _verify_provider_directory_artifact_dataset_fence(
         dataset_rows,
         eligible_ids_by_endpoint,
     )
+    await _assert_uhc_flex_profile_fence_ready(fence, db)
 
 
 async def _lock_and_verify_artifact_dataset_fence(
@@ -19584,6 +19731,11 @@ async def _lock_and_verify_artifact_dataset_fence(
     if not fence.datasets:
         return
     query_executor = executor or db
+    if any(
+        dataset.source_id == UHC_FLEX_PRACTITIONER_SOURCE_ID
+        for dataset in fence.datasets
+    ):
+        await lock_uhc_flex_profile_publication(query_executor)
     await _lock_artifact_fence_endpoint_advisories(fence, query_executor)
     await _lock_artifact_fence_endpoints(fence, query_executor)
     locked_alias_rows = await _lock_artifact_fence_aliases(
@@ -19605,6 +19757,31 @@ async def _lock_and_verify_artifact_dataset_fence(
         locked_dataset_rows,
         eligible_ids_by_endpoint,
     )
+    await _assert_uhc_flex_profile_fence_ready(fence, query_executor)
+
+
+async def _assert_uhc_flex_profile_fence_ready(
+    fence: ProviderDirectoryArtifactDatasetFence,
+    executor: Any,
+) -> None:
+    """Recheck the exact admission-backed cohort inside every fence."""
+
+    from process.uhc_flex_practitioner_publication import (
+        load_uhc_flex_practitioner_dataset_readiness,
+    )
+
+    for dataset in fence.datasets:
+        if dataset.source_id != UHC_FLEX_PRACTITIONER_SOURCE_ID:
+            continue
+        readiness = await load_uhc_flex_practitioner_dataset_readiness(
+            dataset.dataset_id,
+            database=executor,
+        )
+        if not is_uhc_flex_fence_dataset_ready(dataset, readiness):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_dataset_scoped_readiness_changed:"
+                + dataset.dataset_id
+            )
 
 
 async def _lock_artifact_fence_endpoint_advisories(
@@ -23344,6 +23521,32 @@ async def _is_provider_directory_corroboration_artifact_published(
     return True
 
 
+def _profile_source_authority_from_row(
+    source_id: str,
+    source_row_map: Mapping[str, Any],
+) -> str | None:
+    """Validate the optional reviewed authority projected by source SQL."""
+
+    authority_id = source_row_map.get("authority_id")
+    expected_authority_id = (
+        profile_artifact.profile_reviewed_source_authority_id(source_id)
+    )
+    if (
+        authority_id is not None
+        and (
+            not isinstance(authority_id, str)
+            or authority_id != authority_id.strip()
+            or not authority_id
+        )
+    ) or authority_id != expected_authority_id:
+        raise RuntimeError(
+            "provider_directory_profile_source_context_invalid:"
+            + source_id
+            + ":authority_id"
+        )
+    return authority_id
+
+
 def _profile_source_context_from_row(
     source_row: Any,
 ) -> _ProviderDirectoryProfileSourceContext | None:
@@ -23383,12 +23586,17 @@ def _profile_source_context_from_row(
                 + field_name
             )
         context_value_by_field[field_name] = raw_value
+    authority_id = _profile_source_authority_from_row(
+        source_id,
+        source_row_map,
+    )
     return _ProviderDirectoryProfileSourceContext(
         source_id=source_id,
         endpoint_id=endpoint_id,
         canonical_api_base=context_value_by_field["canonical_api_base"],
         org_name=context_value_by_field["org_name"],
         plan_name=context_value_by_field["plan_name"],
+        authority_id=authority_id,
     )
 
 
@@ -23574,6 +23782,7 @@ class _ProviderDirectoryProfileSourceContext:
     canonical_api_base: str | None
     org_name: str | None
     plan_name: str | None
+    authority_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -28131,6 +28340,7 @@ _PROVIDER_DIRECTORY_PROFILE_DELTA_COMPATIBLE_STRATEGIES = frozenset(
     {
         "source-fact-role32-npi5m-v1",
         "source-fact-role32-org32-npi5m-v3",
+        "source-fact-role32-org32-membership32-npi5m-v4",
         profile_artifact.PROFILE_BUILD_STRATEGY_VERSION,
     }
 )
@@ -33233,6 +33443,10 @@ async def _populate_provider_directory_profile_evidence_stage(
         "endpoint_ref": _qt(
             build.schema,
             ProviderDirectoryEndpoint.__tablename__,
+        ),
+        "dataset_resource_ref": _qt(
+            build.schema,
+            ProviderDirectoryDatasetResource.__tablename__,
         ),
     }
     if not bounded:

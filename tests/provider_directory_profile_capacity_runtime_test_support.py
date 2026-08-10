@@ -22,7 +22,7 @@ _RUNTIME_WITNESS_BY_FIELD = {
     ),
     "profile_schema_version": 1,
     "profile_strategy_version": (
-        "source-fact-role32-org32-membership32-npi5m-v4"
+        "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5"
     ),
     "postgres_server_version_num": 180002,
 }
