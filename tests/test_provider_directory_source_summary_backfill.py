@@ -138,6 +138,75 @@ def _publication_metadata_with_summary() -> dict[str, object]:
     }
 
 
+def _semantic_metadata_record(**overrides) -> dict[str, object]:
+    dataset = _dataset()
+    metadata_by_field = {
+        "source_ids": ["source-b", "source-a"],
+        "selected_resources": list(dataset.selected_resources),
+        "resource_hash_contract": (
+            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        ),
+        "semantic_projection_as_of": "2026-08-09",
+        "proof_resource_scope": list(
+            importer._provider_directory_proof_resource_scope(
+                dataset.selected_resources
+            )
+        ),
+    }
+    metadata_by_field.update(overrides)
+    return {
+        "acquisition_root_run_id": dataset.evidence_run_id,
+        "publication_metadata_json": metadata_by_field,
+    }
+
+
+def test_source_summary_candidate_propagates_v3_identity():
+    candidate, metadata_by_field = (
+        importer._source_summary_candidate_from_metadata_record(
+            _semantic_metadata_record(),
+            _dataset(),
+            ("source-a",),
+        )
+    )
+
+    assert candidate.source_ids == ("source-a", "source-b")
+    assert candidate.resource_hash_contract == (
+        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    )
+    assert candidate.semantic_projection_as_of == "2026-08-09"
+    assert candidate.proof_resource_scope == (
+        importer._provider_directory_proof_resource_scope(
+            _dataset().selected_resources
+        )
+    )
+    assert candidate.selected_resources == _dataset().selected_resources
+    assert candidate.expected_resources == _dataset().expected_resources
+    assert metadata_by_field == _semantic_metadata_record()[
+        "publication_metadata_json"
+    ]
+
+
+@pytest.mark.parametrize(
+    "invalid_hash_metadata_by_field",
+    (
+        {"resource_hash_contract": "invalid-contract"},
+        {"semantic_projection_as_of": None},
+    ),
+)
+def test_source_summary_candidate_rejects_invalid_v3_identity(
+    invalid_hash_metadata_by_field,
+):
+    with pytest.raises(
+        importer.ProviderDirectoryArtifactBuildStale,
+        match="source_summary_hash_identity_invalid:dataset-1",
+    ):
+        importer._source_summary_candidate_from_metadata_record(
+            _semantic_metadata_record(**invalid_hash_metadata_by_field),
+            _dataset(),
+            ("source-a",),
+        )
+
+
 @pytest.mark.asyncio
 async def test_targeted_backfill_uses_full_locked_dataset_source_ids():
     executor = SimpleNamespace(

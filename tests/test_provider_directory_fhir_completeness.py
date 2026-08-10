@@ -269,6 +269,7 @@ def test_canonical_and_dataset_payloads_inherit_completeness_and_provenance():
         parsed_model,
         [role_row],
         dataset_id="dataset-1",
+        resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
     )[0]
 
     assert canonical_row["fhir_meta"] == {"versionId": "2"}

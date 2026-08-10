@@ -20,6 +20,10 @@ from process.provider_directory_source_summary import (
     SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_FIELDS,
     SOURCE_SUMMARY_UHC_RETAINED_ONLY_DROP_KEY,
 )
+from process.provider_directory_resource_hash import (
+    legacy_resource_payload_sha256,
+    resource_payload_sha256,
+)
 from process.uhc_provider_file_identity import (
     PROVIDER_MEMBERSHIP,
     UHCSourceFileDescriptor,
@@ -84,6 +88,41 @@ def _provider_record(provider_type: str) -> dict[str, object]:
         "specialty": ["Family Medicine"],
         "last_updated_on": "2026-07-01",
     }
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "payload"),
+    [
+        ("InsurancePlan", {"name": "Example Plan"}),
+        ("Organization", {"name": "Example Organization"}),
+        ("OrganizationAffiliation", {"organization_ref": "Organization/1"}),
+        (
+            "Practitioner",
+            {
+                "names": [{"family": "Example", "given": ["Person"]}],
+                "family_name": "Example",
+                "given_names": ["Person"],
+                "full_name": "Person Example",
+            },
+        ),
+        ("PractitionerRole", {"practitioner_ref": "Practitioner/1"}),
+        ("Location", {"name": "Example Location"}),
+    ],
+)
+def test_official_file_rows_use_explicit_neutral_hash_contract(
+    resource_type,
+    payload,
+):
+    row = retained._canonical_row(
+        resource_type,
+        "resource-1",
+        payload,
+        "rank-1",
+    )
+    stored_payload = json.loads(row[3])
+
+    assert row[2] == resource_payload_sha256(stored_payload)
+    assert row[2] == legacy_resource_payload_sha256(stored_payload)
 
 
 def _individual_exchange_scope():

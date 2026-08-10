@@ -24,6 +24,26 @@ from tests.provider_directory_subset_completion_pg_support import (
     valid_evidence_pairs,
     valid_source_record,
 )
+from tests.provider_directory_stored_content_proof_support import (
+    stored_content_proof,
+)
+
+
+def _activation_content_proof(
+    proof,
+    *,
+    dataset_id: str,
+    root_run_id: str,
+):
+    """Seal one synthetic activation fixture under its exact lineage."""
+
+    return stored_content_proof(
+        proof,
+        RESOURCE_TYPES,
+        VALID_RESOURCE_ROWS,
+        dataset_id=dataset_id,
+        root_run_id=root_run_id,
+    )
 
 
 def _dataset_row(
@@ -71,6 +91,20 @@ def activation_inputs():
         baseline_dataset_id="dataset-baseline",
         baseline_root_run_id="root-baseline",
     )
+    baseline_metadata[
+        proof_store.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+    ] = _activation_content_proof(
+        proof,
+        dataset_id="dataset-baseline",
+        root_run_id="root-baseline",
+    )
+    candidate_metadata_by_field[
+        proof_store.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+    ] = _activation_content_proof(
+        proof,
+        dataset_id="dataset-candidate",
+        root_run_id="root-candidate",
+    )
 
     dataset_rows = [
         _dataset_row(
@@ -101,63 +135,6 @@ def activation_inputs():
     return source_record, dataset_rows, evidence
 
 
-def _single_root_content_proof(
-    proof,
-    *,
-    dataset_id: str,
-    root_run_id: str,
-):
-    descriptors = []
-    for resource_row in VALID_RESOURCE_ROWS:
-        descriptor, _payload = proof_store.build_dataset_proof_shard(
-            [resource_row],
-            dataset_id=dataset_id,
-            endpoint_id="endpoint-a",
-            acquisition_root_run_id=root_run_id,
-            source_ids=("synthetic-source",),
-        )
-        descriptors.append(descriptor)
-    descriptors.sort(key=lambda descriptor: descriptor["shard_id"])
-    completion_dataset = proof["dataset"]
-    metadata = {
-        "contract_id": (
-            proof_store.PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
-        ),
-        "complete": True,
-        "dataset_id": dataset_id,
-        "endpoint_id": "endpoint-a",
-        "acquisition_root_run_id": root_run_id,
-        "source_ids": ["synthetic-source"],
-        "selected_resources": list(RESOURCE_TYPES),
-        "dataset_hash": completion_dataset["hash"],
-        "resource_count": completion_dataset["count"],
-        "resource_hashes": completion_dataset["resource_hashes"],
-        "resource_counts": completion_dataset["resource_counts"],
-        "source_metrics": {
-            "address_records": 0,
-            "addressed_locations": 0,
-            "distinct_npis": 0,
-            "geocoded_locations": 0,
-        },
-        "npi_set_sha256": "0" * 64,
-        "shard_count": len(descriptors),
-        "shard_set_sha256": proof_store._line_hash(
-            proof_store._stable_json(descriptor).encode()
-            for descriptor in descriptors
-        ),
-        "shards": descriptors,
-    }
-    metadata["proof_sha256"] = proof_store._json_hash(metadata)
-    return proof_store.validate_stored_dataset_proof_metadata(
-        metadata,
-        dataset_id=dataset_id,
-        endpoint_id="endpoint-a",
-        acquisition_root_run_id=root_run_id,
-        source_ids=("synthetic-source",),
-        selected_resources=RESOURCE_TYPES,
-    )
-
-
 def _single_root_candidate_metadata(
     proof,
     proof_sha256,
@@ -184,7 +161,7 @@ def _single_root_candidate_metadata(
         "server_issued_subset_replay_evidence_sha256": replay_sha256,
         "server_issued_subset_coverage": coverage,
         "provider_directory_content_proof_v1": (
-            _single_root_content_proof(
+            _activation_content_proof(
                 proof,
                 dataset_id="dataset-candidate",
                 root_run_id="root-candidate",

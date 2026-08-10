@@ -37,6 +37,7 @@ def _parse_with_dataset(resource):
         model,
         [row],
         dataset_id="dataset-a",
+        resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
     )
     return model, row, dataset_rows[0]["payload_json"]
 

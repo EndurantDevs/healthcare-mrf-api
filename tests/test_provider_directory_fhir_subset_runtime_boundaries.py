@@ -319,6 +319,36 @@ def test_subset_resource_rows_reject_invalid_raw_digest():
             model,
             [row_by_field],
             dataset_id="synthetic-dataset",
+            resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+        )
+
+
+def test_subset_resource_rows_reject_semantic_and_unknown_contracts():
+    model, row_by_field, _continuation, _changed = (
+        build_transport_coordinate_rows()
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="subset_resource_hash_contract_invalid",
+    ):
+        importer._endpoint_dataset_resource_rows(
+            model,
+            [row_by_field],
+            dataset_id="synthetic-dataset",
+            resource_hash_contract=(
+                importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            ),
+        )
+    with pytest.raises(
+        ValueError,
+        match="resource_hash_contract_invalid",
+    ):
+        importer._endpoint_dataset_resource_rows(
+            model,
+            [row_by_field],
+            dataset_id="synthetic-dataset",
+            resource_hash_contract="unknown-contract",
         )
 
 

@@ -14,6 +14,9 @@ from tests.provider_directory_fhir_coverage_high_support import (
 )
 
 
+V2_HASH_CONTRACT = importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+
+
 @pytest.mark.asyncio
 async def test_endpoint_scope_state_and_orphan_guards(monkeypatch):
     with pytest.raises(RuntimeError, match="endpoint_scope_invalid"):
@@ -92,8 +95,12 @@ def test_twin_root_and_terminal_proof_guards_reject_mismatches(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="baseline_incompatible"):
         importer._assert_compatible_twin_root_baseline(
-            endpoint_dataset_candidate(),
-            {},
+            endpoint_dataset_candidate(resource_hash_contract=V2_HASH_CONTRACT),
+            {
+                "publication_metadata_json": {
+                    importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: V2_HASH_CONTRACT
+                }
+            },
         )
 
     with pytest.raises(RuntimeError, match="verification_mismatch_invalid"):
@@ -288,6 +295,7 @@ async def test_dataset_content_and_twin_admission_guards(monkeypatch):
     candidate = endpoint_dataset_candidate(
         requires_twin_root_verification=True,
         verification_role=importer.TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE,
+        resource_hash_contract=V2_HASH_CONTRACT,
     )
     monkeypatch.setattr(
         importer,
@@ -297,7 +305,11 @@ async def test_dataset_content_and_twin_admission_guards(monkeypatch):
     monkeypatch.setattr(
         importer,
         "_candidate_with_locked_twin_root_admission",
-        Mock(return_value=endpoint_dataset_candidate()),
+        Mock(
+            return_value=endpoint_dataset_candidate(
+                resource_hash_contract=V2_HASH_CONTRACT
+            )
+        ),
     )
     with pytest.raises(RuntimeError, match="verification_admission_missing"):
         await importer._locked_twin_root_verification_decision(

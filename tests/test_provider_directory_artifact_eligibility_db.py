@@ -174,6 +174,42 @@ def _ordinary_metadata() -> dict[str, object]:
     }
 
 
+def _metadata_with_hash_identity(
+    metadata: dict[str, object],
+    resource_hash_contract: str,
+) -> dict[str, object]:
+    updated_metadata = copy.deepcopy(metadata)
+    updated_metadata[importer.RESOURCE_HASH_CONTRACT_METADATA_KEY] = (
+        resource_hash_contract
+    )
+    if (
+        resource_hash_contract
+        == importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        proof_resource_types = list(
+            importer._provider_directory_proof_resource_scope(
+                updated_metadata["selected_resources"]
+            )
+        )
+        semantic_projection_as_of = "2026-08-09"
+        updated_metadata[
+            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        ] = proof_resource_types
+        updated_metadata[
+            importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
+        ] = semantic_projection_as_of
+        proof = updated_metadata[
+            importer.TWIN_ROOT_VERIFICATION_METADATA_KEY
+        ]["proof"]
+        proof[
+            importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+        ] = proof_resource_types
+        proof[importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY] = (
+            semantic_projection_as_of
+        )
+    return updated_metadata
+
+
 async def _insert_sources(database: Database, schema: str) -> None:
     metadata = json.dumps(_source_metadata())
     await database.status(
@@ -312,6 +348,71 @@ async def _set_all_source_profiles(
         await _set_source_metadata(database, schema, source_id, metadata)
 
 
+async def _set_twin_metadata(
+    database: Database,
+    schema: str,
+    *,
+    baseline_metadata: dict[str, object],
+    candidate_metadata: dict[str, object],
+) -> None:
+    for dataset_id, metadata in (
+        ("dataset_baseline", baseline_metadata),
+        ("dataset_exact_matched", candidate_metadata),
+    ):
+        await database.status(
+            f"""
+            UPDATE {schema}.provider_directory_endpoint_dataset
+               SET publication_metadata_json = CAST(:metadata AS jsonb)
+             WHERE dataset_id = :dataset_id;
+            """,
+            dataset_id=dataset_id,
+            metadata=json.dumps(metadata),
+        )
+
+
+async def _compact_candidate_ids(
+    database: Database,
+) -> list[str]:
+    current_dataset = importer.ProviderDirectoryArtifactDataset(
+        source_id="source_a",
+        endpoint_id=ENDPOINT_ID,
+        serving_endpoint_id=SERVING_ENDPOINT_ID,
+        dataset_id="dataset_current",
+        evidence_run_id="root_current",
+        recorded_expected_resources=(),
+        status=importer.ENDPOINT_DATASET_PUBLISHED,
+        is_current=True,
+    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence(
+        (current_dataset,),
+        should_select_validated_candidates=True,
+    )
+    eligible_ids_by_endpoint = await importer._artifact_eligible_validated_ids(
+        fence,
+        database,
+    )
+    return eligible_ids_by_endpoint.get(ENDPOINT_ID, [])
+
+
+async def _assert_candidate_eligibility(
+    database: Database,
+    schema: str,
+    *,
+    expected: bool,
+    case_name: str,
+) -> None:
+    option_ids = _option_ids(await _artifact_options(database, schema))
+    compact_candidate_ids = await _compact_candidate_ids(database)
+    assert ("dataset_exact_matched" in option_ids) is expected, (
+        case_name,
+        option_ids,
+    )
+    assert ("dataset_exact_matched" in compact_candidate_ids) is expected, (
+        case_name,
+        compact_candidate_ids,
+    )
+
+
 def _option_ids(options: list[dict]) -> list[str]:
     return [str(option["dataset_id"]) for option in options]
 
@@ -365,118 +466,4 @@ async def test_verified_gate_keeps_incumbent_and_exact_matched_candidate(
         )
         assert _option_ids(await _artifact_options(database, schema)) == [
             "dataset_current"
-        ]
-
-@pytest.mark.asyncio
-async def test_verified_gate_rejects_config_and_profile_drift(monkeypatch):
-    async with _candidate_database(monkeypatch) as (database, schema):
-        await _set_all_source_profiles(
-            database,
-            schema,
-            importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-        )
-        await _set_source_metadata(
-            database,
-            schema,
-            "source_a",
-            _source_metadata(
-                status=importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
-                configured_endpoint_id="replacement_endpoint",
-            ),
-        )
-        assert _option_ids(await _artifact_options(database, schema)) == [
-            "dataset_current"
-        ]
-        for invalid_metadata in (
-            _source_metadata(status="unknown"),
-            _source_metadata(status=None),
-        ):
-            await _set_source_metadata(
-                database, schema, "source_a", invalid_metadata
-            )
-            assert _option_ids(await _artifact_options(database, schema)) == [
-                "dataset_current"
-            ]
-        await _set_source_metadata(database, schema, "source_a", _source_metadata())
-        await _set_source_metadata(database, schema, "source_b", {})
-        assert _option_ids(await _artifact_options(database, schema)) == [
-            "dataset_current"
-        ]
-
-
-@pytest.mark.asyncio
-async def test_removed_review_profile_cannot_reclassify_twin_datasets(
-    monkeypatch,
-):
-    async with _candidate_database(monkeypatch) as (database, schema):
-        profile_absent_metadata = _source_metadata(
-            status=None,
-            campaign_id=None,
-        )
-        for source_id in ("source_a", "source_b"):
-            await _set_source_metadata(
-                database,
-                schema,
-                source_id,
-                profile_absent_metadata,
-            )
-        assert _option_ids(await _artifact_options(database, schema)) == [
-            "dataset_current"
-        ]
-
-
-@pytest.mark.asyncio
-async def test_genuine_established_candidate_keeps_profile_absent_path(
-    monkeypatch,
-):
-    async with _candidate_database(monkeypatch) as (database, schema):
-        await database.status(
-            f"""
-            INSERT INTO {schema}.provider_directory_source (
-                source_id, endpoint_id, metadata_json
-            ) VALUES (
-                'established_source', 'established_endpoint',
-                CAST(:source_metadata AS jsonb)
-            );
-            """,
-            source_metadata=json.dumps(
-                {
-                    "provider_directory_supported_resources": ["Organization"],
-                    "provider_directory_fully_enumerable_resources": [
-                        "Organization"
-                    ],
-                }
-            ),
-        )
-        await database.status(
-            f"""
-            INSERT INTO {schema}.provider_directory_endpoint_dataset (
-                dataset_id, endpoint_id, acquisition_root_run_id,
-                dataset_hash, status, is_current, resource_count,
-                publication_metadata_json
-            ) VALUES
-                ('established_current', 'established_endpoint', 'root_current',
-                 :dataset_hash, :published, true, 1, '{{}}'::jsonb),
-                ('established_candidate', 'established_endpoint', 'root_candidate',
-                 :dataset_hash, :validated, false, 1,
-                 CAST(:candidate_metadata AS jsonb));
-            """,
-            dataset_hash=DATASET_HASH,
-            published=importer.ENDPOINT_DATASET_PUBLISHED,
-            validated=importer.ENDPOINT_DATASET_VALIDATED,
-            candidate_metadata=json.dumps(
-                {
-                    "requires_twin_root_verification": False,
-                    "source_ids": ["established_source"],
-                }
-            ),
-        )
-        options = await _artifact_options(
-            database,
-            schema,
-            "established_endpoint",
-        )
-        assert _option_ids(options) == [
-            "established_candidate",
-            "established_current",
         ]

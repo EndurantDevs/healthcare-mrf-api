@@ -33,6 +33,7 @@ import zlib
 
 import asyncpg
 
+from process.provider_directory_resource_hash import resource_payload_sha256
 from process.uhc_canonical_proof import (
     UhcCanonicalContentDigest,
     UhcCanonicalMaterializationIdentity,
@@ -1025,9 +1026,9 @@ def _stable_json(value: Any) -> str:
 
 
 def _payload_hash(payload: Mapping[str, Any]) -> str:
-    # Match provider_directory_fhir._endpoint_dataset_resource_rows exactly.
-    encoded = json.dumps(dict(payload), sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    """Match the retained candidate's explicit transport-neutral contract."""
+
+    return resource_payload_sha256(payload)
 
 
 def _resource_id(prefix: str, *identity: Any) -> str:

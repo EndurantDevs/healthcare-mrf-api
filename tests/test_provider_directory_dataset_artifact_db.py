@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 import importlib
 import json
 import uuid
@@ -360,6 +361,55 @@ async def test_real_postgres_dataset_scope_keeps_explicit_sources_and_cleans(mon
 
 
 @pytest.mark.asyncio
+async def test_real_postgres_scope_materializes_a_proven_linked_family(
+    monkeypatch,
+):
+    async with _dataset_database(monkeypatch) as (database, schema):
+        selected_fence = (
+            await importer._resolve_provider_directory_artifact_datasets(
+                ["source_primary"]
+            )
+        )
+        selected_dataset = selected_fence.datasets[0]
+        retained_dataset = replace(
+            selected_dataset,
+            retained_resources=("Location", "Practitioner"),
+        )
+        retained_fence = replace(
+            selected_fence,
+            datasets=(retained_dataset,),
+        )
+
+        async with importer._provider_directory_artifact_dataset_scope(
+            run_id="artifact-linked-run",
+            source_ids=["source_primary"],
+            fence=retained_fence,
+            metrics={},
+        ):
+            practitioner_scope_table = (
+                importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()[
+                    "provider_directory_practitioner"
+                ]
+            )
+            practitioner_rows = await database.all(
+                f"SELECT source_id, resource_id, full_name "
+                f"FROM {schema}.{practitioner_scope_table};"
+            )
+            assert [
+                dict(practitioner_row._mapping)
+                for practitioner_row in practitioner_rows
+            ] == [
+                {
+                    "source_id": "source_primary",
+                    "resource_id": "linked-practitioner-1",
+                    "full_name": "Unvalidated Linked Practitioner",
+                }
+            ]
+
+        assert await _scope_table_names(database, schema) == []
+
+
+@pytest.mark.asyncio
 async def test_real_postgres_dataset_fence_rejects_alias_repoint_and_current_change(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
         fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
@@ -431,70 +481,3 @@ async def test_real_postgres_explicit_dataset_fence_ignores_unselected_alias_joi
 
         async with database.transaction():
             await importer._lock_and_verify_artifact_dataset_fence(fence)
-
-
-@pytest.mark.asyncio
-async def test_real_postgres_cutover_fence_blocks_dataset_promotion(monkeypatch):
-    async with _dataset_database(monkeypatch) as (database, schema):
-        fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
-        await _insert_next_shared_dataset(database, schema)
-        promotion_database = Database()
-        await promotion_database.connect()
-
-        async def promote_current_dataset() -> None:
-            async with promotion_database.transaction():
-                await promotion_database.status(
-                    f"UPDATE {schema}.provider_directory_endpoint_dataset "
-                    "SET is_current = false WHERE dataset_id = 'dataset_shared';"
-                )
-                await promotion_database.status(
-                    f"UPDATE {schema}.provider_directory_endpoint_dataset "
-                    "SET is_current = true WHERE dataset_id = 'dataset_next';"
-                )
-
-        try:
-            async with database.transaction():
-                await importer._lock_and_verify_artifact_dataset_fence(fence)
-                promotion_task = asyncio.create_task(promote_current_dataset())
-                await asyncio.sleep(0.05)
-                assert not promotion_task.done()
-            await asyncio.wait_for(promotion_task, timeout=2)
-        finally:
-            await promotion_database.disconnect()
-
-        assert await database.scalar(
-            f"SELECT dataset_id FROM {schema}.provider_directory_endpoint_dataset "
-            "WHERE endpoint_id = 'endpoint_shared' AND is_current = true;"
-        ) == "dataset_next"
-
-
-@pytest.mark.asyncio
-async def test_real_postgres_cutover_fence_blocks_alias_join(monkeypatch):
-    async with _dataset_database(monkeypatch) as (database, schema):
-        fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"]
-        )
-        alias_database = Database()
-        await alias_database.connect()
-
-        async def join_endpoint_alias() -> None:
-            await alias_database.status(
-                f"UPDATE {schema}.provider_directory_source "
-                "SET endpoint_id = 'endpoint_shared' "
-                "WHERE source_id = 'source_catalog_only';"
-            )
-
-        try:
-            async with database.transaction():
-                await importer._lock_and_verify_artifact_dataset_fence(fence)
-                alias_task = asyncio.create_task(join_endpoint_alias())
-                await asyncio.sleep(0.05)
-                assert not alias_task.done()
-            await asyncio.wait_for(alias_task, timeout=2)
-        finally:
-            await alias_database.disconnect()
-
-        assert await database.scalar(
-            f"SELECT endpoint_id FROM {schema}.provider_directory_source "
-            "WHERE source_id = 'source_catalog_only';"
-        ) == "endpoint_shared"

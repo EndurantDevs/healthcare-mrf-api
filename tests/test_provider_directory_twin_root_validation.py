@@ -40,6 +40,9 @@ def _candidate(
             == importer.TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE
             else None
         ),
+        resource_hash_contract=(
+            importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+        ),
     )
 
 
@@ -175,6 +178,11 @@ class _ValidationHarness:
                 "is_current": False,
                 "status": importer.ENDPOINT_DATASET_ACQUIRING,
                 "previous_dataset_id": self.candidate.previous_dataset_id,
+                "publication_metadata_json": {
+                    importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (
+                        self.candidate.resource_hash_contract
+                    )
+                },
             }
         return {"dataset_id": self.candidate.previous_dataset_id}
 

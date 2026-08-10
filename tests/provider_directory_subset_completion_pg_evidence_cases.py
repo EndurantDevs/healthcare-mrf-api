@@ -12,6 +12,8 @@ from tests.provider_directory_subset_completion_pg_setup import (
     insert_valid_subset_resources,
 )
 from tests.provider_directory_subset_completion_pg_support import (
+    RESOURCE_TYPES,
+    VALID_RESOURCE_ROWS,
     invalid_cutoff_evidence_pairs,
     malformed_proof_pair,
     malformed_replay_pair,
@@ -19,6 +21,9 @@ from tests.provider_directory_subset_completion_pg_support import (
     terminal_parameters,
     terminal_sql,
     valid_evidence_pairs,
+)
+from tests.provider_directory_stored_content_proof_support import (
+    metadata_with_stored_content_proof,
 )
 from tests.tin_npi_connector_postgres_support import expect_postgres_error
 
@@ -154,12 +159,19 @@ async def insert_marker_bound_subset_resources(scenario):
 async def terminalize_subset_baseline(scenario):
     evidence_pairs = valid_evidence_pairs()
     proof_by_field, proof_sha256, replay_by_field, replay_sha256 = evidence_pairs
-    metadata_by_field = terminal_metadata(
+    metadata_by_field = metadata_with_stored_content_proof(
+        terminal_metadata(
+            proof_by_field,
+            proof_sha256,
+            replay_by_field,
+            replay_sha256,
+            "root-subset",
+        ),
         proof_by_field,
-        proof_sha256,
-        replay_by_field,
-        replay_sha256,
-        "root-subset",
+        RESOURCE_TYPES,
+        VALID_RESOURCE_ROWS,
+        dataset_id="dataset-subset",
+        root_run_id="root-subset",
     )
     baseline_sql = f"""
         UPDATE {scenario.quoted_schema}.provider_directory_endpoint_dataset

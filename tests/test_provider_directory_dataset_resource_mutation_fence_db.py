@@ -48,6 +48,7 @@ async def _create_fence_tables(database: Database, schema: str) -> None:
             resource_id varchar(256) NOT NULL,
             payload_hash varchar(64) NOT NULL,
             payload_json jsonb NOT NULL,
+            acquired_resource_sha256 varchar(64),
             PRIMARY KEY (dataset_id, resource_type, resource_id)
         );
         """

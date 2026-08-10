@@ -77,6 +77,30 @@ def test_decoded_json_field_rejects_malformed_string():
         proof_store._decoded_json_field({"value": "{"}, "value")
 
 
+def test_resource_maps_accept_json_object_key_reordering():
+    """Treat PostgreSQL JSONB object order as representation-only."""
+
+    counts, hashes = proof_store._validated_resource_maps(
+        {
+            "resource_counts": {
+                "Practitioner": 1,
+                "Organization": 1,
+            },
+            "resource_hashes": {
+                "Practitioner": "b" * 64,
+                "Organization": "a" * 64,
+            },
+        },
+        ["Organization", "Practitioner"],
+        exact_scope=True,
+    )
+    assert counts == {"Practitioner": 1, "Organization": 1}
+    assert hashes == {
+        "Practitioner": "b" * 64,
+        "Organization": "a" * 64,
+    }
+
+
 def _valid_shard_payload():
     descriptor, compressed = proof_store.build_dataset_proof_shard(
         [_dataset_resource("Practitioner", "p", {"npi": "123"})],

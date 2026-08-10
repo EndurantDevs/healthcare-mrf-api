@@ -117,16 +117,19 @@ def test_subset_payload_hash_is_neutral_to_page_transport_coordinates():
         model,
         [first_page_row_by_field],
         dataset_id="dataset-a",
+        resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     )[0]
     continuation = importer._endpoint_dataset_resource_rows(
         model,
         [continuation_row_by_field],
         dataset_id="dataset-b",
+        resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     )[0]
     changed = importer._endpoint_dataset_resource_rows(
         model,
         [changed_row_by_field],
         dataset_id="dataset-c",
+        resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     )[0]
 
     assert first["payload_hash"] == continuation["payload_hash"]

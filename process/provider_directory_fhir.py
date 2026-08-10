@@ -197,8 +197,10 @@ from process.uhc_provider_quarantine_contract import (
 )
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
+    PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
     PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
     ProviderDirectoryProofStoreError,
+    ProviderDirectoryStoredProofOptions,
     build_stored_dataset_proof,
     delete_dataset_resource_proof_shards,
     delete_dataset_proof_shards,
@@ -208,11 +210,17 @@ from process.provider_directory_proof_store import (
 )
 from process.provider_directory_resource_hash import (
     DEFAULT_RESOURCE_HASH_CONTRACT,
+    LEGACY_RESOURCE_HASH_CONTRACT,
     RESOURCE_HASH_CONTRACTS,
     RESOURCE_HASH_CONTRACT_METADATA_KEY,
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+    canonical_practitioner_payload,
     persisted_resource_hash_contract,
     resource_content_hash_payload,
     is_resource_payload_hash_match,
+    merge_practitioner_semantic_payloads,
+    merge_semantic_resource_payloads,
     resource_payload_sha256_for_contract,
 )
 from process.uhc_retained_dataset import (
@@ -477,6 +485,19 @@ LINKED_REFERENCE_FIELDS = {
         "Endpoint": ("endpoint_refs",),
     },
 }
+
+
+def _provider_directory_proof_resource_scope(
+    selected_resources: Iterable[str],
+) -> tuple[str, ...]:
+    """Return crawl roots plus the one-hop linked families they may retain."""
+
+    proof_resources = set(selected_resources)
+    for resource_type in tuple(proof_resources):
+        proof_resources.update(
+            LINKED_REFERENCE_FIELDS.get(resource_type, {})
+        )
+    return tuple(sorted(proof_resources))
 RESOURCE_ENDPOINT_FIELDS = {
     "InsurancePlan": "endpoint_insurance_plan",
     "Practitioner": "endpoint_practitioner",
@@ -507,6 +528,7 @@ PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_VERSION = 1
 PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_VERSION = 1
 PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE = "provider_directory_import_seen"
 PROVIDER_DIRECTORY_IMPORT_SEEN_STAGE_PREFIX = "provider_directory_import_seen_stage"
+SEMANTIC_PROJECTION_AS_OF_METADATA_KEY = "semantic_projection_as_of"
 PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES = (
     "pd_price_addr_corrob_lookup_idx",
     "pd_price_addr_corrob_active_lookup_idx",
@@ -1587,10 +1609,18 @@ class FHIRAcquisitionContext:
     self_url: str | None = None
     fetch_url: str | None = None
     fetch_mode: str | None = None
+    semantic_projection_as_of: datetime.date | None = None
 
     def __post_init__(self) -> None:
         if self.fetch_mode is not None and self.fetch_mode not in FHIR_FETCH_MODES:
             raise ValueError(f"unsupported FHIR fetch mode: {self.fetch_mode}")
+        if self.semantic_projection_as_of is not None and not isinstance(
+            self.semantic_projection_as_of,
+            datetime.date,
+        ):
+            raise ValueError(
+                "provider_directory_semantic_projection_as_of_invalid"
+            )
 
 
 @dataclass(frozen=True)
@@ -2070,6 +2100,8 @@ class EndpointDatasetCandidate:
     completion_proof_required_version: int | None = None
     subset_contract: CurrentVersionCensusContract | None = None
     resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT
+    semantic_projection_as_of: str | None = None
+    proof_resource_scope: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -2092,12 +2124,15 @@ class EndpointDatasetCandidateSelection:
     already_published: bool = False
     published_metadata: dict[str, Any] | None = None
     resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT
+    semantic_projection_as_of: str | None = None
+    proof_resource_scope: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
 class EndpointDatasetWriteScope:
     dataset_id: str
     resource_hash_contract: str
+    semantic_projection_as_of: str | None = None
 
     def __post_init__(self) -> None:
         """Reject incomplete or unknown dataset-write contracts."""
@@ -2109,6 +2144,27 @@ class EndpointDatasetWriteScope:
             raise ValueError(
                 "provider_directory_resource_hash_contract_required"
             )
+        if self.resource_hash_contract == (
+            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        ):
+            _validated_semantic_projection_as_of(
+                self.semantic_projection_as_of
+            )
+
+
+@dataclass(frozen=True)
+class ProviderDirectoryResourceWriteOptions:
+    """Bind one resource write to its run, provenance, and hash identity."""
+
+    run_id: str | None
+    track_seen: bool
+    seen_table: str | None = None
+    canonical_api_base: str | None = None
+    source_ids: list[str] | None = None
+    dataset_scope: EndpointDatasetWriteScope | None = None
+    resource_hash_contract: str | None = None
+    semantic_projection_as_of: str | None = None
+    derive_location_contacts: bool = True
 
 
 @dataclass(frozen=True)
@@ -2144,6 +2200,8 @@ class LastUpdatedPartitionInitialization:
 class LastUpdatedPartitionStage:
     rows: tuple[dict[str, Any], ...]
     candidate_hashes_by_id: dict[str, str]
+    resource_hash_contract: str
+    semantic_projection_as_of: str | None
 
 
 @dataclass(frozen=True)
@@ -7745,7 +7803,12 @@ def parse_fhir_resource(
             "administrative_gender": _administrative_gender(resource),
             **_practitioner_derived_profile_fields(
                 resource,
-                as_of=base["observed_at"].date(),
+                as_of=(
+                    acquisition.semantic_projection_as_of
+                    if acquisition is not None
+                    and acquisition.semantic_projection_as_of is not None
+                    else base["observed_at"].date()
+                ),
             ),
             "telecom": _telecom(resource),
             "addresses": _normalized_fhir_addresses(resource.get("address")),
@@ -8069,6 +8132,7 @@ def _append_alohr_parsed_resource(
     resource: dict[str, Any],
     *,
     run_id: str | None,
+    semantic_projection_as_of: str | None = None,
 ) -> None:
     resource_type = _clean_text(resource.get("resourceType")) or "Resource"
     resource_id = _resource_id(resource)
@@ -8082,13 +8146,22 @@ def _append_alohr_parsed_resource(
         acquisition=FHIRAcquisitionContext(
             fetch_url=ALOHR_GRAPHQL_URL,
             fetch_mode="graphql",
+            semantic_projection_as_of=(
+                datetime.date.fromisoformat(
+                    _validated_semantic_projection_as_of(
+                        semantic_projection_as_of
+                    )
+                )
+                if semantic_projection_as_of is not None
+                else None
+            ),
         ),
         run_id=run_id,
         normalize_location_contacts=resource.get("resourceType") != "Location",
     )
     if parsed:
-        model, row = parsed
-        rows_by_model.setdefault(model, []).append(row)
+        model, parsed_resource_row = parsed
+        rows_by_model.setdefault(model, []).append(parsed_resource_row)
 
 
 def _alohr_reviewed_boolean_extensions(
@@ -8139,23 +8212,23 @@ def _alohr_provider_role_resource(
     }
 
 
-def _append_alohr_provider_rows(
-    rows_by_model: dict[type, list[dict[str, Any]]],
-    source_id: str,
+def _alohr_practitioner_resource(
     provider: dict[str, Any],
-    *,
-    run_id: str | None,
-) -> None:
-    """Append normalized Practitioner, Location, and role rows for ALOHR."""
+    provider_id: str,
+    full_name: str,
+    telecom: list[dict[str, Any]],
+    specialty: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build one normalized Practitioner from an ALOHR provider."""
 
-    provider_id = _clean_text(provider.get("providerId")) or _alohr_resource_id("prac", provider.get("npi"), provider.get("firstName"), provider.get("lastName"))
-    full_name = " ".join(provider_value for provider_value in (_clean_text(provider.get("firstName")), _clean_text(provider.get("lastName"))) if provider_value)
-    telecom = _alohr_telecom(provider.get("phone"), provider.get("email"))
-    specialty = _alohr_specialty_codings(provider.get("specialty"), provider.get("specialtyDescription"))
-    identifiers = []
-    if _clean_text(provider.get("npi")):
-        identifiers.append({"system": "http://hl7.org/fhir/sid/us-npi", "value": _clean_text(provider.get("npi"))})
-    practitioner_by_field = {
+    first_name = _clean_text(provider.get("firstName"))
+    npi = _clean_text(provider.get("npi"))
+    identifiers = (
+        [{"system": "http://hl7.org/fhir/sid/us-npi", "value": npi}]
+        if npi
+        else []
+    )
+    return {
         "resourceType": "Practitioner",
         "id": provider_id,
         "active": True,
@@ -8163,19 +8236,60 @@ def _append_alohr_provider_rows(
         "name": [
             {
                 "family": _clean_text(provider.get("lastName")),
-                "given": [_clean_text(provider.get("firstName"))] if _clean_text(provider.get("firstName")) else [],
+                "given": [first_name] if first_name else [],
                 "text": full_name or None,
             }
         ],
         "telecom": telecom,
-        "qualification": [{"code": {"coding": specialty}}] if specialty else [],
-        "communication": [{"coding": [{"display": language}]} for language in provider.get("languages") or [] if _clean_text(language)],
+        "qualification": (
+            [{"code": {"coding": specialty}}] if specialty else []
+        ),
+        "communication": [
+            {"coding": [{"display": language}]}
+            for language in provider.get("languages") or []
+            if _clean_text(language)
+        ],
     }
-    _append_alohr_parsed_resource(rows_by_model, source_id, practitioner_by_field, run_id=run_id)
+
+
+def _append_alohr_provider_rows(
+    rows_by_model: dict[type, list[dict[str, Any]]],
+    source_id: str,
+    provider: dict[str, Any],
+    *,
+    run_id: str | None,
+    semantic_projection_as_of: str | None = None,
+) -> None:
+    """Append normalized Practitioner, Location, and role rows for ALOHR."""
+
+    provider_id = _clean_text(provider.get("providerId")) or _alohr_resource_id("prac", provider.get("npi"), provider.get("firstName"), provider.get("lastName"))
+    full_name = " ".join(provider_value for provider_value in (_clean_text(provider.get("firstName")), _clean_text(provider.get("lastName"))) if provider_value)
+    telecom = _alohr_telecom(provider.get("phone"), provider.get("email"))
+    specialty = _alohr_specialty_codings(provider.get("specialty"), provider.get("specialtyDescription"))
+    practitioner_by_field = _alohr_practitioner_resource(
+        provider,
+        provider_id,
+        full_name,
+        telecom,
+        specialty,
+    )
+    _append_alohr_parsed_resource(
+        rows_by_model,
+        source_id,
+        practitioner_by_field,
+        run_id=run_id,
+        semantic_projection_as_of=semantic_projection_as_of,
+    )
     location_refs: list[dict[str, str]] = []
     for address in _alohr_address_items(provider):
         location = _alohr_location_resource(provider_id, full_name or provider_id, address, telecom)
-        _append_alohr_parsed_resource(rows_by_model, source_id, location, run_id=run_id)
+        _append_alohr_parsed_resource(
+            rows_by_model,
+            source_id,
+            location,
+            run_id=run_id,
+            semantic_projection_as_of=semantic_projection_as_of,
+        )
         location_refs.append({"reference": f"Location/{location['id']}"})
     role = _alohr_provider_role_resource(
         provider,
@@ -8184,7 +8298,13 @@ def _append_alohr_provider_rows(
         specialty,
         telecom,
     )
-    _append_alohr_parsed_resource(rows_by_model, source_id, role, run_id=run_id)
+    _append_alohr_parsed_resource(
+        rows_by_model,
+        source_id,
+        role,
+        run_id=run_id,
+        semantic_projection_as_of=semantic_projection_as_of,
+    )
 
 
 def _append_alohr_organization_rows(
@@ -8193,6 +8313,7 @@ def _append_alohr_organization_rows(
     organization: dict[str, Any],
     *,
     run_id: str | None,
+    semantic_projection_as_of: str | None = None,
 ) -> None:
     org_id = _clean_text(organization.get("orgId")) or _alohr_resource_id("org", organization.get("npi"), organization.get("name"))
     contacts = []
@@ -8215,10 +8336,22 @@ def _append_alohr_organization_rows(
         "telecom": telecom,
         "address": _alohr_address_items(organization),
     }
-    _append_alohr_parsed_resource(rows_by_model, source_id, organization_resource_by_field, run_id=run_id)
+    _append_alohr_parsed_resource(
+        rows_by_model,
+        source_id,
+        organization_resource_by_field,
+        run_id=run_id,
+        semantic_projection_as_of=semantic_projection_as_of,
+    )
     for address in _alohr_address_items(organization):
         location = _alohr_location_resource(org_id, _clean_text(organization.get("name")) or org_id, address, telecom)
-        _append_alohr_parsed_resource(rows_by_model, source_id, location, run_id=run_id)
+        _append_alohr_parsed_resource(
+            rows_by_model,
+            source_id,
+            location,
+            run_id=run_id,
+            semantic_projection_as_of=semantic_projection_as_of,
+        )
 
 
 def provider_directory_address_corroboration_sql(
@@ -13906,6 +14039,7 @@ class ProviderDirectoryArtifactDataset:
     evidence_run_id: str
     serving_endpoint_id: str | None = None
     selected_resources: tuple[str, ...] = ()
+    retained_resources: tuple[str, ...] = ()
     expected_resources: tuple[str, ...] = ()
     recorded_expected_resources: tuple[str, ...] | None = None
     status: str = ENDPOINT_DATASET_PUBLISHED
@@ -13928,6 +14062,12 @@ class ProviderDirectoryArtifactDataset:
     reviewed_root_policy: ReviewedRootPolicy | None = None
     source_verification_contract: tuple[Any, ...] = ()
     source_verification_contract_hash: str | None = None
+
+    @property
+    def artifact_resources(self) -> tuple[str, ...]:
+        """Return every proven family available to serving artifacts."""
+
+        return self.retained_resources or self.selected_resources
 
 
 @dataclass(frozen=True)
@@ -14237,6 +14377,56 @@ def _artifact_profile_absence_sql(source_ref: str, metadata: str) -> str:
     """
 
 
+def _artifact_normalized_resource_hash_contract_sql(metadata: str) -> str:
+    """Decode markerless legacy rows without accepting an explicit null."""
+
+    return f"""
+        CASE
+            WHEN {metadata} ? '{RESOURCE_HASH_CONTRACT_METADATA_KEY}'
+            THEN {metadata} ->> '{RESOURCE_HASH_CONTRACT_METADATA_KEY}'
+            ELSE '{LEGACY_RESOURCE_HASH_CONTRACT}'
+        END
+    """.strip()
+
+
+def _artifact_proof_hash_identity_sql(metadata: str, proof: str) -> str:
+    """Bind one twin proof to its immutable parent hash identity."""
+
+    resource_hash_contract = _artifact_normalized_resource_hash_contract_sql(
+        metadata
+    )
+    proof_scope_key = PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+    projection_date_key = SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
+    return f"""
+        ({resource_hash_contract}) IN (
+            '{LEGACY_RESOURCE_HASH_CONTRACT}',
+            '{TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT}',
+            '{SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT}'
+        )
+        AND ({proof} -> '{proof_scope_key}') IS NOT DISTINCT FROM
+            ({metadata} -> '{proof_scope_key}')
+        AND ({proof} -> '{projection_date_key}') IS NOT DISTINCT FROM
+            ({metadata} -> '{projection_date_key}')
+        AND (
+            (
+                ({resource_hash_contract}) =
+                    '{SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT}'
+                AND jsonb_typeof({metadata} -> '{proof_scope_key}') = 'array'
+                AND jsonb_typeof({metadata} -> '{projection_date_key}') =
+                    'string'
+            )
+            OR (
+                ({resource_hash_contract}) IN (
+                    '{LEGACY_RESOURCE_HASH_CONTRACT}',
+                    '{TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT}'
+                )
+                AND NOT ({metadata} ? '{proof_scope_key}')
+                AND NOT ({metadata} ? '{projection_date_key}')
+            )
+        )
+    """
+
+
 def _artifact_matched_proof_sql(
     metadata: str,
     verification: str,
@@ -14285,6 +14475,7 @@ def _artifact_matched_proof_sql(
             = {metadata} ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
         AND {proof} ->> '{TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY}'
             = {metadata} ->> '{TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY}'
+        AND {_artifact_proof_hash_identity_sql(metadata, proof)}
     """
 
 
@@ -14308,10 +14499,19 @@ def _artifact_twin_proof_equality_sql(
     ]
     if include_subset_completion:
         fields.extend(("completion_proof", "completion_proof_sha256"))
-    return "\n               AND ".join(
+    required_field_sql = "\n               AND ".join(
         f"{candidate_proof} -> '{field}' = {baseline_proof} -> '{field}'"
         for field in fields
     )
+    optional_field_sql = "\n               AND ".join(
+        f"({candidate_proof} -> '{field}') IS NOT DISTINCT FROM "
+        f"({baseline_proof} -> '{field}')"
+        for field in (
+            PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
+            SEMANTIC_PROJECTION_AS_OF_METADATA_KEY,
+        )
+    )
+    return f"{required_field_sql}\n               AND {optional_field_sql}"
 
 
 def _artifact_subset_parent_pair_sql(sql_by_field: Mapping[str, str]) -> str:
@@ -15001,6 +15201,7 @@ class _ArtifactBaselineProofFragments:
     completion_marker_sql: str
     baseline_policy_sql: str
     baseline_contract_sql: str
+    hash_identity_sql: str
     exact_proof_sql: str
 
 
@@ -15022,6 +15223,7 @@ def _artifact_baseline_exists_sql(
                {fragments.completion_marker_sql}
                AND {fragments.baseline_policy_sql}
                AND {fragments.baseline_contract_sql}
+               AND {fragments.hash_identity_sql}
                AND {fragments.baseline_metadata}
                      ->> '{TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY}'
                      = {fragments.metadata}
@@ -15038,6 +15240,91 @@ def _artifact_baseline_exists_sql(
     """
 
 
+def _artifact_baseline_hash_identity_sql(
+    metadata: str,
+    baseline_metadata: str,
+) -> str:
+    """Require the baseline and candidate to share one hash identity."""
+
+    candidate_hash_contract = (
+        _artifact_normalized_resource_hash_contract_sql(metadata)
+    )
+    baseline_hash_contract = (
+        _artifact_normalized_resource_hash_contract_sql(baseline_metadata)
+    )
+    return f"""
+        ({baseline_hash_contract}) = ({candidate_hash_contract})
+        AND ({baseline_metadata}
+             -> '{PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY}')
+            IS NOT DISTINCT FROM
+            ({metadata}
+             -> '{PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY}')
+        AND ({baseline_metadata}
+             -> '{SEMANTIC_PROJECTION_AS_OF_METADATA_KEY}')
+            IS NOT DISTINCT FROM
+            ({metadata} -> '{SEMANTIC_PROJECTION_AS_OF_METADATA_KEY}')
+    """
+
+
+def _artifact_baseline_proof_fragments(
+    dataset_ref: str,
+    metadata: str,
+    verification: str,
+    candidate_alias: str,
+    baseline_alias: str,
+    completion_proof_required_version: int | None,
+    reviewed_root_count: int | None,
+    require_reviewed_root_policy_absent: bool,
+) -> _ArtifactBaselineProofFragments:
+    """Build the independently testable baseline-proof SQL fragments."""
+
+    baseline_metadata = f"{baseline_alias}.publication_metadata_json::jsonb"
+    baseline_verification = (
+        f"{baseline_metadata} -> '{TWIN_ROOT_VERIFICATION_METADATA_KEY}'"
+    )
+    candidate_proof = f"{verification} -> 'proof'"
+    baseline_proof = f"{baseline_verification} -> 'proof'"
+    return _ArtifactBaselineProofFragments(
+        dataset_ref=dataset_ref,
+        metadata=metadata,
+        verification=verification,
+        candidate_alias=candidate_alias,
+        baseline_alias=baseline_alias,
+        baseline_metadata=baseline_metadata,
+        completion_marker_sql=_artifact_completion_marker_sql(
+            candidate_alias,
+            baseline_alias,
+            completion_proof_required_version,
+        ),
+        baseline_policy_sql=_artifact_baseline_policy_sql(
+            baseline_metadata,
+            reviewed_root_count,
+            require_reviewed_root_policy_absent,
+        ),
+        baseline_contract_sql=_artifact_baseline_contract_sql(
+            baseline_alias,
+            baseline_metadata,
+            baseline_verification,
+            baseline_proof,
+            completion_proof_required_version=(
+                completion_proof_required_version
+            ),
+        ),
+        hash_identity_sql=_artifact_baseline_hash_identity_sql(
+            metadata,
+            baseline_metadata,
+        ),
+        exact_proof_sql=_artifact_twin_proof_equality_sql(
+            candidate_proof,
+            baseline_proof,
+            include_subset_completion=(
+                completion_proof_required_version
+                == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+            ),
+        ),
+    )
+
+
 def _artifact_baseline_proof_sql(
     dataset_ref: str,
     metadata: str,
@@ -15050,51 +15337,16 @@ def _artifact_baseline_proof_sql(
     require_reviewed_root_policy_absent: bool = False,
 ) -> str:
     """Require an immutable baseline whose full proof matches the candidate."""
-    baseline_metadata = f"{baseline_alias}.publication_metadata_json::jsonb"
-    baseline_verification = (
-        f"{baseline_metadata} -> '{TWIN_ROOT_VERIFICATION_METADATA_KEY}'"
-    )
-    candidate_proof = f"{verification} -> 'proof'"
-    baseline_proof = f"{baseline_verification} -> 'proof'"
-    exact_proof_sql = _artifact_twin_proof_equality_sql(
-        candidate_proof,
-        baseline_proof,
-        include_subset_completion=(
-            completion_proof_required_version
-            == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
-        ),
-    )
-    baseline_contract_sql = _artifact_baseline_contract_sql(
-        baseline_alias,
-        baseline_metadata,
-        baseline_verification,
-        baseline_proof,
-        completion_proof_required_version=(
-            completion_proof_required_version
-        ),
-    )
-    completion_marker_sql = _artifact_completion_marker_sql(
-        candidate_alias,
-        baseline_alias,
-        completion_proof_required_version,
-    )
-    baseline_policy_sql = _artifact_baseline_policy_sql(
-        baseline_metadata,
-        reviewed_root_count,
-        require_reviewed_root_policy_absent,
-    )
     return _artifact_baseline_exists_sql(
-        _ArtifactBaselineProofFragments(
-            dataset_ref=dataset_ref,
-            metadata=metadata,
-            verification=verification,
-            candidate_alias=candidate_alias,
-            baseline_alias=baseline_alias,
-            baseline_metadata=baseline_metadata,
-            completion_marker_sql=completion_marker_sql,
-            baseline_policy_sql=baseline_policy_sql,
-            baseline_contract_sql=baseline_contract_sql,
-            exact_proof_sql=exact_proof_sql,
+        _artifact_baseline_proof_fragments(
+            dataset_ref,
+            metadata,
+            verification,
+            candidate_alias,
+            baseline_alias,
+            completion_proof_required_version,
+            reviewed_root_count,
+            require_reviewed_root_policy_absent,
         )
     )
 
@@ -15141,6 +15393,10 @@ def _artifact_baseline_contract_sql(
         AND {baseline_proof} ->> 'dataset_hash' = {baseline_alias}.dataset_hash
         AND {baseline_proof} ->> 'resource_count'
             = {baseline_alias}.resource_count::text
+        AND {_artifact_proof_hash_identity_sql(
+            baseline_metadata,
+            baseline_proof,
+        )}
         AND {subset_parent_proof_sql}
     """
 
@@ -15364,6 +15620,15 @@ def _artifact_optional_metadata_fields_sql() -> str:
             _artifact_optional_metadata_sql(REVIEWED_ROOT_POLICY_METADATA_KEY),
             _artifact_optional_metadata_sql(
                 PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+            ),
+            _artifact_optional_metadata_sql(
+                RESOURCE_HASH_CONTRACT_METADATA_KEY
+            ),
+            _artifact_optional_metadata_sql(
+                PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+            ),
+            _artifact_optional_metadata_sql(
+                SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
             ),
         )
     )
@@ -15736,6 +16001,221 @@ def _artifact_dataset_row_identity(
     return value_by_name, serving_endpoint_id
 
 
+@dataclass(frozen=True)
+class _ArtifactContentProofIdentity:
+    resource_hash_contract: str
+    semantic_projection_as_of: str | None
+    proof_resource_scope: tuple[str, ...] | None
+
+
+def _artifact_content_proof_identity(
+    publication_metadata: dict[str, Any],
+    selected_resources: tuple[str, ...],
+    dataset_id: str,
+) -> _ArtifactContentProofIdentity:
+    """Recover one artifact's persisted hash, date, and resource scope."""
+
+    try:
+        resource_hash_contract = _dataset_resource_hash_contract(
+            {"publication_metadata_json": publication_metadata}
+        )
+        semantic_projection_as_of = _dataset_semantic_projection_as_of(
+            {"publication_metadata_json": publication_metadata},
+            resource_hash_contract,
+        )
+        proof_resource_scope = _dataset_proof_resource_scope(
+            {"publication_metadata_json": publication_metadata},
+            selected_resources,
+            resource_hash_contract,
+        )
+    except RuntimeError as error:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_content_proof_invalid:"
+            + dataset_id
+        ) from error
+    return _ArtifactContentProofIdentity(
+        resource_hash_contract=resource_hash_contract,
+        semantic_projection_as_of=semantic_projection_as_of,
+        proof_resource_scope=proof_resource_scope,
+    )
+
+
+def _artifact_content_proof_source_ids(
+    publication_metadata: dict[str, Any],
+    source_id: str,
+    dataset_id: str,
+) -> tuple[str, ...]:
+    """Return the canonical nonempty source scope committed by a proof."""
+
+    raw_source_ids = publication_metadata.get("source_ids")
+    source_ids = (
+        tuple(sorted(raw_source_ids))
+        if isinstance(raw_source_ids, list)
+        and all(
+            isinstance(source_id_value, str)
+            and bool(source_id_value)
+            and source_id_value == source_id_value.strip()
+            for source_id_value in raw_source_ids
+        )
+        else ()
+    )
+    if (
+        not source_ids
+        or len(source_ids) != len(set(source_ids))
+        or source_id not in source_ids
+    ):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_content_proof_invalid:"
+            + dataset_id
+        )
+    return source_ids
+
+
+def _artifact_content_proof_resources(
+    raw_content_proof: Any,
+    *,
+    dataset_id: str,
+    endpoint_id: str,
+    evidence_run_id: str,
+    source_ids: tuple[str, ...],
+    selected_resources: tuple[str, ...],
+    proof_identity: _ArtifactContentProofIdentity,
+) -> tuple[str, ...]:
+    """Validate a sealed content proof and return every proven family."""
+
+    try:
+        stored_proof = validate_stored_dataset_proof_metadata(
+            raw_content_proof,
+            dataset_id=dataset_id,
+            endpoint_id=endpoint_id,
+            acquisition_root_run_id=evidence_run_id,
+            source_ids=source_ids,
+            selected_resources=selected_resources,
+            options=ProviderDirectoryStoredProofOptions(
+                proof_resource_scope=proof_identity.proof_resource_scope,
+                expected_resource_hash_contract=(
+                    proof_identity.resource_hash_contract
+                ),
+                expected_semantic_projection_as_of=(
+                    proof_identity.semantic_projection_as_of
+                ),
+            ),
+        )
+    except ProviderDirectoryProofStoreError as error:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_content_proof_invalid:"
+            + dataset_id
+        ) from error
+    return tuple(sorted(stored_proof["resource_counts"]))
+
+
+def _artifact_dataset_retained_resources(
+    *,
+    source_id: str,
+    endpoint_id: str,
+    dataset_id: str,
+    evidence_run_id: str,
+    selected_resources: tuple[str, ...],
+    publication_metadata: dict[str, Any],
+) -> tuple[str, ...]:
+    """Return the exact proof-bearing families available to artifacts."""
+
+    proof_identity = _artifact_content_proof_identity(
+        publication_metadata,
+        selected_resources,
+        dataset_id,
+    )
+    if source_id == UHC_RETAINED_SOURCE_ID:
+        if (
+            proof_identity.resource_hash_contract
+            == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            or proof_identity.proof_resource_scope is not None
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_content_proof_invalid:"
+                + dataset_id
+            )
+        return selected_resources
+    raw_content_proof = publication_metadata.get(
+        PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+    )
+    if raw_content_proof is None:
+        if (
+            proof_identity.resource_hash_contract
+            == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        ):
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_artifact_content_proof_invalid:"
+                + dataset_id
+            )
+        return selected_resources
+    source_ids = _artifact_content_proof_source_ids(
+        publication_metadata,
+        source_id,
+        dataset_id,
+    )
+    return _artifact_content_proof_resources(
+        raw_content_proof,
+        dataset_id=dataset_id,
+        endpoint_id=endpoint_id,
+        evidence_run_id=evidence_run_id,
+        source_ids=source_ids,
+        selected_resources=selected_resources,
+        proof_identity=proof_identity,
+    )
+
+
+def _artifact_dataset_row_verification_fields(
+    dataset_row_map: Mapping[str, Any],
+    source_record: dict[str, Any],
+    publication_metadata: dict[str, Any],
+    recorded_expected_resources: tuple[str, ...],
+    selection_state: dict[str, Any],
+    dataset_id: str,
+) -> dict[str, Any]:
+    """Build verification fields from one already-validated dataset row."""
+
+    completion_proof = _json_object(
+        dataset_row_map.get("completion_proof_json")
+    )
+    return _artifact_dataset_verification_fields(
+        source_record,
+        publication_metadata,
+        recorded_expected_resources,
+        dataset_id,
+        should_repoint_source_alias=(
+            selection_state["promote_on_cutover"]
+            or selection_state["reconcile_source_alias_on_cutover"]
+        ),
+        completion_proof_required_version=selection_state[
+            "completion_proof_required_version"
+        ],
+        completion_proof_cutoff=_clean_text(completion_proof.get("cutoff")),
+    )
+
+
+def _validate_artifact_finalized_content_proof(
+    dataset_row_map: Mapping[str, Any],
+    publication_metadata: Mapping[str, Any],
+    evidence_run_id: str,
+    dataset_id: str,
+) -> None:
+    """Bind an artifact row to the same finalized proof used by replay."""
+
+    finalized_dataset_by_field = dict(dataset_row_map)
+    finalized_dataset_by_field["acquisition_root_run_id"] = evidence_run_id
+    try:
+        _validate_finalized_content_proof(
+            finalized_dataset_by_field,
+            publication_metadata,
+        )
+    except RuntimeError as error:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_artifact_content_proof_invalid:"
+            + dataset_id
+        ) from error
+
+
 def _provider_directory_artifact_dataset_from_row(
     dataset_row: Any,
 ) -> ProviderDirectoryArtifactDataset | None:
@@ -15758,24 +16238,27 @@ def _provider_directory_artifact_dataset_from_row(
     publication_metadata = _json_object(
         dataset_row_map.get("publication_metadata_json")
     )
-    _validate_finalized_subset_completion_pair(
+    retained_resources = _artifact_dataset_retained_resources(
+        source_id=value_by_name["source_id"] or "",
+        endpoint_id=value_by_name["endpoint_id"] or "",
+        dataset_id=dataset_id,
+        evidence_run_id=value_by_name["evidence_run_id"] or "",
+        selected_resources=selected_resources,
+        publication_metadata=publication_metadata,
+    )
+    _validate_artifact_finalized_content_proof(
         dataset_row_map,
         publication_metadata,
+        value_by_name["evidence_run_id"] or "",
+        dataset_id,
     )
-    completion_proof = _json_object(dataset_row_map.get("completion_proof_json"))
-    verification_fields_by_name = _artifact_dataset_verification_fields(
+    verification_fields_by_name = _artifact_dataset_row_verification_fields(
+        dataset_row_map,
         source_record,
         publication_metadata,
         recorded_expected_resources,
+        selection_state,
         dataset_id,
-        should_repoint_source_alias=(
-            selection_state["promote_on_cutover"]
-            or selection_state["reconcile_source_alias_on_cutover"]
-        ),
-        completion_proof_required_version=selection_state[
-            "completion_proof_required_version"
-        ],
-        completion_proof_cutoff=_clean_text(completion_proof.get("cutoff")),
     )
     return ProviderDirectoryArtifactDataset(
         source_id=value_by_name["source_id"] or "",
@@ -15784,6 +16267,7 @@ def _provider_directory_artifact_dataset_from_row(
         evidence_run_id=value_by_name["evidence_run_id"] or "",
         serving_endpoint_id=serving_endpoint_id,
         selected_resources=selected_resources,
+        retained_resources=retained_resources,
         expected_resources=expected_resources,
         recorded_expected_resources=recorded_expected_resources,
         **verification_fields_by_name,
@@ -16780,6 +17264,7 @@ def _artifact_endpoint_selection_identity(
     return (
         dataset.dataset_id,
         dataset.selected_resources,
+        dataset.artifact_resources,
         dataset.expected_resources,
         dataset.recorded_expected_resources,
         dataset.status,
@@ -17179,7 +17664,10 @@ def _artifact_target_dependency_violation(
         artifact_target
     ]
     selected_resources = set(dataset.selected_resources)
-    if artifact_target == "corroboration" and "InsurancePlan" not in selected_resources:
+    if (
+        artifact_target == "corroboration"
+        and "InsurancePlan" not in selected_resources
+    ):
         return None
     if not selected_resources.intersection(set().union(*alternatives)):
         return None
@@ -17287,7 +17775,7 @@ def _artifact_scope_resource_pairs(
         {
             (dataset.dataset_id, resource_type)
             for dataset in fence.datasets
-            for resource_type in dataset.selected_resources
+            for resource_type in dataset.artifact_resources
             if resource_type in resource_types
         }
     )
@@ -18227,7 +18715,7 @@ async def _provider_directory_artifact_resource_exact_projection(
             dataset
             for dataset in fence.datasets
             if resource_type in resource_types
-            and resource_type in dataset.selected_resources
+            and resource_type in dataset.artifact_resources
         ),
         key=lambda item: (item.source_id, item.dataset_id),
     )
@@ -18901,7 +19389,7 @@ def _artifact_scope_resource_datasets(
             dataset
             for dataset in fence.datasets
             if resource_type in resource_types
-            and resource_type in dataset.selected_resources
+            and resource_type in dataset.artifact_resources
         ),
         key=lambda dataset: (dataset.source_id, dataset.dataset_id),
     )
@@ -21026,6 +21514,24 @@ def _source_summary_candidate_from_metadata_record(
         dataset,
         required_source_ids,
     )
+    try:
+        resource_hash_contract = _dataset_resource_hash_contract(
+            {"publication_metadata_json": publication_metadata}
+        )
+        semantic_projection_as_of = _dataset_semantic_projection_as_of(
+            {"publication_metadata_json": publication_metadata},
+            resource_hash_contract,
+        )
+        proof_resource_scope = _dataset_proof_resource_scope(
+            {"publication_metadata_json": publication_metadata},
+            dataset.selected_resources,
+            resource_hash_contract,
+        )
+    except RuntimeError as error:
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_source_summary_hash_identity_invalid:"
+            + dataset.dataset_id
+        ) from error
     return (
         EndpointDatasetCandidate(
             endpoint_id=dataset.endpoint_id,
@@ -21035,9 +21541,9 @@ def _source_summary_candidate_from_metadata_record(
             selected_resources=dataset.selected_resources,
             import_run_id=dataset.evidence_run_id,
             previous_dataset_id=dataset.previous_dataset_id,
-            resource_hash_contract=_dataset_resource_hash_contract(
-                {"publication_metadata_json": publication_metadata}
-            ),
+            resource_hash_contract=resource_hash_contract,
+            semantic_projection_as_of=semantic_projection_as_of,
+            proof_resource_scope=proof_resource_scope,
             expected_resources=dataset.expected_resources,
         ),
         publication_metadata,
@@ -21348,6 +21854,10 @@ async def _generic_artifact_content_proof(
     candidate: EndpointDatasetCandidate,
     publication_metadata: dict[str, Any],
 ) -> EndpointDatasetContentProof:
+    proof_resource_scope = _candidate_proof_resource_scope(candidate)
+    content_resource_scope = (
+        proof_resource_scope or dataset.selected_resources
+    )
     raw_content_proof = publication_metadata.get(
         PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
     )
@@ -21355,8 +21865,9 @@ async def _generic_artifact_content_proof(
         return await _endpoint_dataset_content_proof(
             db,
             dataset.dataset_id,
-            dataset.selected_resources,
+            content_resource_scope,
             verify_payload_hashes=True,
+            resource_hash_contract=candidate.resource_hash_contract,
         )
     try:
         stored_proof = validate_stored_dataset_proof_metadata(
@@ -21366,6 +21877,15 @@ async def _generic_artifact_content_proof(
             acquisition_root_run_id=dataset.evidence_run_id,
             source_ids=candidate.source_ids,
             selected_resources=dataset.selected_resources,
+            options=ProviderDirectoryStoredProofOptions(
+                proof_resource_scope=proof_resource_scope,
+                expected_resource_hash_contract=(
+                    candidate.resource_hash_contract
+                ),
+                expected_semantic_projection_as_of=(
+                    candidate.semantic_projection_as_of
+                ),
+            ),
         )
     except ProviderDirectoryProofStoreError as error:
         raise ProviderDirectoryArtifactBuildStale(
@@ -21639,6 +22159,7 @@ def _artifact_fence_selection_identity(
                     dataset.dataset_id,
                     dataset.evidence_run_id,
                     dataset.selected_resources,
+                    dataset.artifact_resources,
                     dataset.expected_resources,
                     dataset.recorded_expected_resources,
                     dataset.status,
@@ -36345,6 +36866,74 @@ def _canonical_resource_payload(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resource_payload_for_contract(
+    model: type,
+    resource_row_by_field: dict[str, Any],
+    resource_hash_contract: str,
+) -> dict[str, Any]:
+    payload_by_field = _canonical_resource_payload(resource_row_by_field)
+    if (
+        model is ProviderDirectoryPractitioner
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        return canonical_practitioner_payload(payload_by_field)
+    return payload_by_field
+
+
+def _merge_resource_payload_for_contract(
+    model: type,
+    first_payload: dict[str, Any],
+    second_payload: dict[str, Any],
+    resource_hash_contract: str,
+) -> dict[str, Any]:
+    if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        if model is ProviderDirectoryPractitioner:
+            return merge_practitioner_semantic_payloads(
+                first_payload,
+                second_payload,
+            )
+        return merge_semantic_resource_payloads(
+            first_payload,
+            second_payload,
+        )
+    return second_payload
+
+
+def _canonical_compatibility_resource_row(
+    api_base: str,
+    resource_type: str,
+    resource_id: str,
+    payload_by_field: dict[str, Any],
+    observation_by_field: dict[str, Any],
+    run_id: str | None,
+    store_payload: bool,
+    resource_hash_contract: str,
+) -> dict[str, Any]:
+    """Build one compatibility row from its selected observation."""
+
+    observed_at = observation_by_field.get("observed_at") or _now()
+    return {
+        "canonical_api_base": api_base,
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "resource_url": payload_by_field.get("resource_url"),
+        "fhir_meta": payload_by_field.get("fhir_meta"),
+        "fhir_self_url": payload_by_field.get("fhir_self_url"),
+        "fhir_fetch_url": payload_by_field.get("fhir_fetch_url"),
+        "fhir_fetch_mode": payload_by_field.get("fhir_fetch_mode"),
+        "payload_hash": resource_payload_sha256_for_contract(
+            payload_by_field,
+            resource_hash_contract,
+        ),
+        "payload_json": payload_by_field if store_payload else None,
+        "first_seen_run_id": run_id,
+        "last_seen_run_id": run_id,
+        "observed_at": observed_at,
+        "updated_at": observation_by_field.get("updated_at") or observed_at,
+    }
+
+
 def _canonical_resource_rows(
     model,
     resource_rows: list[dict[str, Any]],
@@ -36354,38 +36943,150 @@ def _canonical_resource_rows(
     store_payload: bool = True,
     resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT,
 ) -> list[dict[str, Any]]:
+    """Build deterministic compatibility rows under one hash contract."""
+
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
     api_base = _canonical_base(canonical_api_base)
     if not resource_type or not api_base:
         return []
-    resource_rows_by_id: dict[str, dict[str, Any]] = {}
+    payload_by_resource_id: dict[str, dict[str, Any]] = {}
+    observation_by_resource_id: dict[str, dict[str, Any]] = {}
     for resource_row_by_field in resource_rows:
         resource_id = _clean_text(resource_row_by_field.get("resource_id"))
         if not resource_id:
             continue
-        payload_by_field = _canonical_resource_payload(resource_row_by_field)
-        payload_hash = resource_payload_sha256_for_contract(
+        incoming_payload = _resource_payload_for_contract(
+            model,
+            resource_row_by_field,
+            resource_hash_contract,
+        )
+        existing_payload = payload_by_resource_id.get(resource_id)
+        payload_by_resource_id[resource_id] = (
+            _merge_resource_payload_for_contract(
+                model,
+                existing_payload,
+                incoming_payload,
+                resource_hash_contract,
+            )
+            if existing_payload is not None
+            else incoming_payload
+        )
+        observation_by_resource_id[resource_id] = resource_row_by_field
+    resource_rows_by_id: dict[str, dict[str, Any]] = {}
+    for resource_id, payload_by_field in payload_by_resource_id.items():
+        resource_rows_by_id[resource_id] = (
+            _canonical_compatibility_resource_row(
+                api_base,
+                resource_type,
+                resource_id,
+                payload_by_field,
+                observation_by_resource_id[resource_id],
+                run_id,
+                store_payload,
+                resource_hash_contract,
+            )
+        )
+    return list(resource_rows_by_id.values())
+
+
+def _validated_acquired_resource_sha256(
+    resource_row_by_field: dict[str, Any],
+    resource_hash_contract: str,
+) -> str | None:
+    """Validate one optional raw-resource commitment."""
+
+    acquired_resource_sha256 = resource_row_by_field.get(
+        "_acquired_resource_sha256"
+    )
+    if acquired_resource_sha256 is not None and (
+        type(acquired_resource_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", acquired_resource_sha256) is None
+    ):
+        raise ValueError(
+            "provider_directory_subset_acquired_content_invalid"
+        )
+    if (
+        acquired_resource_sha256 is not None
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        raise ValueError(
+            "provider_directory_subset_resource_hash_contract_invalid"
+        )
+    return acquired_resource_sha256
+
+
+def _dataset_payloads_by_resource_id(
+    model: type,
+    resource_rows: list[dict[str, Any]],
+    resource_hash_contract: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str | None]]:
+    """Merge repeated identities and bind their raw-resource commitments."""
+
+    payload_by_resource_id: dict[str, dict[str, Any]] = {}
+    acquired_hash_by_resource_id: dict[str, str | None] = {}
+    for resource_row_by_field in resource_rows:
+        resource_id = _clean_text(resource_row_by_field.get("resource_id"))
+        if not resource_id:
+            continue
+        acquired_sha256 = _validated_acquired_resource_sha256(
+            resource_row_by_field,
+            resource_hash_contract,
+        )
+        incoming_payload = _resource_payload_for_contract(
+            model,
+            resource_row_by_field,
+            resource_hash_contract,
+        )
+        existing_payload = payload_by_resource_id.get(resource_id)
+        payload_by_resource_id[resource_id] = (
+            _merge_resource_payload_for_contract(
+                model,
+                existing_payload,
+                incoming_payload,
+                resource_hash_contract,
+            )
+            if existing_payload is not None
+            else incoming_payload
+        )
+        if resource_id in acquired_hash_by_resource_id:
+            if acquired_hash_by_resource_id[resource_id] != acquired_sha256:
+                raise ValueError(
+                    "provider_directory_subset_acquired_content_conflict"
+                )
+        else:
+            acquired_hash_by_resource_id[resource_id] = acquired_sha256
+    return payload_by_resource_id, acquired_hash_by_resource_id
+
+
+def _retained_dataset_resource_record(
+    dataset_id: str,
+    resource_type: str,
+    resource_id: str,
+    payload_by_field: dict[str, Any],
+    acquired_resource_sha256: str | None,
+    resource_hash_contract: str,
+) -> dict[str, Any]:
+    """Build one retained row under its exact persisted hash contract."""
+
+    payload_hash = (
+        subset_payload_sha256(
+            resource_content_hash_payload(payload_by_field)
+        )
+        if acquired_resource_sha256 is not None
+        else resource_payload_sha256_for_contract(
             payload_by_field,
             resource_hash_contract,
         )
-        observed_at = resource_row_by_field.get("observed_at") or _now()
-        resource_rows_by_id[resource_id] = {
-            "canonical_api_base": api_base,
-            "resource_type": resource_type,
-            "resource_id": resource_id,
-            "resource_url": resource_row_by_field.get("resource_url"),
-            "fhir_meta": resource_row_by_field.get("fhir_meta"),
-            "fhir_self_url": resource_row_by_field.get("fhir_self_url"),
-            "fhir_fetch_url": resource_row_by_field.get("fhir_fetch_url"),
-            "fhir_fetch_mode": resource_row_by_field.get("fhir_fetch_mode"),
-            "payload_hash": payload_hash,
-            "payload_json": payload_by_field if store_payload else None,
-            "first_seen_run_id": run_id,
-            "last_seen_run_id": run_id,
-            "observed_at": observed_at,
-            "updated_at": resource_row_by_field.get("updated_at") or observed_at,
-        }
-    return list(resource_rows_by_id.values())
+    )
+    return {
+        "dataset_id": dataset_id,
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "payload_hash": payload_hash,
+        "payload_json": payload_by_field,
+        "acquired_resource_sha256": acquired_resource_sha256,
+    }
 
 
 def _endpoint_dataset_resource_rows(
@@ -36393,46 +37094,38 @@ def _endpoint_dataset_resource_rows(
     resource_rows: list[dict[str, Any]],
     *,
     dataset_id: str | None,
-    resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT,
+    resource_hash_contract: str,
 ) -> list[dict[str, Any]]:
+    """Build deduplicated retained rows with exact contract hashes."""
+
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
     if not dataset_id or not resource_type:
         return []
-    resources_by_id: dict[str, dict[str, Any]] = {}
-    for resource_row_by_field in resource_rows:
-        resource_id = _clean_text(resource_row_by_field.get("resource_id"))
-        if not resource_id:
-            continue
-        acquired_resource_sha256 = resource_row_by_field.get(
-            "_acquired_resource_sha256"
+    if resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
+        raise ValueError(
+            "provider_directory_resource_hash_contract_invalid"
         )
-        payload_by_field = _canonical_resource_payload(resource_row_by_field)
-        if acquired_resource_sha256 is not None and (
-            type(acquired_resource_sha256) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", acquired_resource_sha256) is None
-        ):
-            raise ValueError(
-                "provider_directory_subset_acquired_content_invalid"
-            )
-        payload_hash = (
-            subset_payload_sha256(
-                resource_content_hash_payload(payload_by_field)
-            )
-            if acquired_resource_sha256 is not None
-            else resource_payload_sha256_for_contract(
-                payload_by_field,
-                resource_hash_contract,
-            )
+    payload_by_resource_id, acquired_hash_by_resource_id = (
+        _dataset_payloads_by_resource_id(
+            model,
+            resource_rows,
+            resource_hash_contract,
         )
-        resources_by_id[resource_id] = {
-            "dataset_id": dataset_id,
-            "resource_type": resource_type,
-            "resource_id": resource_id,
-            "payload_hash": payload_hash,
-            "payload_json": payload_by_field,
-            "acquired_resource_sha256": acquired_resource_sha256,
-        }
-    return [resources_by_id[resource_id] for resource_id in sorted(resources_by_id)]
+    )
+    resource_by_id: dict[str, dict[str, Any]] = {}
+    for resource_id, payload_by_field in payload_by_resource_id.items():
+        resource_by_id[resource_id] = _retained_dataset_resource_record(
+            dataset_id,
+            resource_type,
+            resource_id,
+            payload_by_field,
+            acquired_hash_by_resource_id[resource_id],
+            resource_hash_contract,
+        )
+    return [
+        resource_by_id[resource_id]
+        for resource_id in sorted(resource_by_id)
+    ]
 
 
 def _source_resource_edge_rows(
@@ -40198,14 +40891,47 @@ def _bundle_entries(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
     return entries
 
 
+def _source_semantic_projection_as_of(
+    source_record: Mapping[str, Any] | None,
+) -> datetime.date | None:
+    """Return the immutable root-scoped derived-field date."""
+
+    if source_record is None:
+        return None
+    raw_value = source_record.get("_semantic_projection_as_of")
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, datetime.date):
+        return raw_value
+    if not isinstance(raw_value, str):
+        raise ValueError(
+            "provider_directory_semantic_projection_as_of_invalid"
+        )
+    try:
+        projection_date = datetime.date.fromisoformat(raw_value)
+    except ValueError as error:
+        raise ValueError(
+            "provider_directory_semantic_projection_as_of_invalid"
+        ) from error
+    if projection_date.isoformat() != raw_value:
+        raise ValueError(
+            "provider_directory_semantic_projection_as_of_invalid"
+        )
+    return projection_date
+
+
 def _rest_bundle_acquisition(
     entry: dict[str, Any],
     fetch_url: str,
+    source_record: Mapping[str, Any] | None = None,
 ) -> FHIRAcquisitionContext:
     return FHIRAcquisitionContext(
         self_url=_clean_text(entry.get("fullUrl")),
         fetch_url=fetch_url,
         fetch_mode="rest_bundle",
+        semantic_projection_as_of=_source_semantic_projection_as_of(
+            source_record
+        ),
     )
 
 
@@ -40289,7 +41015,11 @@ def _parsed_current_version_census_entries(
             source_record["source_id"],
             raw_resource,
             resource_url=_clean_text(entry_by_field.get("fullUrl")),
-            acquisition=_rest_bundle_acquisition(entry_by_field, request_url),
+            acquisition=_rest_bundle_acquisition(
+                entry_by_field,
+                request_url,
+                source_record,
+            ),
             run_id=run_id,
             normalize_location_contacts=normalize_location_contacts,
         )
@@ -44826,6 +45556,11 @@ class _BulkOutputStreamState:
             acquisition=FHIRAcquisitionContext(
                 fetch_url=log_identity,
                 fetch_mode="bulk_ndjson",
+                semantic_projection_as_of=(
+                    _source_semantic_projection_as_of(
+                        context.source_record
+                    )
+                ),
             ),
             run_id=context.run_id,
             normalize_location_contacts=not (
@@ -46709,7 +47444,11 @@ async def _consume_partition_entries(
             source_record["source_id"],
             entry_record["resource"],
             resource_url=_clean_text(entry_record.get("fullUrl")),
-            acquisition=_rest_bundle_acquisition(entry_record, fetch_url),
+            acquisition=_rest_bundle_acquisition(
+                entry_record,
+                fetch_url,
+                source_record,
+            ),
             run_id=fetch_options.run_id,
             normalize_location_contacts=not (resource_type == "Location" and fetch_options.row_batch_handler),
         )
@@ -48396,17 +49135,55 @@ def _partition_fingerprint_rows(
     return fingerprint_rows
 
 
+def _dataset_proof_rows_by_dataset(
+    incoming_resource_rows: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Group proof-bearing rows by their immutable parent dataset."""
+
+    proof_rows_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for dataset_resource_row in incoming_resource_rows:
+        resource_type = (
+            _clean_text(dataset_resource_row.get("resource_type")) or ""
+        )
+        dataset_id = (
+            _clean_text(dataset_resource_row.get("dataset_id")) or ""
+        )
+        if dataset_id and not resource_type.startswith("LU:"):
+            proof_rows_by_dataset.setdefault(dataset_id, []).append(
+                dataset_resource_row
+            )
+    if not proof_rows_by_dataset:
+        raise RuntimeError(
+            "provider_directory_dataset_resource_proof_rows_missing"
+        )
+    return proof_rows_by_dataset
+
+
 async def _upsert_dataset_resource_rows_on_connection(
     connection: Any,
     resource_rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     *,
     persist_content_proof: bool = False,
+    resource_hash_contract: str | None = None,
+    semantic_projection_as_of: str | None = None,
 ) -> None:
+    """Persist retained rows and page-local proof in one transaction."""
+
     if not resource_rows:
         return
+    if persist_content_proof and resource_hash_contract is None:
+        raise RuntimeError(
+            "provider_directory_resource_hash_contract_required"
+        )
     table = ProviderDirectoryDatasetResource.__table__
     primary_keys = ["dataset_id", "resource_type", "resource_id"]
-    row_list = list(resource_rows)
+    incoming_resource_rows = list(resource_rows)
+    row_list = await _accumulated_endpoint_dataset_rows(
+        connection,
+        incoming_resource_rows,
+        resource_hash_contract=resource_hash_contract,
+        semantic_projection_as_of=semantic_projection_as_of,
+    )
     await _lock_mutable_endpoint_dataset_resource_parents(
         connection,
         _endpoint_dataset_resource_parent_ids(row_list),
@@ -48429,28 +49206,16 @@ async def _upsert_dataset_resource_rows_on_connection(
         await connection.status(statement)
     if not persist_content_proof:
         return
-    proof_rows_by_dataset: dict[str, list[dict[str, Any]]] = {}
-    for dataset_resource_row in row_list:
-        resource_type = (
-            _clean_text(dataset_resource_row.get("resource_type")) or ""
-        )
-        dataset_id = (
-            _clean_text(dataset_resource_row.get("dataset_id")) or ""
-        )
-        if dataset_id and not resource_type.startswith("LU:"):
-            proof_rows_by_dataset.setdefault(dataset_id, []).append(
-                dataset_resource_row
-            )
-    if not proof_rows_by_dataset:
-        raise RuntimeError(
-            "provider_directory_dataset_resource_proof_rows_missing"
-        )
+    proof_rows_by_dataset = _dataset_proof_rows_by_dataset(
+        incoming_resource_rows
+    )
     for dataset_id, proof_rows in sorted(proof_rows_by_dataset.items()):
         await persist_dataset_proof_shard(
             connection,
             _schema(),
             proof_rows,
             dataset_id=dataset_id,
+            expected_resource_hash_contract=resource_hash_contract,
         )
 
 
@@ -48489,6 +49254,60 @@ async def _store_partition_pass_proof(
     )
 
 
+def _last_updated_partition_hash_identity(
+    source_record: dict[str, Any],
+) -> tuple[str, str | None]:
+    """Validate the root-scoped hash identity for one staged window."""
+
+    resource_hash_contract = source_record.get("_resource_hash_contract")
+    if resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
+        raise RuntimeError(
+            "provider_directory_resource_hash_contract_required"
+        )
+    semantic_projection_as_of = source_record.get(
+        "_semantic_projection_as_of"
+    )
+    if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        semantic_projection_as_of = _validated_semantic_projection_as_of(
+            semantic_projection_as_of
+        )
+    else:
+        semantic_projection_as_of = None
+    return resource_hash_contract, semantic_projection_as_of
+
+
+def _last_updated_partition_parsed_rows(
+    source_record: dict[str, Any],
+    model: type,
+    resources: tuple[dict[str, Any], ...],
+    *,
+    run_id: str | None,
+    fetch_url: str,
+) -> list[dict[str, Any]]:
+    """Parse one complete partition window through the normal mapper."""
+
+    parsed_rows: list[dict[str, Any]] = []
+    for resource in resources:
+        parsed = parse_fhir_resource(
+            source_record["source_id"],
+            resource,
+            acquisition=FHIRAcquisitionContext(
+                fetch_url=fetch_url,
+                fetch_mode="rest_bundle",
+                semantic_projection_as_of=(
+                    _source_semantic_projection_as_of(source_record)
+                ),
+            ),
+            run_id=run_id,
+        )
+        if parsed is None or parsed[0] is not model:
+            raise RuntimeError(
+                "provider_directory_last_updated_partition_resource_parse_failed"
+            )
+        parsed_rows.append(parsed[1])
+    return parsed_rows
+
+
 async def _stage_last_updated_partition_window(
     context: PaginationCheckpointContext,
     source_record: dict[str, Any],
@@ -48499,27 +49318,29 @@ async def _stage_last_updated_partition_window(
     run_id: str | None,
     fetch_url: str,
 ) -> LastUpdatedPartitionStage:
-    parsed_rows: list[dict[str, Any]] = []
-    for resource in resources:
-        parsed = parse_fhir_resource(
-            source_record["source_id"],
-            resource,
-            acquisition=FHIRAcquisitionContext(
-                fetch_url=fetch_url,
-                fetch_mode="rest_bundle",
-            ),
-            run_id=run_id,
-        )
-        if parsed is None or parsed[0] is not model:
-            raise RuntimeError(
-                "provider_directory_last_updated_partition_resource_parse_failed"
-            )
-        parsed_rows.append(parsed[1])
+    """Parse and hash one partition window under the root contract."""
+
+    parsed_rows = _last_updated_partition_parsed_rows(
+        source_record,
+        model,
+        resources,
+        run_id=run_id,
+        fetch_url=fetch_url,
+    )
+    resource_hash_contract, semantic_projection_as_of = (
+        _last_updated_partition_hash_identity(source_record)
+    )
+    _assert_practitioner_semantic_projection_as_of(
+        model,
+        parsed_rows,
+        resource_hash_contract,
+        semantic_projection_as_of,
+    )
     staged_rows = _endpoint_dataset_resource_rows(
         model,
         parsed_rows,
         dataset_id=context.dataset_id,
-        resource_hash_contract=source_record.get("_resource_hash_contract"),
+        resource_hash_contract=resource_hash_contract,
     )
     if len(staged_rows) != len(resources):
         raise RuntimeError(
@@ -48531,6 +49352,8 @@ async def _stage_last_updated_partition_window(
             staged_row["resource_id"]: staged_row["payload_hash"]
             for staged_row in staged_rows
         },
+        resource_hash_contract=resource_hash_contract,
+        semantic_projection_as_of=semantic_projection_as_of,
     )
 
 
@@ -49310,6 +50133,12 @@ async def _persist_partition_pass(
                     connection,
                     candidate_stage.rows,
                     persist_content_proof=True,
+                    resource_hash_contract=(
+                        candidate_stage.resource_hash_contract
+                    ),
+                    semantic_projection_as_of=(
+                        candidate_stage.semantic_projection_as_of
+                    ),
                 )
             await _store_partition_pass_proof(
                 state.context,
@@ -51370,7 +52199,11 @@ async def _fetch_resource_rows(
                         source_record["source_id"],
                         entry["resource"],
                         resource_url=_clean_text(entry.get("fullUrl")),
-                        acquisition=_rest_bundle_acquisition(entry, url),
+                        acquisition=_rest_bundle_acquisition(
+                            entry,
+                            url,
+                            source_record,
+                        ),
                         run_id=run_id,
                         normalize_location_contacts=not (
                             resource_type == "Location"
@@ -51883,7 +52716,11 @@ async def _fetch_scan_practitioner_role_rows(
                     source_record["source_id"],
                     entry["resource"],
                     resource_url=_clean_text(entry.get("fullUrl")),
-                    acquisition=_rest_bundle_acquisition(entry, url),
+                    acquisition=_rest_bundle_acquisition(
+                        entry,
+                        url,
+                        source_record,
+                    ),
                     run_id=options.run_id,
                 )
                 if not parsed:
@@ -51997,7 +52834,10 @@ def _parse_practitioner_role_reverse_lookup_rows(
             source_id,
             entry["resource"],
             resource_url=_clean_text(entry.get("fullUrl")),
-            acquisition=_rest_bundle_acquisition(entry, fetch_url),
+            acquisition=_rest_bundle_acquisition(
+                entry,
+                fetch_url,
+            ),
             run_id=run_id,
         )
         if not parsed:
@@ -52322,6 +53162,25 @@ def _linked_resource_refs(rows_by_resource: dict[str, list[dict[str, Any]]]) -> 
     return refs
 
 
+def _source_proof_resource_scope(
+    source_record: Mapping[str, Any],
+) -> frozenset[str] | None:
+    """Return a resumed root's persisted linked-family allowance."""
+
+    raw_scope = source_record.get("_proof_resource_scope")
+    if raw_scope is None:
+        return None
+    if (
+        type(raw_scope) is not list
+        or raw_scope != sorted(set(raw_scope))
+        or not set(raw_scope).issubset(DEFAULT_RESOURCES)
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_scope_invalid"
+        )
+    return frozenset(raw_scope)
+
+
 async def _fetch_linked_resource_row(
     source_record: dict[str, Any],
     resource_type: str,
@@ -52351,13 +53210,20 @@ async def _fetch_linked_resource_row(
             self_url=url,
             fetch_url=url,
             fetch_mode="rest_read",
+            semantic_projection_as_of=(
+                _source_semantic_projection_as_of(source_record)
+            ),
         )
         if response_payload.get("resourceType") == "Bundle":
             entries = _bundle_entries(response_payload)
             bundle_entry = entries[0] if entries else None
             resource_payload = bundle_entry["resource"] if bundle_entry else {}
             if bundle_entry:
-                acquisition = _rest_bundle_acquisition(bundle_entry, url)
+                acquisition = _rest_bundle_acquisition(
+                    bundle_entry,
+                    url,
+                    source_record,
+                )
         parsed = parse_fhir_resource(
             source_record["source_id"],
             resource_payload,
@@ -52365,7 +53231,11 @@ async def _fetch_linked_resource_row(
             acquisition=acquisition,
             run_id=run_id,
         )
-        if parsed and parsed[1].get("resource_id") == resource_id:
+        if (
+            parsed
+            and RESOURCE_TYPES_BY_MODEL.get(parsed[0]) == resource_type
+            and parsed[1].get("resource_id") == resource_id
+        ):
             return parsed
     return None
 
@@ -52396,9 +53266,15 @@ async def _import_linked_resource_rows(
         if resource_row.get("resource_id")
     }
     linked_references: list[tuple[str, str, str, str]] = []
+    proof_resource_scope = _source_proof_resource_scope(source_record)
     for resource_type, resource_id, reference, reference_field in _linked_resource_refs(rows_by_resource):
         if len(linked_references) >= per_source_limit:
             break
+        if (
+            proof_resource_scope is not None
+            and resource_type not in proof_resource_scope
+        ):
+            continue
         if (resource_type, resource_id) in existing_resource_keys:
             continue
         linked_references.append(
@@ -52452,14 +53328,16 @@ async def _import_linked_resource_rows(
             imported = await _upsert_resource_rows(
                 model,
                 resource_rows,
-                run_id=run_id,
-                track_seen=track_seen,
-                seen_table=seen_table,
-                canonical_api_base=canonical_api_base,
-                source_ids=edge_source_ids,
-                dataset_scope=_endpoint_dataset_write_scope(
-                    source_record,
-                    dataset_id,
+                options=ProviderDirectoryResourceWriteOptions(
+                    run_id=run_id,
+                    track_seen=track_seen,
+                    seen_table=seen_table,
+                    canonical_api_base=canonical_api_base,
+                    source_ids=edge_source_ids,
+                    dataset_scope=_endpoint_dataset_write_scope(
+                        source_record,
+                        dataset_id,
+                    ),
                 ),
             )
             if imported:
@@ -52777,7 +53655,11 @@ def _merge_uhc_plan_graph_bundle_rows(
             source_record["source_id"],
             bundle_entry["resource"],
             resource_url=_clean_text(bundle_entry.get("fullUrl")),
-            acquisition=_rest_bundle_acquisition(bundle_entry, fetch_url),
+            acquisition=_rest_bundle_acquisition(
+                bundle_entry,
+                fetch_url,
+                source_record,
+            ),
             run_id=run_id,
         )
         if (
@@ -53162,14 +54044,18 @@ async def _write_uhc_plan_graph_resources(
         written_counts_by_resource[resource_type] = await _upsert_resource_rows(
             RESOURCE_MODELS_BY_TYPE[resource_type],
             _rows_for_compatibility_source(resource_rows, source_record["source_id"]),
-            run_id=run_id,
-            track_seen=stale_cleanup,
-            seen_table=seen_table,
-            canonical_api_base=source_record.get("canonical_api_base")
-            or source_record.get("api_base"),
-            source_ids=[source_record["source_id"]],
-            dataset_scope=_endpoint_dataset_write_scope(
-                source_record
+            options=ProviderDirectoryResourceWriteOptions(
+                run_id=run_id,
+                track_seen=stale_cleanup,
+                seen_table=seen_table,
+                canonical_api_base=(
+                    source_record.get("canonical_api_base")
+                    or source_record.get("api_base")
+                ),
+                source_ids=[source_record["source_id"]],
+                dataset_scope=_endpoint_dataset_write_scope(
+                    source_record
+                ),
             ),
         )
     return written_counts_by_resource
@@ -53987,33 +54873,563 @@ def _resource_rows_with_location_contacts(
     return resource_rows
 
 
+def _assert_practitioner_semantic_projection_as_of(
+    model: type,
+    resource_rows: list[dict[str, Any]],
+    resource_hash_contract: str,
+    semantic_projection_as_of: str | None,
+) -> None:
+    """Fence every v3 derived profile value to the immutable root date."""
+
+    if (
+        model is not ProviderDirectoryPractitioner
+        or resource_hash_contract
+        != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        return
+    expected_as_of = _validated_semantic_projection_as_of(
+        semantic_projection_as_of
+    )
+    for resource_row_by_field in resource_rows:
+        age_projection = (
+            resource_row_by_field.get("age_years"),
+            resource_row_by_field.get("age_as_of"),
+        )
+        practice_projection = (
+            resource_row_by_field.get("years_of_practice"),
+            resource_row_by_field.get("years_of_practice_as_of"),
+            resource_row_by_field.get("years_of_practice_basis"),
+            resource_row_by_field.get("years_of_practice_start_date"),
+        )
+        if any(projection_value is None for projection_value in age_projection) and any(
+            projection_value is not None for projection_value in age_projection
+        ):
+            raise ValueError(
+                "provider_directory_semantic_age_projection_incomplete"
+            )
+        if any(
+            projection_value is None
+            for projection_value in practice_projection
+        ) and any(
+            projection_value is not None
+            for projection_value in practice_projection
+        ):
+            raise ValueError(
+                "provider_directory_semantic_practice_projection_incomplete"
+            )
+        for observed_as_of in (
+            age_projection[1],
+            practice_projection[1],
+        ):
+            if observed_as_of is not None and observed_as_of != expected_as_of:
+                raise ValueError(
+                    "provider_directory_semantic_projection_as_of_mismatch"
+                )
+
+
 async def _persist_endpoint_dataset_rows(
     model: type,
     resource_rows: list[dict[str, Any]],
     dataset_id: str | None,
     *,
     resource_hash_contract: str,
+    semantic_projection_as_of: str | None,
 ) -> list[dict[str, Any]]:
     """Persist immutable endpoint rows and their proof shard transactionally."""
 
-    dataset_rows = _endpoint_dataset_resource_rows(
+    incoming_dataset_rows = _endpoint_dataset_resource_rows(
         model,
         resource_rows,
         dataset_id=dataset_id,
         resource_hash_contract=resource_hash_contract,
     )
-    if not dataset_rows:
-        return dataset_rows
+    if not incoming_dataset_rows:
+        return incoming_dataset_rows
     assert dataset_id is not None
+    _assert_practitioner_semantic_projection_as_of(
+        model,
+        resource_rows,
+        resource_hash_contract,
+        semantic_projection_as_of,
+    )
     async with db.transaction():
+        dataset_rows = await _accumulated_endpoint_dataset_rows(
+            db,
+            incoming_dataset_rows,
+            dataset_id=dataset_id,
+            resource_hash_contract=resource_hash_contract,
+            semantic_projection_as_of=semantic_projection_as_of,
+        )
         await _upsert_rows(ProviderDirectoryDatasetResource, dataset_rows)
         await persist_dataset_proof_shard(
             db,
             _schema(),
-            dataset_rows,
+            incoming_dataset_rows,
             dataset_id=dataset_id,
+            expected_resource_hash_contract=resource_hash_contract,
         )
     return dataset_rows
+
+
+async def _lock_endpoint_dataset_proof_parent(
+    database_executor: Any,
+    dataset_id: str,
+) -> dict[str, Any]:
+    """Share-lock one mutable parent against validation/publication."""
+
+    parent_row = await database_executor.first(
+        f"""
+        SELECT dataset_id, status, is_current, publication_metadata_json
+          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+         WHERE dataset_id = :dataset_id
+         FOR SHARE;
+        """,
+        dataset_id=dataset_id,
+    )
+    parent_by_field = _pagination_checkpoint_row_mapping(parent_row)
+    if (
+        _clean_text(parent_by_field.get("dataset_id")) != dataset_id
+        or _clean_text(parent_by_field.get("status"))
+        != ENDPOINT_DATASET_ACQUIRING
+        or parent_by_field.get("is_current") is not False
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_proof_parent_not_mutable"
+        )
+    return parent_by_field
+
+
+def _validated_endpoint_dataset_resource_scope(
+    raw_scope: Any,
+) -> tuple[str, ...]:
+    """Return one canonical list of supported resource families."""
+
+    if (
+        type(raw_scope) is not list
+        or not raw_scope
+        or not all(
+            isinstance(resource_type, str)
+            and resource_type == resource_type.strip()
+            and resource_type in DEFAULT_RESOURCES
+            for resource_type in raw_scope
+        )
+        or len(set(raw_scope)) != len(raw_scope)
+        or raw_scope != sorted(raw_scope)
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_scope_invalid"
+        )
+    return tuple(raw_scope)
+
+
+def _endpoint_dataset_parent_metadata(
+    parent_by_field: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Decode one parent metadata object without normalizing its identity."""
+
+    metadata = parent_by_field.get("publication_metadata_json")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_resource_scope_invalid"
+            ) from error
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_scope_invalid"
+        )
+    return metadata
+
+
+def _endpoint_dataset_parent_selected_resources(
+    parent_by_field: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return the crawl-root scope committed by one parent."""
+
+    metadata = _endpoint_dataset_parent_metadata(parent_by_field)
+    return _validated_endpoint_dataset_resource_scope(
+        metadata.get("selected_resources")
+    )
+
+
+def _endpoint_dataset_parent_proof_resource_scope(
+    parent_by_field: Mapping[str, Any],
+    resource_hash_contract: str,
+) -> tuple[str, ...] | None:
+    """Return the exact v3 proof closure while preserving old contracts."""
+
+    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        raw_metadata = parent_by_field.get("publication_metadata_json")
+        if raw_metadata is None:
+            return None
+        metadata = _endpoint_dataset_parent_metadata(parent_by_field)
+        if PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY in metadata:
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_resource_scope_invalid"
+            )
+        return None
+    metadata = _endpoint_dataset_parent_metadata(parent_by_field)
+    selected_resources = _endpoint_dataset_parent_selected_resources(
+        parent_by_field
+    )
+    proof_resource_scope = _validated_endpoint_dataset_resource_scope(
+        metadata.get(PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY)
+    )
+    if not set(selected_resources).issubset(proof_resource_scope):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_scope_invalid"
+        )
+    return proof_resource_scope
+
+
+async def _lock_endpoint_dataset_resource_family(
+    database_executor: Any,
+    dataset_id: str,
+    resource_type: str,
+) -> None:
+    """Serialize one mutable family without blocking sibling families."""
+
+    await database_executor.scalar(
+        "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0));",
+        lock_key=(
+            "provider-directory-resource-family:"
+            f"{_schema()}:"
+            f"{dataset_id}:{resource_type}"
+        ),
+    )
+
+
+async def _existing_endpoint_dataset_resources(
+    database_executor: Any,
+    dataset_id: str,
+    resource_type: str,
+    resource_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Lock and return exact existing rows for one proof-bearing batch."""
+
+    if not resource_ids:
+        return {}
+    existing_rows = await database_executor.all(
+        f"""
+        SELECT resource_id, payload_hash, payload_json,
+               acquired_resource_sha256
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = :resource_type
+           AND resource_id = ANY(CAST(:resource_ids AS varchar[]))
+         ORDER BY resource_id
+         FOR UPDATE;
+        """,
+        dataset_id=dataset_id,
+        resource_type=resource_type,
+        resource_ids=resource_ids,
+    )
+    resource_by_id: dict[str, dict[str, Any]] = {}
+    for existing_record in existing_rows:
+        existing_fields = _pagination_checkpoint_row_mapping(existing_record)
+        resource_id = _clean_text(existing_fields.get("resource_id"))
+        raw_payload_by_field = existing_fields.get("payload_json")
+        if isinstance(raw_payload_by_field, str):
+            try:
+                raw_payload_by_field = json.loads(raw_payload_by_field)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    "provider_directory_semantic_union_payload_invalid"
+                ) from error
+        if resource_id is None or not isinstance(raw_payload_by_field, dict):
+            raise RuntimeError(
+                "provider_directory_semantic_resource_payload_invalid"
+            )
+        resource_by_id[resource_id] = {
+            **existing_fields,
+            "payload_json": raw_payload_by_field,
+        }
+    return resource_by_id
+
+
+def _validated_v3_dataset_payload(
+    dataset_row_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return one exact v3 payload only when its immutable hash is valid."""
+
+    payload_by_field = dataset_row_by_field.get("payload_json")
+    if not isinstance(payload_by_field, dict):
+        raise RuntimeError(
+            "provider_directory_semantic_resource_payload_invalid"
+        )
+    if dataset_row_by_field.get("acquired_resource_sha256") is not None:
+        raise RuntimeError(
+            "provider_directory_semantic_resource_subset_invalid"
+        )
+    expected_payload_hash = resource_payload_sha256_for_contract(
+        payload_by_field,
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    )
+    if dataset_row_by_field.get("payload_hash") != expected_payload_hash:
+        raise RuntimeError(
+            "provider_directory_semantic_resource_payload_hash_mismatch"
+        )
+    return payload_by_field
+
+
+def _merged_v3_dataset_payload(
+    resource_type: str,
+    first_payload: Mapping[str, Any],
+    second_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge only the reviewed semantic shape for one repeated identity."""
+
+    if resource_type == "Practitioner":
+        return merge_practitioner_semantic_payloads(
+            first_payload,
+            second_payload,
+        )
+    return merge_semantic_resource_payloads(first_payload, second_payload)
+
+
+@dataclass(frozen=True)
+class _EndpointDatasetBatchIdentity:
+    dataset_id: str
+    resource_type: str
+
+
+def _endpoint_dataset_batch_identity(
+    incoming_dataset_rows: list[dict[str, Any]],
+    dataset_id: str | None,
+) -> _EndpointDatasetBatchIdentity:
+    """Require one dataset and one resource family per mutable batch."""
+
+    resolved_dataset_ids = {
+        _clean_text(dataset_row_by_field.get("dataset_id"))
+        for dataset_row_by_field in incoming_dataset_rows
+    }
+    if dataset_id is not None:
+        resolved_dataset_ids.add(dataset_id)
+    if None in resolved_dataset_ids or len(resolved_dataset_ids) != 1:
+        raise RuntimeError(
+            "provider_directory_semantic_union_dataset_scope_invalid"
+        )
+    resource_types = {
+        _clean_text(dataset_row_by_field.get("resource_type"))
+        for dataset_row_by_field in incoming_dataset_rows
+    }
+    if None in resource_types or len(resource_types) != 1:
+        raise RuntimeError(
+            "provider_directory_semantic_resource_type_scope_invalid"
+        )
+    resolved_dataset_id = next(iter(resolved_dataset_ids))
+    resource_type = next(iter(resource_types))
+    assert resolved_dataset_id is not None
+    assert resource_type is not None
+    return _EndpointDatasetBatchIdentity(
+        dataset_id=resolved_dataset_id,
+        resource_type=resource_type,
+    )
+
+
+async def _lock_endpoint_dataset_batch_identity(
+    database_executor: Any,
+    batch_identity: _EndpointDatasetBatchIdentity,
+    resource_hash_contract: str,
+    semantic_projection_as_of: str | None,
+) -> None:
+    """Fence a mutable batch to the parent's contract, date, and scope."""
+
+    parent_by_field = await _lock_endpoint_dataset_proof_parent(
+        database_executor,
+        batch_identity.dataset_id,
+    )
+    persisted_hash_contract = _dataset_resource_hash_contract(
+        parent_by_field
+    )
+    if persisted_hash_contract != resource_hash_contract:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_hash_contract_changed"
+        )
+    proof_resource_scope = _endpoint_dataset_parent_proof_resource_scope(
+        parent_by_field,
+        persisted_hash_contract,
+    )
+    if (
+        proof_resource_scope is not None
+        and batch_identity.resource_type not in proof_resource_scope
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_scope_changed"
+        )
+    persisted_projection_as_of = _dataset_semantic_projection_as_of(
+        parent_by_field,
+        resource_hash_contract,
+    )
+    if persisted_projection_as_of != semantic_projection_as_of:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_projection_date_changed"
+        )
+    await _lock_endpoint_dataset_resource_family(
+        database_executor,
+        batch_identity.dataset_id,
+        batch_identity.resource_type,
+    )
+
+
+def _incoming_semantic_dataset_rows_by_id(
+    incoming_dataset_rows: list[dict[str, Any]],
+    resource_type: str,
+    semantic_projection_as_of: str | None,
+) -> dict[str, dict[str, Any]]:
+    """Validate and index one duplicate-free v3 resource-family batch."""
+
+    incoming_by_id: dict[str, dict[str, Any]] = {}
+    for incoming_dataset_row in incoming_dataset_rows:
+        resource_id = _clean_text(incoming_dataset_row.get("resource_id"))
+        if resource_id is None:
+            raise RuntimeError(
+                "provider_directory_semantic_resource_identity_invalid"
+            )
+        incoming_payload = _validated_v3_dataset_payload(
+            incoming_dataset_row
+        )
+        if resource_type == "Practitioner":
+            _assert_practitioner_semantic_projection_as_of(
+                ProviderDirectoryPractitioner,
+                [incoming_payload],
+                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                semantic_projection_as_of,
+            )
+        if resource_id in incoming_by_id:
+            raise RuntimeError(
+                "provider_directory_semantic_resource_batch_duplicate"
+            )
+        incoming_by_id[resource_id] = incoming_dataset_row
+    return incoming_by_id
+
+
+async def _merged_semantic_dataset_rows(
+    database_executor: Any,
+    batch_identity: _EndpointDatasetBatchIdentity,
+    incoming_by_id: dict[str, dict[str, Any]],
+    semantic_projection_as_of: str | None,
+) -> list[dict[str, Any]]:
+    """Merge valid v3 observations with each locked retained identity."""
+
+    existing_resource_by_id = await _existing_endpoint_dataset_resources(
+        database_executor,
+        batch_identity.dataset_id,
+        batch_identity.resource_type,
+        sorted(incoming_by_id),
+    )
+    accumulated_rows: list[dict[str, Any]] = []
+    for resource_id in sorted(incoming_by_id):
+        incoming_dataset_row = incoming_by_id[resource_id]
+        accumulated_row_by_field = dict(incoming_dataset_row)
+        existing_resource = existing_resource_by_id.get(resource_id)
+        if existing_resource is not None:
+            existing_payload = _validated_v3_dataset_payload(
+                existing_resource
+            )
+            if batch_identity.resource_type == "Practitioner":
+                _assert_practitioner_semantic_projection_as_of(
+                    ProviderDirectoryPractitioner,
+                    [existing_payload],
+                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                    semantic_projection_as_of,
+                )
+            incoming_payload = _validated_v3_dataset_payload(
+                incoming_dataset_row
+            )
+            merged_payload = _merged_v3_dataset_payload(
+                batch_identity.resource_type,
+                existing_payload,
+                incoming_payload,
+            )
+            accumulated_row_by_field["payload_json"] = merged_payload
+            accumulated_row_by_field["payload_hash"] = (
+                resource_payload_sha256_for_contract(
+                    merged_payload,
+                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                )
+            )
+        accumulated_rows.append(accumulated_row_by_field)
+    return accumulated_rows
+
+
+async def _accumulated_endpoint_dataset_rows(
+    database_executor: Any,
+    incoming_dataset_rows: list[dict[str, Any]],
+    *,
+    dataset_id: str | None = None,
+    resource_hash_contract: str | None,
+    semantic_projection_as_of: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fence proof writes and accumulate exact v3 content across pages."""
+
+    if not incoming_dataset_rows or resource_hash_contract is None:
+        return incoming_dataset_rows
+    if resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
+        raise RuntimeError(
+            "provider_directory_resource_hash_contract_required"
+        )
+    batch_identity = _endpoint_dataset_batch_identity(
+        incoming_dataset_rows,
+        dataset_id,
+    )
+    await _lock_endpoint_dataset_batch_identity(
+        database_executor,
+        batch_identity,
+        resource_hash_contract,
+        semantic_projection_as_of,
+    )
+    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        return incoming_dataset_rows
+    incoming_by_id = _incoming_semantic_dataset_rows_by_id(
+        incoming_dataset_rows,
+        batch_identity.resource_type,
+        semantic_projection_as_of,
+    )
+    return await _merged_semantic_dataset_rows(
+        database_executor,
+        batch_identity,
+        incoming_by_id,
+        semantic_projection_as_of,
+    )
+
+
+def _materialized_resource_rows_from_dataset_rows(
+    resource_rows: list[dict[str, Any]],
+    dataset_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reattach run/source fields to accumulated dataset payloads."""
+
+    observation_by_resource_id = {
+        _clean_text(resource_row.get("resource_id")): resource_row
+        for resource_row in resource_rows
+        if _clean_text(resource_row.get("resource_id"))
+    }
+    materialized_rows: list[dict[str, Any]] = []
+    for dataset_row_by_field in dataset_rows:
+        resource_id = _clean_text(dataset_row_by_field.get("resource_id"))
+        observation_by_field = observation_by_resource_id.get(resource_id)
+        dataset_payload_by_field = dataset_row_by_field.get("payload_json")
+        if observation_by_field is None or not isinstance(
+            dataset_payload_by_field,
+            dict,
+        ):
+            raise RuntimeError(
+                "provider_directory_semantic_union_materialization_invalid"
+            )
+        materialized_rows.append(
+            {
+                **dataset_payload_by_field,
+                "source_id": observation_by_field.get("source_id"),
+                "last_seen_run_id": observation_by_field.get(
+                    "last_seen_run_id"
+                ),
+                "observed_at": observation_by_field.get("observed_at"),
+                "updated_at": observation_by_field.get("updated_at"),
+            }
+        )
+    return materialized_rows
 
 
 async def _upsert_deferred_resource_rows(
@@ -54023,6 +55439,7 @@ async def _upsert_deferred_resource_rows(
     dataset_id: str | None,
     track_seen: bool,
     resource_hash_contract: str | None = None,
+    semantic_projection_as_of: str | None = None,
 ) -> int:
     """Retain a checkpointed FHIR batch without compatibility materialization."""
 
@@ -54046,6 +55463,7 @@ async def _upsert_deferred_resource_rows(
         resource_rows,
         dataset_id,
         resource_hash_contract=resource_hash_contract,
+        semantic_projection_as_of=semantic_projection_as_of,
     )
     return len(dataset_rows)
 
@@ -54066,6 +55484,138 @@ def _endpoint_dataset_write_scope(
         resource_hash_contract=source_record.get(
             "_resource_hash_contract"
         ),
+        semantic_projection_as_of=source_record.get(
+            "_semantic_projection_as_of"
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _ResourceWriteIdentity:
+    dataset_id: str | None
+    resource_hash_contract: str
+    semantic_projection_as_of: str | None
+
+
+def _resolved_resource_write_identity(
+    options: ProviderDirectoryResourceWriteOptions,
+) -> _ResourceWriteIdentity:
+    """Resolve and validate one write's dataset-scoped hash identity."""
+
+    dataset_scope = options.dataset_scope
+    if dataset_scope is not None and options.resource_hash_contract not in {
+        None,
+        dataset_scope.resource_hash_contract,
+    }:
+        raise ValueError(
+            "provider_directory_resource_hash_contract_scope_mismatch"
+        )
+    if dataset_scope is not None and options.semantic_projection_as_of not in {
+        None,
+        dataset_scope.semantic_projection_as_of,
+    }:
+        raise ValueError(
+            "provider_directory_semantic_projection_scope_mismatch"
+        )
+    resource_hash_contract = (
+        dataset_scope.resource_hash_contract
+        if dataset_scope
+        else options.resource_hash_contract
+        or TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+    )
+    projection_as_of = (
+        dataset_scope.semantic_projection_as_of
+        if dataset_scope
+        else options.semantic_projection_as_of
+    )
+    if resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
+        raise ValueError(
+            "provider_directory_resource_hash_contract_invalid"
+        )
+    if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        projection_as_of = _validated_semantic_projection_as_of(
+            projection_as_of
+        )
+    return _ResourceWriteIdentity(
+        dataset_id=dataset_scope.dataset_id if dataset_scope else None,
+        resource_hash_contract=resource_hash_contract,
+        semantic_projection_as_of=projection_as_of,
+    )
+
+
+def _prepared_resource_write_rows(
+    model: type,
+    resource_rows: list[dict[str, Any]],
+    options: ProviderDirectoryResourceWriteOptions,
+    write_identity: _ResourceWriteIdentity,
+) -> list[dict[str, Any]]:
+    """Apply deterministic derivations and enforce the projection date."""
+
+    prepared_rows = (
+        _resource_rows_with_location_contacts(model, resource_rows)
+        if options.derive_location_contacts
+        else resource_rows
+    )
+    _assert_practitioner_semantic_projection_as_of(
+        model,
+        prepared_rows,
+        write_identity.resource_hash_contract,
+        write_identity.semantic_projection_as_of,
+    )
+    return prepared_rows
+
+
+async def _persist_compatible_resource_rows(
+    model: type,
+    resource_rows: list[dict[str, Any]],
+    options: ProviderDirectoryResourceWriteOptions,
+    write_identity: _ResourceWriteIdentity,
+) -> int:
+    """Keep retained, canonical, edge, seen, and typed rows consistent."""
+
+    materialized_resource_rows = resource_rows
+    dataset_rows = await _persist_endpoint_dataset_rows(
+        model,
+        resource_rows,
+        write_identity.dataset_id,
+        resource_hash_contract=write_identity.resource_hash_contract,
+        semantic_projection_as_of=(
+            write_identity.semantic_projection_as_of
+        ),
+    )
+    if (
+        dataset_rows
+        and write_identity.resource_hash_contract
+        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        materialized_resource_rows = (
+            _materialized_resource_rows_from_dataset_rows(
+                resource_rows,
+                dataset_rows,
+            )
+        )
+    if options.canonical_api_base and options.source_ids:
+        await _upsert_canonical_resource_edges(
+            model,
+            materialized_resource_rows,
+            canonical_api_base=options.canonical_api_base,
+            source_ids=options.source_ids,
+            run_id=options.run_id,
+            track_seen=options.track_seen,
+            store_payload=not bool(write_identity.dataset_id),
+            resource_hash_contract=write_identity.resource_hash_contract,
+        )
+    if options.track_seen:
+        await _mark_resource_rows_seen(
+            model,
+            materialized_resource_rows,
+            options.run_id,
+            seen_table=options.seen_table,
+        )
+    return await _upsert_rows(
+        model,
+        materialized_resource_rows,
+        skip_unchanged=options.track_seen and bool(options.run_id),
     )
 
 
@@ -54073,48 +55623,33 @@ async def _upsert_resource_rows(
     model: type,
     resource_rows: list[dict[str, Any]],
     *,
-    run_id: str | None,
-    track_seen: bool,
-    seen_table: str | None = None,
-    canonical_api_base: str | None = None,
-    source_ids: list[str] | None = None,
-    dataset_scope: EndpointDatasetWriteScope | None = None,
+    options: ProviderDirectoryResourceWriteOptions,
 ) -> int:
     """Persist one FHIR batch with its durable dataset proof shard."""
 
     if not resource_rows:
         return 0
-    dataset_id = dataset_scope.dataset_id if dataset_scope else None
-    effective_resource_hash_contract = (
-        dataset_scope.resource_hash_contract
-        if dataset_scope
-        else DEFAULT_RESOURCE_HASH_CONTRACT
-    )
-    resource_rows = _resource_rows_with_location_contacts(model, resource_rows)
-    await _persist_endpoint_dataset_rows(
+    write_identity = _resolved_resource_write_identity(options)
+    prepared_rows = _prepared_resource_write_rows(
         model,
         resource_rows,
-        dataset_id,
-        resource_hash_contract=effective_resource_hash_contract,
+        options,
+        write_identity,
     )
-    if canonical_api_base and source_ids:
-        await _upsert_canonical_resource_edges(
+    if options.dataset_scope is None:
+        return await _persist_compatible_resource_rows(
             model,
-            resource_rows,
-            canonical_api_base=canonical_api_base,
-            source_ids=source_ids,
-            run_id=run_id,
-            track_seen=track_seen,
-            store_payload=not bool(dataset_id),
-            resource_hash_contract=effective_resource_hash_contract,
+            prepared_rows,
+            options,
+            write_identity,
         )
-    if track_seen:
-        await _mark_resource_rows_seen(model, resource_rows, run_id, seen_table=seen_table)
-    return await _upsert_rows(
-        model,
-        resource_rows,
-        skip_unchanged=track_seen and bool(run_id),
-    )
+    async with db.transaction():
+        return await _persist_compatible_resource_rows(
+            model,
+            prepared_rows,
+            options,
+            write_identity,
+        )
 
 
 async def _delete_stale_rows_with_seen_table(
@@ -55684,6 +57219,142 @@ def _dataset_resource_hash_contract(
         ) from exc
 
 
+def _validated_semantic_projection_as_of(value: Any) -> str:
+    """Validate one canonical root-scoped projection date."""
+
+    if value is None:
+        raise RuntimeError(
+            "provider_directory_semantic_projection_as_of_missing"
+        )
+    if (
+        type(value) is not str
+        or len(value) != 10
+        or value != value.strip()
+    ):
+        raise RuntimeError(
+            "provider_directory_semantic_projection_as_of_invalid"
+        )
+    projection_as_of = value
+    try:
+        projection_date = datetime.date.fromisoformat(projection_as_of)
+    except ValueError as error:
+        raise RuntimeError(
+            "provider_directory_semantic_projection_as_of_invalid"
+        ) from error
+    if projection_date.isoformat() != projection_as_of:
+        raise RuntimeError(
+            "provider_directory_semantic_projection_as_of_invalid"
+        )
+    return projection_as_of
+
+
+def _dataset_semantic_projection_as_of(
+    dataset_map: Mapping[str, Any],
+    resource_hash_contract: str,
+) -> str | None:
+    """Create or recover the immutable v3 derived-field date."""
+
+    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        return None
+    if not dataset_map:
+        return _now().date().isoformat()
+    metadata = _json_object(dataset_map.get("publication_metadata_json"))
+    return _validated_semantic_projection_as_of(
+        metadata.get(SEMANTIC_PROJECTION_AS_OF_METADATA_KEY)
+    )
+
+
+def _resource_hash_contract_proof_scope(
+    selected_resources: Iterable[str],
+    resource_hash_contract: str,
+) -> tuple[str, ...] | None:
+    """Derive the proof-bearing resource closure only for semantic v3."""
+
+    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        return None
+    return _provider_directory_proof_resource_scope(selected_resources)
+
+
+def _candidate_proof_resource_scope(
+    candidate: EndpointDatasetCandidate,
+) -> tuple[str, ...] | None:
+    if candidate.resource_hash_contract != (
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        if candidate.proof_resource_scope is not None:
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_resource_scope_invalid"
+            )
+        return None
+    proof_resource_scope = (
+        candidate.proof_resource_scope
+        if candidate.proof_resource_scope is not None
+        else _provider_directory_proof_resource_scope(
+            candidate.selected_resources
+        )
+    )
+    if (
+        proof_resource_scope != tuple(sorted(set(proof_resource_scope)))
+        or not set(candidate.selected_resources).issubset(
+            proof_resource_scope
+        )
+        or not set(proof_resource_scope).issubset(DEFAULT_RESOURCES)
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_scope_invalid"
+        )
+    return proof_resource_scope
+
+
+def _dataset_proof_resource_scope(
+    dataset_map: Mapping[str, Any],
+    selected_resources: Iterable[str],
+    resource_hash_contract: str,
+) -> tuple[str, ...] | None:
+    """Validate a persisted proof closure against its deterministic roots."""
+
+    persisted_scope = _endpoint_dataset_parent_proof_resource_scope(
+        dataset_map,
+        resource_hash_contract,
+    )
+    if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT and (
+        _endpoint_dataset_parent_selected_resources(dataset_map)
+        != tuple(sorted(set(selected_resources)))
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_resource_scope_invalid"
+        )
+    return persisted_scope
+
+
+def _selection_with_semantic_projection_as_of(
+    selection: EndpointDatasetCandidateSelection,
+    dataset_map: Mapping[str, Any],
+    selected_resources: Iterable[str],
+) -> EndpointDatasetCandidateSelection:
+    """Bind one selection to its persisted or fresh v3 projection date."""
+
+    return replace(
+        selection,
+        semantic_projection_as_of=_dataset_semantic_projection_as_of(
+            dataset_map,
+            selection.resource_hash_contract,
+        ),
+        proof_resource_scope=(
+            _dataset_proof_resource_scope(
+                dataset_map,
+                selected_resources,
+                selection.resource_hash_contract,
+            )
+            if dataset_map
+            else _resource_hash_contract_proof_scope(
+                selected_resources,
+                selection.resource_hash_contract,
+            )
+        ),
+    )
+
+
 async def _current_endpoint_dataset_id(
     endpoint_id: str,
     *,
@@ -55739,6 +57410,17 @@ async def _assert_locked_endpoint_candidate(
         != candidate.completion_proof_required_version
         or _dataset_resource_hash_contract(existing_candidate_map)
         != candidate.resource_hash_contract
+        or _dataset_semantic_projection_as_of(
+            existing_candidate_map,
+            candidate.resource_hash_contract,
+        )
+        != candidate.semantic_projection_as_of
+        or _dataset_proof_resource_scope(
+            existing_candidate_map,
+            candidate.selected_resources,
+            candidate.resource_hash_contract,
+        )
+        != _candidate_proof_resource_scope(candidate)
     ):
         raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
     if candidate.repair_empty_orphan:
@@ -55809,6 +57491,19 @@ def _empty_orphan_expected_metadata(
         ),
         "completion_proof_required_version": (
             candidate.completion_proof_required_version
+        ),
+        SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: (
+            candidate.semantic_projection_as_of
+        ),
+        PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: (
+            list(proof_resource_scope)
+            if (
+                proof_resource_scope := _candidate_proof_resource_scope(
+                    candidate
+                )
+            )
+            is not None
+            else None
         ),
     }
     if candidate.reviewed_root_policy is not None:
@@ -56157,16 +57852,12 @@ def _validated_persisted_subset_completion_pair(
     return completion_proof, completion_sha256
 
 
-def _validate_finalized_subset_completion_pair(
+def _validated_finalized_stored_proof(
     dataset_map: Mapping[str, Any],
     metadata: Mapping[str, Any],
-) -> None:
-    """Require a valid direct v3 pair on every finalized replay path."""
+) -> dict[str, Any]:
+    """Validate the sealed shard proof bound to one finalized dataset."""
 
-    completion_pair = _validated_parent_subset_completion_pair(dataset_map)
-    if completion_pair is None:
-        return
-    completion_proof, _completion_sha256 = completion_pair
     dataset_id = _clean_text(dataset_map.get("dataset_id"))
     endpoint_id = _clean_text(dataset_map.get("endpoint_id"))
     acquisition_root_run_id = _clean_text(
@@ -56184,35 +57875,330 @@ def _validate_finalized_subset_completion_pair(
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_proof_invalid"
         )
+    resource_hash_contract = _dataset_resource_hash_contract(dataset_map)
     try:
-        stored_proof = validate_stored_dataset_proof_metadata(
+        return validate_stored_dataset_proof_metadata(
             metadata.get(PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY),
             dataset_id=dataset_id,
             endpoint_id=endpoint_id,
             acquisition_root_run_id=acquisition_root_run_id,
             source_ids=source_ids,
             selected_resources=selected_resources,
+            options=ProviderDirectoryStoredProofOptions(
+                proof_resource_scope=_dataset_proof_resource_scope(
+                    dataset_map,
+                    selected_resources,
+                    resource_hash_contract,
+                ),
+                expected_resource_hash_contract=resource_hash_contract,
+                expected_semantic_projection_as_of=(
+                    _dataset_semantic_projection_as_of(
+                        dataset_map,
+                        resource_hash_contract,
+                    )
+                ),
+            ),
         )
     except ProviderDirectoryProofStoreError as exc:
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_proof_invalid"
         ) from exc
+
+
+def _is_finalized_subset_content_exact(
+    dataset_map: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    completion_proof: Mapping[str, Any],
+    stored_proof: Mapping[str, Any],
+) -> bool:
+    """Return whether direct, shard, and parent commitments are identical."""
+
     completion_dataset = completion_proof["dataset"]
-    if (
+    return bool(
         completion_proof["campaign_id"]
-        != metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
-        or completion_dataset["hash"] != dataset_map.get("dataset_hash")
-        or completion_dataset["count"] != dataset_map.get("resource_count")
-        or completion_dataset["hash"] != stored_proof.get("dataset_hash")
-        or completion_dataset["count"] != stored_proof.get("resource_count")
-        or completion_dataset["resource_hashes"]
-        != stored_proof.get("resource_hashes")
-        or completion_dataset["resource_counts"]
-        != stored_proof.get("resource_counts")
+        == metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
+        and completion_dataset["hash"] == dataset_map.get("dataset_hash")
+        and completion_dataset["count"] == dataset_map.get("resource_count")
+        and completion_dataset["hash"] == stored_proof.get("dataset_hash")
+        and completion_dataset["count"] == stored_proof.get("resource_count")
+        and completion_dataset["resource_hashes"]
+        == stored_proof.get("resource_hashes")
+        and completion_dataset["resource_counts"]
+        == stored_proof.get("resource_counts")
+    )
+
+
+def _validate_finalized_subset_completion_pair(
+    dataset_map: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> None:
+    """Require a valid direct v3 pair on every finalized replay path."""
+
+    completion_pair = _validated_parent_subset_completion_pair(dataset_map)
+    if completion_pair is None:
+        return
+    completion_proof, _completion_sha256 = completion_pair
+    stored_proof = _validated_finalized_stored_proof(
+        dataset_map,
+        metadata,
+    )
+    if not _is_finalized_subset_content_exact(
+        dataset_map,
+        metadata,
+        completion_proof,
+        stored_proof,
     ):
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_proof_invalid"
         )
+
+
+def _is_finalized_semantic_outcome_exact(
+    dataset_map: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    stored_proof: Mapping[str, Any],
+) -> bool:
+    """Return whether the finalized row and outcome bind the sealed proof."""
+
+    outcome_proof = metadata.get(
+        PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
+    )
+    return bool(
+        isinstance(outcome_proof, Mapping)
+        and outcome_proof.get("complete") is True
+        and type(outcome_proof.get("version")) is int
+        and outcome_proof.get("version") == 1
+        and _is_nonnegative_resource_count(
+            outcome_proof.get("resource_count")
+        )
+        and _is_nonnegative_resource_count(dataset_map.get("resource_count"))
+        and _is_nonnegative_resource_count(stored_proof.get("resource_count"))
+        and _is_nonnegative_resource_count_map(
+            outcome_proof.get("resource_counts")
+        )
+        and _is_nonnegative_resource_count_map(
+            stored_proof.get("resource_counts")
+        )
+        and outcome_proof.get("dataset_id") == dataset_map.get("dataset_id")
+        and outcome_proof.get("endpoint_id") == dataset_map.get("endpoint_id")
+        and outcome_proof.get("acquisition_root_run_id")
+        == dataset_map.get("acquisition_root_run_id")
+        and outcome_proof.get("source_ids") == metadata.get("source_ids")
+        and outcome_proof.get("selected_resources")
+        == metadata.get("selected_resources")
+        and outcome_proof.get("dataset_hash")
+        == dataset_map.get("dataset_hash")
+        == stored_proof.get("dataset_hash")
+        and outcome_proof.get("resource_count")
+        == dataset_map.get("resource_count")
+        == stored_proof.get("resource_count")
+        and outcome_proof.get("resource_counts")
+        == stored_proof.get("resource_counts")
+    )
+
+
+def _is_finalized_semantic_twin_proof_exact(
+    metadata: Mapping[str, Any],
+    stored_proof: Mapping[str, Any],
+) -> bool:
+    """Return whether an optional embedded twin proof matches the seal."""
+
+    verification = metadata.get(TWIN_ROOT_VERIFICATION_METADATA_KEY)
+    if verification is None:
+        return True
+    if not isinstance(verification, Mapping):
+        return False
+    embedded_proof = verification.get("proof")
+    return bool(
+        isinstance(embedded_proof, Mapping)
+        and _is_nonnegative_resource_count(
+            embedded_proof.get("resource_count")
+        )
+        and _is_nonnegative_resource_count(stored_proof.get("resource_count"))
+        and _is_nonnegative_resource_count_map(
+            embedded_proof.get("resource_counts")
+        )
+        and _is_nonnegative_resource_count_map(
+            stored_proof.get("resource_counts")
+        )
+        and embedded_proof.get("dataset_hash")
+        == stored_proof.get("dataset_hash")
+        and embedded_proof.get("resource_count")
+        == stored_proof.get("resource_count")
+        and embedded_proof.get("resource_hashes")
+        == stored_proof.get("resource_hashes")
+        and embedded_proof.get("resource_counts")
+        == stored_proof.get("resource_counts")
+    )
+
+
+def _is_nonnegative_resource_count(value: Any) -> bool:
+    """Return whether a proof count is a strict nonnegative JSON integer."""
+
+    return type(value) is int and value >= 0
+
+
+def _is_nonnegative_resource_count_map(value: Any) -> bool:
+    """Return whether every per-family proof count is a strict integer."""
+
+    return bool(
+        isinstance(value, Mapping)
+        and all(
+            isinstance(resource_type, str)
+            and _is_nonnegative_resource_count(resource_count)
+            for resource_type, resource_count in value.items()
+        )
+    )
+
+
+def _validate_finalized_content_proof(
+    dataset_map: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> None:
+    """Bind finalized subset or semantic proof to every replay path."""
+
+    _validate_finalized_subset_completion_pair(dataset_map, metadata)
+    if _dataset_resource_hash_contract(dataset_map) != (
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        return
+    stored_proof = _validated_finalized_stored_proof(dataset_map, metadata)
+    if not _is_finalized_semantic_outcome_exact(
+        dataset_map,
+        metadata,
+        stored_proof,
+    ) or not _is_finalized_semantic_twin_proof_exact(
+        metadata,
+        stored_proof,
+    ):
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_proof_invalid"
+        )
+
+
+@dataclass(frozen=True)
+class _TwinRootDatasetProofState:
+    metadata: Any
+    verification: Any
+    proof: Any
+    semantic_projection_as_of: str | None
+    stored_proof_resource_scope: list[str] | None
+    proof_resource_count: int
+    dataset_resource_count: int
+
+
+def _twin_root_dataset_proof_state(
+    dataset_map: dict[str, Any],
+) -> _TwinRootDatasetProofState:
+    """Recover the normalized fields used by twin-root identity checks."""
+
+    metadata = dataset_map.get("publication_metadata_json")
+    verification = (
+        metadata.get(TWIN_ROOT_VERIFICATION_METADATA_KEY)
+        if isinstance(metadata, dict)
+        else None
+    )
+    proof = verification.get("proof") if isinstance(verification, dict) else None
+    resource_hash_contract = _dataset_resource_hash_contract(dataset_map)
+    projection_as_of = _dataset_semantic_projection_as_of(
+        dataset_map,
+        resource_hash_contract,
+    )
+    selected_resources = (
+        metadata.get("selected_resources")
+        if isinstance(metadata, dict)
+        else ()
+    )
+    proof_resource_scope = _dataset_proof_resource_scope(
+        dataset_map,
+        selected_resources,
+        resource_hash_contract,
+    )
+    try:
+        proof_resource_count = int(proof.get("resource_count") or 0)
+        dataset_resource_count = int(dataset_map.get("resource_count") or 0)
+    except (AttributeError, TypeError, ValueError):
+        proof_resource_count = -1
+        dataset_resource_count = -2
+    return _TwinRootDatasetProofState(
+        metadata=metadata,
+        verification=verification,
+        proof=proof,
+        semantic_projection_as_of=projection_as_of,
+        stored_proof_resource_scope=(
+            list(proof_resource_scope)
+            if proof_resource_scope is not None
+            else None
+        ),
+        proof_resource_count=proof_resource_count,
+        dataset_resource_count=dataset_resource_count,
+    )
+
+
+def _is_twin_root_proof_lineage_exact(
+    dataset_map: dict[str, Any],
+    proof_state: _TwinRootDatasetProofState,
+    verification_role: str,
+    admission_role: str,
+) -> bool:
+    """Return whether roles and immutable dataset lineage match."""
+
+    metadata = proof_state.metadata
+    verification = proof_state.verification
+    proof = proof_state.proof
+    if not all(
+        isinstance(document, dict)
+        for document in (metadata, verification, proof)
+    ):
+        return False
+    return bool(
+        verification.get("role") == verification_role
+        and verification.get("admission_role") == admission_role
+        and metadata.get(TWIN_ROOT_VERIFICATION_ROLE_KEY) == admission_role
+        and _clean_text(metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY))
+        and _clean_text(metadata.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY))
+        and proof.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
+        == metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
+        and proof.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY)
+        == metadata.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY)
+        and _clean_text(proof.get("endpoint_id"))
+        == _clean_text(dataset_map.get("endpoint_id"))
+        and _clean_text(proof.get("acquisition_root_run_id"))
+        == _clean_text(dataset_map.get("acquisition_root_run_id"))
+        and proof.get("source_ids") == metadata.get("source_ids")
+        and proof.get("selected_resources")
+        == metadata.get("selected_resources")
+        and proof.get("expected_resources")
+        == metadata.get("expected_resources")
+    )
+
+
+def _is_twin_root_proof_hash_exact(
+    dataset_map: dict[str, Any],
+    proof_state: _TwinRootDatasetProofState,
+) -> bool:
+    """Return whether proof scope, date, hashes, and count all match."""
+
+    metadata = proof_state.metadata
+    proof = proof_state.proof
+    if not isinstance(metadata, dict) or not isinstance(proof, dict):
+        return False
+    return bool(
+        metadata.get(PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY)
+        == proof_state.stored_proof_resource_scope
+        and proof.get(PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY)
+        == proof_state.stored_proof_resource_scope
+        and metadata.get(SEMANTIC_PROJECTION_AS_OF_METADATA_KEY)
+        == proof_state.semantic_projection_as_of
+        and proof.get(SEMANTIC_PROJECTION_AS_OF_METADATA_KEY)
+        == proof_state.semantic_projection_as_of
+        and isinstance(proof.get("resource_hashes"), dict)
+        and isinstance(proof.get("resource_counts"), dict)
+        and _clean_text(proof.get("dataset_hash"))
+        == _clean_text(dataset_map.get("dataset_hash"))
+        and proof_state.proof_resource_count
+        == proof_state.dataset_resource_count
+    )
 
 
 def _twin_root_dataset_proof(
@@ -56221,55 +58207,28 @@ def _twin_root_dataset_proof(
     verification_role: str,
     admission_role: str,
 ) -> dict[str, Any]:
-    metadata = dataset_map.get("publication_metadata_json")
-    verification = (
-        metadata.get(TWIN_ROOT_VERIFICATION_METADATA_KEY)
-        if isinstance(metadata, dict)
-        else None
-    )
-    proof = verification.get("proof") if isinstance(verification, dict) else None
-    try:
-        proof_resource_count = int(proof.get("resource_count") or 0)
-        dataset_resource_count = int(dataset_map.get("resource_count") or 0)
-    except (AttributeError, TypeError, ValueError):
-        proof_resource_count = -1
-        dataset_resource_count = -2
-    if (
-        not isinstance(metadata, dict)
-        or not isinstance(proof, dict)
-        or verification.get("role") != verification_role
-        or verification.get("admission_role") != admission_role
-        or metadata.get(TWIN_ROOT_VERIFICATION_ROLE_KEY) != admission_role
-        or not _clean_text(metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY))
-        or not _clean_text(metadata.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY))
-        or proof.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
-        != metadata.get(TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY)
-        or proof.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY)
-        != metadata.get(TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY)
-        or _clean_text(proof.get("endpoint_id"))
-        != _clean_text(dataset_map.get("endpoint_id"))
-        or _clean_text(proof.get("acquisition_root_run_id"))
-        != _clean_text(dataset_map.get("acquisition_root_run_id"))
-        or proof.get("source_ids") != metadata.get("source_ids")
-        or proof.get("selected_resources")
-        != metadata.get("selected_resources")
-        or proof.get("expected_resources")
-        != metadata.get("expected_resources")
-        or not isinstance(proof.get("resource_hashes"), dict)
-        or not isinstance(proof.get("resource_counts"), dict)
-        or _clean_text(proof.get("dataset_hash"))
-        != _clean_text(dataset_map.get("dataset_hash"))
-        or proof_resource_count != dataset_resource_count
-    ):
+    """Validate and return one persisted twin-root proof identity."""
+
+    proof_state = _twin_root_dataset_proof_state(dataset_map)
+    if not _is_twin_root_proof_lineage_exact(
+        dataset_map,
+        proof_state,
+        verification_role,
+        admission_role,
+    ) or not _is_twin_root_proof_hash_exact(dataset_map, proof_state):
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_proof_invalid"
         )
+    _validate_finalized_content_proof(
+        dataset_map,
+        proof_state.metadata,
+    )
     _validated_persisted_subset_completion_pair(
         dataset_map,
-        proof,
-        metadata,
+        proof_state.proof,
+        proof_state.metadata,
     )
-    return proof
+    return proof_state.proof
 
 
 def _twin_root_baseline_proof(
@@ -56331,16 +58290,37 @@ def _assert_compatible_twin_root_baseline(
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_baseline_incompatible"
         )
+    baseline_hash_contract = _dataset_resource_hash_contract(dataset_map)
+    baseline_proof_resource_scope = _dataset_proof_resource_scope(
+        dataset_map,
+        candidate.selected_resources,
+        baseline_hash_contract,
+    )
     expected_identity_by_field = {
         "endpoint_id": candidate.endpoint_id,
         "source_ids": list(candidate.source_ids),
         "selected_resources": list(candidate.selected_resources),
+        **(
+            {
+                PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: list(
+                    baseline_proof_resource_scope
+                )
+            }
+            if baseline_proof_resource_scope is not None
+            else {}
+        ),
         "expected_resources": list(candidate.expected_resources),
         TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: (
             candidate.verification_campaign_id
         ),
         TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: (
             candidate.verification_source_scope_hash
+        ),
+        SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: (
+            _dataset_semantic_projection_as_of(
+                dataset_map,
+                baseline_hash_contract,
+            )
         ),
     }
     if any(
@@ -56526,14 +58506,22 @@ def _candidate_with_locked_twin_root_admission(
                 candidate,
                 verification_role=TWIN_ROOT_BASELINE_CANDIDATE_ROLE,
             )
+        baseline_hash_contract = _dataset_resource_hash_contract(baseline)
         return replace(
             candidate,
             verification_role=TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE,
             verification_baseline_dataset_id=_clean_text(
                 baseline.get("dataset_id")
             ),
-            resource_hash_contract=_dataset_resource_hash_contract(
-                baseline
+            resource_hash_contract=baseline_hash_contract,
+            semantic_projection_as_of=_dataset_semantic_projection_as_of(
+                baseline,
+                baseline_hash_contract,
+            ),
+            proof_resource_scope=_dataset_proof_resource_scope(
+                baseline,
+                candidate.selected_resources,
+                baseline_hash_contract,
             ),
         )
     if candidate.verification_role == TWIN_ROOT_BASELINE_CANDIDATE_ROLE:
@@ -56565,10 +58553,23 @@ def _assert_twin_root_resource_hash_contract(
 ) -> None:
     """Prevent one twin campaign from mixing content-hash contracts."""
 
-    if (
-        _dataset_resource_hash_contract(baseline)
-        != candidate.resource_hash_contract
-    ):
+    baseline_hash_contract = _dataset_resource_hash_contract(baseline)
+    if baseline_hash_contract != candidate.resource_hash_contract:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_baseline_incompatible"
+        )
+    if _dataset_semantic_projection_as_of(
+        baseline,
+        baseline_hash_contract,
+    ) != candidate.semantic_projection_as_of:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_verification_baseline_incompatible"
+        )
+    if _dataset_proof_resource_scope(
+        baseline,
+        candidate.selected_resources,
+        baseline_hash_contract,
+    ) != _candidate_proof_resource_scope(candidate):
         raise RuntimeError(
             "provider_directory_endpoint_dataset_verification_baseline_incompatible"
         )
@@ -56580,9 +58581,15 @@ async def _assert_no_conflicting_endpoint_candidate(
 ) -> EndpointDatasetCandidate:
     state = await _locked_endpoint_verification_state(connection, candidate)
     if candidate.requires_twin_root_verification:
-        return _candidate_with_locked_twin_root_admission(candidate, state)
+        admitted_candidate = _candidate_with_locked_twin_root_admission(
+            candidate,
+            state,
+        )
+        _assert_candidate_hash_contract_supported(admitted_candidate)
+        return admitted_candidate
     if state:
         raise RuntimeError("provider_directory_endpoint_dataset_active_conflict")
+    _assert_candidate_hash_contract_supported(candidate)
     return candidate
 
 
@@ -56647,9 +58654,39 @@ async def _upsert_endpoint_dataset_candidate(
     )
 
 
+def _candidate_hash_metadata(
+    candidate: EndpointDatasetCandidate,
+) -> dict[str, Any]:
+    """Return optional v3 hash identity fields for candidate metadata."""
+
+    proof_resource_scope = _candidate_proof_resource_scope(candidate)
+    return {
+        **(
+            {
+                PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: list(
+                    proof_resource_scope
+                )
+            }
+            if proof_resource_scope is not None
+            else {}
+        ),
+        **(
+            {
+                SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: (
+                    candidate.semantic_projection_as_of
+                )
+            }
+            if candidate.semantic_projection_as_of is not None
+            else {}
+        ),
+    }
+
+
 def _endpoint_dataset_candidate_metadata(
     candidate: EndpointDatasetCandidate,
 ) -> dict[str, Any]:
+    """Build the immutable acquisition identity stored on a candidate."""
+
     metadata = {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
@@ -56674,6 +58711,7 @@ def _endpoint_dataset_candidate_metadata(
         RESOURCE_HASH_CONTRACT_METADATA_KEY: (
             candidate.resource_hash_contract
         ),
+        **_candidate_hash_metadata(candidate),
     }
     if candidate.reviewed_root_policy is not None:
         metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] = (
@@ -56792,6 +58830,25 @@ async def _clear_uncheckpointed_endpoint_dataset_candidate(
     async with _mutable_endpoint_dataset_resource_mutation(
         [candidate.dataset_id]
     ) as database_executor:
+        locked_parent = await database_executor.first(
+            f"""
+            SELECT dataset_id
+              FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+             WHERE dataset_id = :dataset_id
+               AND endpoint_id = :endpoint_id
+               AND acquisition_root_run_id IS NOT DISTINCT FROM
+                   :acquisition_root_run_id
+               AND is_current = false
+             FOR UPDATE;
+            """,
+            dataset_id=candidate.dataset_id,
+            endpoint_id=candidate.endpoint_id,
+            acquisition_root_run_id=candidate.acquisition_root_run_id,
+        )
+        if locked_parent is None:
+            raise RuntimeError(
+                "provider_directory_endpoint_dataset_cleanup_parent_changed"
+            )
         await database_executor.status(
             f"""
             DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
@@ -57289,7 +59346,7 @@ def _finalized_endpoint_dataset_verification_fields(
     verification_campaign_id: str | None,
     verification_source_scope_hash: str | None,
 ) -> dict[str, Any]:
-    _validate_finalized_subset_completion_pair(
+    _validate_finalized_content_proof(
         existing_dataset_map,
         metadata,
     )
@@ -57419,8 +59476,12 @@ async def _select_endpoint_dataset_candidate(
         verification_profile,
     )
     if finalized_selection is not None:
-        return finalized_selection
-    return await _select_resumable_endpoint_dataset_candidate(
+        return _selection_with_semantic_projection_as_of(
+            finalized_selection,
+            existing_dataset_map,
+            selected_resources,
+        )
+    resumable_selection = await _select_resumable_endpoint_dataset_candidate(
         existing_dataset_map,
         dataset_id,
         endpoint_id,
@@ -57429,6 +59490,11 @@ async def _select_endpoint_dataset_candidate(
         retry_of_run_id,
         checkpoint_context,
         verification_profile,
+    )
+    return _selection_with_semantic_projection_as_of(
+        resumable_selection,
+        existing_dataset_map,
+        selected_resources,
     )
 
 
@@ -57440,6 +59506,15 @@ def _existing_endpoint_dataset_finalized_selection(
     verification_profile: EndpointDatasetVerificationProfile,
 ) -> EndpointDatasetCandidateSelection | None:
     """Return the first immutable replay state recognized for this root."""
+    if (
+        existing_dataset_map.get("completion_proof_required_version")
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        and _dataset_resource_hash_contract(existing_dataset_map)
+        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_resource_hash_contract_invalid"
+        )
     selector_options_by_name = {
         "requires_twin_root_verification": (
             verification_profile.is_twin_root_required
@@ -57685,11 +59760,20 @@ def _finalized_replay_identity(
 def _base_finalized_replay_identity(
     candidate: EndpointDatasetCandidate,
 ) -> dict[str, Any]:
+    proof_resource_scope = _candidate_proof_resource_scope(candidate)
     return {
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
         "expected_resources": list(candidate.expected_resources),
         "source_ids": list(candidate.source_ids),
+        SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: (
+            candidate.semantic_projection_as_of
+        ),
+        PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: (
+            list(proof_resource_scope)
+            if proof_resource_scope is not None
+            else None
+        ),
     }
 
 
@@ -57796,6 +59880,45 @@ def _candidate_subset_contract(
     return (subset_contracts[0] if subset_contracts else None), None
 
 
+def _candidate_resource_hash_contract(
+    selected_contract: str,
+    completion_proof_required_version: int | None,
+) -> str:
+    """Keep reviewed subset roots on their established strict hash path."""
+
+    if (
+        completion_proof_required_version
+        == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+        and selected_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        return TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+    return selected_contract
+
+
+def _assert_candidate_hash_contract_supported(
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    """Reject custom-proof roots falsely marked as semantic-union v3."""
+
+    if candidate.resource_hash_contract != (
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        return
+    if candidate.completion_proof_required_version == (
+        SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_resource_hash_contract_invalid"
+        )
+    if candidate.source_ids == (UHC_RETAINED_SOURCE_ID,):
+        raise RuntimeError(
+            "provider_directory_retained_resource_hash_contract_invalid"
+        )
+    _validated_semantic_projection_as_of(
+        candidate.semantic_projection_as_of
+    )
+
+
 def _candidate_bound_checkpoint_context(
     checkpoint_context: PaginationCheckpointContext | None,
     endpoint_id: str,
@@ -57827,6 +59950,61 @@ def _candidate_source_ids(
     )
 
 
+def _candidate_hash_fields(
+    selection: EndpointDatasetCandidateSelection,
+    resource_hash_contract: str,
+) -> dict[str, Any]:
+    """Bind only v3 candidates to the selected date and proof closure."""
+
+    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+        return {
+            "semantic_projection_as_of": None,
+            "proof_resource_scope": None,
+        }
+    return {
+        "semantic_projection_as_of": selection.semantic_projection_as_of,
+        "proof_resource_scope": selection.proof_resource_scope,
+    }
+
+
+def _candidate_verification_fields(
+    selection: EndpointDatasetCandidateSelection,
+    verification_profile: EndpointDatasetVerificationProfile,
+) -> dict[str, Any]:
+    """Carry the selected reviewed-root and replay state into a candidate."""
+
+    return {
+        "requires_twin_root_verification": (
+            selection.requires_twin_root_verification
+            if selection.requires_twin_root_verification is not None
+            else verification_profile.is_twin_root_required
+        ),
+        "reviewed_root_policy": (
+            selection.reviewed_root_policy
+            if selection.reviewed_root_policy is not None
+            else verification_profile.reviewed_root_policy
+        ),
+        "verification_campaign_id": selection.verification_campaign_id,
+        "verification_source_scope_hash": (
+            selection.verification_source_scope_hash
+        ),
+        "verification_role": selection.verification_role,
+        "verification_baseline_dataset_id": (
+            selection.verification_baseline_dataset_id
+        ),
+        "verification_terminal_status": (
+            selection.verification_terminal_status
+        ),
+        "verification_terminal_metadata": (
+            selection.verification_terminal_metadata
+        ),
+        "already_validated": selection.already_validated,
+        "validated_metadata": selection.validated_metadata,
+        "already_published": selection.already_published,
+        "published_metadata": selection.published_metadata,
+    }
+
+
 def _build_endpoint_dataset_candidate(
     source_records: list[dict[str, Any]],
     endpoint_id: str,
@@ -57846,7 +60024,11 @@ def _build_endpoint_dataset_candidate(
     subset_contract, proof_required_version = _candidate_subset_contract(
         source_records
     )
-    return EndpointDatasetCandidate(
+    resource_hash_contract = _candidate_resource_hash_contract(
+        selection.resource_hash_contract,
+        proof_required_version,
+    )
+    candidate = EndpointDatasetCandidate(
         endpoint_id=endpoint_id,
         dataset_id=selection.dataset_id,
         acquisition_root_run_id=selection.acquisition_root_run_id,
@@ -57854,34 +60036,18 @@ def _build_endpoint_dataset_candidate(
         selected_resources=selected_resources,
         import_run_id=run_id,
         previous_dataset_id=selection.previous_dataset_id,
-        resource_hash_contract=selection.resource_hash_contract,
+        resource_hash_contract=resource_hash_contract,
+        **_candidate_hash_fields(selection, resource_hash_contract),
         expected_resources=expected_resources,
         checkpoint_context=bound_checkpoint_context,
         reused_from_checkpoint=selection.reused_from_checkpoint,
         repair_empty_orphan=selection.repair_empty_orphan,
-        requires_twin_root_verification=(
-            selection.requires_twin_root_verification
-            if selection.requires_twin_root_verification is not None
-            else verification_profile.is_twin_root_required
-        ),
-        reviewed_root_policy=(
-            selection.reviewed_root_policy
-            if selection.reviewed_root_policy is not None
-            else verification_profile.reviewed_root_policy
-        ),
-        verification_campaign_id=selection.verification_campaign_id,
-        verification_source_scope_hash=selection.verification_source_scope_hash,
-        verification_role=selection.verification_role,
-        verification_baseline_dataset_id=selection.verification_baseline_dataset_id,
-        verification_terminal_status=selection.verification_terminal_status,
-        verification_terminal_metadata=selection.verification_terminal_metadata,
-        already_validated=selection.already_validated,
-        validated_metadata=selection.validated_metadata,
-        already_published=selection.already_published,
-        published_metadata=selection.published_metadata,
+        **_candidate_verification_fields(selection, verification_profile),
         completion_proof_required_version=proof_required_version,
         subset_contract=subset_contract,
     )
+    _assert_candidate_hash_contract_supported(candidate)
+    return candidate
 
 
 def _assert_candidate_reviewed_root_policy(
@@ -58355,6 +60521,11 @@ async def _clear_checkpoint_dataset_resource_type(
         [context.dataset_id],
         database_connection=database_connection,
     ) as database_executor:
+        await _lock_endpoint_dataset_resource_family(
+            database_executor,
+            context.dataset_id,
+            resource_type,
+        )
         await database_executor.status(
             f"""
             DELETE FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)} AS resource
@@ -58388,6 +60559,12 @@ async def _reset_pagination_checkpoint(
         [context.dataset_id] if context.dataset_id else [],
         database_connection=database_connection,
     ) as database_executor:
+        if context.dataset_id:
+            await _lock_endpoint_dataset_resource_family(
+                database_executor,
+                context.dataset_id,
+                resource_type,
+            )
         await database_executor.status(
             _pagination_checkpoint_reset_sql(),
             canonical_api_base=context.canonical_api_base,
@@ -58402,6 +60579,13 @@ async def _reset_pagination_checkpoint(
             next_url=start_url,
             state=PAGINATION_CHECKPOINT_ACTIVE,
         )
+        if context.dataset_id:
+            await delete_dataset_resource_proof_shards(
+                database_executor,
+                _schema(),
+                context.dataset_id,
+                resource_type,
+            )
 
 
 def _empty_pagination_checkpoint_restart_sql() -> str:
@@ -59023,6 +61207,7 @@ class AlohrGraphQLImportOptions:
     resume_required_entries: set[str] | None
     dataset_id: str | None = None
     resource_hash_contract: str | None = None
+    semantic_projection_as_of: str | None = None
 
 
 @dataclass
@@ -59161,18 +61346,23 @@ async def _write_alohr_graphql_page(
         written_count = await _upsert_resource_rows(
             model,
             model_rows,
-            run_id=import_state.options.run_id,
-            track_seen=import_state.options.stale_cleanup,
-            seen_table=import_state.options.seen_table,
-            canonical_api_base=import_state.canonical_api_base,
-            source_ids=[import_state.compatibility_source_id],
-            dataset_scope=_endpoint_dataset_write_scope(
-                {
-                    "_resource_hash_contract": (
-                        import_state.options.resource_hash_contract
-                    )
-                },
-                import_state.options.dataset_id,
+            options=ProviderDirectoryResourceWriteOptions(
+                run_id=import_state.options.run_id,
+                track_seen=import_state.options.stale_cleanup,
+                seen_table=import_state.options.seen_table,
+                canonical_api_base=import_state.canonical_api_base,
+                source_ids=[import_state.compatibility_source_id],
+                dataset_scope=_endpoint_dataset_write_scope(
+                    {
+                        "_resource_hash_contract": (
+                            import_state.options.resource_hash_contract
+                        ),
+                        "_semantic_projection_as_of": (
+                            import_state.options.semantic_projection_as_of
+                        ),
+                    },
+                    import_state.options.dataset_id,
+                ),
             ),
         )
         prior_count = import_state.source_counts_by_resource.get(resource_type, 0)
@@ -59404,6 +61594,7 @@ def _alohr_graphql_stream_specs(
             source_id,
             source_item,
             run_id=options.run_id,
+            semantic_projection_as_of=options.semantic_projection_as_of,
         )
 
     def append_organization(
@@ -59417,6 +61608,7 @@ def _alohr_graphql_stream_specs(
             source_id,
             source_item,
             run_id=options.run_id,
+            semantic_projection_as_of=options.semantic_projection_as_of,
         )
 
     return (
@@ -60484,6 +62676,15 @@ def _endpoint_dataset_publication_metadata(
         "resource_diagnostics": stored_diagnostics,
         **(
             {
+                SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: (
+                    candidate.semantic_projection_as_of
+                )
+            }
+            if candidate.semantic_projection_as_of is not None
+            else {}
+        ),
+        **(
+            {
                 TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: (
                     candidate.verification_campaign_id
                 ),
@@ -60624,6 +62825,7 @@ async def _endpoint_dataset_content_proof(
     resource_types: tuple[str, ...] = (),
     *,
     verify_payload_hashes: bool = False,
+    resource_hash_contract: str | None = None,
 ) -> EndpointDatasetContentProof:
     """Hash an ordered dataset and each resource family with bounded pages."""
     content_hash = hashlib.sha256()
@@ -60648,7 +62850,10 @@ async def _endpoint_dataset_content_proof(
             break
         for resource_row in resource_rows:
             if verify_payload_hashes:
-                _assert_endpoint_dataset_resource_payload_hash(resource_row)
+                _assert_endpoint_dataset_resource_payload_hash(
+                    resource_row,
+                    resource_hash_contract=resource_hash_contract,
+                )
             if resource_count:
                 content_hash.update(b"\n")
             identity = _endpoint_dataset_hash_identity(resource_row)
@@ -60704,7 +62909,11 @@ async def _endpoint_dataset_content_page(
     )
 
 
-def _assert_endpoint_dataset_resource_payload_hash(resource_row: Any) -> None:
+def _assert_endpoint_dataset_resource_payload_hash(
+    resource_row: Any,
+    *,
+    resource_hash_contract: str | None = None,
+) -> None:
     resource_map = _pagination_checkpoint_row_mapping(resource_row)
     raw_payload = resource_map.get("payload_json")
     if isinstance(raw_payload, str):
@@ -60722,13 +62931,29 @@ def _assert_endpoint_dataset_resource_payload_hash(resource_row: Any) -> None:
         "acquired_resource_sha256"
     )
     stored_hash = _clean_text(resource_map.get("payload_hash"))
-    payload_hash_matches = (
-        subset_payload_sha256(resource_content_hash_payload(raw_payload))
-        == stored_hash
-        if acquired_resource_sha256 is not None
-        else is_resource_payload_hash_match(raw_payload, stored_hash)
-    )
-    if not payload_hash_matches:
+    if acquired_resource_sha256 is not None:
+        is_payload_hash_match = (
+            subset_payload_sha256(resource_content_hash_payload(raw_payload))
+            == stored_hash
+        )
+    elif resource_hash_contract is not None:
+        if resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
+            raise ProviderDirectoryArtifactBuildStale(
+                "provider_directory_resource_hash_contract_invalid"
+            )
+        is_payload_hash_match = (
+            resource_payload_sha256_for_contract(
+                raw_payload,
+                resource_hash_contract,
+            )
+            == stored_hash
+        )
+    else:
+        is_payload_hash_match = is_resource_payload_hash_match(
+            raw_payload,
+            stored_hash,
+        )
+    if not is_payload_hash_match:
         raise ProviderDirectoryArtifactBuildStale(
             "provider_directory_endpoint_dataset_payload_hash_mismatch"
         )
@@ -60822,6 +63047,86 @@ async def _uhc_candidate_content_proof(
     )
 
 
+async def _stored_candidate_content_proof(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    acquisition_root_run_id: str,
+) -> Any:
+    """Load one sealed shard proof under the candidate's exact identity."""
+
+    return await build_stored_dataset_proof(
+        connection,
+        _schema(),
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+        acquisition_root_run_id=acquisition_root_run_id,
+        source_ids=candidate.source_ids,
+        selected_resources=candidate.selected_resources,
+        options=ProviderDirectoryStoredProofOptions(
+            proof_resource_scope=_candidate_proof_resource_scope(candidate),
+            expected_resource_hash_contract=candidate.resource_hash_contract,
+            expected_semantic_projection_as_of=(
+                candidate.semantic_projection_as_of
+            ),
+        ),
+    )
+
+
+async def _assert_candidate_semantic_content_proof(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+    stored_proof: Any,
+) -> None:
+    """Require v3 shard and retained-row proofs to match exactly."""
+
+    if candidate.resource_hash_contract != (
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        return
+    content_resource_scope = (
+        _candidate_proof_resource_scope(candidate)
+        or candidate.selected_resources
+    )
+    direct_content_proof = await _endpoint_dataset_content_proof(
+        connection,
+        candidate.dataset_id,
+        content_resource_scope,
+        verify_payload_hashes=True,
+        resource_hash_contract=candidate.resource_hash_contract,
+    )
+    direct_identity = (
+        direct_content_proof.dataset_hash,
+        direct_content_proof.resource_count,
+        direct_content_proof.resource_hashes,
+        direct_content_proof.resource_counts,
+    )
+    stored_identity = (
+        stored_proof.dataset_hash,
+        stored_proof.resource_count,
+        stored_proof.resource_hashes,
+        stored_proof.resource_counts,
+    )
+    if direct_identity != stored_identity:
+        raise RuntimeError(
+            "provider_directory_semantic_content_proof_mismatch"
+        )
+
+
+def _candidate_content_proof_from_stored(
+    stored_proof: Any,
+) -> EndpointDatasetContentProof:
+    """Project a sealed shard proof into the importer proof value."""
+
+    return EndpointDatasetContentProof(
+        dataset_hash=stored_proof.dataset_hash,
+        resource_count=stored_proof.resource_count,
+        resource_hashes=stored_proof.resource_hashes,
+        resource_counts=stored_proof.resource_counts,
+        source_metrics=stored_proof.source_metrics,
+        proof_metadata=stored_proof.metadata,
+    )
+
+
 async def _candidate_endpoint_dataset_content_proof(
     connection: Any,
     candidate: EndpointDatasetCandidate,
@@ -60839,23 +63144,17 @@ async def _candidate_endpoint_dataset_content_proof(
         raise RuntimeError(
             "provider_directory_content_proof_acquisition_root_required"
         )
-    stored_proof = await build_stored_dataset_proof(
+    stored_proof = await _stored_candidate_content_proof(
         connection,
-        _schema(),
-        dataset_id=candidate.dataset_id,
-        endpoint_id=candidate.endpoint_id,
-        acquisition_root_run_id=acquisition_root_run_id,
-        source_ids=candidate.source_ids,
-        selected_resources=candidate.selected_resources,
+        candidate,
+        acquisition_root_run_id,
     )
-    content_proof = EndpointDatasetContentProof(
-        dataset_hash=stored_proof.dataset_hash,
-        resource_count=stored_proof.resource_count,
-        resource_hashes=stored_proof.resource_hashes,
-        resource_counts=stored_proof.resource_counts,
-        source_metrics=stored_proof.source_metrics,
-        proof_metadata=stored_proof.metadata,
+    await _assert_candidate_semantic_content_proof(
+        connection,
+        candidate,
+        stored_proof,
     )
+    content_proof = _candidate_content_proof_from_stored(stored_proof)
     if candidate.completion_proof_required_version != (
         SERVER_ISSUED_SUBSET_REQUIRED_VERSION
     ):
@@ -61475,15 +63774,27 @@ async def _endpoint_dataset_source_summary(
     )
 
 
-def _twin_root_content_proof(
+def _base_twin_root_content_proof(
     candidate: EndpointDatasetCandidate,
     content_proof: EndpointDatasetContentProof,
 ) -> dict[str, Any]:
-    proof_by_field = {
+    """Build the contract-independent portion of one twin-root proof."""
+
+    proof_resource_scope = _candidate_proof_resource_scope(candidate)
+    return {
         "endpoint_id": candidate.endpoint_id,
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "source_ids": list(candidate.source_ids),
         "selected_resources": list(candidate.selected_resources),
+        **(
+            {
+                PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: list(
+                    proof_resource_scope
+                )
+            }
+            if proof_resource_scope is not None
+            else {}
+        ),
         "expected_resources": list(candidate.expected_resources),
         TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: (
             candidate.verification_campaign_id
@@ -61495,35 +63806,65 @@ def _twin_root_content_proof(
         "resource_count": content_proof.resource_count,
         "resource_hashes": content_proof.resource_hashes,
         "resource_counts": content_proof.resource_counts,
-    }
-    if candidate.completion_proof_required_version is not None:
-        try:
-            completion_proof, completion_sha256 = (
-                validate_subset_completion_proof_pair(
-                    content_proof.completion_proof,
-                    content_proof.completion_proof_sha256,
+        **(
+            {
+                SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: (
+                    candidate.semantic_projection_as_of
                 )
+            }
+            if candidate.resource_hash_contract
+            == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            else {}
+        ),
+    }
+
+
+def _subset_twin_content_proof_fields(
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+) -> dict[str, Any]:
+    """Validate and return the optional server-issued subset proof."""
+
+    if candidate.completion_proof_required_version is None:
+        return {}
+    try:
+        completion_proof, completion_sha256 = (
+            validate_subset_completion_proof_pair(
+                content_proof.completion_proof,
+                content_proof.completion_proof_sha256,
             )
-        except ValueError as exc:
-            raise RuntimeError(
-                "provider_directory_subset_completion_proof_invalid"
-            ) from exc
-        if (
-            candidate.subset_contract is None
-            or completion_proof["campaign_id"]
-            != candidate.subset_contract.campaign_id
-            or completion_proof["cutoff"] != candidate.subset_contract.cutoff
-            or completion_proof["page_count"]
-            != candidate.subset_contract.page_count
-        ):
-            raise RuntimeError(
-                "provider_directory_subset_completion_contract_mismatch"
-            )
-        proof_by_field.update(
-            completion_proof=completion_proof,
-            completion_proof_sha256=completion_sha256,
         )
-    return proof_by_field
+    except ValueError as exc:
+        raise RuntimeError(
+            "provider_directory_subset_completion_proof_invalid"
+        ) from exc
+    if (
+        candidate.subset_contract is None
+        or completion_proof["campaign_id"]
+        != candidate.subset_contract.campaign_id
+        or completion_proof["cutoff"] != candidate.subset_contract.cutoff
+        or completion_proof["page_count"]
+        != candidate.subset_contract.page_count
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_completion_contract_mismatch"
+        )
+    return {
+        "completion_proof": completion_proof,
+        "completion_proof_sha256": completion_sha256,
+    }
+
+
+def _twin_root_content_proof(
+    candidate: EndpointDatasetCandidate,
+    content_proof: EndpointDatasetContentProof,
+) -> dict[str, Any]:
+    """Seal exact dataset, contract, scope, and projection identity."""
+
+    return {
+        **_base_twin_root_content_proof(candidate, content_proof),
+        **_subset_twin_content_proof_fields(candidate, content_proof),
+    }
 
 
 def _twin_root_mismatch_fields(
@@ -61536,9 +63877,11 @@ def _twin_root_mismatch_fields(
             "endpoint_id",
             "source_ids",
             "selected_resources",
+            PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
             "expected_resources",
             TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY,
             TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY,
+            SEMANTIC_PROJECTION_AS_OF_METADATA_KEY,
             "dataset_hash",
             "resource_count",
             "resource_hashes",
@@ -61685,23 +64028,29 @@ def _assert_endpoint_dataset_bulk_freshness(
             raise RuntimeError("provider_directory_bulk_snapshot_older_than_current")
 
 
-async def _lock_endpoint_dataset_for_validation(
+async def _locked_endpoint_dataset_candidate_record(
     connection: Any,
     candidate: EndpointDatasetCandidate,
-) -> str | None:
+) -> dict[str, Any]:
+    """Lock the endpoint and return its mutable candidate row."""
+
     endpoint_ref = _qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)
     dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
     endpoint_record = await connection.first(
-        f"SELECT endpoint_id FROM {endpoint_ref} WHERE endpoint_id = :endpoint_id FOR UPDATE;",
+        f"SELECT endpoint_id FROM {endpoint_ref} "
+        "WHERE endpoint_id = :endpoint_id FOR UPDATE;",
         endpoint_id=candidate.endpoint_id,
     )
     if endpoint_record is None:
-        raise RuntimeError("provider_directory_api_endpoint_missing_during_validation")
+        raise RuntimeError(
+            "provider_directory_api_endpoint_missing_during_validation"
+        )
     candidate_record = await connection.first(
         f"""
         SELECT dataset_id, acquisition_root_run_id, is_current, status,
                previous_dataset_id, completion_proof_required_version,
-               completion_proof_json, completion_proof_sha256
+               completion_proof_json, completion_proof_sha256,
+               publication_metadata_json
           FROM {dataset_ref}
          WHERE dataset_id = :dataset_id
            AND endpoint_id = :endpoint_id
@@ -61711,9 +64060,36 @@ async def _lock_endpoint_dataset_for_validation(
         endpoint_id=candidate.endpoint_id,
     )
     if candidate_record is None:
-        raise RuntimeError("provider_directory_endpoint_dataset_candidate_missing")
-    candidate_record_map = _pagination_checkpoint_row_mapping(candidate_record)
-    if (
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_candidate_missing"
+        )
+    return _pagination_checkpoint_row_mapping(candidate_record)
+
+
+def _assert_locked_candidate_identity(
+    candidate_record_map: dict[str, Any],
+    candidate: EndpointDatasetCandidate,
+) -> None:
+    """Require a locked row to retain every mutable candidate field."""
+
+    try:
+        persisted_hash_contract = _dataset_resource_hash_contract(
+            candidate_record_map
+        )
+        persisted_projection_as_of = _dataset_semantic_projection_as_of(
+            candidate_record_map,
+            persisted_hash_contract,
+        )
+        persisted_proof_resource_scope = _dataset_proof_resource_scope(
+            candidate_record_map,
+            candidate.selected_resources,
+            persisted_hash_contract,
+        )
+    except RuntimeError as error:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_candidate_stale"
+        ) from error
+    is_stale = bool(
         candidate_record_map.get("is_current") is True
         or _clean_text(candidate_record_map.get("status"))
         in IMMUTABLE_ENDPOINT_DATASET_STATUSES
@@ -61723,8 +64099,24 @@ async def _lock_endpoint_dataset_for_validation(
         != candidate.completion_proof_required_version
         or candidate_record_map.get("completion_proof_json") is not None
         or candidate_record_map.get("completion_proof_sha256") is not None
-    ):
-        raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
+        or persisted_hash_contract != candidate.resource_hash_contract
+        or persisted_projection_as_of != candidate.semantic_projection_as_of
+        or persisted_proof_resource_scope
+        != _candidate_proof_resource_scope(candidate)
+    )
+    if is_stale:
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_candidate_stale"
+        )
+
+
+async def _locked_current_endpoint_dataset_id(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> str | None:
+    """Lock and verify the incumbent expected by one candidate."""
+
+    dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
     current_dataset_record = await connection.first(
         f"""
         SELECT dataset_id
@@ -61742,8 +64134,24 @@ async def _lock_endpoint_dataset_for_validation(
     )
     current_dataset_id = _clean_text(current_dataset_map.get("dataset_id"))
     if current_dataset_id != candidate.previous_dataset_id:
-        raise RuntimeError("provider_directory_endpoint_dataset_current_changed")
+        raise RuntimeError(
+            "provider_directory_endpoint_dataset_current_changed"
+        )
     return current_dataset_id
+
+
+async def _lock_endpoint_dataset_for_validation(
+    connection: Any,
+    candidate: EndpointDatasetCandidate,
+) -> str | None:
+    """Lock and verify the complete candidate identity before validation."""
+
+    candidate_record_map = await _locked_endpoint_dataset_candidate_record(
+        connection,
+        candidate,
+    )
+    _assert_locked_candidate_identity(candidate_record_map, candidate)
+    return await _locked_current_endpoint_dataset_id(connection, candidate)
 
 
 def _store_validated_endpoint_dataset_sql() -> str:
@@ -61938,6 +64346,7 @@ async def _locked_twin_root_verification_decision(
         admitted_candidate = _candidate_with_locked_twin_root_admission(
             candidate, locked_state
         )
+        _assert_candidate_hash_contract_supported(admitted_candidate)
         if admitted_candidate != candidate:
             raise RuntimeError(
                 "provider_directory_endpoint_dataset_verification_admission_missing"
@@ -62456,6 +64865,13 @@ def _validated_stored_content_proof_metadata(
         acquisition_root_run_id=acquisition_root_run_id,
         source_ids=candidate.source_ids,
         selected_resources=candidate.selected_resources,
+        options=ProviderDirectoryStoredProofOptions(
+            proof_resource_scope=_candidate_proof_resource_scope(candidate),
+            expected_resource_hash_contract=candidate.resource_hash_contract,
+            expected_semantic_projection_as_of=(
+                candidate.semantic_projection_as_of
+            ),
+        ),
     )
     expected_values = (
         content_proof.dataset_hash,
@@ -62921,6 +65337,18 @@ async def _prepare_resource_import_source_group(
             source_record["_resource_hash_contract"] = (
                 candidate.resource_hash_contract
             )
+            if (
+                proof_resource_scope := _candidate_proof_resource_scope(
+                    candidate
+                )
+            ) is not None:
+                source_record["_proof_resource_scope"] = list(
+                    proof_resource_scope
+                )
+            if candidate.semantic_projection_as_of is not None:
+                source_record["_semantic_projection_as_of"] = (
+                    candidate.semantic_projection_as_of
+                )
         if checkpoint_context is not None:
             source_record["_pagination_checkpoint_context"] = checkpoint_context
         if checkpoint_owner_run_id:
@@ -64133,19 +66561,26 @@ async def _import_resources(
                         if dataset_scope
                         else None
                     ),
+                    semantic_projection_as_of=(
+                        dataset_scope.semantic_projection_as_of
+                        if dataset_scope
+                        else None
+                    ),
                 )
             return await _upsert_resource_rows(
                 model,
                 compatibility_rows,
-                run_id=run_id,
-                track_seen=stale_cleanup,
-                seen_table=seen_stage_table,
-                canonical_api_base=(
-                    partition_source.get("canonical_api_base")
-                    or partition_source.get("api_base")
+                options=ProviderDirectoryResourceWriteOptions(
+                    run_id=run_id,
+                    track_seen=stale_cleanup,
+                    seen_table=seen_stage_table,
+                    canonical_api_base=(
+                        partition_source.get("canonical_api_base")
+                        or partition_source.get("api_base")
+                    ),
+                    source_ids=[partition_source["source_id"]],
+                    dataset_scope=dataset_scope,
                 ),
-                source_ids=[partition_source["source_id"]],
-                dataset_scope=dataset_scope,
             )
 
         if _uses_alohr_graphql_connector(partition_source):
@@ -64169,6 +66604,9 @@ async def _import_resources(
                     dataset_id=partition_source.get("_endpoint_dataset_id"),
                     resource_hash_contract=partition_source.get(
                         "_resource_hash_contract"
+                    ),
+                    semantic_projection_as_of=partition_source.get(
+                        "_semantic_projection_as_of"
                     ),
                 ),
             )
@@ -64797,8 +67235,17 @@ def _dataset_rehydration_runtime(
     async def upsert(model: type, rows: list[dict[str, Any]], scope: DatasetScope) -> int:
         """Write one retained batch through normal provenance upserts."""
         return await _upsert_resource_rows(
-            model, rows, run_id=scope.acquisition_root_run_id, track_seen=False,
-            canonical_api_base=scope.canonical_api_base, source_ids=[scope.source_id],
+            model,
+            rows,
+            options=ProviderDirectoryResourceWriteOptions(
+                run_id=scope.acquisition_root_run_id,
+                track_seen=False,
+                canonical_api_base=scope.canonical_api_base,
+                source_ids=[scope.source_id],
+                resource_hash_contract=scope.resource_hash_contract,
+                semantic_projection_as_of=scope.semantic_projection_as_of,
+                derive_location_contacts=False,
+            ),
         )
 
     async def cancelled() -> None:
@@ -65024,7 +67471,7 @@ async def _uhc_candidate_from_state(
     status = _clean_text(state.get("status"))
     is_current = state.get("is_current") is True
     metadata = _json_object(state.get("publication_metadata_json"))
-    return EndpointDatasetCandidate(
+    candidate = EndpointDatasetCandidate(
         endpoint_id=endpoint_id,
         dataset_id=dataset_id,
         acquisition_root_run_id=run_id,
@@ -65039,7 +67486,11 @@ async def _uhc_candidate_from_state(
                 exclude_dataset_id=dataset_id,
             )
         ),
-        resource_hash_contract=_dataset_resource_hash_contract(state),
+        resource_hash_contract=(
+            _dataset_resource_hash_contract(state)
+            if state
+            else TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+        ),
         expected_resources=selected_resources,
         reused_from_checkpoint=bool(state),
         already_validated=status == ENDPOINT_DATASET_VALIDATED,
@@ -65055,6 +67506,8 @@ async def _uhc_candidate_from_state(
             else None
         ),
     )
+    _assert_candidate_hash_contract_supported(candidate)
+    return candidate
 
 
 async def _persist_uhc_candidate_identity(
@@ -65245,6 +67698,11 @@ async def _replace_uhc_candidate_resources(
              WHERE dataset_id=:dataset_id;
             """,
             dataset_id=candidate.dataset_id,
+        )
+        await delete_dataset_proof_shards(
+            executor,
+            _schema(),
+            candidate.dataset_id,
         )
         inserted = _coerce_rowcount(
             await executor.status(

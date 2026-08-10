@@ -22,7 +22,9 @@ from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
     ProviderDirectoryProofStoreError,
     delete_dataset_proof_shards,
-    ensure_dataset_proof_shard_table,
+)
+from tests.provider_directory_proof_store_db_support import (
+    create_proof_store_tables,
 )
 
 
@@ -99,66 +101,6 @@ def _resource_rows():
     ]
 
 
-async def _create_tables(database: Database, schema: str) -> None:
-    await database.status(f'CREATE SCHEMA "{schema}";')
-    await database.status(
-        f"""
-        CREATE TABLE "{schema}".provider_directory_endpoint_dataset (
-            dataset_id varchar(96) PRIMARY KEY,
-            endpoint_id varchar(64) NOT NULL,
-            acquisition_root_run_id varchar(64),
-            status varchar(32) NOT NULL,
-            is_current boolean NOT NULL DEFAULT false,
-            publication_metadata_json jsonb NOT NULL DEFAULT '{{}}'::jsonb
-        );
-        """
-    )
-    await database.status(
-        f"""
-        CREATE TABLE "{schema}".provider_directory_dataset_resource (
-            dataset_id varchar(96) NOT NULL REFERENCES
-                "{schema}".provider_directory_endpoint_dataset(dataset_id),
-            resource_type varchar(64) NOT NULL,
-            resource_id varchar(256) NOT NULL,
-            payload_hash varchar(64) NOT NULL,
-            payload_json jsonb NOT NULL,
-            PRIMARY KEY (dataset_id, resource_type, resource_id)
-        );
-        """
-    )
-    await database.status(
-        f"""
-        INSERT INTO "{schema}".provider_directory_endpoint_dataset (
-            dataset_id, endpoint_id, acquisition_root_run_id,
-            status, is_current, publication_metadata_json
-        ) VALUES (
-            :dataset_id, :endpoint_id, :root_run_id,
-            :status, false, CAST(:metadata_json AS jsonb)
-        );
-        """,
-        dataset_id=DATASET_ID,
-        endpoint_id=ENDPOINT_ID,
-        root_run_id=ROOT_RUN_ID,
-        status=importer.ENDPOINT_DATASET_ACQUIRING,
-        metadata_json=json.dumps({"source_ids": list(SOURCE_IDS)}),
-    )
-    for model in LEGACY_MIRROR_MODELS:
-        await database.status(
-            importer._provider_directory_artifact_scope_table_sql(
-                model,
-                schema,
-                model.__tablename__,
-            )
-        )
-        for statement in importer._artifact_scope_pk_sql(
-            model,
-            schema,
-            model.__tablename__,
-        ):
-            await database.status(statement)
-    await ensure_dataset_proof_shard_table(database, schema)
-
-
 @asynccontextmanager
 async def _proof_database(monkeypatch):
     schema = f"provider_directory_proof_{uuid.uuid4().hex[:12]}"
@@ -177,7 +119,16 @@ async def _proof_database(monkeypatch):
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
         for model in models_with_schema:
             monkeypatch.setattr(model.__table__, "schema", schema)
-        await _create_tables(database, schema)
+        await create_proof_store_tables(
+            database,
+            schema,
+            dataset_id=DATASET_ID,
+            endpoint_id=ENDPOINT_ID,
+            root_run_id=ROOT_RUN_ID,
+            source_ids=SOURCE_IDS,
+            selected_resources=SELECTED_RESOURCES,
+            mirror_models=LEGACY_MIRROR_MODELS,
+        )
         is_schema_created = True
         yield database, schema
     finally:
@@ -207,6 +158,7 @@ def _candidate(
         expected_resources=selected_resources,
         import_run_id=root_run_id,
         previous_dataset_id=None,
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
     )
 
 
@@ -236,6 +188,7 @@ async def _write_resource_batch(connection, dataset_resources) -> None:
                 if dataset_resource["resource_type"] == resource_type
             ],
             persist_content_proof=True,
+            resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
         )
 
 
@@ -387,11 +340,13 @@ async def test_postgres_normal_fhir_batch_commits_resource_with_proof(
                     "addresses": [{"city": "Chicago"}],
                 }
             ],
-            run_id=ROOT_RUN_ID,
-            track_seen=False,
-            dataset_scope=importer.EndpointDatasetWriteScope(
-                DATASET_ID,
-                importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+            options=importer.ProviderDirectoryResourceWriteOptions(
+                run_id=ROOT_RUN_ID,
+                track_seen=False,
+                dataset_scope=importer.EndpointDatasetWriteScope(
+                    DATASET_ID,
+                    importer.LEGACY_RESOURCE_HASH_CONTRACT,
+                ),
             ),
         )
 

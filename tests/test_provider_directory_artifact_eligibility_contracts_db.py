@@ -1,0 +1,379 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+from __future__ import annotations
+
+import copy
+import importlib
+import json
+
+import pytest
+
+from db.connection import Database
+from tests.test_provider_directory_artifact_eligibility_db import (
+    DATASET_HASH,
+    _artifact_options,
+    _assert_candidate_eligibility,
+    _baseline_metadata,
+    _candidate_database,
+    _matched_metadata,
+    _metadata_with_hash_identity,
+    _option_ids,
+    _set_all_source_profiles,
+    _set_source_metadata,
+    _set_twin_metadata,
+    _source_metadata,
+)
+
+
+importer = importlib.import_module("process.provider_directory_fhir")
+
+
+async def _assert_metadata_case(
+    database: Database,
+    schema: str,
+    *,
+    baseline_metadata: dict[str, object],
+    candidate_metadata: dict[str, object],
+    expected: bool,
+    case_name: str,
+) -> None:
+    """Persist one twin pair and assert both eligibility implementations."""
+    await _set_twin_metadata(
+        database,
+        schema,
+        baseline_metadata=baseline_metadata,
+        candidate_metadata=candidate_metadata,
+    )
+    await _assert_candidate_eligibility(
+        database,
+        schema,
+        expected=expected,
+        case_name=case_name,
+    )
+
+
+async def _assert_legacy_hash_compatibility(
+    database: Database,
+    schema: str,
+) -> dict[str, object]:
+    """Accept a markerless legacy baseline with an explicit-v1 candidate."""
+    explicit_v1_candidate = _metadata_with_hash_identity(
+        _matched_metadata(),
+        importer.LEGACY_RESOURCE_HASH_CONTRACT,
+    )
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=_baseline_metadata(),
+        candidate_metadata=explicit_v1_candidate,
+        expected=True,
+        case_name="markerless-v1 baseline with explicit-v1 candidate",
+    )
+    return explicit_v1_candidate
+
+
+async def _assert_transport_neutral_hash_compatibility(
+    database: Database,
+    schema: str,
+) -> dict[str, object]:
+    """Accept matching explicit-v2 parent contracts."""
+    explicit_v2_baseline = _metadata_with_hash_identity(
+        _baseline_metadata(),
+        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+    )
+    explicit_v2_candidate = _metadata_with_hash_identity(
+        _matched_metadata(),
+        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+    )
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=explicit_v2_baseline,
+        candidate_metadata=explicit_v2_candidate,
+        expected=True,
+        case_name="matching explicit-v2 parents",
+    )
+    return explicit_v2_baseline
+
+
+async def _assert_semantic_hash_compatibility(
+    database: Database,
+    schema: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Accept matching semantic-v3 parents and embedded proofs."""
+    semantic_baseline = _metadata_with_hash_identity(
+        _baseline_metadata(),
+        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    )
+    semantic_candidate = _metadata_with_hash_identity(
+        _matched_metadata(),
+        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    )
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=semantic_baseline,
+        candidate_metadata=semantic_candidate,
+        expected=True,
+        case_name="matching semantic-v3 parents and proofs",
+    )
+    return semantic_baseline, semantic_candidate
+
+
+async def _assert_embedded_semantic_drift_rejected(
+    database: Database,
+    schema: str,
+    semantic_baseline: dict[str, object],
+    semantic_candidate: dict[str, object],
+) -> None:
+    """Reject projection-date and resource-scope drift inside proof objects."""
+    candidate_proof_drift = copy.deepcopy(semantic_candidate)
+    candidate_proof_drift[importer.TWIN_ROOT_VERIFICATION_METADATA_KEY]["proof"][
+        importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
+    ] = "2026-08-10"
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=semantic_baseline,
+        candidate_metadata=candidate_proof_drift,
+        expected=False,
+        case_name="candidate proof projection date drift",
+    )
+
+    baseline_proof_drift = copy.deepcopy(semantic_baseline)
+    baseline_proof_drift[importer.TWIN_ROOT_VERIFICATION_METADATA_KEY]["proof"][
+        importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+    ] = ["Practitioner"]
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=baseline_proof_drift,
+        candidate_metadata=semantic_candidate,
+        expected=False,
+        case_name="baseline proof resource scope drift",
+    )
+
+
+async def _assert_semantic_parent_proof_drift(
+    database: Database,
+    schema: str,
+    semantic_baseline: dict[str, object],
+    semantic_candidate: dict[str, object],
+) -> None:
+    """Reject matching drift applied to both parent metadata and its proof."""
+    candidate_scope_drift = copy.deepcopy(semantic_candidate)
+    candidate_scope_drift[
+        importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+    ] = ["Organization", "Practitioner"]
+    candidate_scope_drift[importer.TWIN_ROOT_VERIFICATION_METADATA_KEY]["proof"][
+        importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
+    ] = ["Organization", "Practitioner"]
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=semantic_baseline,
+        candidate_metadata=candidate_scope_drift,
+        expected=False,
+        case_name="candidate parent and proof scope drift",
+    )
+
+    baseline_projection_drift = copy.deepcopy(semantic_baseline)
+    baseline_projection_drift[
+        importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
+    ] = "2026-08-10"
+    baseline_projection_drift[importer.TWIN_ROOT_VERIFICATION_METADATA_KEY]["proof"][
+        importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY
+    ] = "2026-08-10"
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=baseline_projection_drift,
+        candidate_metadata=semantic_candidate,
+        expected=False,
+        case_name="baseline parent and proof projection date drift",
+    )
+
+
+async def _assert_hash_contract_drift_rejected(
+    database: Database,
+    schema: str,
+    explicit_v1_candidate: dict[str, object],
+    explicit_v2_baseline: dict[str, object],
+) -> None:
+    """Reject mismatched, null, and unknown resource-hash contracts."""
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=explicit_v2_baseline,
+        candidate_metadata=explicit_v1_candidate,
+        expected=False,
+        case_name="candidate and baseline hash contract mismatch",
+    )
+
+    invalid_contract_candidate = copy.deepcopy(explicit_v1_candidate)
+    invalid_contract_candidate[importer.RESOURCE_HASH_CONTRACT_METADATA_KEY] = None
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=_baseline_metadata(),
+        candidate_metadata=invalid_contract_candidate,
+        expected=False,
+        case_name="explicit-null hash contract",
+    )
+    invalid_contract_candidate[
+        importer.RESOURCE_HASH_CONTRACT_METADATA_KEY
+    ] = "unknown_contract"
+    await _assert_metadata_case(
+        database,
+        schema,
+        baseline_metadata=_baseline_metadata(),
+        candidate_metadata=invalid_contract_candidate,
+        expected=False,
+        case_name="unknown hash contract",
+    )
+
+
+@pytest.mark.asyncio
+async def test_twin_hash_identity_is_exact_in_options_and_compact_fence(
+    monkeypatch,
+):
+    """Prove v1/v2/v3 identity parity and fail-closed drift handling."""
+    async with _candidate_database(monkeypatch) as (database, schema):
+        await _set_all_source_profiles(
+            database,
+            schema,
+            importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+        )
+        explicit_v1_candidate = await _assert_legacy_hash_compatibility(
+            database, schema
+        )
+        explicit_v2_baseline = await _assert_transport_neutral_hash_compatibility(
+            database, schema
+        )
+        semantic_baseline, semantic_candidate = await _assert_semantic_hash_compatibility(
+            database, schema
+        )
+        await _assert_embedded_semantic_drift_rejected(
+            database, schema, semantic_baseline, semantic_candidate
+        )
+        await _assert_semantic_parent_proof_drift(
+            database, schema, semantic_baseline, semantic_candidate
+        )
+        await _assert_hash_contract_drift_rejected(
+            database, schema, explicit_v1_candidate, explicit_v2_baseline
+        )
+
+
+@pytest.mark.asyncio
+async def test_verified_gate_rejects_config_and_profile_drift(monkeypatch):
+    async with _candidate_database(monkeypatch) as (database, schema):
+        await _set_all_source_profiles(
+            database,
+            schema,
+            importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+        )
+        await _set_source_metadata(
+            database,
+            schema,
+            "source_a",
+            _source_metadata(
+                status=importer.PROVIDER_DIRECTORY_TWIN_ROOT_VERIFIED,
+                configured_endpoint_id="replacement_endpoint",
+            ),
+        )
+        assert _option_ids(await _artifact_options(database, schema)) == [
+            "dataset_current"
+        ]
+        for invalid_metadata in (
+            _source_metadata(status="unknown"),
+            _source_metadata(status=None),
+        ):
+            await _set_source_metadata(
+                database, schema, "source_a", invalid_metadata
+            )
+            assert _option_ids(await _artifact_options(database, schema)) == [
+                "dataset_current"
+            ]
+        await _set_source_metadata(database, schema, "source_a", _source_metadata())
+        await _set_source_metadata(database, schema, "source_b", {})
+        assert _option_ids(await _artifact_options(database, schema)) == [
+            "dataset_current"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_removed_review_profile_cannot_reclassify_twin_datasets(
+    monkeypatch,
+):
+    async with _candidate_database(monkeypatch) as (database, schema):
+        profile_absent_metadata = _source_metadata(
+            status=None,
+            campaign_id=None,
+        )
+        for source_id in ("source_a", "source_b"):
+            await _set_source_metadata(
+                database,
+                schema,
+                source_id,
+                profile_absent_metadata,
+            )
+        assert _option_ids(await _artifact_options(database, schema)) == [
+            "dataset_current"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_genuine_established_candidate_keeps_profile_absent_path(
+    monkeypatch,
+):
+    async with _candidate_database(monkeypatch) as (database, schema):
+        await database.status(
+            f"""
+            INSERT INTO {schema}.provider_directory_source (
+                source_id, endpoint_id, metadata_json
+            ) VALUES (
+                'established_source', 'established_endpoint',
+                CAST(:source_metadata AS jsonb)
+            );
+            """,
+            source_metadata=json.dumps(
+                {
+                    "provider_directory_supported_resources": ["Organization"],
+                    "provider_directory_fully_enumerable_resources": [
+                        "Organization"
+                    ],
+                }
+            ),
+        )
+        await database.status(
+            f"""
+            INSERT INTO {schema}.provider_directory_endpoint_dataset (
+                dataset_id, endpoint_id, acquisition_root_run_id,
+                dataset_hash, status, is_current, resource_count,
+                publication_metadata_json
+            ) VALUES
+                ('established_current', 'established_endpoint', 'root_current',
+                 :dataset_hash, :published, true, 1, '{{}}'::jsonb),
+                ('established_candidate', 'established_endpoint', 'root_candidate',
+                 :dataset_hash, :validated, false, 1,
+                 CAST(:candidate_metadata AS jsonb));
+            """,
+            dataset_hash=DATASET_HASH,
+            published=importer.ENDPOINT_DATASET_PUBLISHED,
+            validated=importer.ENDPOINT_DATASET_VALIDATED,
+            candidate_metadata=json.dumps(
+                {
+                    "requires_twin_root_verification": False,
+                    "source_ids": ["established_source"],
+                }
+            ),
+        )
+        options = await _artifact_options(
+            database,
+            schema,
+            "established_endpoint",
+        )
+        assert _option_ids(options) == [
+            "established_candidate",
+            "established_current",
+        ]

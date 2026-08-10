@@ -284,7 +284,15 @@ async def _seed_direct_fetch_dataset(
         endpoint_id=ENDPOINT_ID,
         root_run_id=ROOT_RUN_ID,
         status=importer.ENDPOINT_DATASET_ACQUIRING,
-        metadata_json=json.dumps({"source_ids": [SOURCE_ID]}),
+        metadata_json=json.dumps(
+            {
+                "source_ids": [SOURCE_ID],
+                "selected_resources": [RESOURCE_TYPE],
+                "resource_hash_contract": (
+                    importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+                ),
+            }
+        ),
     )
 
 
@@ -397,7 +405,10 @@ async def fetch_practitioners(
             model,
             resource_rows,
             DATASET_ID,
-            resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+            resource_hash_contract=(
+                importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+            ),
+            semantic_projection_as_of=None,
         )
         return len(dataset_rows)
 

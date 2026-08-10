@@ -8,6 +8,9 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
+from process.provider_directory_proof_store import (
+    ensure_dataset_proof_shard_table,
+)
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -112,6 +115,7 @@ async def _create_checkpoint_lifecycle_tables(database: Database, schema: str) -
         "UNIQUE (canonical_api_base, resource_type, source_scope_hash, "
         "acquisition_root_run_id));"
     )
+    await ensure_dataset_proof_shard_table(database, schema)
 
 
 async def _seed_checkpoint_lifecycle_rows(database: Database, schema: str) -> None:

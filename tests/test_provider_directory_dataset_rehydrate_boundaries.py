@@ -16,6 +16,9 @@ from process import provider_directory_dataset_rehydrate as rehydrate
 from process import provider_directory_dataset_rehydrate_scope as rehydrate_scope
 from process import provider_directory_dataset_rehydrate_store as rehydrate_store
 from process import provider_directory_dataset_rehydrate_types as rehydrate_types
+from process.provider_directory_resource_hash import (
+    LEGACY_RESOURCE_HASH_CONTRACT,
+)
 
 
 def _mapped_payload():
@@ -188,6 +191,8 @@ def _scope(**changes):
         "dataset_hash": _dataset_hash(),
         "resource_count": 1,
         "resource_types": ("Location",),
+        "resource_hash_contract": LEGACY_RESOURCE_HASH_CONTRACT,
+        "semantic_projection_as_of": None,
         "publication_metadata_hash": "a" * 64,
         "published_at": dt.datetime.now(dt.UTC),
     }
@@ -471,6 +476,7 @@ def test_payload_validation_rejects_each_unsafe_shape(
             resource_id,
             rehydrate_types._payload_hash(payload),
             payload,
+            resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
         )
         == expected_reason
     )
