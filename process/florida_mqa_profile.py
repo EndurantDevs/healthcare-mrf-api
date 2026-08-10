@@ -1208,12 +1208,13 @@ class FloridaMQAClient:
     def _open(self, request: str | Request) -> Any:
         return self.opener.open(request, timeout=120)
 
-    def authenticate(self) -> None:
-        """Authenticate to the source portal without retaining credential values."""
-        response = self._open(f"{self.base_url}/ProfileData")
-        body = response.read().decode("utf-8", "replace")
-        if "Sign out" in body:
-            return
+    @staticmethod
+    def _authentication_contract(
+        response: Any,
+        body: str,
+    ) -> tuple[str, str, str, str, str]:
+        """Extract the B2C policy and transaction fields from a login page."""
+
         match = _SETTINGS_RE.search(body)
         if not match:
             raise RuntimeError("florida_mqa_login_settings_missing")
@@ -1226,10 +1227,49 @@ class FloridaMQAClient:
             or parse_qs(parsed.query).get("p", [""])[0]
             or policy_base.rsplit("/", 1)[-1]
         )
-        transaction = str(settings.get("transId") or settings.get("transactionId") or "")
+        transaction = str(
+            settings.get("transId") or settings.get("transactionId") or ""
+        )
         csrf = str(settings.get("csrf") or settings.get("csrf_token") or "")
         if not policy or not transaction or not csrf:
             raise RuntimeError("florida_mqa_login_contract_changed")
+        return final_url, policy_base, policy, transaction, csrf
+
+    def _complete_authentication_callback(self, confirmed: Any) -> None:
+        """Submit the provider-owned callback form and verify its session."""
+
+        confirmed_html = confirmed.read().decode("utf-8", "replace")
+        form_match = _FORM_RE.search(confirmed_html)
+        if not form_match:
+            raise RuntimeError("florida_mqa_login_callback_missing")
+        callback_url = urljoin(
+            confirmed.geturl(),
+            html.unescape(form_match.group(1)),
+        )
+        callback_fields_by_key = {
+            html.unescape(name): html.unescape(field_value)
+            for name, field_value in _INPUT_RE.findall(form_match.group(2))
+        }
+        callback = self._open(
+            Request(
+                callback_url,
+                data=urlencode(callback_fields_by_key).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        )
+        callback_body = callback.read().decode("utf-8", "replace")
+        if "Sign out" not in callback_body:
+            raise RuntimeError("florida_mqa_login_callback_failed")
+
+    def authenticate(self) -> None:
+        """Authenticate to the source portal without retaining credential values."""
+        response = self._open(f"{self.base_url}/ProfileData")
+        body = response.read().decode("utf-8", "replace")
+        if "Sign out" in body:
+            return
+        final_url, policy_base, policy, transaction, csrf = (
+            self._authentication_contract(response, body)
+        )
         query = urlencode({"tx": transaction, "p": policy})
         login_request = Request(
             f"{policy_base}/SelfAsserted?{query}",
@@ -1256,25 +1296,7 @@ class FloridaMQAClient:
                 }
             )
         )
-        confirmed_html = confirmed.read().decode("utf-8", "replace")
-        form_match = _FORM_RE.search(confirmed_html)
-        if not form_match:
-            raise RuntimeError("florida_mqa_login_callback_missing")
-        callback_url = urljoin(confirmed.geturl(), html.unescape(form_match.group(1)))
-        callback_fields_by_key = {
-            html.unescape(name): html.unescape(field_value)
-            for name, field_value in _INPUT_RE.findall(form_match.group(2))
-        }
-        callback = self._open(
-            Request(
-                callback_url,
-                data=urlencode(callback_fields_by_key).encode(),
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        )
-        callback_body = callback.read().decode("utf-8", "replace")
-        if "Sign out" not in callback_body:
-            raise RuntimeError("florida_mqa_login_callback_failed")
+        self._complete_authentication_callback(confirmed)
 
     def download(self, source: FloridaSource, target: Path) -> tuple[str, int]:
         """Download one authenticated source artifact to the import workspace."""
@@ -1500,33 +1522,15 @@ def _license_status_continuation_values(
     }
 
 
-def _normalized_pipe_values(
+def _repair_pipe_value_alignment(
     profile_source: FloridaSource,
     header: list[str],
     field_values: list[str],
     *,
-    row_number: int,
-    artifact_member: str,
+    physical_field_count: int,
     parser_metrics: dict[str, Any] | None,
-) -> tuple[list[str] | None, dict[str, Any] | None]:
-    """Normalize only explicit source quirks; otherwise quarantine the row."""
-    physical_field_count = len(field_values)
-    physical_row_sha256 = _physical_row_sha256(field_values)
-    trailing_empty_count = 0
-    if len(field_values) > len(header) and field_values[-1] == "":
-        field_values = field_values[:-1]
-        trailing_empty_count = 1
-    if trailing_empty_count:
-        _increment_parser_metric(
-            parser_metrics,
-            "trailing_empty_rows",
-        )
-        _increment_parser_metric(
-            parser_metrics,
-            "trailing_empty_fields",
-            trailing_empty_count,
-        )
-
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Repair the two reviewed source-specific field alignment quirks."""
     repair_metadata_by_key: dict[str, Any] | None = None
     if (
         len(field_values) == len(header) + 1
@@ -1568,6 +1572,43 @@ def _normalized_pipe_values(
                 "physical_field_count": physical_field_count,
             }
             _increment_parser_metric(parser_metrics, "recovered_rows")
+    return field_values, repair_metadata_by_key
+
+
+def _normalized_pipe_values(
+    profile_source: FloridaSource,
+    header: list[str],
+    field_values: list[str],
+    *,
+    row_number: int,
+    artifact_member: str,
+    parser_metrics: dict[str, Any] | None,
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    """Normalize only explicit source quirks; otherwise quarantine the row."""
+    physical_field_count = len(field_values)
+    physical_row_sha256 = _physical_row_sha256(field_values)
+    trailing_empty_count = 0
+    if len(field_values) > len(header) and field_values[-1] == "":
+        field_values = field_values[:-1]
+        trailing_empty_count = 1
+    if trailing_empty_count:
+        _increment_parser_metric(
+            parser_metrics,
+            "trailing_empty_rows",
+        )
+        _increment_parser_metric(
+            parser_metrics,
+            "trailing_empty_fields",
+            trailing_empty_count,
+        )
+
+    field_values, repair_metadata_by_key = _repair_pipe_value_alignment(
+        profile_source,
+        header,
+        field_values,
+        physical_field_count=physical_field_count,
+        parser_metrics=parser_metrics,
+    )
 
     if len(field_values) == len(header):
         return field_values, repair_metadata_by_key
@@ -2712,20 +2753,12 @@ def _administrative_complaint_fact(
     )
 
 
-def _pain_management_fact(
-    profile_source: FloridaSource,
+def _pain_management_value(
     source_row: Mapping[str, str],
-    *,
-    run_id: str,
-    record_id: str,
-    npi: int | None,
-    artifact: Mapping[str, Any],
+    report_period: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Build one reviewed pain-management report fact."""
-    report_period = _without_empty(
-        {"year": source_row.get("year", ""), "quarter": source_row.get("qtr", "")}
-    )
-    field_value = _without_empty(
+    """Build the reviewed value carried by one pain-management fact."""
+    return _without_empty(
         {
             "jurisdiction": "FL",
             "clinic": _without_empty(
@@ -2754,6 +2787,22 @@ def _pain_management_fact(
             ),
         }
     )
+
+
+def _pain_management_fact(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one reviewed pain-management report fact."""
+    report_period = _without_empty(
+        {"year": source_row.get("year", ""), "quarter": source_row.get("qtr", "")}
+    )
+    field_value = _pain_management_value(source_row, report_period)
     period_display = " ".join(
         profile_item
         for profile_item in (
@@ -2788,21 +2837,14 @@ def _pain_management_fact(
     )
 
 
-def _pharmacy_relationship_fact(
-    profile_source: FloridaSource,
+def _pharmacy_relationship_value(
     source_row: Mapping[str, str],
     *,
-    run_id: str,
-    record_id: str,
-    npi: int | None,
-    artifact: Mapping[str, Any],
+    original_date: str,
+    expiration_date: str,
+    status_effective_date: str,
 ) -> dict[str, Any]:
-    """Build one reviewed pharmacy relationship fact."""
-    original_date, _ = _normalize_source_date(source_row.get("pharm_orig_dte", ""))
-    expiration_date, _ = _normalize_source_date(source_row.get("pharm_expr_dte", ""))
-    status_effective_date, _ = _normalize_source_date(
-        source_row.get("pharm_stat_efctv_dte", "")
-    )
+    """Build the reviewed value carried by one pharmacy relationship."""
     pharmacy_location = _without_empty(
         {
             "address_line_1": source_row.get("pharm_pl_addr_l1", ""),
@@ -2813,7 +2855,7 @@ def _pharmacy_relationship_fact(
             "postal_code": source_row.get("pharm_pl_zip", ""),
         }
     )
-    field_value = _without_empty(
+    return _without_empty(
         {
             "jurisdiction": "FL",
             "relationship_profession": source_row.get("rltn_prof_nme", ""),
@@ -2849,6 +2891,29 @@ def _pharmacy_relationship_fact(
             ),
         }
     )
+
+
+def _pharmacy_relationship_fact(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one reviewed pharmacy relationship fact."""
+    original_date, _ = _normalize_source_date(source_row.get("pharm_orig_dte", ""))
+    expiration_date, _ = _normalize_source_date(source_row.get("pharm_expr_dte", ""))
+    status_effective_date, _ = _normalize_source_date(
+        source_row.get("pharm_stat_efctv_dte", "")
+    )
+    field_value = _pharmacy_relationship_value(
+        source_row,
+        original_date=original_date,
+        expiration_date=expiration_date,
+        status_effective_date=status_effective_date,
+    )
     relationship = source_row.get("rltn_prof_nme", "")
     pharmacy_name = source_row.get("pharm_key_name", "")
     details = " — ".join(profile_item for profile_item in (relationship, pharmacy_name) if profile_item)
@@ -2871,6 +2936,29 @@ def _pharmacy_relationship_fact(
     )
 
 
+def _medical_cannabis_authorization(course: str) -> tuple[str, str, str]:
+    """Return the semantic identity and label for one course type."""
+
+    course_token = course.strip().upper()
+    if course_token in {"D", "DIRECTOR"}:
+        return (
+            "dispensing_organization_medical_director_eligibility",
+            "dispensing_organization_medical_director_eligibility",
+            "Eligible to serve as a dispensing organization medical director",
+        )
+    if course_token in {"P", "PHYSICIAN"}:
+        return (
+            "medical_cannabis_ordering",
+            "medical_cannabis_ordering_authorization",
+            "Authorized to order medical cannabis and low-THC cannabis",
+        )
+    return (
+        "medical_cannabis_course_listing",
+        "medical_cannabis_course_listing",
+        "Florida medical cannabis course listing",
+    )
+
+
 def _medical_cannabis_fact(
     profile_source: FloridaSource,
     source_row: Mapping[str, str],
@@ -2883,18 +2971,9 @@ def _medical_cannabis_fact(
     """Build one reviewed medical-cannabis authorization fact."""
     course = source_row.get("course_type", "")
     course_token = course.strip().upper()
-    if course_token in {"D", "DIRECTOR"}:
-        authorization_type = "dispensing_organization_medical_director_eligibility"
-        semantic_fact_type = "dispensing_organization_medical_director_eligibility"
-        display = "Eligible to serve as a dispensing organization medical director"
-    elif course_token in {"P", "PHYSICIAN"}:
-        authorization_type = "medical_cannabis_ordering"
-        semantic_fact_type = "medical_cannabis_ordering_authorization"
-        display = "Authorized to order medical cannabis and low-THC cannabis"
-    else:
-        authorization_type = "medical_cannabis_course_listing"
-        semantic_fact_type = "medical_cannabis_course_listing"
-        display = "Florida medical cannabis course listing"
+    authorization_type, semantic_fact_type, display = (
+        _medical_cannabis_authorization(course)
+    )
     practice_location = _without_empty(
         {
             "address_line_1": source_row.get("pl_addr_line1", ""),
@@ -2939,6 +3018,35 @@ def _medical_cannabis_fact(
     )
 
 
+def _specialized_fact_for_row(
+    profile_source: FloridaSource,
+    source_row: Mapping[str, str],
+    *,
+    run_id: str,
+    record_id: str,
+    npi: int | None,
+    artifact: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Map source-specific supplemental rows through their reviewed builder."""
+    builder_by_source_key = {
+        "medical_cannabis_authorization": _medical_cannabis_fact,
+        "administrative_complaints": _administrative_complaint_fact,
+        "pain_management_report": _pain_management_fact,
+        "pharmacy_pharmacist": _pharmacy_relationship_fact,
+    }
+    fact_builder = builder_by_source_key.get(profile_source.key)
+    if fact_builder is None:
+        return None
+    return fact_builder(
+        profile_source,
+        source_row,
+        run_id=run_id,
+        record_id=record_id,
+        npi=npi,
+        artifact=artifact,
+    )
+
+
 def _facts_for_row(
     profile_source: FloridaSource,
     source_row: Mapping[str, str],
@@ -2978,46 +3086,16 @@ def _facts_for_row(
             npi=npi,
             artifact=artifact,
         )
-    if profile_source.key == "medical_cannabis_authorization":
-        return [
-            _medical_cannabis_fact(
-                profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
-                artifact=artifact,
-            )
-        ]
-    if profile_source.key == "administrative_complaints":
-        return [
-            _administrative_complaint_fact(
-                profile_source,
-                source_row,
-                run_id=run_id,
-                record_id=record_id,
-                npi=npi,
-                artifact=artifact,
-            )
-        ]
-    if profile_source.key == "pain_management_report":
-        return [
-            _pain_management_fact(
-                profile_source,
-                source_row,
-                run_id=run_id,
-                record_id=record_id,
-                npi=npi,
-                artifact=artifact,
-            )
-        ]
-    if profile_source.key == "pharmacy_pharmacist":
-        return [
-            _pharmacy_relationship_fact(
-                profile_source,
-                source_row,
-                run_id=run_id,
-                record_id=record_id,
-                npi=npi,
-                artifact=artifact,
-            )
-        ]
+    specialized_fact = _specialized_fact_for_row(
+        profile_source,
+        source_row,
+        run_id=run_id,
+        record_id=record_id,
+        npi=npi,
+        artifact=artifact,
+    )
+    if specialized_fact is not None:
+        return [specialized_fact]
     return [
         _fact_payload(
             profile_source, source_row, run_id=run_id, record_id=record_id, npi=npi,
@@ -3235,38 +3313,14 @@ def _copy_records(
     )
 
 
-async def _copy_upsert_chunk_on_connection(
-    connection: Any,
-    model: Any,
-    source_rows: list[dict[str, Any]],
+def _copy_upsert_statement_parts(
+    table_name: str,
+    schema_name: str,
     key: str,
-) -> None:
-    """COPY one bounded chunk and merge it in the same short transaction."""
-    table = model.__table__
-    table_name = _validated_identifier(table.name)
-    schema_name = _validated_identifier(table.schema or "mrf")
-    key = _validated_identifier(key)
-    table_columns = {_validated_identifier(column.name) for column in table.columns}
-    if key not in table_columns:
-        raise ValueError(f"conflict key {key!r} is not a column of {table_name!r}")
+    column_names: list[str],
+) -> tuple[str, str, str, str, str]:
+    """Build validated identifiers and conflict SQL for one COPY merge."""
 
-    raw_connection = connection.raw_connection
-    driver_connection = getattr(
-        raw_connection,
-        "driver_connection",
-        raw_connection,
-    )
-    copy_records_to_table = getattr(
-        driver_connection,
-        "copy_records_to_table",
-        None,
-    )
-    if copy_records_to_table is None:
-        raise _CopyUpsertUnavailable(
-            "active database driver lacks copy_records_to_table"
-        )
-
-    column_names, copy_rows = _copy_records(table, source_rows)
     stage_table = _copy_stage_table_name(table_name)
     quoted_stage = _quoted_identifier(stage_table)
     target_ref = (
@@ -3287,6 +3341,59 @@ async def _copy_upsert_chunk_on_connection(
         )
         if update_columns
         else "DO NOTHING"
+    )
+    return stage_table, quoted_stage, target_ref, quoted_columns, conflict_action
+
+
+def _copy_records_to_table_driver(connection: Any) -> Any:
+    """Return the active driver's COPY callable or reject the fast path."""
+
+    raw_connection = connection.raw_connection
+    driver_connection = getattr(
+        raw_connection,
+        "driver_connection",
+        raw_connection,
+    )
+    copy_records_to_table = getattr(
+        driver_connection,
+        "copy_records_to_table",
+        None,
+    )
+    if copy_records_to_table is None:
+        raise _CopyUpsertUnavailable(
+            "active database driver lacks copy_records_to_table"
+        )
+    return copy_records_to_table
+
+
+async def _copy_upsert_chunk_on_connection(
+    connection: Any,
+    model: Any,
+    source_rows: list[dict[str, Any]],
+    key: str,
+) -> None:
+    """COPY one bounded chunk and merge it in the same short transaction."""
+    table = model.__table__
+    table_name = _validated_identifier(table.name)
+    schema_name = _validated_identifier(table.schema or "mrf")
+    key = _validated_identifier(key)
+    table_columns = {_validated_identifier(column.name) for column in table.columns}
+    if key not in table_columns:
+        raise ValueError(f"conflict key {key!r} is not a column of {table_name!r}")
+
+    copy_records_to_table = _copy_records_to_table_driver(connection)
+    column_names, copy_rows = _copy_records(table, source_rows)
+    (
+        stage_table,
+        quoted_stage,
+        target_ref,
+        quoted_columns,
+        conflict_action,
+    ) = _copy_upsert_statement_parts(
+        table_name,
+        schema_name,
+        key,
+        column_names,
     )
 
     await connection.status(
@@ -3525,6 +3632,27 @@ async def _dispose_failed_database_pool(timeout_seconds: float) -> None:
         return
 
 
+def _failed_status_values(
+    run_row: Mapping[str, Any],
+    original_error: BaseException,
+    cleanup_error: str | None,
+) -> dict[str, Any]:
+    """Build the stable terminal-failure update for one import attempt."""
+
+    error_payload_by_key = {
+        "type": type(original_error).__name__,
+        "message": str(original_error),
+    }
+    if cleanup_error:
+        error_payload_by_key["stage_cleanup_error"] = cleanup_error
+    return {
+        "status": "failed",
+        "metrics": run_row.get("metrics") or {},
+        "error": error_payload_by_key,
+        "finished_at": _utcnow(),
+    }
+
+
 async def _mark_failed_run_status(
     *,
     run_id: str,
@@ -3533,18 +3661,11 @@ async def _mark_failed_run_status(
     cleanup_error: str | None,
 ) -> str | None:
     """Best-effort failure status that never overwrites an atomic completion."""
-    error_payload_by_key = {
-        "type": type(original_error).__name__,
-        "message": str(original_error),
-    }
-    if cleanup_error:
-        error_payload_by_key["stage_cleanup_error"] = cleanup_error
-    status_values_by_key = {
-        "status": "failed",
-        "metrics": run_row.get("metrics") or {},
-        "error": error_payload_by_key,
-        "finished_at": _utcnow(),
-    }
+    status_values_by_key = _failed_status_values(
+        run_row,
+        original_error,
+        cleanup_error,
+    )
     attempts = _failure_status_attempts()
     timeout_seconds = _failure_status_timeout_seconds()
     loop = asyncio.get_running_loop()
@@ -3907,6 +4028,50 @@ async def _publish_projection_swap(
     return publication_by_key, final_metrics_by_key
 
 
+def _source_quarantine_guard_reasons(
+    source_key: str,
+    metric: Mapping[str, Any],
+    source_rows: object,
+) -> list[str]:
+    """Validate one source's bounded parse-quarantine policy."""
+    reasons: list[str] = []
+    quarantined_rows = metric.get("quarantined_rows", 0)
+    if not isinstance(quarantined_rows, int) or quarantined_rows < 0:
+        return [f"source_quarantine_metric_invalid:{source_key}"]
+
+    max_quarantined_rows = metric.get(
+        "max_quarantined_rows",
+        DEFAULT_MAX_QUARANTINED_ROWS_PER_SOURCE,
+    )
+    max_quarantined_ratio = metric.get(
+        "max_quarantined_ratio",
+        DEFAULT_MAX_QUARANTINED_ROW_RATIO,
+    )
+    if not isinstance(max_quarantined_rows, int) or max_quarantined_rows < 0:
+        reasons.append(f"source_quarantine_count_limit_invalid:{source_key}")
+    elif quarantined_rows > max_quarantined_rows:
+        reasons.append(
+            f"source_quarantine_count_exceeded:{source_key}:"
+            f"{quarantined_rows}>{max_quarantined_rows}"
+        )
+    if (
+        not isinstance(max_quarantined_ratio, (int, float))
+        or isinstance(max_quarantined_ratio, bool)
+        or not 0 <= max_quarantined_ratio <= 1
+    ):
+        reasons.append(f"source_quarantine_ratio_limit_invalid:{source_key}")
+    elif (
+        isinstance(source_rows, int)
+        and source_rows > 0
+        and quarantined_rows / source_rows > max_quarantined_ratio
+    ):
+        reasons.append(
+            f"source_quarantine_ratio_exceeded:{source_key}:"
+            f"{quarantined_rows}/{source_rows}>{max_quarantined_ratio:g}"
+        )
+    return reasons
+
+
 def _source_validation_guard_reasons(
     source_metrics: Mapping[str, Any],
     *,
@@ -3930,52 +4095,13 @@ def _source_validation_guard_reasons(
         source_rows = metric.get("rows")
         if not isinstance(source_rows, int) or source_rows <= 0:
             reasons.append(f"source_rows_empty:{source_key}")
-        quarantined_rows = metric.get("quarantined_rows", 0)
-        if (
-            not isinstance(quarantined_rows, int)
-            or quarantined_rows < 0
-        ):
-            reasons.append(
-                f"source_quarantine_metric_invalid:{source_key}"
+        reasons.extend(
+            _source_quarantine_guard_reasons(
+                source_key,
+                metric,
+                source_rows,
             )
-        else:
-            max_quarantined_rows = metric.get(
-                "max_quarantined_rows",
-                DEFAULT_MAX_QUARANTINED_ROWS_PER_SOURCE,
-            )
-            max_quarantined_ratio = metric.get(
-                "max_quarantined_ratio",
-                DEFAULT_MAX_QUARANTINED_ROW_RATIO,
-            )
-            if (
-                not isinstance(max_quarantined_rows, int)
-                or max_quarantined_rows < 0
-            ):
-                reasons.append(
-                    f"source_quarantine_count_limit_invalid:{source_key}"
-                )
-            elif quarantined_rows > max_quarantined_rows:
-                reasons.append(
-                    f"source_quarantine_count_exceeded:{source_key}:"
-                    f"{quarantined_rows}>{max_quarantined_rows}"
-                )
-            if (
-                not isinstance(max_quarantined_ratio, (int, float))
-                or isinstance(max_quarantined_ratio, bool)
-                or not 0 <= max_quarantined_ratio <= 1
-            ):
-                reasons.append(
-                    f"source_quarantine_ratio_limit_invalid:{source_key}"
-                )
-            elif (
-                isinstance(source_rows, int)
-                and source_rows > 0
-                and quarantined_rows / source_rows > max_quarantined_ratio
-            ):
-                reasons.append(
-                    f"source_quarantine_ratio_exceeded:{source_key}:"
-                    f"{quarantined_rows}/{source_rows}>{max_quarantined_ratio:g}"
-                )
+        )
         header_sha256 = metric.get("header_sha256")
         if not isinstance(header_sha256, str) or not re.fullmatch(
             r"[a-f0-9]{64}",

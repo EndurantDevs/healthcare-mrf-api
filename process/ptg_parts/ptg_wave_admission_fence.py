@@ -13,6 +13,7 @@ from db.models import (
     ImportRun,
     PTGImportWave,
     PTGImportWaveIntent,
+    PTGImportWaveQuarantine,
     PTGImportWaveSupersession,
 )
 
@@ -73,10 +74,19 @@ async def _capacity_owning_waves(executor: Any) -> list[Any]:
             == PTGImportWave.wave_id
         )
     )
+    quarantined = exists(
+        select(PTGImportWaveQuarantine.predecessor_wave_id).where(
+            PTGImportWaveQuarantine.predecessor_wave_id
+            == PTGImportWave.wave_id,
+            PTGImportWaveQuarantine.recovery_basis
+            == "materialized_preclaim_failure",
+        )
+    )
     return await _all(executor, select(PTGImportWave.wave_id, PTGImportWave.state)
                       .where(
                           PTGImportWave.state.in_(PTG_WAVE_CAPACITY_OWNING_STATES),
                           ~superseded,
+                          ~quarantined,
                       )
                       .order_by(PTGImportWave.created_at, PTGImportWave.wave_id).limit(2))
 
@@ -118,10 +128,24 @@ async def require_wave_admission_capacity(executor: Any) -> None:
         )
         .where(PTGImportWaveIntent.run_id == ImportRun.run_id)
     )
+    quarantined_wave_run = exists(
+        select(PTGImportWaveIntent.run_id)
+        .join(
+            PTGImportWaveQuarantine,
+            PTGImportWaveQuarantine.predecessor_wave_id
+            == PTGImportWaveIntent.wave_id,
+        )
+        .where(
+            PTGImportWaveIntent.run_id == ImportRun.run_id,
+            PTGImportWaveQuarantine.recovery_basis
+            == "materialized_preclaim_failure",
+        )
+    )
     active = await _all(executor, select(ImportRun.run_id).where(
         ImportRun.importer.in_(PTG_WAVE_FENCED_IMPORTERS),
         ImportRun.status.in_(PTG_ACTIVE_RUN_STATES),
         ~superseded_wave_run,
+        ~quarantined_wave_run,
     ).order_by(ImportRun.created_at, ImportRun.run_id).limit(1))
     if active:
         raise PTGWaveCapacityConflict("active PTG work prevents wave admission")

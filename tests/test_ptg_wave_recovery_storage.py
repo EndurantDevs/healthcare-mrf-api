@@ -257,7 +257,8 @@ async def test_normal_work_still_blocks_and_supersession_is_predecessor_scoped(m
     active_sql = _sql(captured_statements[0])
     assert "ptg_import_wave_supersession" in active_sql
     assert "ptg_import_wave_intent" in active_sql
-    assert "ptg_import_wave_quarantine" not in active_sql
+    assert "ptg_import_wave_quarantine" in active_sql
+    assert "ptg_import_wave_quarantine.recovery_basis" in active_sql
 
     captured_statements.clear()
     monkeypatch.setattr(fence, "_has_wave_table", AsyncMock(return_value=True))
@@ -266,4 +267,5 @@ async def test_normal_work_still_blocks_and_supersession_is_predecessor_scoped(m
     assert await capacity_owning_waves(executor)
     owner_sql = _sql(captured_statements[0])
     assert "ptg_import_wave_supersession" in owner_sql
-    assert "ptg_import_wave_quarantine" not in owner_sql
+    assert "ptg_import_wave_quarantine" in owner_sql
+    assert "ptg_import_wave_quarantine.recovery_basis" in owner_sql
