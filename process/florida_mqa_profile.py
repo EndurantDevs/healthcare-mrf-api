@@ -2927,6 +2927,7 @@ def _medical_cannabis_fact(
 ) -> dict[str, Any]:
     """Build one reviewed medical-cannabis authorization fact."""
     course = source_row.get("course_type", "")
+    course_token = course.strip().upper()
     authorization_type, semantic_fact_type, display = (
         _medical_cannabis_authorization(course)
     )
