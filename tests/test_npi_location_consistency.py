@@ -52,7 +52,7 @@ def test_directory_city_alias_merges_into_only_concrete_site():
     assert deduped[0]["location_status"] == "active"
 
 
-def test_hydrated_unsited_location_stays_distinct_on_display_mismatch():
+def test_exact_address_key_merges_even_when_display_fields_disagree():
     concrete_address = _address(
         ADDRESS_A,
         "100 Example Avenue",
@@ -69,10 +69,12 @@ def test_hydrated_unsited_location_stays_distinct_on_display_mismatch():
         [concrete_address, hydrated_unsited_address]
     )
 
-    assert len(deduped) == 2
+    assert len(deduped) == 1
+    assert deduped[0]["premise_key"] == SITE_A
+    assert deduped[0]["address_sources"] == ["nppes", "provider_directory_fhir"]
 
 
-def test_distinct_concrete_sites_keep_scoped_evidence():
+def test_exact_address_key_merges_conflicting_sites_and_reports_integrity(caplog):
     second_site = "10000000-0000-0000-0000-000000000002"
     first_address = _address(
         ADDRESS_A,
@@ -91,14 +93,13 @@ def test_distinct_concrete_sites_keep_scoped_evidence():
         [first_address, second_address]
     )
 
-    source_by_site = {
-        address["premise_key"]: address["address_sources"]
-        for address in deduped
-    }
-    assert source_by_site == {
-        SITE_A: ["synthetic_source_a"],
-        second_site: ["synthetic_source_b"],
-    }
+    assert len(deduped) == 1
+    assert deduped[0]["premise_key"] == SITE_A
+    assert deduped[0]["address_sources"] == [
+        "synthetic_source_a",
+        "synthetic_source_b",
+    ]
+    assert "maps to 2 conflicting non-null site keys" in caplog.text
 
 
 def test_hydration_keeps_primary_identity_metadata_correlated():
@@ -228,6 +229,49 @@ async def test_all_matches_bounded_order_and_candidate_projection(monkeypatch):
         "limit": 2,
         "offset": 2,
         "returned": 1,
+        "total": 3,
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_total_page_still_reports_truthful_has_more(monkeypatch):
+    response_map, _route_calls = await _get_page(
+        monkeypatch,
+        limit="1",
+        include_total=False,
+    )
+
+    assert response_map["address_pagination"] == {
+        "limit": 1,
+        "offset": 0,
+        "returned": 1,
+        "total": None,
+        "has_more": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_final_and_beyond_end_pages_are_truthful(monkeypatch):
+    final_page_map, _final_calls = await _get_page(monkeypatch, limit="1", offset=2)
+    beyond_page_map, _beyond_calls = await _get_page(
+        monkeypatch,
+        limit="1",
+        offset=3,
+    )
+
+    assert final_page_map["address_pagination"] == {
+        "limit": 1,
+        "offset": 2,
+        "returned": 1,
+        "total": 3,
+        "has_more": False,
+    }
+    assert beyond_page_map["address_list"] == []
+    assert beyond_page_map["address_pagination"] == {
+        "limit": 1,
+        "offset": 3,
+        "returned": 0,
         "total": 3,
         "has_more": False,
     }

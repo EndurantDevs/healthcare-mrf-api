@@ -427,7 +427,7 @@ def _set_near_address_column(near_values: list, key: str, value):
     raise AssertionError(f"Unknown NPIAddress column: {key}")
 
 
-def test_dedupe_addresses_keeps_distinct_address_sites():
+def test_dedupe_addresses_merges_conflicting_sites_by_exact_key(caplog):
     addresses = [
         {
             "address_key": "00000000-0000-0000-0000-000000000001",
@@ -452,20 +452,10 @@ def test_dedupe_addresses_keeps_distinct_address_sites():
 
     deduped = npi_module._dedupe_addresses_by_key(addresses)
 
-    assert len(deduped) == 2
-    assert {
-        address.get("premise_key")
-        for address in deduped
-    } == {
-        "00000000-0000-0000-0000-000000000002",
-        "00000000-0000-0000-0000-000000000003",
-    }
-    merged = next(
-        address
-        for address in deduped
-        if address.get("premise_key") == "00000000-0000-0000-0000-000000000002"
-    )
-    assert merged["telephone_number"] == "3125551212"
+    assert len(deduped) == 1
+    assert deduped[0]["premise_key"] == "00000000-0000-0000-0000-000000000002"
+    assert deduped[0]["telephone_number"] == "3125551212"
+    assert "maps to 2 conflicting non-null site keys" in caplog.text
 
 
 @pytest.mark.asyncio
