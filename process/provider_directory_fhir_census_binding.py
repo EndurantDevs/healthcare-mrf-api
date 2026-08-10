@@ -37,8 +37,11 @@ from process.provider_directory_fhir_census_contract import (
 )
 from process.provider_directory_fhir_subset_identity import (
     is_reviewed_subset_contract,
-    reviewed_subset_max_advertised_count_decrease,
     validated_subset_identity_values,
+)
+from process.provider_directory_fhir_subset_profiles import (
+    is_reviewed_subset_terminal_window_required,
+    reviewed_subset_decrease_limit,
 )
 from process.provider_directory_fhir_census_urls import (
     _normalized_base_url,
@@ -100,19 +103,27 @@ class CurrentVersionCensusContract:
 
         return is_reviewed_subset_contract(self)
 
-    @property
-    def max_advertised_count_decrease(self) -> int:
-        """Return the profile-bound terminal advertised-count decrease."""
+    def advertised_count_decrease_limit(self, pre_count: int) -> int:
+        """Return this profile's exact resource-specific decrease limit."""
 
-        maximum = reviewed_subset_max_advertised_count_decrease(
+        return reviewed_subset_decrease_limit(
+            self.strategy_version,
+            self.completion_scopes,
+            pre_count=pre_count,
+            page_count=self.page_count,
+            invalid_error=(
+                "provider_directory_current_version_census_profile_invalid"
+            ),
+        )
+
+    @property
+    def is_terminal_count_window_required(self) -> bool:
+        """Return whether pre-count must fall in the terminal window."""
+
+        return is_reviewed_subset_terminal_window_required(
             self.strategy_version,
             self.completion_scopes,
         )
-        if maximum is None:
-            raise ValueError(
-                "provider_directory_current_version_census_profile_invalid"
-            )
-        return maximum
 
     def start_url(self, resource_type: str, page_count: int) -> str:
         """Return the reviewed URL with source filters and cutoff preserved."""

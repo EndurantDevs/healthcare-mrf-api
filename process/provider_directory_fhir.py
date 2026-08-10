@@ -148,7 +148,7 @@ from process.provider_directory_fhir_subset_completion import (
     validate_subset_replay_evidence_pair,
 )
 from process.provider_directory_fhir_subset_identity import (
-    reviewed_subset_max_advertised_count_decrease,
+    is_reviewed_subset_profile,
     server_issued_subset_source_scope_payload,
 )
 from process.provider_directory_fhir_root_policy import (
@@ -16728,7 +16728,7 @@ def _is_reviewed_subset_source_metadata(metadata: Mapping[str, Any]) -> bool:
         == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
         and metadata.get(CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD)
         == SERVER_ISSUED_SUBSET_SEMANTICS
-        and reviewed_subset_max_advertised_count_decrease(
+        and is_reviewed_subset_profile(
             metadata.get(CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD),
             tuple(metadata[CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD])
             if type(
@@ -16737,7 +16737,6 @@ def _is_reviewed_subset_source_metadata(metadata: Mapping[str, Any]) -> bool:
             is list
             else None,
         )
-        is not None
         and metadata.get(CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD)
         == SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION
         and metadata.get(CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD)

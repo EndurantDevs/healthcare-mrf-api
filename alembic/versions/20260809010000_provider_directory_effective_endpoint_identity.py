@@ -64,6 +64,7 @@ def _adoption_state_fence_sql(
     *,
     reviewed_root_policy_aware: bool = False,
     reviewed_subset_profile_aware: bool = False,
+    reviewed_subset_terminal_window_profile_aware: bool = False,
 ) -> str:
     subset = _subset()
     activation = _activation()
@@ -81,6 +82,9 @@ def _adoption_state_fence_sql(
         require_physical_match=False,
         reviewed_root_policy_aware=reviewed_root_policy_aware,
         reviewed_subset_profile_aware=reviewed_subset_profile_aware,
+        reviewed_subset_terminal_window_profile_aware=(
+            reviewed_subset_terminal_window_profile_aware
+        ),
     )
     published_source_sql = subset._subset_source_sql(
         schema,
@@ -90,6 +94,9 @@ def _adoption_state_fence_sql(
         require_physical_match=True,
         reviewed_root_policy_aware=reviewed_root_policy_aware,
         reviewed_subset_profile_aware=reviewed_subset_profile_aware,
+        reviewed_subset_terminal_window_profile_aware=(
+            reviewed_subset_terminal_window_profile_aware
+        ),
     )
     activation_key = subset._ql(activation._ACTIVATION_KEY)
     verified_status = subset._ql(activation._VERIFIED_STATUS)

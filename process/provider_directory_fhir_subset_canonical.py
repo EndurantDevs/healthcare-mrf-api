@@ -17,8 +17,11 @@ from process.provider_directory_fhir_census_contract import (
     SERVER_ISSUED_SUBSET_SEMANTICS,
     SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
 )
-from process.provider_directory_fhir_subset_identity import (
-    reviewed_subset_max_advertised_count_decrease,
+from process.provider_directory_fhir_subset_profiles import (
+    is_advertised_pre_in_terminal_window,
+    is_reviewed_subset_profile,
+    is_reviewed_subset_terminal_window_required,
+    reviewed_subset_decrease_limit,
 )
 
 
@@ -219,23 +222,16 @@ def _validate_resource_scalar_fields(
     resource_proof: Mapping[str, Any],
     page_count: int,
     max_advertised_count_decrease: int,
+    *,
+    is_terminal_count_window_required: bool,
 ) -> None:
     """Validate scalar proof fields under the selected exact profile."""
 
     numeric_fields = (
-        "advertised_pre",
-        "advertised_post",
-        "returned_unique",
-        "deficit",
-        "geometry_version",
-        "page_count",
-        "pages",
-        "processed_rows",
-        "logical_terminal_offset",
-        "logical_window_end_offset",
-        "terminal_entries",
-        "sparse_pages",
-        "empty_pages",
+        "advertised_pre", "advertised_post", "returned_unique", "deficit",
+        "geometry_version", "page_count", "pages", "processed_rows",
+        "logical_terminal_offset", "logical_window_end_offset",
+        "terminal_entries", "sparse_pages", "empty_pages",
     )
     shape_hashes = resource_proof.get("continuation_shape_sha256")
     if (
@@ -253,6 +249,13 @@ def _validate_resource_scalar_fields(
         != (resource_proof["pages"] - 1) * page_count
         or resource_proof["logical_window_end_offset"]
         != resource_proof["pages"] * page_count
+        or (
+            is_terminal_count_window_required
+            and not is_advertised_pre_in_terminal_window(
+                resource_proof["advertised_pre"],
+                _resource_geometry_by_field(resource_proof),
+            )
+        )
         or resource_proof["terminal_entries"] > page_count
         or resource_proof["returned_unique"]
         > resource_proof["logical_window_end_offset"]
@@ -269,8 +272,9 @@ def _validate_resource_scalar_fields(
         or type(shape_hashes) is not list
         or len(shape_hashes) != resource_proof["pages"] - 1
         or any(not _is_sha256(shape_digest) for shape_digest in shape_hashes)
-        or canonical_sha256(shape_hashes)
-        != resource_proof.get("continuation_shape_chain_sha256")
+        or canonical_sha256(shape_hashes) != resource_proof.get(
+            "continuation_shape_chain_sha256"
+        )
     ):
         raise ValueError("provider_directory_subset_completion_resource_invalid")
 
@@ -331,11 +335,13 @@ def _validate_resource(
     *,
     page_count: int,
     max_advertised_count_decrease: int,
+    is_terminal_count_window_required: bool,
 ) -> int:
     _validate_resource_scalar_fields(
         resource_proof,
         page_count,
         max_advertised_count_decrease,
+        is_terminal_count_window_required=is_terminal_count_window_required,
     )
     _validate_resource_page_geometry(resource_proof, page_count)
     return resource_proof["returned_unique"]
@@ -344,12 +350,9 @@ def _validate_resource(
 def _validated_completion_envelope(
     completion_proof: Any,
     completion_sha256: Any,
-) -> tuple[
-    dict[str, Any],
-    Mapping[str, Any],
-    Mapping[str, Any],
-    int,
-]:
+) -> tuple[dict[str, Any], Mapping[str, Any], Mapping[str, Any], tuple[str, ...], bool]:
+    """Validate and normalize the fixed completion-proof envelope."""
+
     if not isinstance(completion_proof, Mapping) or not _is_sha256(
         completion_sha256
     ):
@@ -364,13 +367,16 @@ def _validated_completion_envelope(
         "canonicalization_version": SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
     }
     completion_scopes = completion_proof_by_field.get("completion_scopes")
-    max_advertised_count_decrease = (
-        reviewed_subset_max_advertised_count_decrease(
-            completion_proof_by_field.get("strategy_version"),
-            tuple(completion_scopes)
-            if type(completion_scopes) is list
-            else None,
-        )
+    normalized_completion_scopes = tuple(completion_scopes) if type(
+        completion_scopes
+    ) is list else ()
+    is_reviewed_profile = is_reviewed_subset_profile(
+        completion_proof_by_field.get("strategy_version"),
+        normalized_completion_scopes,
+    )
+    is_terminal_count_window_required = is_reviewed_subset_terminal_window_required(
+        completion_proof_by_field.get("strategy_version"),
+        normalized_completion_scopes,
     )
     resource_proof_by_type = completion_proof_by_field.get("resources")
     dataset_by_field = completion_proof_by_field.get("dataset")
@@ -380,7 +386,7 @@ def _validated_completion_envelope(
             completion_proof_by_field.get(key) != expected_value
             for key, expected_value in fixed_value_by_field.items()
         )
-        or max_advertised_count_decrease is None
+        or not is_reviewed_profile
         or type(completion_proof_by_field.get("campaign_id")) is not str
         or not completion_proof_by_field["campaign_id"]
         or not _is_canonical_utc_instant(completion_proof_by_field.get("cutoff"))
@@ -396,7 +402,8 @@ def _validated_completion_envelope(
         completion_proof_by_field,
         resource_proof_by_type,
         dataset_by_field,
-        max_advertised_count_decrease,
+        normalized_completion_scopes,
+        is_terminal_count_window_required,
     )
 
 
@@ -457,13 +464,27 @@ def validate_subset_completion_proof_pair(
         completion_proof_by_field,
         resource_proof_by_type,
         dataset_by_field,
-        max_advertised_count_decrease,
+        completion_scopes,
+        is_terminal_count_window_required,
     ) = _validated_completion_envelope(completion_proof, completion_sha256)
     returned_count_by_type = {
         resource_type: _validate_resource(
             resource_proof,
             page_count=completion_proof_by_field["page_count"],
-            max_advertised_count_decrease=max_advertised_count_decrease,
+            max_advertised_count_decrease=(
+                reviewed_subset_decrease_limit(
+                    completion_proof_by_field.get("strategy_version"),
+                    completion_scopes,
+                    pre_count=resource_proof.get("advertised_pre"),
+                    page_count=completion_proof_by_field.get("page_count"),
+                    invalid_error=(
+                        "provider_directory_subset_completion_resource_invalid"
+                    ),
+                )
+            ),
+            is_terminal_count_window_required=(
+                is_terminal_count_window_required
+            ),
         )
         for resource_type, resource_proof in resource_proof_by_type.items()
         if isinstance(resource_proof, Mapping)

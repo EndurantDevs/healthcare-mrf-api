@@ -83,6 +83,10 @@ async def _object_identity_by_kind(scenario, terminal) -> dict[str, tuple]:
         terminal._VALID,
         terminal._abandonment()._DATASET_GUARD,
         terminal._abandonment()._CHECKPOINT_GUARD,
+    ) + (
+        (terminal._DIRECT_VALID,)
+        if hasattr(terminal, "_DIRECT_VALID")
+        else ()
     )
     function_rows = await scenario.connection.fetch(
         """

@@ -17,9 +17,11 @@ from process.provider_directory_fhir_census_execution import (
 from process.provider_directory_fhir_subset_identity import (
     CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD,
     CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
+    SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_BOUNDED_MAX_ADVERTISED_COUNT_DECREASE,
+    SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION,
-    SERVER_ISSUED_SUBSET_MAX_ADVERTISED_COUNT_DECREASE,
     reviewed_subset_max_advertised_count_decrease,
     validated_subset_identity_values,
 )
@@ -43,12 +45,12 @@ def _completed_proof(
         strategy_version=(
             SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION
             if legacy
-            else build_subset_contract().strategy_version
+            else SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION
         ),
         completion_scopes=(
             SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES
             if legacy
-            else build_subset_contract().completion_scopes
+            else SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES
         ),
     )
     initial = current_version_census_initial_proof(
@@ -69,22 +71,22 @@ def _completed_proof(
 
 
 def test_profile_tuple_selects_exact_count_decrease_bound():
-    current_contract = build_subset_contract()
+    bounded_contract = build_subset_contract()
 
     assert reviewed_subset_max_advertised_count_decrease(
         SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION,
         SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES,
     ) == 0
     assert reviewed_subset_max_advertised_count_decrease(
-        current_contract.strategy_version,
-        current_contract.completion_scopes,
-    ) == SERVER_ISSUED_SUBSET_MAX_ADVERTISED_COUNT_DECREASE
+        bounded_contract.strategy_version,
+        bounded_contract.completion_scopes,
+    ) == SERVER_ISSUED_SUBSET_BOUNDED_MAX_ADVERTISED_COUNT_DECREASE
     assert reviewed_subset_max_advertised_count_decrease(
         SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION,
-        current_contract.completion_scopes,
+        bounded_contract.completion_scopes,
     ) is None
     assert reviewed_subset_max_advertised_count_decrease(
-        current_contract.strategy_version,
+        bounded_contract.strategy_version,
         SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES,
     ) is None
 
