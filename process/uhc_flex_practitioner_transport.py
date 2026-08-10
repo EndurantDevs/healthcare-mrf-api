@@ -356,12 +356,12 @@ def _reject_json_constant(_raw_value: str) -> None:
 def _strict_json_object(
     object_pairs: list[tuple[str, Any]],
 ) -> dict[str, Any]:
-    parsed_object: dict[str, Any] = {}
+    object_by_field: dict[str, Any] = {}
     for field_name, field_value in object_pairs:
-        if field_name in parsed_object:
+        if field_name in object_by_field:
             raise ValueError
-        parsed_object[field_name] = field_value
-    return parsed_object
+        object_by_field[field_name] = field_value
+    return object_by_field
 
 
 def _strict_json_payload(response_body: bytes) -> dict[str, Any]:
@@ -397,6 +397,62 @@ def default_uhc_flex_practitioner_session() -> aiohttp.ClientSession:
     )
 
 
+def _require_success_status(response: Any) -> None:
+    response_status = getattr(response, "status", None)
+    status_decision = classify_uhc_flex_practitioner_http_status(response_status)
+    if status_decision.category == "success":
+        return
+    if type(response_status) is int and 300 <= response_status <= 399:
+        raise UHCFlexPractitionerTransportError("redirect_forbidden")
+    is_retryable = status_decision.is_retryable
+    raise UHCFlexPractitionerTransportError(
+        "http_transient" if is_retryable else "http_terminal",
+        retryable=is_retryable,
+        retry_after_seconds=uhc_flex_practitioner_retry_after_seconds(
+            _header_value(getattr(response, "headers", None), "Retry-After")
+        ),
+    )
+
+
+async def _read_exact_response(
+    session: Any, requested_npi: object, request_url: str,
+    response_byte_bound: int,
+    timeout: aiohttp.ClientTimeout,
+    cancel_check: CancelCheck | None,
+    progress_callback: ProgressCallback | None,
+) -> UHCFlexPractitionerQueryResult:
+    await _invoke_cancel(cancel_check)
+    await _invoke_progress(progress_callback, "request_started", 0)
+    async with session.get(
+        request_url,
+        headers={
+            "Accept": UHC_FLEX_PRACTITIONER_ACCEPT,
+            "Accept-Encoding": "identity",
+        },
+        timeout=timeout,
+        allow_redirects=False,
+    ) as response:
+        await _invoke_cancel(cancel_check)
+        _require_exact_response_url(response, request_url)
+        _require_success_status(response)
+        declared_length = _validate_response_headers(response, response_byte_bound)
+        response_body = await _read_response_body(
+            response,
+            declared_length=declared_length,
+            max_response_bytes=response_byte_bound,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+    await _invoke_cancel(cancel_check)
+    response_payload = _strict_json_payload(response_body)
+    query_result = validate_uhc_flex_practitioner_search_bundle(
+        requested_npi, response_payload)
+    await _invoke_cancel(cancel_check)
+    await _invoke_progress(
+        progress_callback, "response_validated", len(response_body))
+    return query_result
+
+
 async def fetch_uhc_flex_practitioner(
     session: Any,
     requested_npi: object,
@@ -412,64 +468,9 @@ async def fetch_uhc_flex_practitioner(
     response_byte_bound = _validated_response_byte_bound(max_response_bytes)
     timeout = _request_timeout(timeout_seconds)
     try:
-        await _invoke_cancel(cancel_check)
-        await _invoke_progress(progress_callback, "request_started", 0)
-        async with session.get(
-            request_url,
-            headers={
-                "Accept": UHC_FLEX_PRACTITIONER_ACCEPT,
-                "Accept-Encoding": "identity",
-            },
-            timeout=timeout,
-            allow_redirects=False,
-        ) as response:
-            await _invoke_cancel(cancel_check)
-            _require_exact_response_url(response, request_url)
-            response_status = getattr(response, "status", None)
-            status_decision = classify_uhc_flex_practitioner_http_status(
-                response_status
-            )
-            if status_decision.category != "success":
-                if (
-                    type(response_status) is int
-                    and 300 <= response_status <= 399
-                ):
-                    raise UHCFlexPractitionerTransportError(
-                        "redirect_forbidden"
-                    )
-                retryable = status_decision.is_retryable
-                raise UHCFlexPractitionerTransportError(
-                    "http_transient" if retryable else "http_terminal",
-                    retryable=retryable,
-                    retry_after_seconds=uhc_flex_practitioner_retry_after_seconds(
-                        _header_value(
-                            getattr(response, "headers", None),
-                            "Retry-After",
-                        )
-                    ),
-                )
-            declared_length = _validate_response_headers(
-                response,
-                response_byte_bound,
-            )
-            response_body = await _read_response_body(
-                response,
-                declared_length=declared_length,
-                max_response_bytes=response_byte_bound,
-                cancel_check=cancel_check,
-                progress_callback=progress_callback,
-            )
-        await _invoke_cancel(cancel_check)
-        response_payload = _strict_json_payload(response_body)
-        query_result = validate_uhc_flex_practitioner_search_bundle(
-            requested_npi,
-            response_payload,
-        )
-        await _invoke_cancel(cancel_check)
-        await _invoke_progress(
-            progress_callback, "response_validated", len(response_body)
-        )
-        return query_result
+        return await _read_exact_response(
+            session, requested_npi, request_url, response_byte_bound,
+            timeout, cancel_check, progress_callback)
     except asyncio.CancelledError:
         raise
     except UHCFlexPractitionerTransportError:
@@ -483,15 +484,12 @@ async def fetch_uhc_flex_practitioner(
         raise UHCFlexPractitionerTransportError("callback_failed") from None
     except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError, EOFError):
         raise UHCFlexPractitionerTransportError(
-            "payload_truncated", retryable=True
-        ) from None
+            "payload_truncated", retryable=True) from None
     except (asyncio.TimeoutError, TimeoutError):
         raise UHCFlexPractitionerTransportError(
-            "transport_timeout", retryable=True
-        ) from None
+            "transport_timeout", retryable=True) from None
     except (aiohttp.ClientConnectionError, ConnectionError, OSError):
         raise UHCFlexPractitionerTransportError(
-            "transport_connection", retryable=True
-        ) from None
+            "transport_connection", retryable=True) from None
     except aiohttp.ClientError:
         raise UHCFlexPractitionerTransportError("transport_failure") from None

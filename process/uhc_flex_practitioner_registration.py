@@ -42,55 +42,22 @@ _COHORT_COMPLETE_SEMANTICS = (
     "terminal_exact_query_results"
 )
 
-_SOURCE_COMPARE_FIELDS = (
-    "source_id",
-    "org_tin",
-    "org_name",
-    "plan_name",
-    "portal_url",
-    "api_base",
-    "canonical_api_base",
-    "endpoint_id",
-    "endpoint_insurance_plan",
-    "endpoint_practitioner",
-    "endpoint_practitioner_role",
-    "endpoint_organization",
-    "endpoint_organization_affiliation",
-    "endpoint_location",
-    "endpoint_healthcare_service",
-    "endpoint_network",
-    "endpoint_endpoint",
-    "requires_registration",
-    "requires_api_key",
-    "auth_type",
-    "last_validated",
-    "last_validated_status",
-    "fhir_version",
-    "compliance_flag",
-    "violation_type",
-    "violation_detail",
-    "data_quality_flag",
-    "data_quality_sample_npi",
-    "data_quality_practitioner_count",
-    "data_quality_checked",
-    "is_medicare_advantage",
-    "is_medicaid_mco",
-    "is_chip",
-    "is_qhp",
-    "seed_source",
-    "seed_source_detail",
-    "seed_source_url",
-    "seed_source_date",
-    "seed_row_id",
-    "id_provider_alt",
-    "team_status",
-    "last_probe_status",
-    "last_probe_status_code",
-    "last_probe_error",
-    "last_probe_run_id",
-    "last_probed_at",
-    "metadata_json",
+_SOURCE_COMPARE_FIELDS = tuple(
+    """source_id org_tin org_name plan_name portal_url api_base
+    canonical_api_base endpoint_id endpoint_insurance_plan endpoint_practitioner
+    endpoint_practitioner_role endpoint_organization
+    endpoint_organization_affiliation endpoint_location
+    endpoint_healthcare_service endpoint_network endpoint_endpoint
+    requires_registration requires_api_key auth_type last_validated
+    last_validated_status fhir_version compliance_flag violation_type
+    violation_detail data_quality_flag data_quality_sample_npi
+    data_quality_practitioner_count data_quality_checked
+    is_medicare_advantage is_medicaid_mco is_chip is_qhp seed_source
+    seed_source_detail seed_source_url seed_source_date seed_row_id
+    id_provider_alt team_status last_probe_status last_probe_status_code
+    last_probe_error last_probe_run_id last_probed_at metadata_json""".split()
 )
+_RegistrationFlag = bool
 
 
 class UHCFlexPractitionerRegistrationError(RuntimeError):
@@ -125,10 +92,10 @@ class UHCFlexPractitionerRegistrationResult:
             raise ValueError("UHC Flex Practitioner registration result is invalid")
 
     @property
-    def created(self) -> bool:
+    def created(self) -> _RegistrationFlag:
         """Return whether this call inserted either immutable registry row."""
 
-        return self.endpoint_created or self.source_created
+        return any((self.endpoint_created, self.source_created))
 
 
 def _schema_name() -> str:
@@ -162,21 +129,21 @@ def _identity_hash(document: object) -> str:
 def uhc_flex_practitioner_endpoint_identity() -> ProviderDirectoryEndpointIdentity:
     """Return the public-facade identity for the dedicated no-auth endpoint."""
 
-    credential_descriptor: dict[str, Any] = {}
+    credential_descriptor_by_field: dict[str, Any] = {}
     endpoint_signature = UHC_FLEX_PRACTITIONER_QUERY_CONTRACT.endpoint_signature()
     endpoint_id = _identity_hash(
         {
             "canonical_api_base": UHC_FLEX_PRACTITIONER_API_BASE,
-            "credential_descriptor": credential_descriptor,
+            "credential_descriptor": credential_descriptor_by_field,
             "endpoint_signature": endpoint_signature,
         }
     )
     return build_provider_directory_endpoint_identity(
         endpoint_id=endpoint_id,
         canonical_api_base=UHC_FLEX_PRACTITIONER_API_BASE,
-        credential_descriptor_hash=_identity_hash(credential_descriptor),
+        credential_descriptor_hash=_identity_hash(credential_descriptor_by_field),
         endpoint_signature_hash=_identity_hash(endpoint_signature),
-        credential_descriptor_json=credential_descriptor,
+        credential_descriptor_json=credential_descriptor_by_field,
         endpoint_signature_json=endpoint_signature,
     )
 
@@ -323,7 +290,7 @@ def _insert_count(value: object) -> tuple[int, bool]:
 async def _insert_endpoint(
     database: Any,
     identity: ProviderDirectoryEndpointIdentity,
-) -> bool:
+) -> _RegistrationFlag:
     public_identity = identity.public_payload()
     inserted_count = await database.status(
         f"""
@@ -402,7 +369,10 @@ async def _validate_endpoint(
         raise UHCFlexPractitionerRegistrationError("drift")
 
 
-async def _insert_source(database: Any, endpoint_id: str) -> bool:
+async def _insert_source(
+    database: Any,
+    endpoint_id: str,
+) -> _RegistrationFlag:
     source_by_field = _expected_source_row(endpoint_id)
     inserted_count = await database.status(
         f"""

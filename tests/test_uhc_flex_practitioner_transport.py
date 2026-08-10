@@ -107,7 +107,7 @@ def _response_from_body(
 ):
     if isinstance(body, dict):
         body = json.dumps(body, separators=(",", ":")).encode()
-    response_headers = {
+    response_headers_by_name = {
         "Content-Type": "application/fhir+json; charset=utf-8",
         "Content-Encoding": "identity",
         "Content-Length": str(len(body)),
@@ -116,7 +116,7 @@ def _response_from_body(
     return _Response(
         chunks if chunks is not None else (body,),
         status=status,
-        headers=response_headers,
+        headers=response_headers_by_name,
         url=url,
     )
 
@@ -145,15 +145,15 @@ async def test_exact_get_uses_fhir_identity_headers_and_bounded_timeout():
     async def progress_callback(phase, byte_count):
         progress_events.append((phase, byte_count))
 
-    result = await transport.fetch_uhc_flex_practitioner(
+    query_result = await transport.fetch_uhc_flex_practitioner(
         session,
         REQUESTED_NPI,
         cancel_check=cancel_check,
         progress_callback=progress_callback,
     )
 
-    assert result.resource_ids == ("practitioner-a",)
-    assert result.requested_npi == REQUESTED_NPI
+    assert query_result.resource_ids == ("practitioner-a",)
+    assert query_result.requested_npi == REQUESTED_NPI
     assert len(cancel_events) == 6
     assert progress_events == [
         ("request_started", 0),
@@ -402,7 +402,7 @@ async def test_cancel_before_request_and_during_stream_is_cooperative():
     cancel_events = []
     progress_events = []
 
-    def cancel_during_stream():
+    def should_cancel_during_stream():
         cancel_events.append("checked")
         return len(cancel_events) == 4
 
@@ -410,7 +410,7 @@ async def test_cancel_before_request_and_during_stream_is_cooperative():
         await transport.fetch_uhc_flex_practitioner(
             during_session,
             REQUESTED_NPI,
-            cancel_check=cancel_during_stream,
+            cancel_check=should_cancel_during_stream,
             progress_callback=lambda phase, count: progress_events.append(
                 (phase, count)
             ),

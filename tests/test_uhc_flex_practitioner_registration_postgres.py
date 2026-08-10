@@ -24,9 +24,66 @@ GENERIC_FLEX_SOURCE_ID = "pdfhir_0b5cfd565c53364a73981dcb"
 OFFICIAL_FILE_SOURCE_ID = "pdfhir_2754e999dd691175821ec26e"
 GENERIC_ENDPOINT_ID = "1" * 64
 OFFICIAL_ENDPOINT_ID = "2" * 64
+_SOURCE_REGISTRY_TABLE_SQL = """
+CREATE TABLE {schema}.provider_directory_source (
+    source_id varchar(64) PRIMARY KEY,
+    org_tin varchar(64),
+    org_name varchar(256) NOT NULL,
+    plan_name varchar(512),
+    portal_url text,
+    api_base text,
+    canonical_api_base text,
+    endpoint_id varchar(64) REFERENCES
+        {schema}.provider_directory_api_endpoint(endpoint_id),
+    endpoint_insurance_plan text,
+    endpoint_practitioner text,
+    endpoint_practitioner_role text,
+    endpoint_organization text,
+    endpoint_organization_affiliation text,
+    endpoint_location text,
+    endpoint_healthcare_service text,
+    endpoint_network text,
+    endpoint_endpoint text,
+    requires_registration boolean NOT NULL DEFAULT false,
+    requires_api_key boolean NOT NULL DEFAULT false,
+    auth_type varchar(64),
+    last_validated varchar(64),
+    last_validated_status varchar(64),
+    fhir_version varchar(32),
+    compliance_flag varchar(64),
+    violation_type varchar(128),
+    violation_detail text,
+    data_quality_flag varchar(64),
+    data_quality_sample_npi varchar(32),
+    data_quality_practitioner_count varchar(64),
+    data_quality_checked text,
+    is_medicare_advantage boolean,
+    is_medicaid_mco boolean,
+    is_chip boolean,
+    is_qhp boolean,
+    seed_source varchar(128),
+    seed_source_detail text,
+    seed_source_url text,
+    seed_source_date varchar(64),
+    seed_row_id varchar(64),
+    id_provider_alt varchar(128),
+    team_status varchar(128),
+    last_probe_status varchar(64),
+    last_probe_status_code integer,
+    last_probe_error text,
+    last_probe_run_id varchar(64),
+    last_probed_at timestamp,
+    metadata_json jsonb,
+    created_at timestamp,
+    updated_at timestamp
+);
+"""
 
 
-async def _create_registry_tables(database: Database, schema_name: str) -> None:
+async def _create_endpoint_registry_table(
+    database: Database,
+    schema_name: str,
+) -> None:
     schema = quoted(schema_name)
     await database.status(
         f"""
@@ -50,62 +107,19 @@ async def _create_registry_tables(database: Database, schema_name: str) -> None:
         );
         """
     )
-    await database.status(
-        f"""
-        CREATE TABLE {schema}.provider_directory_source (
-            source_id varchar(64) PRIMARY KEY,
-            org_tin varchar(64),
-            org_name varchar(256) NOT NULL,
-            plan_name varchar(512),
-            portal_url text,
-            api_base text,
-            canonical_api_base text,
-            endpoint_id varchar(64) REFERENCES
-                {schema}.provider_directory_api_endpoint(endpoint_id),
-            endpoint_insurance_plan text,
-            endpoint_practitioner text,
-            endpoint_practitioner_role text,
-            endpoint_organization text,
-            endpoint_organization_affiliation text,
-            endpoint_location text,
-            endpoint_healthcare_service text,
-            endpoint_network text,
-            endpoint_endpoint text,
-            requires_registration boolean NOT NULL DEFAULT false,
-            requires_api_key boolean NOT NULL DEFAULT false,
-            auth_type varchar(64),
-            last_validated varchar(64),
-            last_validated_status varchar(64),
-            fhir_version varchar(32),
-            compliance_flag varchar(64),
-            violation_type varchar(128),
-            violation_detail text,
-            data_quality_flag varchar(64),
-            data_quality_sample_npi varchar(32),
-            data_quality_practitioner_count varchar(64),
-            data_quality_checked text,
-            is_medicare_advantage boolean,
-            is_medicaid_mco boolean,
-            is_chip boolean,
-            is_qhp boolean,
-            seed_source varchar(128),
-            seed_source_detail text,
-            seed_source_url text,
-            seed_source_date varchar(64),
-            seed_row_id varchar(64),
-            id_provider_alt varchar(128),
-            team_status varchar(128),
-            last_probe_status varchar(64),
-            last_probe_status_code integer,
-            last_probe_error text,
-            last_probe_run_id varchar(64),
-            last_probed_at timestamp,
-            metadata_json jsonb,
-            created_at timestamp,
-            updated_at timestamp
-        );
-        """
-    )
+
+
+async def _create_source_registry_table(
+    database: Database,
+    schema_name: str,
+) -> None:
+    schema = quoted(schema_name)
+    await database.status(_SOURCE_REGISTRY_TABLE_SQL.format(schema=schema))
+
+
+async def _create_registry_tables(database: Database, schema_name: str) -> None:
+    await _create_endpoint_registry_table(database, schema_name)
+    await _create_source_registry_table(database, schema_name)
 
 
 async def _seed_protected_sources(database: Database, schema_name: str) -> None:
@@ -220,6 +234,120 @@ async def _dedicated_fingerprint(
     return dict(row._mapping)
 
 
+async def _assert_collision_rolls_back_endpoint(
+    database: Database,
+    schema_name: str,
+) -> None:
+    schema = quoted(schema_name)
+    await database.status(
+        f"""
+        INSERT INTO {schema}.provider_directory_source (
+            source_id, org_name, canonical_api_base, endpoint_id,
+            auth_type, metadata_json
+        ) VALUES (
+            :source_id, 'Synthetic collision',
+            'https://collision.example.test', :endpoint_id,
+            'none', CAST(:collision_metadata AS jsonb)
+        );
+        """,
+        source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
+        endpoint_id=GENERIC_ENDPOINT_ID,
+        collision_metadata=json.dumps({"drift": True}),
+    )
+    expected_endpoint_id = (
+        registration.uhc_flex_practitioner_endpoint_identity().endpoint_id
+    )
+    with pytest.raises(registration.UHCFlexPractitionerRegistrationError):
+        await registration.register_uhc_flex_practitioner_source(database=database)
+    assert await database.scalar(
+        f"SELECT count(*) FROM {schema}.provider_directory_api_endpoint "
+        "WHERE endpoint_id = :endpoint_id;",
+        endpoint_id=expected_endpoint_id,
+    ) == 0
+    await database.status(
+        f"DELETE FROM {schema}.provider_directory_source "
+        "WHERE source_id = :source_id;",
+        source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
+    )
+
+
+async def _assert_fresh_registration_and_replay(
+    database: Database,
+    schema_name: str,
+    protected_fingerprint: dict[str, object],
+) -> None:
+    created_registration = await registration.register_uhc_flex_practitioner_source(
+        database=database
+    )
+    dedicated_before = await _dedicated_fingerprint(
+        database,
+        schema_name,
+        created_registration.endpoint_id,
+    )
+    replayed_registration = await registration.register_uhc_flex_practitioner_source(
+        database=database
+    )
+    dedicated_after = await _dedicated_fingerprint(
+        database,
+        schema_name,
+        created_registration.endpoint_id,
+    )
+    schema = quoted(schema_name)
+    assert created_registration.endpoint_created is True
+    assert created_registration.source_created is True
+    assert replayed_registration.created is False
+    assert dedicated_after == dedicated_before
+    assert created_registration.endpoint_id not in {
+        GENERIC_ENDPOINT_ID,
+        OFFICIAL_ENDPOINT_ID,
+    }
+    assert await database.scalar(
+        f"SELECT count(*) FROM {schema}.provider_directory_api_endpoint;"
+    ) == 3
+    assert await database.scalar(
+        f"SELECT count(*) FROM {schema}.provider_directory_source;"
+    ) == 3
+    assert await _protected_fingerprint(database, schema_name) == (
+        protected_fingerprint
+    )
+
+
+async def _assert_metadata_drift_rejected(
+    database: Database,
+    schema_name: str,
+    protected_fingerprint: dict[str, object],
+) -> None:
+    schema = quoted(schema_name)
+    await database.status(
+        f"""
+        UPDATE {schema}.provider_directory_source
+           SET metadata_json = jsonb_set(
+                   metadata_json,
+                   '{{provider_directory_profile_eligible}}',
+                   'true'::jsonb
+               )
+         WHERE source_id = :source_id;
+        """,
+        source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
+    )
+    drifted_source = await database.scalar(
+        f"SELECT metadata_json FROM {schema}.provider_directory_source "
+        "WHERE source_id = :source_id;",
+        source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
+    )
+    with pytest.raises(registration.UHCFlexPractitionerRegistrationError):
+        await registration.register_uhc_flex_practitioner_source(database=database)
+    assert await database.scalar(
+        f"SELECT metadata_json FROM {schema}.provider_directory_source "
+        "WHERE source_id = :source_id;",
+        source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
+    ) == drifted_source
+    assert drifted_source["provider_directory_profile_eligible"] is True
+    assert await _protected_fingerprint(database, schema_name) == (
+        protected_fingerprint
+    )
+
+
 @pytest.mark.asyncio
 async def test_flex_registration_is_atomic_distinct_and_drift_rejecting(
     monkeypatch,
@@ -241,106 +369,17 @@ async def test_flex_registration_is_atomic_distinct_and_drift_rejecting(
         await database.status(f"CREATE SCHEMA {quoted(schema_name)};")
         await _create_registry_tables(database, schema_name)
         await _seed_protected_sources(database, schema_name)
-        protected_before = await _protected_fingerprint(database, schema_name)
-        schema = quoted(schema_name)
-
-        await database.status(
-            f"""
-            INSERT INTO {schema}.provider_directory_source (
-                source_id, org_name, canonical_api_base, endpoint_id,
-                auth_type, metadata_json
-            ) VALUES (
-                :source_id, 'Synthetic collision',
-                'https://collision.example.test', :endpoint_id,
-                'none', CAST(:collision_metadata AS jsonb)
-            );
-            """,
-            source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
-            endpoint_id=GENERIC_ENDPOINT_ID,
-            collision_metadata=json.dumps({"drift": True}),
-        )
-        expected_endpoint_id = (
-            registration.uhc_flex_practitioner_endpoint_identity().endpoint_id
-        )
-        with pytest.raises(registration.UHCFlexPractitionerRegistrationError):
-            await registration.register_uhc_flex_practitioner_source(
-                database=database
-            )
-        assert await database.scalar(
-            f"SELECT count(*) FROM {schema}.provider_directory_api_endpoint "
-            "WHERE endpoint_id = :endpoint_id;",
-            endpoint_id=expected_endpoint_id,
-        ) == 0
-        await database.status(
-            f"DELETE FROM {schema}.provider_directory_source "
-            "WHERE source_id = :source_id;",
-            source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        )
-
-        created = await registration.register_uhc_flex_practitioner_source(
-            database=database
-        )
-        dedicated_before = await _dedicated_fingerprint(
+        protected_fingerprint = await _protected_fingerprint(database, schema_name)
+        await _assert_collision_rolls_back_endpoint(database, schema_name)
+        await _assert_fresh_registration_and_replay(
             database,
             schema_name,
-            created.endpoint_id,
+            protected_fingerprint,
         )
-        replayed = await registration.register_uhc_flex_practitioner_source(
-            database=database
-        )
-        dedicated_after = await _dedicated_fingerprint(
+        await _assert_metadata_drift_rejected(
             database,
             schema_name,
-            created.endpoint_id,
-        )
-
-        assert created.endpoint_created is True
-        assert created.source_created is True
-        assert replayed.created is False
-        assert dedicated_after == dedicated_before
-        assert created.endpoint_id not in {
-            GENERIC_ENDPOINT_ID,
-            OFFICIAL_ENDPOINT_ID,
-        }
-        assert await database.scalar(
-            f"SELECT count(*) FROM {schema}.provider_directory_api_endpoint;"
-        ) == 3
-        assert await database.scalar(
-            f"SELECT count(*) FROM {schema}.provider_directory_source;"
-        ) == 3
-        assert await _protected_fingerprint(database, schema_name) == (
-            protected_before
-        )
-
-        await database.status(
-            f"""
-            UPDATE {schema}.provider_directory_source
-               SET metadata_json = jsonb_set(
-                       metadata_json,
-                       '{{provider_directory_profile_eligible}}',
-                       'true'::jsonb
-                   )
-             WHERE source_id = :source_id;
-            """,
-            source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        )
-        drifted_source = await database.scalar(
-            f"SELECT metadata_json FROM {schema}.provider_directory_source "
-            "WHERE source_id = :source_id;",
-            source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        )
-        with pytest.raises(registration.UHCFlexPractitionerRegistrationError):
-            await registration.register_uhc_flex_practitioner_source(
-                database=database
-            )
-        assert await database.scalar(
-            f"SELECT metadata_json FROM {schema}.provider_directory_source "
-            "WHERE source_id = :source_id;",
-            source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        ) == drifted_source
-        assert drifted_source["provider_directory_profile_eligible"] is True
-        assert await _protected_fingerprint(database, schema_name) == (
-            protected_before
+            protected_fingerprint,
         )
     finally:
         await drop_schema(engine, schema_name)

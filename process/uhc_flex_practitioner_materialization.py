@@ -264,6 +264,165 @@ class UHCFlexPractitionerMaterializedRow:
         return json.loads(self._dataset_resource_json)
 
 
+@dataclass(frozen=True, slots=True)
+class _MaterializationContext:
+    dataset_id: str
+    source_id: str
+    run_id: str
+    projection_date: datetime.date
+    fetch_url: str
+
+
+def _materialization_context(
+    *, dataset_id: str, source_id: str, run_id: str,
+    semantic_projection_as_of: str,
+    requested_npi: int,
+) -> _MaterializationContext:
+    canonical_dataset_id = _strict_text(
+        dataset_id, maximum_length=96, error_code="dataset_id_invalid")
+    if source_id != UHC_FLEX_PRACTITIONER_SOURCE_ID:
+        raise UHCFlexPractitionerMaterializationError("source_drift")
+    return _MaterializationContext(
+        dataset_id=canonical_dataset_id,
+        source_id=source_id,
+        run_id=_strict_text(run_id, maximum_length=64, error_code="run_id_invalid"),
+        projection_date=_canonical_projection_date(semantic_projection_as_of),
+        fetch_url=uhc_flex_practitioner_query_url(requested_npi),
+    )
+
+
+def _normalized_result_payload(
+    query_result: UHCFlexPractitionerQueryResult,
+    context: _MaterializationContext,
+    expected_resource_id: str,
+    resource_by_field: dict[str, Any],
+    raw_hash_by_resource_id: dict[str, str],
+) -> tuple[dict[str, Any], str]:
+    if type(expected_resource_id) is not str or (
+        _FHIR_ID_PATTERN.fullmatch(expected_resource_id) is None
+    ):
+        raise UHCFlexPractitionerMaterializationError("resource_id_invalid")
+    acquired_resource_sha256 = raw_hash_by_resource_id.get(expected_resource_id)
+    if (
+        type(acquired_resource_sha256) is not str
+        or _SHA256_PATTERN.fullmatch(acquired_resource_sha256) is None
+        or acquired_resource_sha256 != _raw_resource_sha256(resource_by_field)
+    ):
+        raise UHCFlexPractitionerMaterializationError("raw_content_drift")
+    resource_url = f"{UHC_FLEX_PRACTITIONER_API_BASE}/Practitioner/" + urllib.parse.quote(
+        expected_resource_id, safe="")
+    parsed_resource = parse_fhir_resource(
+        context.source_id,
+        resource_by_field,
+        resource_url=resource_url,
+        acquisition=FHIRAcquisitionContext(
+            self_url=resource_url,
+            fetch_url=context.fetch_url,
+            fetch_mode="rest_bundle",
+            semantic_projection_as_of=context.projection_date,
+        ),
+        run_id=context.run_id,
+    )
+    if parsed_resource is None or type(parsed_resource) is not tuple or len(
+        parsed_resource) != 2:
+        raise UHCFlexPractitionerMaterializationError("resource_model_drift")
+    model, resource_row_by_field = parsed_resource
+    if model is not ProviderDirectoryPractitioner:
+        raise UHCFlexPractitionerMaterializationError("resource_model_drift")
+    if type(resource_row_by_field) is not dict:
+        raise UHCFlexPractitionerMaterializationError("normalized_payload_invalid")
+    if resource_row_by_field.get("resource_id") != expected_resource_id:
+        raise UHCFlexPractitionerMaterializationError("resource_id_drift")
+    if resource_row_by_field.get("npi") != query_result.requested_npi:
+        raise UHCFlexPractitionerMaterializationError("resource_npi_drift")
+    if (
+        resource_row_by_field.get("source_id") != context.source_id
+        or resource_row_by_field.get("last_seen_run_id") != context.run_id
+    ):
+        raise UHCFlexPractitionerMaterializationError("source_drift")
+    return _normalized_payload(resource_row_by_field), acquired_resource_sha256
+
+
+def _materialized_practitioner_row(
+    query_result: UHCFlexPractitionerQueryResult,
+    context: _MaterializationContext,
+    expected_resource_id: str,
+    resource_by_field: dict[str, Any],
+    raw_hash_by_resource_id: dict[str, str],
+) -> UHCFlexPractitionerMaterializedRow:
+    payload_by_field, acquired_resource_sha256 = _normalized_result_payload(
+        query_result, context, expected_resource_id,
+        resource_by_field, raw_hash_by_resource_id)
+    dataset_resource_by_field = _dataset_resource_mapping(
+        dataset_id=context.dataset_id,
+        resource_id=expected_resource_id,
+        payload_by_field=payload_by_field,
+        acquired_resource_sha256=acquired_resource_sha256,
+    )
+    return UHCFlexPractitionerMaterializedRow(
+        requested_npi=query_result.requested_npi,
+        resource_id=expected_resource_id,
+        acquired_resource_sha256=acquired_resource_sha256,
+        _dataset_resource_json=_canonical_json(dataset_resource_by_field),
+    )
+
+
+def _deduplicated_materialized_rows(
+    query_result: UHCFlexPractitionerQueryResult,
+    context: _MaterializationContext,
+    raw_payloads: tuple[dict[str, Any], ...],
+    raw_hash_by_resource_id: dict[str, str],
+) -> tuple[UHCFlexPractitionerMaterializedRow, ...]:
+    materialized_by_id: dict[str, UHCFlexPractitionerMaterializedRow] = {}
+    payload_json_by_hash: dict[str, str] = {}
+    for expected_resource_id, resource_by_field in zip(
+        query_result.resource_ids,
+        raw_payloads,
+        strict=True,
+    ):
+        materialized_resource = _materialized_practitioner_row(
+            query_result, context, expected_resource_id,
+            resource_by_field, raw_hash_by_resource_id,
+        )
+        dataset_resource_by_field = materialized_resource.dataset_resource
+        payload_hash = dataset_resource_by_field["payload_hash"]
+        payload_json = _canonical_json(dataset_resource_by_field["payload_json"])
+        previous_payload_json = payload_json_by_hash.get(payload_hash)
+        if previous_payload_json is not None and previous_payload_json != payload_json:
+            raise UHCFlexPractitionerMaterializationError("semantic_collision")
+        payload_json_by_hash[payload_hash] = payload_json
+        previous_resource = materialized_by_id.get(expected_resource_id)
+        if (
+            previous_resource is not None
+            and previous_resource.dataset_resource
+            != materialized_resource.dataset_resource
+        ):
+            raise UHCFlexPractitionerMaterializationError("semantic_collision")
+        materialized_by_id[expected_resource_id] = materialized_resource
+    if len(materialized_by_id) != query_result.resource_count:
+        raise UHCFlexPractitionerMaterializationError("semantic_collision")
+    return tuple(materialized_by_id[resource_id]
+                 for resource_id in sorted(materialized_by_id))
+
+
+def _materialized_result_rows(
+    query_result: UHCFlexPractitionerQueryResult,
+    context: _MaterializationContext,
+) -> tuple[UHCFlexPractitionerMaterializedRow, ...]:
+    if query_result.is_unmatched:
+        return ()
+    raw_hash_by_resource_id = dict(query_result.resource_sha256_by_id)
+    raw_payloads = query_result.resource_payloads()
+    if (
+        len(raw_hash_by_resource_id) != query_result.resource_count
+        or len(raw_payloads) != query_result.resource_count
+    ):
+        raise UHCFlexPractitionerMaterializationError("result_invalid")
+    return _deduplicated_materialized_rows(
+        query_result, context, raw_payloads, raw_hash_by_resource_id
+    )
+
+
 def materialize_uhc_flex_practitioner_result(
     result: UHCFlexPractitionerQueryResult,
     *,
@@ -276,117 +435,12 @@ def materialize_uhc_flex_practitioner_result(
 
     if type(result) is not UHCFlexPractitionerQueryResult:
         raise UHCFlexPractitionerMaterializationError("result_invalid")
-    canonical_dataset_id = _strict_text(
-        dataset_id,
-        maximum_length=96,
-        error_code="dataset_id_invalid",
+    context = _materialization_context(
+        dataset_id=dataset_id, source_id=source_id, run_id=run_id,
+        semantic_projection_as_of=semantic_projection_as_of,
+        requested_npi=result.requested_npi,
     )
-    if source_id != UHC_FLEX_PRACTITIONER_SOURCE_ID:
-        raise UHCFlexPractitionerMaterializationError("source_drift")
-    canonical_run_id = _strict_text(
-        run_id,
-        maximum_length=64,
-        error_code="run_id_invalid",
-    )
-    projection_date = _canonical_projection_date(semantic_projection_as_of)
-    if result.is_unmatched:
-        return ()
-
-    raw_hash_by_resource_id = dict(result.resource_sha256_by_id)
-    raw_payloads = result.resource_payloads()
-    if (
-        len(raw_hash_by_resource_id) != result.resource_count
-        or len(raw_payloads) != result.resource_count
-    ):
-        raise UHCFlexPractitionerMaterializationError("result_invalid")
-
-    materialized_by_id: dict[str, UHCFlexPractitionerMaterializedRow] = {}
-    payload_json_by_hash: dict[str, str] = {}
-    fetch_url = uhc_flex_practitioner_query_url(result.requested_npi)
-    for expected_resource_id, resource_by_field in zip(
-        result.resource_ids,
-        raw_payloads,
-        strict=True,
-    ):
-        if (
-            type(expected_resource_id) is not str
-            or _FHIR_ID_PATTERN.fullmatch(expected_resource_id) is None
-        ):
-            raise UHCFlexPractitionerMaterializationError("resource_id_invalid")
-        acquired_resource_sha256 = raw_hash_by_resource_id.get(expected_resource_id)
-        if (
-            type(acquired_resource_sha256) is not str
-            or _SHA256_PATTERN.fullmatch(acquired_resource_sha256) is None
-            or acquired_resource_sha256 != _raw_resource_sha256(resource_by_field)
-        ):
-            raise UHCFlexPractitionerMaterializationError("raw_content_drift")
-        resource_url = (
-            f"{UHC_FLEX_PRACTITIONER_API_BASE}/Practitioner/"
-            f"{urllib.parse.quote(expected_resource_id, safe='')}"
-        )
-        parsed = parse_fhir_resource(
-            source_id,
-            resource_by_field,
-            resource_url=resource_url,
-            acquisition=FHIRAcquisitionContext(
-                self_url=resource_url,
-                fetch_url=fetch_url,
-                fetch_mode="rest_bundle",
-                semantic_projection_as_of=projection_date,
-            ),
-            run_id=canonical_run_id,
-        )
-        if parsed is None or type(parsed) is not tuple or len(parsed) != 2:
-            raise UHCFlexPractitionerMaterializationError("resource_model_drift")
-        model, resource_row_by_field = parsed
-        if model is not ProviderDirectoryPractitioner:
-            raise UHCFlexPractitionerMaterializationError("resource_model_drift")
-        if type(resource_row_by_field) is not dict:
-            raise UHCFlexPractitionerMaterializationError("normalized_payload_invalid")
-        normalized_resource_id = resource_row_by_field.get("resource_id")
-        if normalized_resource_id != expected_resource_id:
-            raise UHCFlexPractitionerMaterializationError("resource_id_drift")
-        if resource_row_by_field.get("npi") != result.requested_npi:
-            raise UHCFlexPractitionerMaterializationError("resource_npi_drift")
-        if (
-            resource_row_by_field.get("source_id") != source_id
-            or resource_row_by_field.get("last_seen_run_id") != canonical_run_id
-        ):
-            raise UHCFlexPractitionerMaterializationError("source_drift")
-
-        payload_by_field = _normalized_payload(resource_row_by_field)
-        dataset_resource_by_field = _dataset_resource_mapping(
-            dataset_id=canonical_dataset_id,
-            resource_id=expected_resource_id,
-            payload_by_field=payload_by_field,
-            acquired_resource_sha256=acquired_resource_sha256,
-        )
-        dataset_resource_json = _canonical_json(dataset_resource_by_field)
-        payload_hash = dataset_resource_by_field["payload_hash"]
-        payload_json = _canonical_json(payload_by_field)
-        previous_payload_json = payload_json_by_hash.get(payload_hash)
-        if previous_payload_json is not None and previous_payload_json != payload_json:
-            raise UHCFlexPractitionerMaterializationError("semantic_collision")
-        payload_json_by_hash[payload_hash] = payload_json
-        materialized_row = UHCFlexPractitionerMaterializedRow(
-            requested_npi=result.requested_npi,
-            resource_id=expected_resource_id,
-            acquired_resource_sha256=acquired_resource_sha256,
-            _dataset_resource_json=dataset_resource_json,
-        )
-        previous_row = materialized_by_id.get(expected_resource_id)
-        if (
-            previous_row is not None
-            and previous_row.dataset_resource != materialized_row.dataset_resource
-        ):
-            raise UHCFlexPractitionerMaterializationError("semantic_collision")
-        materialized_by_id[expected_resource_id] = materialized_row
-
-    if len(materialized_by_id) != result.resource_count:
-        raise UHCFlexPractitionerMaterializationError("semantic_collision")
-    return tuple(
-        materialized_by_id[resource_id] for resource_id in sorted(materialized_by_id)
-    )
+    return _materialized_result_rows(result, context)
 
 
 def materialize_uhc_flex_practitioner_stored_resource(

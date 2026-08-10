@@ -34,6 +34,49 @@ PROJECTION_AS_OF = "2026-08-10"
 provider_directory_fhir = importlib.import_module("process.provider_directory_fhir")
 
 
+def _qualification_fixture() -> list[dict]:
+    return [
+        {
+            "identifier": [
+                {
+                    "system": "https://example.test/license",
+                    "value": "LIC-123",
+                }
+            ],
+            "code": {
+                "coding": [
+                    {
+                        "system": "https://example.test/license-type",
+                        "code": "MD",
+                        "display": "Physician",
+                    }
+                ],
+                "text": "Medical license",
+            },
+            "period": {"start": "2005-07-01"},
+            "issuer": {"reference": "Organization/licensing-board"},
+        }
+    ]
+
+
+def _communication_fixture() -> list[dict]:
+    return [
+        {
+            "language": {
+                "coding": [
+                    {
+                        "system": "urn:ietf:bcp:47",
+                        "code": "es",
+                        "display": "Spanish",
+                    }
+                ],
+                "text": "Spanish",
+            },
+            "preferred": True,
+        }
+    ]
+
+
 def _practitioner(resource_id: str, **additional_fields) -> dict:
     return {
         "resourceType": "Practitioner",
@@ -63,54 +106,15 @@ def _practitioner(resource_id: str, **additional_fields) -> dict:
         "gender": "female",
         "birthDate": "1980-06-15",
         "telecom": [
-            {
-                "system": "email",
-                "value": "avery@example.test",
-                "use": "work",
-            },
+            {"system": "email", "value": "avery@example.test", "use": "work"},
             {
                 "system": "url",
                 "value": "https://example.test/avery",
                 "use": "work",
             },
         ],
-        "qualification": [
-            {
-                "identifier": [
-                    {
-                        "system": "https://example.test/license",
-                        "value": "LIC-123",
-                    }
-                ],
-                "code": {
-                    "coding": [
-                        {
-                            "system": "https://example.test/license-type",
-                            "code": "MD",
-                            "display": "Physician",
-                        }
-                    ],
-                    "text": "Medical license",
-                },
-                "period": {"start": "2005-07-01"},
-                "issuer": {"reference": "Organization/licensing-board"},
-            }
-        ],
-        "communication": [
-            {
-                "language": {
-                    "coding": [
-                        {
-                            "system": "urn:ietf:bcp:47",
-                            "code": "es",
-                            "display": "Spanish",
-                        }
-                    ],
-                    "text": "Spanish",
-                },
-                "preferred": True,
-            }
-        ],
+        "qualification": _qualification_fixture(),
+        "communication": _communication_fixture(),
         **additional_fields,
     }
 
@@ -131,16 +135,16 @@ def _materialize(
     result: UHCFlexPractitionerQueryResult,
     **overrides,
 ):
-    arguments = {
+    arguments_by_name = {
         "dataset_id": DATASET_ID,
         "source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID,
         "run_id": RUN_ID,
         "semantic_projection_as_of": PROJECTION_AS_OF,
     }
-    arguments.update(overrides)
+    arguments_by_name.update(overrides)
     return materialization.materialize_uhc_flex_practitioner_result(
         result,
-        **arguments,
+        **arguments_by_name,
     )
 
 
@@ -151,8 +155,8 @@ def _patched_parser(monkeypatch, mutate):
         parsed = original_parser(*args, **kwargs)
         assert parsed is not None
         model, row_by_field = parsed
-        copied_row = dict(row_by_field)
-        return mutate(model, copied_row)
+        copied_row_by_field = dict(row_by_field)
+        return mutate(model, copied_row_by_field)
 
     monkeypatch.setattr(
         materialization,
@@ -161,37 +165,34 @@ def _patched_parser(monkeypatch, mutate):
     )
 
 
-def test_materializes_rich_practitioner_into_semantic_v3_dataset_row():
-    result = _result(_practitioner("practitioner-rich"))
-
-    rows = _materialize(result)
-
-    assert len(rows) == 1
-    row = rows[0]
-    assert row.requested_npi == REQUESTED_NPI
-    assert row.resource_id == "practitioner-rich"
-    assert (
-        row.acquired_resource_sha256
-        == dict(result.resource_sha256_by_id)["practitioner-rich"]
-    )
-    dataset_resource = row.dataset_resource
-    assert dataset_resource == {
-        **dataset_resource,
+def _assert_materialized_identity(query_result, materialized_resource):
+    assert materialized_resource.requested_npi == REQUESTED_NPI
+    assert materialized_resource.resource_id == "practitioner-rich"
+    assert materialized_resource.acquired_resource_sha256 == dict(
+        query_result.resource_sha256_by_id
+    )["practitioner-rich"]
+    dataset_resource_by_field = materialized_resource.dataset_resource
+    assert dataset_resource_by_field == {
+        **dataset_resource_by_field,
         "dataset_id": DATASET_ID,
         "resource_type": "Practitioner",
         "resource_id": "practitioner-rich",
-        "acquired_resource_sha256": row.acquired_resource_sha256,
+        "acquired_resource_sha256": materialized_resource.acquired_resource_sha256,
     }
-    payload = dataset_resource["payload_json"]
-    assert dataset_resource["payload_hash"] == (
+    payload_by_field = dataset_resource_by_field["payload_json"]
+    assert dataset_resource_by_field["payload_hash"] == (
         resource_payload_sha256_for_contract(
-            payload,
+            payload_by_field,
             SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
         )
     )
-    assert payload["full_name"] == "Dr Avery Example"
-    assert payload["administrative_gender"] == "female"
-    assert payload["communications"] == [
+    return payload_by_field
+
+
+def _assert_contact_enrichment(payload_by_field):
+    assert payload_by_field["full_name"] == "Dr Avery Example"
+    assert payload_by_field["administrative_gender"] == "female"
+    assert payload_by_field["communications"] == [
         {
             "codes": [
                 {
@@ -205,7 +206,7 @@ def test_materializes_rich_practitioner_into_semantic_v3_dataset_row():
             "text": "Spanish",
         }
     ]
-    assert payload["telecom"] == [
+    assert payload_by_field["telecom"] == [
         {
             "system": "email",
             "use": "work",
@@ -217,8 +218,11 @@ def test_materializes_rich_practitioner_into_semantic_v3_dataset_row():
             "value": "https://example.test/avery",
         },
     ]
-    assert payload["qualification_codes"][0]["code"] == "MD"
-    assert payload["qualifications"] == [
+
+
+def _assert_qualification_enrichment(payload_by_field):
+    assert payload_by_field["qualification_codes"][0]["code"] == "MD"
+    assert payload_by_field["qualifications"] == [
         {
             "code_codes": [
                 {
@@ -239,16 +243,33 @@ def test_materializes_rich_practitioner_into_semantic_v3_dataset_row():
             "period_start": "2005-07-01",
         }
     ]
-    assert payload["age_years"] == 46
-    assert payload["age_as_of"] == PROJECTION_AS_OF
-    assert payload["years_of_practice"] == 21
-    assert payload["years_of_practice_as_of"] == PROJECTION_AS_OF
+
+
+def _assert_experience_enrichment(payload_by_field):
+    assert payload_by_field["age_years"] == 46
+    assert payload_by_field["age_as_of"] == PROJECTION_AS_OF
+    assert payload_by_field["years_of_practice"] == 21
+    assert payload_by_field["years_of_practice_as_of"] == PROJECTION_AS_OF
     assert {
         "source_id",
         "last_seen_run_id",
         "observed_at",
         "updated_at",
-    }.isdisjoint(payload)
+    }.isdisjoint(payload_by_field)
+
+
+def test_materializes_rich_practitioner_into_semantic_v3_dataset_row():
+    query_result = _result(_practitioner("practitioner-rich"))
+    materialized_resources = _materialize(query_result)
+
+    assert len(materialized_resources) == 1
+    payload_by_field = _assert_materialized_identity(
+        query_result,
+        materialized_resources[0],
+    )
+    _assert_contact_enrichment(payload_by_field)
+    _assert_qualification_enrichment(payload_by_field)
+    _assert_experience_enrichment(payload_by_field)
 
 
 def test_materialized_row_does_not_expose_mutable_internal_mapping():
