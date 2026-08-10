@@ -708,6 +708,7 @@ jobs:
           tests/test_formulary_fhir_storage_postgres.py
           tests/test_formulary_fhir_source_artifact_postgres.py
           tests/test_formulary_fhir_uhc_receipt_postgres.py
+          tests/test_provider_directory_uhc_flex_npi_cohort_postgres.py
           tests/test_uhc_drug_vertical_postgres.py
           tests/test_formulary_fhir_twin_admission_postgres.py
           tests/test_formulary_fhir_twin_repository_postgres.py

@@ -1563,6 +1563,9 @@ keep any legacy full-rebuild schedule held and dispatch only the signed,
 capacity-admitted source-delta geometry; the intermediate dataset checkpoint
 must never be reported as a completed UHC Profile import.
 
+The official-file, Flex-cohort, formulary, and release boundaries are recorded
+in [Provider-directory and formulary source acceptance](provider-directory-formulary-source-acceptance.md).
+
 Capital Blue Cross publishes seven populated Plan-Net collections and an empty
 `Endpoint` collection at `https://providerdirectory-api.capbluecross.com/r4`.
 US-dev probes succeed over normal verified TLS, but broad exact census requests
