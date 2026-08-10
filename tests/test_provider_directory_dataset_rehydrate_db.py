@@ -32,18 +32,15 @@ from process.provider_directory_dataset_rehydrate import (
     RehydrationRuntime,
     rehydrate_current_dataset,
 )
-from process import provider_directory_proof_store as proof_store
-from process.provider_directory_proof_store import (
-    PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
-    build_stored_dataset_proof,
-    ensure_dataset_proof_shard_table,
-)
+from process.provider_directory_proof_store import ensure_dataset_proof_shard_table
 from process.provider_directory_resource_hash import (
     LEGACY_RESOURCE_HASH_CONTRACT,
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-    canonical_practitioner_payload,
     resource_payload_sha256,
     resource_payload_sha256_for_contract,
+)
+from tests.test_provider_directory_dataset_rehydrate_unit import (
+    _replace_fixture_with_semantic_practitioner,
 )
 
 
@@ -57,7 +54,6 @@ ENDPOINT_ID = "endpoint_directory_fixture"
 DATASET_ID = "pdds_directory_fixture"
 ROOT_RUN_ID = "run_directory_fixture_root"
 CANONICAL_BASE = "https://directory.fixture.test/fhir"
-SEMANTIC_PROJECTION_AS_OF = "2026-08-09"
 
 
 async def _require_disposable_postgres(database: Database) -> None:
@@ -85,15 +81,9 @@ def _fixture_payloads() -> tuple[dict[str, object], ...]:
             "country_code": "US",
             "telephone_number": "+1 502 555 0100 ext 12",
             "fax_number": "+1 502 555 0199",
-            "resource_url": (
-                f"https://directory.fixture.test/fhir/Location/location-{location_number}"
-            ),
-            "fhir_self_url": (
-                f"https://directory.fixture.test/fhir/Location/location-{location_number}"
-            ),
-            "fhir_fetch_url": (
-                f"https://directory.fixture.test/fhir/Location?page={location_number}"
-            ),
+            "resource_url": f"https://directory.fixture.test/fhir/Location/location-{location_number}",
+            "fhir_self_url": f"https://directory.fixture.test/fhir/Location/location-{location_number}",
+            "fhir_fetch_url": f"https://directory.fixture.test/fhir/Location?page={location_number}",
             "fhir_fetch_mode": "rest_bundle",
         }
         for location_number in range(1, 4)
@@ -147,16 +137,10 @@ async def _create_fixture_tables(database: Database, schema: str) -> None:
         )
         assert table_sql.startswith("CREATE UNLOGGED TABLE ")
         await database.status(
-            table_sql.replace(
-                "CREATE UNLOGGED TABLE",
-                "CREATE TABLE",
-                1,
-            )
+            table_sql.replace("CREATE UNLOGGED TABLE", "CREATE TABLE", 1)
         )
         for primary_key_statement in importer._artifact_scope_pk_sql(
-            model,
-            schema,
-            model.__tablename__,
+            model, schema, model.__tablename__
         ):
             await database.status(primary_key_statement)
     await ensure_dataset_proof_shard_table(database, schema)
@@ -258,13 +242,15 @@ async def _normal_upsert(
     return await importer._upsert_resource_rows(
         model,
         typed_rows,
-        run_id=scope.acquisition_root_run_id,
-        track_seen=False,
-        canonical_api_base=scope.canonical_api_base,
-        source_ids=[scope.source_id],
-        resource_hash_contract=scope.resource_hash_contract,
-        semantic_projection_as_of=scope.semantic_projection_as_of,
-        derive_location_contacts=False,
+        options=importer.ProviderDirectoryResourceWriteOptions(
+            run_id=scope.acquisition_root_run_id,
+            track_seen=False,
+            canonical_api_base=scope.canonical_api_base,
+            source_ids=[scope.source_id],
+            resource_hash_contract=scope.resource_hash_contract,
+            semantic_projection_as_of=scope.semantic_projection_as_of,
+            derive_location_contacts=False,
+        ),
     )
 
 
@@ -384,176 +370,6 @@ async def _insert_extra_membership(database: Database) -> None:
     )
 
 
-def _semantic_practitioner_payload() -> dict[str, object]:
-    """Return one canonical v3 Practitioner with two exact source names."""
-
-    return canonical_practitioner_payload(
-        {
-            "resource_id": "practitioner-1",
-            "npi": 1000000001,
-            "names": [
-                {
-                    "use": "official",
-                    "family": "Example",
-                    "given": ["Alex"],
-                    "text": "Alex Example",
-                },
-                {
-                    "use": "usual",
-                    "family": "Sample",
-                    "given": ["A."],
-                    "text": "A. Sample",
-                },
-            ],
-            "fhir_meta": {
-                "versionId": "7",
-                "lastUpdated": "2026-08-09T12:00:00Z",
-                "source": "https://directory.fixture.test/fhir",
-            },
-            "resource_url": (
-                "https://directory.fixture.test/fhir/Practitioner/practitioner-1"
-            ),
-            "fhir_self_url": (
-                "https://directory.fixture.test/fhir/Practitioner/practitioner-1"
-            ),
-            "fhir_fetch_url": (
-                "https://directory.fixture.test/fhir/Practitioner?page=1"
-            ),
-            "fhir_fetch_mode": "rest_bundle",
-        }
-    )
-
-
-async def _replace_fixture_with_semantic_practitioner(
-    database: Database,
-    schema: str,
-) -> tuple[dict[str, object], str]:
-    """Replace retained fixture content with one sealed v3 Practitioner."""
-
-    payload = _semantic_practitioner_payload()
-    payload_hash = resource_payload_sha256_for_contract(
-        payload,
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-    )
-    await database.status(
-        f"DELETE FROM {schema}.provider_directory_dataset_resource "
-        "WHERE dataset_id=:dataset_id;",
-        dataset_id=DATASET_ID,
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
-        "dataset_id, resource_type, resource_id, payload_hash, payload_json) "
-        "VALUES (:dataset_id, 'Practitioner', :resource_id, :payload_hash, "
-        "CAST(:payload_json AS json));",
-        dataset_id=DATASET_ID,
-        resource_id=payload["resource_id"],
-        payload_hash=payload_hash,
-        payload_json=json.dumps(payload, sort_keys=True),
-    )
-    dataset_resource = {
-        "dataset_id": DATASET_ID,
-        "resource_type": "Practitioner",
-        "resource_id": payload["resource_id"],
-        "payload_hash": payload_hash,
-        "payload_json": payload,
-        "acquired_resource_sha256": None,
-    }
-    organization_payload = {
-        "resource_id": "organization-linked-1",
-        "active": True,
-        "name": "Linked Organization",
-        "npi": 1234567890,
-    }
-    organization_hash = resource_payload_sha256_for_contract(
-        organization_payload,
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-    )
-    await database.status(
-        f"INSERT INTO {schema}.provider_directory_dataset_resource ("
-        "dataset_id, resource_type, resource_id, payload_hash, payload_json) "
-        "VALUES (:dataset_id, 'Organization', :resource_id, :payload_hash, "
-        "CAST(:payload_json AS json));",
-        dataset_id=DATASET_ID,
-        resource_id=organization_payload["resource_id"],
-        payload_hash=organization_hash,
-        payload_json=json.dumps(organization_payload, sort_keys=True),
-    )
-    dataset_resources = (
-        dataset_resource,
-        {
-            "dataset_id": DATASET_ID,
-            "resource_type": "Organization",
-            "resource_id": organization_payload["resource_id"],
-            "payload_hash": organization_hash,
-            "payload_json": organization_payload,
-            "acquired_resource_sha256": None,
-        },
-    )
-    for retained_resource in dataset_resources:
-        descriptor, compressed = proof_store.build_dataset_proof_shard(
-            [retained_resource],
-            dataset_id=DATASET_ID,
-            endpoint_id=ENDPOINT_ID,
-            acquisition_root_run_id=ROOT_RUN_ID,
-            source_ids=[SOURCE_ID],
-            resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-        )
-        await database.status(
-            f'INSERT INTO "{schema}".'
-            f'"{proof_store.PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}" ('
-            "dataset_id, shard_id, endpoint_id, acquisition_root_run_id, "
-            "source_ids_json, resource_count, resource_counts_json, "
-            "first_identity_json, last_identity_json, input_sha256, "
-            "artifact_sha256, artifact_byte_count, payload_bytes) VALUES ("
-            ":dataset_id, :shard_id, :endpoint_id, :acquisition_root_run_id, "
-            "CAST(:source_ids_json AS jsonb), :resource_count, "
-            "CAST(:resource_counts_json AS jsonb), "
-            "CAST(:first_identity_json AS jsonb), "
-            "CAST(:last_identity_json AS jsonb), :input_sha256, "
-            ":artifact_sha256, :artifact_byte_count, :payload_bytes);",
-            **proof_store._proof_shard_insert_params(descriptor, compressed),
-        )
-    stored_proof = await build_stored_dataset_proof(
-        database,
-        schema,
-        dataset_id=DATASET_ID,
-        endpoint_id=ENDPOINT_ID,
-        acquisition_root_run_id=ROOT_RUN_ID,
-        source_ids=[SOURCE_ID],
-        selected_resources=["Practitioner"],
-        proof_resource_scope=["Organization", "Practitioner"],
-        expected_resource_hash_contract=(
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        ),
-        expected_semantic_projection_as_of=SEMANTIC_PROJECTION_AS_OF,
-    )
-    await database.status(
-        f"UPDATE {schema}.provider_directory_endpoint_dataset SET "
-        "dataset_hash=:dataset_hash, resource_count=2, "
-        "publication_metadata_json=CAST(:metadata_json AS json) "
-        "WHERE dataset_id=:dataset_id;",
-        dataset_id=DATASET_ID,
-        dataset_hash=stored_proof.dataset_hash,
-        metadata_json=json.dumps(
-            {
-                "selected_resources": ["Practitioner"],
-                "source_ids": [SOURCE_ID],
-                "resource_hash_contract": (
-                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                ),
-                "semantic_projection_as_of": SEMANTIC_PROJECTION_AS_OF,
-                "proof_resource_scope": ["Organization", "Practitioner"],
-                PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY: (
-                    stored_proof.metadata
-                ),
-            }
-        ),
-    )
-    return payload, payload_hash
-
-
 def test_fixture_payloads_use_historical_transport_hashes():
     """Keep the PostgreSQL fixture on the legacy read-compatibility path."""
 
@@ -631,15 +447,9 @@ async def test_postgres_rehydrates_exact_semantic_practitioner_union(
     """Prove typed and canonical rows retain the exact v3 name union."""
 
     async with _fixture_database(monkeypatch) as (database, schema):
-        monkeypatch.setenv(
-            "HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS",
-            "1000",
-        )
-        expected_payload, expected_hash = (
-            await _replace_fixture_with_semantic_practitioner(
-                database,
-                schema,
-            )
+        monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "1000")
+        expected_payload, expected_hash = await _replace_fixture_with_semantic_practitioner(
+            database, schema
         )
         completed_summary = await rehydrate_current_dataset(
             _runtime(database, schema),
@@ -654,10 +464,7 @@ async def test_postgres_rehydrates_exact_semantic_practitioner_union(
             "AND resource_id='organization-linked-1';",
             source_id=SOURCE_ID,
         )
-        assert tuple(organization_record) == (
-            "Linked Organization",
-            1234567890,
-        )
+        assert tuple(organization_record) == ("Linked Organization", 1234567890)
         typed_record = await database.first(
             f"SELECT names, family_name, given_names, full_name FROM {schema}."
             "provider_directory_practitioner "

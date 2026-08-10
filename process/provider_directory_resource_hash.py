@@ -132,12 +132,14 @@ def _without_volatile_fhir_time(
     content_by_field = dict(payload_by_field)
     fhir_meta = content_by_field.get("fhir_meta")
     if isinstance(fhir_meta, Mapping):
-        stable_fhir_meta = {
+        stable_fhir_metadata_by_field = {
             key: value
             for key, value in fhir_meta.items()
             if key != "lastUpdated"
         }
-        content_by_field["fhir_meta"] = stable_fhir_meta or None
+        content_by_field["fhir_meta"] = (
+            stable_fhir_metadata_by_field or None
+        )
     return content_by_field
 
 

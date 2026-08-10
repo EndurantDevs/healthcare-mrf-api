@@ -158,10 +158,12 @@ async def test_provider_directory_persistence_helpers_cover_empty_edges(monkeypa
     written = await fhir._upsert_resource_rows(
         fhir.RESOURCE_MODELS_BY_TYPE["Organization"],
         [{"resource_id": "o1"}],
-        run_id="run",
-        track_seen=False,
-        canonical_api_base=fhir.UHC_PROVIDER_DIRECTORY_BASE,
-        source_ids=["uhc"],
+        options=fhir.ProviderDirectoryResourceWriteOptions(
+            run_id="run",
+            track_seen=False,
+            canonical_api_base=fhir.UHC_PROVIDER_DIRECTORY_BASE,
+            source_ids=["uhc"],
+        ),
     )
     assert written == 1
 

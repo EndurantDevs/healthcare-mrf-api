@@ -72,7 +72,7 @@ def test_reviewed_subset_hash_contract_is_version_fenced():
 def test_finalized_subset_rejects_persisted_semantic_contract_without_source_hint(
     terminal_status,
 ):
-    persisted_state = {
+    persisted_dataset_by_field = {
         "status": terminal_status,
         "completion_proof_required_version": (
             importer.SERVER_ISSUED_SUBSET_REQUIRED_VERSION
@@ -90,7 +90,7 @@ def test_finalized_subset_rejects_persisted_semantic_contract_without_source_hin
         match="subset_resource_hash_contract_invalid",
     ):
         importer._existing_endpoint_dataset_finalized_selection(
-            persisted_state,
+            persisted_dataset_by_field,
             "dataset-1",
             "endpoint-1",
             "root-1",

@@ -71,6 +71,20 @@ def activation_inputs():
         baseline_dataset_id="dataset-baseline",
         baseline_root_run_id="root-baseline",
     )
+    baseline_metadata[
+        proof_store.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+    ] = _single_root_content_proof(
+        proof,
+        dataset_id="dataset-baseline",
+        root_run_id="root-baseline",
+    )
+    candidate_metadata_by_field[
+        proof_store.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
+    ] = _single_root_content_proof(
+        proof,
+        dataset_id="dataset-candidate",
+        root_run_id="root-candidate",
+    )
 
     dataset_rows = [
         _dataset_row(

@@ -57,12 +57,12 @@ def _observation(
 ) -> dict[str, object]:
     """Return one mapped resource with retained FHIR provenance."""
 
-    fhir_meta = {
+    fhir_metadata_by_field = {
         "versionId": version_id,
         "source": "https://directory.example.test/fhir",
     }
     if last_updated is not None:
-        fhir_meta["lastUpdated"] = last_updated
+        fhir_metadata_by_field["lastUpdated"] = last_updated
     name_parts = full_name.split()
     family_name = name_parts[-1]
     given_names = name_parts[:-1]
@@ -91,7 +91,7 @@ def _observation(
             "https://directory.example.test/fhir/Practitioner?page=1"
         ),
         "fhir_fetch_mode": "rest_bundle",
-        "fhir_meta": fhir_meta,
+        "fhir_meta": fhir_metadata_by_field,
     }
 
 
@@ -308,13 +308,16 @@ def test_v3_name_union_selects_one_complete_provenance_observation():
     observed_provenance = tuple(
         merged.get(field_name) for field_name in provenance_fields
     ) + (merged["fhir_meta"]["lastUpdated"],)
-    source_provenance = {
-        tuple(payload.get(field_name) for field_name in provenance_fields)
-        + (payload["fhir_meta"]["lastUpdated"],)
-        for payload in (first, second)
+    observed_source_provenances = {
+        tuple(
+            observation_payload_by_field.get(field_name)
+            for field_name in provenance_fields
+        )
+        + (observation_payload_by_field["fhir_meta"]["lastUpdated"],)
+        for observation_payload_by_field in (first, second)
     }
 
-    assert observed_provenance in source_provenance
+    assert observed_provenance in observed_source_provenances
     assert merge_practitioner_semantic_payloads(second, first) == merged
 
 
@@ -345,29 +348,38 @@ def test_v3_within_batch_name_union_precedes_identity_deduplication():
 
 def test_v3_union_rejects_non_name_drift_and_projection_tampering():
     baseline = importer._canonical_resource_payload(_observation())
-    changed = dict(baseline)
-    changed["active"] = True
+    changed_payload_by_field = dict(baseline)
+    changed_payload_by_field["active"] = True
 
-    with pytest.raises(
-        ValueError,
-        match="practitioner_identity_payload_conflict",
-    ):
-        merge_practitioner_semantic_payloads(baseline, changed)
-
-    canonical = canonical_practitioner_payload(baseline)
-    stored_hash = _dataset_row(_observation())["payload_hash"]
-    tampered = {**canonical, "full_name": "Unobserved Projection"}
-    assert not is_resource_payload_hash_match(tampered, stored_hash)
-
-    bool_payload = {**baseline, "active": True}
-    integer_payload = {**baseline, "active": 1}
     with pytest.raises(
         ValueError,
         match="practitioner_identity_payload_conflict",
     ):
         merge_practitioner_semantic_payloads(
-            bool_payload,
-            integer_payload,
+            baseline,
+            changed_payload_by_field,
+        )
+
+    canonical = canonical_practitioner_payload(baseline)
+    stored_hash = _dataset_row(_observation())["payload_hash"]
+    tampered_payload_by_field = {
+        **canonical,
+        "full_name": "Unobserved Projection",
+    }
+    assert not is_resource_payload_hash_match(
+        tampered_payload_by_field,
+        stored_hash,
+    )
+
+    boolean_payload_by_field = {**baseline, "active": True}
+    integer_payload_by_field = {**baseline, "active": 1}
+    with pytest.raises(
+        ValueError,
+        match="practitioner_identity_payload_conflict",
+    ):
+        merge_practitioner_semantic_payloads(
+            boolean_payload_by_field,
+            integer_payload_by_field,
         )
 
 
@@ -398,635 +410,3 @@ def test_v2_hash_remains_readable_after_v3_becomes_default():
         )
         is None
     )
-
-
-def test_contract_reader_keeps_markerless_v1_and_explicit_v2():
-    assert persisted_resource_hash_contract(None) == (
-        LEGACY_RESOURCE_HASH_CONTRACT
-    )
-    assert persisted_resource_hash_contract(
-        {"resource_hash_contract": TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT}
-    ) == TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
-    assert persisted_resource_hash_contract(
-        {"resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT}
-    ) == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-
-
-def test_v3_projection_date_is_created_once_and_reused(monkeypatch):
-    selection = importer.EndpointDatasetCandidateSelection(
-        dataset_id="dataset-1",
-        acquisition_root_run_id="root-1",
-        previous_dataset_id=None,
-        reused_from_checkpoint=False,
-        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-    )
-    monkeypatch.setattr(
-        importer,
-        "_now",
-        lambda: dt.datetime(2026, 8, 9, tzinfo=dt.UTC),
-    )
-    fresh = importer._selection_with_semantic_projection_as_of(
-        selection,
-        {},
-        ("Practitioner",),
-    )
-    assert fresh.semantic_projection_as_of == PROJECTION_AS_OF
-    assert fresh.proof_resource_scope == ("Practitioner",)
-
-    monkeypatch.setattr(
-        importer,
-        "_now",
-        lambda: dt.datetime(2026, 8, 10, tzinfo=dt.UTC),
-    )
-    persisted_state = {
-        "publication_metadata_json": {
-            "resource_hash_contract": (
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-            "semantic_projection_as_of": PROJECTION_AS_OF,
-            "selected_resources": ["Practitioner"],
-            "proof_resource_scope": PROOF_RESOURCE_SCOPE,
-        }
-    }
-    resumed = importer._selection_with_semantic_projection_as_of(
-        selection,
-        persisted_state,
-        ("Practitioner",),
-    )
-    assert resumed.semantic_projection_as_of == PROJECTION_AS_OF
-
-    for invalid_value in (None, " 2026-08-09", "2026-8-9", dt.date(2026, 8, 9)):
-        invalid_state = {
-            "publication_metadata_json": {
-                "resource_hash_contract": (
-                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                ),
-                "semantic_projection_as_of": invalid_value,
-                "selected_resources": ["Practitioner"],
-                "proof_resource_scope": PROOF_RESOURCE_SCOPE,
-            }
-        }
-        with pytest.raises(
-            RuntimeError,
-            match="semantic_projection_as_of",
-        ):
-            importer._selection_with_semantic_projection_as_of(
-                selection,
-                invalid_state,
-                ("Practitioner",),
-            )
-
-
-def test_twin_successor_inherits_and_fences_projection_date(monkeypatch):
-    candidate = importer.EndpointDatasetCandidate(
-        endpoint_id="endpoint-1",
-        dataset_id="dataset-successor",
-        acquisition_root_run_id="root-successor",
-        source_ids=("source-1",),
-        selected_resources=("Practitioner",),
-        expected_resources=("Practitioner",),
-        import_run_id="root-successor",
-        previous_dataset_id=None,
-        requires_twin_root_verification=True,
-        verification_campaign_id="campaign-1",
-        verification_source_scope_hash="scope-1",
-        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-        semantic_projection_as_of="2026-08-10",
-        proof_resource_scope=("Practitioner",),
-    )
-    baseline = {
-        "dataset_id": "dataset-baseline",
-        "publication_metadata_json": {
-            "resource_hash_contract": (
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-            "semantic_projection_as_of": PROJECTION_AS_OF,
-            "selected_resources": ["Practitioner"],
-            "proof_resource_scope": PROOF_RESOURCE_SCOPE,
-        },
-    }
-    monkeypatch.setattr(
-        importer,
-        "_compatible_twin_root_baseline",
-        lambda _candidate, _state: baseline,
-    )
-
-    admitted = importer._candidate_with_locked_twin_root_admission(
-        candidate,
-        baseline,
-    )
-    assert admitted.semantic_projection_as_of == PROJECTION_AS_OF
-
-    resumed = importer.replace(
-        candidate,
-        verification_role=importer.TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE,
-        verification_baseline_dataset_id="dataset-baseline",
-    )
-    with pytest.raises(RuntimeError, match="baseline_incompatible"):
-        importer._candidate_with_locked_twin_root_admission(
-            resumed,
-            baseline,
-        )
-
-
-@pytest.mark.parametrize(
-    ("baseline_contract", "baseline_projection_date", "baseline_scope"),
-    (
-        (LEGACY_RESOURCE_HASH_CONTRACT, None, None),
-        (TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT, None, None),
-        (
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-            PROJECTION_AS_OF,
-            ("PractitionerRole",),
-        ),
-    ),
-)
-def test_fresh_twin_successor_inherits_persisted_baseline_contract(
-    monkeypatch,
-    baseline_contract,
-    baseline_projection_date,
-    baseline_scope,
-):
-    selected_resources = ("PractitionerRole",)
-    candidate = importer.EndpointDatasetCandidate(
-        endpoint_id="endpoint-1",
-        dataset_id="dataset-successor",
-        acquisition_root_run_id="root-successor",
-        source_ids=("source-1",),
-        selected_resources=selected_resources,
-        expected_resources=selected_resources,
-        import_run_id="root-successor",
-        previous_dataset_id=None,
-        requires_twin_root_verification=True,
-        verification_campaign_id="campaign-1",
-        verification_source_scope_hash="scope-1",
-        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-        semantic_projection_as_of="2026-08-10",
-        proof_resource_scope=importer._provider_directory_proof_resource_scope(
-            selected_resources
-        ),
-    )
-    metadata = {
-        "source_ids": ["source-1"],
-        "selected_resources": list(selected_resources),
-        "expected_resources": list(selected_resources),
-        importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: "campaign-1",
-        importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: "scope-1",
-    }
-    if baseline_contract != LEGACY_RESOURCE_HASH_CONTRACT:
-        metadata["resource_hash_contract"] = baseline_contract
-    if baseline_projection_date is not None:
-        metadata["semantic_projection_as_of"] = baseline_projection_date
-    if baseline_scope is not None:
-        metadata["proof_resource_scope"] = list(baseline_scope)
-    baseline = {
-        "dataset_id": "dataset-baseline",
-        "acquisition_root_run_id": "root-baseline",
-        "status": importer.ENDPOINT_DATASET_VERIFICATION_BASELINE,
-        "verification_baseline_count": 1,
-        "completion_proof_required_version": None,
-        "publication_metadata_json": metadata,
-    }
-    baseline_proof = {
-        "endpoint_id": "endpoint-1",
-        "source_ids": ["source-1"],
-        "selected_resources": list(selected_resources),
-        "expected_resources": list(selected_resources),
-        importer.TWIN_ROOT_VERIFICATION_CAMPAIGN_KEY: "campaign-1",
-        importer.TWIN_ROOT_VERIFICATION_SOURCE_SCOPE_KEY: "scope-1",
-    }
-    if baseline_projection_date is not None:
-        baseline_proof["semantic_projection_as_of"] = (
-            baseline_projection_date
-        )
-    if baseline_scope is not None:
-        baseline_proof["proof_resource_scope"] = list(baseline_scope)
-    monkeypatch.setattr(
-        importer,
-        "_twin_root_baseline_proof",
-        lambda _dataset_map: baseline_proof,
-    )
-
-    admitted = importer._candidate_with_locked_twin_root_admission(
-        candidate,
-        baseline,
-    )
-
-    assert admitted.resource_hash_contract == baseline_contract
-    assert admitted.semantic_projection_as_of == baseline_projection_date
-    assert admitted.proof_resource_scope == baseline_scope
-
-
-@pytest.mark.asyncio
-async def test_finalization_lock_rejects_projection_date_tamper():
-    candidate = importer.EndpointDatasetCandidate(
-        endpoint_id="endpoint-1",
-        dataset_id="dataset-1",
-        acquisition_root_run_id="root-1",
-        source_ids=("source-1",),
-        selected_resources=("Practitioner",),
-        expected_resources=("Practitioner",),
-        import_run_id="root-1",
-        previous_dataset_id=None,
-        resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-        semantic_projection_as_of=PROJECTION_AS_OF,
-        proof_resource_scope=("Practitioner",),
-    )
-    connection = SimpleNamespace(
-        first=AsyncMock(
-            side_effect=[
-                {"endpoint_id": "endpoint-1"},
-                {
-                    "dataset_id": "dataset-1",
-                    "acquisition_root_run_id": "root-1",
-                    "is_current": False,
-                    "status": importer.ENDPOINT_DATASET_ACQUIRING,
-                    "previous_dataset_id": None,
-                    "completion_proof_required_version": None,
-                    "completion_proof_json": None,
-                    "completion_proof_sha256": None,
-                    "publication_metadata_json": {
-                        "resource_hash_contract": (
-                            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                        ),
-                        "semantic_projection_as_of": "2026-08-10",
-                        "selected_resources": ["Practitioner"],
-                        "proof_resource_scope": PROOF_RESOURCE_SCOPE,
-                    },
-                },
-            ]
-        )
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match="candidate_stale",
-    ):
-        await importer._lock_endpoint_dataset_for_validation(
-            connection,
-            candidate,
-        )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "projection_fields",
-    [
-        {"age_years": 40, "age_as_of": None},
-        {"age_years": 40, "age_as_of": "2026-08-10"},
-        {
-            "years_of_practice": 10,
-            "years_of_practice_as_of": PROJECTION_AS_OF,
-            "years_of_practice_basis": None,
-            "years_of_practice_start_date": "2016-08-09",
-        },
-    ],
-)
-async def test_v3_accumulator_rejects_partial_or_wrong_date_projection(
-    projection_fields,
-):
-    observation = _observation()
-    observation.update(projection_fields)
-    incoming_row = _dataset_row(observation)
-    connection = SimpleNamespace(
-        first=AsyncMock(
-            return_value={
-                "dataset_id": "dataset-1",
-                "status": importer.ENDPOINT_DATASET_ACQUIRING,
-                "is_current": False,
-                "publication_metadata_json": {
-                    "selected_resources": ["Practitioner"],
-                    "resource_hash_contract": (
-                        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                    ),
-                    "semantic_projection_as_of": PROJECTION_AS_OF,
-                    "proof_resource_scope": PROOF_RESOURCE_SCOPE,
-                },
-            }
-        ),
-        all=AsyncMock(return_value=[]),
-        scalar=AsyncMock(return_value=None),
-    )
-
-    with pytest.raises(ValueError, match="semantic_.*projection"):
-        await importer._accumulated_endpoint_dataset_rows(
-            connection,
-            [incoming_row],
-            dataset_id="dataset-1",
-            resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-            semantic_projection_as_of=PROJECTION_AS_OF,
-        )
-    connection.all.assert_not_awaited()
-    connection.scalar.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_accumulator_rejects_resource_outside_parent_scope(
-):
-    resource_hash_contract = SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-    incoming_row = _dataset_row(_observation(), resource_hash_contract)
-    semantic_projection_as_of = (
-        PROJECTION_AS_OF
-        if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        else None
-    )
-    connection = SimpleNamespace(
-        first=AsyncMock(
-            return_value={
-                "dataset_id": "dataset-1",
-                "status": importer.ENDPOINT_DATASET_ACQUIRING,
-                "is_current": False,
-                "publication_metadata_json": {
-                    "selected_resources": ["Organization"],
-                    "resource_hash_contract": resource_hash_contract,
-                    "proof_resource_scope": ["Endpoint", "Organization"],
-                    **(
-                        {
-                            "semantic_projection_as_of": (
-                                semantic_projection_as_of
-                            )
-                        }
-                        if semantic_projection_as_of is not None
-                        else {}
-                    ),
-                },
-            }
-        ),
-        all=AsyncMock(return_value=[]),
-        scalar=AsyncMock(return_value=None),
-    )
-
-    with pytest.raises(RuntimeError, match="resource_scope_changed"):
-        await importer._accumulated_endpoint_dataset_rows(
-            connection,
-            [incoming_row],
-            dataset_id="dataset-1",
-            resource_hash_contract=(
-                resource_hash_contract
-            ),
-            semantic_projection_as_of=semantic_projection_as_of,
-        )
-    connection.all.assert_not_awaited()
-    connection.scalar.assert_not_awaited()
-
-
-def _semantic_proof_connection() -> _MemoryProofConnection:
-    connection = _MemoryProofConnection()
-    connection.parent["publication_metadata_json"] = {
-        "source_ids": PROOF_SOURCE_IDS,
-        "selected_resources": ["Practitioner"],
-        "proof_resource_scope": PROOF_RESOURCE_SCOPE,
-        "resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-        "semantic_projection_as_of": PROJECTION_AS_OF,
-    }
-    return connection
-
-
-def _semantic_proof_row(**observation_changes) -> dict[str, object]:
-    return {
-        **_dataset_row(_observation(**observation_changes)),
-        "dataset_id": PROOF_DATASET_ID,
-    }
-
-
-async def _semantic_stored_proof(connection: _MemoryProofConnection):
-    return await proof_store.build_stored_dataset_proof(
-        connection,
-        "mrf",
-        dataset_id=PROOF_DATASET_ID,
-        endpoint_id=PROOF_ENDPOINT_ID,
-        acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-        source_ids=PROOF_SOURCE_IDS,
-        selected_resources=["Practitioner"],
-        proof_resource_scope=PROOF_RESOURCE_SCOPE,
-        expected_resource_hash_contract=(
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        ),
-        expected_semantic_projection_as_of=PROJECTION_AS_OF,
-    )
-
-
-@pytest.mark.asyncio
-async def test_v3_sealed_proof_binds_contract_and_projection_date():
-    connection = _semantic_proof_connection()
-    await proof_store.persist_dataset_proof_shard(
-        connection,
-        "mrf",
-        [_semantic_proof_row()],
-        dataset_id=PROOF_DATASET_ID,
-        expected_resource_hash_contract=(
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        ),
-    )
-
-    stored_proof = await _semantic_stored_proof(connection)
-    sealed = stored_proof.metadata
-
-    assert sealed["contract_id"] == (
-        PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
-    )
-    assert sealed["resource_hash_contract"] == (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-    )
-    assert sealed["semantic_projection_as_of"] == PROJECTION_AS_OF
-    assert PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY == (
-        "provider_directory_content_proof_v1"
-    )
-    assert proof_store.validate_stored_dataset_proof_metadata(
-        sealed,
-        dataset_id=PROOF_DATASET_ID,
-        endpoint_id=PROOF_ENDPOINT_ID,
-        acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-        source_ids=PROOF_SOURCE_IDS,
-        selected_resources=["Practitioner"],
-        proof_resource_scope=PROOF_RESOURCE_SCOPE,
-        expected_resource_hash_contract=(
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        ),
-        expected_semantic_projection_as_of=PROJECTION_AS_OF,
-    ) == sealed
-
-    with pytest.raises(
-        ProviderDirectoryProofStoreError,
-        match="projection date changed",
-    ):
-        proof_store.validate_stored_dataset_proof_metadata(
-            sealed,
-            dataset_id=PROOF_DATASET_ID,
-            endpoint_id=PROOF_ENDPOINT_ID,
-            acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-            source_ids=PROOF_SOURCE_IDS,
-            selected_resources=["Practitioner"],
-            proof_resource_scope=PROOF_RESOURCE_SCOPE,
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-            expected_semantic_projection_as_of="2026-08-10",
-        )
-
-
-@pytest.mark.asyncio
-async def test_proof_contracts_reject_cross_version_and_mixed_shards():
-    semantic_connection = _semantic_proof_connection()
-    await proof_store.persist_dataset_proof_shard(
-        semantic_connection,
-        "mrf",
-        [_semantic_proof_row()],
-        dataset_id=PROOF_DATASET_ID,
-        expected_resource_hash_contract=(
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        ),
-    )
-    semantic_proof = await _semantic_stored_proof(semantic_connection)
-    with pytest.raises(
-        ProviderDirectoryProofStoreError,
-        match="contract changed",
-    ):
-        proof_store.validate_stored_dataset_proof_metadata(
-            semantic_proof.metadata,
-            dataset_id=PROOF_DATASET_ID,
-            endpoint_id=PROOF_ENDPOINT_ID,
-            acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-            source_ids=PROOF_SOURCE_IDS,
-            selected_resources=["Practitioner"],
-            proof_resource_scope=PROOF_RESOURCE_SCOPE,
-            expected_resource_hash_contract=(
-                TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
-            ),
-        )
-
-    legacy_descriptor, legacy_payload = proof_store.build_dataset_proof_shard(
-        [
-            _legacy_dataset_resource(
-                "Organization",
-                "organization-1",
-                {"resource_id": "organization-1", "name": "Example"},
-            )
-        ],
-        dataset_id=PROOF_DATASET_ID,
-        endpoint_id=PROOF_ENDPOINT_ID,
-        acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-        source_ids=PROOF_SOURCE_IDS,
-        resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
-    )
-    await semantic_connection.status(
-        "INSERT INTO provider_directory_dataset_proof_shard",
-        **proof_store._proof_shard_insert_params(
-            legacy_descriptor,
-            legacy_payload,
-        ),
-    )
-    with pytest.raises(
-        ProviderDirectoryProofStoreError,
-        match="contract changed",
-    ):
-        await proof_store.build_stored_dataset_proof(
-            semantic_connection,
-            "mrf",
-            dataset_id=PROOF_DATASET_ID,
-            endpoint_id=PROOF_ENDPOINT_ID,
-            acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-            source_ids=PROOF_SOURCE_IDS,
-            selected_resources=["Practitioner"],
-            proof_resource_scope=["Organization", "Practitioner"],
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-            expected_semantic_projection_as_of=PROJECTION_AS_OF,
-        )
-
-
-@pytest.mark.asyncio
-async def test_historical_proof_shape_remains_readable_for_v1_and_v2():
-    legacy_connection = _MemoryProofConnection()
-    await _persist_rows_by_resource(
-        legacy_connection,
-        _sample_dataset_resources(),
-    )
-    legacy_proof = await proof_store.build_stored_dataset_proof(
-        legacy_connection,
-        "mrf",
-        dataset_id=PROOF_DATASET_ID,
-        endpoint_id=PROOF_ENDPOINT_ID,
-        acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-        source_ids=PROOF_SOURCE_IDS,
-        selected_resources=[
-            "InsurancePlan",
-            "Location",
-            "Organization",
-            "OrganizationAffiliation",
-            "Practitioner",
-        ],
-        expected_resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
-    )
-    proof_store.validate_stored_dataset_proof_metadata(
-        legacy_proof.metadata,
-        dataset_id=PROOF_DATASET_ID,
-        endpoint_id=PROOF_ENDPOINT_ID,
-        acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-        source_ids=PROOF_SOURCE_IDS,
-        selected_resources=[
-            "InsurancePlan",
-            "Location",
-            "Organization",
-            "OrganizationAffiliation",
-            "Practitioner",
-        ],
-        expected_resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
-    )
-    proof_store.validate_stored_dataset_proof_metadata(
-        legacy_proof.metadata,
-        dataset_id=PROOF_DATASET_ID,
-        endpoint_id=PROOF_ENDPOINT_ID,
-        acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-        source_ids=PROOF_SOURCE_IDS,
-        selected_resources=[
-            "InsurancePlan",
-            "Location",
-            "Organization",
-            "OrganizationAffiliation",
-            "Practitioner",
-        ],
-        expected_resource_hash_contract=(
-            TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
-        ),
-    )
-    with pytest.raises(
-        ProviderDirectoryProofStoreError,
-        match="contract changed",
-    ):
-        proof_store.validate_stored_dataset_proof_metadata(
-            legacy_proof.metadata,
-            dataset_id=PROOF_DATASET_ID,
-            endpoint_id=PROOF_ENDPOINT_ID,
-            acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-            source_ids=PROOF_SOURCE_IDS,
-            selected_resources=[
-                "InsurancePlan",
-                "Location",
-                "Organization",
-                "OrganizationAffiliation",
-                "Practitioner",
-            ],
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-            expected_semantic_projection_as_of=PROJECTION_AS_OF,
-        )
-
-
-def test_proof_shard_rejects_unknown_hash_contract():
-    with pytest.raises(
-        ProviderDirectoryProofStoreError,
-        match="hash contract is invalid",
-    ):
-        proof_store.build_dataset_proof_shard(
-            [_semantic_proof_row()],
-            dataset_id=PROOF_DATASET_ID,
-            endpoint_id=PROOF_ENDPOINT_ID,
-            acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-            source_ids=PROOF_SOURCE_IDS,
-            resource_hash_contract="unknown-v4",
-        )

@@ -1278,32 +1278,35 @@ async def test_existing_uhc_candidate_replay_and_initialize(monkeypatch):
     persist.assert_awaited_once()
 
 
+async def _retained_candidate_for_state(
+    state_by_field: dict[str, Any],
+) -> importer.EndpointDatasetCandidate:
+    return await importer._uhc_candidate_from_state(
+        "endpoint-official",
+        "dataset-official",
+        "run-root",
+        state_by_field,
+    )
+
+
 @pytest.mark.asyncio
-async def test_uhc_candidate_value_reflects_empty_validated_and_published_state(
-    monkeypatch,
-):
+async def test_retained_candidate_empty_state(monkeypatch):
     current_dataset = AsyncMock(return_value="dataset-old")
     monkeypatch.setattr(
         importer,
         "_current_endpoint_dataset_id",
         current_dataset,
     )
-    empty = await importer._uhc_candidate_from_state(
-        "endpoint-uhc",
-        "dataset-uhc",
-        "run-root",
-        {},
-    )
+    empty = await _retained_candidate_for_state({})
     assert empty.previous_dataset_id == "dataset-old"
     assert empty.reused_from_checkpoint is False
     assert empty.resource_hash_contract == (
         importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
     )
 
-    validated = await importer._uhc_candidate_from_state(
-        "endpoint-uhc",
-        "dataset-uhc",
-        "run-root",
+@pytest.mark.asyncio
+async def test_retained_candidate_finalized_states():
+    validated = await _retained_candidate_for_state(
         {
             "status": importer.ENDPOINT_DATASET_VALIDATED,
             "is_current": False,
@@ -1317,10 +1320,7 @@ async def test_uhc_candidate_value_reflects_empty_validated_and_published_state(
         importer.LEGACY_RESOURCE_HASH_CONTRACT
     )
 
-    published = await importer._uhc_candidate_from_state(
-        "endpoint-uhc",
-        "dataset-uhc",
-        "run-root",
+    published = await _retained_candidate_for_state(
         {
             "status": importer.ENDPOINT_DATASET_PUBLISHED,
             "is_current": True,
@@ -1330,10 +1330,9 @@ async def test_uhc_candidate_value_reflects_empty_validated_and_published_state(
     assert published.already_published is True
     assert published.published_metadata == {"resource_count": 7}
 
-    retained_v2 = await importer._uhc_candidate_from_state(
-        "endpoint-uhc",
-        "dataset-uhc",
-        "run-root",
+@pytest.mark.asyncio
+async def test_retained_candidate_hash_contract_states():
+    retained_v2 = await _retained_candidate_for_state(
         {
             "status": importer.ENDPOINT_DATASET_ACQUIRING,
             "is_current": False,
@@ -1352,10 +1351,7 @@ async def test_uhc_candidate_value_reflects_empty_validated_and_published_state(
         RuntimeError,
         match="retained_resource_hash_contract_invalid",
     ):
-        await importer._uhc_candidate_from_state(
-            "endpoint-uhc",
-            "dataset-uhc",
-            "run-root",
+        await _retained_candidate_for_state(
             {
                 "status": importer.ENDPOINT_DATASET_ACQUIRING,
                 "is_current": False,
@@ -2014,13 +2010,15 @@ async def test_dataset_rehydration_runtime_callbacks(monkeypatch):
     importer._upsert_resource_rows.assert_awaited_once_with(
         importer.ProviderDirectoryOrganization,
         [{}],
-        run_id="root-a",
-        track_seen=False,
-        canonical_api_base="https://example.test/fhir",
-        source_ids=["source-a"],
-        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
-        semantic_projection_as_of=None,
-        derive_location_contacts=False,
+        options=importer.ProviderDirectoryResourceWriteOptions(
+            run_id="root-a",
+            track_seen=False,
+            canonical_api_base="https://example.test/fhir",
+            source_ids=["source-a"],
+            resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
+            semantic_projection_as_of=None,
+            derive_location_contacts=False,
+        ),
     )
     await runtime.cancel_check()
     await runtime.progress_callback({"phase": "copy"})
@@ -6652,6 +6650,19 @@ async def test_delete_stale_resource_rows_prunes_canonical_source_edges(monkeypa
     ) == 4
 
 
+def _resource_write_options(
+    **overrides,
+) -> importer.ProviderDirectoryResourceWriteOptions:
+    option_by_field = {"run_id": "run_1", "track_seen": False}
+    option_by_field.update(overrides)
+    return importer.ProviderDirectoryResourceWriteOptions(**option_by_field)
+
+
+@contextlib.asynccontextmanager
+async def _test_transaction():
+    yield None
+
+
 @pytest.mark.asyncio
 async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch):
     seen_calls = []
@@ -6672,8 +6683,7 @@ async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch)
     written = await importer._upsert_resource_rows(
         ProviderDirectoryLocation,
         rows,
-        run_id="run_1",
-        track_seen=True,
+        options=_resource_write_options(track_seen=True),
     )
 
     assert written == 1
@@ -6734,8 +6744,7 @@ async def test_upsert_resource_rows_batches_location_contact_derivation(monkeypa
     written = await importer._upsert_resource_rows(
         ProviderDirectoryLocation,
         observed_rows,
-        run_id="run_1",
-        track_seen=False,
+        options=_resource_write_options(),
     )
 
     assert written == 2
@@ -6750,6 +6759,19 @@ async def test_upsert_resource_rows_batches_location_contact_derivation(monkeypa
     assert observed_rows[0]["phone_extension"] == "45"
     assert observed_rows[0]["fax_number_digits"] == "3125550199"
     assert observed_rows[1]["phone_number"] == "3125550101"
+
+
+def _canonical_edge_resource_rows():
+    return [
+        {
+            "source_id": source_id,
+            "resource_id": "loc-1",
+            "resource_url": "https://payer.example/fhir/Location/loc-1",
+            "name": "Clinic",
+            "last_seen_run_id": "run_1",
+        }
+        for source_id in ("source_a", "source_b")
+    ]
 
 
 @pytest.mark.asyncio
@@ -6768,30 +6790,16 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
     monkeypatch.setattr(importer, "_mark_resource_rows_seen", fake_mark_seen)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    observed_rows = [
-        {
-            "source_id": "source_a",
-            "resource_id": "loc-1",
-            "resource_url": "https://payer.example/fhir/Location/loc-1",
-            "name": "Clinic",
-            "last_seen_run_id": "run_1",
-        },
-        {
-            "source_id": "source_b",
-            "resource_id": "loc-1",
-            "resource_url": "https://payer.example/fhir/Location/loc-1",
-            "name": "Clinic",
-            "last_seen_run_id": "run_1",
-        },
-    ]
+    observed_rows = _canonical_edge_resource_rows()
 
     written = await importer._upsert_resource_rows(
         ProviderDirectoryLocation,
         observed_rows,
-        run_id="run_1",
-        track_seen=True,
-        canonical_api_base="https://payer.example/fhir/",
-        source_ids=["source_a", "source_b"],
+        options=_resource_write_options(
+            track_seen=True,
+            canonical_api_base="https://payer.example/fhir/",
+            source_ids=["source_a", "source_b"],
+        ),
     )
 
     assert written == 2
@@ -6811,36 +6819,33 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
     assert {observed_row_map["resource_id"] for observed_row_map in edge_call[1]} == {"loc-1"}
 
     assert upsert_calls[2] == (ProviderDirectoryLocation, observed_rows, {"skip_unchanged": True})
-    assert seen_calls == [(ProviderDirectoryLocation, observed_rows, "run_1", {"seen_table": None})]
+    assert seen_calls[0][:3] == (ProviderDirectoryLocation, observed_rows, "run_1")
 
 
-@pytest.mark.asyncio
-async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(monkeypatch):
-    """Keep one contract across immutable and compatibility hash writes."""
-
+def _capture_dataset_backed_writes(monkeypatch):
     upsert_calls = []
     persisted_proof = AsyncMock()
-    accumulated_rows = AsyncMock(
-        side_effect=lambda _database, rows, **_kwargs: rows
-    )
-
-    @contextlib.asynccontextmanager
-    async def fake_transaction():
-        yield None
 
     async def fake_upsert(model, resource_rows, **kwargs):
         upsert_calls.append((model, resource_rows, kwargs))
         return len(resource_rows)
 
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
-    monkeypatch.setattr(importer.db, "transaction", fake_transaction)
+    monkeypatch.setattr(importer.db, "transaction", _test_transaction)
     monkeypatch.setattr(importer, "persist_dataset_proof_shard", persisted_proof)
     monkeypatch.setattr(
         importer,
         "_accumulated_endpoint_dataset_rows",
-        accumulated_rows,
+        AsyncMock(side_effect=lambda _database, rows, **_kwargs: rows),
     )
+    return upsert_calls, persisted_proof
 
+
+@pytest.mark.asyncio
+async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(monkeypatch):
+    """Keep one contract across immutable and compatibility hash writes."""
+
+    upsert_calls, persisted_proof = _capture_dataset_backed_writes(monkeypatch)
     resource_rows = [
         {
             "source_id": "source_a",
@@ -6854,14 +6859,14 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
     written = await importer._upsert_resource_rows(
         ProviderDirectoryPractitionerRole,
         resource_rows,
-        run_id="run_1",
-        track_seen=False,
-        canonical_api_base="https://payer.example/fhir",
-        source_ids=["source_a"],
-        dataset_scope=importer.EndpointDatasetWriteScope(
-            "dataset_1",
-            importer.DEFAULT_RESOURCE_HASH_CONTRACT,
-            "2026-01-01",
+        options=_resource_write_options(
+            canonical_api_base="https://payer.example/fhir",
+            source_ids=["source_a"],
+            dataset_scope=importer.EndpointDatasetWriteScope(
+                "dataset_1",
+                importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+                "2026-01-01",
+            ),
         ),
     )
 
@@ -6887,12 +6892,7 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
     )
 
 
-@pytest.mark.asyncio
-async def test_datasetless_upsert_defaults_to_v2_and_explicit_v3_requires_date(
-    monkeypatch,
-):
-    """Keep compatibility writes historical unless v3 is fully anchored."""
-
+def _datasetless_upsert_fixture(monkeypatch):
     persisted_rows = AsyncMock(return_value=[])
     typed_upsert = AsyncMock(return_value=1)
     monkeypatch.setattr(
@@ -6908,12 +6908,19 @@ async def test_datasetless_upsert_defaults_to_v2_and_explicit_v3_requires_date(
             "names": [],
         }
     ]
+    return persisted_rows, typed_upsert, resource_rows
+
+
+@pytest.mark.asyncio
+async def test_datasetless_upsert_defaults_to_v2(monkeypatch):
+    persisted_rows, typed_upsert, resource_rows = (
+        _datasetless_upsert_fixture(monkeypatch)
+    )
 
     assert await importer._upsert_resource_rows(
         ProviderDirectoryPractitioner,
         resource_rows,
-        run_id="run_1",
-        track_seen=False,
+        options=_resource_write_options(),
     ) == 1
     assert persisted_rows.await_args.kwargs == {
         "resource_hash_contract": (
@@ -6924,6 +6931,12 @@ async def test_datasetless_upsert_defaults_to_v2_and_explicit_v3_requires_date(
     assert persisted_rows.await_count == 1
     assert typed_upsert.await_count == 1
 
+
+@pytest.mark.asyncio
+async def test_datasetless_upsert_requires_v3_date(monkeypatch):
+    persisted_rows, typed_upsert, resource_rows = (
+        _datasetless_upsert_fixture(monkeypatch)
+    )
     with pytest.raises(
         RuntimeError,
         match="semantic_projection_as_of_missing",
@@ -6931,41 +6944,36 @@ async def test_datasetless_upsert_defaults_to_v2_and_explicit_v3_requires_date(
         await importer._upsert_resource_rows(
             ProviderDirectoryPractitioner,
             resource_rows,
-            run_id="run_1",
-            track_seen=False,
-            resource_hash_contract=(
-                importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            options=_resource_write_options(
+                resource_hash_contract=(
+                    importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+                ),
             ),
         )
-    assert persisted_rows.await_count == 1
-    assert typed_upsert.await_count == 1
+    persisted_rows.assert_not_awaited()
+    typed_upsert.assert_not_awaited()
 
     assert await importer._upsert_resource_rows(
         ProviderDirectoryPractitioner,
         resource_rows,
-        run_id="run_1",
-        track_seen=False,
-        resource_hash_contract=(
-            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        options=_resource_write_options(
+            resource_hash_contract=(
+                importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            ),
+            semantic_projection_as_of="2026-08-09",
         ),
-        semantic_projection_as_of="2026-08-09",
     ) == 1
-    assert persisted_rows.await_count == 2
+    assert persisted_rows.await_count == 1
     assert persisted_rows.await_args.kwargs == {
         "resource_hash_contract": (
             importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
         ),
         "semantic_projection_as_of": "2026-08-09",
     }
-    assert typed_upsert.await_count == 2
+    assert typed_upsert.await_count == 1
 
 
-@pytest.mark.asyncio
-async def test_v3_materializes_the_accumulated_payload_for_every_model(
-    monkeypatch,
-):
-    """Keep non-Practitioner typed provenance aligned with retained content."""
-
+def _semantic_v3_materialization_rows():
     incoming_rows = [
         {
             "source_id": "source_a",
@@ -6975,12 +6983,24 @@ async def test_v3_materializes_the_accumulated_payload_for_every_model(
             "fhir_meta": {"lastUpdated": "2026-08-09T10:00:00Z"},
         }
     ]
-    accumulated_payload = {
+    accumulated_payload_by_field = {
         "resource_id": "organization-1",
         "name": "Example Organization",
         "resource_url": "https://directory.example.test/selected-winner",
         "fhir_meta": {"lastUpdated": "2026-08-09T11:00:00Z"},
     }
+    return incoming_rows, accumulated_payload_by_field
+
+
+@pytest.mark.asyncio
+async def test_v3_materializes_the_accumulated_payload_for_every_model(
+    monkeypatch,
+):
+    """Keep non-Practitioner typed provenance aligned with retained content."""
+
+    incoming_rows, accumulated_payload_by_field = (
+        _semantic_v3_materialization_rows()
+    )
     persisted_rows = AsyncMock(
         return_value=[
             {
@@ -6988,16 +7008,12 @@ async def test_v3_materializes_the_accumulated_payload_for_every_model(
                 "resource_type": "Organization",
                 "resource_id": "organization-1",
                 "payload_hash": "a" * 64,
-                "payload_json": accumulated_payload,
+                "payload_json": accumulated_payload_by_field,
             }
         ]
     )
     canonical_upsert = AsyncMock()
     typed_upsert = AsyncMock(return_value=1)
-
-    @contextlib.asynccontextmanager
-    async def fake_transaction():
-        yield None
 
     monkeypatch.setattr(
         importer,
@@ -7010,19 +7026,19 @@ async def test_v3_materializes_the_accumulated_payload_for_every_model(
         canonical_upsert,
     )
     monkeypatch.setattr(importer, "_upsert_rows", typed_upsert)
-    monkeypatch.setattr(importer.db, "transaction", fake_transaction)
+    monkeypatch.setattr(importer.db, "transaction", _test_transaction)
 
     assert await importer._upsert_resource_rows(
         ProviderDirectoryOrganization,
         incoming_rows,
-        run_id="run_1",
-        track_seen=False,
-        canonical_api_base="https://directory.example.test/fhir",
-        source_ids=["source_a"],
-        dataset_scope=importer.EndpointDatasetWriteScope(
-            "dataset_1",
-            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-            "2026-08-09",
+        options=_resource_write_options(
+            canonical_api_base="https://directory.example.test/fhir",
+            source_ids=["source_a"],
+            dataset_scope=importer.EndpointDatasetWriteScope(
+                "dataset_1",
+                importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                "2026-08-09",
+            ),
         ),
     ) == 1
 
@@ -7031,7 +7047,7 @@ async def test_v3_materializes_the_accumulated_payload_for_every_model(
         "https://directory.example.test/selected-winner"
     )
     assert materialized_rows[0]["fhir_meta"] == (
-        accumulated_payload["fhir_meta"]
+        accumulated_payload_by_field["fhir_meta"]
     )
     assert canonical_upsert.await_args.args[1] == materialized_rows
 
@@ -11236,22 +11252,11 @@ def test_artifact_dataset_legacy_metadata_uses_current_source_profile():
     )
 
 
-@pytest.mark.parametrize(
-    ("resource_hash_contract", "proof_resource_scope"),
-    (
-        (
-            importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-            ("InsurancePlan", "Location", "Organization"),
-        ),
-        (importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT, None),
-    ),
-)
-def test_artifact_dataset_projects_every_validated_proof_family(
-    monkeypatch,
+def _artifact_proof_metadata(
     resource_hash_contract,
     proof_resource_scope,
 ):
-    publication_metadata = {
+    metadata_by_field = {
         "source_ids": ["source_a"],
         "selected_resources": ["InsurancePlan"],
         "resource_hash_contract": resource_hash_contract,
@@ -11260,25 +11265,67 @@ def test_artifact_dataset_projects_every_validated_proof_family(
         },
     }
     if proof_resource_scope is not None:
-        publication_metadata.update(
+        metadata_by_field.update(
             semantic_projection_as_of="2026-08-09",
             proof_resource_scope=list(proof_resource_scope),
         )
-    validate_proof = Mock(
-        return_value={
-            "resource_counts": {
-                "InsurancePlan": 1,
-                "Location": 2,
-                "Organization": 1,
-            }
-        }
-    )
+    return metadata_by_field
+
+
+def _artifact_stored_proof_by_field():
+    return {
+        "dataset_hash": "a" * 64,
+        "resource_count": 4,
+        "resource_hashes": {
+            "InsurancePlan": "b" * 64,
+            "Location": "c" * 64,
+            "Organization": "d" * 64,
+        },
+        "resource_counts": {
+            "InsurancePlan": 1,
+            "Location": 2,
+            "Organization": 1,
+        },
+    }
+
+
+def _semantic_artifact_outcome_proof(stored_proof_by_field):
+    return {
+        "complete": True,
+        "version": 1,
+        "dataset_id": "dataset_current",
+        "endpoint_id": "endpoint_1",
+        "acquisition_root_run_id": "acquisition_root",
+        "dataset_hash": stored_proof_by_field["dataset_hash"],
+        "source_ids": ["source_a"],
+        "selected_resources": ["InsurancePlan"],
+        "resource_count": stored_proof_by_field["resource_count"],
+        "resource_counts": stored_proof_by_field["resource_counts"],
+    }
+
+
+def _artifact_dataset_with_validated_proof(
+    monkeypatch,
+    resource_hash_contract,
+    proof_resource_scope,
+):
+    stored_proof_by_field = _artifact_stored_proof_by_field()
+    validate_proof = Mock(return_value=stored_proof_by_field)
     monkeypatch.setattr(
         importer,
         "validate_stored_dataset_proof_metadata",
         validate_proof,
     )
-
+    metadata_by_field = _artifact_proof_metadata(
+        resource_hash_contract,
+        proof_resource_scope,
+    )
+    if resource_hash_contract == (
+        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ):
+        metadata_by_field[
+            importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY
+        ] = _semantic_artifact_outcome_proof(stored_proof_by_field)
     dataset = importer._provider_directory_artifact_dataset_from_row(
         {
             "source_id": "source_a",
@@ -11291,16 +11338,57 @@ def test_artifact_dataset_projects_every_validated_proof_family(
             "evidence_run_id": "acquisition_root",
             "selected_resources": ["InsurancePlan"],
             "recorded_expected_resources": ["InsurancePlan"],
-            "publication_metadata_json": publication_metadata,
+            "dataset_hash": stored_proof_by_field["dataset_hash"],
+            "resource_count": stored_proof_by_field["resource_count"],
+            "publication_metadata_json": metadata_by_field,
         }
     )
-
     assert dataset is not None
+    return dataset, validate_proof
+
+
+def test_artifact_dataset_accepts_linked_proof_scope(monkeypatch):
+    proof_resource_scope = (
+        "InsurancePlan",
+        "Location",
+        "Organization",
+    )
+    dataset, validate_proof = _artifact_dataset_with_validated_proof(
+        monkeypatch,
+        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        proof_resource_scope,
+    )
+
     assert dataset.selected_resources == ("InsurancePlan",)
     assert dataset.artifact_resources == (
         "InsurancePlan",
         "Location",
         "Organization",
+    )
+    assert validate_proof.call_args.kwargs["options"].proof_resource_scope == (
+        proof_resource_scope
+    )
+
+
+def test_artifact_dataset_accepts_v2_proof_scope(monkeypatch):
+    dataset, validate_proof = _artifact_dataset_with_validated_proof(
+        monkeypatch,
+        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+        None,
+    )
+    assert dataset.artifact_resources == (
+        "InsurancePlan",
+        "Location",
+        "Organization",
+    )
+    assert validate_proof.call_args.kwargs["options"].proof_resource_scope is None
+
+
+def test_artifact_scope_filters_linked_families(monkeypatch):
+    dataset, _validate_proof = _artifact_dataset_with_validated_proof(
+        monkeypatch,
+        importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        ("InsurancePlan", "Location", "Organization"),
     )
     fence = importer.ProviderDirectoryArtifactDatasetFence((dataset,))
     assert importer._artifact_scope_resource_pairs(
@@ -11319,9 +11407,6 @@ def test_artifact_dataset_projects_every_validated_proof_family(
         fence,
         publish_artifacts_targets={"address_overlay"},
         publish_corroboration=False,
-    )
-    assert validate_proof.call_args.kwargs["proof_resource_scope"] == (
-        proof_resource_scope
     )
 
 
@@ -11371,21 +11456,21 @@ def test_artifact_dataset_rejects_unvalidated_retained_scope(monkeypatch):
         )
 
 
-def test_uhc_artifact_dataset_rejects_semantic_v3_marker():
+def test_official_file_artifact_dataset_rejects_semantic_v3_marker():
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
-        match="artifact_content_proof_invalid:dataset_uhc",
+        match="artifact_content_proof_invalid:dataset_official",
     ):
         importer._provider_directory_artifact_dataset_from_row(
             {
                 "source_id": importer.UHC_RETAINED_SOURCE_ID,
-                "endpoint_id": "endpoint_uhc",
+                "endpoint_id": "endpoint_official",
                 "source_record_json": _artifact_source_record(
                     importer.UHC_RETAINED_SOURCE_ID,
                     ("Practitioner",),
                 ),
-                "dataset_id": "dataset_uhc",
-                "evidence_run_id": "root_uhc",
+                "dataset_id": "dataset_official",
+                "evidence_run_id": "root_official",
                 "selected_resources": ["Practitioner"],
                 "recorded_expected_resources": ["Practitioner"],
                 "publication_metadata_json": {
@@ -11534,73 +11619,75 @@ def test_artifact_scope_sql_defers_bounded_primary_key_and_expands_aliases():
     assert all(len(name) <= importer.POSTGRES_IDENTIFIER_MAX_LENGTH for name in names)
 
 
-def test_artifact_relation_scope_wires_address_and_network_builders():
+def _artifact_relation_overrides():
+    return {
+        "provider_directory_source": "source_scope",
+        "provider_directory_location": "location_scope",
+        "provider_directory_organization": "organization_scope",
+        "provider_directory_insurance_plan": "plan_scope",
+        "provider_directory_practitioner_role": "role_scope",
+        "provider_directory_organization_affiliation": "affiliation_scope",
+    }
+
+
+def _artifact_relation_sql_by_name():
     relation_token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
-        {
-            "provider_directory_source": "source_scope",
-            "provider_directory_location": "location_scope",
-            "provider_directory_organization": "organization_scope",
-            "provider_directory_insurance_plan": "plan_scope",
-            "provider_directory_practitioner_role": "role_scope",
-            "provider_directory_organization_affiliation": "affiliation_scope",
-        }
+        _artifact_relation_overrides()
     )
     try:
-        archive_sql = importer.provider_directory_location_archive_stage_sql(
-            "mrf",
-            "archive_stage",
-        )
-        network_sql = importer.provider_directory_network_catalog_insert_sql(
-            "mrf",
-            "network_stage",
-            source_ids=["source_a"],
-        )
-        organization_overlay_sql = (
-            importer._address_overlay_component_insert_sql(
+        return {
+            "archive": importer.provider_directory_location_archive_stage_sql(
+                "mrf", "archive_stage"
+            ),
+            "network": importer.provider_directory_network_catalog_insert_sql(
+                "mrf", "network_stage", source_ids=["source_a"]
+            ),
+            "organization": importer._address_overlay_component_insert_sql(
                 "mrf",
                 "address_overlay_stage",
                 component="organization_address",
                 run_id="run_1",
                 source_ids=["source_a"],
-            )
-        )
-        role_overlay_sql = importer._address_overlay_component_insert_sql(
-            "mrf",
-            "address_overlay_stage",
-            component="practitioner_role",
-            run_id="run_1",
-            source_ids=["source_a"],
-        )
-        affiliation_overlay_sql = (
-            importer._address_overlay_component_insert_sql(
+            ),
+            "role": importer._address_overlay_component_insert_sql(
+                "mrf",
+                "address_overlay_stage",
+                component="practitioner_role",
+                run_id="run_1",
+                source_ids=["source_a"],
+            ),
+            "affiliation": importer._address_overlay_component_insert_sql(
                 "mrf",
                 "address_overlay_stage",
                 component="organization_affiliation",
                 run_id="run_1",
                 source_ids=["source_a"],
-            )
-        )
+            ),
+        }
     finally:
         importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(
             relation_token
         )
 
-    assert 'FROM "mrf"."location_scope" AS loc' in archive_sql
-    assert 'FROM "mrf"."organization_scope" AS organization' in archive_sql
-    assert 'FROM "mrf"."plan_scope" AS insurance_plan' in network_sql
-    assert 'FROM "mrf"."role_scope" AS role' in network_sql
-    assert 'JOIN "mrf"."organization_scope" AS network_org' in network_sql
-    assert 'JOIN "mrf"."source_scope" AS src' in network_sql
+
+def test_artifact_relation_scope_wires_address_and_network_builders():
+    sql_by_name = _artifact_relation_sql_by_name()
+    assert 'FROM "mrf"."location_scope" AS loc' in sql_by_name["archive"]
+    assert 'FROM "mrf"."organization_scope" AS organization' in sql_by_name["archive"]
+    assert 'FROM "mrf"."plan_scope" AS insurance_plan' in sql_by_name["network"]
+    assert 'FROM "mrf"."role_scope" AS role' in sql_by_name["network"]
+    assert 'JOIN "mrf"."organization_scope" AS network_org' in sql_by_name["network"]
+    assert 'JOIN "mrf"."source_scope" AS src' in sql_by_name["network"]
     assert 'FROM "mrf"."organization_scope" AS organization' in (
-        organization_overlay_sql
+        sql_by_name["organization"]
     )
-    assert 'FROM "mrf"."role_scope" AS role' in role_overlay_sql
-    assert 'JOIN "mrf"."location_scope" AS loc' in role_overlay_sql
+    assert 'FROM "mrf"."role_scope" AS role' in sql_by_name["role"]
+    assert 'JOIN "mrf"."location_scope" AS loc' in sql_by_name["role"]
     assert 'FROM "mrf"."affiliation_scope" AS affiliation' in (
-        affiliation_overlay_sql
+        sql_by_name["affiliation"]
     )
     assert 'JOIN "mrf"."organization_scope" AS organization' in (
-        affiliation_overlay_sql
+        sql_by_name["affiliation"]
     )
 
 
@@ -13255,10 +13342,12 @@ class _AtomicCandidateInitializationHarness:
             for dataset_id in params["dataset_ids"]
         ]
 
-    async def scalar(self, sql, **_params):
+    async def has_resource_family_lock(self, sql, **_params):
         assert "pg_advisory_xact_lock" in str(sql)
         self.events.append("resource_family_lock")
         return True
+
+    scalar = has_resource_family_lock
 
     async def status(self, sql, **_params):
         sql_text = str(sql)
@@ -13550,19 +13639,26 @@ def _published_endpoint_dataset_test_context():
     )
 
 
-def _published_endpoint_dataset_metadata_by_field():
+def _published_endpoint_dataset_metadata_by_field(
+    resource_hash_contract: str = importer.DEFAULT_RESOURCE_HASH_CONTRACT,
+) -> dict[str, object]:
     return {
         "acquisition_root_run_id": "run_original",
         "selected_resources": ["Practitioner"],
         "expected_resources": ["Practitioner"],
         "source_ids": ["source_a"],
-        importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (
-            importer.DEFAULT_RESOURCE_HASH_CONTRACT
+        importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: resource_hash_contract,
+        **(
+            {
+                importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: "2026-01-01",
+                importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: [
+                    "Practitioner"
+                ],
+            }
+            if resource_hash_contract
+            == importer.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            else {}
         ),
-        importer.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY: "2026-01-01",
-        importer.PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY: [
-            "Practitioner"
-        ],
         "resource_diagnostics": {
             "Practitioner": {
                 "complete": True,
@@ -13658,7 +13754,9 @@ def _install_published_endpoint_dataset_mocks(monkeypatch):
                 "status": importer.ENDPOINT_DATASET_PUBLISHED,
                 "is_current": True,
                 "publication_metadata_json": (
-                    _published_endpoint_dataset_metadata_by_field()
+                    _published_endpoint_dataset_metadata_by_field(
+                        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+                    )
                 ),
             }
         ),
@@ -13733,7 +13831,9 @@ async def test_endpoint_dataset_validated_root_is_idempotent(monkeypatch):
                 "dataset_hash": "a" * 64,
                 "validated_at": "2026-07-13T10:00:00",
                 "publication_metadata_json": (
-                    _published_endpoint_dataset_metadata_by_field()
+                    _published_endpoint_dataset_metadata_by_field(
+                        importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
+                    )
                 ),
             }
         ),
@@ -32229,6 +32329,12 @@ def test_endpoint_dataset_finalization_rejects_inconsistent_state(monkeypatch):
             "verification_role": "baseline",
         },
     )
+    finalized_content_proof_check = Mock()
+    monkeypatch.setattr(
+        importer,
+        "_validate_finalized_content_proof",
+        finalized_content_proof_check,
+    )
     with pytest.raises(RuntimeError, match="promoted_replay_invalid"):
         importer._finalized_endpoint_dataset_verification_fields(
             {},
@@ -32237,6 +32343,7 @@ def test_endpoint_dataset_finalization_rejects_inconsistent_state(monkeypatch):
             verification_campaign_id=None,
             verification_source_scope_hash=None,
         )
+    finalized_content_proof_check.assert_called_once_with({}, {})
 
 
 def test_partition_initializations_require_valid_config_and_checkpoint(monkeypatch):

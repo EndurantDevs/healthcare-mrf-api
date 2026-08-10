@@ -44,6 +44,7 @@ def _candidate(
             == importer.TWIN_ROOT_VERIFICATION_CANDIDATE_ROLE
             else None
         ),
+        resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     )
 
 
@@ -84,6 +85,7 @@ def _baseline_map(
         "resource_count": content_proof.resource_count,
         "verification_baseline_count": 1,
         "publication_metadata_json": {
+            importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: candidate.resource_hash_contract,
             "source_ids": list(candidate.source_ids),
             "selected_resources": list(candidate.selected_resources),
             "expected_resources": list(candidate.expected_resources),
@@ -203,6 +205,7 @@ async def test_pending_candidate_requires_a_root_run(monkeypatch):
                 acquisition_root_run_id=None,
                 previous_dataset_id=None,
                 reused_from_checkpoint=False,
+                resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
             )
         ),
     )

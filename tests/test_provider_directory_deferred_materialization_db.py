@@ -62,13 +62,15 @@ async def _write_practitioner_batch(
     return await importer._upsert_resource_rows(
         importer.ProviderDirectoryPractitioner,
         resource_rows,
-        run_id=ROOT_RUN_ID,
-        track_seen=False,
-        canonical_api_base="https://directory.example.test/fhir",
-        source_ids=["source-a"],
-        dataset_scope=importer.EndpointDatasetWriteScope(
-            DATASET_ID,
-            importer.LEGACY_RESOURCE_HASH_CONTRACT,
+        options=importer.ProviderDirectoryResourceWriteOptions(
+            run_id=ROOT_RUN_ID,
+            track_seen=False,
+            canonical_api_base="https://directory.example.test/fhir",
+            source_ids=["source-a"],
+            dataset_scope=importer.EndpointDatasetWriteScope(
+                DATASET_ID,
+                importer.LEGACY_RESOURCE_HASH_CONTRACT,
+            ),
         ),
     )
 

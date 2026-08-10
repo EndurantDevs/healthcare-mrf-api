@@ -34,6 +34,7 @@ from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
     PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY,
     ProviderDirectoryProofStoreError,
+    ProviderDirectoryStoredProofOptions,
     validate_stored_dataset_proof_metadata,
 )
 
@@ -125,9 +126,7 @@ def _decode_dataset_scope(
     scope_fields_by_name: dict[str, Any],
 ) -> DatasetScope:
     """Decode publication metadata and reject an inexact scope."""
-    publication_metadata = _json_object(
-        scope_fields_by_name.get("publication_metadata_json")
-    )
+    publication_metadata = _json_object(scope_fields_by_name.get("publication_metadata_json"))
     try:
         resource_hash_contract = persisted_resource_hash_contract(
             publication_metadata
@@ -137,9 +136,8 @@ def _decode_dataset_scope(
             resource_hash_contract,
         )
     except ValueError as error:
-        raise DatasetRehydrationError(
-            "provider_directory_dataset_rehydrate_hash_identity_invalid"
-        ) from error
+        message = "provider_directory_dataset_rehydrate_hash_identity_invalid"
+        raise DatasetRehydrationError(message) from error
     selected_resource_types = publication_metadata.get("selected_resources")
     published_source_ids = publication_metadata.get("source_ids")
     if _is_scope_invalid(
@@ -201,7 +199,7 @@ def _retained_resource_types(
     raw_proof_resource_scope = publication_metadata.get(
         PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
     )
-    proof_resource_scope = None
+    proof_resource_types = None
     if raw_proof_resource_scope is not None:
         if (
             not _is_unique_text_list(raw_proof_resource_scope)
@@ -212,8 +210,8 @@ def _retained_resource_types(
             or raw_proof_resource_scope != sorted(raw_proof_resource_scope)
         ):
             raise ValueError("provider_directory_proof_resource_scope_invalid")
-        proof_resource_scope = tuple(raw_proof_resource_scope)
-        if not set(selected_resource_types).issubset(proof_resource_scope):
+        proof_resource_types = tuple(raw_proof_resource_scope)
+        if not set(selected_resource_types).issubset(proof_resource_types):
             raise ValueError("provider_directory_proof_resource_scope_invalid")
     is_semantic_v3 = (
         resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
@@ -234,9 +232,11 @@ def _retained_resource_types(
         acquisition_root_run_id=request.acquisition_root_run_id,
         source_ids=published_source_ids,
         selected_resources=selected_resource_types,
-        proof_resource_scope=proof_resource_scope,
-        expected_resource_hash_contract=resource_hash_contract,
-        expected_semantic_projection_as_of=semantic_projection_as_of,
+        options=ProviderDirectoryStoredProofOptions(
+            proof_resource_scope=proof_resource_types,
+            expected_resource_hash_contract=resource_hash_contract,
+            expected_semantic_projection_as_of=semantic_projection_as_of,
+        ),
     )
     return tuple(stored_proof["resource_counts"])
 

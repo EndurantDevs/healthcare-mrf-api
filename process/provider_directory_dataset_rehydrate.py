@@ -70,9 +70,7 @@ async def rehydrate_current_dataset(
         )
         digest_after = await _verify_dataset_digest(runtime, dataset_scope)
         await _assert_scope_unchanged(runtime, request, dataset_scope)
-    return _execution_summary(
-        request, dataset_scope, summary_by_resource, digest_before, digest_after
-    )
+    return _execution_summary(request, dataset_scope, summary_by_resource, digest_before, digest_after)
 
 
 def _validate_request(request: RehydrationRequest) -> None:
@@ -84,13 +82,9 @@ def _validate_request(request: RehydrationRequest) -> None:
         request.owner_run_id,
     )
     if any(not _clean_text(identity_part) for identity_part in identity_parts):
-        raise DatasetRehydrationError(
-            "provider_directory_dataset_rehydrate_identity_required"
-        )
+        raise DatasetRehydrationError("provider_directory_dataset_rehydrate_identity_required")
     if not 1 <= request.batch_size <= MAX_BATCH_SIZE:
-        raise DatasetRehydrationError(
-            "provider_directory_dataset_rehydrate_batch_size_invalid"
-        )
+        raise DatasetRehydrationError("provider_directory_dataset_rehydrate_batch_size_invalid")
 
 
 async def _rehydrate_selected_resources(
@@ -105,9 +99,7 @@ async def _rehydrate_selected_resources(
         resource_context = await _resource_context(
             runtime, request, scope, resource_type
         )
-        summary_by_resource[resource_type] = await _rehydrate_resource(
-            resource_context
-        )
+        summary_by_resource[resource_type] = await _rehydrate_resource(resource_context)
     return summary_by_resource
 
 

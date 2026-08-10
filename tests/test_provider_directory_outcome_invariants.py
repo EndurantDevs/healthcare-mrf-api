@@ -40,6 +40,19 @@ def _candidate(**overrides) -> importer.EndpointDatasetCandidate:
     return importer.EndpointDatasetCandidate(**candidate_by_field)
 
 
+def _partition_stage_source(
+    resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
+    semantic_projection_as_of=None,
+):
+    source_by_field = {
+        "source_id": "source-1",
+        "_resource_hash_contract": resource_hash_contract,
+    }
+    if semantic_projection_as_of is not None:
+        source_by_field["_semantic_projection_as_of"] = semantic_projection_as_of
+    return source_by_field
+
+
 @pytest.mark.parametrize(
     "control,error",
     [
@@ -400,7 +413,7 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
 
     empty = await importer._stage_last_updated_partition_window(
         _context(),
-        {"source_id": "source-1"},
+        _partition_stage_source(),
         "Practitioner",
         object,
         (),
@@ -413,7 +426,7 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
     with pytest.raises(RuntimeError, match="resource_parse_failed"):
         await importer._stage_last_updated_partition_window(
             _context(),
-            {"source_id": "source-1"},
+            _partition_stage_source(),
             "Practitioner",
             object,
             ({"resourceType": "Practitioner", "id": "p1"},),
@@ -429,7 +442,7 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
     with pytest.raises(RuntimeError, match="stage_count_mismatch"):
         await importer._stage_last_updated_partition_window(
             _context(),
-            {"source_id": "source-1"},
+            _partition_stage_source(),
             "Practitioner",
             object,
             ({"resourceType": "Practitioner", "id": "p1"},),
@@ -442,14 +455,11 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
     ]
     staged = await importer._stage_last_updated_partition_window(
         _context(),
-        {"source_id": "source-1"},
+        _partition_stage_source(),
         "Practitioner",
         object,
         ({"resourceType": "Practitioner", "id": "p1"},),
         run_id="run-1",
         fetch_url="https://example.test/fhir/Practitioner",
     )
-    assert staged.candidate_hashes_by_id == {"p1": "payload-1"}
-
-
-
+    assert (staged.candidate_hashes_by_id, staged.resource_hash_contract, staged.semantic_projection_as_of) == ({"p1": "payload-1"}, importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT, None)

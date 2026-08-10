@@ -495,8 +495,6 @@ def test_bundle_and_pagination_reader_boundaries():
         "https://good.test/fhir",
     ) == {"good.test:443"}
 
-    missing_cursor = urllib.parse.urlsplit("https://idaho.test/fhir?_count=10")
-    bad_count = urllib.parse.urlsplit("https://idaho.test/fhir?ct=x&_count=bad")
-    assert not fhir._is_idaho_medicaid_query_valid(missing_cursor, "Practitioner")
-    assert not fhir._is_idaho_medicaid_query_valid(bad_count, "Practitioner")
+    assert not fhir._is_idaho_medicaid_query_valid(urllib.parse.urlsplit("https://idaho.test/fhir?_count=10"), "Practitioner")
+    assert not fhir._is_idaho_medicaid_query_valid(urllib.parse.urlsplit("https://idaho.test/fhir?ct=x&_count=bad"), "Practitioner")
     assert fhir._url_https_port(urllib.parse.urlsplit("https://example.test:bad")) == 0
