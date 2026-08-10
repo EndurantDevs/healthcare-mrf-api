@@ -116,8 +116,8 @@ def test_parser_handles_yearless_plan_and_rejects_spool_semantic_drift(
     tmp_path,
 ) -> None:
     _artifacts, spool_path, _evidence = _prepared_spool(monkeypatch, tmp_path)
-    membership_row = dict(_membership_row(spool_path))
-    key = spool_reader.spool_plan_key(membership_row)
+    membership_by_field = dict(_membership_row(spool_path))
+    key = spool_reader.spool_plan_key(membership_by_field)
     yearless_key = replace(
         key,
         plan_year=None,
@@ -130,9 +130,9 @@ def test_parser_handles_yearless_plan_and_rejects_spool_semantic_drift(
     )
     assert parser._plan_period(yearless_key) == (None, None)
 
-    semantic_by_field = json.loads(membership_row["semantic_json"])
+    semantic_by_field = json.loads(membership_by_field["semantic_json"])
     invalid_semantic_by_field = dict(
-        membership_row,
+        membership_by_field,
         semantic_json=json_text({**semantic_by_field, "unexpected": True}),
     )
     with pytest.raises(RuntimeError, match="semantics are invalid"):
@@ -145,12 +145,12 @@ def test_parser_handles_yearless_plan_and_rejects_spool_semantic_drift(
             lambda *_arguments, **_keywords: ({"timestamp_basis": "invalid"},),
         )
         with pytest.raises(RuntimeError, match="provenance"):
-            parser._validated_medication_source(key, membership_row)
+            parser._validated_medication_source(key, membership_by_field)
 
     with pytest.raises(RuntimeError, match="semantics are inconsistent"):
         parser._validated_medication_source(
             key,
-            dict(membership_row, drug_name="different name"),
+            dict(membership_by_field, drug_name="different name"),
         )
 
 
