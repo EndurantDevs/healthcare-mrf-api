@@ -28,10 +28,9 @@ from process.provider_directory_fhir_subset_abandonment_evidence import (
     retained_evidence_counts,
     validated_checkpoint_summary,
 )
-from process.provider_directory_fhir_subset_activation_contract import (
-    ACTIVATION_METADATA_KEY,
-    PENDING_STATUS,
-    VERIFIED_STATUS,
+from process.provider_directory_fhir_subset_abandonment_policy import (
+    has_matching_reviewed_root_policy as _has_matching_reviewed_root_policy,
+    reviewed_abandonment_source_state as _reviewed_source_state,
 )
 from process.provider_directory_fhir_subset_identity import (
     subset_source_endpoint_identity,
@@ -39,18 +38,11 @@ from process.provider_directory_fhir_subset_identity import (
 
 
 def _is_pending_source(metadata_by_field: Mapping[str, Any]) -> bool:
-    return (
-        metadata_by_field.get("provider_directory_candidate_status") == PENDING_STATUS
-        and ACTIVATION_METADATA_KEY not in metadata_by_field
-    )
+    return _reviewed_source_state(metadata_by_field) == "pending"
 
 
 def _is_activated_source(metadata_by_field: Mapping[str, Any]) -> bool:
-    return metadata_by_field.get(
-        "provider_directory_candidate_status"
-    ) == VERIFIED_STATUS and isinstance(
-        metadata_by_field.get(ACTIVATION_METADATA_KEY), Mapping
-    )
+    return _reviewed_source_state(metadata_by_field) == "activated"
 
 
 def _configured_endpoint_id(source_row: Mapping[str, Any]) -> str | None:
@@ -296,6 +288,10 @@ def _validate_candidate_verification_identity(
         or verification_campaign
         != _text(
             source_metadata.get("provider_directory_verification_campaign_id")
+        )
+        or not _has_matching_reviewed_root_policy(
+            source_metadata,
+            candidate_metadata,
         )
     ):
         raise ReviewedSubsetAbandonmentError("evidence")

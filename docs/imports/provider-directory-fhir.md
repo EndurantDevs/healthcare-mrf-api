@@ -144,18 +144,21 @@ Use this sequence for a campaign or documentation review:
 An entry classified as `manual_acquisition` is reviewed acquisition input, not
 a generally runnable catalog source. It remains outside scheduled refreshes,
 the generic campaign launcher, the control API, and Profile publication. Its
-`manual_current_version_census` block pins the reviewed v3 source identity,
+`manual_current_version_census` block pins one exact versioned proof and
+strategy profile,
 all seven resource families, credential-free start URLs, server-issued opaque
 continuation strategy, expected non-empty collections, campaign, completion
 scopes, and page count. The operator supplies one exclusive `_lastUpdated`
 cutoff at launch; a cutoff is never persisted in the manifest.
 
-The v3 contract declares `server-issued-traversal-subset` for every reviewed
+The contract declares `server-issued-traversal-subset` for every reviewed
 resource family. It follows only a validated source-issued next link and treats
 `_getpagesoffset` as a logical offset that must advance by exactly the reviewed
 page count. Sparse and empty pages remain valid while a next link exists. A
-resource terminates successfully only when the source returns no next link and
-its cutoff-filtered advertised count is stable before and after traversal.
+resource terminates successfully only when the source returns no next link.
+The legacy stability profile requires equal cutoff-filtered advertised counts.
+The bounded-drift profile permits only equality or a monotone decrease of one;
+an increase or a decrease of two or more remains terminal.
 The proof records advertised, returned unique, and exact deficit counts; it has
 no percentage threshold and requires returned unique to be no greater than
 advertised. Even a zero final deficit remains subset evidence under this
@@ -166,17 +169,18 @@ Each completed root retains sealed, token-inclusive replay commitments that
 prove its source-issued continuation chain. A separate root-neutral completion
 proof binds continuation query shape and offset geometry, ordered raw acquired
 resource hashes, transport-neutral projected content hashes, and dataset
-counts and hashes without retaining URLs, tokens, or root identifiers. Root A
-and Root B must each have valid replay evidence and must match on the entire
-root-neutral proof. Publication stays off until that reviewed twin-root gate
-and the separate artifact review both pass.
+counts and hashes without retaining URLs, tokens, or root identifiers. Each
+campaign snapshots an immutable required root count. One root is explicit
+reduced assurance; two roots remain the standard default and must match on the
+entire root-neutral proof. Publication stays off until the configured root
+policy and the separate artifact review both pass.
 
 Direct database publication and source-catalog mutations use PostgreSQL
-`READ COMMITTED` isolation. The v3 persistence guards fail closed at other
+`READ COMMITTED` isolation. The reviewed-subset persistence guards fail closed at other
 isolation levels so a stale transaction snapshot cannot bypass the final
 source and sole-alias check.
 
-After two roots match, use the separate
+After the configured root policy is satisfied, use the separate
 [reviewed subset state-sync runbook](provider-directory-reviewed-subset-activation.md)
 to review the neutral desired-state evidence and activate the source. The
 selector-free state sync is default-off and does not publish a dataset.
@@ -184,6 +188,10 @@ If every retained reviewed continuation returns HTTP 410, stop retrying that
 root and follow the runbook's selector-free abandonment procedure. The sealed
 `acquisition_abandoned` root remains immutable evidence and is never reset or
 adopted by a later run; recovery starts from a new root.
+If a failed policy-one root instead matches the runbook's exact mixed terminal
+shape, use the separate `seal-terminal-root` operation. Do not reinterpret its
+legacy proof under the bounded-drift profile; seal it first, then start a fresh
+campaign with a new cutoff and root.
 
 Resolve the single reviewed manual entry from the manifest and freeze one
 timezone-aware cutoff for the acquisition pair:
@@ -201,6 +209,7 @@ PROVIDER_DIRECTORY_MANUAL_PAGE_COUNT="$(jq -r \
   '.manual_current_version_census.page_count' <<<"$MANUAL_ENTRY_JSON")"
 PROVIDER_DIRECTORY_CENSUS_CUTOFF="<timezone-aware-ISO-8601-cutoff>"
 PROVIDER_DIRECTORY_CENSUS_RUN_ID="<globally-unique-first-root-run-id>"
+PROVIDER_DIRECTORY_REVIEWED_ROOT_COUNT="<1-or-2>"
 ```
 
 Launch the acquisition only from the worker CLI. Do not add a seed database,
@@ -212,6 +221,7 @@ python main.py start provider-directory-fhir \
   --run-id "$PROVIDER_DIRECTORY_CENSUS_RUN_ID" \
   --acquisition-strategy server-issued-traversal-subset \
   --census-cutoff "$PROVIDER_DIRECTORY_CENSUS_CUTOFF" \
+  --reviewed-root-count "$PROVIDER_DIRECTORY_REVIEWED_ROOT_COUNT" \
   --source-id "$PROVIDER_DIRECTORY_MANUAL_SOURCE_ID" \
   --resources "$PROVIDER_DIRECTORY_MANUAL_RESOURCES" \
   --import-resources \
@@ -233,19 +243,18 @@ python main.py start provider-directory-fhir \
   --defer-typed-materialization
 ```
 
-A successful traversal remains non-current and non-published. Root A is
-retained as the immutable verification baseline. Before running the same
-command a second time, set `PROVIDER_DIRECTORY_CENSUS_RUN_ID` to a different
-globally unique root ID while preserving the identical cutoff. Do not pass
-retry or pagination-root arguments for either fresh root. Root B must have a
-distinct acquisition root, separately valid replay evidence, and the same
-advertised/returned/deficit vector, neutral geometry, and content proof as
-Root A. A transient retry must use a new `--run-id` plus
+A successful traversal remains non-current and non-published. Under explicit
+root count 1 it becomes the sole validated candidate without twin evidence.
+Under root count 2, Root A is retained as the immutable verification baseline;
+run the same command with a distinct fresh Root B ID and identical cutoff and
+policy. Do not pass retry or pagination-root arguments for either fresh root.
+Root B must carry separately valid replay evidence and match Root A's entire
+root-neutral proof. A transient retry in either policy must use a new `--run-id` plus
 `--retry-of-run-id <previous-run-id>` and
 `--pagination-root-run-id <original-root-run-id>`; it resumes the original root
 and is not a second root. A terminal HTTP 410 root is abandoned and never
 retried. Publication, Profile admission, and API verification remain separate
-reviewed operations after the twin-root gate passes.
+reviewed operations after the configured root-policy gate passes.
 
 ## Source
 
@@ -1050,7 +1059,8 @@ This admits only a fresh, candidate-bound, exact-source lineage with no retry
 parent, one anonymous pinned session, one reviewed start URL, unbounded
 streaming, and no retained in-memory rows. It does not add a source-base
 allowlist and does not enable current-version v2 scans. Use the same setting
-for fresh Root A and Root B. The overlap changes only request timing: the next
+for every fresh root required by the campaign policy. The overlap changes only
+request timing: the next
 validated source-issued GET may run while the current page's rows, proof shard,
 and checkpoint are committed, but it is never parsed or consumed before that
 commit succeeds. Unset either prefetch switch to restore sequential transport;

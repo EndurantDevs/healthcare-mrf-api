@@ -104,7 +104,9 @@ def build_execution_proof(
 def build_proof_pair(
     *,
     hop_prefix: str = "1",
+    contract: CurrentVersionCensusContract | None = None,
 ) -> tuple[dict[str, Any], str, dict[str, dict[str, Any]]]:
+    selected_contract = contract or build_subset_contract()
     execution_proof_by_type = {
         resource_type: build_execution_proof(hop_prefix=hop_prefix)
         for resource_type in SERVER_ISSUED_SUBSET_RESOURCE_TYPES
@@ -122,7 +124,7 @@ def build_proof_pair(
         1,
     )
     completion_proof, proof_sha256 = build_subset_completion_proof(
-        contract=build_subset_contract(),
+        contract=selected_contract,
         resource_proof_by_type=execution_proof_by_type,
         dataset_hash="e" * 64,
         resource_count=len(SERVER_ISSUED_SUBSET_RESOURCE_TYPES),

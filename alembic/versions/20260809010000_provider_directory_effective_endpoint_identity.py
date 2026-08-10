@@ -59,7 +59,12 @@ def _installed_shape_fences(schema: str) -> None:
     op.execute(abandonment._preflight_sql(schema, expect_installed=True))
 
 
-def _adoption_state_fence_sql(schema: str) -> str:
+def _adoption_state_fence_sql(
+    schema: str,
+    *,
+    reviewed_root_policy_aware: bool = False,
+    reviewed_subset_profile_aware: bool = False,
+) -> str:
     subset = _subset()
     activation = _activation()
     dataset_ref = subset._qf(schema, subset._ENDPOINT_DATASET)
@@ -74,6 +79,8 @@ def _adoption_state_fence_sql(schema: str) -> str:
         dataset_alias="terminal_dataset",
         use_configured_endpoint_identity=True,
         require_physical_match=False,
+        reviewed_root_policy_aware=reviewed_root_policy_aware,
+        reviewed_subset_profile_aware=reviewed_subset_profile_aware,
     )
     published_source_sql = subset._subset_source_sql(
         schema,
@@ -81,9 +88,24 @@ def _adoption_state_fence_sql(schema: str) -> str:
         dataset_alias="published_dataset",
         use_configured_endpoint_identity=True,
         require_physical_match=True,
+        reviewed_root_policy_aware=reviewed_root_policy_aware,
+        reviewed_subset_profile_aware=reviewed_subset_profile_aware,
     )
     activation_key = subset._ql(activation._ACTIVATION_KEY)
     verified_status = subset._ql(activation._VERIFIED_STATUS)
+    active_source_state = f"""
+        active_source.metadata_json::jsonb ? {activation_key}
+        OR active_source.metadata_json::jsonb
+             ->> 'provider_directory_candidate_status' = {verified_status}
+    """
+    if reviewed_root_policy_aware:
+        active_source_state += f"""
+        OR active_source.metadata_json::jsonb
+             ? {subset._ql(activation._ACTIVATION_KEY_V2)}
+        OR active_source.metadata_json::jsonb
+             ->> 'provider_directory_candidate_status' =
+             {subset._ql(activation._POLICY_VERIFIED_STATUS)}
+        """
     return f"""
     DO $migration$
     BEGIN
@@ -118,13 +140,8 @@ def _adoption_state_fence_sql(schema: str) -> str:
 
         IF EXISTS (
             SELECT 1
-              FROM {source_ref} AS active_source
-             WHERE (
-                    active_source.metadata_json::jsonb ? {activation_key}
-                    OR active_source.metadata_json::jsonb
-                         ->> 'provider_directory_candidate_status' =
-                         {verified_status}
-               )
+             FROM {source_ref} AS active_source
+             WHERE ({active_source_state})
                AND {valid_ref}(active_source.source_id)
                    IS DISTINCT FROM TRUE
         ) THEN

@@ -23,6 +23,8 @@ from process.provider_directory_fhir_subset_identity import (
     CURRENT_VERSION_CENSUS_START_URLS_FIELD,
     CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
     CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD,
+    SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION,
     server_issued_subset_source_scope_payload,
 )
 from tests.provider_directory_fhir_subset_completion_support import (
@@ -102,8 +104,15 @@ VALID_RESOURCE_ROWS = _valid_resource_rows()
 ALTERNATE_RESOURCE_ROWS = _valid_resource_rows(alternate=True)
 
 
-def valid_source_metadata(candidate_status):
-    contract = build_subset_contract()
+def _legacy_subset_contract():
+    return build_subset_contract(
+        strategy_version=SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION,
+        completion_scopes=SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES,
+    )
+
+
+def valid_source_metadata(candidate_status, *, contract=None):
+    selected_contract = contract or _legacy_subset_contract()
     canonical_base = "https://directory.example.test/fhir"
     return {
         "provider_directory_supported_resources": list(RESOURCE_TYPES),
@@ -113,34 +122,44 @@ def valid_source_metadata(candidate_status):
             resource_type: PAGE_COUNT for resource_type in RESOURCE_TYPES
         },
         "provider_directory_acquisition_enabled": True,
-        "provider_directory_coverage_mode": contract.semantics,
+        "provider_directory_coverage_mode": selected_contract.semantics,
         "provider_directory_manual_only": True,
         "provider_directory_server_issued_subset_resources": list(
             RESOURCE_TYPES
         ),
-        CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD: contract.semantics,
-        CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD: contract.contract_version,
-        CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD: contract.page_count,
-        CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD: contract.strategy_version,
-        CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD: contract.traversal_version,
+        CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD: selected_contract.semantics,
+        CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD: (
+            selected_contract.contract_version
+        ),
+        CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD: selected_contract.page_count,
+        CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD: (
+            selected_contract.strategy_version
+        ),
+        CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD: (
+            selected_contract.traversal_version
+        ),
         CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD: (
-            contract.canonicalization_version
+            selected_contract.canonicalization_version
         ),
         CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD: list(
-            contract.completion_scopes
+            selected_contract.completion_scopes
         ),
         CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD: (
-            contract.continuation_strategy
+            selected_contract.continuation_strategy
         ),
-        CURRENT_VERSION_CENSUS_START_URLS_FIELD: dict(contract.start_urls),
-        "provider_directory_verification_campaign_id": contract.campaign_id,
+        CURRENT_VERSION_CENSUS_START_URLS_FIELD: dict(
+            selected_contract.start_urls
+        ),
+        "provider_directory_verification_campaign_id": (
+            selected_contract.campaign_id
+        ),
         "provider_directory_configured_endpoint_id": "endpoint-a",
         "provider_directory_candidate_status": candidate_status,
         "provider_directory_confirmed_base": canonical_base,
     }
 
 
-def valid_source_record(candidate_status):
+def valid_source_record(candidate_status, *, contract=None):
     return {
         "source_id": "synthetic-source",
         "endpoint_id": "endpoint-a",
@@ -148,7 +167,10 @@ def valid_source_record(candidate_status):
         "requires_registration": False,
         "requires_api_key": False,
         "auth_type": "none",
-        "metadata_json": valid_source_metadata(candidate_status),
+        "metadata_json": valid_source_metadata(
+            candidate_status,
+            contract=contract,
+        ),
     }
 
 
@@ -215,8 +237,10 @@ def canonical_sha256_identity(row):
     )
 
 
-def valid_evidence_pairs(*, rows=VALID_RESOURCE_ROWS):
-    proof_by_field, proof_sha256, execution_proof_by_type = build_proof_pair()
+def valid_evidence_pairs(*, rows=VALID_RESOURCE_ROWS, contract=None):
+    proof_by_field, proof_sha256, execution_proof_by_type = build_proof_pair(
+        contract=contract or _legacy_subset_contract(),
+    )
     proof_by_field = _content_bound_proof(proof_by_field, rows)
     proof_sha256 = canonical_sha256(proof_by_field)
     replay_by_field, replay_sha256 = build_subset_replay_evidence(

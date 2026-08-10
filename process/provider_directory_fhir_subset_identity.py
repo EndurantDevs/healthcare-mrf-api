@@ -45,8 +45,11 @@ CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD = (
 SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY = (
     "smile-opaque-logical-offset-v3"
 )
-SERVER_ISSUED_SUBSET_STRATEGY_VERSION = (
+SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION = (
     "provider-directory-fhir-server-issued-traversal-subset-v3"
+)
+SERVER_ISSUED_SUBSET_STRATEGY_VERSION = (
+    "provider-directory-fhir-server-issued-traversal-subset-v4"
 )
 SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION = (
     "provider-directory-fhir-smile-logical-offset-v3"
@@ -54,11 +57,17 @@ SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION = (
 SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION = (
     "provider-directory-fhir-returned-resource-json-v2"
 )
-SERVER_ISSUED_SUBSET_COMPLETION_SCOPES = (
+SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES = (
     "advertised-count-stability",
     "source-issued-continuation",
     "returned-resource-content",
 )
+SERVER_ISSUED_SUBSET_COMPLETION_SCOPES = (
+    "advertised-count-monotone-decrease-at-most-one",
+    "source-issued-continuation",
+    "returned-resource-content",
+)
+SERVER_ISSUED_SUBSET_MAX_ADVERTISED_COUNT_DECREASE = 1
 SERVER_ISSUED_SUBSET_SEMANTICS = "server-issued-traversal-subset"
 SERVER_ISSUED_SUBSET_CAMPAIGN_FIELD = (
     "provider_directory_verification_campaign_id"
@@ -274,20 +283,23 @@ def is_reviewed_subset_contract(contract: Any) -> bool:
     start_urls = getattr(contract, "start_urls", ())
     page_count = getattr(contract, "page_count", None)
     campaign_id = getattr(contract, "campaign_id", None)
+    strategy_version = getattr(contract, "strategy_version", None)
+    completion_scopes = getattr(contract, "completion_scopes", None)
     return bool(
         getattr(contract, "contract_version", None) == 3
         and getattr(contract, "semantics", None)
         == SERVER_ISSUED_SUBSET_SEMANTICS
-        and getattr(contract, "strategy_version", None)
-        == SERVER_ISSUED_SUBSET_STRATEGY_VERSION
+        and reviewed_subset_max_advertised_count_decrease(
+            strategy_version,
+            completion_scopes,
+        )
+        is not None
         and getattr(contract, "continuation_strategy", None)
         == SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY
         and getattr(contract, "traversal_version", None)
         == SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION
         and getattr(contract, "canonicalization_version", None)
         == SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION
-        and getattr(contract, "completion_scopes", None)
-        == SERVER_ISSUED_SUBSET_COMPLETION_SCOPES
         and len(resources) == len(SERVER_ISSUED_SUBSET_RESOURCE_TYPES)
         and set(resources) == set(SERVER_ISSUED_SUBSET_RESOURCE_TYPES)
         and len(start_urls) == len(SERVER_ISSUED_SUBSET_RESOURCE_TYPES)
@@ -297,6 +309,26 @@ def is_reviewed_subset_contract(contract: Any) -> bool:
         and type(campaign_id) is str
         and bool(campaign_id)
     )
+
+
+def reviewed_subset_max_advertised_count_decrease(
+    strategy_version: Any,
+    completion_scopes: Any,
+) -> int | None:
+    """Return the exact count-decrease bound for one allowlisted profile."""
+
+    profile = (strategy_version, completion_scopes)
+    if profile == (
+        SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION,
+        SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES,
+    ):
+        return 0
+    if profile == (
+        SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+        SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+    ):
+        return SERVER_ISSUED_SUBSET_MAX_ADVERTISED_COUNT_DECREASE
+    return None
 
 
 def validated_subset_identity_values(
@@ -314,17 +346,22 @@ def validated_subset_identity_values(
     completion_scopes = metadata.get(CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD)
     raw_campaign_id = metadata.get(SERVER_ISSUED_SUBSET_CAMPAIGN_FIELD)
     campaign_id = raw_campaign_id.strip() if isinstance(raw_campaign_id, str) else ""
+    max_advertised_count_decrease = (
+        reviewed_subset_max_advertised_count_decrease(
+            strategy_version,
+            tuple(completion_scopes) if type(completion_scopes) is list else None,
+        )
+    )
     is_valid = bool(
         type(contract_version) is int
         and contract_version == 3
         and type(page_count) is int
         and 1 <= page_count <= 1000
-        and strategy_version == SERVER_ISSUED_SUBSET_STRATEGY_VERSION
+        and max_advertised_count_decrease is not None
         and traversal_version == SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION
         and canonicalization_version
         == SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION
         and type(completion_scopes) is list
-        and tuple(completion_scopes) == SERVER_ISSUED_SUBSET_COMPLETION_SCOPES
         and campaign_id
     )
     if not is_valid:

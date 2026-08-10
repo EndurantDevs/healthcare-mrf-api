@@ -799,7 +799,12 @@ def _proof_pair_valid_function_sql(schema: str) -> str:
     """
 
 
-def _proof_shape_valid_function_sql(schema: str) -> str:
+def _proof_shape_valid_function_sql(
+    schema: str,
+    *,
+    replace_existing: bool = False,
+    reviewed_subset_profile_aware: bool = False,
+) -> str:
     proof_valid_ref = _qf(schema, _PROOF_SHAPE_VALID_FUNCTION)
     canonical_sha256_ref = _qf(schema, _CANONICAL_SHA256_FUNCTION)
     resource_types_sql = ", ".join(_ql(value) for value in _SUBSET_RESOURCE_TYPES)
@@ -822,8 +827,36 @@ def _proof_shape_valid_function_sql(schema: str) -> str:
             "empty_pages",
         )
     )
+    create_function = (
+        "CREATE OR REPLACE FUNCTION"
+        if replace_existing
+        else "CREATE FUNCTION"
+    )
+    profile_sql = (
+        """
+        IF candidate ->> 'strategy_version' =
+                'provider-directory-fhir-server-issued-traversal-subset-v3'
+           AND candidate -> 'completion_scopes' =
+                '["advertised-count-stability",'
+                '"source-issued-continuation",'
+                '"returned-resource-content"]'::jsonb THEN
+            max_advertised_count_decrease := 0;
+        ELSIF candidate ->> 'strategy_version' =
+                'provider-directory-fhir-server-issued-traversal-subset-v4'
+           AND candidate -> 'completion_scopes' =
+                '["advertised-count-monotone-decrease-at-most-one",'
+                '"source-issued-continuation",'
+                '"returned-resource-content"]'::jsonb THEN
+            max_advertised_count_decrease := 1;
+        ELSE
+            RETURN FALSE;
+        END IF;
+        """
+        if reviewed_subset_profile_aware
+        else "max_advertised_count_decrease := 0;"
+    )
     return f"""
-    CREATE FUNCTION {proof_valid_ref}(
+    {create_function} {proof_valid_ref}(
         candidate jsonb,
         expected_dataset_hash text,
         expected_resource_count bigint
@@ -860,8 +893,10 @@ def _proof_shape_valid_function_sql(schema: str) -> str:
         empty_page_count numeric;
         dataset_resource_count numeric;
         dataset_count_sum numeric := 0;
+        max_advertised_count_decrease numeric;
         cutoff_value text;
     BEGIN
+        {profile_sql}
         IF pg_catalog.jsonb_typeof(candidate) IS DISTINCT FROM 'object'
            OR pg_catalog.jsonb_typeof(candidate -> 'page_count')
                 IS DISTINCT FROM 'number'
@@ -957,8 +992,10 @@ def _proof_shape_valid_function_sql(schema: str) -> str:
                 (resource_value ->> 'empty_pages')::numeric;
             terminal_entries :=
                 (resource_value ->> 'terminal_entries')::numeric;
-            IF advertised_pre IS DISTINCT FROM advertised_post
-               OR returned_unique > advertised_pre
+            IF advertised_post > advertised_pre
+               OR advertised_pre - advertised_post >
+                    max_advertised_count_decrease
+               OR returned_unique > advertised_post
                OR deficit IS DISTINCT FROM advertised_pre - returned_unique
                OR (resource_value ->> 'geometry_version')::numeric <> 2
                OR (resource_value ->> 'page_count')::numeric <>
@@ -2794,6 +2831,8 @@ def _subset_source_resource_set_sql(
 def _subset_source_fixed_identity_sql(
     source_metadata: str,
     dataset_alias: str,
+    *,
+    reviewed_subset_profile_aware: bool = False,
 ) -> str:
     resource_types_sql = ", ".join(
         _ql(resource_type) for resource_type in _SUBSET_RESOURCE_TYPES
@@ -2815,6 +2854,45 @@ def _subset_source_fixed_identity_sql(
         f"({source_metadata} -> "
         "'provider_directory_resource_page_count_caps')"
     )
+    profile_sql = (
+        f"""
+        {source_metadata}
+            ->> 'provider_directory_current_version_census_strategy_version' =
+            {dataset_alias}.completion_proof_json ->> 'strategy_version'
+        AND {source_metadata}
+            -> 'provider_directory_current_version_census_completion_scopes' =
+            {dataset_alias}.completion_proof_json -> 'completion_scopes'
+        AND (
+            (
+                {dataset_alias}.completion_proof_json ->> 'strategy_version' =
+                    'provider-directory-fhir-server-issued-traversal-subset-v3'
+                AND {dataset_alias}.completion_proof_json
+                    -> 'completion_scopes' =
+                    '["advertised-count-stability",'
+                    '"source-issued-continuation",'
+                    '"returned-resource-content"]'::jsonb
+            ) OR (
+                {dataset_alias}.completion_proof_json ->> 'strategy_version' =
+                    'provider-directory-fhir-server-issued-traversal-subset-v4'
+                AND {dataset_alias}.completion_proof_json
+                    -> 'completion_scopes' =
+                    '["advertised-count-monotone-decrease-at-most-one",'
+                    '"source-issued-continuation",'
+                    '"returned-resource-content"]'::jsonb
+            )
+        )
+        """
+        if reviewed_subset_profile_aware
+        else f"""
+        {source_metadata}
+            ->> 'provider_directory_current_version_census_strategy_version' =
+            'provider-directory-fhir-server-issued-traversal-subset-v3'
+        AND {source_metadata}
+            -> 'provider_directory_current_version_census_completion_scopes' =
+            '["advertised-count-stability","source-issued-continuation",'
+            '"returned-resource-content"]'::jsonb
+        """
+    )
     return f"""
         {source_metadata} -> 'provider_directory_manual_only' = 'true'::jsonb
         AND {source_metadata} -> 'provider_directory_acquisition_enabled' =
@@ -2832,19 +2910,13 @@ def _subset_source_fixed_identity_sql(
         AND {source_metadata}
             ->> 'provider_directory_current_version_census_strategy' =
             'server-issued-traversal-subset'
-        AND {source_metadata}
-            ->> 'provider_directory_current_version_census_strategy_version' =
-            'provider-directory-fhir-server-issued-traversal-subset-v3'
+        AND ({profile_sql})
         AND {source_metadata}
             ->> 'provider_directory_current_version_census_traversal_version' =
             'provider-directory-fhir-smile-logical-offset-v3'
         AND {source_metadata}
             ->> 'provider_directory_current_version_census_canonicalization_version' =
             'provider-directory-fhir-returned-resource-json-v2'
-        AND {source_metadata}
-            -> 'provider_directory_current_version_census_completion_scopes' =
-            '["advertised-count-stability","source-issued-continuation",'
-            '"returned-resource-content"]'::jsonb
         AND {source_metadata}
             ->> 'provider_directory_current_version_census_continuation_strategy' =
             'smile-opaque-logical-offset-v3'
@@ -2883,6 +2955,7 @@ def _subset_source_sql(
     use_configured_endpoint_identity: bool = False,
     require_physical_match: bool = True,
     reviewed_root_policy_aware: bool = False,
+    reviewed_subset_profile_aware: bool = False,
 ) -> str:
     """Bind a terminal row to its current reviewed manual source."""
 
@@ -2892,6 +2965,7 @@ def _subset_source_sql(
     fixed_identity_sql = _subset_source_fixed_identity_sql(
         source_metadata,
         dataset_alias,
+        reviewed_subset_profile_aware=reviewed_subset_profile_aware,
     )
     scope_payload_sql = _subset_source_scope_payload_sql(
         "current_source",
@@ -3017,6 +3091,7 @@ def _subset_published_source_guard_sql(
     use_configured_endpoint_identity: bool = False,
     replace_existing: bool = False,
     reviewed_root_policy_aware: bool = False,
+    reviewed_subset_profile_aware: bool = False,
 ) -> str:
     """Reject source mutations that invalidate published subset evidence."""
 
@@ -3029,6 +3104,7 @@ def _subset_published_source_guard_sql(
         use_configured_endpoint_identity=use_configured_endpoint_identity,
         require_physical_match=True,
         reviewed_root_policy_aware=reviewed_root_policy_aware,
+        reviewed_subset_profile_aware=reviewed_subset_profile_aware,
     )
     create_function = (
         "CREATE OR REPLACE FUNCTION"
@@ -3191,6 +3267,7 @@ def _subset_endpoint_dataset_guard_sql(
     *,
     use_configured_endpoint_identity: bool = False,
     reviewed_root_policy_aware: bool = False,
+    reviewed_subset_profile_aware: bool = False,
 ) -> str:
     guard_ref = _qf(schema, _ENDPOINT_DATASET_GUARD)
     source_ref = _qf(schema, _SOURCE)
@@ -3216,6 +3293,7 @@ def _subset_endpoint_dataset_guard_sql(
         use_configured_endpoint_identity=use_configured_endpoint_identity,
         require_physical_match=not use_configured_endpoint_identity,
         reviewed_root_policy_aware=reviewed_root_policy_aware,
+        reviewed_subset_profile_aware=reviewed_subset_profile_aware,
     )
     published_source_sql = _subset_source_sql(
         schema,
@@ -3223,6 +3301,7 @@ def _subset_endpoint_dataset_guard_sql(
         use_configured_endpoint_identity=use_configured_endpoint_identity,
         require_physical_match=True,
         reviewed_root_policy_aware=reviewed_root_policy_aware,
+        reviewed_subset_profile_aware=reviewed_subset_profile_aware,
     )
     metadata = "NEW.publication_metadata_json::jsonb"
     expected_coverage_state_sql = (
@@ -3708,8 +3787,40 @@ def _dataset_resource_guard_sql(
     """
 
 
-def _subset_proof_shape_check(schema: str) -> str:
+def _subset_proof_shape_check(
+    schema: str,
+    *,
+    reviewed_subset_profile_aware: bool = False,
+) -> str:
     proof_shape_valid_ref = _qf(schema, _PROOF_SHAPE_VALID_FUNCTION)
+    profile_sql = (
+        """
+        (
+            completion_proof_json ->> 'strategy_version' =
+                'provider-directory-fhir-server-issued-traversal-subset-v3'
+            AND completion_proof_json -> 'completion_scopes' =
+                '["advertised-count-stability",'
+                '"source-issued-continuation",'
+                '"returned-resource-content"]'::jsonb
+        ) OR (
+            completion_proof_json ->> 'strategy_version' =
+                'provider-directory-fhir-server-issued-traversal-subset-v4'
+            AND completion_proof_json -> 'completion_scopes' =
+                '["advertised-count-monotone-decrease-at-most-one",'
+                '"source-issued-continuation",'
+                '"returned-resource-content"]'::jsonb
+        )
+        """
+        if reviewed_subset_profile_aware
+        else """
+        completion_proof_json ->> 'strategy_version' =
+            'provider-directory-fhir-server-issued-traversal-subset-v3'
+        AND completion_proof_json -> 'completion_scopes' =
+            '["advertised-count-stability",'
+            '"source-issued-continuation",'
+            '"returned-resource-content"]'::jsonb
+        """
+    )
     return """
     completion_proof_json IS NULL OR (
         pg_catalog.jsonb_typeof(completion_proof_json) = 'object'
@@ -3746,16 +3857,11 @@ def _subset_proof_shape_check(schema: str) -> str:
         AND completion_proof_json -> 'contract_version' = '3'::jsonb
         AND completion_proof_json ->> 'semantics' =
             'server-issued-traversal-subset'
-        AND completion_proof_json ->> 'strategy_version' =
-            'provider-directory-fhir-server-issued-traversal-subset-v3'
+        AND ({profile_sql})
         AND completion_proof_json ->> 'traversal_version' =
             'provider-directory-fhir-smile-logical-offset-v3'
         AND completion_proof_json ->> 'canonicalization_version' =
             'provider-directory-fhir-returned-resource-json-v2'
-        AND completion_proof_json -> 'completion_scopes' =
-            '["advertised-count-stability",'
-            '"source-issued-continuation",'
-            '"returned-resource-content"]'::jsonb
         AND pg_catalog.jsonb_typeof(
             completion_proof_json -> 'campaign_id'
         ) = 'string'
@@ -3817,7 +3923,9 @@ def _subset_proof_shape_check(schema: str) -> str:
             resource_count
         ) IS TRUE
     )
-    """.replace("{proof_shape_valid_ref}", proof_shape_valid_ref)
+    """.replace("{profile_sql}", profile_sql).replace(
+        "{proof_shape_valid_ref}", proof_shape_valid_ref
+    )
 
 
 def _completion_digest_check(schema: str) -> str:
