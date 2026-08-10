@@ -30,6 +30,14 @@ rehydrate_scope = importlib.import_module(
 )
 
 
+def test_locked_candidate_translates_invalid_persisted_identity() -> None:
+    with pytest.raises(RuntimeError, match="candidate_stale"):
+        importer._assert_locked_candidate_identity(
+            {"publication_metadata_json": "{"},
+            candidate(),
+        )
+
+
 def test_twin_root_contract_rejects_proof_scope_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -184,6 +192,7 @@ def test_expected_proof_contract_fences_semantic_and_legacy_shapes() -> None:
     ):
         proof_store._assert_expected_semantic_proof(
             {},
+            SEMANTIC_CONTRACT,
             PROJECTION_DATE,
             ["Practitioner"],
         )

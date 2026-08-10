@@ -53,6 +53,26 @@ def _partition_stage_source(
     return source_by_field
 
 
+def _partition_stage_options() -> importer.LastUpdatedPartitionStageOptions:
+    return importer.LastUpdatedPartitionStageOptions(
+        run_id="run-1",
+        fetch_url="https://example.test/fhir/Practitioner",
+    )
+
+
+def _pass_proof(
+    fingerprints_by_id,
+    candidate_hashes_by_id=None,
+) -> importer.LastUpdatedPartitionPassProof:
+    return importer.LastUpdatedPartitionPassProof(
+        resource_type="Practitioner",
+        window_id="window-1",
+        pass_number=1,
+        fingerprints_by_id=fingerprints_by_id,
+        candidate_hashes_by_id=candidate_hashes_by_id or {},
+    )
+
+
 @pytest.mark.parametrize(
     "control,error",
     [
@@ -236,33 +256,25 @@ async def test_partition_window_proof_rejects_duplicate_or_wrong_window_rows():
 async def test_partition_fingerprint_replay_is_empty_exact_or_mismatched(
     monkeypatch,
 ):
-    loader = AsyncMock(return_value=({}, {}))
+    loader = AsyncMock(return_value=_pass_proof({}))
     monkeypatch.setattr(
         importer,
-        "_load_last_updated_partition_window_proof",
+        "_load_partition_pass_proof",
         loader,
     )
     assert not await importer._has_partition_fingerprint_replay(
-        _context(), "Practitioner", "window-1", 1, {}, {}
+        _context(), _pass_proof({})
     )
 
-    loader.return_value = ({"resource-1": "hash-1"}, {})
+    loader.return_value = _pass_proof({"resource-1": "hash-1"})
     assert await importer._has_partition_fingerprint_replay(
         _context(),
-        "Practitioner",
-        "window-1",
-        1,
-        {"resource-1": "hash-1"},
-        {},
+        _pass_proof({"resource-1": "hash-1"}),
     )
     with pytest.raises(RuntimeError, match="fingerprint_replay_mismatch"):
         await importer._has_partition_fingerprint_replay(
             _context(),
-            "Practitioner",
-            "window-1",
-            1,
-            {"resource-1": "different"},
-            {},
+            _pass_proof({"resource-1": "different"}),
         )
 
 
@@ -350,18 +362,14 @@ async def test_partition_fingerprint_store_rejects_mismatch_and_replays(
     with pytest.raises(RuntimeError, match="candidate_hash_mismatch"):
         await importer._store_last_updated_partition_window_fingerprints(
             _context(),
-            "Practitioner",
-            "window-1",
-            1,
-            {"resource-1": "hash-1"},
-            {"other": "payload-1"},
+            _pass_proof(
+                {"resource-1": "hash-1"},
+                {"other": "payload-1"},
+            ),
         )
     await importer._store_last_updated_partition_window_fingerprints(
         _context(),
-        "Practitioner",
-        "window-1",
-        1,
-        {"resource-1": "hash-1"},
+        _pass_proof({"resource-1": "hash-1"}),
     )
     unique.assert_not_awaited()
     writer.assert_not_awaited()
@@ -389,17 +397,16 @@ async def test_partition_fingerprint_store_writes_only_nonempty_new_proof(
     )
 
     await importer._store_last_updated_partition_window_fingerprints(
-        _context(), "Practitioner", "window-1", 1, {}
+        _context(), _pass_proof({})
     )
     writer.assert_not_awaited()
 
     await importer._store_last_updated_partition_window_fingerprints(
         _context(),
-        "Practitioner",
-        "window-1",
-        1,
-        {"resource-1": "hash-1"},
-        {"resource-1": "payload-1"},
+        _pass_proof(
+            {"resource-1": "hash-1"},
+            {"resource-1": "payload-1"},
+        ),
     )
     writer.assert_awaited_once()
 
@@ -417,8 +424,7 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
         "Practitioner",
         object,
         (),
-        run_id="run-1",
-        fetch_url="https://example.test/fhir/Practitioner",
+        _partition_stage_options(),
     )
     assert empty.rows == ()
 
@@ -430,8 +436,7 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
             "Practitioner",
             object,
             ({"resourceType": "Practitioner", "id": "p1"},),
-            run_id="run-1",
-            fetch_url="https://example.test/fhir/Practitioner",
+            _partition_stage_options(),
         )
 
     monkeypatch.setattr(
@@ -446,8 +451,7 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
             "Practitioner",
             object,
             ({"resourceType": "Practitioner", "id": "p1"},),
-            run_id="run-1",
-            fetch_url="https://example.test/fhir/Practitioner",
+            _partition_stage_options(),
         )
 
     endpoint_rows.return_value = [
@@ -459,7 +463,6 @@ async def test_partition_window_staging_handles_empty_invalid_and_exact_rows(
         "Practitioner",
         object,
         ({"resourceType": "Practitioner", "id": "p1"},),
-        run_id="run-1",
-        fetch_url="https://example.test/fhir/Practitioner",
+        _partition_stage_options(),
     )
     assert (staged.candidate_hashes_by_id, staged.resource_hash_contract, staged.semantic_projection_as_of) == ({"p1": "payload-1"}, importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT, None)

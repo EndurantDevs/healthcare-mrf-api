@@ -15,11 +15,21 @@ import tempfile
 from typing import Any, Iterable, Mapping
 import zlib
 
+from process.provider_directory_organization_hash import (
+    composed_organization_semantic_sha256,
+    organization_label_hashes,
+    organization_primary_name_hashes,
+    organization_semantic_base_sha256,
+    organization_semantic_payload_sha256,
+)
 from process.provider_directory_resource_hash import (
     LEGACY_RESOURCE_HASH_CONTRACT,
     RESOURCE_HASH_CONTRACTS,
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+    SEMANTIC_RESOURCE_HASH_CONTRACTS,
     composed_practitioner_semantic_sha256,
+    is_semantic_resource_hash_contract,
     persisted_resource_hash_contract,
     practitioner_name_hashes,
     practitioner_semantic_base_sha256,
@@ -33,6 +43,9 @@ PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID = (
 )
 PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID = (
     "healthporta.provider-directory.content-proof.v2"
+)
+PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID = (
+    "healthporta.provider-directory.content-proof.v3"
 )
 PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY = (
     "provider_directory_content_proof_v1"
@@ -53,6 +66,14 @@ _NPI_RESOURCE_TYPES = {
     "PractitionerRole",
 }
 _ADDRESS_RESOURCE_TYPES = {"Location", "Practitioner"}
+_SEMANTIC_PROOF_HASH_CONTRACT_BY_ID = {
+    PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID: (
+        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    ),
+    PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID: (
+        SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    ),
+}
 _SOURCE_METRIC_FIELDS = {
     "address_records",
     "addressed_locations",
@@ -183,10 +204,45 @@ def _payload_metrics(
     return npi, address_records, addressed_location, geocoded_location
 
 
+def _semantic_proof_hash_fields(
+    resource_type: str,
+    payload_by_field: Mapping[str, Any],
+    resource_hash_contract: str,
+) -> tuple[str, list[str], list[str] | None, str]:
+    """Return base, label, primary-name, and payload commitments."""
+
+    if resource_type == "Practitioner":
+        return (
+            practitioner_semantic_base_sha256(payload_by_field),
+            list(practitioner_name_hashes(payload_by_field)),
+            None,
+            practitioner_semantic_payload_sha256(payload_by_field),
+        )
+    if (
+        resource_type == "Organization"
+        and resource_hash_contract
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    ):
+        return (
+            organization_semantic_base_sha256(payload_by_field),
+            list(organization_label_hashes(payload_by_field)),
+            list(organization_primary_name_hashes(payload_by_field)),
+            organization_semantic_payload_sha256(payload_by_field),
+        )
+    payload_hash = resource_payload_sha256_for_contract(
+        payload_by_field,
+        resource_hash_contract,
+        resource_type=resource_type,
+    )
+    return payload_hash, [], None, payload_hash
+
+
 def _proof_record(
     dataset_row: Mapping[str, Any],
     resource_hash_contract: str = LEGACY_RESOURCE_HASH_CONTRACT,
 ) -> list[Any]:
+    """Encode one exact retained resource under its parent hash contract."""
+
     if resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
         raise ProviderDirectoryProofStoreError(
             "provider directory proof hash contract is invalid"
@@ -210,22 +266,16 @@ def _proof_record(
         payload_hash,
         *_payload_metrics(resource_type, payload_by_field),
     ]
-    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if not is_semantic_resource_hash_contract(resource_hash_contract):
         return proof_record_fields
     try:
-        if resource_type == "Practitioner":
-            base_hash = practitioner_semantic_base_sha256(payload_by_field)
-            name_hashes = list(practitioner_name_hashes(payload_by_field))
-            expected_payload_hash = practitioner_semantic_payload_sha256(
-                payload_by_field
-            )
-        else:
-            expected_payload_hash = resource_payload_sha256_for_contract(
+        base_hash, name_hashes, primary_name_hashes, expected_payload_hash = (
+            _semantic_proof_hash_fields(
+                resource_type,
                 payload_by_field,
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                resource_hash_contract,
             )
-            base_hash = expected_payload_hash
-            name_hashes = []
+        )
     except ValueError as error:
         raise ProviderDirectoryProofStoreError(
             "provider directory semantic proof payload is invalid"
@@ -234,12 +284,24 @@ def _proof_record(
         raise ProviderDirectoryProofStoreError(
             "provider directory semantic proof payload hash changed"
         )
-    return [
+    semantic_record_fields = [
         *proof_record_fields,
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        resource_hash_contract,
         base_hash,
         name_hashes,
     ]
+    if primary_name_hashes is not None:
+        semantic_record_fields.append(primary_name_hashes)
+    return semantic_record_fields
+
+
+def build_dataset_proof_record(
+    dataset_row: Mapping[str, Any],
+    resource_hash_contract: str,
+) -> list[Any]:
+    """Encode one retained row for an immutable occurrence proof."""
+
+    return _proof_record(dataset_row, resource_hash_contract)
 
 
 def _framed_records(
@@ -533,8 +595,8 @@ def _validated_proof_parent_hash_identity(
             raise ProviderDirectoryProofStoreError(
                 "provider directory proof parent resource scope is invalid"
             )
-    is_semantic_contract = (
-        resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    is_semantic_contract = is_semantic_resource_hash_contract(
+        resource_hash_contract
     )
     if (
         has_proof_resource_scope != is_semantic_contract
@@ -857,6 +919,44 @@ class _RecordSpool:
         return output_path
 
 
+def _is_semantic_record_hash_valid(record_fields: list[Any]) -> bool:
+    """Validate the family-specific composition encoded in one v3 record."""
+
+    if record_fields[0] == "Practitioner":
+        expected_hash = composed_practitioner_semantic_sha256(
+            record_fields[8], record_fields[9]
+        )
+        return record_fields[2] == expected_hash
+    if (
+        record_fields[0] == "Organization"
+        and record_fields[7]
+        == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    ):
+        expected_hash = composed_organization_semantic_sha256(
+            record_fields[8], record_fields[9]
+        )
+        return bool(
+            len(record_fields) == 11
+            and set(record_fields[10]).issubset(record_fields[9])
+            and record_fields[2] == expected_hash
+        )
+    return record_fields[8] == record_fields[2] and record_fields[9] == []
+
+
+def _is_hash_list(value: Any) -> bool:
+    """Return whether a proof component is one canonical digest set."""
+
+    return bool(
+        isinstance(value, list)
+        and value == sorted(set(value))
+        and all(
+            isinstance(hash_value, str)
+            and _HASH_RE.fullmatch(hash_value) is not None
+            for hash_value in value
+        )
+    )
+
+
 def _decoded_record(record_line: bytes) -> list[Any]:
     try:
         record_fields = json.loads(record_line)
@@ -866,7 +966,7 @@ def _decoded_record(record_line: bytes) -> list[Any]:
         ) from error
     is_base_shape_valid = bool(
         isinstance(record_fields, list)
-        and len(record_fields) in {7, 10}
+        and len(record_fields) in {7, 10, 11}
         and all(isinstance(record_fields[index], str) for index in range(4))
         and _HASH_RE.fullmatch(record_fields[2]) is not None
         and not any(
@@ -878,38 +978,38 @@ def _decoded_record(record_line: bytes) -> list[Any]:
     )
     is_semantic_shape_valid = bool(
         is_base_shape_valid
-        and len(record_fields) == 10
-        and record_fields[7] == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and len(record_fields) in {10, 11}
+        and record_fields[7] in SEMANTIC_RESOURCE_HASH_CONTRACTS
         and isinstance(record_fields[8], str)
         and _HASH_RE.fullmatch(record_fields[8]) is not None
-        and isinstance(record_fields[9], list)
-        and record_fields[9] == sorted(set(record_fields[9]))
-        and all(
-            isinstance(name_hash, str)
-            and _HASH_RE.fullmatch(name_hash) is not None
-            for name_hash in record_fields[9]
+        and _is_hash_list(record_fields[9])
+        and (
+            len(record_fields) == 10
+            or (
+                record_fields[0] == "Organization"
+                and record_fields[7]
+                == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+                and _is_hash_list(record_fields[10])
+            )
         )
     )
     if is_semantic_shape_valid:
-        if record_fields[0] == "Practitioner":
-            is_semantic_shape_valid = record_fields[2] == (
-                composed_practitioner_semantic_sha256(
-                    record_fields[8],
-                    record_fields[9],
-                )
-            )
-        else:
-            is_semantic_shape_valid = (
-                record_fields[8] == record_fields[2]
-                and record_fields[9] == []
-            )
+        is_semantic_shape_valid = _is_semantic_record_hash_valid(
+            record_fields
+        )
     if not is_base_shape_valid or (
-        len(record_fields) == 10 and not is_semantic_shape_valid
+        len(record_fields) in {10, 11} and not is_semantic_shape_valid
     ):
         raise ProviderDirectoryProofStoreError(
             "provider directory proof record shape changed"
         )
     return record_fields
+
+
+def decode_dataset_proof_record(raw_record: Any) -> list[Any]:
+    """Validate one JSON-compatible occurrence proof record."""
+
+    return _decoded_record(_stable_json(raw_record).encode())
 
 
 def _decoded_json_field(
@@ -1037,8 +1137,18 @@ def _has_incompatible_semantic_records(
 
     return bool(
         any(
-            len(proof_record_fields) != 10
-            or proof_record_fields[0] != "Practitioner"
+            not (
+                (
+                    len(proof_record_fields) == 10
+                    and proof_record_fields[0] == "Practitioner"
+                )
+                or (
+                    len(proof_record_fields) == 11
+                    and proof_record_fields[0] == "Organization"
+                    and proof_record_fields[7]
+                    == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+                )
+            )
             for proof_record_fields in unique_proof_records
         )
         or len(
@@ -1065,57 +1175,131 @@ def _has_incompatible_semantic_records(
     )
 
 
+def _composed_semantic_record_hash(
+    resource_type: str,
+    base_hash: str,
+    name_hashes: list[str],
+) -> str:
+    """Compose the family-specific hash for one reduced proof record."""
+
+    if resource_type == "Organization":
+        return composed_organization_semantic_sha256(
+            base_hash,
+            name_hashes,
+        )
+    return composed_practitioner_semantic_sha256(base_hash, name_hashes)
+
+
+def _organization_union_diagnostics(
+    primary_name_hashes: list[str],
+) -> dict[str, int]:
+    """Summarize exact observed Organization primary-name variants."""
+
+    primary_name_count = len(primary_name_hashes)
+    if primary_name_count <= 1:
+        return _empty_semantic_union_diagnostics()
+    return {
+        "collision_identities": 1,
+        "observation_variants": primary_name_count,
+        "union_name_count": primary_name_count,
+        "added_name_count": primary_name_count - 1,
+    }
+
+
+def _union_record_hashes(
+    proof_records: list[list[Any]],
+    field_index: int,
+) -> list[str]:
+    """Return one ordered digest union from a semantic record group."""
+
+    return sorted(
+        {
+            name_hash
+            for proof_record_fields in proof_records
+            for name_hash in proof_record_fields[field_index]
+        }
+    )
+
+
+def _merged_semantic_proof_record(
+    proof_records: list[list[Any]],
+) -> tuple[list[Any], list[str]]:
+    """Compose one compatible multi-shard semantic identity record."""
+
+    first_record_fields = proof_records[0]
+    resource_type = first_record_fields[0]
+    union_name_hashes = _union_record_hashes(proof_records, 9)
+    merged_record_fields = [
+        resource_type,
+        first_record_fields[1],
+        _composed_semantic_record_hash(
+            resource_type,
+            first_record_fields[8],
+            union_name_hashes,
+        ),
+        *first_record_fields[3:9],
+        union_name_hashes,
+    ]
+    if resource_type == "Organization":
+        merged_record_fields.append(_union_record_hashes(proof_records, 10))
+    return merged_record_fields, union_name_hashes
+
+
 def _finalized_proof_record_group(
     proof_records: list[list[Any]],
 ) -> tuple[list[Any], dict[str, int]]:
     """Reduce one exact identity while retaining every observed name digest."""
 
-    distinct_records_by_json = {
-        _stable_json(proof_record_fields): proof_record_fields
-        for proof_record_fields in proof_records
-    }
-    if len(distinct_records_by_json) == 1:
-        return next(iter(distinct_records_by_json.values())), {
-            "collision_identities": 0,
-            "observation_variants": 0,
-            "union_name_count": 0,
-            "added_name_count": 0,
-        }
-    unique_proof_records = list(distinct_records_by_json.values())
+    unique_proof_records = list(
+        {
+            _stable_json(proof_record_fields): proof_record_fields
+            for proof_record_fields in proof_records
+        }.values()
+    )
+    if len(unique_proof_records) == 1:
+        sole_record_fields = unique_proof_records[0]
+        diagnostics_by_name = (
+            _organization_union_diagnostics(sole_record_fields[10])
+            if len(sole_record_fields) == 11
+            else _empty_semantic_union_diagnostics()
+        )
+        return sole_record_fields, diagnostics_by_name
     if _has_incompatible_semantic_records(unique_proof_records):
         raise ProviderDirectoryProofStoreError(
             "provider directory proof shards conflict"
         )
-    union_name_hashes = sorted(
-        {
-            name_hash
-            for proof_record_fields in unique_proof_records
-            for name_hash in proof_record_fields[9]
-        }
+    merged_record_fields, union_name_hashes = (
+        _merged_semantic_proof_record(unique_proof_records)
     )
-    base_hash = unique_proof_records[0][8]
-    merged_record_fields = [
-        unique_proof_records[0][0],
-        unique_proof_records[0][1],
-        composed_practitioner_semantic_sha256(
-            base_hash,
-            union_name_hashes,
-        ),
-        *unique_proof_records[0][3:7],
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-        base_hash,
-        union_name_hashes,
-    ]
+    if merged_record_fields[0] == "Organization":
+        return merged_record_fields, _organization_union_diagnostics(
+            merged_record_fields[10]
+        )
     return merged_record_fields, {
         "collision_identities": 1,
         "observation_variants": len(unique_proof_records),
         "union_name_count": len(union_name_hashes),
         "added_name_count": len(union_name_hashes)
-        - min(
-            len(proof_record_fields[9])
-            for proof_record_fields in unique_proof_records
-        ),
+        - min(len(record_fields[9]) for record_fields in unique_proof_records),
     }
+
+
+def reduce_dataset_proof_records(
+    raw_records: Iterable[Any],
+) -> tuple[list[Any], dict[str, int]]:
+    """Validate and reduce occurrence records for one resource identity."""
+
+    proof_records = [
+        decode_dataset_proof_record(raw_record)
+        for raw_record in raw_records
+    ]
+    if not proof_records or len(
+        {(record_fields[0], record_fields[1]) for record_fields in proof_records}
+    ) != 1:
+        raise ProviderDirectoryProofStoreError(
+            "provider directory proof record identity changed"
+        )
+    return _finalized_proof_record_group(proof_records)
 
 
 def _empty_source_metrics() -> dict[str, int]:
@@ -1167,7 +1351,7 @@ class _ResourceProofAccumulator:
         )
         record_contract = (
             proof_record_fields[7]
-            if len(proof_record_fields) == 10
+            if len(proof_record_fields) in {10, 11}
             else LEGACY_RESOURCE_HASH_CONTRACT
         )
         if self.observed_contract is None:
@@ -1563,14 +1747,16 @@ def _base_dataset_proof_metadata(
 ) -> dict[str, Any]:
     """Return contract-independent proof metadata for one merged dataset."""
 
-    is_semantic_union = merged_proof.resource_hash_contract == (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-    )
+    semantic_contract_id_by_hash = {
+        resource_hash_contract: proof_contract_id
+        for proof_contract_id, resource_hash_contract in (
+            _SEMANTIC_PROOF_HASH_CONTRACT_BY_ID.items()
+        )
+    }
     metadata_by_field = {
-        "contract_id": (
-            PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
-            if is_semantic_union
-            else PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
+        "contract_id": semantic_contract_id_by_hash.get(
+            merged_proof.resource_hash_contract,
+            PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
         ),
         "complete": True,
         "dataset_id": lineage.dataset_id,
@@ -1604,13 +1790,12 @@ def _semantic_dataset_proof_metadata(
 ) -> dict[str, Any]:
     """Return the semantic-only hash identity and union diagnostics."""
 
-    if (
+    if not is_semantic_resource_hash_contract(
         merged_proof.resource_hash_contract
-        != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
     ):
         return {}
     return {
-        "resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        "resource_hash_contract": merged_proof.resource_hash_contract,
         _SEMANTIC_PROJECTION_AS_OF_FIELD: (
             _validated_semantic_projection_as_of(semantic_projection_as_of)
         ),
@@ -1628,8 +1813,8 @@ def _sealed_dataset_proof_metadata(
 ) -> dict[str, Any]:
     """Seal the merged dataset proof and revalidate its public contract."""
 
-    is_semantic_union = merged_proof.resource_hash_contract == (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    is_semantic_union = is_semantic_resource_hash_contract(
+        merged_proof.resource_hash_contract
     )
     proof_by_field = _base_dataset_proof_metadata(
         lineage,
@@ -1942,7 +2127,7 @@ def _validate_metadata_lineage(
         proof_by_field.get("contract_id")
         not in {
             PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
-            PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID,
+            *_SEMANTIC_PROOF_HASH_CONTRACT_BY_ID,
         }
         or proof_by_field.get("complete") is not True
         or proof_by_field.get("dataset_id") != lineage.dataset_id
@@ -2021,9 +2206,10 @@ def _validate_metadata_contract_summary(
 ) -> None:
     """Validate the mutually exclusive legacy and semantic proof fields."""
 
-    is_semantic_contract = proof_by_field.get("contract_id") == (
-        PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
+    expected_hash_contract = _SEMANTIC_PROOF_HASH_CONTRACT_BY_ID.get(
+        proof_by_field.get("contract_id")
     )
+    is_semantic_contract = expected_hash_contract is not None
     if is_semantic_contract != (lineage.proof_resource_scope is not None):
         raise ProviderDirectoryProofStoreError(
             "provider directory content proof contract changed"
@@ -2032,7 +2218,7 @@ def _validate_metadata_contract_summary(
     if is_semantic_contract:
         if (
             proof_by_field.get("resource_hash_contract")
-            != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            != expected_hash_contract
             or _validated_semantic_projection_as_of(
                 proof_by_field.get(_SEMANTIC_PROJECTION_AS_OF_FIELD)
             )
@@ -2073,6 +2259,7 @@ def _validate_metadata_summary(
 
 def _assert_expected_semantic_proof(
     proof_by_field: Mapping[str, Any],
+    expected_resource_hash_contract: str,
     expected_semantic_projection_as_of: str | None,
     expected_proof_resource_scope: Iterable[str] | None,
 ) -> None:
@@ -2080,7 +2267,7 @@ def _assert_expected_semantic_proof(
 
     if proof_by_field.get(
         "resource_hash_contract"
-    ) != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    ) != expected_resource_hash_contract:
         raise ProviderDirectoryProofStoreError(
             "provider directory semantic proof contract changed"
         )
@@ -2144,11 +2331,11 @@ def _assert_expected_proof_contract(
         raise ProviderDirectoryProofStoreError(
             "provider directory expected proof contract is invalid"
         )
-    is_semantic_proof = proof_by_field.get("contract_id") == (
-        PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
+    is_semantic_proof = proof_by_field.get("contract_id") in (
+        _SEMANTIC_PROOF_HASH_CONTRACT_BY_ID
     )
-    is_semantic_expected = expected_resource_hash_contract == (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    is_semantic_expected = is_semantic_resource_hash_contract(
+        expected_resource_hash_contract
     )
     if is_semantic_proof != is_semantic_expected:
         raise ProviderDirectoryProofStoreError(
@@ -2157,6 +2344,7 @@ def _assert_expected_proof_contract(
     if is_semantic_expected:
         _assert_expected_semantic_proof(
             proof_by_field,
+            expected_resource_hash_contract,
             expected_semantic_projection_as_of,
             expected_proof_resource_scope,
         )
@@ -2319,14 +2507,18 @@ __all__ = [
     "PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY",
     "PROVIDER_DIRECTORY_PROOF_SHARD_TABLE",
     "PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID",
+    "PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID",
     "ProviderDirectoryProofStoreError",
     "ProviderDirectoryStoredProof",
     "ProviderDirectoryStoredProofOptions",
+    "build_dataset_proof_record",
     "build_dataset_proof_shard",
     "build_stored_dataset_proof",
     "delete_dataset_resource_proof_shards",
     "delete_dataset_proof_shards",
+    "decode_dataset_proof_record",
     "ensure_dataset_proof_shard_table",
     "persist_dataset_proof_shard",
+    "reduce_dataset_proof_records",
     "validate_stored_dataset_proof_metadata",
 ]

@@ -5,11 +5,9 @@
 from __future__ import annotations
 
 import dataclasses
-import re
 from typing import Any
 
-from sqlalchemy import types as sa_types
-
+from process.provider_directory_dataset_rehydrate_payload import _validate_payload
 from process.provider_directory_dataset_rehydrate_report import (
     _execution_summary,
     _resource_summary,
@@ -42,14 +40,6 @@ from process.provider_directory_dataset_rehydrate_types import (
     _record_fields,
     _run_cancel_check,
     _table_ref,
-)
-from process.provider_directory_resource_hash import (
-    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-    resource_content_hash_payload,
-    resource_payload_sha256_for_contract,
-)
-from process.provider_directory_fhir_subset_completion import (
-    canonical_payload_sha256 as subset_payload_sha256,
 )
 
 
@@ -231,7 +221,10 @@ async def _process_one_batch(
         )
         retained_records = await _read_retained_batch(context, checkpoint)
         retained_batch = _map_retained_batch(
-            context.model, retained_records, context.scope
+            context.model,
+            retained_records,
+            context.scope,
+            context.resource_type,
         )
         next_checkpoint = _advance_checkpoint(
             checkpoint, retained_batch, mapped_count=0
@@ -293,8 +286,10 @@ def _map_retained_batch(
     model: type,
     retained_records: list[Any],
     scope: DatasetScope,
+    resource_type: str,
 ) -> RetainedBatch:
     """Validate retained hashes and restore immutable acquisition metadata."""
+
     typed_rows: list[dict[str, Any]] = []
     rejection_reasons: list[str] = []
     for retained_record in retained_records:
@@ -307,6 +302,7 @@ def _map_retained_batch(
             _clean_text(retained_fields.get("payload_hash")),
             mapped_payload,
             resource_hash_contract=scope.resource_hash_contract,
+            resource_type=resource_type,
             acquired_resource_sha256=retained_fields.get(
                 "acquired_resource_sha256"
             ),
@@ -441,59 +437,3 @@ async def _report_progress(
             ),
         }
     )
-
-
-def _validate_payload(
-    model: type,
-    resource_id: str,
-    stored_hash: str,
-    mapped_payload: Any,
-    *,
-    resource_hash_contract: str,
-    acquired_resource_sha256: Any = None,
-) -> str | None:
-    """Return a stable reason when a retained mapped payload is unsafe."""
-    if not resource_id or not isinstance(mapped_payload, dict):
-        return "payload_hash_mismatch"
-    try:
-        if acquired_resource_sha256 is not None:
-            if (
-                resource_hash_contract
-                == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ):
-                return "payload_hash_mismatch"
-            if (
-                type(acquired_resource_sha256) is not str
-                or re.fullmatch(r"[0-9a-f]{64}", acquired_resource_sha256)
-                is None
-            ):
-                return "payload_hash_mismatch"
-            expected_hash = subset_payload_sha256(
-                resource_content_hash_payload(mapped_payload)
-            )
-        else:
-            expected_hash = resource_payload_sha256_for_contract(
-                mapped_payload,
-                resource_hash_contract,
-            )
-    except (TypeError, ValueError):
-        return "payload_hash_mismatch"
-    if stored_hash != expected_hash:
-        return "payload_hash_mismatch"
-    reserved_fields = {"source_id", "last_seen_run_id", "observed_at", "updated_at"}
-    if mapped_payload.get("resource_id") != resource_id or reserved_fields & set(
-        mapped_payload
-    ):
-        return "payload_provenance_invalid"
-    column_by_name = {column.name: column for column in model.__table__.columns}
-    if set(mapped_payload) - set(column_by_name):
-        return "payload_unknown_field"
-    for field_name, field_value in mapped_payload.items():
-        column_type = column_by_name[field_name].type
-        if isinstance(column_type, sa_types.String) and field_value is not None:
-            if not isinstance(field_value, str):
-                return "payload_column_type_invalid"
-        if isinstance(column_type, sa_types.Boolean) and field_value is not None:
-            if not isinstance(field_value, bool):
-                return "payload_column_type_invalid"
-    return None

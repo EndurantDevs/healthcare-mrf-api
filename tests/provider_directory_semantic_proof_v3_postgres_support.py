@@ -40,6 +40,7 @@ from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     canonical_practitioner_payload,
+    is_semantic_resource_hash_contract,
     resource_payload_sha256_for_contract,
 )
 
@@ -119,8 +120,7 @@ async def _insert_parent(
                     )
                 )
             }
-            if resource_hash_contract
-            == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+            if is_semantic_resource_hash_contract(resource_hash_contract)
             else {}
         ),
     }

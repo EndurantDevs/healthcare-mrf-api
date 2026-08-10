@@ -314,7 +314,12 @@ async def test_partition_candidate_proof_and_stream_fail_closed(monkeypatch):
     with pytest.raises(RuntimeError, match="stream_count_mismatch"):
         await fhir._stream_last_updated_partition_staged_rows(
             _checkpoint_context(),
-            {"source_id": "source-a"},
+            {
+                "source_id": "source-a",
+                "_resource_hash_contract": (
+                    fhir.LEGACY_RESOURCE_HASH_CONTRACT
+                ),
+            },
             "Practitioner",
             object,
             plan,

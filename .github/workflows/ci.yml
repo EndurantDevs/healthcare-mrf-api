@@ -956,6 +956,10 @@ jobs:
           tests/test_provider_directory_semantic_proof_v3_db.py
           tests/test_provider_directory_semantic_proof_v3_fences_db.py
           tests/test_provider_directory_semantic_candidate_proof_v3_db.py
+          tests/test_provider_directory_organization_union_v4_db.py
+          tests/test_provider_directory_organization_candidate_proof_v4_db.py
+          tests/test_provider_directory_organization_partition_v4_db.py
+          tests/test_provider_directory_organization_partition_v4_fences_db.py
           tests/test_provider_directory_two_phase_publication.py
           tests/test_provider_directory_contract_identity_cutover.py
           tests/test_provider_directory_retry_cleanup.py

@@ -24,6 +24,7 @@ from process.provider_directory_resource_hash import (
     DEFAULT_RESOURCE_HASH_CONTRACT,
     LEGACY_RESOURCE_HASH_CONTRACT,
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
     TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     canonical_practitioner_payload,
     is_resource_payload_hash_match,
@@ -97,7 +98,7 @@ def _observation(
 
 def _dataset_row(
     observation_by_field: dict[str, object],
-    resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT,
+    resource_hash_contract: str = SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
 ) -> dict[str, object]:
     return importer._endpoint_dataset_resource_rows(
         ProviderDirectoryPractitioner,
@@ -109,7 +110,7 @@ def _dataset_row(
 
 def _canonical_row(
     observation_by_field: dict[str, object],
-    resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT,
+    resource_hash_contract: str = SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
 ) -> dict[str, object]:
     return importer._canonical_resource_rows(
         ProviderDirectoryPractitioner,
@@ -383,16 +384,19 @@ def test_v3_union_rejects_non_name_drift_and_projection_tampering():
         )
 
 
-def test_v2_hash_remains_readable_after_v3_becomes_default():
+def test_v2_hash_remains_readable_after_semantic_default_advances():
     observation_by_field = _observation()
     mapped_payload = importer._canonical_resource_payload(
         observation_by_field
     )
     stored_v2_hash = resource_payload_sha256(mapped_payload)
-    default_canonical = _canonical_row(observation_by_field)
+    default_canonical = _canonical_row(
+        observation_by_field,
+        DEFAULT_RESOURCE_HASH_CONTRACT,
+    )
 
     assert DEFAULT_RESOURCE_HASH_CONTRACT == (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
     )
     assert stored_v2_hash != default_canonical["payload_hash"]
     importer._assert_endpoint_dataset_resource_payload_hash(
@@ -407,6 +411,7 @@ def test_v2_hash_remains_readable_after_v3_becomes_default():
             resource_hash_contract=(
                 TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
             ),
+            resource_type="Practitioner",
         )
         is None
     )

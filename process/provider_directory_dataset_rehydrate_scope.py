@@ -27,7 +27,7 @@ from process.provider_directory_dataset_rehydrate_types import (
     _table_ref,
 )
 from process.provider_directory_resource_hash import (
-    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    is_semantic_resource_hash_contract,
     persisted_resource_hash_contract,
 )
 from process.provider_directory_proof_store import (
@@ -213,16 +213,16 @@ def _retained_resource_types(
         proof_resource_types = tuple(raw_proof_resource_scope)
         if not set(selected_resource_types).issubset(proof_resource_types):
             raise ValueError("provider_directory_proof_resource_scope_invalid")
-    is_semantic_v3 = (
-        resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    is_semantic_contract = is_semantic_resource_hash_contract(
+        resource_hash_contract
     )
-    if has_proof_resource_scope != is_semantic_v3:
+    if has_proof_resource_scope != is_semantic_contract:
         raise ValueError("provider_directory_proof_resource_scope_invalid")
     raw_content_proof = publication_metadata.get(
         PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY
     )
     if raw_content_proof is None:
-        if is_semantic_v3:
+        if is_semantic_contract:
             raise ValueError("provider_directory_content_proof_missing")
         return tuple(selected_resource_types)
     stored_proof = validate_stored_dataset_proof_metadata(
@@ -247,7 +247,7 @@ def _semantic_projection_as_of(
 ) -> str | None:
     """Decode the immutable v3 projection date from published metadata."""
 
-    if resource_hash_contract != SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT:
+    if not is_semantic_resource_hash_contract(resource_hash_contract):
         return None
     projection_as_of = publication_metadata.get("semantic_projection_as_of")
     if (
