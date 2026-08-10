@@ -24,6 +24,8 @@ from process.provider_directory_fhir_subset_abandonment_contract import (
     validated_terminal_diagnostics,
 )
 from process.provider_directory_fhir_subset_abandonment_selection import (
+    _has_matching_reviewed_root_policy,
+    _reviewed_source_state,
     selected_reviewed_subset_abandonment,
 )
 from process.provider_directory_fhir_subset_abandonment_store import (
@@ -162,6 +164,76 @@ def test_result_json_validates_boolean_and_already_applied_shape():
     )
     with pytest.raises(ReviewedSubsetAbandonmentError):
         ReviewedSubsetAbandonmentResult(abandoned=1)
+
+
+def test_source_state_accepts_legacy_and_policy_lifecycles_exactly():
+    root_policy_by_field = {
+        "policy_version": "provider-directory-reviewed-root-policy-v1",
+        "required_root_count": 1,
+    }
+    legacy_pending_by_field = {
+        "provider_directory_candidate_status": (
+            "pending_two_matching_reviewed_subset_acquisitions"
+        )
+    }
+    policy_pending_by_field = {
+        "provider_directory_candidate_status": (
+            "pending_reviewed_subset_acquisition"
+        ),
+        "provider_directory_reviewed_root_policy_v1": root_policy_by_field,
+    }
+    policy_active_by_field = {
+        **policy_pending_by_field,
+        "provider_directory_candidate_status": (
+            "verified_reviewed_subset_acquisition"
+        ),
+        "provider_directory_reviewed_subset_activation_v2": {
+            "root_policy": root_policy_by_field
+        },
+    }
+
+    assert _reviewed_source_state(legacy_pending_by_field) == "pending"
+    assert _reviewed_source_state(policy_pending_by_field) == "pending"
+    assert _reviewed_source_state(policy_active_by_field) == "activated"
+
+    mixed_by_field = deepcopy(policy_active_by_field)
+    mixed_by_field["provider_directory_reviewed_subset_activation_v1"] = {}
+    assert _reviewed_source_state(mixed_by_field) is None
+
+    mismatched_by_field = deepcopy(policy_active_by_field)
+    mismatched_by_field["provider_directory_reviewed_subset_activation_v2"] = {
+        "root_policy": {**root_policy_by_field, "required_root_count": 2}
+    }
+    assert _reviewed_source_state(mismatched_by_field) is None
+
+
+def test_abandonment_policy_binding_rejects_presence_or_value_drift():
+    root_policy_by_field = {
+        "policy_version": "provider-directory-reviewed-root-policy-v1",
+        "required_root_count": 1,
+    }
+    source_metadata_by_field = {
+        "provider_directory_reviewed_root_policy_v1": root_policy_by_field
+    }
+
+    assert _has_matching_reviewed_root_policy(
+        source_metadata_by_field,
+        {
+            "provider_directory_reviewed_root_policy_v1": deepcopy(
+                root_policy_by_field
+            )
+        },
+    )
+    assert not _has_matching_reviewed_root_policy(source_metadata_by_field, {})
+    assert not _has_matching_reviewed_root_policy(
+        source_metadata_by_field,
+        {
+            "provider_directory_reviewed_root_policy_v1": {
+                **root_policy_by_field,
+                "required_root_count": 2,
+            }
+        },
+    )
 
 
 @pytest.mark.asyncio

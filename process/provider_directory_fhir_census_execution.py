@@ -27,7 +27,9 @@ from process.provider_directory_fhir_census_page_geometry import (
     validate_census_page_entries,
 )
 from process.provider_directory_fhir_subset_execution import (
+    has_valid_reviewed_subset_counts,
     has_valid_subset_completed_fields,
+    reviewed_subset_count_decrease_from_proof,
     subset_completed_fields,
 )
 
@@ -191,7 +193,7 @@ def _current_version_census_failure(
 
 
 def _completion_failure(
-    is_subset_v3: bool,
+    max_advertised_count_decrease: int | None,
     *,
     pre_count: int,
     post_count: int,
@@ -200,18 +202,19 @@ def _completion_failure(
 ) -> str | None:
     """Return the exact or declared-subset terminal failure code."""
 
-    if not is_subset_v3:
+    if max_advertised_count_decrease is None:
         return _current_version_census_failure(
             pre_count=pre_count,
             post_count=post_count,
             processed_rows=processed_rows,
             unique_candidate_rows=unique_candidate_rows,
         )
-    if post_count != pre_count:
+    advertised_count_decrease = pre_count - post_count
+    if not 0 <= advertised_count_decrease <= max_advertised_count_decrease:
         return "census_drift"
     if processed_rows != unique_candidate_rows:
         return "duplicate_resource_ids"
-    if unique_candidate_rows > pre_count:
+    if unique_candidate_rows > post_count:
         return "returned_count_exceeds_advertised"
     return None
 
@@ -293,8 +296,13 @@ def current_version_census_completed_proof(
         terminal_page_entry_count=terminal_page_entry_count,
     )
     is_subset_v3 = initial_proof.get("contract_version") == 3
+    max_advertised_count_decrease = (
+        reviewed_subset_count_decrease_from_proof(initial_proof)
+        if is_subset_v3
+        else None
+    )
     failure = _completion_failure(
-        is_subset_v3,
+        max_advertised_count_decrease,
         pre_count=pre_count,
         post_count=post_count,
         processed_rows=processed_rows,
@@ -338,16 +346,6 @@ def _has_valid_completed_counts(count_by_name: Mapping[str, Any]) -> bool:
     ):
         return False
     return len(set(count_by_name.values())) == 1
-
-
-def _has_valid_subset_counts(count_by_name: Mapping[str, Any]) -> bool:
-    return bool(
-        all(type(count) is int and count >= 0 for count in count_by_name.values())
-        and count_by_name["pre_count"] == count_by_name["post_count"]
-        and count_by_name["processed_rows"]
-        == count_by_name["unique_candidate_rows"]
-        and count_by_name["unique_candidate_rows"] <= count_by_name["pre_count"]
-    )
 
 
 def _has_valid_terminal_geometry(
@@ -418,7 +416,10 @@ def validated_current_version_census_completed_proof(
     count_by_name = _completed_count_map(completeness)
     is_subset_v3 = contract.is_server_issued_subset_v3
     has_valid_counts = (
-        _has_valid_subset_counts(count_by_name)
+        has_valid_reviewed_subset_counts(
+            count_by_name,
+            contract.max_advertised_count_decrease,
+        )
         if is_subset_v3
         else _has_valid_completed_counts(count_by_name)
     )

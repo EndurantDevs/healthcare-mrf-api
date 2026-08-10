@@ -11,9 +11,7 @@ from process.provider_directory_fhir_census_binding import (
 )
 from process.provider_directory_fhir_census_contract import (
     SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
-    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_SEMANTICS,
-    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
 )
 from process.provider_directory_fhir_subset_canonical import (
@@ -100,6 +98,7 @@ def _validated_resource_metrics(
     geometry_by_field: Mapping[str, Any],
     content_sha256: str,
     acquired_content_sha256: str,
+    max_advertised_count_decrease: int,
 ) -> tuple[int, int, int, int, list[str]]:
     advertised_pre = resource_proof.get("advertised_pre")
     advertised_post = resource_proof.get("advertised_post")
@@ -107,6 +106,12 @@ def _validated_resource_metrics(
     deficit = resource_proof.get("deficit")
     continuation_shape_hashes = resource_proof.get(
         "continuation_shape_sha256"
+    )
+    advertised_count_decrease = (
+        advertised_pre - advertised_post
+        if _is_nonnegative_int(advertised_pre)
+        and _is_nonnegative_int(advertised_post)
+        else None
     )
     if (
         any(
@@ -118,8 +123,9 @@ def _validated_resource_metrics(
                 deficit,
             )
         )
-        or advertised_pre != advertised_post
-        or returned_unique > advertised_pre
+        or advertised_count_decrease is None
+        or not 0 <= advertised_count_decrease <= max_advertised_count_decrease
+        or returned_unique > advertised_post
         or deficit != advertised_pre - returned_unique
         or resource_proof.get("terminal_reason")
         != SERVER_ISSUED_SUBSET_TERMINAL_REASON
@@ -149,6 +155,7 @@ def _canonical_resource_proof(
     *,
     content_sha256: str,
     acquired_content_sha256: str,
+    max_advertised_count_decrease: int,
 ) -> dict[str, Any]:
     geometry_by_field = _geometry_from_execution_proof(resource_proof)
     (
@@ -162,6 +169,7 @@ def _canonical_resource_proof(
         geometry_by_field,
         content_sha256,
         acquired_content_sha256,
+        max_advertised_count_decrease,
     )
     return {
         "advertised_pre": advertised_pre,
@@ -231,10 +239,10 @@ def _completion_proof_by_field(
         "proof_version": SERVER_ISSUED_SUBSET_COMPLETION_PROOF_VERSION,
         "contract_version": SERVER_ISSUED_SUBSET_REQUIRED_VERSION,
         "semantics": SERVER_ISSUED_SUBSET_SEMANTICS,
-        "strategy_version": SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+        "strategy_version": contract.strategy_version,
         "traversal_version": SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
         "canonicalization_version": SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
-        "completion_scopes": list(SERVER_ISSUED_SUBSET_COMPLETION_SCOPES),
+        "completion_scopes": list(contract.completion_scopes),
         "campaign_id": contract.campaign_id,
         "cutoff": contract.cutoff,
         "page_count": contract.page_count,
@@ -272,11 +280,13 @@ def build_subset_completion_proof(
         acquired_resource_hash_by_type,
         resource_count_by_type,
     )
+    max_advertised_count_decrease = contract.max_advertised_count_decrease
     canonical_resource_by_type = {
         resource_type: _canonical_resource_proof(
             resource_proof_by_type[resource_type],
             content_sha256=resource_hash_by_type[resource_type],
             acquired_content_sha256=acquired_resource_hash_by_type[resource_type],
+            max_advertised_count_decrease=max_advertised_count_decrease,
         )
         for resource_type in sorted(resource_types)
     }

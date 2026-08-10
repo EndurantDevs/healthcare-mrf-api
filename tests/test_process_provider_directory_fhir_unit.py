@@ -23362,6 +23362,31 @@ def _terminal_guard_lease(canonical_api_base, source_id, database):
     )
 
 
+def _reviewed_subset_terminal_failure(
+    contract,
+    error_suffix,
+    *,
+    resource_types=None,
+):
+    selected_resource_types = resource_types or contract.resources
+    diagnostics_by_resource = {
+        resource_type: {
+            "bounded": False,
+            "complete": False,
+            "error": (
+                f"{importer.CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:"
+                f"{error_suffix}"
+            ),
+            "fetch_mode": importer.SERVER_ISSUED_SUBSET_FETCH_MODE,
+        }
+        for resource_type in selected_resource_types
+    }
+    return importer.ProviderDirectoryPaginationTerminalFailure(
+        "synthetic terminal traversal",
+        diagnostics_by_resource,
+    )
+
+
 @pytest.mark.asyncio
 async def test_reviewed_subset_terminal_hook_seals_only_exact_checked_in_source(
     monkeypatch,
@@ -23375,21 +23400,7 @@ async def test_reviewed_subset_terminal_hook_seals_only_exact_checked_in_source(
         "canonical_api_base": "https://directory.example.test/fhir",
         importer.CURRENT_VERSION_CENSUS_CONTRACT_FIELD: contract,
     }
-    diagnostic_by_resource = {
-        resource_type: {
-            "bounded": False,
-            "complete": False,
-            "error": (
-                f"{importer.CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:http_410"
-            ),
-            "fetch_mode": importer.SERVER_ISSUED_SUBSET_FETCH_MODE,
-        }
-        for resource_type in contract.resources
-    }
-    failure = importer.ProviderDirectoryPaginationTerminalFailure(
-        "synthetic terminal traversal",
-        diagnostic_by_resource,
-    )
+    failure = _reviewed_subset_terminal_failure(contract, "http_410")
     seal = AsyncMock()
     monkeypatch.setattr(
         "process.provider_directory_fhir_manual_catalog."
@@ -23433,18 +23444,14 @@ async def test_reviewed_subset_terminal_hook_ignores_nonexact_groups(
         "source_id": contract.source_id,
         importer.CURRENT_VERSION_CENSUS_CONTRACT_FIELD: contract,
     }
-    failure = importer.ProviderDirectoryPaginationTerminalFailure(
-        "synthetic partial traversal",
-        {
-            contract.resources[0]: {
-                "bounded": False,
-                "complete": False,
-                "error": (
-                    f"{importer.CURRENT_VERSION_CENSUS_BLOCKED_ERROR}:http_410"
-                ),
-                "fetch_mode": importer.SERVER_ISSUED_SUBSET_FETCH_MODE,
-            }
-        },
+    failure = _reviewed_subset_terminal_failure(
+        contract,
+        "http_410",
+        resource_types=(contract.resources[0],),
+    )
+    census_drift_failure = _reviewed_subset_terminal_failure(
+        contract,
+        "census_drift",
     )
     seal = AsyncMock()
     monkeypatch.setattr(
@@ -23466,6 +23473,11 @@ async def test_reviewed_subset_terminal_hook_ignores_nonexact_groups(
     await importer._abandon_terminal_reviewed_subset_without_masking(
         [source_by_field, dict(source_by_field)],
         failure,
+        guard_lease,
+    )
+    await importer._abandon_terminal_reviewed_subset_without_masking(
+        [source_by_field],
+        census_drift_failure,
         guard_lease,
     )
 

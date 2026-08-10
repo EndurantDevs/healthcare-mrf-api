@@ -103,11 +103,9 @@ from process.provider_directory_fhir_census_contract import (
     CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD,
     CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD,
     SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
-    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_RESOURCE_TYPES,
     SERVER_ISSUED_SUBSET_SEMANTICS,
     SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY,
-    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
     CurrentVersionCensusRuntime,
     current_version_census_request,
@@ -149,6 +147,7 @@ from process.provider_directory_fhir_subset_completion import (
     validate_subset_replay_evidence_pair,
 )
 from process.provider_directory_fhir_subset_identity import (
+    reviewed_subset_max_advertised_count_decrease,
     server_issued_subset_source_scope_payload,
 )
 from process.provider_directory_fhir_root_policy import (
@@ -2269,6 +2268,16 @@ class CurrentVersionCensusTerminalState:
     expected_page_count: int
     terminal_page_entry_count: int
     recent_url_hashes: tuple[str, ...]
+
+
+class _CurrentVersionCensusTerminalProofRejected(Exception):
+    """Roll back terminal-page writes while retaining the rejected proof."""
+
+    def __init__(self, proof_by_field: dict[str, Any]) -> None:
+        super().__init__(
+            "provider_directory_current_version_census_terminal_proof_rejected"
+        )
+        self.proof_by_field = proof_by_field
 
 
 @dataclass(frozen=True)
@@ -14803,9 +14812,8 @@ def _artifact_subset_parent_proof_sql(
 def _artifact_subset_source_fixed_sql(
     source_metadata: str,
     completion_proof: str,
-    completion_scopes_json: str,
 ) -> str:
-    """Return fixed reviewed v3 source identity predicates."""
+    """Bind one allowlisted reviewed-subset profile to its durable proof."""
 
     return f"""
         {source_metadata} -> 'provider_directory_manual_only'
@@ -14815,13 +14823,13 @@ def _artifact_subset_source_fixed_sql(
         AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD}'
             = '{SERVER_ISSUED_SUBSET_SEMANTICS}'
         AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD}'
-            = '{SERVER_ISSUED_SUBSET_STRATEGY_VERSION}'
+            = {completion_proof} ->> 'strategy_version'
         AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD}'
             = '{SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION}'
         AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD}'
             = '{SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION}'
         AND {source_metadata} -> '{CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD}'
-            = '{completion_scopes_json}'::jsonb
+            = {completion_proof} -> 'completion_scopes'
         AND {source_metadata} ->> '{CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD}'
             = '{SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY}'
         AND {source_metadata} -> '{CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD}'
@@ -14900,9 +14908,6 @@ def _artifact_subset_source_identity_sql(
 ) -> str:
     """Bind the reviewed source's fixed v3 identity to its parent proof."""
 
-    completion_scopes_json = json.dumps(
-        list(SERVER_ISSUED_SUBSET_COMPLETION_SCOPES), separators=(",", ":")
-    )
     allowed_resources_sql = ", ".join(
         f"'{resource_type}'"
         for resource_type in SERVER_ISSUED_SUBSET_RESOURCE_TYPES
@@ -14911,7 +14916,6 @@ def _artifact_subset_source_identity_sql(
         _artifact_subset_source_fixed_sql(
             source_metadata,
             f"{dataset_alias}.completion_proof_json",
-            completion_scopes_json,
         ),
         _artifact_subset_source_resources_sql(
             source_metadata, allowed_resources_sql
@@ -16471,14 +16475,20 @@ def _is_reviewed_subset_source_metadata(metadata: Mapping[str, Any]) -> bool:
         == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
         and metadata.get(CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD)
         == SERVER_ISSUED_SUBSET_SEMANTICS
-        and metadata.get(CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD)
-        == SERVER_ISSUED_SUBSET_STRATEGY_VERSION
+        and reviewed_subset_max_advertised_count_decrease(
+            metadata.get(CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD),
+            tuple(metadata[CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD])
+            if type(
+                metadata.get(CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD)
+            )
+            is list
+            else None,
+        )
+        is not None
         and metadata.get(CURRENT_VERSION_CENSUS_TRAVERSAL_VERSION_FIELD)
         == SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION
         and metadata.get(CURRENT_VERSION_CENSUS_CANONICALIZATION_VERSION_FIELD)
         == SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION
-        and metadata.get(CURRENT_VERSION_CENSUS_COMPLETION_SCOPES_FIELD)
-        == list(SERVER_ISSUED_SUBSET_COMPLETION_SCOPES)
         and metadata.get(CURRENT_VERSION_CENSUS_CONTINUATION_STRATEGY_FIELD)
         == SERVER_ISSUED_SUBSET_SMILE_CONTINUATION_STRATEGY
         and type(metadata.get(CURRENT_VERSION_CENSUS_PAGE_COUNT_FIELD)) is int
@@ -51183,24 +51193,30 @@ async def _persist_current_version_terminal_success(
 ) -> dict[str, Any]:
     """Atomically persist a terminal page and its resulting proof boundary."""
 
-    async with db.transaction():
-        await persist_terminal_rows()
-        await cancellation.check()
-        unique_candidate_rows = await _caresource_unique_candidate_count(
-            checkpoint_context,
-            resource_type,
-        )
-        completed_proof_by_field = current_version_census_completed_proof(
-            terminal_state.proof_by_field,
-            post_count=post_count,
-            processed_rows=terminal_state.rows_processed,
-            unique_candidate_rows=unique_candidate_rows,
-            pages_processed=terminal_state.pages_processed,
-            expected_page_count=terminal_state.expected_page_count,
-            terminal_page_entry_count=terminal_state.terminal_page_entry_count,
-        )
-        await cancellation.check()
-        if completed_proof_by_field.get("verified") is True:
+    try:
+        async with db.transaction():
+            await persist_terminal_rows()
+            await cancellation.check()
+            unique_candidate_rows = await _caresource_unique_candidate_count(
+                checkpoint_context,
+                resource_type,
+            )
+            completed_proof_by_field = current_version_census_completed_proof(
+                terminal_state.proof_by_field,
+                post_count=post_count,
+                processed_rows=terminal_state.rows_processed,
+                unique_candidate_rows=unique_candidate_rows,
+                pages_processed=terminal_state.pages_processed,
+                expected_page_count=terminal_state.expected_page_count,
+                terminal_page_entry_count=(
+                    terminal_state.terminal_page_entry_count
+                ),
+            )
+            await cancellation.check()
+            if completed_proof_by_field.get("verified") is not True:
+                raise _CurrentVersionCensusTerminalProofRejected(
+                    completed_proof_by_field
+                )
             await _save_pagination_checkpoint(
                 checkpoint_context,
                 resource_type,
@@ -51210,12 +51226,13 @@ async def _persist_current_version_terminal_success(
                 recent_url_hashes=list(terminal_state.recent_url_hashes),
                 completeness=completed_proof_by_field,
             )
-        else:
-            await _save_pagination_checkpoint_completeness(
-                checkpoint_context,
-                resource_type,
-                completed_proof_by_field,
-            )
+    except _CurrentVersionCensusTerminalProofRejected as rejected:
+        await _save_pagination_checkpoint_completeness(
+            checkpoint_context,
+            resource_type,
+            rejected.proof_by_field,
+        )
+        return rejected.proof_by_field
     return completed_proof_by_field
 
 
@@ -65808,6 +65825,27 @@ async def _retain_terminal_import_failure(
     )
 
 
+def _has_expired_cursor_abandonment_evidence(
+    diagnostics_by_resource: Mapping[str, Any],
+    resource_types: tuple[str, ...],
+) -> bool:
+    """Return whether every resource satisfies the closed HTTP-410 contract."""
+
+    from process.provider_directory_fhir_subset_abandonment_contract import (
+        ReviewedSubsetAbandonmentError,
+        validated_terminal_diagnostics,
+    )
+
+    try:
+        validated_terminal_diagnostics(
+            diagnostics_by_resource,
+            resource_types,
+        )
+    except ReviewedSubsetAbandonmentError:
+        return False
+    return True
+
+
 async def _abandon_terminal_reviewed_subset_without_masking(
     source_records: list[dict[str, Any]],
     failure: ProviderDirectoryPaginationTerminalFailure,
@@ -65826,6 +65864,10 @@ async def _abandon_terminal_reviewed_subset_without_masking(
         census_contract is None
         or not census_contract.is_server_issued_subset_v3
         or set(failure.diagnostics_by_resource) != set(census_contract.resources)
+        or not _has_expired_cursor_abandonment_evidence(
+            failure.diagnostics_by_resource,
+            tuple(sorted(census_contract.resources)),
+        )
         or guard_lease is None
         or not guard_lease.is_held
         or guard_lease.context.canonical_api_base != canonical_api_base

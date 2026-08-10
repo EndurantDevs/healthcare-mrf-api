@@ -6,6 +6,63 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from process.provider_directory_fhir_subset_identity import (
+    reviewed_subset_max_advertised_count_decrease,
+)
+
+
+def reviewed_subset_count_decrease_from_proof(
+    initial_proof: Mapping[str, Any],
+) -> int:
+    """Return the exact allowlisted count-decrease bound in a reviewed proof."""
+
+    raw_completion_scopes = initial_proof.get("completion_scopes")
+    maximum = reviewed_subset_max_advertised_count_decrease(
+        initial_proof.get("strategy_version"),
+        (
+            tuple(raw_completion_scopes)
+            if type(raw_completion_scopes) is list
+            else None
+        ),
+    )
+    if maximum is None:
+        raise ValueError(
+            "provider_directory_current_version_census_profile_invalid"
+        )
+    return maximum
+
+
+def has_valid_reviewed_subset_counts(
+    count_by_name: Mapping[str, Any],
+    max_advertised_count_decrease: int,
+) -> bool:
+    """Validate one allowlisted subset profile's terminal counts."""
+
+    required_count_by_name = {
+        field_name: count_by_name.get(field_name)
+        for field_name in (
+            "pre_count",
+            "post_count",
+            "processed_rows",
+            "unique_candidate_rows",
+        )
+    }
+    if not all(
+        type(count) is int and count >= 0
+        for count in required_count_by_name.values()
+    ):
+        return False
+    advertised_count_decrease = (
+        required_count_by_name["pre_count"]
+        - required_count_by_name["post_count"]
+    )
+    return bool(
+        0 <= advertised_count_decrease <= max_advertised_count_decrease
+        and count_by_name["processed_rows"]
+        == count_by_name["unique_candidate_rows"]
+        and count_by_name["unique_candidate_rows"] <= count_by_name["post_count"]
+    )
+
 
 def subset_completed_fields(
     initial_proof: Mapping[str, Any],

@@ -37,6 +37,7 @@ from process.provider_directory_fhir_census_contract import (
 )
 from process.provider_directory_fhir_subset_identity import (
     is_reviewed_subset_contract,
+    reviewed_subset_max_advertised_count_decrease,
     validated_subset_identity_values,
 )
 from process.provider_directory_fhir_census_urls import (
@@ -98,6 +99,20 @@ class CurrentVersionCensusContract:
         """Return whether every field matches the reviewed subset identity."""
 
         return is_reviewed_subset_contract(self)
+
+    @property
+    def max_advertised_count_decrease(self) -> int:
+        """Return the profile-bound terminal advertised-count decrease."""
+
+        maximum = reviewed_subset_max_advertised_count_decrease(
+            self.strategy_version,
+            self.completion_scopes,
+        )
+        if maximum is None:
+            raise ValueError(
+                "provider_directory_current_version_census_profile_invalid"
+            )
+        return maximum
 
     def start_url(self, resource_type: str, page_count: int) -> str:
         """Return the reviewed URL with source filters and cutoff preserved."""

@@ -13,11 +13,12 @@ from typing import Any, Mapping
 
 from process.provider_directory_fhir_census_contract import (
     SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
-    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_RESOURCE_TYPES,
     SERVER_ISSUED_SUBSET_SEMANTICS,
-    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
+)
+from process.provider_directory_fhir_subset_identity import (
+    reviewed_subset_max_advertised_count_decrease,
 )
 
 
@@ -191,10 +192,36 @@ def _assert_root_neutral(value: Any) -> None:
         raise ValueError("provider_directory_subset_completion_proof_invalid")
 
 
+def _has_valid_resource_counts(
+    resource_proof: Mapping[str, Any],
+    max_advertised_count_decrease: int,
+) -> bool:
+    """Return whether resource counts satisfy the selected exact profile."""
+
+    advertised_pre = resource_proof.get("advertised_pre")
+    advertised_post = resource_proof.get("advertised_post")
+    returned_unique = resource_proof.get("returned_unique")
+    deficit = resource_proof.get("deficit")
+    return bool(
+        _is_nonnegative_int(advertised_pre)
+        and _is_nonnegative_int(advertised_post)
+        and _is_nonnegative_int(returned_unique)
+        and _is_nonnegative_int(deficit)
+        and 0
+        <= advertised_pre - advertised_post
+        <= max_advertised_count_decrease
+        and returned_unique <= advertised_post
+        and deficit == advertised_pre - returned_unique
+    )
+
+
 def _validate_resource_scalar_fields(
     resource_proof: Mapping[str, Any],
     page_count: int,
+    max_advertised_count_decrease: int,
 ) -> None:
+    """Validate scalar proof fields under the selected exact profile."""
+
     numeric_fields = (
         "advertised_pre",
         "advertised_post",
@@ -217,10 +244,10 @@ def _validate_resource_scalar_fields(
             not _is_nonnegative_int(resource_proof.get(field_name))
             for field_name in numeric_fields
         )
-        or resource_proof["advertised_pre"] != resource_proof["advertised_post"]
-        or resource_proof["returned_unique"] > resource_proof["advertised_pre"]
-        or resource_proof["deficit"]
-        != resource_proof["advertised_pre"] - resource_proof["returned_unique"]
+        or not _has_valid_resource_counts(
+            resource_proof,
+            max_advertised_count_decrease,
+        )
         or resource_proof["pages"] <= 0
         or resource_proof["logical_terminal_offset"]
         != (resource_proof["pages"] - 1) * page_count
@@ -303,8 +330,13 @@ def _validate_resource(
     resource_proof: Mapping[str, Any],
     *,
     page_count: int,
+    max_advertised_count_decrease: int,
 ) -> int:
-    _validate_resource_scalar_fields(resource_proof, page_count)
+    _validate_resource_scalar_fields(
+        resource_proof,
+        page_count,
+        max_advertised_count_decrease,
+    )
     _validate_resource_page_geometry(resource_proof, page_count)
     return resource_proof["returned_unique"]
 
@@ -312,7 +344,12 @@ def _validate_resource(
 def _validated_completion_envelope(
     completion_proof: Any,
     completion_sha256: Any,
-) -> tuple[dict[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+) -> tuple[
+    dict[str, Any],
+    Mapping[str, Any],
+    Mapping[str, Any],
+    int,
+]:
     if not isinstance(completion_proof, Mapping) or not _is_sha256(
         completion_sha256
     ):
@@ -323,11 +360,18 @@ def _validated_completion_envelope(
         "proof_version": SERVER_ISSUED_SUBSET_COMPLETION_PROOF_VERSION,
         "contract_version": SERVER_ISSUED_SUBSET_REQUIRED_VERSION,
         "semantics": SERVER_ISSUED_SUBSET_SEMANTICS,
-        "strategy_version": SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
         "traversal_version": SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
         "canonicalization_version": SERVER_ISSUED_SUBSET_CANONICALIZATION_VERSION,
-        "completion_scopes": list(SERVER_ISSUED_SUBSET_COMPLETION_SCOPES),
     }
+    completion_scopes = completion_proof_by_field.get("completion_scopes")
+    max_advertised_count_decrease = (
+        reviewed_subset_max_advertised_count_decrease(
+            completion_proof_by_field.get("strategy_version"),
+            tuple(completion_scopes)
+            if type(completion_scopes) is list
+            else None,
+        )
+    )
     resource_proof_by_type = completion_proof_by_field.get("resources")
     dataset_by_field = completion_proof_by_field.get("dataset")
     if (
@@ -336,6 +380,7 @@ def _validated_completion_envelope(
             completion_proof_by_field.get(key) != expected_value
             for key, expected_value in fixed_value_by_field.items()
         )
+        or max_advertised_count_decrease is None
         or type(completion_proof_by_field.get("campaign_id")) is not str
         or not completion_proof_by_field["campaign_id"]
         or not _is_canonical_utc_instant(completion_proof_by_field.get("cutoff"))
@@ -347,7 +392,12 @@ def _validated_completion_envelope(
         or set(dataset_by_field) != _DATASET_FIELDS
     ):
         raise ValueError("provider_directory_subset_completion_proof_invalid")
-    return completion_proof_by_field, resource_proof_by_type, dataset_by_field
+    return (
+        completion_proof_by_field,
+        resource_proof_by_type,
+        dataset_by_field,
+        max_advertised_count_decrease,
+    )
 
 
 def _validate_completion_dataset(
@@ -407,11 +457,13 @@ def validate_subset_completion_proof_pair(
         completion_proof_by_field,
         resource_proof_by_type,
         dataset_by_field,
+        max_advertised_count_decrease,
     ) = _validated_completion_envelope(completion_proof, completion_sha256)
     returned_count_by_type = {
         resource_type: _validate_resource(
             resource_proof,
             page_count=completion_proof_by_field["page_count"],
+            max_advertised_count_decrease=max_advertised_count_decrease,
         )
         for resource_type, resource_proof in resource_proof_by_type.items()
         if isinstance(resource_proof, Mapping)

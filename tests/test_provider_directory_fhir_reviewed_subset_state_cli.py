@@ -24,6 +24,10 @@ from process.provider_directory_fhir_subset_abandonment_contract import (
     ReviewedSubsetAbandonmentError,
     ReviewedSubsetAbandonmentResult,
 )
+from process.provider_directory_fhir_subset_terminal_disposition_contract import (
+    TERMINAL_DISPOSITION_ENABLED_ENV,
+    ReviewedSubsetTerminalDispositionResult,
+)
 from process import provider_directory_fhir_subset_activation_evidence as evidence_api
 from tests.provider_directory_fhir_subset_activation_support import activation_inputs
 
@@ -56,6 +60,9 @@ def test_operator_is_packaged_and_absent_from_ordinary_runtime_paths():
         "provider_directory_fhir_reviewed_subset_state",
         "HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED",
         "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED",
+        "dispose_reviewed_subset_census_drift_root",
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_"
+        "TERMINAL_DISPOSITION_ENABLED",
     )
     for runtime_path in runtime_paths:
         runtime_source = runtime_path.read_text(encoding="utf-8")
@@ -140,6 +147,12 @@ def test_parser_accepts_only_fixed_command_and_no_selectors(capsys):
     assert vars(abandonment_arguments) == {
         "command": script_module.ABANDON_COMMAND
     }
+    terminal_arguments = script_module._parser().parse_args(
+        [script_module.TERMINAL_DISPOSITION_COMMAND]
+    )
+    assert vars(terminal_arguments) == {
+        "command": script_module.TERMINAL_DISPOSITION_COMMAND
+    }
     with pytest.raises(SystemExit) as error:
         script_module._parser().parse_args(
             [script_module.COMMAND, "--source-id", "private"]
@@ -163,6 +176,10 @@ def test_parser_accepts_only_fixed_command_and_no_selectors(capsys):
     (
         ("COMMAND", STATE_SYNC_ENABLED_ENV),
         ("ABANDON_COMMAND", ABANDONMENT_ENABLED_ENV),
+        (
+            "TERMINAL_DISPOSITION_COMMAND",
+            TERMINAL_DISPOSITION_ENABLED_ENV,
+        ),
     ),
 )
 def test_disabled_mutations_stop_before_runtime_imports(
@@ -279,6 +296,32 @@ async def test_abandonment_command_renders_only_closed_disposition(monkeypatch):
     )
     assert replay_result == (
         '{"abandoned":false,"already_applied":true,"status":"ok"}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_command_renders_only_closed_disposition(monkeypatch):
+    """Keep the mixed terminal seal selector-free and identifier-free."""
+
+    script_module = _script_module()
+    database = _Database()
+    disposition_call = AsyncMock(
+        return_value=ReviewedSubsetTerminalDispositionResult(disposed=True)
+    )
+    monkeypatch.setattr(
+        "process.provider_directory_fhir_subset_terminal_disposition."
+        "dispose_reviewed_subset_census_drift_root",
+        disposition_call,
+    )
+
+    rendered_result = await script_module._execute_operation(
+        database,
+        script_module.TERMINAL_DISPOSITION_COMMAND,
+    )
+
+    disposition_call.assert_awaited_once_with(database=database)
+    assert rendered_result == (
+        '{"already_applied":false,"disposed":true,"status":"ok"}'
     )
 
 

@@ -286,19 +286,38 @@ def _disabled_reviewed_subset_operation_report(
     }
 
 
-def _reviewed_subset_state_sync_report() -> dict[str, Any]:
-    """Prove the selector-free operators are packaged and default-off."""
+def _reviewed_subset_operation_gates() -> tuple[tuple[str, str], ...]:
+    """Return each packaged mutating operation and its one-shot gate."""
 
     from process.provider_directory_fhir_subset_abandonment_contract import (
         ABANDONMENT_ENABLED_ENV,
     )
     from process.provider_directory_fhir_subset_activation_contract import (
-        PENDING_STATUS,
         STATE_SYNC_ENABLED_ENV,
+    )
+    from process.provider_directory_fhir_subset_terminal_disposition_contract import (
+        TERMINAL_DISPOSITION_ENABLED_ENV,
+    )
+
+    return (
+        ("sync-verified-state", STATE_SYNC_ENABLED_ENV),
+        ("abandon-expired-root", ABANDONMENT_ENABLED_ENV),
+        ("seal-terminal-root", TERMINAL_DISPOSITION_ENABLED_ENV),
+    )
+
+
+def _reviewed_subset_state_sync_report() -> dict[str, Any]:
+    """Prove the selector-free operators are packaged and default-off."""
+
+    from process.provider_directory_fhir_subset_activation_contract import (
+        PENDING_STATUS,
         VERIFIED_STATUS,
         reviewed_subset_activation_manifest,
     )
-
+    from process.provider_directory_fhir_root_policy import (
+        POLICY_PENDING_STATUS,
+        POLICY_VERIFIED_STATUS,
+    )
     missing_paths = [
         str(path.relative_to(ROOT))
         for path in (REVIEWED_SUBSET_OPERATOR, REVIEWED_SUBSET_MANIFEST)
@@ -311,16 +330,18 @@ def _reviewed_subset_state_sync_report() -> dict[str, Any]:
             disabled_environment,
         )
         for command_name, disabled_environment in (
-            ("sync-verified-state", STATE_SYNC_ENABLED_ENV),
-            ("abandon-expired-root", ABANDONMENT_ENABLED_ENV),
+            _reviewed_subset_operation_gates()
         )
     }
     is_manifest_valid = (
-        manifest.desired_candidate_status == PENDING_STATUS
+        manifest.desired_candidate_status
+        in (PENDING_STATUS, POLICY_PENDING_STATUS)
         and manifest.evidence is None
     ) or (
-        manifest.desired_candidate_status == VERIFIED_STATUS
+        manifest.desired_candidate_status
+        in (VERIFIED_STATUS, POLICY_VERIFIED_STATUS)
         and manifest.evidence is not None
+        and manifest.is_verified
     )
     return {
         "ok": (

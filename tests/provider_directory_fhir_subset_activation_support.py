@@ -171,15 +171,20 @@ def _single_root_candidate_metadata(
     }
 
 
-def single_root_activation_inputs():
+def single_root_activation_inputs(*, contract=None):
     """Return one policy-bearing source and one complete sealed root."""
 
     root_policy = ReviewedRootPolicy(1)
-    source_record = valid_source_record("pending_reviewed_subset_acquisition")
+    source_record = valid_source_record(
+        "pending_reviewed_subset_acquisition",
+        contract=contract,
+    )
     source_record["metadata_json"][
         "provider_directory_reviewed_root_policy_v1"
     ] = root_policy.document()
-    proof, proof_sha256, replay, replay_sha256 = valid_evidence_pairs()
+    proof, proof_sha256, replay, replay_sha256 = valid_evidence_pairs(
+        contract=contract,
+    )
     scope_sha256 = canonical_sha256(
         server_issued_subset_source_scope_payload(
             source_record,
