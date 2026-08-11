@@ -1023,6 +1023,8 @@ jobs:
           -o asyncio_default_fixture_loop_scope=session
           --durations=20
           tests/test_address_canonical_db.py
+          tests/test_address_format_db.py
+          tests/test_address_formatted_serving_db.py
           tests/test_address_numeric_grid_alias_db.py
           tests/test_address_numeric_grid_alias_fences_db.py
           tests/test_address_numeric_grid_alias_lifecycle_db.py

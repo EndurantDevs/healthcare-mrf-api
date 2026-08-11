@@ -238,6 +238,10 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_importer["terminology-synonyms"]["worker_class"] == "process.TerminologySynonyms"
     assert by_importer["openaddresses"]["worker_class"] == "process.OpenAddresses"
     assert (
+        by_importer["address-formatted-address"]["worker_class"]
+        == "process.AddressArchive"
+    )
+    assert (
         by_importer["address-numeric-grid-alias"]["worker_class"]
         == "process.AddressArchive"
     )

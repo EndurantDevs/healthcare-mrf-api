@@ -90,6 +90,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
         "process.AddressArchive",
         (
             "address-archive-v2-migrate",
+            "address-formatted-address",
             "address-numeric-grid-alias",
             "address-numeric-grid-alias-revoke",
             "address-strict-source-backfill",

@@ -43,25 +43,30 @@ def test_overlay_query_types_optional_address_key_as_uuid():
 async def test_address_overlay_serving_identity_uses_current_relation_oid(
     monkeypatch,
 ):
-    """Bind response caching to the uncached address-overlay relation."""
+    """Bind response caching to both uncached address-serving relations."""
+
+    class Row:
+        overlay_target_oid = 424242
+        unified_target_oid = 434343
 
     class Result:
-        def scalar(self):
-            return 424242
+        def first(self):
+            return Row()
 
     execute = AsyncMock(return_value=Result())
     monkeypatch.setattr(npi_module, "_execute_stmt", execute)
 
     assert (
         await npi_module._provider_directory_address_overlay_serving_identity()
-        == "oid:424242"
+        == "overlay:oid:424242|unified:oid:434343"
     )
     assert (
         "to_regclass(:overlay_table_ref)::oid::bigint"
         in str(execute.await_args.args[0])
     )
     assert execute.await_args.kwargs["params"] == {
-        "overlay_table_ref": "mrf.provider_directory_address_overlay"
+        "overlay_table_ref": "mrf.provider_directory_address_overlay",
+        "unified_table_ref": "mrf.entity_address_unified",
     }
 
 

@@ -340,17 +340,11 @@ def _cohort_sql_phase_1_build_features(ctx: dict[str, Any]) -> str:
     """
 
 
-def _cohort_sql_phase_2_lsh_shard(ctx: dict[str, Any]) -> str:
-    """Build phase-two LSH shard SQL."""
-    schema = ctx["schema"]
-    lsh_table = ctx["lsh_table"]
-    lsh_insert_cols_sql = ctx["lsh_insert_cols_sql"]
-    lsh_select_cols_sql = ctx["lsh_select_cols_sql"]
-    return f"""
+_COHORT_SQL_PHASE_2_LSH_SHARD_TEMPLATE = """
         WITH deleted AS (
             DELETE FROM {schema}.{lsh_table} d
             WHERE d.year = :year
-              AND {_npi_shard_predicate("d.npi")}
+              AND {delete_shard_predicate}
             RETURNING 1
         ),
         provider_proc AS (
@@ -358,12 +352,12 @@ def _cohort_sql_phase_2_lsh_shard(ctx: dict[str, Any]) -> str:
                 pp.npi,
                 pp.year,
                 pp.procedure_code::varchar AS procedure_key
-            FROM {schema}.{PricingProviderProcedure.__tablename__} pp
+            FROM {schema}.{procedure_table} pp
             WHERE pp.year = :year
-              AND {_npi_shard_predicate("pp.npi")}
+              AND {procedure_shard_predicate}
         ),
         perms AS (
-            SELECT generate_series(0, {PROVIDER_QUALITY_MINHASH_NUM_PERM} - 1) AS perm_no
+            SELECT generate_series(0, {minhash_num_perm} - 1) AS perm_no
         ),
         signatures AS (
             SELECT
@@ -379,14 +373,14 @@ def _cohort_sql_phase_2_lsh_shard(ctx: dict[str, Any]) -> str:
             SELECT
                 s.npi,
                 s.year,
-                FLOOR(s.perm_no / {PROVIDER_QUALITY_MINHASH_ROWS_PER_BAND})::int AS band_no,
+                FLOOR(s.perm_no / {minhash_rows_per_band})::int AS band_no,
                 STRING_AGG(
                     LPAD(TO_HEX((s.min_hash % 4294967295)::bigint), 8, '0'),
                     '|' ORDER BY s.perm_no
                 )::varchar AS band_signature,
                 COUNT(*)::int AS rows_in_band
             FROM signatures s
-            GROUP BY s.npi, s.year, FLOOR(s.perm_no / {PROVIDER_QUALITY_MINHASH_ROWS_PER_BAND})
+            GROUP BY s.npi, s.year, FLOOR(s.perm_no / {minhash_rows_per_band})
         ),
         lsh_src AS (
             SELECT
@@ -398,7 +392,7 @@ def _cohort_sql_phase_2_lsh_shard(ctx: dict[str, Any]) -> str:
                 'provider_quality'::varchar AS source,
                 NOW() AS updated_at
             FROM bands b
-            WHERE b.band_no < {PROVIDER_QUALITY_MINHASH_BANDS}
+            WHERE b.band_no < {minhash_bands}
         )
         INSERT INTO {schema}.{lsh_table}
         (
@@ -408,6 +402,22 @@ def _cohort_sql_phase_2_lsh_shard(ctx: dict[str, Any]) -> str:
             {lsh_select_cols_sql}
         FROM lsh_src s;
     """
+
+
+def _cohort_sql_phase_2_lsh_shard(ctx: dict[str, Any]) -> str:
+    """Build phase-two LSH shard SQL."""
+    return _COHORT_SQL_PHASE_2_LSH_SHARD_TEMPLATE.format(
+        schema=ctx["schema"],
+        lsh_table=ctx["lsh_table"],
+        lsh_insert_cols_sql=ctx["lsh_insert_cols_sql"],
+        lsh_select_cols_sql=ctx["lsh_select_cols_sql"],
+        delete_shard_predicate=_npi_shard_predicate("d.npi"),
+        procedure_shard_predicate=_npi_shard_predicate("pp.npi"),
+        procedure_table=PricingProviderProcedure.__tablename__,
+        minhash_num_perm=PROVIDER_QUALITY_MINHASH_NUM_PERM,
+        minhash_rows_per_band=PROVIDER_QUALITY_MINHASH_ROWS_PER_BAND,
+        minhash_bands=PROVIDER_QUALITY_MINHASH_BANDS,
+    )
 
 
 def _cohort_sql_phase_3_procedure_bucket(ctx: dict[str, Any]) -> str | None:
