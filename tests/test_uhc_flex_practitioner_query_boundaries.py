@@ -69,7 +69,9 @@ def test_resource_json_rejects_oversized_or_unserializable_payload(monkeypatch):
     ("identifiers", "expected_code"),
     [
         (None, "requested_npi_missing"),
+        ([], "requested_npi_missing"),
         ([None], "payload_invalid"),
+        ([{"system": UHC_FLEX_OFFICIAL_NPI_SYSTEM, "value": "1588616783"}], "cross_npi"),
         ([{"system": UHC_FLEX_OFFICIAL_NPI_SYSTEM, "value": None}], "resource_npi_invalid"),
         ([{"system": UHC_FLEX_OFFICIAL_NPI_SYSTEM, "value": "123"}], "resource_npi_invalid"),
         ([{"system": UHC_FLEX_OFFICIAL_NPI_SYSTEM, "value": "1234567890"}], "resource_npi_invalid"),
