@@ -66252,52 +66252,113 @@ async def _subset_acquired_resource_hashes(
 ) -> dict[str, str]:
     """Hash ordered raw-resource digests without retaining private transport data."""
 
-    acquired_resource_rows = await connection.all(
-        f"""
-        SELECT resource_type, resource_id,
-               acquired_resource_sha256
-          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
-         WHERE dataset_id = :dataset_id
-           AND resource_type = ANY(CAST(:resource_types AS varchar[]))
-         ORDER BY resource_type, resource_id;
-        """,
-        dataset_id=candidate.dataset_id,
-        resource_types=list(candidate.selected_resources),
-    )
-    entry_by_type: dict[str, list[dict[str, str]]] = {
-        resource_type: [] for resource_type in candidate.selected_resources
+    hasher_by_type = {
+        resource_type: hashlib.sha256(b"[")
+        for resource_type in candidate.selected_resources
     }
-    for acquired_resource_row in acquired_resource_rows:
-        row_map = _pagination_checkpoint_row_mapping(acquired_resource_row)
-        resource_type = _clean_text(row_map.get("resource_type"))
-        resource_id = _clean_text(row_map.get("resource_id"))
-        acquired_sha256 = _clean_text(
-            row_map.get("acquired_resource_sha256")
-        )
-        if (
-            resource_type not in entry_by_type
-            or resource_id is None
-            or acquired_sha256 is None
-            or re.fullmatch(r"[0-9a-f]{64}", acquired_sha256) is None
-        ):
-            raise RuntimeError(
-                "provider_directory_subset_acquired_content_invalid"
+    count_by_type = dict.fromkeys(candidate.selected_resources, 0)
+    after_resource_type: str | None = None
+    after_resource_id: str | None = None
+    batch_size = max(1, ENDPOINT_DATASET_HASH_BATCH_SIZE)
+    while True:
+        query_params_by_name: dict[str, Any] = {
+            "dataset_id": candidate.dataset_id,
+            "resource_types": list(candidate.selected_resources),
+            "batch_size": batch_size,
+        }
+        has_cursor = after_resource_type is not None
+        if has_cursor:
+            query_params_by_name.update(
+                after_resource_type=after_resource_type,
+                after_resource_id=after_resource_id,
             )
-        entry_by_type[resource_type].append(
-            {"resource_id": resource_id, "sha256": acquired_sha256}
+        acquired_resource_rows = await connection.all(
+            _subset_acquired_page_sql(has_cursor),
+            **query_params_by_name,
         )
+        if not acquired_resource_rows:
+            break
+        for acquired_resource_row in acquired_resource_rows:
+            after_resource_type, after_resource_id = (
+                _update_subset_acquired_hash(
+                    acquired_resource_row,
+                    hasher_by_type,
+                    count_by_type,
+                )
+            )
+        if len(acquired_resource_rows) < batch_size:
+            break
     if any(
-        len(entry_by_type[resource_type])
+        count_by_type[resource_type]
         != expected_count_by_type.get(resource_type)
         for resource_type in candidate.selected_resources
     ):
         raise RuntimeError(
             "provider_directory_subset_acquired_content_count_mismatch"
         )
+    for hasher in hasher_by_type.values():
+        hasher.update(b"]")
     return {
-        resource_type: subset_canonical_sha256(entry_by_type[resource_type])
-        for resource_type in sorted(entry_by_type)
+        resource_type: hasher_by_type[resource_type].hexdigest()
+        for resource_type in sorted(hasher_by_type)
     }
+
+
+def _update_subset_acquired_hash(
+    acquired_resource_row: Any,
+    hasher_by_type: dict[str, Any],
+    count_by_type: dict[str, int],
+) -> tuple[str, str]:
+    """Validate and hash one acquired digest, returning its raw cursor."""
+
+    row_map = _pagination_checkpoint_row_mapping(acquired_resource_row)
+    raw_resource_type = row_map.get("resource_type")
+    raw_resource_id = row_map.get("resource_id")
+    resource_type = _clean_text(raw_resource_type)
+    resource_id = _clean_text(raw_resource_id)
+    acquired_sha256 = _clean_text(row_map.get("acquired_resource_sha256"))
+    if (
+        resource_type not in hasher_by_type
+        or resource_id is None
+        or acquired_sha256 is None
+        or re.fullmatch(r"[0-9a-f]{64}", acquired_sha256) is None
+    ):
+        raise RuntimeError(
+            "provider_directory_subset_acquired_content_invalid"
+        )
+    hasher = hasher_by_type[resource_type]
+    if count_by_type[resource_type]:
+        hasher.update(b",")
+    hasher.update(
+        _stable_identity_json(
+            {"resource_id": resource_id, "sha256": acquired_sha256}
+        ).encode("utf-8")
+    )
+    count_by_type[resource_type] += 1
+    return raw_resource_type, raw_resource_id
+
+
+def _subset_acquired_page_sql(has_cursor: bool) -> str:
+    """Render one bounded composite-key page for acquired digests."""
+
+    cursor_filter = (
+        """
+           AND (dataset_id, resource_type, resource_id) >
+               (:dataset_id, :after_resource_type, :after_resource_id)
+        """
+        if has_cursor
+        else ""
+    )
+    return f"""
+        SELECT resource_type, resource_id,
+               acquired_resource_sha256
+          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+         WHERE dataset_id = :dataset_id
+           AND resource_type = ANY(CAST(:resource_types AS varchar[]))
+           {cursor_filter}
+         ORDER BY resource_type, resource_id
+         LIMIT :batch_size;
+    """
 
 
 def _outcome_resource_count_proof(
