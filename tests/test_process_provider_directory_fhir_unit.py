@@ -19153,9 +19153,11 @@ async def test_scan_candidate_dispatches_practitioner_role_to_last_updated(monke
         page_count=100,
         timeout=3,
         run_id="run_scan_candidate",
+        deferred_materialization=True,
     )
 
     assert operation_result is expected_result
+    assert partition_fetch.await_args.args[4].deferred_materialization is True
     partition_fetch.assert_awaited_once()
     assert partition_fetch.await_args.args[:3] == (
         source_row,
