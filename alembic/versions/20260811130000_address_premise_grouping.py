@@ -46,23 +46,29 @@ def _column_sql(schema: str) -> str:
     """
 
 
-def _index_sql(schema: str) -> str:
-    return f"""
-    CREATE INDEX IF NOT EXISTS {_q(_PREMISE_INDEX)}
-        ON {_qt(schema, _OVERLAY_TABLE)} (npi, premise_key)
-     WHERE premise_key IS NOT NULL;
-    """
+def _drop_index_sql(schema: str) -> str:
+    return (
+        "DROP INDEX CONCURRENTLY IF EXISTS "
+        f"{_qt(schema, _PREMISE_INDEX)};"
+    )
 
 
 def upgrade() -> None:
     schema = _schema()
+    op.execute("SET LOCAL lock_timeout = '5s';")
+    # Existing overlays are large and contain no premise values until the
+    # required full artifact rebuild. Building their empty partial index here
+    # would put a full-table scan inside the deployment migration gate. The
+    # overlay publisher instead builds the index on its unpublished stage and
+    # promotes it together with the hydrated rows.
     op.execute(_column_sql(schema))
-    op.execute(_index_sql(schema))
 
 
 def downgrade() -> None:
     schema = _schema()
-    op.execute(f"DROP INDEX IF EXISTS {_qt(schema, _PREMISE_INDEX)};")
+    with op.get_context().autocommit_block():
+        op.execute(_drop_index_sql(schema))
+    op.execute("SET LOCAL lock_timeout = '5s';")
     op.execute(
         f"ALTER TABLE IF EXISTS {_qt(schema, _OVERLAY_TABLE)} "
         "DROP COLUMN IF EXISTS premise_key;"

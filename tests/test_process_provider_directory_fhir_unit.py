@@ -28135,10 +28135,7 @@ async def test_address_overlay_live_ensure_does_not_build_scope_index(monkeypatc
     joined_sql = "\n".join(call.args[0] for call in status.await_args_list)
     assert "provider_directory_address_overlay_source_idx" in joined_sql
     assert "ADD COLUMN IF NOT EXISTS premise_key uuid" in joined_sql
-    assert "provider_directory_address_overlay_npi_premise_key_idx" in joined_sql
-    assert joined_sql.index("ADD COLUMN IF NOT EXISTS premise_key uuid") < joined_sql.index(
-        "provider_directory_address_overlay_npi_premise_key_idx"
-    )
+    assert "provider_directory_address_overlay_npi_premise_key_idx" not in joined_sql
     assert "provider_directory_address_overlay_source_run_resource_idx" not in joined_sql
     assert "(source_id, last_seen_run_id, resource_type, resource_id)" not in joined_sql
 

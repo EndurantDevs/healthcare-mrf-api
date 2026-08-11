@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import importlib
 import importlib.util
 import os
@@ -48,6 +48,13 @@ class _OperationsRecorder:
 
     def execute(self, statement) -> None:
         self.statements.append(str(statement))
+
+    def get_context(self):
+        return self
+
+    @contextmanager
+    def autocommit_block(self):
+        yield
 
 
 def _migration_statements(operation: str, schema: str) -> list[str]:
@@ -95,7 +102,10 @@ async def _apply_statements(
     statements: list[str],
 ) -> None:
     for statement in statements:
-        await database.status(statement)
+        if statement.lstrip().startswith("DROP INDEX CONCURRENTLY"):
+            await database.execute_ddl(statement)
+        else:
+            await database.status(statement)
 
 
 async def _assert_upgrade_shape(database: Database, schema: str) -> None:
@@ -120,8 +130,7 @@ async def _assert_upgrade_shape(database: Database, schema: str) -> None:
     )
     assert column is not None
     assert (column.udt_name, column.is_nullable) == ("uuid", "YES")
-    assert "(npi, premise_key)" in str(index_definition)
-    assert "WHERE (premise_key IS NOT NULL)" in str(index_definition)
+    assert index_definition is None
 
 
 async def _seed_archive_and_overlay_rows(database: Database, schema: str) -> None:
@@ -188,7 +197,9 @@ async def _assert_archive_hydration(database: Database, schema: str, monkeypatch
 
 
 async def _assert_downgrade(database: Database, schema: str) -> None:
-    await _apply_statements(database, _migration_statements("downgrade", schema))
+    downgrade_statements = _migration_statements("downgrade", schema)
+    await _apply_statements(database, downgrade_statements)
+    await _apply_statements(database, downgrade_statements)
     column_count = await database.scalar(
         """
         SELECT count(*)
@@ -205,6 +216,90 @@ async def _assert_downgrade(database: Database, schema: str) -> None:
     )
     assert column_count == 0
     assert index_relation is None
+
+
+async def _create_overlay_stage_for_index(database: Database, schema: str) -> str:
+    stage_table = "provider_directory_address_overlay_stage_index_test"
+    await database.status(
+        f"""
+        CREATE UNLOGGED TABLE "{schema}"."{stage_table}" (
+            source_record_id varchar NOT NULL,
+            npi bigint NOT NULL,
+            premise_key uuid,
+            address_key uuid NOT NULL,
+            source_id varchar NOT NULL,
+            phone_number varchar,
+            last_seen_run_id varchar,
+            resource_type varchar NOT NULL,
+            resource_id varchar NOT NULL
+        );
+        """
+    )
+    await database.status(
+        f"""
+        INSERT INTO "{schema}"."{stage_table}"
+            (source_record_id, npi, premise_key, address_key, source_id,
+             phone_number, last_seen_run_id, resource_type, resource_id)
+        VALUES
+            ('synthetic:one', 1000000001, CAST(:premise_key AS uuid),
+             CAST(:address_key AS uuid), 'synthetic-source', NULL, 'run-one',
+             'Location', 'one'),
+            ('synthetic:two', 1000000002, NULL,
+             CAST(:second_address_key AS uuid), 'synthetic-source', NULL,
+             'run-one', 'Location', 'two');
+        """,
+        premise_key=ARCHIVE_PREMISE_KEY,
+        address_key=MATCHED_ADDRESS_KEY,
+        second_address_key=NULL_PREMISE_ADDRESS_KEY,
+    )
+    return stage_table
+
+
+async def _assert_stage_premise_index(database: Database, schema: str) -> None:
+    stage_table = await _create_overlay_stage_for_index(database, schema)
+    original_db = directory.db
+    directory.db = database
+    try:
+        await directory._create_address_overlay_stage_indexes(schema, stage_table)
+        await database.status(
+            f'ALTER TABLE "{schema}"."{stage_table}" '
+            'RENAME TO "provider_directory_address_overlay";'
+        )
+        await directory._rename_address_overlay_stage_indexes(schema, stage_table)
+    finally:
+        directory.db = original_db
+    index_name = directory._address_overlay_index_name(
+        "provider_directory_address_overlay", "npi_premise_key_idx"
+    )
+    index_row = await database.first(
+        """
+        SELECT pg_get_indexdef(index_record.oid) AS index_definition,
+               index_meta.indisvalid,
+               index_meta.indisready,
+               index_meta.indislive,
+               table_record.relname AS table_name
+          FROM pg_class AS index_record
+          JOIN pg_namespace AS index_namespace
+            ON index_namespace.oid = index_record.relnamespace
+          JOIN pg_index AS index_meta
+            ON index_meta.indexrelid = index_record.oid
+          JOIN pg_class AS table_record
+            ON table_record.oid = index_meta.indrelid
+         WHERE index_namespace.nspname = :schema
+           AND index_record.relname = :index_name;
+        """,
+        schema=schema,
+        index_name=index_name,
+    )
+    assert index_row is not None
+    assert (index_row.indisvalid, index_row.indisready, index_row.indislive) == (
+        True,
+        True,
+        True,
+    )
+    assert "(npi, premise_key)" in index_row.index_definition
+    assert "WHERE (premise_key IS NOT NULL)" in index_row.index_definition
+    assert index_row.table_name == "provider_directory_address_overlay"
 
 
 async def _seed_duplicate_source_rows(database: Database, schema: str) -> None:
@@ -294,3 +389,11 @@ async def test_premise_hydration_binds_duplicate_source_rows_by_stage_identity(
             (MATCHED_ADDRESS_KEY, ARCHIVE_PREMISE_KEY),
             (NULL_PREMISE_ADDRESS_KEY, MERGED_PREMISE_KEY),
         ]
+
+
+@pytest.mark.asyncio
+async def test_premise_index_is_deferred_to_and_promoted_with_overlay_stage():
+    """Build the partial index off-line and promote its exact usable shape."""
+
+    async with _premise_schema() as (database, schema):
+        await _assert_stage_premise_index(database, schema)

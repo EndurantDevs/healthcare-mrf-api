@@ -73069,7 +73069,11 @@ async def _ensure_provider_directory_address_overlay_table(schema: str) -> None:
     await db.status(address_overlay_coordinate_columns_sql(schema))
     await db.status(address_overlay_formatted_address_columns_sql(schema))
     await db.status(address_overlay_premise_key_column_sql(schema))
-    await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    await _create_provider_directory_address_overlay_indexes(
+        schema,
+        PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+        include_premise_index=False,
+    )
 
 
 def _address_overlay_index_name(table_name: str, suffix: str) -> str:
@@ -73080,6 +73084,7 @@ async def _create_provider_directory_address_overlay_indexes(
     schema: str,
     table_name: str,
     *,
+    include_premise_index: bool = False,
     include_scope_index: bool = False,
 ) -> None:
     table_ref = _qt(schema, table_name)
@@ -73087,11 +73092,6 @@ async def _create_provider_directory_address_overlay_indexes(
         f"CREATE UNIQUE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'source_record_idx'))} "
         f"ON {table_ref} (source_record_id);",
         f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'npi_idx'))} ON {table_ref} (npi);",
-        f"""
-        CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'npi_premise_key_idx'))}
-            ON {table_ref} (npi, premise_key)
-         WHERE premise_key IS NOT NULL;
-        """,
         f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'address_key_idx'))} "
         f"ON {table_ref} (address_key);",
         f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'source_idx'))} "
@@ -73102,6 +73102,18 @@ async def _create_provider_directory_address_overlay_indexes(
          WHERE phone_number IS NOT NULL AND phone_number <> '';
         """,
     ]
+    if include_premise_index:
+        # Premise values are archive-hydrated only on the unpublished stage.
+        # Keep this index stage-only so compatibility checks never scan the
+        # large live overlay during a migration or routine target ensure.
+        statements.insert(
+            2,
+            f"""
+            CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'npi_premise_key_idx'))}
+                ON {table_ref} (npi, premise_key)
+             WHERE premise_key IS NOT NULL;
+            """,
+        )
     if include_scope_index:
         statements.append(
             f"""
@@ -73115,7 +73127,10 @@ async def _create_provider_directory_address_overlay_indexes(
 
 async def _create_address_overlay_stage_indexes(schema: str, stage_table: str) -> None:
     await _create_provider_directory_address_overlay_indexes(
-        schema, stage_table, include_scope_index=True
+        schema,
+        stage_table,
+        include_premise_index=True,
+        include_scope_index=True,
     )
 
 

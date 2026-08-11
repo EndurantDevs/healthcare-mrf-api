@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import importlib
 from pathlib import Path
@@ -38,6 +39,13 @@ class _OperationsRecorder:
     def execute(self, statement) -> None:
         self.statements.append(str(statement))
 
+    def get_context(self):
+        return self
+
+    @contextlib.contextmanager
+    def autocommit_block(self):
+        yield
+
 
 def test_premise_migration_is_the_reviewed_subset_successor(monkeypatch):
     migration = _load_migration()
@@ -54,14 +62,13 @@ def test_premise_migration_is_the_reviewed_subset_successor(monkeypatch):
     )
     assert len(recorder.statements) == 2
     upgrade_sql = "\n".join(recorder.statements)
+    assert recorder.statements[0] == "SET LOCAL lock_timeout = '5s';"
     assert 'ALTER TABLE IF EXISTS "premise_test"."provider_directory_address_overlay"' in upgrade_sql
     assert "ADD COLUMN IF NOT EXISTS premise_key uuid" in upgrade_sql
-    assert 'CREATE INDEX IF NOT EXISTS "provider_directory_address_overlay_npi_premise_key_idx"' in upgrade_sql
-    assert '(npi, premise_key)' in upgrade_sql
-    assert "WHERE premise_key IS NOT NULL" in upgrade_sql
+    assert "CREATE INDEX" not in upgrade_sql
 
 
-def test_premise_migration_downgrade_drops_index_before_column(monkeypatch):
+def test_premise_migration_downgrade_drops_index_concurrently_before_column(monkeypatch):
     migration = _load_migration()
     recorder = _OperationsRecorder()
     monkeypatch.setattr(migration, "op", recorder)
@@ -70,9 +77,10 @@ def test_premise_migration_downgrade_drops_index_before_column(monkeypatch):
 
     migration.downgrade()
 
-    assert len(recorder.statements) == 2
-    assert "DROP INDEX IF EXISTS" in recorder.statements[0]
-    assert "DROP COLUMN IF EXISTS premise_key" in recorder.statements[1]
+    assert len(recorder.statements) == 3
+    assert "DROP INDEX CONCURRENTLY IF EXISTS" in recorder.statements[0]
+    assert recorder.statements[1] == "SET LOCAL lock_timeout = '5s';"
+    assert "DROP COLUMN IF EXISTS premise_key" in recorder.statements[2]
 
 
 def test_premise_migration_rejects_conflicting_schema_names(monkeypatch):
@@ -97,17 +105,18 @@ def test_overlay_schema_separates_archive_premise_from_source_columns():
 
 
 @pytest.mark.asyncio
-async def test_overlay_indexes_include_partial_npi_premise_lookup(monkeypatch):
+async def test_overlay_stage_indexes_include_partial_npi_premise_lookup(monkeypatch):
     status = AsyncMock()
     monkeypatch.setattr(directory.db, "status", status)
+    stage_table = "provider_directory_address_overlay_stage_test"
 
-    await directory._create_provider_directory_address_overlay_indexes(
-        "mrf",
-        "provider_directory_address_overlay",
-    )
+    await directory._create_address_overlay_stage_indexes("mrf", stage_table)
 
     joined_sql = "\n".join(call.args[0] for call in status.await_args_list)
-    assert "provider_directory_address_overlay_npi_premise_key_idx" in joined_sql
+    premise_index = directory._address_overlay_index_name(
+        stage_table, "npi_premise_key_idx"
+    )
+    assert premise_index in joined_sql
     assert "(npi, premise_key)" in joined_sql
     assert "WHERE premise_key IS NOT NULL" in joined_sql
 
