@@ -11,7 +11,7 @@ from typing import Any, Mapping
 CAPACITY_GEOMETRY_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-geometry.v5"
 PROFILE_MATERIALIZATION_MODE = "source_delta"
 PROFILE_STRATEGY_VERSION = (
-    "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5"
+    "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
 )
 
 _GEOMETRY_HASH_DOMAIN = "provider_directory_profile_capacity_geometry.v5"

@@ -11,6 +11,7 @@ import pytest
 from process import provider_directory_profile_selection as selection
 from process import provider_directory_profile_selection_contract as contract
 from process import provider_directory_profile_selection_snapshot as snapshot
+from process import provider_directory_profile as profile_artifact
 
 from .test_provider_directory_profile_selection_admission import (
     _profile_params_map,
@@ -67,15 +68,19 @@ def test_request_validation_rejects_every_noncanonical_shape():
     with pytest.raises(selection.ProviderDirectoryProfileSelectionError):
         selection._validated_dataset_collection(None)
     with pytest.raises(selection.ProviderDirectoryProfileSelectionError):
-        selection._validated_dataset_collection([
-            {"source_id": "b", "dataset_id": "1"},
-            {"source_id": "a", "dataset_id": "2"},
-        ])
+        selection._validated_dataset_collection(
+            [
+                {"source_id": "b", "dataset_id": "1"},
+                {"source_id": "a", "dataset_id": "2"},
+            ]
+        )
     with pytest.raises(selection.ProviderDirectoryProfileSelectionError):
-        selection._validated_dataset_collection([
-            {"source_id": "a", "dataset_id": "1"},
-            {"source_id": "a", "dataset_id": "1"},
-        ])
+        selection._validated_dataset_collection(
+            [
+                {"source_id": "a", "dataset_id": "1"},
+                {"source_id": "a", "dataset_id": "1"},
+            ]
+        )
     with pytest.raises(selection.ProviderDirectoryProfileSelectionError):
         selection._validated_dataset_projection({"source_id": "a"})
 
@@ -91,14 +96,16 @@ async def test_registry_row_helpers_reject_corruption_and_preserve_json(
     monkeypatch.setattr(
         selection.db,
         "first",
-        AsyncMock(side_effect=[
-            None,
-            {"proof_id": proof_id, "identity_json": "bad"},
-            {"proof_id": proof_id, "identity_json": identity},
-            None,
-            {"input_identity_digest": "digest", "payload_json": "bad"},
-            {"input_identity_digest": "digest", "payload_json": {"ok": True}},
-        ]),
+        AsyncMock(
+            side_effect=[
+                None,
+                {"proof_id": proof_id, "identity_json": "bad"},
+                {"proof_id": proof_id, "identity_json": identity},
+                None,
+                {"input_identity_digest": "digest", "payload_json": "bad"},
+                {"input_identity_digest": "digest", "payload_json": {"ok": True}},
+            ]
+        ),
     )
 
     assert await selection._registered_proof("digest") is None
@@ -180,7 +187,9 @@ async def test_register_selection_rejects_registry_and_proof_corruption(
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(selection, "_ensure_selection_proof", AsyncMock())
-    monkeypatch.setattr(selection, "_next_authority_revision", AsyncMock(return_value=4))
+    monkeypatch.setattr(
+        selection, "_next_authority_revision", AsyncMock(return_value=4)
+    )
     monkeypatch.setattr(
         selection,
         "_attestation_payload",
@@ -211,7 +220,9 @@ async def test_attest_profile_selection_maps_drift_and_returns_registered_proof(
         AsyncMock(return_value=attestation),
     )
     current = AsyncMock()
-    monkeypatch.setattr(selection, "assert_registered_profile_selection_current", current)
+    monkeypatch.setattr(
+        selection, "assert_registered_profile_selection_current", current
+    )
 
     drifted_request = _valid_request()
     drifted_request["selection_fingerprint"] = "c" * 64
@@ -223,10 +234,13 @@ async def test_attest_profile_selection_maps_drift_and_returns_registered_proof(
         await selection.attest_profile_selection(_valid_request(), _catalog())
 
     current.side_effect = None
-    assert await selection.attest_profile_selection(
-        _valid_request(),
-        _catalog(),
-    ) == attestation.payload
+    assert (
+        await selection.attest_profile_selection(
+            _valid_request(),
+            _catalog(),
+        )
+        == attestation.payload
+    )
 
 
 @pytest.mark.asyncio
@@ -249,13 +263,21 @@ async def test_current_assertion_rejects_changed_unregistered_and_old_proofs(
         computed.request_projection,
         changed_identity_map,
     )
-    with pytest.raises(selection.ProviderDirectoryProfileSelectionStale, match="changed"):
-        await selection._assert_registered_current_in_transaction(attestation, _catalog())
+    with pytest.raises(
+        selection.ProviderDirectoryProfileSelectionStale, match="changed"
+    ):
+        await selection._assert_registered_current_in_transaction(
+            attestation, _catalog()
+        )
 
     compute.return_value = computed
     registered.return_value = None
-    with pytest.raises(selection.ProviderDirectoryProfileSelectionStale, match="not_registered"):
-        await selection._assert_registered_current_in_transaction(attestation, _catalog())
+    with pytest.raises(
+        selection.ProviderDirectoryProfileSelectionStale, match="not_registered"
+    ):
+        await selection._assert_registered_current_in_transaction(
+            attestation, _catalog()
+        )
 
     identity_digest = selection._input_identity_digest(computed.identity_payload)
     registered.return_value = {
@@ -263,8 +285,12 @@ async def test_current_assertion_rejects_changed_unregistered_and_old_proofs(
         "identity_json": computed.identity_payload,
     }
     latest.return_value = None
-    with pytest.raises(selection.ProviderDirectoryProfileSelectionStale, match="not_registered"):
-        await selection._assert_registered_current_in_transaction(attestation, _catalog())
+    with pytest.raises(
+        selection.ProviderDirectoryProfileSelectionStale, match="not_registered"
+    ):
+        await selection._assert_registered_current_in_transaction(
+            attestation, _catalog()
+        )
 
     latest.return_value = {
         "input_identity_digest": identity_digest,
@@ -326,7 +352,9 @@ def test_contract_rejects_noncanonical_attestation_execution_and_results(
 
     noncanonical_map = dict(_attestation().payload)
     noncanonical_map["operation"] = "purge"
-    with pytest.raises(contract.ProviderDirectoryProfileSelectionError, match="canonical"):
+    with pytest.raises(
+        contract.ProviderDirectoryProfileSelectionError, match="canonical"
+    ):
         contract.validated_profile_selection_attestation(noncanonical_map)
 
     params = _profile_params_map()
@@ -336,10 +364,14 @@ def test_contract_rejects_noncanonical_attestation_execution_and_results(
         contract.validated_profile_execution(params)
 
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "other-node")
-    with pytest.raises(contract.ProviderDirectoryProfileSelectionError, match="does not match"):
+    with pytest.raises(
+        contract.ProviderDirectoryProfileSelectionError, match="does not match"
+    ):
         contract.validated_profile_execution(_profile_params_map())
 
-    with pytest.raises(contract.ProviderDirectoryProfileSelectionError, match="row count"):
+    with pytest.raises(
+        contract.ProviderDirectoryProfileSelectionError, match="row count"
+    ):
         contract._profile_result_counts(_execution(), True, 0)
 
     purge_map = dict(_attestation().payload)
@@ -349,9 +381,13 @@ def test_contract_rejects_noncanonical_attestation_execution_and_results(
         contract.validated_profile_selection_attestation(purge_map),
         1,
     )
-    with pytest.raises(contract.ProviderDirectoryProfileSelectionError, match="not empty"):
+    with pytest.raises(
+        contract.ProviderDirectoryProfileSelectionError, match="not empty"
+    ):
         contract._profile_result_counts(purge_execution, 1, 0)
-    with pytest.raises(contract.ProviderDirectoryProfileSelectionError, match="generation identity"):
+    with pytest.raises(
+        contract.ProviderDirectoryProfileSelectionError, match="generation identity"
+    ):
         contract.profile_selection_result(
             _execution(),
             profile_generation_id=" ",
@@ -374,22 +410,35 @@ def test_snapshot_mapping_identifiers_and_catalog_validation(monkeypatch):
     with pytest.raises(RuntimeError, match="catalog_invalid"):
         snapshot._catalog_source_groups({"catalog_digest": "short", "items": []})
     with pytest.raises(RuntimeError, match="catalog_invalid"):
-        snapshot._catalog_source_groups({
-            "catalog_digest": "a" * 64,
-            "items": [{"runnable": True, "profile_enabled": True, "source_ids": []}],
-        })
+        snapshot._catalog_source_groups(
+            {
+                "catalog_digest": "a" * 64,
+                "items": [
+                    {"runnable": True, "profile_enabled": True, "source_ids": []}
+                ],
+            }
+        )
     with pytest.raises(RuntimeError, match="catalog_invalid"):
-        snapshot._catalog_source_groups({
+        snapshot._catalog_source_groups(
+            {
+                "catalog_digest": "a" * 64,
+                "items": [
+                    {"runnable": True, "profile_enabled": True, "source_ids": ["a"]},
+                    {"runnable": True, "profile_enabled": True, "source_ids": ["a"]},
+                ],
+            }
+        )
+    assert snapshot._catalog_source_groups(
+        {
             "catalog_digest": "a" * 64,
             "items": [
-                {"runnable": True, "profile_enabled": True, "source_ids": ["a"]},
-                {"runnable": True, "profile_enabled": True, "source_ids": ["a"]},
+                {"runnable": False, "profile_enabled": True, "source_ids": ["a"]}
             ],
-        })
-    assert snapshot._catalog_source_groups({
-        "catalog_digest": "a" * 64,
-        "items": [{"runnable": False, "profile_enabled": True, "source_ids": ["a"]}],
-    }) == (("pdfhir_1ceb7c0986c320b7eb924881",),)
+        }
+    ) == (
+        ("pdfhir_1ceb7c0986c320b7eb924881",),
+        ("pdfhir_2b088f28554b9e51505b455e",),
+    )
 
 
 @pytest.mark.parametrize(
@@ -404,19 +453,26 @@ def test_snapshot_source_indexes_and_record_guards_cover_invalid_rows():
     with pytest.raises(RuntimeError, match="source_invalid"):
         snapshot._source_selection_indexes([{"source_id": None}])
     with pytest.raises(RuntimeError, match="source_invalid"):
-        snapshot._source_selection_indexes([
-            {"source_id": "a", "endpoint_id": "e"},
-            {"source_id": "a", "endpoint_id": "e"},
-        ])
-    assert snapshot._source_selection_indexes([
-        {"source_id": "a", "endpoint_id": None},
-        {"source_id": "b", "endpoint_id": "e"},
-    ])[1] == {"e": {"b"}}
-    assert snapshot._dataset_selection_by_group(
-        [{"endpoint_id": None, "publication_metadata_json": {"source_ids": ["a"]}}],
-        (("a",),),
-        {},
-    ) == {}
+        snapshot._source_selection_indexes(
+            [
+                {"source_id": "a", "endpoint_id": "e"},
+                {"source_id": "a", "endpoint_id": "e"},
+            ]
+        )
+    assert snapshot._source_selection_indexes(
+        [
+            {"source_id": "a", "endpoint_id": None},
+            {"source_id": "b", "endpoint_id": "e"},
+        ]
+    )[1] == {"e": {"b"}}
+    assert (
+        snapshot._dataset_selection_by_group(
+            [{"endpoint_id": None, "publication_metadata_json": {"source_ids": ["a"]}}],
+            (("a",),),
+            {},
+        )
+        == {}
+    )
 
     invalid_dataset = _dataset_row()
     invalid_dataset["publication_metadata_json"] = None
@@ -439,50 +495,3 @@ def test_snapshot_source_indexes_and_record_guards_cover_invalid_rows():
         {"pdfhir_payer": _source_row()},
     )
     assert selection_records.pairs == []
-
-
-@pytest.mark.asyncio
-async def test_snapshot_database_queries_and_optional_lock(monkeypatch):
-    status = AsyncMock()
-    all_rows = AsyncMock(side_effect=[
-        [SimpleNamespace(_mapping={"source_id": "a"})],
-        [{"dataset_id": "d"}],
-    ])
-    monkeypatch.setattr(snapshot.db, "status", status)
-    monkeypatch.setattr(snapshot.db, "all", all_rows)
-
-    await snapshot._lock_profile_selection_tables()
-    assert await snapshot._selection_source_rows() == [{"source_id": "a"}]
-    assert await snapshot._selection_dataset_rows() == [{"dataset_id": "d"}]
-    assert status.await_count == 4
-    advisory_call = status.await_args_list[0]
-    assert "pg_advisory_xact_lock" in advisory_call.args[0]
-    assert advisory_call.kwargs["lock_identity"].endswith(
-        "pdfhir_1ceb7c0986c320b7eb924881"
-    )
-    assert all_rows.await_count == 2
-
-    lock = AsyncMock()
-    monkeypatch.setattr(snapshot, "_lock_profile_selection_tables", lock)
-    monkeypatch.setattr(
-        snapshot,
-        "_selection_source_rows",
-        AsyncMock(return_value=[_source_row()]),
-    )
-    monkeypatch.setattr(
-        snapshot,
-        "_selection_dataset_rows",
-        AsyncMock(return_value=[_dataset_row()]),
-    )
-    unlocked = await snapshot._compute_current_selection(
-        _catalog(),
-        node_id="dev-node",
-        lock_selection=False,
-    )
-    locked = await snapshot._compute_current_selection(
-        _catalog(),
-        node_id="dev-node",
-        lock_selection=True,
-    )
-    assert unlocked == locked
-    lock.assert_awaited_once_with()

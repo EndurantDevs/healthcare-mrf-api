@@ -52,6 +52,10 @@ from process.uhc_semantic_build_store import (
     UHC_SEMANTIC_CONTRACT_ID,
     UHC_SEMANTIC_CONTRACT_VERSION,
 )
+from tests.uhc_retained_registry_test_support import (
+    records_payload,
+    write_retained_fixture,
+)
 
 
 def _provider_record(provider_type: str) -> dict[str, object]:
@@ -343,9 +347,36 @@ def _admitted_file(tmp_path: Path, *, source_file_id: str = "a" * 64):
         record_count=1,
         range_set_sha256="c" * 64,
         manifest_sha256=hashlib.sha256(b"{}").hexdigest(),
+        manifest_byte_count=2,
         raw_producer_build_id="unit-fixture-producer-v1",
         raw_path=raw_path,
         manifest_path=manifest_path,
+    )
+
+
+def _verified_admitted_file(tmp_path: Path) -> UhcAdmittedFile:
+    fixture = write_retained_fixture(
+        tmp_path / "retained",
+        records_payload(count=4),
+    )
+    manifest = json.loads(fixture["manifest_path"].read_text())
+    return UhcAdmittedFile(
+        catalog_set_sha256="b" * 64,
+        source_file_id="a" * 64,
+        family="ifp",
+        collection_kind="provider_membership",
+        file_name="JSON_Providers_ILIEX.json",
+        artifact_sha256=fixture["artifact_sha256"],
+        artifact_byte_count=fixture["artifact_byte_count"],
+        raw_contract_version=2,
+        raw_range_count=fixture["range_count"],
+        record_count=fixture["record_count"],
+        range_set_sha256=manifest["range_set_sha256"],
+        manifest_sha256=fixture["manifest_sha256"],
+        manifest_byte_count=fixture["manifest_byte_count"],
+        raw_producer_build_id=fixture["producer_build_id"],
+        raw_path=fixture["raw_path"],
+        manifest_path=fixture["manifest_path"],
     )
 
 
@@ -534,20 +565,29 @@ def test_semantic_arguments_and_native_report_contract(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reused_semantic_file_covers_build_missing_and_success(
+async def test_reused_semantic_file_returns_none_for_new_build(tmp_path):
+    admitted = _admitted_file(tmp_path)
+    encoder = "d" * 64
+    identity = admitted.semantic_identity(encoder)
+
+    reused_file = await retained._reused_semantic_file(
+        object(),
+        admitted,
+        identity,
+        _claim(admitted, encoder),
+    )
+
+    assert reused_file is None
+
+
+@pytest.mark.asyncio
+async def test_reused_semantic_file_rejects_missing_sealed_build(
     monkeypatch,
     tmp_path,
 ):
     admitted = _admitted_file(tmp_path)
     encoder = "d" * 64
     identity = admitted.semantic_identity(encoder)
-    assert await retained._reused_semantic_file(
-        object(),
-        admitted,
-        identity,
-        _claim(admitted, encoder),
-    ) is None
-
     monkeypatch.setattr(
         retained,
         "load_sealed_uhc_semantic_build",
@@ -560,16 +600,36 @@ async def test_reused_semantic_file_covers_build_missing_and_success(
             identity,
             _claim(admitted, encoder, sealed_reuse=True),
         )
+
+
+@pytest.mark.asyncio
+async def test_reused_semantic_file_rehashes_source_before_success(
+    monkeypatch,
+    tmp_path,
+):
+    admitted = _admitted_file(tmp_path)
+    encoder = "d" * 64
+    identity = admitted.semantic_identity(encoder)
     build_row_by_field = {
         "stage_schema": "mrf",
         "stage_relation": "stage",
     }
-    retained.load_sealed_uhc_semantic_build.return_value = build_row_by_field
+    monkeypatch.setattr(
+        retained,
+        "load_sealed_uhc_semantic_build",
+        AsyncMock(return_value=build_row_by_field),
+    )
     verifier = AsyncMock()
+    retained_source_verifier = Mock(return_value=(object(), ()))
     monkeypatch.setattr(
         retained,
         "verify_sealed_uhc_semantic_build",
         verifier,
+    )
+    monkeypatch.setattr(
+        retained,
+        "load_verified_range_manifest",
+        retained_source_verifier,
     )
     sealed = await retained._reused_semantic_file(
         object(),
@@ -578,7 +638,98 @@ async def test_reused_semantic_file_covers_build_missing_and_success(
         _claim(admitted, encoder, sealed_reuse=True),
     )
     assert sealed.build_row == build_row_by_field
+    retained_source_verifier.assert_called_once_with(
+        raw_path=admitted.raw_path,
+        manifest_path=admitted.manifest_path,
+        expected_artifact_sha256=admitted.artifact_sha256,
+        expected_artifact_bytes=admitted.artifact_byte_count,
+        expected_manifest_sha256=admitted.manifest_sha256,
+        expected_manifest_bytes=admitted.manifest_byte_count,
+        expected_range_count=admitted.raw_range_count,
+        producer_build_id=admitted.raw_producer_build_id,
+        verify_raw_bytes=True,
+    )
     verifier.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sealed_semantic_reuse_rejects_same_size_retained_tamper(
+    monkeypatch,
+    tmp_path,
+):
+    admitted = _verified_admitted_file(tmp_path)
+    raw_bytes = bytearray(admitted.raw_path.read_bytes())
+    raw_bytes[len(raw_bytes) // 2] ^= 1
+    admitted.raw_path.write_bytes(raw_bytes)
+    encoder = "d" * 64
+    identity = admitted.semantic_identity(encoder)
+    monkeypatch.setattr(
+        retained,
+        "load_sealed_uhc_semantic_build",
+        AsyncMock(return_value={"stage_schema": "mrf", "stage_relation": "stage"}),
+    )
+    sealed_verifier = AsyncMock()
+    monkeypatch.setattr(
+        retained,
+        "verify_sealed_uhc_semantic_build",
+        sealed_verifier,
+    )
+
+    with pytest.raises(UhcRetainedDatasetError, match="reuse source proof"):
+        await retained._reused_semantic_file(
+            object(),
+            admitted,
+            identity,
+            _claim(admitted, encoder, sealed_reuse=True),
+        )
+
+    sealed_verifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["missing", "unreadable"])
+async def test_sealed_semantic_reuse_rejects_unavailable_raw_bytes(
+    monkeypatch,
+    tmp_path,
+    failure_mode,
+):
+    admitted = _verified_admitted_file(tmp_path)
+    if failure_mode == "missing":
+        admitted.raw_path.unlink()
+    else:
+        import process.uhc_retained_types as retained_types
+
+        real_open = retained_types.os.open
+
+        def reject_raw_open(path, flags, *args, **kwargs):
+            if Path(path) == admitted.raw_path:
+                raise PermissionError("synthetic unreadable retained raw")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(retained_types.os, "open", reject_raw_open)
+    encoder = "d" * 64
+    identity = admitted.semantic_identity(encoder)
+    monkeypatch.setattr(
+        retained,
+        "load_sealed_uhc_semantic_build",
+        AsyncMock(return_value={"stage_schema": "mrf", "stage_relation": "stage"}),
+    )
+    sealed_verifier = AsyncMock()
+    monkeypatch.setattr(
+        retained,
+        "verify_sealed_uhc_semantic_build",
+        sealed_verifier,
+    )
+
+    with pytest.raises(UhcRetainedDatasetError, match="reuse source proof"):
+        await retained._reused_semantic_file(
+            object(),
+            admitted,
+            identity,
+            _claim(admitted, encoder, sealed_reuse=True),
+        )
+
+    sealed_verifier.assert_not_awaited()
 
 
 @pytest.mark.asyncio

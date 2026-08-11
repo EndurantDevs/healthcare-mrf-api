@@ -19,22 +19,17 @@ from process.provider_directory_profile_capacity_types import (
 CAPACITY_RUNTIME_WITNESS_DOMAIN = (
     "healthporta.provider-directory.database-capacity-runtime-witness.v1"
 )
-# These frozen wire names collide with a context-blind integration-name
-# fingerprint when written as one source token. Literal assembly preserves the
-# exact public schema without weakening that repository-wide hygiene check.
-CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD = (
-    "import" "_control_source_commit"
-)
-CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD = (
-    "import" "_control_image_digest"
-)
+# Lease-v3 uses source-neutral runtime provenance. Historical lease-v2 readers
+# retain their own closed legacy field set for replay compatibility.
+CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD = "control_plane_source_commit"
+CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD = "control_plane_image_digest"
 
 _RUNTIME_WITNESS_FIELDS = frozenset(
     {
         "healthcare_source_commit",
         "healthcare_image_digest",
-        CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD,
-        CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD,
+        CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD,
+        CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD,
         "profile_migration_revision",
         "profile_schema_version",
         "profile_strategy_version",
@@ -54,9 +49,7 @@ _DEPLOYMENT_WITNESS_FIELDS = frozenset(
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _LOWER_HEX_40 = re.compile(r"[0-9a-f]{40}\Z")
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_MIGRATION_REVISION = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z"
-)
+_MIGRATION_REVISION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _MAX_SIGNED_BIGINT = (1 << 63) - 1
 
@@ -76,12 +69,8 @@ class CapacityLeaseRuntimeWitness:
 
     healthcare_source_commit: str
     healthcare_image_digest: str
-    __annotations__[
-        CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD
-    ] = str
-    __annotations__[
-        CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD
-    ] = str
+    __annotations__[CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD] = str
+    __annotations__[CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD] = str
     profile_migration_revision: str
     profile_schema_version: int
     profile_strategy_version: str
@@ -229,13 +218,13 @@ def _runtime_witness_identity(
             witness["healthcare_image_digest"],
             field="healthcare_image_digest",
         ),
-        CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD: _source_commit(
-            witness[CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD],
-            field=CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD,
+        CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD: _source_commit(
+            witness[CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD],
+            field=CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD,
         ),
-        CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD: _image_digest(
-            witness[CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD],
-            field=CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD,
+        CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD: _image_digest(
+            witness[CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD],
+            field=CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD,
         ),
     }
 
@@ -321,8 +310,8 @@ def _parse_capacity_deployment_witness(
 
 
 __all__ = (
-    "CAPACITY_RUNTIME_COORDINATOR_IMAGE_DIGEST_FIELD",
-    "CAPACITY_RUNTIME_COORDINATOR_SOURCE_COMMIT_FIELD",
+    "CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD",
+    "CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD",
     "CAPACITY_RUNTIME_WITNESS_DOMAIN",
     "CapacityLeaseDeploymentWitness",
     "CapacityLeaseRuntimeWitness",

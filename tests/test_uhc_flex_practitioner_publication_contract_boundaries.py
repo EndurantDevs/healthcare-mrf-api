@@ -19,14 +19,13 @@ from tests.test_uhc_flex_practitioner_publication import _admission
 
 def _readiness(resource_count: int = 1):
     admission = _admission(resource_count=resource_count)
-    identity = publication.build_uhc_flex_practitioner_dataset_identity(
-        admission
-    )
+    identity = publication.build_uhc_flex_practitioner_dataset_identity(admission)
     return publication.UHCFlexPractitionerDatasetReadiness(
         dataset_id=identity.dataset_id,
         previous_dataset_id=None,
         admission_id=admission.admission_id,
         candidate_acquisition_id=admission.candidate_acquisition_id,
+        acquisition_root_run_id=identity.acquisition_root_run_id,
         cohort_id=admission.cohort_id,
         dataset_intent_id=admission.dataset_intent_id,
         endpoint_id=identity.endpoint_id,
@@ -55,9 +54,7 @@ def test_publication_error_codes_are_bounded() -> None:
         error = publication.UHCFlexPractitionerPublicationError(error_code)
         assert error.code == error_code
         assert "Flex Practitioner" in str(error)
-    assert publication.UHCFlexPractitionerPublicationError("unknown").code == (
-        "state"
-    )
+    assert publication.UHCFlexPractitionerPublicationError("unknown").code == ("state")
 
 
 def test_schema_json_and_row_helpers_fail_closed(monkeypatch) -> None:
@@ -74,9 +71,7 @@ def test_schema_json_and_row_helpers_fail_closed(monkeypatch) -> None:
     monkeypatch.delenv("HLTHPRT_DB_SCHEMA")
     assert publication._table("resource") == '"mrf"."resource"'
     assert publication._function("ready") == '"mrf"."ready"'
-    assert publication._canonical_json({"b": 2, "a": 1}) == (
-        '{"a":1,"b":2}'
-    )
+    assert publication._canonical_json({"b": 2, "a": 1}) == ('{"a":1,"b":2}')
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
         match="content is invalid",
@@ -85,18 +80,16 @@ def test_schema_json_and_row_helpers_fail_closed(monkeypatch) -> None:
 
     assert publication._row_fields(None) == {}
     assert publication._row_fields({"value": 1}) == {"value": 1}
-    assert publication._row_fields(
-        SimpleNamespace(_mapping={"value": 2})
-    ) == {"value": 2}
+    assert publication._row_fields(SimpleNamespace(_mapping={"value": 2})) == {
+        "value": 2
+    }
     with pytest.raises(publication.UHCFlexPractitionerPublicationError):
         publication._row_fields(SimpleNamespace(_mapping=[]))
 
 
 def test_identity_metadata_and_result_types_reject_drift() -> None:
     admission = _admission()
-    identity = publication.build_uhc_flex_practitioner_dataset_identity(
-        admission
-    )
+    identity = publication.build_uhc_flex_practitioner_dataset_identity(admission)
     with pytest.raises(ValueError, match="admission is invalid"):
         publication.build_uhc_flex_practitioner_dataset_identity(object())
     with pytest.raises(ValueError, match="endpoint ID is invalid"):
@@ -142,13 +135,17 @@ async def test_readiness_loaders_validate_and_delegate(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="dataset ID is invalid"):
         await publication.load_uhc_flex_practitioner_dataset_readiness("bad")
-    assert await publication.load_uhc_flex_practitioner_dataset_readiness(
-        readiness.dataset_id,
-        database=database,
-    ) is readiness
-    assert await publication.load_current_uhc_flex_dataset_readiness(
-        database=database
-    ) is readiness
+    assert (
+        await publication.load_uhc_flex_practitioner_dataset_readiness(
+            readiness.dataset_id,
+            database=database,
+        )
+        is readiness
+    )
+    assert (
+        await publication.load_current_uhc_flex_dataset_readiness(database=database)
+        is readiness
+    )
     dataset_loader.assert_awaited_once_with(
         readiness.dataset_id,
         database=database,

@@ -47,13 +47,13 @@ def test_profile_evidence_sql_retains_derived_and_source_backed_facts():
     assert "'identifiers', service.identifiers::jsonb" in sql
     assert "'accepting_patients', service.accepting_patients::jsonb" in sql
     assert "'comment', service.comment" in sql
-    assert "JOIN \"fixture\".\"endpoint\" AS endpoint" in sql
+    assert "FROM \"fixture\".\"endpoint\" AS endpoint" in sql
     assert (
         "JOIN \"fixture\".\"provider_directory_dataset_affiliation_organization\" "
         "AS affiliation_edge"
     ) in sql
     assert (
-        "JOIN \"fixture\".\"provider_directory_organization_affiliation\" "
+        "FROM \"fixture\".\"provider_directory_organization_affiliation\" "
         "AS affiliation"
     ) in sql
     assert "affiliation.participating_organization_ref" in sql
@@ -71,7 +71,7 @@ def test_profile_evidence_sql_preserves_uhc_facility_semantics():
     sql = _render_profile_evidence_sql()
 
     assert "'plan_membership'" in sql
-    assert "affiliation_edge.dataset_id = typed_source_context.dataset_id" in sql
+    assert "affiliation_edge.dataset_id = affiliation.dataset_id" in sql
     assert (
         "affiliation.relationship_type =\n"
         "                   'payer_reported_provider_plan_membership'"
@@ -183,10 +183,9 @@ def test_profile_evidence_sql_partitions_direct_organization_memberships():
     )
     membership_join = sql.index("plan_membership_rows AS MATERIALIZED")
     assert bounded_affiliation < membership_join
-    assert (
-        'FROM "fixture"."provider_directory_organization_affiliation" '
-        "AS affiliation"
-    ) in sql[bounded_affiliation:membership_join]
+    assert "FROM affiliation_resource_rows AS affiliation" in sql[
+        bounded_affiliation:membership_join
+    ]
     assert (
         "FROM membership_affiliation_rows AS affiliation"
     ) in sql[membership_join:]
@@ -205,10 +204,50 @@ def test_profile_evidence_sql_accepts_exact_dataset_scoped_affiliations():
         endpoint_ref='"fixture"."endpoint_scope"',
     )
 
-    assert 'JOIN "fixture"."affiliation_scope_a" AS affiliation' in sql
+    assert 'FROM "fixture"."affiliation_scope_a" AS affiliation' in sql
     assert 'JOIN "fixture"."affiliation_edge" AS affiliation_edge' in sql
     assert "provider_directory_organization_affiliation" not in sql
     assert "affiliation_edge.dataset_id = role_rows.dataset_id" in sql
+
+
+def test_dataset_graph_rows_are_normalized_and_never_source_wide() -> None:
+    sql = _render_profile_evidence_sql()
+
+    assert "source_id = ANY(" in sql
+    assert "typed_source_context AS MATERIALIZED" in sql
+    assert "dataset_source_context AS MATERIALIZED" in sql
+    for relation_ref, resource_type in (
+        ('"fixture"."practitioner"', "Practitioner"),
+        ('"fixture"."role"', "PractitionerRole"),
+        ('"fixture"."organization"', "Organization"),
+        (
+            '"fixture"."provider_directory_organization_affiliation"',
+            "OrganizationAffiliation",
+        ),
+        ('"fixture"."service"', "HealthcareService"),
+        ('"fixture"."endpoint"', "Endpoint"),
+    ):
+        assert f"NULL::{relation_ref}" in sql
+        assert f"resource.resource_type = '{resource_type}'" in sql
+    assert sql.count(
+        "dataset_source_context.dataset_id = resource.dataset_id"
+    ) == 6
+    for exact_join in (
+        "practitioner.dataset_id = role.dataset_id",
+        "service.dataset_id = role_rows.dataset_id",
+        "endpoint.dataset_id = role_rows.dataset_id",
+        "affiliation.dataset_id = role_rows.dataset_id",
+        "organization.dataset_id = affiliation.dataset_id",
+        "affiliation_edge.dataset_id = affiliation.dataset_id",
+    ):
+        assert exact_join in sql
+
+    # These two families stay retained references/relations; Profile has no
+    # standalone Location or InsurancePlan fact category.
+    assert "resource.resource_type = 'Location'" not in sql
+    assert "resource.resource_type = 'InsurancePlan'" not in sql
+    assert "location" not in profile.PROFILE_EVIDENCE_FACT_TYPES
+    assert "insurance_plan" not in profile.PROFILE_EVIDENCE_FACT_TYPES
 
 
 def test_profile_evidence_count_sql_is_read_only_and_uses_normalized_rows():

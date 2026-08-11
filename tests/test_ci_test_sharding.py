@@ -158,8 +158,15 @@ def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> Non
         "tests/test_provider_directory_uhc_flex_practitioner_acquisition_postgres.py",
         "tests/test_provider_directory_uhc_flex_practitioner_twin_postgres.py",
         "tests/test_provider_directory_uhc_flex_practitioner_publication_postgres.py",
+        "tests/test_provider_directory_rooted_graph_adoption_postgres.py",
+        "tests/test_provider_directory_rooted_graph_acquisition_postgres.py",
+        "tests/test_provider_directory_rooted_graph_publication_guards_postgres.py",
+        "tests/test_provider_directory_rooted_graph_publication_postgres.py",
     )
-    profile_test = "tests/test_provider_directory_profile_uhc_flex_postgres.py"
+    profile_tests = (
+        "tests/test_provider_directory_profile_capacity_adoption_postgres.py",
+        "tests/test_provider_directory_profile_uhc_flex_postgres.py",
+    )
     lifecycle_step = workflow.split(
         "      - name: Run exact Provider Directory enrichment PostgreSQL "
         "lifecycle gate\n",
@@ -173,8 +180,31 @@ def test_provider_directory_enrichment_postgres_proofs_run_exactly_once() -> Non
     assert "if: matrix.shard == 'provider-directory'" in lifecycle_step
     assert "HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN:" in lifecycle_step
     assert "if: matrix.shard == 'provider-profile'" in profile_step
-    for test_path in (*lifecycle_tests, profile_test):
+    for test_path in (*lifecycle_tests, *profile_tests):
         assert workflow.count(test_path) == 1
     for test_path in lifecycle_tests:
         assert test_path in lifecycle_step
-    assert profile_test in profile_step
+    for test_path in profile_tests:
+        assert test_path in profile_step
+
+
+def test_container_proves_rooted_graph_operator_is_packaged_and_dormant() -> None:
+    workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    operator_step = workflow.split(
+        "      - name: Prove rooted Provider graph operator is packaged and dormant\n",
+        1,
+    )[1].split("      - name:", 1)[0]
+
+    assert "/opt/scripts/smoke/provider_directory_rooted_graph_operator.py" in (
+        operator_step
+    )
+    for gate_name in (
+        "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_REGISTRATION_ENABLED",
+        "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_ENABLED",
+        "HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_ENABLED",
+    ):
+        assert f"-u {gate_name}" in operator_step
+    assert 'test "$operation_status" -eq 1' in operator_step
+    assert '{"code":"disabled","status":"error"}' in operator_step

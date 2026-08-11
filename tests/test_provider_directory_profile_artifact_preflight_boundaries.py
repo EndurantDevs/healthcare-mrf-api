@@ -96,25 +96,24 @@ async def test_capacity_admitted_evidence_batch_preflights_exact_rows(
 ):
     """Preflight exact evidence rows before the admitted insert."""
     build, batch = _evidence_batch_fixture()
-    projection, insert, count_sql, insert_sql = (
-        _patch_evidence_batch_collaborators(monkeypatch)
+    projection, insert, count_sql, insert_sql = _patch_evidence_batch_collaborators(
+        monkeypatch
     )
-    capacity_token = (
-        importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-            object()
-        )
+    capacity_token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
+        object()
     )
     try:
-        assert await importer._execute_profile_evidence_batch(
-            build,
-            batch,
-            "COPY",
-            {},
-        ) == 2
-    finally:
-        importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(
-            capacity_token
+        assert (
+            await importer._execute_profile_evidence_batch(
+                build,
+                batch,
+                "COPY",
+                {},
+            )
+            == 2
         )
+    finally:
+        importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(capacity_token)
     projection.assert_awaited_once()
     insert.assert_awaited_once()
     assert count_sql.call_args.kwargs["fact_type"] == "name"
@@ -129,9 +128,11 @@ def _empty_artifact_projection():
         tables=tuple(
             importer._ProviderDirectoryArtifactScopeTableProjection(
                 table_name=model.__tablename__,
-                resource_type="source"
-                if model is source_model
-                else importer.RESOURCE_TYPES_BY_MODEL[model],
+                resource_type=(
+                    "source"
+                    if model is source_model
+                    else importer.RESOURCE_TYPES_BY_MODEL[model]
+                ),
                 projected_rows=0,
                 projected_logical_bytes=0,
             )
@@ -143,6 +144,7 @@ def _empty_artifact_projection():
 
 def _patch_artifact_preflight_refusal(monkeypatch, events: list[str]) -> None:
     """Record complete layout creation and refuse before any payload DML."""
+
     async def create_layout(model, _schema, _table_name):
         events.append("layout:" + model.__tablename__)
 
@@ -196,9 +198,7 @@ async def test_artifact_scope_creates_complete_layout_and_preflights_before_payl
     assert events[-1] == "preflight"
     assert events.count("preflight") == 1
     assert "payload" not in events
-    assert events[:-1] == sorted(
-        ("layout:" + model.__tablename__ for model in models)
-    )
+    assert events[:-1] == sorted(("layout:" + model.__tablename__ for model in models))
 
 
 @pytest.mark.asyncio
@@ -407,17 +407,35 @@ async def _consume_empty_artifact_scope() -> None:
         return
 
 
+def test_bootstrap_profile_build_requires_capacity_admission(monkeypatch):
+    """Fail closed before first-generation scratch exists or can be built."""
+
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_capacity_admission",
+        lambda: None,
+    )
+    build_fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    with pytest.raises(
+        RuntimeError,
+        match="provider_directory_profile_capacity_admission_required",
+    ):
+        importer._assert_profile_build_capacity_admitted(
+            object(),
+            build_fence,
+            build_fence,
+        )
+
+
 def test_source_delta_build_coordinates_require_matching_admission():
     """Resolve admitted delta coordinates before scratch construction."""
     source_vector = (("source-a", "dataset-a"),)
     context_vector = (("source-a", "a" * 64),)
-    source_vector_hash = (
-        importer._provider_directory_profile_source_vector_hash(source_vector)
+    source_vector_hash = importer._provider_directory_profile_source_vector_hash(
+        source_vector
     )
     context_vector_hash = (
-        importer._provider_directory_profile_source_context_vector_hash(
-            context_vector
-        )
+        importer._provider_directory_profile_source_context_vector_hash(context_vector)
     )
     plan = importer._provider_directory_profile_batch_plan(
         ["source-a"],
@@ -449,15 +467,13 @@ def test_source_delta_build_coordinates_require_matching_admission():
         serving_state=_profile_serving_state(source_vector, context_vector),
     )
     admission = _wal_tracker_admission()
-    capacity_token = (
-        importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
+    capacity_token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
+        admission
     )
     try:
         coordinates = importer._profile_build_coordinates(identity)
     finally:
-        importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(
-            capacity_token
-        )
+        importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(capacity_token)
 
     assert coordinates.build_id == admission.build_id
     assert coordinates.capacity_geometry_status == "verified"

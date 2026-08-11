@@ -7,6 +7,13 @@ from datetime import date
 from typing import Any
 
 from db.connection import db
+from process.provider_directory_dataset_scoped_publication import (
+    ExactCurrentDataset,
+    exact_uhc_dataset_pair,
+    lock_exact_current_dataset,
+    ProviderDirectoryDatasetScopedPublicationError,
+    supersede_exact_current_dataset,
+)
 from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
 )
@@ -62,9 +69,8 @@ def _readiness_from_row(database_row: Any) -> UHCFlexPractitionerDatasetReadines
             dataset_id=database_fields.get("dataset_id"),
             previous_dataset_id=database_fields.get("previous_dataset_id"),
             admission_id=database_fields.get("admission_id"),
-            candidate_acquisition_id=database_fields.get(
-                "candidate_acquisition_id"
-            ),
+            candidate_acquisition_id=database_fields.get("candidate_acquisition_id"),
+            acquisition_root_run_id=database_fields.get("acquisition_root_run_id"),
             cohort_id=database_fields.get("cohort_id"),
             dataset_intent_id=database_fields.get("dataset_intent_id"),
             endpoint_id=database_fields.get("endpoint_id"),
@@ -88,6 +94,7 @@ def _readiness_select_sql(filter_sql: str) -> str:
     return f"""
         SELECT header.dataset_id, header.previous_dataset_id,
                header.admission_id, header.candidate_acquisition_id,
+               header.acquisition_root_run_id,
                header.cohort_id, header.dataset_intent_id,
                header.endpoint_id, header.semantic_projection_as_of,
                header.operation_key, header.dataset_hash,
@@ -162,47 +169,18 @@ async def _assert_no_orphan_parent(
 async def _locked_current_dataset(
     database: Any,
     identity: UHCFlexPractitionerDatasetIdentity,
-) -> str | None:
-    parent_fields = _row_fields(
-        await database.first(
-            f"""
-            SELECT dataset_id
-              FROM {_table(_ENDPOINT_DATASET)}
-             WHERE endpoint_id = :endpoint_id AND is_current IS TRUE
-             FOR UPDATE;
-            """,
-            endpoint_id=identity.endpoint_id,
+) -> ExactCurrentDataset | None:
+    try:
+        return await lock_exact_current_dataset(
+            database,
+            pair=exact_uhc_dataset_pair(),
+            require_ready=False,
         )
-    )
-    current_dataset_id = parent_fields.get("dataset_id")
-    header_fields = _row_fields(
-        await database.first(
-            f"""
-            SELECT dataset_id, source_id, status, is_current
-              FROM {_table(_HEADER)}
-             WHERE source_id = :source_id AND is_current IS TRUE
-             FOR UPDATE;
-            """,
-            source_id=identity.source_id,
+    except ProviderDirectoryDatasetScopedPublicationError as error:
+        code = (
+            error.code if error.code in {"foreign_current", "source_drift"} else "state"
         )
-    )
-    if current_dataset_id is None:
-        if header_fields:
-            raise UHCFlexPractitionerPublicationError("state")
-        return None
-    is_ready = await database.scalar(
-        f"SELECT {_function(_READY_FUNCTION)}(:dataset_id);",
-        dataset_id=current_dataset_id,
-    )
-    if (
-        not header_fields
-        or header_fields.get("dataset_id") != current_dataset_id
-        or header_fields.get("status") != "published"
-        or header_fields.get("is_current") is not True
-        or not is_ready
-    ):
-        raise UHCFlexPractitionerPublicationError("foreign_current")
-    return current_dataset_id
+        raise UHCFlexPractitionerPublicationError(code) from error
 
 
 async def _insert_parent_header(
@@ -319,38 +297,15 @@ async def _insert_building_headers(
 
 async def _supersede_previous(
     database: Any,
-    previous_dataset_id: str | None,
+    previous_dataset: ExactCurrentDataset | None,
 ) -> None:
-    if previous_dataset_id is None:
-        return
-    is_ready = await database.scalar(
-        f"SELECT {_function(_READY_FUNCTION)}(:dataset_id);",
-        dataset_id=previous_dataset_id,
-    )
-    if not is_ready:
-        raise UHCFlexPractitionerPublicationError("foreign_current")
-    header_updated = await database.status(
-        f"""
-        UPDATE {_table(_HEADER)}
-           SET status = 'superseded', is_current = false,
-               superseded_at = transaction_timestamp()
-         WHERE dataset_id = :dataset_id AND status = 'published'
-           AND is_current IS TRUE;
-        """,
-        dataset_id=previous_dataset_id,
-    )
-    parent_updated = await database.status(
-        f"""
-        UPDATE {_table(_ENDPOINT_DATASET)}
-           SET status = 'superseded', is_current = false,
-               superseded_at = transaction_timestamp()
-         WHERE dataset_id = :dataset_id AND status = 'published'
-           AND is_current IS TRUE;
-        """,
-        dataset_id=previous_dataset_id,
-    )
-    if header_updated != 1 or parent_updated != 1:
-        raise UHCFlexPractitionerPublicationError("state")
+    try:
+        await supersede_exact_current_dataset(database, previous_dataset)
+    except ProviderDirectoryDatasetScopedPublicationError as error:
+        code = (
+            error.code if error.code in {"foreign_current", "source_drift"} else "state"
+        )
+        raise UHCFlexPractitionerPublicationError(code) from error
 
 
 async def _publish_candidate(database: Any, dataset_id: str) -> None:
@@ -389,8 +344,7 @@ def _is_expected_admission(
         == UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID
         and admission.source_id == UHC_FLEX_PRACTITIONER_SOURCE_ID
         and admission.connector_id == UHC_FLEX_PRACTITIONER_CONNECTOR_ID
-        and admission.query_contract_id
-        == UHC_FLEX_PRACTITIONER_QUERY_CONTRACT_ID
+        and admission.query_contract_id == UHC_FLEX_PRACTITIONER_QUERY_CONTRACT_ID
         and admission.publication_authority is True
     )
 
@@ -448,7 +402,10 @@ async def _publish_admitted_dataset(
             raise UHCFlexPractitionerPublicationError("replay")
         return UHCFlexPractitionerPublicationResult(readiness, replayed=True)
     await _assert_no_orphan_parent(database, identity)
-    previous_dataset_id = await _locked_current_dataset(database, identity)
+    previous_dataset = await _locked_current_dataset(database, identity)
+    previous_dataset_id = (
+        previous_dataset.dataset_id if previous_dataset is not None else None
+    )
     await _insert_building_headers(
         database,
         identity,
@@ -457,7 +414,7 @@ async def _publish_admitted_dataset(
     )
     await _materialize_candidate(database, identity, admission, batch_size)
     await _validate_candidate(database, identity, admission, batch_size)
-    await _supersede_previous(database, previous_dataset_id)
+    await _supersede_previous(database, previous_dataset)
     await _publish_candidate(database, identity.dataset_id)
     readiness = await load_dataset_readiness(
         identity.dataset_id,

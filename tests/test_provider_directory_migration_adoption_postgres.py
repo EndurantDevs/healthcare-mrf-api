@@ -123,6 +123,7 @@ async def main():
             future_strict_tables = {
                 "provider_directory_profile_build_checkpoint",
                 "provider_directory_profile_capacity_lease_consumption",
+                "provider_directory_profile_capacity_preflight_receipt",
                 "provider_directory_profile_delta_receipt",
                 "provider_directory_profile_serving_generation",
                 "provider_directory_uhc_flex_npi_cohort",
@@ -134,6 +135,14 @@ async def main():
                 "provider_directory_uhc_flex_practitioner_twin_admission",
                 "provider_directory_uhc_flex_practitioner_dataset",
                 "provider_directory_uhc_flex_practitioner_dataset_resource",
+                "provider_directory_rooted_graph_acquisition",
+                "provider_directory_rooted_graph_work",
+                "provider_directory_rooted_graph_resource",
+                "provider_directory_rooted_graph_edge",
+                "provider_directory_rooted_graph_twin_attempt",
+                "provider_directory_rooted_graph_twin_admission",
+                "provider_directory_rooted_graph_dataset",
+                "provider_directory_rooted_graph_dataset_resource",
             }
             target_tables = [
                 table

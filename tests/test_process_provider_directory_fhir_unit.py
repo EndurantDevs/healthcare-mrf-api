@@ -1532,113 +1532,6 @@ async def test_uhc_candidate_content_proof_requires_exact_hashes(
     ) == expected_proof
 
 
-def test_validated_uhc_metadata_maps_each_validation_failure(
-    monkeypatch,
-):
-    candidate = _endpoint_candidate()
-    metadata = {}
-    monkeypatch.setattr(
-        importer,
-        "validate_uhc_summary_input",
-        Mock(return_value={"summary": True}),
-    )
-    monkeypatch.setattr(
-        importer,
-        "validate_semantic_source_summary",
-        Mock(return_value={"resource_counts": {"Practitioner": 1}}),
-    )
-    monkeypatch.setattr(
-        importer,
-        "validate_uhc_canonical_content_proof",
-        Mock(return_value={"resource_counts": {"Practitioner": 1}}),
-    )
-    assert importer._validated_uhc_final_metadata(candidate, metadata)[0] == {
-        "summary": True
-    }
-
-    cases = (
-        (
-            "validate_semantic_source_summary",
-            importer.ProviderDirectorySourceSummaryError("invalid"),
-            "source_summary_invalid",
-        ),
-        (
-            "validate_uhc_canonical_content_proof",
-            importer.UhcCanonicalProofError("invalid"),
-            "content_proof_invalid",
-        ),
-        (
-            "validate_uhc_summary_input",
-            importer.UhcRetainedDatasetError("invalid"),
-            "summary_input_invalid",
-        ),
-    )
-    for validator_name, failure, message in cases:
-        validator = getattr(importer, validator_name)
-        validator.side_effect = failure
-        with pytest.raises(RuntimeError, match=message):
-            importer._validated_uhc_final_metadata(candidate, metadata)
-        validator.side_effect = None
-
-
-def test_uhc_final_publication_consistency_checks_every_proof_boundary():
-    state_by_field = {
-        "status": importer.ENDPOINT_DATASET_PUBLISHED,
-        "is_current": True,
-        "dataset_hash": "a" * 64,
-    }
-    identity_by_field = {"identity": True}
-    metadata = {
-        importer.UHC_RETAINED_PUBLICATION_METADATA_KEY: identity_by_field
-    }
-    outcome_by_field = {
-        "complete": True,
-        "dataset_hash": "a" * 64,
-        "resource_counts": {"Practitioner": 1},
-    }
-    source_summary_by_field = {"resource_counts": {"Practitioner": 1}}
-    canonical_by_field = {
-        "dataset_hash": "a" * 64,
-        "resource_counts": {"Practitioner": 1},
-        "resource_hashes": {"Practitioner": "b" * 64},
-    }
-    source_summary_by_field["resource_hashes"] = canonical_by_field[
-        "resource_hashes"
-    ]
-    arguments = (
-        state_by_field,
-        metadata,
-        outcome_by_field,
-        source_summary_by_field,
-        canonical_by_field,
-        identity_by_field,
-    )
-    assert importer._is_uhc_final_publication_consistent(*arguments)
-
-    invalid_arguments = []
-    for index, replacement in (
-        (0, {**state_by_field, "status": "validated"}),
-        (0, {**state_by_field, "is_current": False}),
-        (2, None),
-        (2, {**outcome_by_field, "complete": False}),
-        (2, {**outcome_by_field, "dataset_hash": "changed"}),
-        (2, {**outcome_by_field, "resource_counts": {}}),
-        (4, {**canonical_by_field, "dataset_hash": "changed"}),
-        (4, {**canonical_by_field, "resource_counts": {}}),
-        (4, {**canonical_by_field, "resource_hashes": {}}),
-        (1, {}),
-    ):
-        changed_arguments = list(arguments)
-        changed_arguments[index] = replacement
-        invalid_arguments.append(changed_arguments)
-    assert all(
-        not importer._is_uhc_final_publication_consistent(
-            *changed_arguments
-        )
-        for changed_arguments in invalid_arguments
-    )
-
-
 @pytest.mark.asyncio
 async def test_uhc_source_local_fence_and_final_proof_fail_closed(
     monkeypatch,
@@ -1663,6 +1556,9 @@ async def test_uhc_source_local_fence_and_final_proof_fail_closed(
 async def test_uhc_final_publication_proof_fails_closed(monkeypatch):
     """Final UHC publication requires exact current proof metadata."""
     candidate = _endpoint_candidate()
+    final_validator = Mock(
+        side_effect=importer.UhcFinalPublicationError("invalid")
+    )
     monkeypatch.setattr(
         importer,
         "_endpoint_dataset_state",
@@ -1670,42 +1566,18 @@ async def test_uhc_final_publication_proof_fails_closed(monkeypatch):
     )
     monkeypatch.setattr(
         importer,
-        "_validated_uhc_final_metadata",
-        Mock(
-            return_value=(
-                {},
-                {"resource_counts": {}, "resource_hashes": {}},
-                {
-                    "dataset_hash": "a" * 64,
-                    "resource_counts": {},
-                    "resource_hashes": {},
-                },
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_expected_uhc_publication_identity",
-        Mock(return_value={}),
+        "validate_uhc_final_publication",
+        final_validator,
     )
     with pytest.raises(RuntimeError, match="current_publication_proof_invalid"):
         await importer._assert_final_uhc_publication(candidate)
-    state_by_field = {
-        "publication_metadata_json": {
-            importer.PROVIDER_DIRECTORY_OUTCOME_RESOURCE_COUNTS_METADATA_KEY: {
-                "resource_counts": {}
-            }
-        },
-        "status": importer.ENDPOINT_DATASET_PUBLISHED,
-        "is_current": True,
-        "dataset_hash": "a" * 64,
-        "resource_count": 1,
-    }
-    importer._endpoint_dataset_state.return_value = state_by_field
-    monkeypatch.setattr(
-        importer,
-        "_is_uhc_final_publication_consistent",
-        Mock(return_value=True),
+    final_validator.side_effect = None
+    final_validator.return_value = SimpleNamespace(
+        dataset_id=candidate.dataset_id,
+        dataset_hash="a" * 64,
+        resource_count=1,
+        resource_counts={"Practitioner": 1},
+        source_summary={"resource_counts": {"Practitioner": 1}},
     )
     publication_result = await importer._assert_final_uhc_publication(
         candidate

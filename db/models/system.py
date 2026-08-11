@@ -69,6 +69,7 @@ __all__ = (
     "ProviderDirectoryPaginationCheckpoint",
     "ProviderDirectoryProfileBuildCheckpoint",
     "ProviderDirectoryProfileCapacityLeaseConsumption",
+    "ProviderDirectoryProfileCapacityPreflightReceipt",
     "ProviderDirectoryProfileDeltaReceipt",
     "ProviderDirectoryProfileServingGeneration",
     "ProviderDirectoryProfileSelectionAuthority",
@@ -2437,7 +2438,8 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
             "AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' "
             "AND contract_id IN ("
             "'provider-directory-database-capacity-lease-v1', "
-            "'provider-directory-database-capacity-lease-v2') "
+            "'provider-directory-database-capacity-lease-v2', "
+            "'provider-directory-database-capacity-lease-v3') "
             "AND key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
             "AND environment_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
             "AND attestor_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
@@ -2509,6 +2511,110 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
     expires_at = Column(TIMESTAMP(timezone=True), nullable=False)
     max_build_deadline = Column(TIMESTAMP(timezone=True), nullable=False)
     recorded_at = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    )
+
+
+_PROFILE_CAPACITY_CONTROL_PLANE_RECEIPT_COLUMN = (
+    "control_plane_receipt_sha256"
+)
+
+
+class ProviderDirectoryProfileCapacityPreflightReceipt(
+    Base,
+    JSONOutputMixin,
+):
+    """One authenticated, replay-fenced Profile capacity signing receipt."""
+
+    __tablename__ = "provider_directory_profile_capacity_preflight_receipt"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("receipt_sha256"),
+        UniqueConstraint(
+            "request_nonce",
+            name="pd_profile_capacity_preflight_request_nonce_key",
+        ),
+        UniqueConstraint(
+            "request_sha256",
+            name="pd_profile_capacity_preflight_request_sha_key",
+        ),
+        CheckConstraint(
+            "contract_id = "
+            "'healthporta.provider-directory-profile-capacity-preflight.v3' "
+            "AND request_contract_id = "
+            "'healthporta.provider-directory-profile-capacity-preflight-request.v3' "
+            "AND limits_contract_id = "
+            "'healthporta.provider-directory-profile-capacity-limits.v2' "
+            "AND materialization_mode = 'source_delta' "
+            "AND profile_strategy_version = "
+            "'source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6' "
+            "AND receipt_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND request_nonce ~ '^[0-9a-f]{64}$' "
+            "AND request_sha256 ~ '^[0-9a-f]{64}$' "
+            f"AND {_PROFILE_CAPACITY_CONTROL_PLANE_RECEIPT_COLUMN} "
+            "~ '^[0-9a-f]{64}$' "
+            "AND selection_proof_id ~ '^[0-9a-f]{64}$' "
+            "AND profile_input_digest ~ '^[0-9a-f]{64}$' "
+            "AND limits_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
+            "AND serving_preflight_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND quiescence_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND control_generation > 0 "
+            "AND profile_schema_version > 0 "
+            "AND issued_at < expires_at "
+            "AND expires_at - issued_at <= interval '86400 seconds' "
+            "AND jsonb_typeof(receipt_json::jsonb) = 'object' "
+            "AND ((consumed_at IS NULL AND consumed_run_id IS NULL "
+            "AND consumed_attestation_id IS NULL) "
+            "OR (consumed_at IS NOT NULL "
+            "AND consumed_at >= issued_at AND consumed_at < expires_at "
+            "AND consumed_run_id ~ '^run_[0-9a-f]{32}$' "
+            "AND consumed_attestation_id ~ '^[0-9a-f]{64}$'))",
+            name="pd_profile_capacity_preflight_values_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    __my_index_elements__ = ["receipt_sha256"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("consumed_at", "expires_at"),
+            "name": "pd_profile_capacity_preflight_open_idx",
+        },
+    ]
+
+    receipt_sha256 = Column(String(64), nullable=False)
+    request_nonce = Column(String(64), nullable=False)
+    request_sha256 = Column(String(64), nullable=False)
+    control_plane_receipt_sha256 = Column(
+        _PROFILE_CAPACITY_CONTROL_PLANE_RECEIPT_COLUMN,
+        String(64),
+        nullable=False,
+    )
+    contract_id = Column(String(96), nullable=False)
+    request_contract_id = Column(String(96), nullable=False)
+    limits_contract_id = Column(String(96), nullable=False)
+    selection_proof_id = Column(String(64), nullable=False)
+    profile_input_digest = Column(String(64), nullable=False)
+    control_generation = Column(BigInteger, nullable=False)
+    profile_schema_version = Column(Integer, nullable=False)
+    profile_strategy_version = Column(String(128), nullable=False)
+    materialization_mode = Column(String(16), nullable=False)
+    limits_sha256 = Column(String(64), nullable=False)
+    capacity_geometry_hash = Column(String(64), nullable=False)
+    serving_preflight_sha256 = Column(String(64), nullable=False)
+    quiescence_sha256 = Column(String(64), nullable=False)
+    receipt_json = Column(JSONB, nullable=False)
+    issued_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    expires_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    consumed_at = Column(TIMESTAMP(timezone=True))
+    consumed_run_id = Column(String(64))
+    consumed_attestation_id = Column(String(64))
+    created_at = Column(
         TIMESTAMP(timezone=True),
         nullable=False,
         server_default=text("now()"),

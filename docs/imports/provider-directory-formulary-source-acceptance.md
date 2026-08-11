@@ -21,10 +21,21 @@ reset cannot silently broaden or weaken the result.
   listing bytes. The adapter must not fetch either listing again.
 - The drug catalog is exactly 24 IFP plus 24 Community & State files. Missing,
   non-JSON, malformed, or conflicting files block admission; 47 of 48 is not a
-  complete publication.
+  complete publication. One normalized source URL cannot identify two files or
+  appear in both families.
+- One durable source-scoped acquisition claim covers the retained listing
+  snapshot and every drug-file HTTP request. Its monotonic generation, random
+  token, expiry, heartbeat, and fenced release admit only one live claimant to
+  start new HTTP requests; the token is rechecked before every request.
+  Cancellation drains in-flight work, and a stale or reclaimed owner cannot
+  CAS-bind an artifact. A remote request already in flight at lease loss cannot
+  be un-issued. A live owner returns a bounded busy error.
 - Drug bytes use the existing content-addressed retained store. Independent
   normalization roots and retries reopen those bytes rather than redownload or
-  duplicate them.
+  duplicate them. A per-file failure does not cancel successful siblings: the
+  bounded task set drains, verified artifacts and sanitized aggregate failure
+  evidence are retained, and the run still fails before parsing or admission.
+  The next attempt requests only identities that remain unresolved.
 - Drug records publish only through the immutable `formulary_fhir` repository.
   The adapter must not invoke the legacy formulary importer or write legacy
   plan-drug relations.
@@ -36,10 +47,13 @@ reset cannot silently broaden or weaken the result.
 
 The drug slice is acceptable only when all of the following are true:
 
-1. The retained observation proves exactly 24+24 drug identities.
+1. The retained observation proves exactly 24+24 drug identities with 48
+   distinct normalized source URLs.
 2. Every retained file passes the real-source schema and resource-bound census.
-3. Acquisition, retry, and both roots use the same artifact set; retry performs
-   zero network requests for already verified files.
+3. One fenced acquisition generation covers catalog snapshot and HTTP work.
+   Acquisition, retry, and both roots use the same artifact set; a partial
+   failure drains all siblings and retry performs zero network requests for
+   already verified files.
 4. Both full repository roots match and PostgreSQL records one exact admission.
 5. A durable receipt binds the listing observation, artifact set, spool proof,
    repository graph, and source configuration.
@@ -69,16 +83,56 @@ The Flex slice is acceptable only when all of the following are true:
 8. Official and Flex evidence remain separately attributable while their
    independent-authority count remains one.
 
+The rooted graph extension is acceptable only when all of the following are
+true:
+
+1. Its dormant source and endpoint registration match the reviewed connector
+   signature and authority, and the root is exactly one locked, ready legacy
+   or rooted Practitioner dataset. Dual, missing, or unrelated current
+   datasets fail closed.
+2. Baseline and candidate acquisitions use separate run identities and
+   sessions but bind the same immutable root, query contract, endpoint
+   signature, authority, and aggregate resource budgets.
+3. PractitionerRole and OrganizationAffiliation are enumerated only by the
+   reviewed exact parent searches. Referenced resources use exact direct
+   reads, while InsurancePlan uses one finite, bounded census whose complete
+   payload remains an admission witness. Any Reference-shaped object outside
+   the reviewed structural field paths blocks the acquisition.
+4. Pagination follows only bounded same-origin opaque links. Page, resource,
+   byte, work-item, resource-row, edge-row, payload-byte, retry, lease, and
+   per-root time limits are identity-bound and durably enforced.
+5. A terminal root proves the complete Practitioner seed, completed direct
+   and affiliation frontiers, the finite plan census, the locally intersected
+   rooted plan set, zero errors, and a fixed point with no undiscovered work.
+   A direct-read 404 or 410 is complete only with a bounded FHIR
+   OperationOutcome witness.
+6. Two sealed roots must match every terminal, resource, edge, census, and
+   aggregate-budget proof before an immutable publication admission exists.
+7. Publication atomically combines the exact root Practitioner rows with the
+   admitted seven graph families, excludes census-only plans, rejects payload
+   conflicts, materializes exact dataset-scoped relationships, and moves one
+   logical current pointer across the legacy and rooted variants.
+8. Profile selection admits exactly one ready variant and reads graph facts
+   only from that selected dataset. A variant change refreshes affected NPIs,
+   removes old-only evidence, and never falls back to source-wide typed rows.
+9. Published metadata states `cohort_complete=true`,
+   `rooted_graph_complete=true`, `endpoint_collection_complete=false`, and
+   `endpoint_complete=false`; it never claims an exhaustive endpoint crawl.
+10. The graph-aware Profile strategy and its signed capacity preflight must
+    pass before any Profile materialization or serving-pointer change.
+
 ## PostgreSQL proof runbook
 
 CI runs Flex registration, exact-cohort sealing, acquisition storage, twin
-admission, and dataset publication once on the `provider-directory` PostgreSQL
-shard with `HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN`. The dataset-scoped
+admission, dataset publication, and the rooted graph lifecycle once on the
+`provider-directory` PostgreSQL shard with
+`HLTHPRT_FHIR_FORMULARY_MIGRATION_POSTGRES_DSN`. The dataset-scoped
 Profile replacement proof runs once on the `provider-profile` shard with
 the shared test database also exposed as
 `HLTHPRT_PROVIDER_DIRECTORY_PROFILE_POSTGRES_DSN`. The lifecycle DSN must name
 an explicit disposable test database; each proof creates and removes its own
-schema.
+schema. That Profile shard also proves the guarded first-generation capacity
+adoption path before any graph-aware Profile materialization can be admitted.
 
 The workflow contract is covered by `tests/test_ci_test_sharding.py`. A skipped
 local database proof means its required database configuration was absent and

@@ -15,6 +15,10 @@ from typing import Any
 import aiohttp
 
 from db.models import db
+from process.provider_directory_source_summary import (
+    SOURCE_SUMMARY_UHC_SELECTED_RESOURCES,
+    SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID,
+)
 from process.uhc_provider_file_catalog_artifacts import (
     fetch_catalog_snapshot,
     retain_catalog_snapshot,
@@ -51,6 +55,11 @@ from process.uhc_provider_file_source_identity import (
     UHC_PROVIDER_FILE_OWNER_ID,
     UHC_PROVIDER_FILE_PORTAL_BASE,
     UHC_PROVIDER_FILE_SOURCE_ID,
+)
+from process.uhc_final_publication_contract import (
+    UhcFinalPublicationError,
+    UhcFinalPublicationExpectation,
+    validate_uhc_final_publication,
 )
 from process.uhc_retained_registry_store_names import table_name as _retained_table
 
@@ -296,6 +305,8 @@ async def _catalog_import_state(
         await db.first(
             f"""
             SELECT source.source_id, dataset.dataset_id,
+                   dataset.endpoint_id, dataset.acquisition_root_run_id,
+                   dataset.status, dataset.is_current, dataset.dataset_hash,
                    dataset.resource_count, dataset.published_at,
                    dataset.publication_metadata_json
               FROM {_table("provider_directory_source")} AS source
@@ -318,35 +329,54 @@ def _current_publication_state(
     bindings_by_file_id: Mapping[str, Mapping[str, Any]],
     dataset_fields: Mapping[str, Any],
 ) -> dict[str, Any]:
-    metadata = _json_value(dataset_fields.get("publication_metadata_json") or {})
-    summary_input = (
-        metadata.get("uhc_retained_summary_input_v1")
-        if isinstance(metadata, Mapping)
-        else None
-    )
-    binding_complete = (
+    has_complete_bindings = (
         len(bindings_by_file_id) == len(file_records)
         and all(
             str(file_record["file_id"]) in bindings_by_file_id
             for file_record in file_records
         )
     )
-    dataset_current = bool(
-        dataset_fields.get("source_id") == UHC_PROVIDER_FILE_SOURCE_ID
-        and dataset_fields.get("dataset_id")
-        and isinstance(summary_input, Mapping)
-        and summary_input.get("complete") is True
-        and summary_input.get("catalog_set_sha256")
-        == selected_catalog_hash
+    publication_proof = None
+    try:
+        publication_proof = validate_uhc_final_publication(
+            dataset_fields,
+            UhcFinalPublicationExpectation(
+                source_id=UHC_PROVIDER_FILE_SOURCE_ID,
+                dataset_id=dataset_fields.get("dataset_id"),
+                endpoint_id=dataset_fields.get("endpoint_id"),
+                acquisition_root_run_id=dataset_fields.get(
+                    "acquisition_root_run_id"
+                ),
+                selected_resources=(
+                    SOURCE_SUMMARY_UHC_SELECTED_RESOURCES
+                ),
+                semantic_contract_id=(
+                    SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID
+                ),
+                catalog_set_sha256=selected_catalog_hash,
+            ),
+        )
+    except UhcFinalPublicationError:
+        publication_proof = None
+    is_dataset_current = publication_proof is not None
+    is_provider_directory_current = (
+        has_complete_bindings and is_dataset_current
     )
-    provider_directory_current = binding_complete and dataset_current
     return {
-        "binding_complete": binding_complete,
-        "dataset_current": dataset_current,
-        "provider_directory_current": provider_directory_current,
-        "dataset_id": dataset_fields.get("dataset_id"),
-        "resource_count": int(dataset_fields.get("resource_count") or 0),
-        "published_at": _iso_utc(dataset_fields.get("published_at")),
+        "binding_complete": has_complete_bindings,
+        "dataset_current": is_dataset_current,
+        "provider_directory_current": is_provider_directory_current,
+        "dataset_id": (
+            publication_proof.dataset_id if publication_proof else None
+        ),
+        "resource_count": (
+            publication_proof.resource_count if publication_proof else 0
+        ),
+        "published_at": (
+            _iso_utc(dataset_fields.get("published_at"))
+            if publication_proof
+            else None
+        ),
     }
 
 

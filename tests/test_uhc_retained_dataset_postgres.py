@@ -240,6 +240,7 @@ async def _native_admitted_file(
         record_count=raw.record_count,
         range_set_sha256=raw.range_set_sha256,
         manifest_sha256=raw.manifest_sha256,
+        manifest_byte_count=raw.manifest_byte_count,
         raw_producer_build_id=raw.producer_build_id,
         raw_path=Path(raw.path),
         manifest_path=Path(raw.manifest_path),
@@ -436,6 +437,7 @@ def _semantic_fixture_identity_and_admission(
         record_count=4,
         range_set_sha256=_digest(collection_kind + ":ranges"),
         manifest_sha256=_digest(collection_kind + ":manifest"),
+        manifest_byte_count=2,
         raw_producer_build_id="postgres-canonical-proof-v1",
         raw_path=Path(__file__),
         manifest_path=Path(__file__),
@@ -544,6 +546,7 @@ _ADMITTED_CATALOG_SCHEMA_SQL = """
             producer_build_id varchar(256) NOT NULL,
             range_set_sha256 varchar(64) NOT NULL,
             manifest_sha256 varchar(64) NOT NULL,
+            manifest_byte_count bigint NOT NULL,
             manifest_storage_uri text NOT NULL,
             status varchar(16) NOT NULL
         );
@@ -696,11 +699,12 @@ async def _install_admitted_file(
     )
     await connection.execute(
         f"INSERT INTO {schema}.provider_directory_uhc_raw_layout "
-        "VALUES ($1, 2, 4, 4, $2, $3, $4, $5, 'verified')",
+        "VALUES ($1, 2, 4, 4, $2, $3, $4, $5, $6, 'verified')",
         admitted_file.artifact_sha256,
         admitted_file.raw_producer_build_id,
         admitted_file.range_set_sha256,
         admitted_file.manifest_sha256,
+        len(manifest_path.read_bytes()),
         manifest_path.as_uri(),
     )
     await _install_admitted_artifact_references(
@@ -774,12 +778,13 @@ async def _install_native_admitted_file(
     )
     await connection.execute(
         f"INSERT INTO {schema}.provider_directory_uhc_raw_layout "
-        "VALUES ($1, 2, 4, $2, $3, $4, $5, $6, 'verified')",
+        "VALUES ($1, 2, 4, $2, $3, $4, $5, $6, $7, 'verified')",
         admitted.artifact_sha256,
         admitted.record_count,
         admitted.raw_producer_build_id,
         admitted.range_set_sha256,
         admitted.manifest_sha256,
+        admitted.manifest_byte_count,
         admitted.manifest_path.resolve().as_uri(),
     )
     await _install_admitted_artifact_references(

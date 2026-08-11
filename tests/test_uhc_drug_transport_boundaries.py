@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 import io
 from types import SimpleNamespace
@@ -12,6 +13,9 @@ import aiohttp
 import pytest
 
 import process.formulary_fhir.uhc_drug_transport as transport
+from process.formulary_fhir.uhc_drug_acquisition_lease import (
+    UHCDrugSourceAcquisitionLeaseError,
+)
 from process.formulary_fhir.uhc_drug_payload import UHCDrugPayloadError
 from tests.uhc_drug_parser_test_support import artifact_set
 
@@ -20,10 +24,7 @@ def _identity(*, expected_byte_count=10):
     artifacts, _bodies = artifact_set()
     return replace(
         artifacts.artifacts[0].identity,
-        source_url=(
-            "https://providermrf.uhc.com/"
-            "api/stream/ui/cs/drugs/test.json"
-        ),
+        source_url=("https://providermrf.uhc.com/" "api/stream/ui/cs/drugs/test.json"),
         expected_byte_count=expected_byte_count,
     )
 
@@ -61,9 +62,7 @@ async def test_callback_and_default_session_are_async_safe() -> None:
     await transport._invoke(callback, "complete")
     assert observed_values == ["complete"]
 
-    session = transport.default_uhc_drug_session_factory(
-        aiohttp.ClientTimeout(total=1)
-    )
+    session = transport.default_uhc_drug_session_factory(aiohttp.ClientTimeout(total=1))
     assert session.auto_decompress is False
     await session.close()
 
@@ -334,3 +333,82 @@ def test_preflight_rejects_file_aggregate_and_storage_bounds(
             max_file_bytes=100,
             concurrency=1,
         )
+
+
+@pytest.mark.asyncio
+async def test_one_bad_file_does_not_starve_successes_and_retry_is_bounded() -> None:
+    attempted_names: list[str] = []
+    retained_names: set[str] = set()
+    progress_rows: list[tuple[int, int, str, str]] = []
+
+    async def acquire(file_name: str, *, fail: bool = False):
+        attempted_names.append(file_name)
+        await asyncio.sleep(0)
+        if fail:
+            raise transport.UHCDrugArtifactAcquisitionError(
+                "private upstream detail",
+                retryable=True,
+            )
+        retained_names.add(file_name)
+        return 4, "cs", file_name
+
+    first_tasks = (
+        asyncio.create_task(acquire("bad.json", fail=True)),
+        asyncio.create_task(acquire("good-a.json")),
+        asyncio.create_task(acquire("good-b.json")),
+    )
+    with pytest.raises(
+        transport.UHCDrugArtifactAcquisitionError,
+        match="artifact set acquisition is incomplete",
+    ) as caught:
+        await transport._complete_pending_tasks(
+            first_tasks,
+            progress_callback=lambda *progress_row: progress_rows.append(progress_row),
+        )
+
+    assert attempted_names == ["bad.json", "good-a.json", "good-b.json"]
+    assert retained_names == {"good-a.json", "good-b.json"}
+    assert caught.value.retryable is True
+    assert caught.value.failure_count == 1
+    assert caught.value.retryable_failure_count == 1
+    assert caught.value.failure_evidence == ("retryable_transport",)
+    assert "private upstream detail" not in str(caught.value)
+    assert {progress_row[3] for progress_row in progress_rows} == retained_names
+
+    retry_bytes = await transport._complete_pending_tasks(
+        (asyncio.create_task(acquire("bad.json")),),
+        progress_callback=None,
+    )
+    assert retry_bytes == 4
+    assert attempted_names.count("bad.json") == 2
+    assert attempted_names.count("good-a.json") == 1
+    assert attempted_names.count("good-b.json") == 1
+    assert retained_names == {"bad.json", "good-a.json", "good-b.json"}
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_is_preserved_and_cancels_pending_transport() -> None:
+    sibling_started = asyncio.Event()
+    sibling_cleaned = asyncio.Event()
+
+    async def lease_lost() -> tuple[int, str, str]:
+        await sibling_started.wait()
+        raise UHCDrugSourceAcquisitionLeaseError("lease_lost")
+
+    async def sibling() -> tuple[int, str, str]:
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_cleaned.set()
+        return 0, "cs", "never.json"
+
+    tasks = (
+        asyncio.create_task(lease_lost()),
+        asyncio.create_task(sibling()),
+    )
+    with pytest.raises(UHCDrugSourceAcquisitionLeaseError) as caught:
+        await transport._complete_pending_tasks(tasks, progress_callback=None)
+
+    assert caught.value.code == "lease_lost"
+    assert sibling_cleaned.is_set()

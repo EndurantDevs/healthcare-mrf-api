@@ -25,14 +25,16 @@ from process.provider_directory_profile_selection_contract import (
     _required_text,
     stable_hash,
 )
+from process.provider_directory_profile_selection_dataset import (
+    _assert_dataset_variant_registry_coordinates,
+    _dataset_selection_by_group,
+    _metadata_source_ids,
+    _source_selection_indexes,
+)
 from process.provider_directory_profile_uhc_flex import (
-    is_uhc_flex_dataset_row_ready,
     load_profile_selection_dataset_rows,
     lock_uhc_flex_profile_publication,
     UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS,
-)
-from process.uhc_flex_practitioner_contract import (
-    UHC_FLEX_PRACTITIONER_SOURCE_ID,
 )
 
 
@@ -98,11 +100,15 @@ def _catalog_source_groups(
         raw_source_ids = catalog_entry.get("source_ids")
         if not isinstance(raw_source_ids, list) or not raw_source_ids:
             raise RuntimeError("provider_directory_profile_selection_catalog_invalid")
-        source_ids = tuple(sorted(
-            _required_text({"source_id": source_id}, "source_id", limit=96)
-            for source_id in raw_source_ids
-        ))
-        if len(source_ids) != len(set(source_ids)) or seen_source_ids.intersection(source_ids):
+        source_ids = tuple(
+            sorted(
+                _required_text({"source_id": source_id}, "source_id", limit=96)
+                for source_id in raw_source_ids
+            )
+        )
+        if len(source_ids) != len(set(source_ids)) or seen_source_ids.intersection(
+            source_ids
+        ):
             raise RuntimeError("provider_directory_profile_selection_catalog_invalid")
         seen_source_ids.update(source_ids)
         source_groups.append(source_ids)
@@ -115,17 +121,29 @@ def _catalog_source_groups(
     return tuple(sorted(source_groups))
 
 
+def _dataset_scoped_variant_source_groups() -> tuple[tuple[str, ...], ...]:
+    """Return explicit alternative source groups without their review labels."""
+
+    return tuple(
+        source_ids
+        for _group_id, source_ids in (
+            profile_artifact.configured_dataset_scoped_profile_variant_groups()
+        )
+    )
+
+
 async def _lock_profile_selection_tables() -> None:
     """Freeze every table that can alter the global current selection."""
 
     await lock_uhc_flex_profile_publication(db)
-    await db.status(f"LOCK TABLE {_table_ref(ProviderDirectoryAPIEndpoint)} IN SHARE MODE;")
+    await db.status(
+        f"LOCK TABLE {_table_ref(ProviderDirectoryAPIEndpoint)} IN SHARE MODE;"
+    )
     await db.status(f"LOCK TABLE {_table_ref(ProviderDirectorySource)} IN SHARE MODE;")
     dependent_relation_refs = [
         _table_ref(ProviderDirectoryEndpointDataset),
         *(
-            f"{_quote_identifier(_schema())}."
-            f"{_quote_identifier(relation_name)}"
+            f"{_quote_identifier(_schema())}." f"{_quote_identifier(relation_name)}"
             for relation_name in UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS
         ),
     ]
@@ -154,65 +172,6 @@ async def _selection_dataset_rows() -> list[Mapping[str, Any]]:
     )
 
 
-def _metadata_source_ids(metadata_map: Any) -> tuple[str, ...] | None:
-    if not isinstance(metadata_map, Mapping):
-        return None
-    raw_source_ids = metadata_map.get("source_ids")
-    if not isinstance(raw_source_ids, list) or not raw_source_ids:
-        return None
-    source_ids = tuple(sorted(
-        source_id
-        for raw_source_id in raw_source_ids
-        if (source_id := _clean_text(raw_source_id))
-    ))
-    if len(source_ids) != len(raw_source_ids) or len(source_ids) != len(set(source_ids)):
-        return None
-    return source_ids
-
-
-def _source_selection_indexes(
-    source_rows: list[Mapping[str, Any]],
-) -> tuple[dict[str, Mapping[str, Any]], dict[str, set[str]]]:
-    source_by_id: dict[str, Mapping[str, Any]] = {}
-    source_ids_by_endpoint: dict[str, set[str]] = {}
-    for source_row in source_rows:
-        source_id = _clean_text(source_row.get("source_id"))
-        endpoint_id = _clean_text(source_row.get("endpoint_id"))
-        if source_id is None or source_id in source_by_id:
-            raise RuntimeError("provider_directory_profile_selection_source_invalid")
-        source_by_id[source_id] = source_row
-        if endpoint_id is not None:
-            source_ids_by_endpoint.setdefault(endpoint_id, set()).add(source_id)
-    return source_by_id, source_ids_by_endpoint
-
-
-def _dataset_selection_by_group(
-    dataset_rows: list[Mapping[str, Any]],
-    source_groups: tuple[tuple[str, ...], ...],
-    source_ids_by_endpoint: Mapping[str, set[str]],
-) -> dict[tuple[str, ...], Mapping[str, Any]]:
-    dataset_by_group: dict[tuple[str, ...], Mapping[str, Any]] = {}
-    for dataset_row in dataset_rows:
-        source_group = _metadata_source_ids(
-            dataset_row.get("publication_metadata_json")
-        )
-        endpoint_id = _clean_text(dataset_row.get("endpoint_id"))
-        is_dataset_scoped = source_group == (UHC_FLEX_PRACTITIONER_SOURCE_ID,)
-        if (
-            source_group in source_groups
-            and endpoint_id is not None
-            and set(source_group).issubset(
-                source_ids_by_endpoint.get(endpoint_id, set())
-            )
-            and (
-                not is_dataset_scoped
-                or is_uhc_flex_dataset_row_ready(dataset_row)
-            )
-        ):
-            dataset_by_group.setdefault(source_group, dataset_row)
-    return dataset_by_group
-
-
 def _canonical_scalar(scalar_value: Any) -> str | None:
     return str(scalar_value) if scalar_value is not None else None
 
@@ -236,7 +195,10 @@ def _selection_records_for_group(
     group_records = _SelectionRecords([], [], [], [])
     for source_id in source_group:
         source_row = source_by_id.get(source_id)
-        if source_row is None or _clean_text(source_row.get("endpoint_id")) != endpoint_id:
+        if (
+            source_row is None
+            or _clean_text(source_row.get("endpoint_id")) != endpoint_id
+        ):
             raise RuntimeError("provider_directory_profile_selection_source_invalid")
         pair_map = _selection_pair(
             source_id,
@@ -314,8 +276,10 @@ def _profile_input(
                 dataset_row.get("dataset_scoped_projection_as_of")
             ),
             "dataset_scoped_ready": True,
+            "dataset_scoped_variant": dataset_row.get("dataset_scoped_variant"),
         }
-        if pair_map["source_id"] == UHC_FLEX_PRACTITIONER_SOURCE_ID
+        if pair_map["source_id"]
+        in profile_artifact.configured_dataset_scoped_profile_source_ids()
         else {}
     )
     return {
@@ -350,9 +314,13 @@ def _selection_records(
         all_records.profile_inputs.extend(group_records.profile_inputs)
         all_records.source_contexts.extend(group_records.source_contexts)
         all_records.request_projection.extend(group_records.request_projection)
-    all_records.pairs.sort(key=lambda pair_map: (
-        pair_map["source_id"], pair_map["dataset_id"], pair_map["endpoint_id"]
-    ))
+    all_records.pairs.sort(
+        key=lambda pair_map: (
+            pair_map["source_id"],
+            pair_map["dataset_id"],
+            pair_map["endpoint_id"],
+        )
+    )
     all_records.request_projection.sort(
         key=lambda projection_map: (
             projection_map["source_id"],
@@ -362,9 +330,13 @@ def _selection_records(
     all_records.source_contexts.sort(
         key=lambda context_map: (context_map["source_id"], context_map["endpoint_id"])
     )
-    all_records.profile_inputs.sort(key=lambda input_map: (
-        input_map["source_id"], input_map["dataset_id"], input_map["endpoint_id"]
-    ))
+    all_records.profile_inputs.sort(
+        key=lambda input_map: (
+            input_map["source_id"],
+            input_map["dataset_id"],
+            input_map["endpoint_id"],
+        )
+    )
     return all_records
 
 
@@ -378,12 +350,14 @@ def _selection_identity(
         for projection_map in selection_records.request_projection
     ]
     selection_fingerprint = stable_hash(
-        {"node_id": node_id, "catalog_digest": catalog_digest, "datasets": dataset_pairs},
+        {
+            "node_id": node_id,
+            "catalog_digest": catalog_digest,
+            "datasets": dataset_pairs,
+        },
         domain="provider_directory_profile_current_selection",
     )
-    source_context_digest = _source_context_digest(
-        selection_records.source_contexts
-    )
+    source_context_digest = _source_context_digest(selection_records.source_contexts)
     profile_input_digest = _profile_input_digest(
         catalog_digest,
         source_context_digest,
@@ -447,10 +421,12 @@ def _computed_selection_from_rows(
 
     source_groups = _catalog_source_groups(catalog_map)
     source_by_id, source_ids_by_endpoint = _source_selection_indexes(source_rows)
+    _assert_dataset_variant_registry_coordinates(source_by_id)
     dataset_by_group = _dataset_selection_by_group(
         dataset_rows,
         source_groups,
         source_ids_by_endpoint,
+        _dataset_scoped_variant_source_groups(),
     )
     selection_records = _selection_records(
         source_groups,

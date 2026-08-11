@@ -28,6 +28,7 @@ from process.provider_directory_profile_capacity_attestation_contract import (
     CAPACITY_RUNTIME_WITNESS_DOMAIN,
     CAPACITY_TABLESPACE_IDENTITY_DOMAIN,
     CAPACITY_VOLUME_IDENTITY_DOMAIN,
+    LEGACY_CAPACITY_LEASE_V2_CONTRACT_ID,
     CapacityLeaseConsumptionBinding,
     CapacityLeaseDeploymentWitness,
     CapacityLeaseRuntimeWitness,
@@ -44,6 +45,7 @@ from process.provider_directory_profile_capacity_attestation_contract import (
     _ENVELOPE_FIELDS,
     _MAX_OID,
     _MAX_SIGNED_BIGINT,
+    _LEGACY_V2_SIGNED_BODY_FIELDS,
     _SIGNED_BODY_FIELDS,
     _STORAGE_CLASSES,
     _database_name_value,
@@ -65,6 +67,10 @@ from process.provider_directory_profile_capacity_attestation_contract import (
     _validation_time,
     canonical_capacity_lease_json,
     capacity_runtime_witness_sha256,
+)
+from process.provider_directory_profile_capacity_signing_guard import (
+    ProfileCapacitySigningGuardError,
+    validated_capacity_signing_guard_fields,
 )
 from process.provider_directory_profile_capacity_consumption import (
     capacity_lease_consumption_values,
@@ -158,7 +164,7 @@ def _parse_capacity_lease_fields(
 ) -> dict[str, Any]:
     """Parse every exact signed field into a typed internal representation."""
 
-    return {
+    parsed_by_field = {
         **_parse_capacity_lease_identity(lease_body),
         **_parse_capacity_runtime_evidence(lease_body),
         "expires_at": _timestamp(
@@ -179,6 +185,22 @@ def _parse_capacity_lease_fields(
         ),
         "volumes": _parse_capacity_volume_list(lease_body["volumes"]),
     }
+    return parsed_by_field
+
+
+def _parse_capacity_signing_guard_fields(
+    lease_body: Mapping[str, Any],
+    parsed_by_field: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the signed replay chain after basic time bounds pass."""
+
+    try:
+        return validated_capacity_signing_guard_fields(
+            lease_body,
+            parsed_by_field,
+        )
+    except ProfileCapacitySigningGuardError as exc:
+        raise _error("binding_mismatch", "signing_preflight_guard") from exc
 
 
 def _parse_capacity_runtime_evidence(
@@ -358,15 +380,21 @@ def verify_database_capacity_lease(
 ) -> VerifiedDatabaseCapacityLease:
     """Verify one private, exclusive, proof-bound PostgreSQL capacity lease."""
 
-    closed_envelope = _exact_mapping(
-        envelope, _ENVELOPE_FIELDS, field="envelope"
+    closed_envelope = _exact_mapping(envelope, _ENVELOPE_FIELDS, field="envelope")
+    raw_lease_body = closed_envelope["lease"]
+    is_legacy_v2 = (
+        isinstance(raw_lease_body, Mapping)
+        and raw_lease_body.get("contract_id") == LEGACY_CAPACITY_LEASE_V2_CONTRACT_ID
     )
-    lease_body = _exact_mapping(
-        closed_envelope["lease"], _SIGNED_BODY_FIELDS, field="lease"
-    )
-    signature_text, signature_bytes = _decode_signature(
-        closed_envelope["signature"]
-    )
+    if is_legacy_v2:
+        _exact_mapping(
+            raw_lease_body,
+            _LEGACY_V2_SIGNED_BODY_FIELDS,
+            field="legacy_v2_lease",
+        )
+        raise _error("unsupported_contract", "contract_id")
+    lease_body = _exact_mapping(raw_lease_body, _SIGNED_BODY_FIELDS, field="lease")
+    signature_text, signature_bytes = _decode_signature(closed_envelope["signature"])
     lease_fields = _parse_capacity_lease_fields(lease_body)
     validated_at = _validation_time(now)
     trust_key, public_key = capacity_trust_key_for_assigned_lease(
@@ -375,9 +403,7 @@ def verify_database_capacity_lease(
         now=validated_at,
     )
     _assert_attestation_id(lease_body)
-    _assert_tablespace_volume_binding(
-        lease_fields["tablespaces"], lease_fields["volumes"]
-    )
+    _assert_tablespace_volume_binding(lease_fields["tablespaces"], lease_fields["volumes"])
     _assert_colocated_volume_accounting(lease_fields["volumes"])
     _assert_temporal_validity(lease_fields, now=validated_at)
     assert_capacity_trust_binding(
@@ -389,9 +415,8 @@ def verify_database_capacity_lease(
         expected_database_oid=expected_database_oid,
         expected_database_name=expected_database_name,
     )
-    canonical_body = _verify_signature(
-        lease_body, signature_bytes, public_key
-    )
+    canonical_body = _verify_signature(lease_body, signature_bytes, public_key)
+    lease_fields = _parse_capacity_signing_guard_fields(lease_body, lease_fields)
     return _build_verified_capacity_lease(
         lease_fields=lease_fields,
         lease_body=lease_body,
@@ -454,7 +479,6 @@ def assert_database_capacity_lease_reservation(
     )
     if projected_completion > lease.max_build_deadline:
         raise _error("deadline_too_short", "max_build_deadline")
-
 __all__ = (
     "CAPACITY_ATTESTATION_ID_DOMAIN", "CAPACITY_LEASE_CONTRACT_ID",
     "CAPACITY_LEASE_DIGEST_DOMAIN", "CAPACITY_LEASE_MAX_FUTURE_SKEW_SECONDS",
