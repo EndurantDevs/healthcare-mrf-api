@@ -137,17 +137,13 @@ async def _selected_rows(
 @pytest.mark.asyncio
 async def test_global_artifact_scope_is_proof_bound(monkeypatch):
     """Filter sibling aliases, preserve fallback, and reject an empty scope."""
-
     schema = f"provider_directory_artifact_scope_{uuid.uuid4().hex[:12]}"
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     database = await _database()
     try:
         await _create_tables(database, schema)
         await _insert_fixture(database, schema)
-        assert await _selected_rows(database) == [
-            ("source_a", "endpoint_a", "dataset_a")
-        ]
-
+        assert await _selected_rows(database) == [("source_a", "endpoint_a", "dataset_a")]
         await database.status(
             f"""
             UPDATE {schema}.provider_directory_endpoint_dataset
@@ -159,7 +155,6 @@ async def test_global_artifact_scope_is_proof_bound(monkeypatch):
             ("source_a", "endpoint_a", "dataset_a"),
             ("source_b", "endpoint_a", "dataset_a"),
         ]
-
         await database.status(
             f"""
             UPDATE {schema}.provider_directory_endpoint_dataset
