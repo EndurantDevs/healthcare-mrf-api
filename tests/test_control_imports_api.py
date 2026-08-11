@@ -65,6 +65,13 @@ def _assert_core_importer_contracts(importer_by_name):
 
 def _assert_alias_importer_contracts(importer_by_name):
     """Verify reviewed alias, strict backfill, and revoke control inputs."""
+    formatted_importer = importer_by_name["address-formatted-address"]
+    assert formatted_importer["family"] == "provider"
+    assert formatted_importer["queue"] == "arq:AddressArchive"
+    assert formatted_importer["cancelable"] is True
+    assert {
+        param["name"] for param in formatted_importer["params_schema"]
+    } >= {"batch_size"}
     assert importer_by_name["address-numeric-grid-alias"]["family"] == "provider"
     assert importer_by_name["address-numeric-grid-alias"]["queue"] == "arq:AddressArchive"
     assert importer_by_name["address-numeric-grid-alias"]["cancelable"] is True
@@ -317,6 +324,10 @@ def test_provider_directory_runtime_contract_preflight_passes():
             "output_matches": True,
         },
         "seal-direct-v4-terminal-root": {
+            "exit_code": 1,
+            "output_matches": True,
+        },
+        "seal-direct-v5-http410-root": {
             "exit_code": 1,
             "output_matches": True,
         },

@@ -230,7 +230,25 @@ async def sync_v4_terminal_disposition(
     )
 
 
+async def sync_v5_terminal_disposition(
+    database: Any,
+    expected_source_id: str,
+) -> ReviewedSubsetTerminalDispositionResult:
+    """Lock and seal the sole reviewed direct-v5 HTTP-410 root."""
+
+    from process.provider_directory_fhir_subset_terminal_disposition_v5_selection import (
+        selected_direct_v5_terminal_disposition,
+    )
+
+    return await _sync_terminal_disposition_transaction(
+        database,
+        expected_source_id,
+        selected_direct_v5_terminal_disposition,
+    )
+
+
 __all__ = (
     "sync_v4_terminal_disposition",
+    "sync_v5_terminal_disposition",
     "sync_reviewed_subset_terminal_disposition_transaction",
 )

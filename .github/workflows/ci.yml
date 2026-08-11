@@ -530,13 +530,15 @@ jobs:
                 sync-verified-state \
                 abandon-expired-root \
                 seal-terminal-root \
-                seal-direct-v4-terminal-root; do
+                seal-direct-v4-terminal-root \
+                seal-direct-v5-http410-root; do
                 set +e
                 operation_output=$(env \
                   -u HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED \
                   -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED \
                   -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_TERMINAL_DISPOSITION_ENABLED \
                   -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_TERMINAL_DISPOSITION_ENABLED \
+                  -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_ENABLED \
                   /opt/venv/bin/python -B \
                   /opt/scripts/smoke/provider_directory_fhir_reviewed_subset_state.py \
                   "$operation" 2>&1)
@@ -991,6 +993,7 @@ jobs:
           tests/test_provider_directory_reviewed_source_generation_postgres.py
           tests/test_provider_directory_reviewed_subset_terminal_disposition_postgres.py
           tests/test_provider_directory_reviewed_subset_direct_v4_disposition_postgres.py
+          tests/test_provider_directory_reviewed_subset_v5_http410_disposition_postgres.py
           tests/test_provider_directory_terminal_root_retirement_postgres.py
           tests/test_provider_directory_terminal_root_retirement_repair_postgres.py
           tests/test_provider_directory_terminal_root_retirement_v2_postgres.py
@@ -1024,6 +1027,8 @@ jobs:
           -o asyncio_default_fixture_loop_scope=session
           --durations=20
           tests/test_address_canonical_db.py
+          tests/test_address_format_db.py
+          tests/test_address_formatted_serving_db.py
           tests/test_address_numeric_grid_alias_db.py
           tests/test_address_numeric_grid_alias_fences_db.py
           tests/test_address_numeric_grid_alias_lifecycle_db.py

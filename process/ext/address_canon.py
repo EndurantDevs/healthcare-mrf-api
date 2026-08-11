@@ -27,6 +27,7 @@ from sqlalchemy import text
 
 from db.models import db
 from process.ext import address_alias_sql
+from process.ext.address_format import ADDRESS_FORMAT_SOURCE, ADDRESS_FORMAT_VERSION
 from process.ext.address_pub28 import (
     PUB28_DIRECTIONAL_MAP,
     PUB28_INVALID_UNIT_VALUES,
@@ -1403,46 +1404,17 @@ async def _has_zip_restore_dependencies(session: Any, schema: str) -> bool:
     return tiger_zcta and geo_zip_lookup
 
 
-def _zip_restore_sql(
-    *,
-    schema: str,
-    staging_table: str,
-    zip_column: str,
-    latitude_column: str,
-    longitude_column: str,
+def _zip_restore_match_ctes_sql(
+    qschema: str,
+    qtable: str,
+    qlat: str,
+    qlon: str,
     state_expr: str,
     country_expr: str,
-    shards: int,
-    has_address_key: bool,
-    only_null_address_key: bool,
+    source_where: str,
 ) -> str:
-    """Build the state-checked coordinate-to-ZIP restoration statement."""
-    qschema = _quote_ident(schema)
-    qtable = _qtable(schema, staging_table)
-    qzip = _quote_ident(zip_column)
-    qlat = _quote_ident(latitude_column)
-    qlon = _quote_ident(longitude_column)
-    source_filters = [
-        f"NULLIF(trim(COALESCE(s.{qzip}::text, '')), '') IS NULL",
-        f"s.{qlat} IS NOT NULL",
-        f"s.{qlon} IS NOT NULL",
-        f"s.{qlat}::double precision BETWEEN -90 AND 90",
-        f"s.{qlon}::double precision BETWEEN -180 AND 180",
-    ]
-    if has_address_key and only_null_address_key:
-        source_filters.append("s.address_key IS NULL")
-    if shards > 1:
-        source_filters.append("mod(abs(hashtext(s.ctid::text)::bigint), :shards) = :shard")
-    source_where = "\n              AND ".join(source_filters)
-    target_filters = [
-        f"NULLIF(trim(COALESCE(target.{qzip}::text, '')), '') IS NULL",
-    ]
-    if has_address_key and only_null_address_key:
-        target_filters.append("target.address_key IS NULL")
-    target_where = "\n                   AND ".join(target_filters)
-
-    return f"""
-        WITH source_rows AS MATERIALIZED (
+    """Build the source, normalization, and match CTEs for ZIP restoration."""
+    return f"""source_rows AS MATERIALIZED (
             SELECT
                 s.ctid AS source_ctid,
                 {state_expr} AS raw_state,
@@ -1477,6 +1449,55 @@ def _zip_restore_sql(
              WHERE normalized.country_code = 'US'
                AND normalized.state_code IS NOT NULL
         ),
+"""
+
+
+def _zip_restore_sql(
+    *,
+    schema: str,
+    staging_table: str,
+    zip_column: str,
+    latitude_column: str,
+    longitude_column: str,
+    state_expr: str,
+    country_expr: str,
+    shards: int,
+    has_address_key: bool,
+    only_null_address_key: bool,
+) -> str:
+    """Build the state-checked coordinate-to-ZIP restoration statement."""
+    qschema = _quote_ident(schema)
+    qtable = _qtable(schema, staging_table)
+    qzip = _quote_ident(zip_column)
+    qlat = _quote_ident(latitude_column)
+    qlon = _quote_ident(longitude_column)
+    source_filters = [
+        f"NULLIF(trim(COALESCE(s.{qzip}::text, '')), '') IS NULL",
+        f"s.{qlat} IS NOT NULL",
+        f"s.{qlon} IS NOT NULL",
+        f"s.{qlat}::double precision BETWEEN -90 AND 90",
+        f"s.{qlon}::double precision BETWEEN -180 AND 180",
+    ]
+    if has_address_key and only_null_address_key:
+        source_filters.append("s.address_key IS NULL")
+    if shards > 1:
+        source_filters.append("mod(abs(hashtext(s.ctid::text)::bigint), :shards) = :shard")
+    source_where = "\n              AND ".join(source_filters)
+    target_filters = [f"NULLIF(trim(COALESCE(target.{qzip}::text, '')), '') IS NULL"]
+    if has_address_key and only_null_address_key:
+        target_filters.append("target.address_key IS NULL")
+    target_where = "\n                   AND ".join(target_filters)
+    match_ctes_sql = _zip_restore_match_ctes_sql(
+        qschema,
+        qtable,
+        qlat,
+        qlon,
+        state_expr,
+        country_expr,
+        source_where,
+    )
+    return f"""
+        WITH {match_ctes_sql}
         unique_matches AS (
             SELECT source_ctid, min(zip5) AS zip5
               FROM matches
@@ -2005,6 +2026,7 @@ async def resolve_into_archive(
     staging = _qtable(schema, staging_table)
     archive = _qtable(schema, archive_table)
     qschema = _quote_ident(schema)
+    formatted_renderer = f"{qschema}.addr_formatted_address_v1"
     keyed_table_name = "address_archive_resolve_keyed"
     keyed_table = _quote_ident("address_archive_resolve_keyed")
     keyed_temp_table = f"pg_temp.{keyed_table}"
@@ -2511,7 +2533,9 @@ async def resolve_into_archive(
                         address_key, identity_key, identity_version, precision, premise_key,
                         line1_norm, unit_norm, city_norm, state_code, zip5, zip4,
                         country_code, first_line, second_line, city_name, state_name,
-                        postal_code, source_bits, strict_source_bits, display_priority
+                        postal_code, formatted_address, formatted_address_version,
+                        formatted_address_source, source_bits, strict_source_bits,
+                        display_priority
                     )
                     SELECT
                         d.address_key,
@@ -2532,6 +2556,16 @@ async def resolve_into_archive(
                         d.city_name,
                         d.state_name,
                         d.postal_code,
+                        {formatted_renderer}(
+                            d.first_line,
+                            d.second_line,
+                            d.city_name,
+                            d.state_name,
+                            d.postal_code,
+                            d.country_code
+                        ),
+                        :formatted_address_version,
+                        :formatted_address_source,
                         :source_bit,
                         CASE WHEN strict.address_key IS NOT NULL
                              THEN :source_bit ELSE 0 END,
@@ -2544,7 +2578,12 @@ async def resolve_into_archive(
                     RETURNING 1
                 )
                 SELECT count(*) FROM inserted;
-            """), {"source_bit": source_bit, "priority": priority})
+            """), {
+                "source_bit": source_bit,
+                "priority": priority,
+                "formatted_address_version": ADDRESS_FORMAT_VERSION,
+                "formatted_address_source": ADDRESS_FORMAT_SOURCE,
+            })
         ).scalar() or 0)
         _emit_progress(
             phase="address archive resolve",
@@ -2588,7 +2627,22 @@ async def resolve_into_archive(
                            postal_code = CASE
                                WHEN :priority < c.display_priority THEN d.postal_code
                                ELSE c.postal_code
-                           END
+                           END,
+                           formatted_address = {formatted_renderer}(
+                               CASE WHEN :priority < c.display_priority
+                                    THEN d.first_line ELSE c.first_line END,
+                               CASE WHEN :priority < c.display_priority
+                                    THEN d.second_line ELSE c.second_line END,
+                               CASE WHEN :priority < c.display_priority
+                                    THEN d.city_name ELSE c.city_name END,
+                               CASE WHEN :priority < c.display_priority
+                                    THEN d.state_name ELSE c.state_name END,
+                               CASE WHEN :priority < c.display_priority
+                                    THEN d.postal_code ELSE c.postal_code END,
+                               c.country_code
+                           ),
+                           formatted_address_version = :formatted_address_version,
+                           formatted_address_source = :formatted_address_source
                       FROM dedup d
                      WHERE c.address_key = d.address_key
                        AND (
@@ -2598,7 +2652,12 @@ async def resolve_into_archive(
                     RETURNING 1
                 )
                 SELECT count(*) FROM updated;
-            """), {"source_bit": source_bit, "priority": priority})
+            """), {
+                "source_bit": source_bit,
+                "priority": priority,
+                "formatted_address_version": ADDRESS_FORMAT_VERSION,
+                "formatted_address_source": ADDRESS_FORMAT_SOURCE,
+            })
         ).scalar() or 0)
         strict_source_updates = int(
             (
@@ -2728,6 +2787,7 @@ async def migrate_legacy_archive_to_v2(
     schema = schema or _schema_name()
     archive_table = archive_table or archive_table_name()
     qschema = _quote_ident(schema)
+    formatted_renderer = f"{qschema}.addr_formatted_address_v1"
     geo_source_type = f"{qschema}.{_quote_ident('address_archive_geo_source')}"
     legacy = _qtable(schema, legacy_table)
     archive = _qtable(schema, archive_table)
@@ -2949,6 +3009,7 @@ async def migrate_legacy_archive_to_v2(
                         line1_norm, unit_norm, city_norm, state_code, zip5, zip4,
                         country_code, first_line, second_line, city_name, state_name,
                         postal_code, telephone_number, fax_number, formatted_address,
+                        formatted_address_version, formatted_address_source,
                         lat, long, place_id, geo_source, geocode_source, geocode_quality,
                         geocoded_at, source_bits, strict_source_bits,
                         display_priority, date_added
@@ -2974,7 +3035,16 @@ async def migrate_legacy_archive_to_v2(
                         postal_code,
                         telephone_number,
                         fax_number,
-                        formatted_address,
+                        {formatted_renderer}(
+                            first_line,
+                            second_line,
+                            city_name,
+                            state_name,
+                            postal_code,
+                            country_code
+                        ),
+                        :formatted_address_version,
+                        :formatted_address_source,
                         lat,
                         long,
                         place_id,
@@ -3075,12 +3145,55 @@ async def migrate_legacy_archive_to_v2(
                     count(*) FILTER (WHERE inserted)::bigint AS inserted_rows,
                     count(*) FILTER (WHERE NOT inserted)::bigint AS updated_rows
                 FROM upserted;
-            """))
+            """), {
+                "formatted_address_version": ADDRESS_FORMAT_VERSION,
+                "formatted_address_source": ADDRESS_FORMAT_SOURCE,
+            })
             upsert_row = upsert_result.first()
             if upsert_row:
                 upserted_rows = int(upsert_row.upserted_rows or 0)
                 inserted_rows = int(upsert_row.inserted_rows or 0)
                 updated_rows = int(upsert_row.updated_rows or 0)
+            await session.execute(
+                text(
+                    f"""
+                    WITH ranked AS ({ranked_cte})
+                    UPDATE {archive} AS target
+                       SET formatted_address = {formatted_renderer}(
+                               target.first_line,
+                               target.second_line,
+                               target.city_name,
+                               target.state_name,
+                               target.postal_code,
+                               target.country_code
+                           ),
+                           formatted_address_version = :formatted_address_version,
+                           formatted_address_source = :formatted_address_source
+                      FROM ranked
+                     WHERE target.address_key = ranked.address_key
+                       AND ROW(
+                               target.formatted_address,
+                               target.formatted_address_version,
+                               target.formatted_address_source
+                           ) IS DISTINCT FROM ROW(
+                               {formatted_renderer}(
+                                   target.first_line,
+                                   target.second_line,
+                                   target.city_name,
+                                   target.state_name,
+                                   target.postal_code,
+                                   target.country_code
+                               ),
+                               :formatted_address_version,
+                               :formatted_address_source
+                           );
+                    """
+                ),
+                {
+                    "formatted_address_version": ADDRESS_FORMAT_VERSION,
+                    "formatted_address_source": ADDRESS_FORMAT_SOURCE,
+                },
+            )
             _emit_progress(
                 phase="address archive v2 migration",
                 unit="phase",

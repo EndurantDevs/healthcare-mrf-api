@@ -173,6 +173,41 @@ disposition service, reinterpret the failed proof, validate, publish, retry,
 or reuse the root. A later acquisition must use a fresh root and the next
 versioned census policy.
 
+## Seal the exact v5 HTTP-410 terminal root
+
+The direct-v4 operator remains frozen to its historical 4/3 census-drift
+packet. A later reviewed v5 root instead retained six independently verified
+terminal-window completions and one incomplete HealthcareService checkpoint
+after the source returned HTTP 410. It is not resumable, and neither the
+all-resource expired-cursor operator nor either older terminal profile may be
+widened to accept it.
+
+After the failed Job is terminal and Kubernetes, database, Redis, and advisory
+lock ownership are all quiet, run the dedicated selector-free command from the
+exact deployed image:
+
+```console
+HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_ENABLED=true \
+  /opt/venv/bin/python -B \
+  /opt/scripts/smoke/provider_directory_fhir_reviewed_subset_state.py \
+  seal-direct-v5-http410-root
+```
+
+The transaction admits only the frozen v5 campaign and cutoff, six verified
+complete checkpoints, and the sole active HealthcareService checkpoint with
+its retained continuation and exact redacted HTTP-410 diagnostic. It binds all
+three diagnostic copies, checkpoint proofs, cursor commitments, resource rows,
+proof shards, source scope, owner lineage, aggregate counts, and the fixed
+identifier-free marker digest. PostgreSQL dispatches the v3 marker through one
+private validator while retaining the v1 and v2 validators and trigger OIDs.
+
+The command changes only the failed parent marker/status and checkpoint
+lifecycle fields.
+It does not retry, validate, publish, activate, delete, or reuse the root.
+After sealing, recovery requires a genuinely fresh root, a new cutoff, and a
+newly reviewed campaign/profile identity; retry and pagination-root arguments
+remain forbidden.
+
 ## Publication and rollback boundary
 
 State sync does not run artifact publication, address materialization, Profile

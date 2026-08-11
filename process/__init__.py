@@ -146,6 +146,10 @@ from process.entity_address_unified import shutdown as entity_address_unified_sh
 from process.entity_address_unified import startup as entity_address_unified_startup
 from process.address_archive_migration import main as initiate_address_archive_migration
 from process.address_archive_migration import process_data as process_address_archive_migration_data
+from process.address_formatted_address import (
+    process_address_formatted_address,
+    run_address_formatted_address_command,
+)
 from process.address_numeric_grid_alias_worker import main as initiate_address_numeric_grid_alias
 from process.address_numeric_grid_alias_worker import process_data as process_address_numeric_grid_alias_data
 from process.address_numeric_grid_alias_worker import (
@@ -896,6 +900,7 @@ class AddressArchive:
         process_address_numeric_grid_alias_data,
         process_address_numeric_grid_alias_revoke,
         process_address_strict_source_backfill,
+        process_address_formatted_address,
         control_single_job_start,
     ]
     on_startup = db_startup
@@ -1821,6 +1826,26 @@ def address_archive_v2_migrate(
     )
 
 
+@click.command(help="Render deterministic formatted addresses into the archive")
+@click.option(
+    "--batch-size",
+    type=click.IntRange(1, 100_000),
+    default=10_000,
+    show_default=True,
+)
+@click.option("--enqueue", is_flag=True, help="Enqueue on arq:AddressArchive.")
+def address_formatted_address(batch_size: int, enqueue: bool):
+    """Materialize versioned address display labels offline."""
+    result = _run(
+        run_address_formatted_address_command(
+            batch_size=batch_size,
+            enqueue=enqueue,
+        )
+    )
+    if result is not None:
+        click.echo(json.dumps(result, sort_keys=True, default=str))
+
+
 @click.command(help="Discover or apply reviewed numeric-grid address aliases")
 @click.option(
     "--mode",
@@ -2042,6 +2067,7 @@ process_group.add_command(pharmacy_economics, name="pharmacy-economics")
 process_group.add_command(entity_address_unified, name="entity-address-unified")
 process_group.add_command(openaddresses, name="openaddresses")
 process_group.add_command(address_archive_v2_migrate, name="address-archive-v2-migrate")
+process_group.add_command(address_formatted_address, name="address-formatted-address")
 process_group.add_command(address_numeric_grid_alias, name="address-numeric-grid-alias")
 process_group.add_command(
     address_strict_source_backfill,

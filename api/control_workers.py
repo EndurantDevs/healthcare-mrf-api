@@ -90,6 +90,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
         "process.AddressArchive",
         (
             "address-archive-v2-migrate",
+            "address-formatted-address",
             "address-numeric-grid-alias",
             "address-numeric-grid-alias-revoke",
             "address-strict-source-backfill",
@@ -813,14 +814,12 @@ def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str
     return ",".join(f"{key}={value}" for key, value in selector_label_map.items())
 
 
-def _worker_job_manifest(
+def _worker_job_container(
     spec: WorkerSpec,
     launch_request: dict[str, Any],
     image: str,
-) -> dict[str, Any]:
-    """Build the Kubernetes Job manifest for one import worker."""
-
-    job_name = _worker_job_name(spec, launch_request)
+) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    """Build the container and volume records for one worker Job."""
     env_list = [
         {"name": "HLTHPRT_WORKER_LAUNCHER", "value": "process"},
         {"name": "HLTHPRT_IMPORT_NODE_ID", "value": os.getenv("HLTHPRT_IMPORT_NODE_ID", "")},
@@ -862,6 +861,17 @@ def _worker_job_manifest(
     volumes = [*pvc_volumes, *_worker_job_secret_volumes(spec)]
     if volumes:
         container_dict["volumeMounts"] = [volume_spec["volumeMount"] for volume_spec in volumes]
+    return container_dict, volumes, run_id
+
+
+def _worker_job_spec(
+    spec: WorkerSpec,
+    launch_request: dict[str, Any],
+    container_dict: dict[str, Any],
+    volumes: list[dict[str, Any]],
+    run_id: str,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Build labels and the Kubernetes Job spec around one container."""
 
     pod_spec_dict: dict[str, Any] = {
         "restartPolicy": "Never",
@@ -912,6 +922,29 @@ def _worker_job_manifest(
     if replicas > 1:
         job_spec_dict["parallelism"] = replicas
         job_spec_dict["completions"] = replicas
+    return labels_by_key, job_spec_dict
+
+
+def _worker_job_manifest(
+    spec: WorkerSpec,
+    launch_request: dict[str, Any],
+    image: str,
+) -> dict[str, Any]:
+    """Build the Kubernetes Job manifest for one import worker."""
+
+    job_name = _worker_job_name(spec, launch_request)
+    container_dict, volumes, run_id = _worker_job_container(
+        spec,
+        launch_request,
+        image,
+    )
+    labels_by_key, job_spec_dict = _worker_job_spec(
+        spec,
+        launch_request,
+        container_dict,
+        volumes,
+        run_id,
+    )
 
     return {
         "apiVersion": "batch/v1",

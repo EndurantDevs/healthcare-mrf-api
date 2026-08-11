@@ -18,31 +18,43 @@ from tests.test_npi_api_extended import (
 )
 
 
-class _ScalarResult:
-    def __init__(self, value):
-        self.value = value
+class _AddressServingIdentityRow:
+    def __init__(self, overlay_oid, unified_oid):
+        self.overlay_target_oid = overlay_oid
+        self.unified_target_oid = unified_oid
 
-    def scalar(self):
-        return self.value
+
+class _AddressServingIdentityResult:
+    def __init__(self, overlay_oid, unified_oid):
+        self.row = _AddressServingIdentityRow(overlay_oid, unified_oid)
+
+    def first(self):
+        return self.row
 
 
 @pytest.mark.parametrize(
-    ("raw_identity", "expected"),
+    ("overlay_oid", "unified_oid", "expected"),
     (
-        (None, "absent"),
-        (424242, "oid:424242"),
+        (None, None, "overlay:absent|unified:absent"),
+        (424242, 434343, "overlay:oid:424242|unified:oid:434343"),
     ),
 )
 @pytest.mark.asyncio
 async def test_address_overlay_identity_serializes_relation_state(
     monkeypatch,
-    raw_identity,
+    overlay_oid,
+    unified_oid,
     expected,
 ):
     monkeypatch.setattr(
         npi_module,
         "_execute_stmt",
-        AsyncMock(return_value=_ScalarResult(raw_identity)),
+        AsyncMock(
+            return_value=_AddressServingIdentityResult(
+                overlay_oid,
+                unified_oid,
+            )
+        ),
     )
 
     assert (
@@ -51,21 +63,35 @@ async def test_address_overlay_identity_serializes_relation_state(
     )
 
 
-@pytest.mark.parametrize("raw_identity", (True, "not-an-oid", 0))
+@pytest.mark.parametrize(
+    ("overlay_oid", "unified_oid", "invalid_relation"),
+    (
+        (True, 1, "provider_directory_address_overlay"),
+        (1, "not-an-oid", "entity_address_unified"),
+        (1, 0, "entity_address_unified"),
+    ),
+)
 @pytest.mark.asyncio
 async def test_address_overlay_identity_rejects_invalid_relation_oids(
     monkeypatch,
-    raw_identity,
+    overlay_oid,
+    unified_oid,
+    invalid_relation,
 ):
     monkeypatch.setattr(
         npi_module,
         "_execute_stmt",
-        AsyncMock(return_value=_ScalarResult(raw_identity)),
+        AsyncMock(
+            return_value=_AddressServingIdentityResult(
+                overlay_oid,
+                unified_oid,
+            )
+        ),
     )
 
     with pytest.raises(
         RuntimeError,
-        match="address_overlay_identity_invalid",
+        match=f"{invalid_relation}_identity_invalid",
     ):
         await npi_module._provider_directory_address_overlay_serving_identity()
 

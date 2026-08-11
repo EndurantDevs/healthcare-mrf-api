@@ -21,7 +21,6 @@ from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir, sha256_file
 from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blob_stream import (
-    _row_mapping,
     stream_artifact_chunks,
 )
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
@@ -395,7 +394,6 @@ async def materialize_ptg2_artifact_from_db(
                 f"artifact byte_count mismatch for {artifact_id}: expected {expected_byte_count}, got {total_raw_bytes}"
             )
         expected_sha = str((metadata or {}).get("sha256") or "").strip()
-        actual_sha = digest.hexdigest()
         if expected_sha and actual_sha != expected_sha:
             raise ValueError(f"artifact checksum mismatch for {artifact_id}")
         os.replace(tmp_path, cache_path)

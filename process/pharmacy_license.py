@@ -468,6 +468,35 @@ class StateSource:
     board_url: str
 
 
+@dataclass(frozen=True)
+class _StageRowIdentity:
+    license_number: str
+    npi: int
+    entity_name: str | None
+    dba_name: str | None
+    city: str | None
+    state_from_source: str | None
+    zip_code: str | None
+
+
+@dataclass(frozen=True)
+class _StageRowStatus:
+    source_status_raw: str | None
+    license_status: str
+    disciplinary_summary: str | None
+    disciplinary_flag: bool
+    source_last_seen_at: datetime.datetime | None
+
+
+@dataclass(frozen=True)
+class _StageRowImportContext:
+    run_id: str
+    snapshot_id: str
+    state_source: StateSource
+    source_url: str
+    imported_at: datetime.datetime
+
+
 @dataclass
 class StateImportStats:
     supported: bool
@@ -1541,6 +1570,69 @@ async def _load_rows_from_direct_csv_source(
     return mapped_rows, final_url, metadata, None
 
 
+def _map_socrata_license_record(
+    state_code: str,
+    license_record: dict[str, Any],
+) -> dict[str, Any]:
+    """Map one configured Socrata row into the shared license shape."""
+    if state_code == "CO":
+        return _map_co_socrata_row(license_record)
+    if state_code == "WA":
+        return _map_wa_socrata_row(license_record)
+    return dict(license_record)
+
+
+async def _fetch_socrata_page(
+    session: aiohttp.ClientSession,
+    source_url: str,
+    *,
+    select_columns: tuple[str, ...],
+    where_clause: str,
+    page_size: int,
+    offset: int,
+) -> tuple[list[dict[str, Any]], str | None, str | None]:
+    """Fetch and parse one configured Socrata CSV page."""
+    query_parameters_by_name = {
+        "$select": ",".join(select_columns),
+        "$where": where_clause,
+        "$limit": str(page_size),
+        "$offset": str(offset),
+    }
+    try:
+        query_url = f"{source_url}?{urlencode(query_parameters_by_name)}"
+        final_url, _content_type, raw = await _fetch_bytes(
+            session,
+            query_url,
+            max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
+        )
+    except Exception as exc:
+        return [], None, f"adapter_fetch_failed:{exc}"
+
+    try:
+        return _parse_csv_records(raw), final_url, None
+    except Exception as exc:
+        return [], final_url, f"adapter_parse_failed:{exc}"
+
+
+def _finish_socrata_load(
+    license_records: list[dict[str, Any]],
+    final_url: str | None,
+    metadata: dict[str, Any],
+    pages_fetched: int,
+    *,
+    page_limit_reached: bool = False,
+    row_limit_reached: bool = False,
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any], None]:
+    """Attach bounded-load metadata and return a successful result."""
+    metadata["pages_fetched"] = pages_fetched
+    metadata["rows_loaded"] = len(license_records)
+    if page_limit_reached:
+        metadata["page_limit_reached"] = True
+    if row_limit_reached:
+        metadata["row_limit_reached"] = True
+    return license_records, final_url, metadata, None
+
+
 async def _load_rows_from_socrata_source(
     session: aiohttp.ClientSession,
     state_source: StateSource,
@@ -1561,56 +1653,40 @@ async def _load_rows_from_socrata_source(
     page_limit = PHARM_LICENSE_STATE_ADAPTER_MAX_PAGES
 
     while pages_fetched < page_limit and len(license_records) < PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
-        query_parameters_by_name = {
-            "$select": ",".join(select_columns),
-            "$where": where_clause,
-            "$limit": str(page_size),
-            "$offset": str(offset),
-        }
-        try:
-            query_url = f"{source_url}?{urlencode(query_parameters_by_name)}"
-            final_url, _content_type, raw = await _fetch_bytes(
-                session,
-                query_url,
-                max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
-            )
-        except Exception as exc:
-            return [], None, metadata, f"adapter_fetch_failed:{exc}"
-
+        page_rows, final_url, error = await _fetch_socrata_page(
+            session,
+            source_url,
+            select_columns=select_columns,
+            where_clause=where_clause,
+            page_size=page_size,
+            offset=offset,
+        )
+        if error is not None:
+            return [], final_url, metadata, error
         pages_fetched += 1
-        try:
-            page_rows = _parse_csv_records(raw)
-        except Exception as exc:
-            return [], final_url, metadata, f"adapter_parse_failed:{exc}"
 
         if not page_rows:
-            metadata["pages_fetched"] = pages_fetched
-            metadata["rows_loaded"] = len(license_records)
-            return license_records, final_url, metadata, None
+            return _finish_socrata_load(license_records, final_url, metadata, pages_fetched)
 
         for license_record in page_rows:
-            if state_source.state_code == "CO":
-                license_records.append(_map_co_socrata_row(license_record))
-            elif state_source.state_code == "WA":
-                license_records.append(_map_wa_socrata_row(license_record))
-            else:
-                license_records.append(dict(license_record))
+            license_records.append(
+                _map_socrata_license_record(state_source.state_code, license_record)
+            )
             if len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
                 break
 
         if len(page_rows) < page_size:
-            metadata["pages_fetched"] = pages_fetched
-            metadata["rows_loaded"] = len(license_records)
-            return license_records, final_url, metadata, None
+            return _finish_socrata_load(license_records, final_url, metadata, pages_fetched)
         offset += page_size
 
-    metadata["pages_fetched"] = pages_fetched
-    metadata["rows_loaded"] = len(license_records)
-    if pages_fetched >= page_limit:
-        metadata["page_limit_reached"] = True
-    if len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
-        metadata["row_limit_reached"] = True
-    return license_records, source_url, metadata, None
+    return _finish_socrata_load(
+        license_records,
+        source_url,
+        metadata,
+        pages_fetched,
+        page_limit_reached=pages_fetched >= page_limit,
+        row_limit_reached=len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS,
+    )
 
 
 async def _load_rows_from_ny_rosa_source(
@@ -2208,6 +2284,33 @@ def _normalize_stage_row(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Normalize one board row into the staging schema or a skip reason."""
     fields_by_normalized_name = _row_index(source_record)
+    identity, skip_reason = _resolve_stage_row_identity(
+        fields_by_normalized_name,
+        npi_resolver,
+    )
+    if identity is None:
+        return None, skip_reason
+    status = _stage_row_status(fields_by_normalized_name)
+    context = _StageRowImportContext(
+        run_id=run_id,
+        snapshot_id=snapshot_id,
+        state_source=state_source,
+        source_url=source_url,
+        imported_at=imported_at,
+    )
+    return _normalized_stage_record(
+        fields_by_normalized_name,
+        identity,
+        status,
+        context,
+    ), None
+
+
+def _resolve_stage_row_identity(
+    fields_by_normalized_name: dict[str, Any],
+    npi_resolver: StateNpiResolver | None,
+) -> tuple[_StageRowIdentity | None, str | None]:
+    """Resolve the stable license and NPI identity for one source row."""
 
     license_number = _pick_license_number(fields_by_normalized_name)
     if not license_number:
@@ -2230,6 +2333,24 @@ def _normalize_stage_row(
         )
     if npi is None:
         return None, "missing_npi"
+    return (
+        _StageRowIdentity(
+            license_number=license_number,
+            npi=npi,
+            entity_name=entity_name,
+            dba_name=dba_name,
+            city=city,
+            state_from_source=state_from_source,
+            zip_code=zip_code,
+        ),
+        None,
+    )
+
+
+def _stage_row_status(
+    fields_by_normalized_name: dict[str, Any],
+) -> _StageRowStatus:
+    """Normalize status, discipline, and last-seen evidence for one row."""
 
     source_status_raw = _safe_text(_pick_by_aliases(fields_by_normalized_name, _STATUS_KEYS))
     license_status = _normalize_license_status(source_status_raw)
@@ -2249,43 +2370,61 @@ def _normalize_stage_row(
     updated_date = _to_date(updated_raw)
     if updated_date is not None:
         source_last_seen_at = datetime.datetime.combine(updated_date, datetime.time.min)
+    return _StageRowStatus(
+        source_status_raw=source_status_raw,
+        license_status=license_status,
+        disciplinary_summary=disciplinary_summary,
+        disciplinary_flag=bool(disciplinary_flag),
+        source_last_seen_at=source_last_seen_at,
+    )
 
-    state_value = (state_from_source or state_source.state_code).upper()[:2]
 
-    normalized_record_by_field = {
-        "snapshot_id": snapshot_id,
-        "run_id": run_id,
-        "state_code": state_source.state_code,
-        "state_name": state_source.state_name,
-        "board_url": state_source.board_url,
-        "source_url": source_url,
-        "npi": npi,
-        "license_number": license_number[:64],
+def _normalized_stage_record(
+    fields_by_normalized_name: dict[str, Any],
+    identity: _StageRowIdentity,
+    status: _StageRowStatus,
+    context: _StageRowImportContext,
+) -> dict[str, Any]:
+    """Project normalized pharmacy-license evidence into the staging schema."""
+
+    state_value = (
+        identity.state_from_source or context.state_source.state_code
+    ).upper()[:2]
+    return {
+        "snapshot_id": context.snapshot_id,
+        "run_id": context.run_id,
+        "state_code": context.state_source.state_code,
+        "state_name": context.state_source.state_name,
+        "board_url": context.state_source.board_url,
+        "source_url": context.source_url,
+        "npi": identity.npi,
+        "license_number": identity.license_number[:64],
         "license_type": _safe_text(_pick_by_aliases(fields_by_normalized_name, _LICENSE_TYPE_KEYS)),
-        "license_status": license_status,
-        "source_status_raw": source_status_raw[:256] if source_status_raw else None,
+        "license_status": status.license_status,
+        "source_status_raw": (
+            status.source_status_raw[:256] if status.source_status_raw else None
+        ),
         "license_issue_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _ISSUE_KEYS)),
         "license_effective_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _EFFECTIVE_KEYS)),
         "license_expiration_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _EXPIRY_KEYS)),
         "last_renewal_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _RENEWAL_KEYS)),
-        "disciplinary_flag": bool(disciplinary_flag),
-        "disciplinary_summary": disciplinary_summary,
+        "disciplinary_flag": status.disciplinary_flag,
+        "disciplinary_summary": status.disciplinary_summary,
         "disciplinary_action_date": _to_date(
             _pick_by_aliases(fields_by_normalized_name, _DISCIPLINARY_DATE_KEYS)
         ),
-        "entity_name": entity_name,
-        "dba_name": dba_name,
+        "entity_name": identity.entity_name,
+        "dba_name": identity.dba_name,
         "address_line1": _safe_text(_pick_by_aliases(fields_by_normalized_name, _ADDRESS1_KEYS)),
         "address_line2": _safe_text(_pick_by_aliases(fields_by_normalized_name, _ADDRESS2_KEYS)),
-        "city": city,
+        "city": identity.city,
         "state": state_value,
-        "zip_code": zip_code,
+        "zip_code": identity.zip_code,
         "phone_number": _safe_text(_pick_by_aliases(fields_by_normalized_name, _PHONE_KEYS)),
         "source_record_id": _safe_text(_pick_by_aliases(fields_by_normalized_name, _SOURCE_RECORD_KEYS)),
-        "source_last_seen_at": source_last_seen_at,
-        "imported_at": imported_at,
+        "source_last_seen_at": status.source_last_seen_at,
+        "imported_at": context.imported_at,
     }
-    return normalized_record_by_field, None
 
 
 async def _flush_stage_batch(batch: list[dict[str, Any]]) -> None:

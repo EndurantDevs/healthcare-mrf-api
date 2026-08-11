@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Closed marker contract for one direct v4 terminal-root disposition."""
+"""Closed marker contract for one direct-v5 HTTP-410 disposition."""
 
 from __future__ import annotations
 
@@ -12,31 +12,35 @@ from process.provider_directory_fhir_subset_terminal_disposition_contract import
     canonical_evidence_sha256,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_profile import (
-    DIRECT_V4_CONTRACT_VERSION,
-    DIRECT_V4_DISPOSITION_BY_RESOURCE_TYPE,
-    DIRECT_V4_DRIFT_RESOURCE_TYPES,
-    DIRECT_V4_LINEAGE_FIELDS,
-    DIRECT_V4_MAX_VERIFIED_DECREASE,
-    DIRECT_V4_REASON_CODE,
-    DIRECT_V4_RESOURCE_DISPOSITION_FIELDS,
-    DIRECT_V4_TERMINAL_MARKER_FIELDS,
+    DIRECT_V5_CONTRACT_VERSION,
+    DIRECT_V5_DISPOSITION_BY_RESOURCE_TYPE,
+    DIRECT_V5_MAX_DECREASE_BASIS_POINTS,
+    DIRECT_V5_MAX_DECREASE_PAGES,
+    DIRECT_V5_PAGE_COUNT,
+    DIRECT_V5_REASON_CODE,
+    DIRECT_V5_TERMINAL_MARKER_FIELDS,
     EXPECTED_RESOURCE_TYPES,
-    TERMINAL_CENSUS_DRIFT_DISPOSITION,
+    RESOURCE_DISPOSITION_FIELDS,
+    TERMINAL_HTTP_410_DISPOSITION,
     VERIFIED_COMPLETE_DISPOSITION,
+)
+from process.provider_directory_fhir_subset_terminal_disposition_v4_contract import (
+    validated_direct_lineage,
 )
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_COUNT_FIELDS = (
+_COMMON_COUNT_FIELDS = (
     "checkpoint_pages",
     "diagnostic_pages",
     "page_delta",
     "retained_rows",
     "advertised_pre",
+)
+_TERMINAL_COUNT_FIELDS = (
     "advertised_post",
     "returned_unique",
     "deficit",
-    "terminal_page_entry_count",
 )
 _HASH_FIELDS = (
     "diagnostic_sha256",
@@ -52,89 +56,92 @@ def _nonnegative_integer(value: object) -> int:
     return value
 
 
+def _decrease_limit(pre_count: int, page_count: int) -> int:
+    percentage_limit = (
+        pre_count * DIRECT_V5_MAX_DECREASE_BASIS_POINTS + 9_999
+    ) // 10_000
+    return min(
+        page_count * DIRECT_V5_MAX_DECREASE_PAGES,
+        percentage_limit,
+    )
+
+
+def _validated_complete_resource(
+    resource_by_field: Mapping[str, Any],
+    count_by_name: Mapping[str, int],
+) -> None:
+    terminal_count_by_name = {
+        field_name: _nonnegative_integer(resource_by_field.get(field_name))
+        for field_name in _TERMINAL_COUNT_FIELDS
+    }
+    pre_count = count_by_name["advertised_pre"]
+    post_count = terminal_count_by_name["advertised_post"]
+    returned_unique = terminal_count_by_name["returned_unique"]
+    if (
+        resource_by_field.get("checkpoint_state") != "complete"
+        or count_by_name["page_delta"] != 0
+        or post_count > pre_count
+        or pre_count - post_count
+        > _decrease_limit(pre_count, DIRECT_V5_PAGE_COUNT)
+        or returned_unique > post_count
+        or terminal_count_by_name["deficit"] != pre_count - returned_unique
+        or count_by_name["retained_rows"] != returned_unique
+    ):
+        raise ReviewedSubsetTerminalDispositionError("evidence")
+
+
+def _validated_http_410_resource(
+    resource_by_field: Mapping[str, Any],
+    count_by_name: Mapping[str, int],
+) -> None:
+    if (
+        resource_by_field.get("checkpoint_state") != "active"
+        or count_by_name["page_delta"] != 0
+        or count_by_name["retained_rows"] > count_by_name["advertised_pre"]
+        or any(
+            resource_by_field.get(field_name) is not None
+            for field_name in _TERMINAL_COUNT_FIELDS
+        )
+    ):
+        raise ReviewedSubsetTerminalDispositionError("evidence")
+
+
 def _validated_resource(
     resource_type: str,
     resource_value: object,
 ) -> dict[str, Any]:
     if (
         not isinstance(resource_value, Mapping)
-        or set(resource_value) != DIRECT_V4_RESOURCE_DISPOSITION_FIELDS
+        or set(resource_value) != RESOURCE_DISPOSITION_FIELDS
     ):
         raise ReviewedSubsetTerminalDispositionError("evidence")
     resource_by_field = dict(resource_value)
     count_by_name = {
         field_name: _nonnegative_integer(resource_by_field.get(field_name))
-        for field_name in _COUNT_FIELDS
+        for field_name in _COMMON_COUNT_FIELDS
     }
-    if any(
-        _SHA256.fullmatch(str(resource_by_field.get(field_name) or "")) is None
-        for field_name in _HASH_FIELDS
+    if (
+        count_by_name["retained_rows"] <= 0
+        or count_by_name["diagnostic_pages"]
+        - count_by_name["checkpoint_pages"]
+        != count_by_name["page_delta"]
+        or any(
+            _SHA256.fullmatch(str(resource_by_field.get(field_name) or ""))
+            is None
+            for field_name in _HASH_FIELDS
+        )
     ):
         raise ReviewedSubsetTerminalDispositionError("evidence")
-    expected_disposition = DIRECT_V4_DISPOSITION_BY_RESOURCE_TYPE[resource_type]
-    advertised_decrease = (
-        count_by_name["advertised_pre"] - count_by_name["advertised_post"]
-    )
-    common_is_valid = bool(
-        resource_by_field.get("disposition") == expected_disposition
-        and count_by_name["diagnostic_pages"]
-        - count_by_name["checkpoint_pages"]
-        == count_by_name["page_delta"]
-        and count_by_name["advertised_post"]
-        <= count_by_name["advertised_pre"]
-        and count_by_name["returned_unique"]
-        <= count_by_name["advertised_post"]
-        and count_by_name["deficit"]
-        == count_by_name["advertised_pre"]
-        - count_by_name["returned_unique"]
-        and count_by_name["retained_rows"] > 0
-    )
+    expected_disposition = DIRECT_V5_DISPOSITION_BY_RESOURCE_TYPE[resource_type]
+    if resource_by_field.get("disposition") != expected_disposition:
+        raise ReviewedSubsetTerminalDispositionError("evidence")
     if expected_disposition == VERIFIED_COMPLETE_DISPOSITION:
-        state_is_valid = bool(
-            resource_by_field.get("checkpoint_state") == "complete"
-            and count_by_name["page_delta"] == 0
-            and advertised_decrease <= DIRECT_V4_MAX_VERIFIED_DECREASE
-            and count_by_name["retained_rows"]
-            == count_by_name["returned_unique"]
-        )
+        _validated_complete_resource(resource_by_field, count_by_name)
+    elif expected_disposition == TERMINAL_HTTP_410_DISPOSITION:
+        _validated_http_410_resource(resource_by_field, count_by_name)
     else:
-        state_is_valid = bool(
-            expected_disposition == TERMINAL_CENSUS_DRIFT_DISPOSITION
-            and resource_by_field.get("checkpoint_state") == "active"
-            and count_by_name["page_delta"] == 1
-            and advertised_decrease > DIRECT_V4_MAX_VERIFIED_DECREASE
-            and count_by_name["returned_unique"]
-            - count_by_name["retained_rows"]
-            == count_by_name["terminal_page_entry_count"]
-        )
-    if not common_is_valid or not state_is_valid:
         raise ReviewedSubsetTerminalDispositionError("evidence")
     return resource_by_field
-
-
-def validated_direct_lineage(value: object) -> dict[str, Any]:
-    """Validate that a direct disposition has no competing lineage."""
-
-    if not isinstance(value, Mapping) or set(value) != DIRECT_V4_LINEAGE_FIELDS:
-        raise ReviewedSubsetTerminalDispositionError("evidence")
-    lineage_by_field = dict(value)
-    count_fields = (
-        "checkpoint_retry_count",
-        "competing_candidate_count",
-        "current_dataset_count",
-        "import_run_row_count",
-        "previous_reference_count",
-    )
-    if (
-        any(
-            _nonnegative_integer(lineage_by_field.get(field_name)) != 0
-            for field_name in count_fields
-        )
-        or lineage_by_field.get("owner_equals_root") is not True
-        or lineage_by_field.get("previous_dataset_present") is not False
-    ):
-        raise ReviewedSubsetTerminalDispositionError("evidence")
-    return lineage_by_field
 
 
 def _resource_totals(
@@ -151,21 +158,23 @@ def _resource_totals(
         "diagnostic_pages_processed": sum(
             resource["diagnostic_pages"] for resource in resources_by_type.values()
         ),
-        "terminal_page_delta": len(DIRECT_V4_DRIFT_RESOURCE_TYPES),
+        "terminal_page_delta": sum(
+            resource["page_delta"] for resource in resources_by_type.values()
+        ),
         "checkpoint_rows_processed": retained_rows,
         "resource_count": retained_rows,
         "proof_row_count": retained_rows,
     }
 
 
-def validated_direct_v4_terminal_marker(marker_value: object) -> dict[str, Any]:
-    """Validate one identifier-free direct-v4 terminal marker."""
+def validated_direct_v5_terminal_marker(marker_value: object) -> dict[str, Any]:
+    """Validate one identifier-free direct-v5 HTTP-410 marker."""
 
     if (
         not isinstance(marker_value, Mapping)
-        or set(marker_value) != DIRECT_V4_TERMINAL_MARKER_FIELDS
-        or marker_value.get("contract_version") != DIRECT_V4_CONTRACT_VERSION
-        or marker_value.get("reason_code") != DIRECT_V4_REASON_CODE
+        or set(marker_value) != DIRECT_V5_TERMINAL_MARKER_FIELDS
+        or marker_value.get("contract_version") != DIRECT_V5_CONTRACT_VERSION
+        or marker_value.get("reason_code") != DIRECT_V5_REASON_CODE
         or marker_value.get("resource_types") != list(EXPECTED_RESOURCE_TYPES)
         or _SHA256.fullmatch(str(marker_value.get("source_scope_sha256") or ""))
         is None
@@ -183,29 +192,27 @@ def validated_direct_v4_terminal_marker(marker_value: object) -> dict[str, Any]:
         )
         for resource_type in EXPECTED_RESOURCE_TYPES
     }
-    expected_total_by_name = _resource_totals(resources_by_type)
     if any(
         _nonnegative_integer(marker_value.get(field_name)) != expected_value
-        for field_name, expected_value in expected_total_by_name.items()
+        for field_name, expected_value in _resource_totals(resources_by_type).items()
     ):
         raise ReviewedSubsetTerminalDispositionError("evidence")
     if _nonnegative_integer(marker_value.get("proof_shard_count")) <= 0:
         raise ReviewedSubsetTerminalDispositionError("evidence")
-    hash_fields = (
-        "source_diagnostics_sha256",
-        "source_import_sha256",
-        "candidate_metadata_sha256",
-    )
     if any(
         _SHA256.fullmatch(str(marker_value.get(field_name) or "")) is None
-        for field_name in hash_fields
+        for field_name in (
+            "source_diagnostics_sha256",
+            "source_import_sha256",
+            "candidate_metadata_sha256",
+        )
     ):
         raise ReviewedSubsetTerminalDispositionError("evidence")
     validated_direct_lineage(marker_value.get("direct_lineage"))
     return dict(marker_value)
 
 
-def direct_v4_terminal_marker(
+def direct_v5_terminal_marker(
     *,
     source_scope_sha256: str,
     resource_dispositions: Mapping[str, Mapping[str, Any]],
@@ -215,15 +222,15 @@ def direct_v4_terminal_marker(
     candidate_metadata: Mapping[str, Any],
     direct_lineage: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Build the exact direct-v4 marker in the existing terminal envelope."""
+    """Build the exact direct-v5 marker in the shared terminal envelope."""
 
     resources_by_type = {
         resource_type: dict(resource_dispositions[resource_type])
         for resource_type in EXPECTED_RESOURCE_TYPES
     }
     marker_by_field: dict[str, Any] = {
-        "contract_version": DIRECT_V4_CONTRACT_VERSION,
-        "reason_code": DIRECT_V4_REASON_CODE,
+        "contract_version": DIRECT_V5_CONTRACT_VERSION,
+        "reason_code": DIRECT_V5_REASON_CODE,
         "source_scope_sha256": source_scope_sha256,
         "resource_types": list(EXPECTED_RESOURCE_TYPES),
         "resource_dispositions": resources_by_type,
@@ -238,11 +245,10 @@ def direct_v4_terminal_marker(
         ),
         "direct_lineage": dict(direct_lineage),
     }
-    return validated_direct_v4_terminal_marker(marker_by_field)
+    return validated_direct_v5_terminal_marker(marker_by_field)
 
 
 __all__ = (
-    "direct_v4_terminal_marker",
-    "validated_direct_lineage",
-    "validated_direct_v4_terminal_marker",
+    "direct_v5_terminal_marker",
+    "validated_direct_v5_terminal_marker",
 )

@@ -37,6 +37,7 @@ from process.provider_directory_fhir_subset_terminal_disposition_contract import
 from process.provider_directory_fhir_subset_terminal_disposition_profile import (
     DIRECT_V4_CAMPAIGN_ID,
     DIRECT_V4_LINEAGE_FIELDS,
+    DIRECT_V5_CAMPAIGN_ID,
     SOURCE_PROFILE_RESOURCE_TYPES,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_util import (
@@ -92,9 +93,10 @@ def is_candidate_policy_one(metadata: Mapping[str, Any]) -> bool:
     )
 
 
-async def _direct_v4_lineage_counts(
+async def _direct_lineage_counts(
     database: Any,
     candidate_by_field: Mapping[str, Any],
+    campaign_id: str,
 ) -> dict[str, int]:
     root_run_id = str(candidate_by_field["acquisition_root_run_id"])
     owner_run_id = str(candidate_by_field["import_run_id"])
@@ -129,7 +131,7 @@ async def _direct_v4_lineage_counts(
         "owner_run_id": owner_run_id,
         "endpoint_id": candidate_by_field["endpoint_id"],
         "dataset_id": candidate_by_field["dataset_id"],
-        "campaign_id": DIRECT_V4_CAMPAIGN_ID,
+        "campaign_id": campaign_id,
     }
     return {
         count_name: int(
@@ -139,16 +141,18 @@ async def _direct_v4_lineage_counts(
     }
 
 
-async def direct_v4_lineage_evidence(
+async def _direct_lineage_evidence(
     database: Any,
     candidate_by_field: Mapping[str, Any],
     checkpoint_rows: tuple[dict[str, Any], ...],
+    campaign_id: str,
 ) -> dict[str, Any]:
     """Require the fresh direct root to have no retry or predecessor lineage."""
 
-    count_by_name = await _direct_v4_lineage_counts(
+    count_by_name = await _direct_lineage_counts(
         database,
         candidate_by_field,
+        campaign_id,
     )
     owner_run_id = clean_text(candidate_by_field.get("import_run_id"))
     root_run_id = clean_text(candidate_by_field.get("acquisition_root_run_id"))
@@ -172,6 +176,36 @@ async def direct_v4_lineage_evidence(
     ):
         raise ReviewedSubsetTerminalDispositionError("evidence")
     return lineage_by_field
+
+
+async def direct_v4_lineage_evidence(
+    database: Any,
+    candidate_by_field: Mapping[str, Any],
+    checkpoint_rows: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Require the frozen v4 root to have no retry or predecessor lineage."""
+
+    return await _direct_lineage_evidence(
+        database,
+        candidate_by_field,
+        checkpoint_rows,
+        DIRECT_V4_CAMPAIGN_ID,
+    )
+
+
+async def direct_v5_lineage_evidence(
+    database: Any,
+    candidate_by_field: Mapping[str, Any],
+    checkpoint_rows: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Require the frozen v5 root to have no retry or predecessor lineage."""
+
+    return await _direct_lineage_evidence(
+        database,
+        candidate_by_field,
+        checkpoint_rows,
+        DIRECT_V5_CAMPAIGN_ID,
+    )
 
 
 def _source_contract(
@@ -338,6 +372,7 @@ def expected_terminal_start_hashes(
 
 __all__ = (
     "direct_v4_lineage_evidence",
+    "direct_v5_lineage_evidence",
     "expected_terminal_start_hashes",
     "is_candidate_policy_one",
     "is_policy_one_pending",

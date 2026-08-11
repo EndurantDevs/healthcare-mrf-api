@@ -199,11 +199,13 @@ def _retryable_disposition(
     return RETRYABLE_HTTP_500_DISPOSITION
 
 
-def _validated_resource_proof(
+def validated_terminal_resource_proof(
     diagnostic: Mapping[str, Any],
     checkpoint: Mapping[str, Any],
     expected_start_url_sha256: str,
 ) -> tuple[dict[str, Any], str, str]:
+    """Validate one retained proof and return its cursor commitments."""
+
     validate_disposition_diagnostic_shape(diagnostic)
     checkpoint_proof = json_object(checkpoint.get("completeness_json"))
     diagnostic_proof = json_object(
@@ -246,7 +248,7 @@ def _resource_disposition(
         checkpoint_proof,
         start_url_sha256,
         recent_cursor_hashes_sha256,
-    ) = _validated_resource_proof(
+    ) = validated_terminal_resource_proof(
         diagnostic,
         checkpoint,
         expected_start_url_sha256,
@@ -279,7 +281,7 @@ def _resource_disposition(
             is_direct_v4=direct_v4,
         )
     )
-    return identity, _resource_marker(
+    return identity, terminal_resource_marker(
         diagnostic,
         checkpoint,
         checkpoint_proof,
@@ -290,7 +292,7 @@ def _resource_disposition(
     )
 
 
-def _resource_marker(
+def terminal_resource_marker(
     diagnostic: Mapping[str, Any],
     checkpoint: Mapping[str, Any],
     checkpoint_proof: Mapping[str, Any],
@@ -300,6 +302,8 @@ def _resource_marker(
     *,
     direct_v4: bool,
 ) -> dict[str, Any]:
+    """Project one validated resource into the durable marker shape."""
+
     marker_by_field = {
         "disposition": disposition,
         "checkpoint_state": checkpoint["state"],
@@ -369,4 +373,8 @@ def validated_resource_dispositions(
     return resource_by_type
 
 
-__all__ = ("validated_resource_dispositions",)
+__all__ = (
+    "terminal_resource_marker",
+    "validated_resource_dispositions",
+    "validated_terminal_resource_proof",
+)

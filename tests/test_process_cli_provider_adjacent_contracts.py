@@ -387,7 +387,18 @@ def _assert_address_archive_migration_controls(monkeypatch) -> None:
     )
 
 
+def _assert_address_formatted_address_controls(monkeypatch) -> None:
+    _assert_cli_forwards(
+        monkeypatch,
+        command=process_cli.address_formatted_address,
+        target_name="run_address_formatted_address_command",
+        args=["--batch-size", "250", "--enqueue"],
+        expected={"batch_size": 250, "enqueue": True},
+    )
+
+
 def test_address_import_commands_preserve_staging_and_migration_controls(monkeypatch) -> None:
     """Verify address import commands preserve staging and migration controls."""
     _assert_openaddresses_import_controls(monkeypatch)
     _assert_address_archive_migration_controls(monkeypatch)
+    _assert_address_formatted_address_controls(monkeypatch)

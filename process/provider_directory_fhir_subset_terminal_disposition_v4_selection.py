@@ -92,6 +92,10 @@ async def _locked_candidate(
     database: Any,
     source_id: str,
     endpoint_id: str,
+    *,
+    proof_version: int = DIRECT_V4_PROOF_CONTRACT_VERSION,
+    campaign_id: str = DIRECT_V4_CAMPAIGN_ID,
+    contract_version: str = DIRECT_V4_CONTRACT_VERSION,
 ) -> dict[str, Any]:
     candidate_rows = await database.all(
         f"""
@@ -129,14 +133,14 @@ async def _locked_candidate(
          FOR UPDATE OF dataset;
         """,
         endpoint_id=endpoint_id,
-        proof_version=DIRECT_V4_PROOF_CONTRACT_VERSION,
+        proof_version=proof_version,
         source_ids=json.dumps([source_id]),
         resource_types=json.dumps(EXPECTED_RESOURCE_TYPES),
-        campaign_id=DIRECT_V4_CAMPAIGN_ID,
+        campaign_id=campaign_id,
         prior_status=TERMINAL_DISPOSITION_PRIOR_STATUS,
         disposed_status=TERMINAL_DISPOSITION_STATUS,
         disposition_key=TERMINAL_DISPOSITION_METADATA_KEY,
-        contract_version=DIRECT_V4_CONTRACT_VERSION,
+        contract_version=contract_version,
     )
     if len(candidate_rows) != 1:
         raise ReviewedSubsetTerminalDispositionError("evidence")
@@ -166,6 +170,9 @@ def _is_new_candidate_valid(
     candidate_by_field: Mapping[str, Any],
     source_id: str,
     endpoint_id: str,
+    *,
+    proof_version: int = DIRECT_V4_PROOF_CONTRACT_VERSION,
+    campaign_id: str = DIRECT_V4_CAMPAIGN_ID,
 ) -> bool:
     source_metadata = json_object(source_by_field.get("metadata_json"))
     candidate_metadata = json_object(
@@ -185,7 +192,7 @@ def _is_new_candidate_valid(
         and candidate_by_field.get("published_at") is None
         and candidate_by_field.get("superseded_at") is None
         and candidate_by_field.get("completion_proof_required_version")
-        == DIRECT_V4_PROOF_CONTRACT_VERSION
+        == proof_version
         and candidate_by_field.get("completion_proof_json") is None
         and candidate_by_field.get("completion_proof_sha256") is None
         and owner_run_id is not None
@@ -196,7 +203,7 @@ def _is_new_candidate_valid(
         and json_text_tuple(candidate_metadata.get("expected_resources"))
         == EXPECTED_RESOURCE_TYPES
         and candidate_metadata.get("verification_campaign_id")
-        == DIRECT_V4_CAMPAIGN_ID
+        == campaign_id
         and candidate_metadata.get("resource_hash_contract")
         == TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
         and candidate_metadata.get("reused_from_checkpoint") is False
@@ -348,11 +355,14 @@ def _is_replay_candidate_valid(
     diagnostics_by_type: Mapping[str, Any],
     completion_by_field: Mapping[str, Any],
     source_id: str,
+    *,
+    contract_version: str = DIRECT_V4_CONTRACT_VERSION,
+    campaign_id: str = DIRECT_V4_CAMPAIGN_ID,
 ) -> bool:
     owner_run_id = clean_text(candidate_by_field.get("import_run_id"))
     root_run_id = clean_text(candidate_by_field.get("acquisition_root_run_id"))
     return bool(
-        marker_by_field.get("contract_version") == DIRECT_V4_CONTRACT_VERSION
+        marker_by_field.get("contract_version") == contract_version
         and clean_text(candidate_by_field.get("status"))
         == TERMINAL_DISPOSITION_STATUS
         and candidate_by_field.get("is_current") is False
@@ -366,7 +376,7 @@ def _is_replay_candidate_valid(
         and completion_by_field.get("resource_diagnostics")
         == diagnostics_by_type
         and completion_by_field.get("verification_campaign_id")
-        == DIRECT_V4_CAMPAIGN_ID
+        == campaign_id
         and clean_text(completion_by_field.get("acquisition_root_run_id"))
         == root_run_id
         and clean_text(completion_by_field.get("terminal_run_id"))
@@ -376,7 +386,7 @@ def _is_replay_candidate_valid(
         == EXPECTED_RESOURCE_TYPES
         and observed_metadata_by_field.get("reused_from_checkpoint") is False
         and observed_metadata_by_field.get("verification_campaign_id")
-        == DIRECT_V4_CAMPAIGN_ID
+        == campaign_id
         and marker_by_field["candidate_metadata_sha256"]
         == canonical_evidence_sha256(observed_metadata_by_field)
         and marker_by_field["source_diagnostics_sha256"]

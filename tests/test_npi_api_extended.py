@@ -1548,7 +1548,7 @@ async def test_get_npi_uses_cached_address(monkeypatch):
     monkeypatch.setattr(npi_module, "db", FakeDB())
 
     request = types.SimpleNamespace(
-        args={},
+        args={"sync_geocode": "0", "lookup_stored_geocode": "1"},
         app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False})
     )
     response = await npi_module.get_npi(request, "1518379601")
@@ -1559,8 +1559,13 @@ async def test_get_npi_uses_cached_address(monkeypatch):
 def _install_latless_detail_cache_collaborators(monkeypatch):
     """Install a deterministic latless detail builder and cache identities."""
 
-    monkeypatch.setenv("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "false")
-    monkeypatch.setenv("HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE", "false")
+    for environment_name in (
+        "HLTHPRT_NPI_DETAIL_SYNC_GEOCODE",
+        "HLTHPRT_NPI_API_SYNC_GEOCODE",
+        "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
+        "HLTHPRT_NPI_API_LOOKUP_STORED_GEOCODE",
+    ):
+        monkeypatch.delenv(environment_name, raising=False)
     build_call_npis = []
 
     async def fake_build(_npi, **_kwargs):
@@ -1614,8 +1619,8 @@ def _install_latless_detail_cache_collaborators(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latless(monkeypatch):
-    """Cache a latless detail response when synchronous geocoding is disabled."""
+async def test_get_npi_default_is_storage_only_and_caches_latless(monkeypatch):
+    """Cache a latless response without archive or geocoder request-time I/O."""
 
     build_call_npis = _install_latless_detail_cache_collaborators(monkeypatch)
 
@@ -1690,7 +1695,7 @@ async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_npi_cache_tracks_address_overlay_serving_identity(
+async def test_get_npi_cache_tracks_address_serving_relation_identity(
     monkeypatch,
 ):
     build_calls = []
@@ -1713,13 +1718,17 @@ async def test_get_npi_cache_tracks_address_overlay_serving_identity(
         "_npi_canonical_publication_identity",
         AsyncMock(return_value="1:nppub1_" + "a" * 43),
     )
-    overlay_identity = AsyncMock(
-        side_effect=["oid:101", "oid:101", "oid:202"]
+    address_serving_identity = AsyncMock(
+        side_effect=[
+            "overlay:oid:101|unified:oid:201",
+            "overlay:oid:101|unified:oid:201",
+            "overlay:oid:101|unified:oid:202",
+        ]
     )
     monkeypatch.setattr(
         npi_module,
         "_provider_directory_address_overlay_serving_identity",
-        overlay_identity,
+        address_serving_identity,
     )
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
@@ -1741,7 +1750,7 @@ async def test_get_npi_cache_tracks_address_overlay_serving_identity(
     assert first.body == second.body
     assert third.body == first.body
     assert len(build_calls) == 2
-    assert overlay_identity.await_count == 3
+    assert address_serving_identity.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -2190,7 +2199,10 @@ async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
     monkeypatch.setattr(npi_module, 'download_it', fail_download)
 
     app = _NpiEndpointTestApp({"NPI_API_UPDATE_GEOCODE": True})
-    request = types.SimpleNamespace(args={}, app=app)
+    request = types.SimpleNamespace(
+        args={"lookup_stored_geocode": "1"},
+        app=app,
+    )
     response = await npi_module.get_npi(request, '1518379601')
     response_body = json.loads(response.body)
     assert response_body['address_list'][0]['lat'] == 41.0
@@ -2246,7 +2258,10 @@ async def test_get_npi_update_addr_coordinates_handles_exception(monkeypatch):
     monkeypatch.setattr(npi_module, 'download_it', fail_download)
 
     app = _NpiEndpointTestApp({"NPI_API_UPDATE_GEOCODE": True})
-    request = types.SimpleNamespace(args={}, app=app)
+    request = types.SimpleNamespace(
+        args={"lookup_stored_geocode": "1"},
+        app=app,
+    )
     response = await npi_module.get_npi(request, '1518379601')
     response_body = json.loads(response.body)
     assert response_body['address_list'][0]['lat'] == 41.0
@@ -2366,7 +2381,9 @@ async def test_get_npi_v2_archive_is_disabled_without_cutover_flag(monkeypatch):
         def add_task(self, coro):  # pragma: no cover - guard
             raise AssertionError('no geocode update task expected')
 
-    request = types.SimpleNamespace(args={}, app=FakeApp())
+    request = types.SimpleNamespace(
+        args={"lookup_stored_geocode": "1"}, app=FakeApp()
+    )
     response = await npi_module.get_npi(request, '1518379601')
     response_body = json.loads(response.body)
     assert response_body['address_list'][0]['lat'] == 41.0
@@ -2417,7 +2434,10 @@ async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresse
     monkeypatch.setattr(npi_module, 'download_it', fail_download)
 
     app = _NpiEndpointTestApp({"NPI_API_UPDATE_GEOCODE": False}, reject_tasks=True)
-    request = types.SimpleNamespace(args={}, app=app)
+    request = types.SimpleNamespace(
+        args={"lookup_stored_geocode": "1"},
+        app=app,
+    )
     response = await npi_module.get_npi(request, '1518379601')
     response_body = json.loads(response.body)
 
@@ -2430,33 +2450,12 @@ async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresse
 async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypatch):
     """Verify get npi v2 archive geocodeless row falls back to legacy."""
     monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "true")
-    address_entry_map = {
-        'npi': 1518379601,
-        'type': 'primary',
-        'checksum': 12,
-        'first_line': '12 Main St',
-        'second_line': '',
-        'city_name': 'Town',
-        'state_name': 'IL',
-        'postal_code': '123450000',
-        'country_code': 'US',
-        'lat': None,
-        'long': None,
-        'formatted_address': None,
-        'plans_network_array': [],
-        'taxonomy_array': [],
-    }
-
-    async def fake_build(_npi, **_kwargs):
-        return {
-            'npi': _npi,
-            'do_business_as': [],
-            'taxonomy_list': [],
-            'taxonomy_group_list': [],
-            'address_list': [dict(address_entry_map)],
-        }
-
-    monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
+    address_entry = _archive_address_entry(12, "12 Main St", country="US")
+    monkeypatch.setattr(
+        npi_module,
+        "_build_npi_details",
+        _npi_details_builder([address_entry]),
+    )
     monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
 
     class FakeDB:
@@ -2479,11 +2478,14 @@ async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypat
     async def fail_download(*_args, **_kwargs):  # pragma: no cover - guard
         raise AssertionError('download should not run when legacy archive hit')
     monkeypatch.setattr(npi_module, 'download_it', fail_download)
-    class FakeApp:
-        config = {'NPI_API_UPDATE_GEOCODE': False}
-        def add_task(self, coro):  # pragma: no cover - guard
-            raise AssertionError('no geocode update task expected')
-    request = types.SimpleNamespace(args={}, app=FakeApp())
+    app = _NpiEndpointTestApp(
+        {"NPI_API_UPDATE_GEOCODE": False},
+        reject_tasks=True,
+    )
+    request = types.SimpleNamespace(
+        args={"lookup_stored_geocode": "1"},
+        app=app,
+    )
     response = await npi_module.get_npi(request, '1518379601')
     response_body = json.loads(response.body)
     assert response_body['address_list'][0]['lat'] == 41.0
@@ -2496,6 +2498,9 @@ def _assert_v2_geocode_upsert(fake_db):
         "INSERT INTO mrf.address_archive_v2", "SELECT DISTINCT ON",
         "ON CONFLICT (address_key) DO UPDATE", "WHERE checksum = :checksum",
         "LEFT(mrf.addr_state_code_v1(state_name), 32)",
+        "mrf.addr_formatted_address_v1(",
+        "formatted_address_version = EXCLUDED.formatted_address_version",
+        "formatted_address_source = EXCLUDED.formatted_address_source",
         "geo_source, geocode_source, geocode_quality",
         "CAST(:geo_source AS mrf.address_archive_geo_source)",
         "geo_source = COALESCE(mrf.address_archive_v2.geo_source, EXCLUDED.geo_source)",
@@ -2553,7 +2558,10 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_key_upsert(monkeypa
     monkeypatch.setattr(npi_module, 'download_it', fail_download)
 
     app = _NpiEndpointTestApp({"NPI_API_UPDATE_GEOCODE": True})
-    request = types.SimpleNamespace(args={}, app=app)
+    request = types.SimpleNamespace(
+        args={"lookup_stored_geocode": "1"},
+        app=app,
+    )
     response = await npi_module.get_npi(request, '1518379601')
     response_body = json.loads(response.body)
     assert response_body['address_list'][0]['lat'] == 45.0

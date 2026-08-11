@@ -218,8 +218,11 @@ shape, use the separate `seal-terminal-root` operation. Do not reinterpret its
 frozen outcome. The exact direct-v4 4/3 terminal outcome uses the separate
 `seal-direct-v4-terminal-root` operation under its own default-off gate; it
 reuses the existing terminal-disposition transaction and does not publish.
-Do not reinterpret either failed root as proof under the bounded-drift profile;
-seal it first, then start a fresh campaign with a new cutoff and root.
+The later six-complete/one-HTTP-410 v5 outcome uses the distinct
+`seal-direct-v5-http410-root` operation and its own default-off gate. It also
+reuses the same transaction and does not retry or publish. Do not reinterpret
+any failed root as proof under a different profile; seal it first, then start a
+fresh campaign with a new cutoff, campaign identity, and root.
 
 Resolve the single reviewed manual entry from the manifest and freeze one
 timezone-aware cutoff for the acquisition pair:

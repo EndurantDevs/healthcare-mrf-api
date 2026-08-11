@@ -62,6 +62,7 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        ProviderDirectoryOrganizationAffiliation,
                        ProviderDirectoryPractitionerRole,
                        ProviderDirectorySource, db)
+from process.ext.address_format import ADDRESS_FORMAT_SOURCE, ADDRESS_FORMAT_VERSION
 from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
 from process.ext.utils import download_it
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
@@ -10843,14 +10844,18 @@ async def get_npi(request, npi):
     include_extra_info = _is_truthy_arg(request.args.get("extra_info"), default=False)
     should_sync_geocode = _is_truthy_arg(
         request.args.get("sync_geocode"),
-        default=_is_environment_flag_enabled("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True),
+        default=_is_environment_flag_enabled(
+            "HLTHPRT_NPI_DETAIL_SYNC_GEOCODE",
+            "HLTHPRT_NPI_API_SYNC_GEOCODE",
+            default=False,
+        ),
     )
     should_lookup_stored_geocode = _is_truthy_arg(
         request.args.get("lookup_stored_geocode"),
         default=_is_environment_flag_enabled(
             "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
             "HLTHPRT_NPI_API_LOOKUP_STORED_GEOCODE",
-            default=True,
+            default=False,
         ),
     )
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
@@ -11127,6 +11132,7 @@ async def get_npi(request, npi):
                     line1_norm, unit_norm, city_norm, state_code, zip5, zip4, country_code,
                     first_line, second_line, city_name, state_name, postal_code,
                     telephone_number, fax_number, formatted_address, lat, long, place_id,
+                    formatted_address_version, formatted_address_source,
                     geo_source, geocode_source, geocode_quality, geocoded_at,
                     source_bits, strict_source_bits, display_priority, date_added
                 )
@@ -11147,7 +11153,13 @@ async def get_npi(request, npi):
                     NULLIF(substring(regexp_replace(COALESCE(postal_code, ''), '[^0-9]', '', 'g') from 6 for 4), ''),
                     {db_schema}.addr_country_code_v1(COALESCE(NULLIF(country_code, ''), 'US')),
                     first_line, second_line, city_name, state_name, postal_code,
-                    telephone_number, fax_number, formatted_address, lat, long, place_id,
+                    telephone_number, fax_number,
+                    {db_schema}.addr_formatted_address_v1(
+                        first_line, second_line, city_name, state_name,
+                        postal_code, COALESCE(NULLIF(country_code, ''), 'US')
+                    ),
+                    lat, long, place_id,
+                    :formatted_address_version, :formatted_address_source,
                     CAST(:geo_source AS {db_schema}.address_archive_geo_source),
                     :geocode_source, :geocode_quality, now(), 1, 1, 0, date_added
                   FROM (
@@ -11165,7 +11177,16 @@ async def get_npi(request, npi):
                         npi
                   ) source
                 ON CONFLICT (address_key) DO UPDATE SET
-                    formatted_address = COALESCE({db_schema}.{archive_table}.formatted_address, EXCLUDED.formatted_address),
+                    formatted_address = {db_schema}.addr_formatted_address_v1(
+                        {db_schema}.{archive_table}.first_line,
+                        {db_schema}.{archive_table}.second_line,
+                        {db_schema}.{archive_table}.city_name,
+                        {db_schema}.{archive_table}.state_name,
+                        {db_schema}.{archive_table}.postal_code,
+                        {db_schema}.{archive_table}.country_code
+                    ),
+                    formatted_address_version = EXCLUDED.formatted_address_version,
+                    formatted_address_source = EXCLUDED.formatted_address_source,
                     lat = COALESCE({db_schema}.{archive_table}.lat, EXCLUDED.lat),
                     long = COALESCE({db_schema}.{archive_table}.long, EXCLUDED.long),
                     place_id = COALESCE({db_schema}.{archive_table}.place_id, EXCLUDED.place_id),
@@ -11181,6 +11202,8 @@ async def get_npi(request, npi):
                 geo_source=geo_source,
                 geocode_source=geocode_source,
                 geocode_quality=geocode_quality,
+                formatted_address_version=ADDRESS_FORMAT_VERSION,
+                formatted_address_source=ADDRESS_FORMAT_SOURCE,
             )
             return
         archive_value_map = {
@@ -12296,36 +12319,51 @@ async def _provider_directory_address_overlay_serving_identity(
     *,
     session: Any = None,
 ) -> str:
-    """Return the uncached serving-relation identity used by response caches."""
+    """Return both address-serving relation identities used by response caches."""
     overlay_table_ref = _schema_cache_key(
         PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
     )
+    unified_table_ref = _schema_cache_key(EntityAddressUnified.__tablename__)
     identity_result = await _execute_stmt(
         text(
-            "SELECT to_regclass(:overlay_table_ref)::oid::bigint "
-            "AS overlay_target_oid;"
+            "SELECT "
+            "to_regclass(:overlay_table_ref)::oid::bigint "
+            "AS overlay_target_oid, "
+            "to_regclass(:unified_table_ref)::oid::bigint "
+            "AS unified_target_oid;"
         ),
         session=session,
-        params={"overlay_table_ref": overlay_table_ref},
+        params={
+            "overlay_table_ref": overlay_table_ref,
+            "unified_table_ref": unified_table_ref,
+        },
     )
-    overlay_target_oid = identity_result.scalar()
-    if overlay_target_oid is None:
-        return "absent"
-    if isinstance(overlay_target_oid, bool):
-        raise RuntimeError(
-            "provider_directory_address_overlay_identity_invalid"
-        )
-    try:
-        normalized_oid = int(overlay_target_oid)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "provider_directory_address_overlay_identity_invalid"
-        ) from exc
-    if normalized_oid < 1:
-        raise RuntimeError(
-            "provider_directory_address_overlay_identity_invalid"
-        )
-    return f"oid:{normalized_oid}"
+    identity_row = identity_result.first()
+    if identity_row is None:
+        raise RuntimeError("address_serving_identity_missing")
+
+    def _serialize_relation_oid(raw_oid: Any, relation_name: str) -> str:
+        if raw_oid is None:
+            return "absent"
+        if isinstance(raw_oid, bool):
+            raise RuntimeError(f"{relation_name}_identity_invalid")
+        try:
+            normalized_oid = int(raw_oid)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"{relation_name}_identity_invalid") from exc
+        if normalized_oid < 1:
+            raise RuntimeError(f"{relation_name}_identity_invalid")
+        return f"oid:{normalized_oid}"
+
+    overlay_identity = _serialize_relation_oid(
+        identity_row.overlay_target_oid,
+        "provider_directory_address_overlay",
+    )
+    unified_identity = _serialize_relation_oid(
+        identity_row.unified_target_oid,
+        "entity_address_unified",
+    )
+    return f"overlay:{overlay_identity}|unified:{unified_identity}"
 
 
 def _directory_overlay_resource_ctes_sql(schema: str) -> str:
@@ -12369,17 +12407,32 @@ def _overlay_coordinate_sql(overlay_columns: set[str]) -> tuple[str, str, str]:
     return lat_select, long_select, coordinate_group_by
 
 
+def _overlay_formatted_address_sql(overlay_columns: set[str]) -> str:
+    """Select a persisted overlay label without doing request-time rendering."""
+    if "formatted_address" not in overlay_columns:
+        return "NULL::varchar AS formatted_address"
+    return (
+        "MAX(NULLIF(BTRIM(formatted_address), ''))::varchar "
+        "AS formatted_address"
+    )
+
+
+def _overlay_location_status_sql() -> str:
+    """Return the current-resource location-status aggregate."""
+    return _provider_directory_location_status_sql(
+        "overlay.payload_json",
+        resource_type_sql="overlay.resource_type",
+    )
+
+
 def _provider_directory_overlay_query_sql(
     overlay_columns: set[str],
 ) -> str:
     """Build the current-resource provider-directory address overlay query."""
     lat_select, long_select, coordinate_group_by = _overlay_coordinate_sql(overlay_columns)
     overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
-    schema = _runtime_db_schema()
-    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(schema)
-    location_status_sql = _provider_directory_location_status_sql(
-        "overlay.payload_json",
-        resource_type_sql="overlay.resource_type",
+    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(
+        _runtime_db_schema()
     )
     return f"""
         WITH {current_resource_ctes_sql}, visible_overlay AS MATERIALIZED (
@@ -12411,6 +12464,7 @@ def _provider_directory_overlay_query_sql(
             fax_number,
             phone_number,
             fax_number_digits,
+            {_overlay_formatted_address_sql(overlay_columns)},
             {lat_select},
             {long_select},
             address_key,
@@ -12420,7 +12474,7 @@ def _provider_directory_overlay_query_sql(
             COUNT(DISTINCT overlay.source_id)::integer AS source_count,
             COUNT(DISTINCT COALESCE(NULLIF(overlay.canonical_api_base, ''), overlay.source_id))::integer AS independent_source_count,
             (COUNT(DISTINCT COALESCE(NULLIF(overlay.canonical_api_base, ''), overlay.source_id)) > 1)::boolean AS multi_source_confirmed,
-            {location_status_sql} AS location_status,
+            {_overlay_location_status_sql()} AS location_status,
             MAX(source_updated_at) AS updated_at
           FROM visible_overlay AS overlay
       GROUP BY
