@@ -29151,6 +29151,7 @@ async def _run_last_updated_partition_test_fetch(
 async def test_last_updated_partition_transient_count_remains_resumable(monkeypatch):
     directory_source = _last_updated_partition_test_source()
     saved_plan_statuses = []
+    saved_progress = []
 
     async def fetch_transient(_source, _request_url, *, timeout):
         return 503, {"resourceType": "OperationOutcome"}, None, 1
@@ -29163,6 +29164,9 @@ async def test_last_updated_partition_transient_count_remains_resumable(monkeypa
         **_kwargs,
     ):
         saved_plan_statuses.append(partition_plan.status.value)
+        saved_progress.append(
+            (_kwargs["pages_processed"], _kwargs["rows_processed"])
+        )
 
     fetch_outcome, staged_resources_by_id, written_resource_ids = (
         await _run_last_updated_partition_test_fetch(
@@ -29178,6 +29182,7 @@ async def test_last_updated_partition_transient_count_remains_resumable(monkeypa
     assert importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR in fetch_outcome.error
     assert fetch_outcome.retry_not_before is not None
     assert saved_plan_statuses == ["counting"]
+    assert saved_progress == [(0, 0)]
     assert staged_resources_by_id == {}
     assert written_resource_ids == []
 
@@ -29347,6 +29352,7 @@ async def test_last_updated_partition_blocks_post_census_drift(
 async def test_last_updated_partition_transient_page_remains_resumable(monkeypatch):
     directory_source = _last_updated_partition_test_source()
     saved_plan_statuses = []
+    saved_progress = []
 
     async def fetch_then_fail(_source, request_url, *, timeout):
         if "_summary=count" in request_url:
@@ -29366,6 +29372,9 @@ async def test_last_updated_partition_transient_page_remains_resumable(monkeypat
         **_kwargs,
     ):
         saved_plan_statuses.append(partition_plan.status.value)
+        saved_progress.append(
+            (_kwargs["pages_processed"], _kwargs["rows_processed"])
+        )
 
     fetch_outcome, staged_resources_by_id, written_resource_ids = (
         await _run_last_updated_partition_test_fetch(
@@ -29386,6 +29395,7 @@ async def test_last_updated_partition_transient_page_remains_resumable(monkeypat
         "acquiring",
         "acquiring",
     ]
+    assert saved_progress[-1] == (2, 0)
     assert staged_resources_by_id == {}
     assert written_resource_ids == []
 
@@ -29561,15 +29571,15 @@ async def test_last_updated_partition_repeated_next_url_remains_retryable(
         f"{importer.LAST_UPDATED_PARTITION_RETRYABLE_ERROR}:"
         "pagination_loop_detected"
     )
-    assert fetch_outcome.pages_fetched == 3
-    assert fetch_outcome.rows_fetched == 1
+    assert fetch_outcome.pages_fetched == 2
+    assert fetch_outcome.rows_fetched == 0
     assert len(responder.requested_urls) == 3
     assert resume_recorder.persisted_resume is not None
     assert resume_recorder.persisted_resume.plan.status is importer.PlanStatus.ACQUIRING
     assert resume_recorder.persisted_resume.plan.failure is None
     assert resume_recorder.persisted_resume.plan.windows["root"].passes == {}
-    assert resume_recorder.persisted_resume.pages_processed == 3
-    assert resume_recorder.persisted_resume.rows_processed == 1
+    assert resume_recorder.persisted_resume.pages_processed == 2
+    assert resume_recorder.persisted_resume.rows_processed == 0
     assert fingerprints_by_window_and_pass == {}
     assert staged_resources_by_id == {}
     assert written_resource_ids == []
@@ -30241,6 +30251,7 @@ async def test_last_updated_partition_empty_resource_has_complete_zero_proof(
     )
 
     assert fetch_outcome.complete is True
+    assert fetch_outcome.pages_fetched == 6
     assert fetch_outcome.rows_fetched == 0
     assert fetch_outcome.fetch_diagnostic["verified"] is True
     assert {
