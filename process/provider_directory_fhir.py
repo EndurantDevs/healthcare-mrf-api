@@ -72757,6 +72757,7 @@ PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_IDENTIFIER_HEX_LENGTH = (
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
     "source_record_idx",
     "npi_idx",
+    "npi_premise_key_idx",
     "address_key_idx",
     "source_idx",
     "phone_idx",
@@ -72946,6 +72947,7 @@ def _provider_directory_address_overlay_columns() -> tuple[str, ...]:
         "resource_id",
         "npi",
         "address_key",
+        "premise_key",
         "first_line",
         "second_line",
         "city_name",
@@ -72970,7 +72972,8 @@ def _provider_directory_address_overlay_columns() -> tuple[str, ...]:
 
 def _provider_directory_address_overlay_source_columns() -> tuple[str, ...]:
     """Return columns emitted directly by Provider Directory source queries."""
-    formatted_columns = {
+    archive_columns = {
+        "premise_key",
         "formatted_address",
         "formatted_address_version",
         "formatted_address_source",
@@ -72978,7 +72981,7 @@ def _provider_directory_address_overlay_source_columns() -> tuple[str, ...]:
     return tuple(
         column
         for column in _provider_directory_address_overlay_columns()
-        if column not in formatted_columns
+        if column not in archive_columns
     )
 
 
@@ -72995,6 +72998,7 @@ def provider_directory_address_overlay_table_sql(db_schema: str | None = None, t
         resource_id varchar(256) NOT NULL,
         npi bigint NOT NULL,
         address_key uuid NOT NULL,
+        premise_key uuid,
         first_line varchar,
         second_line varchar,
         city_name varchar,
@@ -73047,10 +73051,24 @@ def address_overlay_formatted_address_columns_sql(
     """
 
 
+def address_overlay_premise_key_column_sql(
+    db_schema: str | None = None,
+    table_name: str | None = None,
+) -> str:
+    """Add the archive-backed premise key to older overlay tables."""
+    schema = db_schema if db_schema is not None else _schema()
+    table_ref = _qt(schema, table_name or PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    return f"""
+    ALTER TABLE {table_ref}
+        ADD COLUMN IF NOT EXISTS premise_key uuid;
+    """
+
+
 async def _ensure_provider_directory_address_overlay_table(schema: str) -> None:
     await db.status(provider_directory_address_overlay_table_sql(schema))
     await db.status(address_overlay_coordinate_columns_sql(schema))
     await db.status(address_overlay_formatted_address_columns_sql(schema))
+    await db.status(address_overlay_premise_key_column_sql(schema))
     await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
 
 
@@ -73069,6 +73087,11 @@ async def _create_provider_directory_address_overlay_indexes(
         f"CREATE UNIQUE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'source_record_idx'))} "
         f"ON {table_ref} (source_record_id);",
         f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'npi_idx'))} ON {table_ref} (npi);",
+        f"""
+        CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'npi_premise_key_idx'))}
+            ON {table_ref} (npi, premise_key)
+         WHERE premise_key IS NOT NULL;
+        """,
         f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'address_key_idx'))} "
         f"ON {table_ref} (address_key);",
         f"CREATE INDEX IF NOT EXISTS {_q(_address_overlay_index_name(table_name, 'source_idx'))} "
@@ -74526,6 +74549,7 @@ async def _rewrite_address_overlay_alias_rows(
             f"""
             UPDATE {stage_ref} AS stage_row
                SET address_key = target.address_key,
+                   premise_key = target.premise_key,
                    lat = COALESCE(stage_row.lat, target.lat),
                    long = COALESCE(stage_row.long, target.long)
               FROM {aliases} AS active
@@ -74622,6 +74646,44 @@ async def _backfill_address_overlay_stage_coordinates(schema: str, stage_ref: st
     )
 
 
+async def _backfill_address_overlay_stage_premise_keys(
+    schema: str,
+    stage_ref: str,
+) -> int:
+    """Replace staged premise keys with the current unmerged archive value."""
+    if not await _is_table_present(schema, "address_archive_v2"):
+        return _coerce_rowcount(
+            await db.status(
+                f"""
+                UPDATE {stage_ref}
+                   SET premise_key = NULL
+                 WHERE premise_key IS NOT NULL;
+                """
+            )
+        )
+    archive_ref = _qt(schema, "address_archive_v2")
+    return _coerce_rowcount(
+        await db.status(
+            f"""
+            WITH desired_premise AS MATERIALIZED (
+                SELECT stage_source.ctid AS stage_row_id,
+                       archive.premise_key
+                  FROM {stage_ref} AS stage_source
+                  LEFT JOIN {archive_ref} AS archive
+                    ON archive.address_key = stage_source.address_key
+                   AND archive.merged_into IS NULL
+                 WHERE stage_source.address_key IS NOT NULL
+            )
+            UPDATE {stage_ref} AS stage_row
+               SET premise_key = desired_premise.premise_key
+              FROM desired_premise
+             WHERE desired_premise.stage_row_id = stage_row.ctid
+               AND stage_row.premise_key IS DISTINCT FROM desired_premise.premise_key;
+            """
+        )
+    )
+
+
 async def _backfill_address_overlay_stage_formatted_addresses(
     schema: str,
     stage_ref: str,
@@ -74658,7 +74720,11 @@ async def _hydrate_address_overlay_stage_from_archive(
     schema: str,
     stage_ref: str,
 ) -> dict[str, int]:
-    """Hydrate archive-backed label metadata and coordinates in key order."""
+    """Hydrate archive-backed premise, label, and coordinate fields."""
+    premise_rows = await _backfill_address_overlay_stage_premise_keys(
+        schema,
+        stage_ref,
+    )
     formatted_rows = await _backfill_address_overlay_stage_formatted_addresses(
         schema,
         stage_ref,
@@ -74668,6 +74734,7 @@ async def _hydrate_address_overlay_stage_from_archive(
         stage_ref,
     )
     return {
+        "archive_premise_key_backfill_rows": premise_rows,
         "archive_formatted_address_backfill_rows": formatted_rows,
         "archive_coordinate_backfill_rows": coordinate_rows,
     }
@@ -74748,6 +74815,10 @@ def _address_overlay_publish_result(
         "aliases_materialized": stage_metric_dict.get("aliases_materialized", 0),
         "alias_residual_source_keys": stage_metric_dict.get(
             "alias_residual_source_keys",
+            0,
+        ),
+        "archive_premise_key_backfill_rows": stage_metric_dict.get(
+            "archive_premise_key_backfill_rows",
             0,
         ),
         "archive_coordinate_backfill_rows": stage_metric_dict.get("archive_coordinate_backfill_rows", 0),

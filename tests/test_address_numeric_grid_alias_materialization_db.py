@@ -57,6 +57,23 @@ async def _prepare_materializer_alias() -> tuple[str, str, str]:
     return schema, source_key, target_key
 
 
+async def _assert_overlay_premise_matches_archive(
+    schema: str,
+    overlay_stage: str,
+    target_key: str,
+) -> None:
+    """Require alias materialization to carry the target archive premise."""
+    target_premise_key = await db.scalar(
+        f"SELECT premise_key::text FROM {schema}.address_archive_v2 "
+        "WHERE address_key = CAST(:target_key AS uuid);",
+        target_key=target_key,
+    )
+    assert target_premise_key is not None
+    assert await db.scalar(
+        f"SELECT premise_key::text FROM {schema}.{overlay_stage};"
+    ) == target_premise_key
+
+
 async def _assert_overlay_alias_materialization(
     schema: str,
     source_key: str,
@@ -115,6 +132,7 @@ async def _assert_overlay_alias_materialization(
     assert await db.scalar(
         f"SELECT address_key::text FROM {schema}.{overlay_stage};"
     ) == target_key
+    await _assert_overlay_premise_matches_archive(schema, overlay_stage, target_key)
 
 
 _UNIFIED_ALIAS_SOURCE_SQL = """

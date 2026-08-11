@@ -28134,6 +28134,11 @@ async def test_address_overlay_live_ensure_does_not_build_scope_index(monkeypatc
 
     joined_sql = "\n".join(call.args[0] for call in status.await_args_list)
     assert "provider_directory_address_overlay_source_idx" in joined_sql
+    assert "ADD COLUMN IF NOT EXISTS premise_key uuid" in joined_sql
+    assert "provider_directory_address_overlay_npi_premise_key_idx" in joined_sql
+    assert joined_sql.index("ADD COLUMN IF NOT EXISTS premise_key uuid") < joined_sql.index(
+        "provider_directory_address_overlay_npi_premise_key_idx"
+    )
     assert "provider_directory_address_overlay_source_run_resource_idx" not in joined_sql
     assert "(source_id, last_seen_run_id, resource_type, resource_id)" not in joined_sql
 
@@ -28146,6 +28151,9 @@ async def test_address_overlay_stage_builds_and_renames_scope_index(monkeypatch)
     stage_index = importer._address_overlay_index_name(
         stage_table, "source_run_resource_idx"
     )
+    stage_premise_index = importer._address_overlay_index_name(
+        stage_table, "npi_premise_key_idx"
+    )
 
     await importer._create_address_overlay_stage_indexes("mrf", stage_table)
     await importer._rename_address_overlay_stage_indexes("mrf", stage_table)
@@ -28156,6 +28164,10 @@ async def test_address_overlay_stage_builds_and_renames_scope_index(monkeypatch)
     assert (
         f'ALTER INDEX IF EXISTS "mrf"."{stage_index}" '
         'RENAME TO "provider_directory_address_overlay_source_run_resource_idx"'
+    ) in joined_sql
+    assert (
+        f'ALTER INDEX IF EXISTS "mrf"."{stage_premise_index}" '
+        'RENAME TO "provider_directory_address_overlay_npi_premise_key_idx"'
     ) in joined_sql
 
 
@@ -28308,10 +28320,17 @@ def _assert_overlay_staged_swap_sql(status_calls):
         "source_record_idx",
     )
     stage_npi_idx = importer._address_overlay_index_name(stage_table, "npi_idx")
+    stage_npi_premise_idx = importer._address_overlay_index_name(
+        stage_table,
+        "npi_premise_key_idx",
+    )
 
     assert f'CREATE UNLOGGED TABLE "mrf"."{stage_table}"' in joined_sql
     assert f'CREATE UNIQUE INDEX IF NOT EXISTS "{stage_source_record_idx}"' in joined_sql
     assert f'CREATE INDEX IF NOT EXISTS "{stage_npi_idx}"' in joined_sql
+    assert f'CREATE INDEX IF NOT EXISTS "{stage_npi_premise_idx}"' in joined_sql
+    assert "(npi, premise_key)" in joined_sql
+    assert "WHERE premise_key IS NOT NULL" in joined_sql
     assert 'FROM "mrf"."provider_directory_address_overlay"' in joined_sql
     assert "WHERE NOT (source_id = ANY(CAST(:source_ids AS varchar[])))" in joined_sql
     assert "PARTITION BY source_record_id" in joined_sql
@@ -28367,6 +28386,7 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
     }
     assert metrics["duplicates_removed"] == 2
     assert metrics["copied_existing"] == 4
+    assert metrics["archive_premise_key_backfill_rows"] == 0
     assert metrics["archive_coordinate_backfill_rows"] == 0
     assert metrics["orphan_stage_cleanup"]["scanned"] == 0
     assert metrics["source_ids"] == ["source_a"]
