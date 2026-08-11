@@ -420,6 +420,30 @@ def test_local_ptg_cli_dry_run_writes_fixture_and_command(tmp_path, monkeypatch)
     assert (fixture_dir / "index.json").exists()
     assert (fixture_dir / "rates.json.gz").exists()
 
+
+def test_local_ptg_correctness_passes_the_prepared_variant(tmp_path, monkeypatch):
+    observed_arguments_by_name = {}
+    monkeypatch.setattr(harness, "_is_serving_storage_probe_enabled", lambda case, variant: True)
+    monkeypatch.setattr(
+        harness,
+        "analyze_local_serving_sidecar_candidate",
+        lambda **arguments: observed_arguments_by_name.update(arguments) or {"status": "passed"},
+    )
+    monkeypatch.setattr(harness, "serving_index_expectations_for", lambda case, variant: {})
+    run_context_by_key = {
+        "environment": {},
+        "fixture_dir": tmp_path,
+        "run_dir": tmp_path,
+        "variant_id": "prepared-variant",
+    }
+    run_evidence_by_key = {"status": "succeeded", "import_run_id": "run-neutral"}
+
+    result = harness._check_local_ptg_correctness({}, {}, run_context_by_key, run_evidence_by_key)
+
+    assert result["storage"] == {"status": "passed"}
+    assert observed_arguments_by_name["variant_id"] == "prepared-variant"
+
+
 def test_original_file_summary_counts_unique_prices(tmp_path):
     fixture_case_dict = {
         "id": "full-file",

@@ -379,7 +379,15 @@ class _RootRunner:
                 retry_delay = self.retry_delay(error, claim.attempt)
                 await self.release_for_retry(claim)
                 return claim.requested_npi, retry_delay
-            terminal_code = "retry_exhausted" if error.retryable else error.code
+            terminal_code = (
+                "retry_exhausted"
+                if error.retryable
+                else (
+                    f"response_validation_{error.validation_code}"
+                    if error.validation_code is not None
+                    else error.code
+                )
+            )
             await self.terminal_error(claim, terminal_code)
             raise UHCFlexPractitionerAcquisitionError("root_unsealable")
         except Exception:

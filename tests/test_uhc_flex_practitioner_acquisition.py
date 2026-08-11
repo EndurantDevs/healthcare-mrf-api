@@ -120,6 +120,16 @@ async def test_nonretryable_and_exhausted_transport_failures_are_terminal_safe()
             1,
         ),
         (
+            UHCFlexPractitionerTransportError("response_validation", validation_code="cross_npi"),
+            "response_validation_cross_npi",
+            3,
+        ),
+        (
+            UHCFlexPractitionerTransportError("response_validation", validation_code="secret"),
+            "response_validation",
+            3,
+        ),
+        (
             RuntimeError(f"sensitive failure for {MEMBER_NPIS[0]}"),
             "transport_failure",
             3,

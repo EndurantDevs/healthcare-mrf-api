@@ -58,6 +58,12 @@ def test_transport_error_sanitizes_unknown_code_and_retry_metadata():
     assert error.validation_code is None
     assert "provider-secret" not in str(error)
 
+    validation_error = transport.UHCFlexPractitionerTransportError(
+        "response_validation",
+        validation_code="secret",
+    )
+    assert validation_error.validation_code is None
+
 
 def test_retry_after_accepts_naive_http_date(monkeypatch):
     retry_at = dt.datetime.now(dt.UTC).replace(tzinfo=None) + dt.timedelta(seconds=2)
