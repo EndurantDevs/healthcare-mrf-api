@@ -20,6 +20,7 @@ from process.ptg_parts import ptg2_legacy_v3_metadata_reconcile as reconcile
 from process.ptg_parts.ptg2_legacy_v3_metadata_reconcile import (
     LegacyV3MetadataConflict,
 )
+from process.ptg_parts.ptg2_lifecycle_lock import PTG2LifecycleLockDeferred
 from process.ptg_parts.ptg_source_attempt_guard import (
     PTGSourceAttemptFencedError,
 )
@@ -310,6 +311,24 @@ async def test_execute_maps_digest_or_eligibility_drift_to_conflict(
         outer_run_id=OUTER_RUN_ID,
         expected_plan_digest=PLAN_DIGEST,
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_maps_busy_lifecycle_to_retry(monkeypatch) -> None:
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    monkeypatch.setattr(
+        control_module,
+        "reconcile_legacy_v3_metadata",
+        AsyncMock(side_effect=PTG2LifecycleLockDeferred("busy; retry")),
+    )
+
+    with pytest.raises(SanicException) as deferred:
+        await control_module.control_legacy_v3_metadata_execute(
+            _request(_coordinates(include_digest=True))
+        )
+
+    assert deferred.value.status_code == 503
+    assert deferred.value.headers == {"Retry-After": "1"}
 
 
 @pytest.mark.asyncio

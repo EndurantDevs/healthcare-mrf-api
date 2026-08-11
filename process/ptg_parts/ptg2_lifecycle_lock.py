@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
 
 from db.connection import db
@@ -61,6 +62,25 @@ def is_retryable_lifecycle_database_error(error: BaseException) -> bool:
     """Return whether PostgreSQL classified the bounded wait as retryable."""
 
     return lifecycle_database_sqlstate(error) in _RETRYABLE_SQLSTATES
+
+
+@asynccontextmanager
+async def ptg2_lifecycle_transaction(
+    database: Any,
+    *,
+    busy_message: str,
+):
+    """Rollback before exposing a bounded lifecycle database deferral."""
+
+    try:
+        async with database.transaction() as session:
+            yield session
+    except PTG2LifecycleLockDeferred:
+        raise
+    except Exception as error:
+        if not is_retryable_lifecycle_database_error(error):
+            raise
+        raise PTG2LifecycleLockDeferred(busy_message) from error
 
 
 async def configure_ptg2_lifecycle_transaction(
@@ -173,4 +193,5 @@ __all__ = [
     "configure_ptg2_lifecycle_transaction",
     "is_retryable_lifecycle_database_error",
     "lifecycle_database_sqlstate",
+    "ptg2_lifecycle_transaction",
 ]

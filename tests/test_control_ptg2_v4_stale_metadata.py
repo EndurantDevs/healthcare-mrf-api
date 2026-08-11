@@ -11,6 +11,7 @@ from sanic.exceptions import BadRequest, Forbidden, SanicException
 
 from api import control_ptg2_v4_stale_metadata as control_module
 from api.control_ptg_v4 import register_v4_control_routes
+from process.ptg_parts.ptg2_lifecycle_lock import PTG2LifecycleLockDeferred
 from process.ptg_parts.ptg2_v4_stale_metadata_reconcile import (
     PTG2V4StaleMetadataConflict,
 )
@@ -187,6 +188,30 @@ async def test_stale_metadata_execute_maps_state_conflict_to_409(monkeypatch):
         )
 
     assert conflict.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_stale_metadata_execute_maps_busy_lifecycle_to_retry(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    monkeypatch.setattr(
+        control_module,
+        "reconcile_v4_stale_metadata",
+        AsyncMock(side_effect=PTG2LifecycleLockDeferred("busy; retry")),
+    )
+
+    with pytest.raises(SanicException) as deferred:
+        await control_module.control_v4_stale_execute(
+            _request(
+                {
+                    "snapshot_id": SNAPSHOT_ID,
+                    "internal_run_id": INTERNAL_RUN_ID,
+                    "expected_plan_digest": PLAN_DIGEST,
+                }
+            )
+        )
+
+    assert deferred.value.status_code == 503
+    assert deferred.value.headers == {"Retry-After": "1"}
 
 
 @pytest.mark.asyncio

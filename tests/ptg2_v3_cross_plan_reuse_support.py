@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from process.ptg_parts import ptg2_shared_gc as shared_gc
+from tests.ptg2_layout_build_schema_support import (
+    layout_build_candidate_and_pin_ddl,
+)
 from tests.ptg2_v4_migration_catalog_support import (
     attempt_guard_prerequisite_ddl,
 )
 
 
 async def _create_layout_identity_tables(connection, schema: str) -> None:
+    """Create migration-shaped shared layout identity tables."""
+
     for ddl in (
         f"""
         CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
@@ -35,25 +40,7 @@ async def _create_layout_identity_tables(connection, schema: str) -> None:
             created_at timestamptz NOT NULL DEFAULT now()
         )
         """,
-        f"""
-        CREATE TABLE {schema}.ptg2_layout_build_candidate (
-            snapshot_key bigint PRIMARY KEY
-                REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
-            semantic_fingerprint bytea NOT NULL,
-            created_at timestamptz NOT NULL DEFAULT now()
-        )
-        """,
-        f"""
-        CREATE TABLE {schema}.ptg2_block_build_pin (
-            snapshot_key bigint NOT NULL REFERENCES
-                {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
-            build_token varchar(96) NOT NULL,
-            pin_token varchar(96) NOT NULL,
-            block_hash bytea NOT NULL,
-            lease_until timestamptz NOT NULL,
-            PRIMARY KEY (snapshot_key, pin_token, block_hash)
-        )
-        """,
+        *layout_build_candidate_and_pin_ddl(schema),
         f"""
         CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
             snapshot_id varchar(96) PRIMARY KEY,

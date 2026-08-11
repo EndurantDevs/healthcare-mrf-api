@@ -369,6 +369,8 @@ async def row_versions(
 
 
 def operational_absence(_outer_runs: Any) -> dict[str, Any]:
+    """Return the exact synthetic proof that no external work exists."""
+
     return {
         "contract": "ptg_source_attempt_external_absence_v1",
         "job_identity_count": 1,
@@ -379,6 +381,15 @@ def operational_absence(_outer_runs: Any) -> dict[str, Any]:
         "worker_present_count": 0,
         "exact_external_absence": True,
     }
+
+
+def patch_operational_absence(monkeypatch: Any) -> None:
+    """Use the synthetic external-absence proof in the reconciler."""
+
+    async def exact_absence(outer_runs, _event_rows=None):
+        return operational_absence(outer_runs)
+
+    monkeypatch.setattr(reconcile, "load_exact_operational_absence", exact_absence)
 
 
 async def create_test_context(monkeypatch: Any) -> LegacyV3PostgresContext:
@@ -438,6 +449,7 @@ __all__ = [
     "apply_reconcile_migration",
     "legacy_v3_postgres_context",
     "operational_absence",
+    "patch_operational_absence",
     "quoted",
     "apply_reconcile_downgrade",
     "reconcile_downgrade_sql",

@@ -7,6 +7,7 @@ from sanic import response
 from sanic.exceptions import BadRequest, SanicException
 
 from api.control_auth import require_control_auth
+from process.ptg_parts.ptg2_lifecycle_lock import PTG2LifecycleLockDeferred
 from process.ptg_parts.ptg2_legacy_v3_metadata_reconcile import (
     LegacyV3MetadataConflict,
     plan_legacy_v3_metadata_reconcile,
@@ -58,6 +59,12 @@ async def control_legacy_v3_metadata_execute(request):
                 "expected_plan_digest",
             ),
         )
+    except PTG2LifecycleLockDeferred as error:
+        raise SanicException(
+            str(error),
+            status_code=503,
+            headers={"Retry-After": "1"},
+        ) from error
     except LegacyV3MetadataConflict as error:
         raise SanicException(str(error), status_code=409) from error
     except ValueError as error:

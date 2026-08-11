@@ -9,6 +9,9 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_DENSE_LAYOUT_TABLES,
     PTG2_V3_SHARED_GENERATION,
 )
+from tests.ptg2_layout_build_schema_support import (
+    layout_build_candidate_and_pin_ddl,
+)
 from tests.ptg_source_snapshot_removal_postgres_projection import (
     schema_sql as _schema_sql,
     snapshot_manifest as _snapshot_manifest,
@@ -126,25 +129,7 @@ _SCHEMA_STATEMENTS = (
         created_at timestamptz NOT NULL DEFAULT now()
     )
     """,
-    """
-    CREATE TABLE __SCHEMA__.ptg2_layout_build_candidate (
-        snapshot_key bigint PRIMARY KEY REFERENCES
-            __SCHEMA__.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
-        semantic_fingerprint bytea NOT NULL,
-        created_at timestamptz NOT NULL DEFAULT now()
-    )
-    """,
-    """
-    CREATE TABLE __SCHEMA__.ptg2_block_build_pin (
-        snapshot_key bigint NOT NULL REFERENCES
-            __SCHEMA__.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
-        build_token varchar(96) NOT NULL,
-        pin_token varchar(96) NOT NULL,
-        block_hash bytea NOT NULL,
-        lease_until timestamptz NOT NULL,
-        PRIMARY KEY (snapshot_key, pin_token, block_hash)
-    )
-    """,
+    *layout_build_candidate_and_pin_ddl("__SCHEMA__"),
     """
     CREATE TABLE __SCHEMA__.ptg2_v3_snapshot_binding (
         snapshot_id varchar(96) PRIMARY KEY REFERENCES

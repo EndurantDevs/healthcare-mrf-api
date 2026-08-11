@@ -83,7 +83,7 @@ async def control_ensure_import_run_table(_app, _loop):
 async def control_error(request, exc: SanicException):
     """Render control-plane exceptions with the stable JSON error contract."""
 
-    return response.json(_error_payload(request, exc), status=getattr(exc, "status_code", 500))
+    return response.json(_error_payload(request, exc), status=getattr(exc, "status_code", 500), headers=getattr(exc, "headers", None))
 
 
 @blueprint.get("/importers")

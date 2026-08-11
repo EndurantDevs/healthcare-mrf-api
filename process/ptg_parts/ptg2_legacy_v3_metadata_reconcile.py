@@ -30,6 +30,7 @@ from process.ptg_parts.ptg2_legacy_v3_operational_absence import (
 )
 from process.ptg_parts.ptg2_lifecycle_lock import (
     acquire_ptg2_source_lifecycle_lock,
+    ptg2_lifecycle_transaction,
 )
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.db_tables import _quote_ident
@@ -378,7 +379,12 @@ async def _apply_reconcile_transaction(
     operational_evidence: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], str | None]:
     schema_name = resolve_ptg2_schema()
-    async with db.transaction() as session:
+    async with ptg2_lifecycle_transaction(
+        db,
+        busy_message=(
+            "legacy PTG V3 metadata lifecycle transaction is busy; retry"
+        ),
+    ) as session:
         source_file_import_id, observation = await _locked_observation(
             session,
             schema_name=schema_name,

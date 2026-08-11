@@ -14,6 +14,7 @@ from process.ptg_parts.ptg_source_attempt_guard import source_attempt_lock_key
 from process.ptg_parts.ptg_source_attempt_guard import (
     PTGSourceAttemptTerminalError,
 )
+from tests.ptg2_lifecycle_retry_test_support import settle_lifecycle_outcomes
 from tests.ptg2_legacy_v3_reconcile_postgres_support import (
     INTERNAL_RUN_ID,
     OUTER_RUN_ID,
@@ -22,22 +23,12 @@ from tests.ptg2_legacy_v3_reconcile_postgres_support import (
     LegacyV3PostgresContext,
     legacy_v3_postgres_context,
     operational_absence,
+    patch_operational_absence as _patch_operational_absence,
     row_versions,
     seed_ready_v3_target,
     seed_source_event,
     source_options,
 )
-
-
-def _patch_operational_absence(monkeypatch) -> None:
-    async def exact_absence(_outer_runs, _event_rows=None):
-        return operational_absence(_outer_runs)
-
-    monkeypatch.setattr(
-        reconcile,
-        "load_exact_operational_absence",
-        exact_absence,
-    )
 
 
 async def _assert_preplan_rejections(
@@ -93,7 +84,7 @@ async def _execute_concurrent_repair(
         outer_run_id=OUTER_RUN_ID,
     )
     assert plan["status"] == "ready"
-    reports = await asyncio.gather(
+    outcomes = await asyncio.gather(
         *(
             reconcile.reconcile_legacy_v3_metadata(
                 snapshot_id=SNAPSHOT_ID,
@@ -102,7 +93,17 @@ async def _execute_concurrent_repair(
                 expected_plan_digest=plan["plan_digest"],
             )
             for _ordinal in range(2)
-        )
+        ),
+        return_exceptions=True,
+    )
+    reports = await settle_lifecycle_outcomes(
+        outcomes,
+        replay=lambda: reconcile.reconcile_legacy_v3_metadata(
+                snapshot_id=SNAPSHOT_ID,
+                internal_run_id=INTERNAL_RUN_ID,
+                outer_run_id=OUTER_RUN_ID,
+                expected_plan_digest=plan["plan_digest"],
+        ),
     )
     return reports, versions_before, await row_versions(context)
 

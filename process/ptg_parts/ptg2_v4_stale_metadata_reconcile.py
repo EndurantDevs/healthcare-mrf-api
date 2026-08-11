@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from db.connection import db
 from process.ptg_parts.ptg2_lifecycle_lock import (
     acquire_ptg2_source_lifecycle_lock,
+    ptg2_lifecycle_transaction,
 )
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_snapshot_maps import PTG2_V4_SHARED_GENERATION
@@ -267,7 +268,12 @@ async def reconcile_v4_stale_metadata(
         internal_run_id=internal_run_id,
         expected_plan_digest=expected_plan_digest,
     )
-    async with db.transaction() as session:
+    async with ptg2_lifecycle_transaction(
+        db,
+        busy_message=(
+            "PTG V4 stale-metadata lifecycle transaction is busy; retry"
+        ),
+    ) as session:
         marker_by_field, is_idempotent = await _reconcile_locked(
             session,
             request,
