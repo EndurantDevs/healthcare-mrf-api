@@ -279,13 +279,13 @@ async def test_corroboration_fence_accepts_fenced_overlay_override(monkeypatch):
         "_provider_directory_relation_oid",
         AsyncMock(return_value=17),
     )
-    relation_overrides = {
+    relation_override_by_target = {
         provider_directory_fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
             "provider_directory_address_overlay_stage"
     }
     override_token = (
         provider_directory_fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
-            relation_overrides
+            relation_override_by_target
         )
     )
     try:

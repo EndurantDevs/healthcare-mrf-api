@@ -212,7 +212,7 @@ async def test_backfill_command_runs_inline_and_enqueues(monkeypatch):
         process_backfill,
     )
     create_pool, queue = _mock_queue(monkeypatch)
-    command_options = {
+    command_options_by_name = {
         "alias_run_id": "00000000-0000-0000-0000-000000000001",
         "expected_candidate_sha256": "a" * 64,
         "reviewed_by": "synthetic-reviewer",
@@ -221,12 +221,12 @@ async def test_backfill_command_runs_inline_and_enqueues(monkeypatch):
 
     inline_result = (
         await address_numeric_grid_alias_worker.run_address_strict_source_backfill_command(
-            **command_options
+            **command_options_by_name
         )
     )
     queued_result = (
         await address_numeric_grid_alias_worker.run_address_strict_source_backfill_command(
-            **command_options,
+            **command_options_by_name,
             enqueue=True,
         )
     )
@@ -298,7 +298,7 @@ async def test_revoke_worker_and_command_paths(monkeypatch):
         progress,
     )
     create_pool, queue = _mock_queue(monkeypatch)
-    command_options = {
+    command_options_by_name = {
         "source_address_key": revoke_result.source_address_key,
         "expected_target_address_key": revoke_result.target_address_key,
         "reason": revoke_result.revoked_reason,
@@ -313,10 +313,10 @@ async def test_revoke_worker_and_command_paths(monkeypatch):
         process_revoke,
     )
     inline_result = await address_numeric_grid_alias_worker.run_address_alias_revoke_command(
-        **command_options
+        **command_options_by_name
     )
     queued_result = await address_numeric_grid_alias_worker.run_address_alias_revoke_command(
-        **command_options,
+        **command_options_by_name,
         enqueue=True,
     )
 
