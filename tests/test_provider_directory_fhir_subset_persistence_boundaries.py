@@ -282,8 +282,8 @@ def test_coverage_validators_reject_continuation_and_unresolved_drift():
         )
 
 
-def _acquired_rows(candidate):
-    return [
+def _acquired_rows(candidate, *, repeat_first=False):
+    rows = [
         {
             "resource_type": resource_type,
             "resource_id": f"{resource_type.lower()}-1",
@@ -291,30 +291,76 @@ def _acquired_rows(candidate):
         }
         for resource_type in candidate.selected_resources
     ]
+    if repeat_first:
+        rows.append(
+            {
+                **rows[0],
+                "resource_id": "multi-2",
+                "acquired_resource_sha256": "e" * 64,
+            }
+        )
+    return rows
 
 
 @pytest.mark.asyncio
-async def test_acquired_resource_hashes_bind_every_selected_family():
+async def test_acquired_resource_hashes_bind_every_selected_family(monkeypatch):
     candidate, _, content, _, _, _, _ = _persisted_inputs()
-    connection = SimpleNamespace(all=AsyncMock(return_value=_acquired_rows(candidate)))
+    acquired_resource_records = _acquired_rows(candidate, repeat_first=True)
+    acquired_resource_records[0] = {
+        **acquired_resource_records[0],
+        "resource_id": 'escaped-"-\u2603',
+    }
+    repeated_resource_type = acquired_resource_records[0]["resource_type"]
+    ordered_rows = sorted(
+        acquired_resource_records,
+        key=lambda resource_record: (
+            resource_record["resource_type"],
+            resource_record["resource_id"],
+        ),
+    )
+    page_sizes = []
 
+    async def acquired_page(_query, **params):
+        cursor = (
+            params.get("after_resource_type"),
+            params.get("after_resource_id"),
+        )
+        page = [
+            resource_record
+            for resource_record in ordered_rows
+            if cursor[0] is None
+            or (
+                resource_record["resource_type"],
+                resource_record["resource_id"],
+            )
+            > cursor
+        ][: params["batch_size"]]
+        page_sizes.append(len(page))
+        return page
+
+    monkeypatch.setattr(importer, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 2)
+    connection = SimpleNamespace(all=AsyncMock(side_effect=acquired_page))
+
+    expected_count_by_type = dict(content.resource_counts)
+    expected_count_by_type[repeated_resource_type] += 1
     observed = await importer._subset_acquired_resource_hashes(
-        connection,
-        candidate,
-        content.resource_counts,
+        connection, candidate, expected_count_by_type
     )
 
     assert observed == {
         resource_type: importer.subset_canonical_sha256(
             [
                 {
-                    "resource_id": f"{resource_type.lower()}-1",
-                    "sha256": "d" * 64,
+                    "resource_id": resource_record["resource_id"],
+                    "sha256": resource_record["acquired_resource_sha256"],
                 }
+                for resource_record in ordered_rows
+                if resource_record["resource_type"] == resource_type
             ]
         )
         for resource_type in sorted(candidate.selected_resources)
     }
+    assert page_sizes == [2, 2, 2, 2, 0]
 
 
 @pytest.mark.asyncio
