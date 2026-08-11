@@ -8,10 +8,11 @@ import json
 import types
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 import sqlalchemy as sa
+from arq.jobs import serialize_job as arq_serialize_job
 from sqlalchemy.exc import IntegrityError
 from sanic.exceptions import Forbidden, SanicException
 from sanic.exceptions import BadRequest, NotFound
@@ -1306,38 +1307,215 @@ async def test_set_cancel_flag_reports_redis_failure(monkeypatch):
     assert "redis down" in result["error"]
 
 
-@pytest.mark.asyncio
-async def test_remove_queued_job_removes_arq_job(monkeypatch):
-    calls = []
+def _serialized_arq_job(function_name, job_payload_by_name):
+    return arq_serialize_job(
+        function_name,
+        (job_payload_by_name,),
+        {},
+        None,
+        1,
+        serializer=control_imports.serialize_job,
+    )
 
-    class FakeRedis:
-        async def zrem(self, *args):
-            calls.append(("zrem", args))
-            return 1
 
-        async def delete(self, *args):
-            calls.append(("delete", args))
-            return 1
+def _install_arq_cleanup_redis(monkeypatch, raw_job_bytes):
+    pipeline = Mock()
+    pipeline.__aenter__ = AsyncMock(return_value=pipeline)
+    pipeline.__aexit__ = AsyncMock(return_value=None)
+    pipeline.watch = AsyncMock()
+    pipeline.get = AsyncMock(return_value=raw_job_bytes)
+    pipeline.execute = AsyncMock(return_value=[1, 4])
+    fake_redis = Mock()
+    fake_redis.pipeline.return_value = pipeline
 
     async def fake_create_pool(*_args, **_kwargs):
-        return FakeRedis()
+        return fake_redis
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
+    return fake_redis, pipeline
 
-    outcome_by_field = await _remove_queued_job({"metrics": {"queue": "arq:NPI", "job_id": "job_1"}})
+
+@pytest.mark.parametrize(
+    (
+        "importer",
+        "function_name",
+        "job_payload_by_name",
+        "metrics_by_name",
+        "queue_name",
+        "job_id",
+    ),
+    [
+        (
+            "provider-directory-fhir",
+            "control_single_job_start",
+            {"run_id": "run_exact", "importer": "provider-directory-fhir"},
+            {},
+            "arq:ProviderDirectoryFHIR",
+            "provider_directory_start_run_exact",
+        ),
+        (
+            "provider-directory-fhir",
+            "control_single_job_start",
+            {"run_id": "run_exact", "importer": "provider-directory-fhir"},
+            {"job_id": "legacy_provider_directory_job"},
+            "arq:ProviderDirectoryFHIR",
+            "legacy_provider_directory_job",
+        ),
+        (
+            "nucc",
+            "control_single_job_start",
+            {"run_id": "run_exact", "importer": "nucc"},
+            {"job_id": "legacy_job"},
+            "arq:NUCC",
+            "legacy_job",
+        ),
+        (
+            "ptg",
+            "ptg_control_start",
+            {"run_id": "run_exact"},
+            {},
+            "arq:PTG",
+            "ptg_start_run_exact",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_remove_queued_job_validates_and_atomically_removes_exact_arq_job(
+    monkeypatch,
+    importer,
+    function_name,
+    job_payload_by_name,
+    metrics_by_name,
+    queue_name,
+    job_id,
+):
+    fake_redis, pipeline = _install_arq_cleanup_redis(
+        monkeypatch,
+        _serialized_arq_job(function_name, job_payload_by_name),
+    )
+
+    outcome_by_field = await _remove_queued_job(
+        {
+            "run_id": "run_exact",
+            "importer": importer,
+            "metrics": metrics_by_name,
+        }
+    )
 
     assert outcome_by_field == {
         "redis": True,
-        "queue": "arq:NPI",
-        "job_id": "job_1",
+        "queue": queue_name,
+        "job_id": job_id,
         "removed": True,
         "deleted_job_key": True,
-        "deleted_keys": 1,
+        "deleted_keys": 4,
     }
-    assert calls == [
-        ("zrem", ("arq:NPI", "job_1")),
-        ("delete", ("arq:job:job_1", "arq:retry:job_1", "arq:result:job_1")),
+    fake_redis.pipeline.assert_called_once_with(transaction=True)
+    assert pipeline.mock_calls == [
+        call.__aenter__(),
+        call.watch(f"arq:job:{job_id}"),
+        call.get(f"arq:job:{job_id}"),
+        call.multi(),
+        call.zrem(queue_name, job_id),
+        call.delete(
+            f"arq:job:{job_id}",
+            f"arq:retry:{job_id}",
+            f"arq:in-progress:{job_id}",
+            f"arq:result:{job_id}",
+        ),
+        call.execute(),
+        call.__aexit__(None, None, None),
     ]
+
+
+@pytest.mark.parametrize(
+    "raw_job_bytes",
+    [
+        _serialized_arq_job(
+            "control_single_job_start",
+            {"run_id": "run_exact", "importer": "different-importer"},
+        ),
+        arq_serialize_job(
+            "control_single_job_start",
+            None,
+            {},
+            None,
+            1,
+            serializer=control_imports.serialize_job,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_remove_queued_job_refuses_identity_mismatch_without_mutation(
+    monkeypatch,
+    raw_job_bytes,
+):
+    _, pipeline = _install_arq_cleanup_redis(
+        monkeypatch,
+        raw_job_bytes,
+    )
+    mismatch_by_field = await _remove_queued_job(
+        {"run_id": "run_exact", "importer": "provider-directory-fhir"}
+    )
+
+    assert mismatch_by_field["identity_mismatch"] is True
+    assert mismatch_by_field["removed"] is False
+    pipeline.multi.assert_not_called()
+    pipeline.zrem.assert_not_called()
+    pipeline.delete.assert_not_called()
+    pipeline.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remove_queued_job_refuses_watched_job_change(monkeypatch):
+    _, pipeline = _install_arq_cleanup_redis(
+        monkeypatch,
+        _serialized_arq_job(
+            "control_single_job_start",
+            {"run_id": "run_exact", "importer": "provider-directory-fhir"},
+        ),
+    )
+    pipeline.execute.side_effect = control_imports.WatchError("changed")
+
+    outcome_by_field = await _remove_queued_job(
+        {"run_id": "run_exact", "importer": "provider-directory-fhir"}
+    )
+
+    assert outcome_by_field["redis"] is False
+    assert outcome_by_field["removed"] is False
+    assert outcome_by_field["reason"] == "ARQ job changed during cleanup"
+
+
+@pytest.mark.asyncio
+async def test_remove_queued_job_refuses_missing_identity_without_mutation(
+    monkeypatch,
+):
+    _, pipeline = _install_arq_cleanup_redis(monkeypatch, None)
+
+    outcome_by_field = await _remove_queued_job(
+        {"run_id": "run_exact", "importer": "provider-directory-fhir"}
+    )
+
+    assert outcome_by_field["identity_unavailable"] is True
+    assert outcome_by_field["removed"] is False
+    pipeline.multi.assert_not_called()
+    pipeline.zrem.assert_not_called()
+    pipeline.delete.assert_not_called()
+    pipeline.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remove_queued_job_refuses_unresolvable_identity(monkeypatch):
+    create_pool = AsyncMock()
+    monkeypatch.setattr(control_imports, "create_pool", create_pool)
+
+    outcome_by_field = await _remove_queued_job(
+        {"run_id": "run_exact", "importer": "nucc", "metrics": {}}
+    )
+
+    assert outcome_by_field["identity_unavailable"] is True
+    assert outcome_by_field["removed"] is False
+    create_pool.assert_not_awaited()
 
 
 def _load_import_run_migration():
@@ -3034,6 +3212,17 @@ def _install_running_cancel_stubs(monkeypatch, source_run: dict[str, object], de
     monkeypatch.setattr(control_imports, "db", database_recorder)
     monkeypatch.setattr(control_imports, "get_import_run", fake_get_import_run)
     monkeypatch.setattr(control_imports, "_set_cancel_flag", fake_set_cancel_flag)
+    monkeypatch.setattr(
+        control_imports,
+        "_remove_queued_job",
+        AsyncMock(
+            return_value={
+                "redis": True,
+                "removed": False,
+                "reason": "job already claimed",
+            }
+        ),
+    )
     monkeypatch.setattr(control_imports, "_delete_active_worker_jobs", delete_worker_jobs)
     return database_recorder
 
@@ -3327,6 +3516,49 @@ async def test_request_cancel_keeps_uncertain_queued_worker_canceling(
     ]
 
 
+@pytest.mark.parametrize("cleanup_key", ["identity_mismatch", "identity_unavailable"])
+@pytest.mark.asyncio
+async def test_request_cancel_retries_unverified_queue_identity(
+    monkeypatch,
+    cleanup_key,
+):
+    source_run_map = {
+        "run_id": "run_queued_unverified",
+        "importer": "facility-anchors",
+        "status": "queued",
+        "progress": {"pct": 0},
+        "metrics": {"enqueue_adapter": "arq_single_job"},
+        "finished_at": None,
+    }
+    remove_queued_job, _, delete_active_worker_jobs = _install_queued_cancel_stubs(
+        monkeypatch,
+        source_run_map,
+        {"redis": False, "removed": False},
+        {"enabled": True, "deleted": 0, "items": []},
+    )
+    remove_queued_job.side_effect = [
+        {"redis": False, "removed": False, cleanup_key: True},
+        {"redis": True, "removed": True, "deleted_job_key": True},
+    ]
+    delete_active_worker_jobs.side_effect = [
+        {"enabled": True, "deleted": 1, "items": [{"deleted": True}]},
+        {"enabled": True, "deleted": 0, "items": []},
+    ]
+
+    first_cancel_result_map = await control_imports.request_cancel(
+        "run_queued_unverified"
+    )
+    retried_cancel_result_map = await control_imports.request_cancel(
+        "run_queued_unverified"
+    )
+
+    assert first_cancel_result_map["status"] == "canceling"
+    assert first_cancel_result_map["phase_detail"] == "cancel requested"
+    assert first_cancel_result_map["finished_at"] is None
+    assert retried_cancel_result_map["status"] == "canceled"
+    assert retried_cancel_result_map["metrics"]["cancel_signal"]["removed"] is True
+
+
 def test_queued_arq_cancel_completion_requires_a_durable_fence():
     no_worker_after_cancel_flag_map = {
         "removed": False,
@@ -3449,9 +3681,10 @@ async def test_cancel_persistence_skips_events_when_updated_row_is_missing(
     publish_status_event.assert_not_called()
 
 
+@pytest.mark.parametrize("is_queued_arq", [False, True])
 @pytest.mark.asyncio
-async def test_queued_arq_cancel_sets_fence_before_cleanup(monkeypatch):
-    """Fence a popped worker before removing queue state or inspecting jobs."""
+async def test_arq_cancel_sets_fence_before_cleanup(monkeypatch, is_queued_arq):
+    """Fence a popped worker before cleaning queued or active ARQ state."""
     call_order_list = []
     source_run_map = {"run_id": "run_ordered"}
 
@@ -3479,11 +3712,63 @@ async def test_queued_arq_cancel_sets_fence_before_cleanup(monkeypatch):
         source_run_map,
         run_id="run_ordered",
         is_pending_adapter=False,
-        is_queued_arq=True,
+        is_queued_arq=is_queued_arq,
     )
 
     assert call_order_list == ["cancel_flag", "queue", "kubernetes"]
+    if is_queued_arq:
+        assert signal_by_name["cancel_flag"] == {"redis": True}
+    else:
+        assert signal_by_name["redis"] is True
+        assert signal_by_name["arq_cleanup"] == {
+            "redis": True,
+            "removed": False,
+        }
+
+
+@pytest.mark.asyncio
+async def test_arq_cancel_retains_flag_and_refuses_mutation_on_identity_mismatch(
+    monkeypatch,
+):
+    set_cancel_flag = AsyncMock(return_value={"redis": True})
+    remove_queued_job = AsyncMock(
+        return_value={"redis": True, "removed": False, "identity_mismatch": True}
+    )
+    delete_active_worker_jobs = AsyncMock(
+        return_value={"enabled": True, "deleted": 1}
+    )
+    monkeypatch.setattr(control_imports, "_set_cancel_flag", set_cancel_flag)
+    monkeypatch.setattr(control_imports, "_remove_queued_job", remove_queued_job)
+    monkeypatch.setattr(
+        control_imports,
+        "_delete_active_worker_jobs",
+        delete_active_worker_jobs,
+    )
+
+    signal_by_name = await control_imports._cancel_signal_for_run(
+        {"run_id": "run_mismatch"},
+        run_id="run_mismatch",
+        is_pending_adapter=False,
+        is_queued_arq=True,
+    )
+
     assert signal_by_name["cancel_flag"] == {"redis": True}
+    assert signal_by_name["identity_mismatch"] is True
+    assert signal_by_name["kubernetes"] == {"enabled": True, "deleted": 1}
+    set_cancel_flag.assert_awaited_once_with("run_mismatch")
+    delete_active_worker_jobs.assert_awaited_once_with({"run_id": "run_mismatch"})
+
+
+@pytest.mark.parametrize("cleanup_key", ["identity_mismatch", "identity_unavailable"])
+def test_queued_arq_cancel_requires_exact_redis_cleanup_identity(cleanup_key):
+    assert not control_imports._is_queued_arq_cancel_completed(
+        {
+            cleanup_key: True,
+            "removed": False,
+            "cancel_flag": {"redis": True},
+            "kubernetes": {"enabled": True, "deleted": 0, "items": []},
+        }
+    )
 
 
 def test_cancel_progress_preserves_exact_worker_attempt_ownership():
@@ -3562,6 +3847,11 @@ async def test_request_cancel_marks_running_run_canceling(monkeypatch):
     monkeypatch.setattr(control_imports, "db", FakeDb())
     monkeypatch.setattr(control_imports, "get_import_run", fake_get)
     monkeypatch.setattr(control_imports, "_set_cancel_flag", fake_set_cancel_flag)
+    monkeypatch.setattr(
+        control_imports,
+        "_remove_queued_job",
+        AsyncMock(return_value={"redis": True, "removed": False}),
+    )
 
     cancel_result_map = await control_imports.request_cancel("run_running")
 

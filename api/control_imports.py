@@ -17,6 +17,8 @@ from typing import Any
 import click
 import redis
 from arq import create_pool
+from arq.jobs import deserialize_job as arq_deserialize_job
+from redis.exceptions import WatchError
 from sqlalchemy import and_, insert, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 
@@ -244,6 +246,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.provider_directory_fhir",
         "target_function": "process_data",
         "run_shutdown": True,
+        "job_prefix": "provider_directory_start",
     },
     "florida-mqa-profile": {
         "queue": "arq:FloridaMQAProfile",
@@ -2544,6 +2547,24 @@ def _run_import_adapter_payload(
     return job_payload_map
 
 
+def _is_queued_arq_cancel(
+    current_run: dict[str, Any],
+    run_metrics_by_name: dict[str, Any],
+) -> bool:
+    """Preserve queued cancellation provenance across retries."""
+
+    if run_metrics_by_name.get("enqueue_adapter") != "arq_single_job":
+        return False
+    if current_run.get("status") == "queued":
+        return True
+    prior_signal_by_name = run_metrics_by_name.get("cancel_signal")
+    return (
+        current_run.get("status") == "canceling"
+        and isinstance(prior_signal_by_name, dict)
+        and "cancel_flag" in prior_signal_by_name
+    )
+
+
 async def request_cancel(run_id: str) -> dict[str, Any] | None:
     """Mark an active run for cancellation and signal its worker."""
 
@@ -2554,19 +2575,20 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
         await require_not_wave_owned_run(db, run_id)
     if current.get("status") in TERMINAL_STATUSES:
         return current
-    if current.get("status") != "queued" and not _supports_active_cancel(str(current.get("importer") or "")):
+    current_metrics = current.get("metrics") if isinstance(current.get("metrics"), dict) else {}
+    run_metrics_by_name = dict(current_metrics)
+    is_queued_arq = _is_queued_arq_cancel(current, run_metrics_by_name)
+    if (
+        current.get("status") != "queued"
+        and not is_queued_arq
+        and not _supports_active_cancel(str(current.get("importer") or ""))
+    ):
         raise ValueError(f"importer does not support canceling active runs: {current.get('importer')}")
     now = utc_now()
     current_progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
-    current_metrics = current.get("metrics") if isinstance(current.get("metrics"), dict) else {}
-    run_metrics_by_name = dict(current_metrics)
     is_pending_adapter = (
         current.get("status") == "queued"
         and run_metrics_by_name.get("enqueue_adapter") == "pending"
-    )
-    is_queued_arq = (
-        current.get("status") == "queued"
-        and run_metrics_by_name.get("enqueue_adapter") == "arq_single_job"
     )
     worker_cancel_signal_map = await _cancel_signal_for_run(
         current,
@@ -2575,12 +2597,13 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
         is_queued_arq=is_queued_arq,
     )
     run_metrics_by_name["cancel_signal"] = worker_cancel_signal_map
-    has_terminalized_active_worker = (
-        _has_terminalized_active_worker_cancel_signal(worker_cancel_signal_map)
-    )
     canceled_before_start = is_pending_adapter or (
         is_queued_arq
         and _is_queued_arq_cancel_completed(worker_cancel_signal_map)
+    )
+    has_terminalized_active_worker = (
+        _has_terminalized_active_worker_cancel_signal(worker_cancel_signal_map)
+        and (not is_queued_arq or canceled_before_start)
     )
     cancel_state_by_name = _cancel_state_by_name(
         canceled_before_start=canceled_before_start,
@@ -2686,19 +2709,18 @@ async def _cancel_signal_for_run(
 
     if is_pending_adapter:
         return {"redis": False, "pending_adapter": True}
+    cancel_flag_by_name = await _set_cancel_flag(run_id)
+    queued_signal_by_name = await _remove_queued_job(current_run)
+    kubernetes_signal_by_name = await _delete_active_worker_jobs(current_run)
     if is_queued_arq:
-        cancel_flag_by_name = await _set_cancel_flag(run_id)
-        queued_signal_by_name = await _remove_queued_job(current_run)
         queued_signal_by_name["cancel_flag"] = cancel_flag_by_name
-        queued_signal_by_name["kubernetes"] = await _delete_active_worker_jobs(
-            current_run
-        )
+        queued_signal_by_name["kubernetes"] = kubernetes_signal_by_name
         return queued_signal_by_name
-    worker_cancel_signal_map = await _set_cancel_flag(run_id)
-    worker_cancel_signal_map["kubernetes"] = await _delete_active_worker_jobs(
-        current_run
-    )
-    return worker_cancel_signal_map
+    return {
+        **cancel_flag_by_name,
+        "arq_cleanup": queued_signal_by_name,
+        "kubernetes": kubernetes_signal_by_name,
+    }
 
 
 def _cancel_progress_by_name(
@@ -2766,6 +2788,10 @@ def _has_terminalized_active_worker_cancel_signal(cancel_signal: dict[str, Any])
 def _is_queued_arq_cancel_completed(cancel_signal: dict[str, Any]) -> bool:
     """Return whether queued work was removed or its launched worker was fenced."""
 
+    if cancel_signal.get("identity_mismatch") or cancel_signal.get(
+        "identity_unavailable"
+    ):
+        return False
     if cancel_signal.get("removed"):
         return True
     if _has_terminalized_active_worker_cancel_signal(cancel_signal):
@@ -2840,34 +2866,147 @@ def _supports_active_cancel(importer: str) -> bool:
     return importer in _CANCELABLE_IMPORTERS
 
 
+def _arq_cleanup_identity(
+    run: dict[str, Any],
+) -> tuple[str, str, dict[str, Any], str, str]:
+    """Resolve one run's adapter-bound queue and exact ARQ job ID."""
+
+    run_id = str(run.get("run_id") or "").strip()
+    importer = str(run.get("importer") or "").strip()
+    adapter = _adapter_for_import_row(run)
+    if not run_id or not importer or not adapter:
+        raise ValueError("missing queue or job_id")
+    queue = str(adapter["queue"])
+    metrics_by_name = (
+        run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    )
+    job_id = str(metrics_by_name.get("job_id") or "").strip()
+    if not job_id and adapter.get("job_prefix"):
+        job_id = _enqueue_job_options(adapter, {"run_id": run_id})["_job_id"]
+    if not job_id:
+        raise ValueError("missing exact ARQ job ID")
+    return run_id, importer, adapter, queue, job_id
+
+
+def _is_arq_job_owned_by_run(
+    raw_job_bytes: Any,
+    *,
+    adapter: dict[str, Any],
+    run_id: str,
+    importer: str,
+) -> bool:
+    """Validate the stored ARQ function and immutable run ownership."""
+
+    try:
+        job_definition = arq_deserialize_job(
+            raw_job_bytes,
+            deserializer=deserialize_job,
+        )
+        if not isinstance(job_definition.args, (list, tuple)) or len(
+            job_definition.args
+        ) != 1:
+            return False
+        job_payload_by_name = job_definition.args[0]
+        return (
+            job_definition.function == adapter["function"]
+            and job_definition.kwargs == {}
+            and isinstance(job_payload_by_name, dict)
+            and job_payload_by_name.get("run_id") == run_id
+            and (
+                "importer" not in job_payload_by_name
+                or job_payload_by_name.get("importer") == importer
+            )
+        )
+    except Exception:
+        return False
+
+
+def _arq_cleanup_refusal(
+    queue: str,
+    job_id: str,
+    code: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "redis": True,
+        "queue": queue,
+        "job_id": job_id,
+        "removed": False,
+        code: True,
+        "reason": reason,
+    }
+
+
+def _arq_cleanup_outcome(
+    queue: str,
+    job_id: str,
+    transaction_results: list[Any],
+) -> dict[str, Any]:
+    removed_count = int(transaction_results[0] or 0)
+    deleted_key_count = int(transaction_results[1] or 0)
+    return {
+        "redis": True,
+        "queue": queue,
+        "job_id": job_id,
+        "removed": removed_count > 0,
+        "deleted_job_key": deleted_key_count > 0,
+        "deleted_keys": deleted_key_count,
+    }
+
+
 async def _remove_queued_job(run: dict[str, Any]) -> dict[str, Any]:
-    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
-    queue = str(metrics.get("queue") or "").strip()
-    job_id = str(metrics.get("job_id") or "").strip()
-    if not queue or not job_id:
-        return {"redis": False, "removed": False, "reason": "missing queue or job_id"}
+    """Atomically remove exact ARQ state after validating run ownership."""
+
+    try:
+        run_id, importer, adapter, queue, job_id = _arq_cleanup_identity(run)
+    except ValueError as exc:
+        return {"redis": False, "removed": False, "identity_unavailable": True, "reason": str(exc)}
+    job_key = f"arq:job:{job_id}"
     try:
         redis = await create_pool(
             build_redis_settings(),
             job_serializer=serialize_job,
             job_deserializer=deserialize_job,
         )
-        removed = int(await redis.zrem(queue, job_id) or 0)
-        deleted = int(
-            await redis.delete(
-                f"arq:job:{job_id}",
+        async with redis.pipeline(transaction=True) as pipe:
+            await pipe.watch(job_key)
+            raw_job_bytes = await pipe.get(job_key)
+            if raw_job_bytes is None:
+                return _arq_cleanup_refusal(
+                    queue,
+                    job_id,
+                    "identity_unavailable",
+                    "ARQ job payload is unavailable",
+                )
+            if not _is_arq_job_owned_by_run(
+                raw_job_bytes,
+                adapter=adapter,
+                run_id=run_id,
+                importer=importer,
+            ):
+                return _arq_cleanup_refusal(
+                    queue,
+                    job_id,
+                    "identity_mismatch",
+                    "ARQ job payload does not match import run",
+                )
+            pipe.multi()
+            pipe.zrem(queue, job_id)
+            pipe.delete(
+                job_key,
                 f"arq:retry:{job_id}",
+                f"arq:in-progress:{job_id}",
                 f"arq:result:{job_id}",
             )
-            or 0
-        )
+            transaction_results = await pipe.execute()
+        return _arq_cleanup_outcome(queue, job_id, transaction_results)
+    except WatchError:
         return {
-            "redis": True,
+            "redis": False,
             "queue": queue,
             "job_id": job_id,
-            "removed": removed > 0,
-            "deleted_job_key": deleted > 0,
-            "deleted_keys": deleted,
+            "removed": False,
+            "reason": "ARQ job changed during cleanup",
         }
     except Exception as exc:
         return {"redis": False, "removed": False, "error": str(exc), "queue": queue, "job_id": job_id}
