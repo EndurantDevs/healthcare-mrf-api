@@ -13,12 +13,12 @@
     "global_state_usage": 1,
     "inline_suppressions": 2,
     "long_files": 156,
-    "long_functions": 345,
+    "long_functions": 340,
     "missing_contract_docstrings": 0,
     "pass_placeholders": 0,
     "single_letter_names": 0,
     "syntax_errors": 0,
-    "too_many_locals": 133,
+    "too_many_locals": 128,
     "too_many_parameters": 59
   },
   "issue_ids": {

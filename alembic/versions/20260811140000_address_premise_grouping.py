@@ -1,8 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Persist Provider Directory premise keys for offline grouping.
 
-Revision ID: 20260811130000_address_premise_grouping
-Revises: 20260811120000_provider_directory_reviewed_subset_v5_http410_disposition
+Revision ID: 20260811140000_address_premise_grouping
+Revises: 20260811130000_provider_directory_exact_practitioner_resource_order_repair
 """
 
 from __future__ import annotations
@@ -12,9 +12,9 @@ import os
 from alembic import op
 
 
-revision = "20260811130000_address_premise_grouping"
+revision = "20260811140000_address_premise_grouping"
 down_revision = (
-    "20260811120000_provider_directory_reviewed_subset_v5_http410_disposition"
+    "20260811130000_provider_directory_exact_practitioner_resource_order_repair"
 )
 branch_labels = None
 depends_on = None

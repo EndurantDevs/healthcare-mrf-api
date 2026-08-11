@@ -17,7 +17,7 @@ directory = importlib.import_module("process.provider_directory_fhir")
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = (
-    ROOT / "alembic/versions/20260811130000_address_premise_grouping.py"
+    ROOT / "alembic/versions/20260811140000_address_premise_grouping.py"
 )
 
 
@@ -47,7 +47,7 @@ class _OperationsRecorder:
         yield
 
 
-def test_premise_migration_is_the_reviewed_subset_successor(monkeypatch):
+def test_premise_migration_is_the_repository_head_successor(monkeypatch):
     migration = _load_migration()
     recorder = _OperationsRecorder()
     monkeypatch.setattr(migration, "op", recorder)
@@ -56,9 +56,9 @@ def test_premise_migration_is_the_reviewed_subset_successor(monkeypatch):
 
     migration.upgrade()
 
-    assert migration.revision == "20260811130000_address_premise_grouping"
+    assert migration.revision == "20260811140000_address_premise_grouping"
     assert migration.down_revision == (
-        "20260811120000_provider_directory_reviewed_subset_v5_http410_disposition"
+        "20260811130000_provider_directory_exact_practitioner_resource_order_repair"
     )
     assert len(recorder.statements) == 2
     upgrade_sql = "\n".join(recorder.statements)

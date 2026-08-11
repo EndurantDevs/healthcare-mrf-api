@@ -20,7 +20,7 @@ directory = importlib.import_module("process.provider_directory_fhir")
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = (
-    ROOT / "alembic/versions/20260811130000_address_premise_grouping.py"
+    ROOT / "alembic/versions/20260811140000_address_premise_grouping.py"
 )
 MATCHED_ADDRESS_KEY = "00000000-0000-0000-0000-000000000001"
 NULL_PREMISE_ADDRESS_KEY = "00000000-0000-0000-0000-000000000002"
