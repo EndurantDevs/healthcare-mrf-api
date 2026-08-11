@@ -61,6 +61,10 @@ async def _create_tables(database: Database, schema: str) -> None:
             completion_proof_json jsonb,
             completion_proof_sha256 varchar(64)
         );
+        """
+    )
+    await database.status(
+        f"""
         CREATE TABLE {schema}.provider_directory_source (
             source_id varchar(64) PRIMARY KEY,
             endpoint_id varchar(64),
@@ -164,9 +168,17 @@ async def test_global_artifact_scope_is_proof_bound(monkeypatch):
                        '{importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY}',
                        jsonb_build_object('contract_id', 'content-proof.v1')
                    );
+            """
+        )
+        await database.status(
+            f"""
             INSERT INTO {schema}.provider_directory_source
                 (source_id, endpoint_id, metadata_json)
             VALUES ('source_unbound', 'endpoint_missing', '{{}}'::jsonb);
+            """
+        )
+        await database.status(
+            f"""
             INSERT INTO {schema}.provider_directory_endpoint_dataset (
                 dataset_id, endpoint_id, acquisition_root_run_id, dataset_hash,
                 status, is_current, resource_count, publication_metadata_json
@@ -205,6 +217,10 @@ async def test_global_artifact_scope_preserves_cross_endpoint_candidate(
             f"""
             DELETE FROM {schema}.provider_directory_source
              WHERE source_id = 'source_b';
+            """
+        )
+        await database.status(
+            f"""
             INSERT INTO {schema}.provider_directory_endpoint_dataset (
                 dataset_id, endpoint_id, acquisition_root_run_id, dataset_hash,
                 status, is_current, resource_count, publication_metadata_json
