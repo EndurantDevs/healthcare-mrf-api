@@ -1541,6 +1541,69 @@ async def _load_rows_from_direct_csv_source(
     return mapped_rows, final_url, metadata, None
 
 
+def _map_socrata_license_record(
+    state_code: str,
+    license_record: dict[str, Any],
+) -> dict[str, Any]:
+    """Map one configured Socrata row into the shared license shape."""
+    if state_code == "CO":
+        return _map_co_socrata_row(license_record)
+    if state_code == "WA":
+        return _map_wa_socrata_row(license_record)
+    return dict(license_record)
+
+
+async def _fetch_socrata_page(
+    session: aiohttp.ClientSession,
+    source_url: str,
+    *,
+    select_columns: tuple[str, ...],
+    where_clause: str,
+    page_size: int,
+    offset: int,
+) -> tuple[list[dict[str, Any]], str | None, str | None]:
+    """Fetch and parse one configured Socrata CSV page."""
+    query_parameters_by_name = {
+        "$select": ",".join(select_columns),
+        "$where": where_clause,
+        "$limit": str(page_size),
+        "$offset": str(offset),
+    }
+    try:
+        query_url = f"{source_url}?{urlencode(query_parameters_by_name)}"
+        final_url, _content_type, raw = await _fetch_bytes(
+            session,
+            query_url,
+            max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
+        )
+    except Exception as exc:
+        return [], None, f"adapter_fetch_failed:{exc}"
+
+    try:
+        return _parse_csv_records(raw), final_url, None
+    except Exception as exc:
+        return [], final_url, f"adapter_parse_failed:{exc}"
+
+
+def _finish_socrata_load(
+    license_records: list[dict[str, Any]],
+    final_url: str | None,
+    metadata: dict[str, Any],
+    pages_fetched: int,
+    *,
+    page_limit_reached: bool = False,
+    row_limit_reached: bool = False,
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any], None]:
+    """Attach bounded-load metadata and return a successful result."""
+    metadata["pages_fetched"] = pages_fetched
+    metadata["rows_loaded"] = len(license_records)
+    if page_limit_reached:
+        metadata["page_limit_reached"] = True
+    if row_limit_reached:
+        metadata["row_limit_reached"] = True
+    return license_records, final_url, metadata, None
+
+
 async def _load_rows_from_socrata_source(
     session: aiohttp.ClientSession,
     state_source: StateSource,
@@ -1561,56 +1624,40 @@ async def _load_rows_from_socrata_source(
     page_limit = PHARM_LICENSE_STATE_ADAPTER_MAX_PAGES
 
     while pages_fetched < page_limit and len(license_records) < PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
-        query_parameters_by_name = {
-            "$select": ",".join(select_columns),
-            "$where": where_clause,
-            "$limit": str(page_size),
-            "$offset": str(offset),
-        }
-        try:
-            query_url = f"{source_url}?{urlencode(query_parameters_by_name)}"
-            final_url, _content_type, raw = await _fetch_bytes(
-                session,
-                query_url,
-                max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
-            )
-        except Exception as exc:
-            return [], None, metadata, f"adapter_fetch_failed:{exc}"
-
+        page_rows, final_url, error = await _fetch_socrata_page(
+            session,
+            source_url,
+            select_columns=select_columns,
+            where_clause=where_clause,
+            page_size=page_size,
+            offset=offset,
+        )
+        if error is not None:
+            return [], final_url, metadata, error
         pages_fetched += 1
-        try:
-            page_rows = _parse_csv_records(raw)
-        except Exception as exc:
-            return [], final_url, metadata, f"adapter_parse_failed:{exc}"
 
         if not page_rows:
-            metadata["pages_fetched"] = pages_fetched
-            metadata["rows_loaded"] = len(license_records)
-            return license_records, final_url, metadata, None
+            return _finish_socrata_load(license_records, final_url, metadata, pages_fetched)
 
         for license_record in page_rows:
-            if state_source.state_code == "CO":
-                license_records.append(_map_co_socrata_row(license_record))
-            elif state_source.state_code == "WA":
-                license_records.append(_map_wa_socrata_row(license_record))
-            else:
-                license_records.append(dict(license_record))
+            license_records.append(
+                _map_socrata_license_record(state_source.state_code, license_record)
+            )
             if len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
                 break
 
         if len(page_rows) < page_size:
-            metadata["pages_fetched"] = pages_fetched
-            metadata["rows_loaded"] = len(license_records)
-            return license_records, final_url, metadata, None
+            return _finish_socrata_load(license_records, final_url, metadata, pages_fetched)
         offset += page_size
 
-    metadata["pages_fetched"] = pages_fetched
-    metadata["rows_loaded"] = len(license_records)
-    if pages_fetched >= page_limit:
-        metadata["page_limit_reached"] = True
-    if len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS:
-        metadata["row_limit_reached"] = True
-    return license_records, source_url, metadata, None
+    return _finish_socrata_load(
+        license_records,
+        source_url,
+        metadata,
+        pages_fetched,
+        page_limit_reached=pages_fetched >= page_limit,
+        row_limit_reached=len(license_records) >= PHARM_LICENSE_STATE_ADAPTER_MAX_ROWS,
+    )
 
 
 async def _load_rows_from_ny_rosa_source(

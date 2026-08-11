@@ -37,6 +37,9 @@ def _address(
         "state_code": "IL",
         "postal_code": "60001",
         "country_code": "US",
+        "formatted_address": (
+            f"{first_line}, Suite 100, Example City, IL 60001"
+        ),
         "address_precision": "street",
         "address_sources": [source_id],
         "source_count": 1,
@@ -408,11 +411,19 @@ async def test_get_npi_pages_after_overlay_merge_and_dedupe(monkeypatch):
     first_page, first_route_calls = await _get_page(monkeypatch, limit="2")
     second_page, second_route_calls = await _get_page(monkeypatch, limit="2", offset=2)
 
-    assert [row["address_key"] for row in first_page["address_list"]] == [
+    assert [address["address_key"] for address in first_page["address_list"]] == [
         ADDRESS_A,
         ADDRESS_C,
     ]
-    assert [row["address_key"] for row in second_page["address_list"]] == [ADDRESS_B]
+    assert [address["address_key"] for address in second_page["address_list"]] == [
+        ADDRESS_B
+    ]
+    assert first_page["address_list"][0]["formatted_address"] == (
+        "100 Example Avenue, Suite 100, Example City, IL 60001"
+    )
+    assert second_page["address_list"][0]["formatted_address"] == (
+        "200 Example Avenue, Suite 100, Example City, IL 60001"
+    )
     assert first_page["address_pagination"] == {
         "limit": 2,
         "offset": 0,

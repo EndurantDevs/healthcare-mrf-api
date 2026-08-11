@@ -1,4 +1,5 @@
 import datetime
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -25,6 +26,14 @@ class _MappingResult:
 
     def first(self):
         return self._value
+
+
+class _RowsResult:
+    def __init__(self, *rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
 
 
 class _Session:
@@ -123,6 +132,64 @@ def test_sql_bind_contract():
     assert partd_formulary._qualified_table_name(
         SimpleNamespace(schema="archive", name="costs")
     ) == "archive.costs"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_list_serializes_dates_counts_and_metadata():
+    imported_at = datetime.datetime(2026, 7, 24, 10, 30, tzinfo=datetime.timezone.utc)
+    snapshot_row = SimpleNamespace(
+        _mapping={
+            "snapshot_id": "quarterly:20260724:sample",
+            "run_id": "run-sample",
+            "source_type": "quarterly",
+            "source_url": "https://data.example.test/snapshot.zip",
+            "artifact_name": "snapshot.zip",
+            "release_date": datetime.date(2026, 7, 24),
+            "cutoff_month": datetime.date(2026, 7, 1),
+            "status": "complete",
+            "row_count_activity": 12,
+            "row_count_pricing": 34,
+            "imported_at": imported_at,
+            "metadata_json": {"sample": True},
+        }
+    )
+    session = _Session(_ScalarResult(1), _RowsResult(snapshot_row))
+    request = SimpleNamespace(
+        args={
+            "page": "1",
+            "page_size": "1",
+            "source_type": "QUARTERLY",
+            "run_id": "run-sample",
+        },
+        ctx=SimpleNamespace(sa_session=session),
+    )
+
+    snapshot_response = await partd_formulary.list_partd_snapshots(request)
+    response_payload = json.loads(snapshot_response.body)
+
+    assert response_payload == {
+        "page": 1,
+        "page_size": 1,
+        "limit": 1,
+        "offset": 0,
+        "total": 1,
+        "items": [
+            {
+                "snapshot_id": "quarterly:20260724:sample",
+                "run_id": "run-sample",
+                "source_type": "quarterly",
+                "source_url": "https://data.example.test/snapshot.zip",
+                "artifact_name": "snapshot.zip",
+                "release_date": "2026-07-24",
+                "cutoff_month": "2026-07-01",
+                "status": "complete",
+                "row_count_activity": 12,
+                "row_count_pricing": 34,
+                "imported_at": "2026-07-24T10:30:00+00:00",
+                "metadata": {"sample": True},
+            }
+        ],
+    }
 
 
 @pytest.mark.asyncio

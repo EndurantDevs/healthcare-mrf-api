@@ -72890,9 +72890,26 @@ def _provider_directory_address_overlay_columns() -> tuple[str, ...]:
         "fax_number_digits",
         "lat",
         "long",
+        "formatted_address",
+        "formatted_address_version",
+        "formatted_address_source",
         "address_precision",
         "source_updated_at",
         "published_at",
+    )
+
+
+def _provider_directory_address_overlay_source_columns() -> tuple[str, ...]:
+    """Return columns emitted directly by Provider Directory source queries."""
+    formatted_columns = {
+        "formatted_address",
+        "formatted_address_version",
+        "formatted_address_source",
+    }
+    return tuple(
+        column
+        for column in _provider_directory_address_overlay_columns()
+        if column not in formatted_columns
     )
 
 
@@ -72922,6 +72939,9 @@ def provider_directory_address_overlay_table_sql(db_schema: str | None = None, t
         fax_number_digits varchar(15),
         lat numeric,
         long numeric,
+        formatted_address varchar,
+        formatted_address_version smallint,
+        formatted_address_source varchar(32),
         address_precision varchar(32) NOT NULL DEFAULT 'street',
         source_updated_at timestamp,
         published_at timestamp NOT NULL DEFAULT now()
@@ -72943,9 +72963,25 @@ def address_overlay_coordinate_columns_sql(
     """
 
 
+def address_overlay_formatted_address_columns_sql(
+    db_schema: str | None = None,
+    table_name: str | None = None,
+) -> str:
+    """Add archive-backed formatted-address columns to older overlay tables."""
+    schema = db_schema if db_schema is not None else _schema()
+    table_ref = _qt(schema, table_name or PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    return f"""
+    ALTER TABLE {table_ref}
+        ADD COLUMN IF NOT EXISTS formatted_address varchar,
+        ADD COLUMN IF NOT EXISTS formatted_address_version smallint,
+        ADD COLUMN IF NOT EXISTS formatted_address_source varchar(32);
+    """
+
+
 async def _ensure_provider_directory_address_overlay_table(schema: str) -> None:
     await db.status(provider_directory_address_overlay_table_sql(schema))
     await db.status(address_overlay_coordinate_columns_sql(schema))
+    await db.status(address_overlay_formatted_address_columns_sql(schema))
     await _create_provider_directory_address_overlay_indexes(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
 
 
@@ -73449,7 +73485,7 @@ def provider_directory_address_overlay_insert_sql(
     )
     return ADDRESS_OVERLAY_INSERT_SQL_TEMPLATE.format(
         stage_ref=stage_ref,
-        columns=", ".join(_provider_directory_address_overlay_columns()),
+        columns=", ".join(_provider_directory_address_overlay_source_columns()),
         qschema=_q(schema),
         org_address_country_expr=org_address_country_expr,
         location_country_expr=location_country_expr,
@@ -74100,7 +74136,7 @@ def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: s
     )
     return {
         "stage_ref": _qt(schema, stage_table or _address_overlay_stage_table_name(run_id)),
-        "columns": ", ".join(_provider_directory_address_overlay_columns()),
+        "columns": ", ".join(_provider_directory_address_overlay_source_columns()),
         "qschema": _q(schema),
         "org_address_country_expr": _country_restore_default_us_sql("addr.value->>'country'"),
         "practitioner_address_country_expr": _country_restore_default_us_sql(
@@ -74258,7 +74294,7 @@ async def _populate_address_overlay_stage(
     inserted = sum(inserted_by_component.values())
     countries_normalized = await _normalize_address_overlay_stage_countries(stage_ref)
     alias_metrics = await _materialize_address_overlay_aliases(schema, stage_ref)
-    archive_coordinate_backfill_rows = await _backfill_address_overlay_stage_coordinates(schema, stage_ref)
+    archive_metrics = await _hydrate_address_overlay_stage_from_archive(schema, stage_ref)
     duplicates_removed = await _dedupe_address_overlay_stage(
         stage_ref,
         source_ids=source_ids,
@@ -74275,7 +74311,7 @@ async def _populate_address_overlay_stage(
         "components": selected_components,
         "countries_normalized": countries_normalized,
         **alias_metrics,
-        "archive_coordinate_backfill_rows": archive_coordinate_backfill_rows,
+        **archive_metrics,
         "duplicates_removed": duplicates_removed,
         "stage_rows": stage_rows,
     }
@@ -74515,6 +74551,57 @@ async def _backfill_address_overlay_stage_coordinates(schema: str, stage_ref: st
             """
         )
     )
+
+
+async def _backfill_address_overlay_stage_formatted_addresses(
+    schema: str,
+    stage_ref: str,
+) -> int:
+    """Hydrate the complete overlay stage from persisted archive labels."""
+    if not await _is_table_present(schema, "address_archive_v2"):
+        return 0
+    return _coerce_rowcount(
+        await db.status(
+            f"""
+            UPDATE {stage_ref} AS stage_row
+               SET formatted_address = archive.formatted_address,
+                   formatted_address_version = archive.formatted_address_version,
+                   formatted_address_source = archive.formatted_address_source
+              FROM {_qt(schema, "address_archive_v2")} AS archive
+             WHERE stage_row.address_key IS NOT NULL
+               AND archive.address_key = stage_row.address_key
+               AND archive.merged_into IS NULL
+               AND ROW(
+                       stage_row.formatted_address,
+                       stage_row.formatted_address_version,
+                       stage_row.formatted_address_source
+                   ) IS DISTINCT FROM ROW(
+                       archive.formatted_address,
+                       archive.formatted_address_version,
+                       archive.formatted_address_source
+                   );
+            """
+        )
+    )
+
+
+async def _hydrate_address_overlay_stage_from_archive(
+    schema: str,
+    stage_ref: str,
+) -> dict[str, int]:
+    """Hydrate archive-backed label metadata and coordinates in key order."""
+    formatted_rows = await _backfill_address_overlay_stage_formatted_addresses(
+        schema,
+        stage_ref,
+    )
+    coordinate_rows = await _backfill_address_overlay_stage_coordinates(
+        schema,
+        stage_ref,
+    )
+    return {
+        "archive_formatted_address_backfill_rows": formatted_rows,
+        "archive_coordinate_backfill_rows": coordinate_rows,
+    }
 
 
 async def _dedupe_address_overlay_stage(

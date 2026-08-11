@@ -84,14 +84,10 @@ def _ptg2_provider_group_rows(
     return provider_group_rows
 
 
-def _build_provider_set_entry(
-    *,
-    file_id: int,
-    provider_group_ref: Any,
+def _provider_set_group_summary(
     provider_groups: list[dict[str, Any]],
-    network_names: list[str] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]] | tuple[None, None]:
-    """Build one normalized provider-set entry and metadata row."""
+) -> tuple[list[dict[str, Any]], set[int], set[tuple[str, str]], list[str]]:
+    """Collect stable group payloads and union values for one provider set."""
     group_payloads: list[dict[str, Any]] = []
     union_npis: set[int] = set()
     tin_values: set[tuple[str, str]] = set()
@@ -115,6 +111,20 @@ def _build_provider_set_entry(
                 "npi": normalized_npi,
             }
         )
+    return group_payloads, union_npis, tin_values, business_names
+
+
+def _build_provider_set_entry(
+    *,
+    file_id: int,
+    provider_group_ref: Any,
+    provider_groups: list[dict[str, Any]],
+    network_names: list[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]] | tuple[None, None]:
+    """Build one normalized provider-set entry and metadata row."""
+    group_payloads, union_npis, tin_values, business_names = (
+        _provider_set_group_summary(provider_groups)
+    )
     if not group_payloads:
         return None, None
     group_payloads = sorted(group_payloads, key=_canonical_sort_key)

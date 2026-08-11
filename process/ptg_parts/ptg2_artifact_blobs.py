@@ -394,6 +394,43 @@ def _is_cached_file_valid(
         return False
 
 
+async def _write_ptg2_artifact_chunks(
+    session, qualified_chunks: str, artifact_id: str, tmp_path: Path
+) -> tuple[str, int, int]:
+    digest = hashlib.sha256()
+    total_raw_bytes = 0
+    chunk_count = 0
+    with tmp_path.open("wb") as out:
+        chunk_stream = await session.stream(
+            text(
+                f"""
+                SELECT chunk_no, compression, payload, raw_byte_count
+                  FROM {qualified_chunks}
+                 WHERE artifact_id = :artifact_id
+                 ORDER BY chunk_no
+                """
+            ),
+            {"artifact_id": artifact_id},
+        )
+        async for chunk_row in chunk_stream:
+            chunk_record_map = _row_mapping(chunk_row)
+            compression = str(chunk_record_map.get("compression") or "none")
+            stored_chunk_bytes = bytes(chunk_record_map.get("payload") or b"")
+            raw_chunk = (
+                zlib.decompress(stored_chunk_bytes)
+                if compression == "zlib"
+                else stored_chunk_bytes
+            )
+            expected_raw = chunk_record_map.get("raw_byte_count")
+            if expected_raw is not None and len(raw_chunk) != int(expected_raw):
+                raise ValueError(f"artifact chunk raw byte_count mismatch for {artifact_id}:{chunk_count}")
+            out.write(raw_chunk)
+            digest.update(raw_chunk)
+            total_raw_bytes += len(raw_chunk)
+            chunk_count += 1
+    return digest.hexdigest(), total_raw_bytes, chunk_count
+
+
 async def materialize_ptg2_artifact_from_db(
     session,
     storage_uri: str,
@@ -414,38 +451,12 @@ async def materialize_ptg2_artifact_from_db(
     qualified_chunks = f"{_quote_ident(schema)}.ptg2_artifact_blob_chunk"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_name(f"{cache_path.name}.tmp.{os.getpid()}")
-    digest = hashlib.sha256()
-    total_raw_bytes = 0
-    chunk_count = 0
     try:
-        with tmp_path.open("wb") as out:
-            chunk_stream = await session.stream(
-                text(
-                    f"""
-                    SELECT chunk_no, compression, payload, raw_byte_count
-                      FROM {qualified_chunks}
-                     WHERE artifact_id = :artifact_id
-                     ORDER BY chunk_no
-                    """
-                ),
-                {"artifact_id": artifact_id},
+        actual_sha, total_raw_bytes, chunk_count = (
+            await _write_ptg2_artifact_chunks(
+                session, qualified_chunks, artifact_id, tmp_path
             )
-            async for chunk_row in chunk_stream:
-                chunk_record_map = _row_mapping(chunk_row)
-                compression = str(chunk_record_map.get("compression") or "none")
-                stored_chunk_bytes = bytes(chunk_record_map.get("payload") or b"")
-                raw_chunk = (
-                    zlib.decompress(stored_chunk_bytes)
-                    if compression == "zlib"
-                    else stored_chunk_bytes
-                )
-                expected_raw = chunk_record_map.get("raw_byte_count")
-                if expected_raw is not None and len(raw_chunk) != int(expected_raw):
-                    raise ValueError(f"artifact chunk raw byte_count mismatch for {artifact_id}:{chunk_count}")
-                out.write(raw_chunk)
-                digest.update(raw_chunk)
-                total_raw_bytes += len(raw_chunk)
-                chunk_count += 1
+        )
         if chunk_count <= 0:
             raise FileNotFoundError(f"PTG2 artifact has no PostgreSQL chunks: {artifact_id}")
         expected_byte_count = (metadata or {}).get("byte_count")
@@ -454,7 +465,6 @@ async def materialize_ptg2_artifact_from_db(
                 f"artifact byte_count mismatch for {artifact_id}: expected {expected_byte_count}, got {total_raw_bytes}"
             )
         expected_sha = str((metadata or {}).get("sha256") or "").strip()
-        actual_sha = digest.hexdigest()
         if expected_sha and actual_sha != expected_sha:
             raise ValueError(f"artifact checksum mismatch for {artifact_id}")
         os.replace(tmp_path, cache_path)

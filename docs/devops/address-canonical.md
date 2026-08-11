@@ -309,6 +309,70 @@ No public request joins `address_alias_v1`; active mappings are consumed only
 while building archive, overlay, and unified artifacts. This preserves the
 provider endpoint latency contract.
 
+## Versioned Formatted Addresses
+
+Revision `20260811110000_address_formatted_display` installs the immutable,
+parallel-safe `addr_formatted_address_v1(...)` renderer and nullable display
+metadata on `address_archive_v2`, `provider_directory_address_overlay`, and
+`entity_address_unified`. The migration is schema-only: it does not rewrite the
+archive while holding the migration lock.
+
+After the migration and worker restart, materialize existing archive labels as
+a bounded offline job:
+
+```bash
+python main.py start address-formatted-address --batch-size 10000
+```
+
+The job advances by `address_key`, is safe to retry, and reports scanned,
+updated, and batch counts. It writes `formatted_address_version = 1` and
+`formatted_address_source = 'canonical_v1'`; it performs no geocoding, fuzzy
+matching, or network calls. `HLTHPRT_ADDRESS_ARCHIVE_TABLE` may select a
+different unqualified archive table name. Invalid or schema-qualified values
+fail closed.
+
+Next rebuild the complete Provider Directory address artifacts and unified
+addresses so both serving tables copy the stored label and metadata:
+
+```bash
+python main.py start provider-directory-fhir \
+  --publish-artifacts-only \
+  --publish-artifacts-targets addresses \
+  --full-address-artifact-rebuild
+python main.py start entity-address-unified
+```
+
+Provider requests are stored-only by default. They do not render or geocode a
+missing display label. Explicit legacy geocode flags remain compatibility-only
+and are disabled on the public provider routes.
+
+Verify completion before the serving canary:
+
+```sql
+SELECT count(*) AS archive_missing_display
+FROM mrf.address_archive_v2
+WHERE merged_into IS NULL
+  AND formatted_address IS NULL;
+
+SELECT count(*) AS archive_stale_display_version
+FROM mrf.address_archive_v2
+WHERE merged_into IS NULL
+  AND formatted_address IS NOT NULL
+  AND (
+      formatted_address_version IS DISTINCT FROM 1
+      OR formatted_address_source IS DISTINCT FROM 'canonical_v1'
+  );
+
+SELECT count(*) AS unified_missing_display
+FROM mrf.entity_address_unified
+WHERE address_key IS NOT NULL
+  AND formatted_address IS NULL;
+```
+
+Review any remaining rows before publication. Component-empty archive rows may
+legitimately render `NULL`; they must not be filled from a fuzzy or geocoder
+display string merely to make the count zero.
+
 ## Smoke Checks
 
 Run these after migration and restart:

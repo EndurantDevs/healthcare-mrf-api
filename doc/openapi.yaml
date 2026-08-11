@@ -2967,12 +2967,14 @@ paths:
           in: query
           schema:
             type: boolean
-          description: When false, skips live geocoding for address rows missing coordinates
+            default: false
+          description: Explicit legacy opt-in for live geocoding; normal serving is storage-only
         - name: lookup_stored_geocode
           in: query
           schema:
             type: boolean
-          description: When false, skips stored archive geocode lookup for address rows missing coordinates
+            default: false
+          description: Explicit legacy opt-in for an extra archive lookup; normal serving reads published address rows only
         - name: address_limit
           in: query
           schema:

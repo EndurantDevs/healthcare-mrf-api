@@ -1640,6 +1640,10 @@ def test_entity_address_unified_retains_provider_directory_record_ids_when_aggre
         ],
     )
 
+    assert "addr_formatted_address_v1(" in direct_sql
+    assert "formatted_address_version" in direct_sql
+    assert "formatted_address_source" in direct_sql
+
     assert "FILTER (WHERE source_record_id LIKE 'provider_directory_fhir:%')" in raw_sql
     assert "FILTER (WHERE source_record_id LIKE 'provider_directory_fhir:%')" in direct_sql
     assert "ARRAY[]::varchar[])::varchar[] AS source_record_ids" in raw_sql

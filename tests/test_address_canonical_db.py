@@ -738,14 +738,20 @@ def _assert_legacy_archive_stats(stats) -> None:
 async def _assert_legacy_archive_output(schema: str) -> None:
     winner = await db.first(
         f"""
-        SELECT formatted_address, lat, long, place_id, source_bits, display_priority
+        SELECT formatted_address, formatted_address_version,
+               formatted_address_source, lat, long, place_id,
+               source_bits, display_priority
           FROM {schema}.address_archive_v2
          WHERE line1_norm = '123mainst'
            AND unit_norm = 'ste200';
         """
     )
     assert winner is not None
-    assert winner.formatted_address == "new geocode"
+    assert winner.formatted_address == (
+        "123 MAIN ST STE 200, MIAMI, Florida 33156-2814"
+    )
+    assert int(winner.formatted_address_version) == 1
+    assert winner.formatted_address_source == "canonical_v1"
     assert str(winner.place_id) == "place-new"
     assert int(winner.source_bits) & 1 == 1
     assert int(winner.display_priority) == 0
@@ -1391,7 +1397,9 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
     source_rows = await db.all(
         f"""
         SELECT entity_type, entity_id, type, address_sources, first_line,
-               city_name, state_name, postal_code, address_key::text
+               city_name, state_name, postal_code, address_key::text,
+               formatted_address, formatted_address_version,
+               formatted_address_source
           FROM {schema}.{stage_table}
          WHERE address_sources @> ARRAY['mrf']::varchar[];
         """
@@ -1404,9 +1412,55 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
     assert source_row["type"] == "practice"
     assert source_row["first_line"] == "10 Market Street"
     assert source_row["city_name"] == "Boston"
+    assert source_row["formatted_address"] == (
+        "10 Market Street, Suite 5, Boston, MA 02108"
+    )
+    assert source_row["formatted_address_version"] == 1
+    assert source_row["formatted_address_source"] == "canonical_v1"
     assert source_row["address_key"] == str(
         address_canon.address_key_v1("10 Market Street", "Suite 5", "Boston", "MA", "02108", "US")
     )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_chunked_raw_load_stamps_canonical_formatted_address_metadata():
+    """Verify chunked raw loading renders and versions display labels offline."""
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    raw_table = "entity_address_unified_display_raw_fixture"
+    await _prepare_mrf_address_source(schema, raw_table)
+    await db.status(entity_address_unified._prepare_raw_stage_sql(schema, raw_table))
+    source_selects = entity_address_unified._source_selects(
+        schema,
+        {
+            "mrf_address": True,
+            "npi": False,
+            "npi_address": False,
+            "geo_zip_lookup": False,
+        },
+    )
+
+    for source_select in source_selects:
+        await db.status(
+            entity_address_unified._insert_raw_from_source_sql(
+                schema,
+                raw_table,
+                source_select,
+            )
+        )
+    raw_row = await db.first(
+        f"""
+        SELECT formatted_address, formatted_address_version,
+               formatted_address_source
+        FROM {schema}.{raw_table};
+        """
+    )
+
+    assert raw_row.formatted_address == (
+        "10 Market Street, Suite 5, Boston, MA 02108"
+    )
+    assert raw_row.formatted_address_version == 1
+    assert raw_row.formatted_address_source == "canonical_v1"
 
 
 @pytest.mark.asyncio(loop_scope="session")

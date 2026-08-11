@@ -1961,6 +1961,27 @@ async def get_pharmacy_market_by_id(request, market_id):
     )
 
 
+def _parse_pharmacy_access_rankings_pagination(args):
+    return parse_pagination(
+        args,
+        default_limit=DEFAULT_PAGE_SIZE,
+        max_limit=MAX_PAGE_SIZE,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+
+
+def _rank_pharmacy_access_markets(market_items, offset: int) -> list[dict]:
+    ranked_markets = []
+    for rank, market_item in enumerate(market_items, start=offset + 1):
+        ranked_market_dict = dict(market_item)
+        ranked_market_dict["rank"] = rank
+        ranked_markets.append(ranked_market_dict)
+    return ranked_markets
+
+
 @blueprint.get("/pharmacies/rankings/access")
 async def list_pharmacy_access_rankings(request):
     """Rank pharmacy markets by the selected access metric."""
@@ -1971,15 +1992,7 @@ async def list_pharmacy_access_rankings(request):
     args.get("limit")
     args.get("offset")
     args.get("start")
-    pagination = parse_pagination(
-        args,
-        default_limit=DEFAULT_PAGE_SIZE,
-        max_limit=MAX_PAGE_SIZE,
-        default_page=1,
-        allow_offset=True,
-        allow_start=True,
-        allow_page_size=True,
-    )
+    pagination = _parse_pharmacy_access_rankings_pagination(args)
     state = args.get("state")
     city = args.get("city")
     county = args.get("county")
@@ -2013,11 +2026,9 @@ async def list_pharmacy_access_rankings(request):
             chain=chain,
         ),
     )
-    ranked_markets = []
-    for idx, market_item in enumerate(market_items, start=1):
-        ranked_market_dict = dict(market_item)
-        ranked_market_dict["rank"] = pagination.offset + idx
-        ranked_markets.append(ranked_market_dict)
+    ranked_markets = _rank_pharmacy_access_markets(
+        market_items, pagination.offset
+    )
     return response.json(
         {
             "as_of": as_of.isoformat(),

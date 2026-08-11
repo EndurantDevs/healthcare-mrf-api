@@ -104,19 +104,46 @@ async def _is_table_available(session, table) -> bool:
     return bool(result.scalar())
 
 
-async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) -> dict[str, Any]:
-    """Return one pharmacy's active-license summary at the requested date."""
-
-    table = PharmacyLicenseRecord.__table__
-    empty_summary_dict = {
+def _empty_state_license_summary() -> dict[str, Any]:
+    """Return an independent empty state-license summary."""
+    return {
         "has_active_state_license": False,
         "active_license_count": 0,
         "active_states": [],
         "disciplinary_flag_any": False,
         "license_checked_at": None,
     }
+
+
+def _state_license_summary_payload(license_summary_row: Any) -> dict[str, Any]:
+    """Normalize one aggregate state-license row for the public response."""
+    active_states = sorted(
+        {
+            str(state).upper()
+            for state in (license_summary_row.get("active_states") or [])
+            if state
+        }
+    )
+    latest_verified = license_summary_row.get("latest_verified_at")
+    return {
+        "has_active_state_license": bool(
+            license_summary_row.get("active_count") or 0
+        ),
+        "active_license_count": int(license_summary_row.get("active_count") or 0),
+        "active_states": active_states,
+        "disciplinary_flag_any": bool(
+            license_summary_row.get("disciplinary_flag_any")
+        ),
+        "license_checked_at": latest_verified.isoformat() if latest_verified else None,
+    }
+
+
+async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) -> dict[str, Any]:
+    """Return one pharmacy's active-license summary at the requested date."""
+
+    table = PharmacyLicenseRecord.__table__
     if not await _is_table_available(session, table):
-        return empty_summary_dict
+        return _empty_state_license_summary()
 
     table_name = _qualified_table_name(table)
     license_summary_row = (
@@ -151,27 +178,8 @@ async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) 
     ).mappings().first()
 
     if not license_summary_row:
-        return empty_summary_dict
-
-    active_states = sorted(
-        {
-            str(state).upper()
-            for state in (license_summary_row.get("active_states") or [])
-            if state
-        }
-    )
-    latest_verified = license_summary_row.get("latest_verified_at")
-    return {
-        "has_active_state_license": bool(
-            license_summary_row.get("active_count") or 0
-        ),
-        "active_license_count": int(license_summary_row.get("active_count") or 0),
-        "active_states": active_states,
-        "disciplinary_flag_any": bool(
-            license_summary_row.get("disciplinary_flag_any")
-        ),
-        "license_checked_at": latest_verified.isoformat() if latest_verified else None,
-    }
+        return _empty_state_license_summary()
+    return _state_license_summary_payload(license_summary_row)
 
 
 @blueprint.get("/import/status")
@@ -225,6 +233,28 @@ async def get_partd_import_status(request):
     )
 
 
+def _partd_snapshot_item(snapshot_row: Any) -> dict[str, Any]:
+    """Serialize one Part D snapshot row for the public response."""
+    mapping = snapshot_row._mapping
+    release_date = mapping.get("release_date")
+    cutoff_month = mapping.get("cutoff_month")
+    imported_at = mapping.get("imported_at")
+    return {
+        "snapshot_id": mapping.get("snapshot_id"),
+        "run_id": mapping.get("run_id"),
+        "source_type": mapping.get("source_type"),
+        "source_url": mapping.get("source_url"),
+        "artifact_name": mapping.get("artifact_name"),
+        "release_date": release_date.isoformat() if release_date else None,
+        "cutoff_month": cutoff_month.isoformat() if cutoff_month else None,
+        "status": mapping.get("status"),
+        "row_count_activity": int(mapping.get("row_count_activity") or 0),
+        "row_count_pricing": int(mapping.get("row_count_pricing") or 0),
+        "imported_at": imported_at.isoformat() if imported_at else None,
+        "metadata": mapping.get("metadata_json") or {},
+    }
+
+
 @blueprint.get("/snapshots")
 async def list_partd_snapshots(request):
     """List Part D snapshots."""
@@ -267,25 +297,9 @@ async def list_partd_snapshots(request):
     ).offset(pagination.offset).limit(pagination.limit)
 
     snapshot_rows = (await session.execute(data_stmt)).all()
-    snapshot_items = []
-    for snapshot_row in snapshot_rows:
-        mapping = snapshot_row._mapping
-        snapshot_items.append(
-            {
-                "snapshot_id": mapping.get("snapshot_id"),
-                "run_id": mapping.get("run_id"),
-                "source_type": mapping.get("source_type"),
-                "source_url": mapping.get("source_url"),
-                "artifact_name": mapping.get("artifact_name"),
-                "release_date": mapping.get("release_date").isoformat() if mapping.get("release_date") else None,
-                "cutoff_month": mapping.get("cutoff_month").isoformat() if mapping.get("cutoff_month") else None,
-                "status": mapping.get("status"),
-                "row_count_activity": int(mapping.get("row_count_activity") or 0),
-                "row_count_pricing": int(mapping.get("row_count_pricing") or 0),
-                "imported_at": mapping.get("imported_at").isoformat() if mapping.get("imported_at") else None,
-                "metadata": mapping.get("metadata_json") or {},
-            }
-        )
+    snapshot_items = [
+        _partd_snapshot_item(snapshot_row) for snapshot_row in snapshot_rows
+    ]
 
     return response.json(
         {

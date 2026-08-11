@@ -129,21 +129,8 @@ async def _is_zcta_overlap_available(session) -> bool:
     return is_available
 
 
-async def _radius_zip_weights(
-    session,
-    lat: float,
-    lng: float,
-    radius_miles: float,
-) -> tuple[dict[str, float], str]:
-    """Weight ZIP overlaps for a geographic radius using the best available tier."""
-
-    if radius_miles <= 0:
-        return {}, "none"
-    if not await _is_zcta_overlap_available(session):
-        return {}, "zip_centroid"
-
-    radius_meters = radius_miles * MILES_TO_METERS
-    sql = text(
+def _radius_zip_overlap_sql():
+    return text(
         """
         WITH circle AS (
           SELECT ST_Buffer(
@@ -167,10 +154,26 @@ async def _radius_zip_weights(
         WHERE ST_Intersects(z.the_geom::geography, c.geom)
         """
     )
+
+
+async def _radius_zip_weights(
+    session,
+    lat: float,
+    lng: float,
+    radius_miles: float,
+) -> tuple[dict[str, float], str]:
+    """Weight ZIP overlaps for a geographic radius using the best available tier."""
+
+    if radius_miles <= 0:
+        return {}, "none"
+    if not await _is_zcta_overlap_available(session):
+        return {}, "zip_centroid"
+
+    radius_meters = radius_miles * MILES_TO_METERS
     try:
         zip_overlap_rows = (
             await session.execute(
-                sql,
+                _radius_zip_overlap_sql(),
                 {"lat": lat, "lng": lng, "radius_meters": radius_meters},
             )
         ).all()
