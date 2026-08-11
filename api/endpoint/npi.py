@@ -11127,8 +11127,8 @@ async def get_npi(request, npi):
                     line1_norm, unit_norm, city_norm, state_code, zip5, zip4, country_code,
                     first_line, second_line, city_name, state_name, postal_code,
                     telephone_number, fax_number, formatted_address, lat, long, place_id,
-                    geo_source, geocode_source, geocode_quality, geocoded_at, source_bits, display_priority,
-                    date_added
+                    geo_source, geocode_source, geocode_quality, geocoded_at,
+                    source_bits, strict_source_bits, display_priority, date_added
                 )
                 SELECT
                     {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US')),
@@ -11149,7 +11149,7 @@ async def get_npi(request, npi):
                     first_line, second_line, city_name, state_name, postal_code,
                     telephone_number, fax_number, formatted_address, lat, long, place_id,
                     CAST(:geo_source AS {db_schema}.address_archive_geo_source),
-                    :geocode_source, :geocode_quality, now(), 1, 0, date_added
+                    :geocode_source, :geocode_quality, now(), 1, 1, 0, date_added
                   FROM (
                     SELECT DISTINCT ON (
                         {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US'))
@@ -11174,6 +11174,7 @@ async def get_npi(request, npi):
                     geocode_quality = COALESCE({db_schema}.{archive_table}.geocode_quality, EXCLUDED.geocode_quality),
                     geocoded_at = COALESCE({db_schema}.{archive_table}.geocoded_at, EXCLUDED.geocoded_at),
                     source_bits = {db_schema}.{archive_table}.source_bits | 1,
+                    strict_source_bits = {db_schema}.{archive_table}.strict_source_bits | 1,
                     last_seen_at = now();
                 """,
                 checksum=checksum,

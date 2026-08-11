@@ -1012,6 +1012,9 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             source_bit=64,
             priority=7,
             schema=schema,
+            strict_source_predicate=(
+                "strict_source.address_observed_in_source IS TRUE"
+            ),
         )
         print(f"Part D pharmacy activity canonical address resolve complete: {stats}")
 
@@ -1033,6 +1036,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             city,
             state,
             zip_code,
+            address_observed_in_source,
             pharmacy_type,
             mail_order,
             dispensing_fee_brand_30,
@@ -1062,6 +1066,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 city,
                 state,
                 zip_code,
+                address_observed_in_source,
                 pharmacy_type,
                 mail_order,
                 dispensing_fee_brand_30,
@@ -1093,6 +1098,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 city,
                 state,
                 zip_code,
+                address_observed_in_source,
                 pharmacy_type,
                 mail_order,
                 dispensing_fee_brand_30,
@@ -1123,6 +1129,8 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 city,
                 state,
                 zip_code,
+                bool_or(address_observed_in_source)
+                    AS address_observed_in_source,
                 pharmacy_type,
                 mail_order,
                 dispensing_fee_brand_30,
@@ -1206,6 +1214,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             city,
             state,
             zip_code,
+            address_observed_in_source,
             pharmacy_type,
             mail_order,
             dispensing_fee_brand_30,
@@ -1608,6 +1617,21 @@ def _activity_row_from_source(
         else:
             pharmacy_type = "unknown"
 
+    address_line1 = _row_value(
+        source_field_map, "address1", "addressline1", "firstline"
+    )
+    address_line2 = _row_value(
+        source_field_map, "address2", "addressline2", "secondline"
+    )
+    city = _row_value(source_field_map, "city", "cityname")
+    state = _row_value(source_field_map, "state", "statecode", "statename")
+    zip_code = _row_value(
+        source_field_map, "pharmacyzipcode", "zip", "zipcode", "postalcode"
+    )
+    address_observed_in_source = all(
+        str(value or "").strip() for value in (address_line1, city, state, zip_code)
+    )
+
     return {
         "snapshot_id": snapshot_id,
         "npi": npi,
@@ -1617,17 +1641,12 @@ def _activity_row_from_source(
         "pharmacy_name": _row_value(
             source_field_map, "pharmacyname", "name", "providername"
         ),
-        "address_line1": _row_value(
-            source_field_map, "address1", "addressline1", "firstline"
-        ),
-        "address_line2": _row_value(
-            source_field_map, "address2", "addressline2", "secondline"
-        ),
-        "city": _row_value(source_field_map, "city", "cityname"),
-        "state": _row_value(source_field_map, "state", "statecode", "statename"),
-        "zip_code": _row_value(
-            source_field_map, "pharmacyzipcode", "zip", "zipcode", "postalcode"
-        ),
+        "address_line1": address_line1,
+        "address_line2": address_line2,
+        "city": city,
+        "state": state,
+        "zip_code": zip_code,
+        "address_observed_in_source": address_observed_in_source,
         "pharmacy_type": pharmacy_type,
         "mail_order": mail_flag
         if mail_flag is not None
@@ -1819,6 +1838,9 @@ async def _flush_batches(
                     "city": activity_fields.get("city"),
                     "state": activity_fields.get("state"),
                     "zip_code": activity_fields.get("zip_code"),
+                    "address_observed_in_source": bool(
+                        activity_fields.get("address_observed_in_source")
+                    ),
                     "pharmacy_type": activity_fields.get("pharmacy_type"),
                     "mail_order": activity_fields.get("mail_order"),
                     "dispensing_fee_brand_30": activity_fields.get("dispensing_fee_brand_30"),
@@ -1836,6 +1858,11 @@ async def _flush_batches(
                     "_plans": set(),
                 }
                 aggregate_by_key[key] = aggregated_field_map
+            else:
+                aggregated_field_map["address_observed_in_source"] = bool(
+                    aggregated_field_map.get("address_observed_in_source")
+                    or activity_fields.get("address_observed_in_source")
+                )
             aggregated_field_map["_plans"].add(plan_id[:32])
 
         aggregated_rows: list[dict[str, Any]] = []

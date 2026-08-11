@@ -137,6 +137,7 @@ class PartDPharmacyActivity(Base, JSONOutputMixin):
     city = Column(String(128))
     state = Column(String(2))
     zip_code = Column(String(16))
+    address_observed_in_source = Column(Boolean, nullable=False, default=False)
     pharmacy_type = Column(String(64))
     mail_order = Column(Boolean)
     dispensing_fee_brand_30 = Column(Float)
@@ -229,6 +230,7 @@ class PartDPharmacyActivityStage(Base, JSONOutputMixin):
     city = Column(String(128))
     state = Column(String(2))
     zip_code = Column(String(16))
+    address_observed_in_source = Column(Boolean, nullable=False, default=False)
     pharmacy_type = Column(String(64))
     mail_order = Column(Boolean)
     dispensing_fee_brand_30 = Column(Float)
@@ -1250,11 +1252,140 @@ class AddressArchiveV2(Base, JSONOutputMixin):
     postal_validation_status = Column(TEXT)
     geocoded_at = Column(TIMESTAMP(timezone=True))
     source_bits = Column(Integer, nullable=False)
+    strict_source_bits = Column(Integer, nullable=False)
     first_seen_at = Column(TIMESTAMP(timezone=True), nullable=False)
     last_seen_at = Column(TIMESTAMP(timezone=True), nullable=False)
     date_added = Column(DATE)
     display_priority = Column(SMALLINT, nullable=False)
     merged_into = Column(PG_UUID(as_uuid=True))
+
+
+class AddressAliasStateV1(Base, JSONOutputMixin):
+    __tablename__ = "address_alias_state_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("singleton"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["singleton"]
+
+    singleton = Column(Boolean, nullable=False)
+    schema_version = Column(SMALLINT, nullable=False)
+    active_ruleset_version = Column(SMALLINT, nullable=False)
+    generation = Column(BigInteger, nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class AddressAliasArtifactStateV1(Base, JSONOutputMixin):
+    __tablename__ = "address_alias_artifact_state_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("artifact_name"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["artifact_name"]
+
+    artifact_name = Column(String(128), nullable=False)
+    generation = Column(BigInteger, nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class AddressAliasRunV1(Base, JSONOutputMixin):
+    __tablename__ = "address_alias_run_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("run_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["run_id"]
+
+    run_id = Column(PG_UUID(as_uuid=True), nullable=False)
+    alias_kind = Column(String(64), nullable=False)
+    ruleset_version = Column(SMALLINT, nullable=False)
+    mode = Column(String(16), nullable=False)
+    status = Column(String(16), nullable=False)
+    reviewed_shadow_run_id = Column(PG_UUID(as_uuid=True))
+    reviewed_candidate_digest = Column(String(64))
+    reviewed_by = Column(String(256))
+    reviewed_at = Column(TIMESTAMP(timezone=True))
+    candidate_digest = Column(String(64))
+    evidence_digest = Column(String(64))
+    scope_state_code = Column(String(2))
+    scope_zip_prefix = Column(String(5))
+    last_source_address_key = Column(PG_UUID(as_uuid=True))
+    archive_row_count = Column(BigInteger, nullable=False)
+    source_count = Column(BigInteger, nullable=False)
+    candidate_source_count = Column(BigInteger, nullable=False)
+    candidate_row_count = Column(BigInteger, nullable=False)
+    no_candidate_count = Column(BigInteger, nullable=False)
+    active_skipped_count = Column(BigInteger, nullable=False)
+    eligible_count = Column(BigInteger, nullable=False)
+    ambiguous_count = Column(BigInteger, nullable=False)
+    insufficient_provenance_count = Column(BigInteger, nullable=False)
+    backfill_target_count = Column(BigInteger, nullable=False)
+    evidence_target_count = Column(BigInteger, nullable=False)
+    evidence_pair_count = Column(BigInteger, nullable=False)
+    provenance_update_count = Column(BigInteger, nullable=False)
+    reason_buckets = Column(JSONB, nullable=False)
+    sample_rows = Column(JSONB, nullable=False)
+    error_text = Column(TEXT)
+    started_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    completed_at = Column(TIMESTAMP(timezone=True))
+
+
+class AddressAliasCandidateV1(Base, JSONOutputMixin):
+    __tablename__ = "address_alias_candidate_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("run_id", "source_address_key", "target_address_key"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["run_id", "source_address_key", "target_address_key"]
+
+    run_id = Column(PG_UUID(as_uuid=True), nullable=False)
+    source_address_key = Column(PG_UUID(as_uuid=True), nullable=False)
+    source_identity_key = Column(TEXT, nullable=False)
+    target_address_key = Column(PG_UUID(as_uuid=True), nullable=False)
+    target_identity_key = Column(TEXT, nullable=False)
+    candidate_count = Column(Integer, nullable=False)
+    target_strict_source_bits = Column(Integer, nullable=False)
+    target_strict_source_count = Column(SMALLINT, nullable=False)
+    decision = Column(String(32), nullable=False)
+    review_status = Column(String(24), nullable=False)
+    reviewed_by = Column(String(256))
+    reviewed_at = Column(TIMESTAMP(timezone=True))
+    review_reason = Column(TEXT)
+
+
+class AddressAliasV1(Base, JSONOutputMixin):
+    __tablename__ = "address_alias_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("alias_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["alias_id"]
+
+    alias_id = Column(BigInteger, Identity(always=True), nullable=False)
+    source_address_key = Column(PG_UUID(as_uuid=True), nullable=False)
+    source_identity_key = Column(TEXT, nullable=False)
+    target_address_key = Column(PG_UUID(as_uuid=True), nullable=False)
+    target_identity_key = Column(TEXT, nullable=False)
+    alias_kind = Column(String(64), nullable=False)
+    ruleset_version = Column(SMALLINT, nullable=False)
+    target_strict_source_bits = Column(Integer, nullable=False)
+    target_strict_source_count = Column(SMALLINT, nullable=False)
+    candidate_count = Column(Integer, nullable=False)
+    shadow_run_id = Column(PG_UUID(as_uuid=True), nullable=False)
+    apply_run_id = Column(PG_UUID(as_uuid=True), nullable=False)
+    reviewed_candidate_digest = Column(String(64), nullable=False)
+    applied_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    revoked_at = Column(TIMESTAMP(timezone=True))
+    revoked_reason = Column(TEXT)
+    revoked_by = Column(String(256))
+    revoke_run_id = Column(PG_UUID(as_uuid=True))
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    updated_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 
 class OpenAddressesGeocode(Base, JSONOutputMixin):

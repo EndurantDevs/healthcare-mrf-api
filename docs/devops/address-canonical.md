@@ -145,6 +145,170 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
   archive without geocodes. With the flag off, behavior is identical to
   legacy even when the v2 table exists.
 
+## Reviewed Numeric-Grid Aliases
+
+Numeric-grid repair is an offline, generic structural rule. It is not fuzzy
+matching and it is not state-specific. Optional state and ZIP scopes only bound
+an operator run; they do not change the rule.
+
+For example, `1234 E 5678, Suite 202` may alias to
+`1234 E 5678 S, Suite 202` when that exact unit, state, ZIP, and country have
+one structurally richer target backed by at least two independent source bits.
+`Suite 203` is not the same unit and never matches. If both a north and south
+target exist, the source remains ambiguous and no alias is eligible.
+
+The operation is deliberately split into reviewable stages:
+
+The alias run, candidate, and active-alias relations are controlled audit
+tables. Use only the commands below; never issue direct `INSERT`, `UPDATE`,
+`DELETE`, or `TRUNCATE` against them. Row triggers make sealed evidence and
+terminal run state immutable and require revocation instead of deletion, but a
+database owner can bypass row triggers (including with `TRUNCATE`). Database
+owner access is therefore an explicit trusted operational boundary.
+
+1. Seal an initial shadow. The command prints JSON containing the immutable
+   `run_id`, `candidate_digest`, counts, and bounded samples.
+
+   ```bash
+   python main.py start address-numeric-grid-alias \
+     --mode shadow \
+     --state-code TX \
+     --zip-prefix 75
+   ```
+
+2. If target provenance is missing because the strict column was introduced
+   after existing imports, attest only the candidate targets from that exact
+   shadow. The stored source `address_key` is used solely as an indexed
+   prefilter; both key and identity are recomputed from raw source components.
+   The operation never copies historical `source_bits`, never certifies source
+   keys, and never promotes an alias.
+
+   ```bash
+   python main.py start address-strict-source-backfill \
+     --alias-run-id 00000000-0000-0000-0000-000000000001 \
+     --expected-candidate-sha256 <exact-64-character-digest> \
+     --reviewed-by <operator> \
+     --max-targets 256
+   ```
+
+   Exact Marketplace evidence comes from `mrf_address_evidence`, not its
+   independently aggregated summary. Historical Part D rows are excluded
+   because missing addresses may have been filled from NPPES. New Part D rows
+   set strict bit 64 only when their identity fields were present in the Part D
+   source itself. Normal archive resolution never infers strict evidence from
+   a post-processed row: callers must explicitly attest raw-source lineage.
+   This prevents a ZIP restored from coordinates from counting as an exact
+   source observation. Provider Directory archive stages can attest their rows
+   because their input SQL requires a source-observed postal code; other
+   historical evidence is recovered only by this exact-key backfill.
+   Facility Anchor bit 8 is deliberately excluded from historical strict
+   backfill: its import can restore a blank source ZIP from coordinates before
+   the row is published, and the current live table does not retain a raw-ZIP
+   lineage flag. Re-enable that source only after a source-observed postal-code
+   marker is persisted before restoration.
+
+3. Run a new shadow with the same scope. Review this new run—not the first
+   one—because its digest snapshots the attested target bitmasks.
+
+   ```sql
+   SELECT
+       run_id,
+       candidate_digest,
+       source_count,
+       candidate_source_count,
+       eligible_count,
+       ambiguous_count,
+       insufficient_provenance_count,
+       reason_buckets,
+       sample_rows
+   FROM mrf.address_alias_run_v1
+   WHERE run_id = '<new-shadow-run-id>'::uuid;
+
+   SELECT
+       source_address_key,
+       source_identity_key,
+       target_address_key,
+       target_identity_key,
+       candidate_count,
+       target_strict_source_bits,
+       target_strict_source_count,
+       decision
+   FROM mrf.address_alias_candidate_v1
+   WHERE run_id = '<new-shadow-run-id>'::uuid
+   ORDER BY source_address_key, target_address_key;
+   ```
+
+4. Apply only the exact sealed digest after review. Apply re-derives the
+   candidates under the alias lock and aborts if any input changed.
+
+   ```bash
+   python main.py start address-numeric-grid-alias \
+     --mode apply \
+     --alias-run-id <new-shadow-run-id> \
+     --expected-candidate-sha256 <new-exact-digest> \
+     --reviewed-by <operator>
+   ```
+
+5. An activation changes the alias generation. Rebuild the full Provider
+   Directory address artifact set and then run a full unified-address rebuild.
+   Partial overlay publication intentionally fails when its stored generation
+   is stale, because copied rows could retain an old alias after activation or
+   revocation.
+
+   ```bash
+   python main.py start provider-directory-fhir \
+     --publish-artifacts-only \
+     --publish-artifacts-targets addresses \
+     --full-address-artifact-rebuild
+   python main.py start entity-address-unified
+   ```
+
+   The explicit full-rebuild flag keeps every prerequisite bound to the same
+   reviewed global dataset fence, while allowing the address overlay and
+   corroboration artifacts to replace all source partitions at the new alias
+   generation. The `addresses` target includes both network-catalog and
+   corroboration artifacts; partial or source-scoped rebuilds fail closed.
+
+   Verify that the overlay receipt equals the active generation and neither
+   serving artifact retains an active source key:
+
+   ```sql
+   SELECT state.generation, artifact.generation AS overlay_generation
+   FROM mrf.address_alias_state_v1 AS state
+   JOIN mrf.address_alias_artifact_state_v1 AS artifact
+     ON artifact.artifact_name = 'provider_directory_address_overlay'
+   WHERE state.singleton = true;
+
+   SELECT count(*) AS overlay_residual_source_keys
+   FROM mrf.provider_directory_address_overlay AS overlay
+   JOIN mrf.address_alias_v1 AS alias
+     ON alias.source_address_key = overlay.address_key
+    AND alias.revoked_at IS NULL;
+
+   SELECT count(*) AS unified_residual_source_keys
+   FROM mrf.entity_address_unified AS unified
+   JOIN mrf.address_alias_v1 AS alias
+     ON alias.source_address_key = unified.address_key
+    AND alias.revoked_at IS NULL;
+   ```
+
+Revocation is one-way and also changes the generation. It requires the exact
+active source and expected target keys, an operator, and a reason. A revoked
+shadow cannot be reapplied; create a new shadow for any future decision. After
+revocation, repeat both full artifact rebuilds above.
+
+```bash
+python main.py start address-numeric-grid-alias-revoke \
+  --source-address-key <source-uuid> \
+  --expected-target-address-key <target-uuid> \
+  --reason "reviewed rollback" \
+  --reviewed-by <operator>
+```
+
+No public request joins `address_alias_v1`; active mappings are consumed only
+while building archive, overlay, and unified artifacts. This preserves the
+provider endpoint latency contract.
+
 ## Smoke Checks
 
 Run these after migration and restart:

@@ -86,6 +86,7 @@ from process.control_lifecycle import (
     suppress_control_run_heartbeat_persistence,
 )
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
+from process.ext import address_alias_sql
 from process.ext.address_canon import resolve_into_archive
 from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
@@ -637,6 +638,8 @@ PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES = {
         "location_address_keys",
         "location_archive",
         "address_overlay",
+        "network_catalog",
+        "corroboration",
     ),
     "address_artifacts": (
         "location_contacts",
@@ -9001,6 +9004,9 @@ class ProviderDirectoryArtifactBuildFence:
     """Identity of the live relation from which an artifact stage was built."""
 
     target_oid: int | None
+    alias_generation: int | None = None
+    dependency_relation: str | None = None
+    dependency_relation_oid: int | None = None
 
 
 @dataclass(frozen=True)
@@ -9523,6 +9529,33 @@ async def _assert_provider_directory_artifact_build_fence(
     )
     if current_target_oid != stage.build_fence.target_oid:
         raise ProviderDirectoryArtifactBuildStale(stage.target_relation)
+    if stage.build_fence.alias_generation is not None:
+        current_alias_generation = await _address_alias_generation(stage.schema)
+        if current_alias_generation != stage.build_fence.alias_generation:
+            raise ProviderDirectoryArtifactBuildStale(
+                f"{stage.target_relation}:address_alias_generation"
+            )
+    if stage.build_fence.dependency_relation is not None:
+        current_dependency_oid = await _provider_directory_relation_oid(
+            stage.schema,
+            stage.build_fence.dependency_relation,
+        )
+        if current_dependency_oid != stage.build_fence.dependency_relation_oid:
+            raise ProviderDirectoryArtifactBuildStale(
+                f"{stage.target_relation}:dependency_relation"
+            )
+        if (
+            stage.build_fence.dependency_relation
+            == PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+        ):
+            overlay_generation = await _address_alias_artifact_generation(
+                stage.schema,
+                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+            )
+            if overlay_generation != stage.build_fence.alias_generation:
+                raise ProviderDirectoryArtifactBuildStale(
+                    f"{stage.target_relation}:address_overlay_generation"
+                )
 
 
 def _provider_directory_prepared_stage_relations(
@@ -9950,6 +9983,7 @@ async def _promote_provider_directory_artifact_stage_transaction(
         await db.status(f"SET LOCAL lock_timeout = '{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}';")
         await db.status(f"SET LOCAL statement_timeout = '{PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_STATEMENT_TIMEOUT}';")
         await _acquire_provider_directory_artifact_cutover_lock(prepared_stage)
+        await db.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
         await _verify_active_profile_selection_at_cutover()
         active_fence = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
         if active_fence is not None:
@@ -9966,6 +10000,7 @@ async def _promote_provider_directory_artifact_stage_transaction(
         )
         await _install_provider_directory_prepared_stage(prepared_stage)
         await _finish_provider_directory_prepared_stage(prepared_stage)
+        await _record_address_alias_artifact_generation(prepared_stage)
         if active_fence is not None:
             await _promote_provider_directory_artifact_datasets(active_fence)
 
@@ -13141,6 +13176,7 @@ async def _apply_locked_provider_directory_artifact_bundle(
         await _install_provider_directory_prepared_stage(stage)
     for stage in ordered_stages:
         await _finish_provider_directory_prepared_stage(stage)
+        await _record_address_alias_artifact_generation(stage)
     if active_fence is not None:
         await _promote_provider_directory_artifact_datasets(active_fence)
     if profile_delta is None:
@@ -13182,6 +13218,12 @@ async def _promote_provider_directory_artifact_bundle_transaction(
                 statement_timeout,
             )
         )
+        if any(
+            stage.build_fence is not None
+            and stage.build_fence.alias_generation is not None
+            for stage in ordered_stages
+        ):
+            await db.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
         await _lock_provider_directory_artifact_bundle_targets(
             ordered_stages,
             schema,
@@ -13573,6 +13615,46 @@ async def publish_provider_directory_address_corroboration_table(
         metrics_override=network_catalog_metrics_override,
     )
     async with _provider_directory_artifact_build_guard(schema, relation) as build_fence:
+        alias_generation = await _address_alias_generation(schema)
+        artifact_generation = await _address_alias_artifact_generation(
+            schema,
+            relation,
+        )
+        if artifact_generation != alias_generation and effective_source_ids:
+            raise RuntimeError(
+                "address alias generation changed; a full Provider Directory "
+                "address corroboration rebuild is required"
+            )
+        dependency_relation = (
+            _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
+                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+            )
+        )
+        dependency_relation_oid = await _provider_directory_relation_oid(
+            schema,
+            dependency_relation,
+        )
+        if dependency_relation_oid is None:
+            raise RuntimeError(
+                "Provider Directory address overlay dependency is missing"
+            )
+        if dependency_relation == PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
+            overlay_generation = await _address_alias_artifact_generation(
+                schema,
+                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+            )
+            if overlay_generation != alias_generation:
+                raise RuntimeError(
+                    "Provider Directory address overlay uses a stale address alias "
+                    "generation"
+                )
+        build_fence = replace(
+            build_fence,
+            alias_generation=alias_generation,
+            dependency_relation=dependency_relation,
+            dependency_relation_oid=dependency_relation_oid,
+        )
         stage_table = _stage_table_name()
         stage_ref = _qt(schema, stage_table)
         target_ref = _qt(schema, relation)
@@ -22554,6 +22636,7 @@ async def _publish_provider_directory_dataset_artifacts(
     publish_corroboration: bool,
     publish_artifacts_targets: set[str] | None,
     require_complete_global_profile_fence: bool = False,
+    full_address_artifact_rebuild: bool = False,
 ) -> dict[str, Any]:
     """Build one selected dataset bundle and atomically publish its pointers."""
     if require_complete_global_profile_fence and not (
@@ -22600,6 +22683,7 @@ async def _publish_provider_directory_dataset_artifacts(
         publish_corroboration=publish_corroboration,
         publish_artifacts_targets=publish_artifacts_targets,
         artifact_resource_types=artifact_resource_types,
+        full_address_artifact_rebuild=full_address_artifact_rebuild,
     )
 
 
@@ -23325,6 +23409,7 @@ async def _publish_artifact_bundle_from_fence(
     publish_artifacts_targets: set[str] | None,
     artifact_resource_types: frozenset[str],
     resource_fence: ProviderDirectoryArtifactDatasetFence | None = None,
+    full_address_artifact_rebuild: bool = False,
 ) -> dict[str, Any]:
     """Build one immutable serving bundle and publish it behind its fence."""
     resource_fence = (
@@ -23352,6 +23437,7 @@ async def _publish_artifact_bundle_from_fence(
                 source_ids=[dataset.source_id for dataset in fence.datasets],
                 publish_corroboration=publish_corroboration,
                 publish_artifacts_targets=publish_artifacts_targets,
+                full_address_artifact_rebuild=full_address_artifact_rebuild,
             )
             _assert_candidate_artifact_bundle_complete(
                 fence,
@@ -36212,11 +36298,15 @@ async def _publish_provider_directory_artifacts(
     source_ids: list[str] | tuple[str, ...] | None = None,
     publish_corroboration: bool = False,
     publish_artifacts_targets: set[str] | None = None,
+    full_address_artifact_rebuild: bool = False,
 ) -> dict[str, Any]:
     """Publish provider directory artifacts for provider-directory serving."""
     artifact_bundle = _PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.get()
     effective_publish_scope_run_id = (
         run_id if publish_scope_run_id is _PUBLISH_SCOPE_UNSET else publish_scope_run_id
+    )
+    address_artifact_source_ids = (
+        None if full_address_artifact_rebuild else source_ids
     )
     metrics["publish_artifacts_targets"] = (
         sorted(publish_artifacts_targets) if publish_artifacts_targets is not None else "all"
@@ -36336,7 +36426,7 @@ async def _publish_provider_directory_artifacts(
     if is_provider_directory_publish_target_enabled(publish_artifacts_targets, "address_overlay"):
         address_overlay_options_by_name: dict[str, Any] = {
             "run_id": effective_publish_scope_run_id,
-            "source_ids": source_ids,
+            "source_ids": address_artifact_source_ids,
         }
         if artifact_bundle is not None:
             address_overlay_options_by_name["defer_cutover"] = True
@@ -36427,7 +36517,7 @@ async def _publish_provider_directory_artifacts(
     ):
         metrics["ptg_corroboration_view_published"] = (
             await _is_provider_directory_corroboration_artifact_published(
-                source_ids=source_ids,
+                source_ids=address_artifact_source_ids,
                 network_catalog_metrics=metrics["network_catalog"],
                 artifact_bundle=artifact_bundle,
             )
@@ -36728,6 +36818,9 @@ async def publish_provider_directory_location_archive(
                 source_bit=PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT,
                 priority=PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY,
                 schema=schema,
+                # The stage SQL requires a source-observed postal code for
+                # every admitted row, so this path can attest strict lineage.
+                strict_source_predicate="TRUE",
             )
             archive_metric_dict = dict(stats.__dict__)
             archive_metric_dict["openaddresses_coordinate_backfill_rows"] = (
@@ -71386,6 +71479,9 @@ async def process_provider_directory_fhir_data(
     canonical_backfill_only = bool(task.get("canonical_backfill_only", False))
     contact_backfill_only = bool(task.get("contact_backfill_only", False))
     publish_artifacts_only = bool(task.get("publish_artifacts_only", False))
+    full_address_artifact_rebuild = bool(
+        task.get("full_address_artifact_rebuild", False)
+    )
     should_publish_corroboration = _is_publish_corroboration_enabled(
         task.get("publish_corroboration")
     )
@@ -71394,16 +71490,53 @@ async def process_provider_directory_fhir_data(
         or task.get("publish_artifact_targets")
         or task.get("publish_targets")
     )
+    profile_execution_fields = (
+        "provider_directory_profile_contract_id",
+        "provider_directory_profile_generation",
+        "provider_directory_profile_selection_attestation",
+    )
+    has_profile_execution_fields = any(
+        field_name in task for field_name in profile_execution_fields
+    )
+    if full_address_artifact_rebuild:
+        required_address_targets = set(
+            PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES["addresses"]
+        )
+        if not publish_artifacts_only:
+            raise ValueError(
+                "provider_directory_full_address_rebuild_requires_publish_artifacts_only"
+            )
+        if requested_source_ids:
+            raise ValueError(
+                "provider_directory_full_address_rebuild_requires_global_scope"
+            )
+        if (
+            publish_artifacts_targets is not None
+            and not required_address_targets.issubset(publish_artifacts_targets)
+        ):
+            raise ValueError(
+                "provider_directory_full_address_rebuild_targets_incomplete"
+            )
+        if task.get("publish_corroboration") is False:
+            raise ValueError(
+                "provider_directory_full_address_rebuild_requires_corroboration"
+            )
+        if any(
+            (
+                dataset_rehydrate_only,
+                dataset_followup_only,
+                canonical_backfill_only,
+                contact_backfill_only,
+                has_profile_execution_fields,
+            )
+        ):
+            raise ValueError(
+                "provider_directory_full_address_rebuild_incompatible_mode"
+            )
+        should_publish_corroboration = True
     profile_execution = (
         validated_profile_execution(task)
-        if any(
-            field_name in task
-            for field_name in (
-                "provider_directory_profile_contract_id",
-                "provider_directory_profile_generation",
-                "provider_directory_profile_selection_attestation",
-            )
-        )
+        if has_profile_execution_fields
         else None
     )
     open_only = bool(task.get("open_only", True))
@@ -71669,6 +71802,7 @@ async def process_provider_directory_fhir_data(
                 source_ids=requested_source_ids,
                 publish_corroboration=should_publish_corroboration,
                 publish_artifacts_targets=publish_artifacts_targets,
+                full_address_artifact_rebuild=full_address_artifact_rebuild,
                 require_complete_global_profile_fence=bool(
                     task.get("require_complete_global_profile_fence")
                 ),
@@ -72265,6 +72399,7 @@ class _ProviderDirectoryFhirCommandOptions:
     contact_backfill_only: bool = False
     dataset_followup_only: bool = False
     publish_artifacts_only: bool = False
+    full_address_artifact_rebuild: bool = False
     publish_artifacts_targets: list[str] | tuple[str, ...] | str | None = None
     publish_corroboration: bool | None = None
     full_refresh: bool = False
@@ -72401,6 +72536,64 @@ PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES = (
     "phone_idx",
     "source_run_resource_idx",
 )
+
+
+async def _address_alias_generation(schema: str) -> int:
+    """Return the validated generation used by offline serving artifacts."""
+    row = await db.first(address_alias_sql.active_alias_generation_sql(schema=schema))
+    if row is None:
+        raise RuntimeError("address alias singleton state is missing")
+    if int(row.schema_version) != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION:
+        raise RuntimeError(f"unsupported address alias schema version: {row.schema_version}")
+    if (
+        int(row.active_ruleset_version)
+        != address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION
+    ):
+        raise RuntimeError(
+            f"unsupported numeric-grid alias ruleset: {row.active_ruleset_version}"
+        )
+    return int(row.generation)
+
+
+async def _address_alias_artifact_generation(
+    schema: str,
+    artifact_name: str,
+) -> int:
+    """Return the alias generation last materialized into one serving artifact."""
+    value = await db.scalar(
+        f"""
+        SELECT generation
+        FROM {_qt(schema, address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE)}
+        WHERE artifact_name = :artifact_name;
+        """,
+        artifact_name=artifact_name,
+    )
+    if value is None:
+        raise RuntimeError(f"address alias artifact receipt is missing: {artifact_name}")
+    return int(value)
+
+
+async def _record_address_alias_artifact_generation(
+    stage: ProviderDirectoryPreparedArtifactStage,
+) -> None:
+    """Record an alias-aware artifact cutover in the surrounding transaction."""
+    if stage.build_fence is None or stage.build_fence.alias_generation is None:
+        return
+    await db.status(
+        f"""
+        INSERT INTO {_qt(stage.schema, address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE)} (
+            artifact_name,
+            generation,
+            updated_at
+        )
+        VALUES (:artifact_name, :generation, now())
+        ON CONFLICT (artifact_name) DO UPDATE
+        SET generation = EXCLUDED.generation,
+            updated_at = EXCLUDED.updated_at;
+        """,
+        artifact_name=stage.target_relation,
+        generation=stage.build_fence.alias_generation,
+    )
 
 
 def _address_overlay_stage_table_name(run_id: str | None = None) -> str:
@@ -73907,6 +74100,7 @@ async def _populate_address_overlay_stage(
     )
     inserted = sum(inserted_by_component.values())
     countries_normalized = await _normalize_address_overlay_stage_countries(stage_ref)
+    alias_metrics = await _materialize_address_overlay_aliases(schema, stage_ref)
     archive_coordinate_backfill_rows = await _backfill_address_overlay_stage_coordinates(schema, stage_ref)
     duplicates_removed = await _dedupe_address_overlay_stage(
         stage_ref,
@@ -73923,6 +74117,7 @@ async def _populate_address_overlay_stage(
         "component_seconds": duration_seconds_by_component,
         "components": selected_components,
         "countries_normalized": countries_normalized,
+        **alias_metrics,
         "archive_coordinate_backfill_rows": archive_coordinate_backfill_rows,
         "duplicates_removed": duplicates_removed,
         "stage_rows": stage_rows,
@@ -73983,6 +74178,129 @@ async def _normalize_address_overlay_stage_countries(stage_ref: str) -> int:
             """
         )
     )
+
+
+async def _materialize_address_overlay_aliases(
+    schema: str,
+    stage_ref: str,
+) -> dict[str, int]:
+    """Rewrite active alias keys across the complete stage before deduplication."""
+    aliases = _qt(schema, address_alias_sql.ADDRESS_ALIAS_TABLE)
+    archive = _qt(schema, "address_archive_v2")
+    generation = await _address_alias_generation(schema)
+    alias_candidates = int(
+        await db.scalar(
+            f"""
+            SELECT count(*)
+            FROM {stage_ref} AS stage_row
+            JOIN {aliases} AS active
+              ON active.source_address_key = stage_row.address_key
+             AND active.revoked_at IS NULL;
+            """
+        )
+        or 0
+    )
+    violation = await db.first(
+        f"""
+        WITH matching AS (
+            SELECT
+                stage_row.address_key AS source_address_key,
+                active.target_address_key,
+                active.source_identity_key,
+                active.target_identity_key AS recorded_target_identity_key,
+                {_q(schema)}.addr_identity_key_v1(
+                    stage_row.first_line,
+                    stage_row.second_line,
+                    stage_row.city_name,
+                    COALESCE(NULLIF(stage_row.state_name, ''), stage_row.state_code),
+                    stage_row.postal_code,
+                    COALESCE(NULLIF(stage_row.country_code, ''), 'US')
+                ) AS staged_source_identity_key,
+                target.identity_key AS current_target_identity_key,
+                target.address_key AS current_target_address_key
+            FROM {stage_ref} AS stage_row
+            JOIN {aliases} AS active
+              ON active.source_address_key = stage_row.address_key
+             AND active.revoked_at IS NULL
+            LEFT JOIN {archive} AS target
+              ON target.address_key = active.target_address_key
+             AND target.merged_into IS NULL
+        ), violations AS (
+            SELECT
+                CASE
+                    WHEN source_identity_key IS DISTINCT FROM staged_source_identity_key
+                        THEN 'source_identity_mismatch'
+                    WHEN current_target_address_key IS NULL
+                        THEN 'missing_or_merged_target'
+                    WHEN recorded_target_identity_key IS DISTINCT FROM current_target_identity_key
+                        THEN 'target_identity_mismatch'
+                    ELSE NULL
+                END AS violation_kind,
+                source_address_key,
+                target_address_key
+            FROM matching
+            UNION ALL
+            SELECT
+                'multi_hop_alias',
+                matching.source_address_key,
+                matching.target_address_key
+            FROM matching
+            JOIN {aliases} AS downstream
+              ON downstream.source_address_key = matching.target_address_key
+             AND downstream.revoked_at IS NULL
+        )
+        SELECT *
+        FROM violations
+        WHERE violation_kind IS NOT NULL
+        ORDER BY violation_kind, source_address_key
+        LIMIT 1;
+        """
+    )
+    if violation:
+        raise RuntimeError(
+            "provider-directory address alias integrity violation: "
+            f"kind={violation.violation_kind} "
+            f"source={violation.source_address_key} "
+            f"target={violation.target_address_key}"
+        )
+    aliases_materialized = _coerce_rowcount(
+        await db.status(
+            f"""
+            UPDATE {stage_ref} AS stage_row
+               SET address_key = target.address_key,
+                   lat = COALESCE(stage_row.lat, target.lat),
+                   long = COALESCE(stage_row.long, target.long)
+              FROM {aliases} AS active
+              JOIN {archive} AS target
+                ON target.address_key = active.target_address_key
+               AND target.merged_into IS NULL
+             WHERE active.source_address_key = stage_row.address_key
+               AND active.revoked_at IS NULL;
+            """
+        )
+    )
+    residual_source_keys = int(
+        await db.scalar(
+            f"""
+            SELECT count(*)
+            FROM {stage_ref} AS stage_row
+            JOIN {aliases} AS active
+              ON active.source_address_key = stage_row.address_key
+             AND active.revoked_at IS NULL;
+            """
+        )
+        or 0
+    )
+    if residual_source_keys:
+        raise RuntimeError(
+            "provider-directory address alias materialization left active source keys"
+        )
+    return {
+        "address_alias_generation": generation,
+        "alias_candidates": alias_candidates,
+        "aliases_materialized": aliases_materialized,
+        "alias_residual_source_keys": residual_source_keys,
+    }
 
 
 async def _backfill_address_overlay_stage_coordinates(schema: str, stage_ref: str) -> int:
@@ -74077,6 +74395,13 @@ def _address_overlay_publish_result(
         "component_seconds": stage_metric_dict.get("component_seconds", {}),
         "components": list(stage_metric_dict.get("components") or ADDRESS_OVERLAY_COMPONENTS),
         "countries_normalized": stage_metric_dict.get("countries_normalized", 0),
+        "address_alias_generation": stage_metric_dict.get("address_alias_generation", 0),
+        "alias_candidates": stage_metric_dict.get("alias_candidates", 0),
+        "aliases_materialized": stage_metric_dict.get("aliases_materialized", 0),
+        "alias_residual_source_keys": stage_metric_dict.get(
+            "alias_residual_source_keys",
+            0,
+        ),
         "archive_coordinate_backfill_rows": stage_metric_dict.get("archive_coordinate_backfill_rows", 0),
         "duplicates_removed": stage_metric_dict["duplicates_removed"],
         "copied_existing": stage_metric_dict["copied_existing"],
@@ -74373,11 +74698,28 @@ async def publish_provider_directory_address_overlay(
         schema,
         PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
     ) as build_fence:
+        alias_generation = await _address_alias_generation(schema)
+        artifact_generation = await _address_alias_artifact_generation(
+            schema,
+            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+        )
+        selected_components = _clean_address_overlay_components(components)
+        is_full_rebuild = (
+            run_id is None
+            and not effective_source_ids
+            and set(selected_components) == set(ADDRESS_OVERLAY_COMPONENTS)
+        )
+        if artifact_generation != alias_generation and not is_full_rebuild:
+            raise RuntimeError(
+                "address alias generation changed; a full Provider Directory "
+                "address overlay rebuild is required"
+            )
+        build_fence = replace(build_fence, alias_generation=alias_generation)
         return await _build_provider_directory_address_overlay_stage(
             schema,
             run_id,
             effective_source_ids,
-            components,
+            selected_components,
             target_ref,
             build_fence,
             defer_cutover,

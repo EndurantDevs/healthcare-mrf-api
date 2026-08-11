@@ -63,6 +63,50 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert importer_by_name["address-archive-v2-migrate"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["address-archive-v2-migrate"]["queue"] == "arq:AddressArchive"
     assert importer_by_name["address-archive-v2-migrate"]["cancelable"] is True
+    assert importer_by_name["address-numeric-grid-alias"]["family"] == "provider"
+    assert importer_by_name["address-numeric-grid-alias"]["queue"] == "arq:AddressArchive"
+    assert importer_by_name["address-numeric-grid-alias"]["cancelable"] is True
+    assert {
+        param["name"]
+        for param in importer_by_name["address-numeric-grid-alias"]["params_schema"]
+    } >= {
+        "mode",
+        "state_code",
+        "zip_prefix",
+        "alias_run_id",
+        "expected_candidate_sha256",
+        "reviewed_by",
+    }
+    assert importer_by_name["address-strict-source-backfill"]["family"] == "provider"
+    assert (
+        importer_by_name["address-strict-source-backfill"]["queue"]
+        == "arq:AddressArchive"
+    )
+    assert importer_by_name["address-strict-source-backfill"]["cancelable"] is True
+    assert {
+        param["name"]
+        for param in importer_by_name["address-strict-source-backfill"]["params_schema"]
+    } >= {
+        "alias_run_id",
+        "expected_candidate_sha256",
+        "reviewed_by",
+        "max_targets",
+    }
+    assert importer_by_name["address-numeric-grid-alias-revoke"]["family"] == "provider"
+    assert (
+        importer_by_name["address-numeric-grid-alias-revoke"]["queue"]
+        == "arq:AddressArchive"
+    )
+    assert importer_by_name["address-numeric-grid-alias-revoke"]["cancelable"] is True
+    assert {
+        param["name"]
+        for param in importer_by_name["address-numeric-grid-alias-revoke"]["params_schema"]
+    } >= {
+        "source_address_key",
+        "expected_target_address_key",
+        "reason",
+        "reviewed_by",
+    }
     assert importer_by_name["provider-directory-fhir"]["family"] == "provider"
     assert importer_by_name["provider-directory-fhir"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["provider-directory-fhir"]["queue"] == "arq:ProviderDirectoryFHIR"
@@ -118,6 +162,7 @@ def test_importer_registry_exposes_provider_directory_params():
     assert any(param["name"] == "contact_backfill_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "dataset_followup_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "publish_artifacts_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "full_address_artifact_rebuild" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "publish_artifacts_targets" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "publish_corroboration" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "stream_batch_size" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])

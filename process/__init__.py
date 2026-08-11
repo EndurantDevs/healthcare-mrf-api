@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import json
 import os
 
 import click
@@ -145,6 +146,14 @@ from process.entity_address_unified import shutdown as entity_address_unified_sh
 from process.entity_address_unified import startup as entity_address_unified_startup
 from process.address_archive_migration import main as initiate_address_archive_migration
 from process.address_archive_migration import process_data as process_address_archive_migration_data
+from process.address_numeric_grid_alias_worker import main as initiate_address_numeric_grid_alias
+from process.address_numeric_grid_alias_worker import process_data as process_address_numeric_grid_alias_data
+from process.address_numeric_grid_alias_worker import (
+    process_address_numeric_grid_alias_revoke,
+    process_address_strict_source_backfill,
+    run_address_numeric_grid_alias_revoke_command,
+    run_address_strict_source_backfill_command,
+)
 from process.openaddresses import main as initiate_openaddresses
 from process.openaddresses import process_data as process_openaddresses_data
 from process.openaddresses import shutdown as openaddresses_shutdown
@@ -882,7 +891,13 @@ class EntityAddressUnified_finish:
 
 
 class AddressArchive:
-    functions = [process_address_archive_migration_data, control_single_job_start]
+    functions = [
+        process_address_archive_migration_data,
+        process_address_numeric_grid_alias_data,
+        process_address_numeric_grid_alias_revoke,
+        process_address_strict_source_backfill,
+        control_single_job_start,
+    ]
     on_startup = db_startup
     max_jobs = 1
     queue_read_limit = 2
@@ -1336,6 +1351,14 @@ def provider_enrichment(test: bool):
     help="Publish Provider Directory contact and address archive artifacts without fetching FHIR resources.",
 )
 @click.option(
+    "--full-address-artifact-rebuild",
+    is_flag=True,
+    help=(
+        "Rebuild every alias-bearing address serving artifact from the exact "
+        "global dataset fence; requires publish-artifacts-only and no source scope."
+    ),
+)
+@click.option(
     "--publish-artifacts-targets",
     help="Comma-separated Provider Directory artifact stages to publish; defaults to all stages.",
 )
@@ -1440,6 +1463,7 @@ def provider_directory_fhir(
     contact_backfill_only: bool,
     dataset_followup_only: bool,
     publish_artifacts_only: bool,
+    full_address_artifact_rebuild: bool,
     publish_artifacts_targets: str | None,
     publish_corroboration: bool | None,
     full_refresh: bool,
@@ -1502,6 +1526,7 @@ def provider_directory_fhir(
             contact_backfill_only=contact_backfill_only,
             dataset_followup_only=dataset_followup_only,
             publish_artifacts_only=publish_artifacts_only,
+            full_address_artifact_rebuild=full_address_artifact_rebuild,
             publish_artifacts_targets=publish_artifacts_targets,
             publish_corroboration=publish_corroboration,
             full_refresh=full_refresh,
@@ -1796,6 +1821,122 @@ def address_archive_v2_migrate(
     )
 
 
+@click.command(help="Discover or apply reviewed numeric-grid address aliases")
+@click.option(
+    "--mode",
+    type=click.Choice(["off", "shadow", "apply"], case_sensitive=False),
+    default="off",
+    show_default=True,
+)
+@click.option("--state-code", help="Optional two-letter pilot state scope.")
+@click.option("--zip-prefix", help="Optional one-to-five digit pilot ZIP prefix.")
+@click.option("--alias-run-id", help="Sealed shadow run UUID required by apply.")
+@click.option(
+    "--expected-candidate-sha256",
+    help="Exact sealed candidate digest required by apply.",
+)
+@click.option("--reviewed-by", help="Operator identity recorded by apply.")
+@click.option("--sample-limit", type=int, default=20, show_default=True)
+@click.option("--timeout", default="10min", show_default=True)
+@click.option("--enqueue", is_flag=True, help="Enqueue on arq:AddressArchive.")
+def address_numeric_grid_alias(
+    mode: str,
+    state_code: str | None,
+    zip_prefix: str | None,
+    alias_run_id: str | None,
+    expected_candidate_sha256: str | None,
+    reviewed_by: str | None,
+    sample_limit: int,
+    timeout: str,
+    enqueue: bool,
+):
+    """Run the reviewed numeric-grid alias workflow."""
+    result = _run(
+        initiate_address_numeric_grid_alias(
+            mode=mode,
+            state_code=state_code,
+            zip_prefix=zip_prefix,
+            alias_run_id=alias_run_id,
+            expected_candidate_sha256=expected_candidate_sha256,
+            reviewed_by=reviewed_by,
+            sample_limit=sample_limit,
+            timeout=timeout,
+            enqueue=enqueue,
+        )
+    )
+    if result is not None:
+        click.echo(json.dumps(result, sort_keys=True, default=str))
+
+
+@click.command(help="Backfill strict source evidence for one alias shadow")
+@click.option("--alias-run-id", required=True, help="Sealed shadow run UUID.")
+@click.option(
+    "--expected-candidate-sha256",
+    required=True,
+    help="Exact sealed candidate digest.",
+)
+@click.option("--reviewed-by", required=True, help="Operator identity for the backfill.")
+@click.option(
+    "--max-targets",
+    type=click.IntRange(1, 10_000),
+    default=256,
+    show_default=True,
+)
+@click.option("--timeout", default="10min", show_default=True)
+@click.option("--enqueue", is_flag=True, help="Enqueue on arq:AddressArchive.")
+def address_strict_source_backfill(
+    alias_run_id: str,
+    expected_candidate_sha256: str,
+    reviewed_by: str,
+    max_targets: int,
+    timeout: str,
+    enqueue: bool,
+):
+    """Attest exact source evidence for reviewed numeric-grid targets."""
+    result = _run(
+        run_address_strict_source_backfill_command(
+            alias_run_id=alias_run_id,
+            expected_candidate_sha256=expected_candidate_sha256,
+            reviewed_by=reviewed_by,
+            max_targets=max_targets,
+            timeout=timeout,
+            enqueue=enqueue,
+        )
+    )
+    if result is not None:
+        click.echo(json.dumps(result, sort_keys=True, default=str))
+
+
+@click.command(help="Revoke one exact active numeric-grid address alias")
+@click.option("--source-address-key", required=True)
+@click.option("--expected-target-address-key", required=True)
+@click.option("--reason", required=True)
+@click.option("--reviewed-by", required=True)
+@click.option("--timeout", default="30s", show_default=True)
+@click.option("--enqueue", is_flag=True, help="Enqueue on arq:AddressArchive.")
+def address_numeric_grid_alias_revoke(
+    source_address_key: str,
+    expected_target_address_key: str,
+    reason: str,
+    reviewed_by: str,
+    timeout: str,
+    enqueue: bool,
+):
+    """Revoke an active alias without permitting un-revoke."""
+    result = _run(
+        run_address_numeric_grid_alias_revoke_command(
+            source_address_key=source_address_key,
+            expected_target_address_key=expected_target_address_key,
+            reason=reason,
+            reviewed_by=reviewed_by,
+            timeout=timeout,
+            enqueue=enqueue,
+        )
+    )
+    if result is not None:
+        click.echo(json.dumps(result, sort_keys=True, default=str))
+
+
 @click.command(help="Run lightweight MRF payer/source discovery catalog import")
 @click.option("--provider", help="Provider list: all or master-list.")
 @click.option("--limit", type=int, help="Maximum deduped source candidates to process.")
@@ -1919,6 +2060,15 @@ process_group.add_command(pharmacy_economics, name="pharmacy-economics")
 process_group.add_command(entity_address_unified, name="entity-address-unified")
 process_group.add_command(openaddresses, name="openaddresses")
 process_group.add_command(address_archive_v2_migrate, name="address-archive-v2-migrate")
+process_group.add_command(address_numeric_grid_alias, name="address-numeric-grid-alias")
+process_group.add_command(
+    address_strict_source_backfill,
+    name="address-strict-source-backfill",
+)
+process_group.add_command(
+    address_numeric_grid_alias_revoke,
+    name="address-numeric-grid-alias-revoke",
+)
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(geo_census_lookup, name="geo-census")
 process_group.add_command(nucc)

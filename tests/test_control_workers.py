@@ -237,6 +237,18 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"
     assert by_importer["terminology-synonyms"]["worker_class"] == "process.TerminologySynonyms"
     assert by_importer["openaddresses"]["worker_class"] == "process.OpenAddresses"
+    assert (
+        by_importer["address-numeric-grid-alias"]["worker_class"]
+        == "process.AddressArchive"
+    )
+    assert (
+        by_importer["address-strict-source-backfill"]["worker_class"]
+        == "process.AddressArchive"
+    )
+    assert (
+        by_importer["address-numeric-grid-alias-revoke"]["worker_class"]
+        == "process.AddressArchive"
+    )
     assert by_importer["ptg-candidate-audit"]["worker_class"] == "process.PTGCandidateAudit"
     assert by_queue["arq:PTGCandidateAudit"]["role"] == "start"
     assert by_queue["arq:OpenAddresses"]["role"] == "start"

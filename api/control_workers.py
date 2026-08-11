@@ -85,7 +85,16 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:FacilityAnchors", "process.FacilityAnchors", ("facility-anchors",)),
     WorkerSpec("arq:PharmacyEconomics", "process.PharmacyEconomics", ("pharmacy-economics",)),
     WorkerSpec("arq:EntityAddressUnified", "process.EntityAddressUnified", ("entity-address-unified",)),
-    WorkerSpec("arq:AddressArchive", "process.AddressArchive", ("address-archive-v2-migrate",)),
+    WorkerSpec(
+        "arq:AddressArchive",
+        "process.AddressArchive",
+        (
+            "address-archive-v2-migrate",
+            "address-numeric-grid-alias",
+            "address-numeric-grid-alias-revoke",
+            "address-strict-source-backfill",
+        ),
+    ),
     WorkerSpec("arq:OpenAddresses", "process.OpenAddresses", ("openaddresses",)),
 )
 
