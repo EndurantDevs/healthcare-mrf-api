@@ -2,8 +2,9 @@
 
 from sanic import response
 from sanic.blueprints import Blueprint
+from sanic.exceptions import SanicException
 
-from api.control import blueprint as control_blueprint
+from api.control import blueprint as control_blueprint, control_error
 from api.metrics import blueprint as metrics_blueprint
 from api.endpoint.formulary import blueprint as v1_formulary
 from api.endpoint.formulary_fhir import blueprint as v1_formulary_fhir
@@ -26,9 +27,16 @@ from api.ptg2_capacity_evidence import (
     CapacityEvidenceError,
     guard_isolated_capacity_process_request,
 )
+from api.provider_directory_profile_capacity_preflight import (
+    register_profile_capacity_preflight_route,
+)
 from api.runtime_identity import add_runtime_identity_headers
 from api.worker_memory import register_worker_memory_lifecycle
 from db.connection import db
+
+profile_capacity_blueprint = Blueprint("profile_capacity_control", url_prefix="/control")
+register_profile_capacity_preflight_route(profile_capacity_blueprint)
+profile_capacity_blueprint.exception(SanicException)(control_error)
 
 
 def _capacity_process_request_guard(request):
@@ -52,6 +60,7 @@ def init_api(api):
     api.register_middleware(_capacity_process_request_guard, "request")
     api.register_middleware(add_runtime_identity_headers, "response")
     api.blueprint(control_blueprint)
+    api.blueprint(profile_capacity_blueprint)
     api.blueprint(metrics_blueprint)
     api_bluenprint = Blueprint.group(
         [
