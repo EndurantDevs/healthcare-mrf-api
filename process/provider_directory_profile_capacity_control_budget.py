@@ -476,12 +476,10 @@ def _control_metadata_mutation_bounds(
         plan_input.import_run_update,
         sequence_operation_count=import_run_sequence_count,
     )
-    capacity_consumption_insert = (
-        _control_metadata_projection_per_operation(
-            geometry,
-            plan_input.capacity_consumption_insert,
-            sequence_operation_count=1,
-        )
+    capacity_consumption_insert = _control_metadata_projection_per_operation(
+        geometry,
+        plan_input.capacity_consumption_insert,
+        sequence_operation_count=3,
     )
     return (
         checkpoint_insert,

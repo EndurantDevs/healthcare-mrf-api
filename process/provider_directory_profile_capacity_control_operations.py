@@ -242,11 +242,10 @@ def _control_wal_operation_ledger(
         tuple[int, int],
     ],
 ) -> tuple[ProviderDirectoryProfileControlWalOperation, ...]:
+    """Return the closed, ordered WAL operation ledger for one build."""
+
     artifact_batch_count = _checked_add(
-        *(
-            artifact_batch.batch_count
-            for artifact_batch in plan_input.artifact_batch_counts
-        )
+        *(entry.batch_count for entry in plan_input.artifact_batch_counts)
     )
     return (
         _row_lock_control_operation(
@@ -255,8 +254,11 @@ def _control_wal_operation_ledger(
             plan_input.admission_row_lock_count,
         ),
         _metadata_control_operation(
-            geometry, "pre_cutover", "capacity_consumption_insert",
-            1, *metadata_mutation_bounds[3],
+            geometry,
+            "pre_cutover",
+            "capacity_consumption_insert",
+            3,
+            *metadata_mutation_bounds[3],
         ),
         *_artifact_control_operations(geometry, artifact_batch_count),
         *_stage_control_operations(

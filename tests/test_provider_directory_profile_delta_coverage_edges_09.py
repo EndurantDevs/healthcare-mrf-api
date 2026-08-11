@@ -14,6 +14,9 @@ from tests.provider_directory_profile_delta_coverage_support import (
     importer,
     pytest,
 )
+from tests.test_provider_directory_profile_capacity_runtime import (
+    _limits_payload,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,10 +47,13 @@ def test_capacity_artifact_worker_success_and_failure_edges(monkeypatch):
         "_provider_directory_positive_config",
         lambda *_args: (1, False),
     )
-    assert importer._provider_directory_profile_capacity_artifact_workers(
-        database_pool_size=3,
-        pool_reserve_connections=1,
-    ) == 1
+    assert (
+        importer._provider_directory_profile_capacity_artifact_workers(
+            database_pool_size=3,
+            pool_reserve_connections=1,
+        )
+        == 1
+    )
     with pytest.raises(RuntimeError, match="workers_exceeded"):
         importer._provider_directory_profile_capacity_artifact_workers(
             database_pool_size=1,
@@ -64,8 +70,8 @@ async def test_capacity_relation_missing_and_safe_edges(monkeypatch):
     ):
         await importer._profile_capacity_relation_row(12, "p", 0)
     importer.db.first.return_value = _safe_relation_by_field()
-    relation_by_field, toast_oid = (
-        await importer._profile_capacity_relation_row(12, "p", 0)
+    relation_by_field, toast_oid = await importer._profile_capacity_relation_row(
+        12, "p", 0
     )
     assert relation_by_field["relkind"] == "r"
     assert toast_oid is None
@@ -180,17 +186,15 @@ async def test_profile_admission_identity_invalid_and_valid_edges(monkeypatch):
         desired_source_context_vector_hash="d",
     )
     resolver.return_value = valid_identity
-    assert await importer._profile_admission_identity(
-        SimpleNamespace()
-    ) is valid_identity
+    assert (
+        await importer._profile_admission_identity(SimpleNamespace()) is valid_identity
+    )
 
 
 @pytest.mark.asyncio
 async def test_unconsumed_capacity_run_success_edge(monkeypatch):
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=False))
-    await importer._assert_profile_capacity_run_unconsumed(
-        "run_" + "1" * 32
-    )
+    await importer._assert_profile_capacity_run_unconsumed("run_" + "1" * 32)
 
 
 @pytest.mark.asyncio
@@ -224,9 +228,11 @@ async def test_admission_workload_success_edge(monkeypatch):
         batch_plan=object(),
     )
     source_fence = SimpleNamespace(datasets=[])
-    limits = SimpleNamespace(
-        artifact_scope_batch_size=100,
-        pool_reserve_connections=1,
+    limits = importer.profile_capacity_runtime.validated_capacity_limits(
+        _limits_payload(
+            artifact_scope_batch_size=100,
+            pool_reserve_connections=1,
+        )
     )
     monkeypatch.setattr(
         importer.profile_capacity_runtime,
@@ -258,9 +264,7 @@ async def test_admission_workload_success_edge(monkeypatch):
         "_provider_directory_profile_control_wal_plan_input",
         AsyncMock(return_value=object()),
     )
-    resource_fence = SimpleNamespace(
-        datasets=[SimpleNamespace(source_id="source-a")]
-    )
+    resource_fence = SimpleNamespace(datasets=[SimpleNamespace(source_id="source-a")])
     workload = await importer._profile_admission_workload(
         identity,
         source_fence,
@@ -275,11 +279,14 @@ def test_admission_run_id_and_lock_projection_edges():
     with pytest.raises(RuntimeError, match="run_id_invalid"):
         importer._validated_admission_run_id(None, None, execution)
     valid_run_id = "run_" + "1" * 32
-    assert importer._validated_admission_run_id(
-        valid_run_id,
-        valid_run_id,
-        execution,
-    ) == valid_run_id
+    assert (
+        importer._validated_admission_run_id(
+            valid_run_id,
+            valid_run_id,
+            execution,
+        )
+        == valid_run_id
+    )
     valid_projection = SimpleNamespace(
         operations=[
             SimpleNamespace(
@@ -292,9 +299,7 @@ def test_admission_run_id_and_lock_projection_edges():
     )
     importer._assert_admission_lock_projection(valid_projection)
     with pytest.raises(RuntimeError, match="lock_projection_invalid"):
-        importer._assert_admission_lock_projection(
-            SimpleNamespace(operations=[])
-        )
+        importer._assert_admission_lock_projection(SimpleNamespace(operations=[]))
 
 
 @pytest.mark.asyncio
@@ -307,10 +312,13 @@ async def test_admission_database_guard_success_and_failure_edges(monkeypatch):
         "_provider_directory_profile_capacity_database_identity",
         resolver,
     )
-    assert await importer._admission_database_guard(
-        SimpleNamespace(serving_state=object()),
-        expected,
-    ) is observed
+    assert (
+        await importer._admission_database_guard(
+            SimpleNamespace(serving_state=object()),
+            expected,
+        )
+        is observed
+    )
     resolver.return_value = _DatabaseIdentityStub(
         wal_lsn="0/2",
         database_oid=2,
@@ -369,9 +377,7 @@ async def test_admission_run_toast_success_and_failure_edges(monkeypatch):
 
 
 def test_capacity_admission_context_invalid_edge():
-    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-        object()
-    )
+    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(object())
     try:
         with pytest.raises(RuntimeError, match="admission_invalid"):
             importer._provider_directory_profile_capacity_admission()
@@ -384,14 +390,11 @@ async def test_capacity_scratch_row_byte_and_deadline_edges(monkeypatch):
     admission = _wal_tracker_admission()
     future_lease = SimpleNamespace(
         max_build_deadline=(
-            datetime.datetime.now(datetime.timezone.utc)
-            + datetime.timedelta(hours=1)
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
         )
     )
     admission = dataclasses.replace(admission, lease=future_lease)
-    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-        admission
-    )
+    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_capacity_relation_bytes",
@@ -410,12 +413,15 @@ async def test_capacity_scratch_row_byte_and_deadline_edges(monkeypatch):
                 observed_rows=2,
                 maximum_rows=1,
             )
-        assert await importer._assert_provider_directory_profile_capacity_scratch(
-            "profile_stage",
-            (),
-            observed_rows=1,
-            maximum_rows=1,
-        ) == 0
+        assert (
+            await importer._assert_provider_directory_profile_capacity_scratch(
+                "profile_stage",
+                (),
+                observed_rows=1,
+                maximum_rows=1,
+            )
+            == 0
+        )
         expired = dataclasses.replace(
             admission,
             lease=SimpleNamespace(

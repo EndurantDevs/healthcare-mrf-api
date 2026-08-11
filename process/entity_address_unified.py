@@ -28,6 +28,7 @@ from db.models import (
     db,
 )
 from process.control_lifecycle import mark_control_run
+from process.ext import address_alias_sql
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress
 from process import provider_directory_profile as profile_artifact
@@ -99,6 +100,7 @@ ENTITY_ADDRESS_REFRESH_MODES = {
 }
 ARCHIVE_IDENTITY_VERSION = "v2"
 BASE_ADDRESS_VERSION = "address_archive_v2:v2"
+ALIAS_BASE_ADDRESS_VERSION_PREFIX = f"{BASE_ADDRESS_VERSION}+alias-v1:g"
 ARCHIVE_COORDINATE_EPSILON_DEGREES = "0.0000001"
 SUPPORT_TABLE_MODELS = (
     EntityAddressEvidence,
@@ -1611,18 +1613,7 @@ def _drop_stage_primary_key_sql(db_schema: str, table_name: str) -> str:
     """
 
 
-def _ensure_stage_primary_key_sql(
-    db_schema: str,
-    table_name: str,
-    primary_key_columns: Iterable[str],
-) -> str:
-    """Build SQL that restores the requested stage-table primary key."""
-    columns = list(primary_key_columns)
-    if not columns:
-        return ""
-    constraint_name = _archived_identifier(table_name, "_pkey")
-    column_sql = ", ".join(columns)
-    return f"""
+_ENSURE_STAGE_PRIMARY_KEY_SQL = """
     DO $$
     DECLARE
         target_table_oid oid;
@@ -1630,15 +1621,15 @@ def _ensure_stage_primary_key_sql(
         conflicting_table_oid oid;
         conflicting_constraint text;
         orphan_index text;
-        resolved_constraint_name text := {_sql_literal(constraint_name)};
+        resolved_constraint_name text := {constraint_name_literal};
     BEGIN
         SELECT t.oid
           INTO target_table_oid
           FROM pg_class t
           JOIN pg_namespace n
             ON n.oid = t.relnamespace
-         WHERE n.nspname = {_sql_literal(db_schema)}
-           AND t.relname = {_sql_literal(table_name)}
+         WHERE n.nspname = {schema_literal}
+           AND t.relname = {table_literal}
          LIMIT 1;
 
         IF NOT EXISTS (
@@ -1656,8 +1647,8 @@ def _ensure_stage_primary_key_sql(
                 ON ix.indexrelid = i.oid
               LEFT JOIN pg_constraint c
                 ON c.conindid = i.oid
-             WHERE n.nspname = {_sql_literal(db_schema)}
-               AND i.relname = {_sql_literal(constraint_name)}
+             WHERE n.nspname = {schema_literal}
+               AND i.relname = {constraint_name_literal}
              LIMIT 1;
 
             IF conflicting_relation IS NOT NULL
@@ -1669,12 +1660,12 @@ def _ensure_stage_primary_key_sql(
                   AND conflicting_constraint IS NOT NULL THEN
                 EXECUTE format(
                     'ALTER TABLE %I.%I DROP CONSTRAINT %I',
-                    {_sql_literal(db_schema)},
-                    {_sql_literal(table_name)},
+                    {schema_literal},
+                    {table_literal},
                     conflicting_constraint
                 );
             ELSIF conflicting_relation IS NOT NULL THEN
-                resolved_constraint_name := LEFT({_sql_literal(constraint_name)}, 54)
+                resolved_constraint_name := LEFT({constraint_name_literal}, 54)
                     || '_'
                     || SUBSTRING(MD5(target_table_oid::text), 1, 8);
             END IF;
@@ -1682,20 +1673,39 @@ def _ensure_stage_primary_key_sql(
             IF orphan_index IS NOT NULL THEN
                 EXECUTE format(
                     'DROP INDEX IF EXISTS %I.%I',
-                    {_sql_literal(db_schema)},
+                    {schema_literal},
                     orphan_index
                 );
             END IF;
 
             EXECUTE format(
                 'ALTER TABLE %I.%I ADD CONSTRAINT %I PRIMARY KEY ({column_sql})',
-                {_sql_literal(db_schema)},
-                {_sql_literal(table_name)},
+                {schema_literal},
+                {table_literal},
                 resolved_constraint_name
             );
         END IF;
     END $$;
-    """
+"""
+
+
+def _ensure_stage_primary_key_sql(
+    db_schema: str,
+    table_name: str,
+    primary_key_columns: Iterable[str],
+) -> str:
+    """Build SQL that restores the requested stage-table primary key."""
+    columns = list(primary_key_columns)
+    if not columns:
+        return ""
+    constraint_name = _archived_identifier(table_name, "_pkey")
+    column_sql = ", ".join(columns)
+    return _ENSURE_STAGE_PRIMARY_KEY_SQL.format(
+        schema_literal=_sql_literal(db_schema),
+        table_literal=_sql_literal(table_name),
+        constraint_name_literal=_sql_literal(constraint_name),
+        column_sql=column_sql,
+    )
 
 
 async def _ensure_stage_primary_key(
@@ -1734,6 +1744,106 @@ async def _prepare_support_stage_tables(db_schema: str, import_date: str) -> dic
     return stage_classes
 
 
+@dataclass
+class _SupportIndexProgress:
+    context: dict
+    db_schema: str
+    run_id: str | None
+    concurrency: int
+    total: int
+    lock: asyncio.Lock
+    completed: int = 0
+
+
+async def _report_support_index_progress(
+    progress: _SupportIndexProgress,
+    index: int,
+    table_name: str,
+    *,
+    is_completed: bool,
+) -> None:
+    """Emit serialized start or completion progress for one support table."""
+    if not progress.run_id:
+        return
+    async with progress.lock:
+        if is_completed:
+            progress.completed += 1
+        done = progress.completed
+        message = (
+            f"indexed support table {index}/{progress.total}: {table_name}"
+            if is_completed
+            else (
+                f"indexing support table {index}/{progress.total}: {table_name} "
+                f"(concurrency {progress.concurrency})"
+            )
+        )
+        enqueue_live_progress(
+            run_id=progress.run_id,
+            importer="entity-address-unified",
+            status="running",
+            phase="entity-address-unified indexing support tables",
+            unit="tables",
+            done=done,
+            total=progress.total,
+            pct=99,
+            message=message,
+        )
+
+
+async def _index_support_stage(
+    progress: _SupportIndexProgress,
+    index: int,
+    stage_cls,
+) -> None:
+    """Restore a support table primary key and build its additional indexes."""
+    table_name = stage_cls.__tablename__
+    await _report_support_index_progress(
+        progress,
+        index,
+        table_name,
+        is_completed=False,
+    )
+    await _ensure_stage_primary_key(
+        stage_cls,
+        progress.db_schema,
+        context=progress.context,
+    )
+    await _create_stage_indexes(
+        stage_cls,
+        progress.db_schema,
+        context=progress.context,
+    )
+    await _report_support_index_progress(
+        progress,
+        index,
+        table_name,
+        is_completed=True,
+    )
+
+
+async def _run_concurrent_support_indexes(
+    progress: _SupportIndexProgress,
+    stage_table_classes: list[type],
+) -> None:
+    """Run support indexing with bounded concurrency and propagate cancellation."""
+    semaphore = asyncio.Semaphore(progress.concurrency)
+
+    async def _guarded(index: int, stage_cls) -> None:
+        async with semaphore:
+            await _index_support_stage(progress, index, stage_cls)
+
+    index_results = await asyncio.gather(
+        *(
+            _guarded(index, stage_cls)
+            for index, stage_cls in enumerate(stage_table_classes, start=1)
+        ),
+        return_exceptions=True,
+    )
+    for index_result in index_results:
+        if isinstance(index_result, BaseException):
+            raise index_result
+
+
 async def _create_support_stage_indexes(
     stage_classes: dict[type, type],
     db_schema: str,
@@ -1755,67 +1865,19 @@ async def _create_support_stage_indexes(
         len(stage_table_classes),
     )
     phase_context["support_stage_index_concurrency"] = index_concurrency
-    progress_lock = asyncio.Lock()
-    completed_counts = [0]
-    total = len(stage_table_classes)
-
-    async def _index_stage_table(index: int, stage_cls) -> None:
-        table_name = stage_cls.__tablename__
-        if run_id:
-            async with progress_lock:
-                current_done = completed_counts[0]
-                enqueue_live_progress(
-                    run_id=run_id,
-                    importer="entity-address-unified",
-                    status="running",
-                    phase="entity-address-unified indexing support tables",
-                    unit="tables",
-                    done=current_done,
-                    total=total,
-                    pct=99,
-                    message=(
-                        f"indexing support table {index}/{total}: {table_name} "
-                        f"(concurrency {index_concurrency})"
-                    ),
-                )
-        await _ensure_stage_primary_key(stage_cls, db_schema, context=phase_context)
-        await _create_stage_indexes(stage_cls, db_schema, context=phase_context)
-        if run_id:
-            async with progress_lock:
-                completed_counts[0] += 1
-                enqueue_live_progress(
-                    run_id=run_id,
-                    importer="entity-address-unified",
-                    status="running",
-                    phase="entity-address-unified indexing support tables",
-                    unit="tables",
-                    done=completed_counts[0],
-                    total=total,
-                    pct=99,
-                    message=f"indexed support table {index}/{total}: {table_name}",
-                )
-
+    progress = _SupportIndexProgress(
+        context=phase_context,
+        db_schema=db_schema,
+        run_id=run_id,
+        concurrency=index_concurrency,
+        total=len(stage_table_classes),
+        lock=asyncio.Lock(),
+    )
     if index_concurrency <= 1 or len(stage_table_classes) == 1:
         for index, stage_cls in enumerate(stage_table_classes, start=1):
-            await _index_stage_table(index, stage_cls)
+            await _index_support_stage(progress, index, stage_cls)
         return
-
-    semaphore = asyncio.Semaphore(index_concurrency)
-
-    async def _guarded(index: int, stage_cls) -> None:
-        async with semaphore:
-            await _index_stage_table(index, stage_cls)
-
-    index_results = await asyncio.gather(
-        *(
-            _guarded(index, stage_cls)
-            for index, stage_cls in enumerate(stage_table_classes, start=1)
-        ),
-        return_exceptions=True,
-    )
-    for index_result in index_results:
-        if isinstance(index_result, BaseException):
-            raise index_result
+    await _run_concurrent_support_indexes(progress, stage_table_classes)
 
 
 async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
@@ -1983,6 +2045,14 @@ async def _run_entity_address_cutover(
     )
     async with db.transaction():
         await db.status(f"SET LOCAL lock_timeout = {_sql_literal(lock_timeout)};")
+        await db.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
+        expected_alias_generation = int(context.get("address_alias_generation") or 0)
+        current_alias_generation = await _address_alias_generation(db_schema)
+        if current_alias_generation != expected_alias_generation:
+            raise RuntimeError(
+                "address alias generation changed during entity-address-unified build"
+            )
+        await _assert_provider_directory_overlay_alias_fence(db_schema, context)
         await _acquire_cutover_locks(db_schema, relation_names, required_names)
         for swap in swaps:
             await _swap_stage_table(db_schema, swap.live_cls, swap.stage_cls)
@@ -4517,55 +4587,14 @@ def _integer_ranges(min_value: int | None, max_value: int | None, shards: int) -
     return ranges
 
 
-def _shard_source_selects(
-    db_schema: str,
-    source_selects: list[str],
-    *,
-    npi_address_ranges: list[tuple[int, int]] | None = None,
-    mrf_address_ranges: list[tuple[int, int]] | None = None,
-    doctor_clinician_address_ranges: list[tuple[int, int]] | None = None,
-    provider_enrollment_ffs_ranges: list[tuple[int, int]] | None = None,
-) -> list[str]:
-    """Split eligible NPI-backed source queries into bounded ranges."""
-    npi_address_ranges = npi_address_ranges or []
-    mrf_address_ranges = mrf_address_ranges or []
-    doctor_clinician_address_ranges = doctor_clinician_address_ranges or []
-    provider_enrollment_ffs_ranges = provider_enrollment_ffs_ranges or []
-    sharded_selects: list[str] = []
-    shard_specs = _source_shard_specs(
-        db_schema,
-        npi_address_ranges,
-        mrf_address_ranges,
-        doctor_clinician_address_ranges,
-        provider_enrollment_ffs_ranges,
-    )
-
-    for select_sql in source_selects:
-        ranges: list[tuple[int, int]] = []
-        where_marker = ""
-        alias = ""
-        for table_marker, source_marker, candidate_where, candidate_alias, candidate_ranges in shard_specs:
-            if table_marker in select_sql and source_marker in select_sql:
-                ranges = candidate_ranges
-                where_marker = candidate_where
-                alias = candidate_alias
-                break
-        if not ranges or not where_marker or where_marker not in select_sql:
-            sharded_selects.append(select_sql)
-            continue
-        for low, high in ranges:
-            predicate = f"{where_marker}\n               AND {alias}.npi >= {low}\n               AND {alias}.npi < {high}"
-            sharded_selects.append(select_sql.replace(where_marker, predicate, 1))
-    return sharded_selects
-
-
 def _source_shard_specs(
     db_schema: str,
-    npi_address_ranges,
-    mrf_address_ranges,
-    doctor_clinician_address_ranges,
-    provider_enrollment_ffs_ranges,
-):
+    npi_address_ranges: list[tuple[int, int]],
+    mrf_address_ranges: list[tuple[int, int]],
+    doctor_address_ranges: list[tuple[int, int]],
+    enrollment_ranges: list[tuple[int, int]],
+) -> list[tuple[str, str, str, str, list[tuple[int, int]]]]:
+    """Return table, provenance, predicate, alias, and range shard specs."""
     return [
         (
             f"FROM {db_schema}.npi_address AS a",
@@ -4586,22 +4615,68 @@ def _source_shard_specs(
             "'cms_doctors'::varchar AS address_source",
             "WHERE d.npi IS NOT NULL",
             "d",
-            doctor_clinician_address_ranges,
+            doctor_address_ranges,
         ),
         (
             f"FROM {db_schema}.provider_enrollment_ffs AS f",
             "'provider_enrollment_ffs'::varchar AS address_source",
             "WHERE f.npi IS NOT NULL",
             "f",
-            provider_enrollment_ffs_ranges,
+            enrollment_ranges,
         ),
         (
             f"FROM {db_schema}.provider_enrollment_ffs_address AS fa",
             "'provider_enrollment_ffs_address'::varchar AS address_source",
             "WHERE f.npi IS NOT NULL",
             "f",
-            provider_enrollment_ffs_ranges,
+            enrollment_ranges,
         ),
+    ]
+
+
+def _expand_source_shards(
+    select_sql: str,
+    shard_specs: list[tuple[str, str, str, str, list[tuple[int, int]]]],
+) -> list[str]:
+    """Expand one eligible source query into its bounded NPI ranges."""
+    for table_marker, source_marker, where_marker, alias, ranges in shard_specs:
+        if table_marker not in select_sql or source_marker not in select_sql:
+            continue
+        if not ranges or where_marker not in select_sql:
+            return [select_sql]
+        return [
+            select_sql.replace(
+                where_marker,
+                f"{where_marker}\n               AND {alias}.npi >= {low}"
+                f"\n               AND {alias}.npi < {high}",
+                1,
+            )
+            for low, high in ranges
+        ]
+    return [select_sql]
+
+
+def _shard_source_selects(
+    db_schema: str,
+    source_selects: list[str],
+    *,
+    npi_address_ranges: list[tuple[int, int]] | None = None,
+    mrf_address_ranges: list[tuple[int, int]] | None = None,
+    doctor_clinician_address_ranges: list[tuple[int, int]] | None = None,
+    provider_enrollment_ffs_ranges: list[tuple[int, int]] | None = None,
+) -> list[str]:
+    """Split eligible NPI-backed source queries into bounded ranges."""
+    shard_specs = _source_shard_specs(
+        db_schema,
+        npi_address_ranges or [],
+        mrf_address_ranges or [],
+        doctor_clinician_address_ranges or [],
+        provider_enrollment_ffs_ranges or [],
+    )
+    return [
+        sharded_select
+        for select_sql in source_selects
+        for sharded_select in _expand_source_shards(select_sql, shard_specs)
     ]
 
 
@@ -4722,6 +4797,186 @@ def _address_key_expr(
     return fallback
 
 
+async def _address_alias_generation(db_schema: str) -> int:
+    """Read the supported alias generation used by derived address artifacts."""
+    row = await db.first(
+        address_alias_sql.active_alias_generation_sql(schema=db_schema)
+    )
+    if row is None:
+        raise RuntimeError("address alias singleton state is missing")
+    if int(row.schema_version) != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION:
+        raise RuntimeError(f"unsupported address alias schema version: {row.schema_version}")
+    if (
+        int(row.active_ruleset_version)
+        != address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION
+    ):
+        raise RuntimeError(
+            f"unsupported numeric-grid alias ruleset: {row.active_ruleset_version}"
+        )
+    return int(row.generation)
+
+
+def _uses_provider_directory_overlay(
+    db_schema: str,
+    source_selects: list[str],
+) -> bool:
+    overlay_from = f"FROM {db_schema}.provider_directory_address_overlay AS overlay"
+    return any(overlay_from in source_select for source_select in source_selects)
+
+
+async def _provider_directory_overlay_alias_fence(
+    db_schema: str,
+) -> tuple[int, int]:
+    """Return the materialized alias generation and live overlay relation OID."""
+    row = await db.first(
+        f"""
+        SELECT
+            receipt.generation,
+            to_regclass(:overlay_relation)::oid::bigint AS relation_oid
+        FROM {db_schema}.{address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE} AS receipt
+        WHERE receipt.artifact_name = :artifact_name;
+        """,
+        overlay_relation=f"{db_schema}.provider_directory_address_overlay",
+        artifact_name="provider_directory_address_overlay",
+    )
+    if row is None:
+        raise RuntimeError(
+            "Provider Directory address overlay alias-generation receipt is missing"
+        )
+    if row.relation_oid is None:
+        raise RuntimeError("Provider Directory address overlay relation is missing")
+    return int(row.generation), int(row.relation_oid)
+
+
+async def _capture_provider_directory_overlay_alias_fence(
+    db_schema: str,
+    source_selects: list[str],
+    context: dict,
+) -> None:
+    """Fence a selected overlay before a long unified-address build."""
+    if not _uses_provider_directory_overlay(db_schema, source_selects):
+        context.pop("provider_directory_overlay_alias_generation", None)
+        context.pop("provider_directory_overlay_relation_oid", None)
+        return
+    generation, relation_oid = await _provider_directory_overlay_alias_fence(db_schema)
+    expected_generation = int(context.get("address_alias_generation") or 0)
+    if generation != expected_generation:
+        raise RuntimeError(
+            "Provider Directory address overlay uses a stale address alias generation; "
+            "run a full address overlay rebuild before entity-address-unified"
+        )
+    context["provider_directory_overlay_alias_generation"] = generation
+    context["provider_directory_overlay_relation_oid"] = relation_oid
+
+
+async def _assert_provider_directory_overlay_alias_fence(
+    db_schema: str,
+    context: dict,
+) -> None:
+    """Recheck the selected overlay under the alias cutover lock."""
+    expected_oid = context.get("provider_directory_overlay_relation_oid")
+    if expected_oid is None:
+        return
+    expected_generation = int(
+        context.get("provider_directory_overlay_alias_generation") or 0
+    )
+    generation, relation_oid = await _provider_directory_overlay_alias_fence(db_schema)
+    if generation != expected_generation or relation_oid != int(expected_oid):
+        raise RuntimeError(
+            "Provider Directory address overlay changed during "
+            "entity-address-unified build"
+        )
+
+
+_RAW_ALIAS_INTEGRITY_SQL = """
+    WITH matching AS (
+        SELECT
+            active.source_address_key,
+            active.target_address_key,
+            active.source_identity_key,
+            active.target_identity_key AS recorded_target_identity_key,
+            {db_schema}.addr_identity_key_v1(
+                raw.first_line,
+                raw.second_line,
+                raw.city_name,
+                raw.state_name,
+                raw.postal_code,
+                raw.country_code
+            ) AS current_source_identity_key,
+            target.identity_key AS current_target_identity_key,
+            target.address_key AS current_target_address_key
+        FROM {db_schema}.{raw_table} AS raw
+        JOIN {db_schema}.{alias_table} AS active
+          ON active.source_address_key IN (
+                raw.address_key,
+                {computed_address_key}
+             )
+         AND active.revoked_at IS NULL
+        LEFT JOIN {db_schema}.address_archive_v2 AS target
+          ON target.address_key = active.target_address_key
+         AND target.merged_into IS NULL
+    ), violations AS (
+        SELECT
+            CASE
+                WHEN source_identity_key IS DISTINCT FROM current_source_identity_key
+                    THEN 'source_identity_mismatch'
+                WHEN current_target_address_key IS NULL
+                    THEN 'missing_or_merged_target'
+                WHEN recorded_target_identity_key IS DISTINCT FROM current_target_identity_key
+                    THEN 'target_identity_mismatch'
+                ELSE NULL
+            END AS violation_kind,
+            source_address_key,
+            target_address_key
+        FROM matching
+        UNION ALL
+        SELECT
+            'multi_hop_alias',
+            matching.source_address_key,
+            matching.target_address_key
+        FROM matching
+        JOIN {db_schema}.{alias_table} AS downstream
+          ON downstream.source_address_key = matching.target_address_key
+         AND downstream.revoked_at IS NULL
+    )
+    SELECT *
+    FROM violations
+    WHERE violation_kind IS NOT NULL
+    ORDER BY violation_kind, source_address_key
+    LIMIT 1;
+"""
+
+
+async def _validate_raw_alias_integrity(
+    db_schema: str,
+    raw_table: str,
+    *,
+    is_address_canon_available: bool,
+) -> None:
+    """Fail before enrichment when an active alias no longer matches raw identity."""
+    computed_address_key = _address_key_expr(
+        db_schema,
+        is_address_canon_available,
+        address_source="raw.address_source",
+        table_alias="raw",
+    )
+    violation = await db.first(
+        _RAW_ALIAS_INTEGRITY_SQL.format(
+            db_schema=db_schema,
+            raw_table=raw_table,
+            alias_table=address_alias_sql.ADDRESS_ALIAS_TABLE,
+            computed_address_key=computed_address_key,
+        )
+    )
+    if violation:
+        raise RuntimeError(
+            "entity-address-unified alias integrity violation: "
+            f"kind={violation.violation_kind} "
+            f"source={violation.source_address_key} "
+            f"target={violation.target_address_key}"
+        )
+
+
 def _enrich_raw_stage_sql(
     db_schema: str,
     raw_table: str,
@@ -4746,63 +5001,54 @@ def _enrich_raw_stage_sql(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_TRUST_SOURCE_ADDRESS_KEY",
             DEFAULT_TRUST_SOURCE_ADDRESS_KEY,
         )
-        if should_trust_source_key:
-            archive_fields = (
-                "COALESCE(a_direct.address_key, a_fallback.address_key) AS archive_address_key, "
-                "COALESCE(a_direct.premise_key, a_fallback.premise_key) AS premise_key, "
-                "'v' || COALESCE(COALESCE(a_direct.identity_version, a_fallback.identity_version), 2)::text AS archive_identity_version, "
-                "COALESCE(a_direct.precision, a_fallback.precision, 'unknown') AS address_precision, "
-                "COALESCE(a_direct.zip5, a_fallback.zip5) AS archive_zip5, "
-                "NULLIF(upper(left(COALESCE(a_direct.state_code, a_fallback.state_code), 2)), '') AS archive_state_code, "
-                "COALESCE(a_direct.city_norm, a_fallback.city_norm) AS archive_city_norm, "
-                "NULL::varchar AS archive_county_fips, "
-                "COALESCE(a_direct.formatted_address, a_fallback.formatted_address)::varchar AS archive_formatted_address, "
-                "COALESCE(a_direct.lat, a_fallback.lat)::numeric AS archive_lat, "
-                "COALESCE(a_direct.long, a_fallback.long)::numeric AS archive_long, "
-                "COALESCE(a_direct.place_id, a_fallback.place_id)::varchar AS archive_place_id"
-            )
-            archive_join = (
-                f"""
-          LEFT JOIN {db_schema}.address_archive_v2 a_direct
-            ON a_direct.address_key = r.address_key
-           AND a_direct.merged_into IS NULL
+        source_identity_key = (
+            f"{db_schema}.addr_identity_key_v1("
+            "r.first_line, r.second_line, r.city_name, r.state_name, "
+            "r.postal_code, r.country_code)"
+        )
+        candidate_values = (
+            f"(r.address_key, 0), ({computed_address_key}, 1)"
+            if should_trust_source_key
+            else f"({computed_address_key}, 0), (r.address_key, 1)"
+        )
+        archive_fields = (
+            "a.address_key AS archive_address_key, "
+            "a.premise_key, "
+            "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
+            "COALESCE(a.precision, 'unknown') AS address_precision, "
+            "a.zip5 AS archive_zip5, "
+            "NULLIF(upper(left(a.state_code, 2)), '') AS archive_state_code, "
+            "a.city_norm AS archive_city_norm, "
+            "NULL::varchar AS archive_county_fips, "
+            "a.formatted_address::varchar AS archive_formatted_address, "
+            "a.lat::numeric AS archive_lat, "
+            "a.long::numeric AS archive_long, "
+            "a.place_id::varchar AS archive_place_id"
+        )
+        archive_join = f"""
           LEFT JOIN LATERAL (
-              SELECT aa.*
-                FROM {db_schema}.address_archive_v2 aa
-               WHERE a_direct.address_key IS NULL
-                 AND aa.address_key = {computed_address_key}
-                 AND aa.merged_into IS NULL
-               LIMIT 1
-          ) a_fallback ON TRUE"""
-            )
-        else:
-            archive_fields = (
-                "a.address_key AS archive_address_key, "
-                "a.premise_key, "
-                "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
-                "COALESCE(a.precision, 'unknown') AS address_precision, "
-                "a.zip5 AS archive_zip5, "
-                "NULLIF(upper(left(a.state_code, 2)), '') AS archive_state_code, "
-                "a.city_norm AS archive_city_norm, "
-                "NULL::varchar AS archive_county_fips, "
-                "a.formatted_address::varchar AS archive_formatted_address, "
-                "a.lat::numeric AS archive_lat, "
-                "a.long::numeric AS archive_long, "
-                "a.place_id::varchar AS archive_place_id"
-            )
-            archive_join = (
-                f"""
-          LEFT JOIN LATERAL (
-              SELECT aa.*
-                FROM (VALUES ({computed_address_key}, 0), (r.address_key, 1)) AS candidate(address_key, priority)
-                JOIN {db_schema}.address_archive_v2 aa
-                  ON aa.address_key = candidate.address_key
-                 AND aa.merged_into IS NULL
+              SELECT archive_row.*
+                FROM (VALUES {candidate_values}) AS candidate(address_key, priority)
+                LEFT JOIN {db_schema}.address_alias_v1 AS active_alias
+                  ON active_alias.source_address_key = candidate.address_key
+                 AND active_alias.revoked_at IS NULL
+                JOIN {db_schema}.address_archive_v2 AS archive_row
+                  ON archive_row.address_key = COALESCE(
+                        active_alias.target_address_key,
+                        candidate.address_key
+                     )
+                 AND archive_row.merged_into IS NULL
+                 AND (
+                        active_alias.source_address_key IS NULL
+                        OR (
+                            active_alias.source_identity_key = {source_identity_key}
+                            AND active_alias.target_identity_key = archive_row.identity_key
+                        )
+                 )
                WHERE candidate.address_key IS NOT NULL
             ORDER BY candidate.priority
                LIMIT 1
           ) a ON TRUE"""
-            )
     else:
         archive_fields = (
             "NULL::uuid AS archive_address_key, "
@@ -4910,7 +5156,13 @@ def _enrich_raw_stage_sql(
                    THEN ARRAY[r.address_source]::varchar[]
                ELSE r.ptg_source_array
            END,
-{evidence_shard_set}           base_address_version = '{BASE_ADDRESS_VERSION}',
+{evidence_shard_set}           base_address_version = (
+               '{ALIAS_BASE_ADDRESS_VERSION_PREFIX}' || (
+                    SELECT generation::text
+                    FROM {db_schema}.{address_alias_sql.ADDRESS_ALIAS_STATE_TABLE}
+                    WHERE singleton = true
+               )
+           ),
            location_key = {_location_key_expr(
                entity_type='r.entity_type',
                entity_id='r.entity_id',
@@ -5439,6 +5691,42 @@ async def _validate_publish_integrity(
 
     failures: list[str] = []
     integrity_metric_map: dict[str, int | dict[str, int]] = {}
+
+    alias_generation = await _address_alias_generation(db_schema)
+    expected_base_version = f"{ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
+    residual_alias_source_rows, stale_alias_generation_rows = (
+        int(metric_value or 0)
+        for metric_value in await asyncio.gather(
+            db.scalar(
+                f"""
+                SELECT count(*)
+                FROM {db_schema}.{stage_table} AS staged
+                JOIN {db_schema}.{address_alias_sql.ADDRESS_ALIAS_TABLE} AS active
+                  ON active.source_address_key = staged.address_key
+                 AND active.revoked_at IS NULL;
+                """
+            ),
+            db.scalar(
+                f"""
+                SELECT count(*)
+                FROM {db_schema}.{stage_table}
+                WHERE base_address_version IS DISTINCT FROM :base_address_version;
+                """,
+                base_address_version=expected_base_version,
+            ),
+        )
+    )
+    integrity_metric_map["address_alias_generation"] = alias_generation
+    integrity_metric_map["residual_alias_source_rows"] = residual_alias_source_rows
+    integrity_metric_map["stale_alias_generation_rows"] = stale_alias_generation_rows
+    if residual_alias_source_rows:
+        failures.append(
+            f"{residual_alias_source_rows} staged rows retain active alias source keys"
+        )
+    if stale_alias_generation_rows:
+        failures.append(
+            f"{stale_alias_generation_rows} staged rows use a stale address alias generation"
+        )
 
     location_key_constraint_validated = await _is_location_primary_key_validated(db_schema, stage_table)
     integrity_metric_map["location_key_constraint_validated"] = location_key_constraint_validated
@@ -6577,53 +6865,50 @@ def _prepare_multi_source_evidence_table_sql(
     """
 
 
-def _load_multi_source_evidence_base_sql(
+def _multi_source_affected_filter(
     db_schema: str,
-    stage_table: str,
-    evidence_table: str,
-    *,
-    evidence_shards: int,
-    affected_group_table: str | None = None,
-    affected_scope: str = "group",
+    affected_group_table: str | None,
+    affected_scope: str,
 ) -> str:
-    """Build SQL that seeds normalized multi-source evidence groups."""
-    group_hash_expr = _evidence_group_hash_expr(evidence_shards)
-    affected_filter = ""
-    if affected_group_table:
-        if affected_scope == "npi":
-            affected_filter = f"""
-           AND {_entity_address_row_npi_expr("t")} IS NOT NULL
+    """Build the optional NPI- or group-scoped evidence filter."""
+    if not affected_group_table:
+        return ""
+    if affected_scope == "npi":
+        row_npi_expr = _entity_address_row_npi_expr("t")
+        return f"""
+           AND {row_npi_expr} IS NOT NULL
            AND EXISTS (
                 SELECT 1
                   FROM {db_schema}.{affected_group_table} AS affected
                  WHERE affected.entity_npi IS NOT NULL
-                   AND affected.entity_npi = {_entity_address_row_npi_expr("t")}
-           )"""
-        else:
-            affected_filter = f"""
-           AND EXISTS (
-                SELECT 1
-                  FROM {db_schema}.{affected_group_table} AS affected
-                 WHERE {_entity_address_evidence_group_match_sql("affected", "t")}
+                   AND affected.entity_npi = {row_npi_expr}
            )"""
     return f"""
+       AND EXISTS (
+            SELECT 1
+              FROM {db_schema}.{affected_group_table} AS affected
+             WHERE {_entity_address_evidence_group_match_sql("affected", "t")}
+       )"""
+
+
+_LOAD_MULTI_SOURCE_EVIDENCE_SQL = """
     WITH normalized AS (
         SELECT
             t.location_key,
             t.entity_type,
             t.entity_id,
             t.address_key::uuid AS address_key,
-            CASE WHEN t.address_key IS NULL THEN {_street_soft_norm_expr("t.first_line")} END::varchar AS street_key,
+            CASE WHEN t.address_key IS NULL THEN {street_norm} END::varchar AS street_key,
             CASE WHEN t.address_key IS NULL
-                THEN COALESCE(NULLIF(t.city_norm, ''), {_alnum_norm_expr("t.city_name")})
+                THEN COALESCE(NULLIF(t.city_norm, ''), {city_norm})
             END::varchar AS city_key,
             CASE WHEN t.address_key IS NULL
-                THEN COALESCE(NULLIF(t.state_code, ''), {_state_norm_expr("t.state_name")})
+                THEN COALESCE(NULLIF(t.state_code, ''), {state_norm})
             END::varchar AS state_key,
             CASE WHEN t.address_key IS NULL
-                THEN COALESCE(NULLIF(t.zip5, ''), {_zip5_norm_expr("t.postal_code")})
+                THEN COALESCE(NULLIF(t.zip5, ''), {zip_norm})
             END::varchar AS zip_key,
-            CASE WHEN t.address_key IS NULL THEN {_state_norm_expr("t.country_code")} END::varchar AS country_key,
+            CASE WHEN t.address_key IS NULL THEN {country_norm} END::varchar AS country_key,
             COALESCE(t.address_sources, ARRAY[]::varchar[])::varchar[] AS address_sources,
             COALESCE(t.source_record_ids, ARRAY[]::varchar[])::varchar[] AS source_record_ids
           FROM {db_schema}.{stage_table} AS t
@@ -6658,7 +6943,35 @@ def _load_multi_source_evidence_base_sql(
         address_sources,
         source_record_ids
       FROM normalized;
-    """
+"""
+
+
+def _load_multi_source_evidence_base_sql(
+    db_schema: str,
+    stage_table: str,
+    evidence_table: str,
+    *,
+    evidence_shards: int,
+    affected_group_table: str | None = None,
+    affected_scope: str = "group",
+) -> str:
+    """Build SQL that seeds normalized multi-source evidence groups."""
+    return _LOAD_MULTI_SOURCE_EVIDENCE_SQL.format(
+        db_schema=db_schema,
+        stage_table=stage_table,
+        evidence_table=evidence_table,
+        group_hash_expr=_evidence_group_hash_expr(evidence_shards),
+        affected_filter=_multi_source_affected_filter(
+            db_schema,
+            affected_group_table,
+            affected_scope,
+        ),
+        street_norm=_street_soft_norm_expr("t.first_line"),
+        city_norm=_alnum_norm_expr("t.city_name"),
+        state_norm=_state_norm_expr("t.state_name"),
+        zip_norm=_zip5_norm_expr("t.postal_code"),
+        country_norm=_state_norm_expr("t.country_code"),
+    )
 
 
 def _insert_multi_source_evidence_shard_sql(
@@ -6951,16 +7264,7 @@ def _partial_support_patch_sql(
     return statements
 
 
-def _evidence_from_raw_sql(
-    db_schema: str,
-    evidence_stage_table: str,
-    raw_table: str,
-    *,
-    source_run_id: str,
-    node_id: str | None,
-) -> str:
-    """Build provenance-evidence SQL from normalized raw locations."""
-    return f"""
+_EVIDENCE_FROM_RAW_SQL = """
     INSERT INTO {db_schema}.{evidence_stage_table} (
         evidence_id,
         location_key,
@@ -7001,10 +7305,10 @@ def _evidence_from_raw_sql(
         NULL::varchar AS tin,
         source_id,
         source_record_id AS source_record_key,
-        {_sql_literal(source_run_id)}::varchar AS source_run_id,
+        {source_run_literal}::varchar AS source_run_id,
         CASE WHEN address_source = 'ptg' THEN NULLIF(split_part(source_record_id, ':', 3), '') ELSE NULL END::varchar
             AS source_snapshot_id,
-        {_sql_literal(node_id)}::varchar AS node_id,
+        {node_literal}::varchar AS node_id,
         NULL::varchar AS plan_id,
         NULL::varchar AS network_id,
         CASE WHEN CARDINALITY(ptg_plan_array) = 1 THEN ptg_plan_array[1] ELSE NULL END::varchar AS ptg_plan_id,
@@ -7021,21 +7325,28 @@ def _evidence_from_raw_sql(
         NULL::timestamptz AS retired_at
       FROM {db_schema}.{raw_table}
      WHERE location_key IS NOT NULL;
-    """
+"""
 
 
-def _evidence_from_stage_sql(
+def _evidence_from_raw_sql(
     db_schema: str,
     evidence_stage_table: str,
-    stage_table: str,
+    raw_table: str,
     *,
     source_run_id: str,
     node_id: str | None,
-    affected_group_table: str | None = None,
 ) -> str:
-    """Build provenance-evidence SQL from unified staged locations."""
-    affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
-    return f"""
+    """Build provenance-evidence SQL from normalized raw locations."""
+    return _EVIDENCE_FROM_RAW_SQL.format(
+        db_schema=db_schema,
+        evidence_stage_table=evidence_stage_table,
+        raw_table=raw_table,
+        source_run_literal=_sql_literal(source_run_id),
+        node_literal=_sql_literal(node_id),
+    )
+
+
+_EVIDENCE_FROM_STAGE_SQL = """
     INSERT INTO {db_schema}.{evidence_stage_table} (
         evidence_id,
         location_key,
@@ -7076,9 +7387,9 @@ def _evidence_from_stage_sql(
         NULL::varchar AS tin,
         0::smallint AS source_id,
         t.location_key AS source_record_key,
-        {_sql_literal(source_run_id)}::varchar AS source_run_id,
+        {source_run_literal}::varchar AS source_run_id,
         NULL::varchar AS source_snapshot_id,
-        {_sql_literal(node_id)}::varchar AS node_id,
+        {node_literal}::varchar AS node_id,
         NULL::varchar AS plan_id,
         NULL::varchar AS network_id,
         CASE WHEN CARDINALITY(t.ptg_plan_array) = 1 THEN t.ptg_plan_array[1] ELSE NULL END::varchar AS ptg_plan_id,
@@ -7094,7 +7405,28 @@ def _evidence_from_stage_sql(
       FROM {db_schema}.{stage_table} AS t
      WHERE t.location_key IS NOT NULL
        {affected_filter};
-    """
+"""
+
+
+def _evidence_from_stage_sql(
+    db_schema: str,
+    evidence_stage_table: str,
+    stage_table: str,
+    *,
+    source_run_id: str,
+    node_id: str | None,
+    affected_group_table: str | None = None,
+) -> str:
+    """Build provenance-evidence SQL from unified staged locations."""
+    affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
+    return _EVIDENCE_FROM_STAGE_SQL.format(
+        db_schema=db_schema,
+        evidence_stage_table=evidence_stage_table,
+        stage_table=stage_table,
+        source_run_literal=_sql_literal(source_run_id),
+        node_literal=_sql_literal(node_id),
+        affected_filter=affected_filter,
+    )
 
 
 def _plan_bridge_sql(
@@ -10550,8 +10882,41 @@ async def process_entity_address_unified_data(ctx, task=None):
         "provider_directory_endpoint_dataset",
         "provider_directory_dataset_resource",
         "address_archive_v2",
+        address_alias_sql.ADDRESS_ALIAS_TABLE,
+        address_alias_sql.ADDRESS_ALIAS_STATE_TABLE,
     ]
     available_relation_map = {table: await _has_table(db_schema, table) for table in required_checks}
+    if not available_relation_map.get(address_alias_sql.ADDRESS_ALIAS_TABLE) or not (
+        available_relation_map.get(address_alias_sql.ADDRESS_ALIAS_STATE_TABLE)
+    ):
+        raise RuntimeError("entity-address-unified requires migrated address alias schema")
+    alias_generation = await _address_alias_generation(db_schema)
+    alias_base_address_version = f"{ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
+    context["address_alias_generation"] = alias_generation
+    context["base_address_version"] = alias_base_address_version
+    if (is_partial_provider_directory_refresh or should_reuse_stage) and await _has_table(
+        db_schema,
+        stage_table if should_reuse_stage else EntityAddressUnified.__tablename__,
+    ):
+        version_table = (
+            stage_table if should_reuse_stage else EntityAddressUnified.__tablename__
+        )
+        stale_versions = int(
+            await db.scalar(
+                f"""
+                SELECT count(*)
+                FROM {db_schema}.{version_table}
+                WHERE base_address_version IS DISTINCT FROM :base_address_version;
+                """,
+                base_address_version=alias_base_address_version,
+            )
+            or 0
+        )
+        if stale_versions:
+            raise RuntimeError(
+                "address alias generation changed; a full entity-address-unified "
+                "rebuild is required"
+            )
     for table_name in (
         "npi_address",
         "doctor_clinician_address",
@@ -10677,6 +11042,11 @@ async def process_entity_address_unified_data(ctx, task=None):
         test_limit_per_source=test_limit_per_source,
         has_compatibility_data=has_compatibility_data,
         partial_refresh=is_partial_provider_directory_refresh,
+    )
+    await _capture_provider_directory_overlay_alias_fence(
+        db_schema,
+        source_selects,
+        context,
     )
     affected_group_table: str | None = None
     if is_partial_provider_directory_refresh:
@@ -10840,6 +11210,21 @@ async def process_entity_address_unified_data(ctx, task=None):
         )
 
     should_use_chunked_load = _is_env_enabled("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD", True)
+    if not should_use_chunked_load:
+        active_alias_count = int(
+            await db.scalar(
+                f"""
+                SELECT count(*)
+                FROM {db_schema}.{address_alias_sql.ADDRESS_ALIAS_TABLE}
+                WHERE revoked_at IS NULL;
+                """
+            )
+            or 0
+        )
+        if active_alias_count:
+            raise RuntimeError(
+                "active address aliases require chunked entity-address-unified enrichment"
+            )
     if partial_source_refresh and not should_use_chunked_load:
         raise RuntimeError(
             f"entity-address-unified {refresh_mode} refresh requires "
@@ -10922,6 +11307,22 @@ async def process_entity_address_unified_data(ctx, task=None):
                 )
             context["raw_stage_reused"] = True
             context["raw_stage_reused_rows"] = raw_rows
+            stale_raw_versions = int(
+                await db.scalar(
+                    f"""
+                    SELECT count(*)
+                    FROM {db_schema}.{raw_table}
+                    WHERE base_address_version IS DISTINCT FROM :base_address_version;
+                    """,
+                    base_address_version=alias_base_address_version,
+                )
+                or 0
+            )
+            if stale_raw_versions:
+                raise RuntimeError(
+                    "reused entity-address-unified raw stage uses a stale address "
+                    "alias generation; reload the raw stage"
+                )
             if run_id:
                 enqueue_live_progress(
                     run_id=run_id,
@@ -11087,6 +11488,11 @@ async def process_entity_address_unified_data(ctx, task=None):
                     emit_start=True,
                     emit_done=True,
                 )
+        await _validate_raw_alias_integrity(
+            db_schema,
+            raw_table,
+            is_address_canon_available=is_address_canon_available,
+        )
         await _run_sql_phase(
             f"DROP INDEX IF EXISTS {db_schema}.{raw_table}_idx_group_key;",
             context=context,
@@ -11279,6 +11685,13 @@ async def process_entity_address_unified_data(ctx, task=None):
             message="materializing sources",
             emit_start=True,
             emit_done=True,
+        )
+        await db.status(
+            f"""
+            UPDATE {db_schema}.{stage_table}
+               SET base_address_version = :base_address_version;
+            """,
+            base_address_version=alias_base_address_version,
         )
         if run_id:
             enqueue_live_progress(
@@ -12251,6 +12664,11 @@ async def publish_entity_address_unified_generation(ctx):
             source_id=partial_source_ids[0],
             expected_dataset_id=expected_provider_directory_dataset_id,
             expected_root_run_id=expected_provider_directory_root_run_id,
+        )
+    current_alias_generation = await _address_alias_generation(db_schema)
+    if current_alias_generation != int(context.get("address_alias_generation") or 0):
+        raise RuntimeError(
+            "address alias generation changed during entity-address-unified build"
         )
     await _publish_staged_entity_address_tables(
         db_schema,

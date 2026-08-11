@@ -26,6 +26,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from sqlalchemy import text
 
 from db.models import db
+from process.ext import address_alias_sql
 from process.ext.address_pub28 import (
     PUB28_DIRECTIONAL_MAP,
     PUB28_INVALID_UNIT_VALUES,
@@ -171,6 +172,16 @@ class ArchiveSwapStats:
 class _UnitDecision:
     unit: str
     street_text: str
+
+
+@dataclass(frozen=True)
+class NumericGridParts:
+    """Strict structural fields for one numeric-grid street."""
+
+    house_number: str
+    pre_direction: str
+    grid_number: str
+    post_direction: str
 
 
 def _unit_prefix(value: str | None) -> str | None:
@@ -483,6 +494,45 @@ def street_completion_norm(line1: str | None, line2: str | None) -> str | None:
     return cleaned or None
 
 
+def numeric_grid_parts_v1(
+    line1: str | None,
+    line2: str | None,
+) -> NumericGridParts | None:
+    """Parse a strict numeric-grid street without changing canonical identity."""
+    raw_street = _street_raw_text(line1, line2)
+    if re.search(r"[0-9]\s*[^a-zA-Z0-9\s]\s*[0-9]", raw_street):
+        return None
+    tokens = _street_tokens(line1, line2)
+    if not 2 <= len(tokens) <= 4 or not re.fullmatch(r"[0-9]+", tokens[0]):
+        return None
+    token_index = 1
+    pre_direction = ""
+    if token_index < len(tokens) and _is_directional_street_token(tokens[token_index]):
+        pre_direction = _street_token_norm(tokens[token_index])
+        token_index += 1
+    if token_index >= len(tokens) or not re.fullmatch(
+        r"[0-9]+(?:st|nd|rd|th)?",
+        tokens[token_index],
+    ):
+        return None
+    grid_number = _street_token_norm(tokens[token_index])
+    if not re.fullmatch(r"[0-9]+", grid_number):
+        return None
+    token_index += 1
+    post_direction = ""
+    if token_index < len(tokens) and _is_directional_street_token(tokens[token_index]):
+        post_direction = _street_token_norm(tokens[token_index])
+        token_index += 1
+    if token_index != len(tokens):
+        return None
+    return NumericGridParts(
+        house_number=tokens[0],
+        pre_direction=pre_direction,
+        grid_number=grid_number,
+        post_direction=post_direction,
+    )
+
+
 def identity_key_v1(
     first_line: str | None,
     second_line: str | None,
@@ -712,6 +762,83 @@ def _keyed_temp_table_ddl(keyed_table: str) -> str:
     """
 
 
+_KEYED_RAW_COPY_SQL = """
+    WITH raw AS (
+        SELECT
+            row_number() OVER (ORDER BY ctid) AS rn,
+            ctid::text AS source_ctid,
+            address_key AS staged_address_key,
+            NULLIF(trim(COALESCE({first}, '')), '') AS first_line,
+            NULLIF(trim(COALESCE({second}, '')), '') AS second_line,
+            NULLIF(trim(COALESCE({city}, '')), '') AS city_name,
+            NULLIF(trim(COALESCE({state}, '')), '') AS state_name,
+            NULLIF(trim(COALESCE({zip_code}, '')), '') AS postal_code,
+            {country} AS raw_country_code
+        FROM {staging}
+    ),
+    ranked_stamped AS (
+        SELECT
+            raw.*,
+            row_number() OVER (
+                PARTITION BY staged_address_key
+                ORDER BY
+                    first_line IS NULL,
+                    length(COALESCE(first_line, '')) DESC,
+                    second_line IS NULL,
+                    length(COALESCE(second_line, '')) DESC,
+                    city_name IS NULL,
+                    length(COALESCE(city_name, '')) DESC,
+                    COALESCE(first_line, ''),
+                    COALESCE(second_line, ''),
+                    COALESCE(city_name, ''),
+                    COALESCE(state_name, ''),
+                    COALESCE(postal_code, ''),
+                    rn
+            ) AS key_rank
+        FROM raw
+        WHERE staged_address_key IS NOT NULL
+    ),
+    raw_to_normalize AS (
+        SELECT
+            rn,
+            source_ctid,
+            staged_address_key,
+            first_line,
+            second_line,
+            city_name,
+            state_name,
+            postal_code,
+            raw_country_code
+        FROM ranked_stamped
+        WHERE key_rank = 1
+        UNION ALL
+        SELECT
+            rn,
+            source_ctid,
+            staged_address_key,
+            first_line,
+            second_line,
+            city_name,
+            state_name,
+            postal_code,
+            raw_country_code
+        FROM raw
+        WHERE staged_address_key IS NULL
+    )
+    SELECT
+        rn,
+        source_ctid,
+        staged_address_key,
+        first_line,
+        second_line,
+        city_name,
+        state_name,
+        postal_code,
+        raw_country_code
+    FROM raw_to_normalize
+"""
+
+
 def _keyed_raw_copy_sql(
     *,
     staging: str,
@@ -723,81 +850,15 @@ def _keyed_raw_copy_sql(
     country: str,
 ) -> str:
     """Build SQL that copies normalized staging rows into keyed scratch data."""
-    return f"""
-        WITH raw AS (
-            SELECT
-                row_number() OVER (ORDER BY ctid) AS rn,
-                ctid::text AS source_ctid,
-                address_key AS staged_address_key,
-                NULLIF(trim(COALESCE({first}, '')), '') AS first_line,
-                NULLIF(trim(COALESCE({second}, '')), '') AS second_line,
-                NULLIF(trim(COALESCE({city}, '')), '') AS city_name,
-                NULLIF(trim(COALESCE({state}, '')), '') AS state_name,
-                NULLIF(trim(COALESCE({zip_code}, '')), '') AS postal_code,
-                {country} AS raw_country_code
-            FROM {staging}
-        ),
-        ranked_stamped AS (
-            SELECT
-                raw.*,
-                row_number() OVER (
-                    PARTITION BY staged_address_key
-                    ORDER BY
-                        first_line IS NULL,
-                        length(COALESCE(first_line, '')) DESC,
-                        second_line IS NULL,
-                        length(COALESCE(second_line, '')) DESC,
-                        city_name IS NULL,
-                        length(COALESCE(city_name, '')) DESC,
-                        COALESCE(first_line, ''),
-                        COALESCE(second_line, ''),
-                        COALESCE(city_name, ''),
-                        COALESCE(state_name, ''),
-                        COALESCE(postal_code, ''),
-                        rn
-                ) AS key_rank
-            FROM raw
-            WHERE staged_address_key IS NOT NULL
-        ),
-        raw_to_normalize AS (
-            SELECT
-                rn,
-                source_ctid,
-                staged_address_key,
-                first_line,
-                second_line,
-                city_name,
-                state_name,
-                postal_code,
-                raw_country_code
-            FROM ranked_stamped
-            WHERE key_rank = 1
-            UNION ALL
-            SELECT
-                rn,
-                source_ctid,
-                staged_address_key,
-                first_line,
-                second_line,
-                city_name,
-                state_name,
-                postal_code,
-                raw_country_code
-            FROM raw
-            WHERE staged_address_key IS NULL
-        )
-        SELECT
-            rn,
-            source_ctid,
-            staged_address_key,
-            first_line,
-            second_line,
-            city_name,
-            state_name,
-            postal_code,
-            raw_country_code
-        FROM raw_to_normalize
-    """
+    return _KEYED_RAW_COPY_SQL.format(
+        staging=staging,
+        first=first,
+        second=second,
+        city=city,
+        state=state,
+        zip_code=zip_code,
+        country=country,
+    )
 
 
 def _is_canon_version_match(payload: Mapping[str, Any]) -> bool:
@@ -1765,6 +1826,156 @@ def _is_statement_timeout_error(exc: BaseException) -> bool:
     return "statement timeout" in message or "querycancelederror" in message
 
 
+async def _validated_active_alias_state(session: Any, schema: str) -> Any:
+    """Lock alias promotion and return a supported singleton state row."""
+    await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
+    state = (
+        await session.execute(
+            text(address_alias_sql.active_alias_generation_sql(schema=schema))
+        )
+    ).first()
+    if state is None:
+        raise RuntimeError("Address alias singleton state is missing")
+    if int(state.schema_version) != address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Unsupported address alias schema version: {state.schema_version}"
+        )
+    if (
+        int(state.active_ruleset_version)
+        != address_alias_sql.NUMERIC_GRID_ALIAS_RULESET_VERSION
+    ):
+        raise RuntimeError(
+            f"Unsupported numeric-grid alias ruleset: {state.active_ruleset_version}"
+        )
+    return state
+
+
+async def _existing_numeric_grid_alias_count(session: Any) -> int:
+    """Count distinct approved source keys materialized in the temp table."""
+    return int(
+        (
+            await session.execute(
+                text(
+                    "SELECT count(DISTINCT source_address_key) "
+                    "FROM address_numeric_grid_existing_aliases;"
+                )
+            )
+        ).scalar()
+        or 0
+    )
+
+
+async def _apply_persisted_numeric_grid_aliases(
+    session: Any,
+    *,
+    schema: str,
+    keyed_table: str,
+    archive: str,
+) -> dict[str, int]:
+    """Project already-approved aliases into the transient effective key set."""
+    state = await _validated_active_alias_state(session, schema)
+    await session.execute(
+        text("DROP TABLE IF EXISTS pg_temp.address_numeric_grid_existing_aliases;")
+    )
+    await session.execute(
+        text(
+            address_alias_sql.existing_numeric_grid_aliases_sql(
+                schema=schema,
+                keyed_table=keyed_table,
+                archive=archive,
+            )
+        )
+    )
+    existing_count = await _existing_numeric_grid_alias_count(session)
+    if not existing_count:
+        return {
+            "numeric_grid_existing_applied": 0,
+            "address_alias_generation": int(state.generation),
+        }
+
+    violation = (
+        await session.execute(
+            text(
+                address_alias_sql.existing_numeric_grid_alias_violation_sql(
+                    schema=schema,
+                )
+            )
+        )
+    ).first()
+    if violation:
+        raise RuntimeError(
+            "Persisted numeric-grid alias integrity violation: "
+            f"kind={violation.violation_kind} "
+            f"source={violation.source_address_key} "
+            f"target={violation.target_address_key}"
+        )
+    await session.execute(
+        text(
+            address_alias_sql.update_existing_alias_keyed_rows_sql(
+                keyed_table=keyed_table,
+            )
+        )
+    )
+    return {
+        "numeric_grid_existing_applied": existing_count,
+        "address_alias_generation": int(state.generation),
+    }
+
+
+async def _snapshot_strict_source_observations(
+    session: Any,
+    *,
+    keyed_table: str,
+    staging_table: str,
+    strict_source_predicate: str | None,
+) -> None:
+    """Freeze explicitly attested keys before completion or alias projection.
+
+    A missing predicate intentionally records no strict observations. Several
+    import paths restore ZIP codes from coordinates before resolution, so the
+    resolver cannot infer raw-source lineage from the post-restore row alone.
+    Callers must provide a predicate backed by source lineage, or rely on the
+    exact-key offline provenance backfill.
+    """
+    strict_filter = "AND FALSE"
+    if strict_source_predicate is not None:
+        strict_filter = f"""
+              AND EXISTS (
+                    SELECT 1
+                    FROM {staging_table} AS strict_source
+                    WHERE strict_source.address_key = computed.computed_address_key
+                      AND ({strict_source_predicate})
+              )
+        """
+    await session.execute(
+        text("DROP TABLE IF EXISTS pg_temp.address_strict_source_observations;")
+    )
+    await session.execute(
+        text(
+            f"""
+            CREATE TEMP TABLE address_strict_source_observations ON COMMIT DROP AS
+            SELECT DISTINCT
+                computed_address_key AS address_key,
+                identity_key
+            FROM {keyed_table} AS computed
+            WHERE computed.computed_address_key IS NOT NULL
+              AND computed.identity_key IS NOT NULL
+              {strict_filter};
+            """
+        )
+    )
+    await session.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX ON address_strict_source_observations (
+                address_key,
+                identity_key
+            );
+            """
+        )
+    )
+
+
 async def resolve_into_archive(
     staging_table: str,
     field_map: Mapping[str, str],
@@ -1776,6 +1987,7 @@ async def resolve_into_archive(
     work_mem: str = "256MB",
     timeout: str = "10min",
     gate_sample_limit: int = 20,
+    strict_source_predicate: str | None = None,
     cancel_check: Callable[[], Awaitable[None]] | None = None,
 ) -> ResolveStats:
     """Resolve staging addresses into the canonical archive and return gates."""
@@ -2063,7 +2275,18 @@ async def resolve_into_archive(
                 f"stamped={mismatch.staged_address_key} expected={mismatch.computed_address_key} "
                 f"identity={mismatch.identity_key!r}"
             )
-        alias_stats_by_kind: dict[str, int] = {}
+        await _snapshot_strict_source_observations(
+            session,
+            keyed_table=keyed_table,
+            staging_table=staging,
+            strict_source_predicate=strict_source_predicate,
+        )
+        alias_stats_by_kind = await _apply_persisted_numeric_grid_aliases(
+            session,
+            schema=schema,
+            keyed_table=keyed_table,
+            archive=archive,
+        )
         completion_alias_rows = 0
         await session.execute(text("SAVEPOINT address_completion_alias_repair;"))
         completion_alias_timeout = os.getenv(ADDRESS_COMPLETION_ALIAS_TIMEOUT_ENV, "2min")
@@ -2084,9 +2307,10 @@ async def resolve_into_archive(
                 """))
             ).scalar() or {}
             if isinstance(alias_stats_raw, str):
-                alias_stats_by_kind = json.loads(alias_stats_raw)
+                completion_metric_map = json.loads(alias_stats_raw)
             else:
-                alias_stats_by_kind = dict(alias_stats_raw)
+                completion_metric_map = dict(alias_stats_raw)
+            alias_stats_by_kind.update(completion_metric_map)
             completion_alias_rows = int(
                 alias_stats_by_kind.get("completion_aliases") or 0
             )
@@ -2094,7 +2318,6 @@ async def resolve_into_archive(
                 await session.execute(text(f"""
                     UPDATE {keyed_table} AS keyed
                        SET address_key = aliases.target_address_key,
-                           computed_address_key = aliases.target_address_key,
                            identity_key = aliases.target_identity_key,
                            premise_key = aliases.target_premise_key,
                            line1_norm = aliases.target_line1_norm,
@@ -2137,10 +2360,10 @@ async def resolve_into_archive(
                 raise
             if not _is_statement_timeout_error(exc):
                 raise
-            alias_stats_by_kind = {
+            alias_stats_by_kind.update({
                 "completion_aliases": 0,
                 "completion_alias_repair_skipped": 1,
-            }
+            })
             logger.warning("Skipping address completion alias repair after statement timeout: %s", exc)
             _emit_progress(
                 phase="address archive resolve",
@@ -2159,6 +2382,9 @@ async def resolve_into_archive(
             message="materialized deduplicated canonical address keys",
             keyed_rows=keyed_rows,
             completion_aliases=completion_alias_rows,
+            numeric_grid_aliases=int(
+                alias_stats_by_kind.get("numeric_grid_existing_applied") or 0
+            ),
         )
         await session.execute(text(f"CREATE INDEX ON {keyed_table} (address_key) WHERE address_key IS NOT NULL;"))
         await session.execute(text(f"CREATE INDEX ON {keyed_table} (premise_key) WHERE premise_key IS NOT NULL;"))
@@ -2285,30 +2511,35 @@ async def resolve_into_archive(
                         address_key, identity_key, identity_version, precision, premise_key,
                         line1_norm, unit_norm, city_norm, state_code, zip5, zip4,
                         country_code, first_line, second_line, city_name, state_name,
-                        postal_code, source_bits, display_priority
+                        postal_code, source_bits, strict_source_bits, display_priority
                     )
                     SELECT
-                        address_key,
-                        identity_key,
+                        d.address_key,
+                        d.identity_key,
                         {CURRENT_ADDRESS_IDENTITY_VERSION},
-                        CASE WHEN split_part(identity_key, '|', 8) = 'city_zip'
+                        CASE WHEN split_part(d.identity_key, '|', 8) = 'city_zip'
                              THEN 'city_zip' ELSE 'street' END,
-                        premise_key,
-                        line1_norm,
-                        COALESCE(unit_norm, ''),
-                        city_norm,
-                        state_code,
-                        zip5,
-                        zip4,
-                        country_code,
-                        first_line,
-                        second_line,
-                        city_name,
-                        state_name,
-                        postal_code,
+                        d.premise_key,
+                        d.line1_norm,
+                        COALESCE(d.unit_norm, ''),
+                        d.city_norm,
+                        d.state_code,
+                        d.zip5,
+                        d.zip4,
+                        d.country_code,
+                        d.first_line,
+                        d.second_line,
+                        d.city_name,
+                        d.state_name,
+                        d.postal_code,
                         :source_bit,
+                        CASE WHEN strict.address_key IS NOT NULL
+                             THEN :source_bit ELSE 0 END,
                         :priority
-                    FROM dedup
+                    FROM dedup AS d
+                    LEFT JOIN address_strict_source_observations AS strict
+                      ON strict.address_key = d.address_key
+                     AND strict.identity_key = d.identity_key
                     ON CONFLICT (address_key) DO NOTHING
                     RETURNING 1
                 )
@@ -2369,6 +2600,36 @@ async def resolve_into_archive(
                 SELECT count(*) FROM updated;
             """), {"source_bit": source_bit, "priority": priority})
         ).scalar() or 0)
+        strict_source_updates = int(
+            (
+                await session.execute(
+                    text(
+                        f"""
+                        WITH updated AS (
+                            UPDATE {archive} AS archived
+                               SET source_bits = archived.source_bits | :source_bit,
+                                   strict_source_bits =
+                                       archived.strict_source_bits | :source_bit,
+                                   last_seen_at = now()
+                              FROM address_strict_source_observations AS strict
+                             WHERE archived.address_key = strict.address_key
+                               AND archived.identity_key = strict.identity_key
+                               AND (
+                                    (archived.source_bits & :source_bit) = 0
+                                    OR (archived.strict_source_bits & :source_bit) = 0
+                               )
+                            RETURNING 1
+                        )
+                        SELECT count(*) FROM updated;
+                        """
+                    ),
+                    {"source_bit": source_bit},
+                )
+            ).scalar()
+            or 0
+        )
+        alias_stats_by_kind["strict_source_updates"] = strict_source_updates
+        reason_buckets_by_reason["strict_source_updates"] = strict_source_updates
         gate_sample_limit = max(0, min(int(gate_sample_limit or 0), 100))
         if gate_sample_limit:
             sample_rows_result = await session.execute(text(f"""
@@ -2689,7 +2950,8 @@ async def migrate_legacy_archive_to_v2(
                         country_code, first_line, second_line, city_name, state_name,
                         postal_code, telephone_number, fax_number, formatted_address,
                         lat, long, place_id, geo_source, geocode_source, geocode_quality,
-                        geocoded_at, source_bits, display_priority, date_added
+                        geocoded_at, source_bits, strict_source_bits,
+                        display_priority, date_added
                     )
                     SELECT
                         address_key,
@@ -2721,11 +2983,13 @@ async def migrate_legacy_archive_to_v2(
                         CASE WHEN lat IS NOT NULL AND long IS NOT NULL THEN 'legacy_archive' ELSE NULL END,
                         CASE WHEN lat IS NOT NULL AND long IS NOT NULL THEN now() ELSE NULL END,
                         1,
+                        1,
                         0,
                         date_added
                     FROM ranked
                     ON CONFLICT (address_key) DO UPDATE SET
                         source_bits = target.source_bits | 1,
+                        strict_source_bits = target.strict_source_bits | 1,
                         last_seen_at = now(),
                         display_priority = LEAST(target.display_priority, 0),
                         first_line = CASE

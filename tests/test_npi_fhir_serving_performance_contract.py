@@ -57,12 +57,15 @@ async def test_npi_detail_preaggregates_children_after_direct_npi_lookup(
     captured_statements = [call.args[0] for call in execute_mock.await_args_list]
     assert len(captured_statements) == 2
     count_sql, detail_sql = map(str, captured_statements)
-    assert count_sql.index("entity_address_unified.npi =") < count_sql.index(
-        "count_npi_address_rows.type IN"
-    )
-    assert detail_sql.index("entity_address_unified.npi =") < detail_sql.index(
-        "npi_address_rows.type IN"
-    )
+    for statement_sql, serving_filter in (
+        (count_sql, "count_npi_address_rows.type IN"),
+        (detail_sql, "npi_address_rows.type IN"),
+    ):
+        assert "entity_address_unified.npi" in statement_sql
+        assert "entity_address_unified.inferred_npi" in statement_sql
+        assert statement_sql.index("entity_address_unified.npi") < statement_sql.index(
+            serving_filter
+        )
     for aggregate_name in (
         "taxonomy_aggregate",
         "taxonomy_group_aggregate",

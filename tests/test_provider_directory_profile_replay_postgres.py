@@ -399,6 +399,7 @@ async def test_expired_receipt_replays_without_new_admission_or_scratch(
 ):
     """Replay an expired committed receipt without allocating new scratch."""
     scenario = _replay_scenario(is_cross_run)
+    monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setattr(importer, "db", database)
         envelope = await _seed_committed_replay(database, schema, scenario)

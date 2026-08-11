@@ -19,6 +19,9 @@ from process.provider_directory_profile_reference_sql import (
     current_profile_evidence_sql,
     fhir_reference_resource_id_sql,
 )
+from process.provider_directory_profile_source_spec_contract import (
+    validated_profile_source_spec,
+)
 
 
 PROFILE_TABLE = "provider_directory_profile"
@@ -32,7 +35,7 @@ PROFILE_SPEC_PATH = (
 PROFILE_SQL_PATH = Path(__file__).resolve().parent / "sql"
 PROFILE_SCHEMA_VERSION = 1
 PROFILE_BUILD_STRATEGY_VERSION = (
-    "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5"
+    "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
 )
 PROFILE_FACT_LIMIT = 100
 PROFILE_FACT_EVIDENCE_LIMIT = 25
@@ -126,11 +129,7 @@ def sibling_table_ref(table_ref: str, table_name: str) -> str:
 def is_valid_npi(value: Any) -> bool:
     """Return whether a value is a CMS-assignable NPI with a valid check digit."""
     value_text = str(value).strip()
-    if (
-        len(value_text) != 10
-        or not value_text.isascii()
-        or not value_text.isdigit()
-    ):
+    if len(value_text) != 10 or not value_text.isascii() or not value_text.isdigit():
         return False
     npi_value = int(value_text)
     if not NPI_MIN <= npi_value <= NPI_MAX:
@@ -199,60 +198,8 @@ def profile_index_name(table_name: str, suffix: str) -> str:
 def load_profile_source_spec(path: Path | None = None) -> dict[str, Any]:
     """Load and validate the reviewed insurer profile-source contract."""
     spec_path = path or PROFILE_SPEC_PATH
-    source_spec_map = json.loads(spec_path.read_text(encoding="utf-8"))
-    if (
-        not isinstance(source_spec_map, dict)
-        or source_spec_map.get("schema_version") != 1
-    ):
-        raise RuntimeError("provider_directory_profile_source_spec_invalid")
-    source_ids = source_spec_map.get("source_ids")
-    entry_ids = source_spec_map.get("entry_ids")
-    retained_entry_ids = source_spec_map.get("retained_entry_ids", [])
-    dataset_scoped_entry_ids = source_spec_map.get(
-        "dataset_scoped_entry_ids", []
-    )
-    authority_ids_by_source_id = source_spec_map.get(
-        "authority_ids_by_source_id", {}
-    )
-    if (
-        not isinstance(source_ids, list)
-        or not source_ids
-        or len(source_ids) != len(set(source_ids))
-        or not all(
-            isinstance(source_id, str)
-            and source_id.startswith("pdfhir_")
-            and len(source_id) > len("pdfhir_")
-            for source_id in source_ids
-        )
-        or not isinstance(entry_ids, list)
-        or not entry_ids
-        or len(entry_ids) != len(set(entry_ids))
-        or not all(isinstance(entry_id, str) and entry_id for entry_id in entry_ids)
-        or not isinstance(retained_entry_ids, list)
-        or len(retained_entry_ids) != len(set(retained_entry_ids))
-        or not all(
-            isinstance(entry_id, str) and entry_id in entry_ids
-            for entry_id in retained_entry_ids
-        )
-        or not isinstance(dataset_scoped_entry_ids, list)
-        or len(dataset_scoped_entry_ids) != len(set(dataset_scoped_entry_ids))
-        or not all(
-            isinstance(entry_id, str) and entry_id in entry_ids
-            for entry_id in dataset_scoped_entry_ids
-        )
-        or not isinstance(authority_ids_by_source_id, dict)
-        or not all(
-            isinstance(source_id, str)
-            and source_id in source_ids
-            and isinstance(authority_id, str)
-            and authority_id
-            and authority_id == authority_id.strip()
-            and len(authority_id) <= 96
-            for source_id, authority_id in authority_ids_by_source_id.items()
-        )
-    ):
-        raise RuntimeError("provider_directory_profile_source_spec_invalid")
-    return source_spec_map
+    raw_source_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    return validated_profile_source_spec(raw_source_spec)
 
 
 def configured_profile_source_ids(path: Path | None = None) -> tuple[str, ...]:
@@ -278,13 +225,9 @@ def configured_retained_profile_source_ids(
         for source_row in source_rows
         if source_row.get("entry_id") in retained_entry_ids
     ]
-    if (
-        len(retained_source_ids) != len(retained_entry_ids)
-        or not all(
-            isinstance(source_id, str)
-            and source_id in source_spec["source_ids"]
-            for source_id in retained_source_ids
-        )
+    if len(retained_source_ids) != len(retained_entry_ids) or not all(
+        isinstance(source_id, str) and source_id in source_spec["source_ids"]
+        for source_id in retained_source_ids
     ):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
     return tuple(sorted(retained_source_ids))
@@ -308,16 +251,63 @@ def configured_dataset_scoped_profile_source_ids(
         for source_row in source_rows
         if source_row.get("entry_id") in dataset_scoped_entry_ids
     ]
-    if (
-        len(source_ids) != len(dataset_scoped_entry_ids)
-        or not all(
-            isinstance(source_id, str)
-            and source_id in source_spec["source_ids"]
-            for source_id in source_ids
-        )
+    if len(source_ids) != len(dataset_scoped_entry_ids) or not all(
+        isinstance(source_id, str) and source_id in source_spec["source_ids"]
+        for source_id in source_ids
     ):
         raise RuntimeError("provider_directory_profile_source_spec_invalid")
     return tuple(sorted(source_ids))
+
+
+def configured_dataset_scoped_profile_variant_groups(
+    path: Path | None = None,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return explicit alternative dataset generations as reviewed source IDs."""
+
+    source_spec = load_profile_source_spec(path)
+    matrix = source_spec.get("verification_matrix")
+    source_rows = matrix.get("sources") if isinstance(matrix, dict) else None
+    if not isinstance(source_rows, list) or any(
+        not isinstance(source_row, dict) for source_row in source_rows
+    ):
+        raise RuntimeError("provider_directory_profile_source_spec_invalid")
+    source_id_by_entry_id: dict[str, str] = {}
+    for source_row in source_rows:
+        entry_id = source_row.get("entry_id")
+        source_id = source_row.get("source_id")
+        if (
+            isinstance(entry_id, str)
+            and entry_id in source_spec["dataset_scoped_entry_ids"]
+        ):
+            if (
+                entry_id in source_id_by_entry_id
+                or not isinstance(source_id, str)
+                or source_id not in source_spec["source_ids"]
+            ):
+                raise RuntimeError("provider_directory_profile_source_spec_invalid")
+            source_id_by_entry_id[entry_id] = source_id
+    configured_groups: list[tuple[str, tuple[str, ...]]] = []
+    for group in source_spec["dataset_scoped_variant_groups"]:
+        try:
+            source_ids = tuple(
+                source_id_by_entry_id[entry_id] for entry_id in group["entry_ids"]
+            )
+        except KeyError as error:
+            raise RuntimeError(
+                "provider_directory_profile_source_spec_invalid"
+            ) from error
+        configured_groups.append((group["group_id"], source_ids))
+    return tuple(sorted(configured_groups))
+
+
+def configured_dataset_scoped_profile_endpoints(
+    path: Path | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Return the exact reviewed endpoint owned by each dataset source."""
+
+    source_spec = load_profile_source_spec(path)
+    endpoint_ids_by_source_id = source_spec["dataset_scoped_endpoint_ids_by_source_id"]
+    return tuple(sorted(endpoint_ids_by_source_id.items()))
 
 
 def profile_source_authority_id(
@@ -353,9 +343,7 @@ def profile_source_authority_sql(
 ) -> str:
     """Return the SQL expression matching ``profile_source_authority_id``."""
 
-    authority_ids = load_profile_source_spec(path)[
-        "authority_ids_by_source_id"
-    ]
+    authority_ids = load_profile_source_spec(path)["authority_ids_by_source_id"]
     if not authority_ids:
         return endpoint_id_sql
     branches = " ".join(
@@ -377,9 +365,7 @@ def profile_reviewed_source_authority_sql(
 ) -> str:
     """Return explicit reviewed authority SQL, otherwise NULL."""
 
-    authority_ids = load_profile_source_spec(path)[
-        "authority_ids_by_source_id"
-    ]
+    authority_ids = load_profile_source_spec(path)["authority_ids_by_source_id"]
     if not authority_ids:
         return "NULL::varchar"
     branches = " ".join(
@@ -553,7 +539,9 @@ def copy_existing_evidence_sql(
     target_ref: str,
 ) -> str:
     """Copy retained evidence for sources outside an incremental refresh."""
-    columns = ", ".join(quote_identifier(column) for column in profile_evidence_columns())
+    columns = ", ".join(
+        quote_identifier(column) for column in profile_evidence_columns()
+    )
     return f"""
         INSERT INTO {target_ref} ({columns})
         SELECT {columns}
@@ -721,15 +709,11 @@ def _validate_profile_evidence_request(
         request.fact_type is not None
         and request.fact_type not in PROFILE_EVIDENCE_FACT_TYPES
     ):
-        raise ValueError(
-            f"unsupported profile evidence fact type: {request.fact_type}"
-        )
+        raise ValueError(f"unsupported profile evidence fact type: {request.fact_type}")
     if request.role_bucket_count < 1:
         raise ValueError("profile role bucket count must be positive")
     if not 0 <= request.role_bucket < request.role_bucket_count:
-        raise ValueError(
-            "profile role bucket is outside the configured range"
-        )
+        raise ValueError("profile role bucket is outside the configured range")
 
 
 def _profile_evidence_write_bindings(
@@ -758,9 +742,7 @@ def _profile_evidence_write_bindings(
         ),
         "RESULT_SQL": result_sql,
         "CONFLICT_SQL": (
-            ""
-            if request.count_only
-            else "ON CONFLICT (evidence_key) DO NOTHING;"
+            "" if request.count_only else "ON CONFLICT (evidence_key) DO NOTHING;"
         ),
     }
 
@@ -797,9 +779,7 @@ def _profile_evidence_reference_bindings(
         "SERVICE_REF": request.service_ref,
         "ENDPOINT_REF": endpoint_ref,
         "DATASET_RESOURCE_REF": dataset_resource_ref,
-        "DATASET_SCOPED_SOURCE_IDS_SQL": (
-            dataset_scoped_profile_source_ids_sql()
-        ),
+        "DATASET_SCOPED_SOURCE_IDS_SQL": (dataset_scoped_profile_source_ids_sql()),
         "ROLE_PRACTITIONER_RESOURCE_ID_SQL": fhir_reference_resource_id_sql(
             "role.practitioner_ref", "Practitioner"
         ),
@@ -821,8 +801,7 @@ def _profile_branch_scope_sql(
 ) -> str:
     return (
         "TRUE"
-        if request.fact_type is None
-        or request.fact_type in branch_fact_types
+        if request.fact_type is None or request.fact_type in branch_fact_types
         else "FALSE"
     )
 
@@ -840,16 +819,11 @@ def _profile_evidence_scope_bindings(
     )
     if request.fact_type in _PROFILE_QUALIFICATION_FACT_TYPES:
         qualification_scope_sql = (
-            "qualification.qualification_type = "
-            f"'{request.fact_type}'"
+            "qualification.qualification_type = " f"'{request.fact_type}'"
         )
-    bindings_by_name["QUALIFICATION_FACT_SCOPE_SQL"] = (
-        qualification_scope_sql
-    )
+    bindings_by_name["QUALIFICATION_FACT_SCOPE_SQL"] = qualification_scope_sql
     bindings_by_name["FACT_TYPE_SCOPE_SQL"] = (
-        "TRUE"
-        if request.fact_type is None
-        else f"fact_type = '{request.fact_type}'"
+        "TRUE" if request.fact_type is None else f"fact_type = '{request.fact_type}'"
     )
     return bindings_by_name
 
@@ -876,9 +850,7 @@ def _profile_evidence_template_bindings(
         **_profile_evidence_write_bindings(request),
         **_profile_evidence_reference_bindings(request),
         **_profile_evidence_scope_bindings(request),
-        "ROLE_BUCKET_SQL": _profile_bucket_scope_sql(
-            "role", request.role_bucket_count
-        ),
+        "ROLE_BUCKET_SQL": _profile_bucket_scope_sql("role", request.role_bucket_count),
         "AFFILIATION_BUCKET_SQL": _profile_bucket_scope_sql(
             "affiliation", request.role_bucket_count
         ),
@@ -953,9 +925,7 @@ def _assert_profile_npi_range(
         or npi_end <= npi_start
         or npi_end > NPI_MAX + 1
     ):
-        raise ValueError(
-            "profile NPI range is outside the assignable bounds"
-        )
+        raise ValueError("profile NPI range is outside the assignable bounds")
 
 
 def _profile_insert_affected_npis_sql(
@@ -974,10 +944,7 @@ def _profile_insert_affected_npis_sql(
         )
     )
     if rebuild_all or old_evidence_ref is None:
-        return (
-            f"SELECT DISTINCT npi FROM {evidence_ref} WHERE TRUE"
-            f"{npi_scope_sql}"
-        )
+        return f"SELECT DISTINCT npi FROM {evidence_ref} WHERE TRUE" f"{npi_scope_sql}"
     return f"""
         SELECT npi
           FROM {old_evidence_ref}
@@ -1027,9 +994,7 @@ def _profile_aggregate_sql(
                 else f"INSERT INTO {target_ref} ({profile_columns_sql})"
             ),
             "AFFECTED_NPIS_SQL": affected_npis_sql,
-            "EVIDENCE_NPI_SCOPE_SQL": (
-                _profile_evidence_npi_scope_sql(npi_start)
-            ),
+            "EVIDENCE_NPI_SCOPE_SQL": (_profile_evidence_npi_scope_sql(npi_start)),
             "EVIDENCE_REF": evidence_ref,
             "PROFILE_FACT_EVIDENCE_LIMIT": PROFILE_FACT_EVIDENCE_LIMIT,
             "PROFILE_FACT_LIMIT": PROFILE_FACT_LIMIT,
@@ -1043,9 +1008,7 @@ def _profile_aggregate_sql(
                 "evidence.endpoint_id",
             ),
             "RESULT_SQL": result_sql,
-            "CONFLICT_SQL": (
-                ";" if count_only else "ON CONFLICT (npi) DO NOTHING;"
-            ),
+            "CONFLICT_SQL": (";" if count_only else "ON CONFLICT (npi) DO NOTHING;"),
         },
     )
 
@@ -1122,10 +1085,7 @@ def _profile_delta_affected_npis_sql(
             "CAST(:profile_npi_end AS bigint)"
         )
     )
-    return (
-        f"SELECT affected.npi FROM {affected_npi_ref} AS affected"
-        f"{npi_scope_sql}"
-    )
+    return f"SELECT affected.npi FROM {affected_npi_ref} AS affected" f"{npi_scope_sql}"
 
 
 def profile_delta_insert_sql(
@@ -1174,8 +1134,7 @@ def profile_source_dataset_pairs(
 ) -> tuple[list[str], list[str]]:
     """Align selected source IDs with their immutable dataset IDs."""
     dataset_id_by_source_id = {
-        str(dataset.source_id): str(dataset.dataset_id)
-        for dataset in datasets
+        str(dataset.source_id): str(dataset.dataset_id) for dataset in datasets
     }
     source_ids = sorted(set(selected_source_ids))
     missing_source_ids = [
@@ -1185,7 +1144,6 @@ def profile_source_dataset_pairs(
     ]
     if missing_source_ids:
         raise RuntimeError(
-            "provider_directory_profile_dataset_missing:"
-            + ",".join(missing_source_ids)
+            "provider_directory_profile_dataset_missing:" + ",".join(missing_source_ids)
         )
     return source_ids, [dataset_id_by_source_id[source_id] for source_id in source_ids]

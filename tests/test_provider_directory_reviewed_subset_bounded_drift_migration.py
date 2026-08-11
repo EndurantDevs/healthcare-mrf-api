@@ -146,6 +146,68 @@ def test_historical_renderers_remain_exact_profile_only_by_default():
     assert "max_advertised_count_decrease := 1" in aware_sql
 
 
+def test_terminal_window_renderer_preserves_prior_modes():
+    """Keep v5 opt-in while preserving historical renderer modes."""
+
+    migration = _load_migration()
+    subset = migration._subset()
+    schema = "bounded_drift_test"
+    v4_sql = subset._proof_shape_valid_function_sql(
+        schema,
+        replace_existing=True,
+        reviewed_subset_profile_aware=True,
+    )
+    v5_sql = subset._proof_shape_valid_function_sql(
+        schema,
+        replace_existing=True,
+        reviewed_subset_profile_aware=True,
+        reviewed_subset_terminal_window_profile_aware=True,
+    )
+    assert "traversal-subset-v5" not in v4_sql
+    assert "terminal-logical-window-covers-advertised-pre" not in v4_sql
+    assert "traversal-subset-v5" in v5_sql
+    assert "pg_catalog.ceil(advertised_pre / 100::numeric)" in v5_sql
+    assert "page_count * 20" in v5_sql
+    assert "terminal_count_window_required" in v5_sql
+    rendered_objects = (
+        subset._subset_proof_shape_check(
+            schema,
+            reviewed_subset_profile_aware=True,
+            reviewed_subset_terminal_window_profile_aware=True,
+        ),
+        subset._subset_endpoint_dataset_guard_sql(
+            schema,
+            use_configured_endpoint_identity=True,
+            reviewed_root_policy_aware=True,
+            reviewed_subset_profile_aware=True,
+            reviewed_subset_terminal_window_profile_aware=True,
+        ),
+        subset._subset_published_source_guard_sql(
+            schema,
+            use_configured_endpoint_identity=True,
+            replace_existing=True,
+            reviewed_root_policy_aware=True,
+            reviewed_subset_profile_aware=True,
+            reviewed_subset_terminal_window_profile_aware=True,
+        ),
+        migration._activation()._activation_valid_function_sql(
+            schema,
+            use_configured_endpoint_identity=True,
+            replace_existing=True,
+            reviewed_root_policy_aware=True,
+            reviewed_subset_profile_aware=True,
+            reviewed_subset_terminal_window_profile_aware=True,
+        ),
+        migration._identity()._adoption_state_fence_sql(
+            schema,
+            reviewed_root_policy_aware=True,
+            reviewed_subset_profile_aware=True,
+            reviewed_subset_terminal_window_profile_aware=True,
+        ),
+    )
+    assert all("traversal-subset-v5" in sql for sql in rendered_objects)
+
+
 def test_effective_endpoint_fence_accepts_policy_and_profile_awareness():
     """Render adoption checks for policy-one v3/v4 lifecycle state."""
 

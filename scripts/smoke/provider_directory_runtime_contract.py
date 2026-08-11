@@ -301,11 +301,18 @@ def _reviewed_subset_operation_gates() -> tuple[tuple[str, str], ...]:
     from process.provider_directory_fhir_subset_terminal_disposition_contract import (
         TERMINAL_DISPOSITION_ENABLED_ENV,
     )
+    from process.provider_directory_fhir_subset_terminal_disposition_profile import (
+        DIRECT_V4_TERMINAL_DISPOSITION_ENABLED_ENV,
+    )
 
     return (
         ("sync-verified-state", STATE_SYNC_ENABLED_ENV),
         ("abandon-expired-root", ABANDONMENT_ENABLED_ENV),
         ("seal-terminal-root", TERMINAL_DISPOSITION_ENABLED_ENV),
+        (
+            "seal-direct-v4-terminal-root",
+            DIRECT_V4_TERMINAL_DISPOSITION_ENABLED_ENV,
+        ),
     )
 
 

@@ -23,9 +23,7 @@ def _catalog(payloads_by_family=None, *, raw_set_sha256=RAW_SET_SHA256):
 
 def test_drug_catalog_derives_exact_ifp_and_cs_set_without_provider_churn():
     payloads_by_family = live_catalog_payloads()
-    provider_set = provider_catalog.observed_catalog_from_payloads(
-        payloads_by_family
-    )
+    provider_set = provider_catalog.observed_catalog_from_payloads(payloads_by_family)
 
     observed = _catalog(payloads_by_family)
 
@@ -39,9 +37,9 @@ def test_drug_catalog_derives_exact_ifp_and_cs_set_without_provider_churn():
         "cs",
         "ifp",
     }
-    assert {
-        catalog_file.collection_kind for catalog_file in observed.files
-    } == {"drug_formulary"}
+    assert {catalog_file.collection_kind for catalog_file in observed.files} == {
+        "drug_formulary"
+    }
     assert observed.source_raw_set_sha256 == RAW_SET_SHA256
 
 
@@ -55,12 +53,9 @@ def test_drug_semantic_identity_is_independent_of_provider_only_changes():
 
     assert changed.drug_set_sha256 == original.drug_set_sha256
     assert (
-        changed.raw_listing_projection_sha256
-        == original.raw_listing_projection_sha256
+        changed.raw_listing_projection_sha256 == original.raw_listing_projection_sha256
     )
-    assert changed.acquisition_contract_sha256 == (
-        original.acquisition_contract_sha256
-    )
+    assert changed.acquisition_contract_sha256 == (original.acquisition_contract_sha256)
     assert changed.source_raw_set_sha256 != original.source_raw_set_sha256
 
 
@@ -86,8 +81,7 @@ def test_drug_file_change_rotates_set_and_acquisition_identities():
 
     assert changed.drug_set_sha256 != original.drug_set_sha256
     assert (
-        changed.raw_listing_projection_sha256
-        != original.raw_listing_projection_sha256
+        changed.raw_listing_projection_sha256 != original.raw_listing_projection_sha256
     )
 
 
@@ -100,17 +94,10 @@ def test_listing_projection_change_rotates_acquisition_not_semantic_set():
 
     assert changed.drug_set_sha256 == original.drug_set_sha256
     assert (
-        changed.raw_listing_projection_sha256
-        != original.raw_listing_projection_sha256
+        changed.raw_listing_projection_sha256 != original.raw_listing_projection_sha256
     )
-    assert (
-        changed.acquisition_contract_sha256
-        != original.acquisition_contract_sha256
-    )
-    assert (
-        changed.acquisition_contract_sha256
-        != original.acquisition_contract_sha256
-    )
+    assert changed.acquisition_contract_sha256 != original.acquisition_contract_sha256
+    assert changed.acquisition_contract_sha256 != original.acquisition_contract_sha256
 
 
 @pytest.mark.parametrize(
@@ -136,9 +123,7 @@ def test_listing_projection_change_rotates_acquisition_not_semantic_set():
             "not an object",
         ),
         (
-            lambda payloads: payloads["ifp"]["drugs"][0].update(
-                {"size": 0}
-            ),
+            lambda payloads: payloads["ifp"]["drugs"][0].update({"size": 0}),
             "byte count",
         ),
     ],
@@ -167,8 +152,7 @@ def test_drug_catalog_accepts_bound_external_url_and_skips_non_json():
         {
             "isExternal": True,
             "url": (
-                "https://legacy.providerlookuponline.com/"
-                + external_entry["name"]
+                "https://legacy.providerlookuponline.com/" + external_entry["name"]
             ),
         }
     )
@@ -180,8 +164,96 @@ def test_drug_catalog_accepts_bound_external_url_and_skips_non_json():
 
     assert len(observed.files) == 48
     assert any(
-        catalog_file.source_url.startswith(
-            "https://legacy.providerlookuponline.com/"
-        )
+        catalog_file.source_url.startswith("https://legacy.providerlookuponline.com/")
         for catalog_file in observed.files
     )
+
+
+def test_drug_catalog_rejects_one_normalized_url_for_distinct_families():
+    payloads_by_family = live_catalog_payloads()
+    cs_entry = payloads_by_family["cs"]["drugs"][0]
+    ifp_entry = payloads_by_family["ifp"]["drugs"][0]
+    shared_name = cs_entry["name"]
+    cs_url = f"https://legacy.providerlookuponline.com/{shared_name}"
+    ifp_url = f"https://legacy.providerlookuponline.com/{shared_name}"
+    cs_entry.update(
+        {
+            "isExternal": True,
+            "url": cs_url,
+        }
+    )
+    ifp_entry.update(
+        {
+            "isExternal": True,
+            "name": shared_name,
+            "url": ifp_url,
+        }
+    )
+
+    with pytest.raises(
+        provider_catalog.UHCFileCatalogError,
+        match="reuses one source URL",
+    ):
+        _catalog(payloads_by_family)
+
+
+@pytest.mark.parametrize(
+    "path_prefix",
+    (
+        "https://legacy.providerlookuponline.com:443/safe/",
+        "https://legacy.providerlookuponline.com/%4a/",
+        "https://legacy.providerlookuponline.com/%7e/",
+        "https://legacy.providerlookuponline.com/%2E/",
+        "https://legacy.providerlookuponline.com/safe/%2e%2e/",
+    ),
+)
+def test_drug_catalog_rejects_noncanonical_transport_urls(path_prefix):
+    payloads_by_family = live_catalog_payloads()
+    external_entry = payloads_by_family["cs"]["drugs"][0]
+    external_entry.update(
+        {
+            "isExternal": True,
+            "url": path_prefix + external_entry["name"],
+        }
+    )
+
+    with pytest.raises(provider_catalog.UHCFileCatalogError):
+        _catalog(payloads_by_family)
+
+
+def test_drug_catalog_accepts_canonical_percent_encoded_space():
+    payloads_by_family = live_catalog_payloads()
+    external_entry = payloads_by_family["cs"]["drugs"][0]
+    expected_url = (
+        "https://legacy.providerlookuponline.com/safe%20space/" + external_entry["name"]
+    )
+    external_entry.update(
+        {
+            "isExternal": True,
+            "url": expected_url,
+        }
+    )
+
+    observed = _catalog(payloads_by_family)
+
+    assert expected_url in {item.source_url for item in observed.files}
+
+
+def test_drug_catalog_rejects_decoded_dot_segment_source_paths():
+    payloads_by_family = live_catalog_payloads()
+    external_entry = payloads_by_family["cs"]["drugs"][0]
+    external_entry.update(
+        {
+            "isExternal": True,
+            "url": (
+                "https://legacy.providerlookuponline.com/safe/%2e%2e/"
+                + external_entry["name"]
+            ),
+        }
+    )
+
+    with pytest.raises(
+        provider_catalog.UHCFileCatalogError,
+        match="dot segment",
+    ):
+        _catalog(payloads_by_family)

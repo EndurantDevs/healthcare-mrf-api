@@ -39,11 +39,9 @@ def _admission_result(
     evidence = receipt.evidence
     admission = receipt.admission
     if not (
-        receipt.source_observation_sha256
-        == acquisition.source_observation_sha256
+        receipt.source_observation_sha256 == acquisition.source_observation_sha256
         and receipt.artifact_set_sha256 == acquisition.artifact_set_sha256
-        and evidence.source_file_set_sha256
-        == acquisition.source_file_set_sha256
+        and evidence.source_file_set_sha256 == acquisition.source_file_set_sha256
         and admission.baseline_run_id == identities.baseline_run_id
         and admission.candidate_run_id == identities.candidate_run_id
         and admission.cutoff_at == identities.cutoff_at
@@ -65,7 +63,7 @@ async def acquire_and_admit_uhc_drugs(
     raw_set_sha256: str,
     database: Any = db,
 ) -> UHCDrugAdmissionOperationResult:
-    """Acquire outside the lease, then build and receipt exact twins."""
+    """Acquire under its source claim, then build and receipt exact twins."""
 
     require_uhc_acquisition_gate()
     try:

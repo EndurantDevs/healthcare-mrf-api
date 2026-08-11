@@ -1012,6 +1012,9 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             source_bit=64,
             priority=7,
             schema=schema,
+            strict_source_predicate=(
+                "strict_source.address_observed_in_source IS TRUE"
+            ),
         )
         print(f"Part D pharmacy activity canonical address resolve complete: {stats}")
 
@@ -1033,6 +1036,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             city,
             state,
             zip_code,
+            address_observed_in_source,
             pharmacy_type,
             mail_order,
             dispensing_fee_brand_30,
@@ -1062,6 +1066,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 city,
                 state,
                 zip_code,
+                address_observed_in_source,
                 pharmacy_type,
                 mail_order,
                 dispensing_fee_brand_30,
@@ -1093,6 +1098,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 city,
                 state,
                 zip_code,
+                address_observed_in_source,
                 pharmacy_type,
                 mail_order,
                 dispensing_fee_brand_30,
@@ -1123,6 +1129,8 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 city,
                 state,
                 zip_code,
+                bool_or(address_observed_in_source)
+                    AS address_observed_in_source,
                 pharmacy_type,
                 mail_order,
                 dispensing_fee_brand_30,
@@ -1206,6 +1214,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             city,
             state,
             zip_code,
+            address_observed_in_source,
             pharmacy_type,
             mail_order,
             dispensing_fee_brand_30,
@@ -1529,33 +1538,9 @@ def _load_formulary_ndc_map(file_path: Path) -> dict[tuple[str, str], str]:
                 rxnorm_by_formulary_ndc[fallback_key] = rxnorm_id[:32]
     return rxnorm_by_formulary_ndc
 
-def _activity_row_from_source(
-    source_row: dict[str, Any],
-    *,
-    snapshot_id: str,
-    source_type: str,
-    default_date: datetime.date,
-) -> dict[str, Any] | None:
-    """Normalize one pharmacy activity source row."""
-    source_field_map = _row_index(source_row)
-    npi = _to_npi(
-        _row_value(
-            source_field_map,
-            "npi",
-            "pharmacynpi",
-            "pharmacynumber",
-            "pharmacyid",
-            "providernpi",
-        )
-    )
-    if npi is None:
-        return None
-    dispensing_fees = _extract_dispensing_fee_fields(source_field_map)
-
-    _contract_id, _plan_component, _segment_id, plan_id = _extract_plan_fields(
-        source_field_map
-    )
-
+def _activity_status_by_name(
+    source_field_map: dict[str, Any],
+) -> dict[str, Any]:
     year = _to_int(_row_value(source_field_map, "year", "contractyear", "planyear"))
     retail_flag = _to_bool(
         _row_value(source_field_map, "pharmacyretail", "retail", "isretail")
@@ -1580,7 +1565,37 @@ def _activity_row_from_source(
         is_active = any(flag is True for flag in (retail_flag, mail_flag, in_area_flag))
     if is_active is None:
         is_active = True
+    pharmacy_type = _row_value(
+        source_field_map, "pharmacytype", "networktype", "pharmacynetworktype"
+    )
+    if not pharmacy_type:
+        if retail_flag and mail_flag:
+            pharmacy_type = "retail_mail"
+        elif retail_flag:
+            pharmacy_type = "retail"
+        elif mail_flag:
+            pharmacy_type = "mail_order"
+        else:
+            pharmacy_type = "unknown"
+    mail_order = (
+        mail_flag
+        if mail_flag is not None
+        else _to_bool(
+            _row_value(source_field_map, "mailorder", "ismailorder", "mailorderflag")
+        )
+    )
+    return {
+        "year": year,
+        "medicare_active": bool(is_active),
+        "pharmacy_type": pharmacy_type,
+        "mail_order": mail_order,
+    }
 
+
+def _activity_period_by_name(
+    source_field_map: dict[str, Any],
+    default_date: datetime.date,
+) -> dict[str, Any]:
     effective_from = _parse_date(
         _row_value(
             source_field_map,
@@ -1595,56 +1610,81 @@ def _activity_row_from_source(
     effective_to = _parse_date(
         _row_value(source_field_map, "effectiveto", "enddate", "coverageto")
     )
-    pharmacy_type = _row_value(
-        source_field_map, "pharmacytype", "networktype", "pharmacynetworktype"
-    )
-    if not pharmacy_type:
-        if retail_flag and mail_flag:
-            pharmacy_type = "retail_mail"
-        elif retail_flag:
-            pharmacy_type = "retail"
-        elif mail_flag:
-            pharmacy_type = "mail_order"
-        else:
-            pharmacy_type = "unknown"
+    return {
+        "effective_from": effective_from,
+        "effective_to": effective_to,
+    }
 
+
+def _activity_address_by_name(
+    source_field_map: dict[str, Any],
+) -> dict[str, Any]:
+    address_line1 = _row_value(
+        source_field_map, "address1", "addressline1", "firstline"
+    )
+    address_line2 = _row_value(
+        source_field_map, "address2", "addressline2", "secondline"
+    )
+    city = _row_value(source_field_map, "city", "cityname")
+    state = _row_value(source_field_map, "state", "statecode", "statename")
+    zip_code = _row_value(
+        source_field_map, "pharmacyzipcode", "zip", "zipcode", "postalcode"
+    )
+    address_observed_in_source = all(
+        str(component_text or "").strip()
+        for component_text in (address_line1, city, state, zip_code)
+    )
+    return {
+        "address_line1": address_line1,
+        "address_line2": address_line2,
+        "city": city,
+        "state": state,
+        "zip_code": zip_code,
+        "address_observed_in_source": address_observed_in_source,
+    }
+
+
+def _activity_row_from_source(
+    source_row: dict[str, Any],
+    *,
+    snapshot_id: str,
+    source_type: str,
+    default_date: datetime.date,
+) -> dict[str, Any] | None:
+    """Normalize one pharmacy activity source row."""
+    source_field_map = _row_index(source_row)
+    npi = _to_npi(
+        _row_value(
+            source_field_map,
+            "npi",
+            "pharmacynpi",
+            "pharmacynumber",
+            "pharmacyid",
+            "providernpi",
+        )
+    )
+    if npi is None:
+        return None
+    _contract_id, _plan_component, _segment_id, plan_id = _extract_plan_fields(
+        source_field_map
+    )
+    status_by_name = _activity_status_by_name(source_field_map)
+    period_by_name = _activity_period_by_name(source_field_map, default_date)
+    effective_from = period_by_name["effective_from"]
     return {
         "snapshot_id": snapshot_id,
         "npi": npi,
         "plan_id": plan_id[:32],
-        "year": year or effective_from.year,
-        "medicare_active": bool(is_active),
+        "year": status_by_name["year"] or effective_from.year,
+        "medicare_active": status_by_name["medicare_active"],
         "pharmacy_name": _row_value(
             source_field_map, "pharmacyname", "name", "providername"
         ),
-        "address_line1": _row_value(
-            source_field_map, "address1", "addressline1", "firstline"
-        ),
-        "address_line2": _row_value(
-            source_field_map, "address2", "addressline2", "secondline"
-        ),
-        "city": _row_value(source_field_map, "city", "cityname"),
-        "state": _row_value(source_field_map, "state", "statecode", "statename"),
-        "zip_code": _row_value(
-            source_field_map, "pharmacyzipcode", "zip", "zipcode", "postalcode"
-        ),
-        "pharmacy_type": pharmacy_type,
-        "mail_order": mail_flag
-        if mail_flag is not None
-        else _to_bool(
-            _row_value(source_field_map, "mailorder", "ismailorder", "mailorderflag")
-        ),
-        "dispensing_fee_brand_30": dispensing_fees["dispensing_fee_brand_30"],
-        "dispensing_fee_brand_60": dispensing_fees["dispensing_fee_brand_60"],
-        "dispensing_fee_brand_90": dispensing_fees["dispensing_fee_brand_90"],
-        "dispensing_fee_generic_30": dispensing_fees["dispensing_fee_generic_30"],
-        "dispensing_fee_generic_60": dispensing_fees["dispensing_fee_generic_60"],
-        "dispensing_fee_generic_90": dispensing_fees["dispensing_fee_generic_90"],
-        "dispensing_fee_selected_drug_30": dispensing_fees["dispensing_fee_selected_drug_30"],
-        "dispensing_fee_selected_drug_60": dispensing_fees["dispensing_fee_selected_drug_60"],
-        "dispensing_fee_selected_drug_90": dispensing_fees["dispensing_fee_selected_drug_90"],
-        "effective_from": effective_from,
-        "effective_to": effective_to,
+        **_activity_address_by_name(source_field_map),
+        "pharmacy_type": status_by_name["pharmacy_type"],
+        "mail_order": status_by_name["mail_order"],
+        **_extract_dispensing_fee_fields(source_field_map),
+        **period_by_name,
         "source_type": source_type,
     }
 
@@ -1819,6 +1859,9 @@ async def _flush_batches(
                     "city": activity_fields.get("city"),
                     "state": activity_fields.get("state"),
                     "zip_code": activity_fields.get("zip_code"),
+                    "address_observed_in_source": bool(
+                        activity_fields.get("address_observed_in_source")
+                    ),
                     "pharmacy_type": activity_fields.get("pharmacy_type"),
                     "mail_order": activity_fields.get("mail_order"),
                     "dispensing_fee_brand_30": activity_fields.get("dispensing_fee_brand_30"),
@@ -1836,6 +1879,11 @@ async def _flush_batches(
                     "_plans": set(),
                 }
                 aggregate_by_key[key] = aggregated_field_map
+            else:
+                aggregated_field_map["address_observed_in_source"] = bool(
+                    aggregated_field_map.get("address_observed_in_source")
+                    or activity_fields.get("address_observed_in_source")
+                )
             aggregated_field_map["_plans"].add(plan_id[:32])
 
         aggregated_rows: list[dict[str, Any]] = []

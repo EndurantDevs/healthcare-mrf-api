@@ -13,6 +13,21 @@ from db.models import NPIAddress, NPIData, NPIDataOtherIdentifier, NPIDataTaxono
 from db.models import AddressArchive
 
 
+@pytest.fixture(autouse=True)
+def _stub_detail_location_materialization(monkeypatch):
+    """Keep endpoint fixtures focused on their explicitly supplied addresses."""
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_address_rows",
+        AsyncMock(return_value=[]),
+    )
+
+
 class FakeConnection:
     def __init__(self, responses):
         self._responses = list(responses)
@@ -175,11 +190,13 @@ def _install_profile_transition_cache_dependencies(
         profile_fetch,
     )
     monkeypatch.setattr(npi_module, "_build_npi_details", build_details)
-    monkeypatch.setattr(
-        npi_module,
+    for function_name in (
+        "_fetch_npi_location_candidates",
+        "_fetch_npi_address_rows",
+        "_fetch_provider_directory_address_overlay",
         "_fetch_other_names",
-        AsyncMock(return_value=[]),
-    )
+    ):
+        monkeypatch.setattr(npi_module, function_name, AsyncMock(return_value=[]))
     monkeypatch.setattr(
         npi_module,
         "_provider_directory_address_overlay_serving_identity",
@@ -390,11 +407,7 @@ def _build_result_row(npi_value: int) -> list:
             result_values.append(1)
         else:
             result_values.append(f"addr_{column.key}")
-    for column in NPIDataTaxonomy.__table__.columns:
-        if column.key in {"npi", "checksum"}:
-            result_values.append(None)
-        else:
-            result_values.append(f"tax_{column.key}")
+    result_values.append(1)
     return result_values
 
 
@@ -414,7 +427,7 @@ def _set_near_address_column(near_values: list, key: str, value):
     raise AssertionError(f"Unknown NPIAddress column: {key}")
 
 
-def test_dedupe_addresses_keeps_distinct_address_sites():
+def test_dedupe_addresses_merges_conflicting_sites_by_exact_key(caplog):
     addresses = [
         {
             "address_key": "00000000-0000-0000-0000-000000000001",
@@ -439,20 +452,10 @@ def test_dedupe_addresses_keeps_distinct_address_sites():
 
     deduped = npi_module._dedupe_addresses_by_key(addresses)
 
-    assert len(deduped) == 2
-    assert {
-        address.get("premise_key")
-        for address in deduped
-    } == {
-        "00000000-0000-0000-0000-000000000002",
-        "00000000-0000-0000-0000-000000000003",
-    }
-    merged = next(
-        address
-        for address in deduped
-        if address.get("premise_key") == "00000000-0000-0000-0000-000000000002"
-    )
-    assert merged["telephone_number"] == "3125551212"
+    assert len(deduped) == 1
+    assert deduped[0]["premise_key"] == "00000000-0000-0000-0000-000000000002"
+    assert deduped[0]["telephone_number"] == "3125551212"
+    assert "maps to 2 conflicting non-null site keys" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -466,8 +469,19 @@ async def test_get_all_returns_rows(monkeypatch):
     _set_result_address_column(result_row, "country_code", "US")
     class QueryAwareConnection:
         async def all(self, statement, **_params):
-            if "COUNT(DISTINCT" in str(statement):
+            sql_text = str(statement)
+            if "COUNT(DISTINCT" in sql_text:
                 return [(2,)]
+            if "FROM mrf.npi_taxonomy AS taxonomy" in sql_text:
+                return [
+                    types.SimpleNamespace(
+                        _mapping={
+                            "npi": 1234567890,
+                            "checksum": 1,
+                            "healthcare_provider_taxonomy_code": "207Q00000X",
+                        }
+                    )
+                ]
             return [result_row]
 
     class FakeDB:
@@ -1855,6 +1869,16 @@ async def test_get_npi_force_address_update_bypasses_response_cache(monkeypatch)
 @pytest.mark.asyncio
 async def test_get_npi_not_found(monkeypatch):
     monkeypatch.setattr(npi_module, "_build_npi_details", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_directory_address_overlay",
+        AsyncMock(return_value=[]),
+    )
     request = types.SimpleNamespace(args={})
     with pytest.raises(sanic.exceptions.NotFound):
         await npi_module.get_npi(request, "123")
@@ -1961,7 +1985,9 @@ async def test_get_all_format_all_returns_classification_map(monkeypatch):
 async def test_get_all_deduplicates_rows(monkeypatch):
     connections = [
         FakeConnection([[(1,)]]),
-        FakeConnection([[ _build_result_row(999), _build_result_row(999) ]]),
+        FakeConnection(
+            [[_build_result_row(999), _build_result_row(999)], []]
+        ),
     ]
 
     class FakeDB:
@@ -2099,6 +2125,16 @@ async def test_get_npi_not_found(monkeypatch):
         return {}
 
     monkeypatch.setattr(npi_module, '_build_npi_details', AsyncMock(side_effect=fake_build))
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_directory_address_overlay",
+        AsyncMock(return_value=[]),
+    )
 
     request = types.SimpleNamespace(args={}, app=types.SimpleNamespace())
     with pytest.raises(sanic.exceptions.NotFound):

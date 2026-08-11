@@ -17,6 +17,18 @@ def test_generic_profile_followup_descriptor_is_source_local_and_versioned():
     )
 
     assert descriptor["kind"] == "provider_directory_global_profile"
+    assert set(descriptor) == {
+        "status",
+        "kind",
+        "intent",
+        "importer",
+        "source_id",
+        "dataset_id",
+        "parent_run_id",
+        "idempotency_key",
+        "triggered_by",
+        "params",
+    }
     assert descriptor["source_id"] == "pdfhir_payer"
     assert descriptor["dataset_id"] == "dataset-1"
     assert descriptor["parent_run_id"] == "run-root-1"
@@ -47,8 +59,8 @@ def test_migration_and_models_define_durable_monotonic_authority():
         == "provider_directory_profile_selection_observation"
     )
     assert (
-        selection.ProviderDirectoryProfileSelectionObservation.authority_revision
-        .property.columns[0]
-        .autoincrement
+        selection.ProviderDirectoryProfileSelectionObservation.authority_revision.property.columns[
+            0
+        ].autoincrement
         is False
     )

@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import json
-import importlib
-import types
+import importlib, json, types
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
 from sanic.exceptions import BadRequest, SanicException
 
-from api import control
-from api import control_imports
+from api import control, control_imports
 from api import provider_directory_profile_selection_attestation as selection_api
 from process import provider_directory_profile_selection as selection
+from process import provider_directory_profile as profile_artifact
 
 
 importer = importlib.import_module("process.provider_directory_fhir")
@@ -40,6 +38,21 @@ def _catalog() -> dict:
     }
 
 
+def _variant_registry_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "source_id": source_id,
+            "endpoint_id": endpoint_id,
+            "canonical_api_base": "https://synthetic.invalid/R4",
+            "org_name": "Synthetic dataset variant",
+            "plan_name": None,
+        }
+        for source_id, endpoint_id in (
+            profile_artifact.configured_dataset_scoped_profile_endpoints()
+        )
+    ]
+
+
 def _computed() -> selection._ComputedProfileSelection:
     return selection._computed_selection_from_rows(
         _catalog(),
@@ -51,7 +64,8 @@ def _computed() -> selection._ComputedProfileSelection:
                 "canonical_api_base": "https://payer.example/fhir",
                 "org_name": "Payer",
                 "plan_name": "Payer Plan",
-            }
+            },
+            *_variant_registry_rows(),
         ],
         dataset_rows=[
             {
@@ -206,7 +220,8 @@ def test_profile_input_digest_changes_with_source_context_and_dataset_metadata()
                 "canonical_api_base": "https://payer.example/fhir",
                 "org_name": "Renamed Payer",
                 "plan_name": "Payer Plan",
-            }
+            },
+            *_variant_registry_rows(),
         ],
         dataset_rows=[
             {
@@ -266,9 +281,7 @@ def test_attestation_rejects_tampering_and_purge_is_explicit():
         **empty_identity_map,
         "proof_id": selection._proof_id(empty_identity_map),
     }
-    purge = selection.validated_profile_selection_attestation(
-        empty_attestation_map
-    )
+    purge = selection.validated_profile_selection_attestation(empty_attestation_map)
 
     assert purge.operation == "purge"
     assert purge.pairs == ()
@@ -288,8 +301,10 @@ async def test_attestation_endpoint_authenticates_and_never_echoes_request(
         json={"untrusted": "payload"},
     )
 
-    response = await selection_api.control_provider_directory_profile_selection_attestation(
-        request
+    response = (
+        await selection_api.control_provider_directory_profile_selection_attestation(
+            request
+        )
     )
 
     assert json.loads(response.body) == attestation.payload
@@ -308,9 +323,7 @@ async def test_attestation_endpoint_maps_validation_and_drift(monkeypatch):
         selection_api,
         "attest_profile_selection",
         AsyncMock(
-            side_effect=selection.ProviderDirectoryProfileSelectionError(
-                "bad proof"
-            )
+            side_effect=selection.ProviderDirectoryProfileSelectionError("bad proof")
         ),
     )
     with pytest.raises(BadRequest, match="bad proof"):
@@ -388,14 +401,20 @@ def test_global_profile_and_independent_acquisition_do_not_block_each_other(
         "metrics": {},
     }
 
-    assert control_imports._provider_directory_blocking_run(
-        profile_params_map,
-        [active_acquisition_map],
-    ) is None
-    assert control_imports._provider_directory_blocking_run(
-        acquisition_params_map,
-        [active_profile_map],
-    ) is None
+    assert (
+        control_imports._provider_directory_blocking_run(
+            profile_params_map,
+            [active_acquisition_map],
+        )
+        is None
+    )
+    assert (
+        control_imports._provider_directory_blocking_run(
+            acquisition_params_map,
+            [active_profile_map],
+        )
+        is None
+    )
 
 
 def test_artifact_fence_must_match_every_attested_pair():
@@ -472,9 +491,7 @@ async def test_cutover_recomputes_attestation_inside_transaction(monkeypatch):
         "_provider_directory_profile_selection_catalog",
         _catalog,
     )
-    token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-        execution
-    )
+    token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(execution)
     try:
         await importer._verify_active_profile_selection_at_cutover()
     finally:

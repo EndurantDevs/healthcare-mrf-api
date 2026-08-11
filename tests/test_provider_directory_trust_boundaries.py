@@ -3437,6 +3437,7 @@ async def test_artifact_bundle_transaction_runs_all_fenced_steps(monkeypatch):
     )
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(importer.db, "status", AsyncMock())
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=1))
     helper_names = (
         "_acquire_provider_directory_artifact_cutover_lock",
         "_lock_and_verify_artifact_dataset_fence",
@@ -4024,6 +4025,7 @@ async def test_single_stage_transaction_and_unfenced_bundle_paths(monkeypatch):
     )
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(importer.db, "status", AsyncMock())
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=True))
     helper_names = (
         "_acquire_provider_directory_artifact_cutover_lock",
         "_lock_and_verify_artifact_dataset_fence",

@@ -1,6 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Authenticated read-only Provider Directory Profile capacity preflight."""
+"""Authenticated Provider Directory Profile capacity receipt preflight.
+
+The route does not acquire source data or publish a Profile generation.  It
+does durably record (or exactly replay) one immutable, single-use signing
+receipt after the closed preflight checks succeed.
+"""
 
 from __future__ import annotations
 
@@ -12,10 +17,16 @@ from process.provider_directory_fhir import (
     ProviderDirectoryArtifactBuildStale,
     provider_directory_profile_capacity_preflight,
 )
+from process.provider_directory_profile_capacity_preflight_contract import (
+    ProviderDirectoryProfileCapacityPreflightError,
+    validated_capacity_preflight_request,
+)
+from process.provider_directory_profile_capacity_runtime import (
+    ProviderDirectoryProfileCapacityConfigurationError,
+)
 from process.provider_directory_profile_selection import (
     ProviderDirectoryProfileSelectionError,
     ProviderDirectoryProfileSelectionStale,
-    validated_profile_execution,
 )
 from process.provider_directory_profile_runtime_observation import (
     ProviderDirectoryProfileRuntimeObservationError,
@@ -23,25 +34,20 @@ from process.provider_directory_profile_runtime_observation import (
 
 
 async def control_provider_directory_profile_capacity_preflight(request):
-    """Return exact signed-lease geometry without creating durable work."""
+    """Return and durably record one exact replay-fenced signing receipt."""
 
     require_control_auth(request)
     request_payload = request.json if isinstance(request.json, dict) else {}
-    if (
-        request_payload.get(
-            "provider_directory_profile_capacity_attestation"
-        )
-        != {}
-    ):
-        raise BadRequest(
-            "Profile capacity preflight attestation must be empty"
-        )
     try:
-        execution = validated_profile_execution(request_payload)
+        preflight_request = validated_capacity_preflight_request(request_payload)
         preflight = await provider_directory_profile_capacity_preflight(
-            execution
+            preflight_request
         )
-    except ProviderDirectoryProfileSelectionError as exc:
+    except (
+        ProviderDirectoryProfileCapacityConfigurationError,
+        ProviderDirectoryProfileCapacityPreflightError,
+        ProviderDirectoryProfileSelectionError,
+    ) as exc:
         raise BadRequest(str(exc)) from exc
     except (
         ProviderDirectoryArtifactBuildStale,

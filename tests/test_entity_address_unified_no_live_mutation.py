@@ -46,6 +46,11 @@ def _mock_shutdown_dependencies(monkeypatch, events: list[tuple[str, str]]) -> N
 
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
     monkeypatch.setattr(entity_address_unified, "_has_table", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_address_alias_generation",
+        AsyncMock(return_value=0),
+    )
     monkeypatch.setattr(entity_address_unified.db, "scalar", AsyncMock(return_value=100))
     monkeypatch.setattr(entity_address_unified, "_run_sql_phase", run_sql)
     monkeypatch.setattr(
@@ -150,9 +155,14 @@ async def test_archive_coordinate_mismatches_are_informational_but_invalid_coord
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(entity_address_unified, "_has_table", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_address_alias_generation",
+        AsyncMock(return_value=0),
+    )
     monkeypatch.setattr(entity_address_unified.db, "all", AsyncMock(return_value=[]))
 
-    scalar = AsyncMock(side_effect=[0, 1233, 0, 0, 0, 0, 0])
+    scalar = AsyncMock(side_effect=[0, 0, 0, 1233, 0, 0, 0, 0, 0])
     monkeypatch.setattr(entity_address_unified.db, "scalar", scalar)
     invalid_coordinate_count = AsyncMock(return_value=0)
     monkeypatch.setattr(
@@ -171,7 +181,7 @@ async def test_archive_coordinate_mismatches_are_informational_but_invalid_coord
     assert metrics["archive_coordinate_mismatch_rows"] == 1233
     assert metrics["invalid_coordinate_rows"] == 0
 
-    scalar.side_effect = [0, 1233, 0, 0, 0, 0, 0]
+    scalar.side_effect = [0, 0, 0, 1233, 0, 0, 0, 0, 0]
     invalid_coordinate_count.return_value = 1
     with pytest.raises(RuntimeError, match="1 staged rows have invalid latitude/longitude values"):
         await entity_address_unified._validate_publish_integrity(
@@ -181,7 +191,7 @@ async def test_archive_coordinate_mismatches_are_informational_but_invalid_coord
             test_mode=False,
         )
 
-    scalar.side_effect = [0, 1233, 1, 0, 0, 0, 0]
+    scalar.side_effect = [0, 0, 0, 1233, 1, 0, 0, 0, 0]
     invalid_coordinate_count.return_value = 0
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_ARCHIVE_COORDINATES", "true")
     with pytest.raises(RuntimeError, match="1 staged rows reference archive addresses without coordinates"):

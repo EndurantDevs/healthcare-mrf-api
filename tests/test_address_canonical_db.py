@@ -101,7 +101,7 @@ async def _reset_canonical_stage(schema, stage_table, values_sql):
     )
     await db.status(
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2 CASCADE;"
     )
     await db.status(
         f"""
@@ -433,7 +433,7 @@ async def _prepare_stamp_resolve_fixture(schema, stage_table):
     )
     await db.status(
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2 CASCADE;"
     )
     await db.status(
         f"""
@@ -592,7 +592,7 @@ async def test_rust_materialized_resolve_matches_sql_resolve(monkeypatch):
 
     await db.status(
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2 CASCADE;"
     )
     monkeypatch.setenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, "true")
     rust_stats = await resolve_into_archive(
@@ -635,7 +635,7 @@ async def test_resolve_aborts_when_stamped_key_disagrees_with_identity(monkeypat
     )
     await db.status(
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2 CASCADE;"
     )
     await db.status(
         f"""
@@ -696,7 +696,7 @@ async def _prepare_legacy_archive_fixture(schema: str, legacy_table: str) -> Non
     )
     await db.status(
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2 CASCADE;"
     )
     await db.status(
         f"""
@@ -814,7 +814,7 @@ async def test_resolve_reports_gate_warning_for_eligible_unstamped_rows(monkeypa
     )
     await db.status(
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2 CASCADE;"
     )
     await db.status(
         f"""
@@ -934,7 +934,7 @@ async def _prepare_archive_collision_fixture(schema, stage_table):
     )
     await db.status(
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2 CASCADE;"
     )
     await stamp_address_keys(
         stage_table,
@@ -1014,7 +1014,7 @@ async def test_resolve_reason_buckets_and_collision_abort(monkeypatch):
 
     await db.status(
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2 CASCADE;"
     )
     stats = await _resolve_archive_fixture(schema, stage_table)
 
@@ -1431,7 +1431,7 @@ async def test_address_canonical_helpers_honor_cancel_before_writes():
     )
     await db.status(
         f"TRUNCATE TABLE {schema}.address_checksum_map, "
-        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2 CASCADE;"
     )
     await db.status(
         f"""

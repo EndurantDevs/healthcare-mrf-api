@@ -71,9 +71,7 @@ def _set_row(identities):
     return {
         "source_id": identity.source_id,
         "source_file_set_sha256": identity.source_file_set_sha256,
-        "raw_listing_projection_sha256": (
-            identity.raw_listing_projection_sha256
-        ),
+        "raw_listing_projection_sha256": (identity.raw_listing_projection_sha256),
         "expected_file_count": len(identities),
     }
 
@@ -84,9 +82,7 @@ def _observation_row(identities, source_observation_sha256):
         "source_id": identity.source_id,
         "source_observation_sha256": source_observation_sha256,
         "source_file_set_sha256": identity.source_file_set_sha256,
-        "raw_listing_projection_sha256": (
-            identity.raw_listing_projection_sha256
-        ),
+        "raw_listing_projection_sha256": (identity.raw_listing_projection_sha256),
     }
 
 
@@ -132,9 +128,11 @@ async def test_pending_files_returns_only_unverified_exact_catalog_rows(
     database = _database()
     database.first.return_value = _set_row(identities)
     database.all.return_value = [
-        _row(identity, status="verified", artifact_index=index)
-        if index == 0
-        else _row(identity)
+        (
+            _row(identity, status="verified", artifact_index=index)
+            if index == 0
+            else _row(identity)
+        )
         for index, identity in enumerate(identities)
     ]
     verify_retained = Mock()
@@ -250,6 +248,46 @@ async def test_verified_binding_fills_pending_row_once(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pending_binding_runs_fence_inside_fill_without_signature_drift(
+    monkeypatch,
+):
+    """The transaction fence precedes the pending row lock and three-arg install."""
+
+    identity, pending_row, verified_row, install_and_verify, _ = (
+        _install_binding_test_doubles(monkeypatch)
+    )
+    database = _database()
+    observed_state = SimpleNamespace(is_fence_completed=False, read_count=0)
+
+    async def transaction_fence() -> None:
+        observed_state.is_fence_completed = True
+
+    async def read_artifact(*_args, **_keywords):
+        observed_state.read_count += 1
+        if observed_state.read_count == 2:
+            assert observed_state.is_fence_completed is True
+        return verified_row if observed_state.read_count == 3 else pending_row
+
+    database.first.side_effect = read_artifact
+
+    verified = await source_artifacts.bind_verified_source_artifact(
+        identity,
+        source_path=Path("/retained-download"),
+        artifact_sha256="1".zfill(64),
+        artifact_byte_count=identity.expected_byte_count or 1,
+        database=database,
+        transaction_fence=transaction_fence,
+    )
+
+    assert verified.identity == identity
+    install_and_verify.assert_called_once_with(
+        Path("/retained-download"),
+        "1".zfill(64),
+        identity.expected_byte_count or 1,
+    )
+
+
+@pytest.mark.asyncio
 async def test_cancel_after_install_still_fills_ledger_before_propagating(
     monkeypatch,
 ):
@@ -310,8 +348,8 @@ async def test_cancel_after_install_still_fills_ledger_before_propagating(
 async def test_verified_binding_replays_exact_retained_bytes(monkeypatch):
     """An exact verified replay rehashes retained bytes without another fill."""
 
-    identity, _, verified_row, _, verify_retained = (
-        _install_binding_test_doubles(monkeypatch)
+    identity, _, verified_row, _, verify_retained = _install_binding_test_doubles(
+        monkeypatch
     )
     replay_database = _database()
     replay_database.first.return_value = verified_row
@@ -330,11 +368,39 @@ async def test_verified_binding_replays_exact_retained_bytes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_verified_binding_replay_requires_its_transaction_fence(
+    monkeypatch,
+):
+    """A verified replay cannot report success after source ownership is lost."""
+
+    identity, _, verified_row, _, verify_retained = _install_binding_test_doubles(
+        monkeypatch
+    )
+    replay_database = _database()
+    replay_database.first.return_value = verified_row
+
+    async def lost_fence() -> None:
+        raise RuntimeError("synthetic stale owner")
+
+    with pytest.raises(RuntimeError, match="stale owner"):
+        await source_artifacts.bind_verified_source_artifact(
+            identity,
+            artifact_sha256="1".zfill(64),
+            artifact_byte_count=identity.expected_byte_count or 1,
+            database=replay_database,
+            transaction_fence=lost_fence,
+        )
+
+    verify_retained.assert_called_once()
+    replay_database.status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_verified_binding_restores_missing_exact_blob(monkeypatch):
     """A verified row may reinstall only its exact previously sealed bytes."""
 
-    identity, _, verified_row, install_and_verify, _ = (
-        _install_binding_test_doubles(monkeypatch)
+    identity, _, verified_row, install_and_verify, _ = _install_binding_test_doubles(
+        monkeypatch
     )
     restore_database = _database()
     restore_database.first.return_value = verified_row

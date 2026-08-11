@@ -804,6 +804,7 @@ def _proof_shape_valid_function_sql(
     *,
     replace_existing: bool = False,
     reviewed_subset_profile_aware: bool = False,
+    reviewed_subset_terminal_window_profile_aware: bool = False,
 ) -> str:
     proof_valid_ref = _qf(schema, _PROOF_SHAPE_VALID_FUNCTION)
     canonical_sha256_ref = _qf(schema, _CANONICAL_SHA256_FUNCTION)
@@ -832,8 +833,7 @@ def _proof_shape_valid_function_sql(
         if replace_existing
         else "CREATE FUNCTION"
     )
-    profile_sql = (
-        """
+    exact_profile_sql = """
         IF candidate ->> 'strategy_version' =
                 'provider-directory-fhir-server-issued-traversal-subset-v3'
            AND candidate -> 'completion_scopes' =
@@ -841,6 +841,8 @@ def _proof_shape_valid_function_sql(
                 '"source-issued-continuation",'
                 '"returned-resource-content"]'::jsonb THEN
             max_advertised_count_decrease := 0;
+    """
+    bounded_profile_sql = """
         ELSIF candidate ->> 'strategy_version' =
                 'provider-directory-fhir-server-issued-traversal-subset-v4'
            AND candidate -> 'completion_scopes' =
@@ -848,12 +850,69 @@ def _proof_shape_valid_function_sql(
                 '"source-issued-continuation",'
                 '"returned-resource-content"]'::jsonb THEN
             max_advertised_count_decrease := 1;
+    """
+    terminal_window_profile_sql = """
+        ELSIF candidate ->> 'strategy_version' =
+                'provider-directory-fhir-server-issued-traversal-subset-v5'
+           AND candidate -> 'completion_scopes' =
+                '["advertised-count-monotone-decrease-bounded-by-one-percent-and-twenty-pages",'
+                '"terminal-logical-window-covers-advertised-pre",'
+                '"source-issued-continuation",'
+                '"returned-resource-content"]'::jsonb THEN
+            max_advertised_count_decrease := 0;
+            terminal_count_window_required := TRUE;
+    """
+    profile_sql = (
+        exact_profile_sql
+        + (bounded_profile_sql if reviewed_subset_profile_aware else "")
+        + (
+            terminal_window_profile_sql
+            if reviewed_subset_terminal_window_profile_aware
+            else ""
+        )
+        + """
         ELSE
             RETURN FALSE;
         END IF;
         """
-        if reviewed_subset_profile_aware
+        if (
+            reviewed_subset_profile_aware
+            or reviewed_subset_terminal_window_profile_aware
+        )
         else "max_advertised_count_decrease := 0;"
+    )
+    terminal_window_declaration_sql = (
+        "terminal_count_window_required boolean := FALSE;"
+        if reviewed_subset_terminal_window_profile_aware
+        else ""
+    )
+    terminal_window_limit_sql = (
+        """
+            IF terminal_count_window_required THEN
+                max_advertised_count_decrease := LEAST(
+                    page_count * 20,
+                    pg_catalog.ceil(advertised_pre / 100::numeric)
+                );
+            END IF;
+        """
+        if reviewed_subset_terminal_window_profile_aware
+        else ""
+    )
+    terminal_window_geometry_sql = (
+        """
+               OR (
+                    terminal_count_window_required
+                    AND (
+                        (resource_value ->> 'logical_terminal_offset')::numeric
+                            > advertised_pre
+                        OR advertised_pre >
+                            (resource_value ->>
+                                'logical_window_end_offset')::numeric
+                    )
+               )
+        """
+        if reviewed_subset_terminal_window_profile_aware
+        else ""
     )
     return f"""
     {create_function} {proof_valid_ref}(
@@ -894,6 +953,7 @@ def _proof_shape_valid_function_sql(
         dataset_resource_count numeric;
         dataset_count_sum numeric := 0;
         max_advertised_count_decrease numeric;
+        {terminal_window_declaration_sql}
         cutoff_value text;
     BEGIN
         {profile_sql}
@@ -992,6 +1052,7 @@ def _proof_shape_valid_function_sql(
                 (resource_value ->> 'empty_pages')::numeric;
             terminal_entries :=
                 (resource_value ->> 'terminal_entries')::numeric;
+            {terminal_window_limit_sql}
             IF advertised_post > advertised_pre
                OR advertised_pre - advertised_post >
                     max_advertised_count_decrease
@@ -1006,6 +1067,7 @@ def _proof_shape_valid_function_sql(
                     (pages - 1) * page_count
                OR (resource_value ->> 'logical_window_end_offset')::numeric <>
                     pages * page_count
+               {terminal_window_geometry_sql}
                OR terminal_entries > page_count
                OR returned_unique > pages * page_count
                OR sparse_pages > pages
@@ -2833,6 +2895,7 @@ def _subset_source_fixed_identity_sql(
     dataset_alias: str,
     *,
     reviewed_subset_profile_aware: bool = False,
+    reviewed_subset_terminal_window_profile_aware: bool = False,
 ) -> str:
     resource_types_sql = ", ".join(
         _ql(resource_type) for resource_type in _SUBSET_RESOURCE_TYPES
@@ -2853,6 +2916,22 @@ def _subset_source_fixed_identity_sql(
     page_caps = (
         f"({source_metadata} -> "
         "'provider_directory_resource_page_count_caps')"
+    )
+    terminal_window_profile_sql = (
+        f"""
+            OR (
+                {dataset_alias}.completion_proof_json ->> 'strategy_version' =
+                    'provider-directory-fhir-server-issued-traversal-subset-v5'
+                AND {dataset_alias}.completion_proof_json
+                    -> 'completion_scopes' =
+                    '["advertised-count-monotone-decrease-bounded-by-one-percent-and-twenty-pages",'
+                    '"terminal-logical-window-covers-advertised-pre",'
+                    '"source-issued-continuation",'
+                    '"returned-resource-content"]'::jsonb
+            )
+        """
+        if reviewed_subset_terminal_window_profile_aware
+        else ""
     )
     profile_sql = (
         f"""
@@ -2880,9 +2959,13 @@ def _subset_source_fixed_identity_sql(
                     '"source-issued-continuation",'
                     '"returned-resource-content"]'::jsonb
             )
+            {terminal_window_profile_sql}
         )
         """
-        if reviewed_subset_profile_aware
+        if (
+            reviewed_subset_profile_aware
+            or reviewed_subset_terminal_window_profile_aware
+        )
         else f"""
         {source_metadata}
             ->> 'provider_directory_current_version_census_strategy_version' =
@@ -2956,6 +3039,7 @@ def _subset_source_sql(
     require_physical_match: bool = True,
     reviewed_root_policy_aware: bool = False,
     reviewed_subset_profile_aware: bool = False,
+    reviewed_subset_terminal_window_profile_aware: bool = False,
 ) -> str:
     """Bind a terminal row to its current reviewed manual source."""
 
@@ -2966,6 +3050,9 @@ def _subset_source_sql(
         source_metadata,
         dataset_alias,
         reviewed_subset_profile_aware=reviewed_subset_profile_aware,
+        reviewed_subset_terminal_window_profile_aware=(
+            reviewed_subset_terminal_window_profile_aware
+        ),
     )
     scope_payload_sql = _subset_source_scope_payload_sql(
         "current_source",
@@ -3092,6 +3179,7 @@ def _subset_published_source_guard_sql(
     replace_existing: bool = False,
     reviewed_root_policy_aware: bool = False,
     reviewed_subset_profile_aware: bool = False,
+    reviewed_subset_terminal_window_profile_aware: bool = False,
 ) -> str:
     """Reject source mutations that invalidate published subset evidence."""
 
@@ -3105,6 +3193,9 @@ def _subset_published_source_guard_sql(
         require_physical_match=True,
         reviewed_root_policy_aware=reviewed_root_policy_aware,
         reviewed_subset_profile_aware=reviewed_subset_profile_aware,
+        reviewed_subset_terminal_window_profile_aware=(
+            reviewed_subset_terminal_window_profile_aware
+        ),
     )
     create_function = (
         "CREATE OR REPLACE FUNCTION"
@@ -3268,6 +3359,7 @@ def _subset_endpoint_dataset_guard_sql(
     use_configured_endpoint_identity: bool = False,
     reviewed_root_policy_aware: bool = False,
     reviewed_subset_profile_aware: bool = False,
+    reviewed_subset_terminal_window_profile_aware: bool = False,
 ) -> str:
     guard_ref = _qf(schema, _ENDPOINT_DATASET_GUARD)
     source_ref = _qf(schema, _SOURCE)
@@ -3294,6 +3386,9 @@ def _subset_endpoint_dataset_guard_sql(
         require_physical_match=not use_configured_endpoint_identity,
         reviewed_root_policy_aware=reviewed_root_policy_aware,
         reviewed_subset_profile_aware=reviewed_subset_profile_aware,
+        reviewed_subset_terminal_window_profile_aware=(
+            reviewed_subset_terminal_window_profile_aware
+        ),
     )
     published_source_sql = _subset_source_sql(
         schema,
@@ -3302,6 +3397,9 @@ def _subset_endpoint_dataset_guard_sql(
         require_physical_match=True,
         reviewed_root_policy_aware=reviewed_root_policy_aware,
         reviewed_subset_profile_aware=reviewed_subset_profile_aware,
+        reviewed_subset_terminal_window_profile_aware=(
+            reviewed_subset_terminal_window_profile_aware
+        ),
     )
     metadata = "NEW.publication_metadata_json::jsonb"
     expected_coverage_state_sql = (
@@ -3791,10 +3889,26 @@ def _subset_proof_shape_check(
     schema: str,
     *,
     reviewed_subset_profile_aware: bool = False,
+    reviewed_subset_terminal_window_profile_aware: bool = False,
 ) -> str:
     proof_shape_valid_ref = _qf(schema, _PROOF_SHAPE_VALID_FUNCTION)
-    profile_sql = (
+    terminal_window_profile_sql = (
         """
+        OR (
+            completion_proof_json ->> 'strategy_version' =
+                'provider-directory-fhir-server-issued-traversal-subset-v5'
+            AND completion_proof_json -> 'completion_scopes' =
+                '["advertised-count-monotone-decrease-bounded-by-one-percent-and-twenty-pages",'
+                '"terminal-logical-window-covers-advertised-pre",'
+                '"source-issued-continuation",'
+                '"returned-resource-content"]'::jsonb
+        )
+        """
+        if reviewed_subset_terminal_window_profile_aware
+        else ""
+    )
+    profile_sql = (
+        f"""
         (
             completion_proof_json ->> 'strategy_version' =
                 'provider-directory-fhir-server-issued-traversal-subset-v3'
@@ -3810,8 +3924,12 @@ def _subset_proof_shape_check(
                 '"source-issued-continuation",'
                 '"returned-resource-content"]'::jsonb
         )
+        {terminal_window_profile_sql}
         """
-        if reviewed_subset_profile_aware
+        if (
+            reviewed_subset_profile_aware
+            or reviewed_subset_terminal_window_profile_aware
+        )
         else """
         completion_proof_json ->> 'strategy_version' =
             'provider-directory-fhir-server-issued-traversal-subset-v3'

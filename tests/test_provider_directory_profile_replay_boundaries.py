@@ -142,7 +142,7 @@ async def test_attested_profile_returns_committed_replay_before_build(
     )
 
     replay.assert_awaited_once()
-    serving_bootstrap.assert_awaited_once_with(importer._schema())
+    serving_bootstrap.assert_not_awaited()
     replay_publish.assert_awaited_once()
     build.assert_not_awaited()
     assert importer.PROFILE_SELECTION_RESULT_METRIC in publication_result
@@ -284,10 +284,13 @@ async def test_admitted_profile_publish_never_runs_canonical_npi_backfill(
     )
 
     metrics = await importer._publish_provider_directory_artifacts(
-        run_id="run_" + "1" * 32,
-        metrics={},
-        source_ids=["pdfhir_payer"],
-        publish_artifacts_targets={"profile"},
+        importer.ProviderDirectoryArtifactPublishRequest(
+            run_id="run_" + "1" * 32,
+            metrics={},
+            source_ids=["pdfhir_payer"],
+            publish_corroboration=False,
+            publish_artifacts_targets={"profile"},
+        )
     )
 
     assert metrics["resource_id_npis_backfilled"] == {

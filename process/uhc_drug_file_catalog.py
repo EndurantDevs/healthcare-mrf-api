@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
+from yarl import URL
+
 from process.uhc_provider_file_catalog_artifacts import (
     validate_retained_catalog_payloads,
 )
@@ -29,9 +31,7 @@ from process.uhc_provider_file_catalog_contract import (
 DRUG_FORMULARY = "drug_formulary"
 DRUG_CATALOG_CONTRACT = "healthporta-uhc-drug-file-catalog-v1"
 DRUG_RAW_PROJECTION_CONTRACT = "healthporta-uhc-drug-listing-projection-v1"
-DRUG_CATALOG_ACQUISITION_CONTRACT = (
-    "healthporta-uhc-drug-catalog-acquisition-v1"
-)
+DRUG_CATALOG_ACQUISITION_CONTRACT = "healthporta-uhc-drug-catalog-acquisition-v1"
 EXPECTED_DRUG_FILE_COUNTS = {"cs": 24, "ifp": 24}
 
 
@@ -47,6 +47,22 @@ class UHCObservedDrugCatalog:
     collection_summary: tuple[dict[str, Any], ...]
 
 
+def _canonical_drug_source_url(value: object) -> str:
+    """Reject transport-equivalent spellings before identity hashing."""
+
+    source_url = trusted_public_https_url(value)
+    decoded_path = unquote(urlsplit(source_url).path)
+    if any(segment in {".", ".."} for segment in decoded_path.split("/")):
+        raise UHCFileCatalogError("UHC drug catalog source URL contains a dot segment")
+    try:
+        canonical_url = str(URL(source_url))
+    except (TypeError, ValueError):
+        raise UHCFileCatalogError("UHC drug catalog source URL is invalid") from None
+    if canonical_url != source_url:
+        raise UHCFileCatalogError("UHC drug catalog source URL is not canonical")
+    return source_url
+
+
 def _drug_source_url(
     family: str,
     file_name: str,
@@ -56,7 +72,7 @@ def _drug_source_url(
     if type(is_external) is not bool:
         raise UHCFileCatalogError("UHC drug catalog external marker is invalid")
     if is_external:
-        source_url = trusted_public_https_url(entry_by_field.get("url"))
+        source_url = _canonical_drug_source_url(entry_by_field.get("url"))
         if unquote(urlsplit(source_url).path.rsplit("/", 1)[-1]) != file_name:
             raise UHCFileCatalogError(
                 "UHC drug external URL does not match its basename"
@@ -68,7 +84,7 @@ def _drug_source_url(
         raise UHCFileCatalogError(
             "UHC drug catalog blob path does not match its collection"
         )
-    return trusted_public_https_url(
+    return _canonical_drug_source_url(
         urljoin(CATALOG_BASE_URL, f"/api/stream/{quote(blob_path, safe='/')}")
     )
 
@@ -132,9 +148,7 @@ def _catalog_files_from_payload(
         if catalog_file is None:
             continue
         if catalog_file.file_name in logical_names:
-            raise UHCFileCatalogError(
-                "UHC drug catalog contains a duplicate basename"
-            )
+            raise UHCFileCatalogError("UHC drug catalog contains a duplicate basename")
         logical_names.add(catalog_file.file_name)
         files.append(catalog_file)
     if len(files) != EXPECTED_DRUG_FILE_COUNTS[family]:
@@ -166,11 +180,10 @@ def _validate_drug_file(catalog_file: UHCFileCatalogItem) -> None:
         or not catalog_file.file_name.isprintable()
     ):
         raise UHCFileCatalogError("UHC drug catalog file identity is invalid")
-    source_url = trusted_public_https_url(catalog_file.source_url)
+    source_url = _canonical_drug_source_url(catalog_file.source_url)
     source_path = unquote(urlsplit(source_url).path)
     is_expected_internal = source_path == (
-        f"/api/stream/ui/{catalog_file.family}/drugs/"
-        f"{catalog_file.file_name}"
+        f"/api/stream/ui/{catalog_file.family}/drugs/" f"{catalog_file.file_name}"
     )
     if not is_expected_internal and source_path.rsplit("/", 1)[-1] != (
         catalog_file.file_name
@@ -196,6 +209,27 @@ def _validate_drug_file(catalog_file: UHCFileCatalogItem) -> None:
         raise UHCFileCatalogError("UHC drug catalog file identity is inconsistent")
 
 
+def _require_unique_source_urls(
+    files: tuple[UHCFileCatalogItem, ...],
+) -> None:
+    normalized_source_coordinates = []
+    for catalog_file in files:
+        source_url = _canonical_drug_source_url(catalog_file.source_url)
+        parsed_source = urlsplit(source_url)
+        decoded_path = unquote(parsed_source.path)
+        normalized_source_coordinates.append(
+            (
+                (parsed_source.hostname or "").lower(),
+                parsed_source.port or 443,
+                decoded_path,
+            )
+        )
+    if len(set(normalized_source_coordinates)) != len(normalized_source_coordinates):
+        raise UHCFileCatalogError(
+            "UHC drug catalog reuses one source URL across file identities"
+        )
+
+
 def _acquisition_contract_sha256(
     drug_set_sha256: str,
     raw_listing_projection_sha256: str,
@@ -205,9 +239,7 @@ def _acquisition_contract_sha256(
             {
                 "contract": DRUG_CATALOG_ACQUISITION_CONTRACT,
                 "drug_set_sha256": drug_set_sha256,
-                "raw_listing_projection_sha256": (
-                    raw_listing_projection_sha256
-                ),
+                "raw_listing_projection_sha256": (raw_listing_projection_sha256),
             }
         )
     )
@@ -226,6 +258,7 @@ def validate_observed_drug_catalog(catalog: UHCObservedDrugCatalog) -> None:
         catalog.files
     ):
         raise UHCFileCatalogError("UHC drug catalog file identity collision")
+    _require_unique_source_urls(catalog.files)
     expected_collection_summaries = tuple(
         {
             "availability": "published",
@@ -245,10 +278,7 @@ def validate_observed_drug_catalog(catalog: UHCObservedDrugCatalog) -> None:
         if (
             type(digest_value) is not str
             or len(digest_value) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in digest_value
-            )
+            or any(character not in "0123456789abcdef" for character in digest_value)
         ):
             raise UHCFileCatalogError("UHC drug catalog proof is invalid")
     expected_set_sha256 = _drug_set_sha256(
@@ -261,8 +291,7 @@ def validate_observed_drug_catalog(catalog: UHCObservedDrugCatalog) -> None:
     )
     if (
         catalog.drug_set_sha256 != expected_set_sha256
-        or catalog.acquisition_contract_sha256
-        != expected_acquisition_sha256
+        or catalog.acquisition_contract_sha256 != expected_acquisition_sha256
     ):
         raise UHCFileCatalogError("UHC drug catalog hashes are inconsistent")
 
@@ -283,9 +312,7 @@ def _raw_listing_projection_sha256(
     try:
         return sha256_text(canonical_json(projection_by_field))
     except (TypeError, ValueError):
-        raise UHCFileCatalogError(
-            "UHC drug listing projection is invalid"
-        ) from None
+        raise UHCFileCatalogError("UHC drug listing projection is invalid") from None
 
 
 def observed_drug_catalog_from_payloads(
@@ -301,8 +328,7 @@ def observed_drug_catalog_from_payloads(
         type(source_raw_set_sha256) is not str
         or len(source_raw_set_sha256) != 64
         or any(
-            character not in "0123456789abcdef"
-            for character in source_raw_set_sha256
+            character not in "0123456789abcdef" for character in source_raw_set_sha256
         )
     ):
         raise UHCFileCatalogError("UHC drug source catalog proof is invalid")
@@ -317,6 +343,7 @@ def observed_drug_catalog_from_payloads(
     )
     if len({catalog_file.file_id for catalog_file in files}) != len(files):
         raise UHCFileCatalogError("UHC drug catalog file identity collision")
+    _require_unique_source_urls(files)
     collection_summaries = tuple(
         {
             "availability": "published",
@@ -328,9 +355,7 @@ def observed_drug_catalog_from_payloads(
         for family in sorted(files_by_family)
     )
     drug_set_sha256 = _drug_set_sha256(files, collection_summaries)
-    raw_listing_projection_sha256 = _raw_listing_projection_sha256(
-        payloads_by_family
-    )
+    raw_listing_projection_sha256 = _raw_listing_projection_sha256(payloads_by_family)
     return UHCObservedDrugCatalog(
         files=files,
         drug_set_sha256=drug_set_sha256,
@@ -349,9 +374,7 @@ def validate_retained_drug_catalog_proof(
 ) -> tuple[dict[str, Any], UHCObservedDrugCatalog]:
     """Rehash the retained listings before deriving their drug-file set."""
 
-    normalized_proof, payloads_by_family = validate_retained_catalog_payloads(
-        raw_proof
-    )
+    normalized_proof, payloads_by_family = validate_retained_catalog_payloads(raw_proof)
     catalog = observed_drug_catalog_from_payloads(
         payloads_by_family,
         source_raw_set_sha256=normalized_proof["raw_set_sha256"],

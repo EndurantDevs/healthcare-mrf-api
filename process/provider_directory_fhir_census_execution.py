@@ -17,6 +17,9 @@ from process.provider_directory_fhir_census_cursor import (
     resolved_current_version_census_next_url,
     validate_census_resume_url as _validate_resume_url,
 )
+from process.provider_directory_fhir_census_failure import (
+    completion_failure as _completion_failure,
+)
 from process.provider_directory_fhir_census_page_geometry import (
     CURRENT_VERSION_CENSUS_PAGE_GEOMETRY_FIELD,
     CURRENT_VERSION_CENSUS_PAGE_GEOMETRY_VERSION,
@@ -29,7 +32,7 @@ from process.provider_directory_fhir_census_page_geometry import (
 from process.provider_directory_fhir_subset_execution import (
     has_valid_reviewed_subset_counts,
     has_valid_subset_completed_fields,
-    reviewed_subset_count_decrease_from_proof,
+    reviewed_subset_completion_constraints,
     subset_completed_fields,
 )
 
@@ -174,51 +177,6 @@ def current_version_census_persisted_pre_count(
     return pre_count
 
 
-def _current_version_census_failure(
-    *,
-    pre_count: int,
-    post_count: int,
-    processed_rows: int,
-    unique_candidate_rows: int,
-) -> str | None:
-    if post_count != pre_count:
-        return "census_drift"
-    if processed_rows < pre_count:
-        return "cursor_loss"
-    if processed_rows != unique_candidate_rows:
-        return "duplicate_resource_ids"
-    if processed_rows != pre_count:
-        return "processed_count_mismatch"
-    return None
-
-
-def _completion_failure(
-    max_advertised_count_decrease: int | None,
-    *,
-    pre_count: int,
-    post_count: int,
-    processed_rows: int,
-    unique_candidate_rows: int,
-) -> str | None:
-    """Return the exact or declared-subset terminal failure code."""
-
-    if max_advertised_count_decrease is None:
-        return _current_version_census_failure(
-            pre_count=pre_count,
-            post_count=post_count,
-            processed_rows=processed_rows,
-            unique_candidate_rows=unique_candidate_rows,
-        )
-    advertised_count_decrease = pre_count - post_count
-    if not 0 <= advertised_count_decrease <= max_advertised_count_decrease:
-        return "census_drift"
-    if processed_rows != unique_candidate_rows:
-        return "duplicate_resource_ids"
-    if unique_candidate_rows > post_count:
-        return "returned_count_exceeds_advertised"
-    return None
-
-
 def _validated_completion_counts(
     initial_proof: Mapping[str, Any],
     post_count: int,
@@ -279,13 +237,10 @@ def current_version_census_completed_proof(
     expected_page_count: int,
     terminal_page_entry_count: int,
 ) -> dict[str, Any]:
-    """Require advertised-total equality before marking a resource verified."""
+    """Apply the declared count profile before marking a resource verified."""
 
     count_by_name = _validated_completion_counts(
-        initial_proof,
-        post_count,
-        processed_rows,
-        unique_candidate_rows,
+        initial_proof, post_count, processed_rows, unique_candidate_rows
     )
     pre_count = count_by_name["pre_count"]
     terminal_page_geometry = current_version_census_terminal_page_geometry(
@@ -296,13 +251,15 @@ def current_version_census_completed_proof(
         terminal_page_entry_count=terminal_page_entry_count,
     )
     is_subset_v3 = initial_proof.get("contract_version") == 3
-    max_advertised_count_decrease = (
-        reviewed_subset_count_decrease_from_proof(initial_proof)
+    max_advertised_count_decrease, is_terminal_count_window_required = (
+        reviewed_subset_completion_constraints(initial_proof)
         if is_subset_v3
-        else None
+        else (None, False)
     )
     failure = _completion_failure(
         max_advertised_count_decrease,
+        is_terminal_count_window_required=is_terminal_count_window_required,
+        terminal_page_geometry=terminal_page_geometry,
         pre_count=pre_count,
         post_count=post_count,
         processed_rows=processed_rows,
@@ -418,7 +375,9 @@ def validated_current_version_census_completed_proof(
     has_valid_counts = (
         has_valid_reviewed_subset_counts(
             count_by_name,
-            contract.max_advertised_count_decrease,
+            contract.advertised_count_decrease_limit(
+                count_by_name.get("pre_count")
+            ),
         )
         if is_subset_v3
         else _has_valid_completed_counts(count_by_name)
@@ -428,6 +387,9 @@ def validated_current_version_census_completed_proof(
             completeness,
             count_by_name,
             contract.page_count,
+            is_terminal_count_window_required=(
+                contract.is_terminal_count_window_required
+            ),
         )
         if is_subset_v3
         else True

@@ -8,9 +8,7 @@ import json
 from typing import Any
 
 from process.provider_directory_terminal_root_retirement_contract import (
-    RETIREMENT_METADATA_KEY,
     RETIREMENT_STATUS,
-    RETIREMENT_VALID_FUNCTION,
     TerminalRootRetirementError,
     TerminalRootRetirementRequest,
     TerminalRootRetirementResult,
@@ -31,10 +29,13 @@ async def _require_read_committed(database: Any) -> None:
         raise TerminalRootRetirementError("state_invalid")
 
 
-async def _require_valid_retirement(database: Any, dataset_id: str) -> None:
+async def _require_valid_retirement(
+    database: Any,
+    selection: TerminalRootRetirementSelection,
+) -> None:
     is_valid = await database.scalar(
-        f"SELECT {quoted_relation(RETIREMENT_VALID_FUNCTION)}(:dataset_id);",
-        dataset_id=dataset_id,
+        f"SELECT {quoted_relation(selection.profile.valid_function)}(:dataset_id);",
+        dataset_id=selection.request.dataset_id,
     )
     if is_valid is not True:
         raise TerminalRootRetirementError("state_invalid")
@@ -56,7 +57,7 @@ async def preview_terminal_root_retirement_transaction(
         await _require_read_committed(database)
         selection = await selected_terminal_root_retirement(database, request)
         if selection.prior_status == RETIREMENT_STATUS:
-            await _require_valid_retirement(database, request.dataset_id)
+            await _require_valid_retirement(database, selection)
         return _selection_evidence_sha256(selection)
 
 
@@ -103,7 +104,7 @@ async def _apply_parent_cas(
            AND NOT (publication_metadata_json::jsonb ? :marker_key);
         """,
         retirement_status=RETIREMENT_STATUS,
-        marker_key=RETIREMENT_METADATA_KEY,
+        marker_key=selection.profile.metadata_key,
         marker_json=marker_json,
         dataset_id=request.dataset_id,
         endpoint_id=request.endpoint_id,
@@ -130,7 +131,7 @@ async def apply_terminal_root_retirement_transaction(
         selection = await selected_terminal_root_retirement(database, request)
         marker_sha256 = canonical_json_sha256(selection.marker_by_field)
         if selection.prior_status == RETIREMENT_STATUS:
-            await _require_valid_retirement(database, request.dataset_id)
+            await _require_valid_retirement(database, selection)
             return TerminalRootRetirementResult(
                 retired=False,
                 marker_sha256=marker_sha256,
@@ -138,7 +139,7 @@ async def apply_terminal_root_retirement_transaction(
         if _selection_evidence_sha256(selection) != request.expected_evidence_sha256:
             raise TerminalRootRetirementError("evidence_changed")
         await _apply_parent_cas(database, selection)
-        await _require_valid_retirement(database, request.dataset_id)
+        await _require_valid_retirement(database, selection)
         return TerminalRootRetirementResult(
             retired=True,
             marker_sha256=marker_sha256,

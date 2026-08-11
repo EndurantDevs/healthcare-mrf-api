@@ -27,8 +27,22 @@ and atomic candidate build: it reads official catalog files instead of FHIR
 REST pages.
 
 The normal CLI selects it with `--import-resources --source-id
-pdfhir_2754e999dd691175821ec26e`. `--uhc-catalog-set-sha256` is an optional
-exact-current-catalog assertion, not a separate execution mode.
+pdfhir_2754e999dd691175821ec26e`. Admission also requires the lowercase
+SHA-256 of the exact reviewed catalog through `--uhc-catalog-set-sha256` and
+the closed acquisition profile. Omitting the pin, using a different current
+catalog, or changing any profile field fails before acquisition:
+
+```bash
+python main.py start provider-directory-fhir \
+  --run-id "$UHC_PROVIDER_FILE_RUN_ID" \
+  --source-id pdfhir_2754e999dd691175821ec26e \
+  --import-resources \
+  --uhc-catalog-set-sha256 "$UHC_CATALOG_SET_SHA256" \
+  --open-only \
+  --no-bulk-export \
+  --concurrency 1 \
+  --linked-resource-deadline-seconds 0
+```
 
 Missing official files download concurrently with a default bound of four and
 a hard cap of eight. Native retention/admission and independent semantic files
@@ -53,7 +67,13 @@ The existing healthcare read-model wire field remains `entry_id: "uhc"` for down
 
 The 24 IFP states are explicitly enumerated and the provider and plan files normalize to one shared logical scope per state. `UHCEX_HIX` is an explicitly unpaired, retained-only provider scope with `jurisdiction: null`; its token alone does not prove national coverage. Community & State files never pair to IFP plan files.
 
-The live census proved the 53 Community & State product tokens, but not authoritative jurisdiction metadata. Every Community & State logical scope therefore retains its exact product and carries `jurisdiction: null`. No state is inferred from a token prefix, and ambiguous tokens such as `HMOSNP` and `PPOSNP` are not asserted to be national. Publication remains gated until reviewed jurisdiction evidence exists.
+The live census proved the 53 Community & State product tokens, but not
+authoritative jurisdiction metadata. Every Community & State logical scope
+therefore retains its exact product and carries `jurisdiction: null`. No state
+is inferred from a token prefix, and ambiguous tokens such as `HMOSNP` and
+`PPOSNP` are not asserted to be national. Publication preserves those reviewed
+null-jurisdiction scopes exactly; a later jurisdiction enrichment must be a
+separately reviewed, identity-changing contract update.
 
 Parsing is census-closed. The public API always loads the repository census and verifies its frozen semantic digest; callers cannot substitute a census object or alternate path. Unknown names, case drift, unsafe paths, duplicates, missing files, wrong family or collection assignments, and broken IFP pairs fail the contract.
 

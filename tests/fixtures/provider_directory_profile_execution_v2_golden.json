@@ -3,42 +3,492 @@
   "probe": false,
   "provider_directory_profile_capacity_attestation": {
     "lease": {
-      "attestation_id": "98af1e6bde11df82027a9ea99f22f9c9ceed02cdfcc38f8fc7b6a06189f2e1e3",
+      "attestation_id": "8ad1f42240f8345f8b87310ef9456ed819b7c3073dee6932b189df532d2356ba",
       "attestor_id": "capacity-authority-dev",
       "attestor_release_digest": "1111111111111111111111111111111111111111111111111111111111111111",
       "capacity_geometry_hash": "5555555555555555555555555555555555555555555555555555555555555555",
-      "contract_id": "provider-directory-database-capacity-lease-v2",
+      "contract_id": "provider-directory-database-capacity-lease-v3",
       "database_name": "healthporta_test",
       "database_oid": 16401,
       "database_system_identifier": "7527713908662902214",
-      "environment_id": "dev-us",
-      "expires_at": "2026-07-30T13:00:00Z",
-      "issued_at": "2026-07-30T12:00:01Z",
-      "key_id": "capacity-key-2026-07",
-      "max_build_deadline": "2026-07-30T12:55:00Z",
-      "nonce": "2222222222222222222222222222222222222222222222222222222222222222",
-      "observed_at": "2026-07-30T12:00:00Z",
-      "reservation_id": "pd-capacity-reservation-7",
-      "runtime_witness": {
-        "healthcare_source_commit": "1212121212121212121212121212121212121212",
-        "healthcare_image_digest": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
-        "import\u005fcontrol_source_commit": "1414141414141414141414141414141414141414",
-        "import\u005fcontrol_image_digest": "sha256:1515151515151515151515151515151515151515151515151515151515151515",
-        "profile_migration_revision": "20260801130000_provider_directory_capacity_lease_v2",
-        "profile_schema_version": 1,
-        "profile_strategy_version": "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5",
-        "postgres_server_version_num": 180002
-      },
-      "runtime_witness_sha256": "91be002a5ba3464ab0b5b3bfb8d6baebc762df94dd96d3e2254753fc0822a7ea",
       "deployment_witness": {
-        "flux_revision": "main@sha1:1616161616161616161616161616161616161616",
         "bootstrap_config_sha256": "1717171717171717171717171717171717171717171717171717171717171717",
+        "flux_revision": "main@sha1:1616161616161616161616161616161616161616",
         "kubernetes_snapshot_sha256": "1818181818181818181818181818181818181818181818181818181818181818",
         "preflight_pod_name": "healthcare-mrf-api-abc123",
         "preflight_pod_uid": "11111111-2222-3333-4444-555555555555",
         "preflight_transport": "kubectl_exec_loopback_8080"
       },
+      "environment_id": "dev-us",
+      "expires_at": "2026-07-30T13:00:00Z",
+      "issued_at": "2026-07-30T12:00:01Z",
+      "key_id": "capacity-key-2026-07",
+      "max_build_deadline": "2026-07-30T12:55:00Z",
+      "nonce": "79b15f27b2ff3b1d6fddb7b2e2b5d205ba58cbc3f0ae4e3c6d12b11f1e0d7be1",
+      "observed_at": "2026-07-30T12:00:00Z",
+      "reservation_id": "pd-capacity-reservation-7",
+      "runtime_witness": {
+        "control_plane_image_digest": "sha256:1515151515151515151515151515151515151515151515151515151515151515",
+        "control_plane_source_commit": "1414141414141414141414141414141414141414",
+        "healthcare_image_digest": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
+        "healthcare_source_commit": "1212121212121212121212121212121212121212",
+        "postgres_server_version_num": 180002,
+        "profile_migration_revision": "20260811110000_ptg_v12_mainline_merge",
+        "profile_schema_version": 1,
+        "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
+      },
+      "runtime_witness_sha256": "fa6f17d637cc47f2d888245522ce0a58017e15609c19a430672eeae9bf83f51b",
       "signature_algorithm": "Ed25519",
+      "signing_preflight_guard": {
+        "bundle_validation_path": "/v1/provider-directory/profile-capacity-bundle-validation",
+        "capacity_limits_sha256": "0019cd18a238d6abd97c1b72ef795bb00d6612b92cac06e28a8318885af8980e",
+        "contract_id": "healthporta.provider-directory-profile-capacity-signing-preflight-guard.v1",
+        "control_plane_preflight_path": "/v1/provider-directory/profile-capacity-signing-preflight",
+        "control_plane_receipt": {
+          "capacity_limits_sha256": "0019cd18a238d6abd97c1b72ef795bb00d6612b92cac06e28a8318885af8980e",
+          "contract_id": "healthporta.provider-directory-profile-capacity-control-plane-preflight.v1",
+          "expires_at": "2026-07-30T13:00:00Z",
+          "held_followup": {
+            "applied_generation": 10,
+            "authority_epoch": 7,
+            "descriptor_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+            "desired_generation": 11,
+            "followup_preimage_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+            "hold_until": "2026-07-30T13:05:00Z",
+            "node_id": "dev-node",
+            "profile_key": "provider-directory-global-profile",
+            "status": "queued"
+          },
+          "issued_at": "2026-07-30T12:00:01Z",
+          "max_build_deadline": "2026-07-30T12:55:00Z",
+          "profile_execution_identity": {
+            "execution_contract_id": "healthporta.provider-directory-profile-execution.v2",
+            "generation": 11,
+            "materialization_mode": "source_delta",
+            "operation": "publish",
+            "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
+            "profile_schema_version": 1,
+            "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
+            "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
+            "selection_proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+            "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
+          },
+          "quiescence": {
+            "active_held_dispatch_count": 0,
+            "active_profile_run_count": 0,
+            "contract_id": "healthporta.provider-directory-profile-capacity-control-plane-quiescence.v1",
+            "followup_preimage_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+          },
+          "quiescence_sha256": "05f35c4d363c20b2e426fb1511e6143d52696db6ebcc89695058e7beaf7aa1ba",
+          "receipt_sha256": "39bea0c0d6ce30f7a6a4e998c133656318b0a34365d67be0afbd04088c72db16",
+          "request_contract_id": "healthporta.provider-directory-profile-capacity-control-plane-preflight-request.v1",
+          "request_nonce": "2222222222222222222222222222222222222222222222222222222222222222",
+          "request_sha256": "86d9da554574984b79146a5d41de9bbea76aa020490dd08e49543089756769dd",
+          "storage_observation_sha256": "44d9973fe27ae20acfed91ee82c01b4a8c57dcd8a6291435599f220a3257ef0f"
+        },
+        "control_plane_receipt_sha256": "39bea0c0d6ce30f7a6a4e998c133656318b0a34365d67be0afbd04088c72db16",
+        "control_plane_request": {
+          "contract_id": "healthporta.provider-directory-profile-capacity-control-plane-preflight-request.v1",
+          "profile_execution": {
+            "import_resources": false,
+            "probe": false,
+            "provider_directory_profile_capacity_attestation": {},
+            "provider_directory_profile_contract_id": "healthporta.provider-directory-profile-execution.v2",
+            "provider_directory_profile_generation": 11,
+            "provider_directory_profile_selection_attestation": {
+              "authority_revision": 7,
+              "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "contract_id": "healthporta.provider-directory-profile-selection-attestation.v1",
+              "node_id": "dev-node",
+              "operation": "publish",
+              "pairs": [
+                {
+                  "acquisition_root_run_id": "synthetic-run-root-1",
+                  "dataset_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "dataset_id": "synthetic-dataset-1",
+                  "endpoint_id": "synthetic-endpoint-1",
+                  "is_current": true,
+                  "lineage_authority": "healthcare-mrf-api.provider-directory-selection-proof.v1",
+                  "publication_status": "published",
+                  "source_id": "synthetic_profile_source"
+                }
+              ],
+              "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
+              "profile_schema_version": 1,
+              "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
+              "proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+              "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
+              "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
+            },
+            "publish_artifacts_only": true,
+            "publish_artifacts_targets": [
+              "profile"
+            ],
+            "publish_corroboration": false,
+            "require_complete_global_profile_fence": true,
+            "source_ids": []
+          },
+          "provider_directory_profile_capacity_limits": {
+            "artifact_scope_batch_size": 100000,
+            "contract_id": "healthporta.provider-directory-profile-capacity-limits.v2",
+            "lock_timeout_ms": 5000,
+            "maintenance_work_mem_bytes": 67108864,
+            "max_affected_npis": 2000000,
+            "max_artifact_scope_rows": 5000000,
+            "max_build_seconds": 3600,
+            "max_evidence_rows": 10000000,
+            "max_profile_rows": 2000000,
+            "minimum_remaining_bytes": 1000000,
+            "pool_reserve_connections": 4,
+            "relation_byte_caps": [
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "artifact_scope"
+              },
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "evidence_stage"
+              },
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "affected_npi_stage"
+              },
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "profile_stage"
+              },
+              {
+                "max_deleted_logical_bytes": 30000,
+                "max_scratch_bytes": 0,
+                "max_target_growth_bytes": 20000,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "evidence_target"
+              },
+              {
+                "max_deleted_logical_bytes": 30000,
+                "max_scratch_bytes": 0,
+                "max_target_growth_bytes": 20000,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "profile_target"
+              }
+            ],
+            "statement_timeout_ms": 60000,
+            "temp_file_limit_bytes": 1024,
+            "work_mem_bytes": 4194304
+          },
+          "signing_intent": {
+            "contract_id": "healthporta.provider-directory-profile-capacity-signing-intent.v1",
+            "request_nonce": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "storage_observation": {
+            "expires_at": "2026-07-30T13:00:00Z",
+            "issued_at": "2026-07-30T12:00:01Z",
+            "max_build_deadline": "2026-07-30T12:55:00Z",
+            "observed_at": "2026-07-30T12:00:00Z",
+            "temp_tablespace": {
+              "tablespace_name": "pg_default",
+              "tablespace_oid": 1663,
+              "volume_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+            },
+            "volumes": [
+              {
+                "available_after_all_reservations_bytes": 650000000000,
+                "available_bytes": 1000000000000,
+                "volume_class": "data",
+                "volume_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+              },
+              {
+                "available_after_all_reservations_bytes": 650000000000,
+                "available_bytes": 1000000000000,
+                "volume_class": "temp",
+                "volume_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+              },
+              {
+                "available_after_all_reservations_bytes": 650000000000,
+                "available_bytes": 1000000000000,
+                "volume_class": "wal",
+                "volume_digest": "4444444444444444444444444444444444444444444444444444444444444444"
+              }
+            ]
+          }
+        },
+        "control_plane_request_sha256": "86d9da554574984b79146a5d41de9bbea76aa020490dd08e49543089756769dd",
+        "healthcare_preflight_path": "/control/provider-directory/profile-capacity-preflight",
+        "healthcare_receipt": {
+          "artifact_scope_projection": {
+            "projected_logical_bytes": 1,
+            "projected_rows": 1,
+            "projection_hash": "8888888888888888888888888888888888888888888888888888888888888888"
+          },
+          "capacity_geometry": {
+            "contract_id": "synthetic-geometry.v1"
+          },
+          "capacity_geometry_hash": "5555555555555555555555555555555555555555555555555555555555555555",
+          "capacity_limits": {
+            "artifact_scope_batch_size": 100000,
+            "contract_id": "healthporta.provider-directory-profile-capacity-limits.v2",
+            "lock_timeout_ms": 5000,
+            "maintenance_work_mem_bytes": 67108864,
+            "max_affected_npis": 2000000,
+            "max_artifact_scope_rows": 5000000,
+            "max_build_seconds": 3600,
+            "max_evidence_rows": 10000000,
+            "max_profile_rows": 2000000,
+            "minimum_remaining_bytes": 1000000,
+            "pool_reserve_connections": 4,
+            "relation_byte_caps": [
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "artifact_scope"
+              },
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "evidence_stage"
+              },
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "affected_npi_stage"
+              },
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "profile_stage"
+              },
+              {
+                "max_deleted_logical_bytes": 30000,
+                "max_scratch_bytes": 0,
+                "max_target_growth_bytes": 20000,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "evidence_target"
+              },
+              {
+                "max_deleted_logical_bytes": 30000,
+                "max_scratch_bytes": 0,
+                "max_target_growth_bytes": 20000,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "profile_target"
+              }
+            ],
+            "statement_timeout_ms": 60000,
+            "temp_file_limit_bytes": 1024,
+            "work_mem_bytes": 4194304
+          },
+          "capacity_limits_sha256": "0019cd18a238d6abd97c1b72ef795bb00d6612b92cac06e28a8318885af8980e",
+          "contract_id": "healthporta.provider-directory-profile-capacity-preflight.v3",
+          "control_plane_receipt_sha256": "39bea0c0d6ce30f7a6a4e998c133656318b0a34365d67be0afbd04088c72db16",
+          "expires_at": "2026-07-30T13:00:00Z",
+          "issued_at": "2026-07-30T12:00:02Z",
+          "preflight_receipt_storage": {
+            "contract_id": "healthporta.provider-directory-profile-capacity-preflight-storage.v1"
+          },
+          "profile_execution_identity": {
+            "execution_contract_id": "healthporta.provider-directory-profile-execution.v2",
+            "generation": 11,
+            "materialization_mode": "source_delta",
+            "operation": "publish",
+            "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
+            "profile_schema_version": 1,
+            "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
+            "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
+            "selection_proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+            "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
+          },
+          "quiescence": {
+            "active_profile_run_count": 0,
+            "active_profile_run_statuses": [
+              "queued",
+              "starting",
+              "running",
+              "finalizing",
+              "canceling"
+            ],
+            "capacity_consumption_boundary": "unexpired",
+            "claimed_checkpoint_states": [
+              "building_evidence",
+              "evidence_complete",
+              "building_profile",
+              "ready"
+            ],
+            "claimed_profile_checkpoint_count": 0,
+            "contract_id": "healthporta.provider-directory-profile-capacity-signing-quiescence.v1",
+            "outstanding_preflight_receipt_count": 0,
+            "preflight_receipt_boundary": "unconsumed_and_unexpired",
+            "unexpired_capacity_consumption_count": 0
+          },
+          "quiescence_sha256": "d84740c620131557b964373a3aab900ce8d4220d1289fb703f0dee762e864831",
+          "receipt_sha256": "79b15f27b2ff3b1d6fddb7b2e2b5d205ba58cbc3f0ae4e3c6d12b11f1e0d7be1",
+          "request_contract_id": "healthporta.provider-directory-profile-capacity-preflight-request.v3",
+          "request_nonce": "2222222222222222222222222222222222222222222222222222222222222222",
+          "request_sha256": "8cd692e49d3c0a0262a5ab9546c8f74bf138e187e042d5c9f1559033b71d122f",
+          "required_reservation_bytes_by_storage_class": {
+            "data": 180000000000,
+            "temp": 20000000000,
+            "wal": 150000000000
+          },
+          "runtime_observation": {
+            "contract_id": "healthporta.provider-directory-profile-runtime-observation.v1"
+          },
+          "serving_generation_preflight": {
+            "contract_id": "healthporta.provider-directory-profile-serving-generation-preflight.v1",
+            "resolution": "existing"
+          },
+          "serving_generation_preflight_sha256": "603d042d46aa40c819a1ef4d36b5fd3297d635853425114f5def825bba79a111"
+        },
+        "healthcare_receipt_sha256": "79b15f27b2ff3b1d6fddb7b2e2b5d205ba58cbc3f0ae4e3c6d12b11f1e0d7be1",
+        "healthcare_request": {
+          "contract_id": "healthporta.provider-directory-profile-capacity-preflight-request.v3",
+          "profile_execution": {
+            "import_resources": false,
+            "probe": false,
+            "provider_directory_profile_capacity_attestation": {},
+            "provider_directory_profile_contract_id": "healthporta.provider-directory-profile-execution.v2",
+            "provider_directory_profile_generation": 11,
+            "provider_directory_profile_selection_attestation": {
+              "authority_revision": 7,
+              "catalog_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "contract_id": "healthporta.provider-directory-profile-selection-attestation.v1",
+              "node_id": "dev-node",
+              "operation": "publish",
+              "pairs": [
+                {
+                  "acquisition_root_run_id": "synthetic-run-root-1",
+                  "dataset_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "dataset_id": "synthetic-dataset-1",
+                  "endpoint_id": "synthetic-endpoint-1",
+                  "is_current": true,
+                  "lineage_authority": "healthcare-mrf-api.provider-directory-selection-proof.v1",
+                  "publication_status": "published",
+                  "source_id": "synthetic_profile_source"
+                }
+              ],
+              "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
+              "profile_schema_version": 1,
+              "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
+              "proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+              "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
+              "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
+            },
+            "publish_artifacts_only": true,
+            "publish_artifacts_targets": [
+              "profile"
+            ],
+            "publish_corroboration": false,
+            "require_complete_global_profile_fence": true,
+            "source_ids": []
+          },
+          "provider_directory_profile_capacity_limits": {
+            "artifact_scope_batch_size": 100000,
+            "contract_id": "healthporta.provider-directory-profile-capacity-limits.v2",
+            "lock_timeout_ms": 5000,
+            "maintenance_work_mem_bytes": 67108864,
+            "max_affected_npis": 2000000,
+            "max_artifact_scope_rows": 5000000,
+            "max_build_seconds": 3600,
+            "max_evidence_rows": 10000000,
+            "max_profile_rows": 2000000,
+            "minimum_remaining_bytes": 1000000,
+            "pool_reserve_connections": 4,
+            "relation_byte_caps": [
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "artifact_scope"
+              },
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "evidence_stage"
+              },
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "affected_npi_stage"
+              },
+              {
+                "max_deleted_logical_bytes": 0,
+                "max_scratch_bytes": 10000,
+                "max_target_growth_bytes": 0,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "profile_stage"
+              },
+              {
+                "max_deleted_logical_bytes": 30000,
+                "max_scratch_bytes": 0,
+                "max_target_growth_bytes": 20000,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "evidence_target"
+              },
+              {
+                "max_deleted_logical_bytes": 30000,
+                "max_scratch_bytes": 0,
+                "max_target_growth_bytes": 20000,
+                "max_temp_bytes": 1024,
+                "max_wal_bytes": 40000,
+                "relation_name": "profile_target"
+              }
+            ],
+            "statement_timeout_ms": 60000,
+            "temp_file_limit_bytes": 1024,
+            "work_mem_bytes": 4194304
+          },
+          "signing_guard": {
+            "contract_id": "healthporta.provider-directory-profile-capacity-signing-guard-request.v1",
+            "control_plane_receipt_sha256": "39bea0c0d6ce30f7a6a4e998c133656318b0a34365d67be0afbd04088c72db16",
+            "expires_at": "2026-07-30T13:00:00Z",
+            "request_nonce": "2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        },
+        "healthcare_request_sha256": "8cd692e49d3c0a0262a5ab9546c8f74bf138e187e042d5c9f1559033b71d122f",
+        "held_followup_preimage_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+        "storage_observation_sha256": "44d9973fe27ae20acfed91ee82c01b4a8c57dcd8a6291435599f220a3257ef0f"
+      },
+      "signing_preflight_guard_sha256": "936d1324312013cd91c1b0a1a6e5179b152d3a3671c65c204775f7cb4abeb4f6",
       "tablespaces": [
         {
           "tablespace_name": "pg_default",
@@ -77,7 +527,7 @@
         }
       ]
     },
-    "signature": "SLzZrUeYtxvUIJrfFBPo5ngN4zk_R5pG4j33-3ZYI5lukT6SexXVqrP4sK_sKyVwGabeqFs6ydt29dZg7ZfRBA"
+    "signature": "HQOCqvhfTE_6QtOwKNX2aXIkzwErTaJqw05BYTIlm74ojrTQeKSGbEcaujtXupoc3Muy6xXwvUGf5Q6zDllDCw"
   },
   "provider_directory_profile_contract_id": "healthporta.provider-directory-profile-execution.v2",
   "provider_directory_profile_generation": 11,
@@ -89,22 +539,22 @@
     "operation": "publish",
     "pairs": [
       {
-        "acquisition_root_run_id": "run-root-1",
+        "acquisition_root_run_id": "synthetic-run-root-1",
         "dataset_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "dataset_id": "dataset-1",
-        "endpoint_id": "endpoint-1",
+        "dataset_id": "synthetic-dataset-1",
+        "endpoint_id": "synthetic-endpoint-1",
         "is_current": true,
         "lineage_authority": "healthcare-mrf-api.provider-directory-selection-proof.v1",
         "publication_status": "published",
-        "source_id": "pdfhir_payer"
+        "source_id": "synthetic_profile_source"
       }
     ],
-    "profile_input_digest": "ce56caced6e2a9efbc0e9f11cd531e6212ba4293900372eab2e8a3d26dd49d30",
+    "profile_input_digest": "3ed2e9367be3c53944bcb955a2d3208e0afab6567acc14ae9b479e1658eac128",
     "profile_schema_version": 1,
-    "profile_strategy_version": "source-fact-role32-org32-member32-dataset-pract-auth-npi5m-v5",
-    "proof_id": "9c1f5f05299769d9d87dee7f35e88019daedf7bb47c87534803bb84b437daf29",
-    "selection_fingerprint": "bdee59431fa659e4199426063b943bcbbc478c5b788bb543aa26471d13604a4a",
-    "source_context_digest": "3528caf315a2f3a5b2b3d8c56539aa12ab797fe050a5ccfeeec9989434e8d52f"
+    "profile_strategy_version": "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6",
+    "proof_id": "5d17141b686fcfd3cf2c04166fcf8a8a1b818f11170015e2ed506aaaff2d6057",
+    "selection_fingerprint": "24f1d452b097e9d2bd37d7a8289ab69b1567ca73c3148c005846e5b8ec3494e4",
+    "source_context_digest": "5a0762055555794321a23485941c3b676ac4037acc0ed29e7071f94f5678bcd5"
   },
   "publish_artifacts_only": true,
   "publish_artifacts_targets": [

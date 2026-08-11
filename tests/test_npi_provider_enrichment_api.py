@@ -174,6 +174,11 @@ async def test_get_npi_includes_provider_enrichment(monkeypatch):
         }
 
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     fetch_detail = AsyncMock(return_value={"summary": {"status": "enriched"}, "enrollments": {"ffs_public": []}})
     monkeypatch.setattr(
@@ -198,6 +203,16 @@ async def test_get_npi_filters_non_street_addresses_unless_extra_info(monkeypatc
         npi_module,
         "_build_npi_details",
         _build_npi_street_city_details,
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_address_rows",
+        AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     monkeypatch.setattr(
@@ -234,6 +249,11 @@ async def test_get_npi_can_include_chain_provider_enrichment(monkeypatch):
         }
 
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     fetch_detail = AsyncMock(return_value={"summary": {"status": "enriched"}, "enrollments": {"ffs_public": []}})
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_detail", fetch_detail)
@@ -258,6 +278,11 @@ async def test_get_npi_can_return_summary_view(monkeypatch):
         }
 
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(return_value=[]),
+    )
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     fetch_summary_detail = AsyncMock(
         return_value={

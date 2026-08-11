@@ -14,10 +14,10 @@ from process.provider_directory_fhir_subset_completion import (
     validate_subset_completion_proof_pair,
 )
 from process.provider_directory_fhir_subset_identity import (
-    SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES,
+    SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION,
-    SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
 )
 from process.provider_directory_fhir_subset_execution import (
     has_valid_reviewed_subset_counts,
@@ -30,6 +30,9 @@ from tests.provider_directory_fhir_subset_completion_support import (
 
 LEGACY_PROOF_SHA256 = (
     "dca7eb48cb08ad7477048b078a00d64e8dac4c27f5399130eca5c1e1976d2327"
+)
+BOUNDED_PROOF_SHA256 = (
+    "3def46f20f794260f03c0f389042ca9026334b2c550f3571e0d8f7359d714a90"
 )
 
 
@@ -51,12 +54,12 @@ def _contract(*, legacy: bool = False, **overrides):
         "strategy_version": (
             SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION
             if legacy
-            else SERVER_ISSUED_SUBSET_STRATEGY_VERSION
+            else SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION
         ),
         "completion_scopes": (
             SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES
             if legacy
-            else SERVER_ISSUED_SUBSET_COMPLETION_SCOPES
+            else SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES
         ),
         "campaign_id": "synthetic-reviewed-subset-v3",
     }
@@ -130,9 +133,11 @@ def test_bounded_profile_accepts_equal_or_one_lower_post_count(
         )
     )
 
-    assert proof["strategy_version"] == SERVER_ISSUED_SUBSET_STRATEGY_VERSION
+    assert proof["strategy_version"] == (
+        SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION
+    )
     assert proof["completion_scopes"] == list(
-        SERVER_ISSUED_SUBSET_COMPLETION_SCOPES
+        SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES
     )
     validate_subset_completion_proof_pair(proof, proof_sha256)
 
@@ -199,16 +204,28 @@ def test_legacy_profile_still_rejects_one_lower_post_count():
         )
 
 
+def test_bounded_profile_preserves_pre_v5_completion_bytes_and_hash():
+    proof, proof_sha256 = build_subset_completion_proof(
+        **_proof_arguments(_contract())
+    )
+
+    assert proof_sha256 == BOUNDED_PROOF_SHA256
+    assert canonical_sha256(proof) == BOUNDED_PROOF_SHA256
+    assert validate_subset_completion_proof_pair(proof, proof_sha256) == (
+        proof,
+        proof_sha256,
+    )
+
 @pytest.mark.parametrize(
     ("strategy_version", "completion_scopes"),
     (
         (
-            SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+            SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION,
             SERVER_ISSUED_SUBSET_EXACT_COMPLETION_SCOPES,
         ),
         (
             SERVER_ISSUED_SUBSET_EXACT_STRATEGY_VERSION,
-            SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+            SERVER_ISSUED_SUBSET_BOUNDED_COMPLETION_SCOPES,
         ),
     ),
 )

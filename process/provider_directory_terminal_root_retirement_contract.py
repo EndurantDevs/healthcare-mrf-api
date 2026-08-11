@@ -12,27 +12,29 @@ import os
 import re
 from typing import Any, Mapping
 
+from process.provider_directory_terminal_root_retirement_profile import (
+    LEGACY_RETIREMENT_PROFILE,
+    RETIREMENT_PROFILES,
+    SEMANTIC_V4_RETIREMENT_PROFILE,
+    TerminalRootRetirementProfile,
+    selected_retirement_profile,
+)
+
 
 RETIREMENT_STATUS = "acquisition_retired"
-RETIREMENT_METADATA_KEY = "provider_directory_terminal_root_retirement_v1"
-RETIREMENT_CONTRACT_VERSION = (
-    "healthporta.provider-directory.terminal-root-retirement.v1"
-)
+RETIREMENT_METADATA_KEY = LEGACY_RETIREMENT_PROFILE.metadata_key
+RETIREMENT_CONTRACT_VERSION = LEGACY_RETIREMENT_PROFILE.contract_version
 RETIREMENT_REASON_CODE = "terminal_retry_lineage_exhausted"
-RETIREMENT_RESOURCE_HASH_CONTRACT = "transport_bound_v1"
-RETIREMENT_ENABLED_ENV = (
-    "HLTHPRT_PROVIDER_DIRECTORY_TERMINAL_ROOT_RETIREMENT_ENABLED"
-)
+RETIREMENT_RESOURCE_HASH_CONTRACT = LEGACY_RETIREMENT_PROFILE.resource_hash_contract
+RETIREMENT_ENABLED_ENV = "HLTHPRT_PROVIDER_DIRECTORY_TERMINAL_ROOT_RETIREMENT_ENABLED"
 RETIREMENT_TIMEOUT_SECONDS = 180
 MINIMUM_TERMINAL_AGE_SECONDS = 15 * 60
 ELIGIBLE_PRIOR_STATUSES = frozenset({"acquiring"})
 TERMINAL_FAILURE_STATUSES = frozenset(
     {"canceled", "cancelled", "dead_letter", "failed"}
 )
-RETIREMENT_VALID_FUNCTION = "provider_directory_terminal_root_retirement_valid"
-RETIREMENT_EVIDENCE_FUNCTION = (
-    "provider_directory_terminal_root_retirement_evidence"
-)
+RETIREMENT_VALID_FUNCTION = LEGACY_RETIREMENT_PROFILE.valid_function
+RETIREMENT_EVIDENCE_FUNCTION = LEGACY_RETIREMENT_PROFILE.evidence_function
 REQUIRED_CHILD_RELATIONS = frozenset(
     {
         "provider_directory_bulk_acquisition_checkpoint",
@@ -150,17 +152,20 @@ class TerminalRootRetirementSelection:
     prior_status: str
     observed_metadata: dict[str, Any]
     marker_by_field: dict[str, Any]
+    profile: TerminalRootRetirementProfile = LEGACY_RETIREMENT_PROFILE
 
     def __post_init__(self) -> None:
         if (
             type(self.request) is not TerminalRootRetirementRequest
             or _clean_text(self.canonical_api_base, maximum_length=4096) is None
-            or self.prior_status
-            not in (ELIGIBLE_PRIOR_STATUSES | {RETIREMENT_STATUS})
+            or self.prior_status not in (ELIGIBLE_PRIOR_STATUSES | {RETIREMENT_STATUS})
             or not isinstance(self.observed_metadata, dict)
+            or type(self.profile) is not TerminalRootRetirementProfile
+            or terminal_root_retirement_profile(self.observed_metadata)
+            is not self.profile
         ):
             raise TerminalRootRetirementError("evidence_invalid")
-        validated_retirement_marker(self.marker_by_field)
+        validated_retirement_marker(self.marker_by_field, profile=self.profile)
 
 
 @dataclass(frozen=True)
@@ -254,6 +259,17 @@ def retirement_resource_hash_contract(
     raise TerminalRootRetirementError("evidence_invalid")
 
 
+def terminal_root_retirement_profile(
+    publication_metadata: Mapping[str, Any],
+) -> TerminalRootRetirementProfile:
+    """Resolve one closed legacy or explicit semantic-v4 profile."""
+
+    try:
+        return selected_retirement_profile(publication_metadata)
+    except (TypeError, ValueError):
+        raise TerminalRootRetirementError("evidence_invalid") from None
+
+
 def canonical_json_sha256(value: Any) -> str:
     """Hash one JSON-compatible value with the repository canonical shape."""
 
@@ -291,12 +307,8 @@ def _validated_resource_counts(value: Any) -> dict[str, int]:
     if not isinstance(value, Mapping):
         raise TerminalRootRetirementError("evidence_invalid")
     count_by_resource = dict(value)
-    if (
-        not count_by_resource
-        or any(
-            _clean_text(name, maximum_length=64) is None
-            for name in count_by_resource
-        )
+    if not count_by_resource or any(
+        _clean_text(name, maximum_length=64) is None for name in count_by_resource
     ):
         raise TerminalRootRetirementError("evidence_invalid")
     for count in count_by_resource.values():
@@ -315,15 +327,18 @@ def _validated_relation_evidence(value: Any) -> dict[str, dict[str, Any]]:
             _IDENTIFIER.fullmatch(str(relation_name)) is None
             or not isinstance(raw_evidence, Mapping)
             or set(raw_evidence) != _RELATION_EVIDENCE_FIELDS
-            or _HEX_SHA256.fullmatch(str(raw_evidence.get("row_sha256") or ""))
-            is None
+            or _HEX_SHA256.fullmatch(str(raw_evidence.get("row_sha256") or "")) is None
         ):
             raise TerminalRootRetirementError("evidence_invalid")
         _nonnegative_integer(raw_evidence.get("row_count"))
-    return dict(sorted({
-        str(name): dict(evidence)
-        for name, evidence in evidence_by_relation.items()
-    }.items()))
+    return dict(
+        sorted(
+            {
+                str(name): dict(evidence)
+                for name, evidence in evidence_by_relation.items()
+            }.items()
+        )
+    )
 
 
 def validated_retirement_evidence(raw_evidence: Any) -> dict[str, Any]:
@@ -337,13 +352,9 @@ def validated_retirement_evidence(raw_evidence: Any) -> dict[str, Any]:
         "source_identity_sha256",
         "target_identity_sha256",
     )
-    if (
-        set(evidence_by_field) != _EVIDENCE_FIELDS
-        or any(
-            _HEX_SHA256.fullmatch(str(evidence_by_field.get(field_name) or ""))
-            is None
-            for field_name in digest_fields
-        )
+    if set(evidence_by_field) != _EVIDENCE_FIELDS or any(
+        _HEX_SHA256.fullmatch(str(evidence_by_field.get(field_name) or "")) is None
+        for field_name in digest_fields
     ):
         raise TerminalRootRetirementError("evidence_invalid")
     _validated_timestamp(evidence_by_field.get("lineage_finished_at"))
@@ -356,16 +367,9 @@ def validated_retirement_evidence(raw_evidence: Any) -> dict[str, Any]:
     parent_resource_count = _nonnegative_integer(
         evidence_by_field.get("parent_resource_count")
     )
-    proof_shard_count = _nonnegative_integer(
-        evidence_by_field.get("proof_shard_count")
-    )
-    proof_row_count = _nonnegative_integer(
-        evidence_by_field.get("proof_row_count")
-    )
-    if (
-        terminal_run_count == 0
-        or evidence_by_field.get("prior_status") != "acquiring"
-    ):
+    proof_shard_count = _nonnegative_integer(evidence_by_field.get("proof_shard_count"))
+    proof_row_count = _nonnegative_integer(evidence_by_field.get("proof_row_count"))
+    if terminal_run_count == 0 or evidence_by_field.get("prior_status") != "acquiring":
         raise TerminalRootRetirementError("evidence_invalid")
     resource_counts = _validated_resource_counts(
         evidence_by_field.get("resource_counts")
@@ -387,27 +391,35 @@ def retirement_marker(
     *,
     minimum_terminal_age_seconds: int,
     retired_at: str,
+    profile: TerminalRootRetirementProfile = LEGACY_RETIREMENT_PROFILE,
 ) -> dict[str, Any]:
     """Build the closed marker inserted by the single parent CAS."""
 
+    if not any(profile is registered for registered in RETIREMENT_PROFILES):
+        raise TerminalRootRetirementError("evidence_invalid")
     marker_by_field = {
-        "contract_version": RETIREMENT_CONTRACT_VERSION,
+        "contract_version": profile.contract_version,
         "evidence": validated_retirement_evidence(evidence_by_field),
         "minimum_terminal_age_seconds": minimum_terminal_age_seconds,
         "reason_code": RETIREMENT_REASON_CODE,
         "retired_at": retired_at,
     }
-    return validated_retirement_marker(marker_by_field)
+    return validated_retirement_marker(marker_by_field, profile=profile)
 
 
-def validated_retirement_marker(value: Any) -> dict[str, Any]:
+def validated_retirement_marker(
+    raw_marker: Any,
+    *,
+    profile: TerminalRootRetirementProfile = LEGACY_RETIREMENT_PROFILE,
+) -> dict[str, Any]:
     """Validate one exact stored retirement marker."""
 
-    marker_by_field = json_object(value)
+    if not any(profile is registered for registered in RETIREMENT_PROFILES):
+        raise TerminalRootRetirementError("evidence_invalid")
+    marker_by_field = json_object(raw_marker)
     if (
         set(marker_by_field) != _MARKER_FIELDS
-        or marker_by_field.get("contract_version")
-        != RETIREMENT_CONTRACT_VERSION
+        or marker_by_field.get("contract_version") != profile.contract_version
         or marker_by_field.get("reason_code") != RETIREMENT_REASON_CODE
     ):
         raise TerminalRootRetirementError("evidence_invalid")
@@ -451,11 +463,13 @@ __all__ = (
     "RETIREMENT_STATUS",
     "RETIREMENT_TIMEOUT_SECONDS",
     "RETIREMENT_VALID_FUNCTION",
+    "SEMANTIC_V4_RETIREMENT_PROFILE",
     "TERMINAL_FAILURE_STATUSES",
     "TerminalRootRetirementError",
     "TerminalRootRetirementRequest",
     "TerminalRootRetirementResult",
     "TerminalRootRetirementSelection",
+    "TerminalRootRetirementProfile",
     "canonical_json_sha256",
     "json_object",
     "quoted_relation",
@@ -465,6 +479,7 @@ __all__ = (
     "retirement_result_json",
     "row_mapping",
     "schema_name",
+    "terminal_root_retirement_profile",
     "validated_retirement_evidence",
     "validated_retirement_marker",
 )

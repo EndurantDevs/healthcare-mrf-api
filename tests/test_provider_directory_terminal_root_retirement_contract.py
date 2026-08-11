@@ -83,8 +83,16 @@ def test_evidence_keeps_retained_and_proof_counts_independent() -> None:
 @pytest.mark.parametrize(
     ("mutation",),
     [
-        (lambda value: value["child_relations"].pop(next(iter(value["child_relations"]))),),
-        (lambda value: value["child_relations"].update({"unexpected_relation": {"row_count": 0, "row_sha256": SHA}}),),
+        (
+            lambda value: value["child_relations"].pop(
+                next(iter(value["child_relations"]))
+            ),
+        ),
+        (
+            lambda value: value["child_relations"].update(
+                {"unexpected_relation": {"row_count": 0, "row_sha256": SHA}}
+            ),
+        ),
         (lambda value: value.update({"prior_status": "incomplete"}),),
         (lambda value: value.update({"terminal_run_count": True}),),
         (lambda value: value.update({"lineage_finished_at": "2026-08-10"}),),
@@ -118,6 +126,16 @@ def test_marker_and_result_are_identifier_free_and_deterministic() -> None:
         "status": "ok",
     }
 
+    v2_marker = contract.retirement_marker(
+        _evidence(),
+        minimum_terminal_age_seconds=900,
+        retired_at=datetime(2026, 8, 10, tzinfo=timezone.utc).isoformat(),
+        profile=contract.SEMANTIC_V4_RETIREMENT_PROFILE,
+    )
+    assert v2_marker["contract_version"] == (
+        "healthporta.provider-directory.terminal-root-retirement.v2"
+    )
+
 
 def test_operator_gate_and_schema_are_fail_closed(monkeypatch) -> None:
     monkeypatch.delenv(contract.RETIREMENT_ENABLED_ENV, raising=False)
@@ -149,6 +167,98 @@ def test_legacy_hash_contract_accepts_only_absent_or_explicit_v1() -> None:
         ):
             contract.retirement_resource_hash_contract(
                 {"resource_hash_contract": marker}
+            )
+
+
+def test_runtime_profile_accepts_only_closed_hash_contracts_and_marker() -> None:
+    """Resolve only the two closed runtime profiles and matching markers."""
+
+    legacy = contract.terminal_root_retirement_profile({})
+    explicit_legacy = contract.terminal_root_retirement_profile(
+        {"resource_hash_contract": "transport_bound_v1"}
+    )
+    semantic_v4 = contract.terminal_root_retirement_profile(
+        {"resource_hash_contract": "semantic_content_v4"}
+    )
+
+    assert legacy is explicit_legacy
+    assert legacy.metadata_key == contract.RETIREMENT_METADATA_KEY
+    assert semantic_v4 is contract.SEMANTIC_V4_RETIREMENT_PROFILE
+    assert semantic_v4.metadata_key == (
+        "provider_directory_terminal_root_retirement_v2"
+    )
+    assert semantic_v4.evidence_function == (
+        "provider_directory_terminal_root_retirement_v2_evidence"
+    )
+    assert semantic_v4.valid_function == (
+        "provider_directory_terminal_root_retirement_v2_valid"
+    )
+
+    for invalid_metadata in (
+        {"resource_hash_contract": None},
+        {"resource_hash_contract": "transport_neutral_v2"},
+        {"resource_hash_contract": "semantic_content_v3"},
+        {
+            "resource_hash_contract": "semantic_content_v4",
+            contract.RETIREMENT_METADATA_KEY: {},
+        },
+        {
+            "resource_hash_contract": "semantic_content_v4",
+            contract.RETIREMENT_METADATA_KEY: {},
+            semantic_v4.metadata_key: {},
+        },
+    ):
+        with pytest.raises(
+            contract.TerminalRootRetirementError,
+            match="evidence_invalid",
+        ):
+            contract.terminal_root_retirement_profile(invalid_metadata)
+
+
+def test_runtime_profile_rejects_unregistered_profile_objects() -> None:
+    """Reject caller-built profiles at both marker construction boundaries."""
+
+    registered_profile = contract.LEGACY_RETIREMENT_PROFILE
+    registered_marker = contract.retirement_marker(
+        _evidence(),
+        minimum_terminal_age_seconds=900,
+        retired_at="2026-08-10T12:00:00+00:00",
+    )
+    unsupported_profiles = (
+        contract.TerminalRootRetirementProfile(
+            metadata_key="unknown",
+            contract_version="unknown",
+            resource_hash_contract="unknown",
+            evidence_function="unknown",
+            valid_function="unknown",
+        ),
+        contract.TerminalRootRetirementProfile(
+            metadata_key=registered_profile.metadata_key,
+            contract_version=registered_profile.contract_version,
+            resource_hash_contract=registered_profile.resource_hash_contract,
+            evidence_function=registered_profile.evidence_function,
+            valid_function=registered_profile.valid_function,
+        ),
+    )
+    assert unsupported_profiles[1] == registered_profile
+    for unsupported_profile in unsupported_profiles:
+        with pytest.raises(
+            contract.TerminalRootRetirementError,
+            match="evidence_invalid",
+        ):
+            contract.retirement_marker(
+                _evidence(),
+                minimum_terminal_age_seconds=900,
+                retired_at="2026-08-10T12:00:00+00:00",
+                profile=unsupported_profile,
+            )
+        with pytest.raises(
+            contract.TerminalRootRetirementError,
+            match="evidence_invalid",
+        ):
+            contract.validated_retirement_marker(
+                registered_marker,
+                profile=unsupported_profile,
             )
 
 

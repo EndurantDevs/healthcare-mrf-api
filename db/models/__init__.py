@@ -10,3 +10,6 @@ from db.models.provider_directory_uhc_flex import *
 from db.models.provider_directory_uhc_flex_practitioner import *
 from db.models.provider_directory_uhc_flex_practitioner_twin import *
 from db.models.provider_directory_uhc_flex_practitioner_publication import *
+from db.models.provider_directory_rooted_graph import *
+from db.models.provider_directory_rooted_graph_twin import *
+from db.models.provider_directory_rooted_graph_publication import *

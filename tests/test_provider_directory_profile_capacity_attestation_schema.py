@@ -28,6 +28,7 @@ MIGRATION_PATH = (
     / "alembic/versions/20260730110000_provider_directory_profile_delta.py"
 )
 
+
 class _OperationsRecorder:
     def __init__(self):
         self.created_table = None
@@ -87,14 +88,12 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260810160000_ptg2_legacy_global_projection_queue"
+        "20260811110000_ptg_v12_mainline_merge"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (
         "20260801010000_uhc_semantic_layout_identity"
     )
-
-
 def test_capacity_v2_migration_replaces_only_the_guarded_constraint(
     monkeypatch,
 ):
@@ -346,6 +345,7 @@ def test_capacity_consumption_constraints_bind_full_build_and_lease_identity():
         assert field_name in constraints
     assert "provider-directory-database-capacity-lease-v1" in constraints
     assert "provider-directory-database-capacity-lease-v2" in constraints
+    assert "provider-directory-database-capacity-lease-v3" in constraints
     assert "interval '300 seconds'" in constraints
     assert "interval '305 seconds'" in constraints
     assert "interval '5 seconds'" in constraints

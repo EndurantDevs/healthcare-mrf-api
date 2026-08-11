@@ -500,6 +500,26 @@ jobs:
               operation_last_line=$(printf "%s\n" "$operation_output" | tail -n 1)
               test "$operation_last_line" = '\''{"code":"disabled","status":"error"}'\''
             '
+      - name: Prove rooted Provider graph operator is packaged and dormant
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/sh \
+            healthcare-mrf-api:ptg-v4-gate \
+            -ec '
+              set +e
+              operation_output=$(env \
+                -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_REGISTRATION_ENABLED \
+                -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_ENABLED \
+                -u HLTHPRT_PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_ENABLED \
+                /opt/venv/bin/python -B \
+                /opt/scripts/smoke/provider_directory_rooted_graph_operator.py \
+                register 2>&1)
+              operation_status=$?
+              set -e
+              test "$operation_status" -eq 1
+              operation_last_line=$(printf "%s\n" "$operation_output" | tail -n 1)
+              test "$operation_last_line" = '\''{"code":"disabled","status":"error"}'\''
+            '
       - name: Prove reviewed Provider subset operators are packaged and dormant
         run: |
           docker run --rm --platform linux/amd64 \
@@ -509,12 +529,14 @@ jobs:
               for operation in \
                 sync-verified-state \
                 abandon-expired-root \
-                seal-terminal-root; do
+                seal-terminal-root \
+                seal-direct-v4-terminal-root; do
                 set +e
                 operation_output=$(env \
                   -u HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED \
                   -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED \
                   -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_TERMINAL_DISPOSITION_ENABLED \
+                  -u HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_TERMINAL_DISPOSITION_ENABLED \
                   /opt/venv/bin/python -B \
                   /opt/scripts/smoke/provider_directory_fhir_reviewed_subset_state.py \
                   "$operation" 2>&1)
@@ -725,6 +747,7 @@ jobs:
           tests/test_formulary_fhir_storage_postgres.py
           tests/test_formulary_fhir_source_artifact_postgres.py
           tests/test_formulary_fhir_uhc_receipt_postgres.py
+          tests/test_uhc_drug_acquisition_lease_postgres.py
           tests/test_uhc_drug_vertical_postgres.py
           tests/test_formulary_fhir_twin_admission_postgres.py
           tests/test_formulary_fhir_twin_repository_postgres.py
@@ -963,9 +986,15 @@ jobs:
           tests/test_provider_directory_subset_completion_postgres.py
           tests/test_provider_directory_fhir_terminal_atomicity_postgres.py
           tests/test_provider_directory_reviewed_subset_bounded_drift_postgres.py
+          tests/test_provider_directory_reviewed_subset_terminal_window_postgres.py
+          tests/test_provider_directory_reviewed_subset_terminal_window_lock_postgres.py
+          tests/test_provider_directory_reviewed_source_generation_postgres.py
           tests/test_provider_directory_reviewed_subset_terminal_disposition_postgres.py
+          tests/test_provider_directory_reviewed_subset_direct_v4_disposition_postgres.py
           tests/test_provider_directory_terminal_root_retirement_postgres.py
           tests/test_provider_directory_terminal_root_retirement_repair_postgres.py
+          tests/test_provider_directory_terminal_root_retirement_v2_postgres.py
+          tests/test_provider_directory_terminal_root_retirement_v2_topology_postgres.py
       - name: Run exact Provider Directory enrichment PostgreSQL lifecycle gate
         if: matrix.shard == 'provider-directory'
         env:
@@ -977,6 +1006,10 @@ jobs:
           tests/test_provider_directory_uhc_flex_practitioner_acquisition_postgres.py
           tests/test_provider_directory_uhc_flex_practitioner_twin_postgres.py
           tests/test_provider_directory_uhc_flex_practitioner_publication_postgres.py
+          tests/test_provider_directory_rooted_graph_adoption_postgres.py
+          tests/test_provider_directory_rooted_graph_acquisition_postgres.py
+          tests/test_provider_directory_rooted_graph_publication_guards_postgres.py
+          tests/test_provider_directory_rooted_graph_publication_postgres.py
       - name: Run address and Provider Directory DB tests
         if: matrix.shard == 'provider-directory'
         env:
@@ -991,6 +1024,12 @@ jobs:
           -o asyncio_default_fixture_loop_scope=session
           --durations=20
           tests/test_address_canonical_db.py
+          tests/test_address_numeric_grid_alias_db.py
+          tests/test_address_numeric_grid_alias_fences_db.py
+          tests/test_address_numeric_grid_alias_lifecycle_db.py
+          tests/test_address_numeric_grid_alias_materialization_db.py
+          tests/test_address_numeric_grid_alias_runtime_db.py
+          tests/test_address_strict_source_backfill_db.py
           tests/test_ptg2_serving_address_evidence_postgres.py
           tests/test_npi_geo_evidence_search_db.py
           tests/test_entity_address_unified_archive_coordinates_db.py
@@ -1060,6 +1099,7 @@ jobs:
           tests/test_provider_directory_profile_artifact_capacity_postgres.py
           tests/test_provider_directory_profile_artifact_postgres.py
           tests/test_provider_directory_profile_artifact_recovery_postgres.py
+          tests/test_provider_directory_profile_capacity_adoption_postgres.py
           tests/test_provider_directory_profile_capacity_attestation_postgres.py
           tests/test_provider_directory_profile_capacity_attestation_schema.py
           tests/test_provider_directory_profile_capacity_preflight_postgres.py

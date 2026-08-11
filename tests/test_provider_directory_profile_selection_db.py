@@ -14,6 +14,19 @@ from sqlalchemy.exc import OperationalError
 from db.connection import Database
 from process import provider_directory_profile_selection as selection
 from process import provider_directory_profile_selection_snapshot as snapshot
+from process.provider_directory_profile_uhc_flex import (
+    UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS,
+)
+from process.provider_directory_rooted_graph_source_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+)
+from process.uhc_flex_practitioner_contract import (
+    UHC_FLEX_PRACTITIONER_SOURCE_ID,
+)
+from process.uhc_flex_practitioner_registration import (
+    uhc_flex_practitioner_endpoint_identity,
+)
 
 
 def _catalog_map() -> dict[str, object]:
@@ -108,14 +121,13 @@ async def _create_flex_selection_tables(
 ) -> None:
     """Create narrow Flex readiness dependencies locked by selection."""
 
-    for relation_name in (
-        "provider_directory_dataset_resource",
-        "provider_directory_uhc_flex_practitioner_acquisition",
-        "provider_directory_uhc_flex_practitioner_dataset_resource",
-        "provider_directory_uhc_flex_practitioner_resource",
-        "provider_directory_uhc_flex_practitioner_twin_admission",
-        "provider_directory_uhc_flex_practitioner_work",
-    ):
+    dedicated_headers = {
+        "provider_directory_rooted_graph_dataset",
+        "provider_directory_uhc_flex_practitioner_dataset",
+    }
+    for relation_name in UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS:
+        if relation_name in dedicated_headers:
+            continue
         await database.status(
             f"CREATE TABLE {schema}.{relation_name} (id bigint);"
         )
@@ -126,13 +138,38 @@ async def _create_flex_selection_tables(
             admission_id varchar(96),
             semantic_projection_as_of date,
             source_authority_id varchar(96),
-            operation_key varchar(64)
+            operation_key varchar(64),
+            cohort_complete boolean,
+            endpoint_collection_complete boolean,
+            endpoint_complete boolean
         );
         """
     )
     await database.status(
         f"""
         CREATE FUNCTION {schema}.provider_directory_uhc_flex_practitioner_dataset_ready(text)
+        RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT false; $$;
+        """
+    )
+    await database.status(
+        f"""
+        CREATE TABLE {schema}.provider_directory_rooted_graph_dataset (
+            dataset_id varchar(96) PRIMARY KEY,
+            admission_id varchar(96),
+            semantic_projection_as_of date,
+            source_authority_id varchar(96),
+            operation_key varchar(64),
+            publication_kind varchar(32),
+            cohort_complete boolean,
+            rooted_graph_complete boolean,
+            endpoint_collection_complete boolean,
+            endpoint_complete boolean
+        );
+        """
+    )
+    await database.status(
+        f"""
+        CREATE FUNCTION {schema}.provider_directory_rooted_graph_dataset_ready(text)
         RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT false; $$;
         """
     )
@@ -180,18 +217,36 @@ async def _seed_current_selection(database: Database, schema: str) -> None:
     await database.status(
         f"""
         INSERT INTO {schema}.provider_directory_api_endpoint (endpoint_id)
-        VALUES ('endpoint-1');
-        """
+        VALUES
+            ('endpoint-1'),
+            (:legacy_endpoint_id),
+            (:graph_endpoint_id);
+        """,
+        legacy_endpoint_id=(
+            uhc_flex_practitioner_endpoint_identity().endpoint_id
+        ),
+        graph_endpoint_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
     )
     await database.status(
         f"""
         INSERT INTO {schema}.provider_directory_source (
             source_id, endpoint_id, canonical_api_base, org_name, plan_name
-        ) VALUES (
-            'pdfhir_test_payer', 'endpoint-1',
-            'https://payer.example/fhir', 'Payer', 'Payer Plan'
-        );
-        """
+        ) VALUES
+            ('pdfhir_test_payer', 'endpoint-1',
+             'https://payer.example/fhir', 'Payer', 'Payer Plan'),
+            (:legacy_source_id, :legacy_endpoint_id,
+             'https://directory.example/fhir',
+             'Dormant practitioner generation', NULL),
+            (:graph_source_id, :graph_endpoint_id,
+             'https://directory.example/fhir',
+             'Dormant graph generation', NULL);
+        """,
+        legacy_source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID,
+        legacy_endpoint_id=(
+            uhc_flex_practitioner_endpoint_identity().endpoint_id
+        ),
+        graph_source_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+        graph_endpoint_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
     )
     await database.status(
         f"""

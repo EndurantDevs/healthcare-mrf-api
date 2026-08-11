@@ -102,7 +102,7 @@ class ProviderDirectoryUHCFlexPractitionerDataset(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["previous_dataset_id"],
-            [_reference(_DATASET, "dataset_id")],
+            [_reference(_ENDPOINT_DATASET, "dataset_id")],
             name="pd_uhc_flex_practitioner_dataset_previous_fkey",
         ),
         CheckConstraint(

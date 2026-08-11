@@ -23,6 +23,9 @@ from tests.provider_directory_profile_capacity_trust_fixtures import (
     PUBLIC_KEY_HEX,
     capacity_trust,
 )
+from tests.provider_directory_profile_capacity_signing_guard_test_support import (
+    synthetic_profile_task,
+)
 from tests.test_provider_directory_profile_capacity_attestation import (
     VALIDATION_TIME,
     _signed_envelope,
@@ -35,8 +38,10 @@ EXECUTION_V2_FIXTURE = (
     / "fixtures/provider_directory_profile_execution_v2_golden.json"
 )
 EXECUTION_V2_CANONICAL_SHA256 = (
-    "74e5387d5ef06ae48c20e836e1b8f214"
-    "9bfb50082387ba656d2ae8ea00d0444b"
+    "aa3ec27031af096ef676f78795320f104" "26dda68e0c9f8b7f96e02cd765ef3c4"
+)
+EXECUTION_V2_FILE_SHA256 = (
+    "48ea402ac48d386177e6b59905a11ccd" "62c0b1ebd5c16f6cda99546303414d92"
 )
 
 
@@ -98,10 +103,8 @@ def _retired_trust(
         key_id="capacity-key-2026-07",
         attestor_release_digest="11" * 32,
         status="retired",
-        retired_at=retired_at
-        or datetime.datetime(2026, 7, 30, 12, 0, 2, tzinfo=UTC),
-        verify_until=verify_until
-        or datetime.datetime(2026, 7, 30, 13, 0, tzinfo=UTC),
+        retired_at=retired_at or datetime.datetime(2026, 7, 30, 12, 0, 2, tzinfo=UTC),
+        verify_until=verify_until or datetime.datetime(2026, 7, 30, 13, 0, tzinfo=UTC),
     )
     active_key = lease.CapacityLeaseTrustKey(
         public_key=b"\x08" * 32,
@@ -126,9 +129,7 @@ def test_trust_v2_is_mandatory_closed_public_configuration(monkeypatch):
     ):
         runtime.configured_capacity_lease_trust()
 
-    trust = runtime.configured_capacity_lease_trust(
-        json.dumps(_trust_payload())
-    )
+    trust = runtime.configured_capacity_lease_trust(json.dumps(_trust_payload()))
     assert trust.environment_id == "dev-us"
     assert trust.active_key_id == "capacity-key-2026-07"
     assert trust.keys[0].public_key == bytes.fromhex(PUBLIC_KEY_HEX)
@@ -136,27 +137,47 @@ def test_trust_v2_is_mandatory_closed_public_configuration(monkeypatch):
     assert not hasattr(trust, "private_key")
 
 
-def test_execution_v2_golden_freezes_full_capacity_envelope(monkeypatch):
-    task_map = json.loads(EXECUTION_V2_FIXTURE.read_text(encoding="utf-8"))
+def test_execution_v2_golden_freezes_neutral_cross_repository_envelope(
+    monkeypatch,
+):
+    """Freeze bytes consumers must refresh when the signed runtime head moves."""
+    fixture_bytes = EXECUTION_V2_FIXTURE.read_bytes()
+    regenerated_bytes = (
+        json.dumps(
+            synthetic_profile_task(_signed_envelope()),
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    assert fixture_bytes == regenerated_bytes
+    assert len(fixture_bytes) == 27_800
+    assert fixture_bytes.endswith(b"\n")
+    assert not fixture_bytes.endswith(b"\n\n")
+    assert hashlib.sha256(fixture_bytes).hexdigest() == (EXECUTION_V2_FILE_SHA256)
+    task_map = json.loads(fixture_bytes)
     canonical = json.dumps(
         task_map,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("ascii")
-    assert hashlib.sha256(canonical).hexdigest() == (
-        EXECUTION_V2_CANONICAL_SHA256
-    )
+    assert hashlib.sha256(canonical).hexdigest() == (EXECUTION_V2_CANONICAL_SHA256)
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
     execution = selection.validated_profile_execution(task_map)
     assert execution.generation == 11
-    assert execution.capacity_attestation == task_map[
-        "provider_directory_profile_capacity_attestation"
-    ]
+    assert (
+        execution.capacity_attestation
+        == task_map["provider_directory_profile_capacity_attestation"]
+    )
     verified = _verify(dict(execution.capacity_attestation))
-    assert verified.attestation_id == task_map[
-        "provider_directory_profile_capacity_attestation"
-    ]["lease"]["attestation_id"]
+    assert (
+        verified.attestation_id
+        == task_map["provider_directory_profile_capacity_attestation"]["lease"][
+            "attestation_id"
+        ]
+    )
 
 
 @pytest.mark.parametrize(
@@ -173,9 +194,7 @@ def test_trust_rejects_unknown_and_private_fields(target, field_name):
     selected = payload if target == "trust" else payload["keys"][0]
     selected[field_name] = "00" * 32
 
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileCapacityConfigurationError
-    ):
+    with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
         runtime.validated_capacity_lease_trust(payload)
 
 
@@ -184,9 +203,7 @@ def test_trust_rejects_legacy_shape_duplicate_json_and_oversize():
         "public_key_hex": PUBLIC_KEY_HEX,
         "key_id": "capacity-key-2026-07",
     }
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileCapacityConfigurationError
-    ):
+    with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
         runtime.validated_capacity_lease_trust(legacy_trust_by_field)
     with pytest.raises(
         runtime.ProviderDirectoryProfileCapacityConfigurationError,
@@ -217,9 +234,7 @@ def test_trust_storage_identity_is_closed_and_physically_bound(mutation):
     else:
         trust_by_field["database_oid"] = True
 
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileCapacityConfigurationError
-    ):
+    with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
         runtime.validated_capacity_lease_trust(trust_by_field)
 
 
@@ -235,9 +250,7 @@ def test_trust_storage_identity_is_closed_and_physically_bound(mutation):
 def test_trust_requires_sorted_unique_keys_and_exactly_one_active(keys):
     payload = _trust_payload(keys=keys)
 
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileCapacityConfigurationError
-    ):
+    with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
         runtime.validated_capacity_lease_trust(payload)
 
 
@@ -254,18 +267,14 @@ def test_trust_key_count_and_active_identity_are_bounded():
     too_many_keys[-1].update(
         {"status": "active", "retired_at": None, "verify_until": None}
     )
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileCapacityConfigurationError
-    ):
+    with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
         runtime.validated_capacity_lease_trust(
             _trust_payload(
                 active_key_id=too_many_keys[-1]["key_id"],
                 keys=too_many_keys,
             )
         )
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileCapacityConfigurationError
-    ):
+    with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
         runtime.validated_capacity_lease_trust(
             _trust_payload(active_key_id="unknown-key")
         )
@@ -291,9 +300,7 @@ def test_retired_key_metadata_is_canonical_and_bounded(
         "verify_until": verify_until,
     }
     active_key = _active_key("capacity-key-2026-08")
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileCapacityConfigurationError
-    ):
+    with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
         runtime.validated_capacity_lease_trust(
             _trust_payload(
                 active_key_id=active_key["key_id"],

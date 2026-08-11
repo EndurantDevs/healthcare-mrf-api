@@ -81,8 +81,33 @@ dataset. Exact replay returns the same dataset with `replayed=true`.
 This operator does not dispatch the global Provider Directory Profile delta.
 The repository has a public Profile builder, but it is not a safe source-local
 dispatcher: it requires a complete global dataset-selection fence and a
-separately admitted capacity plan. The available follow-up descriptor and
-queue handoff are private orchestration internals.
+separately admitted capacity plan. The publication receipt embeds the exact
+external controller payload at `profile_delta_dispatch.external_followup`.
+Extract it from the recorded receipt without changing any field:
+
+```bash
+GLOBAL_PROFILE_FOLLOWUP_JSON="$(
+  jq -ce '
+    .profile_delta_dispatch
+    | select(.status == "not_dispatched")
+    | select(.required_external_global_dispatch == true)
+    | select(.external_followup_contract_id == "healthporta.provider-directory.global-profile-followup.v1")
+    | .external_followup
+    | select(.status == "required")
+    | select(.kind == "provider_directory_global_profile")
+    | select(.intent == "ensure_desired_generation_observed")
+  ' <<<"$UHC_FLEX_PUBLICATION_RECEIPT_JSON"
+)"
+```
+
+Submit `GLOBAL_PROFILE_FOLLOWUP_JSON` unchanged to the existing external global
+Profile controller. The closed controller payload binds the exact source,
+dataset, acquisition root, idempotency key, and complete-global-fence
+parameters. Its enclosing dispatch receipt separately records
+`external_followup_contract_id` and `profile_strategy_version`; those sibling
+metadata fields are not part of the controller payload. This extraction does
+not dispatch anything, and the Flex operator has no Profile-dispatch command.
+Record the controller result separately.
 
 For that reason, every publication receipt explicitly reports:
 
@@ -90,9 +115,9 @@ For that reason, every publication receipt explicitly reports:
 {"operator_command_available":false,"required_external_global_dispatch":true,"status":"not_dispatched"}
 ```
 
-The production controller must submit the standard global Profile follow-up
-after verifying the published dataset receipt. Do not infer Profile serving
-readiness from this operator's publication result.
+The production controller must submit the embedded standard global Profile
+follow-up after verifying the published dataset receipt. Do not infer Profile
+serving readiness from this operator's publication result.
 
 Run each mutating phase in a separate one-shot Job. Record the exact image
 digest, migration head, gate, selector receipt, Job outcome, database readiness,

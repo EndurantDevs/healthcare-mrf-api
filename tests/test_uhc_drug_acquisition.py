@@ -49,8 +49,7 @@ def _identity(index: int, body: bytes = b"[{}]") -> SourceArtifactIdentity:
         family=family,
         file_name=file_name,
         source_url=(
-            "https://providermrf.uhc.com/api/stream/"
-            f"ui/{family}/drugs/{file_name}"
+            "https://providermrf.uhc.com/api/stream/" f"ui/{family}/drugs/{file_name}"
         ),
         catalog_modified_at="2026-08-10T00:00:00Z",
         catalog_entry_sha256=f"{index + 11:064x}",
@@ -154,6 +153,15 @@ def _install_acquisition_mocks(
         identities=identities,
         source_observation_sha256="c" * 64,
     )
+    claim = acquisition.UHCDrugSourceAcquisitionClaim(
+        source_id=SOURCE_ID,
+        lease_generation=1,
+        lease_token="8" * 64,
+    )
+
+    async def run_claimed(_source_id, operation, *, database):
+        return await operation(claim)
+
     monkeypatch.setattr(
         acquisition,
         "register_uhc_formulary_source",
@@ -165,6 +173,16 @@ def _install_acquisition_mocks(
         AsyncMock(return_value=registration),
     )
     monkeypatch.setattr(acquisition, "require_source_unchanged", AsyncMock())
+    monkeypatch.setattr(
+        acquisition,
+        "require_active_uhc_drug_source_acquisition",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        acquisition,
+        "run_with_uhc_drug_source_acquisition_lease",
+        run_claimed,
+    )
     monkeypatch.setattr(
         acquisition,
         "pending_source_files",
@@ -304,12 +322,49 @@ async def test_stream_rejects_transport_identity_and_length_mismatch(
 async def test_current_acquisition_uses_retained_listing_proof_once(
     monkeypatch,
 ) -> None:
+    """The retained catalog snapshot is loaded exactly once inside the claim."""
+
     retained_proof_by_field = {"retained": "proof"}
     expected_result = object()
+    source_binding = SimpleNamespace(source_id=SOURCE_ID)
+    claim = acquisition.UHCDrugSourceAcquisitionClaim(
+        source_id=SOURCE_ID,
+        lease_generation=7,
+        lease_token="7" * 64,
+    )
     load = AsyncMock(return_value=retained_proof_by_field)
     acquire = AsyncMock(return_value=expected_result)
+    acquisition_state = SimpleNamespace(is_started=False)
+
+    async def run_claimed(source_id, operation, *, database):
+        assert (source_id, database) == (SOURCE_ID, acquisition.db)
+        acquisition_state.is_started = True
+        return await operation(claim)
+
+    async def load_inside_claim(**_keywords):
+        assert acquisition_state.is_started is True
+        return retained_proof_by_field
+
+    load.side_effect = load_inside_claim
+    source_registration = AsyncMock(return_value=source_binding)
+    monkeypatch.setattr(
+        acquisition, "register_uhc_formulary_source", source_registration
+    )
+    claim_guard = AsyncMock()
+    monkeypatch.setattr(
+        acquisition, "require_active_uhc_drug_source_acquisition", claim_guard
+    )
+    monkeypatch.setattr(
+        acquisition,
+        "run_with_uhc_drug_source_acquisition_lease",
+        run_claimed,
+    )
     monkeypatch.setattr(acquisition, "load_retained_uhc_catalog_proof", load)
-    monkeypatch.setattr(acquisition, "acquire_uhc_drug_artifacts", acquire)
+    monkeypatch.setattr(
+        acquisition,
+        "_acquire_registered_uhc_drug_artifacts",
+        acquire,
+    )
 
     acquisition_result = await acquisition.acquire_current_uhc_drug_artifacts(
         raw_set_sha256="c" * 64,
@@ -321,23 +376,24 @@ async def test_current_acquisition_uses_retained_listing_proof_once(
         database=acquisition.db,
     )
     assert acquire.await_args.args == (retained_proof_by_field,)
+    assert acquire.await_args.kwargs["binding"] is source_binding
+    assert acquire.await_args.kwargs["claim"] is claim
     assert acquire.await_args.kwargs["database"] is acquisition.db
 
 
 def test_staging_directory_is_descriptor_validated_and_private(
     retained_artifact_test_root: Path,
 ) -> None:
-    staging = staging_io.prepare_retained_artifact_staging_directory(
-        "uhc-formulary"
-    )
+    staging = staging_io.prepare_retained_artifact_staging_directory("uhc-formulary")
 
     assert staging == retained_artifact_test_root / "tmp" / "uhc-formulary"
     assert staging.is_dir()
     assert os.stat(staging).st_uid == os.geteuid()
     assert os.stat(staging).st_mode & 0o777 == 0o700
-    assert staging_io.prepare_retained_artifact_staging_directory(
-        "uhc-formulary"
-    ) == staging
+    assert (
+        staging_io.prepare_retained_artifact_staging_directory("uhc-formulary")
+        == staging
+    )
 
 
 def test_staging_directory_rejects_symlink_escape(
@@ -348,9 +404,7 @@ def test_staging_directory_rejects_symlink_escape(
     (retained_artifact_test_root / "tmp").symlink_to(outside)
     try:
         with pytest.raises(RetainedArtifactError, match="path_unsafe"):
-            staging_io.prepare_retained_artifact_staging_directory(
-                "uhc-formulary"
-            )
+            staging_io.prepare_retained_artifact_staging_directory("uhc-formulary")
         assert not (outside / "uhc-formulary").exists()
     finally:
         outside.rmdir()
@@ -409,31 +463,28 @@ async def test_pending_cleanup_drains_repeated_outer_cancellation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pending_cleanup_preserves_primary_task_failure() -> None:
+async def test_pending_failure_drains_siblings_and_retains_sanitized_evidence() -> None:
     sibling_started = asyncio.Event()
-    cleanup_started = asyncio.Event()
-    release_cleanup = asyncio.Event()
+    sibling_finished = asyncio.Event()
 
     async def failing() -> tuple[int, str, str]:
         await sibling_started.wait()
-        raise RuntimeError("primary acquisition failure")
+        raise RuntimeError("private identity and URL must not escape")
 
     async def sibling() -> tuple[int, str, str]:
         sibling_started.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cleanup_started.set()
-            await release_cleanup.wait()
-        return 0, "cs", "never.json"
+        await asyncio.sleep(0)
+        sibling_finished.set()
+        return 4, "cs", "retained.json"
 
     tasks = (asyncio.create_task(failing()), asyncio.create_task(sibling()))
-    supervisor = asyncio.create_task(
-        transport._complete_pending_tasks(tasks, progress_callback=None)
-    )
-    await cleanup_started.wait()
-    supervisor.cancel()
-    release_cleanup.set()
+    with pytest.raises(
+        transport.UHCDrugArtifactAcquisitionError,
+        match="artifact set acquisition is incomplete",
+    ) as caught:
+        await transport._complete_pending_tasks(tasks, progress_callback=None)
 
-    with pytest.raises(RuntimeError, match="primary acquisition failure"):
-        await supervisor
+    assert sibling_finished.is_set()
+    assert caught.value.failure_count == 1
+    assert caught.value.failure_evidence == ("artifact_processing",)
+    assert "private identity" not in str(caught.value)

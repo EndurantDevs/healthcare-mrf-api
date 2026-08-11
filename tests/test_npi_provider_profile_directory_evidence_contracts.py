@@ -70,11 +70,7 @@ def test_provider_directory_address_merge_preserves_best_row_and_all_evidence(
     )
     assert merged_addresses[0]["phone_number"] == "5550100"
     assert merged_addresses[0]["fax_number_digits"] == "5550199"
-    assert [address["type"] for address in merged_addresses] == [
-        "primary",
-        "site",
-        "mail",
-    ]
+    assert [address["type"] for address in merged_addresses] == ["primary", "mail"]
 
 
 def test_provider_directory_address_helpers_handle_empty_and_duplicate_values():

@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-import json
 import uuid
 
 from sqlalchemy.exc import DBAPIError
@@ -54,6 +53,13 @@ from tests.provider_directory_uhc_flex_npi_cohort_pg_support import MEMBER_NPIS
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
     seed_official_dataset,
 )
+from tests.provider_directory_rooted_graph_pg_support import (
+    extend_publication_foundation as extend_rooted_publication_foundation,
+)
+from tests.provider_directory_uhc_flex_publication_pg_support import (
+    extend_flex_publication_foundation as _extend_provider_foundation,
+    seed_exact_publication_registry as _seed_exact_source,
+)
 
 
 VERSIONS = Path(__file__).resolve().parents[1] / "alembic/versions"
@@ -67,11 +73,12 @@ TWIN_PATH = VERSIONS / (
 PUBLICATION_PATH = VERSIONS / (
     "20260810080000_provider_directory_uhc_flex_practitioner_publication.py"
 )
+ROOTED_PUBLICATION_PATH = VERSIONS / (
+    "20260811020000_provider_directory_rooted_graph_acquisition.py"
+)
 PROJECTION_DATE = "2026-08-10"
 SOURCE_ID = "pdfhir_1ceb7c0986c320b7eb924881"
-ENDPOINT_ID = (
-    "ad53a7446514ed65b3a8ea7ab68ceb9a1ef85bf6c04fcb882219ecb50928bab5"
-)
+ENDPOINT_ID = "ad53a7446514ed65b3a8ea7ab68ceb9a1ef85bf6c04fcb882219ecb50928bab5"
 
 
 def _configure_database(monkeypatch, url) -> Database:
@@ -83,84 +90,6 @@ def _configure_database(monkeypatch, url) -> Database:
     monkeypatch.setenv("HLTHPRT_DB_DATABASE", str(url.database))
     monkeypatch.delenv("HLTHPRT_DB_DATABASE_OVERRIDE", raising=False)
     return Database()
-
-
-async def _extend_provider_foundation(connection, schema_name: str) -> None:
-    """Give the focused fixture the production columns used by publication."""
-
-    schema = quoted(schema_name)
-    await connection.execute(
-        f"""
-        ALTER TABLE {schema}.provider_directory_api_endpoint
-            ADD COLUMN canonical_api_base text,
-            ADD COLUMN metadata_json jsonb;
-        ALTER TABLE {schema}.provider_directory_source
-            ADD COLUMN canonical_api_base text,
-            ADD COLUMN requires_registration boolean,
-            ADD COLUMN requires_api_key boolean,
-            ADD COLUMN auth_type text,
-            ADD COLUMN metadata_json jsonb;
-        ALTER TABLE {schema}.provider_directory_endpoint_dataset
-            ADD COLUMN import_run_id varchar(64),
-            ADD COLUMN previous_dataset_id varchar(96),
-            ADD COLUMN created_at timestamp,
-            ADD COLUMN validated_at timestamp,
-            ADD COLUMN published_at timestamp,
-            ADD COLUMN superseded_at timestamp,
-            ADD COLUMN completion_proof_required_version integer,
-            ADD COLUMN completion_proof_json jsonb,
-            ADD COLUMN completion_proof_sha256 varchar(64);
-        ALTER TABLE {schema}.provider_directory_dataset_resource
-            ADD COLUMN acquired_resource_sha256 varchar(64);
-        CREATE UNIQUE INDEX provider_directory_endpoint_dataset_current_idx
-            ON {schema}.provider_directory_endpoint_dataset(endpoint_id)
-            WHERE is_current IS TRUE;
-        CREATE UNIQUE INDEX provider_directory_endpoint_dataset_root_idx
-            ON {schema}.provider_directory_endpoint_dataset(
-                endpoint_id, acquisition_root_run_id
-            ) WHERE acquisition_root_run_id IS NOT NULL;
-        """
-    )
-
-
-async def _seed_exact_source(connection, schema_name: str) -> None:
-    schema = quoted(schema_name)
-    endpoint_metadata_by_field = {
-        "authority_id": "unitedhealthcare",
-        "resource_types": ["Practitioner"],
-    }
-    source_metadata_by_field = {
-        "provider_directory_acquisition_enabled": False,
-        "provider_directory_acquisition_mode": "manual",
-        "provider_directory_authority_id": "unitedhealthcare",
-        "provider_directory_connector_id": (
-            "pdufpc_16ebdbf260dc9815ae38830a6991fea5d6533ab8db7389da"
-        ),
-        "provider_directory_endpoint_collection_complete": False,
-        "provider_directory_endpoint_complete": False,
-        "provider_directory_query_contract_id": (
-            "healthporta.provider-directory.uhc-flex-practitioner-exact-npi.v1"
-        ),
-        "provider_directory_resource_types": ["Practitioner"],
-    }
-    await connection.execute(
-        f"INSERT INTO {schema}.provider_directory_api_endpoint "
-        "(endpoint_id, canonical_api_base, metadata_json) "
-        "VALUES ($1, $2, $3::jsonb)",
-        ENDPOINT_ID,
-        "https://flex.optum.com/fhirpublic/R4",
-        json.dumps(endpoint_metadata_by_field),
-    )
-    await connection.execute(
-        f"INSERT INTO {schema}.provider_directory_source "
-        "(source_id, endpoint_id, canonical_api_base, requires_registration, "
-        "requires_api_key, auth_type, metadata_json) "
-        "VALUES ($1, $2, $3, false, false, 'none', $4::jsonb)",
-        SOURCE_ID,
-        ENDPOINT_ID,
-        "https://flex.optum.com/fhirpublic/R4",
-        json.dumps(source_metadata_by_field),
-    )
 
 
 def _query_result(npi: int, matched: bool):
@@ -198,17 +127,18 @@ async def _sealed_pair(
     operation_key: str,
     matched: bool,
     admit: bool = True,
+    cohort=None,
 ):
-    cohort = cohort_fixture()
+    selected_cohort = cohort if cohort is not None else cohort_fixture()
     intent_id = build_uhc_flex_practitioner_dataset_intent_id(
-        cohort.cohort_id,
+        selected_cohort.cohort_id,
         PROJECTION_DATE,
         operation_key,
     )
     identities = []
     for role in ("baseline", "candidate"):
         identity = build_uhc_flex_practitioner_acquisition_identity(
-            cohort,
+            selected_cohort,
             acquisition_role=role,
             run_id=build_uhc_flex_practitioner_run_id(intent_id, role),
             dataset_intent_id=intent_id,
@@ -251,6 +181,8 @@ async def _prepare_publication_schema(
     schema_name: str,
     schema: str,
     migrations: tuple,
+    *,
+    include_rooted_registry: bool = False,
 ) -> None:
     async with engine.begin() as engine_connection:
         await engine_connection.exec_driver_sql(f"CREATE SCHEMA {schema}")
@@ -276,7 +208,11 @@ async def _prepare_publication_schema(
     await run_migration(engine, migrations[3], "upgrade")
     connection = await connect(url)
     try:
-        await _seed_exact_source(connection, schema_name)
+        await _seed_exact_source(
+            connection,
+            schema_name,
+            include_rooted=include_rooted_registry,
+        )
     finally:
         await connection.close()
 
@@ -296,10 +232,25 @@ async def _publication_test_scope(monkeypatch):
             (COHORT_PATH, ACQUISITION_PATH, TWIN_PATH, PUBLICATION_PATH)
         )
     )
+    rooted_migration = load_migration(
+        ROOTED_PUBLICATION_PATH,
+        "flex_publication_rooted",
+    )
     try:
         await _prepare_publication_schema(
-            engine, url, schema_name, schema, migrations
+            engine,
+            url,
+            schema_name,
+            schema,
+            migrations,
+            include_rooted_registry=True,
         )
+        connection = await connect(url)
+        try:
+            await extend_rooted_publication_foundation(connection, schema_name)
+        finally:
+            await connection.close()
+        await run_migration(engine, rooted_migration, "upgrade")
         await database.connect()
         yield url, schema, database, engine, migrations[3]
     finally:
@@ -321,10 +272,13 @@ async def _assert_admission_gate(database: Database, schema: str) -> None:
             database=database,
             batch_size=1,
         )
-    assert await database.scalar(
-        f"SELECT count(*) FROM {schema}."
-        "provider_directory_uhc_flex_practitioner_dataset"
-    ) == 0
+    assert (
+        await database.scalar(
+            f"SELECT count(*) FROM {schema}."
+            "provider_directory_uhc_flex_practitioner_dataset"
+        )
+        == 0
+    )
 
 
 async def _publish_successive_datasets(database: Database):
@@ -363,9 +317,10 @@ async def _publish_successive_datasets(database: Database):
     assert empty.replayed is False
     assert empty.readiness.resource_count == 0
     assert empty.readiness.previous_dataset_id == first.readiness.dataset_id
-    assert await publication.load_current_uhc_flex_dataset_readiness(
-        database=database
-    ) == empty.readiness
+    assert (
+        await publication.load_current_uhc_flex_dataset_readiness(database=database)
+        == empty.readiness
+    )
     with pytest.raises(
         publication.UHCFlexPractitionerPublicationError,
         match="replay is not current",
@@ -409,46 +364,71 @@ async def _assert_official_dataset_rotation_revokes_readiness(
     schema: str,
     dataset_id: str,
 ) -> None:
-    ready_function = (
-        f"{schema}.provider_directory_uhc_flex_practitioner_dataset_ready"
+    ready_function = f"{schema}.provider_directory_uhc_flex_practitioner_dataset_ready"
+    assert (
+        await connection.fetchval(
+            f"SELECT {ready_function}($1)",
+            dataset_id,
+        )
+        is True
     )
-    assert await connection.fetchval(
-        f"SELECT {ready_function}($1)",
-        dataset_id,
-    ) is True
     await connection.execute(
         f"UPDATE {schema}.provider_directory_endpoint_dataset "
         "SET status = 'superseded', is_current = false, "
         "superseded_at = transaction_timestamp() WHERE dataset_id = $1",
         DATASET_ID,
     )
-    assert await connection.fetchval(
-        f"SELECT {ready_function}($1)",
-        dataset_id,
-    ) is False
+    assert (
+        await connection.fetchval(
+            f"SELECT {ready_function}($1)",
+            dataset_id,
+        )
+        is False
+    )
 
 
 async def _assert_mutation_guards(connection, schema: str) -> None:
     guarded_statements = (
-        f"UPDATE {schema}.provider_directory_uhc_flex_practitioner_dataset "
-        "SET dataset_hash = repeat('0', 64) WHERE is_current",
-        f"UPDATE {schema}.provider_directory_endpoint_dataset "
-        "SET publication_metadata_json = '{}'::jsonb WHERE is_current",
-        f"UPDATE {schema}.provider_directory_uhc_flex_practitioner_"
-        "dataset_resource SET payload_hash = repeat('0', 64)",
-        f"UPDATE {schema}.provider_directory_source SET metadata_json = "
-        "jsonb_set(metadata_json, '{provider_directory_authority_id}', "
-        "'\"drift\"'::jsonb) WHERE source_id = '" + SOURCE_ID + "'",
-        f"UPDATE {schema}.provider_directory_api_endpoint SET metadata_json = "
-        "jsonb_set(metadata_json, '{authority_id}', '\"drift\"'::jsonb) "
-        "WHERE endpoint_id = '" + ENDPOINT_ID + "'",
-        f"TRUNCATE TABLE {schema}."
-        "provider_directory_uhc_flex_practitioner_dataset_resource",
-        f"TRUNCATE TABLE {schema}."
-        "provider_directory_uhc_flex_practitioner_dataset CASCADE",
+        (
+            "55000",
+            f"UPDATE {schema}.provider_directory_uhc_flex_practitioner_dataset "
+            "SET dataset_hash = repeat('0', 64) WHERE is_current",
+        ),
+        (
+            {"23514", "55000"},
+            f"UPDATE {schema}.provider_directory_endpoint_dataset "
+            "SET publication_metadata_json = '{}'::jsonb WHERE is_current",
+        ),
+        (
+            "55000",
+            f"UPDATE {schema}.provider_directory_uhc_flex_practitioner_"
+            "dataset_resource SET payload_hash = repeat('0', 64)",
+        ),
+        (
+            "55000",
+            f"UPDATE {schema}.provider_directory_source SET metadata_json = "
+            "jsonb_set(metadata_json, '{provider_directory_authority_id}', "
+            "'\"drift\"'::jsonb) WHERE source_id = '" + SOURCE_ID + "'",
+        ),
+        (
+            "55000",
+            f"UPDATE {schema}.provider_directory_api_endpoint SET metadata_json = "
+            "jsonb_set(metadata_json, '{authority_id}', '\"drift\"'::jsonb) "
+            "WHERE endpoint_id = '" + ENDPOINT_ID + "'",
+        ),
+        (
+            "55000",
+            f"TRUNCATE TABLE {schema}."
+            "provider_directory_uhc_flex_practitioner_dataset_resource",
+        ),
+        (
+            "55000",
+            f"TRUNCATE TABLE {schema}."
+            "provider_directory_uhc_flex_practitioner_dataset CASCADE",
+        ),
     )
-    for statement in guarded_statements:
-        await assert_sqlstate(connection, "55000", statement)
+    for expected_sqlstate, statement in guarded_statements:
+        await assert_sqlstate(connection, expected_sqlstate, statement)
 
 
 @pytest.mark.asyncio

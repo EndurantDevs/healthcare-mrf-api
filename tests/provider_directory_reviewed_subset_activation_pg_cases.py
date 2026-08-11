@@ -18,6 +18,7 @@ from tests.provider_directory_reviewed_subset_activation_pg_support import (
 )
 from tests.provider_directory_reviewed_subset_activation_pg_upsert import (
     prove_catalog_upserts_preserve_activation,
+    prove_unprotected_generation_replacement,
 )
 from tests.provider_directory_subset_completion_pg_setup import (
     MigrationSqlCapture,
@@ -153,9 +154,8 @@ async def _prove_third_root_rejected(scenario, evidence_pairs) -> None:
                 *terminal_arguments,
             )
     except asyncpg.PostgresError as error:
-        assert (
-            "provider_directory_reviewed_subset_activation_dataset_invalid"
-            in str(error)
+        assert "provider_directory_reviewed_subset_activation_dataset_invalid" in str(
+            error
         )
     else:
         raise AssertionError("extra proof-bearing root was accepted")
@@ -221,9 +221,8 @@ async def _prove_activation_downgrade_blocked(scenario, migration) -> None:
             for statement in capture.statements:
                 await scenario.connection.execute(statement)
     except asyncpg.PostgresError as error:
-        assert (
-            "provider_directory_reviewed_subset_activation_downgrade_blocked"
-            in str(error)
+        assert "provider_directory_reviewed_subset_activation_downgrade_blocked" in str(
+            error
         )
     else:
         raise AssertionError("active reviewed subset downgrade was accepted")
@@ -231,8 +230,7 @@ async def _prove_activation_downgrade_blocked(scenario, migration) -> None:
 
 async def _prove_unrelated_source_dml_is_scoped(scenario, migration) -> None:
     validation_ref = (
-        f"{scenario.quoted_schema}."
-        f'"{migration._ACTIVATION_VALID_FUNCTION}"'
+        f"{scenario.quoted_schema}." f'"{migration._ACTIVATION_VALID_FUNCTION}"'
     )
     await scenario.connection.execute(
         f"""
@@ -268,13 +266,16 @@ async def _prove_unrelated_source_dml_is_scoped(scenario, migration) -> None:
          WHERE source_id LIKE 'synthetic-unrelated-%';
         """
     )
-    assert await scenario.connection.fetchval(
-        f"""
+    assert (
+        await scenario.connection.fetchval(
+            f"""
         SELECT pg_catalog.count(*) = 1
           FROM {scenario.quoted_schema}.provider_directory_source
          WHERE source_id = 'synthetic-source'
         """
-    ) is True
+        )
+        is True
+    )
 
 
 def _activation_scope_marker() -> dict[str, object]:
@@ -417,6 +418,7 @@ async def prove_reviewed_subset_activation_lifecycle(
     """Prove exact activation, mutation fences, and post-publish replay."""
 
     marker_by_field = activation_marker(evidence_pairs)
+    await prove_unprotected_generation_replacement(scenario)
     await scenario.connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
     await scenario.connection.execute("SET CONSTRAINTS ALL DEFERRED")
     await _prove_invalid_activation_transitions(

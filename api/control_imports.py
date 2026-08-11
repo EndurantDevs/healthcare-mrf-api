@@ -267,6 +267,27 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.address_archive_migration",
         "target_function": "process_data",
     },
+    "address-numeric-grid-alias": {
+        "queue": "arq:AddressArchive",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.address_numeric_grid_alias_worker",
+        "target_function": "process_data",
+    },
+    "address-strict-source-backfill": {
+        "queue": "arq:AddressArchive",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.address_numeric_grid_alias_worker",
+        "target_function": "process_address_strict_source_backfill",
+    },
+    "address-numeric-grid-alias-revoke": {
+        "queue": "arq:AddressArchive",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.address_numeric_grid_alias_worker",
+        "target_function": "process_address_numeric_grid_alias_revoke",
+    },
     "openaddresses": {
         "queue": "arq:OpenAddresses",
         "function": "control_single_job_start",
@@ -322,6 +343,9 @@ _CANCELABLE_IMPORTERS = {
     "mrf-source-discovery",
     "provider-directory-fhir",
     "address-archive-v2-migrate",
+    "address-numeric-grid-alias",
+    "address-strict-source-backfill",
+    "address-numeric-grid-alias-revoke",
     "clinical-reference",
     "ms-drg",
     "openaddresses",
@@ -446,6 +470,9 @@ def _importer_family(importer: str) -> str:
         "entity-address-unified",
         "cms-doctors",
         "address-archive-v2-migrate",
+        "address-numeric-grid-alias",
+        "address-strict-source-backfill",
+        "address-numeric-grid-alias-revoke",
     }:
         return "provider"
     if importer in {"partd-formulary-network", "pharmacy-license", "pharmacy-economics"}:
@@ -1484,6 +1511,7 @@ def _provider_directory_artifact_scope(params: dict[str, Any]) -> frozenset[str]
         "stale_cleanup",
         "publish_after_acquisition",
         "publish_artifacts",
+        "full_address_artifact_rebuild",
     )
     if any(params.get(flag_name) for flag_name in incompatible_flags):
         return None

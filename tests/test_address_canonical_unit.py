@@ -1574,12 +1574,12 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "location_key varchar(64)" in raw_sql
     assert "archive_identity_version varchar(16)" in raw_sql
     assert "ptg_plan_array varchar[]" in raw_sql
-    assert "LEFT JOIN mrf.address_archive_v2 a_direct" in enrich_sql
+    assert "LEFT JOIN mrf.address_alias_v1 AS active_alias" in enrich_sql
     assert "LEFT JOIN LATERAL" in enrich_sql
-    assert "a_direct.address_key IS NULL" in enrich_sql
+    assert "active_alias.target_address_key" in enrich_sql
     assert "mrf.addr_key_v1(r.first_line, r.second_line, r.city_name, r.state_name, r.postal_code, r.country_code)" in enrich_sql
-    assert "FROM mrf.address_archive_v2 aa" in enrich_sql
-    assert "ORDER BY candidate.priority" not in enrich_sql
+    assert "JOIN mrf.address_archive_v2 AS archive_row" in enrich_sql
+    assert "ORDER BY candidate.priority" in enrich_sql
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_TRUST_SOURCE_ADDRESS_KEY", "0")
     legacy_enrich_sql = entity_address_unified._enrich_raw_stage_sql("mrf", "entity_address_unified_raw")
     assert "ORDER BY candidate.priority" in legacy_enrich_sql
@@ -2768,6 +2768,11 @@ async def test_provider_directory_partial_shutdown_uses_atomic_publisher(monkeyp
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "none")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_address_alias_generation",
+        AsyncMock(return_value=0),
+    )
     monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
     monkeypatch.setattr(entity_address_unified, "_has_table", AsyncMock(return_value=True))
     monkeypatch.setattr(

@@ -40,12 +40,9 @@ from tests.uhc_drug_vertical_postgres_support import VerticalProofIdentity
 pytest_plugins = ("tests.provider_directory_retained_reader_fixtures",)
 
 VERSIONS = Path(FOUNDATION_PATH).parent
-ARTIFACT_PATH = VERSIONS / (
-    "20260810030000_fhir_formulary_source_artifact.py"
-)
-RECEIPT_PATH = VERSIONS / (
-    "20260810040000_fhir_formulary_uhc_admission_receipt.py"
-)
+ARTIFACT_PATH = VERSIONS / ("20260810030000_fhir_formulary_source_artifact.py")
+RECEIPT_PATH = VERSIONS / ("20260810040000_fhir_formulary_uhc_admission_receipt.py")
+LEASE_PATH = VERSIONS / ("20260811030000_fhir_formulary_source_acquisition_lease.py")
 MIGRATION_PATHS = (
     FOUNDATION_PATH,
     ATTEMPT_PATH,
@@ -53,14 +50,13 @@ MIGRATION_PATHS = (
     GUARDS_PATH,
     ARTIFACT_PATH,
     RECEIPT_PATH,
+    LEASE_PATH,
 )
 
 
 async def _upgrade_schema(engine, schema_name: str) -> None:
     async with engine.begin() as connection:
-        await connection.exec_driver_sql(
-            f"CREATE SCHEMA {quoted(schema_name)}"
-        )
+        await connection.exec_driver_sql(f"CREATE SCHEMA {quoted(schema_name)}")
     for index, migration_path in enumerate(MIGRATION_PATHS):
         migration = load_migration(
             migration_path,
@@ -144,9 +140,7 @@ async def test_uhc_drug_vertical_restart_and_receipt_only_publication(
 
     url = database_url()
     schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
-    migration_engine = create_async_engine(
-        url.set(drivername="postgresql+asyncpg")
-    )
+    migration_engine = create_async_engine(url.set(drivername="postgresql+asyncpg"))
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
     monkeypatch.setenv("DB_SCHEMA", schema_name)
     monkeypatch.setenv("HLTHPRT_UHC_FORMULARY_MIN_FREE_BYTES", "1")

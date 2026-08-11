@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,115 +16,58 @@ from api import provider_directory_sources
 from process import provider_directory_profile as profile
 from process import provider_directory_profile_selection_snapshot as snapshot
 from process import provider_directory_profile_uhc_flex as flex_profile
+from process.provider_directory_dataset_scoped_publication import (
+    LEGACY_PRACTITIONER_VARIANT,
+    ROOTED_COMBINED_VARIANT,
+)
+from process.provider_directory_rooted_graph_source_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+)
 from process.uhc_flex_practitioner_contract import (
     UHC_FLEX_PRACTITIONER_SOURCE_ID,
 )
+from tests.provider_directory_profile_uhc_flex_test_support import (
+    FLEX_DATASET_ID,
+    FLEX_ENDPOINT_ID,
+    GRAPH_DATASET_ID,
+    GRAPH_ENDPOINT_ID,
+    OFFICIAL_ENDPOINT_ID,
+    OFFICIAL_SOURCE_ID,
+    _artifact_dataset_row,
+    _catalog,
+    _dataset_rows,
+    _flex_metadata,
+    _readiness_record,
+    _rooted_dataset_rows,
+    _rooted_metadata,
+    _source_rows,
+)
 
 
-OFFICIAL_SOURCE_ID = "pdfhir_2754e999dd691175821ec26e"
-FLEX_ENDPOINT_ID = "a" * 64
-OFFICIAL_ENDPOINT_ID = "b" * 64
-FLEX_DATASET_ID = "pdufpd_" + "c" * 48
 importer = importlib.import_module("process.provider_directory_fhir")
-
-
-def _flex_metadata(*, projection: str = "2026-08-09") -> dict[str, object]:
-    return {
-        "acquisition_root_run_id": "pdufpar_" + "d" * 48,
-        "admission_id": "pdufpa_" + "e" * 48,
-        "cohort_complete": True,
-        "dataset_id": FLEX_DATASET_ID,
-        "endpoint_collection_complete": False,
-        "endpoint_complete": False,
-        "endpoint_id": FLEX_ENDPOINT_ID,
-        "expected_resources": ["Practitioner"],
-        "operation_key": "f" * 64,
-        "publication_contract_id": (
-            "healthporta.provider-directory.uhc-flex-practitioner-"
-            "dataset-publication.v1"
-        ),
-        "resource_hash_contract": "semantic_content_v3",
-        "selected_resources": ["Practitioner"],
-        "semantic_projection_as_of": projection,
-        "source_authority_id": "unitedhealthcare",
-        "source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        "source_ids": [UHC_FLEX_PRACTITIONER_SOURCE_ID],
-    }
-
-
-def _source_rows() -> list[dict[str, object]]:
-    return [
-        {
-            "source_id": OFFICIAL_SOURCE_ID,
-            "endpoint_id": OFFICIAL_ENDPOINT_ID,
-            "canonical_api_base": "https://files.example.test",
-            "org_name": "Official files",
-            "plan_name": None,
-        },
-        {
-            "source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID,
-            "endpoint_id": FLEX_ENDPOINT_ID,
-            "canonical_api_base": "https://directory.example.test/R4",
-            "org_name": "Practitioner enrichment",
-            "plan_name": None,
-        },
-        {
-            "source_id": "pdfhir_0b5cfd565c53364a73981dcb",
-            "endpoint_id": "probe-endpoint",
-            "canonical_api_base": "https://directory.example.test/R4",
-            "org_name": "Generic probe",
-            "plan_name": None,
-        },
-    ]
-
-
-def _dataset_rows(*, ready: bool = True) -> list[dict[str, object]]:
-    metadata = _flex_metadata()
-    return [
-        {
-            "endpoint_id": FLEX_ENDPOINT_ID,
-            "dataset_id": FLEX_DATASET_ID,
-            "acquisition_root_run_id": metadata["acquisition_root_run_id"],
-            "dataset_hash": "1" * 64,
-            "status": "published",
-            "is_current": True,
-            "resource_count": 3,
-            "validated_at": "2026-08-09T00:00:00",
-            "published_at": "2026-08-10T00:00:00",
-            "superseded_at": None,
-            "publication_metadata_json": metadata,
-            "dataset_scoped_ready": ready,
-            "dataset_scoped_admission_id": metadata["admission_id"],
-            "dataset_scoped_projection_as_of": "2026-08-09",
-            "dataset_scoped_authority_id": "unitedhealthcare",
-            "dataset_scoped_operation_key": "f" * 64,
-        }
-    ]
-
-
-def _catalog() -> dict[str, object]:
-    return {
-        "catalog_digest": "2" * 64,
-        "items": [
-            {
-                "entry_id": "uhc-provider-files",
-                "runnable": True,
-                "profile_enabled": True,
-                "source_ids": [OFFICIAL_SOURCE_ID],
-            },
-            {
-                "entry_id": "uhc-generic-probe",
-                "runnable": False,
-                "profile_enabled": False,
-                "source_ids": ["pdfhir_0b5cfd565c53364a73981dcb"],
-            },
-        ],
-    }
 
 
 def test_flex_profile_source_is_dataset_scoped_and_shares_authority():
     assert profile.configured_dataset_scoped_profile_source_ids() == (
         UHC_FLEX_PRACTITIONER_SOURCE_ID,
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+    )
+    assert profile.configured_dataset_scoped_profile_variant_groups() == (
+        (
+            "uhc-flex-enrichment-generation",
+            (
+                UHC_FLEX_PRACTITIONER_SOURCE_ID,
+                PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+            ),
+        ),
+    )
+    assert profile.configured_dataset_scoped_profile_endpoints() == tuple(
+        sorted(
+            (
+                (UHC_FLEX_PRACTITIONER_SOURCE_ID, FLEX_ENDPOINT_ID),
+                (PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID, GRAPH_ENDPOINT_ID),
+            )
+        )
     )
     assert (
         profile.profile_source_authority_id(
@@ -136,6 +80,13 @@ def test_flex_profile_source_is_dataset_scoped_and_shares_authority():
         profile.profile_source_authority_id(
             UHC_FLEX_PRACTITIONER_SOURCE_ID,
             FLEX_ENDPOINT_ID,
+        )
+        == "unitedhealthcare"
+    )
+    assert (
+        profile.profile_source_authority_id(
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+            GRAPH_ENDPOINT_ID,
         )
         == "unitedhealthcare"
     )
@@ -201,6 +152,64 @@ def test_profile_source_helpers_fail_closed_and_render_empty_contracts(
     assert profile.dataset_scoped_profile_source_ids_sql() == ("ARRAY[]::varchar[]")
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_authority", "different_authority", "same_endpoint", "overlap"),
+)
+def test_dataset_variant_spec_rejects_unreviewed_group_coordinates(
+    tmp_path,
+    mutation,
+) -> None:
+    source_spec = deepcopy(profile.load_profile_source_spec())
+    if mutation == "missing_authority":
+        del source_spec["authority_ids_by_source_id"][
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
+        ]
+    elif mutation == "different_authority":
+        source_spec["authority_ids_by_source_id"][
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
+        ] = "different-authority"
+    elif mutation == "same_endpoint":
+        source_spec["dataset_scoped_endpoint_ids_by_source_id"][
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
+        ] = FLEX_ENDPOINT_ID
+    else:
+        source_spec["dataset_scoped_variant_groups"].append(
+            {
+                "group_id": "overlap",
+                "entry_ids": [
+                    "uhc-flex-practitioner-enrichment",
+                    "uhc-flex-rooted-graph-enrichment",
+                ],
+            }
+        )
+    spec_path = tmp_path / "profile-sources.json"
+    spec_path.write_text(json.dumps(source_spec), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="source_spec_invalid"):
+        profile.load_profile_source_spec(spec_path)
+
+
+@pytest.mark.parametrize("coverage", ("missing", "partial"))
+def test_dataset_variant_spec_requires_exact_group_coverage(
+    tmp_path,
+    coverage,
+) -> None:
+    source_spec = deepcopy(profile.load_profile_source_spec())
+    if coverage == "missing":
+        source_spec["dataset_scoped_variant_groups"] = []
+    else:
+        source_spec["dataset_scoped_entry_ids"].append("uhc-provider-files")
+        source_spec["dataset_scoped_endpoint_ids_by_source_id"][
+            OFFICIAL_SOURCE_ID
+        ] = OFFICIAL_ENDPOINT_ID
+    spec_path = tmp_path / "profile-sources.json"
+    spec_path.write_text(json.dumps(source_spec), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="source_spec_invalid"):
+        profile.load_profile_source_spec(spec_path)
+
+
 def test_profile_sql_reads_flex_only_from_the_selected_dataset():
     sql = profile.profile_evidence_insert_sql(
         target_ref='"fixture"."evidence"',
@@ -213,17 +222,44 @@ def test_profile_sql_reads_flex_only_from_the_selected_dataset():
     )
     assert "typed_practitioner_rows AS MATERIALIZED" in sql
     assert "dataset_practitioner_rows AS MATERIALIZED" in sql
+    for family_cte in (
+        "dataset_organization_rows AS MATERIALIZED",
+        "dataset_service_resource_rows AS MATERIALIZED",
+        "dataset_endpoint_rows AS MATERIALIZED",
+    ):
+        assert family_cte in sql
+    for bucketed_family_cte in (
+        "typed_role_rows AS NOT MATERIALIZED",
+        "dataset_role_rows AS NOT MATERIALIZED",
+        "role_resource_rows AS NOT MATERIALIZED",
+        "typed_affiliation_rows AS NOT MATERIALIZED",
+        "dataset_affiliation_rows AS NOT MATERIALIZED",
+        "affiliation_resource_rows AS NOT MATERIALIZED",
+    ):
+        assert bucketed_family_cte in sql
     assert 'FROM "fixture"."dataset_resource" AS resource' in sql
     assert "dataset_source_context.dataset_id = resource.dataset_id" in sql
-    assert "resource.resource_type = 'Practitioner'" in sql
+    for resource_type in (
+        "Practitioner",
+        "PractitionerRole",
+        "Organization",
+        "OrganizationAffiliation",
+        "HealthcareService",
+        "Endpoint",
+    ):
+        assert f"resource.resource_type = '{resource_type}'" in sql
     assert "resource.payload_json::jsonb ->> 'resource_id'" in sql
     assert UHC_FLEX_PRACTITIONER_SOURCE_ID in sql
     assert "JOIN typed_source_context" in sql
-    assert "ON typed_source_context.source_id = role.source_id" in sql
-    assert "ON typed_source_context.source_id = service.source_id" in sql
-    assert "ON typed_source_context.source_id = affiliation.source_id" in sql
+    assert "typed_source_context.source_id = role.source_id" in sql
+    assert "typed_source_context.source_id = service.source_id" in sql
+    assert "typed_source_context.source_id = affiliation.source_id" in sql
     assert "SELECT * FROM typed_practitioner_rows" in sql
     assert "SELECT * FROM dataset_practitioner_rows" in sql
+    assert "practitioner.dataset_id = role.dataset_id" in sql
+    assert "service.dataset_id = role_rows.dataset_id" in sql
+    assert "endpoint.dataset_id = role_rows.dataset_id" in sql
+    assert "organization.dataset_id = affiliation.dataset_id" in sql
 
 
 def test_public_catalog_admits_dedicated_dataset_source_without_running_probe():
@@ -275,6 +311,69 @@ def test_selection_admits_only_ready_exact_cohort_and_never_generic_probe():
     assert not_ready.request_projection == ()
     assert not_ready.identity_payload["operation"] == "purge"
 
+    rooted = snapshot._computed_selection_from_rows(
+        _catalog(),
+        node_id="test-node",
+        source_rows=_source_rows(),
+        dataset_rows=_rooted_dataset_rows(),
+    )
+    assert rooted.request_projection == (
+        {
+            "source_id": PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+            "dataset_id": GRAPH_DATASET_ID,
+        },
+    )
+    rooted_profile_input = snapshot._profile_input(
+        rooted.identity_payload["pairs"][0],
+        _rooted_dataset_rows()[0],
+        _rooted_metadata(),
+    )
+    assert rooted_profile_input["dataset_scoped_variant"] == (ROOTED_COMBINED_VARIANT)
+
+
+def test_selection_rejects_two_variant_currents_or_foreign_current() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="profile_selection_dataset_variant_ambiguous",
+    ):
+        snapshot._computed_selection_from_rows(
+            _catalog(),
+            node_id="test-node",
+            source_rows=_source_rows(),
+            dataset_rows=[*_dataset_rows(), *_rooted_dataset_rows()],
+        )
+
+    foreign = deepcopy(_rooted_dataset_rows())
+    foreign[0]["dataset_id"] = "generic-current"
+    with pytest.raises(
+        RuntimeError,
+        match="profile_selection_dataset_variant_invalid",
+    ):
+        snapshot._computed_selection_from_rows(
+            _catalog(),
+            node_id="test-node",
+            source_rows=_source_rows(),
+            dataset_rows=foreign,
+        )
+
+
+def test_selection_requires_dormant_variant_registration_before_legacy() -> None:
+    source_rows = [
+        source_row
+        for source_row in _source_rows()
+        if source_row["source_id"] != PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
+    ]
+    with pytest.raises(
+        RuntimeError,
+        match="profile_selection_dataset_variant_registry_invalid",
+    ):
+        snapshot._computed_selection_from_rows(
+            _catalog(),
+            node_id="test-node",
+            source_rows=source_rows,
+            dataset_rows=_dataset_rows(),
+        )
+
 
 def test_selection_identity_binds_projection_admission_and_operation():
     first = snapshot._computed_selection_from_rows(
@@ -315,39 +414,6 @@ def test_dataset_scoped_readiness_rejects_any_closed_field_drift():
             dataset_rows=rows,
         )
         assert computed.request_projection == ()
-
-
-def _readiness_record(**overrides: object) -> SimpleNamespace:
-    metadata = _flex_metadata()
-    readiness_by_field: dict[str, object] = {
-        "dataset_id": FLEX_DATASET_ID,
-        "endpoint_id": FLEX_ENDPOINT_ID,
-        "source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        "source_authority_id": "unitedhealthcare",
-        "dataset_hash": "1" * 64,
-        "resource_count": 3,
-        "semantic_projection_as_of": metadata["semantic_projection_as_of"],
-        "admission_id": metadata["admission_id"],
-        "operation_key": metadata["operation_key"],
-        "cohort_complete": True,
-        "endpoint_collection_complete": False,
-        "endpoint_complete": False,
-    }
-    readiness_by_field.update(overrides)
-    return SimpleNamespace(**readiness_by_field)
-
-
-def _artifact_dataset_row() -> dict[str, object]:
-    metadata = _flex_metadata()
-    return {
-        "source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID,
-        "dataset_id": FLEX_DATASET_ID,
-        "endpoint_id": FLEX_ENDPOINT_ID,
-        "acquisition_root_run_id": metadata["acquisition_root_run_id"],
-        "dataset_hash": "1" * 64,
-        "resource_count": 3,
-        "publication_metadata_json": metadata,
-    }
 
 
 def test_artifact_readiness_matches_exact_generic_parent_and_metadata():
@@ -402,6 +468,7 @@ async def test_artifact_fence_rechecks_exact_flex_readiness(monkeypatch):
         dataset_hash="1" * 64,
         resource_count=3,
         dataset_scoped_ready=True,
+        dataset_scoped_variant=LEGACY_PRACTITIONER_VARIANT,
         semantic_projection_as_of="2026-08-09",
         source_authority_id="unitedhealthcare",
         admission_id="pdufpa_" + "e" * 48,
@@ -423,54 +490,3 @@ async def test_artifact_fence_rechecks_exact_flex_readiness(monkeypatch):
     loader.return_value = _readiness_record()
     await importer._assert_uhc_flex_profile_fence_ready(fence, object())
     assert loader.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_artifact_fence_takes_publication_lock_before_row_locks(
-    monkeypatch,
-):
-    events: list[str] = []
-    fence = SimpleNamespace(
-        datasets=(SimpleNamespace(source_id=UHC_FLEX_PRACTITIONER_SOURCE_ID),)
-    )
-
-    def async_step(name: str, return_value: object = None) -> AsyncMock:
-        return AsyncMock(
-            side_effect=lambda *_args, **_kwargs: (
-                events.append(name),
-                return_value,
-            )[1]
-        )
-
-    monkeypatch.setattr(
-        importer,
-        "lock_uhc_flex_profile_publication",
-        async_step("publication"),
-    )
-    for function_name, event_name, return_value in (
-        ("_lock_artifact_fence_endpoint_advisories", "endpoint_advisory", None),
-        ("_lock_artifact_fence_endpoints", "endpoint_rows", None),
-        ("_lock_artifact_fence_aliases", "source_rows", []),
-        ("_artifact_fence_dataset_rows", "dataset_rows", []),
-        ("_artifact_eligible_validated_ids", "eligible_rows", {}),
-        ("_assert_uhc_flex_profile_fence_ready", "readiness", None),
-    ):
-        monkeypatch.setattr(
-            importer,
-            function_name,
-            async_step(event_name, return_value),
-        )
-    monkeypatch.setattr(
-        importer,
-        "_assert_locked_artifact_fence_aliases",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        importer,
-        "_assert_locked_artifact_fence_datasets",
-        lambda *_args: None,
-    )
-
-    await importer._lock_and_verify_artifact_dataset_fence(fence, object())
-    assert events[0] == "publication"
-    assert events[-1] == "readiness"

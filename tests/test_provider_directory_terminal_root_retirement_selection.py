@@ -135,7 +135,7 @@ class SelectionDatabase:
             return [deepcopy(self.endpoint)]
         if "dataset.import_run_id = :owner_run_id" in sql:
             return [deepcopy(self.target)]
-        if "FROM \"mrf\".\"provider_directory_source\"" in sql:
+        if 'FROM "mrf"."provider_directory_source"' in sql:
             return [] if self.source is None else [deepcopy(self.source)]
         if "dataset.dataset_id = :predecessor_id" in sql:
             return [] if self.predecessor is None else [deepcopy(self.predecessor)]
@@ -149,7 +149,13 @@ class SelectionDatabase:
         self.calls.append(("scalar", sql, params))
         if "pg_try_advisory_xact_lock" in sql:
             return self.lock_results.pop(0)
-        if contract.RETIREMENT_EVIDENCE_FUNCTION in sql:
+        if any(
+            function_name in sql
+            for function_name in (
+                contract.RETIREMENT_EVIDENCE_FUNCTION,
+                contract.SEMANTIC_V4_RETIREMENT_PROFILE.evidence_function,
+            )
+        ):
             return deepcopy(self.evidence)
         if "pg_catalog.to_char(" in sql:
             return "2026-08-10 12:00:00+00"
@@ -186,12 +192,37 @@ async def test_selection_locks_scope_inventory_and_exact_legacy_state() -> None:
     assert lineage_call[2]["minimum_age"] == 900
 
     explicit = SelectionDatabase()
-    explicit.target["publication_metadata_json"]["resource_hash_contract"] = (
-        contract.RETIREMENT_RESOURCE_HASH_CONTRACT
-    )
+    explicit.target["publication_metadata_json"][
+        "resource_hash_contract"
+    ] = contract.RETIREMENT_RESOURCE_HASH_CONTRACT
     assert (
         await selected_terminal_root_retirement(explicit, request())
     ).prior_status == "acquiring"
+
+
+@pytest.mark.asyncio
+async def test_semantic_v4_selection_binds_profile_and_independent_counts() -> None:
+    database = SelectionDatabase()
+    database.target["resource_count"] = 0
+    database.target["publication_metadata_json"][
+        "resource_hash_contract"
+    ] = "semantic_content_v4"
+    database.evidence["parent_resource_count"] = 0
+
+    selection = await selected_terminal_root_retirement(database, request())
+
+    assert selection.profile is contract.SEMANTIC_V4_RETIREMENT_PROFILE
+    assert selection.marker_by_field["contract_version"] == (
+        "healthporta.provider-directory.terminal-root-retirement.v2"
+    )
+    assert selection.marker_by_field["evidence"]["parent_resource_count"] == 0
+    assert selection.marker_by_field["evidence"]["actual_resource_count"] == 7
+    evidence_call = next(
+        call
+        for call in database.calls
+        if contract.SEMANTIC_V4_RETIREMENT_PROFILE.evidence_function in call[1]
+    )
+    assert evidence_call[2] == {"dataset_id": "dataset-candidate"}
 
 
 @pytest.mark.asyncio
@@ -201,12 +232,12 @@ async def test_selection_fails_closed_on_busy_drift_and_competitor() -> None:
     with pytest.raises(contract.TerminalRootRetirementError, match="busy"):
         await selected_terminal_root_retirement(busy, request())
 
-    drifted = SelectionDatabase()
-    drifted.target["publication_metadata_json"]["resource_hash_contract"] = (
-        "semantic_content_v4"
-    )
+    unsupported = SelectionDatabase()
+    unsupported.target["publication_metadata_json"][
+        "resource_hash_contract"
+    ] = "semantic_content_v3"
     with pytest.raises(contract.TerminalRootRetirementError, match="evidence_invalid"):
-        await selected_terminal_root_retirement(drifted, request())
+        await selected_terminal_root_retirement(unsupported, request())
 
     null_contract = SelectionDatabase()
     null_contract.target["publication_metadata_json"]["resource_hash_contract"] = None
@@ -224,6 +255,17 @@ async def test_selection_fails_closed_on_busy_drift_and_competitor() -> None:
     ]["row_count"] = 1
     with pytest.raises(contract.TerminalRootRetirementError, match="evidence_invalid"):
         await selected_terminal_root_retirement(referenced, request())
+
+    dual_marker = SelectionDatabase()
+    dual_marker.target["publication_metadata_json"].update(
+        {
+            "resource_hash_contract": "semantic_content_v4",
+            contract.RETIREMENT_METADATA_KEY: {},
+            contract.SEMANTIC_V4_RETIREMENT_PROFILE.metadata_key: {},
+        }
+    )
+    with pytest.raises(contract.TerminalRootRetirementError, match="evidence_invalid"):
+        await selected_terminal_root_retirement(dual_marker, request())
 
 
 @pytest.mark.asyncio
@@ -248,7 +290,9 @@ async def test_selection_binds_apply_to_preview_evidence_token() -> None:
         database, request(expected_evidence_sha256=token)
     )
 
-    assert contract.canonical_json_sha256(selection.marker_by_field["evidence"]) == token
+    assert (
+        contract.canonical_json_sha256(selection.marker_by_field["evidence"]) == token
+    )
     with pytest.raises(contract.TerminalRootRetirementError, match="evidence_changed"):
         await selected_terminal_root_retirement(
             SelectionDatabase(), request(expected_evidence_sha256="f" * 64)
@@ -282,3 +326,30 @@ async def test_replay_uses_marker_without_mutable_source_or_predecessor() -> Non
         for call in database.calls
     )
     assert not any("WITH RECURSIVE" in call[1] for call in database.calls)
+
+
+@pytest.mark.asyncio
+async def test_semantic_v4_replay_uses_only_its_versioned_marker() -> None:
+    database = SelectionDatabase()
+    profile = contract.SEMANTIC_V4_RETIREMENT_PROFILE
+    marker = contract.retirement_marker(
+        database.evidence,
+        minimum_terminal_age_seconds=900,
+        retired_at="2026-08-10T12:00:00+00:00",
+        profile=profile,
+    )
+    database.target["status"] = contract.RETIREMENT_STATUS
+    database.target["publication_metadata_json"].update(
+        {
+            "resource_hash_contract": "semantic_content_v4",
+            profile.metadata_key: marker,
+        }
+    )
+    database.source = None
+    database.predecessor = None
+
+    selection = await selected_terminal_root_retirement(database, request())
+
+    assert selection.profile is profile
+    assert selection.marker_by_field == marker
+    assert not any(profile.evidence_function in call[1] for call in database.calls)

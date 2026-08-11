@@ -6,30 +6,40 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from process.provider_directory_fhir_subset_identity import (
-    reviewed_subset_max_advertised_count_decrease,
+from process.provider_directory_fhir_subset_profiles import (
+    is_advertised_pre_in_terminal_window,
+    is_reviewed_subset_terminal_window_required,
+    reviewed_subset_decrease_limit,
 )
 
 
-def reviewed_subset_count_decrease_from_proof(
+def reviewed_subset_completion_constraints(
     initial_proof: Mapping[str, Any],
-) -> int:
-    """Return the exact allowlisted count-decrease bound in a reviewed proof."""
+) -> tuple[int, bool]:
+    """Return the count bound and terminal-window requirement."""
 
     raw_completion_scopes = initial_proof.get("completion_scopes")
-    maximum = reviewed_subset_max_advertised_count_decrease(
-        initial_proof.get("strategy_version"),
-        (
-            tuple(raw_completion_scopes)
-            if type(raw_completion_scopes) is list
-            else None
+    completion_scopes = (
+        tuple(raw_completion_scopes)
+        if type(raw_completion_scopes) is list
+        else None
+    )
+    strategy_version = initial_proof.get("strategy_version")
+    return (
+        reviewed_subset_decrease_limit(
+            strategy_version,
+            completion_scopes,
+            pre_count=initial_proof.get("pre_count"),
+            page_count=initial_proof.get("page_count"),
+            invalid_error=(
+                "provider_directory_current_version_census_profile_invalid"
+            ),
+        ),
+        is_reviewed_subset_terminal_window_required(
+            strategy_version,
+            completion_scopes,
         ),
     )
-    if maximum is None:
-        raise ValueError(
-            "provider_directory_current_version_census_profile_invalid"
-        )
-    return maximum
 
 
 def has_valid_reviewed_subset_counts(
@@ -155,6 +165,8 @@ def has_valid_subset_completed_fields(
     completeness: Mapping[str, Any],
     count_by_name: Mapping[str, Any],
     page_count: int,
+    *,
+    is_terminal_count_window_required: bool = False,
 ) -> bool:
     """Validate ordered v3 terminal counters and both continuation chains."""
 
@@ -164,8 +176,16 @@ def has_valid_subset_completed_fields(
     terminal_pages = terminal_geometry.get("pages_processed")
     if type(terminal_pages) is not int or terminal_pages <= 0:
         return False
+    pre_count = count_by_name.get("pre_count")
     return bool(
-        completeness.get("advertised_pre") == count_by_name["pre_count"]
+        (
+            not is_terminal_count_window_required
+            or is_advertised_pre_in_terminal_window(
+                pre_count,
+                terminal_geometry,
+            )
+        )
+        and completeness.get("advertised_pre") == count_by_name["pre_count"]
         and completeness.get("advertised_post") == count_by_name["post_count"]
         and completeness.get("returned_unique")
         == count_by_name["unique_candidate_rows"]

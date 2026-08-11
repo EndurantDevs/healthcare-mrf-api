@@ -169,6 +169,16 @@ def _install_exact_address_mocks(
     monkeypatch.setattr(npi_module, "_build_npi_details", build_details)
     monkeypatch.setattr(
         npi_module,
+        "_fetch_npi_location_candidates",
+        AsyncMock(
+            side_effect=[
+                deepcopy(detail_payload_map["address_list"]),
+                deepcopy(detail_payload_map["address_list"]),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        npi_module,
         "_fetch_provider_directory_address_overlay",
         fetch_overlay,
     )

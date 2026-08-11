@@ -36,6 +36,9 @@ from process.formulary_fhir.source_artifact_contract import (
 from process.provider_directory_retained_artifact_base import RetainedArtifactError
 from tests.uhc_drug_parser_test_support import artifact_set
 from tests.uhc_drug_receipt_test_support import admitted_twin
+from tests.uhc_drug_state_boundary_test_support import (
+    install_postflight_drift_mocks,
+)
 from tests.test_uhc_drug_sync import _binding
 from tests.test_uhc_drug_sync import CUTOFF
 
@@ -190,9 +193,7 @@ def test_acquisition_result_rejects_census_and_family_drift() -> None:
     changed_artifacts = VerifiedSourceArtifactSet(
         source_id=exact_artifacts.source_id,
         source_file_set_sha256=exact_artifacts.source_file_set_sha256,
-        raw_listing_projection_sha256=(
-            exact_artifacts.raw_listing_projection_sha256
-        ),
+        raw_listing_projection_sha256=(exact_artifacts.raw_listing_projection_sha256),
         artifacts=changed_rows,
         artifact_set_sha256=artifact_set_sha256(changed_rows),
     )
@@ -210,36 +211,15 @@ async def test_acquisition_rejects_source_binding_postflight_drift(monkeypatch) 
     binding = _binding()
     changed_binding = replace(binding, configuration_hash="e" * 64)
     registration = SimpleNamespace(
-        identities=tuple(
-            artifact.identity for artifact in exact_artifacts.artifacts
-        ),
+        identities=tuple(artifact.identity for artifact in exact_artifacts.artifacts),
         source_observation_sha256="c" * 64,
     )
-    monkeypatch.setattr(
-        acquisition,
-        "register_uhc_formulary_source",
-        AsyncMock(side_effect=[binding, changed_binding]),
-    )
-    monkeypatch.setattr(
-        acquisition,
-        "register_uhc_source_file_set",
-        AsyncMock(return_value=registration),
-    )
-    monkeypatch.setattr(acquisition, "require_source_unchanged", AsyncMock())
-    monkeypatch.setattr(
-        acquisition,
-        "pending_source_files",
-        AsyncMock(return_value=()),
-    )
-    monkeypatch.setattr(
-        acquisition,
-        "acquire_pending_uhc_drug_artifacts",
-        AsyncMock(return_value=0),
-    )
-    monkeypatch.setattr(
-        acquisition,
-        "load_complete_source_artifact_set",
-        AsyncMock(return_value=exact_artifacts),
+    install_postflight_drift_mocks(
+        monkeypatch,
+        binding=binding,
+        changed_binding=changed_binding,
+        registration=registration,
+        exact_artifacts=exact_artifacts,
     )
 
     with pytest.raises(
@@ -416,8 +396,7 @@ async def test_twin_artifact_and_contract_drift_fail_closed(monkeypatch) -> None
                     replace(
                         artifacts.artifacts[0],
                         verified_at=(
-                            artifacts.artifacts[0].verified_at
-                            + dt.timedelta(seconds=1)
+                            artifacts.artifacts[0].verified_at + dt.timedelta(seconds=1)
                         ),
                     ),
                     *artifacts.artifacts[1:],

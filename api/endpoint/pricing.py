@@ -8600,32 +8600,9 @@ async def list_provider_procedures(request, npi: str):
     )
 
 
-async def _provider_procedure_detail(
-    request,
-    npi: str,
-    code_value: str,
-    *,
-    default_code_system: str = INTERNAL_CODE_SYSTEM,
-):
-    """Build the provider procedure detail response for an internal or external service code."""
-    session = _get_session(request)
-    args = request.args
-
-    provider_npi = _parse_int(npi, "npi", minimum=1)
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
-    if provider_npi is None:
-        raise InvalidUsage("Path parameter 'npi' must be provided")
-
-    year, year_source = await _resolve_year(session, provider_procedure_table, year)
-    internal_codes, code_context = await _resolve_internal_codes_for_request(
-        session,
-        code_value,
-        args,
-        default_system=default_code_system,
-    )
-
-    query = (
+def _provider_procedure_detail_query(provider_npi, internal_codes, year):
+    """Build the bounded provider-procedure lookup query."""
+    return (
         select(
             provider_procedure_table,
             procedure_table.c.avg_submitted_charge,
@@ -8654,7 +8631,34 @@ async def _provider_procedure_detail(
         .limit(1)
     )
 
-    procedure_query_result = await session.execute(query)
+
+async def _provider_procedure_detail(
+    request,
+    npi: str,
+    code_value: str,
+    *,
+    default_code_system: str = INTERNAL_CODE_SYSTEM,
+):
+    """Build the provider procedure detail response for an internal or external service code."""
+    session = _get_session(request)
+    args = request.args
+
+    provider_npi = _parse_int(npi, "npi", minimum=1)
+    year = _parse_int(args.get("year"), "year", minimum=2013)
+    include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
+    if provider_npi is None:
+        raise InvalidUsage("Path parameter 'npi' must be provided")
+
+    year, year_source = await _resolve_year(session, provider_procedure_table, year)
+    internal_codes, code_context = await _resolve_internal_codes_for_request(
+        session,
+        code_value,
+        args,
+        default_system=default_code_system,
+    )
+    procedure_query_result = await session.execute(
+        _provider_procedure_detail_query(provider_npi, internal_codes, year)
+    )
     procedure_row = procedure_query_result.first()
     if procedure_row is None:
         raise sanic.exceptions.NotFound("Provider procedure not found")

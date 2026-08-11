@@ -151,7 +151,7 @@ def _admission(
         initial_wal_lsn=initial_wal_lsn,
         wal_tracker=importer._ProviderDirectoryProfileWalTracker(
             accounted_control_operation_counts={
-                "capacity_consumption_insert": 1,
+                "capacity_consumption_insert": 3,
             }
         ),
     )

@@ -153,7 +153,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260810160000_ptg2_legacy_global_projection_queue"
+        "20260811110000_ptg_v12_mainline_merge"
     ]
 
 

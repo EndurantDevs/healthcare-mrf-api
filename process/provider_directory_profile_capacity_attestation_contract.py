@@ -29,34 +29,21 @@ from process.provider_directory_profile_capacity_runtime_witness import (
     capacity_runtime_witness_sha256,
 )
 
-CAPACITY_LEASE_CONTRACT_ID = (
-    "provider-directory-database-capacity-lease-v2"
-)
+LEGACY_CAPACITY_LEASE_V2_CONTRACT_ID = "provider-directory-database-capacity-lease-v2"
+CAPACITY_LEASE_CONTRACT_ID = "provider-directory-database-capacity-lease-v3"
 CAPACITY_LEASE_SIGNATURE_ALGORITHM = "Ed25519"
-CAPACITY_LEASE_SIGNATURE_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-lease.v2"
-)
-CAPACITY_ATTESTATION_ID_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-attestation-id.v2"
-)
-CAPACITY_LEASE_DIGEST_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-lease-digest.v2"
-)
-CAPACITY_LEASE_PUBLIC_KEY_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-public-key.v1"
-)
-CAPACITY_TABLESPACE_IDENTITY_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-tablespaces.v1"
-)
-CAPACITY_VOLUME_IDENTITY_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-volumes.v1"
-)
+CAPACITY_LEASE_SIGNATURE_DOMAIN = "healthporta.provider-directory.database-capacity-lease.v3"
+CAPACITY_ATTESTATION_ID_DOMAIN = "healthporta.provider-directory.database-capacity-attestation-id.v3"
+CAPACITY_LEASE_DIGEST_DOMAIN = "healthporta.provider-directory.database-capacity-lease-digest.v3"
+CAPACITY_LEASE_PUBLIC_KEY_DOMAIN = "healthporta.provider-directory.database-capacity-public-key.v1"
+CAPACITY_TABLESPACE_IDENTITY_DOMAIN = "healthporta.provider-directory.database-capacity-tablespaces.v1"
+CAPACITY_VOLUME_IDENTITY_DOMAIN = "healthporta.provider-directory.database-capacity-volumes.v1"
 
 CAPACITY_LEASE_MAX_FUTURE_SKEW_SECONDS = 5
 CAPACITY_LEASE_MAX_OBSERVATION_AGE_SECONDS = 300
 CAPACITY_LEASE_MAX_VALIDITY_SECONDS = 24 * 60 * 60
 
-_SIGNED_BODY_FIELDS = frozenset(
+_LEGACY_V2_SIGNED_BODY_FIELDS = frozenset(
     {
         "attestation_id",
         "attestor_id",
@@ -80,6 +67,13 @@ _SIGNED_BODY_FIELDS = frozenset(
         "signature_algorithm",
         "tablespaces",
         "volumes",
+    }
+)
+_SIGNED_BODY_FIELDS = frozenset(
+    {
+        *_LEGACY_V2_SIGNED_BODY_FIELDS,
+        "signing_preflight_guard",
+        "signing_preflight_guard_sha256",
     }
 )
 _ATTESTATION_ID_FIELDS = _SIGNED_BODY_FIELDS - {"attestation_id"}
@@ -158,6 +152,8 @@ class VerifiedDatabaseCapacityLease:
     nonce: str
     observed_at: datetime.datetime
     reservation_id: str
+    signing_preflight_guard: dict[str, Any]
+    signing_preflight_guard_sha256: str
     runtime_witness: CapacityLeaseRuntimeWitness
     runtime_witness_sha256: str
     deployment_witness: CapacityLeaseDeploymentWitness
@@ -484,6 +480,7 @@ __all__ = (
     "CAPACITY_RUNTIME_WITNESS_DOMAIN",
     "CAPACITY_TABLESPACE_IDENTITY_DOMAIN",
     "CAPACITY_VOLUME_IDENTITY_DOMAIN",
+    "LEGACY_CAPACITY_LEASE_V2_CONTRACT_ID",
     "CapacityLeaseConsumptionBinding",
     "CapacityLeaseDeploymentWitness",
     "CapacityLeaseRuntimeWitness",
