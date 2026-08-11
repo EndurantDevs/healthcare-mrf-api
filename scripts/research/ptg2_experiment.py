@@ -1590,6 +1590,61 @@ def _serving_row_digest_update(
     digest.update(f"{code_key}\t{provider_set_key}\t{provider_count}\t{price_set_id.lower()}\n".encode("utf-8"))
 
 
+def _finish_serving_by_code_candidate(
+    output_path: Path,
+    body_path: Path,
+    price_set_values: list[str],
+    blocks: list[dict[str, int]],
+    row_count: int,
+    body_offset: int,
+    source_digest: Any,
+) -> dict[str, Any]:
+    metadata = {
+        "format": "research_serving_by_code_v1",
+        "row_count": row_count,
+        "code_count": len(blocks),
+        "price_set_count": len(price_set_values),
+        "body_bytes": body_offset,
+        "price_dictionary_bytes": len(price_set_values) * 16,
+        "block_index_bytes": len(blocks) * 16,
+        "source_sha256": source_digest.hexdigest(),
+    }
+    header = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    with output_path.open("wb") as output_file:
+        output_file.write(b"PTG2SBC1")
+        output_file.write(struct.pack("<I", len(header)))
+        output_file.write(header)
+        for price_set_id in price_set_values:
+            output_file.write(_uuid_bytes(price_set_id))
+        for block in blocks:
+            output_file.write(
+                struct.pack("<iQI", int(block["code_key"]), int(block["offset"]), int(block["count"]))
+            )
+        with body_path.open("rb") as body:
+            shutil.copyfileobj(body, output_file)
+    body_path.unlink(missing_ok=True)
+
+    gzip_path = output_path.with_suffix(output_path.suffix + ".gz")
+    with output_path.open("rb") as artifact_source, gzip.open(
+        gzip_path,
+        "wb",
+        compresslevel=6,
+    ) as compressed:
+        shutil.copyfileobj(artifact_source, compressed)
+    decoded_digest = digest_serving_by_code_candidate(output_path)
+    metadata.update(
+        {
+            "artifact_path": str(output_path),
+            "artifact_bytes": output_path.stat().st_size,
+            "gzip_path": str(gzip_path),
+            "gzip_bytes": gzip_path.stat().st_size,
+            "decoded_sha256": decoded_digest,
+            "roundtrip": "passed" if decoded_digest == metadata["source_sha256"] else "failed",
+        }
+    )
+    return metadata
+
+
 def write_serving_by_code_candidate(
     serving_rows: Any,
     output_path: Path,
@@ -1638,49 +1693,15 @@ def write_serving_by_code_candidate(
             _serving_row_digest_update(source_digest, code_key, provider_set_key, provider_count, price_set_id)
     if blocks:
         blocks[-1]["count"] = current_block_count
-
-    metadata = {
-        "format": "research_serving_by_code_v1",
-        "row_count": row_count,
-        "code_count": len(blocks),
-        "price_set_count": len(price_set_values),
-        "body_bytes": body_offset,
-        "price_dictionary_bytes": len(price_set_values) * 16,
-        "block_index_bytes": len(blocks) * 16,
-        "source_sha256": source_digest.hexdigest(),
-    }
-    header = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    with output_path.open("wb") as out:
-        out.write(b"PTG2SBC1")
-        out.write(struct.pack("<I", len(header)))
-        out.write(header)
-        for price_set_id in price_set_values:
-            out.write(_uuid_bytes(price_set_id))
-        for block in blocks:
-            out.write(struct.pack("<iQI", int(block["code_key"]), int(block["offset"]), int(block["count"])))
-        with body_path.open("rb") as body:
-            shutil.copyfileobj(body, out)
-    body_path.unlink(missing_ok=True)
-
-    gzip_path = output_path.with_suffix(output_path.suffix + ".gz")
-    with output_path.open("rb") as artifact_source, gzip.open(
-        gzip_path,
-        "wb",
-        compresslevel=6,
-    ) as compressed:
-        shutil.copyfileobj(artifact_source, compressed)
-    decoded_digest = digest_serving_by_code_candidate(output_path)
-    metadata.update(
-        {
-            "artifact_path": str(output_path),
-            "artifact_bytes": output_path.stat().st_size,
-            "gzip_path": str(gzip_path),
-            "gzip_bytes": gzip_path.stat().st_size,
-            "decoded_sha256": decoded_digest,
-            "roundtrip": "passed" if decoded_digest == metadata["source_sha256"] else "failed",
-        }
+    return _finish_serving_by_code_candidate(
+        output_path,
+        body_path,
+        price_set_values,
+        blocks,
+        row_count,
+        body_offset,
+        source_digest,
     )
-    return metadata
 
 
 def digest_serving_by_code_candidate(path: Path) -> str:
@@ -1889,8 +1910,9 @@ def write_serving_by_provider_set_candidate(
     return metadata
 
 
-def digest_serving_by_provider_set_candidate(path: Path) -> str:
-    """Compute a stable digest of serving by provider set candidate."""
+def _provider_set_candidate_layout(
+    path: Path,
+) -> tuple[bytes, int, list[str], int, int]:
     artifact_bytes = path.read_bytes()
     if artifact_bytes[:8] != b"PTG2SBP1":
         raise ValueError("unexpected serving-by-provider-set artifact magic")
@@ -1911,6 +1933,18 @@ def digest_serving_by_provider_set_candidate(path: Path) -> str:
         )
         for index in range(price_count)
     ]
+    return artifact_bytes, provider_set_count, price_sets, index_start, body_start
+
+
+def digest_serving_by_provider_set_candidate(path: Path) -> str:
+    """Compute a stable digest of serving by provider set candidate."""
+    (
+        artifact_bytes,
+        provider_set_count,
+        price_sets,
+        index_start,
+        body_start,
+    ) = _provider_set_candidate_layout(path)
     digest = hashlib.sha256()
     for index in range(provider_set_count):
         raw = artifact_bytes[
@@ -2322,6 +2356,45 @@ def postgres_posting_candidate_table_names(
     }
 
 
+def _postgres_posting_table_sql(
+    serving: str,
+    posting: str,
+    dictionary: str,
+    rows_per_block: int,
+) -> str:
+    return f"""
+        CREATE UNLOGGED TABLE {posting} AS
+        WITH keyed AS (
+            SELECT
+                serving.code_key,
+                serving.provider_set_key,
+                serving.provider_count,
+                dictionary.price_set_key,
+                (
+                    row_number() OVER (
+                        PARTITION BY serving.code_key
+                        ORDER BY serving.provider_set_key, dictionary.price_set_key
+                    ) - 1
+                ) / {rows_per_block} AS block_no
+            FROM {serving} serving
+            JOIN {dictionary} dictionary
+              ON dictionary.price_set_global_id_128 = serving.price_set_global_id_128
+        )
+        SELECT
+            code_key,
+            block_no::integer AS block_no,
+            count(*)::integer AS row_count,
+            array_agg(provider_set_key ORDER BY provider_set_key, price_set_key)::integer[]
+                AS provider_set_keys,
+            array_agg(provider_count ORDER BY provider_set_key, price_set_key)::integer[]
+                AS provider_counts,
+            array_agg(price_set_key ORDER BY provider_set_key, price_set_key)::integer[]
+                AS price_set_keys
+        FROM keyed
+        GROUP BY code_key, block_no;
+        """
+
+
 def postgres_posting_candidate_sql(
     *,
     serving_table: str,
@@ -2362,37 +2435,7 @@ def postgres_posting_candidate_sql(
         CREATE UNIQUE INDEX {dictionary_value_idx}
         ON {dictionary} (price_set_global_id_128);
         """,
-        f"""
-        CREATE UNLOGGED TABLE {posting} AS
-        WITH keyed AS (
-            SELECT
-                serving.code_key,
-                serving.provider_set_key,
-                serving.provider_count,
-                dictionary.price_set_key,
-                (
-                    row_number() OVER (
-                        PARTITION BY serving.code_key
-                        ORDER BY serving.provider_set_key, dictionary.price_set_key
-                    ) - 1
-                ) / {rows_per_block} AS block_no
-            FROM {serving} serving
-            JOIN {dictionary} dictionary
-              ON dictionary.price_set_global_id_128 = serving.price_set_global_id_128
-        )
-        SELECT
-            code_key,
-            block_no::integer AS block_no,
-            count(*)::integer AS row_count,
-            array_agg(provider_set_key ORDER BY provider_set_key, price_set_key)::integer[]
-                AS provider_set_keys,
-            array_agg(provider_count ORDER BY provider_set_key, price_set_key)::integer[]
-                AS provider_counts,
-            array_agg(price_set_key ORDER BY provider_set_key, price_set_key)::integer[]
-                AS price_set_keys
-        FROM keyed
-        GROUP BY code_key, block_no;
-        """,
+        _postgres_posting_table_sql(serving, posting, dictionary, rows_per_block),
         f"""
         CREATE INDEX {posting_code_idx}
         ON {posting} (code_key, block_no);
@@ -2639,15 +2682,13 @@ def analyze_postgres_binary_candidate(
     }
 
 
-def analyze_postgres_posting_candidate(
-    *,
+def _build_postgres_posting_candidate(
     env_overrides: dict[str, str],
     serving_table: str,
     import_run_id: str,
     variant_id: str,
     block_rows: int,
-) -> dict[str, Any]:
-    """Analyze storage and lookup behavior for the PostgreSQL posting candidate."""
+) -> tuple[dict[str, str], float]:
     schema_name, _serving_name = split_qualified_table(serving_table)
     table_names = postgres_posting_candidate_table_names(
         schema_name=schema_name,
@@ -2662,7 +2703,74 @@ def analyze_postgres_posting_candidate(
         block_rows=block_rows,
     ):
         psql_exec(env_overrides, statement)
-    build_elapsed_seconds = time.monotonic() - started
+    return table_names, time.monotonic() - started
+
+
+def _postgres_posting_benchmarks(
+    env_overrides: dict[str, str],
+    posting_table: str,
+) -> dict[str, Any]:
+    sample = psql_json(
+        env_overrides,
+        "SELECT row_to_json(t) FROM ("
+        "SELECT code_key, provider_set_keys[1] AS provider_set_key, "
+        "price_set_keys[1] AS price_set_key "
+        f"FROM {posting_table} "
+        "WHERE row_count > 0 "
+        "ORDER BY row_count DESC, code_key, block_no "
+        "LIMIT 1"
+        ") AS t;",
+    )
+    benchmark_results_by_name: dict[str, Any] = {}
+    if sample.get("code_key") is None or sample.get("provider_set_key") is None:
+        return benchmark_results_by_name
+    code_key = int(sample["code_key"])
+    provider_set_key = int(sample["provider_set_key"])
+    price_set_key = int(sample.get("price_set_key") or 0)
+    benchmark_queries_by_name = {
+        "code_lookup": (
+            f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} "
+            f"WHERE code_key = {code_key}"
+        ),
+        "provider_overlap": (
+            f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} "
+            f"WHERE provider_set_keys && ARRAY[{provider_set_key}]::integer[]"
+        ),
+        "code_provider_overlap": (
+            f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} "
+            f"WHERE code_key = {code_key} "
+            f"AND provider_set_keys && ARRAY[{provider_set_key}]::integer[]"
+        ),
+        "price_overlap": (
+            f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} "
+            f"WHERE price_set_keys && ARRAY[{price_set_key}]::integer[]"
+        ),
+    }
+    for name, benchmark_sql in benchmark_queries_by_name.items():
+        plan = explain_json(env_overrides, benchmark_sql)
+        benchmark_results_by_name[name] = {
+            "execution_ms": _explain_execution_ms(plan),
+            "plan": (
+                plan[0].get("Plan", {})
+                if isinstance(plan, list) and plan and isinstance(plan[0], dict)
+                else {}
+            ),
+        }
+    return benchmark_results_by_name
+
+
+def analyze_postgres_posting_candidate(
+    *,
+    env_overrides: dict[str, str],
+    serving_table: str,
+    import_run_id: str,
+    variant_id: str,
+    block_rows: int,
+) -> dict[str, Any]:
+    """Analyze storage and lookup behavior for the PostgreSQL posting candidate."""
+    table_names, build_elapsed_seconds = _build_postgres_posting_candidate(
+        env_overrides, serving_table, import_run_id, variant_id, block_rows
+    )
 
     posting_table = table_names["serving_posting"]
     price_set_dictionary_table = table_names["price_set_dictionary"]
@@ -2688,43 +2796,7 @@ def analyze_postgres_posting_candidate(
     posting_rows = int(storage.get("posting_rows") or 0)
     candidate_total_bytes = int(storage.get("candidate_total_bytes") or 0)
     source_total_bytes = int(storage.get("source_total_bytes") or 0)
-    sample = psql_json(
-        env_overrides,
-        "SELECT row_to_json(t) FROM ("
-        "SELECT code_key, provider_set_keys[1] AS provider_set_key, price_set_keys[1] AS price_set_key "
-        f"FROM {posting_table} "
-        "WHERE row_count > 0 "
-        "ORDER BY row_count DESC, code_key, block_no "
-        "LIMIT 1"
-        ") AS t;",
-    )
-    benchmark_results_by_name: dict[str, Any] = {}
-    if sample.get("code_key") is not None and sample.get("provider_set_key") is not None:
-        code_key = int(sample["code_key"])
-        provider_set_key = int(sample["provider_set_key"])
-        price_set_key = int(sample.get("price_set_key") or 0)
-        benchmark_queries_by_name = {
-            "code_lookup": f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} WHERE code_key = {code_key}",
-            "provider_overlap": (
-                f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} "
-                f"WHERE provider_set_keys && ARRAY[{provider_set_key}]::integer[]"
-            ),
-            "code_provider_overlap": (
-                f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} "
-                f"WHERE code_key = {code_key} "
-                f"AND provider_set_keys && ARRAY[{provider_set_key}]::integer[]"
-            ),
-            "price_overlap": (
-                f"SELECT COALESCE(SUM(row_count), 0) FROM {posting_table} "
-                f"WHERE price_set_keys && ARRAY[{price_set_key}]::integer[]"
-            ),
-        }
-        for name, sql in benchmark_queries_by_name.items():
-            plan = explain_json(env_overrides, sql)
-            benchmark_results_by_name[name] = {
-                "execution_ms": _explain_execution_ms(plan),
-                "plan": plan[0].get("Plan", {}) if isinstance(plan, list) and plan and isinstance(plan[0], dict) else {},
-            }
+    benchmark_results_by_name = _postgres_posting_benchmarks(env_overrides, posting_table)
     is_roundtrip_valid = source_rows == posting_rows
     return {
         "status": "passed" if is_roundtrip_valid else "failed",
@@ -2994,6 +3066,62 @@ class LocalFixtureServer:
         self.thread.join(timeout=5)
 
 
+def _scanner_fixture_setup(
+    case: dict[str, Any],
+    variant: dict[str, Any],
+    suite: dict[str, Any],
+    run_dir: Path,
+) -> tuple[Path, list[str], dict[str, str]]:
+    env_overrides = env_for_variant(case, variant)
+    scanner = resolve_root_path(
+        case.get("scanner_binary")
+        or suite.get("scanner_binary")
+        or DEFAULT_SCANNER
+    )
+    artifact = write_fixture(case, run_dir)
+    scanner_environment_by_name = {
+        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
+        "HLTHPRT_PTG2_RAW_SOURCE_SHA256": hashlib.sha256(
+            artifact.read_bytes()
+        ).hexdigest(),
+        "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": (b"\xcc" * 32).hex(),
+        "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "research-snapshot",
+        "HLTHPRT_PTG2_COMPACT_PLAN_ID": "research-plan",
+        "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "research-plan-month",
+        "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "research-source-trace",
+        "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH": str(
+            run_dir / "manifest_serving.copy"
+        ),
+        "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH": str(
+            run_dir / "price_atom.copy"
+        ),
+        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH": str(
+            run_dir / "price_set_atom.copy"
+        ),
+        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_SUMMARY_COPY_PATH": str(
+            run_dir / "price_set_summary.copy"
+        ),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH": str(
+            run_dir / "provider_group_member.copy"
+        ),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH": str(
+            run_dir / "provider-forward.sidecar"
+        ),
+        "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH": str(
+            run_dir / "provider-inverted.sidecar"
+        ),
+        "HLTHPRT_PTG2_V3_SERVING_RUN_DIR": str(run_dir / "serving-runs"),
+        "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS": "false",
+        "HLTHPRT_PTG2_MANIFEST_ONLY": "true",
+        **env_overrides,
+    }
+    return (
+        scanner,
+        [str(scanner), "--compact-serving", str(artifact)],
+        scanner_environment_by_name,
+    )
+
+
 def run_scanner_fixture(
     *,
     case: dict[str, Any],
@@ -3007,48 +3135,9 @@ def run_scanner_fixture(
     variant_id = str(variant["id"])
     run_dir = output_root / case_id / variant_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    env_overrides = env_for_variant(case, variant)
-    scanner = resolve_root_path(case.get("scanner_binary") or suite.get("scanner_binary") or DEFAULT_SCANNER)
-    artifact = write_fixture(case, run_dir)
-    serving_copy = run_dir / "manifest_serving.copy"
-    price_atom_copy = run_dir / "price_atom.copy"
-    price_set_atom_copy = run_dir / "price_set_atom.copy"
-    price_set_summary_copy = run_dir / "price_set_summary.copy"
-    member_copy = run_dir / "provider_group_member.copy"
-    serving_run_directory = run_dir / "serving-runs"
-    provider_forward_sidecar = run_dir / "provider-forward.sidecar"
-    provider_inverted_sidecar = run_dir / "provider-inverted.sidecar"
-    scanner_environment_by_name = {
-        "HLTHPRT_PTG2_SNAPSHOT_ARCH": "postgres_binary_v3",
-        "HLTHPRT_PTG2_RAW_SOURCE_SHA256": hashlib.sha256(
-            artifact.read_bytes()
-        ).hexdigest(),
-        "HLTHPRT_PTG2_V3_COVERAGE_SCOPE_ID": (b"\xcc" * 32).hex(),
-        "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "research-snapshot",
-        "HLTHPRT_PTG2_COMPACT_PLAN_ID": "research-plan",
-        "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "research-plan-month",
-        "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "research-source-trace",
-        "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH": str(serving_copy),
-        "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH": str(price_atom_copy),
-        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_ATOM_COPY_PATH": str(
-            price_set_atom_copy
-        ),
-        "HLTHPRT_PTG2_MANIFEST_PRICE_SET_SUMMARY_COPY_PATH": str(
-            price_set_summary_copy
-        ),
-        "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH": str(member_copy),
-        "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH": str(
-            provider_forward_sidecar
-        ),
-        "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH": str(
-            provider_inverted_sidecar
-        ),
-        "HLTHPRT_PTG2_V3_SERVING_RUN_DIR": str(serving_run_directory),
-        "HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS": "false",
-        "HLTHPRT_PTG2_MANIFEST_ONLY": "true",
-        **env_overrides,
-    }
-    command_args = [str(scanner), "--compact-serving", str(artifact)]
+    scanner, command_args, scanner_environment_by_name = _scanner_fixture_setup(
+        case, variant, suite, run_dir
+    )
     if dry_run:
         return RunResult(
             case_id=case_id,

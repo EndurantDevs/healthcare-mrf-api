@@ -146,6 +146,27 @@ async def _content_page_and_plan(database: Database):
     return page_rows, list(_plan_nodes(raw_plan))
 
 
+async def _acquired_page_and_plan(database: Database):
+    query = importer._subset_acquired_page_sql(True).strip().removesuffix(";")
+    params_by_name = {
+        "dataset_id": DATASET_ID,
+        "resource_types": [RESOURCE_TYPE],
+        "after_resource_type": RESOURCE_TYPE,
+        "after_resource_id": CURSOR_ID,
+        "batch_size": BATCH_SIZE,
+    }
+    async with database.acquire() as connection:
+        await connection.status(
+            "SET plan_cache_mode = force_generic_plan;"
+        )
+        page_rows = await connection.all(query, **params_by_name)
+        raw_plan = await connection.scalar(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + query,
+            **params_by_name,
+        )
+    return page_rows, list(_plan_nodes(raw_plan))
+
+
 async def _seed_overlapping_proof_rows(
     database: Database,
     schema: str,
@@ -296,4 +317,47 @@ async def test_postgres_content_proof_cursor_is_a_bounded_index_range(
     assert not any(
         "resource_id" in str(plan_node.get("Filter", ""))
         for plan_node in resource_nodes
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_subset_acquired_cursor_is_a_bounded_index_range(
+    monkeypatch,
+):
+    async with _content_proof_database(monkeypatch) as (database, schema):
+        await _seed_content_rows(database, schema)
+        page_rows, plan_nodes = await _acquired_page_and_plan(database)
+
+    assert [page_record.resource_id for page_record in page_rows] == [
+        f"{resource_id:08d}"
+        for resource_id in range(15_001, 15_001 + BATCH_SIZE)
+    ]
+    resource_nodes = [
+        plan_node
+        for plan_node in plan_nodes
+        if plan_node.get("Relation Name")
+        == "provider_directory_dataset_resource"
+    ]
+    assert resource_nodes
+    assert all(
+        plan_node.get("Node Type") != "Seq Scan"
+        for plan_node in resource_nodes
+    )
+    index_conditions = " ".join(
+        str(plan_node.get("Index Cond", ""))
+        for plan_node in resource_nodes
+    )
+    rows_inspected = sum(
+        int(plan_node.get("Actual Rows", 0))
+        + int(plan_node.get("Rows Removed by Filter", 0))
+        for plan_node in resource_nodes
+    )
+    assert rows_inspected < 100
+    assert any(
+        str(plan_node.get("Index Name", "")).endswith("_pkey")
+        for plan_node in resource_nodes
+    )
+    assert all(
+        identity_column in index_conditions
+        for identity_column in ("dataset_id", "resource_type", "resource_id")
     )

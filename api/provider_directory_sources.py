@@ -9,6 +9,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from api.provider_directory_rooted_fhir_publication import (
+    is_rooted_fhir_catalog_entry,
+    unavailable_rooted_fhir_publication,
+    ROOTED_FHIR_PUBLICATION_FIELD,
+)
 from process import provider_directory_profile as profile_artifact
 
 
@@ -131,6 +136,10 @@ def provider_directory_source_catalog(
         catalog_entry_by_field["profile_enabled"] = all(
             source_id in profile_source_ids for source_id in source_ids
         )
+        if is_rooted_fhir_catalog_entry(catalog_entry_by_field):
+            catalog_entry_by_field[ROOTED_FHIR_PUBLICATION_FIELD] = (
+                unavailable_rooted_fhir_publication()
+            )
         catalog_items.append(catalog_entry_by_field)
 
     if runnable_source_ids | nonrunnable_profile_source_ids != profile_source_ids:
