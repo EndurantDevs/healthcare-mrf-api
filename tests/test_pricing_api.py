@@ -2219,6 +2219,7 @@ async def test_autocomplete_procedures_includes_match_details_when_requested(
         "_query_terminology",
         AsyncMock(return_value=[match_by_field]),
     )
+    monkeypatch.setattr(pricing_module, "PRICING_DEFAULT_YEAR", 2024)
     request = make_request(
         [FakeResult(rows=[])],
         args={"q": "knee", "include_matches": "true"},
@@ -2228,7 +2229,164 @@ async def test_autocomplete_procedures_includes_match_details_when_requested(
     pricing_response = json.loads(response.body)
 
     assert pricing_response["query"]["include_matches"] is True
+    assert pricing_response["query"]["year_source"] == "env"
     assert pricing_response["items"][0]["matches"] == [match_by_field]
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_procedures_non_deduped_edge_rows(monkeypatch):
+    terminology_rows = [
+        {
+            "canonical_term": "",
+            "term": "",
+            "target_system": "",
+            "target_code": "",
+        },
+        {
+            "canonical_term": "Synthetic procedure",
+            "term": "synthetic",
+            "target_system": "HP_PROCEDURE_CODE",
+            "target_code": "123",
+            "source": "synthetic_terminology",
+        },
+    ]
+    monkeypatch.setattr(
+        pricing_module,
+        "_query_terminology",
+        AsyncMock(return_value=terminology_rows),
+    )
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "code_system": "",
+                        "code": "",
+                        "display_name": "",
+                        "short_description": "",
+                    },
+                    {
+                        "code_system": "CPT",
+                        "code": "12345",
+                        "display_name": "Synthetic catalog procedure",
+                        "short_description": "Synthetic",
+                        "source": "cms_physician_provider_service",
+                    },
+                ]
+            )
+        ],
+        args={
+            "q": "synthetic",
+            "year": "2023",
+            "code_system": "CPT",
+            "dedupe_terms": "false",
+            "include_matches": "true",
+            "max_codes_per_term": "99",
+        },
+    )
+
+    response = await autocomplete_procedures(request)
+    pricing_response = json.loads(response.body)
+
+    assert pricing_response["pagination"]["total"] == 2
+    assert pricing_response["query"]["year_source"] == "request"
+    assert pricing_response["query"]["max_codes_per_term"] == 25
+    assert pricing_response["items"][0]["terminology_match"] == terminology_rows[1]
+    assert pricing_response["items"][1]["term"] == "Synthetic catalog procedure"
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_procedures_deduped_edge_rows(monkeypatch):
+    """Deduplicate malformed terminology and catalog edge rows."""
+    terminology_rows = _deduped_terminology_rows()
+    monkeypatch.setattr(
+        pricing_module,
+        "_query_terminology",
+        AsyncMock(return_value=terminology_rows),
+    )
+    request = make_request(
+        [FakeResult(rows=_deduped_catalog_rows())],
+        args={
+            "q": "syn",
+            "include_matches": "true",
+            "max_codes_per_term": "1",
+        },
+    )
+
+    response = await autocomplete_procedures(request)
+    pricing_response = json.loads(response.body)
+
+    assert [
+        pricing_item_by_field["term"]
+        for pricing_item_by_field in pricing_response["items"]
+    ] == [
+        "Synthetic term",
+        "Other term",
+        "Other code term",
+        "Another term",
+    ]
+    synthetic_item_by_field = pricing_response["items"][0]
+    assert synthetic_item_by_field["internal_codes"] == ["123"]
+    assert synthetic_item_by_field["codes"] == [
+        {"code_system": "HP_PROCEDURE_CODE", "code": "123"}
+    ]
+    assert len(synthetic_item_by_field["matches"]) == 5
+
+
+def _deduped_terminology_rows():
+    return [
+        {"canonical_term": "", "target_system": "", "target_code": ""},
+        *[
+            {
+                "canonical_term": "Synthetic term",
+                "term": "synthetic",
+                "target_system": "HP_PROCEDURE_CODE",
+                "target_code": "123",
+                "source": "synthetic_terminology" if index == 0 else None,
+            }
+            for index in range(5)
+        ],
+        {
+            "canonical_term": "Synthetic term",
+            "term": "synthetic",
+            "target_system": "",
+            "target_code": "",
+        },
+    ]
+
+
+def _deduped_catalog_rows():
+    return [
+        {
+            "display_name": "",
+            "short_description": "",
+            "code": "",
+        },
+        {
+            "display_name": "Synthetic term",
+            "short_description": "",
+            "code_system": "HP_PROCEDURE_CODE",
+            "code": "123",
+        },
+        {
+            "display_name": "Other term",
+            "short_description": "Synthetic short",
+            "code_system": "",
+            "code": "",
+        },
+        {
+            "display_name": "Other code term",
+            "short_description": "",
+            "code_system": "CPT",
+            "code": "SYN123",
+        },
+        {
+            "display_name": "Another term",
+            "short_description": "",
+            "code_system": "HCPCS",
+            "code": "A1",
+        },
+    ]
 
 
 @pytest.mark.asyncio
