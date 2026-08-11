@@ -990,6 +990,7 @@ jobs:
           tests/test_provider_directory_reviewed_subset_terminal_window_postgres.py
           tests/test_provider_directory_reviewed_subset_terminal_window_lock_postgres.py
           tests/test_provider_directory_reviewed_source_generation_postgres.py
+          tests/test_provider_directory_reviewed_policy_rotation_postgres.py
           tests/test_provider_directory_reviewed_subset_terminal_disposition_postgres.py
           tests/test_provider_directory_reviewed_subset_direct_v4_disposition_postgres.py
           tests/test_provider_directory_reviewed_subset_v5_http410_disposition_postgres.py

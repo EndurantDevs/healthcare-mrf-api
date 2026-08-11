@@ -136,6 +136,7 @@ def test_workflow_uses_four_unique_main_coverage_artifacts_and_timeouts() -> Non
         "tests/test_provider_directory_terminal_root_retirement_v2_postgres.py",
         "tests/test_provider_directory_terminal_root_retirement_v2_topology_postgres.py",
         "tests/test_provider_directory_reviewed_subset_terminal_window_postgres.py",
+        "tests/test_provider_directory_reviewed_policy_rotation_postgres.py",
     ):
         _assert_single_lifecycle_test(workflow, lifecycle_step, test_path)
     for workflow_line in workflow.splitlines():

@@ -1557,6 +1557,15 @@ PROVIDER_DIRECTORY_SUBSET_TWIN_ROOT_VERIFIED = (
 PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY = (
     "provider_directory_verification_campaign_id"
 )
+_REVIEWED_SUBSET_POLICY_PREDECESSOR_CAMPAIGN_ID = (
+    "provider-directory-reviewed-subset-2026-08-10-v5"
+)
+_REVIEWED_SUBSET_POLICY_SUCCESSOR_CAMPAIGN_ID = (
+    "provider-directory-reviewed-subset-2026-08-11-v5-r2"
+)
+_REVIEWED_SUBSET_POLICY_STRATEGY_VERSION = (
+    "provider-directory-fhir-server-issued-traversal-subset-v5"
+)
 PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY = (
     "provider_directory_configured_endpoint_id"
 )
@@ -38065,8 +38074,74 @@ def _preserved_source_activation_sql(
     )
 
 
-def _preserved_source_reviewed_root_policy_expression(
+def _is_reviewed_rotation_generation(
+    metadata: Any,
+    *,
+    campaign_id: str,
+    required_root_count: int,
+) -> Any:
+    """Match one type-exact pending v5 root-policy generation."""
+
+    expected_metadata = func.jsonb_build_object(
+        literal("provider_directory_candidate_status"),
+        literal(PROVIDER_DIRECTORY_ROOT_POLICY_PENDING),
+        literal(PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY),
+        literal(campaign_id),
+        literal(CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD),
+        literal(_REVIEWED_SUBSET_POLICY_STRATEGY_VERSION),
+        literal(CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD),
+        literal(3),
+        literal("provider_directory_manual_only"),
+        literal(True),
+    )
+    expected_policy = func.jsonb_build_object(
+        literal("policy_version"),
+        literal(REVIEWED_ROOT_POLICY_VERSION),
+        literal("required_root_count"),
+        literal(required_root_count),
+    )
+    policy = metadata.op("->")(
+        literal(REVIEWED_ROOT_POLICY_METADATA_KEY)
+    )
+    return func.coalesce(
+        and_(
+            metadata.op("@>")(expected_metadata),
+            policy == expected_policy,
+            *(
+                metadata.op("?")(literal(marker_key)) == literal(False)
+                for marker_key in (
+                    REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+                    REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
+                )
+            ),
+        ),
+        literal(False),
+    )
+
+
+def _reviewed_subset_policy_successor_expression(
     target_metadata: Any,
+    incoming_metadata: Any,
+) -> Any:
+    """Admit only the exact pending one-root to two-root campaign rotation."""
+
+    return and_(
+        _is_reviewed_rotation_generation(
+            target_metadata,
+            campaign_id=_REVIEWED_SUBSET_POLICY_PREDECESSOR_CAMPAIGN_ID,
+            required_root_count=1,
+        ),
+        _is_reviewed_rotation_generation(
+            incoming_metadata,
+            campaign_id=_REVIEWED_SUBSET_POLICY_SUCCESSOR_CAMPAIGN_ID,
+            required_root_count=2,
+        ),
+    )
+
+
+def _reviewed_policy_update_expression(
+    target_metadata: Any,
+    incoming_metadata: Any,
     merged_metadata: Any,
 ) -> Any:
     """Keep the audited campaign policy across catalog upserts."""
@@ -38088,6 +38163,11 @@ def _preserved_source_reviewed_root_policy_expression(
         candidate_status,
     )
     has_policy = func.jsonb_typeof(policy) == literal("object")
+    successor_transition = _reviewed_subset_policy_successor_expression(
+        target_metadata,
+        incoming_metadata,
+    )
+    should_preserve_transition = successor_transition.is_not(True)
     return case(
         (
             and_(
@@ -38098,19 +38178,81 @@ def _preserved_source_reviewed_root_policy_expression(
                         literal(PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED),
                     )
                 ),
+                should_preserve_transition,
             ),
             merged_metadata.op("||")(preserved_policy_and_status),
         ),
         (
-            has_policy,
+            and_(has_policy, should_preserve_transition),
             merged_metadata.op("||")(preserved_policy),
         ),
         else_=merged_metadata,
     )
 
 
+def _reviewed_rotation_generation_sql(
+    metadata: str,
+    *,
+    campaign_id: str,
+    required_root_count: int,
+) -> str:
+    """Render one type-exact pending v5 root-policy generation."""
+
+    policy_key = REVIEWED_ROOT_POLICY_METADATA_KEY
+    status_key = "provider_directory_candidate_status"
+    campaign_key = PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+    strategy_key = CURRENT_VERSION_CENSUS_STRATEGY_VERSION_FIELD
+    contract_key = CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD
+    expected_metadata = (
+        "pg_catalog.jsonb_build_object("
+        f"'{status_key}', '{PROVIDER_DIRECTORY_ROOT_POLICY_PENDING}', "
+        f"'{campaign_key}', '{campaign_id}', "
+        f"'{strategy_key}', '{_REVIEWED_SUBSET_POLICY_STRATEGY_VERSION}', "
+        f"'{contract_key}', 3, "
+        "'provider_directory_manual_only', TRUE)"
+    )
+    expected_policy = (
+        "pg_catalog.jsonb_build_object("
+        f"'policy_version', '{REVIEWED_ROOT_POLICY_VERSION}', "
+        f"'required_root_count', {required_root_count})"
+    )
+    activation_absent = " AND ".join(
+        f"NOT ({metadata} ? '{marker_key}')"
+        for marker_key in (
+            REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,
+            REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,
+        )
+    )
+    return (
+        "COALESCE(("
+        f"{metadata} @> {expected_metadata}) AND ("
+        f"{metadata} -> '{policy_key}' = {expected_policy}) AND "
+        f"{activation_absent}, FALSE)"
+    )
+
+
+def _reviewed_subset_policy_successor_sql(
+    target_metadata: str,
+    incoming_metadata: str,
+) -> str:
+    """Render exact COPY parity for the pending campaign-policy rotation."""
+
+    target_generation = _reviewed_rotation_generation_sql(
+        target_metadata,
+        campaign_id=_REVIEWED_SUBSET_POLICY_PREDECESSOR_CAMPAIGN_ID,
+        required_root_count=1,
+    )
+    incoming_generation = _reviewed_rotation_generation_sql(
+        incoming_metadata,
+        campaign_id=_REVIEWED_SUBSET_POLICY_SUCCESSOR_CAMPAIGN_ID,
+        required_root_count=2,
+    )
+    return f"({target_generation}) AND ({incoming_generation})"
+
+
 def _preserved_source_reviewed_root_policy_sql(
     target_metadata: str,
+    incoming_metadata: str,
     merged_metadata: str,
 ) -> str:
     """Render COPY-upsert parity for campaign-policy preservation."""
@@ -38127,14 +38269,19 @@ def _preserved_source_reviewed_root_policy_sql(
         "pg_catalog.jsonb_build_object("
         f"'{policy_key}', {policy}, '{status_key}', {status})"
     )
+    successor_transition = _reviewed_subset_policy_successor_sql(
+        target_metadata,
+        incoming_metadata,
+    )
     return (
         "CASE WHEN pg_catalog.jsonb_typeof("
         f"{policy}) = 'object' AND {status} IN ("
         f"'{PROVIDER_DIRECTORY_ROOT_POLICY_PENDING}', "
-        f"'{PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED}') "
+        f"'{PROVIDER_DIRECTORY_ROOT_POLICY_VERIFIED}') AND ("
+        f"{successor_transition}) IS NOT TRUE "
         f"THEN ({merged_metadata}) || {preserved_policy_and_status} "
         "WHEN pg_catalog.jsonb_typeof("
-        f"{policy}) = 'object' "
+        f"{policy}) = 'object' AND ({successor_transition}) IS NOT TRUE "
         f"THEN ({merged_metadata}) || {preserved_policy} "
         f"ELSE {merged_metadata} END"
     )
@@ -38148,8 +38295,9 @@ def _source_metadata_update_expression(table, excluded_value):
         excluded_value.cast(JSONB), func.jsonb_build_object()
     )
     policy_preserved_metadata = (
-        _preserved_source_reviewed_root_policy_expression(
+        _reviewed_policy_update_expression(
             target_metadata,
+            incoming_metadata,
             target_metadata.op("||")(incoming_metadata),
         )
     )
@@ -38230,6 +38378,7 @@ def _source_metadata_update_sql(
     )
     policy_preserved_metadata = _preserved_source_reviewed_root_policy_sql(
         target_metadata,
+        f"COALESCE({incoming_prefix}.{quoted}::jsonb, '{{}}'::jsonb)",
         merged_metadata,
     )
     effective_metadata = _preserved_source_activation_sql(

@@ -586,7 +586,7 @@
         "continuation_strategy": "smile-opaque-logical-offset-v3",
         "expected_nonempty_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"],
         "page_count": 250,
-        "verification_campaign_id": "provider-directory-reviewed-subset-2026-08-10-v5",
+        "verification_campaign_id": "provider-directory-reviewed-subset-2026-08-11-v5-r2",
         "start_urls": {
           "InsurancePlan": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/InsurancePlan",
           "PractitionerRole": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/PractitionerRole",

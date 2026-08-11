@@ -26,6 +26,7 @@ from process.provider_directory_fhir_census_contract import (
     current_version_census_request,
 )
 from process.provider_directory_fhir_root_policy import (
+    REVIEWED_ROOT_POLICY_METADATA_KEY,
     ReviewedRootPolicy,
 )
 from process.provider_directory_fhir_subset_profiles import (
@@ -33,6 +34,9 @@ from process.provider_directory_fhir_subset_profiles import (
     SERVER_ISSUED_SUBSET_BOUNDED_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
     SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+)
+from process.provider_directory_fhir_subset_terminal_disposition_profile import (
+    DIRECT_V5_CAMPAIGN_ID,
 )
 from tests.provider_directory_fhir_subset_activation_support import (
     single_root_activation_inputs,
@@ -45,6 +49,7 @@ from tests.provider_directory_reviewed_root_policy_pg import (
     _install_policy_predecessors,
 )
 from tests.provider_directory_reviewed_subset_activation_pg_upsert import (
+    _copy_upsert_sql,
     _values_upsert_sql,
 )
 from tests.tin_npi_connector_postgres_support import TransactionalSchema
@@ -52,6 +57,9 @@ from tests.tin_npi_connector_postgres_support import TransactionalSchema
 
 importer = importlib.import_module("process.provider_directory_fhir")
 CUTOFF = "2026-08-01T12:00:00.000000Z"
+SUCCESSOR_CAMPAIGN_ID = (
+    "provider-directory-reviewed-subset-2026-08-11-v5-r2"
+)
 
 
 async def _require_disposable_postgres(database: Database) -> None:
@@ -92,11 +100,11 @@ async def _reviewed_source_database(monkeypatch):
         await database.disconnect()
 
 
-def _reviewed_v5_source() -> dict:
+def _reviewed_v5_source(*, required_root_count: int = 1) -> dict:
     source_id = manual_catalog.reviewed_manual_census_source_id()
     seed_row = manual_catalog.reviewed_manual_census_seed_rows(
         source_id,
-        root_policy=ReviewedRootPolicy(1),
+        root_policy=ReviewedRootPolicy(required_root_count),
     )[0]
     source_record = importer._source_row_from_seed(seed_row)
     resources = list(seed_row["metadata_json"][
@@ -131,6 +139,17 @@ def _reviewed_v5_source() -> dict:
     assert request is not None
     contract = bind_current_version_census_contract(request, [source_record])
     assert contract.is_terminal_count_window_required
+    return source_record
+
+
+def _prior_v5_source(successor_source: dict) -> dict:
+    source_record = deepcopy(successor_source)
+    source_record.pop(CURRENT_VERSION_CENSUS_CONTRACT_FIELD, None)
+    metadata = source_record["metadata_json"]
+    metadata[importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY] = (
+        DIRECT_V5_CAMPAIGN_ID
+    )
+    metadata[REVIEWED_ROOT_POLICY_METADATA_KEY] = ReviewedRootPolicy(1).document()
     return source_record
 
 
@@ -207,6 +226,67 @@ async def test_policy_guard_allows_pending_v4_to_v5_generation(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("upsert_path", ("values", "copy"))
+async def test_policy_guard_allows_pending_v5_successor_rotation(
+    monkeypatch,
+    upsert_path,
+):
+    """Admit only the pending campaign and two-root policy transition."""
+
+    scenario = await TransactionalSchema.create(monkeypatch)
+    try:
+        await _install_policy_predecessors(scenario)
+        contract = build_subset_contract(
+            strategy_version=SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
+            completion_scopes=SERVER_ISSUED_SUBSET_COMPLETION_SCOPES,
+            campaign_id=SUCCESSOR_CAMPAIGN_ID,
+        )
+        successor_source, _, _ = single_root_activation_inputs(
+            contract=contract
+        )
+        successor_source["metadata_json"][
+            REVIEWED_ROOT_POLICY_METADATA_KEY
+        ] = ReviewedRootPolicy(2).document()
+        prior_source = _prior_v5_source(successor_source)
+        await _insert_policy_source(scenario, prior_source)
+        if upsert_path == "values":
+            statement, parameters = _values_upsert_sql(
+                scenario,
+                note="v5-successor-refresh",
+                source_id=successor_source["source_id"],
+                endpoint_id=successor_source["endpoint_id"],
+                canonical_api_base=successor_source["canonical_api_base"],
+                incoming_metadata=successor_source["metadata_json"],
+            )
+            await scenario.connection.execute(statement, *parameters)
+        else:
+            await scenario.connection.execute(
+                _copy_upsert_sql(
+                    scenario,
+                    source_id=successor_source["source_id"],
+                    endpoint_id=successor_source["endpoint_id"],
+                ),
+                json.dumps(successor_source["metadata_json"], sort_keys=True),
+            )
+
+        raw_metadata = await scenario.connection.fetchval(
+            f"""
+            SELECT metadata_json::text
+              FROM {scenario.quoted_schema}.provider_directory_source
+             WHERE source_id = 'synthetic-source'
+            """
+        )
+        persisted_source = deepcopy(successor_source)
+        persisted_source["metadata_json"] = json.loads(raw_metadata)
+        assert importer._is_reviewed_subset_generation_exact(
+            successor_source,
+            persisted_source,
+        )
+    finally:
+        await scenario.close()
+
+
+@pytest.mark.asyncio
 async def test_pending_v4_generation_commits_exact_v5_before_return(
     monkeypatch,
 ):
@@ -233,6 +313,44 @@ async def test_pending_v4_generation_commits_exact_v5_before_return(
             v5_source,
             persisted_source,
         )
+
+
+@pytest.mark.asyncio
+async def test_prior_v5_generation_commits_two_root_successor_before_return(
+    monkeypatch,
+):
+    """Commit the new campaign and policy before any caller can probe."""
+
+    async with _reviewed_source_database(monkeypatch) as (
+        _database,
+        observer,
+        schema,
+    ):
+        successor_source = _reviewed_v5_source(required_root_count=2)
+        prior_source = _prior_v5_source(successor_source)
+        await importer._upsert_provider_directory_source_rows([prior_source])
+
+        await importer._upsert_provider_directory_source_rows(
+            [successor_source],
+            require_reviewed_subset_generation=True,
+        )
+
+        persisted_source = await _persisted_source(
+            observer,
+            schema,
+            successor_source["source_id"],
+        )
+        assert importer._is_reviewed_subset_generation_exact(
+            successor_source,
+            persisted_source,
+        )
+        metadata = persisted_source["metadata_json"]
+        assert metadata[
+            importer.PROVIDER_DIRECTORY_VERIFICATION_CAMPAIGN_METADATA_KEY
+        ] == SUCCESSOR_CAMPAIGN_ID
+        assert metadata[REVIEWED_ROOT_POLICY_METADATA_KEY][
+            "required_root_count"
+        ] == 2
 
 
 @pytest.mark.asyncio

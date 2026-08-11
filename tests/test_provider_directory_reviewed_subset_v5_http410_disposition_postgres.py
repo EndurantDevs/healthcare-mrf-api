@@ -64,6 +64,9 @@ MIGRATION_PATH = ROOT / "alembic/versions" / (
 SYNTHETIC_V5_MARKER_SHA256 = (
     "f419b51652df88f110e7f1f8ea61298c7342d19427e9f6209d839ce54434eb83"
 )
+SUCCESSOR_CAMPAIGN_ID = (
+    "provider-directory-reviewed-subset-2026-08-11-v5-r2"
+)
 
 
 def _load_migration(path=MIGRATION_PATH, module_name="v5_http410_migration"):
@@ -242,6 +245,30 @@ async def _assert_v3_downgrade_is_blocked(
     )
 
 
+async def _assert_replay_survives_source_campaign_rotation(
+    scenario,
+    database,
+) -> None:
+    """Keep sealed evidence replayable after the next source generation."""
+
+    async with scenario.connection.transaction():
+        await scenario.connection.execute(
+            f"""
+            UPDATE {scenario.quoted_schema}.provider_directory_source
+               SET metadata_json = pg_catalog.jsonb_set(
+                       metadata_json::jsonb,
+                       '{{provider_directory_verification_campaign_id}}',
+                       pg_catalog.to_jsonb($1::text),
+                       false
+                   )
+             WHERE source_id = 'source-a'
+            """,
+            SUCCESSOR_CAMPAIGN_ID,
+        )
+    replay = await sync_v5_terminal_disposition(database, "source-a")
+    assert replay.disposed is False
+
+
 @pytest.mark.asyncio
 async def test_v5_http410_guard_rollback_seal_replay_and_downgrade_fence(
     monkeypatch,
@@ -275,6 +302,10 @@ async def test_v5_http410_guard_rollback_seal_replay_and_downgrade_fence(
             direct,
             database,
             immutable_before,
+        )
+        await _assert_replay_survives_source_campaign_rotation(
+            scenario,
+            database,
         )
         await _assert_v3_downgrade_is_blocked(scenario, migration)
         assert await _object_identity_by_kind(scenario, direct) == before_identity
