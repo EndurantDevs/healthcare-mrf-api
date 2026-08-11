@@ -7,6 +7,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 
+import asyncpg
 import pytest
 
 from process.provider_directory_fhir_census_contract import (
@@ -30,6 +31,9 @@ from tests.provider_directory_fhir_subset_completion_support import (
 from tests.provider_directory_reviewed_root_policy_pg import (
     _insert_policy_source,
     _install_policy_predecessors,
+)
+from tests.provider_directory_reviewed_subset_activation_pg_support import (
+    flush_deferred_fixture_events,
 )
 from tests.provider_directory_reviewed_subset_activation_pg_upsert import (
     _copy_upsert_sql,
@@ -121,6 +125,7 @@ _DENIED_ROTATION_CASES = (
             "generation": "incoming",
             "path": (importer.REVIEWED_SUBSET_ACTIVATION_METADATA_KEY,),
             "value": {},
+            "reject": True,
         },
         id="incoming-activation-v1",
     ),
@@ -129,6 +134,7 @@ _DENIED_ROTATION_CASES = (
             "generation": "incoming",
             "path": (importer.REVIEWED_SUBSET_ACTIVATION_METADATA_KEY_V2,),
             "value": {},
+            "reject": True,
         },
         id="incoming-activation-v2",
     ),
@@ -240,6 +246,36 @@ async def _stored_metadata(scenario: TransactionalSchema) -> dict:
     return json.loads(raw_metadata)
 
 
+async def _execute_rotation_case(
+    scenario: TransactionalSchema,
+    upsert_path: str,
+    successor_source: dict,
+    *,
+    should_reject: bool,
+) -> None:
+    """Force deferred guards and prove commit-equivalent behavior."""
+
+    if should_reject:
+        with pytest.raises(
+            asyncpg.PostgresError,
+            match="provider_directory_reviewed_subset_activation_transition_invalid",
+        ):
+            async with scenario.connection.transaction():
+                await _execute_upsert(
+                    scenario,
+                    upsert_path,
+                    successor_source,
+                )
+                await scenario.connection.execute(
+                    "SET CONSTRAINTS ALL IMMEDIATE"
+                )
+        return
+    async with scenario.connection.transaction():
+        await _execute_upsert(scenario, upsert_path, successor_source)
+        await scenario.connection.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        await scenario.connection.execute("SET CONSTRAINTS ALL DEFERRED")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("upsert_path", ("values", "copy"))
 @pytest.mark.parametrize("invalid_case_by_field", _DENIED_ROTATION_CASES)
@@ -266,7 +302,13 @@ async def test_policy_guard_denies_nonexact_successor_rotation(
             "provider_directory_candidate_status"
         ]
         await _insert_policy_source(scenario, prior_source)
-        await _execute_upsert(scenario, upsert_path, successor_source)
+        await flush_deferred_fixture_events(scenario)
+        await _execute_rotation_case(
+            scenario,
+            upsert_path,
+            successor_source,
+            should_reject=bool(invalid_case_by_field.get("reject")),
+        )
 
         persisted_source = deepcopy(successor_source)
         persisted_source["metadata_json"] = await _stored_metadata(scenario)
