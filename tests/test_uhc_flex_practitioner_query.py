@@ -268,6 +268,33 @@ def test_search_bundle_rejects_a_second_exact_cross_npi_identifier():
     assert _validation_error_code(_search_bundle([resource])) == "cross_npi"
 
 
+def test_search_bundle_keeps_exact_resource_and_omits_ambiguous_sibling():
+    exact_resource = _practitioner("practitioner-a")
+    ambiguous_resource = _practitioner("practitioner-b")
+    ambiguous_resource["identifier"].append(
+        {
+            "system": UHC_FLEX_OFFICIAL_NPI_SYSTEM,
+            "value": str(OTHER_NPI),
+        }
+    )
+
+    result = validate_uhc_flex_practitioner_search_bundle(
+        REQUESTED_NPI,
+        _search_bundle([ambiguous_resource, exact_resource], total=2),
+    )
+
+    assert result.outcome == UHC_FLEX_PRACTITIONER_MATCHED
+    assert result.resource_ids == ("practitioner-a",)
+
+    conflicting_resource_map = dict(ambiguous_resource, id="practitioner-a")
+    assert (
+        _validation_error_code(
+            _search_bundle([exact_resource, conflicting_resource_map], total=2)
+        )
+        == "duplicate_resource_conflict"
+    )
+
+
 def test_search_bundle_rejects_entry_or_total_above_the_fixed_cap():
     over_cap_resources = [
         _practitioner(f"practitioner-{index}")

@@ -31,9 +31,7 @@ UHC_FLEX_PRACTITIONER_MAX_RESOURCE_JSON_BYTES = 1 << 20
 _FHIR_ID_PATTERN = re.compile(r"[A-Za-z0-9\-.]{1,64}\Z")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 423, 425, 429})
-_RETRY_CATEGORIES = frozenset(
-    {"invalid", "retryable", "success", "terminal"}
-)
+_RETRY_CATEGORIES = frozenset({"invalid", "retryable", "success", "terminal"})
 
 
 class UHCFlexPractitionerQueryError(ValueError):
@@ -106,9 +104,7 @@ def _canonical_requested_npi(requested_npi: object) -> int:
     try:
         return canonical_uhc_flex_npi(requested_npi)
     except ValueError:
-        raise UHCFlexPractitionerQueryError(
-            "requested_npi_invalid"
-        ) from None
+        raise UHCFlexPractitionerQueryError("requested_npi_invalid") from None
 
 
 def uhc_flex_practitioner_query_url(requested_npi: object) -> str:
@@ -218,9 +214,7 @@ def _exact_resource_npis(resource_by_field: dict[str, Any]) -> tuple[int, ...]:
         try:
             exact_npis.append(canonical_uhc_flex_npi(int(raw_npi)))
         except ValueError:
-            raise UHCFlexPractitionerQueryError(
-                "resource_npi_invalid"
-            ) from None
+            raise UHCFlexPractitionerQueryError("resource_npi_invalid") from None
     return tuple(exact_npis)
 
 
@@ -296,18 +290,28 @@ def _validated_resource_json_rows(
     requested_npi: int,
 ) -> tuple[tuple[str, str], ...]:
     canonical_json_by_id: dict[str, str] = {}
+    admitted_resource_ids: set[str] = set()
+    ambiguous_resource_count = 0
     for entry_by_field in entries:
         resource_by_field = _entry_practitioner(entry_by_field)
-        _validate_resource_npi(resource_by_field, requested_npi)
+        exact_npis = _exact_resource_npis(resource_by_field)
+        if not exact_npis:
+            raise UHCFlexPractitionerQueryError("requested_npi_missing")
+        if requested_npi not in exact_npis:
+            raise UHCFlexPractitionerQueryError("cross_npi")
         resource_id = _resource_id(resource_by_field)
         canonical_json = _canonical_resource_json(resource_by_field)
         previous_json = canonical_json_by_id.get(resource_id)
         if previous_json is not None and previous_json != canonical_json:
-            raise UHCFlexPractitionerQueryError(
-                "duplicate_resource_conflict"
-            )
+            raise UHCFlexPractitionerQueryError("duplicate_resource_conflict")
         canonical_json_by_id[resource_id] = canonical_json
-    return tuple(sorted(canonical_json_by_id.items()))
+        if any(resource_npi != requested_npi for resource_npi in exact_npis):
+            ambiguous_resource_count += 1
+        else:
+            admitted_resource_ids.add(resource_id)
+    if not admitted_resource_ids and ambiguous_resource_count:
+        raise UHCFlexPractitionerQueryError("cross_npi")
+    return tuple((key, canonical_json_by_id[key]) for key in sorted(admitted_resource_ids))
 
 
 def _query_result_sha256(

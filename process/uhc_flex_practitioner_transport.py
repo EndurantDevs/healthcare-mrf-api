@@ -84,11 +84,15 @@ class UHCFlexPractitionerTransportError(RuntimeError):
         self.retryable = retryable is True
         self.is_retryable = self.retryable
         self.retry_after_seconds = safe_retry_after if self.retryable else 0.0
+        normalized_validation_code = (
+            UHCFlexPractitionerQueryError(validation_code).code
+            if type(validation_code) is str
+            else None
+        )
         self.validation_code = (
             validation_code
             if safe_code == "response_validation"
-            and type(validation_code) is str
-            and validation_code
+            and normalized_validation_code == validation_code
             else None
         )
         super().__init__(_ERROR_MESSAGES[safe_code])
