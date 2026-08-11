@@ -17,6 +17,7 @@ from process.provider_directory_fhir_subset_terminal_disposition_profile import 
     COUNT_DRIFT_DISPOSITION,
     COUNT_DRIFT_RESOURCE_TYPES,
     DIRECT_V4_CONTRACT_VERSION,
+    DIRECT_V5_CONTRACT_VERSION,
     EXPECTED_DISPOSITION_BY_RESOURCE_TYPE,
     EXPECTED_RESOURCE_TYPES,
     RESOURCE_DISPOSITION_FIELDS,
@@ -456,8 +457,15 @@ def _validated_legacy_terminal_disposition_marker(
 def validated_terminal_disposition_marker(
     marker_by_field: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate either supported contract in the terminal marker envelope."""
-
+    """Validate one supported contract in the terminal marker envelope."""
+    if (
+        isinstance(marker_by_field, Mapping)
+        and marker_by_field.get("contract_version") == DIRECT_V5_CONTRACT_VERSION
+    ):
+        from process.provider_directory_fhir_subset_terminal_disposition_v5_contract import (
+            validated_direct_v5_terminal_marker,
+        )
+        return validated_direct_v5_terminal_marker(marker_by_field)
     if (
         isinstance(marker_by_field, Mapping)
         and marker_by_field.get("contract_version") == DIRECT_V4_CONTRACT_VERSION
@@ -465,7 +473,6 @@ def validated_terminal_disposition_marker(
         from process.provider_directory_fhir_subset_terminal_disposition_v4_contract import (
             validated_direct_v4_terminal_marker,
         )
-
         return validated_direct_v4_terminal_marker(marker_by_field)
     return _validated_legacy_terminal_disposition_marker(marker_by_field)
 
