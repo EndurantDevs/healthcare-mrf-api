@@ -91,7 +91,11 @@ MEDICATION_ALLOWED_CODE_SYSTEMS = {
 CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
-PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"premise_key"}
+PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {
+    "premise_key",
+    "_address_site_keys",
+    "_address_site_key_status",
+}
 PUBLIC_NPI_EXCLUDED_COLUMNS = {
     "employer_identification_number",
     "parent_organization_tin",
@@ -906,7 +910,13 @@ PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL = """
 # callers walk every address via address_offset, or opt out with address_limit=all.
 NPI_DETAIL_ADDRESS_DEFAULT_LIMIT = 200
 NPI_DETAIL_ADDRESS_MAX_LIMIT = 1000
+NPI_DETAIL_ADDRESS_GROUP_DEFAULT_LIMIT = 5
+NPI_DETAIL_ADDRESS_GROUP_MAX_LIMIT = 5
+NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT = 5
 NPI_SEARCH_ADDRESS_DEFAULT_LIMIT = 3
+ADDRESS_GROUPING_FLAT = "flat"
+ADDRESS_GROUPING_PREMISE = "premise"
+ADDRESS_GROUPING_VALUES = {ADDRESS_GROUPING_FLAT, ADDRESS_GROUPING_PREMISE}
 
 
 def _npi_detail_cache_key(
@@ -928,6 +938,8 @@ def _npi_detail_cache_key(
     address_offset: int = 0,
     include_address_total: bool = True,
     address_key: str | None = None,
+    address_site_key: str | None = None,
+    address_grouping: str = ADDRESS_GROUPING_FLAT,
 ) -> str:
     schema = _runtime_db_schema()
     address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
@@ -944,7 +956,8 @@ def _npi_detail_cache_key(
         f"npipub:{canonical_publication_identity or 'untracked'}|"
         f"alim:{address_limit if address_limit is not None else 'all'}|"
         f"aoff:{int(address_offset or 0)}|atotal:{int(include_address_total)}|"
-        f"akey:{address_key or 'none'}"
+        f"akey:{address_key or 'none'}|"
+        f"askey:{address_site_key or 'none'}|agroup:{address_grouping}"
     )
 
 
@@ -982,7 +995,11 @@ def _is_npi_detail_response_cacheable(
         return False
     if not sync_geocode:
         return True
-    for address in data.get("address_list") or []:
+    address_list = list(data.get("address_list") or [])
+    for group in data.get("address_groups") or []:
+        if isinstance(group, Mapping):
+            address_list.extend(group.get("members") or [])
+    for address in address_list:
         if isinstance(address, dict) and not address.get("lat"):
             return False
     return True
@@ -1214,9 +1231,8 @@ def _merge_address_key_group(
     address_key = ""
     site_keys: set[str] = set()
     for address in address_group:
-        address_key, site_key = _address_key_and_site_key(address)
-        if site_key:
-            site_keys.add(site_key)
+        address_key, _site_key = _address_key_and_site_key(address)
+        site_keys.update(_address_site_keys(address))
     if len(site_keys) > 1:
         logger.warning(
             "Canonical address_key %s maps to %d conflicting non-null site keys",
@@ -1231,7 +1247,17 @@ def _merge_address_key_group(
             _provider_location_sort_key(address),
         ),
     )
-    return [_merge_address_bucket(ordered_group)]
+    merged_address = _merge_address_bucket(ordered_group)
+    if site_keys:
+        merged_address["_address_site_keys"] = sorted(site_keys)
+    merged_address["_address_site_key_status"] = (
+        "available"
+        if len(site_keys) == 1
+        else "conflicting"
+        if len(site_keys) > 1
+        else "missing"
+    )
+    return [merged_address]
 
 
 def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
@@ -1342,6 +1368,141 @@ def _provider_location_sort_key(address: Mapping[str, Any]) -> tuple[Any, ...]:
 
 def _rank_provider_locations(addresses: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(addresses, key=_provider_location_sort_key)
+
+
+def _address_site_keys(address: Mapping[str, Any]) -> list[str]:
+    """Return every known exact premise key for one delivery-point member."""
+    raw_site_keys: list[Any] = []
+    stored_site_keys = address.get("_address_site_keys")
+    if isinstance(stored_site_keys, (list, tuple, set)):
+        raw_site_keys.extend(stored_site_keys)
+    raw_site_keys.extend(
+        (address.get(PUBLIC_ADDRESS_SITE_KEY), address.get("premise_key"))
+    )
+    return sorted(
+        {
+            normalized_site_key
+            for raw_site_key in raw_site_keys
+            if (normalized_site_key := _normalized_address_identity(raw_site_key))
+        }
+    )
+
+
+def _is_address_site_key_match(
+    address: Mapping[str, Any],
+    address_site_key: str,
+) -> bool:
+    return address_site_key in _address_site_keys(address)
+
+
+def _premise_group_identity(
+    address: Mapping[str, Any],
+    singleton_index: int,
+) -> tuple[tuple[str, str], dict[str, Any]]:
+    """Choose a strict stored-key grouping identity without fuzzy inference."""
+    site_keys = _address_site_keys(address)
+    address_key = _normalized_address_identity(address.get("address_key"))
+    if len(site_keys) == 1:
+        site_key = site_keys[0]
+        return ("site", site_key), {
+            "group_key": site_key,
+            "grouping_basis": "address_site_key",
+            "address_site_key": site_key,
+            "address_site_key_status": "available",
+        }
+    if address_key:
+        return ("address", address_key), {
+            "group_key": address_key,
+            "grouping_basis": "address_key_fallback",
+            "address_site_key": None,
+            "address_site_key_status": (
+                "conflicting" if len(site_keys) > 1 else "missing"
+            ),
+        }
+    singleton_key = f"singleton:{singleton_index}"
+    return ("singleton", singleton_key), {
+        "group_key": None,
+        "grouping_basis": "singleton",
+        "address_site_key": None,
+        "address_site_key_status": (
+            "conflicting" if len(site_keys) > 1 else "missing"
+        ),
+    }
+
+
+def _group_provider_locations_by_premise(
+    addresses: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group ranked members by exact stored premise keys, preserving all units."""
+    group_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+    for singleton_index, address in enumerate(addresses):
+        group_identity, group_fields = _premise_group_identity(
+            address,
+            singleton_index,
+        )
+        group_map = group_by_identity.get(group_identity)
+        if group_map is None:
+            group_map = {**group_fields, "members": []}
+            group_by_identity[group_identity] = group_map
+        group_map["members"].append(address)
+    return list(group_by_identity.values())
+
+
+def _member_pagination(total: int, returned: int) -> dict[str, Any]:
+    has_more = returned < total
+    return {
+        "limit": NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT,
+        "offset": 0,
+        "returned": returned,
+        "total": total,
+        "has_more": has_more,
+        "next_offset": returned if has_more else None,
+    }
+
+
+def _address_group_pagination(
+    *,
+    limit: int,
+    offset: int,
+    returned: int,
+    total: int,
+) -> dict[str, Any]:
+    next_offset = offset + returned
+    has_more = next_offset < total
+    return {
+        "limit": limit,
+        "offset": offset,
+        "returned": returned,
+        "total": total,
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
+    }
+
+
+def _finalize_public_provider_address(
+    address: dict[str, Any],
+    *,
+    include_sources: bool,
+    include_evidence: bool,
+    suppress_conflicting_site_key: bool = False,
+) -> dict[str, Any]:
+    """Remove serving internals while preserving the full public member row."""
+    if (
+        suppress_conflicting_site_key
+        and address.get("_address_site_key_status") == "conflicting"
+    ):
+        address.pop("premise_key", None)
+        address.pop(PUBLIC_ADDRESS_SITE_KEY, None)
+    else:
+        _attach_public_address_site_key(address, address)
+    for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+        address.pop(key, None)
+    address.pop("_base_row_identities", None)
+    if not (include_sources or include_evidence):
+        address.pop("location_key", None)
+    if not include_evidence:
+        address.pop("source_record_ids", None)
+    return address
 
 
 def _directory_source_ids(record_ids: Any) -> list[str]:
@@ -10860,10 +11021,37 @@ async def get_npi(request, npi):
     )
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))
+    address_grouping = str(
+        request.args.get("address_grouping") or ADDRESS_GROUPING_FLAT
+    ).strip().lower()
+    if address_grouping not in ADDRESS_GROUPING_VALUES:
+        raise sanic.exceptions.InvalidUsage(
+            "address_grouping must be one of: flat, premise"
+        )
     # address_list paging: default-bounded so high-volume providers never serialize
     # 1k+ addresses; address_limit=all (or 0) opts out and returns the full list.
     raw_address_limit = request.args.get("address_limit")
-    if raw_address_limit is None or str(raw_address_limit).strip() == "":
+    if address_grouping == ADDRESS_GROUPING_PREMISE:
+        normalized_group_limit = str(raw_address_limit or "").strip().lower()
+        if normalized_group_limit in ("all", "0", "-1"):
+            raise sanic.exceptions.InvalidUsage(
+                "address_limit must be between 1 and 5 for premise grouping"
+            )
+        try:
+            address_limit = (
+                NPI_DETAIL_ADDRESS_GROUP_DEFAULT_LIMIT
+                if not normalized_group_limit
+                else int(normalized_group_limit)
+            )
+        except (TypeError, ValueError) as exc:
+            raise sanic.exceptions.InvalidUsage(
+                "address_limit must be between 1 and 5 for premise grouping"
+            ) from exc
+        if not 1 <= address_limit <= NPI_DETAIL_ADDRESS_GROUP_MAX_LIMIT:
+            raise sanic.exceptions.InvalidUsage(
+                "address_limit must be between 1 and 5 for premise grouping"
+            )
+    elif raw_address_limit is None or str(raw_address_limit).strip() == "":
         address_limit = NPI_DETAIL_ADDRESS_DEFAULT_LIMIT
     elif str(raw_address_limit).strip().lower() in ("all", "0", "-1"):
         address_limit = None
@@ -10878,13 +11066,19 @@ async def get_npi(request, npi):
         address_offset = 0
     include_address_total = _is_truthy_arg(request.args.get("include_address_total"), default=True)
     raw_address_key = request.args.get("address_key")
-    if raw_address_key is None or not str(raw_address_key).strip():
-        address_key = None
-    else:
-        try:
-            address_key = str(uuid.UUID(str(raw_address_key).strip()))
-        except (AttributeError, TypeError, ValueError):
-            raise sanic.exceptions.InvalidUsage("address_key must be a UUID")
+    raw_address_site_key = request.args.get("address_site_key")
+    if address_grouping == ADDRESS_GROUPING_PREMISE and (
+        str(raw_address_key or "").strip()
+        or str(raw_address_site_key or "").strip()
+    ):
+        raise sanic.exceptions.InvalidUsage(
+            "address_key and address_site_key are not supported with premise grouping"
+        )
+    address_key = _normalize_uuid_key(raw_address_key, "address_key")
+    address_site_key = _normalize_uuid_key(
+        raw_address_site_key,
+        "address_site_key",
+    )
     npi = int(npi)
     request_session = _request_session(request)
     profile_record: dict[str, Any] | None = None
@@ -10960,6 +11154,8 @@ async def get_npi(request, npi):
         address_offset=address_offset,
         include_address_total=include_address_total,
         address_key=address_key,
+        address_site_key=address_site_key,
+        address_grouping=address_grouping,
     )
     if is_response_cache_enabled:
         cached_body = _npi_detail_response_cache_get(cache_key)
@@ -11454,6 +11650,7 @@ async def get_npi(request, npi):
     overlay_addresses = await _fetch_provider_directory_address_overlay(
         npi,
         address_key=address_key,
+        address_site_key=address_site_key,
         session=request_session,
     )
     initial_base_addresses = list(
@@ -11463,6 +11660,7 @@ async def get_npi(request, npi):
         await _fetch_npi_location_candidates(
             npi,
             address_key=address_key,
+            address_site_key=address_site_key,
             session=request_session,
         )
     )
@@ -11481,17 +11679,39 @@ async def get_npi(request, npi):
             if isinstance(address, Mapping)
             and str(address.get("address_key") or "").lower() == address_key
         ]
+    if address_site_key is not None:
+        addresses = [
+            address
+            for address in addresses
+            if isinstance(address, Mapping)
+            and _is_address_site_key_match(address, address_site_key)
+        ]
     if not include_extra_info:
         addresses = [address for address in addresses if _is_public_street_level_address(address)]
     addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
     if not has_provider_detail and not profile_record and not addresses:
         raise sanic.exceptions.NotFound
     address_total = len(addresses)
-    selected_candidates = addresses
-    if address_limit is not None:
-        selected_candidates = selected_candidates[
+    selected_group_specs: list[dict[str, Any]] = []
+    if address_grouping == ADDRESS_GROUPING_PREMISE:
+        all_group_specs = _group_provider_locations_by_premise(addresses)
+        selected_group_specs = all_group_specs[
             address_offset : address_offset + address_limit
         ]
+        selected_candidates = [
+            member
+            for group_spec in selected_group_specs
+            for member in group_spec["members"][
+                :NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT
+            ]
+        ]
+    else:
+        all_group_specs = []
+        selected_candidates = addresses
+        if address_limit is not None:
+            selected_candidates = selected_candidates[
+                address_offset : address_offset + address_limit
+            ]
     addresses = await _hydrate_selected_provider_locations(
         npi,
         selected_candidates,
@@ -11501,49 +11721,94 @@ async def get_npi(request, npi):
         address_key=address_key,
         session=request_session,
     )
-    if addresses:
-        if include_sources or include_evidence:
-            await _attach_provider_directory_source_details(
-                addresses,
-                include_role_evidence=include_evidence,
-                session=request_session,
+    if addresses and (include_sources or include_evidence):
+        await _attach_provider_directory_source_details(
+            addresses,
+            include_role_evidence=include_evidence,
+            session=request_session,
+        )
+    update_address_tasks = [
+        _update_address(address)
+        for address in addresses
+        if address
+    ]
+    updated_addresses = (
+        list(await asyncio.gather(*update_address_tasks))
+        if update_address_tasks
+        else []
+    )
+    if address_grouping == ADDRESS_GROUPING_PREMISE:
+        provider_detail_by_field.pop("address_list", None)
+        provider_detail_by_field.pop("address_pagination", None)
+        response_groups: list[dict[str, Any]] = []
+        member_cursor = 0
+        for group_spec in selected_group_specs:
+            member_total = len(group_spec["members"])
+            member_returned = min(
+                member_total,
+                NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT,
             )
-        update_address_tasks = [
-            _update_address(address)
-            for address in addresses
-            if address
-        ]
-        if update_address_tasks:
-            provider_detail_by_field["address_list"] = list(
-                await asyncio.gather(*update_address_tasks)
+            group_members = [
+                _finalize_public_provider_address(
+                    dict(address),
+                    include_sources=include_sources,
+                    include_evidence=include_evidence,
+                    suppress_conflicting_site_key=True,
+                )
+                for address in updated_addresses[
+                    member_cursor : member_cursor + member_returned
+                ]
+                if isinstance(address, dict)
+            ]
+            member_cursor += member_returned
+            response_groups.append(
+                {
+                    "group_key": group_spec["group_key"],
+                    "grouping_basis": group_spec["grouping_basis"],
+                    "address_site_key": group_spec["address_site_key"],
+                    "address_site_key_status": group_spec[
+                        "address_site_key_status"
+                    ],
+                    "members": group_members,
+                    "member_pagination": _member_pagination(
+                        member_total,
+                        len(group_members),
+                    ),
+                }
             )
-        else:
-            provider_detail_by_field["address_list"] = []
+        provider_detail_by_field["address_grouping"] = ADDRESS_GROUPING_PREMISE
+        provider_detail_by_field["address_groups"] = response_groups
+        provider_detail_by_field["address_group_pagination"] = (
+            _address_group_pagination(
+                limit=address_limit,
+                offset=address_offset,
+                returned=len(response_groups),
+                total=len(all_group_specs),
+            )
+        )
     else:
-        provider_detail_by_field["address_list"] = []
-    for address in provider_detail_by_field["address_list"]:
-        if isinstance(address, dict):
-            _attach_public_address_site_key(address, address)
-            for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                address.pop(key, None)
-            address.pop("_base_row_identities", None)
-            if not (include_sources or include_evidence):
-                address.pop("location_key", None)
-            if not include_evidence:
-                address.pop("source_record_ids", None)
-    # Never silently truncate: describe the combined, deduplicated result set.
-    returned = len(provider_detail_by_field["address_list"])
-    effective_offset = address_offset if address_limit is not None else 0
-    provider_detail_by_field["address_pagination"] = {
-        "limit": address_limit,
-        "offset": effective_offset,
-        "returned": returned,
-        "total": address_total if include_address_total else None,
-        "has_more": bool(
-            address_limit is not None
-            and effective_offset + returned < address_total
-        ),
-    }
+        provider_detail_by_field["address_list"] = [
+            _finalize_public_provider_address(
+                dict(address),
+                include_sources=include_sources,
+                include_evidence=include_evidence,
+            )
+            for address in updated_addresses
+            if isinstance(address, dict)
+        ]
+        # Never silently truncate: describe the combined, deduplicated result set.
+        returned = len(provider_detail_by_field["address_list"])
+        effective_offset = address_offset if address_limit is not None else 0
+        provider_detail_by_field["address_pagination"] = {
+            "limit": address_limit,
+            "offset": effective_offset,
+            "returned": returned,
+            "total": address_total if include_address_total else None,
+            "has_more": bool(
+                address_limit is not None
+                and effective_offset + returned < address_total
+            ),
+        }
 
     if provider_enrichment_view == "summary":
         fetch_provider_enrichment = _fetch_provider_enrichment_summary_detail
@@ -11690,6 +11955,7 @@ async def _fetch_npi_location_candidates(
     npi: int,
     *,
     address_key: str | None = None,
+    address_site_key: str | None = None,
     session: Any = None,
 ) -> list[dict[str, Any]]:
     """Read only the fields needed to rank the complete base location set."""
@@ -11717,6 +11983,13 @@ async def _fetch_npi_location_candidates(
         ) == npi
     if address_key is not None:
         filters.append(address_table.c.address_key == address_key)
+    if address_site_key is not None:
+        if (
+            address_model is not EntityAddressUnified
+            or "premise_key" not in existing_columns
+        ):
+            return []
+        filters.append(address_table.c.premise_key == address_site_key)
     statement = (
         select(*candidate_columns)
         .where(*filters)
@@ -12417,6 +12690,26 @@ def _overlay_formatted_address_sql(overlay_columns: set[str]) -> str:
     )
 
 
+def _overlay_premise_key_sql(
+    overlay_columns: set[str],
+) -> tuple[str, str, str]:
+    """Return select, predicate, and grouping SQL for stored premise keys."""
+    if "premise_key" not in overlay_columns:
+        return (
+            "NULL::uuid AS premise_key",
+            "AND CAST(:address_site_key AS uuid) IS NULL",
+            "",
+        )
+    return (
+        "premise_key",
+        """AND (
+                   CAST(:address_site_key AS uuid) IS NULL
+                   OR overlay.premise_key = CAST(:address_site_key AS uuid)
+               )""",
+        ", premise_key",
+    )
+
+
 def _overlay_location_status_sql() -> str:
     """Return the current-resource location-status aggregate."""
     return _provider_directory_location_status_sql(
@@ -12425,16 +12718,7 @@ def _overlay_location_status_sql() -> str:
     )
 
 
-def _provider_directory_overlay_query_sql(
-    overlay_columns: set[str],
-) -> str:
-    """Build the current-resource provider-directory address overlay query."""
-    lat_select, long_select, coordinate_group_by = _overlay_coordinate_sql(overlay_columns)
-    overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
-    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(
-        _runtime_db_schema()
-    )
-    return f"""
+_PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE = """
         WITH {current_resource_ctes_sql}, visible_overlay AS MATERIALIZED (
             SELECT overlay.*, current_resource.canonical_api_base,
                    current_resource.payload_json
@@ -12449,6 +12733,7 @@ def _provider_directory_overlay_query_sql(
                    CAST(:address_key AS uuid) IS NULL
                    OR overlay.address_key = CAST(:address_key AS uuid)
                )
+               {premise_filter}
         )
         SELECT
             npi,
@@ -12464,25 +12749,52 @@ def _provider_directory_overlay_query_sql(
             fax_number,
             phone_number,
             fax_number_digits,
-            {_overlay_formatted_address_sql(overlay_columns)},
+            {formatted_address_select},
             {lat_select},
             {long_select},
             address_key,
+            {premise_select},
             address_precision,
             ARRAY['provider_directory_fhir']::varchar[] AS address_sources,
             ARRAY_AGG(overlay.source_record_id ORDER BY overlay.source_record_id)::varchar[] AS source_record_ids,
             COUNT(DISTINCT overlay.source_id)::integer AS source_count,
             COUNT(DISTINCT COALESCE(NULLIF(overlay.canonical_api_base, ''), overlay.source_id))::integer AS independent_source_count,
             (COUNT(DISTINCT COALESCE(NULLIF(overlay.canonical_api_base, ''), overlay.source_id)) > 1)::boolean AS multi_source_confirmed,
-            {_overlay_location_status_sql()} AS location_status,
+            {location_status_select} AS location_status,
             MAX(source_updated_at) AS updated_at
           FROM visible_overlay AS overlay
       GROUP BY
             npi, first_line, second_line, city_name, state_name, state_code,
             postal_code, country_code, telephone_number, fax_number, phone_number,
-            fax_number_digits, address_key, address_precision{coordinate_group_by}
+            fax_number_digits, address_key, address_precision{coordinate_group_by}{premise_group_by}
       ORDER BY first_line NULLS LAST, city_name NULLS LAST, address_key;
-    """
+"""
+
+
+def _provider_directory_overlay_query_sql(
+    overlay_columns: set[str],
+) -> str:
+    """Build the current-resource provider-directory address overlay query."""
+    lat_select, long_select, coordinate_group_by = _overlay_coordinate_sql(overlay_columns)
+    premise_select, premise_filter, premise_group_by = _overlay_premise_key_sql(
+        overlay_columns
+    )
+    overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(
+        _runtime_db_schema()
+    )
+    return _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE.format(
+        current_resource_ctes_sql=current_resource_ctes_sql,
+        overlay_table_sql=overlay_table_sql,
+        premise_filter=premise_filter,
+        formatted_address_select=_overlay_formatted_address_sql(overlay_columns),
+        lat_select=lat_select,
+        long_select=long_select,
+        premise_select=premise_select,
+        location_status_select=_overlay_location_status_sql(),
+        coordinate_group_by=coordinate_group_by,
+        premise_group_by=premise_group_by,
+    )
 
 
 def _provider_directory_location_status_sql(
@@ -12543,6 +12855,7 @@ async def _fetch_provider_directory_address_overlay(
     npi: int,
     *,
     address_key: str | None = None,
+    address_site_key: str | None = None,
     session: Any = None,
 ) -> list[dict[str, Any]]:
     """Fetch FHIR address evidence with endpoint-aware confirmation counts."""
@@ -12563,7 +12876,11 @@ async def _fetch_provider_directory_address_overlay(
     overlay_result = await _execute_stmt(
         overlay_query,
         session=session,
-        params={"npi": int(npi), "address_key": address_key},
+        params={
+            "npi": int(npi),
+            "address_key": address_key,
+            "address_site_key": address_site_key,
+        },
     )
     overlay_addresses: list[dict[str, Any]] = []
     for overlay_row in overlay_result.all():

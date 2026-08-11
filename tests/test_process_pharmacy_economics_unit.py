@@ -192,3 +192,34 @@ async def test_fetch_sdud_uses_prescription_counts_only(monkeypatch, econ_module
     assert result["IL"]["12345678901"]["volume"] == 150
     assert "12345678902" not in result["IL"]
     assert "XX" not in result
+
+
+def test_pharmacy_economics_rows_preserve_margin_inputs(econ_module):
+    updated_at = econ_module.datetime.datetime(2026, 8, 11, 12, 30)
+    summary_rows = list(
+        econ_module._pharmacy_economics_rows(
+            {
+                "UT": {
+                    "12345678901": {"name": "Example A", "volume": 12},
+                    "12345678902": {"name": "Example B", "volume": 3},
+                }
+            },
+            {"12345678901": 2.0},
+            {"12345678901": 1.5},
+            updated_at,
+        )
+    )
+
+    assert summary_rows == [
+        {
+            "state": "UT",
+            "ndc11": "12345678901",
+            "drug_name": "Example A",
+            "sdud_volume": 12,
+            "nadac_per_unit": 2.0,
+            "ful_per_unit": 1.5,
+            "medicaid_dispensing_fee": econ_module.STATE_DISPENSING_FEES["UT"],
+            "estimated_gross_margin": -4.77,
+            "updated_at": updated_at,
+        }
+    ]

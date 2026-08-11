@@ -2795,6 +2795,29 @@ def _get_cached_lowercase_payload(row: dict[str, Any]) -> dict[str, Any]:
     return payload_lower
 
 
+def _matched_peer_target_geography(
+    payload_lower: dict[str, Any],
+    geography_priority: list[tuple[str, str]],
+) -> tuple[int, str] | None:
+    row_scope, row_value, row_geography_label = _extract_peer_target_geography(
+        payload_lower
+    )
+    for index, (target_scope, target_value) in enumerate(geography_priority):
+        if _is_row_geography_match(
+            row_scope,
+            row_value,
+            target_scope,
+            target_value,
+        ):
+            selected_geography = row_geography_label or (
+                "national"
+                if target_scope == "national"
+                else f"{target_scope}:{target_value}"
+            )
+            return index, selected_geography
+    return None
+
+
 def _collect_peer_target_candidates(
     peer_target_rows: list[dict[str, Any]],
     *,
@@ -2806,32 +2829,23 @@ def _collect_peer_target_candidates(
     requested_procedure_codes: set[str],
 ) -> list[dict[str, Any]]:
     """Collect quality peer targets matching geography, specialty, taxonomy, and procedure criteria."""
-    geography_priority = _geography_priority_for_benchmark_mode(
-        benchmark_mode,
-        state_key=state_key,
-        zip5=zip5,
-    )
+    geography_priority = _geography_priority_for_benchmark_mode(benchmark_mode, state_key=state_key, zip5=zip5)
     candidates: list[dict[str, Any]] = []
 
     for peer_target_row in peer_target_rows:
         payload_lower = _get_cached_lowercase_payload(peer_target_row)
-        row_mode = str(_pick_first_from_lowered(payload_lower, "benchmark_mode", "mode") or "").strip().lower()
+        row_mode = str(
+            _pick_first_from_lowered(payload_lower, "benchmark_mode", "mode") or ""
+        ).strip().lower()
         if row_mode and row_mode in QUALITY_BENCHMARK_MODE_ORDER and row_mode != benchmark_mode:
             continue
-
-        row_scope, row_value, row_geography_label = _extract_peer_target_geography(payload_lower)
-        geography_rank = None
-        matched_geography_scope = None
-        matched_geography_value = None
-        for index, (target_scope, target_value) in enumerate(geography_priority):
-            if _is_row_geography_match(row_scope, row_value, target_scope, target_value):
-                geography_rank = index
-                matched_geography_scope = target_scope
-                matched_geography_value = target_value
-                break
-        if geography_rank is None:
+        geography_match = _matched_peer_target_geography(
+            payload_lower,
+            geography_priority,
+        )
+        if geography_match is None:
             continue
-
+        geography_rank, selected_geography = geography_match
         cohort_level = _normalize_cohort_level(
             _pick_first_from_lowered(payload_lower, "cohort_level", "cohort_tier", "cohort", "level")
         ) or "L3"
@@ -2846,7 +2860,6 @@ def _collect_peer_target_candidates(
             upper=True,
         )
         procedure_match_ratio, procedure_bucket = _procedure_match_ratio(payload_lower, requested_procedure_codes)
-
         candidates.append(
             {
                 "row": peer_target_row,
@@ -2860,15 +2873,9 @@ def _collect_peer_target_candidates(
                 "strict_match": bool(is_specialty_match and is_taxonomy_match),
                 "procedure_bucket": procedure_bucket,
                 "peer_count": _peer_count_from_row(payload_lower),
-                "selected_geography": row_geography_label
-                or (
-                    "national"
-                    if matched_geography_scope == "national"
-                    else f"{matched_geography_scope}:{matched_geography_value}"
-                ),
+                "selected_geography": selected_geography,
             }
         )
-
     return sorted(candidates, key=_peer_target_sort_key)
 
 

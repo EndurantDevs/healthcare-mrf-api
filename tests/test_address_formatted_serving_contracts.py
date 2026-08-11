@@ -81,9 +81,15 @@ async def test_overlay_stage_skips_hydration_without_archive(monkeypatch):
     status.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_overlay_population_hydrates_after_alias_rewrite(monkeypatch):
-    events: list[str] = []
+def _record_overlay_event(events, name, value):
+    def record(*_args, **_kwargs):
+        events.append(name)
+        return value
+
+    return record
+
+
+def _stub_overlay_population_dependencies(monkeypatch, events):
     monkeypatch.setattr(
         directory,
         "_copy_existing_address_overlay",
@@ -102,22 +108,24 @@ async def test_overlay_population_hydrates_after_alias_rewrite(monkeypatch):
     monkeypatch.setattr(
         directory,
         "_materialize_address_overlay_aliases",
-        AsyncMock(side_effect=lambda *_: events.append("aliases") or {}),
+        AsyncMock(side_effect=_record_overlay_event(events, "aliases", {})),
     )
-    monkeypatch.setattr(
-        directory,
-        "_backfill_address_overlay_stage_formatted_addresses",
-        AsyncMock(side_effect=lambda *_: events.append("formatted") or 2),
-    )
-    monkeypatch.setattr(
-        directory,
-        "_backfill_address_overlay_stage_coordinates",
-        AsyncMock(side_effect=lambda *_: events.append("coordinates") or 0),
-    )
+    for function_name, event_name, changed_rows in (
+        ("_backfill_address_overlay_stage_premise_keys", "premise", 1),
+        ("_backfill_address_overlay_stage_formatted_addresses", "formatted", 2),
+        ("_backfill_address_overlay_stage_coordinates", "coordinates", 0),
+    ):
+        monkeypatch.setattr(
+            directory,
+            function_name,
+            AsyncMock(
+                side_effect=_record_overlay_event(events, event_name, changed_rows)
+            ),
+        )
     monkeypatch.setattr(
         directory,
         "_dedupe_address_overlay_stage",
-        AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("dedupe") or 0),
+        AsyncMock(side_effect=_record_overlay_event(events, "dedupe", 0)),
     )
     monkeypatch.setattr(
         directory,
@@ -126,6 +134,12 @@ async def test_overlay_population_hydrates_after_alias_rewrite(monkeypatch):
     )
     monkeypatch.setattr(directory.db, "scalar", AsyncMock(return_value=1))
     monkeypatch.setattr(directory.db, "status", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_overlay_population_hydrates_after_alias_rewrite(monkeypatch):
+    events: list[str] = []
+    _stub_overlay_population_dependencies(monkeypatch, events)
 
     metrics = await directory._populate_address_overlay_stage(
         "mrf",
@@ -136,7 +150,8 @@ async def test_overlay_population_hydrates_after_alias_rewrite(monkeypatch):
         {},
     )
 
-    assert events == ["aliases", "formatted", "coordinates", "dedupe"]
+    assert events == ["aliases", "premise", "formatted", "coordinates", "dedupe"]
+    assert metrics["archive_premise_key_backfill_rows"] == 1
     assert metrics["archive_formatted_address_backfill_rows"] == 2
 
 
