@@ -1214,48 +1214,12 @@ def lookup_global_sidecar_members(
                     metadata=metadata,
                     max_members=max_members,
                 )
-            if not _is_standard_membership_magic(magic):
-                raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
-            magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(
+            return _lookup_standard_sidecar_members(
                 mapped_bytes,
-                0,
+                owner_id,
+                metadata=metadata,
+                max_members=max_members,
             )
-            if version != PTG2_MANIFEST_VERSION:
-                raise PTG2ManifestArtifactError(f"unsupported global membership sidecar version: {version!r}")
-            expected_entries = metadata.get("entry_count", metadata.get("owner_count")) if metadata is not None else None
-            if expected_entries is not None and entry_count != int(expected_entries):
-                raise PTG2ManifestArtifactError("global membership sidecar entry count mismatch")
-            index_start = header_size
-            index_end = index_start + entry_count * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
-            if len(mapped_bytes) < index_end:
-                raise PTG2ManifestArtifactError("global membership sidecar ended inside the owner index")
-            member_start = index_end
-            low = 0
-            high = int(entry_count) - 1
-            while low <= high:
-                mid = (low + high) // 2
-                record_offset = index_start + mid * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE
-                candidate_owner, member_offset, member_count = _MEMBERSHIP_INDEX_RECORD.unpack_from(
-                    mapped_bytes,
-                    record_offset,
-                )
-                if candidate_owner < owner_id:
-                    low = mid + 1
-                    continue
-                if candidate_owner > owner_id:
-                    high = mid - 1
-                    continue
-                start = member_start + member_offset * 16
-                end = start + member_count * 16
-                if end > len(mapped_bytes):
-                    raise PTG2ManifestArtifactError("global membership sidecar member block is truncated")
-                if max_members is not None:
-                    end = min(end, start + max(max_members, 0) * 16)
-                return tuple(
-                    bytes(mapped_bytes[pos : pos + 16])
-                    for pos in range(start, end, 16)
-                )
-            return ()
 
 
 def _lookup_standard_sidecar_members(

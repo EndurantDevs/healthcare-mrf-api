@@ -1789,18 +1789,13 @@ def _provider_set_pattern_digest_update(
             _serving_row_digest_update(digest, code_key, provider_set_key, provider_count, price_sets[price_key])
 
 
-def write_serving_by_provider_set_candidate(
-    serving_rows: Any,
-    output_path: Path,
-) -> dict[str, Any]:
-    """Write and round-trip a harness-only reverse serving artifact.
-
-    The reverse path is for "all prices for one NPI": NPI -> provider groups ->
-    provider sets -> every code/price served by those sets. Rows are grouped by
-    repeated price vectors so we do not store a second full copy of the matrix.
-    """
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def _collect_provider_set_patterns(serving_rows: Any) -> tuple[
+    list[str],
+    set[int],
+    int,
+    list[tuple[int, dict[tuple[tuple[int, int], ...], list[int]]]],
+]:
+    """Group reverse serving rows by provider set and repeated price vector."""
     price_key_by_set_id: dict[str, int] = {}
     price_set_values: list[str] = []
     seen_code_keys: set[int] = set()
@@ -1814,17 +1809,15 @@ def write_serving_by_provider_set_candidate(
     code_keys_by_pattern: dict[tuple[tuple[int, int], ...], list[int]] = {}
 
     def price_key_for(value: str) -> int:
-        """Intern a normalized price-set ID and return its dense integer key."""
+        """Intern one normalized price-set ID."""
         price_set_id = str(value).strip().lower()
-        price_set_key = price_key_by_set_id.get(price_set_id)
-        if price_set_key is None:
-            price_set_key = len(price_set_values)
-            price_key_by_set_id[price_set_id] = price_set_key
+        price_set_key = price_key_by_set_id.setdefault(price_set_id, len(price_set_values))
+        if price_set_key == len(price_set_values):
             price_set_values.append(price_set_id)
         return price_set_key
 
     def flush_code() -> None:
-        """Group the buffered code under its shared serving-entry pattern."""
+        """Commit the buffered code pattern."""
         if current_code is None:
             return
         pattern_entries = tuple(current_code_entries)
@@ -1832,13 +1825,11 @@ def write_serving_by_provider_set_candidate(
         current_code_entries.clear()
 
     def flush_provider() -> None:
-        """Commit the current provider-set patterns and clear their buffers."""
+        """Commit the current provider-set patterns."""
         if current_provider_set is None:
             return
         flush_code()
-        provider_patterns.append(
-            (current_provider_set, code_keys_by_pattern.copy())
-        )
+        provider_patterns.append((current_provider_set, code_keys_by_pattern.copy()))
         code_keys_by_pattern.clear()
 
     for raw_row in serving_rows:
@@ -1857,8 +1848,17 @@ def write_serving_by_provider_set_candidate(
         seen_code_keys.add(code_key)
         row_count += 1
     flush_provider()
+    return price_set_values, seen_code_keys, row_count, provider_patterns
 
-    body_path = output_path.with_suffix(output_path.suffix + ".body.tmp")
+
+def _write_provider_set_pattern_body(
+    body_path: Path,
+    provider_patterns: list[
+        tuple[int, dict[tuple[tuple[int, int], ...], list[int]]]
+    ],
+    price_set_values: list[str],
+) -> tuple[list[dict[str, int]], int, Any, int]:
+    """Write reverse serving pattern blocks and return their metadata."""
     blocks: list[dict[str, int]] = []
     body_offset = 0
     source_digest = hashlib.sha256()
@@ -1875,13 +1875,9 @@ def write_serving_by_provider_set_candidate(
                 code_keys = tuple(sorted(code_key_list))
                 before = body.tell()
                 _write_uvarint(body, len(code_keys))
-                previous_code_key = 0
-                for index, code_key in enumerate(code_keys):
-                    if index == 0:
-                        _write_uvarint(body, code_key)
-                    else:
-                        _write_uvarint(body, code_key - previous_code_key)
-                    previous_code_key = code_key
+                _write_uvarint(body, code_keys[0])
+                for previous_code_key, code_key in zip(code_keys, code_keys[1:]):
+                    _write_uvarint(body, code_key - previous_code_key)
                 _write_uvarint(body, len(entries))
                 for provider_count, price_set_key in entries:
                     _write_uvarint(body, provider_count)
@@ -1897,7 +1893,25 @@ def write_serving_by_provider_set_candidate(
                     price_set_values,
                 )
             blocks[-1]["count"] = block_pattern_count
+    return blocks, body_offset, source_digest, pattern_count
 
+
+def write_serving_by_provider_set_candidate(
+    serving_rows: Any, output_path: Path
+) -> dict[str, Any]:
+    """Write and round-trip a harness-only reverse serving artifact."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    price_set_values, seen_code_keys, row_count, provider_patterns = (
+        _collect_provider_set_patterns(serving_rows)
+    )
+    body_path = output_path.with_suffix(output_path.suffix + ".body.tmp")
+    blocks, body_offset, source_digest, pattern_count = (
+        _write_provider_set_pattern_body(
+            body_path,
+            provider_patterns,
+            price_set_values,
+        )
+    )
     metadata = {
         "format": "research_serving_by_provider_set_v1",
         "row_count": row_count,
@@ -2571,22 +2585,13 @@ async def _read_postgres_binary_records_async(
     ]
 
 
-def analyze_postgres_binary_candidate(
-    *,
+def _build_postgres_binary_records(
     env_overrides: dict[str, str],
     serving_table: str,
-    import_run_id: str,
-    variant_id: str,
+    table_name: str,
     include_reverse: bool,
-) -> dict[str, Any]:
-    """Analyze storage and lookup behavior for the PostgreSQL binary candidate."""
-    schema_name, _serving_name = split_qualified_table(serving_table)
-    table_names = postgres_binary_candidate_table_names(
-        schema_name=schema_name,
-        import_run_id=import_run_id,
-        variant_id=variant_id,
-    )
-    table_name = table_names["serving_binary"]
+) -> tuple[dict[str, Any], dict[str, Any] | None, float, str, str | None]:
+    """Build, persist, and read back PostgreSQL binary candidate records."""
     started = time.monotonic()
     sql_by_code = (
         "SELECT code_key, provider_set_key, provider_count, price_set_global_id_128 "
@@ -2622,12 +2627,21 @@ def analyze_postgres_binary_candidate(
     readback_reverse_digest = None
     if include_reverse:
         readback_reverse_digest = digest_provider_set_records(readback_records)
-    has_forward_roundtrip = forward.get("source_sha256") == readback_forward_digest
-    has_reverse_roundtrip = (
-        True
-        if reverse is None
-        else reverse.get("source_sha256") == readback_reverse_digest
+    return (
+        forward,
+        reverse,
+        build_elapsed_seconds,
+        readback_forward_digest,
+        readback_reverse_digest,
     )
+
+
+def _postgres_binary_storage_benchmarks(
+    env_overrides: dict[str, str],
+    serving_table: str,
+    table_name: str,
+    include_reverse: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     storage = psql_json(
         env_overrides,
         "SELECT json_build_object("
@@ -2648,9 +2662,6 @@ def analyze_postgres_binary_candidate(
         f")"
         ") AS payload;",
     )
-    source_rows = int(storage.get("source_rows") or 0)
-    artifact_total_bytes = int(storage.get("artifact_total_bytes") or 0)
-    source_total_bytes = int(storage.get("source_total_bytes") or 0)
     sample = psql_json(
         env_overrides,
         "SELECT row_to_json(t) FROM ("
@@ -2683,6 +2694,38 @@ def analyze_postgres_binary_candidate(
             "execution_ms": _explain_execution_ms(plan),
             "plan": plan[0].get("Plan", {}) if isinstance(plan, list) and plan and isinstance(plan[0], dict) else {},
         }
+    return storage, benchmark_results_by_name
+
+
+def analyze_postgres_binary_candidate(
+    *, env_overrides: dict[str, str], serving_table: str, import_run_id: str,
+    variant_id: str, include_reverse: bool,
+) -> dict[str, Any]:
+    """Analyze storage and lookup behavior for the PostgreSQL binary candidate."""
+    schema_name = split_qualified_table(serving_table)[0]
+    table_names = postgres_binary_candidate_table_names(
+        schema_name=schema_name, import_run_id=import_run_id, variant_id=variant_id
+    )
+    table_name = table_names["serving_binary"]
+    forward, reverse, build_elapsed_seconds, readback_forward_digest, readback_reverse_digest = (
+        _build_postgres_binary_records(
+            env_overrides, serving_table, table_name, include_reverse
+        )
+    )
+    has_forward_roundtrip = forward.get("source_sha256") == readback_forward_digest
+    has_reverse_roundtrip = (
+        True
+        if reverse is None
+        else reverse.get("source_sha256") == readback_reverse_digest
+    )
+    storage, benchmark_results_by_name = (
+        _postgres_binary_storage_benchmarks(
+            env_overrides, serving_table, table_name, include_reverse
+        )
+    )
+    source_rows = int(storage.get("source_rows") or 0)
+    artifact_total_bytes = int(storage.get("artifact_total_bytes") or 0)
+    source_total_bytes = int(storage.get("source_total_bytes") or 0)
     combined_rows = int(forward.get("row_count") or 0) + int((reverse or {}).get("row_count") or 0)
     has_complete_roundtrip = (
         has_forward_roundtrip

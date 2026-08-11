@@ -1406,33 +1406,48 @@ async def _build_dynamic_zip_peer_stats(
         if len(trimmed_rows) < min_providers:
             continue
 
-        charges = sorted(
-            float(_as_float(charge_row.get("avg_submitted_charge")) or 0.0)
-            for charge_row in trimmed_rows
-            if (_as_float(charge_row.get("avg_submitted_charge")) or 0.0) > 0
+        peer_statistics_by_metric = _dynamic_zip_peer_statistics(
+            trimmed_rows,
+            specialty_candidate,
+            min_providers,
         )
-        if len(charges) < min_providers:
+        if peer_statistics_by_metric is None:
             continue
-        claim_counts = [
-            float(_as_float(charge_row.get("claim_count")) or 0.0)
-            for charge_row in trimmed_rows
-        ]
-
-        peer_statistics_by_metric = {
-            "provider_count": len(trimmed_rows),
-            "min_claim_count": min(claim_counts) if claim_counts else None,
-            "max_claim_count": max(claim_counts) if claim_counts else None,
-            "p10": _percentile_cont(charges, 0.10),
-            "p20": _percentile_cont(charges, 0.20),
-            "p40": _percentile_cont(charges, 0.40),
-            "p50": _percentile_cont(charges, 0.50),
-            "p60": _percentile_cont(charges, 0.60),
-            "p80": _percentile_cont(charges, 0.80),
-            "p90": _percentile_cont(charges, 0.90),
-            "specialty_key": specialty_candidate,
-        }
         return peer_statistics_by_metric, specialty_candidate
     return None
+
+
+def _dynamic_zip_peer_statistics(
+    trimmed_charge_rows: list[dict[str, Any]],
+    specialty_key: str,
+    min_providers: int,
+) -> dict[str, Any] | None:
+    """Summarize one sufficiently large trimmed dynamic ZIP cohort."""
+
+    charges = sorted(
+        float(_as_float(charge_row.get("avg_submitted_charge")) or 0.0)
+        for charge_row in trimmed_charge_rows
+        if (_as_float(charge_row.get("avg_submitted_charge")) or 0.0) > 0
+    )
+    if len(charges) < min_providers:
+        return None
+    claim_counts = [
+        float(_as_float(charge_row.get("claim_count")) or 0.0)
+        for charge_row in trimmed_charge_rows
+    ]
+    return {
+        "provider_count": len(trimmed_charge_rows),
+        "min_claim_count": min(claim_counts) if claim_counts else None,
+        "max_claim_count": max(claim_counts) if claim_counts else None,
+        "p10": _percentile_cont(charges, 0.10),
+        "p20": _percentile_cont(charges, 0.20),
+        "p40": _percentile_cont(charges, 0.40),
+        "p50": _percentile_cont(charges, 0.50),
+        "p60": _percentile_cont(charges, 0.60),
+        "p80": _percentile_cont(charges, 0.80),
+        "p90": _percentile_cont(charges, 0.90),
+        "specialty_key": specialty_key,
+    }
 
 
 def _parse_setting_key(raw: Any) -> str:
@@ -2795,6 +2810,29 @@ def _get_cached_lowercase_payload(row: dict[str, Any]) -> dict[str, Any]:
     return payload_lower
 
 
+def _matched_peer_target_geography(
+    payload_lower: dict[str, Any],
+    geography_priority: list[tuple[str, str]],
+) -> tuple[int, str] | None:
+    row_scope, row_value, row_geography_label = _extract_peer_target_geography(
+        payload_lower
+    )
+    for index, (target_scope, target_value) in enumerate(geography_priority):
+        if _is_row_geography_match(
+            row_scope,
+            row_value,
+            target_scope,
+            target_value,
+        ):
+            selected_geography = row_geography_label or (
+                "national"
+                if target_scope == "national"
+                else f"{target_scope}:{target_value}"
+            )
+            return index, selected_geography
+    return None
+
+
 def _collect_peer_target_candidates(
     peer_target_rows: list[dict[str, Any]],
     *,
@@ -2806,32 +2844,23 @@ def _collect_peer_target_candidates(
     requested_procedure_codes: set[str],
 ) -> list[dict[str, Any]]:
     """Collect quality peer targets matching geography, specialty, taxonomy, and procedure criteria."""
-    geography_priority = _geography_priority_for_benchmark_mode(
-        benchmark_mode,
-        state_key=state_key,
-        zip5=zip5,
-    )
+    geography_priority = _geography_priority_for_benchmark_mode(benchmark_mode, state_key=state_key, zip5=zip5)
     candidates: list[dict[str, Any]] = []
 
     for peer_target_row in peer_target_rows:
         payload_lower = _get_cached_lowercase_payload(peer_target_row)
-        row_mode = str(_pick_first_from_lowered(payload_lower, "benchmark_mode", "mode") or "").strip().lower()
+        row_mode = str(
+            _pick_first_from_lowered(payload_lower, "benchmark_mode", "mode") or ""
+        ).strip().lower()
         if row_mode and row_mode in QUALITY_BENCHMARK_MODE_ORDER and row_mode != benchmark_mode:
             continue
-
-        row_scope, row_value, row_geography_label = _extract_peer_target_geography(payload_lower)
-        geography_rank = None
-        matched_geography_scope = None
-        matched_geography_value = None
-        for index, (target_scope, target_value) in enumerate(geography_priority):
-            if _is_row_geography_match(row_scope, row_value, target_scope, target_value):
-                geography_rank = index
-                matched_geography_scope = target_scope
-                matched_geography_value = target_value
-                break
-        if geography_rank is None:
+        geography_match = _matched_peer_target_geography(
+            payload_lower,
+            geography_priority,
+        )
+        if geography_match is None:
             continue
-
+        geography_rank, selected_geography = geography_match
         cohort_level = _normalize_cohort_level(
             _pick_first_from_lowered(payload_lower, "cohort_level", "cohort_tier", "cohort", "level")
         ) or "L3"
@@ -2846,7 +2875,6 @@ def _collect_peer_target_candidates(
             upper=True,
         )
         procedure_match_ratio, procedure_bucket = _procedure_match_ratio(payload_lower, requested_procedure_codes)
-
         candidates.append(
             {
                 "row": peer_target_row,
@@ -2860,15 +2888,9 @@ def _collect_peer_target_candidates(
                 "strict_match": bool(is_specialty_match and is_taxonomy_match),
                 "procedure_bucket": procedure_bucket,
                 "peer_count": _peer_count_from_row(payload_lower),
-                "selected_geography": row_geography_label
-                or (
-                    "national"
-                    if matched_geography_scope == "national"
-                    else f"{matched_geography_scope}:{matched_geography_value}"
-                ),
+                "selected_geography": selected_geography,
             }
         )
-
     return sorted(candidates, key=_peer_target_sort_key)
 
 
@@ -9635,6 +9657,36 @@ async def autocomplete_provider_types(request):
         include_broad=True,
         limit=max((pagination.offset + pagination.limit) * 5, 100),
     )
+    ordered_provider_type_items = _provider_type_autocomplete_items(
+        provider_type_rows
+    )
+    total = len(ordered_provider_type_items)
+    page_items = ordered_provider_type_items[
+        pagination.offset: pagination.offset + pagination.limit
+    ]
+
+    return response.json(
+        {
+            "items": page_items,
+            "pagination": {
+                "total": total,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {
+                "q": search_query,
+                "data_status": "available" if provider_type_rows else "empty_or_unavailable",
+            },
+        }
+    )
+
+
+def _provider_type_autocomplete_items(
+    provider_type_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Deduplicate and rank provider-type terminology matches."""
+
     provider_type_items_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for provider_type_row in provider_type_rows:
         target_system = str(provider_type_row.get("target_system") or "").upper()
@@ -9684,26 +9736,7 @@ async def autocomplete_provider_types(request):
             str(provider_type_item_by_field.get("term") or "").lower(),
         )
     )
-    total = len(ordered_provider_type_items)
-    page_items = ordered_provider_type_items[
-        pagination.offset: pagination.offset + pagination.limit
-    ]
-
-    return response.json(
-        {
-            "items": page_items,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {
-                "q": search_query,
-                "data_status": "available" if provider_type_rows else "empty_or_unavailable",
-            },
-        }
-    )
+    return ordered_provider_type_items
 
 
 @blueprint.get("/provider-types/resolve", name="pricing.provider_types.resolve")

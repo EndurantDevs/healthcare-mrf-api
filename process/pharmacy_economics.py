@@ -309,6 +309,39 @@ async def _fetch_ful(client, ful_url: str) -> dict[str, float]:
     return ful_map
 
 
+def _pharmacy_economics_rows(
+    sdud_data: dict[str, dict[str, dict]],
+    nadac_data: dict[str, float],
+    ful_data: dict[str, float],
+    updated_at: datetime.datetime,
+):
+    for state, ndcs in sdud_data.items():
+        dispensing_fee = STATE_DISPENSING_FEES.get(state, 10.00)
+        for ndc11, drug_info in ndcs.items():
+            nadac_cost = nadac_data.get(ndc11)
+            if nadac_cost is None:
+                continue
+            ful_ceiling = ful_data.get(ndc11)
+            # Standard 30-day quantity baseline.
+            quantity = 30
+            reimbursed_per_unit = (
+                min(nadac_cost, ful_ceiling) if ful_ceiling else nadac_cost
+            )
+            total_reimbursement = (reimbursed_per_unit * quantity) + dispensing_fee
+            total_cost = nadac_cost * quantity
+            yield {
+                "state": state,
+                "ndc11": ndc11,
+                "drug_name": drug_info["name"],
+                "sdud_volume": drug_info["volume"],
+                "nadac_per_unit": nadac_cost,
+                "ful_per_unit": ful_ceiling,
+                "medicaid_dispensing_fee": dispensing_fee,
+                "estimated_gross_margin": round(total_reimbursement - total_cost, 2),
+                "updated_at": updated_at,
+            }
+
+
 async def process_pharmacy_economics_data(ctx, task=None):
     """Load pharmacy economics source data into staging."""
     task = task or {}
@@ -340,45 +373,17 @@ async def process_pharmacy_economics_data(ctx, task=None):
     now = datetime.datetime.utcnow()
     pricing_batch_rows = []
 
-    for state, ndcs in sdud_data.items():
-        dispensing_fee = STATE_DISPENSING_FEES.get(state, 10.00)
-
-        for ndc11, info in ndcs.items():
-            nadac_cost = nadac_data.get(ndc11)
-            ful_ceiling = ful_data.get(ndc11)
-
-            if nadac_cost is None:
-                continue
-
-            # Standard 30-day quantity baseline
-            qty = 30
-            reimb_per_unit = min(nadac_cost, ful_ceiling) if ful_ceiling else nadac_cost
-            total_reimb = (reimb_per_unit * qty) + dispensing_fee
-            total_cost = nadac_cost * qty
-            gross_margin = total_reimb - total_cost
-
-            pricing_batch_rows.append({
-                "state": state,
-                "ndc11": ndc11,
-                "drug_name": info["name"],
-                "sdud_volume": info["volume"],
-                "nadac_per_unit": nadac_cost,
-                "ful_per_unit": ful_ceiling,
-                "medicaid_dispensing_fee": dispensing_fee,
-                "estimated_gross_margin": round(gross_margin, 2),
-                "updated_at": now,
-            })
-
-            if len(pricing_batch_rows) >= batch_size:
-                await push_objects(pricing_batch_rows, stage_cls)
-                accepted_rows += len(pricing_batch_rows)
-                pricing_batch_rows.clear()
-                if test_mode and accepted_rows >= test_row_limit:
-                    break
-
-            if test_mode and accepted_rows + len(pricing_batch_rows) >= test_row_limit:
-                break
-
+    for pricing_row in _pharmacy_economics_rows(
+        sdud_data,
+        nadac_data,
+        ful_data,
+        now,
+    ):
+        pricing_batch_rows.append(pricing_row)
+        if len(pricing_batch_rows) >= batch_size:
+            await push_objects(pricing_batch_rows, stage_cls)
+            accepted_rows += len(pricing_batch_rows)
+            pricing_batch_rows.clear()
         if test_mode and accepted_rows + len(pricing_batch_rows) >= test_row_limit:
             break
 

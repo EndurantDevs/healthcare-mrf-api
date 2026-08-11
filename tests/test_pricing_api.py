@@ -52,6 +52,76 @@ resolve_procedure_taxonomy = pricing_module.resolve_procedure_taxonomy
 pricing_statistics = pricing_module.pricing_statistics
 
 
+def test_dynamic_zip_peer_statistics_preserve_trimmed_cohort_metrics():
+    trimmed_charge_rows = [
+        {"avg_submitted_charge": 100.0, "claim_count": 8},
+        {"avg_submitted_charge": 200.0, "claim_count": 12},
+    ]
+
+    peer_statistics_by_metric = pricing_module._dynamic_zip_peer_statistics(
+        trimmed_charge_rows,
+        "specialty-neutral",
+        2,
+    )
+
+    assert peer_statistics_by_metric is not None
+    assert peer_statistics_by_metric["provider_count"] == 2
+    assert peer_statistics_by_metric["min_claim_count"] == 8.0
+    assert peer_statistics_by_metric["max_claim_count"] == 12.0
+    assert peer_statistics_by_metric["p50"] == 150.0
+    assert peer_statistics_by_metric["specialty_key"] == "specialty-neutral"
+    assert (
+        pricing_module._dynamic_zip_peer_statistics(
+            trimmed_charge_rows,
+            "specialty-neutral",
+            3,
+        )
+        is None
+    )
+
+
+def test_provider_type_autocomplete_items_deduplicate_and_rank():
+    provider_type_rows = [
+        {
+            "target_system": "provider_type",
+            "target_code": "family",
+            "target_display": "Family practice",
+            "canonical_term": "Family practice",
+            "term": "Family",
+            "source": "source-b",
+        },
+        {
+            "target_system": "PROVIDER_TYPE",
+            "target_code": "family",
+            "term": "Family medicine",
+            "source": "source-a",
+        },
+        {
+            "target_system": "taxonomy",
+            "target_code": "neutral-code",
+            "target_display": "Neutral specialty",
+            "term": "Specialty",
+            "source": "source-c",
+        },
+    ]
+
+    provider_type_items = pricing_module._provider_type_autocomplete_items(
+        provider_type_rows
+    )
+
+    assert [
+        provider_type_item["target_code"]
+        for provider_type_item in provider_type_items
+    ] == [
+        "family",
+        "neutral-code",
+    ]
+    assert provider_type_items[0]["provider_type"] == "family"
+    assert provider_type_items[0]["aliases"] == ["Family", "Family medicine"]
+    assert provider_type_items[0]["sources"] == ["source-a", "source-b"]
+    assert provider_type_items[1]["provider_type"] is None
+
+
 def test_allowed_amount_response_filters_preserve_numeric_zero():
     filters_by_name = pricing_module._allowed_amount_response_filters(
         {"lat": 0.0, "long": 0.0, "radius_miles": 0.0}

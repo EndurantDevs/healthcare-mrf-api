@@ -468,35 +468,6 @@ class StateSource:
     board_url: str
 
 
-@dataclass(frozen=True)
-class _StageRowIdentity:
-    license_number: str
-    npi: int
-    entity_name: str | None
-    dba_name: str | None
-    city: str | None
-    state_from_source: str | None
-    zip_code: str | None
-
-
-@dataclass(frozen=True)
-class _StageRowStatus:
-    source_status_raw: str | None
-    license_status: str
-    disciplinary_summary: str | None
-    disciplinary_flag: bool
-    source_last_seen_at: datetime.datetime | None
-
-
-@dataclass(frozen=True)
-class _StageRowImportContext:
-    run_id: str
-    snapshot_id: str
-    state_source: StateSource
-    source_url: str
-    imported_at: datetime.datetime
-
-
 @dataclass
 class StateImportStats:
     supported: bool
@@ -2272,6 +2243,124 @@ async def _load_records_from_source(
     return [], "unsupported_source_format"
 
 
+def _stage_row_identity(
+    fields_by_normalized_name: dict[str, Any],
+    *,
+    state_source: StateSource,
+    npi_resolver: StateNpiResolver | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    license_number = _pick_license_number(fields_by_normalized_name)
+    if not license_number:
+        return None, "missing_license_number"
+    entity_name = _safe_text(_pick_by_aliases(fields_by_normalized_name, _ENTITY_NAME_KEYS))
+    dba_name = _safe_text(_pick_by_aliases(fields_by_normalized_name, _DBA_KEYS))
+    city = _safe_text(_pick_by_aliases(fields_by_normalized_name, _CITY_KEYS))
+    state_from_source = _safe_text(_pick_by_aliases(fields_by_normalized_name, _STATE_KEYS))
+    zip_code = _safe_text(_pick_by_aliases(fields_by_normalized_name, _ZIP_KEYS))
+    npi = _pick_npi(fields_by_normalized_name)
+    if npi is None and npi_resolver:
+        npi = npi_resolver.resolve(
+            license_number=license_number,
+            entity_name=entity_name,
+            dba_name=dba_name,
+            city=city,
+            zip_code=zip_code,
+        )
+    if npi is None:
+        return None, "missing_npi"
+    return {
+        "license_number": license_number,
+        "entity_name": entity_name,
+        "dba_name": dba_name,
+        "city": city,
+        "state": (state_from_source or state_source.state_code).upper()[:2],
+        "zip_code": zip_code,
+        "npi": npi,
+    }, None
+
+
+def _disciplinary_fields(
+    fields_by_normalized_name: dict[str, Any],
+    source_status_raw: str | None,
+) -> tuple[bool, str | None]:
+    disciplinary_summary = _safe_text(
+        _pick_by_aliases(fields_by_normalized_name, _DISCIPLINARY_SUMMARY_KEYS)
+    )
+    disciplinary_flag = _to_bool(
+        _pick_by_aliases(fields_by_normalized_name, _DISCIPLINARY_FLAG_KEYS)
+    )
+    if disciplinary_flag is None:
+        disciplinary_flag = bool(disciplinary_summary)
+        if not disciplinary_flag and source_status_raw:
+            lower_status = source_status_raw.lower()
+            disciplinary_flag = any(
+                marker in lower_status for marker in _DISCIPLINARY_HINTS
+            )
+    return bool(disciplinary_flag), disciplinary_summary
+
+
+def _source_last_seen_at(
+    fields_by_normalized_name: dict[str, Any],
+) -> datetime.datetime | None:
+    updated_raw = _pick_by_aliases(fields_by_normalized_name, _UPDATED_KEYS)
+    updated_date = _to_date(updated_raw)
+    if updated_date is None:
+        return None
+    return datetime.datetime.combine(updated_date, datetime.time.min)
+
+
+def _build_normalized_stage_record(
+    fields_by_normalized_name: dict[str, Any],
+    *,
+    identity_fields_by_name: dict[str, Any],
+    run_id: str,
+    snapshot_id: str,
+    state_source: StateSource,
+    source_url: str,
+    imported_at: datetime.datetime,
+) -> dict[str, Any]:
+    source_status_raw = _safe_text(
+        _pick_by_aliases(fields_by_normalized_name, _STATUS_KEYS)
+    )
+    disciplinary_flag, disciplinary_summary = _disciplinary_fields(
+        fields_by_normalized_name,
+        source_status_raw,
+    )
+    return {
+        "snapshot_id": snapshot_id,
+        "run_id": run_id,
+        "state_code": state_source.state_code,
+        "state_name": state_source.state_name,
+        "board_url": state_source.board_url,
+        "source_url": source_url,
+        "npi": identity_fields_by_name["npi"],
+        "license_number": identity_fields_by_name["license_number"][:64],
+        "license_type": _safe_text(_pick_by_aliases(fields_by_normalized_name, _LICENSE_TYPE_KEYS)),
+        "license_status": _normalize_license_status(source_status_raw),
+        "source_status_raw": source_status_raw[:256] if source_status_raw else None,
+        "license_issue_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _ISSUE_KEYS)),
+        "license_effective_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _EFFECTIVE_KEYS)),
+        "license_expiration_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _EXPIRY_KEYS)),
+        "last_renewal_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _RENEWAL_KEYS)),
+        "disciplinary_flag": disciplinary_flag,
+        "disciplinary_summary": disciplinary_summary,
+        "disciplinary_action_date": _to_date(
+            _pick_by_aliases(fields_by_normalized_name, _DISCIPLINARY_DATE_KEYS)
+        ),
+        "entity_name": identity_fields_by_name["entity_name"],
+        "dba_name": identity_fields_by_name["dba_name"],
+        "address_line1": _safe_text(_pick_by_aliases(fields_by_normalized_name, _ADDRESS1_KEYS)),
+        "address_line2": _safe_text(_pick_by_aliases(fields_by_normalized_name, _ADDRESS2_KEYS)),
+        "city": identity_fields_by_name["city"],
+        "state": identity_fields_by_name["state"],
+        "zip_code": identity_fields_by_name["zip_code"],
+        "phone_number": _safe_text(_pick_by_aliases(fields_by_normalized_name, _PHONE_KEYS)),
+        "source_record_id": _safe_text(_pick_by_aliases(fields_by_normalized_name, _SOURCE_RECORD_KEYS)),
+        "source_last_seen_at": _source_last_seen_at(fields_by_normalized_name),
+        "imported_at": imported_at,
+    }
+
+
 def _normalize_stage_row(
     source_record: dict[str, Any],
     *,
@@ -2284,147 +2373,22 @@ def _normalize_stage_row(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Normalize one board row into the staging schema or a skip reason."""
     fields_by_normalized_name = _row_index(source_record)
-    identity, skip_reason = _resolve_stage_row_identity(
+    identity_fields_by_name, skip_reason = _stage_row_identity(
         fields_by_normalized_name,
-        npi_resolver,
+        state_source=state_source,
+        npi_resolver=npi_resolver,
     )
-    if identity is None:
+    if identity_fields_by_name is None:
         return None, skip_reason
-    status = _stage_row_status(fields_by_normalized_name)
-    context = _StageRowImportContext(
+    return _build_normalized_stage_record(
+        fields_by_normalized_name,
+        identity_fields_by_name=identity_fields_by_name,
         run_id=run_id,
         snapshot_id=snapshot_id,
         state_source=state_source,
         source_url=source_url,
         imported_at=imported_at,
-    )
-    return _normalized_stage_record(
-        fields_by_normalized_name,
-        identity,
-        status,
-        context,
     ), None
-
-
-def _resolve_stage_row_identity(
-    fields_by_normalized_name: dict[str, Any],
-    npi_resolver: StateNpiResolver | None,
-) -> tuple[_StageRowIdentity | None, str | None]:
-    """Resolve the stable license and NPI identity for one source row."""
-
-    license_number = _pick_license_number(fields_by_normalized_name)
-    if not license_number:
-        return None, "missing_license_number"
-
-    entity_name = _safe_text(_pick_by_aliases(fields_by_normalized_name, _ENTITY_NAME_KEYS))
-    dba_name = _safe_text(_pick_by_aliases(fields_by_normalized_name, _DBA_KEYS))
-    city = _safe_text(_pick_by_aliases(fields_by_normalized_name, _CITY_KEYS))
-    state_from_source = _safe_text(_pick_by_aliases(fields_by_normalized_name, _STATE_KEYS))
-    zip_code = _safe_text(_pick_by_aliases(fields_by_normalized_name, _ZIP_KEYS))
-
-    npi = _pick_npi(fields_by_normalized_name)
-    if npi is None and npi_resolver:
-        npi = npi_resolver.resolve(
-            license_number=license_number,
-            entity_name=entity_name,
-            dba_name=dba_name,
-            city=city,
-            zip_code=zip_code,
-        )
-    if npi is None:
-        return None, "missing_npi"
-    return (
-        _StageRowIdentity(
-            license_number=license_number,
-            npi=npi,
-            entity_name=entity_name,
-            dba_name=dba_name,
-            city=city,
-            state_from_source=state_from_source,
-            zip_code=zip_code,
-        ),
-        None,
-    )
-
-
-def _stage_row_status(
-    fields_by_normalized_name: dict[str, Any],
-) -> _StageRowStatus:
-    """Normalize status, discipline, and last-seen evidence for one row."""
-
-    source_status_raw = _safe_text(_pick_by_aliases(fields_by_normalized_name, _STATUS_KEYS))
-    license_status = _normalize_license_status(source_status_raw)
-
-    disciplinary_summary = _safe_text(
-        _pick_by_aliases(fields_by_normalized_name, _DISCIPLINARY_SUMMARY_KEYS)
-    )
-    disciplinary_flag = _to_bool(_pick_by_aliases(fields_by_normalized_name, _DISCIPLINARY_FLAG_KEYS))
-    if disciplinary_flag is None:
-        disciplinary_flag = bool(disciplinary_summary)
-        if not disciplinary_flag and source_status_raw:
-            lower = source_status_raw.lower()
-            disciplinary_flag = any(marker in lower for marker in _DISCIPLINARY_HINTS)
-
-    source_last_seen_at = None
-    updated_raw = _pick_by_aliases(fields_by_normalized_name, _UPDATED_KEYS)
-    updated_date = _to_date(updated_raw)
-    if updated_date is not None:
-        source_last_seen_at = datetime.datetime.combine(updated_date, datetime.time.min)
-    return _StageRowStatus(
-        source_status_raw=source_status_raw,
-        license_status=license_status,
-        disciplinary_summary=disciplinary_summary,
-        disciplinary_flag=bool(disciplinary_flag),
-        source_last_seen_at=source_last_seen_at,
-    )
-
-
-def _normalized_stage_record(
-    fields_by_normalized_name: dict[str, Any],
-    identity: _StageRowIdentity,
-    status: _StageRowStatus,
-    context: _StageRowImportContext,
-) -> dict[str, Any]:
-    """Project normalized pharmacy-license evidence into the staging schema."""
-
-    state_value = (
-        identity.state_from_source or context.state_source.state_code
-    ).upper()[:2]
-    return {
-        "snapshot_id": context.snapshot_id,
-        "run_id": context.run_id,
-        "state_code": context.state_source.state_code,
-        "state_name": context.state_source.state_name,
-        "board_url": context.state_source.board_url,
-        "source_url": context.source_url,
-        "npi": identity.npi,
-        "license_number": identity.license_number[:64],
-        "license_type": _safe_text(_pick_by_aliases(fields_by_normalized_name, _LICENSE_TYPE_KEYS)),
-        "license_status": status.license_status,
-        "source_status_raw": (
-            status.source_status_raw[:256] if status.source_status_raw else None
-        ),
-        "license_issue_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _ISSUE_KEYS)),
-        "license_effective_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _EFFECTIVE_KEYS)),
-        "license_expiration_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _EXPIRY_KEYS)),
-        "last_renewal_date": _to_date(_pick_by_aliases(fields_by_normalized_name, _RENEWAL_KEYS)),
-        "disciplinary_flag": status.disciplinary_flag,
-        "disciplinary_summary": status.disciplinary_summary,
-        "disciplinary_action_date": _to_date(
-            _pick_by_aliases(fields_by_normalized_name, _DISCIPLINARY_DATE_KEYS)
-        ),
-        "entity_name": identity.entity_name,
-        "dba_name": identity.dba_name,
-        "address_line1": _safe_text(_pick_by_aliases(fields_by_normalized_name, _ADDRESS1_KEYS)),
-        "address_line2": _safe_text(_pick_by_aliases(fields_by_normalized_name, _ADDRESS2_KEYS)),
-        "city": identity.city,
-        "state": state_value,
-        "zip_code": identity.zip_code,
-        "phone_number": _safe_text(_pick_by_aliases(fields_by_normalized_name, _PHONE_KEYS)),
-        "source_record_id": _safe_text(_pick_by_aliases(fields_by_normalized_name, _SOURCE_RECORD_KEYS)),
-        "source_last_seen_at": status.source_last_seen_at,
-        "imported_at": context.imported_at,
-    }
 
 
 async def _flush_stage_batch(batch: list[dict[str, Any]]) -> None:

@@ -19153,9 +19153,11 @@ async def test_scan_candidate_dispatches_practitioner_role_to_last_updated(monke
         page_count=100,
         timeout=3,
         run_id="run_scan_candidate",
+        deferred_materialization=True,
     )
 
     assert operation_result is expected_result
+    assert partition_fetch.await_args.args[4].deferred_materialization is True
     partition_fetch.assert_awaited_once()
     assert partition_fetch.await_args.args[:3] == (
         source_row,
@@ -25971,6 +25973,7 @@ class _ResourceOverlapHarness:
     async def fetch(self, _source, resource_type, **kwargs):
         self.lifecycle_events.append(("start", resource_type))
         self.bulk_export_requests.append(kwargs["bulk_export"])
+        assert kwargs["deferred_materialization"] is True
         if resource_type == "PractitionerRole":
             assert self.foundation_completed.is_set()
         else:
@@ -28131,6 +28134,8 @@ async def test_address_overlay_live_ensure_does_not_build_scope_index(monkeypatc
 
     joined_sql = "\n".join(call.args[0] for call in status.await_args_list)
     assert "provider_directory_address_overlay_source_idx" in joined_sql
+    assert "ADD COLUMN IF NOT EXISTS premise_key uuid" in joined_sql
+    assert "provider_directory_address_overlay_npi_premise_key_idx" not in joined_sql
     assert "provider_directory_address_overlay_source_run_resource_idx" not in joined_sql
     assert "(source_id, last_seen_run_id, resource_type, resource_id)" not in joined_sql
 
@@ -28143,6 +28148,9 @@ async def test_address_overlay_stage_builds_and_renames_scope_index(monkeypatch)
     stage_index = importer._address_overlay_index_name(
         stage_table, "source_run_resource_idx"
     )
+    stage_premise_index = importer._address_overlay_index_name(
+        stage_table, "npi_premise_key_idx"
+    )
 
     await importer._create_address_overlay_stage_indexes("mrf", stage_table)
     await importer._rename_address_overlay_stage_indexes("mrf", stage_table)
@@ -28153,6 +28161,10 @@ async def test_address_overlay_stage_builds_and_renames_scope_index(monkeypatch)
     assert (
         f'ALTER INDEX IF EXISTS "mrf"."{stage_index}" '
         'RENAME TO "provider_directory_address_overlay_source_run_resource_idx"'
+    ) in joined_sql
+    assert (
+        f'ALTER INDEX IF EXISTS "mrf"."{stage_premise_index}" '
+        'RENAME TO "provider_directory_address_overlay_npi_premise_key_idx"'
     ) in joined_sql
 
 
@@ -28305,10 +28317,17 @@ def _assert_overlay_staged_swap_sql(status_calls):
         "source_record_idx",
     )
     stage_npi_idx = importer._address_overlay_index_name(stage_table, "npi_idx")
+    stage_npi_premise_idx = importer._address_overlay_index_name(
+        stage_table,
+        "npi_premise_key_idx",
+    )
 
     assert f'CREATE UNLOGGED TABLE "mrf"."{stage_table}"' in joined_sql
     assert f'CREATE UNIQUE INDEX IF NOT EXISTS "{stage_source_record_idx}"' in joined_sql
     assert f'CREATE INDEX IF NOT EXISTS "{stage_npi_idx}"' in joined_sql
+    assert f'CREATE INDEX IF NOT EXISTS "{stage_npi_premise_idx}"' in joined_sql
+    assert "(npi, premise_key)" in joined_sql
+    assert "WHERE premise_key IS NOT NULL" in joined_sql
     assert 'FROM "mrf"."provider_directory_address_overlay"' in joined_sql
     assert "WHERE NOT (source_id = ANY(CAST(:source_ids AS varchar[])))" in joined_sql
     assert "PARTITION BY source_record_id" in joined_sql
@@ -28364,6 +28383,7 @@ async def test_overlay_publish_uses_staged_swap(monkeypatch):
     }
     assert metrics["duplicates_removed"] == 2
     assert metrics["copied_existing"] == 4
+    assert metrics["archive_premise_key_backfill_rows"] == 0
     assert metrics["archive_coordinate_backfill_rows"] == 0
     assert metrics["orphan_stage_cleanup"]["scanned"] == 0
     assert metrics["source_ids"] == ["source_a"]
@@ -30890,6 +30910,45 @@ async def test_last_updated_partition_staged_rows_stream_with_keyset(monkeypatch
     assert streamed_count == written_count == 2
     assert row_responder.requested_cursors == ["", "prac-1", "prac-2"]
     assert written_batches == [["prac-1"], ["prac-2"]]
+
+
+@pytest.mark.asyncio
+async def test_completed_deferred_practitioner_role_skips_staged_replay(
+    monkeypatch,
+):
+    directory_source, _config, _plan, state, fetch_options = (
+        _partition_retry_state_with_completed_window()
+    )
+    stream_rows = AsyncMock(side_effect=AssertionError("unexpected replay"))
+    monkeypatch.setattr(
+        importer,
+        "_stream_last_updated_partition_staged_rows",
+        stream_rows,
+    )
+
+    fetch_result = await importer._completed_partition_fetch_result(
+        directory_source,
+        "PractitionerRole",
+        ProviderDirectoryPractitionerRole,
+        state,
+        dataclasses.replace(
+            fetch_options,
+            deferred_materialization=True,
+        ),
+        importer.LastUpdatedPartitionProofCounts(
+            leaf_count_sum=2,
+            pass1_unique=2,
+            pass2_unique=2,
+            staged_candidate_count=2,
+            invalid_candidate_count=0,
+            orphan_proof_count=0,
+        ),
+    )
+
+    assert fetch_result.complete is True
+    assert fetch_result.rows_fetched == fetch_result.rows_written == 2
+    stream_rows.assert_not_awaited()
+
 
 def _checkpoint_context(**overrides):
     context_by_field = {

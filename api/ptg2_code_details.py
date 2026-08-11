@@ -20,20 +20,10 @@ from api.ptg2_serving_utils import _row_mapping
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 
 
-async def _enrich_ptg2_code_details(
-    session,
-    response_payload: dict[str, Any],
-    args: dict[str, Any],
-) -> dict[str, Any]:
-    """Attach requested code-catalog details to a PTG pricing response."""
-
-    if not _is_request_flag_enabled(args.get("include_code_details")):
-        return response_payload
-
+def _code_detail_lookup_keys(
+    response_items: list[dict[str, Any]],
+) -> set[tuple[str, str]]:
     lookup_keys: set[tuple[str, str]] = set()
-    response_items = [
-        dict(response_item) for response_item in response_payload.get("items", [])
-    ]
     for response_item in response_items:
         billing_key = _catalog_key(
             response_item.get("reported_code_system")
@@ -54,36 +44,13 @@ async def _enrich_ptg2_code_details(
                 modifier_key = _catalog_key("MODIFIER", modifier_code)
                 if modifier_key:
                     lookup_keys.add(modifier_key)
+    return lookup_keys
 
-    if not lookup_keys:
-        return response_payload
 
-    clauses: list[str] = []
-    query_params_by_name: dict[str, Any] = {}
-    for idx, (code_system, code) in enumerate(sorted(lookup_keys)):
-        clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
-        query_params_by_name[f"code_system_{idx}"] = code_system
-        query_params_by_name[f"code_{idx}"] = code
-    query_result = await session.execute(
-        text(
-            f"""
-            SELECT code_system, code, display_name, short_description
-            FROM {PTG2_SCHEMA}.code_catalog
-            WHERE {" OR ".join(clauses)}
-            """
-        ),
-        query_params_by_name,
-    )
-    detail_map = {
-        (
-            str(catalog_row.get("code_system") or ""),
-            str(catalog_row.get("code") or ""),
-        ): _catalog_detail(catalog_row)
-        for catalog_row in (
-            _row_mapping(query_row) for query_row in query_result
-        )
-    }
-
+def _apply_code_details(
+    response_items: list[dict[str, Any]],
+    detail_map: dict[tuple[str, str], dict[str, Any]],
+) -> None:
     for response_item in response_items:
         billing_key = _catalog_key(
             response_item.get("reported_code_system")
@@ -118,6 +85,53 @@ async def _enrich_ptg2_code_details(
         response_item["prices"] = enriched_prices
         response_item["tic_prices"] = enriched_prices
         response_item["price_summary"] = _summarize_price_payload(enriched_prices)
+
+
+async def _enrich_ptg2_code_details(
+    session,
+    response_payload: dict[str, Any],
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach requested code-catalog details to a PTG pricing response."""
+
+    if not _is_request_flag_enabled(args.get("include_code_details")):
+        return response_payload
+
+    response_items = [
+        dict(response_item) for response_item in response_payload.get("items", [])
+    ]
+    lookup_keys = _code_detail_lookup_keys(response_items)
+
+    if not lookup_keys:
+        return response_payload
+
+    clauses: list[str] = []
+    query_params_by_name: dict[str, Any] = {}
+    for idx, (code_system, code) in enumerate(sorted(lookup_keys)):
+        clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
+        query_params_by_name[f"code_system_{idx}"] = code_system
+        query_params_by_name[f"code_{idx}"] = code
+    query_result = await session.execute(
+        text(
+            f"""
+            SELECT code_system, code, display_name, short_description
+            FROM {PTG2_SCHEMA}.code_catalog
+            WHERE {" OR ".join(clauses)}
+            """
+        ),
+        query_params_by_name,
+    )
+    detail_map = {
+        (
+            str(catalog_row.get("code_system") or ""),
+            str(catalog_row.get("code") or ""),
+        ): _catalog_detail(catalog_row)
+        for catalog_row in (
+            _row_mapping(query_row) for query_row in query_result
+        )
+    }
+
+    _apply_code_details(response_items, detail_map)
 
     enriched_response_by_field = dict(response_payload)
     enriched_response_by_field["items"] = response_items
