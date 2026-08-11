@@ -88,7 +88,7 @@ def _load_migration():
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     assert script.get_heads() == [
-        "20260811030000_fhir_formulary_source_acquisition_lease"
+        "20260811100000_address_numeric_grid_alias"
     ]
     migration = _load_capacity_v2_migration()
     assert migration.down_revision == (

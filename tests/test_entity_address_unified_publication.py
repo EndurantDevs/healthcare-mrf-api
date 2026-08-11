@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 import importlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,6 +52,8 @@ class _RecordingDB:
     async def scalar(self, statement, **_params):
         if "relpersistence" in statement:
             return self.persistence_values.pop(0)
+        if "address_numeric_grid_alias_v1" in statement:
+            return 1
         if "pg_try_advisory_xact_lock" in statement:
             return self.advisory_values.pop(0)
         raise AssertionError(f"unexpected scalar SQL: {statement}")
@@ -61,6 +64,15 @@ class _RecordingDB:
             (name,)
             for name in sorted(set(params["relation_names"]) & self.existing_names)
         ]
+
+    async def first(self, statement, **_params):
+        if "address_alias_state_v1" in statement:
+            return SimpleNamespace(
+                schema_version=1,
+                active_ruleset_version=1,
+                generation=0,
+            )
+        raise AssertionError(f"unexpected first SQL: {statement}")
 
     async def status(self, statement, **_params):
         self.statements.append(statement)

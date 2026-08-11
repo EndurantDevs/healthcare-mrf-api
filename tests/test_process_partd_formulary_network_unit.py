@@ -167,6 +167,28 @@ def test_activity_row_from_source_includes_dispensing_fee_fields():
     assert activity["dispensing_fee_brand_30"] == 1.1
     assert activity["dispensing_fee_generic_90"] == 0.3
     assert activity["dispensing_fee_selected_drug_60"] == 2.2
+    assert activity["address_observed_in_source"] is False
+
+
+def test_activity_row_tracks_address_observed_in_partd_source():
+    activity = module._activity_row_from_source(
+        {
+            "NPI": "1518379601",
+            "Contract ID": "S1234",
+            "Plan ID": "001",
+            "Segment ID": "000",
+            "Address 1": "10 E 20 N",
+            "City": "Example City",
+            "State": "TX",
+            "ZIP": "75001",
+        },
+        snapshot_id="quarterly:20260101:test",
+        source_type="quarterly",
+        default_date=datetime.date(2026, 1, 1),
+    )
+
+    assert activity is not None
+    assert activity["address_observed_in_source"] is True
 
 
 def test_match_cost_fields_includes_fee_token():

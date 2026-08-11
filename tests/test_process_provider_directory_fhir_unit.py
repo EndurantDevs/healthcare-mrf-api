@@ -81,7 +81,7 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 55
+    assert len(command_signature.parameters) == 56
     assert "resource_scan_concurrency" in command_signature.parameters
     assert (
         "provider_directory_reviewed_root_count"
@@ -10195,10 +10195,26 @@ def _artifact_publish_scalar(row_count: int, statements: list[str] | None = None
 
 def _stub_artifact_build_guard(monkeypatch):
     @contextlib.asynccontextmanager
-    async def unlocked_guard(*_args, **_kwargs):
-        yield
+    async def unlocked_guard(_schema, target_relation, **_kwargs):
+        target_oid = 101 if "address_overlay" in target_relation else None
+        yield importer.ProviderDirectoryArtifactBuildFence(target_oid=target_oid)
 
     monkeypatch.setattr(importer, "_provider_directory_artifact_build_guard", unlocked_guard)
+    monkeypatch.setattr(importer, "_address_alias_generation", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        importer,
+        "_address_alias_artifact_generation",
+        AsyncMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_relation_oid",
+        AsyncMock(
+            side_effect=lambda _schema, relation: (
+                101 if "address_overlay" in relation else None
+            )
+        ),
+    )
 
 
 def _artifact_stage_table(status_calls: list[tuple[str, dict[str, Any]]], prefix: str) -> str:
@@ -10236,8 +10252,21 @@ def _stub_staged_publish_db(
 
     monkeypatch.setattr(importer.db, "status", fake_status)
     monkeypatch.setattr(importer.db, "scalar", _artifact_publish_scalar(row_count))
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
     monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[]))
     monkeypatch.setattr(importer.db, "transaction", lambda: _ArtifactPublishTransaction())
+    monkeypatch.setattr(
+        importer,
+        "_materialize_address_overlay_aliases",
+        AsyncMock(
+            return_value={
+                "address_alias_generation": 0,
+                "alias_candidates": 0,
+                "aliases_materialized": 0,
+                "alias_residual_source_keys": 0,
+            }
+        ),
+    )
     return status_calls
 
 
@@ -11994,13 +12023,13 @@ async def test_dataset_artifact_bundle_promotes_after_complete_stage_build(monke
         scope_options_by_name.update(kwargs)
         yield fence
 
-    async def publish_artifacts(**kwargs):
+    async def publish_artifacts(request):
         assert isinstance(
             importer._PROVIDER_DIRECTORY_ARTIFACT_BUNDLE.get(),
             importer.ProviderDirectoryArtifactBundle,
         )
         events.append("build")
-        return kwargs["metrics"]
+        return request.metrics
 
     monkeypatch.setattr(
         importer,
@@ -12179,9 +12208,9 @@ def _install_confirmed_promotion_harness(monkeypatch, fence, events):
     async def dataset_scope(**_kwargs):
         yield fence
 
-    async def publish_artifacts(**kwargs):
+    async def publish_artifacts(request):
         events.append("build")
-        return kwargs["metrics"]
+        return request.metrics
 
     async def promote_bundle(_bundle):
         events.append("promote")
@@ -15234,6 +15263,96 @@ async def test_main_forwards_publish_artifact_targets(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_full_address_rebuild_is_global_and_forced_through_public_flow(monkeypatch):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    publish = AsyncMock(return_value={"published": True})
+    monkeypatch.setattr(
+        importer,
+        "_publish_provider_directory_dataset_artifacts",
+        publish,
+    )
+
+    result = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "publish_artifacts_only": True,
+            "full_address_artifact_rebuild": True,
+            "publish_artifacts_targets": "addresses",
+        },
+    )
+
+    assert result == {"published": True}
+    assert publish.await_args.kwargs["source_ids"] == []
+    assert publish.await_args.kwargs["full_address_artifact_rebuild"] is True
+    assert publish.await_args.kwargs["publish_corroboration"] is True
+    assert {
+        "address_overlay",
+        "network_catalog",
+        "corroboration",
+    }.issubset(publish.await_args.kwargs["publish_artifacts_targets"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_fields, expected_error",
+    (
+        (
+            {"publish_artifacts_only": False},
+            "requires_publish_artifacts_only",
+        ),
+        (
+            {"source_ids": ["synthetic-source"]},
+            "requires_global_scope",
+        ),
+        (
+            {"publish_artifacts_targets": "address_overlay"},
+            "targets_incomplete",
+        ),
+        (
+            {"publish_corroboration": False},
+            "requires_corroboration",
+        ),
+        (
+            {"dataset_rehydrate_only": True},
+            "incompatible_mode",
+        ),
+        (
+            {"dataset_followup_only": True},
+            "incompatible_mode",
+        ),
+        (
+            {"canonical_backfill_only": True},
+            "incompatible_mode",
+        ),
+        (
+            {"contact_backfill_only": True},
+            "incompatible_mode",
+        ),
+        (
+            {"provider_directory_profile_contract_id": "synthetic-contract"},
+            "incompatible_mode",
+        ),
+    ),
+)
+async def test_full_address_rebuild_rejects_partial_contract(
+    invalid_fields,
+    expected_error,
+):
+    task_options_by_name = {
+        "test": True,
+        "publish_artifacts_only": True,
+        "full_address_artifact_rebuild": True,
+        "publish_artifacts_targets": "addresses",
+    }
+    task_options_by_name.update(invalid_fields)
+
+    with pytest.raises(ValueError, match=expected_error):
+        await importer.process_data({"context": {}}, task_options_by_name)
+
+
 def _stub_artifact_dataset_scope(monkeypatch) -> None:
     @contextlib.asynccontextmanager
     async def dataset_scope(**_kwargs):
@@ -15422,9 +15541,11 @@ def test_provider_directory_publish_artifact_targets_parse_aliases():
         "location_coordinates",
         "resource_id_npis",
         "location_address_keys",
-        "location_archive",
-        "address_overlay",
-    }
+            "location_archive",
+            "address_overlay",
+            "network_catalog",
+            "corroboration",
+        }
 
     with pytest.raises(ValueError, match="Unsupported Provider Directory publish_artifacts_targets"):
         importer._provider_directory_publish_artifact_targets("bad-stage")
@@ -27436,10 +27557,14 @@ async def test_artifact_publish_source_scope(monkeypatch):
     monkeypatch.setattr(importer, "publish_provider_directory_network_catalog", network_catalog_publish)
 
     metrics = await importer._publish_provider_directory_artifacts(
-        run_id="run_1",
-        metrics={},
-        address_key_run_id="run_1",
-        source_ids=["source_a", "source_b"],
+        importer.ProviderDirectoryArtifactPublishRequest(
+            run_id="run_1",
+            metrics={},
+            address_key_run_id="run_1",
+            source_ids=["source_a", "source_b"],
+            publish_corroboration=False,
+            publish_artifacts_targets=None,
+        )
     )
 
     assert metrics["location_coordinates_backfilled"] == 8
@@ -27473,6 +27598,113 @@ async def test_artifact_publish_source_scope(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_full_address_rebuild_only_unscopes_alias_bearing_artifacts(
+    monkeypatch,
+):
+    """Full rebuild unscopes only alias-bearing overlay and corroboration."""
+    publishers_by_name = _stub_full_address_rebuild_publishers(monkeypatch)
+    await importer._publish_provider_directory_artifacts(
+        importer.ProviderDirectoryArtifactPublishRequest(
+            run_id=None,
+            metrics={},
+            publish_scope_run_id=None,
+            source_ids=["source-a", "source-b"],
+            publish_corroboration=True,
+            publish_artifacts_targets=set(
+                importer.PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGET_ALIASES[
+                    "addresses"
+                ]
+            ),
+            full_address_artifact_rebuild=True,
+        )
+    )
+    _assert_full_address_rebuild_scope(publishers_by_name)
+
+
+def _stub_full_address_rebuild_publishers(monkeypatch):
+    """Install artifact publishers and return the mocks used for scope proof."""
+    monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_location_contacts",
+        AsyncMock(return_value={"location_contact_rows_updated": 0}),
+    )
+    coordinate_backfill = AsyncMock(return_value=0)
+    archive_publish = AsyncMock(return_value={"inserted": 0, "provenance_updates": 0})
+    overlay_publish = AsyncMock(return_value={"published": True})
+    network_publish = AsyncMock(return_value={"published": True})
+    corroboration_publish = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_location_coordinates",
+        coordinate_backfill,
+    )
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_resource_id_npis",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_location_address_keys",
+        AsyncMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_location_archive",
+        archive_publish,
+    )
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_address_overlay",
+        overlay_publish,
+    )
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_network_catalog",
+        network_publish,
+    )
+    monkeypatch.setattr(
+        importer,
+        "_is_address_corroboration_published",
+        corroboration_publish,
+    )
+    return {
+        "coordinate": coordinate_backfill,
+        "archive": archive_publish,
+        "overlay": overlay_publish,
+        "network": network_publish,
+        "corroboration": corroboration_publish,
+    }
+
+
+def _assert_full_address_rebuild_scope(publishers_by_name):
+    """Assert ordinary artifacts stay scoped while alias artifacts are global."""
+    publishers_by_name["coordinate"].assert_awaited_once_with(
+        run_id=None,
+        source_ids=["source-a", "source-b"],
+        seen_table=None,
+    )
+    publishers_by_name["archive"].assert_awaited_once_with(
+        run_id=None,
+        source_ids=["source-a", "source-b"],
+        seen_table=None,
+    )
+    publishers_by_name["network"].assert_awaited_once_with(
+        run_id=None,
+        source_ids=["source-a", "source-b"],
+    )
+    publishers_by_name["overlay"].assert_awaited_once_with(
+        run_id=None,
+        source_ids=None,
+    )
+    publishers_by_name["corroboration"].assert_awaited_once_with(
+        refresh_network_catalog=False,
+        source_ids=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_resource_id_npi_backfill_receives_publish_scope(monkeypatch):
     """The resource-id NPI stage should honor artifact run and source scope."""
     monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())
@@ -27480,11 +27712,14 @@ async def test_resource_id_npi_backfill_receives_publish_scope(monkeypatch):
     monkeypatch.setattr(importer, "backfill_provider_directory_resource_id_npis", npi_backfill)
 
     metrics = await importer._publish_provider_directory_artifacts(
-        run_id="run_1",
-        metrics={},
-        address_key_run_id="run_1",
-        source_ids=["source_a", "source_b"],
-        publish_artifacts_targets={"resource_id_npis"},
+        importer.ProviderDirectoryArtifactPublishRequest(
+            run_id="run_1",
+            metrics={},
+            address_key_run_id="run_1",
+            source_ids=["source_a", "source_b"],
+            publish_corroboration=False,
+            publish_artifacts_targets={"resource_id_npis"},
+        )
     )
 
     assert metrics["resource_id_npis_backfilled"] == {"Practitioner": 2, "Organization": 1}

@@ -17,14 +17,23 @@ class _StageClass:
 
 def _configure_database_harness(monkeypatch, sql_events):
     """Route database effects into a deterministic SQL event log."""
-    async def record_status(statement):
+    async def record_status(statement, **_params):
         sql_events.append(str(statement))
 
     async def record_create_table(_table, **_kwargs):
         sql_events.append("CREATE_STAGE")
 
-    async def scalar(statement):
-        sql_events.append(str(statement))
+    async def scalar(statement, **_params):
+        statement_text = str(statement)
+        sql_events.append(statement_text)
+        if (
+            "base_address_version IS DISTINCT FROM" in statement_text
+            or (
+                "address_alias_v1" in statement_text
+                and "WHERE revoked_at IS NULL" in statement_text
+            )
+        ):
+            return 0
         return 1
 
     async def run_sql_phase(statement, **options):
@@ -42,6 +51,8 @@ def _configure_database_harness(monkeypatch, sql_events):
     monkeypatch.setattr(entity_address, "_has_table", is_table_present)
     monkeypatch.setattr(entity_address, "_has_table_column", AsyncMock(return_value=True))
     monkeypatch.setattr(entity_address, "_is_address_canon_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(entity_address, "_address_alias_generation", AsyncMock(return_value=0))
+    monkeypatch.setattr(entity_address, "_validate_raw_alias_integrity", AsyncMock())
     monkeypatch.setattr(entity_address.db, "status", record_status)
     monkeypatch.setattr(entity_address.db, "create_table", record_create_table)
     monkeypatch.setattr(entity_address.db, "scalar", scalar)

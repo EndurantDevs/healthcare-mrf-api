@@ -55,6 +55,23 @@ async def _temporary_schema():
     await database.connect()
     schema = f"eau_cutover_{uuid.uuid4().hex[:12]}"
     await database.status(f"CREATE SCHEMA {schema};")
+    await database.status(
+        f"""
+        CREATE TABLE {schema}.address_alias_state_v1 (
+            singleton boolean PRIMARY KEY,
+            schema_version smallint NOT NULL,
+            active_ruleset_version smallint NOT NULL,
+            generation bigint NOT NULL
+        );
+        """
+    )
+    await database.status(
+        f"""
+        INSERT INTO {schema}.address_alias_state_v1 (
+            singleton, schema_version, active_ruleset_version, generation
+        ) VALUES (true, 1, 1, 0);
+        """
+    )
     try:
         yield database, schema
     finally:
