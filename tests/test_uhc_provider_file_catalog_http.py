@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from process import uhc_provider_file_catalog_artifacts as artifacts
 from process import uhc_provider_file_catalog_types as catalog_types
+from process.formulary_fhir import uhc_drug_transport as drug_transport
 from tests.uhc_provider_file_catalog_test_data import live_catalog_payloads
 
 
@@ -22,11 +25,14 @@ class _Content:
 
 
 class _Response:
-    def __init__(self, *, chunks=(), status=200, headers=None, url=None):
+    def __init__(
+        self, *, chunks=(), status=200, headers=None, url=None, content_length=None
+    ):
         self.content = _Content(chunks)
         self.status = status
         self.headers = headers or {}
         self.url = url or catalog_types.CATALOG_URLS["cs"]
+        self.content_length = content_length
 
     async def __aenter__(self):
         return self
@@ -130,6 +136,25 @@ async def test_fetch_revalidates_redirect_without_query_credentials():
 
 
 @pytest.mark.asyncio
+async def test_fetch_rejects_implicit_response_url_change():
+    catalog_session = _Session(
+        [
+            _Response(
+                chunks=[b"{}"],
+                url=catalog_types.CATALOG_URLS["ifp"],
+            )
+        ]
+    )
+
+    with pytest.raises(catalog_types.UHCFileCatalogError, match="response URL"):
+        await artifacts._fetch_document(
+            catalog_session,
+            "cs",
+            catalog_types.CATALOG_URLS["cs"],
+        )
+
+
+@pytest.mark.asyncio
 async def test_fetch_accepts_exact_identity_document_and_valid_redirect():
     raw_bytes = b'{"providers":[]}'
     redirected_url = "https://legacy.providerlookuponline.com/catalog.json"
@@ -170,6 +195,38 @@ async def test_fetch_accepts_exact_identity_document_and_valid_redirect():
         request_options["headers"] == {"Accept-Encoding": "identity"}
         for _request_url, request_options in catalog_session.requests
     )
+
+
+@pytest.mark.asyncio
+async def test_drug_stream_accepts_validated_redirect():
+    source_url = catalog_types.CATALOG_URLS["cs"]
+    redirected_url = catalog_types.CATALOG_URLS["ifp"]
+    raw_bytes = b"[{}]"
+    catalog_session = _Session(
+        [
+            _Response(
+                status=302,
+                headers={"Location": redirected_url},
+                url=source_url,
+            ),
+            _Response(
+                chunks=[raw_bytes],
+                headers={"Content-Length": str(len(raw_bytes))},
+                url=redirected_url,
+                content_length=len(raw_bytes),
+            ),
+        ]
+    )
+
+    digest, byte_count = await drug_transport.stream_uhc_drug_response(
+        catalog_session,
+        SimpleNamespace(source_url=source_url, expected_byte_count=len(raw_bytes)),
+        io.BytesIO(),
+        max_bytes=100,
+        cancel_check=None,
+    )
+
+    assert (digest, byte_count) == (hashlib.sha256(raw_bytes).hexdigest(), 4)
 
 
 @pytest.mark.asyncio

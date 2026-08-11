@@ -58,6 +58,7 @@ from process.provider_directory_retained_artifact_base import RetainedArtifactEr
 from process.provider_directory_retained_blob_staging import (
     prepare_retained_artifact_staging_directory,
 )
+from process.uhc_provider_file_catalog_artifacts import _validated_get
 from process.uhc_provider_file_catalog_contract import UHCFileCatalogError
 from process.uhc_provider_file_catalog_contract import trusted_public_https_url
 
@@ -204,23 +205,24 @@ async def stream_uhc_drug_response(
     """Stream one exact identity-encoded reviewed response into a stage file."""
 
     source_url = _validated_source_url(identity)
-    async with session.get(
-        source_url,
-        allow_redirects=False,
-        headers={"Accept-Encoding": "identity"},
-    ) as response:
-        declared_length = _declared_response_length(
-            response,
-            identity,
-            source_url=source_url,
-            max_bytes=max_bytes,
-        )
-        content_digest, downloaded_byte_count = await _download_response_body(
-            response,
-            output_file,
-            max_bytes=max_bytes,
-            cancel_check=cancel_check,
-        )
+    try:
+        async with _validated_get(session, source_url) as response:
+            declared_length = _declared_response_length(
+                response,
+                identity,
+                source_url=str(response.url),
+                max_bytes=max_bytes,
+            )
+            content_digest, downloaded_byte_count = await _download_response_body(
+                response,
+                output_file,
+                max_bytes=max_bytes,
+                cancel_check=cancel_check,
+            )
+    except UHCFileCatalogError:
+        raise UHCDrugArtifactAcquisitionError(
+            "Drug artifact redirect is invalid"
+        ) from None
     _require_complete_response(
         identity,
         declared_length=declared_length,
