@@ -1052,6 +1052,7 @@ jobs:
           tests/test_provider_directory_artifact_scope_bulk_load_db.py
           tests/test_provider_directory_dataset_rehydrate_db.py
           tests/test_provider_directory_proof_store_db.py
+          tests/test_provider_directory_content_proof_keyset_db.py
           tests/test_provider_directory_dataset_resource_mutation_fence_db.py
           tests/test_provider_directory_semantic_proof_v3_db.py
           tests/test_provider_directory_semantic_proof_v3_fences_db.py
