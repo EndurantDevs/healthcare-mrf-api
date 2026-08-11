@@ -21,6 +21,7 @@ from process.ptg_parts.artifacts import resolve_ptg2_artifact_dir, sha256_file
 from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_artifact_blob_stream import (
+    _row_mapping,
     stream_artifact_chunks,
 )
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
@@ -386,6 +387,7 @@ async def materialize_ptg2_artifact_from_db(
             artifact_id,
             tmp_path,
         )
+        actual_sha = digest.hexdigest()
         if chunk_count <= 0:
             raise FileNotFoundError(f"PTG2 artifact has no PostgreSQL chunks: {artifact_id}")
         expected_byte_count = (metadata or {}).get("byte_count")
