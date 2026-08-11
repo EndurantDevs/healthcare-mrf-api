@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import asdict
 from typing import Any
 
@@ -246,7 +245,3 @@ async def run_address_alias_revoke_command(
         {},
         task_options_by_name,
     )
-
-
-if __name__ == "__main__":  # pragma: no cover
-    asyncio.run(main())
