@@ -19153,9 +19153,11 @@ async def test_scan_candidate_dispatches_practitioner_role_to_last_updated(monke
         page_count=100,
         timeout=3,
         run_id="run_scan_candidate",
+        deferred_materialization=True,
     )
 
     assert operation_result is expected_result
+    assert partition_fetch.await_args.args[4].deferred_materialization is True
     partition_fetch.assert_awaited_once()
     assert partition_fetch.await_args.args[:3] == (
         source_row,
@@ -25971,6 +25973,7 @@ class _ResourceOverlapHarness:
     async def fetch(self, _source, resource_type, **kwargs):
         self.lifecycle_events.append(("start", resource_type))
         self.bulk_export_requests.append(kwargs["bulk_export"])
+        assert kwargs["deferred_materialization"] is True
         if resource_type == "PractitionerRole":
             assert self.foundation_completed.is_set()
         else:
@@ -30890,6 +30893,45 @@ async def test_last_updated_partition_staged_rows_stream_with_keyset(monkeypatch
     assert streamed_count == written_count == 2
     assert row_responder.requested_cursors == ["", "prac-1", "prac-2"]
     assert written_batches == [["prac-1"], ["prac-2"]]
+
+
+@pytest.mark.asyncio
+async def test_completed_deferred_practitioner_role_skips_staged_replay(
+    monkeypatch,
+):
+    directory_source, _config, _plan, state, fetch_options = (
+        _partition_retry_state_with_completed_window()
+    )
+    stream_rows = AsyncMock(side_effect=AssertionError("unexpected replay"))
+    monkeypatch.setattr(
+        importer,
+        "_stream_last_updated_partition_staged_rows",
+        stream_rows,
+    )
+
+    fetch_result = await importer._completed_partition_fetch_result(
+        directory_source,
+        "PractitionerRole",
+        ProviderDirectoryPractitionerRole,
+        state,
+        dataclasses.replace(
+            fetch_options,
+            deferred_materialization=True,
+        ),
+        importer.LastUpdatedPartitionProofCounts(
+            leaf_count_sum=2,
+            pass1_unique=2,
+            pass2_unique=2,
+            staged_candidate_count=2,
+            invalid_candidate_count=0,
+            orphan_proof_count=0,
+        ),
+    )
+
+    assert fetch_result.complete is True
+    assert fetch_result.rows_fetched == fetch_result.rows_written == 2
+    stream_rows.assert_not_awaited()
+
 
 def _checkpoint_context(**overrides):
     context_by_field = {
