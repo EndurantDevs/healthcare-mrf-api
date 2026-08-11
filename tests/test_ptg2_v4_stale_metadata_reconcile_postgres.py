@@ -18,10 +18,12 @@ from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     StaleMetadataFenceError,
     lock_writable_snapshot,
 )
+from tests.ptg2_lifecycle_retry_test_support import settle_lifecycle_outcomes
 from tests.ptg2_v4_stale_metadata_postgres_support import (
     INTERNAL_RUN_ID,
     SNAPSHOT_ID,
-    assert_registered_writers_are_fenced, configure_test_schema,
+    assert_registered_writers_are_fenced,
+    configure_reconciler,
     create_stale_schema,
     database_for_dsn,
     decoded_json,
@@ -29,32 +31,14 @@ from tests.ptg2_v4_stale_metadata_postgres_support import (
     external_state,
     postgres_dsn,
     quoted,
+    ready_plan,
     row_versions,
     seed_physical_state,
     seed_ready_pair,
 )
 
-def _configure_reconciler(monkeypatch, schema_name, test_database) -> None:
-    configure_test_schema(monkeypatch, schema_name)
-    monkeypatch.setenv(
-        reconcile.PTG2_V4_STALE_METADATA_SECONDS_ENV,
-        "3600",
-    )
-    monkeypatch.setattr(reconcile, "db", test_database)
-
-async def _ready_plan() -> dict:
-    plan_by_field = await reconcile.plan_v4_stale_metadata(
-        snapshot_id=SNAPSHOT_ID,
-        internal_run_id=INTERNAL_RUN_ID,
-    )
-    serialized_plan = json.dumps(plan_by_field, sort_keys=True)
-    assert plan_by_field["status"] == "ready"
-    assert SNAPSHOT_ID not in serialized_plan
-    assert INTERNAL_RUN_ID not in serialized_plan
-    return plan_by_field
-
 async def _concurrent_reports(plan_by_field: dict) -> None:
-    reports = await asyncio.gather(
+    outcomes = await asyncio.gather(
         *(
             reconcile.reconcile_v4_stale_metadata(
                 snapshot_id=SNAPSHOT_ID,
@@ -62,7 +46,16 @@ async def _concurrent_reports(plan_by_field: dict) -> None:
                 expected_plan_digest=plan_by_field["plan_digest"],
             )
             for _ordinal in range(2)
-        )
+        ),
+        return_exceptions=True,
+    )
+    reports = await settle_lifecycle_outcomes(
+        outcomes,
+        replay=lambda: reconcile.reconcile_v4_stale_metadata(
+                snapshot_id=SNAPSHOT_ID,
+                internal_run_id=INTERNAL_RUN_ID,
+                expected_plan_digest=plan_by_field["plan_digest"],
+        ),
     )
     assert {report["status"] for report in reports} == {
         "reconciled",
@@ -77,6 +70,8 @@ async def _concurrent_reports(plan_by_field: dict) -> None:
         for report in reports
     ]
     assert sorted(update_counts) == [(0, 0, 0), (1, 1, 1)]
+
+
 async def _assert_persisted_marker(
     connection,
     schema_name: str,
@@ -367,7 +362,7 @@ async def _run_paused_artifact_race(
 
 
 async def _assert_plan_drift_guards(connection, schema_name: str) -> dict:
-    reviewed_plan = await _ready_plan()
+    reviewed_plan = await ready_plan()
     with pytest.raises(
         reconcile.PTG2V4StaleMetadataConflict,
         match="state changed after plan review",
@@ -387,7 +382,7 @@ async def _assert_plan_drift_guards(connection, schema_name: str) -> dict:
         message_pattern="not eligible",
     )
     await _set_heartbeat(connection, schema_name, is_stale=True)
-    reviewed_plan = await _ready_plan()
+    reviewed_plan = await ready_plan()
     await _set_plan_month_attachment(
         connection,
         schema_name,
@@ -402,13 +397,13 @@ async def _assert_plan_drift_guards(connection, schema_name: str) -> dict:
         schema_name,
         is_present=False,
     )
-    reviewed_plan = await _ready_plan()
+    reviewed_plan = await ready_plan()
     await _assert_manifest_stage_existence_blocks_execute(
         connection,
         schema_name,
         reviewed_plan,
     )
-    return await _ready_plan()
+    return await ready_plan()
 
 
 @pytest.mark.asyncio
@@ -431,8 +426,8 @@ async def test_exact_stale_pair_reconciles_once_without_physical_side_effects(
             schema_name,
         )
 
-        _configure_reconciler(monkeypatch, schema_name, test_database)
-        plan_by_field = await _ready_plan()
+        configure_reconciler(monkeypatch, schema_name, test_database)
+        plan_by_field = await ready_plan()
         await _concurrent_reports(plan_by_field)
         await _assert_persisted_marker(
             setup_connection,
@@ -476,7 +471,7 @@ async def test_execute_rechecks_staleness_and_attached_state_under_lock(
     try:
         await create_stale_schema(setup_connection, schema_name)
         await seed_ready_pair(setup_connection, schema_name)
-        _configure_reconciler(monkeypatch, schema_name, test_database)
+        configure_reconciler(monkeypatch, schema_name, test_database)
         refreshed_plan = await _assert_plan_drift_guards(
             setup_connection,
             schema_name,

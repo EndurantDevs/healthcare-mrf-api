@@ -171,25 +171,20 @@ async def _reserve_reused_cross_plan_layout(
     identity_a,
     identity_b,
 ):
+    """Reserve one cross-plan layout for exact reuse assertions."""
     schema = f'"{schema_name}"'
     async with database.transaction() as session:
         first = await reserve_shared_layout(
-            session,
-            schema_name=schema_name,
+            session, schema_name=schema_name,
             semantic_fingerprint=identity_a.semantic_fingerprint,
             build_token="build-a",
         )
         assert not first.reused
-        await session.execute(
-            text(
-                f"""
-                UPDATE {schema}.ptg2_v3_snapshot_layout
-                   SET state = 'sealed',
-                       lease_until = transaction_timestamp() - INTERVAL '1 second'
-                 WHERE snapshot_key = :snapshot_key
-                """
-            ),
-            {"snapshot_key": first.snapshot_key},
+        await _seal_cross_plan_layout_candidate(
+            session,
+            schema,
+            first,
+            identity_a,
         )
         second = await reserve_shared_layout(
             session,
@@ -200,6 +195,44 @@ async def _reserve_reused_cross_plan_layout(
         assert second.reused
         assert second.snapshot_key == first.snapshot_key
     return first.snapshot_key
+
+
+async def _seal_cross_plan_layout_candidate(
+    session,
+    schema,
+    first,
+    identity_a,
+) -> None:
+    """Seal and publish the first fingerprint before its reuse reserve."""
+    await session.execute(
+        text(
+            f"""
+            UPDATE {schema}.ptg2_v3_snapshot_layout
+               SET state = 'sealed', mapping_digest = :mapping_digest,
+                   support_digest = :support_digest,
+                   lease_until = transaction_timestamp() - INTERVAL '1 second'
+             WHERE snapshot_key = :snapshot_key
+            """
+        ),
+        {"snapshot_key": first.snapshot_key, "mapping_digest": b"m" * 32,
+         "support_digest": b"s" * 32},
+    )
+    await session.execute(
+        text(
+            f"""
+            INSERT INTO {schema}.ptg2_v3_layout_fingerprint
+                (semantic_fingerprint, snapshot_key)
+            VALUES (:semantic_fingerprint, :snapshot_key)
+            """
+        ),
+        {"semantic_fingerprint": identity_a.semantic_fingerprint,
+         "snapshot_key": first.snapshot_key},
+    )
+    await session.execute(
+        text(f"DELETE FROM {schema}.ptg2_layout_build_candidate "
+             "WHERE snapshot_key = :snapshot_key"),
+        {"snapshot_key": first.snapshot_key},
+    )
 
 
 async def _bind_cross_plan_layout(

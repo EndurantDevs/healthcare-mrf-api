@@ -22,6 +22,7 @@ from tests.ptg2_shared_gc_test_support import (
     _hash,
     _patch_v4_abandonment_pipeline,
 )
+from tests.ptg2_shared_gc_schema_support import _create_gc_block_schema
 
 async def _create_gc_layout_schema(connection, schema: str) -> None:
     await connection.status(
@@ -50,48 +51,6 @@ async def _create_gc_layout_schema(connection, schema: str) -> None:
         )
         """
     )
-
-
-async def _create_gc_block_schema(connection, schema: str) -> None:
-    await connection.status(
-        f"""
-        CREATE TABLE {schema}.ptg2_v3_block (
-            block_hash bytea PRIMARY KEY,
-            stored_byte_count bigint NOT NULL
-        )
-        """
-    )
-    await connection.status(
-        f"""
-        CREATE TABLE {schema}.ptg2_v3_snapshot_block (
-            snapshot_key bigint NOT NULL
-                REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
-            block_hash bytea NOT NULL REFERENCES {schema}.ptg2_v3_block(block_hash),
-            PRIMARY KEY (snapshot_key, block_hash)
-        )
-        """
-    )
-    await connection.status(
-        f"""
-        CREATE TABLE {schema}.ptg2_v3_gc_candidate (
-            block_hash bytea PRIMARY KEY
-                REFERENCES {schema}.ptg2_v3_block(block_hash) ON DELETE CASCADE,
-            eligible_at timestamptz NOT NULL,
-            queued_at timestamptz NOT NULL
-        )
-        """
-    )
-    excluded_tables = {
-        "ptg2_v3_snapshot_layout",
-        "ptg2_v3_snapshot_binding",
-        "ptg2_v3_block",
-        "ptg2_v3_snapshot_block",
-        "ptg2_v3_gc_candidate",
-    }
-    for table_name in set(shared_gc._SHARED_TABLE_NAMES) - excluded_tables:
-        await connection.status(
-            f'CREATE TABLE {schema}."{table_name}" (snapshot_key bigint)'
-        )
 
 
 async def _insert_gc_layout_fixture(connection, schema: str) -> None:
@@ -219,6 +178,25 @@ _V4_ABANDONMENT_TABLE_TEMPLATES = (
     )
     """,
     """
+    CREATE TABLE {schema}.ptg2_layout_build_candidate (
+        snapshot_key bigint PRIMARY KEY
+            REFERENCES {schema}.ptg2_v3_snapshot_layout(snapshot_key)
+            ON DELETE CASCADE,
+        semantic_fingerprint bytea NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE {schema}.ptg2_block_build_pin (
+        snapshot_key bigint NOT NULL REFERENCES
+            {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+        build_token varchar(96) NOT NULL,
+        pin_token varchar(96) NOT NULL,
+        block_hash bytea NOT NULL,
+        lease_until timestamptz NOT NULL,
+        PRIMARY KEY (snapshot_key, pin_token, block_hash)
+    )
+    """,
+    """
     CREATE TABLE {schema}.ptg2_v3_snapshot_binding (
         snapshot_id varchar(96) PRIMARY KEY,
         snapshot_key bigint NOT NULL
@@ -291,6 +269,8 @@ _V4_ABANDONMENT_RESERVED_TABLES = frozenset(
     {
         "ptg2_v3_snapshot_layout",
         "ptg2_v3_layout_fingerprint",
+        "ptg2_layout_build_candidate",
+        "ptg2_block_build_pin",
         "ptg2_v3_snapshot_binding",
         "ptg2_v3_block",
         "ptg2_v3_snapshot_block",

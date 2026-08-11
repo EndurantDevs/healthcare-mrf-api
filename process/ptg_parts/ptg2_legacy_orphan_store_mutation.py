@@ -23,7 +23,7 @@ from process.ptg_parts.ptg2_legacy_orphan_store_common import (
     LegacyRelationCatalog,
 )
 from process.ptg_parts.ptg2_lifecycle_lock import (
-    PTG2_SOURCE_POINTER_GC_LOCK_KEY,
+    acquire_ptg2_lifecycle_lock,
 )
 
 
@@ -34,13 +34,9 @@ async def lock_legacy_sweep_lifecycle(
 ) -> None:
     """Acquire the shared lifecycle lock before any authority snapshot."""
 
-    await executor.status(
-        "SELECT set_config('lock_timeout', :lock_timeout, true)",
+    await acquire_ptg2_lifecycle_lock(
+        executor,
         lock_timeout=lock_timeout,
-    )
-    await executor.status(
-        "SELECT pg_advisory_xact_lock(hashtext(:lock_key))",
-        lock_key=PTG2_SOURCE_POINTER_GC_LOCK_KEY,
     )
 
 

@@ -1,5 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from __future__ import annotations
+
 import asyncio
 import datetime
 import importlib

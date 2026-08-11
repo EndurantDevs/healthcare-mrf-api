@@ -48,7 +48,7 @@ from tests.ptg2_shared_publish_test_support import (
 async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatch):
     """The publication result is built only from bounded SQL aggregates."""
 
-    session = _bounded_stage_session()
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock())
 
     @asynccontextmanager
     async def transaction():
@@ -61,11 +61,29 @@ async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatc
         "lock_shared_layout_for_dense_write",
         AsyncMock(),
     )
-    mapping_upsert = AsyncMock()
+    expected = ptg2_shared_publish.SharedBlockStagePublication(
+        object_kinds=("a_kind", "z_kind"),
+        mapping_count=3,
+        unique_block_count=2,
+        logical_byte_count=30,
+        stored_byte_count=20,
+    )
+    publish_batched = AsyncMock(return_value=expected)
     monkeypatch.setattr(
         ptg2_shared_publish,
-        "_upsert_shared_block_mappings",
-        mapping_upsert,
+        "prepare_shared_cas_block_stage",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "_publish_shared_block_stage_batched",
+        publish_batched,
+    )
+    delete_pins = AsyncMock(return_value=2)
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "delete_shared_block_build_pins",
+        delete_pins,
     )
 
     publication = await publish_shared_block_stage(
@@ -74,21 +92,36 @@ async def test_shared_block_stage_returns_only_bounded_sql_aggregates(monkeypatc
         snapshot_key=42,
         build_token="build-42",
     )
+    _assert_bounded_stage_publication(
+        publication,
+        session,
+        publish_batched,
+        delete_pins,
+    )
+
+
+def _assert_bounded_stage_publication(
+    publication,
+    session,
+    publish_batched,
+    delete_pins,
+) -> None:
+    """Assert bounded aggregate projection and its exact SQL calls."""
 
     assert publication.object_kinds == ("a_kind", "z_kind")
     assert publication.mapping_count == 3
     assert publication.unique_block_count == 2
     assert publication.logical_byte_count == 30
     assert publication.stored_byte_count == 20
-    _assert_shared_stage_sql(session)
     session.scalar.assert_not_awaited()
-    mapping_upsert.assert_awaited_once_with(
+    publish_batched.assert_awaited_once_with(
         session,
-        schema_name="mrf",
-        stage_table="ptg2_v3_block_stage_proof",
+        schema='"mrf"',
+        stage='"ptg2_v3_block_stage_proof"',
         snapshot_key=42,
-        expected_count=3,
+        progress_callback=ptg2_shared_publish._discard_publish_work,
     )
+    delete_pins.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -112,6 +145,16 @@ async def test_slow_sql_stage_reports_exact_bounded_rows_before_completion(
         ptg2_shared_publish,
         "lock_shared_layout_for_dense_write",
         AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "prepare_shared_cas_block_stage",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ptg2_shared_publish,
+        "delete_shared_block_build_pins",
+        AsyncMock(return_value=4_101),
     )
     progress_capture = _FirstBatchProgress()
     publish_task = asyncio.create_task(
@@ -144,11 +187,11 @@ async def test_slow_sql_stage_reports_exact_bounded_rows_before_completion(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_progress", (False, True))
-async def test_v4_cas_session_helper_restores_lock_timeout_for_both_paths(
+async def test_v4_cas_session_helper_is_read_only_for_both_paths(
     monkeypatch,
     with_progress,
 ):
-    """Callback-free and reporting paths share one bounded transaction body."""
+    """Callback-free and reporting paths do not mutate shared lock state."""
 
     publication = object()
     publish_batched = AsyncMock(return_value=publication)
@@ -183,10 +226,8 @@ async def test_v4_cas_session_helper_restores_lock_timeout_for_both_paths(
             else ptg2_shared_publish._discard_publish_work
         ),
     )
-    session.scalar.assert_awaited_once()
-    restore_statement = str(session.execute.await_args.args[0])
-    assert "set_config('lock_timeout'" in restore_statement
-    assert session.execute.await_args.args[1] == {"lock_timeout": "2750ms"}
+    session.scalar.assert_not_awaited()
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -276,46 +317,10 @@ async def test_slow_v4_cas_sql_reports_exact_batches_before_completion(
 async def test_shared_block_stage_rejects_incompatible_version_in_combined_scan(
     monkeypatch,
 ):
-    session = SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=[
-                None,
-                None,
-                _OneRowResult(
-                    (1, 1, 3, 3, ["serving"], True, False, True)
-                ),
-            ]
-        ),
-        scalar=AsyncMock(),
-    )
-
-    @asynccontextmanager
-    async def transaction():
-        yield session
-
-    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
-    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
-    monkeypatch.setattr(
-        ptg2_shared_publish,
-        "lock_shared_layout_for_dense_write",
-        AsyncMock(),
-    )
-    mapping_upsert = AsyncMock()
-    monkeypatch.setattr(
-        ptg2_shared_publish,
-        "_upsert_shared_block_mappings",
-        mapping_upsert,
-    )
-
     with pytest.raises(RuntimeError, match="incompatible format version"):
-        await publish_shared_block_stage(
-            schema_name="mrf",
-            stage_table="ptg2_v3_block_stage_proof",
-            snapshot_key=42,
-            build_token="build-42",
+        ptg2_shared_publish._validate_shared_block_batch(
+            (1, 1, 3, 3, ["serving"], True, False, True)
         )
-
-    mapping_upsert.assert_not_awaited()
 
 @pytest.mark.asyncio
 async def test_shared_block_mapping_upsert_counts_stage_when_not_supplied():
@@ -354,56 +359,37 @@ async def test_shared_block_mapping_upsert_rejects_negative_expected_count():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("aggregate_row", "message"),
+    ("summary", "message"),
     (
         (
-            (1, 1, 3, 3, ["serving"], False, False, True),
-            "conflicts with stored",
-        ),
-        (
-            (1, 2, 3, 3, ["serving"], False, False, False),
+            ptg2_shared_publish._BatchedBlockStageSummary(
+                mapping_count=1,
+                unique_block_count=2,
+                coordinate_count=1,
+                logical_byte_count=3,
+                stored_byte_count=3,
+                object_kinds={"serving"},
+            ),
             "invalid aggregates",
         ),
         (
-            (2, 2, 3, 3, ["z_kind", "a_kind"], False, False, False),
-            "invalid object kinds",
+            ptg2_shared_publish._BatchedBlockStageSummary(
+                mapping_count=2,
+                unique_block_count=2,
+                coordinate_count=1,
+                logical_byte_count=3,
+                stored_byte_count=3,
+                object_kinds={"serving"},
+            ),
+            "mapping conflicts",
         ),
     ),
-    ids=("stored-mismatch", "invalid-counts", "invalid-kinds"),
+    ids=("invalid-counts", "coordinate-mismatch"),
 )
 async def test_shared_block_stage_rejects_invalid_aggregate_proof(
     monkeypatch,
-    aggregate_row,
+    summary,
     message,
 ):
-    session = SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=[None, None, _OneRowResult(aggregate_row), None]
-        ),
-        scalar=AsyncMock(),
-    )
-
-    @asynccontextmanager
-    async def transaction():
-        yield session
-
-    monkeypatch.setattr(ptg2_shared_publish.db, "transaction", transaction)
-    monkeypatch.setattr(ptg2_shared_publish.db, "status", AsyncMock())
-    monkeypatch.setattr(
-        ptg2_shared_publish,
-        "lock_shared_layout_for_dense_write",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(
-        ptg2_shared_publish,
-        "_upsert_shared_block_mappings",
-        AsyncMock(),
-    )
-
     with pytest.raises(RuntimeError, match=message):
-        await publish_shared_block_stage(
-            schema_name="mrf",
-            stage_table="ptg2_v3_block_stage_proof",
-            snapshot_key=42,
-            build_token="build-42",
-        )
+        ptg2_shared_publish._validated_batched_stage_publication(summary)

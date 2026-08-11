@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from process import ptg_compatibility_projector as compatibility_projector
+
 from process import ptg_wave_controller as controller
 
 
@@ -346,22 +348,52 @@ async def test_controller_loop_propagates_reconciliation_cancellation(monkeypatc
 @pytest.mark.asyncio
 async def test_start_controller_is_explicit_and_saves_task_and_pool(monkeypatch):
     app = types.SimpleNamespace(ctx=types.SimpleNamespace())
+    projector_task = object()
+    controller_task = object()
+    create_task = Mock(side_effect=[projector_task, controller_task])
+    monkeypatch.setattr(controller.asyncio, "create_task", create_task)
     monkeypatch.setattr(controller, "controller_enabled", Mock(return_value=False))
     await controller.start_ptg_wave_controller(app)
     assert not hasattr(app.ctx, "ptg_wave_controller_task")
+    assert app.ctx.ptg_compatibility_projector_task is projector_task
+    projector_coroutine = create_task.call_args_list[0].args[0]
+    projector_coroutine.close()
 
     redis = object()
-    task = object()
     monkeypatch.setattr(controller, "controller_enabled", Mock(return_value=True))
     monkeypatch.setattr(controller, "_controller_runtime_config", Mock(return_value=("image", "runtime")))
     monkeypatch.setattr(controller, "build_redis_settings", Mock(return_value={"redis": True}))
     monkeypatch.setattr(controller, "create_pool", AsyncMock(return_value=redis))
-    monkeypatch.setattr(controller.asyncio, "create_task", Mock(return_value=task))
     await controller.start_ptg_wave_controller(app)
     assert app.ctx.ptg_wave_redis is redis
-    assert app.ctx.ptg_wave_controller_task is task
-    coroutine = controller.asyncio.create_task.call_args.args[0]
+    assert app.ctx.ptg_wave_controller_task is controller_task
+    coroutine = create_task.call_args_list[1].args[0]
     coroutine.close()
+
+
+@pytest.mark.asyncio
+async def test_compatibility_projector_runs_without_wave_controller(monkeypatch):
+    plan_drain = AsyncMock()
+    pointer_drain = AsyncMock()
+    monkeypatch.setattr(
+        compatibility_projector,
+        "drain_immutable_plan_catalog_outbox",
+        plan_drain,
+    )
+    monkeypatch.setattr(
+        compatibility_projector,
+        "drain_legacy_global_projection_queue",
+        pointer_drain,
+    )
+    monkeypatch.setattr(
+        compatibility_projector.asyncio,
+        "sleep",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await compatibility_projector.run_ptg_compatibility_projector()
+    plan_drain.assert_awaited_once_with(max_requests=8)
+    pointer_drain.assert_awaited_once_with(max_requests=8)
 
 
 class _Task:
@@ -381,6 +413,7 @@ class _Task:
 @pytest.mark.parametrize("async_close", [False, True])
 async def test_stop_controller_cancels_task_and_closes_sync_or_async_pool(async_close):
     task = _Task()
+    projector_task = _Task()
     closed_values = []
     if async_close:
         async def close():
@@ -391,11 +424,13 @@ async def test_stop_controller_cancels_task_and_closes_sync_or_async_pool(async_
     app = types.SimpleNamespace(
         ctx=types.SimpleNamespace(
             ptg_wave_controller_task=task,
+            ptg_compatibility_projector_task=projector_task,
             ptg_wave_redis=types.SimpleNamespace(close=close),
         ),
     )
     await controller.stop_ptg_wave_controller(app)
     assert task.cancelled
+    assert projector_task.cancelled
     assert closed_values == [True]
 
     await controller.stop_ptg_wave_controller(

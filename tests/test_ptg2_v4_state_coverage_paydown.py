@@ -318,7 +318,7 @@ async def test_allowed_pointer_publication_uses_locked_transaction(
     assert publication_outcome["source_key"] == ptg._allowed_source_pointer_key(
         "source"
     )
-    acquire.assert_awaited_once_with(session)
+    acquire.assert_awaited_once_with(session, source_key="source")
     swap.assert_awaited_once()
 
 

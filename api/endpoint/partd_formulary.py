@@ -297,9 +297,7 @@ async def list_partd_snapshots(request):
     ).offset(pagination.offset).limit(pagination.limit)
 
     snapshot_rows = (await session.execute(data_stmt)).all()
-    snapshot_items = [
-        _partd_snapshot_item(snapshot_row) for snapshot_row in snapshot_rows
-    ]
+    snapshot_items = [_partd_snapshot_item(snapshot_row) for snapshot_row in snapshot_rows]
 
     return response.json(
         {

@@ -2421,6 +2421,10 @@ class PTG2CurrentPlanSource(Base, JSONOutputMixin):
         {"index_elements": ("plan_id",), "name": "ptg2_current_plan_source_plan_idx"},
         {"index_elements": ("plan_id", "plan_market_type", "import_month"), "name": "ptg2_current_plan_source_lookup_idx"},
         {"index_elements": ("source_key",), "name": "ptg2_current_plan_source_source_idx"},
+        {
+            "index_elements": ("source_key", "snapshot_id"),
+            "name": "ptg2_current_plan_source_source_snapshot_idx",
+        },
         {"index_elements": ("snapshot_id",), "name": "ptg2_current_plan_source_snapshot_idx"},
         {
             "index_elements": ("previous_snapshot_id",),

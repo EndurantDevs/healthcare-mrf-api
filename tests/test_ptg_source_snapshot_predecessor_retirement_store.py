@@ -101,7 +101,7 @@ async def test_apply_retirement_uses_exact_cas_and_never_mutates_snapshot_rows()
     joined = "\n".join(statement for statement, _params in session.statements)
     assert 'UPDATE "mrf".ptg2_current_source_snapshot' in joined
     assert 'UPDATE "mrf".ptg2_current_plan_source' in joined
-    assert 'UPDATE "mrf".ptg2_current_snapshot' in joined
+    assert 'UPDATE "mrf".ptg2_current_snapshot' not in joined
     assert 'DELETE FROM "mrf".ptg2_snapshot_pin' in joined
     assert "previous_snapshot_id = NULL" in joined
     assert "snapshot_id = :current_snapshot_id" in joined
@@ -153,26 +153,23 @@ async def test_insert_audit_records_counts_without_snapshot_foreign_key_writes()
 
 
 @pytest.mark.asyncio
-async def test_apply_skips_absent_global_pointer(monkeypatch):
+async def test_apply_defers_legacy_global_pointer_even_when_present(monkeypatch):
     clear_source = AsyncMock()
     clear_plans = AsyncMock()
-    clear_global = AsyncMock()
     delete_pin = AsyncMock()
     monkeypatch.setattr(store, "_clear_source_predecessor", clear_source)
     monkeypatch.setattr(store, "_clear_plan_predecessors", clear_plans)
-    monkeypatch.setattr(store, "_clear_global_predecessor", clear_global)
     monkeypatch.setattr(store, "_delete_exact_rollback_pin", delete_pin)
 
     await store.apply_predecessor_retirement(
         object(),
         schema_name="mrf",
         request=_request(),
-        decision=PredecessorRetirementDecision(1, 2, 0, 1),
+        decision=PredecessorRetirementDecision(1, 2, 1, 1),
     )
 
     clear_source.assert_awaited_once()
     clear_plans.assert_awaited_once()
-    clear_global.assert_not_awaited()
     delete_pin.assert_awaited_once()
 
 

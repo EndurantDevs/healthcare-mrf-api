@@ -8,6 +8,7 @@ the upstream reconciler cannot change beneath a cursor.
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select, update
@@ -28,12 +29,35 @@ from process.ptg_wave_outcome_contract import (
     _outcome_record,
     _validate_claim_outcomes,
     _validate_linkage_ack,
+    _validate_persisted_linkage_ack_replay,
+    _validate_v6_linkage_ack_binding,
     linkage_mapping_digest,
     sign_linkage_ack,
 )
 from process.ptg_wave_outcome_terminal_validation import (
     verify_terminal_eligibility,
 )
+from process.ptg_wave_receipt_authority import (
+    LINKAGE_RECEIPT_SCHEMA,
+    PTGWaveReceiptKeyring,
+)
+from process.ptg_wave_receipt_process_authority import (
+    require_process_receipt_keyring,
+)
+from process.ptg_wave_receipt_contract import (
+    PTGWaveReceiptContractError,
+    admission_receipt_mapping,
+    linkage_receipt_payload,
+    ordinary_cutover_id,
+)
+
+
+@dataclass(frozen=True)
+class _V6LinkageReceiptRequest:
+    cutover_id: object
+    receipt_key_id: object
+    receipt_keyring: PTGWaveReceiptKeyring | None
+    receipt_issued_at: dt.datetime | str | None
 
 
 async def snapshot_terminal_outcomes(wave_id: str) -> str:
@@ -204,24 +228,53 @@ async def get_wave_outcomes_page(
 
 
 async def record_linkage_ack(
-    wave_id: str, ack: object, *, key: str | bytes | None = None,
-) -> str:
+    wave_id: str,
+    ack: object,
+    *,
+    key: str | bytes | None = None,
+    cutover_id: object = None,
+    receipt_key_id: object = None,
+    receipt_keyring: PTGWaveReceiptKeyring | None = None,
+    receipt_issued_at: dt.datetime | str | None = None,
+) -> str | dict[str, Any]:
     """Verify and persist the signed all-N source-linkage acknowledgement."""
 
     async with db.transaction() as session:
-        result = await session.execute(
-            select(PTGImportWave).where(PTGImportWave.wave_id == wave_id).with_for_update()
+        wave, outcomes, is_v6_wave, is_v6_replay = await _locked_linkage_state(
+            session, wave_id
         )
-        wave = result.scalar_one_or_none()
-        if wave is None or wave.state != "awaiting_linkage" or wave.outcomes_digest is None:
-            raise PTGWaveOutcomeConflict("linkage acknowledgement is not expected for this wave")
-        outcomes = (await session.execute(
-            select(PTGImportWaveOutcome).where(PTGImportWaveOutcome.wave_id == wave_id)
-            .order_by(PTGImportWaveOutcome.ordinal).with_for_update()
-        )).scalars().all()
-        if len(outcomes) != wave.intent_count:
-            raise PTGWaveOutcomeConflict("linkage acknowledgement requires every stable terminal outcome")
-        ack, digest = _validate_linkage_ack(wave, outcomes, ack, key)
+        if is_v6_replay:
+            ack, digest = _validate_persisted_linkage_ack_replay(
+                wave,
+                outcomes,
+                ack,
+            )
+        elif is_v6_wave:
+            ack, digest = _validate_v6_linkage_ack_binding(
+                wave,
+                outcomes,
+                ack,
+            )
+        else:
+            ack, digest = _validate_linkage_ack(wave, outcomes, ack, key)
+        if getattr(wave, "receipt_key_id", None) is not None:
+            return await _record_v6_linkage_receipt(
+                session,
+                wave,
+                outcomes,
+                ack,
+                digest,
+                request=_V6LinkageReceiptRequest(
+                    cutover_id=cutover_id,
+                    receipt_key_id=receipt_key_id,
+                    receipt_keyring=receipt_keyring,
+                    receipt_issued_at=receipt_issued_at,
+                ),
+            )
+        if cutover_id is not None or receipt_key_id is not None:
+            raise PTGWaveOutcomeConflict(
+                "legacy linkage cannot request an asymmetric receipt"
+            )
         if wave.linkage_ack_digest is not None:
             if wave.linkage_ack_digest != digest:
                 raise PTGWaveOutcomeConflict("linkage acknowledgement conflicts with the first receipt")
@@ -230,6 +283,178 @@ async def record_linkage_ack(
         wave.linkage_ack_digest = digest
         await session.flush()
         return digest
+
+
+async def _locked_linkage_state(
+    session: Any,
+    wave_id: str,
+) -> tuple[Any, list[Any], bool, bool]:
+    """Lock one wave then its complete immutable outcome graph."""
+
+    wave_query_result = await session.execute(
+        select(PTGImportWave)
+        .where(PTGImportWave.wave_id == wave_id)
+        .with_for_update()
+    )
+    wave = wave_query_result.scalar_one_or_none()
+    is_v6_wave = bool(
+        wave is not None and getattr(wave, "receipt_key_id", None) is not None
+    )
+    is_v6_replay = bool(
+        is_v6_wave and getattr(wave, "linkage_receipt", None) is not None
+    )
+    if (
+        wave is None
+        or (wave.state != "awaiting_linkage" and not is_v6_replay)
+        or wave.outcomes_digest is None
+    ):
+        raise PTGWaveOutcomeConflict(
+            "linkage acknowledgement is not expected for this wave"
+        )
+    outcomes = (
+        await session.execute(
+            select(PTGImportWaveOutcome)
+            .where(PTGImportWaveOutcome.wave_id == wave_id)
+            .order_by(PTGImportWaveOutcome.ordinal)
+            .with_for_update()
+        )
+    ).scalars().all()
+    if len(outcomes) != wave.intent_count:
+        raise PTGWaveOutcomeConflict(
+            "linkage acknowledgement requires every stable terminal outcome"
+        )
+    return wave, outcomes, is_v6_wave, is_v6_replay
+
+
+async def _record_v6_linkage_receipt(
+    session: Any,
+    wave: Any,
+    outcomes: list[Any],
+    ack: dict[str, Any],
+    linkage_ack_digest: str,
+    *,
+    request: _V6LinkageReceiptRequest,
+) -> dict[str, Any]:
+    """Persist or replay the RSA receipt for one v6 linkage graph."""
+
+    if (
+        not isinstance(request.receipt_key_id, str)
+        or request.receipt_key_id != wave.receipt_key_id
+        or not isinstance(request.cutover_id, str)
+        or request.cutover_id != ordinary_cutover_id(wave.wave_id)
+    ):
+        raise PTGWaveOutcomeConflict(
+            "V12 linkage receipt request does not bind the stored key and cutover"
+        )
+    _validate_v6_outcome_snapshot(wave, outcomes)
+    intents = (
+        await session.execute(
+            select(PTGImportWaveIntent)
+            .where(PTGImportWaveIntent.wave_id == wave.wave_id)
+            .order_by(PTGImportWaveIntent.ordinal)
+            .with_for_update()
+        )
+    ).scalars().all()
+    receipt, is_replay = _resolve_v6_linkage_receipt(
+        wave,
+        intents,
+        ack,
+        linkage_ack_digest,
+        request,
+    )
+    if is_replay:
+        return receipt
+    wave.linkage_ack = ack
+    wave.linkage_ack_digest = linkage_ack_digest
+    wave.linkage_receipt = receipt
+    wave.linkage_receipt_payload_digest = receipt["payload_digest"]
+    parsed_issued_at = dt.datetime.strptime(
+        receipt["issued_at"],
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+    ).replace(tzinfo=dt.UTC)
+    wave.linkage_receipt_issued_at = parsed_issued_at
+    await session.flush()
+    return receipt
+
+
+def _resolve_v6_linkage_receipt(
+    wave: Any,
+    intents: list[Any],
+    ack: dict[str, Any],
+    linkage_ack_digest: str,
+    request: _V6LinkageReceiptRequest,
+) -> tuple[dict[str, Any], bool]:
+    """Build a first receipt or verify the exact persisted replay."""
+
+    try:
+        admission = admission_receipt_mapping(
+            wave,
+            intents,
+        )
+        receipt_payload = linkage_receipt_payload(
+            admission,
+            cutover_id=request.cutover_id,
+            outcomes_digest=wave.outcomes_digest,
+            mapping_digest=ack["mapping_digest"],
+            linkage_ack_digest=linkage_ack_digest,
+        )
+        keyring = require_process_receipt_keyring(request.receipt_keyring)
+        if wave.linkage_ack_digest is not None:
+            if wave.linkage_ack_digest != linkage_ack_digest:
+                raise PTGWaveOutcomeConflict(
+                    "linkage acknowledgement conflicts with the first receipt"
+                )
+            if wave.linkage_receipt is None:
+                raise PTGWaveOutcomeConflict(
+                    "V12 linkage acknowledgement lacks its asymmetric receipt"
+                )
+            return (
+                keyring.validate_stored_receipt(
+                    wave.linkage_receipt,
+                    schema=LINKAGE_RECEIPT_SCHEMA,
+                    key_id=wave.receipt_key_id,
+                    expected_payload=receipt_payload,
+                ),
+                True,
+            )
+        issued_at = request.receipt_issued_at or dt.datetime.now(dt.UTC)
+        receipt = keyring.sign_receipt(
+            schema=LINKAGE_RECEIPT_SCHEMA,
+            key_id=wave.receipt_key_id,
+            issued_at=issued_at,
+            receipt_payload=receipt_payload,
+        )
+    except PTGWaveReceiptContractError as exc:
+        raise PTGWaveOutcomeConflict(str(exc)) from exc
+    return receipt, False
+
+
+def _validate_v6_outcome_snapshot(wave: Any, outcomes: list[Any]) -> None:
+    """Re-derive the durable all-N graph before granting RSA authority."""
+
+    records = [
+        {
+            "ordinal": row.ordinal,
+            "run_id": row.run_id,
+            "job_id": row.job_id,
+            "source_file_import_id": row.source_file_import_id,
+            "content_version": row.content_version,
+            "status": row.status,
+            "snapshot_id": row.snapshot_id,
+            "import_id": row.import_id,
+        }
+        for row in outcomes
+    ]
+    if any(
+        getattr(row, "outcome_digest", None) != _record_digest(record)
+        for row, record in zip(outcomes, records)
+    ) or wave.outcomes_digest != _collection_digest(
+        "healthporta.ptg-wave.outcomes.v1",
+        records,
+    ):
+        raise PTGWaveOutcomeConflict(
+            "V12 linkage receipt requires the exact persisted outcome graph"
+        )
 
 
 __all__ = [

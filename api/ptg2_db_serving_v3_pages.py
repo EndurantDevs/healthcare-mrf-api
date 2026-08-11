@@ -130,40 +130,24 @@ def _read_provider_page_entry(
 ) -> tuple[int, PTG2V3ProviderPage | None, int]:
     """Decode and validate one provider-page entry from a strict V3 block."""
 
-    provider_offset, cursor = read_strict_uvarint(block_bytes, cursor)
-    block_start = block_key * PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN
-    provider_set_key = block_start + provider_offset
-    provider_count, cursor = read_strict_uvarint(block_bytes, cursor)
-    total_row_count, cursor = read_strict_uvarint(block_bytes, cursor)
-    page_row_count, cursor = read_strict_uvarint(block_bytes, cursor)
-    has_valid_metadata = (
-        _is_key_in_block(
-            provider_set_key,
-            block_key,
-            PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN,
-        )
-        and (previous_provider_set_key is None or provider_set_key > previous_provider_set_key)
-        and total_row_count > 0
-        and page_row_count == min(total_row_count, PTG2_SERVING_BINARY_V3_PAGE_ROWS)
-        and provider_count <= 2**32 - 1
-    )
-    if not has_valid_metadata:
-        raise ValueError("provider page metadata is invalid")
-    current_code_key = 0
-    normal_rows: list[tuple[int, int]] = []
-    for _row_index in range(page_row_count):
-        code_delta, cursor = read_strict_uvarint(block_bytes, cursor)
-        price_key, cursor = read_strict_uvarint(block_bytes, cursor)
-        current_code_key += code_delta
-        if current_code_key > 2**31 - 1 or price_key > 2**32 - 1:
-            raise ValueError("provider page row value is out of range")
-        normal_rows.append((current_code_key, price_key))
-    source_keys, cursor = decode_dense_source_vector(
+    (
+        provider_set_key,
+        provider_count,
+        total_row_count,
+        page_row_count,
+        cursor,
+    ) = _provider_page_metadata(
         block_bytes,
         cursor,
-        entry_count=page_row_count,
-        source_count=source_count,
-        source_bits=source_bits,
+        block_key,
+        previous_provider_set_key,
+    )
+    normal_rows, source_keys, cursor = _provider_page_rows(
+        block_bytes,
+        cursor,
+        page_row_count,
+        source_count,
+        source_bits,
     )
     previous_pair = None
     page_entries = []
@@ -189,6 +173,64 @@ def _read_provider_page_entry(
             total_row_count=total_row_count,
         )
     return provider_set_key, provider_page, cursor
+
+
+def _provider_page_metadata(
+    block_bytes: bytes,
+    cursor: int,
+    block_key: int,
+    previous_provider_set_key: int | None,
+):
+    provider_offset, cursor = read_strict_uvarint(block_bytes, cursor)
+    block_start = block_key * PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN
+    provider_set_key = block_start + provider_offset
+    provider_count, cursor = read_strict_uvarint(block_bytes, cursor)
+    total_row_count, cursor = read_strict_uvarint(block_bytes, cursor)
+    page_row_count, cursor = read_strict_uvarint(block_bytes, cursor)
+    has_valid_metadata = (
+        _is_key_in_block(
+            provider_set_key,
+            block_key,
+            PTG2_SERVING_BINARY_V3_PROVIDER_PAGE_BLOCK_SPAN,
+        )
+        and (
+            previous_provider_set_key is None
+            or provider_set_key > previous_provider_set_key
+        )
+        and total_row_count > 0
+        and page_row_count
+        == min(total_row_count, PTG2_SERVING_BINARY_V3_PAGE_ROWS)
+        and provider_count <= 2**32 - 1
+    )
+    if not has_valid_metadata:
+        raise ValueError("provider page metadata is invalid")
+    return provider_set_key, provider_count, total_row_count, page_row_count, cursor
+
+
+def _provider_page_rows(
+    block_bytes: bytes,
+    cursor: int,
+    page_row_count: int,
+    source_count: int,
+    source_bits: int,
+):
+    current_code_key = 0
+    normal_rows: list[tuple[int, int]] = []
+    for _row_index in range(page_row_count):
+        code_delta, cursor = read_strict_uvarint(block_bytes, cursor)
+        price_key, cursor = read_strict_uvarint(block_bytes, cursor)
+        current_code_key += code_delta
+        if current_code_key > 2**31 - 1 or price_key > 2**32 - 1:
+            raise ValueError("provider page row value is out of range")
+        normal_rows.append((current_code_key, price_key))
+    source_keys, cursor = decode_dense_source_vector(
+        block_bytes,
+        cursor,
+        entry_count=page_row_count,
+        source_count=source_count,
+        source_bits=source_bits,
+    )
+    return normal_rows, source_keys, cursor
 
 
 def _decode_provider_page_block(

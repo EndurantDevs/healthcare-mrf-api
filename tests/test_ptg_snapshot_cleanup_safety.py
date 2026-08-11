@@ -94,9 +94,9 @@ def test_rollback_cleanup_ignores_legacy_layouts(monkeypatch):
         )
     )
 
-    assert connection.pointer_sql.count("previous_snapshot_id AS snapshot_id") == 3
-    assert "plan_release_snapshot_binding" in connection.pointer_sql
-    assert "binding.source_key = :source_key" in connection.pointer_sql
+    assert connection.pointer_sql == ""
+    assert connection.manifest_sql == ""
+    assert connection.status_calls == []
     assert _dropped_table_statements(connection) == []
 
 
@@ -118,7 +118,9 @@ def test_locked_cleanup_never_drops_legacy_tables(monkeypatch):
         )
     )
 
-    assert "status" in connection.manifest_sql
+    assert connection.pointer_sql == ""
+    assert connection.manifest_sql == ""
+    assert connection.status_calls == []
     assert _dropped_table_statements(connection) == []
 
 

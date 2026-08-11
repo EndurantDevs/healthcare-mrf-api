@@ -1846,11 +1846,8 @@ LIMIT 1;
     }
 
 
-@blueprint.get("/pharmacies/markets")
-async def list_pharmacy_markets(request):
-    """List pharmacy market summaries under the requested filters."""
-    session = _get_session(request)
-    args = request.args
+def _market_list_request(args):
+    """Parse one pharmacy-market list request without performing I/O."""
     args.get("page")
     args.get("page_size")
     args.get("limit")
@@ -1883,44 +1880,53 @@ async def list_pharmacy_markets(request):
     as_of = _parse_date_param(args.get("as_of"), "as_of") or datetime.date.today()
     include_staffing = _is_boolean_parameter_enabled(args.get("include_staffing"), default=False)
     chain = _canonical_chain(args.get("chain"))
-
-    total, market_items = await _query_market_summaries(
-        session,
-        _MarketSummaryQuery(
-            scope=scope,
-            sort=sort,
-            order=order,
-            as_of=as_of,
-            include_staffing=include_staffing,
-            limit=pagination.limit,
-            offset=pagination.offset,
-            state=(str(state).strip().upper() if state else None),
-            city=(str(city).strip().upper() if city else None),
-            county=(str(county).strip() if county else None),
-            zip_code=zip_code,
-            chain=chain,
-        ),
+    query = _MarketSummaryQuery(
+        scope=scope,
+        sort=sort,
+        order=order,
+        as_of=as_of,
+        include_staffing=include_staffing,
+        limit=pagination.limit,
+        offset=pagination.offset,
+        state=(str(state).strip().upper() if state else None),
+        city=(str(city).strip().upper() if city else None),
+        county=(str(county).strip() if county else None),
+        zip_code=zip_code,
+        chain=chain,
     )
+    response_filter_by_field = {
+        "state": state.upper() if state else None,
+        "city": city,
+        "county": county,
+        "zip": zip_code,
+        "chain": chain,
+    }
+    return pagination, query, response_filter_by_field
+
+
+@blueprint.get("/pharmacies/markets")
+async def list_pharmacy_markets(request):
+    """List pharmacy market summaries under the requested filters."""
+    session = _get_session(request)
+    pagination, query, response_filter_by_field = _market_list_request(request.args)
+    total, market_items = await _query_market_summaries(session, query)
     return response.json(
         {
-            "as_of": as_of.isoformat(),
-            "scope": scope,
-            "sort": sort,
-            "order": order,
+            "as_of": query.as_of.isoformat(),
+            "scope": query.scope,
+            "sort": query.sort,
+            "order": query.order,
             "page": pagination.page,
             "page_size": pagination.limit,
             "limit": pagination.limit,
             "offset": pagination.offset,
             "total": total,
-            "filters": {
-                "state": state.upper() if state else None,
-                "city": city,
-                "county": county,
-                "zip": zip_code,
-                "chain": chain,
-            },
+            "filters": response_filter_by_field,
             "items": market_items,
-            "methodology": _pharmacy_market_methodology(as_of, include_staffing),
+            "methodology": _pharmacy_market_methodology(
+                query.as_of,
+                query.include_staffing,
+            ),
         }
     )
 
@@ -2007,32 +2013,50 @@ async def list_pharmacy_access_rankings(request):
 
     scope = _parse_scope(args.get("scope"), default=default_scope)
     as_of = _parse_date_param(args.get("as_of"), "as_of") or datetime.date.today()
-    include_staffing = _is_boolean_parameter_enabled(args.get("include_staffing"), default=False)
-    chain = _canonical_chain(args.get("chain"))
-    total, market_items = await _query_market_summaries(
-        session,
-        _MarketSummaryQuery(
-            scope=scope,
-            sort="access_score",
-            order="desc",
-            as_of=as_of,
-            include_staffing=include_staffing,
-            limit=pagination.limit,
-            offset=pagination.offset,
-            state=(str(state).strip().upper() if state else None),
-            city=(str(city).strip().upper() if city else None),
-            county=(str(county).strip() if county else None),
-            zip_code=zip_code,
-            chain=chain,
-        ),
+    include_staffing = _is_boolean_parameter_enabled(
+        args.get("include_staffing"), default=False
     )
+    chain = _canonical_chain(args.get("chain"))
+    query = _MarketSummaryQuery(
+        scope=scope,
+        sort="access_score",
+        order="desc",
+        as_of=as_of,
+        include_staffing=include_staffing,
+        limit=pagination.limit,
+        offset=pagination.offset,
+        state=(str(state).strip().upper() if state else None),
+        city=(str(city).strip().upper() if city else None),
+        county=(str(county).strip() if county else None),
+        zip_code=zip_code,
+        chain=chain,
+    )
+    total, market_items = await _query_market_summaries(session, query)
+    return _access_ranking_response(
+        pagination,
+        as_of,
+        include_staffing,
+        query,
+        total,
+        market_items,
+    )
+
+
+def _access_ranking_response(
+    pagination,
+    as_of,
+    include_staffing: bool,
+    query: _MarketSummaryQuery,
+    total: int,
+    market_items,
+):
     ranked_markets = _rank_pharmacy_access_markets(
         market_items, pagination.offset
     )
     return response.json(
         {
             "as_of": as_of.isoformat(),
-            "scope": scope,
+            "scope": query.scope,
             "page": pagination.page,
             "page_size": pagination.limit,
             "limit": pagination.limit,

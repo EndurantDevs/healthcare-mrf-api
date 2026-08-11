@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from api import control_wave_linkage_route as linkage_routes
 from tests.test_ptg_wave_failure_controller_edges import (
     AsyncMock,
     BadRequest,
@@ -126,17 +127,17 @@ async def test_control_wave_routes_translate_admission_and_lookup(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_control_wave_routes_require_exact_linkage_payload(monkeypatch):
-    monkeypatch.setattr(routes, "require_control_auth", Mock())
+    monkeypatch.setattr(linkage_routes, "require_control_auth", Mock())
 
     with pytest.raises(BadRequest, match="only linkage_ack"):
-        await routes.control_record_import_wave_linkage(
+        await linkage_routes.control_record_import_wave_linkage(
             _Request(json={"linkage_ack": {}, "extra": True}), "wave-synthetic"
         )
 
     monkeypatch.setattr(
-        routes, "record_linkage_ack", AsyncMock(return_value="a" * 64)
+        linkage_routes, "record_linkage_ack", AsyncMock(return_value="a" * 64)
     )
-    response = await routes.control_record_import_wave_linkage(
+    response = await linkage_routes.control_record_import_wave_linkage(
         _Request(json={"linkage_ack": {"synthetic": True}}), "wave-synthetic"
     )
     assert response.status == 200

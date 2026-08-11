@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -24,6 +25,16 @@ def _patch_pointer_transaction(monkeypatch, authoritative_snapshot):
         source_pointers,
         "_locked_snapshot_publication_row",
         AsyncMock(return_value=authoritative_snapshot),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "mark_legacy_global_projection_dirty",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "drain_legacy_global_projection_queue",
+        AsyncMock(return_value=SimpleNamespace(reconciled=1)),
     )
     return session
 
@@ -135,6 +146,43 @@ async def test_global_pointer_rejects_candidates_and_publishes_legacy_rows(
     monkeypatch,
 ) -> None:
     """Reject candidate bypass while retaining the legacy global promotion path."""
+    await _assert_global_pointer_rejections(monkeypatch)
+    _patch_pointer_transaction(monkeypatch, {"manifest": {}})
+    bind_layout = AsyncMock()
+    publish_snapshot = AsyncMock()
+    reconcile_global = AsyncMock(return_value="reconciled")
+    monkeypatch.setattr(source_pointers, "bind_snapshot_to_shared_layout", bind_layout)
+    monkeypatch.setattr(
+        source_pointers,
+        "_publish_snapshot_in_pointer_transaction",
+        publish_snapshot,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "_attempt_global_snapshot_pointer_reconciliation",
+        reconcile_global,
+    )
+    attributes_by_name = {"snapshot_id": "legacy", "status": "published"}
+    promotion_by_field = await source_pointers._publish_ptg2_global_snapshot_pointer(
+        snapshot_attributes=attributes_by_name,
+        updated_at=dt.datetime(2026, 7, 24),
+        shared_snapshot_key=7,
+    )
+    assert promotion_by_field == {
+        "status": "promoted", "snapshot_id": "legacy",
+        "global_pointer": "reconciled",
+    }
+    bind_layout.assert_awaited_once()
+    publish_snapshot.assert_awaited_once()
+    reconcile_global.assert_awaited_once_with(
+        schema_name="tenant",
+        snapshot_id="legacy",
+        updated_at=dt.datetime(2026, 7, 24),
+    )
+
+
+async def _assert_global_pointer_rejections(monkeypatch) -> None:
+    """Reject missing identities and candidate bypass of source publication."""
 
     with pytest.raises(ValueError, match="snapshot id"):
         await source_pointers._publish_ptg2_global_snapshot_pointer(
@@ -156,37 +204,3 @@ async def test_global_pointer_rejects_candidates_and_publishes_legacy_rows(
             snapshot_attributes={"snapshot_id": "candidate"},
             updated_at=dt.datetime(2026, 7, 24),
         )
-
-    _patch_pointer_transaction(monkeypatch, {"manifest": {}})
-    bind_layout = AsyncMock()
-    publish_snapshot = AsyncMock()
-    reconcile_global = AsyncMock()
-    monkeypatch.setattr(
-        source_pointers,
-        "bind_snapshot_to_shared_layout",
-        bind_layout,
-    )
-    monkeypatch.setattr(
-        source_pointers,
-        "_publish_snapshot_in_pointer_transaction",
-        publish_snapshot,
-    )
-    monkeypatch.setattr(
-        source_pointers,
-        "_reconcile_global_snapshot_pointer",
-        reconcile_global,
-    )
-    attributes_by_name = {"snapshot_id": "legacy", "status": "published"}
-    promotion_by_field = await source_pointers._publish_ptg2_global_snapshot_pointer(
-        snapshot_attributes=attributes_by_name,
-        updated_at=dt.datetime(2026, 7, 24),
-        shared_snapshot_key=7,
-    )
-    assert promotion_by_field == {
-        "status": "promoted",
-        "snapshot_id": "legacy",
-        "global_pointer": "reconciled",
-    }
-    bind_layout.assert_awaited_once()
-    publish_snapshot.assert_awaited_once()
-    reconcile_global.assert_awaited_once()

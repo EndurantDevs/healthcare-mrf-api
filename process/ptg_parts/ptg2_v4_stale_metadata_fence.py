@@ -238,6 +238,15 @@ async def drop_attempt_stage_tables(
         return
     schema = _quote_ident(schema_name)
     async with database.transaction() as session:
+        statement = getattr(database, "text", text)
+        await _execute_statement(
+            session,
+            statement(
+                "SELECT set_config('lock_timeout', :lock_timeout, true), "
+                "set_config('statement_timeout', :statement_timeout, true)"
+            ),
+            {"lock_timeout": "100ms", "statement_timeout": "1s"},
+        )
         await lock_writable_snapshot(
             session,
             database,

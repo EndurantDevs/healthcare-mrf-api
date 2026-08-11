@@ -7,6 +7,7 @@ from sanic import response
 from sanic.exceptions import BadRequest, SanicException
 
 from api.control_auth import require_control_auth
+from process.ptg_parts.ptg2_lifecycle_lock import PTG2LifecycleLockDeferred
 from process.ptg_parts.ptg2_v4_stale_metadata_reconcile import (
     PTG2V4StaleMetadataConflict,
     plan_v4_stale_metadata,
@@ -52,6 +53,12 @@ async def control_v4_stale_execute(request):
                 payload_by_field.get("expected_plan_digest") or ""
             ),
         )
+    except PTG2LifecycleLockDeferred as exc:
+        raise SanicException(
+            str(exc),
+            status_code=503,
+            headers={"Retry-After": "1"},
+        ) from exc
     except PTG2V4StaleMetadataConflict as exc:
         raise SanicException(str(exc), status_code=409) from exc
     except ValueError as exc:

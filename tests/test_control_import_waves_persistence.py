@@ -10,157 +10,18 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from api import control_import_waves as waves
-from tests.test_control_import_waves import _KEY, _payload
-
-
-class _Result:
-    def __init__(self, *, rows=(), scalar=None, rowcount=1):
-        self.rows = list(rows)
-        self._scalar = scalar
-        self.rowcount = rowcount
-
-    def scalars(self):
-        return iter(self.rows)
-
-    def all(self):
-        return list(self.rows)
-
-    def scalar_one_or_none(self):
-        return self._scalar
-
-
-class _Session:
-    def __init__(self, *results):
-        self.results = list(results)
-        self.added = []
-        self.flush_count = 0
-        self.scalar_result = None
-
-    async def execute(self, _statement, _parameters=None):
-        assert self.results, "unexpected database execute"
-        return self.results.pop(0)
-
-    async def scalar(self, _statement, _parameters=None):
-        return self.scalar_result
-
-    def add(self, value):
-        self.added.append(value)
-
-    async def flush(self):
-        self.flush_count += 1
-
-
-class _Transaction:
-    def __init__(self, session):
-        self.session = session
-
-    async def __aenter__(self):
-        return self.session
-
-    async def __aexit__(self, exc_type, exc, traceback):
-        return False
-
-
-def _install_transaction(monkeypatch, session):
-    monkeypatch.setattr(waves.db, "transaction", lambda: _Transaction(session))
-
-
-def _request():
-    return {
-        "wave_id": "wave-unit",
-        "idempotency_key": "wave-key",
-        "request_digest": "1" * 64,
-        "attestation": {"signed": True},
-        "attestation_digest": "2" * 64,
-        "signature_digest": "3" * 64,
-        "wave_digest": "4" * 64,
-        "release_queue": "arq:PTGSmall:wave:" + "4" * 64,
-        "partition": {
-            "physical_coordinate_count": 1,
-            "physical_coordinate_digest": "5" * 64,
-            "partition_digest": "6" * 64,
-            "imported_coordinate_count": 1,
-            "imported_coordinate_digest": "7" * 64,
-            "reused_coordinate_count": 0,
-            "reused_coordinate_digest": "8" * 64,
-        },
-        "intents": [
-            {
-                "run_id": "run-unit",
-                "source_file_import_id": "source-unit",
-                "content_version": "v1",
-                "params": {"source_file_import_id": "source-unit"},
-            },
-        ],
-    }
-
-
-def _prepared():
-    return {
-        "ordinal": 0,
-        "run_id": "run-unit",
-        "source_id": "source-unit",
-        "content_version": "v1",
-        "job_id": "job-unit",
-        "run_key": "run-key",
-        "persisted_params": {"source_file_import_id": "source-unit"},
-        "job_payload": {"run_id": "run-unit"},
-        "serialized_job": b"job",
-        "serialized_job_digest": "9" * 64,
-        "run_values": {
-            "run_id": "run-unit",
-            "engine": "healthcare-mrf-api",
-            "importer": "ptg",
-            "family": "pricing",
-            "status": "queued",
-            "params": {},
-            "idempotency_key": "run-key",
-            "triggered_by": "api",
-            "source_file_import_id": "source-unit",
-        },
-    }
-
-
-def _wave_record(**overrides):
-    fields_by_field = {
-        "wave_id": "wave-unit",
-        "request_digest": "1" * 64,
-        "cohort_attestation_digest": "2" * 64,
-        "physical_coordinate_count": 1,
-        "physical_coordinate_digest": "5" * 64,
-        "imported_coordinate_count": 1,
-        "imported_coordinate_digest": "7" * 64,
-        "reused_coordinate_count": 0,
-        "reused_coordinate_digest": "8" * 64,
-        "partition_digest": "6" * 64,
-        "intent_count": 1,
-        "jobs_digest": "a" * 64,
-        "manifest_digest": "b" * 64,
-        "wave_digest": "4" * 64,
-        "enqueue_time_ms": 1234,
-        "state": "admitted",
-        "state_version": 1,
-        "queue": waves.QUEUE,
-        "release_queue": "arq:PTGSmall:wave:" + "4" * 64,
-        "worker_class": waves.WORKER_CLASS,
-        "resource_class": waves.RESOURCE_CLASS,
-        "worker_limit": waves.WORKER_LIMIT,
-        "protocol_identity": waves.PROTOCOL_IDENTITY,
-        "serializer_identity": waves.SERIALIZER_IDENTITY,
-        "kubernetes_job_uid": None,
-        "kubernetes_job_receipt_digest": None,
-        "kubernetes_ready_attestation_digest": None,
-        "redis_release_attestation_digest": None,
-        "outcomes_digest": None,
-        "linkage_ack_digest": None,
-        "terminal_evidence_digest": None,
-        "redis_cleanup_evidence_digest": None,
-        "kubernetes_delete_evidence_digest": None,
-        "cleanup_evidence_digest": None,
-        "resolved_at": None,
-    }
-    fields_by_field.update(overrides)
-    return types.SimpleNamespace(**fields_by_field)
+from tests.control_import_waves_test_support import (
+    KEY as _KEY,
+    QueryResult as _Result,
+    Session as _Session,
+    install_transaction as _install_transaction,
+    installed_v6_replay_session as _installed_v6_replay_session,
+    prepared_intent as _prepared,
+    request as _request,
+    signed_payload as _payload,
+    v6_payload as _v6_payload,
+    wave_record as _wave_record,
+)
 
 
 def test_job_and_run_identifiers_are_stable_and_domain_separated():
@@ -459,6 +320,96 @@ async def test_admission_replay_and_conflicts_are_immutable(monkeypatch):
     session.results = [_Result(rows=[existing, _wave_record(wave_id="other")])]
     with pytest.raises(waves.ImportWaveConflict, match="different immutable waves"):
         await waves.admit_import_wave({"signed": True})
+
+
+@pytest.mark.asyncio
+async def test_v6_replay_keeps_retired_epoch_but_new_admission_requires_active(
+    monkeypatch,
+):
+    retired_key_id = "receipt-retired"
+    existing = _wave_record(receipt_key_id=retired_key_id)
+    session = _Session(_Result(rows=[existing]))
+    request, _wave = _install_admission_dependencies(monkeypatch, session)
+    request["receipt_key_id"] = retired_key_id
+    request["receipt_public_modulus_hex"] = "8" + "0" * 510 + "1"
+    request["receipt_public_exponent"] = 65537
+    existing.receipt_public_modulus_hex = request[
+        "receipt_public_modulus_hex"
+    ]
+    existing.receipt_public_exponent = 65537
+    keyring = Mock()
+    keyring.require_active_public_material.side_effect = AssertionError(
+        "exact replay must not require the epoch to remain active"
+    )
+
+    response, created = await waves.admit_import_wave(
+        {"signed": True},
+        receipt_keyring=keyring,
+    )
+
+    assert response == {"wave_id": "wave-unit"}
+    assert created is False
+    keyring.require_active_public_material.assert_not_called()
+
+    session.results = [_Result(rows=[])]
+    from process.ptg_wave_receipt_authority import (
+        PTGWaveReceiptAuthorityError,
+    )
+
+    keyring.require_active_public_material.side_effect = (
+        PTGWaveReceiptAuthorityError(
+            "fresh admission must pin the active receipt key epoch"
+        )
+    )
+    with pytest.raises(PTGWaveReceiptAuthorityError, match="active receipt key"):
+        await waves.admit_import_wave(
+            {"signed": True},
+            receipt_keyring=keyring,
+        )
+    waves.persist_admission_recoveries.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_v6_exact_replay_survives_control_token_rotation(monkeypatch):
+    """Prove exact V6 replay is independent of control-token rotation."""
+    wave_request_by_field, existing, session = _installed_v6_replay_session(
+        monkeypatch
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_CONTROL_API_TOKEN",
+        "token-b-after-v6-admission",
+    )
+    monkeypatch.setattr(waves, "acquire_ptg_admission_lock", AsyncMock())
+    replay_allowed = AsyncMock()
+    monkeypatch.setattr(
+        waves,
+        "require_materialized_preclaim_replay_allowed",
+        replay_allowed,
+    )
+    monkeypatch.setattr(
+        waves,
+        "_wave_response",
+        Mock(return_value={"wave_id": existing.wave_id}),
+    )
+    keyring = Mock()
+    keyring.require_active_for_admission.side_effect = AssertionError(
+        "an exact replay must not become a new receipt-key admission"
+    )
+    response, created = await waves.admit_import_wave(
+        copy.deepcopy(wave_request_by_field),
+        receipt_keyring=keyring,
+    )
+    assert created is False
+    assert response == {"wave_id": existing.wave_id}
+    replay_allowed.assert_awaited_once_with(session, existing.wave_id)
+    keyring.require_active_for_admission.assert_not_called()
+    session.results = [_Result(rows=[])]
+    with pytest.raises(ValueError, match="signature is invalid"):
+        await waves.admit_import_wave(
+            copy.deepcopy(wave_request_by_field),
+            receipt_keyring=keyring,
+        )
+    keyring.require_active_for_admission.assert_not_called()
 
 
 @pytest.mark.asyncio

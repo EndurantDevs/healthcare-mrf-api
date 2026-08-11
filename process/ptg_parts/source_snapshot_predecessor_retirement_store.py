@@ -4,10 +4,16 @@
 from __future__ import annotations
 
 import datetime
+import logging
 from typing import Any, Mapping
 
 from db.connection import db
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    PTG2LifecycleLockDeferred,
+    acquire_ptg2_source_lifecycle_lock,
+    is_retryable_lifecycle_database_error,
+)
 from process.ptg_parts.source_snapshot_predecessor_retirement_types import (
     PTG2PredecessorRetirementConflict,
     PredecessorRetirementContext,
@@ -29,6 +35,10 @@ from process.ptg_parts.source_snapshot_rollback_types import (
 
 
 _LOCK_CONTENTION_SQLSTATES = frozenset({"40P01", "55P03"})
+_GLOBAL_POINTER_LOCK_IDENTITY = "legacy_global_snapshot_pointer"
+_GLOBAL_POINTER_LOCK_TIMEOUT = "50ms"
+_GLOBAL_POINTER_STATEMENT_TIMEOUT = "500ms"
+logger = logging.getLogger(__name__)
 
 
 def _schema_sql(template: str, schema: str) -> str:
@@ -149,14 +159,20 @@ async def load_retirement_context(
         raise PTG2PredecessorRetirementConflict(
             "predecessor retirement is contending with a release update; retry"
         ) from exc
+    source_query_templates = tuple(
+        query_template
+        for query_template in MRF_CONTEXT_QUERY_TEMPLATES
+        if query_template[0] != "global_pointer_records"
+    )
     context_records_by_surface.update(
         await _load_context_surfaces(
             session,
             schema,
-            MRF_CONTEXT_QUERY_TEMPLATES,
+            source_query_templates,
             pair_params_by_name,
         )
     )
+    context_records_by_surface["global_pointer_records"] = ()
     return PredecessorRetirementContext(**context_records_by_surface)
 
 
@@ -223,8 +239,6 @@ async def apply_predecessor_retirement(
         params_by_name,
         expected_count=decision.plan_pointer_count,
     )
-    if decision.global_pointer_count:
-        await _clear_global_predecessor(session, schema, params_by_name)
     if decision.deleted_rollback_pin_count:
         await _delete_exact_rollback_pin(session, schema, params_by_name)
 
@@ -257,19 +271,6 @@ async def _clear_plan_predecessors(
         conflict_message=(
             "source plan pointers changed during predecessor retirement"
         ),
-    )
-
-
-async def _clear_global_predecessor(
-    session: Any,
-    schema: str,
-    params_by_name: Mapping[str, Any],
-) -> None:
-    await _require_one_changed(
-        session,
-        _schema_sql(GLOBAL_POINTER_UPDATE, schema),
-        params_by_name,
-        conflict_message="global pointer changed during predecessor retirement",
     )
 
 
@@ -310,7 +311,6 @@ async def postcheck_predecessor_retirement(
         request.audit_coordinates(),
     )
     reference_fields = (
-        "global_references",
         "source_references",
         "plan_references",
         "pin_references",
@@ -333,6 +333,44 @@ async def postcheck_predecessor_retirement(
         raise PTG2PredecessorRetirementConflict(
             "current snapshot or immutable snapshot lineage changed"
         )
+
+
+async def attempt_legacy_global_predecessor_clear(
+    *,
+    schema_name: str,
+    request: PredecessorRetirementRequest,
+) -> str:
+    """Best-effort legacy singleton cleanup after source retirement commits."""
+
+    try:
+        async with db.transaction() as session:
+            await acquire_ptg2_source_lifecycle_lock(
+                session,
+                source_key=_GLOBAL_POINTER_LOCK_IDENTITY,
+                lock_timeout=_GLOBAL_POINTER_LOCK_TIMEOUT,
+                statement_timeout=_GLOBAL_POINTER_STATEMENT_TIMEOUT,
+            )
+            compatibility_result = await session.execute(
+                db.text(
+                    _schema_sql(
+                        GLOBAL_POINTER_UPDATE,
+                        _quote_ident(schema_name),
+                    )
+                ),
+                request.audit_coordinates(),
+            )
+            has_cleared_pointer = compatibility_result.one_or_none() is not None
+    except Exception as exc:
+        if not isinstance(exc, PTG2LifecycleLockDeferred) and not (
+            is_retryable_lifecycle_database_error(exc)
+        ):
+            logger.warning(
+                "Deferred legacy PTG global predecessor cleanup for %s: %s",
+                request.predecessor_snapshot_id,
+                exc,
+            )
+        return "deferred"
+    return "cleared" if has_cleared_pointer else "unchanged"
 
 
 async def database_utc_timestamp(session: Any) -> datetime.datetime:
@@ -402,6 +440,7 @@ async def insert_retirement_audit(
 
 __all__ = [
     "apply_predecessor_retirement",
+    "attempt_legacy_global_predecessor_clear",
     "insert_retirement_audit",
     "load_retirement_audit",
     "load_retirement_context",

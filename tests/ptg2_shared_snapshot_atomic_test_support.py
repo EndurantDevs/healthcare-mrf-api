@@ -185,6 +185,7 @@ def _install_atomic_source_transaction_mocks(monkeypatch, atomic_fixture) -> Non
         "_copy_binary_file_to_stage": AsyncMock(),
         "stage_tax_identity_source_projection": atomic_fixture.stage_source,
         "lock_v4_shared_layout_for_map_write": atomic_fixture.lock_physical_layout,
+        "prepare_v4_cas_block_stage": AsyncMock(),
         "_publish_v4_cas_in_session": AsyncMock(return_value=object()),
         "stage_v4_inferred_taxonomy_compiler_copy": AsyncMock(
             return_value=SimpleNamespace(table_name="taxonomy-stage")

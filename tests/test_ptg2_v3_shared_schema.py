@@ -153,7 +153,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "20260811140000_address_premise_grouping"
+        "20260811140000_ptg_v12_provider_publication_merge"
     ]
 
 

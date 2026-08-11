@@ -396,6 +396,7 @@ def _initialized_capacity_evidence_app(monkeypatch) -> Sanic:
 
     import api as api_package
     from api import control as control_api
+    from api import control_wave_routes
     from api.endpoint import pricing
 
     async def fake_search(_session, _args, pagination):
@@ -418,6 +419,9 @@ def _initialized_capacity_evidence_app(monkeypatch) -> Sanic:
     async def skip_control_schema_ensure():
         return None
 
+    async def skip_receipt_key_coverage(*, keyring=None):
+        del keyring
+
     process_identity = _install_fresh_process_identity(monkeypatch)
     process_identity.started_at = datetime.now(timezone.utc).replace(microsecond=0)
     for environment_name, environment_value in SIGNING_ENV.items():
@@ -427,6 +431,11 @@ def _initialized_capacity_evidence_app(monkeypatch) -> Sanic:
         control_api,
         "ensure_import_run_table",
         skip_control_schema_ensure,
+    )
+    monkeypatch.setattr(
+        control_wave_routes,
+        "assert_nonterminal_receipt_key_coverage",
+        skip_receipt_key_coverage,
     )
     monkeypatch.setattr(pricing, "search_current_ptg2_index", fake_search)
 

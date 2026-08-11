@@ -1404,46 +1404,17 @@ async def _has_zip_restore_dependencies(session: Any, schema: str) -> bool:
     return tiger_zcta and geo_zip_lookup
 
 
-def _zip_restore_sql(
-    *,
-    schema: str,
-    staging_table: str,
-    zip_column: str,
-    latitude_column: str,
-    longitude_column: str,
+def _zip_restore_match_ctes_sql(
+    qschema: str,
+    qtable: str,
+    qlat: str,
+    qlon: str,
     state_expr: str,
     country_expr: str,
-    shards: int,
-    has_address_key: bool,
-    only_null_address_key: bool,
+    source_where: str,
 ) -> str:
-    """Build the state-checked coordinate-to-ZIP restoration statement."""
-    qschema = _quote_ident(schema)
-    qtable = _qtable(schema, staging_table)
-    qzip = _quote_ident(zip_column)
-    qlat = _quote_ident(latitude_column)
-    qlon = _quote_ident(longitude_column)
-    source_filters = [
-        f"NULLIF(trim(COALESCE(s.{qzip}::text, '')), '') IS NULL",
-        f"s.{qlat} IS NOT NULL",
-        f"s.{qlon} IS NOT NULL",
-        f"s.{qlat}::double precision BETWEEN -90 AND 90",
-        f"s.{qlon}::double precision BETWEEN -180 AND 180",
-    ]
-    if has_address_key and only_null_address_key:
-        source_filters.append("s.address_key IS NULL")
-    if shards > 1:
-        source_filters.append("mod(abs(hashtext(s.ctid::text)::bigint), :shards) = :shard")
-    source_where = "\n              AND ".join(source_filters)
-    target_filters = [
-        f"NULLIF(trim(COALESCE(target.{qzip}::text, '')), '') IS NULL",
-    ]
-    if has_address_key and only_null_address_key:
-        target_filters.append("target.address_key IS NULL")
-    target_where = "\n                   AND ".join(target_filters)
-
-    return f"""
-        WITH source_rows AS MATERIALIZED (
+    """Build the source, normalization, and match CTEs for ZIP restoration."""
+    return f"""source_rows AS MATERIALIZED (
             SELECT
                 s.ctid AS source_ctid,
                 {state_expr} AS raw_state,
@@ -1478,6 +1449,55 @@ def _zip_restore_sql(
              WHERE normalized.country_code = 'US'
                AND normalized.state_code IS NOT NULL
         ),
+"""
+
+
+def _zip_restore_sql(
+    *,
+    schema: str,
+    staging_table: str,
+    zip_column: str,
+    latitude_column: str,
+    longitude_column: str,
+    state_expr: str,
+    country_expr: str,
+    shards: int,
+    has_address_key: bool,
+    only_null_address_key: bool,
+) -> str:
+    """Build the state-checked coordinate-to-ZIP restoration statement."""
+    qschema = _quote_ident(schema)
+    qtable = _qtable(schema, staging_table)
+    qzip = _quote_ident(zip_column)
+    qlat = _quote_ident(latitude_column)
+    qlon = _quote_ident(longitude_column)
+    source_filters = [
+        f"NULLIF(trim(COALESCE(s.{qzip}::text, '')), '') IS NULL",
+        f"s.{qlat} IS NOT NULL",
+        f"s.{qlon} IS NOT NULL",
+        f"s.{qlat}::double precision BETWEEN -90 AND 90",
+        f"s.{qlon}::double precision BETWEEN -180 AND 180",
+    ]
+    if has_address_key and only_null_address_key:
+        source_filters.append("s.address_key IS NULL")
+    if shards > 1:
+        source_filters.append("mod(abs(hashtext(s.ctid::text)::bigint), :shards) = :shard")
+    source_where = "\n              AND ".join(source_filters)
+    target_filters = [f"NULLIF(trim(COALESCE(target.{qzip}::text, '')), '') IS NULL"]
+    if has_address_key and only_null_address_key:
+        target_filters.append("target.address_key IS NULL")
+    target_where = "\n                   AND ".join(target_filters)
+    match_ctes_sql = _zip_restore_match_ctes_sql(
+        qschema,
+        qtable,
+        qlat,
+        qlon,
+        state_expr,
+        country_expr,
+        source_where,
+    )
+    return f"""
+        WITH {match_ctes_sql}
         unique_matches AS (
             SELECT source_ctid, min(zip5) AS zip5
               FROM matches

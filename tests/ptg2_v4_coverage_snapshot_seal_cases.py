@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 from tests.ptg2_v4_coverage_support import (
     PTG2_V3_SHARED_FORMAT_VERSION,
     _Result,
@@ -198,6 +200,7 @@ async def _assert_persisted_metadata_summary(
 
 
 async def _assert_new_layout_seal(monkeypatch, expected_summary):
+    """Verify a fresh V4 layout seals with exact coverage metadata."""
     owner_by_field = {
         "snapshot_key": 17,
         "root_state": "building",
@@ -206,28 +209,11 @@ async def _assert_new_layout_seal(monkeypatch, expected_summary):
         "representation": "pattern_v1",
         "projection_id_scope": snapshot_maps.PTG2_V4_PROJECTION_ID_SCOPE,
     }
-
-    async def fake_summarize_maps(*_args, **_kwargs):
-        return expected_summary
-
-    async def fake_summarize_metadata(*_args, **_kwargs):
-        return _metadata()
-
-    monkeypatch.setattr(
-        snapshot_maps,
-        "summarize_persisted_v4_snapshot_maps",
-        fake_summarize_maps,
-    )
-    monkeypatch.setattr(
-        snapshot_maps,
-        "summarize_persisted_v4_snapshot_metadata",
-        fake_summarize_metadata,
-    )
+    _install_new_layout_seal_mocks(monkeypatch, expected_summary)
     new_session = _ScriptedSession(
         _Result(rows=(owner_by_field,)),
         _Result(rows=((None, None, None),)),
         _Result(scalar=17),
-        _Result(),
         _Result(),
         _Result(scalar=17),
     )
@@ -249,6 +235,51 @@ async def _assert_new_layout_seal(monkeypatch, expected_summary):
     )
     assert (sealed.snapshot_key, sealed.reused) == (17, False)
     return owner_by_field
+
+
+def _install_new_layout_seal_mocks(monkeypatch, expected_summary) -> None:
+    """Install exact V4 summary and short-seal dependencies."""
+
+    async def fake_summarize_maps(*_args, **_kwargs):
+        return expected_summary
+
+    async def fake_summarize_metadata(*_args, **_kwargs):
+        return _metadata()
+
+    monkeypatch.setattr(
+        snapshot_maps,
+        "summarize_persisted_v4_snapshot_maps",
+        fake_summarize_maps,
+    )
+    monkeypatch.setattr(
+        snapshot_maps,
+        "summarize_persisted_v4_snapshot_metadata",
+        fake_summarize_metadata,
+    )
+    monkeypatch.setattr(
+        snapshot_maps,
+        "acquire_ptg2_source_lifecycle_lock",
+        AsyncMock(return_value="layout_token"),
+    )
+    monkeypatch.setattr(
+        snapshot_maps,
+        "acquire_layout_digest_lock",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        snapshot_maps,
+        "publish_layout_fingerprint",
+        AsyncMock(
+            side_effect=lambda *_args, **kwargs: kwargs[
+                "canonical_snapshot_key"
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        snapshot_maps,
+        "delete_layout_build_candidate",
+        AsyncMock(),
+    )
 
 
 def _reusable_layout_row(expected_summary):
@@ -295,19 +326,27 @@ async def _assert_reused_layout_seal(
     owner_by_field,
 ) -> None:
     reusable_layout_by_field = _reusable_layout_row(expected_summary)
-    deleted_snapshot_keys: list[int] = []
+    deferred_cleanup_pairs: list[tuple[int, int]] = []
 
-    async def fake_delete(_session, *, snapshot_key: int, **_kwargs):
-        deleted_snapshot_keys.append(snapshot_key)
+    async def fake_cleanup(
+        _session,
+        *,
+        snapshot_key: int,
+        canonical_snapshot_key: int,
+        **_kwargs,
+    ):
+        deferred_cleanup_pairs.append((snapshot_key, canonical_snapshot_key))
 
-    monkeypatch.setattr(snapshot_maps, "delete_shared_layout_dense_rows", fake_delete)
+    monkeypatch.setattr(
+        snapshot_maps,
+        "mark_layout_build_candidate_cleanup_pending",
+        fake_cleanup,
+    )
     reused_session = _ScriptedSession(
         _Result(rows=(owner_by_field,)),
         _Result(rows=((None, None, None),)),
         _Result(scalar=17),
-        _Result(),
         _Result(rows=(reusable_layout_by_field,)),
-        _Result(),
         _Result(),
         _Result(scalar=17),
     )
@@ -328,7 +367,7 @@ async def _assert_reused_layout_seal(
         },
     )
     assert (reused.snapshot_key, reused.reused) == (18, True)
-    assert deleted_snapshot_keys == [17]
+    assert deferred_cleanup_pairs == [(17, 18)]
     with pytest.raises(ValueError, match="support digest"):
         await snapshot_maps.seal_v4_shared_layout(
             object(),

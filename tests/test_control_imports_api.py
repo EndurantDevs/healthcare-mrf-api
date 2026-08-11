@@ -14,7 +14,7 @@ import pytest
 import sqlalchemy as sa
 from arq.jobs import serialize_job as arq_serialize_job
 from sqlalchemy.exc import IntegrityError
-from sanic.exceptions import Forbidden
+from sanic.exceptions import Forbidden, SanicException
 from sanic.exceptions import BadRequest, NotFound
 
 from db.models import ImportRun
@@ -945,6 +945,21 @@ def test_control_error_payload_uses_contract_shape():
     }
     assert missing_payload["error"]["code"] == "not_found"
     assert missing_payload["error"]["request_id"] == "req_control_1"
+
+
+@pytest.mark.asyncio
+async def test_control_error_preserves_retry_headers():
+    request = types.SimpleNamespace(headers={}, id="retry_request")
+    error = SanicException(
+        "busy; retry",
+        status_code=503,
+        headers={"Retry-After": "1"},
+    )
+
+    route_response = await control.control_error(request, error)
+
+    assert route_response.status == 503
+    assert route_response.headers.get("Retry-After") == "1"
 
 
 @pytest.mark.asyncio

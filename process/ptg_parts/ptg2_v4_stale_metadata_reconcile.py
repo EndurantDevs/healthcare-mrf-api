@@ -8,7 +8,10 @@ import re
 from typing import Any, Mapping
 
 from db.connection import db
-from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_source_lifecycle_lock,
+    ptg2_lifecycle_transaction,
+)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_snapshot_maps import PTG2_V4_SHARED_GENERATION
 from process.ptg_parts.ptg2_v4_stale_metadata_authority import (
@@ -155,7 +158,10 @@ async def _lock_stale_target(
 ) -> None:
     """Serialize the lifecycle before loading the existing reviewed fence."""
 
-    await acquire_ptg2_lifecycle_lock(session)
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=f"snapshot_{request.snapshot_id}",
+    )
     await session.execute(
         db.text(
             "SELECT pg_advisory_xact_lock("
@@ -262,7 +268,12 @@ async def reconcile_v4_stale_metadata(
         internal_run_id=internal_run_id,
         expected_plan_digest=expected_plan_digest,
     )
-    async with db.transaction() as session:
+    async with ptg2_lifecycle_transaction(
+        db,
+        busy_message=(
+            "PTG V4 stale-metadata lifecycle transaction is busy; retry"
+        ),
+    ) as session:
         marker_by_field, is_idempotent = await _reconcile_locked(
             session,
             request,

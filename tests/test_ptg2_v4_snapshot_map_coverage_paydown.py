@@ -408,20 +408,25 @@ async def test_seal_database_compare_and_swap_failures(monkeypatch) -> None:
             summary=_summary(),
             metadata=_metadata(),
         )
+    cleanup_pending = AsyncMock()
     monkeypatch.setattr(
         snapshot_maps,
-        "delete_shared_layout_dense_rows",
-        AsyncMock(),
+        "mark_layout_build_candidate_cleanup_pending",
+        cleanup_pending,
     )
-    with pytest.raises(RuntimeError, match="duplicate build changed"):
-        await snapshot_maps._discard_duplicate_v4_layout(
-            _ScriptedSession(_Result(), _Result(scalar=None)),
-            schema_name="mrf",
-            schema='"mrf"',
-            snapshot_key=1,
-            build_token="token",
-            reusable_snapshot_key=2,
-        )
+    session = object()
+    await snapshot_maps._defer_duplicate_v4_cleanup(
+        session,
+        schema_name="mrf",
+        snapshot_key=1,
+        canonical_snapshot_key=2,
+    )
+    cleanup_pending.assert_awaited_once_with(
+        session,
+        schema_name="mrf",
+        snapshot_key=1,
+        canonical_snapshot_key=2,
+    )
     with pytest.raises(RuntimeError, match="expected building generation"):
         await snapshot_maps._seal_new_v4_layout(
             _ScriptedSession(_Result(scalar=None)),

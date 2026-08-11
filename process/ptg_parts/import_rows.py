@@ -203,6 +203,18 @@ def _combine_provider_set_entries(
             ),
         }
         return single_provider_entry_by_field, provider_row_by_field
+    return _combine_multiple_provider_set_entries(
+        file_id=file_id,
+        clean_entries=clean_entries,
+        network_names=network_names,
+    )
+
+
+def _combine_multiple_provider_set_entries(
+    *, file_id: int, clean_entries: list[dict[str, Any]],
+    network_names: list[str] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Combine multiple normalized provider-set entries without I/O."""
     entry_hashes = sorted(
         {int(provider_entry["__hash__"]) for provider_entry in clean_entries}
     )

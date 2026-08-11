@@ -62,7 +62,10 @@ async def test_terminal_retry_rejects_an_inexact_attempt(snapshot_fields, messag
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("terminal_row", [None, ("run-one",)])
+@pytest.mark.parametrize(
+    "terminal_row",
+    [None, {"import_run_id": "run-one", "options": {}}],
+)
 async def test_terminal_retry_requires_a_terminal_row_before_stage_drop(
     monkeypatch,
     terminal_row,

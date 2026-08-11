@@ -299,7 +299,9 @@ async def test_direct_engine_binding_precedes_snapshot_lookup(monkeypatch):
         protected_control_payload()
     )
     monkeypatch.setattr(ptg, "ensure_database", harness.ensure_database)
-    monkeypatch.setattr(ptg, "ensure_ptg2_tables", harness.ensure_tables)
+    monkeypatch.setattr(
+        ptg, "require_ptg2_runtime_schema_ready", harness.ensure_tables
+    )
     monkeypatch.setattr(
         ptg,
         "_ptg2_source_import_lock",
@@ -356,7 +358,9 @@ async def test_anonymous_import_skips_frozen_binding_store(monkeypatch):
 
     harness = _DirectEngineOrderHarness()
     monkeypatch.setattr(ptg, "ensure_database", harness.ensure_database)
-    monkeypatch.setattr(ptg, "ensure_ptg2_tables", harness.ensure_tables)
+    monkeypatch.setattr(
+        ptg, "require_ptg2_runtime_schema_ready", harness.ensure_tables
+    )
     monkeypatch.setattr(
         ptg,
         "_ptg2_source_import_lock",
@@ -400,7 +404,9 @@ async def test_markerless_control_import_checks_frozen_binding_store(
         expected_import_run_id="ptg2:markerless_import",
     )
     monkeypatch.setattr(ptg, "ensure_database", harness.ensure_database)
-    monkeypatch.setattr(ptg, "ensure_ptg2_tables", harness.ensure_tables)
+    monkeypatch.setattr(
+        ptg, "require_ptg2_runtime_schema_ready", harness.ensure_tables
+    )
     monkeypatch.setattr(
         ptg,
         "_ptg2_source_import_lock",

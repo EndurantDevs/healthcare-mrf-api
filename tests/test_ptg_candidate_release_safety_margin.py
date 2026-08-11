@@ -155,7 +155,11 @@ async def test_held_attestation_loader_returns_public_digest_projection(
     }
     monkeypatch.setattr(attestation.db, "transaction", lambda: _Transaction(session))
     lifecycle_lock = AsyncMock()
-    monkeypatch.setattr(attestation, "acquire_ptg2_lifecycle_lock", lifecycle_lock)
+    monkeypatch.setattr(
+        attestation,
+        "acquire_ptg2_source_lifecycle_lock",
+        lifecycle_lock,
+    )
     monkeypatch.setattr(
         attestation,
         "_locked_candidate_identity",
@@ -190,7 +194,7 @@ async def test_held_attestation_loader_returns_public_digest_projection(
         "attested_at": attested_at.isoformat(),
         "expires_at": expires_at.isoformat(),
     }
-    lifecycle_lock.assert_awaited_once_with(session)
+    lifecycle_lock.assert_awaited_once_with(session, source_key="source_a")
     assert loader.await_args.kwargs["allow_expired"] is True
 
 
@@ -200,7 +204,11 @@ async def test_held_attestation_loader_rejects_identity_drift_and_expiry(
 ):
     session = object()
     monkeypatch.setattr(attestation.db, "transaction", lambda: _Transaction(session))
-    monkeypatch.setattr(attestation, "acquire_ptg2_lifecycle_lock", AsyncMock())
+    monkeypatch.setattr(
+        attestation,
+        "acquire_ptg2_source_lifecycle_lock",
+        AsyncMock(),
+    )
     identity_loader = AsyncMock(
         return_value={
             "source_key": "changed",

@@ -349,6 +349,60 @@ def _owner_row(
     }
 
 
+def configure_publication_spies(monkeypatch):
+    """Install deterministic spies for bounded dictionary publication."""
+    lock_calls: list[tuple[int, str]] = []
+    batches: list[tuple[str, tuple[int, ...]]] = []
+
+    async def fake_lock(
+        _session,
+        *,
+        snapshot_key: int,
+        build_token: str,
+        **_kwargs,
+    ):
+        lock_calls.append((snapshot_key, build_token))
+
+    async def fake_npi_batch(_session, *, npi_rows, **_kwargs):
+        batches.append(("npi", tuple(row["npi_key"] for row in npi_rows)))
+
+    async def fake_component_batch(_session, *, component_rows, **_kwargs):
+        component_keys = tuple(
+            row["component_key"] for row in component_rows
+        )
+        batches.append(("component", component_keys))
+
+    async def fake_pattern_batch(_session, *, pattern_rows, **_kwargs):
+        pattern_keys = tuple(row["pattern_key"] for row in pattern_rows)
+        batches.append(("pattern", pattern_keys))
+
+    async def fake_dense(_session, *, expected_count: int, **_kwargs):
+        return expected_count
+
+    monkeypatch.setattr(
+        snapshot_maps,
+        "lock_v4_shared_layout_for_map_write",
+        fake_lock,
+    )
+    monkeypatch.setattr(
+        snapshot_maps,
+        "_publish_v4_npi_batch",
+        fake_npi_batch,
+    )
+    monkeypatch.setattr(
+        snapshot_maps,
+        "_publish_v4_component_batch",
+        fake_component_batch,
+    )
+    monkeypatch.setattr(
+        snapshot_maps,
+        "_publish_v4_pattern_batch",
+        fake_pattern_batch,
+    )
+    monkeypatch.setattr(snapshot_maps, "_verify_dense_table_keys", fake_dense)
+    return fake_lock, lock_calls, batches
+
+
 __all__ = [
     "Any",
     "AuditCandidate",
@@ -369,6 +423,7 @@ __all__ = [
     "_relation_row",
     "_summary",
     "assert_snapshot_manifest_builder_rejections",
+    "configure_publication_spies",
     "snapshot_manifest_fixture",
     "synthetic_adaptive_layout_decision",
     "asynccontextmanager",

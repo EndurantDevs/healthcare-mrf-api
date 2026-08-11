@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -12,81 +11,19 @@ import pytest
 from process.ptg_parts import ptg2_legacy_v3_metadata_contract as contract
 from process.ptg_parts import ptg2_legacy_v3_metadata_reconcile as reconcile
 from process.ptg_parts import ptg2_legacy_v3_metadata_store as store
-
-
-_SNAPSHOT_ID = "ptg2:202607:coverage"
-_INTERNAL_RUN_ID = "ptg2:coverage-run"
-_OUTER_RUN_ID = "run_coverage"
-_SOURCE_IMPORT_ID = "source-import-coverage"
-_DIGEST = "a" * 64
-
-class _QueryResult:
-    def __init__(self, *, scalar=None, rowcount: int = 1) -> None:
-        self._scalar = scalar
-        self.rowcount = rowcount
-
-    def scalar_one_or_none(self):
-        return self._scalar
-
-class _Session:
-    def __init__(self, *responses: _QueryResult) -> None:
-        self.responses = list(responses)
-        self.calls: list[tuple[str, dict | None]] = []
-
-    async def execute(self, statement, parameters=None):
-        self.calls.append((str(statement), parameters))
-        if self.responses:
-            return self.responses.pop(0)
-        return _QueryResult()
-
-class _Transaction:
-    def __init__(self, session: _Session) -> None:
-        self.session = session
-
-    async def __aenter__(self):
-        return self.session
-
-    async def __aexit__(self, exc_type, exc, traceback):
-        return False
-
-def _database(session: _Session):
-    return SimpleNamespace(transaction=lambda: _Transaction(session))
-
-def _coordinates() -> reconcile._ReconcileCoordinates:
-    return reconcile._ReconcileCoordinates(
-        snapshot_id=_SNAPSHOT_ID,
-        internal_run_id=_INTERNAL_RUN_ID,
-        outer_run_id=_OUTER_RUN_ID,
-    )
-
-def _ready_plan() -> dict[str, object]:
-    return {
-        "status": "ready",
-        "reason_codes": [],
-        "target_digest": "b" * 64,
-        "plan_digest": _DIGEST,
-        "attachment_digest": "c" * 64,
-        "catalog_digest": "d" * 64,
-        "event_high_water_mark": "7",
-        "retained_state_digest": "e" * 64,
-        "preserved_row_digest": "f" * 64,
-    }
-
-def _reconcile_write() -> store.LegacyV3ReconcileWrite:
-    return store.LegacyV3ReconcileWrite(
-        schema_name="mrf",
-        snapshot_id=_SNAPSHOT_ID,
-        internal_run_id=_INTERNAL_RUN_ID,
-        source_file_import_id=_SOURCE_IMPORT_ID,
-        outer_run_id=_OUTER_RUN_ID,
-        target_digest="b" * 64,
-        plan_digest=_DIGEST,
-        attachment_digest="c" * 64,
-        catalog_digest="d" * 64,
-        event_high_water_mark=7,
-        reconciliation_id="e" * 64,
-        marker={"observed_at": dt.datetime(2026, 8, 1, tzinfo=dt.UTC)},
-    )
+from tests.ptg2_legacy_v3_coverage_contract_support import (
+    DIGEST as _DIGEST,
+    INTERNAL_RUN_ID as _INTERNAL_RUN_ID,
+    OUTER_RUN_ID as _OUTER_RUN_ID,
+    SNAPSHOT_ID as _SNAPSHOT_ID,
+    SOURCE_IMPORT_ID as _SOURCE_IMPORT_ID,
+    QueryResult as _QueryResult,
+    Session as _Session,
+    coordinates as _coordinates,
+    database as _database,
+    ready_plan as _ready_plan,
+    reconcile_write as _reconcile_write,
+)
 
 def test_contract_payload_timestamp_and_stale_age_edges() -> None:
     assert contract._payload(None) == {}
@@ -292,7 +229,11 @@ async def test_reconcile_lock_target_uses_both_durable_locks(monkeypatch) -> Non
     session = _Session(_QueryResult(scalar=_SOURCE_IMPORT_ID), _QueryResult(), _QueryResult())
     lifecycle_lock = AsyncMock()
     relation_lock = AsyncMock()
-    monkeypatch.setattr(reconcile, "acquire_ptg2_lifecycle_lock", lifecycle_lock)
+    monkeypatch.setattr(
+        reconcile,
+        "acquire_ptg2_source_lifecycle_lock",
+        lifecycle_lock,
+    )
     monkeypatch.setattr(reconcile, "lock_legacy_v3_reconcile_relations", relation_lock)
     monkeypatch.setenv(reconcile._ATTEMPT_AUTHORITY_SCHEMA_ENV, "source_authority")
     source_import_id = await reconcile._lock_reconcile_target(
@@ -306,7 +247,10 @@ async def test_reconcile_lock_target_uses_both_durable_locks(monkeypatch) -> Non
     assert len(session.calls) == 3
     assert session.calls[1][1]["lock_key"].endswith(_SOURCE_IMPORT_ID)
     assert session.calls[2][1]["pair_lock_key"].startswith(reconcile._PAIR_LOCK_NAMESPACE)
-    lifecycle_lock.assert_awaited_once_with(session)
+    lifecycle_lock.assert_awaited_once_with(
+        session,
+        source_key=_SOURCE_IMPORT_ID,
+    )
     assert relation_lock.await_args.kwargs["control_schema_name"] == "source_authority"
 
 

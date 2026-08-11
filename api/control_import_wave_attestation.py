@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -17,6 +18,7 @@ ROLLBACK_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v4"
 MATERIALIZED_PRECLAIM_ATTESTATION_VERSION = (
     "healthporta.ptg-import-wave-attestation.v5"
 )
+RECEIPT_ATTESTATION_VERSION = "healthporta.ptg-import-wave-attestation.v6"
 _ATTESTATION_DOMAINS = {
     LEGACY_ATTESTATION_VERSION: (
         b"healthporta.ptg-import-wave-attestation.v1\0"
@@ -30,6 +32,9 @@ _ATTESTATION_DOMAINS = {
     ),
     MATERIALIZED_PRECLAIM_ATTESTATION_VERSION: (
         b"healthporta.ptg-import-wave-attestation.v5\0"
+    ),
+    RECEIPT_ATTESTATION_VERSION: (
+        b"healthporta.ptg-import-wave-attestation.v6\0"
     ),
 }
 AUTHORIZATION_BASIS = (
@@ -109,11 +114,11 @@ def sign_cohort_attestation(
     ).hexdigest()
 
 
-def _verify_attestation(
+def _validate_attestation_envelope(
     attestation: object,
-    *,
-    attestation_key: str | bytes | None,
 ) -> dict[str, Any]:
+    """Validate exact fields without reauthenticating persisted history."""
+
     if not isinstance(attestation, dict):
         raise ValueError("cohort_attestation must be an object")
     schema_version = attestation.get("schema_version")
@@ -130,6 +135,14 @@ def _verify_attestation(
         expected_attestation_fields.add("admission_rollback_supersession")
     if schema_version == MATERIALIZED_PRECLAIM_ATTESTATION_VERSION:
         expected_attestation_fields.add("materialized_preclaim_supersession")
+    if schema_version == RECEIPT_ATTESTATION_VERSION:
+        expected_attestation_fields.update(
+            {
+                "receipt_key_id",
+                "receipt_public_modulus_hex",
+                "receipt_public_exponent",
+            }
+        )
     if set(attestation) != expected_attestation_fields:
         raise ValueError("cohort_attestation fields are not exact")
     if (
@@ -143,13 +156,56 @@ def _verify_attestation(
         for key, field_value in attestation.items()
         if key != "signature"
     }
+    if schema_version == RECEIPT_ATTESTATION_VERSION:
+        _validate_receipt_key_material(attestation)
+    return {**unsigned_attestation_map, "signature": signature}
+
+
+def _validate_receipt_key_material(attestation: Mapping[str, Any]) -> None:
+    """Validate the RSA trust root embedded in a V6 attestation."""
+
+    from process.ptg_wave_receipt_authority import (
+        PTGWaveReceiptAuthorityError,
+        require_receipt_key_id,
+        require_receipt_public_material,
+    )
+
+    try:
+        require_receipt_key_id(
+            attestation.get("receipt_key_id"),
+            "cohort_attestation receipt key ID",
+        )
+        require_receipt_public_material(
+            attestation.get("receipt_public_modulus_hex"),
+            attestation.get("receipt_public_exponent"),
+        )
+    except PTGWaveReceiptAuthorityError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _verify_attestation(
+    attestation: object,
+    *,
+    attestation_key: str | bytes | None,
+) -> dict[str, Any]:
+    """Authenticate a new admission under the current control HMAC key."""
+
+    validated = _validate_attestation_envelope(attestation)
+    unsigned_attestation_map = {
+        key: field_value
+        for key, field_value in validated.items()
+        if key != "signature"
+    }
     expected_signature = sign_cohort_attestation(
         unsigned_attestation_map,
         key=_attestation_key(attestation_key),
     )
-    if not hmac.compare_digest(signature, expected_signature):
+    if not hmac.compare_digest(
+        validated["signature"],
+        expected_signature,
+    ):
         raise ValueError("cohort_attestation signature is invalid")
-    return {**unsigned_attestation_map, "signature": signature}
+    return validated
 
 
 def _validate_snapshot(
@@ -170,6 +226,7 @@ def _validate_snapshot(
         SUPERSESSION_ATTESTATION_VERSION,
         ROLLBACK_ATTESTATION_VERSION,
         MATERIALIZED_PRECLAIM_ATTESTATION_VERSION,
+        RECEIPT_ATTESTATION_VERSION,
     }:
         expected_snapshot_fields |= {
             "authorization_basis",
@@ -194,6 +251,7 @@ def _validate_snapshot(
         SUPERSESSION_ATTESTATION_VERSION,
         ROLLBACK_ATTESTATION_VERSION,
         MATERIALIZED_PRECLAIM_ATTESTATION_VERSION,
+        RECEIPT_ATTESTATION_VERSION,
     }:
         if count < 0:
             raise ValueError(

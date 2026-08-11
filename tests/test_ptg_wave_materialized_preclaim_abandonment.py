@@ -326,7 +326,10 @@ async def test_control_route_is_exact_authenticated_and_idempotent(monkeypatch):
     )
     assert response.status == 201
     service.assert_awaited_once_with(
-        "materialized-wave", "successor-wave", redis="redis"
+        "materialized-wave",
+        "successor-wave",
+        redis="redis",
+        receipt_keyring=None,
     )
 
     for request_body in ({}, {"cutover_id": "x", "extra": True}, []):
@@ -376,3 +379,6 @@ async def test_capacity_query_excludes_only_proof_bound_abandonment():
     sql = str(executor.statement)
     assert "ptg_import_wave_quarantine.recovery_basis" in sql
     assert "ptg_import_wave_quarantine.reason" not in sql
+    assert set(
+        executor.statement.compile().params["recovery_basis_1"]
+    ) == set(fence.CAPACITY_RELEASING_QUARANTINE_BASES)

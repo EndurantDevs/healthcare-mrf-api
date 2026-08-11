@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import datetime as dt
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any, Iterable
+from unittest.mock import AsyncMock
 
+from process.ptg_parts import source_pointers
 from process.ptg_parts.ptg2_shared_reuse import (
     SharedPhysicalArtifactIdentity,
     SharedSnapshotSourceAssignment,
@@ -174,6 +177,27 @@ def source_row(
     }
 
 
+def source_session(
+    snapshot_id: str,
+    source_assignment: SharedSnapshotSourceAssignment,
+    *,
+    plans=None,
+) -> SourcePublicationSession:
+    """Build one deterministic source-publication session."""
+    expected_plans = plans or [
+        {"plan_id": "plan", "plan_market_type": "group"}
+    ]
+    return SourcePublicationSession(
+        scope={
+            "plan_id": "plan",
+            "plan_market_type": "group",
+            "coverage_scope_id": b"c" * 32,
+        },
+        plans=expected_plans,
+        sources=[source_row(snapshot_id, source_assignment)],
+    )
+
+
 def active_stale_context(**overrides: Any):
     """Build a stale, metadata-only context for fail-closed plan tests."""
 
@@ -248,6 +272,65 @@ def prepared_layout_arguments(**overrides: Any) -> dict[str, Any]:
     return layout_arguments_by_name
 
 
+def installed_source_activation_transaction(monkeypatch: Any) -> SimpleNamespace:
+    """Install an ordered executable source-activation transaction fixture."""
+
+    transaction_events: list[str] = []
+
+    def record_event(event_name: str, value: object = None) -> object:
+        transaction_events.append(event_name)
+        return value
+
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=lambda *_args, **_kwargs: record_event(
+                "projection-dirty",
+                QueryResult(),
+            )
+        )
+    )
+
+    @asynccontextmanager
+    async def transaction():
+        transaction_events.append("transaction-begin")
+        yield session
+        transaction_events.append("transaction-commit")
+
+    writable_lock = AsyncMock()
+    activation = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: record_event(
+            "activate",
+            {"status": "promoted"},
+        )
+    )
+    drain = AsyncMock(
+        side_effect=lambda **_kwargs: record_event(
+            "drain",
+            SimpleNamespace(reconciled=1),
+        )
+    )
+    monkeypatch.setattr(source_pointers, "resolve_ptg2_schema", lambda: "tenant")
+    monkeypatch.setattr(source_pointers.db, "transaction", transaction)
+    monkeypatch.setattr(source_pointers, "_acquire_source_pointer_gc_lock", AsyncMock())
+    monkeypatch.setattr(source_pointers, "lock_writable_snapshot", writable_lock)
+    monkeypatch.setattr(
+        source_pointers,
+        "_activate_ptg2_source_candidate_in_transaction",
+        activation,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "drain_legacy_global_projection_queue",
+        drain,
+    )
+    return SimpleNamespace(
+        activation=activation,
+        events=transaction_events,
+        session=session,
+        writable_lock=writable_lock,
+    )
+
+
 __all__ = [
     "Operations",
     "QueryResult",
@@ -256,6 +339,8 @@ __all__ = [
     "TransactionDatabase",
     "active_stale_context",
     "assignment",
+    "installed_source_activation_transaction",
     "prepared_layout_arguments",
     "source_row",
+    "source_session",
 ]

@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.connection import Database
+from process.ptg_parts import ptg2_v4_stale_metadata_reconcile as reconcile
 from process.ptg_parts.ptg2_v4_attempt_registry import ATTEMPT_ATTACHMENTS
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     StaleMetadataFenceError,
@@ -24,6 +25,28 @@ from tests.ptg2_v4_stale_metadata_postgres_schema import SCHEMA_DDL
 
 SNAPSHOT_ID = "ptg2:202607:synthetic-stale"
 INTERNAL_RUN_ID = "ptg2:synthetic-stale-run"
+
+
+def configure_reconciler(monkeypatch, schema_name, test_database) -> None:
+    """Bind the V4 reconciler to one synthetic schema and database."""
+
+    configure_test_schema(monkeypatch, schema_name)
+    monkeypatch.setenv(reconcile.PTG2_V4_STALE_METADATA_SECONDS_ENV, "3600")
+    monkeypatch.setattr(reconcile, "db", test_database)
+
+
+async def ready_plan() -> dict:
+    """Return and validate the redacted ready plan for the fixture pair."""
+
+    plan_by_field = await reconcile.plan_v4_stale_metadata(
+        snapshot_id=SNAPSHOT_ID,
+        internal_run_id=INTERNAL_RUN_ID,
+    )
+    serialized_plan = json.dumps(plan_by_field, sort_keys=True)
+    assert plan_by_field["status"] == "ready"
+    assert SNAPSHOT_ID not in serialized_plan
+    assert INTERNAL_RUN_ID not in serialized_plan
+    return plan_by_field
 
 class _OperationRecorder:
     """Capture Alembic SQL so a synthetic schema can run the real migration."""
@@ -176,11 +199,22 @@ async def apply_attempt_migrations(connection, schema_name: str) -> None:
         await connection.execute(statement)
 
 
+async def apply_artifact_blob_migration(connection, schema_name: str) -> None:
+    """Apply the migration-owned current artifact-blob catalog."""
+
+    migration = _load_attempt_migration(
+        "20260810150000_ptg2_artifact_blob_chunks.py"
+    )
+    for statement in _migration_sql(migration, schema_name):
+        await connection.execute(statement)
+
+
 async def create_stale_schema(connection, schema_name: str) -> None:
     """Create the current catalog touched by the reconciler."""
 
     await create_unmigrated_stale_schema(connection, schema_name)
     await apply_attempt_migrations(connection, schema_name)
+    await apply_artifact_blob_migration(connection, schema_name)
 
 
 async def seed_ready_pair(connection, schema_name: str) -> None:

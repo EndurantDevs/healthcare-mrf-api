@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from api import control_wave_linkage_route as linkage_routes
 from tests.test_ptg_wave_failure_controller_residual import (
     AsyncMock,
     BadRequest,
@@ -349,6 +350,7 @@ def test_import_attestation_partition_guards():
 @pytest.mark.asyncio
 async def test_control_wave_route_error_translation_and_outcomes(monkeypatch):
     monkeypatch.setattr(routes, "require_control_auth", Mock())
+    monkeypatch.setattr(linkage_routes, "require_control_auth", Mock())
     monkeypatch.setattr(
         routes,
         "admit_import_wave",
@@ -374,12 +376,12 @@ async def test_control_wave_route_error_translation_and_outcomes(monkeypatch):
             _Request(args={"after_ordinal": "bad"}), "wave"
         )
     monkeypatch.setattr(
-        routes,
+        linkage_routes,
         "record_linkage_ack",
         AsyncMock(side_effect=routes.PTGWaveOutcomeConflict("conflict")),
     )
     with pytest.raises(SanicException, match="conflict"):
-        await routes.control_record_import_wave_linkage(
+        await linkage_routes.control_record_import_wave_linkage(
             _Request(json={"linkage_ack": {}}), "wave"
         )
     monkeypatch.setattr(routes, "get_wave_receipts", AsyncMock(return_value=None))

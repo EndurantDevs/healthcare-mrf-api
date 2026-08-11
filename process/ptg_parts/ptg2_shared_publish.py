@@ -25,6 +25,15 @@ from process.ptg_parts.ptg2_shared_block_copy import (
     SelectiveSharedBlockCopyReader,
     scan_shared_block_copy,
 )
+from process.ptg_parts.ptg2_block_build_pins import (
+    SharedBlockBuildPinLease,
+    delete_shared_block_build_pins,
+    pin_shared_block_hashes,
+    is_pin_lease_renewed,
+)
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    configure_ptg2_lifecycle_transaction,
+)
 from process.ptg_parts.ptg2_shared_finalize import validate_v3_finalizer_summary
 from process.ptg_parts.ptg2_shared_graph import SharedGraphConversionResult
 from process.ptg_parts.ptg2_shared_graph import (
@@ -32,6 +41,7 @@ from process.ptg_parts.ptg2_shared_graph import (
     SharedGraphShardBundle,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
+    PTG2_V4_SHARED_GENERATION,
     lock_v4_shared_layout_for_map_write,
 )
 
@@ -54,40 +64,6 @@ _SHARED_BLOCK_EXISTENCE_BATCH_ROWS = 8_192
 # operation bounded while avoiding hundreds of thousands of round trips for a
 # dense block stage.
 _SHARED_BLOCK_PUBLISH_BATCH_ROWS = 4_096
-_SHARED_BLOCK_PUBLISH_LOCK_TIMEOUT_MS = 30_000
-_BOUND_SHARED_BLOCK_PUBLISH_LOCK_TIMEOUT_SQL = """
-SELECT set_config(
-    'lock_timeout',
-    CASE
-        WHEN current_setting('lock_timeout') = '0'
-          OR current_setting('lock_timeout')::interval
-               > CAST(:maximum_timeout_ms AS bigint) * INTERVAL '1 millisecond'
-        THEN CAST(:maximum_timeout_ms AS text) || 'ms'
-        ELSE current_setting('lock_timeout')
-    END,
-    TRUE
-)
-"""
-_BATCH_INSERT_BLOCK_SQL = """
-INSERT INTO {schema}.ptg2_v3_block
-    (block_hash, format_version, object_kind, codec, entry_count,
-     raw_byte_count, stored_byte_count, payload, created_at)
-SELECT DISTINCT ON (staged.block_hash)
-       staged.block_hash, staged.format_version, staged.object_kind,
-       staged.codec, staged.entry_count, staged.raw_byte_count,
-       staged.stored_byte_count, staged.payload, now()
-  FROM {schema}.{stage} AS staged
-  JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
- WHERE staged.format_version = :format_version
-   AND staged.payload IS NOT NULL
-   AND NOT EXISTS (
-           SELECT 1
-             FROM {schema}.ptg2_v3_block AS stored
-            WHERE stored.block_hash = staged.block_hash
-       )
- ORDER BY staged.block_hash
-ON CONFLICT (block_hash) DO NOTHING
-"""
 _BATCH_INSERT_MAPPING_SQL = """
 INSERT INTO {schema}.ptg2_v3_snapshot_block
     (snapshot_key, object_kind, block_key, fragment_no, entry_count, block_hash)
@@ -165,15 +141,6 @@ SELECT COUNT(*)::bigint,
    AND mapping.block_key = staged.block_key
    AND mapping.fragment_no = staged.fragment_no
 """
-_V4_BATCH_LOCK_SQL = """
-SELECT stored.block_hash
-  FROM {schema}.ptg2_v3_block AS stored
-  JOIN {schema}.{stage} AS staged
-    ON staged.block_hash = stored.block_hash
-  JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
- ORDER BY stored.block_hash
- FOR KEY SHARE OF stored
-"""
 _V4_BATCH_UNIQUE_TOTALS_SQL = """
 WITH inserted AS (
     INSERT INTO {seen_hash} (block_hash)
@@ -223,53 +190,58 @@ SELECT COUNT(*)::bigint,
   LEFT JOIN {schema}.ptg2_v3_block AS stored
     ON stored.block_hash = staged.block_hash
 """
-_V4_BATCH_DELETE_GC_SQL = """
-WITH locked_candidate AS MATERIALIZED (
-    SELECT candidate.block_hash
-      FROM {schema}.ptg2_v3_gc_candidate AS candidate
-     WHERE EXISTS (
-            SELECT 1
-              FROM {schema}.{stage} AS staged
-              JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
-             WHERE staged.block_hash = candidate.block_hash
-     )
-     ORDER BY candidate.eligible_at, candidate.block_hash
-     FOR UPDATE OF candidate
-)
-DELETE FROM {schema}.ptg2_v3_gc_candidate AS candidate
- USING locked_candidate
- WHERE candidate.block_hash = locked_candidate.block_hash
-"""
-_BATCH_INVENTORY_REUSE_HASH_SQL = """
-INSERT INTO {reuse_hash} (block_hash)
+_V4_STAGE_HASH_BATCH_SQL = """
 SELECT DISTINCT staged.block_hash
   FROM {schema}.{stage} AS staged
-  JOIN {batch} AS batch ON batch.row_ctid = staged.ctid
+ WHERE (NOT :has_last_hash OR staged.block_hash > :last_hash)
+ ORDER BY staged.block_hash
+ LIMIT :batch_rows
+"""
+_V4_DURABLE_INSERT_BLOCK_SQL = """
+INSERT INTO {schema}.ptg2_v3_block
+    (block_hash, format_version, object_kind, codec, entry_count,
+     raw_byte_count, stored_byte_count, payload, created_at)
+SELECT DISTINCT ON (staged.block_hash)
+       staged.block_hash, staged.format_version, staged.object_kind,
+       staged.codec, staged.entry_count, staged.raw_byte_count,
+       staged.stored_byte_count, staged.payload, transaction_timestamp()
+  FROM {schema}.{stage} AS staged
+ WHERE staged.block_hash = ANY(CAST(:block_hashes AS bytea[]))
+   AND staged.format_version = :format_version
+   AND staged.payload IS NOT NULL
+ ORDER BY staged.block_hash
 ON CONFLICT (block_hash) DO NOTHING
 """
-_BATCH_PROTECT_REUSE_BLOCK_SQL = """
-SELECT stored.block_hash
-  FROM {schema}.ptg2_v3_block AS stored
- WHERE stored.block_hash = ANY(CAST(:block_hashes AS bytea[]))
- ORDER BY stored.block_hash
- FOR UPDATE OF stored
-"""
-_BATCH_PROTECT_REUSE_CANDIDATE_SQL = """
-WITH locked_candidate AS MATERIALIZED (
-    SELECT candidate.block_hash
-      FROM {schema}.ptg2_v3_gc_candidate AS candidate
-     WHERE candidate.block_hash = ANY(CAST(:block_hashes AS bytea[]))
-     ORDER BY candidate.eligible_at, candidate.block_hash
-     FOR UPDATE OF candidate
-)
-DELETE FROM {schema}.ptg2_v3_gc_candidate AS candidate
- USING locked_candidate
- WHERE candidate.block_hash = locked_candidate.block_hash
-"""
-_BATCH_REMAINING_REUSE_CANDIDATE_SQL = """
-SELECT COUNT(*)::bigint
-  FROM {schema}.ptg2_v3_gc_candidate AS candidate
-  JOIN {reuse_hash} AS reused USING (block_hash)
+_V4_DURABLE_VALIDATE_BLOCK_SQL = """
+SELECT COUNT(*)::bigint,
+       0::bigint,
+       0::bigint,
+       0::bigint,
+       ARRAY[]::text[],
+       COALESCE(
+           BOOL_OR(staged.format_version <> :format_version),
+           FALSE
+       ),
+       COALESCE(
+           BOOL_OR(staged.payload IS NULL AND stored.block_hash IS NULL),
+           FALSE
+       ),
+       COALESCE(
+           BOOL_OR(
+               stored.block_hash IS NULL
+               OR stored.format_version <> staged.format_version
+               OR stored.object_kind <> staged.object_kind
+               OR stored.codec <> staged.codec
+               OR stored.entry_count <> staged.entry_count
+               OR stored.raw_byte_count <> staged.raw_byte_count
+               OR stored.stored_byte_count <> staged.stored_byte_count
+           ),
+           FALSE
+       )
+  FROM {schema}.{stage} AS staged
+  LEFT JOIN {schema}.ptg2_v3_block AS stored
+    ON stored.block_hash = staged.block_hash
+ WHERE staged.block_hash = ANY(CAST(:block_hashes AS bytea[]))
 """
 _SHARED_BLOCK_COPY_INTEGER_METRIC_FIELDS = (
     "source_copy_bytes",
@@ -444,7 +416,6 @@ class _BatchedBlockStageSummary:
 class _BatchedStageCursors:
     """Name the bounded cursor and temporary-table resources for one stage."""
 
-    inventory_cursor: str
     publication_cursors: tuple[str, str]
     batch_table: str
     seen_hash_table: str
@@ -1698,14 +1669,13 @@ async def _upsert_shared_block_mappings(
         raise RuntimeError("strict V3 shared layout mapping conflicts with staged output")
 
 
-def _batched_stage_object_names() -> tuple[str, str, str, str, str, str]:
+def _batched_stage_object_names() -> tuple[str, str, str, str, str]:
     """Return isolated temporary relation and cursor names."""
 
     token = uuid.uuid4().hex[:20]
     return tuple(
         _quote_ident(f"ptg2_publish_{kind}_{token}")
         for kind in (
-            "reuse_protection_cursor",
             "payload_cursor",
             "reuse_cursor",
             "batch",
@@ -1724,7 +1694,6 @@ async def _open_batched_stage_cursors(
     """Create bounded payload-first cursors and shared identity sets."""
 
     (
-        reuse_protection_cursor,
         payload_cursor,
         reuse_cursor,
         batch,
@@ -1751,7 +1720,6 @@ async def _open_batched_stage_cursors(
         )
     )
     for cursor, stage_predicate in (
-        (reuse_protection_cursor, ""),
         (payload_cursor, "WHERE payload IS NOT NULL"),
         (reuse_cursor, "WHERE payload IS NULL"),
     ):
@@ -1763,7 +1731,6 @@ async def _open_batched_stage_cursors(
             )
         )
     return _BatchedStageCursors(
-        inventory_cursor=reuse_protection_cursor,
         publication_cursors=(payload_cursor, reuse_cursor),
         batch_table=batch,
         seen_hash_table=seen_hash,
@@ -1796,150 +1763,6 @@ async def _load_next_stage_batch(
     return row_ctids
 
 
-async def _inventory_batched_reuse_hashes(
-    session: Any,
-    *,
-    cursor: str,
-    batch: str,
-    template_name_map: Mapping[str, str],
-    progress_callback: Callable[[str, int], None],
-) -> None:
-    """Collect every stage hash through bounded CTID slices."""
-
-    while True:
-        row_ctids = await _load_next_stage_batch(
-            session,
-            cursor=cursor,
-            batch=batch,
-        )
-        if not row_ctids:
-            break
-        await session.execute(
-            db.text(_BATCH_INVENTORY_REUSE_HASH_SQL.format(**template_name_map))
-        )
-        _report_publish_work(
-            progress_callback,
-            "reuse_inventory_batches",
-        )
-    await session.execute(db.text(f"CLOSE {cursor}"))
-
-
-async def _protect_inventoried_reuse_hashes(
-    session: Any,
-    *,
-    cursor: str,
-    reuse_hash: str,
-    template_name_map: Mapping[str, str],
-    progress_callback: Callable[[str, int], None],
-) -> None:
-    """Lock inventoried blocks globally and cancel matching GC candidates."""
-
-    await session.execute(
-        db.text(
-            f"DECLARE {cursor} NO SCROLL CURSOR FOR "
-            f"SELECT block_hash FROM {reuse_hash} ORDER BY block_hash"
-        )
-    )
-    while True:
-        hash_result = await session.execute(
-            db.text(
-                f"FETCH FORWARD {_SHARED_BLOCK_PUBLISH_BATCH_ROWS} "
-                f"FROM {cursor}"
-            )
-        )
-        block_hashes = tuple(
-            bytes(hash_row[0]) for hash_row in hash_result.all()
-        )
-        if not block_hashes:
-            break
-        await session.execute(
-            db.text(_BATCH_PROTECT_REUSE_BLOCK_SQL.format(**template_name_map)),
-            {"block_hashes": list(block_hashes)},
-        )
-        await session.execute(
-            db.text(
-                _BATCH_PROTECT_REUSE_CANDIDATE_SQL.format(**template_name_map)
-            ),
-            {"block_hashes": list(block_hashes)},
-        )
-        _report_publish_work(
-            progress_callback,
-            "reuse_protection_batches",
-        )
-    await session.execute(db.text(f"CLOSE {cursor}"))
-
-
-async def _protect_batched_stage_reuses(
-    session: Any,
-    *,
-    schema: str,
-    stage: str,
-    cursor: str,
-    batch: str,
-    progress_callback: Callable[[str, int], None],
-) -> str:
-    """Lock durable reuse targets and cancel GC before payload publication."""
-
-    await session.execute(
-        db.text(_BOUND_SHARED_BLOCK_PUBLISH_LOCK_TIMEOUT_SQL),
-        {"maximum_timeout_ms": _SHARED_BLOCK_PUBLISH_LOCK_TIMEOUT_MS},
-    )
-    reuse_token = uuid.uuid4().hex[:20]
-    reuse_hash = _quote_ident(f"ptg2_publish_reuse_hash_{reuse_token}")
-    reuse_hash_cursor = _quote_ident(
-        f"ptg2_publish_reuse_hash_cursor_{reuse_token}"
-    )
-    template_name_map = {
-        "schema": schema,
-        "stage": stage,
-        "batch": batch,
-        "reuse_hash": reuse_hash,
-    }
-    await session.execute(
-        db.text(
-            f"CREATE TEMP TABLE {reuse_hash} "
-            "(block_hash bytea PRIMARY KEY) ON COMMIT DROP"
-        )
-    )
-    await _inventory_batched_reuse_hashes(
-        session,
-        cursor=cursor,
-        batch=batch,
-        template_name_map=template_name_map,
-        progress_callback=progress_callback,
-    )
-    await _protect_inventoried_reuse_hashes(
-        session,
-        cursor=reuse_hash_cursor,
-        reuse_hash=reuse_hash,
-        template_name_map=template_name_map,
-        progress_callback=progress_callback,
-    )
-    return reuse_hash
-
-
-async def _require_no_batched_stage_gc_candidates(
-    session: Any,
-    *,
-    schema: str,
-    reuse_hash: str,
-) -> None:
-    """Fail the publication transaction if any staged hash remains GC-eligible."""
-
-    remaining_result = await session.execute(
-        db.text(
-            _BATCH_REMAINING_REUSE_CANDIDATE_SQL.format(
-                schema=schema,
-                reuse_hash=reuse_hash,
-            )
-        )
-    )
-    if int(remaining_result.one()[0] or 0) != 0:
-        raise RuntimeError(
-            "strict shared block stage retains a GC candidate after protection"
-        )
-
-
 async def _publish_shared_block_batch(
     session: Any,
     *,
@@ -1962,21 +1785,6 @@ async def _publish_shared_block_batch(
         "seen_hash": seen_hash,
         "seen_coordinate": seen_coordinate,
     }
-    await session.execute(
-        db.text(_V4_BATCH_LOCK_SQL.format(**template_name_map))
-    )
-    await session.execute(
-        db.text(_BATCH_INSERT_BLOCK_SQL.format(**template_name_map)),
-        format_parameter_map,
-    )
-    block_validation_result = await session.execute(
-        db.text(_V4_BATCH_AGGREGATE_SQL.format(**template_name_map)),
-        format_parameter_map,
-    )
-    _validate_shared_block_batch(block_validation_result.one())
-    await session.execute(
-        db.text(_V4_BATCH_DELETE_GC_SQL.format(**template_name_map))
-    )
     await session.execute(
         db.text(_BATCH_INSERT_MAPPING_SQL.format(**template_name_map)),
         {"snapshot_key": int(snapshot_key)},
@@ -2099,20 +1907,12 @@ async def _publish_shared_block_stage_batched(
     snapshot_key: int,
     progress_callback: Callable[[str, int], None],
 ) -> SharedBlockStagePublication:
-    """Publish a stage as genuine bounded SQL work with exact counters."""
+    """Attach already durable, pinned CAS through bounded snapshot-local work."""
 
     cursor_set = await _open_batched_stage_cursors(
         session,
         schema=schema,
         stage=stage,
-    )
-    reuse_hash = await _protect_batched_stage_reuses(
-        session,
-        schema=schema,
-        stage=stage,
-        cursor=cursor_set.inventory_cursor,
-        batch=cursor_set.batch_table,
-        progress_callback=progress_callback,
     )
     summary = await _drain_shared_block_stage_cursors(
         session,
@@ -2122,12 +1922,232 @@ async def _publish_shared_block_stage_batched(
         snapshot_key=int(snapshot_key),
         progress_callback=progress_callback,
     )
-    await _require_no_batched_stage_gc_candidates(
-        session,
-        schema=schema,
-        reuse_hash=reuse_hash,
-    )
     return _validated_batched_stage_publication(summary)
+
+
+async def _v4_stage_hash_batch(
+    *,
+    schema: str,
+    stage: str,
+    last_hash: bytes | None,
+) -> tuple[bytes, ...]:
+    rows = await db.all(
+        db.text(
+            _V4_STAGE_HASH_BATCH_SQL.format(
+                schema=schema,
+                stage=stage,
+            )
+        ),
+        has_last_hash=last_hash is not None,
+        last_hash=last_hash or b"",
+        batch_rows=_SHARED_BLOCK_PUBLISH_BATCH_ROWS,
+    )
+    hashes = tuple(bytes(row[0]) for row in rows)
+    if (
+        hashes != tuple(sorted(set(hashes)))
+        or any(len(block_hash) != 32 for block_hash in hashes)
+        or (last_hash is not None and hashes and hashes[0] <= last_hash)
+    ):
+        raise RuntimeError("PTG V4 block stage hash cursor changed")
+    return hashes
+
+
+async def _pin_v4_cas_stage(
+    *,
+    schema_name: str,
+    schema: str,
+    stage: str,
+    snapshot_key: int,
+    build_token: str,
+    pin_token: str,
+    progress_callback: Callable[[str, int], None],
+) -> None:
+    last_hash: bytes | None = None
+    while True:
+        block_hashes = await _v4_stage_hash_batch(
+            schema=schema,
+            stage=stage,
+            last_hash=last_hash,
+        )
+        if not block_hashes:
+            return
+        async with db.transaction() as session:
+            await pin_shared_block_hashes(
+                session,
+                schema_name=schema_name,
+                snapshot_key=int(snapshot_key),
+                build_token=str(build_token),
+                pin_token=pin_token,
+                block_hashes=block_hashes,
+            )
+        last_hash = block_hashes[-1]
+        _report_publish_work(progress_callback, "block_pin_batches")
+
+
+async def _publish_v4_durable_cas_batch(
+    *,
+    schema_name: str,
+    schema: str,
+    stage: str,
+    snapshot_key: int,
+    build_token: str,
+    block_hashes: Sequence[bytes],
+) -> None:
+    await _publish_durable_cas_batch(
+        schema_name=schema_name,
+        schema=schema,
+        stage=stage,
+        snapshot_key=int(snapshot_key),
+        build_token=build_token,
+        expected_generation=PTG2_V4_SHARED_GENERATION,
+        block_hashes=block_hashes,
+    )
+
+
+async def _publish_durable_cas_batch(
+    *,
+    schema_name: str,
+    schema: str,
+    stage: str,
+    snapshot_key: int,
+    build_token: str,
+    expected_generation: str,
+    block_hashes: Sequence[bytes],
+) -> None:
+    """Commit one bounded CAS batch while the exact build owner is live."""
+
+    async with db.transaction() as session:
+        await configure_ptg2_lifecycle_transaction(
+            session,
+            lock_timeout="500ms",
+            statement_timeout="5s",
+        )
+        await lock_shared_layout_for_dense_write(
+            session,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=str(build_token),
+            expected_generation=expected_generation,
+        )
+        block_parameters_by_name = {
+            "block_hashes": list(block_hashes),
+            "format_version": PTG2_V3_SHARED_FORMAT_VERSION,
+        }
+        await session.execute(
+            db.text(
+                _V4_DURABLE_INSERT_BLOCK_SQL.format(
+                    schema=schema,
+                    stage=stage,
+                )
+            ),
+            block_parameters_by_name,
+        )
+        validation_result = await session.execute(
+            db.text(
+                _V4_DURABLE_VALIDATE_BLOCK_SQL.format(
+                    schema=schema,
+                    stage=stage,
+                )
+            ),
+            block_parameters_by_name,
+        )
+        _validate_shared_block_batch(validation_result.one())
+        if not await is_pin_lease_renewed(
+            session,
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=str(build_token),
+            pin_token=stage.strip('"'),
+        ):
+            raise RuntimeError("PTG block pin heartbeat lost ownership")
+
+
+async def prepare_shared_cas_block_stage(
+    *,
+    schema_name: str,
+    stage_table: str,
+    snapshot_key: int,
+    build_token: str,
+    expected_generation: str,
+    progress_callback: Callable[[str, int], None] | None = None,
+) -> None:
+    """Durably pin and publish one V3-compatible CAS stage in short batches."""
+
+    schema = _quote_ident(_safe_identifier(schema_name))
+    stage = _quote_ident(_safe_identifier(stage_table))
+    report = progress_callback or _discard_publish_work
+    await _pin_v4_cas_stage(
+        schema_name=schema_name,
+        schema=schema,
+        stage=stage,
+        snapshot_key=int(snapshot_key),
+        build_token=str(build_token),
+        pin_token=stage_table,
+        progress_callback=report,
+    )
+    last_hash: bytes | None = None
+    while True:
+        block_hashes = await _v4_stage_hash_batch(
+            schema=schema,
+            stage=stage,
+            last_hash=last_hash,
+        )
+        if not block_hashes:
+            return
+        await _publish_durable_cas_batch(
+            schema_name=schema_name,
+            schema=schema,
+            stage=stage,
+            snapshot_key=int(snapshot_key),
+            build_token=str(build_token),
+            expected_generation=str(expected_generation),
+            block_hashes=block_hashes,
+        )
+        last_hash = block_hashes[-1]
+        _report_publish_work(report, "durable_cas_batches")
+
+
+async def prepare_v4_cas_block_stage(
+    *,
+    schema_name: str,
+    stage_table: str,
+    snapshot_key: int,
+    build_token: str,
+    progress_callback: Callable[[str, int], None] | None = None,
+) -> None:
+    """Pin all hashes, then publish CAS rows in independent short batches."""
+
+    schema = _quote_ident(_safe_identifier(schema_name))
+    stage = _quote_ident(_safe_identifier(stage_table))
+    report = progress_callback or _discard_publish_work
+    await _pin_v4_cas_stage(
+        schema_name=schema_name,
+        schema=schema,
+        stage=stage,
+        snapshot_key=int(snapshot_key),
+        build_token=str(build_token),
+        pin_token=stage_table,
+        progress_callback=report,
+    )
+    last_hash: bytes | None = None
+    while True:
+        block_hashes = await _v4_stage_hash_batch(
+            schema=schema,
+            stage=stage,
+            last_hash=last_hash,
+        )
+        if not block_hashes:
+            return
+        await _publish_v4_durable_cas_batch(
+            schema_name=schema_name,
+            schema=schema,
+            stage=stage,
+            snapshot_key=int(snapshot_key),
+            build_token=str(build_token),
+            block_hashes=block_hashes,
+        )
+        last_hash = block_hashes[-1]
+        _report_publish_work(report, "durable_cas_batches")
 
 
 async def _publish_v4_cas_batch(
@@ -2138,7 +2158,7 @@ async def _publish_v4_cas_batch(
     batch: str,
     seen_hash: str,
 ) -> tuple[Sequence[Any], Sequence[Any]]:
-    """Publish, protect, and verify one bounded V4 CAS batch."""
+    """Read and verify one already durable, pinned V4 CAS batch."""
 
     template_name_map = {
         "schema": schema,
@@ -2146,22 +2166,12 @@ async def _publish_v4_cas_batch(
         "batch": batch,
         "seen_hash": seen_hash,
     }
-    await session.execute(
-        db.text(_V4_BATCH_LOCK_SQL.format(**template_name_map))
-    )
-    await session.execute(
-        db.text(_BATCH_INSERT_BLOCK_SQL.format(**template_name_map)),
-        {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
-    )
     unique_result = await session.execute(
         db.text(_V4_BATCH_UNIQUE_TOTALS_SQL.format(**template_name_map))
     )
     aggregate_result = await session.execute(
         db.text(_V4_BATCH_AGGREGATE_SQL.format(**template_name_map)),
         {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
-    )
-    await session.execute(
-        db.text(_V4_BATCH_DELETE_GC_SQL.format(**template_name_map))
     )
     return aggregate_result.one(), unique_result.one()
 
@@ -2213,14 +2223,6 @@ async def _publish_v4_cas_stage_batched(
         schema=schema,
         stage=stage,
     )
-    reuse_hash = await _protect_batched_stage_reuses(
-        session,
-        schema=schema,
-        stage=stage,
-        cursor=cursor_set.inventory_cursor,
-        batch=cursor_set.batch_table,
-        progress_callback=progress_callback,
-    )
     summary = _BatchedV4CASStageSummary()
     for cursor in cursor_set.publication_cursors:
         while True:
@@ -2246,11 +2248,6 @@ async def _publish_v4_cas_stage_batched(
             )
             _report_publish_work(progress_callback, "publish_batches")
         await session.execute(db.text(f"CLOSE {cursor}"))
-    await _require_no_batched_stage_gc_candidates(
-        session,
-        schema=schema,
-        reuse_hash=reuse_hash,
-    )
     return _validated_v4_cas_publication(summary)
 
 
@@ -2263,30 +2260,19 @@ async def _publish_v4_cas_in_session(
 ) -> V4CASBlockStagePublication:
     """Publish one V4 CAS stage inside the caller's open transaction.
 
-    The caller owns the V4 layout lock, transaction boundary, and stage-table
-    cleanup.  Keeping those responsibilities outside this helper lets the CAS
-    rows, GC-candidate cancellation, and packed-map reachability commit as one
-    atomic publication.  Bounded CAS protection temporarily caps lock waits;
-    restore the caller's exact transaction-local setting before later map and
-    dictionary work continues.
+    The caller owns the V4 layout lock, transaction boundary, pins, and stage
+    cleanup. CAS rows are already durable and protected, so this pass performs
+    no shared-row lock or mutation while checking exact stage accounting.
     """
 
     schema = _quote_ident(_safe_identifier(schema_name))
     stage = _quote_ident(_safe_identifier(stage_table))
-    prior_lock_timeout = await session.scalar(
-        db.text("SELECT current_setting('lock_timeout')")
-    )
-    publication = await _publish_v4_cas_stage_batched(
+    return await _publish_v4_cas_stage_batched(
         session,
         schema=schema,
         stage=stage,
         progress_callback=progress_callback or _discard_publish_work,
     )
-    await session.execute(
-        db.text("SELECT set_config('lock_timeout', :lock_timeout, TRUE)"),
-        {"lock_timeout": str(prior_lock_timeout)},
-    )
-    return publication
 
 
 async def publish_shared_block_stage(
@@ -2298,179 +2284,85 @@ async def publish_shared_block_stage(
     expected_generation: str = PTG2_V3_SHARED_GENERATION,
     progress_callback: Callable[[str, int], None] | None = None,
 ) -> SharedBlockStagePublication:
-    """Publish a compact Rust-generated block stage without reading payloads in Python."""
+    """Durably publish CAS, then attach one snapshot through local mappings."""
 
     schema = _quote_ident(_safe_identifier(schema_name))
     stage = _quote_ident(_safe_identifier(stage_table))
     try:
-        async with db.transaction() as session:
-            await lock_shared_layout_for_dense_write(
-                session,
-                schema_name=schema_name,
-                snapshot_key=int(snapshot_key),
-                build_token=build_token,
-                expected_generation=expected_generation,
-            )
-            if progress_callback is not None:
-                return await _publish_shared_block_stage_batched(
-                    session,
-                    schema=schema,
-                    stage=stage,
-                    snapshot_key=int(snapshot_key),
-                    progress_callback=progress_callback,
-                )
-            # Protect every durable reuse target before a concurrent sweep can
-            # remove it. The lock is held until its GC candidacy is canceled
-            # and the snapshot mapping commits.
-            await session.execute(
-                db.text(
-                    f"""
-                    SELECT stored.block_hash
-                      FROM {schema}.ptg2_v3_block AS stored
-                      JOIN (
-                           SELECT DISTINCT block_hash
-                             FROM {schema}.{stage}
-                      ) AS staged
-                        ON staged.block_hash = stored.block_hash
-                     FOR KEY SHARE OF stored
-                    """
-                )
-            )
-            await session.execute(
-                db.text(
-                    f"""
-                    INSERT INTO {schema}.ptg2_v3_block
-                        (block_hash, format_version, object_kind, codec, entry_count,
-                         raw_byte_count, stored_byte_count, payload, created_at)
-                    SELECT DISTINCT ON (staged.block_hash)
-                           staged.block_hash, staged.format_version,
-                           staged.object_kind, staged.codec, staged.entry_count,
-                           staged.raw_byte_count, staged.stored_byte_count,
-                           staged.payload, now()
-                      FROM {schema}.{stage} AS staged
-                     WHERE staged.format_version = :format_version
-                       AND staged.payload IS NOT NULL
-                       AND NOT EXISTS (
-                               SELECT 1
-                                 FROM {schema}.ptg2_v3_block AS stored
-                                WHERE stored.block_hash = staged.block_hash
-                           )
-                     ORDER BY staged.block_hash
-                    ON CONFLICT (block_hash) DO NOTHING
-                    """
-                ),
-                {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
-            )
-            _report_publish_work(progress_callback, "publish_batches")
-            # block_hash is the SHA-256 identity for format, kind, codec, and payload;
-            # mandatory audit and fail-closed serving reads recompute it before decode.
-            aggregate_result = await session.execute(
-                db.text(
-                    f"""
-                    SELECT COUNT(*)::bigint,
-                           COUNT(DISTINCT staged.block_hash)::bigint,
-                           COALESCE(SUM(staged.raw_byte_count), 0)::bigint,
-                           COALESCE(SUM(staged.stored_byte_count), 0)::bigint,
-                           COALESCE(
-                               ARRAY_AGG(
-                                   DISTINCT staged.object_kind
-                                   ORDER BY staged.object_kind
-                               ),
-                               ARRAY[]::text[]
-                           ),
-                           COALESCE(
-                               BOOL_OR(staged.format_version <> :format_version),
-                               FALSE
-                           ),
-                           COALESCE(
-                               BOOL_OR(
-                                   staged.payload IS NULL
-                                   AND stored.block_hash IS NULL
-                               ),
-                               FALSE
-                           ),
-                           COALESCE(
-                               BOOL_OR(
-                                   stored.block_hash IS NULL
-                                   OR stored.format_version <> staged.format_version
-                                   OR stored.object_kind <> staged.object_kind
-                                   OR stored.codec <> staged.codec
-                                   OR stored.entry_count <> staged.entry_count
-                                   OR stored.raw_byte_count <> staged.raw_byte_count
-                                   OR stored.stored_byte_count <> staged.stored_byte_count
-                               ),
-                               FALSE
-                           )
-                      FROM {schema}.{stage} staged
-                      LEFT JOIN {schema}.ptg2_v3_block stored
-                        ON stored.block_hash = staged.block_hash
-                    """
-                ),
-                {"format_version": PTG2_V3_SHARED_FORMAT_VERSION},
-            )
-            aggregate_row = aggregate_result.one()
-            _report_publish_work(progress_callback, "publish_batches")
-            incompatible_version = bool(aggregate_row[5])
-            if incompatible_version:
-                raise RuntimeError(
-                    "strict V3 shared-block stage uses an incompatible format version"
-                )
-            missing_durable_block = bool(aggregate_row[6])
-            if missing_durable_block:
-                raise RuntimeError(
-                    "strict V3 shared block stage has no payload or durable CAS row"
-                )
-            mismatch = bool(aggregate_row[7])
-            if mismatch:
-                raise RuntimeError("strict V3 shared block conflicts with stored content metadata")
-            mapping_count = int(aggregate_row[0])
-            await session.execute(
-                db.text(
-                    f"""
-                    DELETE FROM {schema}.ptg2_v3_gc_candidate AS candidate
-                     USING (
-                           SELECT DISTINCT block_hash
-                             FROM {schema}.{stage}
-                     ) AS staged
-                     WHERE candidate.block_hash = staged.block_hash
-                    """
-                )
-            )
-            await _upsert_shared_block_mappings(
-                session,
+        await prepare_shared_cas_block_stage(
+            schema_name=schema_name,
+            stage_table=stage_table,
+            snapshot_key=int(snapshot_key),
+            build_token=build_token,
+            expected_generation=expected_generation,
+            progress_callback=progress_callback,
+        )
+        lease = SharedBlockBuildPinLease(
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=build_token,
+            pin_token=stage_table,
+        )
+        await lease.start()
+        try:
+            return await _attach_shared_block_stage(
                 schema_name=schema_name,
                 stage_table=stage_table,
                 snapshot_key=int(snapshot_key),
-                expected_count=mapping_count,
-                **(
-                    {"progress_callback": progress_callback}
-                    if progress_callback is not None
-                    else {}
-                ),
+                build_token=build_token,
+                expected_generation=expected_generation,
+                lease=lease,
+                progress_callback=progress_callback,
             )
-
-        unique_block_count = int(aggregate_row[1])
-        logical_byte_count = int(aggregate_row[2])
-        stored_byte_count = int(aggregate_row[3])
-        if min(
-            mapping_count,
-            unique_block_count,
-            logical_byte_count,
-            stored_byte_count,
-        ) < 0 or unique_block_count > mapping_count:
-            raise RuntimeError("strict V3 shared block stage returned invalid aggregates")
-        object_kinds = tuple(str(object_kind) for object_kind in (aggregate_row[4] or ()))
-        if object_kinds != tuple(sorted(set(object_kinds))):
-            raise RuntimeError("strict V3 shared block stage returned invalid object kinds")
-        return SharedBlockStagePublication(
-            object_kinds=object_kinds,
-            mapping_count=mapping_count,
-            unique_block_count=unique_block_count,
-            logical_byte_count=logical_byte_count,
-            stored_byte_count=stored_byte_count,
-        )
+        finally:
+            await lease.close()
     finally:
         await db.status(f"DROP TABLE IF EXISTS {schema}.{stage};")
+
+
+async def _attach_shared_block_stage(
+    *,
+    schema_name: str,
+    stage_table: str,
+    snapshot_key: int,
+    build_token: str,
+    expected_generation: str,
+    lease: SharedBlockBuildPinLease,
+    progress_callback: Callable[[str, int], None] | None,
+) -> SharedBlockStagePublication:
+    """Atomically attach one V3 mapping and remove its live build pins."""
+
+    schema = _quote_ident(_safe_identifier(schema_name))
+    stage = _quote_ident(_safe_identifier(stage_table))
+    async with db.transaction() as session:
+        await lock_shared_layout_for_dense_write(
+            session,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+            expected_generation=expected_generation,
+        )
+        publication = await _publish_shared_block_stage_batched(
+            session,
+            schema=schema,
+            stage=stage,
+            snapshot_key=snapshot_key,
+            progress_callback=progress_callback or _discard_publish_work,
+        )
+        lease.require_live()
+        deleted_pin_count = await delete_shared_block_build_pins(
+            session,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+            pin_token=stage_table,
+        )
+        await lease.close()
+        if deleted_pin_count != publication.unique_block_count:
+            raise RuntimeError(
+                "PTG V3 block pin set changed before mapping attach"
+            )
+        return publication
 
 
 async def _publish_v4_cas_for_compatibility(
@@ -2490,21 +2382,71 @@ async def _publish_v4_cas_for_compatibility(
     schema = _quote_ident(_safe_identifier(schema_name))
     stage = _quote_ident(_safe_identifier(stage_table))
     try:
-        async with db.transaction() as session:
-            await lock_v4_shared_layout_for_map_write(
-                session,
-                schema_name=schema_name,
-                snapshot_key=int(snapshot_key),
-                build_token=build_token,
-            )
-            return await _publish_v4_cas_in_session(
-                session,
+        await prepare_v4_cas_block_stage(
+            schema_name=schema_name,
+            stage_table=stage_table,
+            snapshot_key=int(snapshot_key),
+            build_token=str(build_token),
+            progress_callback=progress_callback,
+        )
+        lease = SharedBlockBuildPinLease(
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=str(build_token),
+            pin_token=stage_table,
+        )
+        await lease.start()
+        try:
+            return await _attach_v4_compatibility_stage(
                 schema_name=schema_name,
                 stage_table=stage_table,
+                snapshot_key=int(snapshot_key),
+                build_token=str(build_token),
+                lease=lease,
                 progress_callback=progress_callback,
             )
+        finally:
+            await lease.close()
     finally:
         await db.status(f"DROP TABLE IF EXISTS {schema}.{stage};")
+
+
+async def _attach_v4_compatibility_stage(
+    *,
+    schema_name: str,
+    stage_table: str,
+    snapshot_key: int,
+    build_token: str,
+    lease: SharedBlockBuildPinLease,
+    progress_callback: Callable[[str, int], None] | None,
+) -> V4CASBlockStagePublication:
+    """Atomically attach the compatibility V4 stage and remove its pins."""
+
+    async with db.transaction() as session:
+        await lock_v4_shared_layout_for_map_write(
+            session,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+        )
+        publication = await _publish_v4_cas_in_session(
+            session,
+            schema_name=schema_name,
+            stage_table=stage_table,
+            progress_callback=progress_callback,
+        )
+        lease.require_live()
+        deleted_pin_count = await delete_shared_block_build_pins(
+            session,
+            schema_name=schema_name,
+            snapshot_key=snapshot_key,
+            build_token=build_token,
+            pin_token=stage_table,
+        )
+        await lease.close()
+        if deleted_pin_count != publication.unique_block_count:
+            raise RuntimeError("PTG V4 block pin set changed before attach")
+        return publication
 
 
 async def publish_v4_cas_block_stage(
@@ -2792,6 +2734,7 @@ __all__ = [
     "copy_shared_block_binary_file",
     "create_shared_block_stage",
     "publish_v4_cas_block_stage",
+    "prepare_v4_cas_block_stage",
     "publish_shared_block_stage",
     "publish_shared_finalizer_dictionaries",
     "publish_shared_graph",

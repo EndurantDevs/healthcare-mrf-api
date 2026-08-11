@@ -56,6 +56,19 @@ _GRAPH_TABLE_DDL = (
     )
     """,
     """
+    CREATE TABLE {schema}.ptg2_block_build_pin (
+        snapshot_key bigint NOT NULL REFERENCES
+            {schema}.ptg2_v3_snapshot_layout(snapshot_key) ON DELETE CASCADE,
+        build_token varchar(96) NOT NULL,
+        pin_token varchar(96) NOT NULL,
+        block_hash bytea NOT NULL CHECK (octet_length(block_hash) = 32),
+        created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+        heartbeat_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+        lease_until timestamptz NOT NULL,
+        PRIMARY KEY (snapshot_key, pin_token, block_hash)
+    )
+    """,
+    """
     CREATE TABLE {schema}.ptg2_v3_snapshot_block (
         snapshot_key bigint NOT NULL,
         object_kind varchar(64) NOT NULL,

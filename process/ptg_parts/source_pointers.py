@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from db.connection import db
 from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
@@ -32,8 +33,14 @@ from process.ptg_parts.ptg2_candidate_attestation import (
     verify_held_candidate_attestation_in_transaction,
 )
 from process.ptg_parts.ptg2_lifecycle_lock import (
+    PTG2LifecycleLockDeferred,
     PTG2_SOURCE_POINTER_GC_LOCK_KEY,
-    acquire_ptg2_lifecycle_lock,
+    acquire_ptg2_source_lifecycle_lock,
+    is_retryable_lifecycle_database_error,
+)
+from process.ptg_parts.ptg2_legacy_global_projection_queue import (
+    drain_legacy_global_projection_queue,
+    mark_legacy_global_projection_dirty,
 )
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
@@ -47,13 +54,16 @@ from process.ptg_parts.source_pointer_reviewed_activation import (
 )
 
 
+logger = logging.getLogger(__name__)
+_GLOBAL_POINTER_LOCK_IDENTITY = "legacy_global_snapshot_pointer"
+_GLOBAL_POINTER_LOCK_TIMEOUT = "50ms"
+_GLOBAL_POINTER_STATEMENT_TIMEOUT = "500ms"
+
+
 _GLOBAL_SNAPSHOT_POINTER_RECONCILIATION_SQL = """
-WITH publish_lock AS MATERIALIZED (
-    SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))
-), candidate_snapshot AS MATERIALIZED (
+WITH candidate_snapshot AS MATERIALIZED (
     SELECT candidate.snapshot_id, candidate.published_at
-      FROM __SCHEMA__.ptg2_snapshot AS candidate,
-           publish_lock
+      FROM __SCHEMA__.ptg2_snapshot AS candidate
      WHERE candidate.snapshot_id = :snapshot_id
        AND candidate.status = 'published'
 ), updated_global_pointer AS (
@@ -317,20 +327,24 @@ def _has_result_row(query_result: Any) -> bool:
     return query_result.first() is not None
 
 
-async def _acquire_source_pointer_gc_lock(session: Any) -> None:
-    await acquire_ptg2_lifecycle_lock(session)
+async def _acquire_source_pointer_gc_lock(
+    session: Any,
+    *,
+    source_key: str,
+) -> None:
+    await acquire_ptg2_source_lifecycle_lock(
+        session,
+        source_key=source_key,
+    )
 
 
 _SOURCE_POINTER_CAS_SQL = """
-WITH publish_lock AS MATERIALIZED (
-    SELECT pg_advisory_xact_lock(hashtext(:publish_lock_key))
-), updated_pointer AS (
+WITH updated_pointer AS (
     UPDATE {schema}.ptg2_current_source_snapshot AS current_pointer
        SET snapshot_id = :snapshot_id,
            previous_snapshot_id = :previous_snapshot_id,
            import_month = :import_month,
            updated_at = :updated_at
-      FROM publish_lock
      WHERE current_pointer.source_key = :source_key
        AND (
             current_pointer.snapshot_id IS NOT DISTINCT FROM :previous_snapshot_id
@@ -344,7 +358,6 @@ WITH publish_lock AS MATERIALIZED (
     INSERT INTO {schema}.ptg2_current_source_snapshot
         (source_key, snapshot_id, previous_snapshot_id, import_month, updated_at)
     SELECT :source_key, :snapshot_id, :previous_snapshot_id, :import_month, :updated_at
-      FROM publish_lock
      WHERE :previous_snapshot_id IS NULL
     ON CONFLICT (source_key) DO NOTHING
     RETURNING snapshot_id
@@ -375,7 +388,6 @@ async def _compare_and_swap_source_pointer(
             )
         ),
         {
-            "publish_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY,
             "source_key": source_key,
             "snapshot_id": snapshot_id,
             "previous_snapshot_id": previous_snapshot_id,
@@ -573,7 +585,6 @@ async def _reconcile_global_snapshot_pointer(
     reconciliation_result = await session.execute(
         db.text(reconciliation_sql),
         {
-            "publish_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY,
             "snapshot_id": snapshot_id,
             "updated_at": updated_at,
         },
@@ -582,6 +593,41 @@ async def _reconcile_global_snapshot_pointer(
         raise RuntimeError(
             f"PTG snapshot {snapshot_id} was not available for global pointer reconciliation"
         )
+
+
+async def _attempt_global_snapshot_pointer_reconciliation(
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    updated_at: datetime.datetime,
+) -> str:
+    """Best-effort compatibility projection after source publication commits."""
+
+    try:
+        async with db.transaction() as session:
+            await acquire_ptg2_source_lifecycle_lock(
+                session,
+                source_key=_GLOBAL_POINTER_LOCK_IDENTITY,
+                lock_timeout=_GLOBAL_POINTER_LOCK_TIMEOUT,
+                statement_timeout=_GLOBAL_POINTER_STATEMENT_TIMEOUT,
+            )
+            await _reconcile_global_snapshot_pointer(
+                session,
+                schema_name=schema_name,
+                snapshot_id=snapshot_id,
+                updated_at=updated_at,
+            )
+    except Exception as exc:
+        if not isinstance(exc, PTG2LifecycleLockDeferred) and not (
+            is_retryable_lifecycle_database_error(exc)
+        ):
+            logger.warning(
+                "Deferred legacy PTG global pointer projection for %s: %s",
+                snapshot_id,
+                exc,
+            )
+        return "deferred"
+    return "reconciled"
 
 
 async def _replace_source_plan_pointers(
@@ -824,7 +870,10 @@ async def _stage_ptg2_source_candidate(
         previous_snapshot_id=previous_snapshot_id,
     )
     async with db.transaction() as session:
-        await _acquire_source_pointer_gc_lock(session)
+        await _acquire_source_pointer_gc_lock(
+            session,
+            source_key=source_key,
+        )
         await bind_snapshot_to_shared_layout(
             session,
             schema_name=schema_name,
@@ -1125,14 +1174,46 @@ async def activate_ptg2_source_candidate(
     if not normalized_source_key or not normalized_snapshot_id:
         raise ValueError("source_key and snapshot_id are required")
     schema_name = resolve_ptg2_schema()
+    activation_result = await _commit_candidate_activation(
+        schema_name=schema_name,
+        source_key=normalized_source_key,
+        snapshot_id=normalized_snapshot_id,
+        expected_current_snapshot_id=expected_current_snapshot_id,
+        expected_audit_only_attestation_digest=(
+            expected_audit_only_attestation_digest
+        ),
+        rollback_owner_id=rollback_owner_id,
+    )
+    return await _attach_legacy_global_pointer_status(
+        activation_result,
+        schema_name=schema_name,
+        source_key=normalized_source_key,
+    )
+
+
+async def _commit_candidate_activation(
+    *,
+    schema_name: str,
+    source_key: str,
+    snapshot_id: str,
+    expected_current_snapshot_id: str | None,
+    expected_audit_only_attestation_digest: bytes | None,
+    rollback_owner_id: str | None,
+) -> dict[str, Any]:
+    """Commit one source-local activation and its projection dirty marker."""
+
+    activation_result: dict[str, Any] | None = None
     async with db.transaction() as session:
-        await _acquire_source_pointer_gc_lock(session)
+        await _acquire_source_pointer_gc_lock(
+            session,
+            source_key=source_key,
+        )
         if rollback_owner_id is not None:
             completed_activation = await completed_reviewed_activation(
                 session,
                 schema_name=schema_name,
-                source_key=normalized_source_key,
-                snapshot_id=normalized_snapshot_id,
+                source_key=source_key,
+                snapshot_id=snapshot_id,
                 expected_current_snapshot_id=expected_current_snapshot_id,
                 expected_audit_only_attestation_digest=(
                     expected_audit_only_attestation_digest
@@ -1140,24 +1221,53 @@ async def activate_ptg2_source_candidate(
                 rollback_owner_id=rollback_owner_id,
             )
             if completed_activation is not None:
-                return completed_activation
-        await lock_writable_snapshot(
+                activation_result = completed_activation
+        if activation_result is None:
+            await lock_writable_snapshot(
+                session,
+                db,
+                schema_name=schema_name,
+                snapshot_id=snapshot_id,
+            )
+            activation_result = await (
+                _activate_ptg2_source_candidate_in_transaction(
+                    session,
+                    schema_name=schema_name,
+                    source_key=source_key,
+                    snapshot_id=snapshot_id,
+                    expected_current_snapshot_id=expected_current_snapshot_id,
+                    expected_audit_only_attestation_digest=(
+                        expected_audit_only_attestation_digest
+                    ),
+                    rollback_owner_id=rollback_owner_id,
+                )
+            )
+        await mark_legacy_global_projection_dirty(
             session,
-            db,
             schema_name=schema_name,
-            snapshot_id=normalized_snapshot_id,
+            source_key=source_key,
         )
-        return await _activate_ptg2_source_candidate_in_transaction(
-            session,
-            schema_name=schema_name,
-            source_key=normalized_source_key,
-            snapshot_id=normalized_snapshot_id,
-            expected_current_snapshot_id=expected_current_snapshot_id,
-            expected_audit_only_attestation_digest=(
-                expected_audit_only_attestation_digest
-            ),
-            rollback_owner_id=rollback_owner_id,
-        )
+    return activation_result
+
+
+async def _attach_legacy_global_pointer_status(
+    activation_by_field: dict[str, Any],
+    *,
+    schema_name: str,
+    source_key: str,
+) -> dict[str, Any]:
+    """Run the bounded non-gating legacy projection after source commit."""
+
+    drain = await drain_legacy_global_projection_queue(
+        max_requests=1,
+        source_key=source_key,
+    )
+    global_pointer_status = (
+        "reconciled" if drain.reconciled == 1 else "deferred"
+    )
+    if "global_pointer" in activation_by_field:
+        activation_by_field["global_pointer"] = global_pointer_status
+    return activation_by_field
 
 
 @dataclass(frozen=True)
@@ -1403,12 +1513,6 @@ async def _persist_candidate_activation(
             activation_mode=activation_mode,
         ),
     )
-    await _reconcile_global_snapshot_pointer(
-        session,
-        schema_name=schema_name,
-        snapshot_id=snapshot_id,
-        updated_at=activation_context.activated_at,
-    )
     await _replace_source_plan_pointers(
         session,
         schema_name=schema_name,
@@ -1451,7 +1555,7 @@ def _candidate_activation_result(
             "previous_snapshot_id"
         ],
         "plan_source_count": len(activation_context.plan_pointer_entries),
-        "global_pointer": "reconciled",
+        "global_pointer": "pending_compatibility_projection",
     }
     if allowed_pointer_by_field is not None:
         result_by_field["allowed_amount_pointer"] = allowed_pointer_by_field
@@ -1566,6 +1670,7 @@ async def _publish_ptg2_source_pointers(
     coverage_scope_id: bytes | None = None,
     coverage_plan_scopes: Sequence[Any] | None = None,
     require_audit_attestation: bool = False,
+    locked_validator: Callable[[Any], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Publish or activate source pointers under the strict audit contract."""
 
@@ -1579,14 +1684,21 @@ async def _publish_ptg2_source_pointers(
     ):
         raise ValueError("snapshot attributes do not match the requested snapshot")
     schema_name = resolve_ptg2_schema()
+    publication_by_field: dict[str, Any]
+    should_project_global_pointer = snapshot_attributes is not None
     async with db.transaction() as session:
-        await _acquire_source_pointer_gc_lock(session)
+        await _acquire_source_pointer_gc_lock(
+            session,
+            source_key=normalized_source_key,
+        )
         await lock_writable_snapshot(
             session,
             db,
             schema_name=schema_name,
             snapshot_id=normalized_snapshot_id,
         )
+        if locked_validator is not None:
+            await locked_validator(session)
         authoritative_snapshot = await _locked_snapshot_publication_row(
             session,
             schema_name=schema_name,
@@ -1595,80 +1707,100 @@ async def _publish_ptg2_source_pointers(
         if require_audit_attestation or _needs_audited_candidate_activation(
             authoritative_snapshot
         ):
-            return await _activate_ptg2_source_candidate_in_transaction(
+            publication_by_field = await (
+                _activate_ptg2_source_candidate_in_transaction(
+                    session,
+                    schema_name=schema_name,
+                    source_key=normalized_source_key,
+                    snapshot_id=normalized_snapshot_id,
+                    expected_current_snapshot_id=previous_snapshot_id,
+                )
+            )
+        else:
+            if shared_snapshot_key is not None:
+                await bind_snapshot_to_shared_layout(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_id=normalized_snapshot_id,
+                    snapshot_key=int(shared_snapshot_key),
+                )
+            plan_pointer_entries = await _source_plan_rows(
+                snapshot_id=normalized_snapshot_id,
+                source_key=normalized_source_key,
+                import_month=import_month,
+                previous_snapshot_id=previous_snapshot_id,
+                updated_at=updated_at,
+            )
+            if shared_snapshot_key is not None:
+                if coverage_scope_id is None:
+                    raise ValueError(
+                        "strict V3 publication requires a coverage scope id"
+                    )
+                await _bind_snapshot_coverage_scope(
+                    session,
+                    schema_name=schema_name,
+                    snapshot_id=normalized_snapshot_id,
+                    coverage_scope_id=coverage_scope_id,
+                    plan_pointer_entries=plan_pointer_entries,
+                    coverage_plan_scopes=coverage_plan_scopes,
+                )
+            if snapshot_attributes is None and (
+                str(authoritative_snapshot.get("status") or "")
+                .strip()
+                .lower()
+                != PTG2_STATUS_PUBLISHED
+            ):
+                raise ValueError(
+                    "source-pointer repoint requires an already published snapshot"
+                )
+            await _compare_and_swap_source_pointer(
                 session,
                 schema_name=schema_name,
                 source_key=normalized_source_key,
                 snapshot_id=normalized_snapshot_id,
-                expected_current_snapshot_id=previous_snapshot_id,
-            )
-        if shared_snapshot_key is not None:
-            await bind_snapshot_to_shared_layout(
-                session,
-                schema_name=schema_name,
-                snapshot_id=normalized_snapshot_id,
-                snapshot_key=int(shared_snapshot_key),
-            )
-        plan_pointer_entries = await _source_plan_rows(
-            snapshot_id=normalized_snapshot_id,
-            source_key=normalized_source_key,
-            import_month=import_month,
-            previous_snapshot_id=previous_snapshot_id,
-            updated_at=updated_at,
-        )
-        if shared_snapshot_key is not None:
-            if coverage_scope_id is None:
-                raise ValueError("strict V3 publication requires a coverage scope id")
-            await _bind_snapshot_coverage_scope(
-                session,
-                schema_name=schema_name,
-                snapshot_id=normalized_snapshot_id,
-                coverage_scope_id=coverage_scope_id,
-                plan_pointer_entries=plan_pointer_entries,
-                coverage_plan_scopes=coverage_plan_scopes,
-            )
-        if snapshot_attributes is None and (
-            str(authoritative_snapshot.get("status") or "").strip().lower()
-            != PTG2_STATUS_PUBLISHED
-        ):
-            raise ValueError(
-                "source-pointer repoint requires an already published snapshot"
-            )
-        await _compare_and_swap_source_pointer(
-            session,
-            schema_name=schema_name,
-            source_key=normalized_source_key,
-            snapshot_id=normalized_snapshot_id,
-            previous_snapshot_id=previous_snapshot_id,
-            import_month=import_month,
-            updated_at=updated_at,
-        )
-        await _publish_snapshot_in_pointer_transaction(
-            session,
-            schema_name=schema_name,
-            snapshot_attributes=snapshot_attributes,
-        )
-        if snapshot_attributes is not None:
-            await _reconcile_global_snapshot_pointer(
-                session,
-                schema_name=schema_name,
-                snapshot_id=normalized_snapshot_id,
+                previous_snapshot_id=previous_snapshot_id,
+                import_month=import_month,
                 updated_at=updated_at,
             )
-        await _replace_source_plan_pointers(
+            await _publish_snapshot_in_pointer_transaction(
+                session,
+                schema_name=schema_name,
+                snapshot_attributes=snapshot_attributes,
+            )
+            await _replace_source_plan_pointers(
+                session,
+                schema_name=schema_name,
+                source_key=normalized_source_key,
+                plan_pointer_entries=plan_pointer_entries,
+            )
+            publication_by_field = {
+                "status": "promoted",
+                "source_key": normalized_source_key,
+                "snapshot_id": normalized_snapshot_id,
+                "previous_snapshot_id": previous_snapshot_id,
+                "plan_source_count": len(plan_pointer_entries),
+                "global_pointer": (
+                    "pending_compatibility_projection"
+                    if should_project_global_pointer
+                    else "not_requested"
+                ),
+            }
+        await mark_legacy_global_projection_dirty(
             session,
             schema_name=schema_name,
             source_key=normalized_source_key,
-            plan_pointer_entries=plan_pointer_entries,
         )
-    return {
-        "status": "promoted",
-        "source_key": normalized_source_key,
-        "snapshot_id": normalized_snapshot_id,
-        "previous_snapshot_id": previous_snapshot_id,
-        "plan_source_count": len(plan_pointer_entries),
-        "global_pointer": "reconciled" if snapshot_attributes is not None else "not_requested",
-    }
+    projection_drain = await drain_legacy_global_projection_queue(
+        max_requests=1,
+        source_key=normalized_source_key,
+    )
+    if should_project_global_pointer:
+        global_pointer_status = (
+            "reconciled" if projection_drain.reconciled == 1 else "deferred"
+        )
+        if "global_pointer" in publication_by_field:
+            publication_by_field["global_pointer"] = global_pointer_status
+    return publication_by_field
 
 
 async def _publish_ptg2_global_snapshot_pointer(
@@ -1677,12 +1809,16 @@ async def _publish_ptg2_global_snapshot_pointer(
     updated_at: datetime.datetime,
     shared_snapshot_key: int | None = None,
 ) -> dict[str, Any]:
+    """Project one source snapshot into the legacy compatibility pointer."""
     schema_name = resolve_ptg2_schema()
     snapshot_id = str(snapshot_attributes.get("snapshot_id") or "").strip()
     if not snapshot_id:
         raise ValueError("Global snapshot-pointer promotion requires a snapshot id")
     async with db.transaction() as session:
-        await _acquire_source_pointer_gc_lock(session)
+        await _acquire_source_pointer_gc_lock(
+            session,
+            source_key=f"snapshot_{snapshot_id}",
+        )
         await lock_writable_snapshot(
             session,
             db,
@@ -1716,14 +1852,28 @@ async def _publish_ptg2_global_snapshot_pointer(
             schema_name=schema_name,
             snapshot_attributes=snapshot_attributes,
         )
-        await _reconcile_global_snapshot_pointer(
-            session,
-            schema_name=schema_name,
-            snapshot_id=snapshot_id,
-            updated_at=updated_at,
-        )
+    return await _complete_global_snapshot_pointer_projection(
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        updated_at=updated_at,
+    )
+
+
+async def _complete_global_snapshot_pointer_projection(
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    updated_at: datetime.datetime,
+) -> dict[str, Any]:
+    """Run the non-gating singleton projection after the source commit."""
+
+    global_pointer_status = await _attempt_global_snapshot_pointer_reconciliation(
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        updated_at=updated_at,
+    )
     return {
         "status": "promoted",
         "snapshot_id": snapshot_id,
-        "global_pointer": "reconciled",
+        "global_pointer": global_pointer_status,
     }

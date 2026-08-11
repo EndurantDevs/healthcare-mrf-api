@@ -9,42 +9,58 @@ re-serializing the admitted jobs.
 from __future__ import annotations
 
 import datetime as dt
-import hmac
+from collections.abc import Mapping
 from typing import Any
 
 from arq.jobs import serialize_job as arq_serialize_job
 from sqlalchemy import select
 
+from api import control_import_wave_direct as direct_wave
 from api.control_frozen_rate_files import validated_control_import_payload
 from api.control_import_wave_attestation import (
     ATTESTATION_VERSION,
     MATERIALIZED_PRECLAIM_ATTESTATION_VERSION,
+    RECEIPT_ATTESTATION_VERSION,
     ROLLBACK_ATTESTATION_VERSION,
     SUPERSESSION_ATTESTATION_VERSION,
     _canonical,
-    _identifier,
     _sha256,
-    _validate_partition,
-    _validate_snapshot,
-    _verify_attestation,
     sign_cohort_attestation,
+)
+from api.control_import_wave_constants import (
+    MAX_ATTESTATION_CANONICAL_BYTES,
+    MAX_INTENT_CANONICAL_BYTES,
+    MAX_INTENTS,
+    PROTOCOL_IDENTITY,
+    QUEUE,
+    RESOURCE_CLASS,
+    SERIALIZER_IDENTITY,
+    WORKER_CLASS,
+    WORKER_LIMIT,
 )
 from api.control_import_wave_materialized_preclaim import (
     require_materialized_preclaim_replay_allowed,
 )
-from api.control_imports import (
-    _assert_ptg_rebuild_request_params,
-    _import_param_views,
-    _normalize_triggered_by,
+from api.control_import_wave_payload import (
+    _canonical_job_payload,
+    _job_id,
+    _project_import_wave_payload,
+    _run_key,
+    _validate_signed_intents,
+    validate_import_wave_payload,
 )
-from api import control_import_wave_direct as direct_wave
+from api.control_import_wave_session import SessionExecutor as _SessionExecutor
 from api.control_import_wave_response import (
     get_import_wave,
     wave_response as _wave_response,
 )
 from api.control_import_wave_recovery import (
     persist_admission_recoveries,
-    project_admission_recovery_proofs,
+)
+from api.control_imports import (
+    _assert_ptg_rebuild_request_params,
+    _import_param_views,
+    _normalize_triggered_by,
 )
 from db.models import (
     ImportRun,
@@ -64,48 +80,21 @@ from process.ptg_parts.ptg_wave_admission_fence import (
     require_wave_admission_capacity,
 )
 from process.serialization import serialize_job
+from process.ptg_wave_receipt_authority import (
+    PTGWaveReceiptPublicEpoch,
+    PTGWaveReceiptKeyring,
+)
+from process.ptg_wave_receipt_process_authority import (
+    require_process_receipt_keyring,
+)
 
 
-QUEUE = "arq:PTGSmall"
-WORKER_CLASS = "process.PTGSmall"
-RESOURCE_CLASS = "small"
-WORKER_LIMIT = 12
-MAX_INTENTS = 4096
-MAX_INTENT_CANONICAL_BYTES = direct_wave.MAX_INTENT_CANONICAL_BYTES
-MAX_ATTESTATION_CANONICAL_BYTES = direct_wave.MAX_ATTESTATION_CANONICAL_BYTES
-PROTOCOL_IDENTITY = "healthporta.ptg-small.exact-wave.v1"
-SERIALIZER_IDENTITY = "arq-0.28.process-msgpack.v1"
 class ImportWaveConflict(ValueError):
     """A replay attempted to change a previously admitted immutable wave."""
 
 
 def _now() -> dt.datetime:
     return dt.datetime.now(dt.UTC).replace(tzinfo=None)
-
-
-def _job_id(wave_id: str, request_digest: str, ordinal: int, run_id: str) -> str:
-    identity = _sha256(f"{wave_id}\0{request_digest}\0{ordinal}\0{run_id}".encode())
-    return f"ptg_start_{identity}"
-
-
-def _run_key(wave_id: str, request_digest: str, ordinal: int) -> str:
-    return "ptg-wave:" + _sha256(f"{wave_id}\0{request_digest}\0{ordinal}".encode())
-
-
-def _canonical_job_payload(payload: Any) -> Any:
-    if isinstance(payload, dict):
-        if not all(isinstance(key, str) for key in payload):
-            raise ValueError("ARQ job payload keys must be strings")
-        return {key: _canonical_job_payload(payload[key]) for key in sorted(payload)}
-    if isinstance(payload, list):
-        return [_canonical_job_payload(item) for item in payload]
-    if isinstance(payload, (str, int, bool)) or payload is None:
-        return payload
-    if isinstance(payload, float):
-        if not payload == payload or payload in (float("inf"), float("-inf")):
-            raise ValueError("ARQ job payload contains a non-finite float")
-        return payload
-    raise ValueError("ARQ job payload contains an unsupported value")
 
 
 def _validated_intent_payload(
@@ -119,13 +108,9 @@ def _validated_intent_payload(
     _assert_ptg_rebuild_request_params("ptg", raw_params)
     control_payload = validated_control_import_payload(
         {
-            "run_id": run_id,
-            "importer": "ptg",
-            "params": raw_params,
-            "idempotency_key": run_key,
-            "triggered_by": "api",
-            "source_file_import_id": source_id,
-            "import_id": source_id,
+            "run_id": run_id, "importer": "ptg", "params": raw_params,
+            "idempotency_key": run_key, "triggered_by": "api",
+            "source_file_import_id": source_id, "import_id": source_id,
         }
     )
     actual_source_id = source_file_import_id_from_payload(
@@ -133,23 +118,23 @@ def _validated_intent_payload(
         required=True,
     )
     if actual_source_id != source_id:
-        raise ValueError("intent source_file_import_id does not match its PTG parameters")
+        raise ValueError(
+            "intent source_file_import_id does not match its PTG parameters"
+        )
     return source_id, control_payload
 
 
 def _prepare_intent(
     intent: dict[str, Any], *, wave_id: str, request_digest: str,
-    wave_digest: str, release_queue: str, ordinal: int, enqueue_time_ms: int, now: dt.datetime,
+    wave_digest: str, release_queue: str, ordinal: int,
+    enqueue_time_ms: int, now: dt.datetime,
 ) -> dict[str, Any]:
     """Prepare one immutable run, enqueue payload, and serialized ARQ job."""
-
     run_id = intent["run_id"]
     job_id = _job_id(wave_id, request_digest, ordinal, run_id)
     run_key = _run_key(wave_id, request_digest, ordinal)
     source_id, control_payload = _validated_intent_payload(
-        intent,
-        run_id=run_id,
-        run_key=run_key,
+        intent, run_id=run_id, run_key=run_key,
     )
     views = _import_param_views("ptg", control_payload["params"], run_id=run_id)
     persisted_parameter_map = {
@@ -197,130 +182,6 @@ def _prepare_intent(
         "job_payload": job_payload, "serialized_job": serialized_job,
         "serialized_job_digest": _sha256(serialized_job), "run_values": run_field_map,
     }
-
-
-def _validate_signed_intents(raw_intents: object, *, wave_id: str | None = None) -> list[dict[str, Any]]:
-    if not isinstance(raw_intents, list) or not 1 <= len(raw_intents) <= MAX_INTENTS:
-        raise ValueError(f"cohort_attestation intents must contain between 1 and {MAX_INTENTS} items")
-    intents: list[dict[str, Any]] = []
-    run_ids: set[str] = set()
-    source_ids: set[str] = set()
-    for ordinal, raw in enumerate(raw_intents):
-        direct_wave.require_bounded_direct_intent(raw)
-        expected_intent_fields = {
-            "ordinal", "run_id", "source_file_import_id", "content_version", "params",
-        }
-        if not isinstance(raw, dict) or set(raw) != expected_intent_fields:
-            raise ValueError("each signed intent fields are not exact")
-        if raw["ordinal"] != ordinal:
-            raise ValueError("signed intent ordinals must be contiguous from zero")
-        run_id = _identifier(raw["run_id"], "run_id", 64)
-        source_id = _identifier(raw["source_file_import_id"], "source_file_import_id", 64)
-        if run_id in run_ids or source_id in source_ids:
-            raise ValueError("signed intent run_id and source_file_import_id values must be unique")
-        run_ids.add(run_id)
-        source_ids.add(source_id)
-        if not isinstance(raw["params"], dict):
-            raise ValueError("signed intent params must be an object")
-        content_version = _identifier(raw["content_version"], "content_version", 128)
-        normalized_params = direct_wave.normalized_wave_params(raw["params"])
-        direct_wave.require_matching_direct_coordinate(
-            normalized_params,
-            content_version,
-            source_file_import_id=source_id,
-            wave_id=wave_id or "",
-        )
-        intents.append({
-            "run_id": run_id, "source_file_import_id": source_id,
-            "content_version": content_version,
-            "params": normalized_params,
-        })
-    return intents
-
-
-def validate_import_wave_payload(
-    request_body: object, *, attestation_key: str | bytes | None = None,
-) -> dict[str, Any]:
-    """Verify the closed orchestrator attestation and derive all identities."""
-
-    if not isinstance(request_body, dict) or set(request_body) != {"cohort_attestation"}:
-        raise ValueError("import wave payload must contain only cohort_attestation")
-    direct_wave.require_bounded_wave_request(request_body)
-    attestation = _verify_attestation(
-        request_body["cohort_attestation"],
-        attestation_key=attestation_key,
-    )
-    wave_id = _identifier(attestation["wave_id"], "wave_id", 64)
-    idempotency_key = _identifier(attestation["idempotency_key"], "idempotency_key", 160)
-    snapshot = _validate_snapshot(
-        attestation["snapshot"],
-        schema_version=attestation["schema_version"],
-    )
-    partition = _validate_partition(attestation["partition"])
-    intents = _validate_signed_intents(
-        attestation["intents"],
-        wave_id=wave_id,
-    )
-    recovery_proofs = project_admission_recovery_proofs(
-        attestation,
-        wave_id=wave_id,
-    )
-    if partition["imported_coordinate_count"] != len(intents):
-        raise ValueError("partition imported_coordinate_count must equal signed intent count")
-    imported_coordinate_digest = _sha256(
-        "\0".join(
-            f"{intent['source_file_import_id']}\0{intent['content_version']}"
-            for intent in intents
-        ).encode("utf-8")
-    )
-    if not hmac.compare_digest(
-        partition["imported_coordinate_digest"], imported_coordinate_digest
-    ):
-        raise ValueError("partition imported_coordinate_digest does not match signed intents")
-    unsigned_attestation_map = {
-        key: intent_field_value
-        for key, intent_field_value in attestation.items()
-        if key != "signature"
-    }
-    request_digest = _sha256(_canonical(unsigned_attestation_map))
-    wave_digest = _sha256((PROTOCOL_IDENTITY + "\0" + request_digest).encode())
-    validated_request_map = {
-        "wave_id": wave_id, "idempotency_key": idempotency_key,
-        "attestation": attestation, "snapshot": snapshot, "partition": partition,
-        "intents": intents, "request_digest": request_digest,
-        "attestation_digest": _sha256(_canonical(attestation)),
-        "signature_digest": _sha256(attestation["signature"].encode()),
-        "wave_digest": wave_digest, "release_queue": f"{QUEUE}:wave:{wave_digest}",
-    }
-    validated_request_map.update(recovery_proofs)
-    return validated_request_map
-
-
-class _SessionExecutor:
-    def __init__(self, session: Any) -> None:
-        self.session = session
-
-    async def execute(self, statement: Any, parameters: dict[str, Any] | None = None):
-        """Execute one statement through the active admission transaction."""
-
-        return await self.session.execute(statement, parameters or {})
-
-    async def scalar(self, statement: Any, *args: Any, **parameters: Any):
-        """Return one scalar through the active admission transaction."""
-
-        values = dict(args[0]) if args else {}
-        values.update(parameters)
-        return await self.session.scalar(statement, values)
-
-    async def all(self, statement: Any, **parameters: Any):
-        """Return all rows through the active admission transaction."""
-
-        return (await self.session.execute(statement, parameters)).all()
-
-    async def status(self, statement: Any, **parameters: Any):
-        """Return the affected-row count for a transactional statement."""
-
-        return (await self.session.execute(statement, parameters)).rowcount
 
 
 def _manifest_digests(prepared: list[dict[str, Any]], *, wave_digest: str, enqueue_time_ms: int) -> tuple[str, str]:
@@ -375,6 +236,7 @@ def _new_wave_record(
     manifest_digest: str,
     enqueue_time_ms: int,
     now: dt.datetime,
+    receipt_public_epoch: PTGWaveReceiptPublicEpoch | None = None,
 ) -> PTGImportWave:
     partition = request["partition"]
     return PTGImportWave(
@@ -391,6 +253,17 @@ def _new_wave_record(
         reused_coordinate_digest=partition["reused_coordinate_digest"],
         intent_count=len(prepared_intents), jobs_digest=jobs_digest,
         manifest_digest=manifest_digest, wave_digest=request["wave_digest"],
+        receipt_key_id=request["receipt_key_id"],
+        receipt_public_modulus_hex=(
+            receipt_public_epoch.rsa_modulus
+            if receipt_public_epoch is not None
+            else request["receipt_public_modulus_hex"]
+        ),
+        receipt_public_exponent=(
+            receipt_public_epoch.rsa_exponent
+            if receipt_public_epoch is not None
+            else request["receipt_public_exponent"]
+        ),
         queue=QUEUE, release_queue=request["release_queue"], worker_class=WORKER_CLASS,
         resource_class=RESOURCE_CLASS, worker_limit=WORKER_LIMIT,
         protocol_identity=PROTOCOL_IDENTITY, serializer_identity=SERIALIZER_IDENTITY,
@@ -426,37 +299,34 @@ async def admit_import_wave(
     admission_request: object,
     *,
     redis: Any = None,
+    receipt_keyring: PTGWaveReceiptKeyring | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Atomically admit one authenticated complete wave or return its exact replay."""
 
-    request = validate_import_wave_payload(admission_request)
-    now = _now()
-    enqueue_time_ms = int(now.replace(tzinfo=dt.UTC).timestamp() * 1000)
-    prepared_intents, jobs_digest, manifest_digest = _prepare_wave_intents(
-        request,
-        now=now,
-        enqueue_time_ms=enqueue_time_ms,
+    request, authentication_error = _project_admission_request(
+        admission_request
     )
     async with db.transaction() as session:
         executor = _SessionExecutor(session)
-        await require_source_attempt_capabilities(executor, require_attempt_authority=False)
-        for source_id in sorted(
-            intent_entry["source_id"] for intent_entry in prepared_intents
-        ):
-            await guard_source_attempt(executor, source_file_import_id=source_id)
         await acquire_ptg_admission_lock(executor)
-        existing_rows = list((await session.execute(
-            select(PTGImportWave).where((PTGImportWave.wave_id == request["wave_id"]) |
-                                         (PTGImportWave.idempotency_key == request["idempotency_key"])).limit(2).with_for_update()
-        )).scalars())
-        if len(existing_rows) > 1:
-            raise ImportWaveConflict("wave_id and idempotency_key identify different immutable waves")
-        existing = existing_rows[0] if existing_rows else None
-        if existing is not None:
-            if existing.request_digest != request["request_digest"]:
-                raise ImportWaveConflict("wave_id or idempotency_key conflicts with immutable request digest")
-            await require_materialized_preclaim_replay_allowed(session, existing.wave_id)
-            return _wave_response(existing), False
+        replay_response = await _locked_existing_wave_response(session, request)
+        if replay_response is not None:
+            return replay_response, False
+        if authentication_error is not None:
+            raise authentication_error
+        now = _now()
+        enqueue_time_ms = int(
+            now.replace(tzinfo=dt.UTC).timestamp() * 1000
+        )
+        prepared_intents, jobs_digest, manifest_digest, receipt_public_epoch = (
+            await _prepare_guarded_admission_intents(
+                executor,
+                request,
+                now=now,
+                enqueue_time_ms=enqueue_time_ms,
+                receipt_keyring=receipt_keyring,
+            )
+        )
         await persist_admission_recoveries(
             session,
             request,
@@ -471,6 +341,7 @@ async def admit_import_wave(
             manifest_digest=manifest_digest,
             enqueue_time_ms=enqueue_time_ms,
             now=now,
+            receipt_public_epoch=receipt_public_epoch,
         )
         await _persist_wave_intents(session, executor, wave, prepared_intents)
         await session.flush()
@@ -484,7 +355,115 @@ async def admit_import_wave(
         return _wave_response(wave), True
 
 
+def _project_admission_request(
+    admission_request: object,
+) -> tuple[dict[str, Any], ValueError | None]:
+    """Authenticate a new request while retaining V6 replay identity."""
+
+    raw_attestation = (
+        admission_request.get("cohort_attestation")
+        if isinstance(admission_request, dict)
+        else None
+    )
+    is_v6_request = bool(
+        isinstance(raw_attestation, dict)
+        and raw_attestation.get("schema_version")
+        == RECEIPT_ATTESTATION_VERSION
+    )
+    try:
+        return validate_import_wave_payload(admission_request), None
+    except ValueError as exc:
+        if not is_v6_request:
+            raise
+        return (
+            _project_import_wave_payload(
+                admission_request,
+                authenticate=False,
+            ),
+            exc,
+        )
+
+
+async def _locked_existing_wave_response(
+    session: Any,
+    request: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return an exact locked replay or reject immutable identity drift."""
+
+    existing_rows = list(
+        (
+            await session.execute(
+                select(PTGImportWave)
+                .where(
+                    (PTGImportWave.wave_id == request["wave_id"])
+                    | (PTGImportWave.idempotency_key == request["idempotency_key"])
+                )
+                .limit(2)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    if len(existing_rows) > 1:
+        raise ImportWaveConflict(
+            "wave_id and idempotency_key identify different immutable waves"
+        )
+    existing = existing_rows[0] if existing_rows else None
+    if existing is None:
+        return None
+    if (
+        existing.request_digest != request["request_digest"]
+        or getattr(existing, "receipt_key_id", None) != request["receipt_key_id"]
+        or getattr(existing, "receipt_public_modulus_hex", None)
+        != request.get("receipt_public_modulus_hex")
+        or getattr(existing, "receipt_public_exponent", None)
+        != request.get("receipt_public_exponent")
+        or existing.cohort_attestation_digest != request["attestation_digest"]
+        or existing.cohort_signature_digest != request["signature_digest"]
+        or _canonical(existing.cohort_attestation)
+        != _canonical(request["attestation"])
+    ):
+        raise ImportWaveConflict(
+            "wave_id or idempotency_key conflicts with immutable request digest"
+        )
+    await require_materialized_preclaim_replay_allowed(session, existing.wave_id)
+    return _wave_response(existing)
+
+
+async def _prepare_guarded_admission_intents(
+    executor: _SessionExecutor,
+    request: Mapping[str, Any],
+    *,
+    now: dt.datetime,
+    enqueue_time_ms: int,
+    receipt_keyring: PTGWaveReceiptKeyring | None,
+) -> tuple[list[dict[str, Any]], str, str, Any]:
+    """Prepare source-local rows, fence attempts, and pin active receipt trust."""
+
+    prepared_intents, jobs_digest, manifest_digest = _prepare_wave_intents(
+        request,
+        now=now,
+        enqueue_time_ms=enqueue_time_ms,
+    )
+    await require_source_attempt_capabilities(
+        executor,
+        require_attempt_authority=False,
+    )
+    for source_id in sorted(
+        intent_entry["source_id"] for intent_entry in prepared_intents
+    ):
+        await guard_source_attempt(executor, source_file_import_id=source_id)
+    receipt_public_epoch = None
+    if request["receipt_key_id"] is not None:
+        keyring = require_process_receipt_keyring(receipt_keyring)
+        receipt_public_epoch = keyring.require_active_public_material(
+            key_id=request["receipt_key_id"],
+            modulus=request["receipt_public_modulus_hex"],
+            exponent=request["receipt_public_exponent"],
+        )
+    return prepared_intents, jobs_digest, manifest_digest, receipt_public_epoch
+
+
 __all__ = [
-    "ATTESTATION_VERSION", "MATERIALIZED_PRECLAIM_ATTESTATION_VERSION", "ROLLBACK_ATTESTATION_VERSION", "SUPERSESSION_ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
+    "ATTESTATION_VERSION", "MATERIALIZED_PRECLAIM_ATTESTATION_VERSION", "RECEIPT_ATTESTATION_VERSION", "ROLLBACK_ATTESTATION_VERSION", "SUPERSESSION_ATTESTATION_VERSION", "ImportWaveConflict", "admit_import_wave", "get_import_wave",
     "sign_cohort_attestation", "validate_import_wave_payload",
 ]

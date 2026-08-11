@@ -41,11 +41,7 @@ async def test_store_ptg2_artifact_in_db_removes_transient_local_path(monkeypatc
     artifact_path.write_bytes(b"provider-membership")
     fake_db = FakeDB()
 
-    async def fake_ensure(_schema):
-        return None
-
     monkeypatch.setattr(artifact_blobs, "db", fake_db)
-    monkeypatch.setattr(artifact_blobs, "ensure_ptg2_artifact_blob_table", fake_ensure)
     monkeypatch.setattr(artifact_blobs, "ptg2_artifact_db_retain_local_cache", lambda: False)
 
     stored = await artifact_blobs.store_ptg2_artifact_file_in_db(
@@ -61,6 +57,10 @@ async def test_store_ptg2_artifact_in_db_removes_transient_local_path(monkeypatc
     assert "path" not in stored
     assert "path" not in manifest_payload
     assert stored["storage_uri"].startswith("db://ptg2_artifact/")
+    assert not any(
+        sql.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP "))
+        for sql, _params in fake_db.session.calls
+    )
 
 
 @pytest.mark.asyncio
@@ -69,11 +69,7 @@ async def test_store_ptg2_artifact_honors_per_artifact_chunk_size(monkeypatch, t
     artifact_path.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
     fake_db = FakeDB()
 
-    async def fake_ensure(_schema):
-        return None
-
     monkeypatch.setattr(artifact_blobs, "db", fake_db)
-    monkeypatch.setattr(artifact_blobs, "ensure_ptg2_artifact_blob_table", fake_ensure)
 
     stored = await artifact_blobs.store_ptg2_artifact_file_in_db(
         artifact_path,
@@ -90,3 +86,7 @@ async def test_store_ptg2_artifact_honors_per_artifact_chunk_size(monkeypatch, t
     ]
     assert len(chunk_inserts) == 3
     assert stored["chunk_bytes"] == 1024 * 1024
+    assert not any(
+        sql.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP "))
+        for sql, _params in fake_db.session.calls
+    )

@@ -1406,33 +1406,48 @@ async def _build_dynamic_zip_peer_stats(
         if len(trimmed_rows) < min_providers:
             continue
 
-        charges = sorted(
-            float(_as_float(charge_row.get("avg_submitted_charge")) or 0.0)
-            for charge_row in trimmed_rows
-            if (_as_float(charge_row.get("avg_submitted_charge")) or 0.0) > 0
+        peer_statistics_by_metric = _dynamic_zip_peer_statistics(
+            trimmed_rows,
+            specialty_candidate,
+            min_providers,
         )
-        if len(charges) < min_providers:
+        if peer_statistics_by_metric is None:
             continue
-        claim_counts = [
-            float(_as_float(charge_row.get("claim_count")) or 0.0)
-            for charge_row in trimmed_rows
-        ]
-
-        peer_statistics_by_metric = {
-            "provider_count": len(trimmed_rows),
-            "min_claim_count": min(claim_counts) if claim_counts else None,
-            "max_claim_count": max(claim_counts) if claim_counts else None,
-            "p10": _percentile_cont(charges, 0.10),
-            "p20": _percentile_cont(charges, 0.20),
-            "p40": _percentile_cont(charges, 0.40),
-            "p50": _percentile_cont(charges, 0.50),
-            "p60": _percentile_cont(charges, 0.60),
-            "p80": _percentile_cont(charges, 0.80),
-            "p90": _percentile_cont(charges, 0.90),
-            "specialty_key": specialty_candidate,
-        }
         return peer_statistics_by_metric, specialty_candidate
     return None
+
+
+def _dynamic_zip_peer_statistics(
+    trimmed_charge_rows: list[dict[str, Any]],
+    specialty_key: str,
+    min_providers: int,
+) -> dict[str, Any] | None:
+    """Summarize one sufficiently large trimmed dynamic ZIP cohort."""
+
+    charges = sorted(
+        float(_as_float(charge_row.get("avg_submitted_charge")) or 0.0)
+        for charge_row in trimmed_charge_rows
+        if (_as_float(charge_row.get("avg_submitted_charge")) or 0.0) > 0
+    )
+    if len(charges) < min_providers:
+        return None
+    claim_counts = [
+        float(_as_float(charge_row.get("claim_count")) or 0.0)
+        for charge_row in trimmed_charge_rows
+    ]
+    return {
+        "provider_count": len(trimmed_charge_rows),
+        "min_claim_count": min(claim_counts) if claim_counts else None,
+        "max_claim_count": max(claim_counts) if claim_counts else None,
+        "p10": _percentile_cont(charges, 0.10),
+        "p20": _percentile_cont(charges, 0.20),
+        "p40": _percentile_cont(charges, 0.40),
+        "p50": _percentile_cont(charges, 0.50),
+        "p60": _percentile_cont(charges, 0.60),
+        "p80": _percentile_cont(charges, 0.80),
+        "p90": _percentile_cont(charges, 0.90),
+        "specialty_key": specialty_key,
+    }
 
 
 def _parse_setting_key(raw: Any) -> str:
@@ -8607,32 +8622,9 @@ async def list_provider_procedures(request, npi: str):
     )
 
 
-async def _provider_procedure_detail(
-    request,
-    npi: str,
-    code_value: str,
-    *,
-    default_code_system: str = INTERNAL_CODE_SYSTEM,
-):
-    """Build the provider procedure detail response for an internal or external service code."""
-    session = _get_session(request)
-    args = request.args
-
-    provider_npi = _parse_int(npi, "npi", minimum=1)
-    year = _parse_int(args.get("year"), "year", minimum=2013)
-    include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
-    if provider_npi is None:
-        raise InvalidUsage("Path parameter 'npi' must be provided")
-
-    year, year_source = await _resolve_year(session, provider_procedure_table, year)
-    internal_codes, code_context = await _resolve_internal_codes_for_request(
-        session,
-        code_value,
-        args,
-        default_system=default_code_system,
-    )
-
-    query = (
+def _provider_procedure_detail_query(provider_npi, internal_codes, year):
+    """Build the bounded provider-procedure lookup query."""
+    return (
         select(
             provider_procedure_table,
             procedure_table.c.avg_submitted_charge,
@@ -8661,7 +8653,34 @@ async def _provider_procedure_detail(
         .limit(1)
     )
 
-    procedure_query_result = await session.execute(query)
+
+async def _provider_procedure_detail(
+    request,
+    npi: str,
+    code_value: str,
+    *,
+    default_code_system: str = INTERNAL_CODE_SYSTEM,
+):
+    """Build the provider procedure detail response for an internal or external service code."""
+    session = _get_session(request)
+    args = request.args
+
+    provider_npi = _parse_int(npi, "npi", minimum=1)
+    year = _parse_int(args.get("year"), "year", minimum=2013)
+    include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
+    if provider_npi is None:
+        raise InvalidUsage("Path parameter 'npi' must be provided")
+
+    year, year_source = await _resolve_year(session, provider_procedure_table, year)
+    internal_codes, code_context = await _resolve_internal_codes_for_request(
+        session,
+        code_value,
+        args,
+        default_system=default_code_system,
+    )
+    procedure_query_result = await session.execute(
+        _provider_procedure_detail_query(provider_npi, internal_codes, year)
+    )
     procedure_row = procedure_query_result.first()
     if procedure_row is None:
         raise sanic.exceptions.NotFound("Provider procedure not found")
@@ -9638,6 +9657,36 @@ async def autocomplete_provider_types(request):
         include_broad=True,
         limit=max((pagination.offset + pagination.limit) * 5, 100),
     )
+    ordered_provider_type_items = _provider_type_autocomplete_items(
+        provider_type_rows
+    )
+    total = len(ordered_provider_type_items)
+    page_items = ordered_provider_type_items[
+        pagination.offset: pagination.offset + pagination.limit
+    ]
+
+    return response.json(
+        {
+            "items": page_items,
+            "pagination": {
+                "total": total,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {
+                "q": search_query,
+                "data_status": "available" if provider_type_rows else "empty_or_unavailable",
+            },
+        }
+    )
+
+
+def _provider_type_autocomplete_items(
+    provider_type_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Deduplicate and rank provider-type terminology matches."""
+
     provider_type_items_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for provider_type_row in provider_type_rows:
         target_system = str(provider_type_row.get("target_system") or "").upper()
@@ -9687,26 +9736,7 @@ async def autocomplete_provider_types(request):
             str(provider_type_item_by_field.get("term") or "").lower(),
         )
     )
-    total = len(ordered_provider_type_items)
-    page_items = ordered_provider_type_items[
-        pagination.offset: pagination.offset + pagination.limit
-    ]
-
-    return response.json(
-        {
-            "items": page_items,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
-            },
-            "query": {
-                "q": search_query,
-                "data_status": "available" if provider_type_rows else "empty_or_unavailable",
-            },
-        }
-    )
+    return ordered_provider_type_items
 
 
 @blueprint.get("/provider-types/resolve", name="pricing.provider_types.resolve")

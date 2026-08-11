@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -95,6 +96,18 @@ def _patch_pointer_transaction(monkeypatch, authoritative_snapshot):
         "_locked_snapshot_publication_row",
         AsyncMock(return_value=authoritative_snapshot),
     )
+    dirty_marker = AsyncMock()
+    monkeypatch.setattr(
+        source_pointers,
+        "mark_legacy_global_projection_dirty",
+        dirty_marker,
+    )
+    monkeypatch.setattr(
+        source_pointers,
+        "drain_legacy_global_projection_queue",
+        AsyncMock(return_value=SimpleNamespace(reconciled=1)),
+    )
+    return dirty_marker
 
 
 def _patch_legacy_publication_writers(monkeypatch, plan_pointer_entries):
@@ -399,7 +412,7 @@ async def test_source_publication_binds_the_immutable_coverage_scope(
 ):
     """Exercise physical and logical scope binding before pointer promotion."""
 
-    _patch_pointer_transaction(
+    dirty_marker = _patch_pointer_transaction(
         monkeypatch,
         {"status": source_pointers.PTG2_STATUS_PUBLISHED, "manifest": {}},
     )
@@ -427,6 +440,7 @@ async def test_source_publication_binds_the_immutable_coverage_scope(
     assert publication_by_field["status"] == "promoted"
     bind_layout.assert_awaited_once()
     bind_scope.assert_awaited_once()
+    dirty_marker.assert_awaited_once()
 
 
 @pytest.mark.asyncio

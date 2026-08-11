@@ -89,6 +89,9 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     seal_v4_shared_layout,
 )
 from scripts.ptg_v4_dev_canary_storage import relation_size_rows
+from tests.ptg2_layout_build_schema_support import (
+    layout_build_candidate_and_pin_ddl,
+)
 from tests.ptg2_v4_migration_catalog_support import (
     attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
@@ -806,6 +809,8 @@ def _isolate_graph_caches(monkeypatch) -> None:
 
 
 async def _create_v4_layout_tables(database: Database, schema: str) -> None:
+    """Create the migration-shaped V4 layout identity tables."""
+
     for statement in (
         f"""
         CREATE TABLE {schema}.ptg2_v3_snapshot_layout (
@@ -841,6 +846,7 @@ async def _create_v4_layout_tables(database: Database, schema: str) -> None:
             created_at timestamptz NOT NULL DEFAULT now()
         )
         """,
+        *layout_build_candidate_and_pin_ddl(schema),
     ):
         await database.execute_ddl(statement)
 

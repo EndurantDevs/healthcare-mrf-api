@@ -25,85 +25,86 @@ from process.ptg_parts.ptg_wave_admission_fence import (
     PTGWaveOwnershipConflict,
     is_ptg_wave_owned_run,
 )
-from tests.ptg_wave_supersession_fixtures import recovery_proofs
+from tests.control_import_waves_test_support import (
+    KEY as _KEY,
+    receipt_test_modulus as _receipt_test_modulus,
+    signed_payload as _payload,
+    unsigned_attestation as _unsigned,
+    v6_payload as _v6_payload,
+)
 
 
-_KEY = "test-control-key"
+def test_v6_requires_exact_receipt_epoch_shape_and_operation_digest():
+    validation_result = validate_import_wave_payload(
+        _v6_payload(),
+        attestation_key=_KEY,
+    )
+    assert validation_result["receipt_key_id"] == "receipt-active"
+    assert validation_result["receipt_public_modulus_hex"] == _receipt_test_modulus()
+    assert validation_result["receipt_public_exponent"] == 65537
+    assert validation_result["wave_id"] == "6" * 64
 
+    retired = validate_import_wave_payload(
+        _v6_payload(key_id="receipt-retired"),
+        attestation_key=_KEY,
+    )
+    assert retired["receipt_key_id"] == "receipt-retired"
 
-def _unsigned(
-    count: int = 2,
-    *,
-    schema_version: str = ATTESTATION_VERSION,
-) -> dict:
-    imported_digest = hashlib.sha256(
-        "\0".join(
-            f"coordinate-unit-{ordinal}\0v1" for ordinal in range(count)
-        ).encode("utf-8")
-    ).hexdigest()
-    snapshot_by_field = {
-        "snapshot_digest": "a" * 64,
-        "membership_digest": "b" * 64,
-        "inventory_digest": "c" * 64,
-        "subscription_coverage_digest": "d" * 64,
-        "entitlement_coverage_count": 2,
-        "entitlement_coverage_digest": "8" * 64,
-        "catalog_generation": "9" * 64,
+    malformed = _v6_payload()
+    malformed["cohort_attestation"]["wave_id"] = "not-a-digest"
+    malformed["cohort_attestation"]["idempotency_key"] = "not-a-digest"
+    unsigned_attestation_by_field = {
+        field: epoch_value
+        for field, epoch_value in malformed["cohort_attestation"].items()
+        if field != "signature"
     }
-    if schema_version != LEGACY_ATTESTATION_VERSION:
-        snapshot_by_field.update(
-            authorization_basis=AUTHORIZATION_BASIS,
-            authorization_digest="7" * 64,
+    malformed["cohort_attestation"]["signature"] = sign_cohort_attestation(
+        unsigned_attestation_by_field,
+        key=_KEY,
+    )
+    with pytest.raises(ValueError, match="operation digest"):
+        validate_import_wave_payload(
+            malformed,
+            attestation_key=_KEY,
         )
-    unsigned_attestation_map = {
-        "schema_version": schema_version,
-        "wave_id": "wave-unit",
-        "idempotency_key": "wave-unit-key",
-        "snapshot": snapshot_by_field,
-        "partition": {
-            "complete": True,
-            "physical_coordinate_count": count,
-            "physical_coordinate_digest": "e" * 64,
-            "imported_coordinate_count": count,
-            "imported_coordinate_digest": imported_digest,
-            "reused_coordinate_count": 0,
-            "reused_coordinate_digest": "0" * 64,
-            "partition_digest": "f" * 64,
-        },
-        "intents": [
-            {
-                "ordinal": ordinal,
-                "run_id": f"run-unit-{ordinal}",
-                "source_file_import_id": f"coordinate-unit-{ordinal}",
-                "content_version": "v1",
-                "params": {
-                    "source_file_import_id": f"coordinate-unit-{ordinal}",
-                    "import_id": f"coordinate-unit-{ordinal}",
-                },
-            }
-            for ordinal in range(count)
-        ],
-    }
-    unsigned_attestation_map.update(recovery_proofs(
-        schema_version=schema_version,
-        successor_wave_id=unsigned_attestation_map["wave_id"],
-        intent_count=count,
-    ))
-    return unsigned_attestation_map
 
 
-def _payload(
-    count: int = 2,
-    *,
-    schema_version: str = ATTESTATION_VERSION,
-) -> dict:
-    unsigned = _unsigned(count, schema_version=schema_version)
-    return {
-        "cohort_attestation": {
-            **unsigned,
-            "signature": sign_cohort_attestation(unsigned, key=_KEY),
-        }
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda attestation: attestation.pop("receipt_key_id"),
+        lambda attestation: attestation.pop("receipt_public_modulus_hex"),
+        lambda attestation: attestation.pop("receipt_public_exponent"),
+        lambda attestation: attestation.update(extra="forbidden"),
+        lambda attestation: attestation.update(
+            receipt_public_modulus_hex="0" * 512
+        ),
+        lambda attestation: attestation.update(receipt_public_exponent=True),
+        lambda attestation: attestation.update(
+            schema_version=ATTESTATION_VERSION
+        ),
+    ),
+)
+def test_v6_rejects_missing_extra_and_schema_downgrade(mutation):
+    payload = _v6_payload()
+    mutation(payload["cohort_attestation"])
+    unsigned_attestation_by_field = {
+        field: value
+        for field, value in payload["cohort_attestation"].items()
+        if field != "signature"
     }
+    try:
+        payload["cohort_attestation"]["signature"] = sign_cohort_attestation(
+            unsigned_attestation_by_field,
+            key=_KEY,
+        )
+    except ValueError:
+        payload["cohort_attestation"]["signature"] = "0" * 64
+    with pytest.raises(ValueError):
+        validate_import_wave_payload(
+            payload,
+            attestation_key=_KEY,
+        )
 
 
 def test_signed_full_request_identity_binds_snapshot_partition_and_all_intents():

@@ -30,6 +30,11 @@ from sanic import Sanic
 from api import init_api
 from db.migrator import db_group
 from process import process_group, process_group_end
+from process.ptg_wave_receipt_process_authority import (
+    RECEIPT_AUTHORITY_ROLE_SIGNER,
+    receipt_authority_role,
+    require_receipt_authority_worker_count,
+)
 
 
 def _new_event_loop():
@@ -67,6 +72,8 @@ def _default_api_workers() -> int:
 @click.option('--accesslog', help='Enable or disable access log', is_flag=True)
 def start(host, port, workers, debug, accesslog):
     """Start the API server with the requested runtime options."""
+    if receipt_authority_role() == RECEIPT_AUTHORITY_ROLE_SIGNER:
+        require_receipt_authority_worker_count(workers)
     connection._detect_server_capabilities = lambda *a, **kw: ServerCapabilities(
         advisory_locks=False,
         notifications=False,

@@ -30,8 +30,16 @@ from process.ptg_wave_materialized_preclaim_supersession_contract import (
     RECOVERY_BASIS,
     validate_materialized_preclaim_supersession_proof,
 )
+from process.ptg_wave_receipt_contract import (
+    PTGWaveReceiptContractError,
+    admission_receipt_mapping,
+    validate_abandonment_request,
+)
 from process.ptg_wave_redis import (
     attest_ptg_small_wave_unclaimed_failure_redis,
+)
+from process.ptg_wave_v12_pristine_abandonment import (
+    attest_v12_pristine_materialized_abandonment,
 )
 
 
@@ -145,6 +153,45 @@ async def attest_locked_materialized_preclaim_abandonment(
             "materialized predecessor runs must be unassigned"
         )
     return await _observe(snapshot, cutover_id, redis=redis)
+
+
+async def attest_locked_v12_abandonment(
+    session: Any,
+    wave_id: str,
+    request: object,
+    *,
+    redis: Any,
+) -> dict[str, Any]:
+    """Reobserve a fresh-v6 pristine wave without legacy recovery lineage."""
+
+    wave_id = _wave_id(wave_id, "wave ID")
+    if await _supersession_row(session, wave_id, lock_row=True) is not None:
+        raise PTGWaveMaterializedPreclaimConflict(
+            "fresh V12 wave already has an immutable supersession"
+        )
+    snapshot = await _load_snapshot(session, wave_id, lock_rows=True)
+    try:
+        admission = admission_receipt_mapping(
+            snapshot.wave,
+            snapshot.intents,
+        )
+        validated_request = validate_abandonment_request(
+            request,
+            wave=snapshot.wave,
+            admission=admission,
+        )
+    except PTGWaveReceiptContractError as exc:
+        raise PTGWaveMaterializedPreclaimConflict(str(exc)) from exc
+    if any(getattr(run, "node_id", None) is not None for run in snapshot.runs):
+        raise PTGWaveMaterializedPreclaimConflict(
+            "fresh V12 materialized runs must be unassigned"
+        )
+    return await _observe_v12(
+        snapshot,
+        cutover_id=validated_request["cutover_id"],
+        admission=admission,
+        redis=redis,
+    )
 
 
 async def _load_snapshot(
@@ -334,6 +381,58 @@ async def _observe(
         ) from exc
 
 
+async def _observe_v12(
+    snapshot: _MaterializedDatabaseSnapshot,
+    *,
+    cutover_id: str,
+    admission: dict[str, Any],
+    redis: Any,
+) -> dict[str, Any]:
+    """Observe the external V12 boundary and build its distinct proof."""
+
+    if redis is None:
+        raise PTGWaveMaterializedPreclaimConflict(
+            "fresh V12 abandonment requires the Redis observer"
+        )
+    try:
+        actual_job = get_wave_job(snapshot.wave.wave_digest)
+        if actual_job is None:
+            raise PTGWaveMaterializedPreclaimConflict(
+                "fresh V12 predecessor Kubernetes Job is unavailable"
+            )
+        manifest = restore_wave_manifest(
+            PTGWaveBundle(wave=snapshot.wave, intents=snapshot.intents)
+        )
+        redis_attestation = await attest_ptg_small_wave_unclaimed_failure_redis(
+            redis,
+            manifest,
+        )
+        return attest_v12_pristine_materialized_abandonment(
+            PTGWaveMaterializedPreclaimObservation(
+                predecessor_wave=snapshot.wave,
+                intents=snapshot.intents,
+                runs=snapshot.runs,
+                claims=snapshot.claims,
+                outcomes=snapshot.outcomes,
+                worker_start_event_ordinals=(
+                    snapshot.worker_start_event_ordinals
+                ),
+                logical_supersession=snapshot.logical_supersession,
+                admission_rollback=snapshot.admission_rollback,
+                actual_job=actual_job,
+                redis_unclaimed_attestation=redis_attestation.as_mapping(),
+            ),
+            cutover_id=cutover_id,
+            admission=admission,
+        )
+    except PTGWaveMaterializedPreclaimConflict:
+        raise
+    except Exception as exc:
+        raise PTGWaveMaterializedPreclaimConflict(
+            "fresh V12 abandonment observation failed"
+        ) from exc
+
+
 async def _supersession_row(
     session: Any,
     predecessor_wave_id: str,
@@ -381,6 +480,7 @@ def _wave_id(value: Any, name: str) -> str:
 
 __all__ = [
     "attest_locked_materialized_preclaim_abandonment",
+    "attest_locked_v12_abandonment",
     "attest_locked_materialized_preclaim_supersession",
     "get_materialized_preclaim_supersession_candidate",
 ]

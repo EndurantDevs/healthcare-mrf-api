@@ -3,12 +3,18 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_DENSE_LAYOUT_TABLES,
     PTG2_V3_SHARED_GENERATION,
+)
+from tests.ptg2_layout_build_schema_support import (
+    layout_build_candidate_and_pin_ddl,
+)
+from tests.ptg_source_snapshot_removal_postgres_projection import (
+    schema_sql as _schema_sql,
+    snapshot_manifest as _snapshot_manifest,
 )
 
 
@@ -123,6 +129,7 @@ _SCHEMA_STATEMENTS = (
         created_at timestamptz NOT NULL DEFAULT now()
     )
     """,
+    *layout_build_candidate_and_pin_ddl("__SCHEMA__"),
     """
     CREATE TABLE __SCHEMA__.ptg2_v3_snapshot_binding (
         snapshot_id varchar(96) PRIMARY KEY REFERENCES
@@ -269,10 +276,6 @@ VALUES
 """
 
 
-def _schema_sql(statement: str, schema: str) -> str:
-    return statement.replace("__SCHEMA__", schema)
-
-
 async def create_production_shaped_schema(database: Any, schema_name: str) -> None:
     """Create the production foreign-key shape used by removal tests."""
 
@@ -287,19 +290,6 @@ async def create_production_shaped_schema(database: Any, schema_name: str) -> No
                 "(snapshot_key bigint NOT NULL)"
             )
         await connection.status(_schema_sql(_SCHEMA_STATEMENTS[-1], schema))
-
-
-def _snapshot_manifest(source_key: str) -> str:
-    return json.dumps(
-        {
-            "serving_index": {
-                "arch_version": "postgres_binary_v3",
-                "storage_generation": PTG2_V3_SHARED_GENERATION,
-                "shared_snapshot_key": 10,
-                "source_key": source_key,
-            }
-        }
-    )
 
 
 async def _insert_snapshot_binding(

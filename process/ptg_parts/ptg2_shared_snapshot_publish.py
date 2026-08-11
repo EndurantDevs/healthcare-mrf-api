@@ -49,7 +49,9 @@ from process.ptg_parts.ptg2_shared_finalize import (
     run_v3_direct_finalizer,
 )
 from process.ptg_parts.ptg2_shared_graph import SharedGraphConversionResult
-from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_source_lifecycle_lock,
+)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_stale_metadata_fence import (
     lock_writable_snapshot,
@@ -82,8 +84,13 @@ from process.ptg_parts.ptg2_shared_publish import (
     publish_shared_finalizer_dictionaries,
     publish_shared_graph,
     _publish_v4_cas_in_session,
+    prepare_v4_cas_block_stage,
     shared_block_stage_name,
     shared_graph_bundles_from_artifacts,
+)
+from process.ptg_parts.ptg2_block_build_pins import (
+    SharedBlockBuildPinLease,
+    delete_shared_block_build_pins,
 )
 from process.ptg_parts.ptg2_shared_reuse import (
     SharedLogicalPlanScope,
@@ -920,7 +927,10 @@ async def publish_shared_v3_snapshot_sources(
     primary_plan = normalized_plan_scopes[0]
     schema = _quote_ident(schema_name)
     async with db.transaction() as session:
-        await acquire_ptg2_lifecycle_lock(session)
+        await acquire_ptg2_source_lifecycle_lock(
+            session,
+            source_key=f"snapshot_{snapshot_id}",
+        )
         await lock_writable_snapshot(
             session,
             db,
@@ -1093,7 +1103,10 @@ async def delete_unpublished_snapshot_sources(
 
     schema = _quote_ident(schema_name)
     async with db.transaction() as session:
-        await acquire_ptg2_lifecycle_lock(session)
+        await acquire_ptg2_source_lifecycle_lock(
+            session,
+            source_key=f"snapshot_{snapshot_id}",
+        )
         await lock_writable_snapshot(
             session,
             db,
@@ -3840,6 +3853,7 @@ async def _publish_v4_dictionaries_and_maps(
         else None
     )
     created_stages: list[str] = []
+    pin_lease: SharedBlockBuildPinLease | None = None
     try:
         for stage, statement in zip(
             stages,
@@ -3982,6 +3996,20 @@ async def _publish_v4_dictionaries_and_maps(
                 "AND tin_id_128 = substring(tin_hmac_sha256 FROM 1 FOR 16)"
             ),
         )
+        await prepare_v4_cas_block_stage(
+            schema_name=schema_name,
+            stage_table=block_stage,
+            snapshot_key=int(snapshot_key),
+            build_token=build_token,
+            progress_callback=progress_callback,
+        )
+        pin_lease = SharedBlockBuildPinLease(
+            schema_name=schema_name,
+            snapshot_key=int(snapshot_key),
+            build_token=build_token,
+            pin_token=block_stage,
+        )
+        await pin_lease.start()
         async with db.transaction() as session:
             tax_identity_source_stage = (
                 await stage_tax_identity_source_projection(
@@ -3998,12 +4026,9 @@ async def _publish_v4_dictionaries_and_maps(
                 snapshot_key=int(snapshot_key),
                 build_token=build_token,
             )
-            # Protect payload-free reuse rows as soon as the layout fence is
-            # held. GC does not acquire that layout fence, so delaying these
-            # globally ordered block locks until after dictionary validation
-            # would let it remove a reused CAS row during a long validation.
-            # The helper restores the caller's prior lock_timeout before the
-            # remaining publication SQL proceeds.
+            # The CAS rows were committed in short batches and remain protected
+            # by durable attempt pins. This pass only validates them while the
+            # source-local layout and map work proceed.
             cas_publication = await _publish_v4_cas_in_session(
                 session,
                 schema_name=schema_name,
@@ -4430,6 +4455,18 @@ async def _publish_v4_dictionaries_and_maps(
                 and tax_identity_source_stage is not None
                 else None
             )
+            pin_lease.require_live()
+            deleted_pin_count = await delete_shared_block_build_pins(
+                session,
+                schema_name=schema_name,
+                snapshot_key=int(snapshot_key),
+                build_token=build_token,
+                pin_token=block_stage,
+            )
+            await pin_lease.close()
+            pin_lease = None
+            if deleted_pin_count != cas_publication.unique_block_count:
+                raise RuntimeError("PTG V4 block pin set changed before map attach")
             return (
                 cas_publication,
                 map_summary,
@@ -4446,11 +4483,18 @@ async def _publish_v4_dictionaries_and_maps(
                 tax_identity_source_publication,
             )
     finally:
+        has_primary_error = sys.exc_info()[0] is not None
+        if pin_lease is not None:
+            try:
+                await pin_lease.close()
+            except BaseException:
+                if not has_primary_error:
+                    raise
         await _cleanup_v4_dictionary_attempt(
             schema=schema,
             stages=stages,
             prepared_tax_identity_source=prepared_tax_identity_source,
-            preserve_primary_error=sys.exc_info()[0] is not None,
+            preserve_primary_error=has_primary_error,
         )
 
 

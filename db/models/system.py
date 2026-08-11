@@ -35,6 +35,7 @@ __all__ = (
     "PTGImportWaveAdmissionRollback",
     "PTGImportWaveClaim",
     "PTGImportWaveIntent",
+    "PTGImportWaveOrdinaryTerminalReceipt",
     "PTGImportWaveOutcome",
     "PTGImportWaveQuarantine",
     "PTGImportWaveSupersession",
@@ -275,6 +276,60 @@ class PTGImportWave(Base, JSONOutputMixin):
             "AND ((cleanup_summary IS NULL) = (cleanup_evidence_digest IS NULL))",
             name="ptg_import_wave_receipt_pairs_check",
         ),
+        CheckConstraint(
+            "((cohort_attestation ->> 'schema_version' = "
+            "'healthporta.ptg-import-wave-attestation.v6' "
+                "AND receipt_key_id IS NOT NULL "
+                "AND receipt_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
+                "AND cohort_attestation ->> 'receipt_key_id' = receipt_key_id "
+                "AND receipt_public_modulus_hex IS NOT NULL "
+                "AND length(receipt_public_modulus_hex) = 512 "
+                "AND receipt_public_modulus_hex ~ '^[0-9a-f]+$' "
+                "AND left(receipt_public_modulus_hex, 1) ~ '^[89a-f]$' "
+                "AND right(receipt_public_modulus_hex, 1) ~ '^[13579bdf]$' "
+                "AND receipt_public_exponent IS NOT NULL "
+                "AND receipt_public_exponent = 65537 "
+                "AND cohort_attestation ->> 'receipt_public_modulus_hex' "
+                "= receipt_public_modulus_hex "
+                "AND (cohort_attestation ->> 'receipt_public_exponent')::integer "
+                "= receipt_public_exponent) "
+                "OR (cohort_attestation ->> 'schema_version' <> "
+                "'healthporta.ptg-import-wave-attestation.v6' "
+                "AND receipt_key_id IS NULL "
+                "AND receipt_public_modulus_hex IS NULL "
+                "AND receipt_public_exponent IS NULL))",
+            name="ptg_import_wave_receipt_key_epoch_check",
+        ),
+        CheckConstraint(
+            "(linkage_receipt IS NULL "
+            "AND linkage_receipt_payload_digest IS NULL "
+            "AND linkage_receipt_issued_at IS NULL) OR ("
+            "cohort_attestation ->> 'schema_version' = "
+            "'healthporta.ptg-import-wave-attestation.v6' "
+            "AND linkage_ack IS NOT NULL "
+            "AND linkage_ack_digest ~ '^[0-9a-f]{64}$' "
+            "AND json_typeof(linkage_receipt) = 'object' "
+            "AND linkage_receipt ->> 'schema' = "
+            "'healthporta.ptg-wave-linkage-receipt.v2' "
+            "AND linkage_receipt ->> 'key_id' = receipt_key_id "
+            "AND linkage_receipt ->> 'payload_digest' = "
+            "linkage_receipt_payload_digest "
+            "AND length(linkage_receipt ->> 'signature') = 512 "
+            "AND linkage_receipt ->> 'signature' ~ '^[0-9a-f]+$' "
+            "AND linkage_receipt #>> '{payload,wave_id}' = wave_id "
+            "AND linkage_receipt #>> '{payload,wave_digest}' = wave_digest "
+            "AND linkage_receipt #>> '{payload,linkage_ack_digest}' = "
+            "linkage_ack_digest "
+            "AND linkage_receipt_payload_digest ~ '^[0-9a-f]{64}$' "
+            "AND linkage_receipt_issued_at IS NOT NULL)",
+            name="ptg_import_wave_linkage_receipt_check",
+        ),
+        CheckConstraint(
+            "cohort_attestation ->> 'schema_version' <> "
+            "'healthporta.ptg-import-wave-attestation.v6' "
+            "OR linkage_ack IS NULL OR linkage_receipt IS NOT NULL",
+            name="ptg_import_wave_v6_linkage_receipt_required_check",
+        ),
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
     wave_id = Column(String(64), nullable=False)
@@ -283,6 +338,9 @@ class PTGImportWave(Base, JSONOutputMixin):
     cohort_attestation = Column(JSON, nullable=False)
     cohort_attestation_digest = Column(String(64), nullable=False)
     cohort_signature_digest = Column(String(64), nullable=False)
+    receipt_key_id = Column(String(64))
+    receipt_public_modulus_hex = Column(String(512))
+    receipt_public_exponent = Column(Integer)
     physical_coordinate_count = Column(Integer, nullable=False)
     physical_coordinate_digest = Column(String(64), nullable=False)
     imported_coordinate_count = Column(Integer, nullable=False)
@@ -330,6 +388,9 @@ class PTGImportWave(Base, JSONOutputMixin):
     failure_receipt_digest = Column(String(64))
     linkage_ack = Column(JSON)
     linkage_ack_digest = Column(String(64))
+    linkage_receipt = Column(JSON)
+    linkage_receipt_payload_digest = Column(String(64))
+    linkage_receipt_issued_at = Column(TIMESTAMP(timezone=True))
     redis_cleanup_ticket = Column(String(128))
     redis_cleanup_started_at = Column(TIMESTAMP)
     redis_cleanup_evidence = Column(JSON)
@@ -359,7 +420,8 @@ class PTGImportWaveQuarantine(Base, JSONOutputMixin):
         ),
         CheckConstraint(
             "reason IN ('legacy_uncertain_slots_waiting_pre_receipt', "
-            "'materialized_preclaim_failure')",
+            "'materialized_preclaim_failure', "
+            "'v12_pristine_materialized_cutover')",
             name="ptg_import_wave_quarantine_reason_check",
         ),
         CheckConstraint(
@@ -377,8 +439,54 @@ class PTGImportWaveQuarantine(Base, JSONOutputMixin):
             "AND encode(sha256(recovery_evidence_canonical), 'hex') "
             "= recovery_evidence_sha256 "
             "AND convert_from(recovery_evidence_canonical, 'UTF8')::jsonb "
+            "= recovery_evidence - 'proof_digest') OR ("
+            "reason = 'v12_pristine_materialized_cutover' "
+            "AND recovery_basis = 'v12_pristine_materialized_cutover' "
+            "AND successor_wave_id IS NOT NULL "
+            "AND successor_wave_id <> predecessor_wave_id "
+            "AND jsonb_typeof(recovery_evidence) = 'object' "
+            "AND recovery_evidence ->> 'schema_version' = "
+            "'healthporta.ptg-wave.v12-pristine-materialized-abandonment-proof.v1' "
+            "AND recovery_evidence_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND octet_length(recovery_evidence_canonical) > 0 "
+            "AND encode(sha256(convert_to("
+            "'healthporta.ptg-wave.v12-pristine-materialized-abandonment-proof.v1', "
+            "'UTF8') || decode('00', 'hex') || "
+            "recovery_evidence_canonical), 'hex') = recovery_evidence_sha256 "
+            "AND convert_from(recovery_evidence_canonical, 'UTF8')::jsonb "
             "= recovery_evidence - 'proof_digest')",
             name="ptg_import_wave_quarantine_abandonment_evidence_check",
+        ),
+        CheckConstraint(
+            "(recovery_basis IS DISTINCT FROM "
+            "'v12_pristine_materialized_cutover' "
+            "AND abandonment_receipt IS NULL "
+            "AND abandonment_receipt_payload_digest IS NULL "
+            "AND abandonment_receipt_issued_at IS NULL "
+            "AND receipt_key_id IS NULL) OR ("
+            "reason = 'v12_pristine_materialized_cutover' "
+            "AND recovery_basis = 'v12_pristine_materialized_cutover' "
+            "AND "
+            "recovery_evidence ->> 'schema_version' = "
+            "'healthporta.ptg-wave.v12-pristine-materialized-abandonment-proof.v1' "
+            "AND receipt_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
+            "AND jsonb_typeof(abandonment_receipt) = 'object' "
+            "AND abandonment_receipt ->> 'schema' = "
+            "'healthporta.ptg-wave-abandonment-receipt.v2' "
+            "AND abandonment_receipt ->> 'key_id' = receipt_key_id "
+            "AND abandonment_receipt ->> 'payload_digest' = "
+            "abandonment_receipt_payload_digest "
+            "AND length(abandonment_receipt ->> 'signature') = 512 "
+            "AND abandonment_receipt ->> 'signature' ~ '^[0-9a-f]+$' "
+            "AND abandonment_receipt #>> '{payload,wave_id}' = "
+            "predecessor_wave_id "
+            "AND abandonment_receipt #>> '{payload,cutover_id}' = "
+            "successor_wave_id "
+            "AND abandonment_receipt #>> "
+            "'{payload,recovery_evidence_sha256}' = recovery_evidence_sha256 "
+            "AND abandonment_receipt_payload_digest ~ '^[0-9a-f]{64}$' "
+            "AND abandonment_receipt_issued_at IS NOT NULL)",
+            name="ptg_import_wave_quarantine_receipt_check",
         ),
         UniqueConstraint(
             "successor_wave_id",
@@ -393,6 +501,10 @@ class PTGImportWaveQuarantine(Base, JSONOutputMixin):
     recovery_evidence = Column(JSONB)
     recovery_evidence_canonical = Column(LargeBinary)
     recovery_evidence_sha256 = Column(String(64))
+    receipt_key_id = Column(String(64))
+    abandonment_receipt = Column(JSONB)
+    abandonment_receipt_payload_digest = Column(String(64))
+    abandonment_receipt_issued_at = Column(TIMESTAMP(timezone=True))
     created_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 
@@ -569,6 +681,70 @@ class PTGImportWaveIntent(Base, JSONOutputMixin):
     job_payload = Column(JSON, nullable=False)
     serialized_job = Column(LargeBinary, nullable=False)
     serialized_job_digest = Column(String(64), nullable=False)
+
+
+class PTGImportWaveOrdinaryTerminalReceipt(Base, JSONOutputMixin):
+    """Append-only RSA proof for one later ordinary PTG member run."""
+
+    __tablename__ = "ptg_import_wave_ordinary_terminal_receipt"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("wave_id", "member_ordinal"),
+        ForeignKeyConstraint(
+            ("wave_id", "member_ordinal"),
+            (PTGImportWaveIntent.wave_id, PTGImportWaveIntent.ordinal),
+            name="ptg_wave_ordinary_terminal_member_fkey",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ("run_id",),
+            (ImportRun.run_id,),
+            name="ptg_wave_ordinary_terminal_run_fkey",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "source_file_import_id",
+            name="ptg_wave_ordinary_terminal_source_import_key",
+        ),
+        UniqueConstraint(
+            "run_id",
+            name="ptg_wave_ordinary_terminal_run_id_key",
+        ),
+        CheckConstraint(
+            "member_ordinal >= 0 "
+            "AND length(source_file_import_id) BETWEEN 1 AND 64 "
+            "AND length(run_id) BETWEEN 1 AND 64 "
+            "AND receipt_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
+            "AND jsonb_typeof(receipt) = 'object' "
+            "AND receipt ->> 'schema' = "
+            "'healthporta.ptg-wave-ordinary-terminal-receipt.v1' "
+            "AND receipt ->> 'key_id' = receipt_key_id "
+            "AND receipt ->> 'payload_digest' = payload_digest "
+            "AND receipt #>> '{payload,wave_id}' = wave_id "
+            "AND (receipt #>> '{payload,member_ordinal}')::integer "
+            "= member_ordinal "
+            "AND receipt #>> '{payload,source_file_import_id}' "
+            "= source_file_import_id "
+            "AND receipt #>> '{payload,run_id}' = run_id "
+            "AND payload_digest ~ '^[0-9a-f]{64}$' "
+            "AND length(receipt ->> 'signature') = 512 "
+            "AND receipt ->> 'signature' ~ '^[0-9a-f]+$'",
+            name="ptg_wave_ordinary_terminal_receipt_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
+    )
+    wave_id = Column(String(64), nullable=False)
+    member_ordinal = Column(Integer, nullable=False)
+    source_file_import_id = Column(String(64), nullable=False)
+    run_id = Column(String(64), nullable=False)
+    receipt_key_id = Column(String(64), nullable=False)
+    receipt = Column(JSONB, nullable=False)
+    payload_digest = Column(String(64), nullable=False)
+    issued_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 
 class PTGImportWaveClaim(Base, JSONOutputMixin):
