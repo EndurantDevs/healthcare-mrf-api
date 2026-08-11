@@ -45,7 +45,12 @@ async def _insert_candidate_dataset(
         endpoint_id=SECOND_ENDPOINT_ID,
         root_run_id=SECOND_ROOT_RUN_ID,
         status=importer.ENDPOINT_DATASET_ACQUIRING,
-        metadata_json=json.dumps({"source_ids": list(SECOND_SOURCE_IDS)}),
+        metadata_json=json.dumps(
+            {
+                "selected_resources": list(SECOND_SELECTED_RESOURCES),
+                "source_ids": list(SECOND_SOURCE_IDS),
+            }
+        ),
     )
 
 
