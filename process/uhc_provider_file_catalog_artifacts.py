@@ -114,6 +114,8 @@ async def _validated_get(session: aiohttp.ClientSession, url: str):
             headers={"Accept-Encoding": "identity"},
         ) as response:
             response_url = trusted_public_https_url(str(response.url))
+            if response_url != request_url:
+                raise UHCFileCatalogError("Catalog response URL is invalid")
             if response.status not in REDIRECT_STATUSES:
                 yield response
                 return

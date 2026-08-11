@@ -286,8 +286,8 @@ async def test_complete_acquisition_opens_no_network_session(monkeypatch) -> Non
 @pytest.mark.parametrize(
     ("response_by_field", "message"),
     [
-        ({"status": 302}, "exact reviewed URL"),
-        ({"url": "https://other.example.invalid/file"}, "exact reviewed URL"),
+        ({"status": 302}, "redirect"),
+        ({"url": "https://other.example.invalid/file"}, "redirect"),
         ({"headers": {"Content-Encoding": "gzip"}}, "content encoding"),
         ({"declared_length": 3}, "declared byte count changed"),
     ],
