@@ -303,6 +303,7 @@ def _reviewed_subset_operation_gates() -> tuple[tuple[str, str], ...]:
     )
     from process.provider_directory_fhir_subset_terminal_disposition_profile import (
         DIRECT_V4_TERMINAL_DISPOSITION_ENABLED_ENV,
+        DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_ENABLED_ENV,
     )
 
     return (
@@ -312,6 +313,10 @@ def _reviewed_subset_operation_gates() -> tuple[tuple[str, str], ...]:
         (
             "seal-direct-v4-terminal-root",
             DIRECT_V4_TERMINAL_DISPOSITION_ENABLED_ENV,
+        ),
+        (
+            "seal-direct-v5-http410-root",
+            DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_ENABLED_ENV,
         ),
     )
 

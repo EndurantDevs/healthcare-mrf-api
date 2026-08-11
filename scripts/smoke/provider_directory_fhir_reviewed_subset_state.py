@@ -25,6 +25,9 @@ EVIDENCE_COMMAND = "render-neutral-evidence"
 ABANDON_COMMAND = "abandon-expired-root"
 TERMINAL_DISPOSITION_COMMAND = "seal-terminal-root"
 DIRECT_V4_TERMINAL_DISPOSITION_COMMAND = "seal-direct-v4-terminal-root"
+DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND = (
+    "seal-direct-v5-http410-root"
+)
 _ENABLED_ENV_BY_COMMAND = {
     COMMAND: "HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED",
     ABANDON_COMMAND: (
@@ -36,6 +39,10 @@ _ENABLED_ENV_BY_COMMAND = {
     ),
     DIRECT_V4_TERMINAL_DISPOSITION_COMMAND: (
         "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_"
+        "TERMINAL_DISPOSITION_ENABLED"
+    ),
+    DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND: (
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V5_HTTP410_"
         "TERMINAL_DISPOSITION_ENABLED"
     ),
 }
@@ -92,6 +99,7 @@ def _parser() -> argparse.ArgumentParser:
             ABANDON_COMMAND,
             TERMINAL_DISPOSITION_COMMAND,
             DIRECT_V4_TERMINAL_DISPOSITION_COMMAND,
+            DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND,
         ),
     )
     return parser
@@ -226,6 +234,16 @@ async def _execute_direct_v4_terminal_disposition(database: Any) -> str:
     return terminal_disposition_result_json(result)
 
 
+async def _execute_v5_terminal_disposition(database: Any) -> str:
+    from process.provider_directory_fhir_subset_terminal_disposition import (
+        dispose_v5_terminal_root,
+        terminal_disposition_result_json,
+    )
+
+    result = await dispose_v5_terminal_root(database=database)
+    return terminal_disposition_result_json(result)
+
+
 async def _execute_operation(database: Any, command: str) -> str:
     if command == COMMAND:
         return await _execute_state_sync(database)
@@ -237,6 +255,8 @@ async def _execute_operation(database: Any, command: str) -> str:
         return await _execute_terminal_disposition(database)
     if command == DIRECT_V4_TERMINAL_DISPOSITION_COMMAND:
         return await _execute_direct_v4_terminal_disposition(database)
+    if command == DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND:
+        return await _execute_v5_terminal_disposition(database)
     raise RuntimeError("reviewed subset operator command is invalid")
 
 
